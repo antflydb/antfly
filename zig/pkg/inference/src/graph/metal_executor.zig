@@ -493,7 +493,7 @@ fn printRuntimeDebugTimingStats(metal_stats: model_runtime.RuntimeDebugTimingSta
         },
     );
     std.debug.print(
-        "metal_runtime_memory: buffers={d} total_mb={d} embedding_mb={d} norm_mb={d} dense_linear_mb={d} dense_linear_buffers={d} dense_largest_slot={d} dense_largest_mb={d} dense_largest_in={d} dense_largest_out={d} dense_weight_mb={d} dense_f32_mb={d} dense_bf16_mb={d} dense_f16_mb={d} dense_f32_slots={d} dense_bf16_slots={d} dense_f16_slots={d} quant_linear_mb={d} scratch_mb={d} scratch_pool_mb={d} scratch_pool_slots={d} scratch_pool_in_use={d} scratch_pool_pending={d} attention_span_mb={d} hidden_state_mb={d} frame_retained_mb={d} graph_plan_mb={d} graph_plan_slots={d} graph_plan_active={d} graph_plan_count={d} graph_plan_allocs={d} graph_plan_reuses={d}\n",
+        "metal_runtime_memory: buffers={d} total_mb={d} embedding_mb={d} norm_mb={d} dense_linear_mb={d} dense_linear_buffers={d} dense_largest_slot={d} dense_largest_mb={d} dense_largest_in={d} dense_largest_out={d} dense_weight_mb={d} dense_f32_mb={d} dense_bf16_mb={d} dense_f16_mb={d} dense_f32_slots={d} dense_bf16_slots={d} dense_f16_slots={d} quant_linear_mb={d} scratch_mb={d} scratch_pool_mb={d} scratch_pool_slots={d} scratch_pool_in_use={d} scratch_pool_pending={d} reuse_pool_mb={d} reuse_pool_slots={d} reuse_pool_peak_slots={d} reuse_allocs={d} reuse_hits={d} attention_span_mb={d} hidden_state_mb={d} frame_retained_mb={d}\n",
         .{
             provider_stats.metal_runtime_buffer_count,
             provider_stats.metal_runtime_total_bytes / (1024 * 1024),
@@ -518,9 +518,19 @@ fn printRuntimeDebugTimingStats(metal_stats: model_runtime.RuntimeDebugTimingSta
             provider_stats.metal_runtime_scratch_pool_slots,
             provider_stats.metal_runtime_scratch_pool_in_use_slots,
             provider_stats.metal_runtime_scratch_pool_pending_slots,
+            provider_stats.metal_runtime_reuse_pool_bytes / (1024 * 1024),
+            provider_stats.metal_runtime_reuse_pool_slots,
+            provider_stats.metal_runtime_reuse_pool_peak_slots,
+            provider_stats.metal_runtime_reuse_alloc_count,
+            provider_stats.metal_runtime_reuse_hit_count,
             provider_stats.metal_runtime_attention_span_bytes / (1024 * 1024),
             provider_stats.metal_runtime_hidden_state_bytes / (1024 * 1024),
             provider_stats.metal_runtime_frame_retained_bytes / (1024 * 1024),
+        },
+    );
+    std.debug.print(
+        "metal_runtime_memory_plan: graph_plan_mb={d} graph_plan_slots={d} graph_plan_active={d} graph_plan_count={d} graph_plan_allocs={d} graph_plan_reuses={d}\n",
+        .{
             provider_stats.metal_runtime_graph_plan_bytes / (1024 * 1024),
             provider_stats.metal_runtime_graph_plan_slots,
             provider_stats.metal_runtime_graph_plan_active,

@@ -46,7 +46,6 @@ MODEL_TASKS = (
     "chunkers",
     "rerankers",
     "generators",
-    "recognizers",
     "classifiers",
     "rewriters",
     "readers",
@@ -177,30 +176,37 @@ CLASSIFIER_MODELS = [
     ),
 ]
 
-RECOGNIZER_MODELS = [
+DEFAULT_EXTRACTOR_MODEL = "antflydb/gliner2-base-v1"
+DEFAULT_EXTRACTOR_VARIANT = "gguf:Q4_K"
+
+EXTRACTOR_MODELS = [
     ModelSpec(
         name="gliner2-base-v1",
-        repo="fastino/gliner2-base-v1",
-        task="recognizers",
-        variant="native",
+        repo=DEFAULT_EXTRACTOR_MODEL,
+        task="extractors",
+        variant=DEFAULT_EXTRACTOR_VARIANT,
+        extra_files=(
+            "gliner2-encoder.Q4_K.gguf",
+            "gliner2-head.Q4_K.gguf",
+        ),
     ),
     # CC-BY-NC-SA: non-commercial only, and ~3GB. Kept for relation-extraction coverage,
     # but it must not appear in any default bundle. GLiNER2 is the recommended extractor.
     ModelSpec(
         name="rebel-large",
         repo="Babelscape/rebel-large",
-        task="recognizers",
+        task="extractors",
     ),
     ModelSpec(
         name="bert-base-NER",
         repo="dslim/bert-base-NER",
-        task="recognizers",
+        task="extractors",
         variant="native",
     ),
     ModelSpec(
         name="pii-deberta-v3-xsmall",
         repo="mukuls9971/pii-deberta-v3-xsmall",
-        task="recognizers",
+        task="extractors",
         variant="native",
     ),
 ]
@@ -261,7 +267,7 @@ CURATED_MODELS = [
     *CHUNKER_MODELS,
     *RERANKER_MODELS,
     *CLASSIFIER_MODELS,
-    *RECOGNIZER_MODELS,
+    *EXTRACTOR_MODELS,
     *READER_MODELS,
     *TRANSCRIBER_MODELS,
 ]
@@ -279,8 +285,7 @@ DEFAULT_MODEL_BY_PATH = {
     "/ai/v1/generate": (DEFAULT_GENERATOR_MODEL, "generators"),
     "/ai/v1/chat/completions": (DEFAULT_GENERATOR_MODEL, "generators"),
     "/ai/v1/classify": ("cross-encoder/nli-distilroberta-base", "classifiers"),
-    "/ai/v1/recognize": ("fastino/gliner2-base-v1", "recognizers"),
-    "/ai/v1/extract": ("fastino/gliner2-base-v1", "recognizers"),
+    "/ai/v1/extract": (DEFAULT_EXTRACTOR_MODEL, "extractors"),
     "/ai/v1/read": ("antflydb/florence-2-base", "readers"),
     "/ai/v1/transcribe": ("openai/whisper-tiny", "transcribers"),
 }
@@ -290,7 +295,6 @@ TASK_NAME_BY_DIR = {
     "chunkers": "chunk",
     "rerankers": "rerank",
     "generators": "generate",
-    "recognizers": "recognize",
     "classifiers": "classify",
     "rewriters": "rewrite",
     "readers": "read",
@@ -302,7 +306,7 @@ LISTING_BOOTSTRAP = {
     "embedders": EMBEDDER_MODELS[0],
     "rerankers": RERANKER_MODELS[0],
     "classifiers": CLASSIFIER_MODELS[0],
-    "recognizers": RECOGNIZER_MODELS[0],
+    "extractors": EXTRACTOR_MODELS[0],
     "readers": READER_MODELS[0],
     "transcribers": TRANSCRIBER_MODELS[0],
 }

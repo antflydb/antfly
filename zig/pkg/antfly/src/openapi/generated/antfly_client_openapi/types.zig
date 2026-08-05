@@ -1575,7 +1575,6 @@ pub const ConnectedModelType = enum {
     generator,
     reranker,
     chunker,
-    recognizer,
     classifier,
     rewriter,
     reader,
@@ -1589,7 +1588,6 @@ pub const ConnectedModelType = enum {
             .generator => "generator",
             .reranker => "reranker",
             .chunker => "chunker",
-            .recognizer => "recognizer",
             .classifier => "classifier",
             .rewriter => "rewriter",
             .reader => "reader",
@@ -1610,7 +1608,6 @@ pub const ConnectedModelType = enum {
             .{ "generator", .generator },
             .{ "reranker", .reranker },
             .{ "chunker", .chunker },
-            .{ "recognizer", .recognizer },
             .{ "classifier", .classifier },
             .{ "rewriter", .rewriter },
             .{ "reader", .reader },
@@ -3204,6 +3201,7 @@ pub const ExtractionOptions = struct {
     include_confidence: ?bool = null,
     include_spans: ?bool = null,
     reader: ?ExtractionReaderOptions = null,
+    resolver: ?ExtractionResolverOptions = null,
 };
 
 pub const ExtractionReaderOptions = struct {
@@ -3225,6 +3223,7 @@ pub const ExtractionRelationEndpoint = struct {
     id: ?[]const u8 = null,
 };
 
+/// Optional source and target labels constrain relation endpoints. A target requires a source.
 pub const ExtractionRelationSchema = struct {
     type: []const u8,
     source: ?[]const u8 = null,
@@ -3238,6 +3237,16 @@ pub const ExtractionRequest = struct {
     options: ?ExtractionOptions = null,
 };
 
+/// Optional cross-input entity and relation deduplication.
+pub const ExtractionResolverOptions = struct {
+    similarity_threshold: ?f32 = null,
+    type_must_match: ?bool = null,
+    min_entity_confidence: ?f32 = null,
+    min_relation_confidence: ?f32 = null,
+    deduplicate_relations: ?bool = null,
+    track_provenance: ?bool = null,
+};
+
 pub const ExtractionResponse = struct {
     object: []const u8,
     model: []const u8,
@@ -3245,6 +3254,7 @@ pub const ExtractionResponse = struct {
     usage: ?std.json.Value = null,
 };
 
+/// Selects one extraction operation family per request. Entity labels may accompany relation schemas so relation extraction can return its participating entities in the same response.
 pub const ExtractionSchema = struct {
     entities: ?[]const []const u8 = null,
     relations: ?[]const ExtractionRelationSchema = null,
@@ -3255,7 +3265,7 @@ pub const ExtractionSchema = struct {
 pub const ExtractionStructureField = std.json.Value;
 
 pub const ExtractionStructureSchema = struct {
-    fields: ?std.json.ArrayHashMap(ExtractionStructureField) = null,
+    fields: std.json.ArrayHashMap(ExtractionStructureField),
 };
 
 pub const ExtractionToken = struct {
@@ -4393,7 +4403,7 @@ pub const InferenceConfig = struct {
     api_url: []const u8,
     /// API key used when calling an authenticated shared Antfly inference API.
     api_key: ?[]const u8 = null,
-    /// Base directory containing model subdirectories. Antfly inference auto-discovers models from: - `{models_dir}/embedders/` - Embedding models (ONNX) - `{models_dir}/chunkers/` - Chunking models (ONNX) - `{models_dir}/rerankers/` - Reranking models (ONNX) - `{models_dir}/recognizers/` - Recognition models (ONNX) - `{models_dir}/rewriters/` - Seq2Seq rewriter models (ONNX) Defaults to ~/.antfly/inference/models (set via viper). If not set, only built-in fixed chunking is available.
+    /// Base directory containing model subdirectories. Antfly inference auto-discovers models from: - `{models_dir}/embedders/` - Embedding models (ONNX) - `{models_dir}/chunkers/` - Chunking models (ONNX) - `{models_dir}/rerankers/` - Reranking models (ONNX) - `{models_dir}/extractors/` - Entity, relation, and structured extraction models - `{models_dir}/rewriters/` - Seq2Seq rewriter models (ONNX) Defaults to ~/.antfly/inference/models (set via viper). If not set, only built-in fixed chunking is available.
     models_dir: ?[]const u8 = null,
     /// Base directory containing Traditional ML predictor subdirectories. The `/ml/v1/*` API auto-discovers predictors from `{ml_dir}/{name}/tabular_model.json`. Defaults to ~/.antfly/inference/ml.
     ml_dir: ?[]const u8 = null,
@@ -4442,7 +4452,7 @@ pub const InferenceConnection = struct {
     names: ?[]const []const u8 = null,
     /// Model types this instance is configured for.
     configured_model_types: ?[]const ConnectedModelType = null,
-    /// Models reported by the provider, grouped by model type. Keys are pluralized ConnectedModelType values ("embedders", "generators", "rerankers", "chunkers", "recognizers", "classifiers", "rewriters", "readers", "transcribers", "extractors") plus "other" for models the provider's listing API does not classify by task. Populated only when the request includes the "models" expansion.
+    /// Models reported by the provider, grouped by model type. Keys are pluralized ConnectedModelType values ("embedders", "generators", "rerankers", "chunkers", "classifiers", "rewriters", "readers", "transcribers", "extractors") plus "other" for models the provider's listing API does not classify by task. Populated only when the request includes the "models" expansion.
     models: ?std.json.ArrayHashMap([]const ConnectedModel) = null,
 };
 
@@ -4971,7 +4981,6 @@ pub const InferenceModelKind = enum {
     reranker,
     chunker,
     classifier,
-    recognizer,
     rewriter,
     reader,
     transcriber,
@@ -4984,7 +4993,6 @@ pub const InferenceModelKind = enum {
             .reranker => "reranker",
             .chunker => "chunker",
             .classifier => "classifier",
-            .recognizer => "recognizer",
             .rewriter => "rewriter",
             .reader => "reader",
             .transcriber => "transcriber",
@@ -5004,7 +5012,6 @@ pub const InferenceModelKind = enum {
             .{ "reranker", .reranker },
             .{ "chunker", .chunker },
             .{ "classifier", .classifier },
-            .{ "recognizer", .recognizer },
             .{ "rewriter", .rewriter },
             .{ "reader", .reader },
             .{ "transcriber", .transcriber },
@@ -5073,8 +5080,6 @@ pub const InferenceModelsResponse = struct {
     extractors: std.json.ArrayHashMap(InferenceModelInfo),
     /// Available generator/LLM models from models_dir/generators/
     generators: std.json.ArrayHashMap(InferenceModelInfo),
-    /// Available recognizer models from models_dir/recognizers/
-    recognizers: std.json.ArrayHashMap(InferenceModelInfo),
     /// Available Seq2Seq rewriter models from models_dir/rewriters/
     rewriters: std.json.ArrayHashMap(InferenceModelInfo),
     /// Available reader/OCR models from models_dir/readers/

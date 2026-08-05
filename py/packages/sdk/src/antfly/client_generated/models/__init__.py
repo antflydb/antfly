@@ -215,12 +215,14 @@ from .extraction_relation import ExtractionRelation
 from .extraction_relation_endpoint import ExtractionRelationEndpoint
 from .extraction_relation_schema import ExtractionRelationSchema
 from .extraction_request import ExtractionRequest
+from .extraction_resolver_options import ExtractionResolverOptions
 from .extraction_response import ExtractionResponse
 from .extraction_response_object import ExtractionResponseObject
 from .extraction_response_usage import ExtractionResponseUsage
 from .extraction_schema import ExtractionSchema
 from .extraction_schema_structures import ExtractionSchemaStructures
 from .extraction_structure_field_type_1 import ExtractionStructureFieldType1
+from .extraction_structure_field_type_1_type import ExtractionStructureFieldType1Type
 from .extraction_structure_schema import ExtractionStructureSchema
 from .extraction_structure_schema_fields import ExtractionStructureSchemaFields
 from .extraction_token import ExtractionToken
@@ -383,7 +385,6 @@ from .inference_models_response_extractors import InferenceModelsResponseExtract
 from .inference_models_response_generators import InferenceModelsResponseGenerators
 from .inference_models_response_object import InferenceModelsResponseObject
 from .inference_models_response_readers import InferenceModelsResponseReaders
-from .inference_models_response_recognizers import InferenceModelsResponseRecognizers
 from .inference_models_response_rerankers import InferenceModelsResponseRerankers
 from .inference_models_response_rewriters import InferenceModelsResponseRewriters
 from .inference_models_response_transcribers import InferenceModelsResponseTranscribers
@@ -929,12 +930,14 @@ __all__ = (
     "ExtractionRelationEndpoint",
     "ExtractionRelationSchema",
     "ExtractionRequest",
+    "ExtractionResolverOptions",
     "ExtractionResponse",
     "ExtractionResponseObject",
     "ExtractionResponseUsage",
     "ExtractionSchema",
     "ExtractionSchemaStructures",
     "ExtractionStructureFieldType1",
+    "ExtractionStructureFieldType1Type",
     "ExtractionStructureSchema",
     "ExtractionStructureSchemaFields",
     "ExtractionToken",
@@ -1097,7 +1100,6 @@ __all__ = (
     "InferenceModelsResponseGenerators",
     "InferenceModelsResponseObject",
     "InferenceModelsResponseReaders",
-    "InferenceModelsResponseRecognizers",
     "InferenceModelsResponseRerankers",
     "InferenceModelsResponseRewriters",
     "InferenceModelsResponseTranscribers",

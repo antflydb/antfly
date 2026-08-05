@@ -99,6 +99,7 @@ pub const HubFile = struct {
     name: []const u8,
     size: ?u64 = null,
     sha256: ?[]const u8 = null,
+    git_blob_sha1: ?[]const u8 = null,
 };
 
 pub const PayloadSupportSummary = struct {
@@ -142,6 +143,7 @@ const always_files = [_][]const u8{
     "added_tokens.json",
     "gliner_config.json",
     "termite_bundle.json",
+    "antfly_inference_bundle.json",
     "spm.model",
     "model_manifest.json",
     "antfly_metadata.json",
@@ -1050,6 +1052,10 @@ pub const DownloadProgress = struct {
     total_bytes: ?u64,
     files_done: usize,
     files_total: usize,
+    /// True when the artifact was verified locally and no response body was
+    /// transferred. The byte counters describe completed artifact bytes, not
+    /// necessarily network traffic.
+    cached: bool = false,
 };
 
 pub const ProgressCallback = *const fn (progress: DownloadProgress, ctx: ?*anyopaque) void;
@@ -1519,6 +1525,7 @@ pub fn downloadModel(
         for (files) |f| {
             allocator.free(f.name);
             if (f.sha256) |sum| allocator.free(sum);
+            if (f.git_blob_sha1) |sum| allocator.free(sum);
         }
         allocator.free(files);
     }
@@ -1692,7 +1699,7 @@ pub fn downloadModel(
             }, progress.context);
         }
 
-        try downloadFile(allocator, io, owner, name, filename, dest_dir, artifact_config, progress, i, resolved.items.len, total_bytes, file_meta.sha256);
+        const cached = try downloadFile(allocator, io, owner, name, filename, dest_dir, artifact_config, progress, i, resolved.items.len, total_bytes, file_meta.sha256, file_meta.git_blob_sha1);
 
         const dest_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dest_dir, filename });
         defer allocator.free(dest_path);
@@ -1714,6 +1721,7 @@ pub fn downloadModel(
                 .total_bytes = progress_total_bytes,
                 .files_done = i + 1,
                 .files_total = to_download.items.len,
+                .cached = cached,
             }, progress.context);
         }
     }
@@ -1850,7 +1858,10 @@ pub fn listModelFiles(
     name: []const u8,
     config: HubConfig,
 ) ![]HubFile {
-    const url = try std.fmt.allocPrint(allocator, "{s}/api/models/{s}/{s}", .{ config.base_url, owner, name });
+    // `blobs=true` is required for artifact sizes and content digests. Without it,
+    // Hugging Face returns only filenames and every completed managed pull must be
+    // downloaded again because the receipt cannot prove artifact identity.
+    const url = try modelInfoUrlAlloc(allocator, config.base_url, owner, name);
     defer allocator.free(url);
 
     var client = httpx.Client.initWithConfig(allocator, io, .{
@@ -1894,15 +1905,31 @@ pub fn listModelFiles(
 
     const body = resp.body orelse return error.EmptyResponse;
 
-    // Parse JSON response — extract siblings[].rfilename
+    return parseHubFiles(allocator, body);
+}
+
+fn modelInfoUrlAlloc(allocator: std.mem.Allocator, base_url: []const u8, owner: []const u8, name: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/api/models/{s}/{s}?blobs=true", .{ base_url, owner, name });
+}
+
+fn parseHubFiles(allocator: std.mem.Allocator, body: []const u8) ![]HubFile {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
     defer parsed.deinit();
 
-    const obj = parsed.value.object;
-    const siblings = (obj.get("siblings") orelse return error.InvalidResponse).array;
+    if (parsed.value != .object) return error.InvalidResponse;
+    const siblings_value = parsed.value.object.get("siblings") orelse return error.InvalidResponse;
+    if (siblings_value != .array) return error.InvalidResponse;
 
     var files = std.ArrayListUnmanaged(HubFile).empty;
-    for (siblings.items) |sibling| {
+    errdefer {
+        for (files.items) |file| {
+            allocator.free(file.name);
+            if (file.sha256) |sum| allocator.free(sum);
+            if (file.git_blob_sha1) |sum| allocator.free(sum);
+        }
+        files.deinit(allocator);
+    }
+    for (siblings_value.array.items) |sibling| {
         if (sibling == .object) {
             if (sibling.object.get("rfilename")) |rf| {
                 if (rf == .string) {
@@ -1912,10 +1939,24 @@ pub fn listModelFiles(
                     var file = HubFile{
                         .name = try allocator.dupe(u8, rf.string),
                     };
+                    errdefer {
+                        allocator.free(file.name);
+                        if (file.sha256) |sum| allocator.free(sum);
+                        if (file.git_blob_sha1) |sum| allocator.free(sum);
+                    }
 
                     if (sibling.object.get("size")) |size_val| {
                         if (size_val == .integer and size_val.integer >= 0) {
                             file.size = @intCast(size_val.integer);
+                        }
+                    }
+
+                    if (sibling.object.get("blobId")) |blob_id| {
+                        if (blob_id == .string and isSha1Hex(blob_id.string)) {
+                            // Git blob IDs provide revision identity for ordinary Hub
+                            // files. They are a cache-consistency check, not a modern
+                            // cryptographic trust boundary; LFS payloads use SHA-256.
+                            file.git_blob_sha1 = try allocator.dupe(u8, blob_id.string);
                         }
                     }
 
@@ -1926,9 +1967,10 @@ pub fn listModelFiles(
                                     file.size = @intCast(lfs_size.integer);
                                 }
                             }
-                            if (lfs.object.get("oid")) |oid| {
-                                if (oid == .string and oid.string.len == 64) {
-                                    file.sha256 = try allocator.dupe(u8, oid.string);
+                            const digest = lfs.object.get("sha256") orelse lfs.object.get("oid");
+                            if (digest) |sha| {
+                                if (sha == .string and isSha256Hex(sha.string)) {
+                                    file.sha256 = try allocator.dupe(u8, sha.string);
                                 }
                             }
                         }
@@ -1941,6 +1983,22 @@ pub fn listModelFiles(
     }
 
     return try files.toOwnedSlice(allocator);
+}
+
+fn isSha256Hex(value: []const u8) bool {
+    if (value.len != 64) return false;
+    for (value) |byte| {
+        if (!std.ascii.isHex(byte)) return false;
+    }
+    return true;
+}
+
+fn isSha1Hex(value: []const u8) bool {
+    if (value.len != 40) return false;
+    for (value) |byte| {
+        if (!std.ascii.isHex(byte)) return false;
+    }
+    return true;
 }
 
 pub fn readModelFileAlloc(
@@ -2158,7 +2216,8 @@ fn downloadFile(
     files_total: usize,
     total_bytes: ?u64,
     expected_sha256: ?[]const u8,
-) !void {
+    expected_git_blob_sha1: ?[]const u8,
+) !bool {
     if (!managed_receipt.artifactPathIsSafe(filename)) return error.InvalidModelArtifactPath;
     const max_response_size = try downloadResponseLimit(config);
     if (total_bytes) |total| {
@@ -2168,8 +2227,8 @@ fn downloadFile(
     var dest = std.Io.Dir.cwd();
     const dest_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dest_dir, filename });
     defer allocator.free(dest_path);
-    if (try existingFinalFileSatisfies(dest, io, dest_path, expected_sha256)) {
-        return;
+    if (try existingFinalFileSatisfies(dest, io, dest_path, expected_sha256, expected_git_blob_sha1)) {
+        return true;
     }
 
     var headers_buf: [4][2][]const u8 = undefined;
@@ -2212,14 +2271,14 @@ fn downloadFile(
     // to the current revision—even when its size happens to equal the
     // advertised size. Small non-LFS sidecars are restarted instead of
     // risking a mixed-version artifact.
-    if (resume_from > 0 and expected_sha256 == null) {
+    if (resume_from > 0 and expected_sha256 == null and expected_git_blob_sha1 == null) {
         dest.deleteFile(io, temp_path) catch {};
         resume_from = 0;
     }
     if (total_bytes) |total| {
         if (resume_from == total) {
-            try finalizeDownloadedFile(dest, io, temp_path, dest_path, expected_sha256);
-            return;
+            try finalizeDownloadedFile(dest, io, temp_path, dest_path, expected_sha256, expected_git_blob_sha1);
+            return true;
         }
         if (resume_from > total) {
             dest.deleteFile(io, temp_path) catch {};
@@ -2369,7 +2428,8 @@ fn downloadFile(
         break;
     }
 
-    try finalizeDownloadedFile(dest, io, temp_path, dest_path, expected_sha256);
+    try finalizeDownloadedFile(dest, io, temp_path, dest_path, expected_sha256, expected_git_blob_sha1);
+    return false;
 }
 
 fn finalizeDownloadedFile(
@@ -2378,9 +2438,15 @@ fn finalizeDownloadedFile(
     temp_path: []const u8,
     dest_path: []const u8,
     expected_sha256: ?[]const u8,
+    expected_git_blob_sha1: ?[]const u8,
 ) !void {
     if (expected_sha256) |sum| {
         verifyFileSha256(dest, io, temp_path, sum) catch |err| {
+            dest.deleteFile(io, temp_path) catch {};
+            return err;
+        };
+    } else if (expected_git_blob_sha1) |sum| {
+        verifyFileGitBlobSha1(dest, io, temp_path, sum) catch |err| {
             dest.deleteFile(io, temp_path) catch {};
             return err;
         };
@@ -2401,6 +2467,7 @@ fn existingFinalFileSatisfies(
     io: std.Io,
     path: []const u8,
     expected_sha256: ?[]const u8,
+    expected_git_blob_sha1: ?[]const u8,
 ) !bool {
     dir.access(io, path, .{}) catch |err| switch (err) {
         error.FileNotFound => return false,
@@ -2408,6 +2475,10 @@ fn existingFinalFileSatisfies(
     };
     if (expected_sha256) |sum| {
         verifyFileSha256(dir, io, path, sum) catch return false;
+        return true;
+    }
+    if (expected_git_blob_sha1) |sum| {
+        verifyFileGitBlobSha1(dir, io, path, sum) catch return false;
         return true;
     }
     // A size match alone is not an identity check. Re-fetch artifacts without
@@ -2456,6 +2527,34 @@ fn verifyFileSha256(dir: std.Io.Dir, io: std.Io, path: []const u8, expected_hex:
     if (!std.mem.eql(u8, &actual_hex, expected_hex)) {
         return error.ChecksumMismatch;
     }
+}
+
+fn verifyFileGitBlobSha1(dir: std.Io.Dir, io: std.Io, path: []const u8, expected_hex: []const u8) !void {
+    if (!isSha1Hex(expected_hex)) return error.ChecksumMismatch;
+
+    var file = try dir.openFile(io, path, .{});
+    defer file.close(io);
+    const stat = try file.stat(io);
+
+    var hasher = std.crypto.hash.Sha1.init(.{});
+    var header_buffer: [64]u8 = undefined;
+    const header = try std.fmt.bufPrint(&header_buffer, "blob {d}\x00", .{stat.size});
+    hasher.update(header);
+
+    var buf: [64 * 1024]u8 = undefined;
+    while (true) {
+        const n = file.readStreaming(io, &.{buf[0..]}) catch |err| switch (err) {
+            error.EndOfStream => 0,
+            else => return err,
+        };
+        if (n == 0) break;
+        hasher.update(buf[0..n]);
+    }
+
+    var digest: [std.crypto.hash.Sha1.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    const actual_hex = std.fmt.bytesToHex(digest, .lower);
+    if (!std.mem.eql(u8, &actual_hex, expected_hex)) return error.ChecksumMismatch;
 }
 
 test "appendMultiStageArtifacts selects multistage OCR payloads and sidecars" {
@@ -2903,6 +3002,93 @@ test "verify file sha256 matches expected digest" {
     try verifyFileSha256(tmp.dir, std.testing.io, "payload.bin", "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9");
 }
 
+test "completed artifact cache reuses only digest-verified files" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "payload.bin",
+        .data = "hello world",
+    });
+
+    const matching = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+    const mismatched = "0000000000000000000000000000000000000000000000000000000000000000";
+    try std.testing.expect(try existingFinalFileSatisfies(tmp.dir, std.testing.io, "payload.bin", matching, null));
+    try std.testing.expect(!(try existingFinalFileSatisfies(tmp.dir, std.testing.io, "payload.bin", mismatched, null)));
+    try std.testing.expect(!(try existingFinalFileSatisfies(tmp.dir, std.testing.io, "payload.bin", null, null)));
+}
+
+test "completed artifact cache reuses Git blob verified files" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "payload.bin",
+        .data = "hello world",
+    });
+
+    const matching = "95d09f2b10159347eece71399a7e2e907ea3df4f";
+    const mismatched = "0000000000000000000000000000000000000000";
+    try std.testing.expect(try existingFinalFileSatisfies(tmp.dir, std.testing.io, "payload.bin", null, matching));
+    try std.testing.expect(!(try existingFinalFileSatisfies(tmp.dir, std.testing.io, "payload.bin", null, mismatched)));
+}
+
+test "hub blob metadata records sha256 identities for cache reuse" {
+    const allocator = std.testing.allocator;
+    const digest = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+    const body =
+        "{\"siblings\":[" ++
+        "{\"rfilename\":\"model.safetensors\",\"size\":11,\"blobId\":\"0123456789abcdef0123456789abcdef01234567\",\"lfs\":{\"size\":795300000,\"sha256\":\"" ++ digest ++ "\"}}," ++
+        "{\"rfilename\":\"legacy.bin\",\"lfs\":{\"oid\":\"" ++ digest ++ "\"}}," ++
+        "{\"rfilename\":\"config.json\",\"size\":42,\"blobId\":\"abcdef0123456789abcdef0123456789abcdef01\"}]}";
+
+    const files = try parseHubFiles(allocator, body);
+    defer {
+        for (files) |file| {
+            allocator.free(file.name);
+            if (file.sha256) |sum| allocator.free(sum);
+            if (file.git_blob_sha1) |sum| allocator.free(sum);
+        }
+        allocator.free(files);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), files.len);
+    try std.testing.expectEqual(@as(?u64, 795300000), files[0].size);
+    try std.testing.expectEqualStrings(digest, files[0].sha256.?);
+    try std.testing.expectEqualStrings(digest, files[1].sha256.?);
+    try std.testing.expectEqualStrings("abcdef0123456789abcdef0123456789abcdef01", files[2].git_blob_sha1.?);
+}
+
+test "hub model metadata request opts into blob identities" {
+    const url = try modelInfoUrlAlloc(std.testing.allocator, "https://huggingface.co", "antflydb", "gliner2-base-v1");
+    defer std.testing.allocator.free(url);
+    try std.testing.expectEqualStrings(
+        "https://huggingface.co/api/models/antflydb/gliner2-base-v1?blobs=true",
+        url,
+    );
+}
+
+test "hub blob metadata rejects malformed digests without losing file metadata" {
+    const allocator = std.testing.allocator;
+    const body =
+        "{\"siblings\":[{\"rfilename\":\"config.json\",\"size\":42," ++
+        "\"lfs\":{\"sha256\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}}]}";
+
+    const files = try parseHubFiles(allocator, body);
+    defer {
+        for (files) |file| {
+            allocator.free(file.name);
+            if (file.sha256) |sum| allocator.free(sum);
+            if (file.git_blob_sha1) |sum| allocator.free(sum);
+        }
+        allocator.free(files);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), files.len);
+    try std.testing.expectEqual(@as(?u64, 42), files[0].size);
+    try std.testing.expect(files[0].sha256 == null);
+}
+
 const python_download_server_script =
     "import pathlib\n" ++
     "import socketserver\n" ++
@@ -3024,6 +3210,7 @@ test "downloadFile rejects artifact paths outside the model root before network 
             .{},
             0,
             1,
+            null,
             null,
             null,
         ),
@@ -3398,6 +3585,7 @@ test "downloadFile rejects artifacts above the configured disk limit before netw
             1,
             129,
             null,
+            null,
         ),
     );
 }
@@ -3432,6 +3620,7 @@ test "downloadFile removes an oversized partial before network access" {
             .{},
             0,
             1,
+            null,
             null,
             null,
         ),
@@ -3490,6 +3679,7 @@ test "downloadFile removes a fresh partial after streamed size overflow" {
             1,
             null,
             null,
+            null,
         ),
     );
     const part_path = try std.fs.path.join(allocator, &.{ dest_dir, "model.onnx.part" });
@@ -3532,6 +3722,7 @@ test "downloadFile verifies a complete partial before installing it" {
             1,
             3,
             "0000000000000000000000000000000000000000000000000000000000000000",
+            null,
         ),
     );
     try std.testing.expectError(
@@ -3601,9 +3792,9 @@ test "downloadFile resumes from partial file with 206 response" {
 
     const base_url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{port});
     defer allocator.free(base_url);
-    try downloadFile(allocator, io, "owner", "name", "tokenizer.json", dest_dir, .{
+    _ = try downloadFile(allocator, io, "owner", "name", "tokenizer.json", dest_dir, .{
         .base_url = base_url,
-    }, .{}, 0, 1, payload.len, "f6b6d844d9e70a622a4b1f2eab9cd77aa2b09280930adc897fad746fdf2c6a1c");
+    }, .{}, 0, 1, payload.len, "f6b6d844d9e70a622a4b1f2eab9cd77aa2b09280930adc897fad746fdf2c6a1c", null);
 
     const final_path = try std.fs.path.join(allocator, &.{ dest_dir, "tokenizer.json" });
     defer allocator.free(final_path);
@@ -3660,9 +3851,9 @@ test "downloadFile restarts when a 206 content range is inconsistent" {
 
     const base_url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{port});
     defer allocator.free(base_url);
-    try downloadFile(allocator, io, "owner", "name", "tokenizer.json", dest_dir, .{
+    _ = try downloadFile(allocator, io, "owner", "name", "tokenizer.json", dest_dir, .{
         .base_url = base_url,
-    }, .{}, 0, 1, payload.len, "f6b6d844d9e70a622a4b1f2eab9cd77aa2b09280930adc897fad746fdf2c6a1c");
+    }, .{}, 0, 1, payload.len, "f6b6d844d9e70a622a4b1f2eab9cd77aa2b09280930adc897fad746fdf2c6a1c", null);
 
     const final_path = try std.fs.path.join(allocator, &.{ dest_dir, "tokenizer.json" });
     defer allocator.free(final_path);
@@ -3716,9 +3907,9 @@ test "downloadFile discards a streamed range error before retrying fresh" {
 
     const base_url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{port});
     defer allocator.free(base_url);
-    try downloadFile(allocator, io, "owner", "name", "tokenizer.json", dest_dir, .{
+    _ = try downloadFile(allocator, io, "owner", "name", "tokenizer.json", dest_dir, .{
         .base_url = base_url,
-    }, .{}, 0, 1, payload.len, "f6b6d844d9e70a622a4b1f2eab9cd77aa2b09280930adc897fad746fdf2c6a1c");
+    }, .{}, 0, 1, payload.len, "f6b6d844d9e70a622a4b1f2eab9cd77aa2b09280930adc897fad746fdf2c6a1c", null);
 
     const final_path = try std.fs.path.join(allocator, &.{ dest_dir, "tokenizer.json" });
     defer allocator.free(final_path);
@@ -3744,9 +3935,10 @@ test "downloadFile skips existing complete destination before network" {
     defer allocator.free(final_path);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = final_path, .data = payload });
 
-    try downloadFile(allocator, io, "owner", "name", "model.gguf", dest_dir, .{
+    const cached = try downloadFile(allocator, io, "owner", "name", "model.gguf", dest_dir, .{
         .base_url = "http://127.0.0.1:1",
-    }, .{}, 0, 1, payload.len, "5d4601650452897026e60f1d6996d5b2941f3e3634ffebe6cc11458508c756f2");
+    }, .{}, 0, 1, payload.len, "5d4601650452897026e60f1d6996d5b2941f3e3634ffebe6cc11458508c756f2", null);
+    try std.testing.expect(cached);
 
     const part_path = try std.fs.path.join(allocator, &.{ dest_dir, "model.gguf.part" });
     defer allocator.free(part_path);
@@ -3774,9 +3966,10 @@ test "downloadFile skips existing large artifact with pointer-sized metadata" {
     defer allocator.free(final_path);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = final_path, .data = &payload });
 
-    try downloadFile(allocator, io, "owner", "name", "model.gguf", dest_dir, .{
+    const cached = try downloadFile(allocator, io, "owner", "name", "model.gguf", dest_dir, .{
         .base_url = "http://127.0.0.1:1",
-    }, .{}, 0, 1, 102, "8fc662ff2c1d2293998c59eff63476a828c715345d33d0219a1260be634422d1");
+    }, .{}, 0, 1, 102, "8fc662ff2c1d2293998c59eff63476a828c715345d33d0219a1260be634422d1", null);
+    try std.testing.expect(cached);
 
     const part_path = try std.fs.path.join(allocator, &.{ dest_dir, "model.gguf.part" });
     defer allocator.free(part_path);
@@ -3858,12 +4051,12 @@ test "downloadFile restarts cleanly when range is ignored" {
 
     const base_url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{port});
     defer allocator.free(base_url);
-    try downloadFile(allocator, io, "owner", "name", "tokenizer.json", dest_dir, .{
+    _ = try downloadFile(allocator, io, "owner", "name", "tokenizer.json", dest_dir, .{
         .base_url = base_url,
         // Force the bounded writer to detect the ignored Range response before
         // getToWriter can return its HTTP 200 status.
         .max_artifact_bytes = payload.len,
-    }, .{}, 0, 1, payload.len, "b237163979797d22f20311e364eb817ae436427249a000f222051f65b6fcadc9");
+    }, .{}, 0, 1, payload.len, "b237163979797d22f20311e364eb817ae436427249a000f222051f65b6fcadc9", null);
 
     const final_path = try std.fs.path.join(allocator, &.{ dest_dir, "tokenizer.json" });
     defer allocator.free(final_path);
@@ -3920,7 +4113,7 @@ test "downloadFile deletes partial file on checksum mismatch" {
     defer allocator.free(base_url);
     try std.testing.expectError(error.ChecksumMismatch, downloadFile(allocator, io, "owner", "name", "tokenizer.json", dest_dir, .{
         .base_url = base_url,
-    }, .{}, 0, 1, payload.len, "0000000000000000000000000000000000000000000000000000000000000000"));
+    }, .{}, 0, 1, payload.len, "0000000000000000000000000000000000000000000000000000000000000000", null));
 
     const final_path = try std.fs.path.join(allocator, &.{ dest_dir, "tokenizer.json" });
     defer allocator.free(final_path);

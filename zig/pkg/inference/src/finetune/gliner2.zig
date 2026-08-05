@@ -13,24 +13,21 @@
 // limitations under the License.
 
 const std = @import("std");
-const build_options = @import("build_options");
+const builtin = @import("builtin");
 const tensor_mod = @import("../backends/tensor.zig");
 const Tensor = tensor_mod.Tensor;
 const DType = tensor_mod.DType;
 const c_file = @import("../util/c_file.zig");
 const compat = @import("../io/compat.zig");
 const lora = @import("lora.zig");
-const neftune = @import("neftune.zig");
-const graph_bridge = @import("graph_bridge.zig");
 const gliner2_boundary = @import("gliner2_boundary.zig");
 const entity_cleanup_model = @import("entity_cleanup_model.zig");
-const ops_mod = @import("../ops/ops.zig");
-const ComputeBackend = ops_mod.ComputeBackend;
 const safetensors = @import("../models/safetensors.zig");
 const tensor_access = @import("../models/tensor_access.zig");
 const weight_source = @import("../models/weight_source.zig");
 
-pub const artifact_family_version = "gliner2_lora/v1alpha1";
+pub const artifact_family_version = "gliner2_lora/v1";
+pub const legacy_artifact_family_version = "gliner2_lora/v1alpha1";
 pub const checkpoint_file_name = "model.safetensors";
 pub const config_file_name = "config.json";
 pub const encoder_config_file_name = "encoder_config/config.json";
@@ -40,10 +37,33 @@ pub const task_head_checkpoint_file_name = "task_head.safetensors";
 pub const tokenizer_file_name = "tokenizer.json";
 pub const tokenizer_config_file_name = "tokenizer_config.json";
 pub const special_tokens_map_file_name = "special_tokens_map.json";
+pub const added_tokens_file_name = "added_tokens.json";
+pub const sentencepiece_model_file_name = "spm.model";
+pub const materialization_manifest_file_name = "materialization_manifest.json";
+pub const materialization_schema_version = "gliner2_materialized_model/v1";
+
+pub fn isSupportedArtifactFamilyVersion(version: []const u8) bool {
+    return std.mem.eql(u8, version, artifact_family_version) or
+        std.mem.eql(u8, version, legacy_artifact_family_version);
+}
 
 pub const default_lora_target_modules = [_][]const u8{
+    "encoder",
+    "span_rep",
+    "classifier",
+    "count_embed",
+    "count_pred",
+};
+
+pub const default_lora_dropout: f32 = 0.0;
+
+pub const expanded_encoder_lora_target_modules = [_][]const u8{
     "query_proj",
+    "key_proj",
     "value_proj",
+    "attention.output.dense",
+    "intermediate.dense",
+    "output.dense",
 };
 
 pub const BackboneConfig = struct {
@@ -136,6 +156,7 @@ pub const AdapterConfig = struct {
     task_type: ?[]const u8 = null,
     r: ?usize = null,
     lora_alpha: ?f64 = null,
+    lora_dropout: ?f64 = null,
     target_modules: ?[]const []const u8 = null,
     use_dora: ?bool = null,
 };
@@ -150,6 +171,7 @@ pub const LoRATargetTensor = struct {
 pub const BootstrapOptions = struct {
     rank: usize = 16,
     alpha: f32 = 32.0,
+    dropout: f32 = default_lora_dropout,
     base_model_name_or_path: ?[]const u8 = null,
     target_modules: ?[]const []const u8 = null,
 };
@@ -164,7 +186,9 @@ pub const BootstrapSummary = struct {
     base_model_name_or_path: []const u8,
     lora_rank: usize,
     lora_alpha: f32,
+    lora_dropout: f32,
     target_modules: []const []const u8,
+    resolved_target_modules: []const []const u8,
     resolved_tensors: []LoRATargetTensor,
 };
 
@@ -191,8 +215,11 @@ pub const LoRABundleInspectionSummary = struct {
     base_model_name_or_path: ?[]const u8 = null,
     lora_rank: ?usize = null,
     lora_alpha: ?f64 = null,
+    lora_dropout: ?f64 = null,
     target_module_count: usize = 0,
     target_modules: ?[]const []const u8 = null,
+    resolved_target_module_count: usize = 0,
+    resolved_target_modules: ?[]const []const u8 = null,
     resolved_tensor_count: usize = 0,
     trainable_parameter_count: usize = 0,
     dora_magnitude_tensor_count: usize = 0,
@@ -237,6 +264,7 @@ pub const LoadedLoRABundle = struct {
     base_model_name_or_path: ?[]const u8 = null,
     lora_rank: usize,
     lora_alpha: f32,
+    lora_dropout: f32 = default_lora_dropout,
     target_modules: []const []const u8,
     layers: []LoadedLoRALayer,
     passthrough_tensors: []LoadedPassthroughTensor,
@@ -272,105 +300,77 @@ pub const LoadedLoRABundle = struct {
     }
 };
 
-pub const LoRALayerAdamState = struct {
+pub fn validateLoRADropout(dropout: f32) !void {
+    if (!std.math.isFinite(dropout) or dropout < 0.0 or dropout >= 1.0) return error.InvalidLoRADropout;
+}
+
+pub fn expandLoRATargetModules(
     allocator: std.mem.Allocator,
-    m_a: []f32,
-    v_a: []f32,
-    m_b: []f32,
-    v_b: []f32,
-    step: u64,
-
-    pub fn init(allocator: std.mem.Allocator, size_a: usize, size_b: usize) !LoRALayerAdamState {
-        const m_a = try allocator.alloc(f32, size_a);
-        errdefer allocator.free(m_a);
-        const v_a = try allocator.alloc(f32, size_a);
-        errdefer allocator.free(v_a);
-        const m_b = try allocator.alloc(f32, size_b);
-        errdefer allocator.free(m_b);
-        const v_b = try allocator.alloc(f32, size_b);
-        errdefer allocator.free(v_b);
-        @memset(m_a, 0);
-        @memset(v_a, 0);
-        @memset(m_b, 0);
-        @memset(v_b, 0);
-        return .{ .allocator = allocator, .m_a = m_a, .v_a = v_a, .m_b = m_b, .v_b = v_b, .step = 0 };
+    requested_target_modules: []const []const u8,
+) ![]const []const u8 {
+    var expanded = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (expanded.items) |item| allocator.free(item);
+        expanded.deinit(allocator);
     }
 
-    pub fn deinit(self: *LoRALayerAdamState) void {
-        self.allocator.free(self.m_a);
-        self.allocator.free(self.v_a);
-        self.allocator.free(self.m_b);
-        self.allocator.free(self.v_b);
-        self.* = undefined;
+    for (requested_target_modules) |raw| {
+        const target = std.mem.trim(u8, raw, " \t\r\n");
+        if (target.len == 0) return error.InvalidLoRATargetModule;
+        if (std.mem.eql(u8, target, "encoder")) {
+            for (expanded_encoder_lora_target_modules) |item| try appendUniqueString(allocator, &expanded, item);
+        } else if (std.mem.eql(u8, target, "encoder.query")) {
+            try appendUniqueString(allocator, &expanded, "query_proj");
+        } else if (std.mem.eql(u8, target, "encoder.key")) {
+            try appendUniqueString(allocator, &expanded, "key_proj");
+        } else if (std.mem.eql(u8, target, "encoder.value")) {
+            try appendUniqueString(allocator, &expanded, "value_proj");
+        } else if (std.mem.eql(u8, target, "encoder.dense")) {
+            try appendUniqueString(allocator, &expanded, "attention.output.dense");
+            try appendUniqueString(allocator, &expanded, "intermediate.dense");
+            try appendUniqueString(allocator, &expanded, "output.dense");
+        } else if (std.mem.eql(u8, target, "span_rep")) {
+            try appendUniqueString(allocator, &expanded, "span_rep.span_rep_layer.project_start.0");
+            try appendUniqueString(allocator, &expanded, "span_rep.span_rep_layer.project_start.3");
+            try appendUniqueString(allocator, &expanded, "span_rep.span_rep_layer.project_end.0");
+            try appendUniqueString(allocator, &expanded, "span_rep.span_rep_layer.project_end.3");
+            try appendUniqueString(allocator, &expanded, "span_rep.span_rep_layer.out_project.0");
+            try appendUniqueString(allocator, &expanded, "span_rep.span_rep_layer.out_project.3");
+        } else if (std.mem.eql(u8, target, "classifier")) {
+            try appendUniqueString(allocator, &expanded, "classifier.0");
+            try appendUniqueString(allocator, &expanded, "classifier.2");
+        } else if (std.mem.eql(u8, target, "count_embed")) {
+            try appendUniqueString(allocator, &expanded, "count_embed.transformer.in_projector");
+            // Official GLiNER2 wraps this module, but PyTorch MultiheadAttention
+            // reads out_proj.weight directly and does not call the LoRA forward.
+            try appendUniqueString(allocator, &expanded, "count_embed.transformer.transformer.layers.0.linear1");
+            try appendUniqueString(allocator, &expanded, "count_embed.transformer.transformer.layers.0.linear2");
+            try appendUniqueString(allocator, &expanded, "count_embed.transformer.transformer.layers.1.linear1");
+            try appendUniqueString(allocator, &expanded, "count_embed.transformer.transformer.layers.1.linear2");
+            try appendUniqueString(allocator, &expanded, "count_embed.transformer.out_projector.0");
+            try appendUniqueString(allocator, &expanded, "count_embed.transformer.out_projector.2");
+            try appendUniqueString(allocator, &expanded, "count_embed.transformer.out_projector.4");
+        } else if (std.mem.eql(u8, target, "count_pred")) {
+            try appendUniqueString(allocator, &expanded, "count_pred.0");
+            try appendUniqueString(allocator, &expanded, "count_pred.2");
+        } else {
+            try appendUniqueString(allocator, &expanded, target);
+        }
     }
-};
 
-pub const LoRATrainOptions = struct {
-    learning_rate: f32 = 1e-4,
-    max_examples: usize = 0, // 0 = all
-    layer_name: ?[]const u8 = null,
-    max_grad_norm: f32 = 1.0,
-    grad_accum_steps: u32 = 1,
-    llrd_decay: f32 = 1.0,
-    use_schedule_free: bool = false,
-    /// Optional compute backend for gradient computation.
-    /// If null, defaults to native CPU math.
-    compute_backend: ?*const ComputeBackend = null,
-    /// DDP rank of this process. Rank 0 is responsible for eval logging and checkpoint writes.
-    /// Set to 0 for single-device training (default).
-    ddp_rank: u32 = 0,
-    /// Linear LR warmup steps. LR ramps from 0 → learning_rate over the first warmup_steps
-    /// optimizer updates. 0 = no warmup.
-    warmup_steps: u32 = 0,
-    /// Evaluate and conditionally save a checkpoint every N epochs.
-    /// When > 0, saves the best checkpoint (by eval MSE) seen so far after each interval.
-    /// 0 = only evaluate and save at the end of training.
-    checkpoint_interval: usize = 0,
-    /// Stop training early if eval MSE has not improved for this many consecutive checkpoint
-    /// evaluations. Requires checkpoint_interval > 0 or implicitly sets it to 1. 0 = disabled.
-    early_stopping_patience: usize = 0,
-    /// Pre-compiled PJRT gradient executors, one per LoRA layer.
-    /// Length must equal bundle.layers.len if non-null.
-    pjrt_lora_steps: if (build_options.enable_pjrt) ?[]?graph_bridge.LoRAPjrtTrainStep else void =
-        if (build_options.enable_pjrt) null else {},
-    /// NEFTune embedding-noise alpha (Jain et al., NeurIPS 2023). 0 = disabled;
-    /// typical values 5.0 - 15.0. Applied to cached hidden states on the training
-    /// path only (never during eval). Determinism is keyed off the Adam step.
-    neftune_alpha: f32 = 0.0,
-};
+    return expanded.toOwnedSlice(allocator);
+}
 
-pub const LoRATrainMetrics = struct {
-    examples_seen: usize = 0,
-    updates_applied: usize = 0,
-    average_loss: f64 = 0,
-};
-
-pub const LoRATrainEvalSummary = struct {
-    artifact_family_version: []const u8,
-    base_model_dir: []const u8,
-    adapter_model_dir: []const u8,
-    saved_adapter_dir: []const u8,
-    /// Total epochs requested.
-    epochs: usize,
-    /// Actual epochs completed (may be less than epochs when early stopping fires).
-    epochs_trained: usize,
-    learning_rate: f32,
-    train_metrics: []LoRATrainMetrics,
-    eval_mse_before: f64,
-    /// Eval MSE at the end of training (last evaluation run).
-    eval_mse_after: f64,
-    /// Lowest eval MSE achieved at any checkpoint during training.
-    best_eval_mse: f64,
-
-    pub fn deinit(self: *LoRATrainEvalSummary, allocator: std.mem.Allocator) void {
-        allocator.free(self.artifact_family_version);
-        allocator.free(self.base_model_dir);
-        allocator.free(self.adapter_model_dir);
-        allocator.free(self.saved_adapter_dir);
-        allocator.free(self.train_metrics);
-        self.* = undefined;
+fn appendUniqueString(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged([]const u8),
+    value: []const u8,
+) !void {
+    for (list.items) |item| {
+        if (std.mem.eql(u8, item, value)) return;
     }
-};
+    try list.append(allocator, try allocator.dupe(u8, value));
+}
 
 pub const AutodiffAdapterParam = struct {
     name: []const u8,
@@ -386,7 +386,9 @@ pub const AutodiffAdapterExportSummary = struct {
     exported_tensor_count: usize,
     lora_rank: usize,
     lora_alpha: f32,
+    lora_dropout: f32,
     target_modules: []const []const u8,
+    resolved_target_modules: []const []const u8,
 };
 
 pub const AutodiffRegularParamExportSummary = struct {
@@ -412,6 +414,33 @@ pub const MaterializeSummary = struct {
     copied_boundary_task_head: bool,
     copied_cleanup_head: bool,
     copied_base_tensor_count: usize,
+};
+
+const MaterializationInventory = struct {
+    config: bool,
+    encoder_config: bool,
+    tokenizer: bool,
+    tokenizer_config: bool,
+    special_tokens_map: bool,
+    added_tokens: bool,
+    sentencepiece_model: bool,
+};
+
+const MaterializationManifest = struct {
+    schema_version: []const u8 = materialization_schema_version,
+    status: []const u8 = "complete",
+    artifact_family_version: []const u8,
+    checkpoint_file: []const u8 = checkpoint_file_name,
+    base_model_dir: []const u8,
+    adapter_model_dir: []const u8,
+    merged_lora_tensor_count: usize,
+    merged_dora_tensor_count: usize,
+    task_head_passthrough_tensor_count: usize,
+    attached_task_head_tensor_count: usize,
+    copied_boundary_head: bool,
+    copied_boundary_task_head: bool,
+    copied_cleanup_head: bool,
+    supporting_artifacts: MaterializationInventory,
 };
 
 pub const ClassifierTaskHead = struct {
@@ -486,13 +515,19 @@ pub fn resolveArtifactPaths(allocator: std.mem.Allocator, model_input: []const u
         try allocator.dupe(u8, model_input);
     errdefer allocator.free(checkpoint_path);
 
-    const config_path = try std.fs.path.join(allocator, &.{ model_dir, config_file_name });
-    errdefer allocator.free(config_path);
     const encoder_config_path = try std.fs.path.join(allocator, &.{ model_dir, encoder_config_file_name });
     errdefer allocator.free(encoder_config_path);
+    const root_config_path = try std.fs.path.join(allocator, &.{ model_dir, config_file_name });
+    const config_path = if (isRegularFilePath(root_config_path)) root_config_path else if (isRegularFilePath(encoder_config_path)) blk: {
+        allocator.free(root_config_path);
+        break :blk try allocator.dupe(u8, encoder_config_path);
+    } else {
+        allocator.free(root_config_path);
+        return error.MissingModelConfig;
+    };
+    errdefer allocator.free(config_path);
 
     if (!isRegularFilePath(checkpoint_path)) return error.MissingModelCheckpoint;
-    if (!isRegularFilePath(config_path)) return error.MissingModelConfig;
     if (!isRegularFilePath(encoder_config_path)) return error.MissingEncoderConfig;
 
     return .{
@@ -538,7 +573,7 @@ pub fn inspectCheckpoint(
     defer reader.deinit();
 
     var summary = CheckpointInspection{
-        .artifact_family_version = try allocator.dupe(u8, artifact_family_version),
+        .artifact_family_version = try inspectionArtifactFamilyVersion(allocator, paths.model_dir),
         .model_dir = try allocator.dupe(u8, paths.model_dir),
         .checkpoint_path = try allocator.dupe(u8, paths.checkpoint_path),
         .config_path = try allocator.dupe(u8, paths.config_path),
@@ -630,8 +665,14 @@ pub fn bootstrapLoRABundle(
     defer freeCheckpointInspection(allocator, &inspect);
 
     if (options.rank == 0) return error.InvalidLoRARank;
+    try validateLoRADropout(options.dropout);
     const requested_target_modules = options.target_modules orelse default_lora_target_modules[0..];
-    const resolved_tensors = try inferLoRATargetTensors(allocator, inspect.checkpoint_path, requested_target_modules);
+    const resolved_target_modules = try expandLoRATargetModules(allocator, requested_target_modules);
+    errdefer {
+        for (resolved_target_modules) |item| allocator.free(item);
+        allocator.free(resolved_target_modules);
+    }
+    const resolved_tensors = try inferLoRATargetTensors(allocator, inspect.checkpoint_path, resolved_target_modules);
     errdefer freeLoRATargetTensors(allocator, resolved_tensors);
     if (resolved_tensors.len == 0) return error.NoLoRATargetTensorsResolved;
 
@@ -648,7 +689,7 @@ pub fn bootstrapLoRABundle(
     errdefer allocator.free(base_model_name_or_path);
 
     try writeBootstrapAdapterCheckpoint(allocator, adapter_checkpoint_path, resolved_tensors, options.rank);
-    try writeAdapterConfigJson(allocator, adapter_config_path, base_model_name_or_path, options.rank, options.alpha, requested_target_modules, false);
+    try writeAdapterConfigJson(allocator, adapter_config_path, base_model_name_or_path, options.rank, options.alpha, options.dropout, requested_target_modules, false);
 
     return .{
         .artifact_family_version = try allocator.dupe(u8, artifact_family_version),
@@ -660,7 +701,9 @@ pub fn bootstrapLoRABundle(
         .base_model_name_or_path = base_model_name_or_path,
         .lora_rank = options.rank,
         .lora_alpha = options.alpha,
+        .lora_dropout = options.dropout,
         .target_modules = try dupeStringSlice(allocator, requested_target_modules),
+        .resolved_target_modules = resolved_target_modules,
         .resolved_tensors = resolved_tensors,
     };
 }
@@ -702,24 +745,29 @@ pub fn inspectLoRABundle(
         };
         if (parsed.kind != .a) continue;
         const adapter_a_info = entry.value_ptr.*;
-        const adapter_b_name = try std.fmt.allocPrint(allocator, "{s}.lora_B.weight", .{parsed.base_tensor_base_name});
+        const adapter_b_name = try std.fmt.allocPrint(allocator, "{s}.lora_B.weight", .{parsed.adapter_tensor_base_name});
         defer allocator.free(adapter_b_name);
         const base_tensor_name = try std.fmt.allocPrint(allocator, "{s}.weight", .{parsed.base_tensor_base_name});
         defer allocator.free(base_tensor_name);
         const adapter_b_info = adapter_reader.header.tensors.get(adapter_b_name) orelse return error.MissingAdapterPair;
-        const base_info = base_reader.header.tensors.get(base_tensor_name) orelse return error.MissingBaseTensorForAdapter;
-        if (adapter_a_info.shape.len != 2 or adapter_b_info.shape.len != 2 or base_info.shape.len != 2) return error.InvalidAdapterTensorShape;
-        if (adapter_a_info.shape[1] != base_info.shape[1]) return error.AdapterInputDimMismatch;
-        if (adapter_b_info.shape[0] != base_info.shape[0]) return error.AdapterOutputDimMismatch;
+        if (adapter_a_info.shape.len != 2 or adapter_b_info.shape.len != 2) return error.InvalidAdapterTensorShape;
+        const base_output_dim, const base_input_dim = if (isGraphOwnedLoRABaseModule(parsed.module_name)) blk: {
+            break :blk .{ adapter_b_info.shape[0], adapter_a_info.shape[1] };
+        } else if (base_reader.header.tensors.get(base_tensor_name)) |base_info| blk: {
+            if (base_info.shape.len != 2) return error.InvalidAdapterTensorShape;
+            break :blk .{ base_info.shape[0], base_info.shape[1] };
+        } else return error.MissingBaseTensorForAdapter;
+        if (adapter_a_info.shape[1] != base_input_dim) return error.AdapterInputDimMismatch;
+        if (adapter_b_info.shape[0] != base_output_dim) return error.AdapterOutputDimMismatch;
         if (adapter_a_info.shape[0] != adapter_b_info.shape[1]) return error.AdapterRankMismatch;
 
-        const maybe_dora_name = try doraMagnitudeTensorName(allocator, base_tensor_name);
+        const maybe_dora_name = try std.fmt.allocPrint(allocator, "{s}.lora_magnitude_vector.weight", .{parsed.adapter_tensor_base_name});
         defer allocator.free(maybe_dora_name);
         var dora_name_for_summary: ?[]const u8 = null;
         var dora_parameter_count: usize = 0;
         if (adapter_reader.header.tensors.get(maybe_dora_name)) |dora_info| {
             if (dora_info.shape.len != 1) return error.InvalidAdapterTensorShape;
-            if (dora_info.shape[0] != base_info.shape[0]) return error.AdapterOutputDimMismatch;
+            if (dora_info.shape[0] != base_output_dim) return error.AdapterOutputDimMismatch;
             dora_name_for_summary = try allocator.dupe(u8, maybe_dora_name);
             dora_parameter_count = @intCast(dora_info.shape[0]);
         }
@@ -730,8 +778,8 @@ pub fn inspectLoRABundle(
             .adapter_b_tensor_name = try allocator.dupe(u8, adapter_b_name),
             .dora_magnitude_tensor_name = dora_name_for_summary,
             .module_name = try allocator.dupe(u8, parsed.module_name),
-            .input_dim = @intCast(base_info.shape[1]),
-            .output_dim = @intCast(base_info.shape[0]),
+            .input_dim = @intCast(base_input_dim),
+            .output_dim = @intCast(base_output_dim),
             .rank = @intCast(adapter_a_info.shape[0]),
             .adapter_parameter_count = @as(usize, @intCast(adapter_a_info.shape[0])) * @as(usize, @intCast(adapter_a_info.shape[1])) +
                 @as(usize, @intCast(adapter_b_info.shape[0])) * @as(usize, @intCast(adapter_b_info.shape[1])) +
@@ -771,8 +819,11 @@ pub fn inspectLoRABundle(
         .base_model_name_or_path = try dupeOptionalString(allocator, adapter_config.base_model_name_or_path),
         .lora_rank = adapter_config.lora_rank,
         .lora_alpha = adapter_config.lora_alpha,
+        .lora_dropout = adapter_config.lora_dropout,
         .target_module_count = adapter_config.target_module_count,
         .target_modules = try dupeOptionalStringSlice(allocator, adapter_config.target_modules),
+        .resolved_target_module_count = adapter_config.resolved_target_module_count,
+        .resolved_target_modules = try dupeOptionalStringSlice(allocator, adapter_config.resolved_target_modules),
         .resolved_tensor_count = tensors.items.len,
         .trainable_parameter_count = trainable_parameter_count,
         .dora_magnitude_tensor_count = dora_magnitude_tensor_count,
@@ -905,6 +956,7 @@ pub fn loadLoRABundle(
         .base_model_name_or_path = try dupeOptionalString(allocator, inspected.base_model_name_or_path),
         .lora_rank = inspected.lora_rank.?,
         .lora_alpha = @floatCast(inspected.lora_alpha.?),
+        .lora_dropout = if (inspected.lora_dropout) |value| @floatCast(value) else 0.0,
         .target_modules = if (inspected.target_modules) |items|
             try dupeStringSlice(allocator, items)
         else
@@ -987,6 +1039,7 @@ pub fn saveLoRABundle(bundle: *const LoadedLoRABundle, out_dir: []const u8) !voi
         bundle.base_model_name_or_path orelse bundle.base_model_dir,
         bundle.lora_rank,
         bundle.lora_alpha,
+        bundle.lora_dropout,
         bundle.target_modules,
         bundleHasDoRA(bundle),
     );
@@ -1006,9 +1059,11 @@ pub fn exportAutodiffAdaptersAsPeftBundle(
     base_model_name_or_path: []const u8,
     rank: usize,
     alpha: f32,
+    dropout: f32,
     target_modules: []const []const u8,
     params: []const AutodiffAdapterParam,
 ) !AutodiffAdapterExportSummary {
+    try validateLoRADropout(dropout);
     try compat.cwd().createDirPath(compat.io(), out_dir);
     const checkpoint_path = try std.fs.path.join(allocator, &.{ out_dir, adapter_checkpoint_file_name });
     errdefer allocator.free(checkpoint_path);
@@ -1027,11 +1082,18 @@ pub fn exportAutodiffAdaptersAsPeftBundle(
         for (owned_shapes.items) |item| allocator.free(item);
         owned_shapes.deinit(allocator);
     }
+    var peft_target_modules: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (peft_target_modules.items) |item| allocator.free(item);
+        peft_target_modules.deinit(allocator);
+    }
 
     var tensor_count: usize = 0;
     for (params) |param| {
         const peft_name = try autodiffParamNameToPeftName(allocator, param.name);
         errdefer allocator.free(peft_name);
+        const module_name = peftModuleNameForAdapterTensor(peft_name) orelse return error.InvalidAutodiffAdapterName;
+        try appendUniqueString(allocator, &peft_target_modules, module_name);
         const shape = try i32DimsToUsize(allocator, param.dims);
         errdefer allocator.free(shape);
         if (elementCount(shape) != param.weights.len) return error.AdapterTensorShapeMismatch;
@@ -1045,9 +1107,15 @@ pub fn exportAutodiffAdaptersAsPeftBundle(
         };
         tensor_count += 1;
     }
+    if (peft_target_modules.items.len == 0) return error.NoLoRATargetTensorsResolved;
+    const resolved_target_modules = try peft_target_modules.toOwnedSlice(allocator);
+    errdefer {
+        for (resolved_target_modules) |item| allocator.free(item);
+        allocator.free(resolved_target_modules);
+    }
 
     try writeHeaderAndTensorsF32(allocator, checkpoint_path, tensors[0..tensor_count]);
-    try writeAdapterConfigJson(allocator, config_path, base_model_name_or_path, rank, alpha, target_modules, false);
+    try writeAdapterConfigJson(allocator, config_path, base_model_name_or_path, rank, alpha, dropout, resolved_target_modules, false);
 
     return .{
         .artifact_family_version = try allocator.dupe(u8, artifact_family_version),
@@ -1057,7 +1125,9 @@ pub fn exportAutodiffAdaptersAsPeftBundle(
         .exported_tensor_count = tensor_count,
         .lora_rank = rank,
         .lora_alpha = alpha,
+        .lora_dropout = dropout,
         .target_modules = try dupeStringSlice(allocator, target_modules),
+        .resolved_target_modules = resolved_target_modules,
     };
 }
 
@@ -1132,6 +1202,11 @@ pub fn materializeMergedModel(
     adapter_model_dir: []const u8,
     out_dir: []const u8,
 ) !MaterializeSummary {
+    if (pathExists(out_dir)) return error.OutputDirectoryAlreadyExists;
+    const staging_dir = try materializationStagingPath(allocator, out_dir);
+    defer allocator.free(staging_dir);
+    if (pathExists(staging_dir)) return error.MaterializationStagingDirectoryExists;
+
     var bundle = try loadLoRABundle(allocator, base_model_dir, adapter_model_dir);
     defer bundle.deinit();
 
@@ -1188,24 +1263,28 @@ pub fn materializeMergedModel(
     }
     const attached_task_head_tensor_count = try attachTaskHeadCheckpointIfPresent(allocator, adapter_model_dir, &merged);
 
-    try compat.cwd().createDirPath(compat.io(), out_dir);
-    const output_checkpoint_path = try std.fs.path.join(allocator, &.{ out_dir, checkpoint_file_name });
-    errdefer allocator.free(output_checkpoint_path);
+    try compat.cwd().createDirPath(compat.io(), staging_dir);
+    var staging_published = false;
+    defer if (!staging_published) compat.cwd().deleteTree(compat.io(), staging_dir) catch {};
+
+    const staged_checkpoint_path = try std.fs.path.join(allocator, &.{ staging_dir, checkpoint_file_name });
+    defer allocator.free(staged_checkpoint_path);
     const bytes = try buildMergedSafetensorsFile(allocator, base_access, base_names, &merged);
     defer allocator.free(bytes);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = output_checkpoint_path, .data = bytes });
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = staged_checkpoint_path, .data = bytes });
 
-    try copySupportingArtifactIfPresent(allocator, base_model_dir, out_dir, config_file_name);
-    try copySupportingArtifactIfPresent(allocator, base_model_dir, out_dir, encoder_config_file_name);
-    try copySupportingArtifactIfPresent(allocator, base_model_dir, out_dir, tokenizer_file_name);
-    try copySupportingArtifactIfPresent(allocator, base_model_dir, out_dir, tokenizer_config_file_name);
-    try copySupportingArtifactIfPresent(allocator, base_model_dir, out_dir, special_tokens_map_file_name);
-    try copySupportingArtifactIfPresent(allocator, adapter_model_dir, out_dir, tokenizer_file_name);
-    try copySupportingArtifactIfPresent(allocator, adapter_model_dir, out_dir, tokenizer_config_file_name);
-    try copySupportingArtifactIfPresent(allocator, adapter_model_dir, out_dir, special_tokens_map_file_name);
-    try copySupportingArtifactIfPresent(allocator, adapter_model_dir, out_dir, gliner2_boundary.boundary_head_file_name);
-    try copySupportingArtifactIfPresent(allocator, adapter_model_dir, out_dir, gliner2_boundary.boundary_task_head_file_name);
-    try copySupportingArtifactIfPresent(allocator, adapter_model_dir, out_dir, entity_cleanup_model.head_file_name);
+    const inventory = MaterializationInventory{
+        .config = try copySupportingArtifactFromPreferredSource(allocator, base_model_dir, null, staging_dir, config_file_name, true),
+        .encoder_config = try copySupportingArtifactFromPreferredSource(allocator, base_model_dir, null, staging_dir, encoder_config_file_name, true),
+        .tokenizer = try copySupportingArtifactFromPreferredSource(allocator, adapter_model_dir, base_model_dir, staging_dir, tokenizer_file_name, true),
+        .tokenizer_config = try copySupportingArtifactFromPreferredSource(allocator, adapter_model_dir, base_model_dir, staging_dir, tokenizer_config_file_name, true),
+        .special_tokens_map = try copySupportingArtifactFromPreferredSource(allocator, adapter_model_dir, base_model_dir, staging_dir, special_tokens_map_file_name, true),
+        .added_tokens = try copySupportingArtifactFromPreferredSource(allocator, adapter_model_dir, base_model_dir, staging_dir, added_tokens_file_name, true),
+        .sentencepiece_model = try copySupportingArtifactFromPreferredSource(allocator, adapter_model_dir, base_model_dir, staging_dir, sentencepiece_model_file_name, false),
+    };
+    try copySupportingArtifactIfPresent(allocator, adapter_model_dir, staging_dir, gliner2_boundary.boundary_head_file_name);
+    try copySupportingArtifactIfPresent(allocator, adapter_model_dir, staging_dir, gliner2_boundary.boundary_task_head_file_name);
+    try copySupportingArtifactIfPresent(allocator, adapter_model_dir, staging_dir, entity_cleanup_model.head_file_name);
 
     var span_rep_passthrough_tensor_count: usize = 0;
     var count_embed_passthrough_tensor_count: usize = 0;
@@ -1214,26 +1293,40 @@ pub fn materializeMergedModel(
         if (isCountEmbedName(item.name)) count_embed_passthrough_tensor_count += 1;
     }
     const copied_boundary_head = blk: {
-        const path = try std.fs.path.join(allocator, &.{ out_dir, gliner2_boundary.boundary_head_file_name });
+        const path = try std.fs.path.join(allocator, &.{ staging_dir, gliner2_boundary.boundary_head_file_name });
         defer allocator.free(path);
         break :blk isRegularFilePath(path);
     };
     const copied_boundary_task_head = blk: {
-        const path = try std.fs.path.join(allocator, &.{ out_dir, gliner2_boundary.boundary_task_head_file_name });
+        const path = try std.fs.path.join(allocator, &.{ staging_dir, gliner2_boundary.boundary_task_head_file_name });
         defer allocator.free(path);
         break :blk isRegularFilePath(path);
     };
     const copied_cleanup_head = blk: {
-        const path = try std.fs.path.join(allocator, &.{ out_dir, entity_cleanup_model.head_file_name });
+        const path = try std.fs.path.join(allocator, &.{ staging_dir, entity_cleanup_model.head_file_name });
         defer allocator.free(path);
         break :blk isRegularFilePath(path);
     };
 
-    return .{
-        .artifact_family_version = try allocator.dupe(u8, artifact_family_version),
-        .base_model_dir = try allocator.dupe(u8, base_model_dir),
-        .adapter_model_dir = try allocator.dupe(u8, adapter_model_dir),
-        .output_dir = try allocator.dupe(u8, out_dir),
+    var reloaded = try inspectCheckpoint(allocator, staging_dir, null);
+    defer freeCheckpointInspection(allocator, &reloaded);
+    if (!reloaded.core_backbone_loadable) return error.MaterializedCheckpointNotLoadable;
+
+    const output_checkpoint_path = try std.fs.path.join(allocator, &.{ out_dir, checkpoint_file_name });
+    errdefer allocator.free(output_checkpoint_path);
+    const summary_family_version = try allocator.dupe(u8, artifact_family_version);
+    errdefer allocator.free(summary_family_version);
+    const summary_base_model_dir = try allocator.dupe(u8, base_model_dir);
+    errdefer allocator.free(summary_base_model_dir);
+    const summary_adapter_model_dir = try allocator.dupe(u8, adapter_model_dir);
+    errdefer allocator.free(summary_adapter_model_dir);
+    const summary_output_dir = try allocator.dupe(u8, out_dir);
+    errdefer allocator.free(summary_output_dir);
+    const summary = MaterializeSummary{
+        .artifact_family_version = summary_family_version,
+        .base_model_dir = summary_base_model_dir,
+        .adapter_model_dir = summary_adapter_model_dir,
+        .output_dir = summary_output_dir,
         .output_checkpoint_path = output_checkpoint_path,
         .merged_lora_tensor_count = bundle.layers.len + bundle.passthrough_tensors.len,
         .merged_dora_tensor_count = merged_dora_tensor_count,
@@ -1246,6 +1339,28 @@ pub fn materializeMergedModel(
         .copied_cleanup_head = copied_cleanup_head,
         .copied_base_tensor_count = base_names.len - bundle.layers.len,
     };
+
+    try syncMaterializationFiles(allocator, staging_dir);
+    const manifest_path = try std.fs.path.join(allocator, &.{ staging_dir, materialization_manifest_file_name });
+    defer allocator.free(manifest_path);
+    try writeSyncedJsonFile(allocator, manifest_path, MaterializationManifest{
+        .artifact_family_version = artifact_family_version,
+        .base_model_dir = base_model_dir,
+        .adapter_model_dir = adapter_model_dir,
+        .merged_lora_tensor_count = summary.merged_lora_tensor_count,
+        .merged_dora_tensor_count = summary.merged_dora_tensor_count,
+        .task_head_passthrough_tensor_count = summary.task_head_passthrough_tensor_count,
+        .attached_task_head_tensor_count = summary.attached_task_head_tensor_count,
+        .copied_boundary_head = summary.copied_boundary_head,
+        .copied_boundary_task_head = summary.copied_boundary_task_head,
+        .copied_cleanup_head = summary.copied_cleanup_head,
+        .supporting_artifacts = inventory,
+    });
+    try syncDirectoryPath(staging_dir);
+    try std.Io.Dir.rename(compat.cwd(), staging_dir, compat.cwd(), out_dir, compat.io());
+    staging_published = true;
+    try syncDirectoryPath(std.fs.path.dirname(out_dir) orelse ".");
+    return summary;
 }
 
 pub fn freeCheckpointInspection(allocator: std.mem.Allocator, summary: *CheckpointInspection) void {
@@ -1271,6 +1386,8 @@ pub fn freeBootstrapSummary(allocator: std.mem.Allocator, summary: *BootstrapSum
     allocator.free(summary.base_model_name_or_path);
     for (summary.target_modules) |item| allocator.free(item);
     allocator.free(summary.target_modules);
+    for (summary.resolved_target_modules) |item| allocator.free(item);
+    allocator.free(summary.resolved_target_modules);
     freeLoRATargetTensors(allocator, summary.resolved_tensors);
     summary.* = undefined;
 }
@@ -1287,6 +1404,10 @@ pub fn freeLoRABundleInspectionSummary(allocator: std.mem.Allocator, summary: *L
         for (modules) |item| allocator.free(item);
         allocator.free(modules);
     }
+    if (summary.resolved_target_modules) |modules| {
+        for (modules) |item| allocator.free(item);
+        allocator.free(modules);
+    }
     for (summary.tensors) |*item| freeLoRATensorSummary(allocator, item);
     allocator.free(summary.tensors);
     summary.* = undefined;
@@ -1299,6 +1420,8 @@ pub fn freeAutodiffAdapterExportSummary(allocator: std.mem.Allocator, summary: *
     allocator.free(summary.adapter_config_path);
     for (summary.target_modules) |item| allocator.free(item);
     allocator.free(summary.target_modules);
+    for (summary.resolved_target_modules) |item| allocator.free(item);
+    allocator.free(summary.resolved_target_modules);
     summary.* = undefined;
 }
 
@@ -1306,6 +1429,15 @@ pub fn freeAutodiffRegularParamExportSummary(allocator: std.mem.Allocator, summa
     allocator.free(summary.artifact_family_version);
     allocator.free(summary.output_dir);
     allocator.free(summary.checkpoint_path);
+    summary.* = undefined;
+}
+
+pub fn freeMaterializeSummary(allocator: std.mem.Allocator, summary: *MaterializeSummary) void {
+    allocator.free(summary.artifact_family_version);
+    allocator.free(summary.base_model_dir);
+    allocator.free(summary.adapter_model_dir);
+    allocator.free(summary.output_dir);
+    allocator.free(summary.output_checkpoint_path);
     summary.* = undefined;
 }
 
@@ -1351,42 +1483,61 @@ fn inferLoRATargetTensors(
 
 fn moduleNameForTensor(tensor_name: []const u8) ?[]const u8 {
     const ordered_modules = [_][]const u8{
+        "attention.output.dense",
+        "intermediate.dense",
+        "output.dense",
         "query_proj",
         "key_proj",
         "value_proj",
+        "classifier",
+        "span_rep",
+        "count_embed",
+        "count_pred",
     };
+    if (std.mem.eql(u8, tensor_name, "classifier.weight")) return "classifier";
+    if (std.mem.startsWith(u8, tensor_name, "classifier.") and std.mem.endsWith(u8, tensor_name, ".weight")) return "classifier";
+    if (std.mem.eql(u8, tensor_name, "span_rep.weight")) return "span_rep";
+    if (std.mem.eql(u8, tensor_name, "count_embed.weight")) return "count_embed";
+    if (std.mem.eql(u8, tensor_name, "count_pred.weight")) return "count_pred";
     inline for (ordered_modules) |module_name| {
         const dot_suffix = "." ++ module_name ++ ".weight";
         const slash_suffix = "/" ++ module_name ++ "/weight";
         if (std.mem.endsWith(u8, tensor_name, dot_suffix)) return module_name;
         if (std.mem.endsWith(u8, tensor_name, slash_suffix)) return module_name;
     }
+    if (std.mem.indexOf(u8, tensor_name, "span_rep") != null and std.mem.endsWith(u8, tensor_name, ".weight")) return "span_rep";
+    if (std.mem.indexOf(u8, tensor_name, "count_embed") != null and std.mem.endsWith(u8, tensor_name, ".weight")) return "count_embed";
+    if (std.mem.indexOf(u8, tensor_name, "count_pred") != null and std.mem.endsWith(u8, tensor_name, ".weight")) return "count_pred";
     return null;
 }
 
 const LoRAAdapterTensorKind = enum { a, b };
 
 const ParsedLoRAAdapterTensorName = struct {
+    adapter_tensor_base_name: []const u8,
     base_tensor_base_name: []const u8,
     module_name: []const u8,
     kind: LoRAAdapterTensorKind,
 };
 
 fn parseLoRAAdapterTensorName(tensor_name: []const u8) ?ParsedLoRAAdapterTensorName {
+    const peft_prefix = "base_model.model.";
     if (std.mem.endsWith(u8, tensor_name, ".lora_A.weight")) {
-        const base = tensor_name[0 .. tensor_name.len - ".lora_A.weight".len];
+        const adapter_base = tensor_name[0 .. tensor_name.len - ".lora_A.weight".len];
+        const base = if (std.mem.startsWith(u8, adapter_base, peft_prefix)) adapter_base[peft_prefix.len..] else adapter_base;
         const module = moduleNameForBaseTensor(base) orelse return null;
-        return .{ .base_tensor_base_name = base, .module_name = module, .kind = .a };
+        return .{ .adapter_tensor_base_name = adapter_base, .base_tensor_base_name = base, .module_name = module, .kind = .a };
     }
     if (std.mem.endsWith(u8, tensor_name, ".lora_B.weight")) {
-        const base = tensor_name[0 .. tensor_name.len - ".lora_B.weight".len];
+        const adapter_base = tensor_name[0 .. tensor_name.len - ".lora_B.weight".len];
+        const base = if (std.mem.startsWith(u8, adapter_base, peft_prefix)) adapter_base[peft_prefix.len..] else adapter_base;
         const module = moduleNameForBaseTensor(base) orelse return null;
-        return .{ .base_tensor_base_name = base, .module_name = module, .kind = .b };
+        return .{ .adapter_tensor_base_name = adapter_base, .base_tensor_base_name = base, .module_name = module, .kind = .b };
     }
     return null;
 }
 
-fn autodiffParamNameToPeftName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+pub fn autodiffParamNameToPeftName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
     if (std.mem.endsWith(u8, name, ".lora_A")) {
         const base = name[0 .. name.len - ".lora_A".len];
         return autodiffParamBaseToPeftName(allocator, tensorBaseName(base), "lora_A");
@@ -1398,29 +1549,63 @@ fn autodiffParamNameToPeftName(allocator: std.mem.Allocator, name: []const u8) !
     return error.InvalidAutodiffAdapterName;
 }
 
+fn peftModuleNameForAdapterTensor(name: []const u8) ?[]const u8 {
+    const prefix = "base_model.model.";
+    if (!std.mem.startsWith(u8, name, prefix)) return null;
+    const suffix = if (std.mem.endsWith(u8, name, ".lora_A.weight"))
+        ".lora_A.weight"
+    else if (std.mem.endsWith(u8, name, ".lora_B.weight"))
+        ".lora_B.weight"
+    else
+        return null;
+    return name[prefix.len .. name.len - suffix.len];
+}
+
 fn autodiffParamBaseToPeftName(allocator: std.mem.Allocator, base_no_weight: []const u8, adapter_name: []const u8) ![]const u8 {
     // The autodiff trainer strips the outer HF "encoder." prefix before
     // graph execution, while GLiNER2 checkpoint/bundle tools validate
     // against the original HF checkpoint names.
     if (std.mem.startsWith(u8, base_no_weight, "encoder.layer.")) {
-        return std.fmt.allocPrint(allocator, "encoder.{s}.{s}.weight", .{ base_no_weight, adapter_name });
+        return std.fmt.allocPrint(allocator, "base_model.model.encoder.{s}.{s}.weight", .{ base_no_weight, adapter_name });
     }
-    return std.fmt.allocPrint(allocator, "{s}.{s}.weight", .{ base_no_weight, adapter_name });
+    return std.fmt.allocPrint(allocator, "base_model.model.{s}.{s}.weight", .{ base_no_weight, adapter_name });
 }
 
 fn moduleNameForBaseTensor(base_tensor_name: []const u8) ?[]const u8 {
     const ordered_modules = [_][]const u8{
+        "attention.output.dense",
+        "intermediate.dense",
+        "output.dense",
         "query_proj",
         "key_proj",
         "value_proj",
+        "classifier",
+        "span_rep",
+        "count_embed",
+        "count_pred",
     };
+    if (std.mem.eql(u8, base_tensor_name, "classifier")) return "classifier";
+    if (std.mem.startsWith(u8, base_tensor_name, "classifier.")) return "classifier";
+    if (std.mem.eql(u8, base_tensor_name, "span_rep")) return "span_rep";
+    if (std.mem.eql(u8, base_tensor_name, "count_embed")) return "count_embed";
+    if (std.mem.eql(u8, base_tensor_name, "count_pred")) return "count_pred";
     inline for (ordered_modules) |module_name| {
         const dot_suffix = "." ++ module_name;
         const slash_suffix = "/" ++ module_name;
         if (std.mem.endsWith(u8, base_tensor_name, dot_suffix)) return module_name;
         if (std.mem.endsWith(u8, base_tensor_name, slash_suffix)) return module_name;
     }
+    if (std.mem.indexOf(u8, base_tensor_name, "span_rep") != null) return "span_rep";
+    if (std.mem.indexOf(u8, base_tensor_name, "count_embed") != null) return "count_embed";
+    if (std.mem.indexOf(u8, base_tensor_name, "count_pred") != null) return "count_pred";
     return null;
+}
+
+fn isGraphOwnedLoRABaseModule(module_name: []const u8) bool {
+    return std.mem.eql(u8, module_name, "classifier") or
+        std.mem.eql(u8, module_name, "span_rep") or
+        std.mem.eql(u8, module_name, "count_embed") or
+        std.mem.eql(u8, module_name, "count_pred");
 }
 
 fn writeBootstrapAdapterCheckpoint(
@@ -1500,8 +1685,13 @@ fn writeHeaderAndTensorsF32(allocator: std.mem.Allocator, path: []const u8, tens
     }
     try writer.writeByte('}');
 
-    var file = try compat.cwd().createFile(compat.io(), path, .{ .truncate = true });
-    defer file.close(compat.io());
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
+    defer allocator.free(tmp_path);
+    compat.cwd().deleteFile(compat.io(), tmp_path) catch {};
+    errdefer compat.cwd().deleteFile(compat.io(), tmp_path) catch {};
+    var file = try compat.cwd().createFile(compat.io(), tmp_path, .{ .truncate = true });
+    var closed = false;
+    errdefer if (!closed) file.close(compat.io());
 
     var len_buf: [8]u8 = undefined;
     std.mem.writeInt(u64, &len_buf, header_buf.written().len, .little);
@@ -1510,6 +1700,9 @@ fn writeHeaderAndTensorsF32(allocator: std.mem.Allocator, path: []const u8, tens
     for (tensors) |tensor| {
         try file.writeStreamingAll(compat.io(), std.mem.sliceAsBytes(tensor.data));
     }
+    file.close(compat.io());
+    closed = true;
+    try std.Io.Dir.rename(compat.cwd(), tmp_path, compat.cwd(), path, compat.io());
 }
 
 fn buildDeterministicLoraA(allocator: std.mem.Allocator, rows: usize, cols: usize) ![]f32 {
@@ -1571,21 +1764,39 @@ fn writeAdapterConfigJson(
     base_model_name_or_path: []const u8,
     rank: usize,
     alpha: f32,
+    dropout: f32,
     target_modules: []const []const u8,
     use_dora: bool,
 ) !void {
+    try validateLoRADropout(dropout);
     var buffer: std.Io.Writer.Allocating = .init(allocator);
     defer buffer.deinit();
     try std.json.Stringify.value(.{
+        .auto_mapping = .{
+            .base_model_class = "Extractor",
+            .parent_library = "gliner2.model",
+        },
         .base_model_name_or_path = base_model_name_or_path,
+        .bias = "none",
+        .inference_mode = true,
         .peft_type = "LORA",
-        .task_type = "TOKEN_CLS",
+        .task_type = @as(?[]const u8, null),
         .r = rank,
         .lora_alpha = alpha,
+        .lora_dropout = dropout,
         .target_modules = target_modules,
         .use_dora = use_dora,
     }, .{ .whitespace = .indent_2 }, &buffer.writer);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = buffer.written() });
+    try writeFileAtomic(allocator, path, buffer.written());
+}
+
+fn writeFileAtomic(allocator: std.mem.Allocator, path: []const u8, data: []const u8) !void {
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
+    defer allocator.free(tmp_path);
+    compat.cwd().deleteFile(compat.io(), tmp_path) catch {};
+    errdefer compat.cwd().deleteFile(compat.io(), tmp_path) catch {};
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = tmp_path, .data = data });
+    try std.Io.Dir.rename(compat.cwd(), tmp_path, compat.cwd(), path, compat.io());
 }
 
 fn bundleHasDoRA(bundle: *const LoadedLoRABundle) bool {
@@ -1602,8 +1813,11 @@ const AdapterInspection = struct {
     base_model_name_or_path: ?[]const u8 = null,
     lora_rank: ?usize = null,
     lora_alpha: ?f64 = null,
+    lora_dropout: ?f64 = null,
     target_module_count: usize = 0,
     target_modules: ?[]const []const u8 = null,
+    resolved_target_module_count: usize = 0,
+    resolved_target_modules: ?[]const []const u8 = null,
     use_dora: ?bool = null,
 };
 
@@ -1635,8 +1849,18 @@ fn inspectAdapterConfig(allocator: std.mem.Allocator, input: []const u8) !Adapte
         .base_model_name_or_path = if (adapter_config) |cfg| try dupeOptionalString(allocator, cfg.base_model_name_or_path) else null,
         .lora_rank = if (adapter_config) |cfg| cfg.r else null,
         .lora_alpha = if (adapter_config) |cfg| cfg.lora_alpha else null,
+        .lora_dropout = if (adapter_config) |cfg| cfg.lora_dropout else null,
         .target_module_count = if (adapter_config) |cfg| if (cfg.target_modules) |items| items.len else 0 else 0,
         .target_modules = if (adapter_config) |cfg| try dupeOptionalStringSlice(allocator, cfg.target_modules) else null,
+        .resolved_target_module_count = if (adapter_config) |cfg| if (cfg.target_modules) |items| blk: {
+            const resolved = try expandLoRATargetModules(allocator, items);
+            defer {
+                for (resolved) |item| allocator.free(item);
+                allocator.free(resolved);
+            }
+            break :blk resolved.len;
+        } else 0 else 0,
+        .resolved_target_modules = if (adapter_config) |cfg| if (cfg.target_modules) |items| try expandLoRATargetModules(allocator, items) else null else null,
         .use_dora = if (adapter_config) |cfg| cfg.use_dora else null,
     };
 }
@@ -1647,6 +1871,10 @@ fn freeAdapterInspection(allocator: std.mem.Allocator, inspection: *AdapterInspe
     if (inspection.adapter_config_path) |value| allocator.free(value);
     if (inspection.base_model_name_or_path) |value| allocator.free(value);
     if (inspection.target_modules) |modules| {
+        for (modules) |item| allocator.free(item);
+        allocator.free(modules);
+    }
+    if (inspection.resolved_target_modules) |modules| {
         for (modules) |item| allocator.free(item);
         allocator.free(modules);
     }
@@ -1756,6 +1984,7 @@ fn dupeAdapterConfig(allocator: std.mem.Allocator, config: AdapterConfig) !Adapt
         .task_type = try dupeOptionalString(allocator, config.task_type),
         .r = config.r,
         .lora_alpha = config.lora_alpha,
+        .lora_dropout = config.lora_dropout,
         .target_modules = try dupeOptionalStringSlice(allocator, config.target_modules),
         .use_dora = config.use_dora,
     };
@@ -1851,6 +2080,135 @@ fn copySupportingArtifactIfPresent(
     const parent = std.fs.path.dirname(dst);
     if (parent) |dir_path| try compat.cwd().createDirPath(compat.io(), dir_path);
     try compat.cwd().writeFile(compat.io(), .{ .sub_path = dst, .data = bytes });
+}
+
+fn copySupportingArtifactFromPreferredSource(
+    allocator: std.mem.Allocator,
+    preferred_source_dir: []const u8,
+    fallback_source_dir: ?[]const u8,
+    out_dir: []const u8,
+    file_name: []const u8,
+    required: bool,
+) !bool {
+    const preferred_path = try optionalPathInDir(allocator, preferred_source_dir, file_name);
+    defer if (preferred_path) |path| allocator.free(path);
+    const fallback_path = if (preferred_path == null and fallback_source_dir != null)
+        try optionalPathInDir(allocator, fallback_source_dir.?, file_name)
+    else
+        null;
+    defer if (fallback_path) |path| allocator.free(path);
+    const source_path = preferred_path orelse fallback_path orelse {
+        if (required) return error.RequiredSupportingArtifactMissing;
+        return false;
+    };
+
+    const bytes = try c_file.readFile(allocator, source_path);
+    defer allocator.free(bytes);
+    const dst = try std.fs.path.join(allocator, &.{ out_dir, file_name });
+    defer allocator.free(dst);
+    if (std.fs.path.dirname(dst)) |parent| try compat.cwd().createDirPath(compat.io(), parent);
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = dst, .data = bytes });
+    return true;
+}
+
+fn materializationStagingPath(allocator: std.mem.Allocator, out_dir: []const u8) ![]const u8 {
+    const name = std.fs.path.basename(out_dir);
+    if (name.len == 0 or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) {
+        return error.InvalidOutputDirectory;
+    }
+    const staging_name = try std.fmt.allocPrint(allocator, ".{s}.staging-{d}", .{ name, std.posix.system.getpid() });
+    defer allocator.free(staging_name);
+    return std.fs.path.join(allocator, &.{ std.fs.path.dirname(out_dir) orelse ".", staging_name });
+}
+
+fn pathExists(path: []const u8) bool {
+    _ = compat.cwd().statFile(compat.io(), path, .{}) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return false,
+        else => return true,
+    };
+    return true;
+}
+
+fn inspectionArtifactFamilyVersion(allocator: std.mem.Allocator, model_dir: []const u8) ![]const u8 {
+    const manifest_path = try std.fs.path.join(allocator, &.{ model_dir, materialization_manifest_file_name });
+    defer allocator.free(manifest_path);
+    if (!isRegularFilePath(manifest_path)) return allocator.dupe(u8, artifact_family_version);
+
+    const bytes = try compat.cwd().readFileAlloc(compat.io(), manifest_path, allocator, .limited(1024 * 1024));
+    defer allocator.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidMaterializationManifest;
+    const object = parsed.value.object;
+    const schema_value = object.get("schema_version") orelse return error.InvalidMaterializationManifest;
+    const status_value = object.get("status") orelse return error.InvalidMaterializationManifest;
+    const family_value = object.get("artifact_family_version") orelse return error.InvalidMaterializationManifest;
+    if (schema_value != .string or status_value != .string or family_value != .string) {
+        return error.InvalidMaterializationManifest;
+    }
+    if (!std.mem.eql(u8, schema_value.string, materialization_schema_version) or
+        !std.mem.eql(u8, status_value.string, "complete"))
+    {
+        return error.InvalidMaterializationManifest;
+    }
+    if (!isSupportedArtifactFamilyVersion(family_value.string)) return error.UnsupportedArtifactFamilyVersion;
+    return allocator.dupe(u8, family_value.string);
+}
+
+fn syncMaterializationFiles(allocator: std.mem.Allocator, staging_dir: []const u8) !void {
+    const file_names = [_][]const u8{
+        checkpoint_file_name,
+        config_file_name,
+        encoder_config_file_name,
+        tokenizer_file_name,
+        tokenizer_config_file_name,
+        special_tokens_map_file_name,
+        added_tokens_file_name,
+        sentencepiece_model_file_name,
+        gliner2_boundary.boundary_head_file_name,
+        gliner2_boundary.boundary_task_head_file_name,
+        entity_cleanup_model.head_file_name,
+    };
+    for (file_names) |file_name| {
+        const path = try std.fs.path.join(allocator, &.{ staging_dir, file_name });
+        defer allocator.free(path);
+        if (!isRegularFilePath(path)) continue;
+        var file = try compat.cwd().openFile(compat.io(), path, .{});
+        defer file.close(compat.io());
+        try file.sync(compat.io());
+    }
+    const encoder_dir = try std.fs.path.join(allocator, &.{ staging_dir, "encoder_config" });
+    defer allocator.free(encoder_dir);
+    try syncDirectoryPath(encoder_dir);
+    try syncDirectoryPath(staging_dir);
+}
+
+fn writeSyncedJsonFile(allocator: std.mem.Allocator, path: []const u8, value: anytype) !void {
+    const rendered = try std.json.Stringify.valueAlloc(allocator, value, .{ .whitespace = .indent_2 });
+    defer allocator.free(rendered);
+    var file = try compat.cwd().createFile(compat.io(), path, .{ .truncate = true });
+    defer file.close(compat.io());
+    try file.writeStreamingAll(compat.io(), rendered);
+    try file.sync(compat.io());
+}
+
+fn syncDirectoryPath(path: []const u8) !void {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) return;
+    var dir = if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.openDirAbsolute(compat.io(), path, .{ .iterate = true })
+    else
+        try compat.cwd().openDir(compat.io(), path, .{ .iterate = true });
+    defer dir.close(compat.io());
+    while (true) switch (std.posix.errno(std.posix.system.fsync(dir.handle))) {
+        .SUCCESS => return,
+        .INTR => continue,
+        .INVAL => return,
+        .BADF => return error.InvalidFileDescriptor,
+        .IO => return error.InputOutput,
+        .NOSPC => return error.NoSpaceLeft,
+        .DQUOT => return error.DiskQuota,
+        else => |err| return std.posix.unexpectedErrno(err),
+    };
 }
 
 fn openTensorAccessForFile(allocator: std.mem.Allocator, path: []const u8) !tensor_access.TensorAccess {
@@ -2045,745 +2403,6 @@ fn isRegularFilePath(path: []const u8) bool {
     return stat.kind == .file;
 }
 
-/// Train LoRA adapters for one epoch using cached top-layer representations.
-/// Uses span prediction loss: for each span, the dot product of a mean-pooled
-/// hidden state with a deterministic probe vector is the score.
-/// MSE loss against gold labels drives adapter updates.
-pub fn trainLoRABundleEpochCached(
-    allocator: std.mem.Allocator,
-    bundle: *LoadedLoRABundle,
-    cached_summary: *const gliner2_boundary.CachedBoundarySummary,
-    adam_states: []LoRALayerAdamState,
-    sf_states: []?LoRALayerSFState,
-    options: LoRATrainOptions,
-) !LoRATrainMetrics {
-    std.debug.assert(adam_states.len == bundle.layers.len);
-    std.debug.assert(sf_states.len == bundle.layers.len);
-
-    var metrics = LoRATrainMetrics{};
-    const limit = if (options.max_examples > 0 and options.max_examples < cached_summary.examples.len)
-        options.max_examples
-    else
-        cached_summary.examples.len;
-    if (limit == 0) return metrics;
-
-    const hidden_size = cached_summary.hidden_size;
-    const num_layers = bundle.layers.len;
-
-    // Allocate flat grad buffers: we'll slice them per-layer using sizes.
-    // Total elements for grad_a = sum of input_dim * rank; likewise for grad_b.
-    var total_a: usize = 0;
-    var total_b: usize = 0;
-    for (bundle.layers) |layer| {
-        total_a += layer.input_dim * layer.rank;
-        total_b += layer.rank * layer.output_dim;
-    }
-    const flat_grad_a = try allocator.alloc(f32, total_a);
-    defer allocator.free(flat_grad_a);
-    const flat_grad_b = try allocator.alloc(f32, total_b);
-    defer allocator.free(flat_grad_b);
-
-    // Build per-layer slice views into the flat buffers.
-    const grad_as = try allocator.alloc([]f32, num_layers);
-    defer allocator.free(grad_as);
-    const grad_bs = try allocator.alloc([]f32, num_layers);
-    defer allocator.free(grad_bs);
-    {
-        var off_a: usize = 0;
-        var off_b: usize = 0;
-        for (bundle.layers, 0..) |layer, li| {
-            const sz_a = layer.input_dim * layer.rank;
-            const sz_b = layer.rank * layer.output_dim;
-            grad_as[li] = flat_grad_a[off_a .. off_a + sz_a];
-            grad_bs[li] = flat_grad_b[off_b .. off_b + sz_b];
-            off_a += sz_a;
-            off_b += sz_b;
-        }
-    }
-
-    // Reusable buffers.
-    var span_hidden = try allocator.alloc(f32, hidden_size);
-    defer allocator.free(span_hidden);
-
-    // NEFTune scratch: when enabled, we noise a per-example copy of hidden_in
-    // rather than mutating the cached summary in place. Sized to the largest
-    // (seq_len * hidden_size) observed across examples.
-    const neftune_enabled = options.neftune_alpha > 0.0;
-    var max_hidden_elems: usize = 0;
-    var max_seq_len: usize = 0;
-    if (neftune_enabled) {
-        for (cached_summary.examples[0..limit]) |*ex| {
-            const e = ex.seq_len * hidden_size;
-            if (e > max_hidden_elems) max_hidden_elems = e;
-            if (ex.seq_len > max_seq_len) max_seq_len = ex.seq_len;
-        }
-    }
-    var neftune_hidden_scratch: []f32 = &[_]f32{};
-    var neftune_mask_scratch: []f32 = &[_]f32{};
-    if (neftune_enabled and max_hidden_elems > 0) {
-        neftune_hidden_scratch = try allocator.alloc(f32, max_hidden_elems);
-        neftune_mask_scratch = try allocator.alloc(f32, max_seq_len);
-    }
-    defer if (neftune_hidden_scratch.len > 0) allocator.free(neftune_hidden_scratch);
-    defer if (neftune_mask_scratch.len > 0) allocator.free(neftune_mask_scratch);
-
-    var accum_steps: u32 = 0;
-    var total_loss: f64 = 0;
-
-    // Zero grad buffers before the first accumulation block.
-    for (0..num_layers) |li| {
-        @memset(grad_as[li], 0);
-        @memset(grad_bs[li], 0);
-    }
-
-    for (cached_summary.examples[0..limit], 0..) |*example, ex_idx| {
-
-        // hidden_in is laid out as [seq_len * hidden_size]. On the training path
-        // we optionally apply NEFTune (Jain et al., NeurIPS 2023) embedding-noise
-        // regularization to a per-example copy so the cached summary itself stays
-        // clean across epochs. Eval paths (evalLoRABundleMSE) read example.hidden_in
-        // directly and are never noised.
-        //
-        // Hook point: we only have CPU access to the post-encoder top-layer hidden
-        // states here — the encoder is frozen and already rolled into the cached
-        // boundary summary. Applying NEFTune to these features acts as input-feature
-        // noise for the LoRA head, which is the earliest CPU-accessible buffer in
-        // the training path.
-        const seq_len = example.seq_len;
-        const needed = seq_len * hidden_size;
-        if (example.hidden_in.len < needed) continue;
-        var hidden_in: []const f32 = example.hidden_in[0..needed];
-        if (neftune_enabled and needed > 0) {
-            const scratch = neftune_hidden_scratch[0..needed];
-            @memcpy(scratch, example.hidden_in[0..needed]);
-            const mask_slice = neftune_mask_scratch[0..seq_len];
-            const mask_src_len = @min(seq_len, example.attention_mask.len);
-            var mi: usize = 0;
-            while (mi < mask_src_len) : (mi += 1) {
-                mask_slice[mi] = if (example.attention_mask[mi] != 0) 1.0 else 0.0;
-            }
-            while (mi < seq_len) : (mi += 1) mask_slice[mi] = 0.0;
-            // Step seed: combine the first layer's optimizer step (monotonic across
-            // epochs) with the example index so intra-epoch examples get distinct
-            // noise streams without relying on a trainer-level global step counter.
-            const step_seed: u64 = (if (adam_states.len > 0) adam_states[0].step else 0) *% 0x9E3779B97F4A7C15 +% @as(u64, ex_idx);
-            neftune.applyInPlace(
-                scratch,
-                mask_slice,
-                seq_len,
-                hidden_size,
-                options.neftune_alpha,
-                step_seed,
-            );
-            hidden_in = scratch;
-        }
-
-        var example_loss: f64 = 0;
-        var span_count: usize = 0;
-
-        for (0..example.max_spans) |span_idx| {
-            if (example.span_mask[span_idx] <= 0.0) continue;
-
-            // span_indices stores word indices; translate to token indices via first_token_positions.
-            const word_start_raw = example.span_indices[span_idx * 2];
-            const word_end_raw = example.span_indices[span_idx * 2 + 1];
-            if (word_start_raw < 0 or word_end_raw < 0) continue;
-            const word_start = @as(usize, @intCast(word_start_raw));
-            const word_end = @as(usize, @intCast(word_end_raw));
-            if (word_start >= example.max_words_per_sample or word_end >= example.max_words_per_sample) continue;
-            const tok_start = @as(usize, @intCast(example.first_token_positions[word_start]));
-            // tok_end: exclusive token boundary after word_end's subwords.
-            // For non-final words, use the next word's first token directly.
-            // For the final encoded word (next slot is zero or out of range), scan forward
-            // via words_mask (1-indexed word ids) to avoid including trailing special tokens
-            // like [SEP] that live past the last text token.
-            const tok_end: usize = blk: {
-                if (word_end + 1 < example.max_words_per_sample and
-                    example.first_token_positions[word_end + 1] > 0)
-                {
-                    break :blk @as(usize, @intCast(example.first_token_positions[word_end + 1]));
-                }
-                const expected_mask: i32 = @intCast(word_end + 1); // words_mask is 1-indexed
-                var t = @as(usize, @intCast(example.first_token_positions[word_end]));
-                while (t < seq_len and t < example.words_mask.len and example.words_mask[t] == expected_mask) : (t += 1) {}
-                break :blk t;
-            };
-            if (tok_start >= seq_len or tok_end > seq_len or tok_start >= tok_end) continue;
-
-            // Mean-pool hidden states over [tok_start, tok_end).
-            @memset(span_hidden, 0);
-            const span_len: f32 = @floatFromInt(tok_end - tok_start);
-            for (tok_start..tok_end) |t| {
-                const row = hidden_in[t * hidden_size .. (t + 1) * hidden_size];
-                for (row, 0..) |val, d| span_hidden[d] += val;
-            }
-            for (span_hidden) |*v| v.* /= span_len;
-
-            // For each entity type, compute score and loss.
-            for (0..example.num_entity_types) |et| {
-                const flat_label_idx = span_idx * example.num_entity_types + et;
-                if (flat_label_idx >= example.span_labels.len) continue;
-                const target = example.span_labels[flat_label_idx];
-
-                // Build a deterministic unit probe from entity type index.
-                const probe = try buildProbeVectorForDim(allocator, et, hidden_size);
-                defer allocator.free(probe);
-
-                // Forward: score = span_hidden · probe (dot product).
-                var score: f32 = 0;
-                for (span_hidden, probe) |h, p| score += h * p;
-
-                // Apply LoRA delta to the score.  For each matching layer,
-                // compute the LoRA-adapted output contribution along probe direction.
-                for (bundle.layers) |*layer| {
-                    if (!layerMatchesScope(layer.base_tensor_name, options.layer_name)) continue;
-                    // LoRA contribution: delta_h = B * A * x * scale
-                    // score_delta = probe · delta_h = scale * (probe^T B) (A x)
-                    const layer_a = lora.Matrix{ .rows = layer.input_dim, .cols = layer.rank, .data = layer.adapter_a };
-                    const layer_b = lora.Matrix{ .rows = layer.rank, .cols = layer.output_dim, .data = layer.adapter_b };
-                    const scale = lora.effectiveScale(bundle.lora_alpha, layer.rank);
-                    // A*x => low-rank vector of size rank
-                    var ax = try allocator.alloc(f32, layer.rank);
-                    defer allocator.free(ax);
-                    @memset(ax, 0);
-                    const n_in = @min(span_hidden.len, layer.input_dim);
-                    for (0..n_in) |i| {
-                        const a_row = layer_a.row(i);
-                        for (a_row, 0..) |a, r| ax[r] += span_hidden[i] * a;
-                    }
-                    // B*(A*x) => output vector of size output_dim
-                    var bax = try allocator.alloc(f32, layer.output_dim);
-                    defer allocator.free(bax);
-                    @memset(bax, 0);
-                    for (0..layer.rank) |r| {
-                        const b_row = layer_b.row(r);
-                        const m = ax[r] * scale;
-                        const n_out = @min(bax.len, b_row.len);
-                        for (0..n_out) |o| bax[o] += m * b_row[o];
-                    }
-                    const n_out = @min(probe.len, bax.len);
-                    for (0..n_out) |o| score += probe[o] * bax[o];
-                }
-
-                const err = score - target;
-                example_loss += 0.5 * @as(f64, err * err);
-                span_count += 1;
-
-                // Backward: output_grad_for_layer = err * probe (grad w.r.t. hidden output).
-                // We treat span_hidden as the "input" to each LoRA layer and
-                // probe * err as the upstream gradient w.r.t. each layer's output.
-                for (bundle.layers, 0..) |*layer, li| {
-                    if (!layerMatchesScope(layer.base_tensor_name, options.layer_name)) continue;
-                    const output_grad = try allocator.alloc(f32, layer.output_dim);
-                    defer allocator.free(output_grad);
-                    const n_out = @min(probe.len, layer.output_dim);
-                    for (0..n_out) |o| output_grad[o] = err * probe[o];
-                    for (n_out..layer.output_dim) |o| output_grad[o] = 0;
-
-                    // Pad or truncate span_hidden to match layer.input_dim.
-                    const effective_input_dim = @min(span_hidden.len, layer.input_dim);
-                    var input_vec = span_hidden[0..effective_input_dim];
-                    var padded: ?[]f32 = null;
-                    if (effective_input_dim < layer.input_dim) {
-                        padded = try allocator.alloc(f32, layer.input_dim);
-                        @memcpy(padded.?[0..effective_input_dim], input_vec);
-                        @memset(padded.?[effective_input_dim..], 0);
-                        input_vec = padded.?;
-                    }
-                    defer if (padded) |p| allocator.free(p);
-
-                    // Try PJRT path first; fall back to CPU on error or when disabled.
-                    // PJRT is skipped in distributed mode (world_size > 1) because the PJRT
-                    // gradient path has no collective ops.
-                    var used_pjrt = false;
-                    if (comptime build_options.enable_pjrt) {
-                        // world_size > 1 means distributed training regardless of backend.
-                        // PJRT has no collective ops, so disable it unconditionally when replicas > 1.
-                        if (options.world_size <= 1) {
-                            if (options.pjrt_lora_steps) |pjrt_steps| {
-                                if (pjrt_steps[li]) |*pjrt_step| {
-                                    if (graph_bridge.computeLoRALinearGradsWithPjrt(
-                                        allocator,
-                                        pjrt_step,
-                                        layer.base_weight,
-                                        layer.adapter_a,
-                                        layer.adapter_b,
-                                        input_vec,
-                                        output_grad,
-                                    )) |grads| {
-                                        defer allocator.free(grads.grad_a);
-                                        defer allocator.free(grads.grad_b);
-                                        for (grad_as[li], grads.grad_a) |*acc, g| acc.* += g;
-                                        for (grad_bs[li], grads.grad_b) |*acc, g| acc.* += g;
-                                        used_pjrt = true;
-                                    } else |_| {}
-                                }
-                            }
-                        }
-                    }
-                    if (!used_pjrt) {
-                        lora.accumulateLinearLoRAGradsBackend(
-                            options.compute_backend,
-                            grad_as[li],
-                            grad_bs[li],
-                            1, // input_rows
-                            layer.input_dim,
-                            input_vec,
-                            layer.output_dim,
-                            output_grad,
-                            .{ .rows = layer.input_dim, .cols = layer.rank, .data = layer.adapter_a },
-                            .{ .rows = layer.rank, .cols = layer.output_dim, .data = layer.adapter_b },
-                            bundle.lora_alpha,
-                        );
-                    }
-                }
-            }
-        }
-
-        if (span_count > 0) {
-            total_loss += example_loss / @as(f64, @floatFromInt(span_count));
-        }
-        metrics.examples_seen += 1;
-        accum_steps += 1;
-
-        if (accum_steps >= options.grad_accum_steps) {
-            // Clip global grad norm on the (potentially averaged) gradients.
-            var global_sq: f32 = 0;
-            for (0..num_layers) |li| {
-                if (!layerMatchesScope(bundle.layers[li].base_tensor_name, options.layer_name)) continue;
-                for (grad_as[li]) |g| global_sq += g * g;
-                for (grad_bs[li]) |g| global_sq += g * g;
-            }
-            const global_norm = @sqrt(global_sq);
-            const clip_scale: f32 = if (options.max_grad_norm > 0 and global_norm > options.max_grad_norm)
-                options.max_grad_norm / global_norm
-            else
-                1.0;
-
-            // Apply optimizer (AdamW or Schedule-Free AdamW) with LLRD per layer.
-            for (bundle.layers, 0..) |*layer, li| {
-                if (!layerMatchesScope(layer.base_tensor_name, options.layer_name)) continue;
-                const eff_world_size: u32 = if (comptime false) options.world_size else 1;
-                const world_scale: f32 = if (eff_world_size > 1) 1.0 / @as(f32, @floatFromInt(eff_world_size)) else 1.0;
-                const accum_scale: f32 = 1.0 / @as(f32, @floatFromInt(accum_steps));
-                const final_scale = clip_scale * world_scale * accum_scale;
-                for (grad_as[li]) |*g| g.* *= final_scale;
-                for (grad_bs[li]) |*g| g.* *= final_scale;
-                const base_lr = layerLR(layer.base_tensor_name, options.learning_rate, options.llrd_decay, num_layers);
-                if (options.use_schedule_free) {
-                    if (sf_states[li]) |*sf| {
-                        sf.step += 1;
-                        const lr = warmupAdjustedLR(base_lr, sf.step, options.warmup_steps);
-                        applyScheduleFreeAtStep(layer.adapter_a, grad_as[li], sf.z_a, sf.v_a, sf.step, lr);
-                        applyScheduleFreeAtStep(layer.adapter_b, grad_bs[li], sf.z_b, sf.v_b, sf.step, lr);
-                    }
-                } else {
-                    // Increment step once per optimizer update, share across A and B.
-                    adam_states[li].step += 1;
-                    const lr = warmupAdjustedLR(base_lr, adam_states[li].step, options.warmup_steps);
-                    applyAdamWAtStep(layer.adapter_a, grad_as[li], adam_states[li].m_a, adam_states[li].v_a, adam_states[li].step, lr);
-                    applyAdamWAtStep(layer.adapter_b, grad_bs[li], adam_states[li].m_b, adam_states[li].v_b, adam_states[li].step, lr);
-                }
-                metrics.updates_applied += 1;
-            }
-            accum_steps = 0;
-            // Zero grad buffers for the next accumulation block.
-            for (0..num_layers) |li| {
-                @memset(grad_as[li], 0);
-                @memset(grad_bs[li], 0);
-            }
-        }
-    }
-
-    // Flush any remaining partial accumulation window at epoch end.
-    if (accum_steps > 0) {
-        var global_sq: f32 = 0;
-        for (0..num_layers) |li| {
-            if (!layerMatchesScope(bundle.layers[li].base_tensor_name, options.layer_name)) continue;
-            for (grad_as[li]) |g| global_sq += g * g;
-            for (grad_bs[li]) |g| global_sq += g * g;
-        }
-        const global_norm = @sqrt(global_sq);
-        const clip_scale: f32 = if (options.max_grad_norm > 0 and global_norm > options.max_grad_norm)
-            options.max_grad_norm / global_norm
-        else
-            1.0;
-        for (bundle.layers, 0..) |*layer, li| {
-            if (!layerMatchesScope(layer.base_tensor_name, options.layer_name)) continue;
-            const eff_world_size: u32 = if (comptime false) options.world_size else 1;
-            const world_scale: f32 = if (eff_world_size > 1) 1.0 / @as(f32, @floatFromInt(eff_world_size)) else 1.0;
-            const accum_scale: f32 = 1.0 / @as(f32, @floatFromInt(accum_steps));
-            const final_scale = clip_scale * world_scale * accum_scale;
-            for (grad_as[li]) |*g| g.* *= final_scale;
-            for (grad_bs[li]) |*g| g.* *= final_scale;
-            const base_lr = layerLR(layer.base_tensor_name, options.learning_rate, options.llrd_decay, num_layers);
-            if (options.use_schedule_free) {
-                if (sf_states[li]) |*sf| {
-                    sf.step += 1;
-                    const lr = warmupAdjustedLR(base_lr, sf.step, options.warmup_steps);
-                    applyScheduleFreeAtStep(layer.adapter_a, grad_as[li], sf.z_a, sf.v_a, sf.step, lr);
-                    applyScheduleFreeAtStep(layer.adapter_b, grad_bs[li], sf.z_b, sf.v_b, sf.step, lr);
-                }
-            } else {
-                adam_states[li].step += 1;
-                const lr = warmupAdjustedLR(base_lr, adam_states[li].step, options.warmup_steps);
-                applyAdamWAtStep(layer.adapter_a, grad_as[li], adam_states[li].m_a, adam_states[li].v_a, adam_states[li].step, lr);
-                applyAdamWAtStep(layer.adapter_b, grad_bs[li], adam_states[li].m_b, adam_states[li].v_b, adam_states[li].step, lr);
-            }
-            metrics.updates_applied += 1;
-        }
-    }
-
-    if (metrics.examples_seen > 0) {
-        metrics.average_loss = total_loss / @as(f64, @floatFromInt(metrics.examples_seen));
-    }
-    return metrics;
-}
-
-/// Create adam states for all layers in the bundle, run training epochs,
-/// evaluate on eval set, save bundle, and return summary.
-pub fn trainEvalLoRABundleCached(
-    allocator: std.mem.Allocator,
-    bundle: *LoadedLoRABundle,
-    train_summary: *const gliner2_boundary.CachedBoundarySummary,
-    eval_summary: *const gliner2_boundary.CachedBoundarySummary,
-    out_dir: []const u8,
-    options: LoRATrainOptions,
-    epochs: usize,
-) !LoRATrainEvalSummary {
-    // Allocate per-layer Adam states.
-    const adam_states = try allocator.alloc(LoRALayerAdamState, bundle.layers.len);
-    // Track how many have been successfully initialized so cleanup is safe.
-    var init_count: usize = 0;
-    defer {
-        for (adam_states[0..init_count]) |*state| state.deinit();
-        allocator.free(adam_states);
-    }
-    for (bundle.layers, 0..) |layer, li| {
-        adam_states[li] = try LoRALayerAdamState.init(
-            allocator,
-            layer.input_dim * layer.rank,
-            layer.rank * layer.output_dim,
-        );
-        init_count += 1;
-    }
-
-    // Allocate per-layer Schedule-Free states (only populated when use_schedule_free is true).
-    const sf_states = try allocator.alloc(?LoRALayerSFState, bundle.layers.len);
-    defer allocator.free(sf_states);
-    var sf_init_count: usize = 0;
-    defer {
-        var i: usize = 0;
-        while (i < sf_init_count) : (i += 1) {
-            if (sf_states[i]) |*s| s.deinit();
-        }
-    }
-    for (bundle.layers, 0..) |layer, li| {
-        if (options.use_schedule_free) {
-            sf_states[li] = try LoRALayerSFState.init(allocator, layer.adapter_a, layer.adapter_b);
-        } else {
-            sf_states[li] = null;
-        }
-        sf_init_count += 1;
-    }
-
-    // Eval before training (all ranks; replicas are identical so results are consistent).
-    const eval_mse_before = try evalLoRABundleMSE(allocator, bundle, eval_summary, options.layer_name);
-    std.log.info("gliner2 train: baseline eval_mse={d:.4}", .{eval_mse_before});
-
-    // Effective eval interval for mid-training checkpointing and early stopping.
-    // If early_stopping_patience is set without an explicit interval, eval every epoch.
-    const effective_eval_interval: usize = if (options.checkpoint_interval > 0)
-        options.checkpoint_interval
-    else if (options.early_stopping_patience > 0)
-        1
-    else
-        0;
-
-    var epoch_metrics_list = std.ArrayListUnmanaged(LoRATrainMetrics).empty;
-    errdefer epoch_metrics_list.deinit(allocator);
-    try epoch_metrics_list.ensureTotalCapacity(allocator, epochs);
-
-    var best_eval_mse: f64 = eval_mse_before;
-    var eval_mse_after: f64 = eval_mse_before;
-    var no_improve_count: usize = 0;
-    // Tracks whether the best-model checkpoint has been written at least once.
-    // Distinct from `any_eval_done` so that a run where eval fires but never improves
-    // still writes a final checkpoint (the last-epoch weights) rather than saving nothing.
-    var best_saved = false;
-    var any_eval_done = false;
-
-    for (0..epochs) |ep| {
-        const m = try trainLoRABundleEpochCached(allocator, bundle, train_summary, adam_states, sf_states, options);
-        epoch_metrics_list.appendAssumeCapacity(m);
-        std.log.info("gliner2 train: epoch={d}/{d} loss={d:.4} mse={d:.4} examples={d} updates={d}", .{ ep + 1, epochs, m.average_loss, m.average_loss * 2.0, m.examples_seen, m.updates_applied });
-
-        const is_last_epoch = ep + 1 == epochs;
-        const do_eval = effective_eval_interval > 0 and
-            ((ep + 1) % effective_eval_interval == 0 or is_last_epoch);
-
-        if (do_eval) {
-            any_eval_done = true;
-            eval_mse_after = try evalLoRABundleMSE(allocator, bundle, eval_summary, options.layer_name);
-            std.log.info("gliner2 eval: epoch={d}/{d} mse={d:.4} best={d:.4} improved={}", .{ ep + 1, epochs, eval_mse_after, best_eval_mse, eval_mse_after < best_eval_mse });
-            if (eval_mse_after < best_eval_mse) {
-                best_eval_mse = eval_mse_after;
-                no_improve_count = 0;
-                // Only rank 0 writes checkpoints to avoid concurrent writes in DDP.
-                if (options.ddp_rank == 0) {
-                    try saveLoRABundle(bundle, out_dir);
-                    std.log.info("gliner2 checkpoint: epoch={d} best_mse={d:.4} saved={s}", .{ ep + 1, best_eval_mse, out_dir });
-                }
-                best_saved = true;
-            } else {
-                no_improve_count += 1;
-                if (options.early_stopping_patience > 0 and no_improve_count >= options.early_stopping_patience) {
-                    std.log.info("gliner2 early_stop: epoch={d} no_improve={d}/{d}", .{ ep + 1, no_improve_count, options.early_stopping_patience });
-                    break;
-                }
-            }
-        }
-    }
-
-    // Final eval + save when:
-    //   (a) No eval interval was configured — standard single-save-at-end path.
-    //   (b) Eval ran throughout training but eval MSE never improved past the
-    //       before-training baseline — save the last-epoch weights rather than nothing.
-    // We do NOT run this when `best_saved = true`: that would overwrite a better
-    // earlier checkpoint with potentially worse last-epoch weights.
-    if (!best_saved) {
-        if (!any_eval_done) {
-            // No mid-training eval at all — run it now so eval_mse_after is populated.
-            eval_mse_after = try evalLoRABundleMSE(allocator, bundle, eval_summary, options.layer_name);
-            if (eval_mse_after < best_eval_mse) best_eval_mse = eval_mse_after;
-        }
-        if (options.ddp_rank == 0) {
-            try saveLoRABundle(bundle, out_dir);
-            std.log.info("gliner2 checkpoint: final mse={d:.4} saved={s}", .{ eval_mse_after, out_dir });
-        }
-    }
-
-    const train_metrics = try epoch_metrics_list.toOwnedSlice(allocator);
-    errdefer allocator.free(train_metrics);
-
-    return .{
-        .artifact_family_version = try allocator.dupe(u8, artifact_family_version),
-        .base_model_dir = try allocator.dupe(u8, bundle.base_model_dir),
-        .adapter_model_dir = try allocator.dupe(u8, bundle.adapter_model_dir),
-        .saved_adapter_dir = try allocator.dupe(u8, out_dir),
-        .epochs = epochs,
-        .epochs_trained = train_metrics.len,
-        .learning_rate = options.learning_rate,
-        .train_metrics = train_metrics,
-        .eval_mse_before = eval_mse_before,
-        .eval_mse_after = eval_mse_after,
-        .best_eval_mse = best_eval_mse,
-    };
-}
-
-fn evalLoRABundleMSE(
-    allocator: std.mem.Allocator,
-    bundle: *const LoadedLoRABundle,
-    cached_summary: *const gliner2_boundary.CachedBoundarySummary,
-    layer_name: ?[]const u8,
-) !f64 {
-    const hidden_size = cached_summary.hidden_size;
-    var total_mse: f64 = 0;
-    var total_count: usize = 0;
-
-    var span_hidden = try allocator.alloc(f32, hidden_size);
-    defer allocator.free(span_hidden);
-
-    for (cached_summary.examples) |*example| {
-        const hidden_in = example.hidden_in;
-        const seq_len = example.seq_len;
-        if (hidden_in.len < seq_len * hidden_size) continue;
-
-        for (0..example.max_spans) |span_idx| {
-            if (example.span_mask[span_idx] <= 0.0) continue;
-            const word_start_raw = example.span_indices[span_idx * 2];
-            const word_end_raw = example.span_indices[span_idx * 2 + 1];
-            if (word_start_raw < 0 or word_end_raw < 0) continue;
-            const word_start = @as(usize, @intCast(word_start_raw));
-            const word_end = @as(usize, @intCast(word_end_raw));
-            if (word_start >= example.max_words_per_sample or word_end >= example.max_words_per_sample) continue;
-            const tok_start = @as(usize, @intCast(example.first_token_positions[word_start]));
-            const tok_end: usize = blk: {
-                if (word_end + 1 < example.max_words_per_sample and
-                    example.first_token_positions[word_end + 1] > 0)
-                {
-                    break :blk @as(usize, @intCast(example.first_token_positions[word_end + 1]));
-                }
-                const expected_mask: i32 = @intCast(word_end + 1);
-                var t = @as(usize, @intCast(example.first_token_positions[word_end]));
-                while (t < seq_len and t < example.words_mask.len and example.words_mask[t] == expected_mask) : (t += 1) {}
-                break :blk t;
-            };
-            if (tok_start >= seq_len or tok_end > seq_len or tok_start >= tok_end) continue;
-
-            @memset(span_hidden, 0);
-            const span_len: f32 = @floatFromInt(tok_end - tok_start);
-            for (tok_start..tok_end) |t| {
-                const row = hidden_in[t * hidden_size .. (t + 1) * hidden_size];
-                for (row, 0..) |val, d| span_hidden[d] += val;
-            }
-            for (span_hidden) |*v| v.* /= span_len;
-
-            for (0..example.num_entity_types) |et| {
-                const flat_label_idx = span_idx * example.num_entity_types + et;
-                if (flat_label_idx >= example.span_labels.len) continue;
-                const target = example.span_labels[flat_label_idx];
-
-                const probe = try buildProbeVectorForDim(allocator, et, hidden_size);
-                defer allocator.free(probe);
-
-                var score: f32 = 0;
-                for (span_hidden, probe) |h, p| score += h * p;
-
-                for (bundle.layers) |*layer| {
-                    if (!layerMatchesScope(layer.base_tensor_name, layer_name)) continue;
-                    const layer_a = lora.Matrix{ .rows = layer.input_dim, .cols = layer.rank, .data = layer.adapter_a };
-                    const layer_b = lora.Matrix{ .rows = layer.rank, .cols = layer.output_dim, .data = layer.adapter_b };
-                    const scale = lora.effectiveScale(bundle.lora_alpha, layer.rank);
-                    var ax = try allocator.alloc(f32, layer.rank);
-                    defer allocator.free(ax);
-                    @memset(ax, 0);
-                    const n_in = @min(span_hidden.len, layer.input_dim);
-                    for (0..n_in) |i| {
-                        const a_row = layer_a.row(i);
-                        for (a_row, 0..) |a, r| ax[r] += span_hidden[i] * a;
-                    }
-                    var bax = try allocator.alloc(f32, layer.output_dim);
-                    defer allocator.free(bax);
-                    @memset(bax, 0);
-                    for (0..layer.rank) |r| {
-                        const b_row = layer_b.row(r);
-                        const m = ax[r] * scale;
-                        const n_out = @min(bax.len, b_row.len);
-                        for (0..n_out) |o| bax[o] += m * b_row[o];
-                    }
-                    const n_out = @min(probe.len, bax.len);
-                    for (0..n_out) |o| score += probe[o] * bax[o];
-                }
-
-                const err = score - target;
-                total_mse += @as(f64, err * err);
-                total_count += 1;
-            }
-        }
-    }
-
-    return if (total_count > 0) total_mse / @as(f64, @floatFromInt(total_count)) else 0;
-}
-
-fn layerMatchesScope(tensor_name: []const u8, scope: ?[]const u8) bool {
-    const s = scope orelse return true;
-    return std.mem.indexOf(u8, tensor_name, s) != null;
-}
-
-/// Linear warmup: ramp LR from 0 → base_lr over the first warmup_steps optimizer updates.
-/// step is 1-indexed (first update = step 1). warmup_steps = 0 disables warmup.
-fn warmupAdjustedLR(base_lr: f32, step: u64, warmup_steps: u32) f32 {
-    if (warmup_steps == 0 or step >= warmup_steps) return base_lr;
-    return base_lr * @as(f32, @floatFromInt(step)) / @as(f32, @floatFromInt(warmup_steps));
-}
-
-fn applyAdamWAtStep(params: []f32, grads: []const f32, m: []f32, v: []f32, step: u64, lr: f32) void {
-    const t: f32 = @floatFromInt(step);
-    const beta1: f32 = 0.9;
-    const beta2: f32 = 0.999;
-    const eps: f32 = 1e-8;
-    const wd: f32 = 0.01;
-    const bc1 = 1.0 - std.math.pow(f32, beta1, t);
-    const bc2 = 1.0 - std.math.pow(f32, beta2, t);
-    for (params, grads, m, v) |*p, g, *mi, *vi| {
-        mi.* = beta1 * mi.* + (1.0 - beta1) * g;
-        vi.* = beta2 * vi.* + (1.0 - beta2) * g * g;
-        p.* -= lr * (mi.* / bc1 / (@sqrt(vi.* / bc2) + eps) + wd * p.*);
-    }
-}
-
-const LoRALayerSFState = struct {
-    allocator: std.mem.Allocator,
-    z_a: []f32,
-    v_a: []f32,
-    z_b: []f32,
-    v_b: []f32,
-    step: u64,
-
-    fn init(alloc: std.mem.Allocator, adapter_a: []const f32, adapter_b: []const f32) !LoRALayerSFState {
-        const z_a = try alloc.dupe(f32, adapter_a);
-        errdefer alloc.free(z_a);
-        const v_a = try alloc.alloc(f32, adapter_a.len);
-        errdefer alloc.free(v_a);
-        @memset(v_a, 0);
-        const z_b = try alloc.dupe(f32, adapter_b);
-        errdefer alloc.free(z_b);
-        const v_b = try alloc.alloc(f32, adapter_b.len);
-        errdefer alloc.free(v_b);
-        @memset(v_b, 0);
-        return .{ .allocator = alloc, .z_a = z_a, .v_a = v_a, .z_b = z_b, .v_b = v_b, .step = 0 };
-    }
-
-    fn deinit(self: *LoRALayerSFState) void {
-        self.allocator.free(self.z_a);
-        self.allocator.free(self.v_a);
-        self.allocator.free(self.z_b);
-        self.allocator.free(self.v_b);
-        self.* = undefined;
-    }
-};
-
-fn applyScheduleFreeAtStep(params: []f32, grads: []const f32, z: []f32, v: []f32, step: u64, lr: f32) void {
-    const t: f32 = @floatFromInt(step);
-    const beta2: f32 = 0.999;
-    const epsilon: f32 = 1e-8;
-    const weight_decay: f32 = 0.01;
-    const c = @min(@as(f32, 0.9), 1.0 / t);
-    for (params, grads, z, v) |*x, g, *zi, *vi| {
-        vi.* = beta2 * vi.* + (1.0 - beta2) * g * g;
-        const v_hat = vi.* / (1.0 - std.math.pow(f32, beta2, t));
-        zi.* = zi.* - lr * g / (@sqrt(v_hat) + epsilon) - lr * weight_decay * zi.*;
-        x.* = (1.0 - c) * x.* + c * zi.*;
-    }
-}
-
-fn parseGLiner2LayerIndex(tensor_name: []const u8) ?usize {
-    const candidates = [_][]const u8{ "encoder.layer.", "model.encoder.layer.", "bert.encoder.layer." };
-    inline for (candidates) |prefix| {
-        if (std.mem.indexOf(u8, tensor_name, prefix)) |start| {
-            const digits = tensor_name[start + prefix.len ..];
-            var end: usize = 0;
-            while (end < digits.len and std.ascii.isDigit(digits[end])) : (end += 1) {}
-            if (end > 0) return std.fmt.parseUnsigned(usize, digits[0..end], 10) catch null;
-        }
-    }
-    return null;
-}
-
-fn layerLR(tensor_name: []const u8, base_lr: f32, decay: f32, num_layers: usize) f32 {
-    if (decay >= 1.0) return base_lr;
-    const li = parseGLiner2LayerIndex(tensor_name) orelse return base_lr;
-    const depth = if (num_layers > 0) num_layers - 1 - @min(li, num_layers - 1) else 0;
-    return base_lr * std.math.pow(f32, decay, @as(f32, @floatFromInt(depth)));
-}
-
-/// Build a deterministic unit-norm probe vector of length `dim` seeded by `seed`.
-fn buildProbeVectorForDim(allocator: std.mem.Allocator, seed: usize, dim: usize) ![]f32 {
-    const probe = try allocator.alloc(f32, dim);
-    var sq: f32 = 0;
-    for (0..dim) |d| {
-        const angle = @as(f32, @floatFromInt((seed + 1) * (d + 3)));
-        probe[d] = @sin(angle * 0.017);
-        sq += probe[d] * probe[d];
-    }
-    const norm = @sqrt(sq);
-    if (norm > 0) {
-        for (probe) |*v| v.* /= norm;
-    }
-    return probe;
-}
-
 test "gliner2 checkpoint inspection reads config and tensor summary" {
     const allocator = std.testing.allocator;
     const root = try std.fmt.allocPrint(allocator, "/tmp/termite_gliner2_inspect_test_{d}", .{std.posix.system.getpid()});
@@ -2835,6 +2454,59 @@ test "gliner2 checkpoint inspection reads config and tensor summary" {
     try std.testing.expect(summary.core_backbone_loadable);
 }
 
+test "gliner2 upstream lora target groups expand to concrete modules" {
+    const allocator = std.testing.allocator;
+    const expanded = try expandLoRATargetModules(allocator, default_lora_target_modules[0..]);
+    defer {
+        for (expanded) |item| allocator.free(item);
+        allocator.free(expanded);
+    }
+
+    try std.testing.expect(stringSliceContains(expanded, "query_proj"));
+    try std.testing.expect(stringSliceContains(expanded, "key_proj"));
+    try std.testing.expect(stringSliceContains(expanded, "value_proj"));
+    try std.testing.expect(stringSliceContains(expanded, "attention.output.dense"));
+    try std.testing.expect(stringSliceContains(expanded, "intermediate.dense"));
+    try std.testing.expect(stringSliceContains(expanded, "output.dense"));
+    try std.testing.expect(stringSliceContains(expanded, "span_rep.span_rep_layer.project_start.0"));
+    try std.testing.expect(stringSliceContains(expanded, "span_rep.span_rep_layer.project_start.3"));
+    try std.testing.expect(stringSliceContains(expanded, "span_rep.span_rep_layer.project_end.0"));
+    try std.testing.expect(stringSliceContains(expanded, "span_rep.span_rep_layer.project_end.3"));
+    try std.testing.expect(stringSliceContains(expanded, "span_rep.span_rep_layer.out_project.0"));
+    try std.testing.expect(stringSliceContains(expanded, "span_rep.span_rep_layer.out_project.3"));
+    try std.testing.expect(stringSliceContains(expanded, "classifier.0"));
+    try std.testing.expect(stringSliceContains(expanded, "classifier.2"));
+    try std.testing.expect(stringSliceContains(expanded, "count_embed.transformer.in_projector"));
+    try std.testing.expect(stringSliceContains(expanded, "count_embed.transformer.transformer.layers.0.linear1"));
+    try std.testing.expect(stringSliceContains(expanded, "count_embed.transformer.transformer.layers.0.linear2"));
+    try std.testing.expect(stringSliceContains(expanded, "count_embed.transformer.transformer.layers.1.linear1"));
+    try std.testing.expect(stringSliceContains(expanded, "count_embed.transformer.transformer.layers.1.linear2"));
+    try std.testing.expect(stringSliceContains(expanded, "count_embed.transformer.out_projector.0"));
+    try std.testing.expect(stringSliceContains(expanded, "count_embed.transformer.out_projector.2"));
+    try std.testing.expect(stringSliceContains(expanded, "count_embed.transformer.out_projector.4"));
+    try std.testing.expect(stringSliceContains(expanded, "count_pred.0"));
+    try std.testing.expect(stringSliceContains(expanded, "count_pred.2"));
+    try std.testing.expect(!stringSliceContains(expanded, "count_embed.gru"));
+    try std.testing.expect(!stringSliceContains(expanded, "count_embed.transformer.transformer.layers.0.self_attn.out_proj"));
+    try std.testing.expect(!stringSliceContains(expanded, "count_embed.transformer.transformer.layers.1.self_attn.out_proj"));
+    try std.testing.expect(!stringSliceContains(expanded, "self_attn.in_proj_weight"));
+    try std.testing.expect(!stringSliceContains(expanded, "task_classifier"));
+}
+
+test "gliner2 lora dropout validates python-compatible range" {
+    try validateLoRADropout(0.0);
+    try validateLoRADropout(0.1);
+    try std.testing.expectError(error.InvalidLoRADropout, validateLoRADropout(-0.1));
+    try std.testing.expectError(error.InvalidLoRADropout, validateLoRADropout(1.0));
+}
+
+test "gliner2 lora artifact family writes v1 and accepts legacy v1alpha1" {
+    try std.testing.expectEqualStrings("gliner2_lora/v1", artifact_family_version);
+    try std.testing.expect(isSupportedArtifactFamilyVersion(artifact_family_version));
+    try std.testing.expect(isSupportedArtifactFamilyVersion(legacy_artifact_family_version));
+    try std.testing.expect(!isSupportedArtifactFamilyVersion("gliner2_lora/v2"));
+}
+
 test "gliner2 bootstrap and inspect lora bundle" {
     const allocator = std.testing.allocator;
     const root = try std.fmt.allocPrint(allocator, "/tmp/termite_gliner2_bootstrap_test_{d}", .{std.posix.system.getpid()});
@@ -2857,6 +2529,16 @@ test "gliner2 bootstrap and inspect lora bundle" {
         .sub_path = encoder_config_path,
         .data = "{\"hidden_size\":128,\"num_hidden_layers\":1,\"num_attention_heads\":4}",
     });
+    for ([_][]const u8{
+        tokenizer_file_name,
+        tokenizer_config_file_name,
+        special_tokens_map_file_name,
+        added_tokens_file_name,
+    }) |file_name| {
+        const tokenizer_artifact_path = try std.fs.path.join(allocator, &.{ root, file_name });
+        defer allocator.free(tokenizer_artifact_path);
+        try compat.cwd().writeFile(compat.io(), .{ .sub_path = tokenizer_artifact_path, .data = "{}" });
+    }
     const checkpoint_path = try std.fs.path.join(allocator, &.{ root, checkpoint_file_name });
     defer allocator.free(checkpoint_path);
     try writeHeaderAndTensorsF32(allocator, checkpoint_path, &.{
@@ -2864,6 +2546,7 @@ test "gliner2 bootstrap and inspect lora bundle" {
         .{ .name = "encoder.encoder.rel_embeddings.weight", .shape = &.{ 32, 32 }, .data = &[_]f32{0} ** (32 * 32) },
         .{ .name = "encoder.encoder.LayerNorm.weight", .shape = &.{128}, .data = &[_]f32{0} ** 128 },
         .{ .name = "encoder.encoder.layer.0.attention.self.query_proj.weight", .shape = &.{ 128, 128 }, .data = &[_]f32{0} ** (128 * 128) },
+        .{ .name = "encoder.encoder.layer.0.attention.self.key_proj.weight", .shape = &.{ 128, 128 }, .data = &[_]f32{0} ** (128 * 128) },
         .{ .name = "encoder.encoder.layer.0.attention.self.value_proj.weight", .shape = &.{ 128, 128 }, .data = &[_]f32{0} ** (128 * 128) },
     });
 
@@ -2871,7 +2554,7 @@ test "gliner2 bootstrap and inspect lora bundle" {
     defer allocator.free(out_dir);
     var bootstrap = try bootstrapLoRABundle(allocator, root, out_dir, .{ .rank = 8, .alpha = 16 });
     defer freeBootstrapSummary(allocator, &bootstrap);
-    try std.testing.expectEqual(@as(usize, 2), bootstrap.resolved_tensors.len);
+    try std.testing.expectEqual(@as(usize, 3), bootstrap.resolved_tensors.len);
 
     var bundle = try loadLoRABundle(allocator, root, out_dir);
     defer bundle.deinit();
@@ -2897,26 +2580,75 @@ test "gliner2 bootstrap and inspect lora bundle" {
 
     var inspect = try inspectLoRABundle(allocator, root, out_dir);
     defer freeLoRABundleInspectionSummary(allocator, &inspect);
-    try std.testing.expectEqual(@as(usize, 2), inspect.resolved_tensor_count);
+    try std.testing.expectEqual(@as(usize, 3), inspect.resolved_tensor_count);
     try std.testing.expectEqual(@as(?usize, 8), inspect.lora_rank);
-    try std.testing.expectEqual(@as(usize, 2), inspect.dora_magnitude_tensor_count);
-    try std.testing.expectEqual(@as(usize, 256), inspect.dora_magnitude_parameter_count);
+    try std.testing.expectEqual(@as(usize, 3), inspect.dora_magnitude_tensor_count);
+    try std.testing.expectEqual(@as(usize, 384), inspect.dora_magnitude_parameter_count);
     try std.testing.expectEqual(@as(?bool, true), inspect.use_dora);
     try std.testing.expect(inspect.cleanup_head_present);
 
     const materialized_dir = try std.fs.path.join(allocator, &.{ root, "materialized" });
     defer allocator.free(materialized_dir);
-    const materialize = try materializeMergedModel(allocator, root, out_dir, materialized_dir);
-    defer {
-        allocator.free(materialize.artifact_family_version);
-        allocator.free(materialize.base_model_dir);
-        allocator.free(materialize.adapter_model_dir);
-        allocator.free(materialize.output_dir);
-        allocator.free(materialize.output_checkpoint_path);
-    }
+    var materialize = try materializeMergedModel(allocator, root, out_dir, materialized_dir);
+    defer freeMaterializeSummary(allocator, &materialize);
     try std.testing.expect(materialize.copied_cleanup_head);
-    try std.testing.expectEqual(@as(usize, 2), materialize.merged_dora_tensor_count);
+    try std.testing.expectEqual(@as(usize, 3), materialize.merged_dora_tensor_count);
     try std.testing.expectEqual(@as(usize, 2), materialize.attached_task_head_tensor_count);
+    try std.testing.expectError(error.OutputDirectoryAlreadyExists, materializeMergedModel(allocator, root, out_dir, materialized_dir));
+
+    const completion_path = try std.fs.path.join(allocator, &.{ materialized_dir, materialization_manifest_file_name });
+    defer allocator.free(completion_path);
+    const completion_bytes = try compat.cwd().readFileAlloc(compat.io(), completion_path, allocator, .limited(64 * 1024));
+    defer allocator.free(completion_bytes);
+    var completion = try std.json.parseFromSlice(std.json.Value, allocator, completion_bytes, .{});
+    defer completion.deinit();
+    try std.testing.expectEqualStrings("complete", completion.value.object.get("status").?.string);
+    try std.testing.expectEqualStrings(artifact_family_version, completion.value.object.get("artifact_family_version").?.string);
+    const inventory = completion.value.object.get("supporting_artifacts").?.object;
+    try std.testing.expect(inventory.get("tokenizer").?.bool);
+    try std.testing.expect(inventory.get("added_tokens").?.bool);
+    try std.testing.expect(!inventory.get("sentencepiece_model").?.bool);
+
+    const manifest_inventory = MaterializationInventory{
+        .config = true,
+        .encoder_config = true,
+        .tokenizer = true,
+        .tokenizer_config = true,
+        .special_tokens_map = true,
+        .added_tokens = true,
+        .sentencepiece_model = false,
+    };
+    try writeSyncedJsonFile(allocator, completion_path, MaterializationManifest{
+        .artifact_family_version = legacy_artifact_family_version,
+        .base_model_dir = root,
+        .adapter_model_dir = out_dir,
+        .merged_lora_tensor_count = materialize.merged_lora_tensor_count,
+        .merged_dora_tensor_count = materialize.merged_dora_tensor_count,
+        .task_head_passthrough_tensor_count = materialize.task_head_passthrough_tensor_count,
+        .attached_task_head_tensor_count = materialize.attached_task_head_tensor_count,
+        .copied_boundary_head = materialize.copied_boundary_head,
+        .copied_boundary_task_head = materialize.copied_boundary_task_head,
+        .copied_cleanup_head = materialize.copied_cleanup_head,
+        .supporting_artifacts = manifest_inventory,
+    });
+    var legacy_reload = try inspectCheckpoint(allocator, materialized_dir, null);
+    defer freeCheckpointInspection(allocator, &legacy_reload);
+    try std.testing.expectEqualStrings(legacy_artifact_family_version, legacy_reload.artifact_family_version);
+
+    try writeSyncedJsonFile(allocator, completion_path, MaterializationManifest{
+        .artifact_family_version = "gliner2_lora/v2",
+        .base_model_dir = root,
+        .adapter_model_dir = out_dir,
+        .merged_lora_tensor_count = materialize.merged_lora_tensor_count,
+        .merged_dora_tensor_count = materialize.merged_dora_tensor_count,
+        .task_head_passthrough_tensor_count = materialize.task_head_passthrough_tensor_count,
+        .attached_task_head_tensor_count = materialize.attached_task_head_tensor_count,
+        .copied_boundary_head = materialize.copied_boundary_head,
+        .copied_boundary_task_head = materialize.copied_boundary_task_head,
+        .copied_cleanup_head = materialize.copied_cleanup_head,
+        .supporting_artifacts = manifest_inventory,
+    });
+    try std.testing.expectError(error.UnsupportedArtifactFamilyVersion, inspectCheckpoint(allocator, materialized_dir, null));
 
     var materialized_access = try openTensorAccessForFile(allocator, materialize.output_checkpoint_path);
     defer materialized_access.deinit();
@@ -2947,6 +2679,22 @@ test "gliner2 bootstrap and inspect lora bundle" {
     try std.testing.expectApproxEqAbs(@as(f32, 16.5), adapter_logits[0], 1e-5);
     try std.testing.expectApproxEqAbs(@as(f32, 15.75), adapter_logits[1], 1e-5);
     try std.testing.expectApproxEqAbs(@as(f32, 16.75), adapter_logits[2], 1e-5);
+
+    // A missing required inventory file must leave neither a published model
+    // nor the same-process staging directory behind.
+    const added_tokens_path = try std.fs.path.join(allocator, &.{ root, added_tokens_file_name });
+    defer allocator.free(added_tokens_path);
+    try compat.cwd().deleteFile(compat.io(), added_tokens_path);
+    const failed_materialized_dir = try std.fs.path.join(allocator, &.{ root, "materialized-missing-inventory" });
+    defer allocator.free(failed_materialized_dir);
+    const failed_staging_dir = try materializationStagingPath(allocator, failed_materialized_dir);
+    defer allocator.free(failed_staging_dir);
+    try std.testing.expectError(
+        error.RequiredSupportingArtifactMissing,
+        materializeMergedModel(allocator, root, out_dir, failed_materialized_dir),
+    );
+    try std.testing.expect(!pathExists(failed_materialized_dir));
+    try std.testing.expect(!pathExists(failed_staging_dir));
 }
 
 test "gliner2 exports autodiff adapter params as inspectable PEFT bundle" {
@@ -3004,18 +2752,27 @@ test "gliner2 exports autodiff adapter params as inspectable PEFT bundle" {
         root,
         2,
         4,
-        &.{"query_proj"},
+        0.0,
+        &.{"query"},
         &params,
     );
     defer freeAutodiffAdapterExportSummary(allocator, &exported);
     try std.testing.expectEqual(@as(usize, 2), exported.exported_tensor_count);
+
+    const config_bytes = try compat.cwd().readFileAlloc(compat.io(), exported.adapter_config_path, allocator, .limited(64 * 1024));
+    defer allocator.free(config_bytes);
+    var config = try std.json.parseFromSlice(std.json.Value, allocator, config_bytes, .{});
+    defer config.deinit();
+    try std.testing.expect(config.value.object.get("task_type").? == .null);
+    try std.testing.expectEqualStrings("Extractor", config.value.object.get("auto_mapping").?.object.get("base_model_class").?.string);
+    try std.testing.expectEqualStrings("encoder.encoder.layer.0.attention.self.query_proj", config.value.object.get("target_modules").?.array.items[0].string);
 
     var inspected = try inspectLoRABundle(allocator, root, out_dir);
     defer freeLoRABundleInspectionSummary(allocator, &inspected);
     try std.testing.expectEqual(@as(usize, 1), inspected.resolved_tensor_count);
     try std.testing.expectEqual(@as(usize, 512), inspected.trainable_parameter_count);
     try std.testing.expectEqualStrings("encoder.encoder.layer.0.attention.self.query_proj.weight", inspected.tensors[0].base_tensor_name);
-    try std.testing.expectEqualStrings("encoder.encoder.layer.0.attention.self.query_proj.lora_A.weight", inspected.tensors[0].adapter_a_tensor_name);
+    try std.testing.expectEqualStrings("base_model.model.encoder.encoder.layer.0.attention.self.query_proj.lora_A.weight", inspected.tensors[0].adapter_a_tensor_name);
 }
 
 test "gliner2 classifier task head reloads and scores golden hidden rows" {

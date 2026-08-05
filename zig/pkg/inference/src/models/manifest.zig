@@ -1009,7 +1009,7 @@ fn applyImplicitModelTypeHints(manifest: *ModelManifest, model_dir_path: []const
 
 fn inferModelTypeFromTasks(tasks: []const []const u8) ?ModelType {
     for (tasks) |task| {
-        if (std.mem.eql(u8, task, "recognize") or std.mem.eql(u8, task, "extract")) return .recognizer;
+        if (std.mem.eql(u8, task, "extract")) return .recognizer;
     }
     for (tasks) |task| {
         if (std.mem.eql(u8, task, "rerank")) return .reranker;
@@ -1090,7 +1090,7 @@ fn inferModelTypeFromPath(model_dir_path: []const u8) ?ModelType {
         if (std.mem.eql(u8, component, "rerankers")) return .reranker;
         if (std.mem.eql(u8, component, "chunkers")) return .chunker;
         if (std.mem.eql(u8, component, "generators")) return .generator;
-        if (std.mem.eql(u8, component, "recognizers")) return .recognizer;
+        if (std.mem.eql(u8, component, "extractors")) return .recognizer;
         if (std.mem.eql(u8, component, "classifiers")) return .classifier;
         if (std.mem.eql(u8, component, "rewriters")) return .rewriter;
         if (std.mem.eql(u8, component, "readers")) return .reader;
@@ -2584,8 +2584,8 @@ test "rerank model name overrides sequence classifier config" {
     try std.testing.expectEqual(ModelTypeOrigin.path, manifest.model_type_origin);
 }
 
-test "inferModelTypeFromPath detects recognizer directory" {
-    try std.testing.expectEqual(@as(?ModelType, .recognizer), inferModelTypeFromPath("C:\\models\\recognizers\\fastino\\gliner2-base-v1"));
+test "inferModelTypeFromPath detects extractor directory" {
+    try std.testing.expectEqual(@as(?ModelType, .recognizer), inferModelTypeFromPath("C:\\models\\extractors\\fastino\\gliner2-base-v1"));
 }
 
 test "parseModelManifestJson parses inputs array" {
@@ -2593,10 +2593,9 @@ test "parseModelManifestJson parses inputs array" {
     defer manifest.deinit();
 
     try parseModelManifestJson(&manifest, std.testing.allocator,
-        \\{"type":"recognizer","tasks":["recognize","extract"],"capabilities":["extraction"],"inputs":["text","image"],"sparse_3d_output_layout":"seq_batch"}
+        \\{"type":"recognizer","tasks":["extract"],"capabilities":["extraction"],"inputs":["text","image"],"sparse_3d_output_layout":"seq_batch"}
     );
 
-    try std.testing.expect(manifest.hasTask("recognize"));
     try std.testing.expect(manifest.hasTask("extract"));
     try std.testing.expect(manifest.hasCapability("extraction"));
     try std.testing.expect(manifest.hasInput("text"));

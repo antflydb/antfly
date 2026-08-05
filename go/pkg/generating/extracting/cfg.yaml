@@ -1,0 +1,10 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/oapi-codegen/oapi-codegen/HEAD/configuration-schema.json
+package: extracting
+generate:
+  embedded-spec: true
+  models: true
+output: openapi.gen.go
+output-options:
+  skip-prune: true
+import-mapping:
+  ../shared/generating.yaml: github.com/antflydb/antfly/go/pkg/generating

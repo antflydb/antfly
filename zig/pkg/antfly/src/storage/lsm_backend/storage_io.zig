@@ -60,10 +60,13 @@ pub const NativeStorageStats = struct {
 pub fn nativeFdAdmissionCapacityForSoftLimit(soft_limit: u64) usize {
     if (soft_limit == std.math.maxInt(u64)) return unlimited_fd_admission_capacity;
     // Public inbound sockets independently receive at most one quarter of the
-    // process table. Give native storage one third, leaving at least five
-    // twelfths for listeners, Raft, outbound providers, logs, and operator
-    // recovery traffic even when the deployment lowers RLIMIT_NOFILE.
-    const bounded = @max(@as(u64, 1), soft_limit / 3);
+    // process table. Give native storage one half, leaving the final quarter
+    // for listeners, Raft, outbound providers, logs, and operator recovery
+    // traffic. A third was too conservative: at RLIMIT_NOFILE=256 the 85-slot
+    // pool could not retain the lifetime locks required by a normal multi-shard
+    // graph/full-text workload even though the process still had ample OS
+    // descriptor headroom.
+    const bounded = @max(@as(u64, 1), soft_limit / 2);
     return @intCast(@min(bounded, unlimited_fd_admission_capacity));
 }
 
@@ -1033,7 +1036,9 @@ else
 
                 if (builtin.is_test and test_fd_cache_pause_after_open.load(.acquire)) {
                     test_fd_cache_open_paused.store(true, .release);
-                    while (!test_fd_cache_release_after_open.load(.acquire)) std.Thread.yield() catch {};
+                    while (!test_fd_cache_release_after_open.load(.acquire)) {
+                        io.sleep(.fromMilliseconds(1), .awake) catch {};
+                    }
                 }
 
                 const entry = try self.allocator.create(Entry);
@@ -3658,9 +3663,10 @@ test "native fd cache evicts to per-store budget" {
 }
 
 test "native fd admission reserves non-storage process capacity" {
-    try std.testing.expectEqual(@as(usize, 2), nativeFdAdmissionCapacityForSoftLimit(8));
-    try std.testing.expectEqual(@as(usize, 21), nativeFdAdmissionCapacityForSoftLimit(64));
-    try std.testing.expectEqual(@as(usize, 341), nativeFdAdmissionCapacityForSoftLimit(1024));
+    try std.testing.expectEqual(@as(usize, 4), nativeFdAdmissionCapacityForSoftLimit(8));
+    try std.testing.expectEqual(@as(usize, 32), nativeFdAdmissionCapacityForSoftLimit(64));
+    try std.testing.expectEqual(@as(usize, 128), nativeFdAdmissionCapacityForSoftLimit(256));
+    try std.testing.expectEqual(@as(usize, 512), nativeFdAdmissionCapacityForSoftLimit(1024));
     try std.testing.expectEqual(unlimited_fd_admission_capacity, nativeFdAdmissionCapacityForSoftLimit(std.math.maxInt(u64)));
     try std.testing.expectEqual(unlimited_fd_admission_capacity, nativeFdAdmissionCapacityForSoftLimit(1_048_576));
 }

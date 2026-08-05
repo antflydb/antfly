@@ -17,7 +17,6 @@ if TYPE_CHECKING:
     from ..models.inference_models_response_extractors import InferenceModelsResponseExtractors
     from ..models.inference_models_response_generators import InferenceModelsResponseGenerators
     from ..models.inference_models_response_readers import InferenceModelsResponseReaders
-    from ..models.inference_models_response_recognizers import InferenceModelsResponseRecognizers
     from ..models.inference_models_response_rerankers import InferenceModelsResponseRerankers
     from ..models.inference_models_response_rewriters import InferenceModelsResponseRewriters
     from ..models.inference_models_response_transcribers import InferenceModelsResponseTranscribers
@@ -40,7 +39,6 @@ class InferenceModelsResponse:
         embedders (InferenceModelsResponseEmbedders): Available embedding models from models_dir/embedders/
         extractors (InferenceModelsResponseExtractors): Available extractor models (models with 'extraction' capability)
         generators (InferenceModelsResponseGenerators): Available generator/LLM models from models_dir/generators/
-        recognizers (InferenceModelsResponseRecognizers): Available recognizer models from models_dir/recognizers/
         rewriters (InferenceModelsResponseRewriters): Available Seq2Seq rewriter models from models_dir/rewriters/
         readers (InferenceModelsResponseReaders): Available reader/OCR models from models_dir/readers/
         transcribers (InferenceModelsResponseTranscribers): Available transcriber/speech-to-text models from
@@ -56,7 +54,6 @@ class InferenceModelsResponse:
     embedders: InferenceModelsResponseEmbedders
     extractors: InferenceModelsResponseExtractors
     generators: InferenceModelsResponseGenerators
-    recognizers: InferenceModelsResponseRecognizers
     rewriters: InferenceModelsResponseRewriters
     readers: InferenceModelsResponseReaders
     transcribers: InferenceModelsResponseTranscribers
@@ -87,8 +84,6 @@ class InferenceModelsResponse:
 
         generators = self.generators.to_dict()
 
-        recognizers = self.recognizers.to_dict()
-
         rewriters = self.rewriters.to_dict()
 
         readers = self.readers.to_dict()
@@ -109,7 +104,6 @@ class InferenceModelsResponse:
                 "embedders": embedders,
                 "extractors": extractors,
                 "generators": generators,
-                "recognizers": recognizers,
                 "rewriters": rewriters,
                 "readers": readers,
                 "transcribers": transcribers,
@@ -128,7 +122,6 @@ class InferenceModelsResponse:
         from ..models.inference_models_response_extractors import InferenceModelsResponseExtractors
         from ..models.inference_models_response_generators import InferenceModelsResponseGenerators
         from ..models.inference_models_response_readers import InferenceModelsResponseReaders
-        from ..models.inference_models_response_recognizers import InferenceModelsResponseRecognizers
         from ..models.inference_models_response_rerankers import InferenceModelsResponseRerankers
         from ..models.inference_models_response_rewriters import InferenceModelsResponseRewriters
         from ..models.inference_models_response_transcribers import InferenceModelsResponseTranscribers
@@ -159,8 +152,6 @@ class InferenceModelsResponse:
 
         generators = InferenceModelsResponseGenerators.from_dict(d.pop("generators"))
 
-        recognizers = InferenceModelsResponseRecognizers.from_dict(d.pop("recognizers"))
-
         rewriters = InferenceModelsResponseRewriters.from_dict(d.pop("rewriters"))
 
         readers = InferenceModelsResponseReaders.from_dict(d.pop("readers"))
@@ -178,7 +169,6 @@ class InferenceModelsResponse:
             embedders=embedders,
             extractors=extractors,
             generators=generators,
-            recognizers=recognizers,
             rewriters=rewriters,
             readers=readers,
             transcribers=transcribers,

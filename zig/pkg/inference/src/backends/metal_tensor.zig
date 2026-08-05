@@ -55,6 +55,16 @@ pub const MemoryStats = struct {
     device_owned_bytes_released: u64 = 0,
     device_owned_live_bytes: u64 = 0,
     device_owned_peak_live_bytes: u64 = 0,
+    device_owned_live_lt_256kb_bytes: u64 = 0,
+    device_owned_peak_lt_256kb_bytes: u64 = 0,
+    device_owned_live_256kb_1mb_bytes: u64 = 0,
+    device_owned_peak_256kb_1mb_bytes: u64 = 0,
+    device_owned_live_1mb_4mb_bytes: u64 = 0,
+    device_owned_peak_1mb_4mb_bytes: u64 = 0,
+    device_owned_live_4mb_16mb_bytes: u64 = 0,
+    device_owned_peak_4mb_16mb_bytes: u64 = 0,
+    device_owned_live_ge_16mb_bytes: u64 = 0,
+    device_owned_peak_ge_16mb_bytes: u64 = 0,
     device_borrowed_tensors_created: u64 = 0,
     retained_device_views_created: u64 = 0,
     host_mirror_allocations: u64 = 0,
@@ -69,6 +79,32 @@ pub const MemoryStats = struct {
 
 var memory_stats = MemoryStats{};
 var to_host_trace_count: usize = 0;
+var owned_alloc_trace_count: usize = 0;
+const owned_peak_snapshot_capacity: usize = 16384;
+const owned_peak_snapshot_label_len: usize = 96;
+
+const OwnedAllocationRecord = struct {
+    handle: ?*anyopaque = null,
+    bytes: usize = 0,
+    dims: [max_dims]i32 = [_]i32{0} ** max_dims,
+    rank: u8 = 0,
+    seq: u64 = 0,
+    label: [owned_peak_snapshot_label_len]u8 = [_]u8{0} ** owned_peak_snapshot_label_len,
+    label_len: u8 = 0,
+    active: bool = false,
+
+    fn labelSlice(self: *const OwnedAllocationRecord) []const u8 {
+        return self.label[0..self.label_len];
+    }
+};
+
+var owned_allocation_records = [_]OwnedAllocationRecord{.{}} ** owned_peak_snapshot_capacity;
+var owned_allocation_next_slot: usize = 0;
+var owned_allocation_sequence: u64 = 0;
+var owned_allocation_live_record_count: usize = 0;
+var owned_allocation_lost_record_count: u64 = 0;
+var owned_peak_snapshot_print_count: usize = 0;
+var owned_alloc_context: []const u8 = "";
 
 fn getenvUsize(comptime name: [*:0]const u8) ?usize {
     if (comptime @import("builtin").os.tag == .freestanding) return null;
@@ -87,17 +123,226 @@ fn traceToHostStackLimit() usize {
     return getenvUsize("TERMITE_METAL_TRACE_TO_HOST_STACK_LIMIT") orelse 0;
 }
 
-fn noteDeviceOwnedCreate(byte_len: usize) void {
+fn traceOwnedAllocLimit() usize {
+    return getenvUsize("TERMITE_METAL_TRACE_OWNED_ALLOC_LIMIT") orelse 0;
+}
+
+fn traceOwnedAllocMinBytes() usize {
+    return getenvUsize("TERMITE_METAL_TRACE_OWNED_ALLOC_MIN_BYTES") orelse 0;
+}
+
+fn ownedPeakSnapshotTop() usize {
+    const requested = getenvUsize("TERMITE_METAL_OWNED_PEAK_SNAPSHOT_TOP") orelse 0;
+    return @min(requested, 32);
+}
+
+fn ownedPeakSnapshotLimit() usize {
+    return getenvUsize("TERMITE_METAL_OWNED_PEAK_SNAPSHOT_LIMIT") orelse 8;
+}
+
+fn ownedPeakSnapshotMinBytes() u64 {
+    return getenvUsize("TERMITE_METAL_OWNED_PEAK_SNAPSHOT_MIN_BYTES") orelse 0;
+}
+
+// The owned-allocation record table is consumed only by the (env-gated) peak
+// snapshot / alloc trace. Maintaining it costs an O(capacity) slot scan per
+// device buffer alloc/free, so skip it entirely unless a diagnostic is enabled.
+// Cached because the environment is constant for the process lifetime; the cache
+// is a file-scope var so resetMemoryStats can clear it, keeping the recording
+// gate consistent with the (live-evaluated) print gate across test resets.
+var owned_allocation_recording_enabled_cache: ?bool = null;
+fn ownedAllocationRecordingEnabled() bool {
+    if (owned_allocation_recording_enabled_cache) |c| return c;
+    const enabled = ownedPeakSnapshotTop() > 0 or traceOwnedAllocLimit() > 0;
+    owned_allocation_recording_enabled_cache = enabled;
+    return enabled;
+}
+
+pub fn setOwnedAllocationContext(label: []const u8) void {
+    owned_alloc_context = label;
+}
+
+pub fn clearOwnedAllocationContext() void {
+    owned_alloc_context = "";
+}
+
+fn copyLabel(dst: *[owned_peak_snapshot_label_len]u8, src: []const u8) u8 {
+    const n = @min(src.len, dst.len);
+    if (n > 0) @memcpy(dst[0..n], src[0..n]);
+    if (n < dst.len) @memset(dst[n..], 0);
+    return @intCast(n);
+}
+
+fn noteOwnedAllocationRecord(handle: *anyopaque, byte_len: usize, dims: []const i32) void {
+    if (!ownedAllocationRecordingEnabled()) return;
+    var slot_index: ?usize = null;
+    for (&owned_allocation_records, 0..) |*record, idx| {
+        if (!record.active) {
+            slot_index = idx;
+            break;
+        }
+    }
+    if (slot_index == null and owned_allocation_records.len > 0) {
+        for (0..owned_allocation_records.len) |_| {
+            const idx = owned_allocation_next_slot;
+            owned_allocation_next_slot = (owned_allocation_next_slot + 1) % owned_allocation_records.len;
+            if (!owned_allocation_records[idx].active) {
+                slot_index = idx;
+                break;
+            }
+        }
+    }
+    const idx = slot_index orelse {
+        owned_allocation_lost_record_count += 1;
+        return;
+    };
+    var dims_buf = [_]i32{0} ** max_dims;
+    const rank = @min(dims.len, max_dims);
+    for (dims[0..rank], 0..) |dim, axis| dims_buf[axis] = dim;
+    owned_allocation_sequence += 1;
+    var label_buf = [_]u8{0} ** owned_peak_snapshot_label_len;
+    const label_len = copyLabel(&label_buf, owned_alloc_context);
+    owned_allocation_records[idx] = .{
+        .handle = handle,
+        .bytes = byte_len,
+        .dims = dims_buf,
+        .rank = @intCast(rank),
+        .seq = owned_allocation_sequence,
+        .label = label_buf,
+        .label_len = label_len,
+        .active = true,
+    };
+    owned_allocation_live_record_count += 1;
+}
+
+fn forgetOwnedAllocationRecord(handle: *anyopaque) void {
+    if (!ownedAllocationRecordingEnabled()) return;
+    for (&owned_allocation_records) |*record| {
+        if (!record.active or record.handle != handle) continue;
+        record.active = false;
+        record.handle = null;
+        owned_allocation_live_record_count -|= 1;
+        return;
+    }
+}
+
+fn maybeRecordTop(top: []OwnedAllocationRecord, used: *usize, record: OwnedAllocationRecord) void {
+    const cap = top.len;
+    if (cap == 0) return;
+    var pos: usize = 0;
+    while (pos < used.* and top[pos].bytes >= record.bytes) : (pos += 1) {}
+    if (pos >= cap) return;
+    if (used.* < cap) used.* += 1;
+    var idx = used.* - 1;
+    while (idx > pos) : (idx -= 1) top[idx] = top[idx - 1];
+    top[pos] = record;
+}
+
+fn printOwnedPeakSnapshot() void {
+    const top_n = ownedPeakSnapshotTop();
+    if (top_n == 0) return;
+    if (memory_stats.device_owned_peak_live_bytes < ownedPeakSnapshotMinBytes()) return;
+    if (owned_peak_snapshot_print_count >= ownedPeakSnapshotLimit()) return;
+    owned_peak_snapshot_print_count += 1;
+
+    var top = [_]OwnedAllocationRecord{.{}} ** 32;
+    var used: usize = 0;
+    var live_bytes: u64 = 0;
+    for (owned_allocation_records) |record| {
+        if (!record.active) continue;
+        live_bytes += @intCast(record.bytes);
+        maybeRecordTop(top[0..top_n], &used, record);
+    }
+
+    std.debug.print(
+        "metal_owned_peak_snapshot: peak={d} live={d} live_records={d} tracked_live_records={d} lost_records={d} top={d}\n",
+        .{
+            memory_stats.device_owned_peak_live_bytes,
+            live_bytes,
+            owned_allocation_live_record_count,
+            used,
+            owned_allocation_lost_record_count,
+            top_n,
+        },
+    );
+    for (top[0..used], 0..) |record, i| {
+        std.debug.print(
+            "metal_owned_peak_snapshot_entry: index={d} bytes={d} seq={d} label=\"{s}\" dims=[",
+            .{ i + 1, record.bytes, record.seq, record.labelSlice() },
+        );
+        for (record.dims[0..record.rank], 0..) |dim, axis| {
+            if (axis != 0) std.debug.print(",", .{});
+            std.debug.print("{d}", .{dim});
+        }
+        std.debug.print("]\n", .{});
+    }
+}
+
+fn updateOwnedCreateBucket(byte_len: usize) void {
+    const bytes: u64 = @intCast(byte_len);
+    if (byte_len < 256 * 1024) {
+        memory_stats.device_owned_live_lt_256kb_bytes += bytes;
+        memory_stats.device_owned_peak_lt_256kb_bytes = @max(memory_stats.device_owned_peak_lt_256kb_bytes, memory_stats.device_owned_live_lt_256kb_bytes);
+    } else if (byte_len < 1024 * 1024) {
+        memory_stats.device_owned_live_256kb_1mb_bytes += bytes;
+        memory_stats.device_owned_peak_256kb_1mb_bytes = @max(memory_stats.device_owned_peak_256kb_1mb_bytes, memory_stats.device_owned_live_256kb_1mb_bytes);
+    } else if (byte_len < 4 * 1024 * 1024) {
+        memory_stats.device_owned_live_1mb_4mb_bytes += bytes;
+        memory_stats.device_owned_peak_1mb_4mb_bytes = @max(memory_stats.device_owned_peak_1mb_4mb_bytes, memory_stats.device_owned_live_1mb_4mb_bytes);
+    } else if (byte_len < 16 * 1024 * 1024) {
+        memory_stats.device_owned_live_4mb_16mb_bytes += bytes;
+        memory_stats.device_owned_peak_4mb_16mb_bytes = @max(memory_stats.device_owned_peak_4mb_16mb_bytes, memory_stats.device_owned_live_4mb_16mb_bytes);
+    } else {
+        memory_stats.device_owned_live_ge_16mb_bytes += bytes;
+        memory_stats.device_owned_peak_ge_16mb_bytes = @max(memory_stats.device_owned_peak_ge_16mb_bytes, memory_stats.device_owned_live_ge_16mb_bytes);
+    }
+}
+
+fn updateOwnedReleaseBucket(byte_len: usize) void {
+    const bytes: u64 = @intCast(byte_len);
+    if (byte_len < 256 * 1024) {
+        memory_stats.device_owned_live_lt_256kb_bytes -|= bytes;
+    } else if (byte_len < 1024 * 1024) {
+        memory_stats.device_owned_live_256kb_1mb_bytes -|= bytes;
+    } else if (byte_len < 4 * 1024 * 1024) {
+        memory_stats.device_owned_live_1mb_4mb_bytes -|= bytes;
+    } else if (byte_len < 16 * 1024 * 1024) {
+        memory_stats.device_owned_live_4mb_16mb_bytes -|= bytes;
+    } else {
+        memory_stats.device_owned_live_ge_16mb_bytes -|= bytes;
+    }
+}
+
+fn noteDeviceOwnedCreate(handle: *anyopaque, byte_len: usize, dims: []const i32) void {
     memory_stats.device_owned_buffers_created += 1;
     memory_stats.device_owned_bytes_created += @intCast(byte_len);
     memory_stats.device_owned_live_bytes += @intCast(byte_len);
+    updateOwnedCreateBucket(byte_len);
+    noteOwnedAllocationRecord(handle, byte_len, dims);
+    const previous_peak = memory_stats.device_owned_peak_live_bytes;
     memory_stats.device_owned_peak_live_bytes = @max(memory_stats.device_owned_peak_live_bytes, memory_stats.device_owned_live_bytes);
+    const limit = traceOwnedAllocLimit();
+    if (limit > 0 and owned_alloc_trace_count < limit and byte_len >= traceOwnedAllocMinBytes()) {
+        owned_alloc_trace_count += 1;
+        std.debug.print(
+            "metal_owned_alloc_trace: bytes={d} live={d} peak={d} new_peak={} dims=[",
+            .{ byte_len, memory_stats.device_owned_live_bytes, memory_stats.device_owned_peak_live_bytes, memory_stats.device_owned_peak_live_bytes > previous_peak },
+        );
+        for (dims, 0..) |dim, i| {
+            if (i != 0) std.debug.print(",", .{});
+            std.debug.print("{d}", .{dim});
+        }
+        std.debug.print("]\n", .{});
+    }
+    if (memory_stats.device_owned_peak_live_bytes > previous_peak) printOwnedPeakSnapshot();
 }
 
-fn noteDeviceOwnedRelease(byte_len: usize) void {
+fn noteDeviceOwnedRelease(handle: *anyopaque, byte_len: usize) void {
     memory_stats.device_owned_buffers_released += 1;
     memory_stats.device_owned_bytes_released += @intCast(byte_len);
     memory_stats.device_owned_live_bytes -|= @intCast(byte_len);
+    updateOwnedReleaseBucket(byte_len);
+    forgetOwnedAllocationRecord(handle);
 }
 
 fn noteHostMirrorAlloc(byte_len: usize) void {
@@ -118,6 +363,15 @@ pub fn memoryStatsSnapshot() MemoryStats {
 
 pub fn resetMemoryStats() void {
     memory_stats = .{};
+    owned_alloc_trace_count = 0;
+    owned_peak_snapshot_print_count = 0;
+    owned_allocation_next_slot = 0;
+    owned_allocation_sequence = 0;
+    owned_allocation_live_record_count = 0;
+    owned_allocation_lost_record_count = 0;
+    owned_alloc_context = "";
+    owned_allocation_recording_enabled_cache = null;
+    owned_allocation_records = [_]OwnedAllocationRecord{.{}} ** owned_peak_snapshot_capacity;
 }
 
 pub const DeviceStorage = struct {
@@ -136,6 +390,11 @@ extern fn termite_metal_buffer_alloc(
     length: usize,
     storage_mode: c_int,
 ) ?*anyopaque;
+extern fn termite_metal_buffer_alloc_fresh(
+    runtime: *anyopaque,
+    length: usize,
+    storage_mode: c_int,
+) ?*anyopaque;
 extern fn termite_metal_buffer_release(handle: *anyopaque) void;
 extern fn termite_metal_decode_runtime_release_buffer(runtime: *anyopaque, handle: *anyopaque) void;
 extern fn termite_metal_buffer_contents(handle: *anyopaque) ?*anyopaque;
@@ -147,6 +406,7 @@ extern fn termite_metal_buffer_download(
     length: usize,
 ) c_int;
 extern fn termite_metal_decode_runtime_flush_active_frame(runtime: *anyopaque) c_int;
+extern fn termite_metal_decode_runtime_has_active_frame(runtime: *anyopaque) c_int;
 extern fn termite_metal_decode_runtime_retain_active_frame_buffer(runtime: *anyopaque, handle: *anyopaque) c_int;
 extern fn termite_metal_buffer_upload(
     runtime: *anyopaque,
@@ -239,7 +499,7 @@ pub const MetalTensor = struct {
                 .byte_len = byte_len,
             },
         };
-        noteDeviceOwnedCreate(byte_len);
+        noteDeviceOwnedCreate(handle, byte_len, dims);
         for (dims, 0..) |axis_dim, i| t.shape_buf[i] = axis_dim;
         return t;
     }
@@ -297,22 +557,49 @@ pub const MetalTensor = struct {
         if (ref.ref_count == 0 and ref.release_on_drop and !ref.released) {
             termite_metal_decode_runtime_release_buffer(ref.runtime, ref.handle);
             ref.released = true;
-            noteDeviceOwnedRelease(ref.byte_len);
+            noteDeviceOwnedRelease(ref.handle, ref.byte_len);
         }
         if (ref.ref_count == 0) {
             std.heap.c_allocator.destroy(ref);
         }
     }
 
-    /// Allocate a fresh device buffer of `byte_len` bytes on the runtime's
-    /// Metal device and wrap it as an owned device tensor.
+    /// Allocate a device buffer of `byte_len` bytes on the runtime's Metal
+    /// device, permitting same-frame pool reuse, and wrap it as an owned
+    /// device tensor.
     pub fn deviceAllocate(
         runtime: *anyopaque,
         byte_len: usize,
         mode: StorageMode,
         dims: []const i32,
     ) !MetalTensor {
-        const handle = termite_metal_buffer_alloc(runtime, byte_len, @intFromEnum(mode)) orelse
+        return deviceAllocateImpl(runtime, byte_len, mode, dims, false);
+    }
+
+    /// Allocate a new Metal buffer even when in-frame reuse is enabled. This
+    /// is reserved for operations whose encoded reads can outlive the Zig
+    /// tensor wrapper that owns a potential reuse candidate. Once the fresh
+    /// tensor itself dies it may enter the normal reuse pool.
+    pub fn deviceAllocateFresh(
+        runtime: *anyopaque,
+        byte_len: usize,
+        mode: StorageMode,
+        dims: []const i32,
+    ) !MetalTensor {
+        return deviceAllocateImpl(runtime, byte_len, mode, dims, true);
+    }
+
+    fn deviceAllocateImpl(
+        runtime: *anyopaque,
+        byte_len: usize,
+        mode: StorageMode,
+        dims: []const i32,
+        fresh: bool,
+    ) !MetalTensor {
+        const handle = (if (fresh)
+            termite_metal_buffer_alloc_fresh(runtime, byte_len, @intFromEnum(mode))
+        else
+            termite_metal_buffer_alloc(runtime, byte_len, @intFromEnum(mode))) orelse
             return error.MetalBufferAllocFailed;
         var tensor = deviceOwned(runtime, handle, 0, byte_len, dims);
         errdefer tensor.deinit();
@@ -445,6 +732,12 @@ pub const MetalTensor = struct {
         return self.device != null;
     }
 
+    pub fn isOwnedDeviceBuffer(self: *const MetalTensor) bool {
+        const d = self.device orelse return false;
+        if (d.ref.released or d.ref.ref_count == 0) return false;
+        return d.ref.release_on_drop;
+    }
+
     pub fn deviceHandle(self: *const MetalTensor) ?*anyopaque {
         if (self.device) |d| {
             if (d.ref.released or d.ref.ref_count == 0) return null;
@@ -544,8 +837,33 @@ pub const MetalTensor = struct {
 
         // Mirror already populated by a prior call — host fields hold count
         // elements, either aliasing Shared contents or a downloaded Private
-        // mirror. Reuse it.
-        if (self.len == count) return self.data[0..self.len];
+        // mirror. Reuse it, but only after the same active-frame flush the
+        // first-read path performs below: a runtime frame may still be
+        // queuing GPU writes to this buffer (in-place updates, planned-frame
+        // commands), so returning the cached mirror without draining the
+        // frame is a stale-readback corruption class. The flush is a cheap
+        // no-op when no frame is active.
+        if (self.len == count) {
+            const frame_was_active = termite_metal_decode_runtime_has_active_frame(dev.ref.runtime) != 0;
+            if (termite_metal_decode_runtime_flush_active_frame(dev.ref.runtime) != 0) {
+                return error.MetalFrameSyncFailed;
+            }
+            if (frame_was_active and dev.mirror_owned) {
+                // Owned mirrors are Private-storage snapshots (Shared
+                // mirrors alias device memory and are coherent after the
+                // flush). Refresh the snapshot so writes queued since it was
+                // taken become visible.
+                const rc = termite_metal_buffer_download(
+                    dev.ref.runtime,
+                    dev.ref.handle,
+                    dev.byte_offset,
+                    @ptrCast(self.data),
+                    dev.byte_len,
+                );
+                if (rc != 0) return error.MetalBufferDownloadFailed;
+            }
+            return self.data[0..self.len];
+        }
 
         // If this tensor was produced inside an active runtime frame, host
         // materialization is an explicit synchronization boundary. Drain the
@@ -584,6 +902,95 @@ pub const MetalTensor = struct {
         dev.mirror_owned = true;
         noteHostMirrorAlloc(dev.byte_len);
         return buf;
+    }
+
+    /// Synchronize host-visible state with the final device contents.
+    /// Drains any active runtime frame so queued GPU writes land, then
+    /// refreshes an owned (Private-storage) host mirror that may have
+    /// been snapshotted before later device writes. Shared-storage
+    /// mirrors alias device memory and are coherent once the frame is
+    /// drained; device tensors without a cached mirror need no refresh
+    /// (their first `toHostSlice` downloads fresh bytes). Host-only
+    /// tensors are a no-op. Used for values that escape an execution
+    /// scope (graph outputs read after the owning frame completed).
+    pub fn syncHostMirror(self: *MetalTensor) !void {
+        if (self.device) |*dev| {
+            if (dev.ref.released or dev.ref.ref_count == 0) return error.ReleasedDeviceBuffer;
+            if (termite_metal_decode_runtime_flush_active_frame(dev.ref.runtime) != 0) {
+                return error.MetalFrameSyncFailed;
+            }
+            const count = dev.byte_len / @sizeOf(f32);
+            if (self.len == count and dev.mirror_owned) {
+                const rc = termite_metal_buffer_download(
+                    dev.ref.runtime,
+                    dev.ref.handle,
+                    dev.byte_offset,
+                    @ptrCast(self.data),
+                    dev.byte_len,
+                );
+                if (rc != 0) return error.MetalBufferDownloadFailed;
+            }
+        }
+    }
+
+    /// Diagnostic only: abs-sum of the RAW device bytes via a fresh
+    /// download (frame-flushed), bypassing any cached host mirror and
+    /// mutating no tensor state. Host-only tensors sum their host data.
+    pub fn debugRawDeviceAbsSum(self: *MetalTensor) !f64 {
+        const dev = if (self.device) |*d| d else {
+            var acc: f64 = 0;
+            for (self.data[0..self.len]) |v| acc += @abs(v);
+            return acc;
+        };
+        if (dev.ref.released or dev.ref.ref_count == 0) return error.ReleasedDeviceBuffer;
+        if (termite_metal_decode_runtime_flush_active_frame(dev.ref.runtime) != 0) {
+            return error.MetalFrameSyncFailed;
+        }
+        const count = dev.byte_len / @sizeOf(f32);
+        const buf = try std.heap.c_allocator.alloc(f32, count);
+        defer std.heap.c_allocator.free(buf);
+        const rc = termite_metal_buffer_download(
+            dev.ref.runtime,
+            dev.ref.handle,
+            dev.byte_offset,
+            @ptrCast(buf.ptr),
+            dev.byte_len,
+        );
+        if (rc != 0) return error.MetalBufferDownloadFailed;
+        var acc: f64 = 0;
+        for (buf) |v| acc += @abs(v);
+        return acc;
+    }
+
+    /// Diagnostic only: CPU reference for a last-dim row-sum reduce over
+    /// the RAW device bytes (fresh frame-flushed download). Returns the
+    /// sum of |row sums| so it is directly comparable with an abs-sum of
+    /// the reduce kernel's output.
+    pub fn debugRawDeviceRowSumAbs(self: *MetalTensor, row_count: usize, row_width: usize) !f64 {
+        const dev = if (self.device) |*d| d else return error.UnsupportedTensorType;
+        if (dev.ref.released or dev.ref.ref_count == 0) return error.ReleasedDeviceBuffer;
+        if (termite_metal_decode_runtime_flush_active_frame(dev.ref.runtime) != 0) {
+            return error.MetalFrameSyncFailed;
+        }
+        const count = dev.byte_len / @sizeOf(f32);
+        if (row_count * row_width > count) return error.InvalidTensorShape;
+        const buf = try std.heap.c_allocator.alloc(f32, count);
+        defer std.heap.c_allocator.free(buf);
+        const rc = termite_metal_buffer_download(
+            dev.ref.runtime,
+            dev.ref.handle,
+            dev.byte_offset,
+            @ptrCast(buf.ptr),
+            dev.byte_len,
+        );
+        if (rc != 0) return error.MetalBufferDownloadFailed;
+        var acc: f64 = 0;
+        for (0..row_count) |r| {
+            var row_sum: f64 = 0;
+            for (0..row_width) |c| row_sum += buf[r * row_width + c];
+            acc += @abs(row_sum);
+        }
+        return acc;
     }
 };
 

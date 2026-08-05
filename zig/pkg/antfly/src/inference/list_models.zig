@@ -30,7 +30,6 @@ pub const ModelKind = enum {
     generator,
     reranker,
     chunker,
-    recognizer,
     classifier,
     rewriter,
     reader,
@@ -44,7 +43,6 @@ pub const ModelKind = enum {
             .generator => "generators",
             .reranker => "rerankers",
             .chunker => "chunkers",
-            .recognizer => "recognizers",
             .classifier => "classifiers",
             .rewriter => "rewriters",
             .reader => "readers",
@@ -490,7 +488,7 @@ pub fn parseAntflyModels(alloc: std.mem.Allocator, body: []const u8) !ListResult
     var builder = ResultBuilder.init(alloc);
     errdefer builder.deinit();
 
-    const groups = [_]ModelKind{ .embedder, .generator, .reranker, .chunker, .recognizer, .classifier, .rewriter, .reader, .transcriber, .extractor };
+    const groups = [_]ModelKind{ .embedder, .generator, .reranker, .chunker, .classifier, .rewriter, .reader, .transcriber, .extractor };
     for (groups) |kind| {
         const group_value = parsed.value.object.get(kind.groupKey()) orelse continue;
         if (group_value != .object) continue;

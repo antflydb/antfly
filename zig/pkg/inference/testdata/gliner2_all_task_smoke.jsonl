@@ -1,0 +1,4 @@
+{"input":"John Smith works at Acme Corp in Paris.","output":{"entities":{"person":["John Smith"],"organization":["Acme Corp"],"location":["Paris"]}}}
+{"input":"This support ticket is urgent and negative.","output":{"classifications":[{"task":"sentiment","labels":["positive","negative"],"true_label":["negative"]},{"task":"priority","labels":["low","normal","urgent"],"true_label":["urgent"]}]}}
+{"input":"iPhone 15 costs $999 and is available in blue.","output":{"json_structures":[{"product":{"name":"iPhone 15","price":"$999","color":"blue","status":{"value":"available","choices":["available","sold out"]}}}]}}
+{"input":"Elon Musk founded SpaceX in California.","output":{"relations":[{"founded":{"head":"Elon Musk","tail":"SpaceX","place":"California"}}]}}

@@ -13,7 +13,8 @@ T = TypeVar("T", bound="ExtractionRelationSchema")
 
 @_attrs_define
 class ExtractionRelationSchema:
-    """
+    """Optional source and target labels constrain relation endpoints. A target requires a source.
+
     Attributes:
         type_ (str):
         source (str | Unset):

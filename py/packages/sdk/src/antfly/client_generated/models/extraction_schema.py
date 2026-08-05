@@ -19,12 +19,15 @@ T = TypeVar("T", bound="ExtractionSchema")
 
 @_attrs_define
 class ExtractionSchema:
-    """
-    Attributes:
-        entities (list[str] | Unset):
-        relations (list[ExtractionRelationSchema] | Unset):
-        classifications (list[ExtractionClassificationSchema] | Unset):
-        structures (ExtractionSchemaStructures | Unset):
+    """Selects one extraction operation family per request. Entity labels may
+    accompany relation schemas so relation extraction can return its
+    participating entities in the same response.
+
+        Attributes:
+            entities (list[str] | Unset):
+            relations (list[ExtractionRelationSchema] | Unset):
+            classifications (list[ExtractionClassificationSchema] | Unset):
+            structures (ExtractionSchemaStructures | Unset):
     """
 
     entities: list[str] | Unset = UNSET

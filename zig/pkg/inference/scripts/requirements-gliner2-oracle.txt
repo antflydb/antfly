@@ -1,0 +1,14 @@
+# Numerical/runtime dependencies for the frozen Fastino GLiNER2 oracle.
+# Install the verified upstream checkout separately and put it first on
+# PYTHONPATH; the release scripts prove imports came from that checkout.
+accelerate==1.14.0
+huggingface-hub==1.26.0
+numpy==2.4.2
+peft==0.20.0
+pydantic==2.13.4
+requests==2.34.2
+safetensors==0.7.0
+tokenizers==0.22.2
+torch==2.10.0
+transformers==5.1.0
+urllib3==2.7.0

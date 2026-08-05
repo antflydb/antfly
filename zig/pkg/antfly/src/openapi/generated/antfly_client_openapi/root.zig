@@ -168,6 +168,7 @@ pub const ExtractionRelation = types.ExtractionRelation;
 pub const ExtractionRelationEndpoint = types.ExtractionRelationEndpoint;
 pub const ExtractionRelationSchema = types.ExtractionRelationSchema;
 pub const ExtractionRequest = types.ExtractionRequest;
+pub const ExtractionResolverOptions = types.ExtractionResolverOptions;
 pub const ExtractionResponse = types.ExtractionResponse;
 pub const ExtractionSchema = types.ExtractionSchema;
 pub const ExtractionStructureField = types.ExtractionStructureField;

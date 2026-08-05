@@ -45,6 +45,11 @@ pub const RuntimeStats = struct {
     stream_syncs: usize = 0,
 };
 
+pub const DeviceMemoryInfo = struct {
+    free_bytes: usize,
+    total_bytes: usize,
+};
+
 fn graphInstantiateResultName(result: CUgraphInstantiateResult) []const u8 {
     return switch (result) {
         driver_mod.CUDA_GRAPH_INSTANTIATE_SUCCESS => "success",
@@ -151,6 +156,15 @@ pub const CudaContext = struct {
         try self.makeCurrent();
         try self.driver.check(self.driver.fns.cuStreamSynchronize(self.stream));
         self.stats.stream_syncs += 1;
+    }
+
+    pub fn memoryInfo(self: *CudaContext) driver_mod.Error!DeviceMemoryInfo {
+        try self.makeCurrent();
+        var free_bytes: usize = 0;
+        var total_bytes: usize = 0;
+        try self.driver.check(self.driver.fns.cuMemGetInfo(&free_bytes, &total_bytes));
+        if (total_bytes == 0 or free_bytes > total_bytes) return error.InvalidCudaState;
+        return .{ .free_bytes = free_bytes, .total_bytes = total_bytes };
     }
 
     pub fn createStreamEvent(self: *CudaContext) driver_mod.Error!CUevent {

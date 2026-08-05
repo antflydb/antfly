@@ -35,6 +35,7 @@ import (
 	"time"
 
 	generatingtypes "github.com/antflydb/antfly/go/pkg/generating"
+	extractingtypes "github.com/antflydb/antfly/go/pkg/generating/extracting"
 	"github.com/antflydb/antfly/go/pkg/libaf/ai"
 	"github.com/antflydb/antfly/go/pkg/libaf/chunking"
 	"github.com/antflydb/antfly/go/pkg/libaf/embeddings"
@@ -57,6 +58,34 @@ const (
 	maxReadBatchImages = 64
 	maxReadBatchBytes  = int64(256 * 1024 * 1024)
 )
+
+type entityExtractionRequest struct {
+	Model             string
+	Texts             []string
+	IDs               []string
+	Labels            []string
+	RelationLabels    []string
+	Resolver          *extractingtypes.ExtractionResolverOptions
+	IncludeConfidence bool
+	IncludeSpans      bool
+	Threshold         float32
+	FlatNER           bool
+}
+
+type extractedEntity struct {
+	Text  string
+	Label string
+	Start int
+	End   int
+	Score float32
+}
+
+type extractedRelation struct {
+	Head  extractedEntity
+	Tail  extractedEntity
+	Label string
+	Score float32
+}
 
 var errReadBatchTooLarge = errors.New("read batch too large")
 
@@ -135,11 +164,6 @@ func (t *TermiteAPI) ClassifyText(w http.ResponseWriter, r *http.Request) {
 	t.node.handleApiClassify(w, r)
 }
 
-// RecognizeEntities implements ServerInterface
-func (t *TermiteAPI) RecognizeEntities(w http.ResponseWriter, r *http.Request) {
-	t.node.handleApiRecognize(w, r)
-}
-
 // GenerateContent implements ServerInterface
 func (t *TermiteAPI) GenerateContent(w http.ResponseWriter, r *http.Request) {
 	t.node.handleApiGenerate(w, r)
@@ -167,7 +191,280 @@ func (t *TermiteAPI) TranscribeAudio(w http.ResponseWriter, r *http.Request) {
 
 // ExtractJSON implements ServerInterface
 func (t *TermiteAPI) ExtractJSON(w http.ResponseWriter, r *http.Request) {
-	t.node.handleApiExtract(w, r)
+	defer func() { _ = r.Body.Close() }()
+	var req extractingtypes.ExtractionRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxReadBatchBytes)).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	texts, err := extractionTexts(req.Inputs)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	hasEntities := req.Schema.Entities != nil && len(*req.Schema.Entities) > 0
+	hasRelations := req.Schema.Relations != nil && len(*req.Schema.Relations) > 0
+	hasStructures := req.Schema.Structures != nil && len(*req.Schema.Structures) > 0
+	hasClassifications := req.Schema.Classifications != nil && len(*req.Schema.Classifications) > 0
+	operations := 0
+	if hasEntities || hasRelations {
+		operations++
+	}
+	if hasStructures {
+		operations++
+	}
+	if hasClassifications {
+		operations++
+	}
+	if operations != 1 {
+		http.Error(w, "schema must request exactly one supported extraction operation", http.StatusBadRequest)
+		return
+	}
+	if hasClassifications {
+		t.node.handleApiExtractionClassifications(w, r, req, texts)
+		return
+	}
+	if hasEntities || hasRelations {
+		ids := make([]string, len(req.Inputs))
+		for i := range req.Inputs {
+			if req.Inputs[i].Id != nil {
+				ids[i] = *req.Inputs[i].Id
+			}
+		}
+		entityReq := entityExtractionRequest{
+			Model:   req.Model,
+			Texts:   texts,
+			IDs:     ids,
+			FlatNER: true,
+		}
+		if hasEntities {
+			entityReq.Labels = *req.Schema.Entities
+		}
+		if hasRelations {
+			labels := make([]string, 0, len(*req.Schema.Relations))
+			for _, relation := range *req.Schema.Relations {
+				label := relation.Type
+				if relation.Source != nil {
+					label = *relation.Source + "::" + label
+				}
+				if relation.Target != nil {
+					label += "::" + *relation.Target
+				}
+				labels = append(labels, label)
+			}
+			entityReq.RelationLabels = labels
+		}
+		if req.Options != nil && req.Options.Resolver != nil {
+			entityReq.Resolver = req.Options.Resolver
+		}
+		if req.Options != nil {
+			entityReq.IncludeConfidence = valueOr(req.Options.IncludeConfidence, false)
+			entityReq.IncludeSpans = valueOr(req.Options.IncludeSpans, false)
+			entityReq.Threshold = valueOr(req.Options.Threshold, float32(0))
+			entityReq.FlatNER = valueOr(req.Options.FlatNer, true)
+		}
+		t.node.handleEntityExtraction(w, r, entityReq)
+		return
+	}
+	schemas, err := canonicalStructureSchemas(*req.Schema.Structures)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	ids := make([]string, len(req.Inputs))
+	for i := range req.Inputs {
+		if req.Inputs[i].Id != nil {
+			ids[i] = *req.Inputs[i].Id
+		}
+	}
+	t.node.handleStructuredExtract(w, r, req.Model, texts, ids, schemas, req.Options)
+}
+
+func (ln *TermiteNode) handleApiExtractionClassifications(w http.ResponseWriter, r *http.Request, req extractingtypes.ExtractionRequest, texts []string) {
+	release, err := ln.requestQueue.Acquire(r.Context())
+	if err != nil {
+		http.Error(w, "extraction capacity unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	defer release()
+	if ln.nerRegistry == nil {
+		http.Error(w, "model not found", http.StatusNotFound)
+		return
+	}
+	model, err := ln.nerRegistry.Acquire(req.Model)
+	if err != nil {
+		writeModelAcquireError(w, ln.logger, req.Model, err)
+		return
+	}
+	defer ln.nerRegistry.Release(req.Model)
+	classifier, ok := model.(ner.Classifier)
+	if !ok {
+		http.Error(w, "model does not support classification extraction", http.StatusBadRequest)
+		return
+	}
+
+	data := make([]extractingtypes.ExtractionObject, len(texts))
+	for i := range req.Inputs {
+		if req.Inputs[i].Id != nil {
+			data[i].Id = req.Inputs[i].Id
+		}
+	}
+	includeConfidence := req.Options != nil && valueOr(req.Options.IncludeConfidence, false)
+	for _, schema := range *req.Schema.Classifications {
+		if schema.Name == "" || len(schema.Labels) == 0 {
+			http.Error(w, "classification name and labels are required", http.StatusBadRequest)
+			return
+		}
+		config := ner.DefaultClassificationConfig()
+		config.MultiLabel = valueOr(schema.MultiLabel, false)
+		if config.MultiLabel {
+			config.TopK = 0
+		}
+		if req.Options != nil && req.Options.Threshold != nil {
+			config.Threshold = *req.Options.Threshold
+		}
+		results, classifyErr := classifier.ClassifyText(r.Context(), texts, schema.Labels, &config)
+		if classifyErr != nil {
+			http.Error(w, fmt.Sprintf("classification extraction failed: %v", classifyErr), http.StatusInternalServerError)
+			return
+		}
+		for i, items := range results {
+			if data[i].Classifications == nil {
+				empty := make([]extractingtypes.ExtractionClassification, 0)
+				data[i].Classifications = &empty
+			}
+			for _, item := range items {
+				classification := extractingtypes.ExtractionClassification{Name: schema.Name, Label: item.Label}
+				if includeConfidence {
+					classification.Score = &item.Score
+				}
+				*data[i].Classifications = append(*data[i].Classifications, classification)
+			}
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(extractingtypes.ExtractionResponse{Object: extractingtypes.Extraction, Model: req.Model, Data: data}); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
+
+func valueOr[T any](value *T, fallback T) T {
+	if value != nil {
+		return *value
+	}
+	return fallback
+}
+
+func extractionTexts(inputs []extractingtypes.ExtractionInput) ([]string, error) {
+	texts := make([]string, len(inputs))
+	for i, input := range inputs {
+		var text string
+		if err := json.Unmarshal(input.Content, &text); err == nil {
+			texts[i] = text
+			continue
+		}
+		var parts []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}
+		if err := json.Unmarshal(input.Content, &parts); err != nil {
+			return nil, fmt.Errorf("input %d must contain text", i)
+		}
+		var builder strings.Builder
+		for _, part := range parts {
+			if part.Type == "text" && part.Text != "" {
+				if builder.Len() > 0 {
+					builder.WriteByte('\n')
+				}
+				builder.WriteString(part.Text)
+			}
+		}
+		if builder.Len() == 0 {
+			return nil, fmt.Errorf("input %d must contain text", i)
+		}
+		texts[i] = builder.String()
+	}
+	return texts, nil
+}
+
+func canonicalStructureSchemas(structures map[string]extractingtypes.ExtractionStructureSchema) ([]ner.ExtractionSchema, error) {
+	structureNames := make([]string, 0, len(structures))
+	for name := range structures {
+		structureNames = append(structureNames, name)
+	}
+	slices.Sort(structureNames)
+	out := make([]ner.ExtractionSchema, 0, len(structureNames))
+	for _, name := range structureNames {
+		if name == "" {
+			return nil, errors.New("structure name is required")
+		}
+		structure := structures[name]
+		if len(structure.Fields) == 0 {
+			return nil, fmt.Errorf("structure %q has no fields", name)
+		}
+		fieldNames := make([]string, 0, len(structure.Fields))
+		for fieldName := range structure.Fields {
+			fieldNames = append(fieldNames, fieldName)
+		}
+		slices.Sort(fieldNames)
+		fields := make([]ner.SchemaField, 0, len(fieldNames))
+		for _, fieldName := range fieldNames {
+			if fieldName == "" {
+				return nil, fmt.Errorf("structure %q has an empty field name", name)
+			}
+			descriptor := structure.Fields[fieldName]
+			fieldType, choices, err := canonicalStructureField(descriptor)
+			if err != nil {
+				return nil, fmt.Errorf("structure %q field %q: %w", name, fieldName, err)
+			}
+			fields = append(fields, ner.SchemaField{Name: fieldName, Type: fieldType, Choices: choices})
+		}
+		out = append(out, ner.ExtractionSchema{Name: name, Fields: fields})
+	}
+	return out, nil
+}
+
+func canonicalStructureField(descriptor extractingtypes.ExtractionStructureField) (ner.FieldType, []string, error) {
+	if value, err := descriptor.AsExtractionStructureField0(); err == nil {
+		fieldType, err := canonicalStructureFieldType(value)
+		return fieldType, nil, err
+	}
+	value, err := descriptor.AsExtractionStructureField1()
+	if err != nil {
+		return 0, nil, errors.New("descriptor must be a string or object")
+	}
+	fieldType := ner.FieldTypeStr
+	if value.Type != nil {
+		fieldType, err = canonicalStructureFieldType(string(*value.Type))
+		if err != nil {
+			return 0, nil, err
+		}
+	}
+	var choices []string
+	if value.Enum != nil {
+		if len(*value.Enum) < 2 {
+			return 0, nil, errors.New("enum must contain at least two strings")
+		}
+		choices = make([]string, len(*value.Enum))
+		for i, choice := range *value.Enum {
+			if choice == "" {
+				return 0, nil, errors.New("enum values must be non-empty strings")
+			}
+			choices[i] = choice
+		}
+	}
+	return fieldType, choices, nil
+}
+
+func canonicalStructureFieldType(value string) (ner.FieldType, error) {
+	switch strings.ToLower(value) {
+	case "str", "string":
+		return ner.FieldTypeStr, nil
+	case "list", "array":
+		return ner.FieldTypeList, nil
+	default:
+		return 0, fmt.Errorf("unsupported type %q", value)
+	}
 }
 
 // stringsToModelInfoMap converts a flat list of model names to a map with empty ModelInfo.
@@ -242,7 +539,6 @@ func (t *TermiteAPI) ListModels(w http.ResponseWriter, r *http.Request) {
 		Rerankers:      map[string]ModelInfo{},
 		Embedders:      map[string]ModelInfo{},
 		Generators:     map[string]ModelInfo{},
-		Recognizers:    map[string]ModelInfo{},
 		Extractors:     map[string]ModelInfo{},
 		Rewriters:      map[string]ModelInfo{},
 		Classifiers:    map[string]ModelInfo{},
@@ -273,14 +569,10 @@ func (t *TermiteAPI) ListModels(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if t.node.nerRegistry != nil {
-		resp.Recognizers = capsMapToModelInfoMap(t.node.nerRegistry.List())
-
-		// Populate extractors: NER models with extraction capability
-		for name, caps := range t.node.nerRegistry.List() {
-			if slices.Contains(caps, string(modelregistry.CapabilityExtraction)) {
-				resp.Extractors[name] = ModelInfo{Capabilities: caps}
-			}
-		}
+		// Entity, relation, and structured extraction share one public model
+		// collection. Individual capabilities describe which modes each model
+		// can execute.
+		resp.Extractors = capsMapToModelInfoMap(t.node.nerRegistry.List())
 	}
 
 	if t.node.seq2seqRegistry != nil {
@@ -966,10 +1258,8 @@ func (ln *TermiteNode) handleApiRerank(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleApiRecognize handles NER (Named Entity Recognition) requests
-func (ln *TermiteNode) handleApiRecognize(w http.ResponseWriter, r *http.Request) {
-	defer func() { _ = r.Body.Close() }()
-
+// handleEntityExtraction executes the canonical entity/relation extraction request.
+func (ln *TermiteNode) handleEntityExtraction(w http.ResponseWriter, r *http.Request, req entityExtractionRequest) {
 	// Check if NER is available
 	if ln.nerRegistry == nil || len(ln.nerRegistry.List()) == 0 {
 		http.Error(w, "NER not available: no models configured", http.StatusServiceUnavailable)
@@ -995,29 +1285,6 @@ func (ln *TermiteNode) handleApiRecognize(w http.ResponseWriter, r *http.Request
 
 	// Update queue metrics
 	UpdateQueueMetrics(ln.requestQueue.Stats())
-
-	// Decode request
-	var req struct {
-		Model          string          `json:"model"`           // Model name to use (required)
-		Texts          []string        `json:"texts"`           // Texts to extract entities from
-		Labels         []string        `json:"labels"`          // Custom labels for zero-shot models (optional)
-		RelationLabels []string        `json:"relation_labels"` // Relation types to extract (optional, for models with relations capability)
-		Resolver       *ResolverConfig `json:"resolver"`        // Entity resolution config (optional)
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	// Validate request
-	if req.Model == "" {
-		http.Error(w, "model is required", http.StatusBadRequest)
-		return
-	}
-	if len(req.Texts) == 0 {
-		http.Error(w, "texts are required", http.StatusBadRequest)
-		return
-	}
 
 	// Acquire model from registry
 	model, err := ln.nerRegistry.Acquire(req.Model)
@@ -1095,11 +1362,11 @@ func (ln *TermiteNode) handleApiRecognize(w http.ResponseWriter, r *http.Request
 		zap.Int("total_relations", utils.CountNested(relations)))
 
 	// Convert internal Entity type to API response type
-	apiEntities := make([][]RecognizeEntity, len(entities))
+	apiEntities := make([][]extractedEntity, len(entities))
 	for i, textEntities := range entities {
-		apiEntities[i] = make([]RecognizeEntity, len(textEntities))
+		apiEntities[i] = make([]extractedEntity, len(textEntities))
 		for j, e := range textEntities {
-			apiEntities[i][j] = RecognizeEntity{
+			apiEntities[i][j] = extractedEntity{
 				Text:  e.Text,
 				Label: e.Label,
 				Start: e.Start,
@@ -1109,22 +1376,22 @@ func (ln *TermiteNode) handleApiRecognize(w http.ResponseWriter, r *http.Request
 		}
 	}
 
-	// Convert internal Relation type to API response type
-	var apiRelations [][]Relation
+	// Convert internal relation type to the unified extraction response type.
+	var apiRelations [][]extractedRelation
 	if len(relations) > 0 {
-		apiRelations = make([][]Relation, len(relations))
+		apiRelations = make([][]extractedRelation, len(relations))
 		for i, textRelations := range relations {
-			apiRelations[i] = make([]Relation, len(textRelations))
+			apiRelations[i] = make([]extractedRelation, len(textRelations))
 			for j, rel := range textRelations {
-				apiRelations[i][j] = Relation{
-					Head: RecognizeEntity{
+				apiRelations[i][j] = extractedRelation{
+					Head: extractedEntity{
 						Text:  rel.HeadEntity.Text,
 						Label: rel.HeadEntity.Label,
 						Start: rel.HeadEntity.Start,
 						End:   rel.HeadEntity.End,
 						Score: rel.HeadEntity.Score,
 					},
-					Tail: RecognizeEntity{
+					Tail: extractedEntity{
 						Text:  rel.TailEntity.Text,
 						Label: rel.TailEntity.Label,
 						Start: rel.TailEntity.Start,
@@ -1141,16 +1408,12 @@ func (ln *TermiteNode) handleApiRecognize(w http.ResponseWriter, r *http.Request
 	// If resolver config is present, run entity resolution to deduplicate.
 	if req.Resolver != nil {
 		cfg := ner.ResolverConfig{
-			SimilarityThreshold:   float64(req.Resolver.SimilarityThreshold),
-			TypeMustMatch:         req.Resolver.TypeMustMatch,
-			MinEntityConfidence:   req.Resolver.MinEntityConfidence,
-			MinRelationConfidence: req.Resolver.MinRelationConfidence,
-			DeduplicateRelations:  req.Resolver.DeduplicateRelations,
-			TrackProvenance:       req.Resolver.TrackProvenance,
-		}
-		// Apply defaults for zero-valued threshold (omitzero sends 0 for unset floats).
-		if cfg.SimilarityThreshold == 0 {
-			cfg.SimilarityThreshold = 0.85
+			SimilarityThreshold:   float64(valueOr(req.Resolver.SimilarityThreshold, float32(0.85))),
+			TypeMustMatch:         valueOr(req.Resolver.TypeMustMatch, true),
+			MinEntityConfidence:   valueOr(req.Resolver.MinEntityConfidence, float32(0)),
+			MinRelationConfidence: valueOr(req.Resolver.MinRelationConfidence, float32(0)),
+			DeduplicateRelations:  valueOr(req.Resolver.DeduplicateRelations, true),
+			TrackProvenance:       valueOr(req.Resolver.TrackProvenance, true),
 		}
 
 		kg := ner.BuildKnowledgeGraph(entities, relations, cfg)
@@ -1161,61 +1424,117 @@ func (ln *TermiteNode) handleApiRecognize(w http.ResponseWriter, r *http.Request
 			entityByID[kg.Entities[i].ID] = &kg.Entities[i]
 		}
 
-		// Flatten resolved entities into a single array (no per-text grouping).
-		resolvedEntities := make([]RecognizeEntity, len(kg.Entities))
-		for i, re := range kg.Entities {
-			resolvedEntities[i] = RecognizeEntity{
+		apiEntities = make([][]extractedEntity, len(req.Texts))
+		for _, re := range kg.Entities {
+			resolvedEntity := extractedEntity{
 				Text:  re.CanonicalName,
 				Label: re.Label,
 				Score: re.Score,
 			}
-		}
-		apiEntities = [][]RecognizeEntity{resolvedEntities}
-
-		// Flatten resolved relations into a single array.
-		if len(kg.Relations) > 0 {
-			resolvedRelations := make([]Relation, len(kg.Relations))
-			for i, rr := range kg.Relations {
-				head := entityByID[rr.HeadID]
-				tail := entityByID[rr.TailID]
-				resolvedRelations[i] = Relation{
-					Head: RecognizeEntity{
-						Text:  head.CanonicalName,
-						Label: head.Label,
-						Score: head.Score,
-					},
-					Tail: RecognizeEntity{
-						Text:  tail.CanonicalName,
-						Label: tail.Label,
-						Score: tail.Score,
-					},
-					Label: rr.Label,
-					Score: rr.Score,
+			for _, textIndex := range re.TextIndices {
+				if textIndex >= 0 && textIndex < len(apiEntities) {
+					apiEntities[textIndex] = append(apiEntities[textIndex], resolvedEntity)
 				}
 			}
-			apiRelations = [][]Relation{resolvedRelations}
+		}
+
+		apiRelations = make([][]extractedRelation, len(req.Texts))
+		for _, rr := range kg.Relations {
+			head := entityByID[rr.HeadID]
+			tail := entityByID[rr.TailID]
+			if head == nil || tail == nil {
+				continue
+			}
+			resolvedRelation := extractedRelation{
+				Head: extractedEntity{
+					Text:  head.CanonicalName,
+					Label: head.Label,
+					Score: head.Score,
+				},
+				Tail: extractedEntity{
+					Text:  tail.CanonicalName,
+					Label: tail.Label,
+					Score: tail.Score,
+				},
+				Label: rr.Label,
+				Score: rr.Score,
+			}
+			for _, textIndex := range rr.TextIndices {
+				if textIndex >= 0 && textIndex < len(apiRelations) {
+					apiRelations[textIndex] = append(apiRelations[textIndex], resolvedRelation)
+				}
+			}
 		}
 	}
 
-	// Send response
-	nerResp := RecognizeResponse{
-		Model:     req.Model,
-		Entities:  apiEntities,
-		Relations: apiRelations,
+	data := make([]extractingtypes.ExtractionObject, len(apiEntities))
+	for i := range apiEntities {
+		if i < len(req.IDs) && req.IDs[i] != "" {
+			data[i].Id = &req.IDs[i]
+		}
+		entities := make([]extractingtypes.ExtractionEntity, len(apiEntities[i]))
+		for j, entity := range apiEntities[i] {
+			entities[j] = extractingtypes.ExtractionEntity{Text: entity.Text, Label: entity.Label}
+			if req.IncludeSpans {
+				entities[j].Start, entities[j].End = &entity.Start, &entity.End
+			}
+			if req.IncludeConfidence {
+				entities[j].Score = &entity.Score
+			}
+		}
+		data[i].Entities = &entities
+		if i < len(apiRelations) {
+			relations := make([]extractingtypes.ExtractionRelation, 0, len(apiRelations[i]))
+			for _, relation := range apiRelations[i] {
+				head, headOK := extractedEntityIndex(apiEntities[i], relation.Head)
+				tail, tailOK := extractedEntityIndex(apiEntities[i], relation.Tail)
+				if !headOK || !tailOK {
+					ln.logger.Error("relation references an entity missing from extraction output", zap.Int("input_index", i), zap.String("relation", relation.Label))
+					http.Error(w, "invalid relation extraction result", http.StatusInternalServerError)
+					return
+				}
+				apiRelation := extractingtypes.ExtractionRelation{Type: relation.Label, Source: &extractingtypes.ExtractionRelationEndpoint{EntityIndex: &head}, Target: &extractingtypes.ExtractionRelationEndpoint{EntityIndex: &tail}}
+				if req.IncludeConfidence {
+					apiRelation.Score = &relation.Score
+				}
+				relations = append(relations, apiRelation)
+			}
+			data[i].Relations = &relations
+		}
+	}
+	response := extractingtypes.ExtractionResponse{
+		Object: extractingtypes.Extraction,
+		Data:   data,
+		Model:  req.Model,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(nerResp); err != nil {
+	if err := json.NewEncoder(w).Encode(response); err != nil {
 		ln.logger.Error("encoding response", zap.Error(err))
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 }
 
-// handleApiExtract handles structured JSON extraction requests
-func (ln *TermiteNode) handleApiExtract(w http.ResponseWriter, r *http.Request) {
-	defer func() { _ = r.Body.Close() }()
+func extractedEntityIndex(entities []extractedEntity, needle extractedEntity) (int, bool) {
+	for i, entity := range entities {
+		if entity.Text == needle.Text && entity.Label == needle.Label && entity.Start == needle.Start && entity.End == needle.End {
+			return i, true
+		}
+	}
+	return 0, false
+}
 
+// handleStructuredExtract executes a canonical structured extraction request.
+func (ln *TermiteNode) handleStructuredExtract(
+	w http.ResponseWriter,
+	r *http.Request,
+	modelName string,
+	texts []string,
+	ids []string,
+	schemas []ner.ExtractionSchema,
+	options *extractingtypes.ExtractionOptions,
+) {
 	// Check if NER is available
 	if ln.nerRegistry == nil || len(ln.nerRegistry.List()) == 0 {
 		http.Error(w, "JSON extraction not available: no models configured", http.StatusServiceUnavailable)
@@ -1242,83 +1561,46 @@ func (ln *TermiteNode) handleApiExtract(w http.ResponseWriter, r *http.Request) 
 	// Update queue metrics
 	UpdateQueueMetrics(ln.requestQueue.Stats())
 
-	// Decode request manually instead of using the generated ExtractRequest type because
-	// the generated type uses `bool` with `omitzero`, making it impossible to distinguish
-	// an unset flat_ner (should default to true) from an explicitly set false value.
-	// Using *bool here lets us detect the difference.
-	var req struct {
-		Model             string              `json:"model"`
-		Texts             []string            `json:"texts"`
-		Schema            map[string][]string `json:"schema"`
-		Threshold         float32             `json:"threshold"`
-		FlatNER           *bool               `json:"flat_ner"`
-		IncludeConfidence bool                `json:"include_confidence"`
-		IncludeSpans      bool                `json:"include_spans"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	// Validate request
-	if req.Model == "" {
-		http.Error(w, "model is required", http.StatusBadRequest)
-		return
-	}
-	if len(req.Texts) == 0 {
-		http.Error(w, "texts are required", http.StatusBadRequest)
-		return
-	}
-	if len(req.Schema) == 0 {
-		http.Error(w, "schema is required", http.StatusBadRequest)
-		return
-	}
-
-	// Parse schema
-	schemas, err := ner.ParseSchemaString(req.Schema)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("invalid schema: %v", err), http.StatusBadRequest)
-		return
-	}
-
 	// Build extraction config
 	config := ner.DefaultExtractionConfig()
-	if req.Threshold > 0 {
-		config.Threshold = req.Threshold
+	if options != nil {
+		if options.Threshold != nil {
+			config.Threshold = *options.Threshold
+		}
+		if options.FlatNer != nil {
+			config.FlatNER = *options.FlatNer
+		}
+		config.IncludeConfidence = valueOr(options.IncludeConfidence, false)
+		config.IncludeSpans = valueOr(options.IncludeSpans, false)
 	}
-	if req.FlatNER != nil {
-		config.FlatNER = *req.FlatNER
-	}
-	config.IncludeConfidence = req.IncludeConfidence
-	config.IncludeSpans = req.IncludeSpans
 
 	// Acquire model and check extraction support
-	model, err := ln.nerRegistry.Acquire(req.Model)
+	model, err := ln.nerRegistry.Acquire(modelName)
 	if err != nil {
-		writeModelAcquireError(w, ln.logger, req.Model, err)
+		writeModelAcquireError(w, ln.logger, modelName, err)
 		return
 	}
-	defer ln.nerRegistry.Release(req.Model)
+	defer ln.nerRegistry.Release(modelName)
 
 	extractor, ok := model.(ner.Extractor)
 	if !ok {
-		http.Error(w, fmt.Sprintf("model %s does not support extraction", req.Model), http.StatusBadRequest)
+		http.Error(w, fmt.Sprintf("model %s does not support extraction", modelName), http.StatusBadRequest)
 		return
 	}
 
 	// Perform extraction
-	results, err := extractor.Extract(r.Context(), req.Texts, schemas, config)
+	results, err := extractor.Extract(r.Context(), texts, schemas, config)
 	if err != nil {
 		ln.logger.Error("extraction failed",
-			zap.String("model", req.Model),
-			zap.Int("num_texts", len(req.Texts)),
+			zap.String("model", modelName),
+			zap.Int("num_texts", len(texts)),
 			zap.Error(err))
 		http.Error(w, fmt.Sprintf("extraction failed: %v", err), http.StatusInternalServerError)
 		return
 	}
 
 	// Record metrics
-	RecordExtractionRequest(req.Model)
+	RecordExtractionRequest(modelName)
 	totalFields := 0
 	for _, result := range results {
 		for _, instances := range result {
@@ -1327,11 +1609,11 @@ func (ln *TermiteNode) handleApiExtract(w http.ResponseWriter, r *http.Request) 
 			}
 		}
 	}
-	RecordExtractionFields(req.Model, totalFields)
+	RecordExtractionFields(modelName, totalFields)
 
 	ln.logger.Info("extraction request completed",
-		zap.String("model", req.Model),
-		zap.Int("num_texts", len(req.Texts)),
+		zap.String("model", modelName),
+		zap.Int("num_texts", len(texts)),
 		zap.Int("total_fields", totalFields))
 
 	// Convert internal ExtractionResult to API response format
@@ -1363,13 +1645,25 @@ func (ln *TermiteNode) handleApiExtract(w http.ResponseWriter, r *http.Request) 
 		apiResults[i] = apiResult
 	}
 
-	resp := ExtractResponse{
-		Model:   req.Model,
-		Results: apiResults,
+	data := make([]extractingtypes.ExtractionObject, len(apiResults))
+	for i := range apiResults {
+		if i < len(ids) && ids[i] != "" {
+			data[i].Id = &ids[i]
+		}
+		structures := make(map[string]interface{}, len(apiResults[i]))
+		for name, value := range apiResults[i] {
+			structures[name] = value
+		}
+		data[i].Structures = &structures
+	}
+	response := extractingtypes.ExtractionResponse{
+		Object: extractingtypes.Extraction,
+		Data:   data,
+		Model:  modelName,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(resp); err != nil {
+	if err := json.NewEncoder(w).Encode(response); err != nil {
 		ln.logger.Error("encoding response", zap.Error(err))
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

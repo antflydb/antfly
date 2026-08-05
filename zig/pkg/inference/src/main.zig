@@ -248,8 +248,6 @@ pub fn runFromArgs(
         try inference.native_transcribe.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "read")) {
         try inference.native_read.main(allocator, init.io, command_args);
-    } else if (std.mem.eql(u8, command, "recognize")) {
-        try inference.native_recognize.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "extract")) {
         try inference.native_extract.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "compare")) {
@@ -576,8 +574,7 @@ fn printUsage(usage_name: []const u8) void {
         \\  run-artifact Run or validate a compiled offline artifact
         \\  transcribe Run native audio transcription from the command line
         \\  read      Run image/document reading from the command line
-        \\  recognize Run native entity recognition from the command line
-        \\  extract   Run native structured extraction from the command line
+        \\  extract   Run native entity, relation, or structured extraction from the command line
         \\  compare   Compare inference backends or implementations
         \\  finetune  Run fine-tuning recipes, datasets, adapters, train/eval, and workflows
         \\  smoke     Run a native GGUF/SafeTensors smoke test

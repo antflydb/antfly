@@ -16,6 +16,7 @@ package ner
 
 import (
 	"math"
+	"slices"
 	"testing"
 )
 
@@ -138,6 +139,9 @@ func TestBuildKnowledgeGraph_BasicResolution(t *testing.T) {
 			}
 			if len(e.Mentions) != 2 {
 				t.Errorf("expected 2 mentions, got %d: %v", len(e.Mentions), e.Mentions)
+			}
+			if !slices.Equal(e.TextIndices, []int{0, 1}) {
+				t.Errorf("expected source texts [0 1], got %v", e.TextIndices)
 			}
 		}
 	}

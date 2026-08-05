@@ -141,7 +141,7 @@ const inference_delegated_steps = [_][]const u8{
     "bench-linalg",
     "bench-audio",
     "bench-gliner2-native",
-    "gliner2-production-readiness",
+    "gliner2-entity-training-readiness",
     "test-finetune",
     "test",
     "wasm",
@@ -1676,6 +1676,8 @@ pub fn build(b: *std.Build) void {
             .onnx_graph = termite_onnx_graph_mod,
             .pjrt = termite_pjrt_mod,
             .generating_openapi = generating_openapi_mod,
+            .extraction_openapi = extraction_openapi_mod,
+            .extracting = extracting_mod,
         },
     });
     const inference_build_options_mod = inference_graph.build_options_mod;

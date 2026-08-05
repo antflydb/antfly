@@ -17,7 +17,7 @@ T = TypeVar("T", bound="InferenceConnectionModels")
 class InferenceConnectionModels:
     """Models reported by the provider, grouped by model type. Keys are
     pluralized ConnectedModelType values ("embedders", "generators",
-    "rerankers", "chunkers", "recognizers", "classifiers", "rewriters",
+    "rerankers", "chunkers", "classifiers", "rewriters",
     "readers", "transcribers", "extractors") plus "other" for models
     the provider's listing API does not classify by task. Populated
     only when the request includes the "models" expansion.

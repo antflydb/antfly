@@ -90,7 +90,7 @@ pub const Context = struct {
 /// than sharing one process-wide default. Model discovery and compatibility
 /// inspection are filesystem work, so same-key concurrent requests share a
 /// selection instead of reparsing every installed model. Striped selection
-/// locks allow unrelated recognizers to discover readers concurrently while a
+/// locks allow unrelated extractors to discover readers concurrently while a
 /// short state lock protects the bounded cache. The short TTL makes newly
 /// installed preferred readers visible without a restart. Structurally invalid
 /// candidates enter a bounded cooldown so the same request can immediately try
@@ -331,7 +331,7 @@ pub const ReaderResolver = struct {
 
         // Candidate health is a property of the reader artifact, not of the
         // recognizer that happened to select it. Invalidate every positive
-        // selection of the failed path so other recognizers do not repeat an
+        // selection of the failed path so other extractors do not repeat an
         // expensive model load before observing the global quarantine.
         var entries_it = self.entries.iterator();
         while (entries_it.next()) |entry| {
@@ -497,7 +497,7 @@ const ReaderExtractor = struct {
 };
 
 fn tryResolveRecognizer(ctx: Context, model_name: []const u8) !?Extractor {
-    const path = resolveNamedModelPath(ctx, model_name, "recognizers") catch |err| switch (err) {
+    const path = resolveNamedModelPath(ctx, model_name, "extractors") catch |err| switch (err) {
         error.ModelNotFound => return null,
         else => return err,
     };
@@ -854,7 +854,7 @@ test "resolve prefers reader for image extraction when both exist" {
     defer tmp.cleanup();
 
     try writeTestManifest(tmp.dir, "readers/acme/doc-extract", "{\"type\":\"reader\",\"capabilities\":[\"extraction\"],\"inputs\":[\"image\"]}");
-    try writeTestManifest(tmp.dir, "recognizers/acme/doc-extract", "{\"type\":\"recognizer\",\"capabilities\":[\"extraction\"],\"inputs\":[\"text\"]}");
+    try writeTestManifest(tmp.dir, "extractors/acme/doc-extract", "{\"type\":\"recognizer\",\"capabilities\":[\"extraction\"],\"inputs\":[\"text\"]}");
 
     const models_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
     defer allocator.free(models_dir);
@@ -878,7 +878,7 @@ test "resolve rejects extraction recognizer without text input before inference"
 
     try writeTestManifest(
         tmp.dir,
-        "recognizers/acme/audio-only-extract",
+        "extractors/acme/audio-only-extract",
         "{\"type\":\"recognizer\",\"capabilities\":[\"extraction\"],\"inputs\":[\"audio\"]}",
     );
 
@@ -1191,7 +1191,7 @@ test "one extraction request falls back after a structural reader failure" {
         .reader_text_override = .{ .context = &fake, .readFn = FakeReaders.read },
     };
 
-    const texts = try readTextsForExtraction(ctx, "acme/recognizer", &.{"image"}, .{});
+    const texts = try readTextsForExtraction(ctx, "acme/extractor", &.{"image"}, .{});
     defer {
         for (texts) |text| allocator.free(text);
         allocator.free(texts);
@@ -1200,7 +1200,7 @@ test "one extraction request falls back after a structural reader failure" {
     try std.testing.expectEqual(@as(usize, 2), fake.read_count);
     try std.testing.expectEqualStrings("fallback text", texts[0]);
     try std.testing.expect(resolver.failed_candidates.contains(FakeReaders.preferred));
-    try std.testing.expectEqualStrings(FakeReaders.fallback, resolver.entries.get("acme/recognizer").?.path.?);
+    try std.testing.expectEqualStrings(FakeReaders.fallback, resolver.entries.get("acme/extractor").?.path.?);
 }
 
 test "reader selection does not recache a candidate quarantined during discovery" {
@@ -1244,13 +1244,13 @@ test "reader selection does not recache a candidate quarantined during discovery
         .model_manager = undefined,
         .reader_resolver = &resolver,
         .reader_discovery_override = .{ .context = &discovery, .discoverFn = Discovery.discover },
-    }, "acme/recognizer");
+    }, "acme/extractor");
     defer allocator.free(path);
 
     try std.testing.expectEqual(@as(usize, 2), discovery.calls);
     try std.testing.expect(discovery.saw_quarantine);
     try std.testing.expectEqualStrings(Discovery.fallback, path);
-    try std.testing.expectEqualStrings(Discovery.fallback, resolver.entries.get("acme/recognizer").?.path.?);
+    try std.testing.expectEqualStrings(Discovery.fallback, resolver.entries.get("acme/extractor").?.path.?);
 }
 
 test "structurally broken preferred reader falls back within its cooldown" {
@@ -1314,16 +1314,16 @@ test "reader selection cache evicts the oldest entry at its fixed capacity" {
 
     for (0..max_reader_selection_cache_entries + 1) |i| {
         var key_buf: [64]u8 = undefined;
-        const key = try std.fmt.bufPrint(&key_buf, "acme/recognizer-{d}", .{i});
+        const key = try std.fmt.bufPrint(&key_buf, "acme/extractor-{d}", .{i});
         var path_buf: [64]u8 = undefined;
         const path = try std.fmt.bufPrint(&path_buf, "/models/readers/reader-{d}", .{i});
         try resolver.cacheLocked(key, path, std.Io.Timestamp.fromNanoseconds(@intCast(i)));
     }
 
     try std.testing.expectEqual(max_reader_selection_cache_entries, resolver.entries.count());
-    try std.testing.expect(!resolver.entries.contains("acme/recognizer-0"));
+    try std.testing.expect(!resolver.entries.contains("acme/extractor-0"));
     var newest_key_buf: [64]u8 = undefined;
-    const newest_key = try std.fmt.bufPrint(&newest_key_buf, "acme/recognizer-{d}", .{max_reader_selection_cache_entries});
+    const newest_key = try std.fmt.bufPrint(&newest_key_buf, "acme/extractor-{d}", .{max_reader_selection_cache_entries});
     try std.testing.expect(resolver.entries.contains(newest_key));
 }
 
@@ -1347,13 +1347,13 @@ test "structural reader failure invalidates every recognizer selection" {
     var resolver = ReaderResolver.init(allocator);
     defer resolver.deinit();
     const now = std.Io.Timestamp.now(std.testing.io, .awake);
-    try resolver.cacheLocked("acme/recognizer-a", "/models/readers/broken", now);
-    try resolver.cacheLocked("acme/recognizer-b", "/models/readers/broken", now);
+    try resolver.cacheLocked("acme/extractor-a", "/models/readers/broken", now);
+    try resolver.cacheLocked("acme/extractor-b", "/models/readers/broken", now);
 
     try resolver.markCandidateFailure(std.testing.io, "/models/readers/broken");
 
-    try std.testing.expect(resolver.entries.get("acme/recognizer-a").?.path == null);
-    try std.testing.expect(resolver.entries.get("acme/recognizer-b").?.path == null);
+    try std.testing.expect(resolver.entries.get("acme/extractor-a").?.path == null);
+    try std.testing.expect(resolver.entries.get("acme/extractor-b").?.path == null);
     try std.testing.expectEqual(@as(usize, 1), resolver.failed_candidates.count());
 }
 
@@ -1364,11 +1364,11 @@ test "reader selection state cleans up every allocation failure" {
             defer resolver.deinit();
 
             const now = std.Io.Timestamp.now(std.testing.io, .awake);
-            try resolver.cacheLocked("acme/recognizer", "/models/readers/preferred", now);
+            try resolver.cacheLocked("acme/extractor", "/models/readers/preferred", now);
             try resolver.cacheUnavailableLocked("acme/missing", now);
             try resolver.markCandidateFailure(std.testing.io, "/models/readers/preferred");
             try resolver.markCandidateFailure(std.testing.io, "/models/readers/fallback");
-            var snapshot = try resolver.snapshotLocked("acme/recognizer", now);
+            var snapshot = try resolver.snapshotLocked("acme/extractor", now);
             defer snapshot.deinit();
         }
     };
@@ -1403,7 +1403,7 @@ test "reader path resolution cleans up every allocation failure" {
                     .context = &discovery_context,
                     .discoverFn = Discovery.discover,
                 },
-            }, "acme/recognizer");
+            }, "acme/extractor");
             defer allocator.free(path);
         }
     };
@@ -1533,7 +1533,7 @@ test "reader discovery preserves allocation failure" {
         .models_dir = models_dir,
         .session_manager = undefined,
         .model_manager = undefined,
-    }, "acme/recognizer"));
+    }, "acme/extractor"));
 }
 
 test "extractor resolution cleans up and preserves every allocation failure" {
@@ -1575,7 +1575,7 @@ test "resolve prefers recognizer for text extraction when both exist" {
     defer tmp.cleanup();
 
     try writeTestManifest(tmp.dir, "readers/acme/doc-extract", "{\"type\":\"reader\",\"capabilities\":[\"extraction\"],\"inputs\":[\"image\"]}");
-    try writeTestManifest(tmp.dir, "recognizers/acme/doc-extract", "{\"type\":\"recognizer\",\"capabilities\":[\"extraction\"],\"inputs\":[\"text\"]}");
+    try writeTestManifest(tmp.dir, "extractors/acme/doc-extract", "{\"type\":\"recognizer\",\"capabilities\":[\"extraction\"],\"inputs\":[\"text\"]}");
 
     const models_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
     defer allocator.free(models_dir);

@@ -28,6 +28,18 @@ pub const ResolverConfig = struct {
     track_provenance: bool = true,
 };
 
+pub const ResolvedMention = struct {
+    text_index: usize,
+    text: []const u8,
+    start: usize,
+    end: usize,
+    score: f32,
+
+    fn deinit(self: *ResolvedMention, allocator: std.mem.Allocator) void {
+        allocator.free(self.text);
+    }
+};
+
 pub const ResolvedEntity = struct {
     id: []const u8,
     canonical_name: []const u8,
@@ -35,6 +47,7 @@ pub const ResolvedEntity = struct {
     score: f32,
     mentions: ?[]const []const u8 = null,
     text_indices: ?[]const usize = null,
+    occurrences: []ResolvedMention,
 
     pub fn deinit(self: *ResolvedEntity, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
@@ -45,6 +58,8 @@ pub const ResolvedEntity = struct {
             allocator.free(mentions);
         }
         if (self.text_indices) |indices| allocator.free(indices);
+        for (self.occurrences) |*occurrence| occurrence.deinit(allocator);
+        allocator.free(self.occurrences);
     }
 };
 
@@ -322,13 +337,45 @@ fn buildResolvedEntity(
     errdefer text_indices.deinit(allocator);
     for (indices) |idx| try appendUniqueUsize(allocator, &text_indices, entities[idx].text_index);
 
+    const id = try std.fmt.allocPrint(allocator, "entity-{d}", .{cluster_index});
+    errdefer allocator.free(id);
+    const canonical_name = try allocator.dupe(u8, entities[best_index].entity.text);
+    errdefer allocator.free(canonical_name);
+    const label = try allocator.dupe(u8, entities[best_index].entity.label);
+    errdefer allocator.free(label);
+    const owned_mentions = if (cfg.track_provenance) try mention_values.toOwnedSlice(allocator) else null;
+    errdefer if (owned_mentions) |mentions| {
+        for (mentions) |mention| allocator.free(mention);
+        allocator.free(mentions);
+    };
+    const owned_text_indices = try text_indices.toOwnedSlice(allocator);
+    errdefer allocator.free(owned_text_indices);
+    const occurrences = try allocator.alloc(ResolvedMention, indices.len);
+    var occurrences_initialized: usize = 0;
+    errdefer {
+        for (occurrences[0..occurrences_initialized]) |*occurrence| occurrence.deinit(allocator);
+        allocator.free(occurrences);
+    }
+    for (indices, 0..) |idx, occurrence_index| {
+        const indexed = entities[idx];
+        occurrences[occurrence_index] = .{
+            .text_index = indexed.text_index,
+            .text = try allocator.dupe(u8, indexed.entity.text),
+            .start = indexed.entity.start,
+            .end = indexed.entity.end,
+            .score = indexed.entity.score,
+        };
+        occurrences_initialized += 1;
+    }
+
     return .{
-        .id = try std.fmt.allocPrint(allocator, "entity-{d}", .{cluster_index}),
-        .canonical_name = try allocator.dupe(u8, entities[best_index].entity.text),
-        .label = try allocator.dupe(u8, entities[best_index].entity.label),
+        .id = id,
+        .canonical_name = canonical_name,
+        .label = label,
         .score = max_score,
-        .mentions = if (cfg.track_provenance) try mention_values.toOwnedSlice(allocator) else null,
-        .text_indices = try text_indices.toOwnedSlice(allocator),
+        .mentions = owned_mentions,
+        .text_indices = owned_text_indices,
+        .occurrences = occurrences,
     };
 }
 
@@ -607,5 +654,10 @@ test "buildKnowledgeGraph resolves entities and deduplicates relations" {
     try std.testing.expectEqual(@as(usize, 2), kg.entities.len);
     try std.testing.expectEqual(@as(usize, 1), kg.relations.len);
     try std.testing.expectEqualStrings("Elon Musk", kg.entities[0].canonical_name);
+    try std.testing.expectEqual(@as(usize, 2), kg.entities[0].occurrences.len);
+    try std.testing.expectEqualStrings("Elon Musk", kg.entities[0].occurrences[0].text);
+    try std.testing.expectEqual(@as(usize, 9), kg.entities[0].occurrences[0].end);
+    try std.testing.expectEqualStrings("Musk", kg.entities[0].occurrences[1].text);
+    try std.testing.expectEqual(@as(usize, 4), kg.entities[0].occurrences[1].end);
     try std.testing.expectEqual(@as(f32, 0.90), kg.relations[0].score);
 }

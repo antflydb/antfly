@@ -1,0 +1,1 @@
+{"input":"red cart","output":{"json_structures":[{"item":{"tag":"red","status":{"value":"yes","choices":["yes","no"]}}},{"item":{"tag":"red","status":{"value":"yes","choices":["yes","no"]}}},{"empty":{"status":"","note":""}}]}}

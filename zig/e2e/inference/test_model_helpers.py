@@ -18,6 +18,8 @@ import requests
 from . import models
 from .conftest import InferenceServer, capacity_retry_delay, retry_transient_capacity
 from .models import (
+    DEFAULT_EXTRACTOR_MODEL,
+    DEFAULT_EXTRACTOR_VARIANT,
     DEFAULT_GENERATOR_MODEL,
     DEFAULT_MULTIMODAL_GENERATOR_MODEL,
     DEFAULT_TOOL_GENERATOR_MODEL,
@@ -259,6 +261,32 @@ def test_reader_environment_override_preserves_curated_variant(monkeypatch):
     florence = next(spec for spec in specs if spec.repo == "antflydb/florence-2-base")
 
     assert florence.pull_ref == "hf:antflydb/florence-2-base:gguf:Q4_K"
+
+
+def test_default_extractor_uses_complete_antfly_gguf_bundle(tmp_path):
+    spec = models.spec_for_name(DEFAULT_EXTRACTOR_MODEL, "extractors")
+    assert spec is not None
+    assert spec.variant == DEFAULT_EXTRACTOR_VARIANT
+    assert spec.pull_ref == "hf:antflydb/gliner2-base-v1:gguf:Q4_K"
+    assert models.DEFAULT_MODEL_BY_PATH["/ai/v1/extract"] == (
+        DEFAULT_EXTRACTOR_MODEL,
+        "extractors",
+    )
+
+    model_dir = tmp_path / DEFAULT_EXTRACTOR_MODEL
+    model_dir.mkdir(parents=True)
+    encoder = model_dir / "gliner2-encoder.Q4_K.gguf"
+    head = model_dir / "gliner2-head.Q4_K.gguf"
+    encoder.write_bytes(b"encoder")
+
+    partial = models._probe_model_dir(model_dir)
+    assert partial is not None
+    assert not models._model_satisfies_spec(partial, spec)
+
+    head.write_bytes(b"head")
+    complete = models._probe_model_dir(model_dir)
+    assert complete is not None
+    assert models._model_satisfies_spec(complete, spec)
 
 
 def test_generator_environment_override_preserves_curated_variant(monkeypatch):

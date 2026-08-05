@@ -461,12 +461,13 @@ pub const DecoderRuntimeApplyLinearQkvRequest = struct {
 };
 
 pub const DecoderRuntimeActivationKind = enum(u8) {
-    gelu,
-    gelu_new,
-    silu,
-    relu,
-    quick_gelu,
-    relu_squared,
+    gelu = 0,
+    gelu_new = 1,
+    silu = 2,
+    relu = 3,
+    quick_gelu = 4,
+    relu_squared = 5,
+    gelu_exact = 17,
 };
 
 pub const PlannedLayerContract = struct {
@@ -498,6 +499,45 @@ pub const DecoderRuntimeApplyActivationRequest = struct {
     dim: usize,
 };
 
+pub const DecoderRuntimeApplyGeluBackwardRequest = struct {
+    input: CT,
+    upstream_grad: CT,
+    dim: usize,
+    exact: bool = false,
+};
+
+pub const DecoderRuntimeFfnGeluBackwardChainRequest = struct {
+    first_lhs: CT,
+    first_rhs: CT,
+    first_rhs_contract_axis: u32,
+    second_lhs: CT,
+    second_rhs: CT,
+    second_rhs_contract_axis: u32,
+    gelu_input: CT,
+    output_rhs: CT,
+    output_rhs_contract_axis: u32,
+    rows: usize,
+    hidden_size: usize,
+    intermediate_size: usize,
+    first_k: usize,
+    second_k: usize,
+    exact: bool = false,
+};
+
+pub const DecoderRuntimeFfnGeluBackwardChainResult = struct {
+    first: CT,
+    second_branch: CT,
+    upstream: CT,
+    gelu: CT,
+    output: CT,
+};
+
+pub const DecoderRuntimeFfnGeluBackwardOutputResult = struct {
+    first: CT,
+    gelu: CT,
+    output: CT,
+};
+
 pub const DecoderRuntimeApplyAddRequest = struct {
     lhs: CT,
     rhs: CT,
@@ -517,6 +557,21 @@ pub const DecoderRuntimeApplyScaledAddScaleRequest = struct {
     dim: usize,
     lhs_scale: f32,
     output_scale: f32,
+};
+
+pub const DecoderRuntimeApplyMultiplyAddRequest = struct {
+    lhs: CT,
+    rhs: CT,
+    addend: CT,
+    dim: usize,
+};
+
+pub const DecoderRuntimeApplyMultiplyAdd2Request = struct {
+    lhs0: CT,
+    rhs0: CT,
+    lhs1: CT,
+    rhs1: CT,
+    dim: usize,
 };
 
 pub const AttentionMode = enum {

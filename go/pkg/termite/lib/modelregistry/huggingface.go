@@ -786,9 +786,9 @@ var pipelineTagToModelType = map[string]ModelType{
 	"zero-shot-classification": ModelTypeClassifier,
 
 	// Recognizer models
-	"object-detection":     ModelTypeRecognizer,
-	"image-classification": ModelTypeRecognizer,
-	"image-segmentation":   ModelTypeRecognizer,
+	"object-detection":     ModelTypeExtractor,
+	"image-classification": ModelTypeExtractor,
+	"image-segmentation":   ModelTypeExtractor,
 }
 
 // GetRepoInfo fetches the HuggingFace model info including pipeline_tag and tags.

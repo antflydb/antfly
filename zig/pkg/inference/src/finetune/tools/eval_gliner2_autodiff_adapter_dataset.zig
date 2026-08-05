@@ -20,13 +20,19 @@ const gliner2_autodiff = inference.finetune.gliner2_real_autodiff;
 const compat = inference.io.compat;
 const adapter_eval = @import("eval_gliner2_autodiff_adapter.zig");
 
+const canonical_normalization = gliner2_data.canonical_scoring_normalization;
+const canonical_normalization_profile = gliner2_data.canonical_scoring_normalization_profile;
+
 const Options = struct {
     model_dir: []const u8,
     adapter_dir: []const u8,
     eval_data: []const u8,
     entity_types_csv: []const u8,
     seq_len: usize = 32,
-    max_span_width: usize = 4,
+    /// Candidate-span width. Defaults to the adapter manifest's trained
+    /// max_span_width (trainer default 8 for manifests predating the field);
+    /// set explicitly to override.
+    max_span_width: ?usize = null,
     backend: adapter_eval.EvalBackend = .native,
     compiled_required: bool = false,
     objective: gliner2_autodiff.GlinerObjective = .span_start,
@@ -40,10 +46,13 @@ const Options = struct {
     best_span_per_label_start: bool = false,
     best_label_per_span_start: bool = false,
     require_entitylike_span: bool = false,
+    match_text_label_only: bool = false,
     sweep_thresholds: []const f32 = &.{},
     min_precision: ?f64 = null,
     min_recall: ?f64 = null,
     min_f1: ?f64 = null,
+    min_exact_match: ?f64 = null,
+    full_task_minimums: FullTaskMinimums = .{},
     out_path: ?[]const u8 = null,
     thresholds_out_path: ?[]const u8 = null,
     diagnostic_limit: usize = 50,
@@ -75,6 +84,7 @@ const QualitySummary = struct {
     seq_len: usize,
     max_span_width: usize,
     example_count: usize,
+    evaluated_entity_record_count: usize,
     gold_entity_count: usize,
     predicted_entity_count: usize,
     correct_entity_count: usize,
@@ -83,6 +93,7 @@ const QualitySummary = struct {
     precision: f64,
     recall: f64,
     f1: f64,
+    exact_match: f64,
     min_prediction_score: f32,
     label_thresholds: []const LabelThreshold,
     label_score_biases: []const LabelScoreBias,
@@ -92,6 +103,7 @@ const QualitySummary = struct {
     best_span_per_label_start: bool,
     best_label_per_span_start: bool,
     require_entitylike_span: bool,
+    match_mode: []const u8,
     per_label_score_stats: []const LabelScoreStats,
     per_label: []const LabelMetric,
     threshold_sweep: []const ThresholdMetric,
@@ -100,7 +112,139 @@ const QualitySummary = struct {
     recommended_label_thresholds_csv: []const u8,
     diagnostic_limit: usize,
     diagnostics: []const QualityDiagnostic,
+    full_task: ?FullTaskSummary,
+    full_task_minimums: ?FullTaskMinimumSummary,
+    failure: ?[]const u8,
     status: []const u8,
+};
+
+const TaskMetricSummary = struct {
+    true_positive: usize,
+    false_positive: usize,
+    false_negative: usize,
+    precision: f64,
+    recall: f64,
+    micro_f1: f64,
+    exact_match: ?f64,
+    cases: usize,
+    gold_atoms: usize,
+};
+
+const CountMetricSummary = struct {
+    correct: usize,
+    cases: usize,
+    accuracy: ?f64,
+};
+
+const FullTaskSummary = struct {
+    classifications: TaskMetricSummary,
+    json_structures: TaskMetricSummary,
+    relations: TaskMetricSummary,
+    /// Public-result count after empty decoded instances are removed.
+    count: CountMetricSummary,
+    /// Direct accuracy of the `count_pred` argmax before field decoding.
+    raw_count: CountMetricSummary,
+    normalization: []const u8 = canonical_normalization,
+    normalization_profile: []const u8 = canonical_normalization_profile,
+    relation_semantics: []const u8 = "ordered head/tail only",
+};
+
+const FullTaskMinimums = struct {
+    classifications_micro_f1: ?f64 = null,
+    classifications_exact_match: ?f64 = null,
+    json_structures_micro_f1: ?f64 = null,
+    json_structures_exact_match: ?f64 = null,
+    relations_micro_f1: ?f64 = null,
+    relations_exact_match: ?f64 = null,
+    count_accuracy: ?f64 = null,
+
+    fn complete(self: FullTaskMinimums) bool {
+        return self.classifications_micro_f1 != null and
+            self.classifications_exact_match != null and
+            self.json_structures_micro_f1 != null and
+            self.json_structures_exact_match != null and
+            self.relations_micro_f1 != null and
+            self.relations_exact_match != null and
+            self.count_accuracy != null;
+    }
+};
+
+const FullTaskMinimumSummary = struct {
+    classifications_micro_f1: f64,
+    classifications_exact_match: f64,
+    json_structures_micro_f1: f64,
+    json_structures_exact_match: f64,
+    relations_micro_f1: f64,
+    relations_exact_match: f64,
+    count_accuracy: f64,
+};
+
+const TaskMetricAccumulator = struct {
+    true_positive: usize = 0,
+    false_positive: usize = 0,
+    false_negative: usize = 0,
+    exact_correct: usize = 0,
+    cases: usize = 0,
+
+    fn add(self: *TaskMetricAccumulator, gold: usize, predicted: usize, correct: usize, exact: bool) void {
+        self.true_positive += correct;
+        self.false_positive += predicted - correct;
+        self.false_negative += gold - correct;
+        self.exact_correct += @intFromBool(exact);
+        self.cases += 1;
+    }
+
+    fn finish(self: TaskMetricAccumulator) TaskMetricSummary {
+        const precision = ratio(self.true_positive, self.true_positive + self.false_positive);
+        const recall = ratio(self.true_positive, self.true_positive + self.false_negative);
+        return .{
+            .true_positive = self.true_positive,
+            .false_positive = self.false_positive,
+            .false_negative = self.false_negative,
+            .precision = precision,
+            .recall = recall,
+            .micro_f1 = f1Score(precision, recall),
+            .exact_match = if (self.cases == 0) null else ratio(self.exact_correct, self.cases),
+            .cases = self.cases,
+            .gold_atoms = self.true_positive + self.false_negative,
+        };
+    }
+};
+
+const CountMetricAccumulator = struct {
+    correct: usize = 0,
+    cases: usize = 0,
+
+    fn add(self: *CountMetricAccumulator, expected: usize, actual: usize) void {
+        self.correct += @intFromBool(expected == actual);
+        self.cases += 1;
+    }
+
+    fn finish(self: CountMetricAccumulator) CountMetricSummary {
+        return .{
+            .correct = self.correct,
+            .cases = self.cases,
+            .accuracy = if (self.cases == 0) null else ratio(self.correct, self.cases),
+        };
+    }
+};
+
+const FullTaskAccumulator = struct {
+    classifications: TaskMetricAccumulator = .{},
+    json_structures: TaskMetricAccumulator = .{},
+    relations: TaskMetricAccumulator = .{},
+    count: CountMetricAccumulator = .{},
+    raw_count: CountMetricAccumulator = .{},
+
+    fn finish(self: FullTaskAccumulator) FullTaskSummary {
+        return .{
+            .classifications = self.classifications.finish(),
+            .json_structures = self.json_structures.finish(),
+            .relations = self.relations.finish(),
+            .count = self.count.finish(),
+            .raw_count = self.raw_count.finish(),
+        };
+    }
 };
 
 const LabelScoreStats = struct {
@@ -177,6 +321,8 @@ const EvalAccumulator = struct {
     gold_total: usize = 0,
     predicted_total: usize = 0,
     correct_total: usize = 0,
+    exact_cases: usize = 0,
+    exact_correct: usize = 0,
 
     fn init(allocator: std.mem.Allocator, threshold: f32, entity_types: []const []const u8) !EvalAccumulator {
         const label_metrics = try allocator.alloc(LabelMetric, entity_types.len);
@@ -207,6 +353,11 @@ const EvalAccumulator = struct {
         for (self.label_metrics) |*metric| finishMetric(metric);
     }
 
+    fn addExact(self: *EvalAccumulator, correct: bool) void {
+        self.exact_cases += 1;
+        if (correct) self.exact_correct += 1;
+    }
+
     fn precision(self: *const EvalAccumulator) f64 {
         return ratio(self.correct_total, self.predicted_total);
     }
@@ -217,6 +368,10 @@ const EvalAccumulator = struct {
 
     fn f1(self: *const EvalAccumulator) f64 {
         return f1Score(self.precision(), self.recall());
+    }
+
+    fn exactMatch(self: *const EvalAccumulator) f64 {
+        return ratio(self.exact_correct, self.exact_cases);
     }
 
     fn thresholdMetric(self: *const EvalAccumulator) ThresholdMetric {
@@ -237,18 +392,20 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(opts.sweep_thresholds);
     defer freeLabelThresholds(allocator, opts.label_thresholds);
     defer freeLabelScoreBiases(allocator, opts.label_score_biases);
-    const entity_types = try parseCsv(allocator, opts.entity_types_csv);
+    var loaded_records = try gliner2_data.loadTrainingRecords(allocator, opts.eval_data, null);
+    defer loaded_records.deinit();
+
+    const limit = if (opts.max_examples == 0) loaded_records.records.len else @min(opts.max_examples, loaded_records.records.len);
+    if (limit == 0) return error.NoEvalExamples;
+    const configured_entity_types = try parseCsv(allocator, opts.entity_types_csv);
+    defer freeStringSlice(allocator, configured_entity_types);
+    const entity_types = try metricEntityTypesForRecordsAlloc(allocator, configured_entity_types, loaded_records.records[0..limit]);
     defer freeStringSlice(allocator, entity_types);
     try validateLabelThresholds(opts.label_thresholds, entity_types);
     try validateLabelScoreBiases(opts.label_score_biases, entity_types);
 
-    var loaded = try gliner2_data.loadExamples(allocator, opts.eval_data, null);
-    defer loaded.deinit();
-
-    const limit = if (opts.max_examples == 0) loaded.examples.len else @min(opts.max_examples, loaded.examples.len);
-    if (limit == 0) return error.NoEvalExamples;
-
     const decode_floor = minDecodeThreshold(opts);
+    const max_span_width = try adapter_eval.resolveAdapterMaxSpanWidth(allocator, opts.adapter_dir, opts.max_span_width);
     var main_accum = try EvalAccumulator.init(allocator, opts.min_prediction_score, entity_types);
     defer main_accum.deinit(allocator);
     const score_stats = try allocator.alloc(LabelScoreStats, entity_types.len);
@@ -263,8 +420,34 @@ pub fn main(init: std.process.Init) !void {
 
     var diagnostics = std.ArrayListUnmanaged(QualityDiagnostic).empty;
     defer diagnostics.deinit(allocator);
+    var full_task_accum = FullTaskAccumulator{};
 
-    for (loaded.examples[0..limit], 0..) |ex, example_index| {
+    const native_session: ?*adapter_eval.NativeEvalSession = if (opts.backend == .native and opts.objective != .token)
+        try adapter_eval.NativeEvalSession.init(allocator, .{
+            .model_dir = opts.model_dir,
+            .adapter_dir = opts.adapter_dir,
+            .seq_len = opts.seq_len,
+            .max_span_width = max_span_width,
+            .objective_override = opts.objective,
+            .prediction_threshold = decode_floor,
+            .label_score_biases = opts.label_score_biases,
+        })
+    else
+        null;
+    defer if (native_session) |session| session.deinit();
+
+    for (loaded_records.records[0..limit], 0..) |record, example_index| {
+        var full_prediction: ?adapter_eval.NativeRecordPrediction = null;
+        defer if (full_prediction) |*prediction| prediction.deinit(allocator);
+        if (native_session != null and opts.objective == .gliner2_total_loss) {
+            full_prediction = try native_session.?.evalRecord(record);
+            try scoreFullTaskRecord(allocator, &full_task_accum, record, full_prediction.?);
+        }
+
+        var record_entities = try recordEntitiesAlloc(allocator, record);
+        defer if (record_entities) |*entities| entities.deinit(allocator);
+        if (record_entities == null) continue;
+        const ex = record_entities.?.example(record.text);
         for (ex.entities) |ent| {
             if (indexOfLabel(entity_types, ent.label)) |label_idx| {
                 main_accum.addGold(label_idx);
@@ -272,29 +455,52 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
-        var summary = try adapter_eval.evalSavedAdapterText(allocator, .{
-            .model_dir = opts.model_dir,
-            .adapter_dir = opts.adapter_dir,
-            .text = ex.text,
-            .entity_types_csv = opts.entity_types_csv,
-            .seq_len = opts.seq_len,
-            .max_span_width = opts.max_span_width,
-            .backend = opts.backend,
-            .compiled_required = opts.compiled_required,
-            .objective_override = opts.objective,
-            .prediction_threshold = decode_floor,
-            .label_score_biases = opts.label_score_biases,
-        });
-        defer summary.deinit(allocator);
-
-        observeScores(score_stats, entity_types, summary.predictions);
         var diagnostic_ctx = DiagnosticContext{
             .items = &diagnostics,
             .example_index = example_index,
             .limit = opts.diagnostic_limit,
         };
-        try scoreExample(allocator, &main_accum, ex, entity_types, summary.predictions, opts, &diagnostic_ctx);
-        for (sweep_accums) |*accum| try scoreExample(allocator, accum, ex, entity_types, summary.predictions, opts, null);
+
+        var session_predictions: ?[]adapter_eval.TopEntity = null;
+        defer if (session_predictions) |predictions| adapter_eval.freeEntityPredictions(allocator, predictions);
+        var saved_summary: ?adapter_eval.EvalSummary = null;
+        defer if (saved_summary) |*summary| summary.deinit(allocator);
+        if (full_prediction) |prediction| {
+            session_predictions = try copyTopEntitySlice(allocator, prediction.entity_predictions);
+        } else if (native_session) |session| {
+            session_predictions = session.evalText(record.text, record_entities.?.schema) catch |err| switch (err) {
+                error.NoEntityPredictions => null,
+                else => return err,
+            };
+        } else {
+            const record_biases = try labelScoreBiasesForSchemaAlloc(allocator, opts.label_score_biases, record_entities.?.schema);
+            defer allocator.free(record_biases);
+            saved_summary = adapter_eval.evalSavedAdapterText(allocator, .{
+                .model_dir = opts.model_dir,
+                .adapter_dir = opts.adapter_dir,
+                .text = record.text,
+                .entity_types = record_entities.?.schema,
+                .seq_len = opts.seq_len,
+                .max_span_width = max_span_width,
+                .backend = opts.backend,
+                .compiled_required = opts.compiled_required,
+                .objective_override = opts.objective,
+                .prediction_threshold = decode_floor,
+                .label_score_biases = record_biases,
+            }) catch |err| switch (err) {
+                error.NoEntityPredictions => null,
+                else => return err,
+            };
+        }
+        const predictions: []const adapter_eval.TopEntity = if (session_predictions) |items|
+            items
+        else if (saved_summary) |summary|
+            summary.predictions
+        else
+            &.{};
+        observeScores(score_stats, entity_types, predictions);
+        try scoreExample(allocator, &main_accum, ex, entity_types, predictions, opts, true, &diagnostic_ctx);
+        for (sweep_accums) |*accum| try scoreExample(allocator, accum, ex, entity_types, predictions, opts, true, null);
     }
 
     main_accum.finish();
@@ -302,6 +508,7 @@ pub fn main(init: std.process.Init) !void {
     const precision = main_accum.precision();
     const recall = main_accum.recall();
     const f1 = main_accum.f1();
+    const exact_match = main_accum.exactMatch();
 
     const threshold_sweep = try allocator.alloc(ThresholdMetric, sweep_accums.len);
     defer allocator.free(threshold_sweep);
@@ -311,7 +518,11 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(best_per_label_thresholds);
     const recommended_label_thresholds_csv = try formatLabelThresholdCsv(allocator, best_per_label_thresholds);
     defer allocator.free(recommended_label_thresholds_csv);
-    const quality_gate_failure = try qualityGateFailure(precision, recall, f1, opts);
+    const full_task_summary: ?FullTaskSummary = if (opts.objective == .gliner2_total_loss)
+        full_task_accum.finish()
+    else
+        null;
+    const quality_gate_failure = try qualityGateFailure(precision, recall, f1, exact_match, full_task_summary, opts);
 
     const summary = QualitySummary{
         .model_dir = opts.model_dir,
@@ -320,8 +531,9 @@ pub fn main(init: std.process.Init) !void {
         .entity_types = entity_types,
         .objective = objectiveName(opts.objective),
         .seq_len = opts.seq_len,
-        .max_span_width = opts.max_span_width,
+        .max_span_width = max_span_width,
         .example_count = limit,
+        .evaluated_entity_record_count = main_accum.exact_cases,
         .gold_entity_count = main_accum.gold_total,
         .predicted_entity_count = main_accum.predicted_total,
         .correct_entity_count = main_accum.correct_total,
@@ -330,6 +542,7 @@ pub fn main(init: std.process.Init) !void {
         .precision = precision,
         .recall = recall,
         .f1 = f1,
+        .exact_match = exact_match,
         .min_prediction_score = opts.min_prediction_score,
         .label_thresholds = opts.label_thresholds,
         .label_score_biases = opts.label_score_biases,
@@ -339,6 +552,7 @@ pub fn main(init: std.process.Init) !void {
         .best_span_per_label_start = opts.best_span_per_label_start,
         .best_label_per_span_start = opts.best_label_per_span_start,
         .require_entitylike_span = opts.require_entitylike_span,
+        .match_mode = if (opts.match_text_label_only) "text-label" else "exact-offset",
         .per_label_score_stats = score_stats,
         .per_label = main_accum.label_metrics,
         .threshold_sweep = threshold_sweep,
@@ -347,6 +561,9 @@ pub fn main(init: std.process.Init) !void {
         .recommended_label_thresholds_csv = recommended_label_thresholds_csv,
         .diagnostic_limit = opts.diagnostic_limit,
         .diagnostics = diagnostics.items,
+        .full_task = full_task_summary,
+        .full_task_minimums = fullTaskMinimumSummary(opts.full_task_minimums),
+        .failure = if (quality_gate_failure) |failure| @tagName(failure) else null,
         .status = if (quality_gate_failure == null) "passed" else "failed",
     };
 
@@ -367,9 +584,28 @@ const QualityGateFailure = enum {
     precision,
     recall,
     f1,
+    exact_match,
+    classifications_coverage,
+    classifications_micro_f1,
+    classifications_exact_match,
+    json_structures_coverage,
+    json_structures_micro_f1,
+    json_structures_exact_match,
+    relations_coverage,
+    relations_micro_f1,
+    relations_exact_match,
+    count_coverage,
+    count_accuracy,
 };
 
-fn qualityGateFailure(precision: f64, recall: f64, f1: f64, opts: Options) !?QualityGateFailure {
+fn qualityGateFailure(
+    precision: f64,
+    recall: f64,
+    f1: f64,
+    exact_match: f64,
+    full_task: ?FullTaskSummary,
+    opts: Options,
+) !?QualityGateFailure {
     if (opts.min_precision) |threshold| {
         if (!std.math.isFinite(threshold) or threshold < 0 or threshold > 1) return error.InvalidQualityThreshold;
         if (precision < threshold) return .precision;
@@ -382,7 +618,38 @@ fn qualityGateFailure(precision: f64, recall: f64, f1: f64, opts: Options) !?Qua
         if (!std.math.isFinite(threshold) or threshold < 0 or threshold > 1) return error.InvalidQualityThreshold;
         if (f1 < threshold) return .f1;
     }
+    if (opts.min_exact_match) |threshold| {
+        if (!std.math.isFinite(threshold) or threshold < 0 or threshold > 1) return error.InvalidQualityThreshold;
+        if (exact_match < threshold) return .exact_match;
+    }
+    if (opts.objective != .gliner2_total_loss) return null;
+    if (!opts.full_task_minimums.complete()) return error.MissingFullTaskQualityThreshold;
+    const metrics = full_task orelse return error.MissingFullTaskMetrics;
+    if (metrics.classifications.cases == 0 or metrics.classifications.gold_atoms == 0) return .classifications_coverage;
+    if (metrics.json_structures.cases == 0 or metrics.json_structures.gold_atoms == 0) return .json_structures_coverage;
+    if (metrics.relations.cases == 0 or metrics.relations.gold_atoms == 0) return .relations_coverage;
+    if (metrics.count.cases == 0) return .count_coverage;
+    if (metrics.classifications.micro_f1 < opts.full_task_minimums.classifications_micro_f1.?) return .classifications_micro_f1;
+    if (metrics.classifications.exact_match.? < opts.full_task_minimums.classifications_exact_match.?) return .classifications_exact_match;
+    if (metrics.json_structures.micro_f1 < opts.full_task_minimums.json_structures_micro_f1.?) return .json_structures_micro_f1;
+    if (metrics.json_structures.exact_match.? < opts.full_task_minimums.json_structures_exact_match.?) return .json_structures_exact_match;
+    if (metrics.relations.micro_f1 < opts.full_task_minimums.relations_micro_f1.?) return .relations_micro_f1;
+    if (metrics.relations.exact_match.? < opts.full_task_minimums.relations_exact_match.?) return .relations_exact_match;
+    if (metrics.count.accuracy.? < opts.full_task_minimums.count_accuracy.?) return .count_accuracy;
     return null;
+}
+
+fn fullTaskMinimumSummary(minimums: FullTaskMinimums) ?FullTaskMinimumSummary {
+    if (!minimums.complete()) return null;
+    return .{
+        .classifications_micro_f1 = minimums.classifications_micro_f1.?,
+        .classifications_exact_match = minimums.classifications_exact_match.?,
+        .json_structures_micro_f1 = minimums.json_structures_micro_f1.?,
+        .json_structures_exact_match = minimums.json_structures_exact_match.?,
+        .relations_micro_f1 = minimums.relations_micro_f1.?,
+        .relations_exact_match = minimums.relations_exact_match.?,
+        .count_accuracy = minimums.count_accuracy.?,
+    };
 }
 
 fn qualityGateFailureError(failure: QualityGateFailure) anyerror {
@@ -390,6 +657,18 @@ fn qualityGateFailureError(failure: QualityGateFailure) anyerror {
         .precision => error.EntityPrecisionBelowThreshold,
         .recall => error.EntityRecallBelowThreshold,
         .f1 => error.EntityF1BelowThreshold,
+        .exact_match => error.EntityExactMatchBelowThreshold,
+        .classifications_coverage => error.NoPositiveClassificationCoverage,
+        .classifications_micro_f1 => error.ClassificationF1BelowThreshold,
+        .classifications_exact_match => error.ClassificationExactMatchBelowThreshold,
+        .json_structures_coverage => error.NoPositiveJsonStructureCoverage,
+        .json_structures_micro_f1 => error.JsonStructureF1BelowThreshold,
+        .json_structures_exact_match => error.JsonStructureExactMatchBelowThreshold,
+        .relations_coverage => error.NoPositiveRelationCoverage,
+        .relations_micro_f1 => error.RelationF1BelowThreshold,
+        .relations_exact_match => error.RelationExactMatchBelowThreshold,
+        .count_coverage => error.NoPositiveCountCoverage,
+        .count_accuracy => error.CountAccuracyBelowThreshold,
     };
 }
 
@@ -490,6 +769,7 @@ fn scoreExample(
     entity_types: []const []const u8,
     predictions: []const adapter_eval.TopEntity,
     opts: Options,
+    count_exact: bool,
     diagnostic_ctx: ?*DiagnosticContext,
 ) !void {
     const selected = try selectPredictions(allocator, predictions, accum.threshold, opts);
@@ -498,13 +778,15 @@ fn scoreExample(
     defer allocator.free(gold_matched);
     @memset(gold_matched, false);
 
+    var relevant_predictions: usize = 0;
     for (selected) |prediction_idx| {
         const prediction = predictions[prediction_idx];
         const pred_label_idx = indexOfLabel(entity_types, prediction.label) orelse continue;
+        relevant_predictions += 1;
         var correct = false;
         for (ex.entities, 0..) |ent, gold_idx| {
             if (gold_matched[gold_idx]) continue;
-            if (std.mem.eql(u8, ent.label, prediction.label) and ent.start == prediction.start and ent.end == prediction.end) {
+            if (try predictionMatchesGold(ex, ent, prediction, opts)) {
                 gold_matched[gold_idx] = true;
                 correct = true;
                 break;
@@ -516,6 +798,15 @@ fn scoreExample(
         }
     }
 
+    var relevant_gold: usize = 0;
+    var matched_gold: usize = 0;
+    for (ex.entities, 0..) |ent, gold_idx| {
+        if (indexOfLabel(entity_types, ent.label) == null) continue;
+        relevant_gold += 1;
+        if (gold_matched[gold_idx]) matched_gold += 1;
+    }
+    if (count_exact) accum.addExact(relevant_predictions == relevant_gold and matched_gold == relevant_gold);
+
     if (diagnostic_ctx) |ctx| {
         for (ex.entities, 0..) |ent, gold_idx| {
             if (gold_matched[gold_idx]) continue;
@@ -523,6 +814,210 @@ fn scoreExample(
             try appendFalseNegativeDiagnostic(allocator, ctx, ex, ent, entity_types[label_idx]);
         }
     }
+}
+
+fn copyTopEntitySlice(allocator: std.mem.Allocator, predictions: []const adapter_eval.TopEntity) ![]adapter_eval.TopEntity {
+    const out = try allocator.alloc(adapter_eval.TopEntity, predictions.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |prediction| {
+            allocator.free(prediction.text);
+            allocator.free(prediction.label);
+        }
+        allocator.free(out);
+    }
+    for (predictions, 0..) |prediction, idx| {
+        out[idx] = .{
+            .text = try allocator.dupe(u8, prediction.text),
+            .label = try allocator.dupe(u8, prediction.label),
+            .start = prediction.start,
+            .end = prediction.end,
+            .score = prediction.score,
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn scoreFullTaskRecord(
+    allocator: std.mem.Allocator,
+    accum: *FullTaskAccumulator,
+    record: gliner2_data.UpstreamRecord,
+    prediction: adapter_eval.NativeRecordPrediction,
+) !void {
+    if (prediction.tasks.len != record.tasks.len) return error.NativeTaskPredictionCountMismatch;
+    for (record.tasks, prediction.tasks) |task, predicted| {
+        if (task.kind != predicted.kind or !std.mem.eql(u8, task.name, predicted.name)) return error.NativeTaskPredictionOrderMismatch;
+        switch (task.kind) {
+            .entities => {},
+            .classifications => try scoreClassificationTask(&accum.classifications, task, predicted),
+            .json_structures => {
+                const correct = try countMatchingFields(task.fields, predicted.fields);
+                const exact = try jsonInstancesExactAlloc(allocator, task, predicted);
+                accum.json_structures.add(task.fields.len, predicted.fields.len, correct, exact);
+                accum.count.add(task.count, predicted.emitted_count);
+                accum.raw_count.add(@min(task.count, @as(usize, 19)), predicted.predicted_count);
+            },
+            .relations => {
+                const correct = try countMatchingRelationPairsAlloc(allocator, task, predicted);
+                const exact = task.count == predicted.emitted_count and correct == task.count;
+                accum.relations.add(task.count, predicted.emitted_count, correct, exact);
+                accum.count.add(task.count, predicted.emitted_count);
+                accum.raw_count.add(@min(task.count, @as(usize, 19)), predicted.predicted_count);
+            },
+        }
+    }
+}
+
+fn scoreClassificationTask(
+    accum: *TaskMetricAccumulator,
+    task: gliner2_data.UpstreamTask,
+    prediction: adapter_eval.NativeTaskPrediction,
+) !void {
+    var matched: [gliner2_autodiff.max_span_start_entity_types]bool = @splat(false);
+    var correct: usize = 0;
+    for (prediction.classifications) |predicted| {
+        for (task.true_labels, 0..) |gold, gold_idx| {
+            if (matched[gold_idx] or !try normalizedValueEqual(gold, predicted.label)) continue;
+            matched[gold_idx] = true;
+            correct += 1;
+            break;
+        }
+    }
+    accum.add(
+        task.true_labels.len,
+        prediction.classifications.len,
+        correct,
+        correct == task.true_labels.len and correct == prediction.classifications.len,
+    );
+}
+
+fn countMatchingFields(gold: []const gliner2_data.UpstreamField, predicted: []const adapter_eval.NativeFieldPrediction) !usize {
+    var correct: usize = 0;
+    for (predicted, 0..) |candidate, candidate_idx| {
+        var prior_matches: usize = 0;
+        for (predicted[0..candidate_idx]) |prior| {
+            if (std.mem.eql(u8, prior.field, candidate.field) and try normalizedValueEqual(prior.value, candidate.value)) prior_matches += 1;
+        }
+        var gold_matches: usize = 0;
+        for (gold) |field| {
+            if (std.mem.eql(u8, field.name, candidate.field) and try normalizedValueEqual(field.value, candidate.value)) gold_matches += 1;
+        }
+        if (prior_matches < gold_matches) correct += 1;
+    }
+    return correct;
+}
+
+fn jsonInstancesExactAlloc(
+    allocator: std.mem.Allocator,
+    task: gliner2_data.UpstreamTask,
+    prediction: adapter_eval.NativeTaskPrediction,
+) !bool {
+    if (task.count != prediction.emitted_count) return false;
+    const matched = try allocator.alloc(bool, prediction.emitted_count);
+    defer allocator.free(matched);
+    @memset(matched, false);
+    for (0..task.count) |gold_instance| {
+        var found = false;
+        for (0..prediction.emitted_count) |predicted_instance| {
+            if (matched[predicted_instance]) continue;
+            if (try jsonInstanceEqual(task.fields, gold_instance, prediction.fields, predicted_instance)) {
+                matched[predicted_instance] = true;
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
+fn jsonInstanceEqual(
+    gold: []const gliner2_data.UpstreamField,
+    gold_instance: usize,
+    predicted: []const adapter_eval.NativeFieldPrediction,
+    predicted_instance: usize,
+) !bool {
+    var gold_len: usize = 0;
+    for (gold) |field| gold_len += @intFromBool(field.instance == gold_instance);
+    var predicted_len: usize = 0;
+    for (predicted) |field| predicted_len += @intFromBool(field.instance == predicted_instance);
+    if (gold_len != predicted_len) return false;
+    for (gold, 0..) |field, field_idx| {
+        if (field.instance != gold_instance) continue;
+        var prior_matches: usize = 0;
+        for (gold[0..field_idx]) |prior| {
+            if (prior.instance == gold_instance and std.mem.eql(u8, prior.name, field.name) and try normalizedValueEqual(prior.value, field.value)) prior_matches += 1;
+        }
+        var predicted_matches: usize = 0;
+        for (predicted) |candidate| {
+            if (candidate.instance == predicted_instance and std.mem.eql(u8, candidate.field, field.name) and try normalizedValueEqual(candidate.value, field.value)) predicted_matches += 1;
+        }
+        if (predicted_matches <= prior_matches) return false;
+    }
+    return true;
+}
+
+fn countMatchingRelationPairsAlloc(
+    allocator: std.mem.Allocator,
+    task: gliner2_data.UpstreamTask,
+    prediction: adapter_eval.NativeTaskPrediction,
+) !usize {
+    const matched = try allocator.alloc(bool, prediction.emitted_count);
+    defer allocator.free(matched);
+    @memset(matched, false);
+    var correct: usize = 0;
+    for (0..task.count) |gold_instance| {
+        const gold_head = relationGoldValue(task.fields, gold_instance, "head") orelse return error.UnsupportedRelationFields;
+        const gold_tail = relationGoldValue(task.fields, gold_instance, "tail") orelse return error.UnsupportedRelationFields;
+        for (0..prediction.emitted_count) |predicted_instance| {
+            if (matched[predicted_instance]) continue;
+            const predicted_head = relationPredictionValue(prediction.fields, predicted_instance, "head") orelse continue;
+            const predicted_tail = relationPredictionValue(prediction.fields, predicted_instance, "tail") orelse continue;
+            if (!try normalizedValueEqual(gold_head, predicted_head) or !try normalizedValueEqual(gold_tail, predicted_tail)) continue;
+            matched[predicted_instance] = true;
+            correct += 1;
+            break;
+        }
+    }
+    return correct;
+}
+
+fn relationGoldValue(fields: []const gliner2_data.UpstreamField, instance: usize, name: []const u8) ?[]const u8 {
+    var result: ?[]const u8 = null;
+    for (fields) |field| {
+        if (field.instance != instance or !std.mem.eql(u8, field.name, name)) continue;
+        if (result != null or std.mem.trim(u8, field.value, " \t\r\n").len == 0) return null;
+        result = field.value;
+    }
+    return result;
+}
+
+fn relationPredictionValue(fields: []const adapter_eval.NativeFieldPrediction, instance: usize, name: []const u8) ?[]const u8 {
+    var result: ?[]const u8 = null;
+    for (fields) |field| {
+        if (field.instance != instance or !std.mem.eql(u8, field.field, name)) continue;
+        if (result != null or std.mem.trim(u8, field.value, " \t\r\n").len == 0) return null;
+        result = field.value;
+    }
+    return result;
+}
+
+fn normalizedValueEqual(lhs: []const u8, rhs: []const u8) !bool {
+    return gliner2_data.canonicalScoringValueEqual(lhs, rhs);
+}
+
+fn predictionMatchesGold(
+    ex: gliner2_data.Example,
+    ent: gliner2_data.Entity,
+    prediction: adapter_eval.TopEntity,
+    opts: Options,
+) !bool {
+    if (!try normalizedValueEqual(ent.label, prediction.label)) return false;
+    if (!opts.match_text_label_only) return ent.start == prediction.start and ent.end == prediction.end;
+
+    const gold_text = if (ent.text.len > 0) ent.text else spanText(ex.text, ent.start, ent.end);
+    return normalizedValueEqual(gold_text, prediction.text);
 }
 
 fn appendFalsePositiveDiagnostic(
@@ -738,12 +1233,22 @@ fn parseOptions(args_in: std.process.Args, allocator: std.mem.Allocator) !?Optio
             opts.best_label_per_span_start = true;
         } else if (std.mem.eql(u8, arg, "--require-entitylike-span")) {
             opts.require_entitylike_span = true;
+        } else if (std.mem.eql(u8, arg, "--match-text-label-only")) {
+            opts.match_text_label_only = true;
+        } else if (std.mem.eql(u8, arg, "--upstream-entity-decode")) {
+            opts.min_prediction_score = 0.5;
+            opts.nms_overlap_threshold = 0.0;
+            opts.match_text_label_only = true;
         } else if (std.mem.eql(u8, arg, "--min-precision")) {
             opts.min_precision = try std.fmt.parseFloat(f64, args.next() orelse return usageError());
         } else if (std.mem.eql(u8, arg, "--min-recall")) {
             opts.min_recall = try std.fmt.parseFloat(f64, args.next() orelse return usageError());
         } else if (std.mem.eql(u8, arg, "--min-f1")) {
             opts.min_f1 = try std.fmt.parseFloat(f64, args.next() orelse return usageError());
+        } else if (std.mem.eql(u8, arg, "--min-exact-match")) {
+            opts.min_exact_match = try std.fmt.parseFloat(f64, args.next() orelse return usageError());
+        } else if (std.mem.eql(u8, arg, "--min-task-metric")) {
+            try parseFullTaskMinimum(args.next() orelse return usageError(), &opts.full_task_minimums);
         } else if (std.mem.eql(u8, arg, "--out")) {
             opts.out_path = args.next() orelse return usageError();
         } else if (std.mem.eql(u8, arg, "--thresholds-out")) {
@@ -761,6 +1266,12 @@ fn parseOptions(args_in: std.process.Args, allocator: std.mem.Allocator) !?Optio
     if (opts.nms_overlap_threshold) |threshold| {
         if (!std.math.isFinite(threshold) or threshold < 0 or threshold > 1) return error.InvalidNmsOverlapThreshold;
     }
+    if (opts.objective == .gliner2_total_loss) {
+        if (opts.backend != .native) return error.FullTaskEvaluationRequiresNativeBackend;
+        if (!opts.full_task_minimums.complete()) return error.MissingFullTaskQualityThreshold;
+    } else if (!fullTaskMinimumsEmpty(opts.full_task_minimums)) {
+        return error.FullTaskMinimumRequiresTotalLossObjective;
+    }
     opts.sweep_thresholds = try sweep_thresholds.toOwnedSlice(allocator);
     opts.label_thresholds = try label_thresholds.toOwnedSlice(allocator);
     opts.label_score_biases = try label_score_biases.toOwnedSlice(allocator);
@@ -771,9 +1282,47 @@ fn parseUsize(value: []const u8) !usize {
     return std.fmt.parseUnsigned(usize, value, 10);
 }
 
+fn fullTaskMinimumsEmpty(minimums: FullTaskMinimums) bool {
+    return minimums.classifications_micro_f1 == null and
+        minimums.classifications_exact_match == null and
+        minimums.json_structures_micro_f1 == null and
+        minimums.json_structures_exact_match == null and
+        minimums.relations_micro_f1 == null and
+        minimums.relations_exact_match == null and
+        minimums.count_accuracy == null;
+}
+
+fn parseFullTaskMinimum(value: []const u8, minimums: *FullTaskMinimums) !void {
+    const separator = std.mem.indexOfScalar(u8, value, '=') orelse return error.InvalidFullTaskQualityThreshold;
+    const key = std.mem.trim(u8, value[0..separator], " \t\r\n");
+    const raw = std.mem.trim(u8, value[separator + 1 ..], " \t\r\n");
+    if (key.len == 0 or raw.len == 0) return error.InvalidFullTaskQualityThreshold;
+    const threshold = std.fmt.parseFloat(f64, raw) catch return error.InvalidFullTaskQualityThreshold;
+    if (!std.math.isFinite(threshold) or threshold <= 0 or threshold > 1) return error.InvalidFullTaskQualityThreshold;
+    const slot: *?f64 = if (std.mem.eql(u8, key, "classifications.micro_f1"))
+        &minimums.classifications_micro_f1
+    else if (std.mem.eql(u8, key, "classifications.exact_match"))
+        &minimums.classifications_exact_match
+    else if (std.mem.eql(u8, key, "json_structures.micro_f1"))
+        &minimums.json_structures_micro_f1
+    else if (std.mem.eql(u8, key, "json_structures.exact_match"))
+        &minimums.json_structures_exact_match
+    else if (std.mem.eql(u8, key, "relations.micro_f1"))
+        &minimums.relations_micro_f1
+    else if (std.mem.eql(u8, key, "relations.exact_match"))
+        &minimums.relations_exact_match
+    else if (std.mem.eql(u8, key, "count.accuracy"))
+        &minimums.count_accuracy
+    else
+        return error.UnknownFullTaskQualityMetric;
+    if (slot.* != null) return error.DuplicateFullTaskQualityMetric;
+    slot.* = threshold;
+}
+
 fn parseObjective(value: []const u8) !gliner2_autodiff.GlinerObjective {
     if (std.mem.eql(u8, value, "token")) return .token;
     if (std.mem.eql(u8, value, "span-start") or std.mem.eql(u8, value, "span_start")) return .span_start;
+    if (std.mem.eql(u8, value, "gliner2-total-loss") or std.mem.eql(u8, value, "gliner2_total_loss")) return .gliner2_total_loss;
     return error.InvalidObjective;
 }
 
@@ -788,10 +1337,14 @@ fn objectiveName(objective: gliner2_autodiff.GlinerObjective) []const u8 {
     return switch (objective) {
         .token => "token",
         .span_start => "span-start",
+        .gliner2_total_loss => "gliner2-total-loss",
     };
 }
 
 fn parseCsv(allocator: std.mem.Allocator, value: []const u8) ![][]const u8 {
+    if (std.mem.eql(u8, std.mem.trim(u8, value, " \t\r\n"), "-")) {
+        return allocator.alloc([]const u8, 0);
+    }
     var out = std.ArrayListUnmanaged([]const u8).empty;
     errdefer {
         for (out.items) |item| allocator.free(item);
@@ -805,6 +1358,118 @@ fn parseCsv(allocator: std.mem.Allocator, value: []const u8) ![][]const u8 {
     }
     if (out.items.len == 0) return error.EmptyCsv;
     return try out.toOwnedSlice(allocator);
+}
+
+const RecordEntities = struct {
+    schema: []const []const u8,
+    entities: []gliner2_data.Entity,
+
+    fn deinit(self: *RecordEntities, allocator: std.mem.Allocator) void {
+        allocator.free(self.schema);
+        allocator.free(self.entities);
+        self.* = undefined;
+    }
+
+    fn example(self: *const RecordEntities, text: []const u8) gliner2_data.Example {
+        return .{ .text = text, .entities = self.entities };
+    }
+};
+
+fn recordEntitiesAlloc(
+    allocator: std.mem.Allocator,
+    record: gliner2_data.UpstreamRecord,
+) !?RecordEntities {
+    var labels = std.ArrayListUnmanaged([]const u8).empty;
+    defer labels.deinit(allocator);
+    var entities = std.ArrayListUnmanaged(gliner2_data.Entity).empty;
+    defer entities.deinit(allocator);
+    var has_entity_task = false;
+    for (record.tasks) |task| {
+        if (task.kind != .entities) continue;
+        has_entity_task = true;
+        if (task.schema_fields.len > 0) {
+            for (task.schema_fields) |label| try appendEntitySchemaLabel(allocator, &labels, label);
+        } else {
+            for (task.fields) |field| try appendEntitySchemaLabel(allocator, &labels, field.name);
+        }
+        for (task.fields) |field| {
+            if (indexOfLabel(labels.items, field.name) == null) return error.EntityGoldLabelMissingFromSchema;
+            const start = field.start orelse return error.EntityGoldMissingOffsets;
+            const end = field.end orelse return error.EntityGoldMissingOffsets;
+            if (start >= end or end > record.text.len) return error.InvalidEntityGoldOffsets;
+            try entities.append(allocator, .{
+                .text = record.text[start..end],
+                .label = field.name,
+                .start = start,
+                .end = end,
+            });
+        }
+    }
+    if (!has_entity_task) return null;
+    if (labels.items.len == 0) return error.EmptyEntitySchema;
+    const schema = try labels.toOwnedSlice(allocator);
+    errdefer allocator.free(schema);
+    const gold = try entities.toOwnedSlice(allocator);
+    return .{
+        .schema = schema,
+        .entities = gold,
+    };
+}
+
+fn metricEntityTypesForRecordsAlloc(
+    allocator: std.mem.Allocator,
+    configured: []const []const u8,
+    records: []const gliner2_data.UpstreamRecord,
+) ![][]const u8 {
+    var labels = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (labels.items) |label| allocator.free(label);
+        labels.deinit(allocator);
+    }
+    for (configured) |label| try appendOwnedEntityLabel(allocator, &labels, label);
+    for (records) |record| {
+        for (record.tasks) |task| {
+            if (task.kind != .entities) continue;
+            if (task.schema_fields.len > 0) {
+                for (task.schema_fields) |label| try appendOwnedEntityLabel(allocator, &labels, label);
+            } else {
+                for (task.fields) |field| try appendOwnedEntityLabel(allocator, &labels, field.name);
+            }
+        }
+    }
+    return labels.toOwnedSlice(allocator);
+}
+
+fn appendEntitySchemaLabel(
+    allocator: std.mem.Allocator,
+    labels: *std.ArrayListUnmanaged([]const u8),
+    label: []const u8,
+) !void {
+    if (indexOfLabel(labels.items, label) == null) try labels.append(allocator, label);
+}
+
+fn appendOwnedEntityLabel(
+    allocator: std.mem.Allocator,
+    labels: *std.ArrayListUnmanaged([]const u8),
+    label: []const u8,
+) !void {
+    if (indexOfLabel(labels.items, label) != null) return;
+    const owned = try allocator.dupe(u8, label);
+    errdefer allocator.free(owned);
+    try labels.append(allocator, owned);
+}
+
+fn labelScoreBiasesForSchemaAlloc(
+    allocator: std.mem.Allocator,
+    biases: []const LabelScoreBias,
+    schema: []const []const u8,
+) ![]LabelScoreBias {
+    var out = std.ArrayListUnmanaged(LabelScoreBias).empty;
+    defer out.deinit(allocator);
+    for (biases) |bias| {
+        if (indexOfLabel(schema, bias.label) != null) try out.append(allocator, bias);
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 fn parseThresholdCsv(allocator: std.mem.Allocator, value: []const u8, out: *std.ArrayListUnmanaged(f32)) !void {
@@ -919,17 +1584,18 @@ fn usageError() error{InvalidArguments} {
 
 fn printUsage() void {
     std.debug.print(
-        \\usage: eval-gliner2-autodiff-adapter-dataset <model_dir> <adapter_dir> <eval_jsonl_or_dir> <entity_types_csv> [options]
+        \\usage: eval-gliner2-autodiff-adapter-dataset <model_dir> <adapter_dir> <eval_jsonl_or_dir> <entity_types_csv|-> [options]
         \\
+        \\Use '-' to derive each entity schema from its structured JSONL record.
         \\Reports exact-match entity precision/recall/F1 for a saved GLiNER2 autodiff adapter.
         \\Evaluates all decoded entities above --min-prediction-score.
         \\
         \\options:
         \\  --seq-len N
-        \\  --max-span-width N
+        \\  --max-span-width N   Default: adapter manifest's trained width
         \\  --backend auto|metal|native
         \\  --compiled-required
-        \\  --objective token|span-start
+        \\  --objective token|span-start|gliner2-total-loss
         \\  --max-examples N
         \\  --min-prediction-score FLOAT
         \\  --label-thresholds label=FLOAT[,label=FLOAT...]
@@ -942,14 +1608,83 @@ fn printUsage() void {
         \\  --best-span-per-label-start
         \\  --best-label-per-span-start
         \\  --require-entitylike-span
+        \\  --match-text-label-only
+        \\  --upstream-entity-decode
         \\  --min-precision FLOAT
         \\  --min-recall FLOAT
         \\  --min-f1 FLOAT
+        \\  --min-exact-match FLOAT
+        \\  --min-task-metric KEY=FLOAT (required once per full-task key)
+        \\    classifications.micro_f1, classifications.exact_match,
+        \\    json_structures.micro_f1, json_structures.exact_match,
+        \\    relations.micro_f1, relations.exact_match, count.accuracy
         \\  --out PATH
         \\  --thresholds-out PATH
         \\  --diagnostic-limit N
         \\
     , .{});
+}
+
+test "dataset evaluator can match by text and label without exact offsets" {
+    const allocator = std.testing.allocator;
+    const labels = [_][]const u8{"location"};
+    var accum = try EvalAccumulator.init(allocator, 0.5, &labels);
+    defer accum.deinit(allocator);
+    accum.addGold(0);
+
+    var entities = [_]gliner2_data.Entity{.{
+        .text = "Seattle",
+        .label = "location",
+        .start = 20,
+        .end = 27,
+    }};
+    const ex = gliner2_data.Example{
+        .text = "Alice works from Seattle.",
+        .entities = &entities,
+    };
+    const predictions = [_]adapter_eval.TopEntity{.{
+        .text = "Seattle",
+        .label = "location",
+        .start = 19,
+        .end = 26,
+        .score = 0.9,
+    }};
+    const opts = Options{
+        .model_dir = "",
+        .adapter_dir = "",
+        .eval_data = "",
+        .entity_types_csv = "location",
+        .min_prediction_score = 0.5,
+        .match_text_label_only = true,
+    };
+
+    try scoreExample(allocator, &accum, ex, &labels, &predictions, opts, true, null);
+
+    try std.testing.expectEqual(@as(usize, 1), accum.predicted_total);
+    try std.testing.expectEqual(@as(usize, 1), accum.correct_total);
+    try std.testing.expectEqual(@as(usize, 1), accum.exact_cases);
+    try std.testing.expectEqual(@as(usize, 1), accum.exact_correct);
+}
+
+test "release scoring uses the versioned Unicode normalization admitted profile" {
+    try std.testing.expectEqualStrings(
+        "unicode_nfc_collapsed_whitespace_casefold/v1",
+        canonical_normalization,
+    );
+    try std.testing.expect(try normalizedValueEqual("  CAFÉ\tworker ", "café  WORKER"));
+    try std.testing.expect(try normalizedValueEqual("Москва\u{00a0}東京", "МОСКВА 東京"));
+    try std.testing.expect(!(try normalizedValueEqual("café", "cafe")));
+
+    try std.testing.expectError(
+        error.UnsupportedCanonicalNormalization,
+        normalizedValueEqual("CAFE\u{0301}", "café"),
+    );
+    try std.testing.expectError(
+        error.UnsupportedCanonicalCasefold,
+        normalizedValueEqual("straße", "STRASSE"),
+    );
+    const invalid_utf8 = [_]u8{ 0xc3, 0x28 };
+    try std.testing.expectError(error.InvalidUtf8, normalizedValueEqual(&invalid_utf8, ""));
 }
 
 test "dataset evaluator records false positive and false negative diagnostics" {
@@ -959,7 +1694,7 @@ test "dataset evaluator records false positive and false negative diagnostics" {
     defer accum.deinit(allocator);
     accum.addGold(0);
 
-    const entities = [_]gliner2_data.Entity{.{
+    var entities = [_]gliner2_data.Entity{.{
         .text = "Alice",
         .label = "person",
         .start = 0,
@@ -991,10 +1726,12 @@ test "dataset evaluator records false positive and false negative diagnostics" {
         .limit = 8,
     };
 
-    try scoreExample(allocator, &accum, ex, &labels, &predictions, opts, &diagnostic_ctx);
+    try scoreExample(allocator, &accum, ex, &labels, &predictions, opts, true, &diagnostic_ctx);
 
     try std.testing.expectEqual(@as(usize, 1), accum.predicted_total);
     try std.testing.expectEqual(@as(usize, 0), accum.correct_total);
+    try std.testing.expectEqual(@as(usize, 1), accum.exact_cases);
+    try std.testing.expectEqual(@as(usize, 0), accum.exact_correct);
     try std.testing.expectEqual(@as(usize, 2), diagnostics.items.len);
     try std.testing.expectEqualStrings("false_positive", diagnostics.items[0].kind);
     try std.testing.expectEqualStrings("Bob", diagnostics.items[0].prediction.?.text);
@@ -1028,4 +1765,143 @@ test "dataset evaluator formats reusable per-label threshold csv" {
     defer allocator.free(csv);
 
     try std.testing.expectEqualStrings("person=0.150000,organization=0.250000", csv);
+}
+
+test "dataset evaluator uses only explicit entity task fields and structured schemas" {
+    const allocator = std.testing.allocator;
+    const schema = [_][]const u8{"person,primary"};
+    const entity_fields = [_]gliner2_data.UpstreamField{.{
+        .name = "person,primary",
+        .value = "Alice",
+        .start = 0,
+        .end = 5,
+    }};
+    const json_fields = [_]gliner2_data.UpstreamField{.{
+        .name = "person,primary",
+        .value = "Alice",
+        .start = 10,
+        .end = 15,
+    }};
+    const tasks = [_]gliner2_data.UpstreamTask{
+        .{
+            .kind = .entities,
+            .name = "entities",
+            .schema_fields = &schema,
+            .fields = &entity_fields,
+        },
+        .{
+            .kind = .json_structures,
+            .name = "contact",
+            .schema_fields = &schema,
+            .fields = &json_fields,
+        },
+    };
+    const record = gliner2_data.UpstreamRecord{ .text = "Alice met Alice", .tasks = &tasks };
+    var view = (try recordEntitiesAlloc(allocator, record)).?;
+    defer view.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), view.schema.len);
+    try std.testing.expectEqualStrings("person,primary", view.schema[0]);
+    try std.testing.expectEqual(@as(usize, 1), view.entities.len);
+    try std.testing.expectEqual(@as(usize, 0), view.entities[0].start);
+    try std.testing.expectEqual(@as(usize, 5), view.entities[0].end);
+
+    const metric_labels = try metricEntityTypesForRecordsAlloc(allocator, &.{"legacy"}, &.{record});
+    defer freeStringSlice(allocator, metric_labels);
+    try std.testing.expectEqual(@as(usize, 2), metric_labels.len);
+    try std.testing.expectEqualStrings("person,primary", metric_labels[1]);
+
+    const no_entity_tasks = [_]gliner2_data.UpstreamTask{.{
+        .kind = .classifications,
+        .name = "sentiment",
+        .labels = &.{ "positive", "negative" },
+    }};
+    try std.testing.expect((try recordEntitiesAlloc(allocator, .{ .text = "Fine", .tasks = &no_entity_tasks })) == null);
+}
+
+test "full-task release gates require positive coverage and every minimum" {
+    const perfect_task = TaskMetricSummary{
+        .true_positive = 1,
+        .false_positive = 0,
+        .false_negative = 0,
+        .precision = 1.0,
+        .recall = 1.0,
+        .micro_f1 = 1.0,
+        .exact_match = 1.0,
+        .cases = 1,
+        .gold_atoms = 1,
+    };
+    const perfect_count = CountMetricSummary{ .correct = 2, .cases = 2, .accuracy = 1.0 };
+    const full = FullTaskSummary{
+        .classifications = perfect_task,
+        .json_structures = perfect_task,
+        .relations = perfect_task,
+        .count = perfect_count,
+        .raw_count = perfect_count,
+    };
+    const minimums = FullTaskMinimums{
+        .classifications_micro_f1 = 0.8,
+        .classifications_exact_match = 0.8,
+        .json_structures_micro_f1 = 0.8,
+        .json_structures_exact_match = 0.8,
+        .relations_micro_f1 = 0.8,
+        .relations_exact_match = 0.8,
+        .count_accuracy = 0.8,
+    };
+    const opts = Options{
+        .model_dir = "",
+        .adapter_dir = "",
+        .eval_data = "",
+        .entity_types_csv = "-",
+        .objective = .gliner2_total_loss,
+        .backend = .native,
+        .full_task_minimums = minimums,
+    };
+    try std.testing.expectEqual(
+        @as(?QualityGateFailure, null),
+        try qualityGateFailure(1.0, 1.0, 1.0, 1.0, full, opts),
+    );
+
+    var no_classification_gold = full;
+    no_classification_gold.classifications.gold_atoms = 0;
+    try std.testing.expectEqual(
+        QualityGateFailure.classifications_coverage,
+        (try qualityGateFailure(1.0, 1.0, 1.0, 1.0, no_classification_gold, opts)).?,
+    );
+
+    var weak_relation = full;
+    weak_relation.relations.micro_f1 = 0.5;
+    try std.testing.expectEqual(
+        QualityGateFailure.relations_micro_f1,
+        (try qualityGateFailure(1.0, 1.0, 1.0, 1.0, weak_relation, opts)).?,
+    );
+
+    var incomplete = opts;
+    incomplete.full_task_minimums.count_accuracy = null;
+    try std.testing.expectError(
+        error.MissingFullTaskQualityThreshold,
+        qualityGateFailure(1.0, 1.0, 1.0, 1.0, full, incomplete),
+    );
+}
+
+test "full-task metric parser is complete and structured schema sentinel is empty" {
+    const allocator = std.testing.allocator;
+    var minimums = FullTaskMinimums{};
+    inline for (.{
+        "classifications.micro_f1=0.5",
+        "classifications.exact_match=0.5",
+        "json_structures.micro_f1=0.5",
+        "json_structures.exact_match=0.5",
+        "relations.micro_f1=0.5",
+        "relations.exact_match=0.5",
+        "count.accuracy=0.5",
+    }) |value| try parseFullTaskMinimum(value, &minimums);
+    try std.testing.expect(minimums.complete());
+    try std.testing.expectError(
+        error.DuplicateFullTaskQualityMetric,
+        parseFullTaskMinimum("count.accuracy=0.6", &minimums),
+    );
+
+    const configured = try parseCsv(allocator, "-");
+    defer freeStringSlice(allocator, configured);
+    try std.testing.expectEqual(@as(usize, 0), configured.len);
 }

@@ -188,6 +188,9 @@ required_symbols=(
   termite_copy_u8
   termite_f32_to_bf16
   termite_f32_to_f16
+  termite_f32_to_i32
+  termite_round_f32
+  termite_primitive_transpose_2d_f32
   termite_add_bias_relu_rows_f32
   termite_add_weighted_scalars_f32
   termite_linear_bf16_weight_f32_tiled
@@ -212,6 +215,26 @@ required_symbols=(
   termite_deberta_attention_fused_f32
   termite_deberta_attention_tc_f16_m16n32
   termite_deberta_attention_tc_f16_m32n16
+  termite_deberta_attention_backward_scores_f32
+  termite_deberta_attention_backward_f32
+  termite_training_accumulate_f32
+  termite_training_adamw_f32
+  termite_training_sum_squares_f32
+  termite_masked_bce_accumulate_f32
+  termite_masked_bce_finalize_f32
+  termite_masked_bce_backward_f32
+  termite_elementwise_broadcast_f32
+  termite_primitive_where_f32
+  termite_primitive_batched_dot_f32
+  termite_primitive_reduce_f32
+  termite_primitive_broadcast_f32
+  termite_layer_norm_backward_f32
+  termite_primitive_softmax_f32
+  termite_primitive_gather_f32
+  termite_primitive_scatter_add_axis0_f32
+  termite_primitive_transpose_f32
+  termite_primitive_concat_f32
+  termite_primitive_slice_f32
   termite_gliner_gather_concat_relu_f32
   termite_split_last_dim3_f32
   termite_rope_per_item_f32
