@@ -29124,9 +29124,12 @@ test "api index status uses read runtime status without consulting write source"
     try std.testing.expectEqual(@as(?u64, 9), parsed.value.status.doc_count);
     try std.testing.expectEqual(@as(?u64, 9), parsed.value.status.total_indexed);
     try std.testing.expectEqual(@as(?u64, 17), parsed.value.status.node_count);
-    try std.testing.expectEqual(@as(?u64, 7), parsed.value.status.replay_applied_sequence);
+    // This legacy-shaped observation has no generation-scoped coverage
+    // witness. Preserve its authoritative replay debt instead of inferring
+    // readiness from physical index cardinality alone.
+    try std.testing.expectEqual(@as(?u64, 3), parsed.value.status.replay_applied_sequence);
     try std.testing.expectEqual(@as(?u64, 7), parsed.value.status.replay_target_sequence);
-    try std.testing.expectEqual(@as(?bool, false), parsed.value.status.replay_catch_up_required);
+    try std.testing.expectEqual(@as(?bool, true), parsed.value.status.replay_catch_up_required);
     const shard_status = parsed.value.shard_status.?;
     const shard_10 = shard_status.@"10".?;
     try std.testing.expectEqual(@as(?u64, 9), shard_10.doc_count);
