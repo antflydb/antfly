@@ -131,10 +131,18 @@ core_build_runner_argv[4]="$core_local_cache"
 core_build_runner_argv[5]="$core_global_cache"
 
 echo "Replaying the failing build-runner/compiler protocol for a core dump..."
+root_mode="$(stat -c '%a' /)"
+restore_root_mode() {
+  sudo chmod "$root_mode" /
+}
+trap restore_root_mode EXIT
+sudo chmod 1777 /
 set +e
-(cd "$repo_root/zig" && timeout 40m sudo bash -c 'ulimit -c unlimited; exec "$@"' _ "${core_build_runner_argv[@]}") 2>&1 | tee "$core_replay_log"
+(cd "$repo_root/zig" && timeout 40m "${core_build_runner_argv[@]}") 2>&1 | tee "$core_replay_log"
 replay_status=${PIPESTATUS[0]}
 set -e
+restore_root_mode
+trap - EXIT
 printf 'core build-runner exit status: %s\n' "$replay_status" >> "$diagnostic_root/system-info.txt"
 capture_memory_snapshot "after core build-runner replay"
 
@@ -158,6 +166,11 @@ if [ -n "$core_path" ]; then
   sudo rm -f -- "$core_path"
 else
   echo "The uninstrumented compiler replay did not produce a Zig core dump." | tee "$backtrace_log"
+fi
+
+if [ "${ANTFLY_CORE_ONLY:-false}" = true ]; then
+  echo "Core-only mode: skipping replay diagnostics already captured by the prior run."
+  exit 0
 fi
 
 # Preserve the additional replay diagnostics added during investigation.
