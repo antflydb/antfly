@@ -3511,10 +3511,10 @@ pub fn build(b: *std.Build) void {
 
     const raft_transport_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        // The top-level Raft declaration walk makes the nested transport test
-        // declarations reachable; the qualified filter then keeps execution
-        // scoped to the transport package.
-        .filters = &.{ "raft integration module compiles", "raft.transport." },
+        // The top-level declaration walk makes the transport and shared HTTP
+        // tests reachable; qualified filters keep this focused bucket scoped
+        // to those layers.
+        .filters = &.{ "raft integration module compiles", "raft.transport.", "common.http." },
     });
     const run_raft_transport_tests = addFilteredTestRunArtifact(b, raft_transport_tests);
 
@@ -6034,6 +6034,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_raft_runtime_tests.step);
     unit_test_step.dependOn(&run_raft_restore_tests.step);
     unit_test_step.dependOn(&run_raft_ready_continuation_tests.step);
+    unit_test_step.dependOn(&run_raft_transport_tests.step);
 
     // Progress mode uses one union-filtered root artifact too. Storage and
     // metadata module paths overlap, while raft-transport is a strict subset

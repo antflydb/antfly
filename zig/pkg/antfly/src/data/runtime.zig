@@ -1063,6 +1063,9 @@ pub const HealthSource = struct {
             try health_metrics.appendPromMetric(writer, "antfly_query_rejected_total", "counter", "Public queries rejected by admission control", http.rejected_requests_total);
             try health_metrics.appendPromMetric(writer, "antfly_http_accept_errors_total", "counter", "Public HTTP listener accept failures", http.accept_errors_total);
             try health_metrics.appendPromMetric(writer, "antfly_http_cancellation_watcher_start_failures_total", "counter", "Public requests cancelled because peer observation could not be scheduled", http.cancellation_watcher_start_failures_total);
+            try health_metrics.appendPromMetric(writer, "antfly_http_deadline_observer_failures_total", "counter", "Public requests closed because deadline observation could not be scheduled", http.deadline_observer_failures_total);
+            try health_metrics.appendPromMetric(writer, "antfly_http_deadline_expirations_total", "counter", "Public request sockets closed after header or body deadlines", http.deadline_expirations_total);
+            try health_metrics.appendPromMetric(writer, "antfly_http_active_deadline_observers", "gauge", "Public request sockets currently watched for header or body deadlines", http.active_deadline_observers);
             try health_metrics.appendPromMetric(writer, "antfly_http_peer_disconnects_total", "counter", "Public request peer disconnects propagated to cancellation", http.peer_disconnects_total);
             try health_metrics.appendPromMetric(writer, "antfly_http_active_peer_observers", "gauge", "Public request sockets currently watched for disconnect", http.active_peer_observers);
         }
@@ -4054,6 +4057,7 @@ pub const DataServer = struct {
         if (self.query_io_impl == null) {
             self.query_io_impl = std.Io.Threaded.init(self.alloc, .{
                 .async_limit = self.query_async_limit,
+                .concurrent_limit = .limited(backend_runtime_mod.default_io_concurrent_limit),
             });
         }
         _ = self.read_source.withIo(&self.query_io_impl.?);

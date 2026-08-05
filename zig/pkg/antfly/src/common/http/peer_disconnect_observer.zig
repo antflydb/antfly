@@ -28,20 +28,63 @@ fn sleepMs(ms: u64) void {
     };
 }
 
-/// A bounded, multiplexed H1 peer-lifetime observer.
+fn monotonicNowNs() ?u64 {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return null;
+    var ts: std.posix.timespec = undefined;
+    if (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts)) != .SUCCESS) return null;
+    const seconds = std.math.cast(u64, ts.sec) orelse return null;
+    const nanos = std.math.cast(u64, ts.nsec) orelse return null;
+    return std.math.add(u64, std.math.mul(u64, seconds, std.time.ns_per_s) catch return null, nanos) catch null;
+}
+
+/// A bounded, multiplexed H1 socket-lifetime observer.
 ///
-/// One owner thread watches every admitted request. This deliberately avoids
-/// `Io.concurrent`: the threaded Io backend assigns a blocking poll to one
-/// worker and permanently grows its worker pool for each simultaneous request.
-/// The registry therefore keeps cancellation O(1) threads per listener while
-/// retaining O(n) descriptors and a small, fixed polling cadence.
+/// One owner thread watches every admitted request for peer disconnects and
+/// enforces header/body deadlines. This deliberately avoids `Io.concurrent`:
+/// the threaded Io backend permanently retains one worker for every concurrent
+/// blocking timeout race. The registry therefore keeps observation O(1)
+/// threads per listener while retaining O(n) descriptors and a small, fixed
+/// polling cadence.
 pub const Observer = struct {
-    const Entry = struct {
-        id: u64,
-        fd: std.posix.fd_t,
+    pub const Deadline = struct {
+        const State = enum(u8) {
+            pending,
+            expired,
+            observer_failed,
+        };
+
+        state: std.atomic.Value(State) = .init(.pending),
+
+        pub fn didExpire(self: *const Deadline) bool {
+            return self.state.load(.acquire) == .expired;
+        }
+
+        pub fn observerFailed(self: *const Deadline) bool {
+            return self.state.load(.acquire) == .observer_failed;
+        }
+    };
+
+    const PeerAction = struct {
         cancellation: *http_common.RequestCancellation,
         peer_disconnects_total: ?*std.atomic.Value(u64),
         observer_failures_total: ?*std.atomic.Value(u64),
+    };
+
+    const DeadlineAction = struct {
+        state: *Deadline,
+        expires_at_ns: u64,
+        expirations_total: ?*std.atomic.Value(u64),
+    };
+
+    const Action = union(enum) {
+        peer: PeerAction,
+        deadline: DeadlineAction,
+    };
+
+    const Entry = struct {
+        id: u64,
+        fd: std.posix.fd_t,
+        action: Action,
         unread_input: bool = false,
     };
 
@@ -62,6 +105,9 @@ pub const Observer = struct {
     entries: std.ArrayListUnmanaged(Entry) = .empty,
     next_id: u64 = 1,
     active_count: std.atomic.Value(usize) = .init(0),
+    active_peer_count: std.atomic.Value(usize) = .init(0),
+    active_deadline_count: std.atomic.Value(usize) = .init(0),
+    deadline_expirations_total: std.atomic.Value(u64) = .init(0),
     stopping: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
     /// A single kqueue observes EOF behind unread pipelined bytes on Darwin.
@@ -100,6 +146,8 @@ pub const Observer = struct {
         // scope. Any residue here indicates a lifecycle bug and cannot be read.
         std.debug.assert(self.entries.items.len == 0);
         std.debug.assert(self.active_count.load(.acquire) == 0);
+        std.debug.assert(self.active_peer_count.load(.acquire) == 0);
+        std.debug.assert(self.active_deadline_count.load(.acquire) == 0);
         self.entries.deinit(self.alloc);
     }
 
@@ -115,6 +163,10 @@ pub const Observer = struct {
 
         platform_sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
+        // Close the check/register race with deinit() and fatal observer
+        // failures. Once stopping is published, no stack-backed action may be
+        // admitted because no owner thread is guaranteed to retire it.
+        if (self.stopping.load(.acquire)) return error.ObserverUnavailable;
         if (self.entries.items.len >= self.capacity) return error.ObserverCapacityExceeded;
 
         const id = self.nextId();
@@ -122,16 +174,66 @@ pub const Observer = struct {
         self.entries.appendAssumeCapacity(.{
             .id = id,
             .fd = fd,
-            .cancellation = cancellation,
-            .peer_disconnects_total = peer_disconnects_total,
-            .observer_failures_total = observer_failures_total,
+            .action = .{ .peer = .{
+                .cancellation = cancellation,
+                .peer_disconnects_total = peer_disconnects_total,
+                .observer_failures_total = observer_failures_total,
+            } },
         });
         _ = self.active_count.fetchAdd(1, .release);
+        _ = self.active_peer_count.fetchAdd(1, .release);
+        return .{ .observer = self, .id = id };
+    }
+
+    pub fn registerDeadline(
+        self: *Observer,
+        fd: std.posix.fd_t,
+        timeout_ms: u32,
+        state: *Deadline,
+        expirations_total: ?*std.atomic.Value(u64),
+    ) !Registration {
+        if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding)
+            return error.ObserverUnavailable;
+        if (self.thread == null or self.stopping.load(.acquire)) return error.ObserverUnavailable;
+        const now_ns = monotonicNowNs() orelse return error.ObserverUnavailable;
+        const timeout_ns = std.math.mul(u64, timeout_ms, std.time.ns_per_ms) catch std.math.maxInt(u64);
+        const expires_at_ns = std.math.add(u64, now_ns, timeout_ns) catch std.math.maxInt(u64);
+        state.state.store(.pending, .release);
+
+        platform_sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.stopping.load(.acquire)) return error.ObserverUnavailable;
+        if (self.entries.items.len >= self.capacity) return error.ObserverCapacityExceeded;
+
+        const id = self.nextId();
+        self.entries.appendAssumeCapacity(.{
+            .id = id,
+            .fd = fd,
+            .action = .{ .deadline = .{
+                .state = state,
+                .expires_at_ns = expires_at_ns,
+                .expirations_total = expirations_total,
+            } },
+        });
+        _ = self.active_count.fetchAdd(1, .release);
+        _ = self.active_deadline_count.fetchAdd(1, .release);
         return .{ .observer = self, .id = id };
     }
 
     pub fn activeCount(self: *const Observer) usize {
         return self.active_count.load(.acquire);
+    }
+
+    pub fn activePeerCount(self: *const Observer) usize {
+        return self.active_peer_count.load(.acquire);
+    }
+
+    pub fn activeDeadlineCount(self: *const Observer) usize {
+        return self.active_deadline_count.load(.acquire);
+    }
+
+    pub fn deadlineExpirationsTotal(self: *const Observer) u64 {
+        return self.deadline_expirations_total.load(.acquire);
     }
 
     fn nextId(self: *Observer) u64 {
@@ -148,9 +250,7 @@ pub const Observer = struct {
         defer self.mutex.unlock();
         for (self.entries.items, 0..) |entry, index| {
             if (entry.id != id) continue;
-            if (comptime builtin.os.tag == .macos) self.updateKqueue(entry.fd, id, false) catch {};
-            _ = self.entries.swapRemove(index);
-            _ = self.active_count.fetchSub(1, .release);
+            self.removeEntryLocked(index);
             return;
         }
     }
@@ -179,6 +279,7 @@ pub const Observer = struct {
                 continue;
             }
             for (self.entries.items) |entry| {
+                if (entry.action != .peer) continue;
                 // POLL constants are comptime integers. Give the mutable mask
                 // the ABI type used by pollfd.events so Linux can add RDHUP at
                 // runtime without leaving `events` inferred as comptime_int.
@@ -199,6 +300,11 @@ pub const Observer = struct {
             if (ready > 0) {
                 platform_sync.lockYielding(&self.mutex);
                 self.processPollEventsLocked(fds.items, ids.items);
+                self.expireDeadlinesLocked();
+                self.mutex.unlock();
+            } else {
+                platform_sync.lockYielding(&self.mutex);
+                self.expireDeadlinesLocked();
                 self.mutex.unlock();
             }
         }
@@ -258,6 +364,7 @@ pub const Observer = struct {
                     self.peekEntryLocked(index);
                 }
             }
+            self.expireDeadlinesLocked();
             self.mutex.unlock();
         }
     }
@@ -287,6 +394,7 @@ pub const Observer = struct {
 
     fn peekEntryLocked(self: *Observer, index: usize) void {
         const entry = &self.entries.items[index];
+        std.debug.assert(entry.action == .peer);
         var byte: [1]u8 = undefined;
         const n = std.c.recv(entry.fd, &byte, byte.len, @intCast(std.posix.MSG.PEEK | std.posix.MSG.DONTWAIT));
         if (n == 0) {
@@ -318,54 +426,105 @@ pub const Observer = struct {
 
     fn cancelEntryLocked(self: *Observer, index: usize, peer_disconnect: bool) void {
         const entry = self.entries.items[index];
+        const peer = switch (entry.action) {
+            .peer => |value| value,
+            .deadline => unreachable,
+        };
         if (peer_disconnect) {
-            if (entry.peer_disconnects_total) |counter| _ = counter.fetchAdd(1, .monotonic);
+            if (peer.peer_disconnects_total) |counter| _ = counter.fetchAdd(1, .monotonic);
         } else {
-            if (entry.observer_failures_total) |counter| _ = counter.fetchAdd(1, .monotonic);
+            if (peer.observer_failures_total) |counter| _ = counter.fetchAdd(1, .monotonic);
         }
-        entry.cancellation.cancel();
-        if (comptime builtin.os.tag == .macos) self.updateKqueue(entry.fd, entry.id, false) catch {};
+        peer.cancellation.cancel();
+        self.removeEntryLocked(index);
+    }
+
+    fn expireDeadlinesLocked(self: *Observer) void {
+        const now_ns = monotonicNowNs() orelse {
+            self.failAllLocked();
+            self.stopping.store(true, .release);
+            return;
+        };
+        var index: usize = 0;
+        while (index < self.entries.items.len) {
+            const entry = self.entries.items[index];
+            const deadline = switch (entry.action) {
+                .deadline => |value| value,
+                .peer => {
+                    index += 1;
+                    continue;
+                },
+            };
+            if (now_ns < deadline.expires_at_ns) {
+                index += 1;
+                continue;
+            }
+            deadline.state.state.store(.expired, .release);
+            _ = self.deadline_expirations_total.fetchAdd(1, .monotonic);
+            if (deadline.expirations_total) |counter| _ = counter.fetchAdd(1, .monotonic);
+            _ = std.c.shutdown(entry.fd, std.c.SHUT.RDWR);
+            self.removeEntryLocked(index);
+        }
+    }
+
+    fn removeEntryLocked(self: *Observer, index: usize) void {
+        const entry = self.entries.items[index];
+        switch (entry.action) {
+            .peer => {
+                if (comptime builtin.os.tag == .macos) self.updateKqueue(entry.fd, entry.id, false) catch {};
+                _ = self.active_peer_count.fetchSub(1, .release);
+            },
+            .deadline => {
+                _ = self.active_deadline_count.fetchSub(1, .release);
+            },
+        }
         _ = self.entries.swapRemove(index);
         _ = self.active_count.fetchSub(1, .release);
     }
 
     fn failAllLocked(self: *Observer) void {
-        while (self.entries.items.len > 0) self.cancelEntryLocked(self.entries.items.len - 1, false);
+        while (self.entries.items.len > 0) {
+            const index = self.entries.items.len - 1;
+            const entry = self.entries.items[index];
+            switch (entry.action) {
+                .peer => self.cancelEntryLocked(index, false),
+                .deadline => |deadline| {
+                    deadline.state.state.store(.observer_failed, .release);
+                    _ = std.c.shutdown(entry.fd, std.c.SHUT.RDWR);
+                    self.removeEntryLocked(index);
+                },
+            }
+        }
     }
 };
 
 test "std http listener multiplexed peer observer cancels many disconnected sockets with one owner thread" {
     if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var listener = try (std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }).listen(io, .{});
-    defer listener.deinit(io);
-
     var observer = Observer.init(std.testing.allocator, 32);
     try observer.start();
     defer observer.deinit();
 
-    var clients: [32]std.Io.net.Stream = undefined;
-    var servers: [32]std.Io.net.Stream = undefined;
+    var sockets: [32][2]std.posix.fd_t = undefined;
     var cancellations = [_]http_common.RequestCancellation{.{}} ** 32;
     var registrations: [32]Observer.Registration = undefined;
     var initialized: usize = 0;
-    var clients_open = true;
+    var clients_open: usize = 0;
     defer {
         for (registrations[0..initialized]) |*registration| registration.deinit();
-        if (clients_open) for (clients[0..initialized]) |*stream| stream.close(io);
-        for (servers[0..initialized]) |*stream| stream.close(io);
+        for (sockets[clients_open..initialized]) |pair| _ = std.posix.system.close(pair[0]);
+        for (sockets[0..initialized]) |pair| _ = std.posix.system.close(pair[1]);
     }
     for (0..32) |index| {
-        clients[index] = try listener.socket.address.connect(io, .{ .mode = .stream });
-        servers[index] = try listener.accept(io);
-        registrations[index] = try observer.register(servers[index].socket.handle, &cancellations[index], null, null);
+        if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &sockets[index]) != 0)
+            return error.Unexpected;
+        registrations[index] = try observer.register(sockets[index][1], &cancellations[index], null, null);
         initialized += 1;
     }
     try std.testing.expectEqual(@as(usize, 32), observer.activeCount());
-    for (&clients) |*stream| {
-        stream.close(io);
+    for (&sockets) |pair| {
+        _ = std.posix.system.close(pair[0]);
+        clients_open += 1;
     }
-    clients_open = false;
 
     for (0..400) |_| {
         var cancelled: usize = 0;
@@ -380,33 +539,144 @@ test "std http listener multiplexed peer observer cancels many disconnected sock
 
 test "std http listener peer observer sees FIN behind unread bytes without consuming them" {
     if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var listener = try (std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }).listen(io, .{});
-    defer listener.deinit(io);
-    var client = try listener.socket.address.connect(io, .{ .mode = .stream });
-    defer client.close(io);
-    var server = try listener.accept(io);
-    defer server.close(io);
+    var sockets: [2]std.posix.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &sockets) != 0)
+        return error.Unexpected;
+    defer _ = std.posix.system.close(sockets[0]);
+    defer _ = std.posix.system.close(sockets[1]);
 
     var observer = Observer.init(std.testing.allocator, 1);
     try observer.start();
     defer observer.deinit();
     var cancellation: http_common.RequestCancellation = .{};
-    var registration = try observer.register(server.socket.handle, &cancellation, null, null);
+    var registration = try observer.register(sockets[1], &cancellation, null, null);
     defer registration.deinit();
 
-    var write_buffer: [1]u8 = undefined;
-    var writer = client.writer(io, &write_buffer);
-    try writer.interface.writeAll("B");
-    try writer.interface.flush();
-    try io.vtable.netShutdown(io.userdata, client.socket.handle, .send);
+    try std.testing.expectEqual(@as(isize, 1), std.c.send(sockets[0], "B", 1, 0));
+    try std.testing.expectEqual(@as(c_int, 0), std.c.shutdown(sockets[0], std.c.SHUT.WR));
     for (0..400) |_| {
         if (cancellation.isCancelled()) break;
         sleepMs(5);
     }
     try std.testing.expect(cancellation.isCancelled());
     var queued: [1]u8 = undefined;
-    const read_len = std.c.recv(server.socket.handle, &queued, queued.len, 0);
+    const read_len = std.c.recv(sockets[1], &queued, queued.len, 0);
     try std.testing.expectEqual(@as(isize, 1), read_len);
     try std.testing.expectEqualStrings("B", &queued);
+}
+
+fn runDeadlineStormRound(observer: *Observer) !void {
+    const batch_size = 32;
+    var sockets: [32][2]std.posix.fd_t = undefined;
+    var deadlines = [_]Observer.Deadline{.{}} ** 32;
+    var registrations: [32]Observer.Registration = undefined;
+    var initialized: usize = 0;
+    defer {
+        for (registrations[0..initialized]) |*registration| registration.deinit();
+        for (sockets[0..initialized]) |pair| {
+            _ = std.posix.system.close(pair[0]);
+            _ = std.posix.system.close(pair[1]);
+        }
+    }
+
+    for (0..32) |index| {
+        if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &sockets[index]) != 0)
+            return error.Unexpected;
+        registrations[index] = try observer.registerDeadline(
+            sockets[index][1],
+            250,
+            &deadlines[index],
+            null,
+        );
+        initialized += 1;
+    }
+    try std.testing.expectEqual(@as(usize, batch_size), observer.activeDeadlineCount());
+
+    for (0..400) |_| {
+        if (observer.activeDeadlineCount() == 0) break;
+        sleepMs(5);
+    }
+    for (&deadlines) |*deadline| try std.testing.expect(deadline.didExpire());
+    try std.testing.expectEqual(@as(usize, 0), observer.activeCount());
+    try std.testing.expectEqual(@as(usize, 0), observer.activePeerCount());
+    try std.testing.expectEqual(@as(usize, 0), observer.activeDeadlineCount());
+}
+
+test "std http listener socket observer does not ratchet workers across deadline storms" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
+
+    var observer = Observer.init(std.testing.allocator, 32);
+    try observer.start();
+    defer observer.deinit();
+
+    for (0..4) |round| {
+        try runDeadlineStormRound(&observer);
+        try std.testing.expectEqual(@as(u64, @intCast((round + 1) * 32)), observer.deadlineExpirationsTotal());
+    }
+}
+
+test "std http listener socket observer unregisters completed deadline without firing" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
+    var sockets: [2]std.posix.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &sockets) != 0)
+        return error.Unexpected;
+    defer _ = std.posix.system.close(sockets[0]);
+    defer _ = std.posix.system.close(sockets[1]);
+
+    var observer = Observer.init(std.testing.allocator, 1);
+    try observer.start();
+    defer observer.deinit();
+    var deadline: Observer.Deadline = .{};
+    var registration = try observer.registerDeadline(sockets[1], 50, &deadline, null);
+    registration.deinit();
+    sleepMs(100);
+
+    try std.testing.expect(!deadline.didExpire());
+    try std.testing.expectEqual(@as(usize, 0), observer.activeCount());
+    try std.testing.expectEqual(@as(u64, 0), observer.deadlineExpirationsTotal());
+}
+
+test "std http listener socket observer distinguishes observer failure from timeout" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
+    var sockets: [2]std.posix.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &sockets) != 0)
+        return error.Unexpected;
+    defer _ = std.posix.system.close(sockets[0]);
+    defer _ = std.posix.system.close(sockets[1]);
+
+    var observer = Observer.init(std.testing.allocator, 1);
+    try observer.start();
+    defer observer.deinit();
+    var deadline: Observer.Deadline = .{};
+    var registration = try observer.registerDeadline(sockets[1], 60_000, &deadline, null);
+    defer registration.deinit();
+
+    platform_sync.lockYielding(&observer.mutex);
+    observer.failAllLocked();
+    observer.mutex.unlock();
+    try std.testing.expect(deadline.observerFailed());
+    try std.testing.expect(!deadline.didExpire());
+    try std.testing.expectEqual(@as(u64, 0), observer.deadlineExpirationsTotal());
+    try std.testing.expectEqual(@as(usize, 0), observer.activeCount());
+}
+
+test "std http listener socket observer rejects registration after fatal stop" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
+    var sockets: [2]std.posix.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &sockets) != 0)
+        return error.Unexpected;
+    defer _ = std.posix.system.close(sockets[0]);
+    defer _ = std.posix.system.close(sockets[1]);
+
+    var observer = Observer.init(std.testing.allocator, 1);
+    try observer.start();
+    defer observer.deinit();
+    observer.stopAfterRuntimeFailure();
+
+    var deadline: Observer.Deadline = .{};
+    try std.testing.expectError(
+        error.ObserverUnavailable,
+        observer.registerDeadline(sockets[1], 60_000, &deadline, null),
+    );
+    try std.testing.expectEqual(@as(usize, 0), observer.activeCount());
 }
