@@ -64,6 +64,7 @@ pub const scraping = @import("antfly_scraping");
 pub const native_recognize = @import("native_recognize.zig");
 pub const native_extract = @import("native_extract.zig");
 pub const compare_generate = @import("cli/compare_generate.zig");
+pub const run_options = @import("cli/run_options.zig");
 pub const native_smoke = @import("native_smoke.zig");
 pub const cuda_info = @import("cuda_info.zig");
 pub const cuda_microbench = @import("bench/cuda_microbench.zig");
@@ -122,6 +123,7 @@ test {
     _ = native_recognize;
     _ = native_extract;
     _ = compare_generate;
+    _ = run_options;
     _ = native_smoke;
     _ = cuda_info;
     _ = cuda_microbench;

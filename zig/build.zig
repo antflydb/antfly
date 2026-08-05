@@ -3651,6 +3651,7 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_test_mod,
         .filters = selectTestFilters(b, &.{
             "storage.db.db.test.",
+            "storage.db.promotion_runtime.test.",
             "unsupported transforms fail atomically instead of reporting success",
             "supported transform on a missing document remains a no-op without upsert",
             "io threaded applied callback observes published watermark outside runtime lock",
