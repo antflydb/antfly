@@ -119,6 +119,87 @@ def test_managed_completion_receipt_rejects_boolean_numeric_fields(tmp_path):
     assert not _looks_like_model_dir(model_dir)
 
 
+@pytest.mark.parametrize(
+    "artifact_path",
+    (
+        "nested//model.onnx",
+        "nested/./model.onnx",
+        "C:model.onnx",
+        "nested\\model.onnx",
+        "model\x00.onnx",
+    ),
+)
+def test_managed_completion_receipt_rejects_runtime_unsafe_paths(
+    tmp_path, artifact_path
+):
+    model_dir = tmp_path / "owner" / "unsafe-path"
+    model_dir.mkdir(parents=True)
+    (model_dir / models.MANAGED_DOWNLOAD_COMPLETE).write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "artifacts": [{"path": artifact_path, "size": 1}],
+            }
+        )
+    )
+
+    assert not _looks_like_model_dir(model_dir)
+
+
+def test_managed_completion_receipt_rejects_duplicate_artifact_paths(tmp_path):
+    model_dir = tmp_path / "owner" / "duplicate-path"
+    model_dir.mkdir(parents=True)
+    (model_dir / "model.onnx").write_bytes(b"x")
+    artifact = {"path": "model.onnx", "size": 1}
+    (model_dir / models.MANAGED_DOWNLOAD_COMPLETE).write_text(
+        json.dumps({"version": 1, "artifacts": [artifact, artifact]})
+    )
+
+    assert not _looks_like_model_dir(model_dir)
+
+
+def test_managed_completion_receipt_bounds_artifact_count(monkeypatch, tmp_path):
+    monkeypatch.setattr(models, "MAX_MANAGED_DOWNLOAD_ARTIFACTS", 1)
+    model_dir = tmp_path / "owner" / "too-many-artifacts"
+    model_dir.mkdir(parents=True)
+    (model_dir / "model.onnx").write_bytes(b"x")
+    (model_dir / "config.json").write_bytes(b"{}")
+    (model_dir / models.MANAGED_DOWNLOAD_COMPLETE).write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "artifacts": [
+                    {"path": "model.onnx", "size": 1},
+                    {"path": "config.json", "size": 2},
+                ],
+            }
+        )
+    )
+
+    assert not _looks_like_model_dir(model_dir)
+
+
+def test_managed_completion_receipt_limit_is_measured_in_bytes(monkeypatch, tmp_path):
+    model_dir = tmp_path / "owner" / "receipt-byte-limit"
+    model_dir.mkdir(parents=True)
+    (model_dir / "model.onnx").write_bytes(b"x")
+    serialized = json.dumps(
+        {
+            "version": 1,
+            "artifacts": [{"path": "model.onnx", "size": 1}],
+            "note": "é" * 32,
+        },
+        ensure_ascii=False,
+    )
+    assert len(serialized) < len(serialized.encode("utf-8"))
+    monkeypatch.setattr(models, "MAX_MANAGED_DOWNLOAD_RECEIPT_BYTES", len(serialized))
+    (model_dir / models.MANAGED_DOWNLOAD_COMPLETE).write_text(
+        serialized, encoding="utf-8"
+    )
+
+    assert not _looks_like_model_dir(model_dir)
+
+
 def test_reader_environment_override_preserves_curated_variant(monkeypatch):
     monkeypatch.setenv("ANTFLY_INFERENCE_FLORENCE_MODEL", "antflydb/florence-2-base")
 

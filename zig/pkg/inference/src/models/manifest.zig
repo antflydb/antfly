@@ -537,6 +537,97 @@ const ArtifactCatalog = struct {
     }
 };
 
+/// A direct GGUF path still belongs to the nearest managed model ancestor, if
+/// one exists. Preserve standalone-file support while preventing an absolute
+/// path from bypassing an in-progress marker or selecting an unreceipted file
+/// inside a managed publication.
+const DirectGgufArtifact = struct {
+    allocator: std.mem.Allocator,
+    path: ?[]u8,
+    requested_path: []u8,
+    catalog: ArtifactCatalog,
+
+    fn init(allocator: std.mem.Allocator, requested_path: []const u8) !DirectGgufArtifact {
+        const resolved_requested_path = try managed_receipt.resolveRequestedFilePath(
+            allocator,
+            std.Options.debug_io,
+            requested_path,
+        );
+        errdefer allocator.free(resolved_requested_path);
+        const canonical_path = try managed_receipt.resolveRegularFilePath(
+            allocator,
+            std.Options.debug_io,
+            resolved_requested_path,
+        );
+        errdefer allocator.free(canonical_path);
+
+        var ancestor = std.fs.path.dirname(resolved_requested_path) orelse ".";
+        while (true) {
+            if (try managed_receipt.loadValidated(
+                allocator,
+                std.Options.debug_io,
+                ancestor,
+            )) |receipt| {
+                var catalog = ArtifactCatalog{
+                    .allocator = allocator,
+                    .model_dir_path = ancestor,
+                    .receipt = receipt,
+                };
+                errdefer catalog.deinit();
+
+                var relative_start = ancestor.len;
+                while (relative_start < resolved_requested_path.len and
+                    std.fs.path.isSep(resolved_requested_path[relative_start]))
+                {
+                    relative_start += 1;
+                }
+                const relative_path = try allocator.dupe(u8, resolved_requested_path[relative_start..]);
+                defer allocator.free(relative_path);
+                for (relative_path) |*byte| {
+                    if (std.fs.path.isSep(byte.*)) byte.* = '/';
+                }
+                const artifact = receipt.find(relative_path) orelse
+                    return error.ModelArtifactNotPublished;
+                if (!std.mem.eql(u8, artifact.canonical_path, canonical_path))
+                    return error.ModelArtifactNotPublished;
+                return .{
+                    .allocator = allocator,
+                    .path = canonical_path,
+                    .requested_path = resolved_requested_path,
+                    .catalog = catalog,
+                };
+            }
+
+            const parent = std.fs.path.dirname(ancestor) orelse break;
+            if (std.mem.eql(u8, parent, ancestor)) break;
+            ancestor = parent;
+        }
+
+        return .{
+            .allocator = allocator,
+            .path = canonical_path,
+            .requested_path = resolved_requested_path,
+            .catalog = .{
+                .allocator = allocator,
+                .model_dir_path = std.fs.path.dirname(resolved_requested_path) orelse ".",
+            },
+        };
+    }
+
+    fn takePath(self: *DirectGgufArtifact) []u8 {
+        const path = self.path.?;
+        self.path = null;
+        return path;
+    }
+
+    fn deinit(self: *DirectGgufArtifact) void {
+        self.catalog.deinit();
+        if (self.path) |path| self.allocator.free(path);
+        self.allocator.free(self.requested_path);
+        self.* = undefined;
+    }
+};
+
 fn readOptionalMetadataFile(
     allocator: std.mem.Allocator,
     model_dir_path: []const u8,
@@ -570,15 +661,17 @@ test "optional metadata preserves non-missing open failures" {
 /// Load a model manifest by inspecting the directory contents and parsing configs.
 pub fn loadFromDir(allocator: std.mem.Allocator, model_dir_path: []const u8) !ModelManifest {
     if (std.mem.endsWith(u8, model_dir_path, ".gguf")) {
+        var direct = try DirectGgufArtifact.init(allocator, model_dir_path);
+        defer direct.deinit();
         var manifest = ModelManifest{ .allocator = allocator };
         errdefer manifest.deinit();
-        manifest.gguf_path = try allocator.dupe(u8, model_dir_path);
+        manifest.gguf_path = direct.takePath();
         try ignoreNonResourceMetadataError(applyGgufTokenizerMetadata(
             &manifest,
             allocator,
-            null,
-            std.fs.path.dirname(model_dir_path) orelse ".",
-            model_dir_path,
+            &direct.catalog,
+            direct.catalog.model_dir_path,
+            manifest.gguf_path.?,
         ));
         return manifest;
     }
@@ -721,7 +814,9 @@ pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const 
     errdefer manifest.deinit();
 
     if (std.mem.endsWith(u8, model_dir_path, ".gguf")) {
-        manifest.gguf_path = try allocator.dupe(u8, model_dir_path);
+        var direct = try DirectGgufArtifact.init(allocator, model_dir_path);
+        defer direct.deinit();
+        manifest.gguf_path = direct.takePath();
         return manifest;
     }
 
@@ -3647,6 +3742,104 @@ test "private staging manifests load only through the validated plan API" {
     defer manifest.deinit();
     try std.testing.expectEqual(@as(u32, 42), manifest.hidden_size);
     try std.testing.expect(manifest.gguf_path != null);
+}
+
+test "direct gguf paths honor the nearest managed publication receipt" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "model/aliases");
+    try tmp.dir.createDirPath(io, "model/artifacts");
+    try tmp.dir.writeFile(io, .{ .sub_path = "model/artifacts/published.gguf", .data = "published" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model/artifacts/stale.gguf", .data = "stale" });
+    try tmp.dir.symLink(io, "../artifacts/published.gguf", "model/aliases/published.gguf", .{});
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "model/.antfly-download-complete.json",
+        .data = "{\"version\":1,\"artifacts\":[{\"path\":\"artifacts/published.gguf\",\"size\":9}]}",
+    });
+
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "model" });
+    defer allocator.free(model_dir);
+    const published_path = try std.fs.path.join(allocator, &.{ model_dir, "artifacts", "published.gguf" });
+    defer allocator.free(published_path);
+    const stale_path = try std.fs.path.join(allocator, &.{ model_dir, "artifacts", "stale.gguf" });
+    defer allocator.free(stale_path);
+    const alias_path = try std.fs.path.join(allocator, &.{ model_dir, "aliases", "published.gguf" });
+    defer allocator.free(alias_path);
+
+    var manifest = try loadFromDir(allocator, published_path);
+    defer manifest.deinit();
+    try std.testing.expect(manifest.gguf_path != null);
+    try std.testing.expectError(error.ModelArtifactNotPublished, loadFromDir(allocator, stale_path));
+    try std.testing.expectError(error.ModelArtifactNotPublished, loadListingFromDir(allocator, stale_path));
+    try std.testing.expectError(error.ModelArtifactNotPublished, loadFromDir(allocator, alias_path));
+    try std.testing.expectError(error.ModelArtifactNotPublished, loadListingFromDir(allocator, alias_path));
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "model/.antfly-download-complete.json",
+        .data = "{\"version\":1,\"artifacts\":[{\"path\":\"artifacts/published.gguf\",\"size\":9},{\"path\":\"aliases/published.gguf\",\"size\":9}]}",
+    });
+    var alias_manifest = try loadFromDir(allocator, alias_path);
+    defer alias_manifest.deinit();
+    try std.testing.expect(alias_manifest.gguf_path != null);
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "model/.antfly-download-in-progress",
+        .data = "{\"version\":1,\"state\":\"in_progress\"}",
+    });
+    try std.testing.expectError(error.IncompleteManagedDownload, loadFromDir(allocator, published_path));
+    try std.testing.expectError(error.IncompleteManagedDownload, loadListingFromDir(allocator, published_path));
+}
+
+test "direct unmanaged gguf paths must resolve to regular files" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const missing_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "missing.gguf" });
+    defer allocator.free(missing_path);
+    try std.testing.expectError(error.FileNotFound, loadFromDir(allocator, missing_path));
+    try std.testing.expectError(error.FileNotFound, loadListingFromDir(allocator, missing_path));
+
+    try tmp.dir.createDir(io, "directory.gguf", .default_dir);
+    const directory_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "directory.gguf" });
+    defer allocator.free(directory_path);
+    try std.testing.expectError(error.InvalidModelArtifactKind, loadFromDir(allocator, directory_path));
+    try std.testing.expectError(error.InvalidModelArtifactKind, loadListingFromDir(allocator, directory_path));
+}
+
+test "direct managed gguf loading cleans up every allocation failure" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "model/artifacts");
+    try tmp.dir.writeFile(io, .{ .sub_path = "model/artifacts/model.gguf", .data = "published" });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "model/.antfly-download-complete.json",
+        .data = "{\"version\":1,\"artifacts\":[{\"path\":\"artifacts/model.gguf\",\"size\":9}]}",
+    });
+    const model_path = try std.fs.path.join(allocator, &.{
+        ".zig-cache",
+        "tmp",
+        tmp.sub_path[0..],
+        "model",
+        "artifacts",
+        "model.gguf",
+    });
+    defer allocator.free(model_path);
+
+    const Runner = struct {
+        fn run(alloc: std.mem.Allocator, path: []const u8) !void {
+            var manifest = try loadFromDir(alloc, path);
+            defer manifest.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Runner.run, .{model_path});
 }
 
 test "gguf discovery resolves unknown filesystem entry kinds" {

@@ -100,8 +100,15 @@ pub const ReaderResolver = struct {
         failed_at: std.Io.Timestamp,
     };
 
+    const CacheState = enum {
+        selected,
+        unavailable,
+        invalidated,
+    };
+
     const CacheEntry = struct {
         path: ?[]u8 = null,
+        state: CacheState = .invalidated,
         cached_at: std.Io.Timestamp = .zero,
         last_accessed_at: std.Io.Timestamp,
     };
@@ -109,6 +116,7 @@ pub const ReaderResolver = struct {
     const Snapshot = struct {
         allocator: std.mem.Allocator,
         cached_path: ?[]u8 = null,
+        unavailable: bool = false,
         failed_paths: FailedReaderPathSet = .empty,
 
         fn deinit(self: *Snapshot) void {
@@ -188,6 +196,7 @@ pub const ReaderResolver = struct {
         if (self.entries.getPtr(extractor_model_name)) |entry| {
             if (entry.path) |old_path| self.allocator.free(old_path);
             entry.path = cache_path;
+            entry.state = .selected;
             entry.cached_at = cached_at;
             entry.last_accessed_at = cached_at;
             return;
@@ -198,6 +207,31 @@ pub const ReaderResolver = struct {
         errdefer self.allocator.free(cache_key);
         try self.entries.put(self.allocator, cache_key, .{
             .path = cache_path,
+            .state = .selected,
+            .cached_at = cached_at,
+            .last_accessed_at = cached_at,
+        });
+    }
+
+    fn cacheUnavailableLocked(
+        self: *ReaderResolver,
+        extractor_model_name: []const u8,
+        cached_at: std.Io.Timestamp,
+    ) !void {
+        if (self.entries.getPtr(extractor_model_name)) |entry| {
+            if (entry.path) |path| self.allocator.free(path);
+            entry.path = null;
+            entry.state = .unavailable;
+            entry.cached_at = cached_at;
+            entry.last_accessed_at = cached_at;
+            return;
+        }
+
+        self.evictOldestLocked();
+        const cache_key = try self.allocator.dupe(u8, extractor_model_name);
+        errdefer self.allocator.free(cache_key);
+        try self.entries.put(self.allocator, cache_key, .{
+            .state = .unavailable,
             .cached_at = cached_at,
             .last_accessed_at = cached_at,
         });
@@ -253,17 +287,24 @@ pub const ReaderResolver = struct {
         errdefer snapshot.deinit();
         if (self.entries.getPtr(extractor_model_name)) |entry| {
             entry.last_accessed_at = now;
-            if (entry.path) |path| {
-                const age = std.Io.Timestamp.durationTo(entry.cached_at, now).nanoseconds;
-                if (age >= 0 and age < reader_selection_cache_ttl_ns and
-                    !self.candidateFailedLocked(path, now))
-                {
-                    snapshot.cached_path = try self.allocator.dupe(u8, path);
+            const age = std.Io.Timestamp.durationTo(entry.cached_at, now).nanoseconds;
+            if (age >= 0 and age < reader_selection_cache_ttl_ns) {
+                if (entry.state == .unavailable) {
+                    snapshot.unavailable = true;
                     return snapshot;
                 }
+                if (entry.state == .selected) if (entry.path) |path| {
+                    if (!self.candidateFailedLocked(path, now)) {
+                        snapshot.cached_path = try self.allocator.dupe(u8, path);
+                        return snapshot;
+                    }
+                };
+            }
+            if (entry.path) |path| {
                 self.allocator.free(path);
                 entry.path = null;
             }
+            entry.state = .invalidated;
         }
 
         self.expireFailuresLocked(now);
@@ -298,6 +339,7 @@ pub const ReaderResolver = struct {
                 if (!std.mem.eql(u8, path, failed_path)) continue;
                 self.allocator.free(path);
                 entry.value_ptr.path = null;
+                entry.value_ptr.state = .invalidated;
             }
         }
 
@@ -580,8 +622,20 @@ fn resolveReaderModelPathForExtraction(ctx: Context, extractor_model_name: []con
                 snapshot.cached_path = null;
                 return path;
             }
+            if (snapshot.unavailable) return error.NoReaderModelAvailable;
 
-            const path = try discoverReaderModelPathForExtraction(ctx, canonical_extractor_name, &snapshot.failed_paths);
+            const path = discoverReaderModelPathForExtraction(ctx, canonical_extractor_name, &snapshot.failed_paths) catch |err| switch (err) {
+                error.NoReaderModelAvailable => {
+                    resolver.mutex.lockUncancelable(ctx.io);
+                    defer resolver.mutex.unlock(ctx.io);
+                    try resolver.cacheUnavailableLocked(
+                        canonical_extractor_name,
+                        std.Io.Timestamp.now(ctx.io, .awake),
+                    );
+                    return err;
+                },
+                else => return err,
+            };
             errdefer ctx.allocator.free(path);
             var accepted = false;
             {
@@ -946,6 +1000,47 @@ test "image extraction caches a supported fallback reader selection" {
     try std.testing.expect(resolver.failed_candidates.contains(first));
 }
 
+test "image extraction caches unavailable reader discovery for a bounded ttl" {
+    const Discovery = struct {
+        calls: usize = 0,
+
+        fn discover(
+            raw: *anyopaque,
+            _: std.mem.Allocator,
+            _: std.Io,
+            _: []const u8,
+            _: *const FailedReaderPathSet,
+        ) ![]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return error.NoReaderModelAvailable;
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var resolver = ReaderResolver.init(allocator);
+    defer resolver.deinit();
+    var discovery = Discovery{};
+    const ctx = Context{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .models_dir = "/models",
+        .session_manager = undefined,
+        .model_manager = undefined,
+        .reader_resolver = &resolver,
+        .reader_discovery_override = .{ .context = &discovery, .discoverFn = Discovery.discover },
+    };
+
+    try std.testing.expectError(error.NoReaderModelAvailable, resolveReaderModelPathForExtraction(ctx, "acme/missing"));
+    try std.testing.expectError(error.NoReaderModelAvailable, resolveReaderModelPathForExtraction(ctx, "acme/missing"));
+    try std.testing.expectEqual(@as(usize, 1), discovery.calls);
+    try std.testing.expectEqual(ReaderResolver.CacheState.unavailable, resolver.entries.get("acme/missing").?.state);
+
+    resolver.entries.getPtr("acme/missing").?.cached_at = std.Io.Timestamp.zero;
+    try std.testing.expectError(error.NoReaderModelAvailable, resolveReaderModelPathForExtraction(ctx, "acme/missing"));
+    try std.testing.expectEqual(@as(usize, 2), discovery.calls);
+}
+
 test "image extraction fallback cache is isolated by recognizer" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1270,6 +1365,7 @@ test "reader selection state cleans up every allocation failure" {
 
             const now = std.Io.Timestamp.now(std.testing.io, .awake);
             try resolver.cacheLocked("acme/recognizer", "/models/readers/preferred", now);
+            try resolver.cacheUnavailableLocked("acme/missing", now);
             try resolver.markCandidateFailure(std.testing.io, "/models/readers/preferred");
             try resolver.markCandidateFailure(std.testing.io, "/models/readers/fallback");
             var snapshot = try resolver.snapshotLocked("acme/recognizer", now);

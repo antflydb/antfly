@@ -128,6 +128,35 @@ fn realPathAlloc(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]
     return try allocator.dupe(u8, sentinel_path);
 }
 
+/// Resolve the parent of a requested file without resolving the final path
+/// component. This preserves the exact name used to address a symlink while
+/// removing relative and symlinked ancestor ambiguity. The returned path is
+/// owned by `allocator`.
+pub fn resolveRequestedFilePath(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+) ![]u8 {
+    const parent = std.fs.path.dirname(path) orelse ".";
+    const canonical_parent = try realPathAlloc(allocator, io, parent);
+    defer allocator.free(canonical_parent);
+    return std.fs.path.join(allocator, &.{ canonical_parent, std.fs.path.basename(path) });
+}
+
+/// Resolve a path to its canonical regular-file target. The returned path is
+/// owned by `allocator`.
+pub fn resolveRegularFilePath(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+) ![]u8 {
+    const canonical_path = try realPathAlloc(allocator, io, path);
+    errdefer allocator.free(canonical_path);
+    const stat = try std.Io.Dir.cwd().statFile(io, canonical_path, .{ .follow_symlinks = false });
+    if (stat.kind != .file) return error.InvalidModelArtifactKind;
+    return canonical_path;
+}
+
 fn resolveContainedArtifactFromCanonicalRoot(
     allocator: std.mem.Allocator,
     io: std.Io,

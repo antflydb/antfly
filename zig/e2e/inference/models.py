@@ -37,6 +37,7 @@ MANAGED_DOWNLOAD_IN_PROGRESS = ".antfly-download-in-progress"
 MANAGED_DOWNLOAD_PLAN = ".antfly-download-plan.json"
 MANAGED_DOWNLOAD_COMPLETE = ".antfly-download-complete.json"
 MAX_MANAGED_DOWNLOAD_RECEIPT_BYTES = 16 * 1024 * 1024
+MAX_MANAGED_DOWNLOAD_ARTIFACTS = 64 * 1024
 SUPPORTED_MODEL_SUFFIXES = (".gguf", ".onnx", ".safetensors")
 
 MODEL_TASKS = (
@@ -396,7 +397,7 @@ def _validated_managed_artifacts(path: Path) -> tuple[str, ...] | None:
 
     root = path.resolve()
     try:
-        with completion_path.open(encoding="utf-8") as receipt:
+        with completion_path.open("rb") as receipt:
             serialized = receipt.read(MAX_MANAGED_DOWNLOAD_RECEIPT_BYTES + 1)
         if len(serialized) > MAX_MANAGED_DOWNLOAD_RECEIPT_BYTES:
             return ()
@@ -406,10 +407,15 @@ def _validated_managed_artifacts(path: Path) -> tuple[str, ...] | None:
         return ()
     if type(completion.get("version")) is not int or completion["version"] != 1:
         return ()
-    if not isinstance(artifacts, list) or not artifacts:
+    if (
+        not isinstance(artifacts, list)
+        or not artifacts
+        or len(artifacts) > MAX_MANAGED_DOWNLOAD_ARTIFACTS
+    ):
         return ()
 
     artifact_paths: list[str] = []
+    seen_paths: set[str] = set()
     has_supported_payload = False
     for artifact in artifacts:
         if not isinstance(artifact, dict):
@@ -422,14 +428,18 @@ def _validated_managed_artifacts(path: Path) -> tuple[str, ...] | None:
             or artifact_size < 0
         ):
             return ()
+        parts = artifact_path.split("/")
         relative = PurePosixPath(artifact_path)
         if (
             relative.is_absolute()
-            or not relative.parts
-            or any(part in ("", ".", "..") for part in relative.parts)
+            or any(part in ("", ".", "..") for part in parts)
             or "\\" in artifact_path
+            or ":" in artifact_path
+            or "\x00" in artifact_path
+            or artifact_path in seen_paths
         ):
             return ()
+        seen_paths.add(artifact_path)
         candidate = path.joinpath(*relative.parts)
         try:
             resolved = candidate.resolve(strict=True)
