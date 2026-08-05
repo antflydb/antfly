@@ -114,7 +114,11 @@ pub const MergePolicy = struct {
                 else
                     0.0;
                 const width_ratio = @as(f64, @floatFromInt(len)) / @as(f64, @floatFromInt(max_merge_at_once));
-                const backlog_width_bonus = if (budget_pressure > 1.0) (budget_pressure - 1.0) * width_ratio else 0.0;
+                // Once the segment budget is exceeded, prefer enough fan-in
+                // to drain the debt rather than repeatedly merging pairs. A
+                // single worker cannot catch a sustained producer when every
+                // merge reduces the live set by only one segment.
+                const backlog_width_bonus = budget_pressure * width_ratio * 2.0;
                 const score = (skew * self.skew_weight) +
                     (size_ratio * self.size_weight) -
                     (delete_ratio * self.delete_reclaim_weight) -
@@ -564,7 +568,7 @@ test "bounded merge splits output and preserves live documents" {
     try std.testing.expectEqual(@as(u32, 3), total_docs);
 }
 
-test "merge policy picks small segments and applyMerge replaces them" {
+test "merge policy drains a small-segment backlog and applyMerge replaces it" {
     const alloc = std.testing.allocator;
     const introducer = @import("introducer.zig");
 
@@ -614,14 +618,17 @@ test "merge policy picks small segments and applyMerge replaces them" {
     const planned = (try policy.plan(alloc, infos)).?;
     defer alloc.free(planned);
 
-    try std.testing.expectEqual(@as(usize, 2), planned.len);
+    // All three floor-sized segments are above the two-segment tier budget.
+    // Draining the full eligible fan-in is the behavior that prevents a
+    // sustained producer from outrunning pairwise compaction.
+    try std.testing.expectEqual(@as(usize, 3), planned.len);
 
     const merged = try mergeSegments(alloc, writer.snapshot(), planned);
     defer alloc.free(merged);
 
     try applyMerge(&writer, planned, merged);
 
-    try std.testing.expectEqual(@as(usize, 2), writer.snapshot().segments.len);
+    try std.testing.expectEqual(@as(usize, 1), writer.snapshot().segments.len);
 
     const results = try writer.snapshot().search(alloc, "body", &.{ "hello", "world" }, 10);
     defer alloc.free(results.hits);
@@ -708,6 +715,29 @@ test "merge policy compacts floor segments under tier pressure" {
     defer alloc.free(planned);
 
     try std.testing.expect(planned.len >= 2);
+}
+
+test "merge policy uses full fan-in while tiny segment backlog is growing" {
+    const alloc = std.testing.allocator;
+    const policy = MergePolicy{
+        .max_segments_per_tier = 10,
+        .max_merge_at_once = 10,
+        .max_segment_size = 5 * 1024 * 1024 * 1024,
+        .floor_segment_size = 16 * 1024 * 1024,
+    };
+    var infos: [64]SegmentInfo = undefined;
+    for (&infos, 0..) |*info, i| {
+        info.* = .{
+            .index = i,
+            .size = 32 * 1024 + i,
+            .doc_count = 8,
+            .has_deletions = false,
+        };
+    }
+
+    const planned = (try policy.plan(alloc, &infos)).?;
+    defer alloc.free(planned);
+    try std.testing.expectEqual(@as(usize, policy.max_merge_at_once), planned.len);
 }
 
 test "merge direct-copies single-source field sections when eligible" {

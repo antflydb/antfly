@@ -74,7 +74,13 @@ pub const LoadedVisionReader = struct {
         var model_handle = try model_manager.acquireFromDir(model_path);
         errdefer model_handle.release();
         const model = model_handle.get();
-        const florence_config = session_factory.getFlorenceConfig(model.session) orelse return error.InvalidModelForReading;
+        const florence_config = session_factory.getFlorenceConfig(model.session) orelse {
+            std.log.err(
+                "reader model resolved without a Florence session requested_path={s} loaded_path={s} backend={s}",
+                .{ model_path, model.model_dir, @tagName(model.session.backend()) },
+            );
+            return error.InvalidModelForReading;
+        };
         const preproc_path = model.manifest.preprocessor_config_path orelse return error.IncompleteFlorence2Bundle;
         const preproc = try loadPreprocessorConfigFile(allocator, preproc_path);
         if (preproc.image_size != @as(usize, florence_config.image_size)) {

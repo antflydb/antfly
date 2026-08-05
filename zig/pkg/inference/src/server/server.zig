@@ -398,6 +398,21 @@ pub const PromptCacheConfig = struct {
     }
 };
 
+test "extraction resolution distinguishes absence resource pressure and internal failure" {
+    try std.testing.expectEqual(
+        ExtractionResolutionFailure.not_found,
+        classifyExtractionResolutionFailure(error.ModelNotFound),
+    );
+    try std.testing.expectEqual(
+        ExtractionResolutionFailure.resource_exhausted,
+        classifyExtractionResolutionFailure(error.OutOfMemory),
+    );
+    try std.testing.expectEqual(
+        ExtractionResolutionFailure.internal,
+        classifyExtractionResolutionFailure(error.Unexpected),
+    );
+}
+
 test "prompt cache config reports node target in bytes" {
     const cfg = PromptCacheConfig{ .enabled = true, .max_bytes_mb = 512 };
     try std.testing.expectEqual(@as(usize, 512 * 1024 * 1024), cfg.runtimeConfig(null).max_bytes);
@@ -2278,12 +2293,27 @@ fn requestModelResolutionErrorKind(err: anyerror) RequestModelResolutionErrorKin
     };
 }
 
+const ExtractionResolutionFailure = enum {
+    not_found,
+    resource_exhausted,
+    internal,
+};
+
+fn classifyExtractionResolutionFailure(err: anyerror) ExtractionResolutionFailure {
+    return switch (err) {
+        error.ModelNotFound => .not_found,
+        error.OutOfMemory => .resource_exhausted,
+        else => .internal,
+    };
+}
+
 pub const Node = struct {
     config: NodeConfig,
     allocator: std.mem.Allocator,
     session_manager: backends_mod.SessionManager,
     model_manager: model_manager_mod.ModelManager,
     registry: registry_mod.ModelRegistry,
+    extraction_reader_resolver: extractors_mod.ReaderResolver,
     tabular_registry: tabular_mod.registry.Registry,
     embed_cache: cache_mod.ResultCache([]const f32),
     metrics: metrics_mod.Metrics,
@@ -2413,6 +2443,7 @@ pub const Node = struct {
             .session_manager = session_manager,
             .model_manager = model_manager_mod.ModelManager.init(allocator, session_manager),
             .registry = registry_mod.ModelRegistry.init(allocator, config.models_dir),
+            .extraction_reader_resolver = extractors_mod.ReaderResolver.init(allocator),
             .tabular_registry = tabular_mod.registry.Registry.init(allocator),
             .embed_cache = cache_mod.ResultCache([]const f32).init(allocator, 120_000),
             .metrics = metrics_mod.Metrics.default,
@@ -2470,6 +2501,7 @@ pub const Node = struct {
     pub fn deinit(self: *Node) void {
         self.model_manager.deinit();
         self.registry.deinit();
+        self.extraction_reader_resolver.deinit();
         self.tabular_registry.deinit();
         self.embed_cache.deinit();
         var compatibility_it = self.compatibility_cache.iterator();
@@ -3785,6 +3817,7 @@ pub const Node = struct {
             .models_dir = self.config.models_dir,
             .session_manager = &self.session_manager,
             .model_manager = &self.model_manager,
+            .reader_resolver = &self.extraction_reader_resolver,
         };
         // Resolve the cheap manifest/path surface before any remote fetch or
         // media decode. The extractor itself does not load model weights until
@@ -3927,13 +3960,13 @@ pub const Node = struct {
                 // Variant resolution within task-type dir
                 const task_dir = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.config.models_dir, tt });
                 defer self.allocator.free(task_dir);
-                if (registry_mod.resolveVariant(self.allocator, io, task_dir, name_without_variant)) |variant_path| {
+                if (try registry_mod.resolveVariant(self.allocator, io, task_dir, name_without_variant)) |variant_path| {
                     return variant_path;
                 }
             }
 
             // Variant resolution: look for "name-{suffix}" with shortest suffix wins
-            if (registry_mod.resolveVariant(self.allocator, io, self.config.models_dir, name_without_variant)) |variant_path| {
+            if (try registry_mod.resolveVariant(self.allocator, io, self.config.models_dir, name_without_variant)) |variant_path| {
                 return variant_path;
             }
 
@@ -3948,7 +3981,7 @@ pub const Node = struct {
                 }
 
                 // Variant resolution on model-only name
-                if (registry_mod.resolveVariant(self.allocator, io, self.config.models_dir, model_only)) |variant_path| {
+                if (try registry_mod.resolveVariant(self.allocator, io, self.config.models_dir, model_only)) |variant_path| {
                     return variant_path;
                 }
             }
@@ -9265,9 +9298,16 @@ pub const Node = struct {
             .models_dir = self.config.models_dir,
             .session_manager = &self.session_manager,
             .model_manager = &self.model_manager,
+            .reader_resolver = &self.extraction_reader_resolver,
         };
-        var extractor = extractors_mod.resolve(extractor_ctx, body.model, has_images) catch
-            return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" });
+        var extractor = extractors_mod.resolve(extractor_ctx, body.model, has_images) catch |err| switch (classifyExtractionResolutionFailure(err)) {
+            .not_found => return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" }),
+            .resource_exhausted => return err,
+            .internal => return ctx.status(500).json(.{
+                .@"error" = "MODEL_RESOLUTION_FAILED",
+                .message = @errorName(err),
+            }),
+        };
         defer extractor.deinit(ctx.allocator);
 
         const results = (if (has_texts)
@@ -13213,6 +13253,7 @@ test "download remote content accepts data uri" {
         .session_manager = undefined,
         .model_manager = undefined,
         .registry = undefined,
+        .extraction_reader_resolver = undefined,
         .tabular_registry = undefined,
         .embed_cache = undefined,
         .metrics = undefined,
@@ -13452,6 +13493,7 @@ test "download remote content blocks private ip urls when configured" {
         .session_manager = undefined,
         .model_manager = undefined,
         .registry = undefined,
+        .extraction_reader_resolver = undefined,
         .tabular_registry = undefined,
         .embed_cache = undefined,
         .metrics = undefined,
@@ -13469,6 +13511,7 @@ test "download remote content blocks hosts outside allowlist" {
         .session_manager = undefined,
         .model_manager = undefined,
         .registry = undefined,
+        .extraction_reader_resolver = undefined,
         .tabular_registry = undefined,
         .embed_cache = undefined,
         .metrics = undefined,

@@ -21,6 +21,7 @@
 const std = @import("std");
 const httpx = @import("httpx");
 const builtin = @import("builtin");
+const managed_receipt = @import("managed_receipt.zig");
 
 pub const default_max_artifact_bytes: u64 = 64 * 1024 * 1024 * 1024;
 pub const default_max_model_bytes: u64 = 128 * 1024 * 1024 * 1024;
@@ -43,28 +44,15 @@ pub const HubConfig = struct {
     max_model_bytes: u64 = default_max_model_bytes,
 };
 
-pub const managed_download_in_progress_filename = ".antfly-download-in-progress";
-pub const managed_download_plan_filename = ".antfly-download-plan.json";
-pub const managed_download_complete_filename = ".antfly-download-complete.json";
+pub const managed_download_in_progress_filename = managed_receipt.in_progress_filename;
+pub const managed_download_plan_filename = managed_receipt.plan_filename;
+pub const managed_download_complete_filename = managed_receipt.complete_filename;
 pub const managed_download_lock_filename = ".antfly-download.lock";
+const managed_download_staging_suffix = ".antfly-download-staging";
+const managed_download_backup_suffix = ".antfly-download-backup";
 
-const ManagedArtifactReceipt = struct {
-    path: []const u8,
-    size: u64,
-    sha256: ?[]const u8 = null,
-};
-
-const ManagedDownloadSource = struct {
-    owner: []const u8,
-    name: []const u8,
-    variant: []const u8,
-};
-
-const ManagedDownloadReceipt = struct {
-    version: u32 = 1,
-    source: ?ManagedDownloadSource = null,
-    artifacts: []const ManagedArtifactReceipt,
-};
+const ManagedArtifactReceipt = managed_receipt.ArtifactReceipt;
+const ManagedDownloadReceipt = managed_receipt.DownloadReceipt;
 
 pub const ManagedDownloadState = enum {
     unmanaged,
@@ -270,9 +258,12 @@ const gguf_quant_preference = [_][]const u8{
     "Q2_K",
 };
 
-/// Preferred external multimodal projector GGUF payloads, best quality first.
+/// Preferred external multimodal projector GGUF payloads for automatic pulls.
+/// Q8 is effectively lossless for projector inference while avoiding the
+/// roughly 2x residency and download cost of F16/BF16. Users who need a dense
+/// projector can still select it explicitly with `--projector BF16`.
 const gguf_projector_preference = [_][]const u8{
-    "f16", "bf16", "F16", "BF16", "Q8_0", "q8_0", "Q6_K", "q6_k", "Q5_K_M", "q5_k_m", "Q4_K_M", "q4_k_m",
+    "Q8_0", "q8_0", "Q6_K", "q6_k", "Q5_K_M", "q5_k_m", "Q4_K_M", "q4_k_m", "f16", "bf16", "F16", "BF16",
 };
 
 fn basename(path: []const u8) []const u8 {
@@ -1018,9 +1009,9 @@ fn writeSyntheticMetadata(
     io: std.Io,
     dest_dir: []const u8,
     plan: SyntheticMetadataPlan,
-) !void {
+) !?ManagedArtifactReceipt {
     switch (plan) {
-        .none => {},
+        .none => return null,
         .paddleocr => |payload| {
             const metadata =
                 try std.fmt.allocPrint(allocator,
@@ -1044,7 +1035,11 @@ fn writeSyntheticMetadata(
 
             const metadata_path = try std.fmt.allocPrint(allocator, "{s}/antfly_metadata.json", .{dest_dir});
             defer allocator.free(metadata_path);
-            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = metadata_path, .data = metadata });
+            try writeFileAtomically(allocator, io, metadata_path, metadata);
+            return .{
+                .path = "antfly_metadata.json",
+                .size = metadata.len,
+            };
         },
     }
 }
@@ -1119,6 +1114,175 @@ fn managedPath(
     return std.fs.path.join(allocator, &.{ dest_dir, filename });
 }
 
+fn managedSiblingPath(
+    allocator: std.mem.Allocator,
+    destination: []const u8,
+    suffix: []const u8,
+) ![]u8 {
+    const leaf = try std.fmt.allocPrint(allocator, ".{s}{s}", .{ std.fs.path.basename(destination), suffix });
+    defer allocator.free(leaf);
+    return std.fs.path.join(allocator, &.{ std.fs.path.dirname(destination) orelse ".", leaf });
+}
+
+pub fn managedModelLockPathAlloc(
+    allocator: std.mem.Allocator,
+    destination: []const u8,
+) ![]u8 {
+    return managedSiblingPath(allocator, destination, managed_download_lock_filename);
+}
+
+fn pathExists(dir: std.Io.Dir, io: std.Io, path: []const u8) !bool {
+    dir.access(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return true;
+}
+
+fn removeTreeIfExists(dir: std.Io.Dir, io: std.Io, path: []const u8) !void {
+    if (!try pathExists(dir, io, path)) return;
+    try dir.deleteTree(io, path);
+}
+
+fn seedManagedArtifactsWithHardLinks(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    source_dir: []const u8,
+    staging_dir: []const u8,
+) !void {
+    var receipt = managed_receipt.loadValidated(allocator, io, source_dir) catch |err| switch (err) {
+        error.InvalidManagedDownload,
+        error.IncompleteManagedDownload,
+        error.ModelArtifactOutsideRoot,
+        => return,
+        else => return err,
+    } orelse return;
+    defer receipt.deinit();
+
+    const cwd = std.Io.Dir.cwd();
+    for (receipt.artifacts) |artifact| {
+        const staging_path = try std.fs.path.join(allocator, &.{ staging_dir, artifact.path });
+        defer allocator.free(staging_path);
+        if (std.fs.path.dirname(staging_path)) |parent| try cwd.createDirPath(io, parent);
+
+        // Hard links let a repair reuse verified multi-gigabyte weights without
+        // copying them. Downloads install replacements with atomic rename, so
+        // changing the staged file can never mutate the published inode.
+        std.Io.Dir.hardLink(cwd, artifact.canonical_path, cwd, staging_path, io, .{ .follow_symlinks = false }) catch continue;
+    }
+}
+
+/// A pull transaction built beside the published model directory.
+///
+/// Downloads never mutate the active cache. Verified existing artifacts are
+/// hard-linked into the staging tree for zero-copy reuse, and the completed
+/// tree is published with same-filesystem renames. An interrupted publication
+/// is recovered on the next pull from the retained backup directory.
+pub const ManagedModelTransaction = struct {
+    allocator: std.mem.Allocator,
+    destination: []u8,
+    staging: []u8,
+    backup: []u8,
+    committed: bool = false,
+
+    pub fn begin(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        destination: []const u8,
+    ) !ManagedModelTransaction {
+        const owned_destination = try allocator.dupe(u8, destination);
+        errdefer allocator.free(owned_destination);
+        const staging = try managedSiblingPath(allocator, destination, managed_download_staging_suffix);
+        errdefer allocator.free(staging);
+        const backup = try managedSiblingPath(allocator, destination, managed_download_backup_suffix);
+        errdefer allocator.free(backup);
+        const transaction = ManagedModelTransaction{
+            .allocator = allocator,
+            .destination = owned_destination,
+            .staging = staging,
+            .backup = backup,
+        };
+
+        const cwd = std.Io.Dir.cwd();
+        const destination_exists = try pathExists(cwd, io, transaction.destination);
+        const backup_exists = try pathExists(cwd, io, transaction.backup);
+        var recovered_publication = false;
+        if (backup_exists) {
+            if (!destination_exists) {
+                try std.Io.Dir.rename(cwd, transaction.backup, cwd, transaction.destination, io);
+            } else if (managedDownloadState(allocator, io, transaction.destination) == .complete) {
+                try removeTreeIfExists(cwd, io, transaction.backup);
+            } else {
+                try removeTreeIfExists(cwd, io, transaction.destination);
+                try std.Io.Dir.rename(cwd, transaction.backup, cwd, transaction.destination, io);
+            }
+            recovered_publication = true;
+        }
+        if (recovered_publication) {
+            try syncManagedDirectory(io, std.fs.path.dirname(transaction.destination) orelse ".");
+        }
+
+        if (!try pathExists(cwd, io, transaction.staging)) {
+            try cwd.createDirPath(io, transaction.staging);
+        }
+        try seedManagedArtifactsWithHardLinks(allocator, io, transaction.destination, transaction.staging);
+        try beginManagedDownload(allocator, io, transaction.staging);
+        return transaction;
+    }
+
+    pub fn commit(self: *ManagedModelTransaction, io: std.Io) !void {
+        if (self.committed) return error.ManagedDownloadAlreadyCommitted;
+        if (managedDownloadState(self.allocator, io, self.staging) != .complete) {
+            return error.IncompleteManagedDownload;
+        }
+
+        const cwd = std.Io.Dir.cwd();
+        try removeTreeIfExists(cwd, io, self.backup);
+        const had_destination = try pathExists(cwd, io, self.destination);
+        if (had_destination) {
+            try std.Io.Dir.rename(cwd, self.destination, cwd, self.backup, io);
+        }
+        std.Io.Dir.rename(cwd, self.staging, cwd, self.destination, io) catch |err| {
+            if (had_destination) {
+                std.Io.Dir.rename(cwd, self.backup, cwd, self.destination, io) catch {};
+            }
+            return err;
+        };
+
+        const parent = std.fs.path.dirname(self.destination) orelse ".";
+        syncManagedDirectory(io, parent) catch |err| {
+            removeTreeIfExists(cwd, io, self.destination) catch {};
+            if (had_destination) {
+                std.Io.Dir.rename(cwd, self.backup, cwd, self.destination, io) catch {};
+            }
+            return err;
+        };
+
+        // Publication is durable at this point. Backup cleanup is best effort:
+        // retaining it is safe, and the next transaction will remove it.
+        self.committed = true;
+        if (had_destination) {
+            removeTreeIfExists(cwd, io, self.backup) catch return;
+            syncManagedDirectory(io, parent) catch {};
+        }
+    }
+
+    pub fn deinit(self: *ManagedModelTransaction, io: std.Io) void {
+        _ = io;
+        // Failed pulls intentionally retain the hidden staging tree. Verified
+        // final artifacts and digest-bound .part files can then be reused by
+        // the next locked attempt without exposing them through discovery.
+        self.freePaths();
+        self.* = undefined;
+    }
+
+    fn freePaths(self: *ManagedModelTransaction) void {
+        self.allocator.free(self.destination);
+        self.allocator.free(self.staging);
+        self.allocator.free(self.backup);
+    }
+};
+
 fn writeFileAtomically(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1139,6 +1303,70 @@ fn writeFileAtomically(
     }
     try std.Io.Dir.rename(cwd, temp_path, cwd, path, io);
     try syncManagedDirectory(io, std.fs.path.dirname(path) orelse ".");
+}
+
+/// Atomically replace a private staging artifact and update its validated plan.
+/// Callers must hold the model pull lock; published directories must never use
+/// this API because the artifact and plan renames are intentionally separate.
+pub fn writeManagedArtifactAndUpdatePlan(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dest_dir: []const u8,
+    relative_path: []const u8,
+    data: []const u8,
+) !void {
+    if (!managed_receipt.artifactPathIsSafe(relative_path)) return error.InvalidModelArtifactPath;
+
+    var validated = try managed_receipt.loadValidatedPlan(allocator, io, dest_dir);
+    defer validated.deinit();
+
+    var artifacts = std.ArrayListUnmanaged(ManagedArtifactReceipt).empty;
+    defer artifacts.deinit(allocator);
+    try artifacts.ensureTotalCapacity(allocator, validated.artifacts.len + 1);
+    var replaced = false;
+    for (validated.artifacts) |artifact| {
+        if (std.mem.eql(u8, artifact.path, relative_path)) {
+            try artifacts.append(allocator, .{
+                .path = relative_path,
+                .size = data.len,
+            });
+            replaced = true;
+        } else {
+            try artifacts.append(allocator, .{
+                .path = artifact.path,
+                .size = artifact.size,
+                .sha256 = artifact.sha256,
+            });
+        }
+    }
+    if (!replaced) {
+        if (validated.artifacts.len >= managed_receipt.max_artifact_count) {
+            return error.InvalidManagedDownload;
+        }
+        try artifacts.append(allocator, .{
+            .path = relative_path,
+            .size = data.len,
+        });
+    }
+
+    const receipt_json = try std.json.Stringify.valueAlloc(
+        allocator,
+        ManagedDownloadReceipt{
+            .version = validated.parsed.value.version,
+            .source = validated.parsed.value.source,
+            .artifacts = artifacts.items,
+        },
+        .{},
+    );
+    defer allocator.free(receipt_json);
+    if (receipt_json.len > managed_receipt.max_receipt_bytes) return error.InvalidManagedDownload;
+    const artifact_path = try managedPath(allocator, dest_dir, relative_path);
+    defer allocator.free(artifact_path);
+    const plan_path = try managedPath(allocator, dest_dir, managed_download_plan_filename);
+    defer allocator.free(plan_path);
+
+    try writeFileAtomically(allocator, io, artifact_path, data);
+    try writeFileAtomically(allocator, io, plan_path, receipt_json);
 }
 
 fn syncManagedDirectory(io: std.Io, path: []const u8) !void {
@@ -1217,24 +1445,6 @@ pub fn completeManagedDownload(
     try syncManagedDirectory(io, dest_dir);
 }
 
-fn managedArtifactPathIsSafe(path: []const u8) bool {
-    if (path.len == 0 or std.fs.path.isAbsolute(path)) return false;
-    // Hub repository paths are POSIX-style on every platform. Rejecting
-    // backslashes avoids treating an attacker-controlled receipt differently
-    // on Windows.
-    if (std.mem.indexOfScalar(u8, path, '\\') != null) return false;
-    var parts = std.mem.splitScalar(u8, path, '/');
-    while (parts.next()) |part| {
-        if (part.len == 0 or
-            std.mem.eql(u8, part, ".") or
-            std.mem.eql(u8, part, ".."))
-        {
-            return false;
-        }
-    }
-    return true;
-}
-
 /// Return the publication state of a model directory managed by `pull`.
 ///
 /// A completion receipt is accepted only when every recorded artifact still
@@ -1247,86 +1457,12 @@ pub fn managedDownloadState(
     io: std.Io,
     dest_dir: []const u8,
 ) ManagedDownloadState {
-    const in_progress_path = managedPath(
-        allocator,
-        dest_dir,
-        managed_download_in_progress_filename,
-    ) catch return .incomplete;
-    defer allocator.free(in_progress_path);
-    const plan_path = managedPath(
-        allocator,
-        dest_dir,
-        managed_download_plan_filename,
-    ) catch return .incomplete;
-    defer allocator.free(plan_path);
-    const complete_path = managedPath(
-        allocator,
-        dest_dir,
-        managed_download_complete_filename,
-    ) catch return .incomplete;
-    defer allocator.free(complete_path);
-
-    const cwd = std.Io.Dir.cwd();
-    if (cwd.access(io, in_progress_path, .{})) |_| return .incomplete else |err| switch (err) {
-        error.FileNotFound => {},
-        else => return .incomplete,
+    var receipt = managed_receipt.loadValidated(allocator, io, dest_dir) catch return .incomplete;
+    if (receipt) |*validated| {
+        validated.deinit();
+        return .complete;
     }
-    if (cwd.access(io, plan_path, .{})) |_| return .incomplete else |err| switch (err) {
-        error.FileNotFound => {},
-        else => return .incomplete,
-    }
-
-    const receipt_json = cwd.readFileAlloc(
-        io,
-        complete_path,
-        allocator,
-        .limited(16 * 1024 * 1024),
-    ) catch |err| switch (err) {
-        error.FileNotFound => {
-            // Close the race with beginManagedDownload, which publishes the
-            // marker before deleting an old completion receipt.
-            if (managedPublicationFilesBlocked(cwd, io, in_progress_path, plan_path)) {
-                return .incomplete;
-            }
-            return .unmanaged;
-        },
-        else => return .incomplete,
-    };
-    defer allocator.free(receipt_json);
-    var parsed = std.json.parseFromSlice(
-        ManagedDownloadReceipt,
-        allocator,
-        receipt_json,
-        .{ .ignore_unknown_fields = true },
-    ) catch return .incomplete;
-    defer parsed.deinit();
-    if ((parsed.value.version != 1 and parsed.value.version != 2) or parsed.value.artifacts.len == 0) {
-        return .incomplete;
-    }
-
-    var has_supported_payload = false;
-    for (parsed.value.artifacts) |artifact| {
-        if (!managedArtifactPathIsSafe(artifact.path)) return .incomplete;
-        const artifact_path = std.fs.path.join(
-            allocator,
-            &.{ dest_dir, artifact.path },
-        ) catch return .incomplete;
-        defer allocator.free(artifact_path);
-        const actual_size = requiredFileSize(cwd, io, artifact_path) catch
-            return .incomplete;
-        if (actual_size != artifact.size) return .incomplete;
-        if (std.mem.endsWith(u8, artifact.path, ".gguf") or
-            std.mem.endsWith(u8, artifact.path, ".onnx") or
-            std.mem.endsWith(u8, artifact.path, ".safetensors"))
-        {
-            has_supported_payload = true;
-        }
-    }
-    if (!has_supported_payload) return .incomplete;
-    if (managedPublicationFilesBlocked(cwd, io, in_progress_path, plan_path)) {
-        return .incomplete;
-    }
-    return .complete;
+    return .unmanaged;
 }
 
 /// Verify that a completed managed directory was published for the exact Hub
@@ -1340,45 +1476,14 @@ pub fn managedDownloadMatchesSource(
     name: []const u8,
     variant: []const u8,
 ) bool {
-    if (managedDownloadState(allocator, io, dest_dir) != .complete) return false;
-    const complete_path = managedPath(allocator, dest_dir, managed_download_complete_filename) catch return false;
-    defer allocator.free(complete_path);
-    const receipt_json = std.Io.Dir.cwd().readFileAlloc(
-        io,
-        complete_path,
-        allocator,
-        .limited(16 * 1024 * 1024),
-    ) catch return false;
-    defer allocator.free(receipt_json);
-    var parsed = std.json.parseFromSlice(
-        ManagedDownloadReceipt,
-        allocator,
-        receipt_json,
-        .{ .ignore_unknown_fields = true },
-    ) catch return false;
-    defer parsed.deinit();
-    const source = parsed.value.source orelse return false;
-    return parsed.value.version == 2 and
+    const receipt = managed_receipt.loadValidated(allocator, io, dest_dir) catch return false;
+    var validated = receipt orelse return false;
+    defer validated.deinit();
+    const source = validated.parsed.value.source orelse return false;
+    return validated.parsed.value.version == 2 and
         std.mem.eql(u8, source.owner, owner) and
         std.mem.eql(u8, source.name, name) and
         std.mem.eql(u8, source.variant, variant);
-}
-
-fn managedPublicationFilesBlocked(
-    cwd: std.Io.Dir,
-    io: std.Io,
-    in_progress_path: []const u8,
-    plan_path: []const u8,
-) bool {
-    if (cwd.access(io, in_progress_path, .{})) |_| return true else |err| switch (err) {
-        error.FileNotFound => {},
-        else => return true,
-    }
-    if (cwd.access(io, plan_path, .{})) |_| return true else |err| switch (err) {
-        error.FileNotFound => {},
-        else => return true,
-    }
-    return false;
 }
 
 pub fn managedDownloadPublicationBlocked(
@@ -1386,24 +1491,7 @@ pub fn managedDownloadPublicationBlocked(
     io: std.Io,
     dest_dir: []const u8,
 ) bool {
-    const in_progress_path = managedPath(
-        allocator,
-        dest_dir,
-        managed_download_in_progress_filename,
-    ) catch return true;
-    defer allocator.free(in_progress_path);
-    const plan_path = managedPath(
-        allocator,
-        dest_dir,
-        managed_download_plan_filename,
-    ) catch return true;
-    defer allocator.free(plan_path);
-    return managedPublicationFilesBlocked(
-        std.Io.Dir.cwd(),
-        io,
-        in_progress_path,
-        plan_path,
-    );
+    return managed_receipt.publicationBlocked(allocator, io, dest_dir);
 }
 
 /// Download a model from HuggingFace Hub.
@@ -1613,16 +1701,11 @@ pub fn downloadModel(
             remaining_model_bytes,
             artifact_size,
         );
-        // Registry.pull may rewrite model_manifest.json after this function
-        // returns, so it is deliberately excluded from the immutable artifact
-        // receipt finalized by the registry.
-        if (!std.mem.eql(u8, filename, "model_manifest.json")) {
-            try receipts.append(allocator, .{
-                .path = filename,
-                .size = artifact_size,
-                .sha256 = file_meta.sha256,
-            });
-        }
+        try receipts.append(allocator, .{
+            .path = filename,
+            .size = artifact_size,
+            .sha256 = file_meta.sha256,
+        });
 
         if (progress.callback) |cb| {
             cb(.{
@@ -1635,7 +1718,16 @@ pub fn downloadModel(
         }
     }
 
-    try writeSyntheticMetadata(allocator, io, dest_dir, synthetic_metadata);
+    if (try writeSyntheticMetadata(allocator, io, dest_dir, synthetic_metadata)) |metadata_receipt| {
+        var replaced = false;
+        for (receipts.items) |*receipt| {
+            if (!std.mem.eql(u8, receipt.path, metadata_receipt.path)) continue;
+            receipt.* = metadata_receipt;
+            replaced = true;
+            break;
+        }
+        if (!replaced) try receipts.append(allocator, metadata_receipt);
+    }
 
     const receipt_json = try std.json.Stringify.valueAlloc(
         allocator,
@@ -1647,6 +1739,12 @@ pub fn downloadModel(
         .{},
     );
     defer allocator.free(receipt_json);
+    if (receipts.items.len == 0 or
+        receipts.items.len > managed_receipt.max_artifact_count or
+        receipt_json.len > managed_receipt.max_receipt_bytes)
+    {
+        return error.InvalidManagedDownload;
+    }
     const plan_path = try managedPath(allocator, dest_dir, managed_download_plan_filename);
     defer allocator.free(plan_path);
     try writeFileAtomically(allocator, io, plan_path, receipt_json);
@@ -1808,6 +1906,9 @@ pub fn listModelFiles(
         if (sibling == .object) {
             if (sibling.object.get("rfilename")) |rf| {
                 if (rf == .string) {
+                    if (!managed_receipt.artifactPathIsSafe(rf.string)) {
+                        return error.InvalidModelArtifactPath;
+                    }
                     var file = HubFile{
                         .name = try allocator.dupe(u8, rf.string),
                     };
@@ -2058,6 +2159,7 @@ fn downloadFile(
     total_bytes: ?u64,
     expected_sha256: ?[]const u8,
 ) !void {
+    if (!managed_receipt.artifactPathIsSafe(filename)) return error.InvalidModelArtifactPath;
     const max_response_size = try downloadResponseLimit(config);
     if (total_bytes) |total| {
         if (total > config.max_artifact_bytes) return error.DownloadSizeLimitExceeded;
@@ -2646,7 +2748,25 @@ test "projector-only selection finds mmproj gguf" {
     try std.testing.expect(try appendBestGgufProjectorFile(allocator, &to_download, &files));
 
     try std.testing.expectEqual(@as(usize, 1), to_download.items.len);
-    try std.testing.expectEqualStrings("mmproj-gemma-4-e2b-it-f16.gguf", to_download.items[0].name);
+    try std.testing.expectEqualStrings("nested/mmproj-gemma-4-e2b-it-q8_0.gguf", to_download.items[0].name);
+}
+
+test "automatic projector selection prefers q8 while dense remains explicit" {
+    const allocator = std.testing.allocator;
+    const files = [_]HubFile{
+        .{ .name = "mmproj-gemma-4-E2B-it-BF16.gguf", .size = 928 * 1024 * 1024 },
+        .{ .name = "mmproj-gemma-4-E2B-it-Q8_0.gguf", .size = 480 * 1024 * 1024 },
+    };
+
+    var automatic = std.ArrayListUnmanaged(HubFile).empty;
+    defer automatic.deinit(allocator);
+    try std.testing.expect(try appendSelectedGgufProjectorFile(allocator, &automatic, &files, .auto));
+    try std.testing.expectEqualStrings("mmproj-gemma-4-E2B-it-Q8_0.gguf", automatic.items[0].name);
+
+    var explicit = std.ArrayListUnmanaged(HubFile).empty;
+    defer explicit.deinit(allocator);
+    try std.testing.expect(try appendSelectedGgufProjectorFile(allocator, &explicit, &files, .{ .match = "BF16" }));
+    try std.testing.expectEqualStrings("mmproj-gemma-4-E2B-it-BF16.gguf", explicit.items[0].name);
 }
 
 test "gguf selection honors requested projector suffix" {
@@ -2890,6 +3010,26 @@ test "aggregate model budget uses checked arithmetic" {
     );
 }
 
+test "downloadFile rejects artifact paths outside the model root before network access" {
+    try std.testing.expectError(
+        error.InvalidModelArtifactPath,
+        downloadFile(
+            std.testing.allocator,
+            std.testing.io,
+            "owner",
+            "model",
+            "../escape.gguf",
+            "unused",
+            .{ .base_url = "http://127.0.0.1:1" },
+            .{},
+            0,
+            1,
+            null,
+            null,
+        ),
+    );
+}
+
 test "managed download publication keeps incomplete state fail closed" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -2974,6 +3114,218 @@ test "managed download receipt source identity is exact" {
 
     try std.testing.expect(managedDownloadMatchesSource(allocator, io, dest_dir, "owner", "model", "gguf:Q4_K_M"));
     try std.testing.expect(!managedDownloadMatchesSource(allocator, io, dest_dir, "owner", "model", "gguf:Q8_0"));
+}
+
+test "managed staging artifact replacement updates the publication receipt" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dest_dir = try testTmpPath(allocator, tmp, "managed-update");
+    defer allocator.free(dest_dir);
+    try beginManagedDownload(allocator, io, dest_dir);
+    const decoder_path = try managedPath(allocator, dest_dir, "model.gguf");
+    defer allocator.free(decoder_path);
+    try writeFileAtomically(allocator, io, decoder_path, "decoder");
+    const plan_path = try managedPath(allocator, dest_dir, managed_download_plan_filename);
+    defer allocator.free(plan_path);
+    try writeFileAtomically(
+        allocator,
+        io,
+        plan_path,
+        "{\"version\":2,\"source\":{\"owner\":\"owner\",\"name\":\"model\",\"variant\":\"gguf:Q4_K_M\"},\"artifacts\":[{\"path\":\"model.gguf\",\"size\":7}]}",
+    );
+
+    const manifest_json = "{\"type\":\"generator\"}";
+    try writeManagedArtifactAndUpdatePlan(
+        allocator,
+        io,
+        dest_dir,
+        "model_manifest.json",
+        manifest_json,
+    );
+    var plan = try managed_receipt.loadValidatedPlan(allocator, io, dest_dir);
+    defer plan.deinit();
+    const manifest_artifact = plan.find("model_manifest.json") orelse
+        return error.TestExpectedManifestArtifact;
+    try std.testing.expectEqual(@as(u64, manifest_json.len), manifest_artifact.size);
+    try std.testing.expectEqual(@as(u32, 2), plan.parsed.value.version);
+    try std.testing.expectEqualStrings("gguf:Q4_K_M", plan.parsed.value.source.?.variant);
+
+    try completeManagedDownload(allocator, io, dest_dir);
+    try std.testing.expectEqual(ManagedDownloadState.complete, managedDownloadState(allocator, io, dest_dir));
+    try std.testing.expect(managedDownloadMatchesSource(allocator, io, dest_dir, "owner", "model", "gguf:Q4_K_M"));
+}
+
+test "managed model transaction reuses artifacts and publishes completed repair" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dest_dir = try testTmpPath(allocator, tmp, "transactional-model");
+    defer allocator.free(dest_dir);
+    try cwd.createDirPath(io, dest_dir);
+    const decoder_path = try std.fs.path.join(allocator, &.{ dest_dir, "model.gguf" });
+    defer allocator.free(decoder_path);
+    try cwd.writeFile(io, .{ .sub_path = decoder_path, .data = "decoder" });
+    const complete_path = try managedPath(allocator, dest_dir, managed_download_complete_filename);
+    defer allocator.free(complete_path);
+    try cwd.writeFile(io, .{
+        .sub_path = complete_path,
+        .data = "{\"version\":1,\"artifacts\":[{\"path\":\"model.gguf\",\"size\":7}]}",
+    });
+    try std.testing.expectEqual(ManagedDownloadState.complete, managedDownloadState(allocator, io, dest_dir));
+
+    var transaction = try ManagedModelTransaction.begin(allocator, io, dest_dir);
+    defer transaction.deinit(io);
+    const staged_decoder_path = try std.fs.path.join(allocator, &.{ transaction.staging, "model.gguf" });
+    defer allocator.free(staged_decoder_path);
+    var published_decoder = try cwd.openFile(io, decoder_path, .{});
+    defer published_decoder.close(io);
+    var staged_decoder = try cwd.openFile(io, staged_decoder_path, .{});
+    defer staged_decoder.close(io);
+    try std.testing.expectEqual((try published_decoder.stat(io)).inode, (try staged_decoder.stat(io)).inode);
+
+    const projector_path = try std.fs.path.join(allocator, &.{ transaction.staging, "nested/mmproj-model-Q8_0.gguf" });
+    defer allocator.free(projector_path);
+    try cwd.createDirPath(io, std.fs.path.dirname(projector_path).?);
+    try cwd.writeFile(io, .{ .sub_path = projector_path, .data = "projector" });
+    const plan_path = try managedPath(allocator, transaction.staging, managed_download_plan_filename);
+    defer allocator.free(plan_path);
+    try writeFileAtomically(
+        allocator,
+        io,
+        plan_path,
+        "{\"version\":1,\"artifacts\":[{\"path\":\"model.gguf\",\"size\":7},{\"path\":\"nested/mmproj-model-Q8_0.gguf\",\"size\":9}]}",
+    );
+    try completeManagedDownload(allocator, io, transaction.staging);
+    try transaction.commit(io);
+
+    try std.testing.expectEqual(ManagedDownloadState.complete, managedDownloadState(allocator, io, dest_dir));
+    const published_projector_path = try std.fs.path.join(allocator, &.{ dest_dir, "nested/mmproj-model-Q8_0.gguf" });
+    defer allocator.free(published_projector_path);
+    try cwd.access(io, published_projector_path, .{});
+}
+
+test "managed model transaction never reuses receipt symlinks outside model root" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dest_dir = try testTmpPath(allocator, tmp, "symlink-model");
+    defer allocator.free(dest_dir);
+    try cwd.createDirPath(io, dest_dir);
+    const outside_path = try testTmpPath(allocator, tmp, "outside.gguf");
+    defer allocator.free(outside_path);
+    try cwd.writeFile(io, .{ .sub_path = outside_path, .data = "outside" });
+    const decoder_path = try std.fs.path.join(allocator, &.{ dest_dir, "model.gguf" });
+    defer allocator.free(decoder_path);
+    try cwd.symLink(io, "../outside.gguf", decoder_path, .{});
+    const complete_path = try managedPath(allocator, dest_dir, managed_download_complete_filename);
+    defer allocator.free(complete_path);
+    try cwd.writeFile(io, .{
+        .sub_path = complete_path,
+        .data = "{\"version\":1,\"artifacts\":[{\"path\":\"model.gguf\",\"size\":7}]}",
+    });
+
+    try std.testing.expectEqual(ManagedDownloadState.incomplete, managedDownloadState(allocator, io, dest_dir));
+    var transaction = try ManagedModelTransaction.begin(allocator, io, dest_dir);
+    defer transaction.deinit(io);
+    const staged_decoder_path = try std.fs.path.join(allocator, &.{ transaction.staging, "model.gguf" });
+    defer allocator.free(staged_decoder_path);
+    try std.testing.expectError(error.FileNotFound, cwd.openFile(io, staged_decoder_path, .{}));
+}
+
+test "managed model transaction failure preserves last known good cache" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dest_dir = try testTmpPath(allocator, tmp, "failed-transactional-model");
+    defer allocator.free(dest_dir);
+    try cwd.createDirPath(io, dest_dir);
+    const decoder_path = try std.fs.path.join(allocator, &.{ dest_dir, "model.gguf" });
+    defer allocator.free(decoder_path);
+    try cwd.writeFile(io, .{ .sub_path = decoder_path, .data = "known-good" });
+    const complete_path = try managedPath(allocator, dest_dir, managed_download_complete_filename);
+    defer allocator.free(complete_path);
+    try cwd.writeFile(io, .{
+        .sub_path = complete_path,
+        .data = "{\"version\":1,\"artifacts\":[{\"path\":\"model.gguf\",\"size\":10}]}",
+    });
+
+    var transaction = try ManagedModelTransaction.begin(allocator, io, dest_dir);
+    const staged_decoder_path = try std.fs.path.join(allocator, &.{ transaction.staging, "model.gguf" });
+    defer allocator.free(staged_decoder_path);
+    const staged_replacement_path = try std.fmt.allocPrint(allocator, "{s}.part", .{staged_decoder_path});
+    defer allocator.free(staged_replacement_path);
+    try cwd.writeFile(io, .{ .sub_path = staged_replacement_path, .data = "replacement" });
+    try std.Io.Dir.rename(cwd, staged_replacement_path, cwd, staged_decoder_path, io);
+    const retained_staging_path = try allocator.dupe(u8, transaction.staging);
+    defer allocator.free(retained_staging_path);
+    transaction.deinit(io);
+
+    try std.testing.expectEqual(ManagedDownloadState.complete, managedDownloadState(allocator, io, dest_dir));
+    const decoder = try cwd.readFileAlloc(io, decoder_path, allocator, .limited(64));
+    defer allocator.free(decoder);
+    try std.testing.expectEqualStrings("known-good", decoder);
+
+    var resumed = try ManagedModelTransaction.begin(allocator, io, dest_dir);
+    defer resumed.deinit(io);
+    try std.testing.expectEqualStrings(retained_staging_path, resumed.staging);
+    const resumed_decoder_path = try std.fs.path.join(allocator, &.{ resumed.staging, "model.gguf" });
+    defer allocator.free(resumed_decoder_path);
+    const resumed_decoder = try cwd.readFileAlloc(io, resumed_decoder_path, allocator, .limited(64));
+    defer allocator.free(resumed_decoder);
+    try std.testing.expectEqualStrings("replacement", resumed_decoder);
+}
+
+test "managed model transaction recovers interrupted directory publication" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dest_dir = try testTmpPath(allocator, tmp, "interrupted-transactional-model");
+    defer allocator.free(dest_dir);
+    try cwd.createDirPath(io, dest_dir);
+    const decoder_path = try std.fs.path.join(allocator, &.{ dest_dir, "model.gguf" });
+    defer allocator.free(decoder_path);
+    try cwd.writeFile(io, .{ .sub_path = decoder_path, .data = "known-good" });
+    const complete_path = try managedPath(allocator, dest_dir, managed_download_complete_filename);
+    defer allocator.free(complete_path);
+    try cwd.writeFile(io, .{
+        .sub_path = complete_path,
+        .data = "{\"version\":1,\"artifacts\":[{\"path\":\"model.gguf\",\"size\":10}]}",
+    });
+
+    const backup_path = try managedSiblingPath(allocator, dest_dir, managed_download_backup_suffix);
+    defer allocator.free(backup_path);
+    const stale_staging_path = try managedSiblingPath(allocator, dest_dir, managed_download_staging_suffix);
+    defer allocator.free(stale_staging_path);
+    try std.Io.Dir.rename(cwd, dest_dir, cwd, backup_path, io);
+    try cwd.createDirPath(io, stale_staging_path);
+    const partial_path = try std.fs.path.join(allocator, &.{ stale_staging_path, "model.gguf.part" });
+    defer allocator.free(partial_path);
+    try cwd.writeFile(io, .{ .sub_path = partial_path, .data = "partial" });
+
+    var transaction = try ManagedModelTransaction.begin(allocator, io, dest_dir);
+    defer transaction.deinit(io);
+    try std.testing.expectEqual(ManagedDownloadState.complete, managedDownloadState(allocator, io, dest_dir));
+    try std.testing.expectError(error.FileNotFound, cwd.openDir(io, backup_path, .{}));
+    try cwd.access(io, partial_path, .{});
+    try std.testing.expectEqualStrings(stale_staging_path, transaction.staging);
+    const staged_decoder_path = try std.fs.path.join(allocator, &.{ transaction.staging, "model.gguf" });
+    defer allocator.free(staged_decoder_path);
+    try cwd.access(io, staged_decoder_path, .{});
 }
 
 test "content range validation requires exact resume boundaries" {

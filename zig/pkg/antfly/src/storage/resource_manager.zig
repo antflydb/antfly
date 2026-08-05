@@ -441,7 +441,12 @@ const DerivedRecoverableRetryCounters = struct {
         _ = self.total.fetchAdd(1, .monotonic);
         switch (err) {
             error.WriterLocked => _ = self.writer_locked.fetchAdd(1, .monotonic),
-            error.ResourceBudgetExceeded => _ = self.resource_budget.fetchAdd(1, .monotonic),
+            error.ResourceBudgetExceeded,
+            error.PersistentDescriptorAdmissionExhausted,
+            error.TextMergeBackpressureTimeout,
+            error.TextMergeBackpressureUnavailable,
+            error.TextMergeRuntimeShutdown,
+            => _ = self.resource_budget.fetchAdd(1, .monotonic),
             error.ReplayDocumentNotVisible => _ = self.replay_document_not_visible.fetchAdd(1, .monotonic),
             error.ArtifactRepairRequired => _ = self.artifact_repair_required.fetchAdd(1, .monotonic),
             error.NotFound => _ = self.not_found.fetchAdd(1, .monotonic),
