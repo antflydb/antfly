@@ -587,6 +587,12 @@ pub const DocumentArtifactManifest = struct {
     unsupported_reason: ?[]u8 = null,
     unit_count: usize = 0,
     chunk_count: usize = 0,
+    ocr_attempted_count: usize = 0,
+    ocr_selected_count: usize = 0,
+    ocr_retained_embedded_count: usize = 0,
+    ocr_failed_count: usize = 0,
+    ocr_failed_page_numbers: []i64 = &.{},
+    ocr_failed_pages_truncated: bool = false,
     child_ranges: []DocumentArtifactChildRange = &.{},
     child_range_count: usize = 0,
     merge_status: []u8 = "",
@@ -608,6 +614,7 @@ pub const DocumentArtifactManifest = struct {
         if (self.content_type.len > 0) alloc.free(self.content_type);
         if (self.route_type.len > 0) alloc.free(self.route_type);
         if (self.unsupported_reason) |unsupported_reason| alloc.free(unsupported_reason);
+        if (self.ocr_failed_page_numbers.len > 0) alloc.free(self.ocr_failed_page_numbers);
         for (self.child_ranges) |*child_range| child_range.deinit(alloc);
         if (self.child_ranges.len > 0) alloc.free(self.child_ranges);
         if (self.merge_status.len > 0) alloc.free(self.merge_status);

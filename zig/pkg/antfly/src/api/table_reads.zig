@@ -13351,6 +13351,12 @@ const RemoteDocumentArtifactManifest = struct {
     unsupported_reason: ?[]const u8 = null,
     unit_count: usize = 0,
     chunk_count: usize = 0,
+    ocr_attempted_count: usize = 0,
+    ocr_selected_count: usize = 0,
+    ocr_retained_embedded_count: usize = 0,
+    ocr_failed_count: usize = 0,
+    ocr_failed_page_numbers: []const i64 = &.{},
+    ocr_failed_pages_truncated: bool = false,
     child_ranges: []const ChildRange = &.{},
     child_range_count: usize = 0,
     merge_status: []const u8 = "",
@@ -13433,6 +13439,11 @@ fn remoteDocumentArtifactManifestAlloc(alloc: std.mem.Allocator, remote: RemoteD
     errdefer if (last_error_code) |value| alloc.free(value);
     const last_error_message = if (remote.last_error_message) |value| try alloc.dupe(u8, value) else null;
     errdefer if (last_error_message) |value| alloc.free(value);
+    const ocr_failed_page_numbers: []i64 = if (remote.ocr_failed_page_numbers.len > 0)
+        try alloc.dupe(i64, remote.ocr_failed_page_numbers)
+    else
+        @constCast(&.{});
+    errdefer if (ocr_failed_page_numbers.len > 0) alloc.free(ocr_failed_page_numbers);
 
     return .{
         .document_id = document_id,
@@ -13449,6 +13460,12 @@ fn remoteDocumentArtifactManifestAlloc(alloc: std.mem.Allocator, remote: RemoteD
         .unsupported_reason = unsupported_reason,
         .unit_count = remote.unit_count,
         .chunk_count = remote.chunk_count,
+        .ocr_attempted_count = remote.ocr_attempted_count,
+        .ocr_selected_count = remote.ocr_selected_count,
+        .ocr_retained_embedded_count = remote.ocr_retained_embedded_count,
+        .ocr_failed_count = remote.ocr_failed_count,
+        .ocr_failed_page_numbers = ocr_failed_page_numbers,
+        .ocr_failed_pages_truncated = remote.ocr_failed_pages_truncated,
         .child_ranges = child_ranges,
         .child_range_count = if (remote.child_range_count > 0) remote.child_range_count else child_ranges.len,
         .merge_status = merge_status,

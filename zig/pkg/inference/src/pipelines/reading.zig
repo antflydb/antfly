@@ -51,6 +51,7 @@ pub const ReadTelemetry = struct {
 };
 
 var last_read_telemetry: ReadTelemetry = .{};
+threadlocal var active_read_profile_source_fingerprint: ?[]const u8 = null;
 
 pub fn resetLastReadTelemetry() void {
     last_read_telemetry = .{};
@@ -77,6 +78,7 @@ pub const ReadConfig = struct {
     pix2struct_patch_width: usize = 0,
     pix2struct_do_normalize: bool = false,
     prompt: ?[]const u8 = null,
+    source_fingerprint: ?[]const u8 = null,
 };
 
 pub const ReadResult = struct {
@@ -116,6 +118,9 @@ pub const ReadingPipeline = struct {
 
     /// Read text from an image. image_data is raw JPEG/PNG bytes.
     pub fn read(self: *ReadingPipeline, image_data: []const u8) !ReadResult {
+        const previous_source_fingerprint = active_read_profile_source_fingerprint;
+        active_read_profile_source_fingerprint = self.config.source_fingerprint;
+        defer active_read_profile_source_fingerprint = previous_source_fingerprint;
         resetLastReadTelemetry();
         const allocator = self.allocator;
         const debug_cuda_session = platform.env.getenvBool("ANTFLY_INFERENCE_DEBUG_CUDA_SESSION");
@@ -152,26 +157,38 @@ pub const ReadingPipeline = struct {
     /// back to the existing serial path; native Florence uses a batched encoder
     /// and KV-decoder path where the selected backend supports it.
     pub fn readBatch(self: *ReadingPipeline, image_datas: []const []const u8) ![]ReadResult {
+        const previous_source_fingerprint = active_read_profile_source_fingerprint;
+        active_read_profile_source_fingerprint = self.config.source_fingerprint;
+        defer active_read_profile_source_fingerprint = previous_source_fingerprint;
         const allocator = self.allocator;
         if (image_datas.len == 0) return try allocator.alloc(ReadResult, 0);
         if (image_datas.len == 1) {
+            logReadBatchMode("single", image_datas, null);
             const out = try allocator.alloc(ReadResult, 1);
             errdefer allocator.free(out);
             out[0] = try self.read(image_datas[0]);
             return out;
         }
-        if (expectsFlattenedPatches(self.vision_encoder)) return self.readBatchSerial(image_datas);
+        if (expectsFlattenedPatches(self.vision_encoder)) {
+            logReadBatchMode("serial", image_datas, "flattened_patches_model");
+            return self.readBatchSerial(image_datas);
+        }
 
         if (session_factory.getFlorenceConfig(self.vision_encoder) != null) {
+            logReadBatchMode("native_florence", image_datas, null);
             return self.readBatchNativeFlorenceChunked(image_datas) catch |err| switch (err) {
                 error.UnsupportedShape,
                 error.UnsupportedOperation,
                 error.UnsupportedFlorence2ResidentMetal,
-                => self.readBatchSerial(image_datas),
+                => {
+                    logReadBatchMode("serial_fallback", image_datas, @errorName(err));
+                    return self.readBatchSerial(image_datas);
+                },
                 else => return err,
             };
         }
 
+        logReadBatchMode("serial", image_datas, "non_florence_model");
         return self.readBatchSerial(image_datas);
     }
 
@@ -194,7 +211,10 @@ pub const ReadingPipeline = struct {
     fn readBatchNativeFlorenceChunked(self: *ReadingPipeline, image_datas: []const []const u8) ![]ReadResult {
         const allocator = self.allocator;
         const max_batch = nativeFlorenceReadBatchSize();
-        if (max_batch <= 1) return self.readBatchSerial(image_datas);
+        if (max_batch <= 1) {
+            logReadBatchMode("serial", image_datas, "configured_batch_size_one");
+            return self.readBatchSerial(image_datas);
+        }
 
         const out = try allocator.alloc(ReadResult, image_datas.len);
         var filled: usize = 0;
@@ -1309,6 +1329,13 @@ pub const ReadingPipeline = struct {
         const prefix_len: usize = if (self.config.forced_bos_token_id != null and dec_len > 1) 2 else 1;
         const text_len = if (dec_len > prefix_len) dec_len - prefix_len else 0;
         last_read_telemetry.generated_tokens = text_len;
+        if (readProfileEnabled()) {
+            if (active_read_profile_source_fingerprint) |source_fingerprint| {
+                std.log.info("read-profile source_fingerprint={s} phase=output output_tokens={d} model_max_tokens={d}", .{ source_fingerprint, text_len, self.config.max_length });
+            } else {
+                std.log.info("read-profile phase=output output_tokens={d} model_max_tokens={d}", .{ text_len, self.config.max_length });
+            }
+        }
         const token_ids = try allocator.alloc(i32, text_len);
         defer allocator.free(token_ids);
         for (0..text_len) |i| token_ids[i] = @intCast(dec_ids[prefix_len + i]);
@@ -1439,12 +1466,37 @@ fn tokenTensorToU32(cb: *const ComputeBackend, allocator: std.mem.Allocator, tok
 
 fn logReadProfile(phase: []const u8, start_ns: u64) void {
     if (!readProfileEnabled()) return;
-    std.log.info("read-profile phase={s} elapsed_ms={d:.3}", .{ phase, nsToMs(nowNs() - start_ns) });
+    if (active_read_profile_source_fingerprint) |source_fingerprint| {
+        std.log.info("read-profile source_fingerprint={s} phase={s} elapsed_ms={d:.3}", .{ source_fingerprint, phase, nsToMs(nowNs() - start_ns) });
+    } else {
+        std.log.info("read-profile phase={s} elapsed_ms={d:.3}", .{ phase, nsToMs(nowNs() - start_ns) });
+    }
 }
 
 fn logReadProfileStep(phase: []const u8, step: usize, seq_len: usize, elapsed_ns: u64) void {
     if (!readProfileEnabled()) return;
-    std.log.info("read-profile phase={s} step={d} seq_len={d} elapsed_ms={d:.3}", .{ phase, step, seq_len, nsToMs(elapsed_ns) });
+    if (active_read_profile_source_fingerprint) |source_fingerprint| {
+        std.log.info("read-profile source_fingerprint={s} phase={s} step={d} seq_len={d} elapsed_ms={d:.3}", .{ source_fingerprint, phase, step, seq_len, nsToMs(elapsed_ns) });
+    } else {
+        std.log.info("read-profile phase={s} step={d} seq_len={d} elapsed_ms={d:.3}", .{ phase, step, seq_len, nsToMs(elapsed_ns) });
+    }
+}
+
+fn logReadBatchMode(mode: []const u8, image_datas: []const []const u8, fallback_reason: ?[]const u8) void {
+    if (!readProfileEnabled()) return;
+    var encoded_bytes: usize = 0;
+    for (image_datas) |data| encoded_bytes +|= data.len;
+    if (active_read_profile_source_fingerprint) |source_fingerprint| {
+        if (fallback_reason) |reason| {
+            std.log.info("read-profile source_fingerprint={s} phase=batch mode={s} count={d} encoded_bytes={d} serial_fallback_reason={s}", .{ source_fingerprint, mode, image_datas.len, encoded_bytes, reason });
+        } else {
+            std.log.info("read-profile source_fingerprint={s} phase=batch mode={s} count={d} encoded_bytes={d}", .{ source_fingerprint, mode, image_datas.len, encoded_bytes });
+        }
+    } else if (fallback_reason) |reason| {
+        std.log.info("read-profile phase=batch mode={s} count={d} encoded_bytes={d} serial_fallback_reason={s}", .{ mode, image_datas.len, encoded_bytes, reason });
+    } else {
+        std.log.info("read-profile phase=batch mode={s} count={d} encoded_bytes={d}", .{ mode, image_datas.len, encoded_bytes });
+    }
 }
 
 fn nowNs() u64 {

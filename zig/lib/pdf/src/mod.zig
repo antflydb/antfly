@@ -13,6 +13,8 @@
 // limitations under the License.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const darwin_render = if (builtin.os.tag == .macos) @import("darwin_render.zig") else struct {};
 
 pub const text_encoding = @import("text_encoding.zig");
 pub const reader = @import("reader.zig");
@@ -20,6 +22,21 @@ pub const syntax = @import("syntax.zig");
 pub const render = @import("render.zig");
 
 const Allocator = std.mem.Allocator;
+const minimum_direct_render_dpi: u16 = 48;
+const minimum_requested_render_dpi: u16 = 72;
+
+pub const RenderedPagePng = struct {
+    png: []u8,
+    requested_dpi: u16,
+    effective_dpi: u16,
+    width: u32,
+    height: u32,
+
+    pub fn deinit(self: *RenderedPagePng, alloc: Allocator) void {
+        alloc.free(self.png);
+        self.* = undefined;
+    }
+};
 
 pub const Backend = struct {
     ptr: *const anyopaque,
@@ -61,15 +78,42 @@ fn renderFirstPagePngNative(_: *const anyopaque, alloc: Allocator, pdf_bytes: []
     return try renderPagePngAlloc(alloc, pdf_bytes, 1, 72, 40_000_000);
 }
 
-/// Render a one-based PDF page at the requested raster resolution.
+/// Renders a one-based PDF page at the requested raster resolution. Geometry is
+/// scaled before rasterization so embedded page images are sampled directly at
+/// the target resolution rather than upscaling a 72-DPI preview.
 pub fn renderPagePngAlloc(alloc: Allocator, pdf_bytes: []const u8, page_number: usize, dpi: u16, max_pixels: u64) ![]u8 {
-    if (page_number == 0) return error.InvalidPageNumber;
-    if (dpi < 72 or dpi > 600) return error.InvalidRenderDpi;
     var parsed = try reader.Reader.init(alloc, pdf_bytes);
     defer parsed.deinit();
+    return try renderParsedPagePngAlloc(alloc, &parsed, page_number, dpi, max_pixels);
+}
+
+pub fn renderParsedPagePngAlloc(alloc: Allocator, parsed: *reader.Reader, page_number: usize, dpi: u16, max_pixels: u64) ![]u8 {
+    if (dpi < minimum_requested_render_dpi or dpi > 600) return error.InvalidRenderDpi;
+    return try renderParsedPagePngEffectiveAlloc(alloc, parsed, page_number, dpi, max_pixels);
+}
+
+fn renderParsedPagePngEffectiveAlloc(alloc: Allocator, parsed: *reader.Reader, page_number: usize, dpi: u16, max_pixels: u64) ![]u8 {
+    return renderParsedPagePngNativeAlloc(alloc, parsed, page_number, dpi, max_pixels) catch |err| switch (err) {
+        error.UnsupportedStreamFilter,
+        error.UnsupportedNativeDecode,
+        error.UnsupportedPdfRendering,
+        error.InvalidFlateStream,
+        error.MissingEndStream,
+        error.UnexpectedEof,
+        => if (builtin.os.tag == .macos)
+            try darwin_render.renderPagePngAlloc(alloc, parsed.sourceBytes(), page_number, dpi, max_pixels)
+        else
+            return err,
+        else => return err,
+    };
+}
+
+fn renderParsedPagePngNativeAlloc(alloc: Allocator, parsed: *reader.Reader, page_number: usize, dpi: u16, max_pixels: u64) ![]u8 {
+    if (page_number == 0) return error.InvalidPageNumber;
+    if (dpi < minimum_direct_render_dpi or dpi > 600) return error.InvalidRenderDpi;
     const page_count = try parsed.pageCount();
     if (page_number > page_count) return error.InvalidPageNumber;
-    // Reject oversized pages before decoding images and font resources.
+    // Reject oversized pages before decoding page images and font resources.
     const unscaled_box = try parsed.extractPageBox(page_number);
     const scale = @as(f64, @floatFromInt(dpi)) / 72.0;
     const preflight_width = @max(1.0, unscaled_box.max_x - unscaled_box.min_x) * scale;
@@ -196,6 +240,55 @@ pub fn renderPagePngAlloc(alloc: Allocator, pdf_bytes: []const u8, page_number: 
     return try render.renderPageContentPngInBox(alloc, page_box, plain_runs.items, image_runs, shading_runs, all_pattern_runs.items, all_shape_runs.items);
 }
 
+/// Renders at the requested DPI when safe, reducing it only enough to satisfy
+/// both the dimension and pixel guards. Direct requests remain at least 72
+/// DPI, but exceptionally large scanned pages may adapt as low as 48 DPI so a
+/// useful 4K raster is preferred over dropping the page entirely.
+pub fn renderParsedPagePngAdaptiveAlloc(
+    alloc: Allocator,
+    parsed: *reader.Reader,
+    page_number: usize,
+    requested_dpi: u16,
+    max_pixels: u64,
+    max_dimension: u32,
+) !RenderedPagePng {
+    if (page_number == 0) return error.InvalidPageNumber;
+    if (requested_dpi < 72 or requested_dpi > 600) return error.InvalidRenderDpi;
+    if (max_pixels == 0 or max_dimension == 0) return error.RenderedPageTooLarge;
+    const page_count = try parsed.pageCount();
+    if (page_number > page_count) return error.InvalidPageNumber;
+    const box = try parsed.extractPageBox(page_number);
+    const page_width = @max(1.0, box.max_x - box.min_x);
+    const page_height = @max(1.0, box.max_y - box.min_y);
+
+    var effective_dpi = requested_dpi;
+    var width: u32 = 0;
+    var height: u32 = 0;
+    while (true) {
+        const scale = @as(f64, @floatFromInt(effective_dpi)) / 72.0;
+        const width_f = @ceil(page_width * scale);
+        const height_f = @ceil(page_height * scale);
+        const fits_integer = width_f <= @as(f64, @floatFromInt(std.math.maxInt(u32))) and
+            height_f <= @as(f64, @floatFromInt(std.math.maxInt(u32)));
+        if (fits_integer) {
+            width = @intFromFloat(width_f);
+            height = @intFromFloat(height_f);
+            const pixels = @as(u64, width) * @as(u64, height);
+            if (width <= max_dimension and height <= max_dimension and pixels <= max_pixels) break;
+        }
+        if (effective_dpi == minimum_direct_render_dpi) return error.RenderedPageTooLarge;
+        effective_dpi -= 1;
+    }
+
+    return .{
+        .png = try renderParsedPagePngEffectiveAlloc(alloc, parsed, page_number, effective_dpi, max_pixels),
+        .requested_dpi = requested_dpi,
+        .effective_dpi = effective_dpi,
+        .width = width,
+        .height = height,
+    };
+}
+
 fn scaleBox(box: *reader.PageBox, scale: f64) void {
     box.min_x *= scale;
     box.min_y *= scale;
@@ -285,8 +378,9 @@ fn scalePatternRuns(runs: []reader.PatternRun, scale: f64) void {
         }
         if (run.clip_box) |*box| scaleBox(box, scale);
         scalePoints(run.clip_points, scale);
-        // Tile geometry and tile-local runs remain in pattern space. The
-        // pattern matrix is the single mapping into scaled page space.
+        // Tiling geometry and tile-local runs remain in pattern space. The
+        // pattern matrix is the single mapping into the scaled page space;
+        // scaling both produced tiles that grew by scale^2 at higher DPI.
         run.pattern_matrix.a *= scale;
         run.pattern_matrix.b *= scale;
         run.pattern_matrix.c *= scale;
@@ -769,6 +863,14 @@ test "native backend renders simple image xobject pdf first page png" {
     const png = try backend.renderFirstPagePng(alloc, out.items);
     defer alloc.free(png);
     try std.testing.expectEqualSlices(u8, &.{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' }, png[0..8]);
+    const scanned_ocr_png = try renderPagePngAlloc(alloc, out.items, 1, 150, 40_000_000);
+    defer alloc.free(scanned_ocr_png);
+    const scanned_native_page = try @import("antfly_image").png.decodeRgba(alloc, png);
+    defer alloc.free(scanned_native_page.rgba);
+    const scanned_ocr_page = try @import("antfly_image").png.decodeRgba(alloc, scanned_ocr_png);
+    defer alloc.free(scanned_ocr_page.rgba);
+    try std.testing.expect(scanned_ocr_page.width > scanned_native_page.width);
+    try std.testing.expect(scanned_ocr_page.height > scanned_native_page.height);
 }
 
 test "native backend renders Type3 text glyphs through shape path" {
@@ -2421,4 +2523,142 @@ test {
     _ = reader;
     _ = syntax;
     _ = render;
+}
+
+test "native page renderer honors OCR DPI and pixel guard" {
+    const alloc = std.testing.allocator;
+    const fixture = @embedFile("../testdata/simple_text_fixture.pdf");
+    const png_72 = try renderPagePngAlloc(alloc, fixture, 1, 72, 40_000_000);
+    defer alloc.free(png_72);
+    const png_150 = try renderPagePngAlloc(alloc, fixture, 1, 150, 40_000_000);
+    defer alloc.free(png_150);
+    const decoded_72 = try @import("antfly_image").png.decodeRgba(alloc, png_72);
+    defer alloc.free(decoded_72.rgba);
+    const decoded_150 = try @import("antfly_image").png.decodeRgba(alloc, png_150);
+    defer alloc.free(decoded_150.rgba);
+    try std.testing.expect(decoded_150.width > decoded_72.width);
+    try std.testing.expect(decoded_150.height > decoded_72.height);
+    try std.testing.expectError(error.RenderedPageTooLarge, renderPagePngAlloc(alloc, fixture, 1, 150, 10));
+    try std.testing.expectError(error.InvalidPageNumber, renderPagePngAlloc(alloc, fixture, 2, 150, 40_000_000));
+}
+
+test "adaptive OCR rendering records effective DPI and enforces safety caps" {
+    const alloc = std.testing.allocator;
+    const fixture = @embedFile("../testdata/simple_text_fixture.pdf");
+    var parsed = try reader.Reader.init(alloc, fixture);
+    defer parsed.deinit();
+
+    var adaptive = try renderParsedPagePngAdaptiveAlloc(alloc, &parsed, 1, 150, 40_000_000, 1000);
+    defer adaptive.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 150), adaptive.requested_dpi);
+    try std.testing.expect(adaptive.effective_dpi >= 72);
+    try std.testing.expect(adaptive.effective_dpi < adaptive.requested_dpi);
+    try std.testing.expect(adaptive.width <= 1000);
+    try std.testing.expect(adaptive.height <= 1000);
+    const decoded = try @import("antfly_image").png.decodeRgba(alloc, adaptive.png);
+    defer alloc.free(decoded.rgba);
+    try std.testing.expectEqual(adaptive.width, decoded.width);
+    try std.testing.expectEqual(adaptive.height, decoded.height);
+
+    var low_dpi = try renderParsedPagePngAdaptiveAlloc(alloc, &parsed, 1, 150, 40_000_000, 700);
+    defer low_dpi.deinit(alloc);
+    try std.testing.expect(low_dpi.effective_dpi >= minimum_direct_render_dpi);
+    try std.testing.expect(low_dpi.effective_dpi < minimum_requested_render_dpi);
+    try std.testing.expect(low_dpi.width <= 700);
+    try std.testing.expect(low_dpi.height <= 700);
+    try std.testing.expectError(error.RenderedPageTooLarge, renderParsedPagePngAdaptiveAlloc(alloc, &parsed, 1, 150, 40_000_000, 400));
+    try std.testing.expectError(error.RenderedPageTooLarge, renderParsedPagePngAdaptiveAlloc(alloc, &parsed, 1, 150, 10, 4096));
+    try std.testing.expectError(error.InvalidRenderDpi, renderParsedPagePngAlloc(alloc, &parsed, 1, 48, 40_000_000));
+}
+
+test "OCR DPI scaling maps tiling patterns exactly once" {
+    const alloc = std.testing.allocator;
+    const tile_points = try alloc.dupe([2]f64, &.{ .{ 0, 0 }, .{ 5, 0 }, .{ 5, 5 }, .{ 0, 5 } });
+    var tile_shapes = try alloc.alloc(reader.ShapeRun, 1);
+    tile_shapes[0] = .{
+        .kind = .fill,
+        .color = .{ 0, 0, 0, 0xff },
+        .stroke_width = 0,
+        .closed = true,
+        .points = tile_points,
+    };
+    const target_points = try alloc.dupe([2]f64, &.{ .{ 0, 0 }, .{ 20, 0 }, .{ 20, 20 }, .{ 0, 20 } });
+    var runs = [_]reader.PatternRun{.{
+        .kind = .fill,
+        .points = target_points,
+        .pattern_bbox = .{ .min_x = 0, .min_y = 0, .max_x = 5, .max_y = 5 },
+        .pattern_x_step = 5,
+        .pattern_y_step = 5,
+        .tile_shape_runs = tile_shapes,
+    }};
+    defer runs[0].deinit(alloc);
+
+    scalePatternRuns(&runs, 2);
+    try std.testing.expectApproxEqAbs(@as(f64, 40), runs[0].points[1][0], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 2), runs[0].pattern_matrix.a, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 5), runs[0].pattern_x_step, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 5), runs[0].pattern_bbox.max_x, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 5), runs[0].tile_shape_runs[0].points[1][0], 0.001);
+}
+
+test "native page renderer renders the requested one-based PDF page" {
+    const alloc = std.testing.allocator;
+    const fixture = @embedFile("../testdata/two_page_text_fixture.pdf");
+    var parsed = try reader.Reader.init(alloc, fixture);
+    defer parsed.deinit();
+    const second_text = try parsed.extractPageTextAlloc(2);
+    defer alloc.free(second_text);
+    try std.testing.expect(std.mem.indexOf(u8, second_text, "SECOND PAGE") != null);
+
+    const first_png = try renderPagePngAlloc(alloc, fixture, 1, 150, 40_000_000);
+    defer alloc.free(first_png);
+    const second_png = try renderPagePngAlloc(alloc, fixture, 2, 150, 40_000_000);
+    defer alloc.free(second_png);
+    const first = try @import("antfly_image").png.decodeRgba(alloc, first_png);
+    defer alloc.free(first.rgba);
+    const second = try @import("antfly_image").png.decodeRgba(alloc, second_png);
+    defer alloc.free(second.rgba);
+    try std.testing.expectEqual(first.width, second.width);
+    try std.testing.expectEqual(first.height, second.height);
+    try std.testing.expect(!std.mem.eql(u8, first.rgba, second.rgba));
+}
+
+test "reader ignores stale positive page-tree Count hints" {
+    const alloc = std.testing.allocator;
+    const fixture = @embedFile("../testdata/two_page_text_fixture.pdf");
+    const mutated = try alloc.dupe(u8, fixture);
+    defer alloc.free(mutated);
+    const marker = std.mem.indexOf(u8, mutated, "/Count 2") orelse return error.InvalidTestFixture;
+    mutated[marker + "/Count ".len] = '1';
+
+    var parsed = try reader.Reader.init(alloc, mutated);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), try parsed.pageCount());
+    const second = try parsed.extractPageTextAlloc(2);
+    defer alloc.free(second);
+    try std.testing.expect(std.mem.indexOf(u8, second, "SECOND PAGE") != null);
+}
+
+test "native page renderer preserves a raster scanned-table fixture for OCR" {
+    const alloc = std.testing.allocator;
+    const fixture = @embedFile("../testdata/scanned_table_fixture.pdf");
+    var parsed = try reader.Reader.init(alloc, fixture);
+    defer parsed.deinit();
+    const embedded_text = try parsed.extractPageTextAlloc(1);
+    defer alloc.free(embedded_text);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.trim(u8, embedded_text, &std.ascii.whitespace).len);
+
+    const png = try renderPagePngAlloc(alloc, fixture, 1, 150, 40_000_000);
+    defer alloc.free(png);
+    const page = try @import("antfly_image").png.decodeRgba(alloc, png);
+    defer alloc.free(page.rgba);
+    try std.testing.expect(page.width >= 133);
+    try std.testing.expect(page.height >= 100);
+
+    var dark_pixels: usize = 0;
+    var i: usize = 0;
+    while (i + 3 < page.rgba.len) : (i += 4) {
+        if (page.rgba[i] < 128 and page.rgba[i + 1] < 128 and page.rgba[i + 2] < 128) dark_pixels += 1;
+    }
+    try std.testing.expect(dark_pixels > 500);
 }

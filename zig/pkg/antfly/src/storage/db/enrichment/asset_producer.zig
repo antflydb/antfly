@@ -74,6 +74,8 @@ pub const Request = struct {
     source_text: []const u8,
     source_parts_json: ?[]const u8 = null,
     content_type: []const u8 = "",
+    /// Stable source fingerprint for opt-in producer/inference profiling.
+    source_fingerprint: ?[]const u8 = null,
 };
 
 pub const Producer = struct {

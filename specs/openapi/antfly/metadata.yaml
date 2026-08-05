@@ -2073,6 +2073,27 @@ components:
         chunk_count:
           type: integer
           description: Number of indexable chunks derived from the units.
+        ocr_attempted_count:
+          type: integer
+          description: Number of pages for which OCR was attempted.
+        ocr_selected_count:
+          type: integer
+          description: Number of pages where OCR text was selected over embedded text.
+        ocr_retained_embedded_count:
+          type: integer
+          description: Number of attempted pages where embedded text remained preferable.
+        ocr_failed_count:
+          type: integer
+          description: Number of pages whose OCR rendering or recognition failed.
+        ocr_failed_page_numbers:
+          type: array
+          description: Up to 32 one-based page numbers with retryable OCR failures.
+          items:
+            type: integer
+            format: uint32
+        ocr_failed_pages_truncated:
+          type: boolean
+          description: Whether additional failed page numbers were omitted from the summary.
         child_ranges:
           type: array
           description: Parsed child range descriptors for this artifact generation.

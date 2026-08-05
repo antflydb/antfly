@@ -302,10 +302,6 @@ pub const Runtime = struct {
             .ignore_unknown_fields = true,
         });
         defer cfg_parsed.deinit();
-        if (!isLocalReaderProvider(cfg_parsed.value.provider, cfg_parsed.value.resolvedUrl())) return error.BatchIncompatible;
-        const local = self.antfly_provider orelse return error.BatchIncompatible;
-        const read_images = local.read_images orelse return error.BatchIncompatible;
-
         const sources = try alloc.alloc(ReaderSource, requests.len);
         var sources_filled: usize = 0;
         defer {
@@ -317,16 +313,13 @@ pub const Runtime = struct {
         var flat_images = std.ArrayListUnmanaged([]const u8).empty;
         defer flat_images.deinit(alloc);
 
-        var shared_prompt: ?[]const u8 = null;
+        var shared_prompt: ?[]const u8 = cfg_parsed.value.prompt;
         for (requests, 0..) |request, i| {
             sources[i] = try parseReaderSource(alloc, request.source_text, request.source_parts_json);
             sources_filled += 1;
-            if (!optionalStringsEqual(shared_prompt, sources[i].prompt)) {
-                if (i == 0) {
-                    shared_prompt = sources[i].prompt;
-                } else {
-                    return error.BatchIncompatible;
-                }
+            const effective_prompt = sources[i].prompt orelse cfg_parsed.value.prompt;
+            if (!optionalStringsEqual(shared_prompt, effective_prompt)) {
+                if (i == 0) shared_prompt = effective_prompt else return error.BatchIncompatible;
             }
             image_counts[i] = sources[i].images.len;
             try flat_images.appendSlice(alloc, sources[i].images);
@@ -344,10 +337,11 @@ pub const Runtime = struct {
         while (image_offset < flat_images.items.len) {
             const image_end = @min(image_offset + local_reader_batch_max_images, flat_images.items.len);
             const chunk_images = flat_images.items[image_offset..image_end];
-            const chunk_results = try read_images(local.ptr, alloc, cfg_parsed.value.model orelse "", .{
+            const chunk_results = try self.readImagesWithConfig(alloc, cfg_parsed.value, .{
                 .images = chunk_images,
                 .prompt = shared_prompt,
                 .max_tokens = cfg_parsed.value.max_tokens,
+                .source_fingerprint = requests[0].source_fingerprint,
             });
             if (chunk_results.len != chunk_images.len) {
                 for (chunk_results) |*result| readers.deinitResult(alloc, result);
@@ -418,41 +412,36 @@ pub const Runtime = struct {
         var source = try parseReaderSource(alloc, request.source_text, request.source_parts_json);
         defer source.deinit(alloc);
 
-        if (isLocalReaderProvider(cfg_parsed.value.provider, cfg_parsed.value.resolvedUrl())) {
+        const results = try self.readImagesWithConfig(alloc, cfg_parsed.value, .{
+            .images = source.images,
+            .prompt = source.prompt orelse cfg_parsed.value.prompt,
+            .max_tokens = cfg_parsed.value.max_tokens,
+            .source_fingerprint = request.source_fingerprint,
+        });
+        defer {
+            for (results) |*result| readers.deinitResult(alloc, result);
+            alloc.free(results);
+        }
+        return try encodeReaderResults(alloc, request.content_type, results);
+    }
+
+    fn readImagesWithConfig(self: *Runtime, alloc: Allocator, cfg: readers.Config, request: readers.Request) ![]readers.Result {
+        if (isLocalReaderProvider(cfg.provider, cfg.resolvedUrl())) {
             const local = self.antfly_provider orelse return error.UnsupportedReaderProvider;
             const read_images = local.read_images orelse return error.UnsupportedReaderProvider;
-            const results = try read_images(local.ptr, alloc, cfg_parsed.value.model orelse "", .{
-                .images = source.images,
-                .prompt = source.prompt,
-                .max_tokens = cfg_parsed.value.max_tokens,
-            });
-            defer {
-                for (results) |*result| readers.deinitResult(alloc, result);
-                alloc.free(results);
-            }
-            return try encodeReaderResults(alloc, request.content_type, results);
+            return try read_images(local.ptr, alloc, cfg.model orelse "", request);
         }
 
         var registry = readers.Registry.init(alloc);
         defer registry.deinit();
-        try registry.registerConfig("asset", cfg_parsed.value);
+        try registry.registerConfig("asset", cfg);
 
         var runtime = readers.Runtime.init(alloc);
         defer runtime.deinit();
         try runtime.loadFromRegistry(self.http, &registry);
 
         const provider = try runtime.get("asset");
-        const results = try provider.read(alloc, .{
-            .images = source.images,
-            .prompt = source.prompt,
-            .max_tokens = cfg_parsed.value.max_tokens,
-        });
-        defer {
-            for (results) |*result| readers.deinitResult(alloc, result);
-            alloc.free(results);
-        }
-
-        return try encodeReaderResults(alloc, request.content_type, results);
+        return try provider.read(alloc, request);
     }
 
     fn transcribe(self: *Runtime, alloc: Allocator, request: asset_producer.Request) ![]u8 {

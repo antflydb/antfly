@@ -90,6 +90,7 @@ const managed_embedder = @import("../inference/managed_embedder.zig");
 const db_embedder = @import("../storage/db/enrichment/embedder.zig");
 const asset_producer_runtime = @import("../asset_producer_runtime.zig");
 const asset_producer_mod = @import("../storage/db/enrichment/asset_producer.zig");
+const document_extraction_mod = @import("../storage/db/enrichment/document_extraction.zig");
 const distributed_txn = @import("distributed_txn.zig");
 const build_options = @import("build_options");
 const tracing = @import("../tracing/mod.zig");
@@ -18265,7 +18266,12 @@ fn objectIsModelBackedAssetEnrichment(alloc: std.mem.Allocator, object: std.json
     defer if (owns_producer_json) alloc.free(@constCast(producer_json));
     var producer_cfg = asset_producer_mod.parseProducerConfig(alloc, producer_json) catch return false;
     defer producer_cfg.deinit(alloc);
-    return producer_cfg.type != .copy and producer_cfg.type != .document_extraction;
+    if (producer_cfg.type == .document_extraction) {
+        var extraction_cfg = document_extraction_mod.parseConfig(alloc, producer_cfg.config_json) catch return false;
+        defer extraction_cfg.deinit(alloc);
+        return extraction_cfg.ocr_enabled or extraction_cfg.transcription_enabled;
+    }
+    return producer_cfg.type != .copy;
 }
 
 test "provisioning detects model backed graph shorthand assets inside config_json strings" {
@@ -18295,6 +18301,16 @@ test "provisioning does not require asset producer for copy graph shorthand asse
         \\  "config_json":"{\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\"},\"artifact\":{\"name\":\"relations_v1\",\"kind\":\"asset\",\"field\":\"relations\"}}"
         \\}]
     ));
+}
+
+test "provisioning detects document extraction OCR as model backed" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(try indexesJsonNeedsAssetProducer(alloc,
+        \\[{"enrichments":[{"name":"units","kind":"asset","field":"url","producer_json":"{\"type\":\"document_extraction\",\"config\":{\"ocr\":{\"enabled\":true,\"config\":{\"provider\":\"antfly\"}}}}"}]}]
+    ));
+    try std.testing.expect(!(try indexesJsonNeedsAssetProducer(alloc,
+        \\[{"enrichments":[{"name":"units","kind":"asset","field":"url","producer_json":"{\"type\":\"document_extraction\",\"config\":{}}"}]}]
+    )));
 }
 
 test "provisioning detects generated embedding chunkers inside index metadata" {

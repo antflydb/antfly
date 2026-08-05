@@ -1570,6 +1570,11 @@ pub fn build(b: *std.Build) void {
     });
     pdf_mod.addImport("antfly_image", image_mod);
     pdf_mod.addImport("antfly_font", font_mod);
+    if (target.result.os.tag == .macos) {
+        addMacosSdkPaths(b, pdf_mod, target);
+        pdf_mod.linkFramework("CoreFoundation", .{});
+        pdf_mod.linkFramework("CoreGraphics", .{});
+    }
     const wasm_image_mod = b.createModule(.{
         .root_source_file = b.path("lib/image/src/mod.zig"),
         .target = wasm_target,
@@ -2696,6 +2701,26 @@ pub fn build(b: *std.Build) void {
     const lib_image_test_step = b.step("lib-image-test", "Run shared image tests");
     lib_image_test_step.dependOn(&run_lib_image_tests.step);
 
+    const pdf_test_mod = b.createModule(.{
+        .root_source_file = b.path("lib/pdf/pdf_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    pdf_test_mod.addImport("antfly_image", image_mod);
+    pdf_test_mod.addImport("antfly_font", font_mod);
+    if (target.result.os.tag == .macos) {
+        addMacosSdkPaths(b, pdf_test_mod, target);
+        pdf_test_mod.linkFramework("CoreFoundation", .{});
+        pdf_test_mod.linkFramework("CoreGraphics", .{});
+    }
+    const lib_pdf_tests = b.addTest(.{
+        .root_module = pdf_test_mod,
+    });
+    lib_pdf_tests.root_module.link_libc = true;
+    const run_lib_pdf_tests = b.addRunArtifact(lib_pdf_tests);
+    const lib_pdf_test_step = b.step("lib-pdf-test", "Run shared PDF tests");
+    lib_pdf_test_step.dependOn(&run_lib_pdf_tests.step);
+
     const lib_image_bench_build_options = b.addOptions();
     const lib_image_spng_paths = detectSpngPaths(b, target);
     const lib_image_enable_spng = lib_image_spng_paths != null;
@@ -2751,6 +2776,11 @@ pub fn build(b: *std.Build) void {
     });
     pdf_bench_pdf_mod.addImport("antfly_image", pdf_bench_image_mod);
     pdf_bench_pdf_mod.addImport("antfly_font", pdf_bench_font_mod);
+    if (target.result.os.tag == .macos) {
+        addMacosSdkPaths(b, pdf_bench_pdf_mod, target);
+        pdf_bench_pdf_mod.linkFramework("CoreFoundation", .{});
+        pdf_bench_pdf_mod.linkFramework("CoreGraphics", .{});
+    }
     const pdf_bench_mod = b.createModule(.{
         .root_source_file = b.path("lib/pdf/src/pdf_bench.zig"),
         .target = target,
@@ -6020,6 +6050,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_mcp_tests.step);
     unit_test_step.dependOn(&run_lib_a2a_tests.step);
     unit_test_step.dependOn(&run_lib_image_tests.step);
+    unit_test_step.dependOn(&run_lib_pdf_tests.step);
     unit_test_step.dependOn(&run_lib_audio_tests.step);
     unit_test_step.dependOn(&run_hf_tokenizer_tests.step);
     unit_test_step.dependOn(delegated_inference_steps.inference_test);

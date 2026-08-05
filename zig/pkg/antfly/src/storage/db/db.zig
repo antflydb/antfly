@@ -24785,7 +24785,19 @@ fn computeDocumentExtractionAssetRequestDerived(
         },
     };
     defer extraction.deinit(alloc);
-    try completeDocumentExtractionGeneratedText(alloc, db.enrichment_runtime, config, source_url, downloaded_mut.data, extraction.content_type, &extraction);
+    if (db.enrichment_runtime) |runtime| {
+        try enrichment_runtime_mod.completeDocumentExtractionGeneratedTextForRequest(
+            runtime,
+            alloc,
+            request,
+            config,
+            source_url,
+            downloaded_mut.data,
+            extraction.content_type,
+            &extraction,
+        );
+    }
+    document_extraction_mod.rebaseUnitCharOffsets(extraction.units);
 
     const byte_source_fingerprint = if (metadata_fingerprint == null)
         try documentExtractionFingerprintAlloc(alloc, source_url, config_json, config.content_type, config.filename, downloaded_mut.content_type, downloaded_mut.data)
@@ -24973,7 +24985,13 @@ fn completeDocumentExtractionGeneratedText(
             var rendered_page: ?[]u8 = null;
             defer if (rendered_page) |png| alloc.free(png);
             if (std.mem.eql(u8, extraction.route_type, "pdf")) {
-                rendered_page = document_extraction_mod.renderPdfPagePngAlloc(alloc, source_bytes, unit.page_number orelse 1) catch |err| {
+                rendered_page = document_extraction_mod.renderPdfPagePngAlloc(
+                    alloc,
+                    source_bytes,
+                    unit.page_number orelse 1,
+                    config.ocr_render_dpi,
+                    config.ocr_max_rendered_pixels,
+                ) catch |err| {
                     const any_err: anyerror = err;
                     if (any_err == error.OutOfMemory) return any_err;
                     try markGeneratedUnitTextFailure(alloc, unit, "ocr_text", .ocr, any_err);
@@ -24981,7 +24999,7 @@ fn completeDocumentExtractionGeneratedText(
                 };
             }
             const parts_json = if (rendered_page) |png|
-                try document_extraction_mod.ocrPagePartsJsonAlloc(alloc, extraction.route_type, source_content_type, unit.*, png)
+                try document_extraction_mod.ocrPagePartsJsonAlloc(alloc, config, extraction.route_type, source_content_type, unit.*, png)
             else
                 try documentGeneratedTextPartsJsonAlloc(alloc, extraction.route_type, source_content_type, unit.*);
             defer alloc.free(parts_json);
@@ -25836,6 +25854,16 @@ fn buildDocumentUnitChunkPayloadAlloc(
         .extraction_status = unit.extraction_status,
         .confidence = documentUnitConfidence(unit),
         .ocr_used = unit.ocr_used,
+        .ocr_attempted = unit.ocr_attempted,
+        .ocr_render_dpi = unit.ocr_render_dpi,
+        .ocr_effective_render_dpi = unit.ocr_effective_render_dpi,
+        .ocr_rendered_width = unit.ocr_rendered_width,
+        .ocr_rendered_height = unit.ocr_rendered_height,
+        .ocr_rendered_bytes = unit.ocr_rendered_bytes,
+        .ocr_failure_stage = unit.ocr_failure_stage,
+        .ocr_trigger_reasons = unit.ocr_trigger_reasons,
+        .ocr_embedded_quality = unit.ocr_embedded_quality,
+        .ocr_output_quality = unit.ocr_output_quality,
         .ocr_confidence = unit.ocr_confidence,
         .ocr_bbox = unit.ocr_bbox,
         .transcript_used = unit.transcript_used,
@@ -25881,6 +25909,24 @@ fn documentExtractionUnitFingerprintAlloc(alloc: Allocator, unit: document_extra
         hasher.update(&buf);
     }
     hasher.update(if (unit.ocr_used) "ocr:1" else "ocr:0");
+    hasher.update(if (unit.ocr_attempted) "ocr_attempted:1" else "ocr_attempted:0");
+    if (unit.ocr_render_dpi) |dpi| {
+        var dpi_buf: [@sizeOf(u16)]u8 = undefined;
+        std.mem.writeInt(u16, &dpi_buf, dpi, .big);
+        hasher.update(&dpi_buf);
+    }
+    if (unit.ocr_effective_render_dpi) |dpi| {
+        var dpi_buf: [@sizeOf(u16)]u8 = undefined;
+        std.mem.writeInt(u16, &dpi_buf, dpi, .big);
+        hasher.update(&dpi_buf);
+    }
+    if (unit.ocr_rendered_width) |value| hasher.update(std.mem.asBytes(&value));
+    if (unit.ocr_rendered_height) |value| hasher.update(std.mem.asBytes(&value));
+    if (unit.ocr_rendered_bytes) |value| hasher.update(std.mem.asBytes(&value));
+    if (unit.ocr_failure_stage) |value| hasher.update(value);
+    if (unit.ocr_trigger_reasons) |value| hasher.update(value);
+    if (unit.ocr_embedded_quality) |value| hasher.update(value);
+    if (unit.ocr_output_quality) |value| hasher.update(value);
     if (unit.ocr_confidence) |confidence| {
         var value = confidence;
         hasher.update(std.mem.asBytes(&value));
@@ -26115,6 +26161,16 @@ fn documentUnitPayloadAlloc(
         .source_sha256 = unit.source_sha256,
         .byte_length = unit.byte_length,
         .confidence = documentUnitConfidence(unit),
+        .ocr_attempted = unit.ocr_attempted,
+        .ocr_render_dpi = unit.ocr_render_dpi,
+        .ocr_effective_render_dpi = unit.ocr_effective_render_dpi,
+        .ocr_rendered_width = unit.ocr_rendered_width,
+        .ocr_rendered_height = unit.ocr_rendered_height,
+        .ocr_rendered_bytes = unit.ocr_rendered_bytes,
+        .ocr_failure_stage = unit.ocr_failure_stage,
+        .ocr_trigger_reasons = unit.ocr_trigger_reasons,
+        .ocr_embedded_quality = unit.ocr_embedded_quality,
+        .ocr_output_quality = unit.ocr_output_quality,
         .ocr_confidence = unit.ocr_confidence,
         .ocr_bbox = unit.ocr_bbox,
         .transcript_confidence = unit.transcript_confidence,
@@ -26128,6 +26184,16 @@ fn documentUnitPayloadAlloc(
             .byte_length = unit.byte_length,
             .confidence = documentUnitConfidence(unit),
             .ocr_used = unit.ocr_used,
+            .ocr_attempted = unit.ocr_attempted,
+            .ocr_render_dpi = unit.ocr_render_dpi,
+            .ocr_effective_render_dpi = unit.ocr_effective_render_dpi,
+            .ocr_rendered_width = unit.ocr_rendered_width,
+            .ocr_rendered_height = unit.ocr_rendered_height,
+            .ocr_rendered_bytes = unit.ocr_rendered_bytes,
+            .ocr_failure_stage = unit.ocr_failure_stage,
+            .ocr_trigger_reasons = unit.ocr_trigger_reasons,
+            .ocr_embedded_quality = unit.ocr_embedded_quality,
+            .ocr_output_quality = unit.ocr_output_quality,
             .ocr_confidence = unit.ocr_confidence,
             .ocr_bbox = unit.ocr_bbox,
             .transcript_used = unit.transcript_used,
@@ -26152,6 +26218,16 @@ fn documentUnitPayloadAlloc(
                 .byte_length = unit.byte_length,
                 .confidence = documentUnitConfidence(unit),
                 .ocr_used = unit.ocr_used,
+                .ocr_attempted = unit.ocr_attempted,
+                .ocr_render_dpi = unit.ocr_render_dpi,
+                .ocr_effective_render_dpi = unit.ocr_effective_render_dpi,
+                .ocr_rendered_width = unit.ocr_rendered_width,
+                .ocr_rendered_height = unit.ocr_rendered_height,
+                .ocr_rendered_bytes = unit.ocr_rendered_bytes,
+                .ocr_failure_stage = unit.ocr_failure_stage,
+                .ocr_trigger_reasons = unit.ocr_trigger_reasons,
+                .ocr_embedded_quality = unit.ocr_embedded_quality,
+                .ocr_output_quality = unit.ocr_output_quality,
                 .ocr_confidence = unit.ocr_confidence,
                 .ocr_bbox = unit.ocr_bbox,
                 .transcript_used = unit.transcript_used,
@@ -26349,6 +26425,16 @@ fn documentArtifactManifestFromJsonAlloc(
     errdefer if (last_error_code) |value| alloc.free(value);
     const last_error_message = try jsonObjectOptionalNestedStringDup(alloc, object, "last_error", "message");
     errdefer if (last_error_message) |value| alloc.free(value);
+    var ocr_failed_page_numbers: []i64 = &.{};
+    if (object.get("ocr_failed_page_numbers")) |pages| {
+        if (pages != .array) return error.InvalidDocumentExtractionManifest;
+        ocr_failed_page_numbers = try alloc.alloc(i64, pages.array.items.len);
+        errdefer if (ocr_failed_page_numbers.len > 0) alloc.free(ocr_failed_page_numbers);
+        for (pages.array.items, 0..) |page, i| {
+            if (page != .integer or page.integer < 1) return error.InvalidDocumentExtractionManifest;
+            ocr_failed_page_numbers[i] = page.integer;
+        }
+    }
 
     const child_ranges = try documentArtifactChildRangesFromJsonAlloc(alloc, object);
     errdefer {
@@ -26395,6 +26481,12 @@ fn documentArtifactManifestFromJsonAlloc(
         .unsupported_reason = unsupported_reason,
         .unit_count = try jsonObjectUsize(object, "unit_count"),
         .chunk_count = try jsonObjectUsize(object, "chunk_count"),
+        .ocr_attempted_count = (try jsonObjectOptionalUsize(object, "ocr_attempted_count")) orelse 0,
+        .ocr_selected_count = (try jsonObjectOptionalUsize(object, "ocr_selected_count")) orelse 0,
+        .ocr_retained_embedded_count = (try jsonObjectOptionalUsize(object, "ocr_retained_embedded_count")) orelse 0,
+        .ocr_failed_count = (try jsonObjectOptionalUsize(object, "ocr_failed_count")) orelse 0,
+        .ocr_failed_page_numbers = ocr_failed_page_numbers,
+        .ocr_failed_pages_truncated = (try jsonObjectOptionalBool(object, "ocr_failed_pages_truncated")) orelse false,
         .child_ranges = child_ranges,
         .child_range_count = child_ranges.len,
         .merge_status = merge_status,
@@ -26721,6 +26813,61 @@ fn documentExtractionManifestPayloadAlloc(
     }
     try appendJsonFieldUsize(alloc, &out, &first, "unit_count", extraction.units.len);
     try appendJsonFieldUsize(alloc, &out, &first, "chunk_count", chunk_keys.len);
+    var ocr_attempted_count: usize = 0;
+    var ocr_selected_count: usize = 0;
+    var ocr_retained_embedded_count: usize = 0;
+    var ocr_failed_count: usize = 0;
+    var failed_pages: [32]u32 = undefined;
+    var failed_pages_len: usize = 0;
+    for (extraction.units) |unit| {
+        if (!unit.ocr_attempted) continue;
+        ocr_attempted_count += 1;
+        if (unit.ocr_used) ocr_selected_count += 1;
+        if (unit.extraction_status) |status| {
+            if (std.mem.eql(u8, status, "completed_embedded_preferred")) ocr_retained_embedded_count += 1;
+            if (std.mem.eql(u8, status, "failed_ocr")) {
+                ocr_failed_count += 1;
+                if (failed_pages_len < failed_pages.len) if (unit.page_number) |page| {
+                    failed_pages[failed_pages_len] = page;
+                    failed_pages_len += 1;
+                };
+            }
+        }
+    }
+    try appendJsonFieldUsize(alloc, &out, &first, "ocr_attempted_count", ocr_attempted_count);
+    try appendJsonFieldUsize(alloc, &out, &first, "ocr_selected_count", ocr_selected_count);
+    try appendJsonFieldUsize(alloc, &out, &first, "ocr_retained_embedded_count", ocr_retained_embedded_count);
+    try appendJsonFieldUsize(alloc, &out, &first, "ocr_failed_count", ocr_failed_count);
+    try appendJsonFieldName(alloc, &out, &first, "ocr_failed_page_numbers");
+    try out.append(alloc, '[');
+    for (failed_pages[0..failed_pages_len], 0..) |page, i| {
+        if (i > 0) try out.append(alloc, ',');
+        const rendered_page = try std.fmt.allocPrint(alloc, "{d}", .{page});
+        defer alloc.free(rendered_page);
+        try out.appendSlice(alloc, rendered_page);
+    }
+    try out.append(alloc, ']');
+    try appendJsonFieldBool(alloc, &out, &first, "ocr_failed_pages_truncated", ocr_failed_count > failed_pages_len);
+    try appendJsonFieldName(alloc, &out, &first, "ocr_failure_details");
+    try out.append(alloc, '[');
+    var failure_detail_count: usize = 0;
+    for (extraction.units) |unit| {
+        const status = unit.extraction_status orelse continue;
+        if (!std.mem.eql(u8, status, "failed_ocr")) continue;
+        if (failure_detail_count >= 32) break;
+        if (failure_detail_count > 0) try out.append(alloc, ',');
+        failure_detail_count += 1;
+        try out.append(alloc, '{');
+        var detail_first = true;
+        if (unit.page_number) |page| try appendJsonFieldU64(alloc, &out, &detail_first, "page_number", page);
+        try appendJsonFieldString(alloc, &out, &detail_first, "unit_id", unit.unit_id);
+        try appendJsonFieldString(alloc, &out, &detail_first, "retained_method", unit.method);
+        try appendJsonFieldString(alloc, &out, &detail_first, "error_message", unit.extraction_warning orelse "OCR failed without a recorded cause");
+        if (unit.ocr_failure_stage) |stage| try appendJsonFieldString(alloc, &out, &detail_first, "failure_stage", stage);
+        try appendJsonFieldBool(alloc, &out, &detail_first, "retryable", true);
+        try out.append(alloc, '}');
+    }
+    try out.append(alloc, ']');
     try appendJsonFieldName(alloc, &out, &first, "child_ranges");
     try out.append(alloc, '[');
     try appendDocumentExtractionRangeDescriptors(alloc, &out, artifact_name, unit_keys, chunk_keys, extraction.units, previous_child_ranges);
@@ -32131,7 +32278,10 @@ fn accountDenseCoverage(
             if (doc.action == .delete or internal_keys.isInternalUserKey(doc.key) or !ctx.index_manager.byte_range.contains(doc.key)) continue;
             try outcomes.append(ctx.alloc, .{
                 .doc_key = doc.key,
-                .outcome = if (produced.contains(doc.key)) .produced else .skipped,
+                .outcome = if (produced.contains(doc.key))
+                    .produced
+                else
+                    try denseMissingArtifactCoverageOutcome(ctx, index_name, doc.key),
             });
         }
     } else {
@@ -32142,6 +32292,43 @@ fn accountDenseCoverage(
         }
     }
     try setDerivedCoverageOutcomes(ctx.alloc, ctx.store, ctx.index_manager, index_name, outcomes.items);
+}
+
+fn denseMissingArtifactCoverageOutcome(
+    ctx: *const AsyncContext,
+    index_name: []const u8,
+    doc_key: []const u8,
+) !DerivedCoverageOutcome {
+    const dense = ctx.index_manager.denseIndex(index_name) orelse return .skipped;
+    const chunk_name = dense.chunk_name orelse return .skipped;
+    const chunk_cfg = ctx.index_manager.getEnrichment(.chunk, chunk_name) orelse return .skipped;
+    if (chunk_cfg.source_artifact_name.len == 0) return .skipped;
+
+    const manifest_key = try internal_keys.artifactNamedPrefixAlloc(ctx.alloc, doc_key, "asset", chunk_cfg.source_artifact_name);
+    defer ctx.alloc.free(manifest_key);
+    const manifest = ctx.store.get(ctx.alloc, manifest_key) catch |err| switch (err) {
+        error.NotFound => return .skipped,
+        else => return err,
+    };
+    defer ctx.alloc.free(manifest);
+    var parsed = try std.json.parseFromSlice(std.json.Value, ctx.alloc, manifest, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidDocumentExtractionManifest;
+    const object = parsed.value.object;
+    if (object.get("last_error") != null) return .terminal_failed;
+    if (object.get("merge_status")) |value| {
+        if (value == .string and std.mem.eql(u8, value.string, "failed")) return .terminal_failed;
+    }
+    if (object.get("route_type")) |value| {
+        if (value == .string and std.mem.eql(u8, value.string, "error")) return .terminal_failed;
+    }
+    const chunk_count = try jsonObjectU64(object, "chunk_count");
+    const ocr_failed_count = try jsonObjectU64(object, "ocr_failed_count");
+    const failed_pages = if (object.get("ocr_failed_page_numbers")) |value|
+        if (value == .array) value.array.items.len else 0
+    else
+        0;
+    return if (chunk_count == 0 and (ocr_failed_count > 0 or failed_pages > 0)) .terminal_failed else .skipped;
 }
 
 fn accountSparseCoverage(
@@ -48567,6 +48754,74 @@ test "db document extraction completes image OCR with reader producer" {
     try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"text\":\"reader:data:image/png;base64,iVBORw0KGgppbWFnZSBieXRlcw==\"") != null);
 }
 
+test "db document extraction attempts forced OCR for a scanned PDF" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var fake = TestAssetProducer{ .reader_output = "scanned PDF transcription with enough text to remain selected" };
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .asset_producer = fake.producer(),
+        },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"},\"ocr\":{\"enabled\":true,\"mode\":\"always\",\"config\":{\"provider\":\"mock-reader\"}}}}",
+    });
+
+    const pdf_bytes = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "lib/pdf/testdata/scanned_table_fixture.pdf",
+        alloc,
+        .limited(4 * 1024 * 1024),
+    );
+    defer alloc.free(pdf_bytes);
+    const encoded_len = std.base64.standard.Encoder.calcSize(pdf_bytes.len);
+    const encoded = try alloc.alloc(u8, encoded_len);
+    defer alloc.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, pdf_bytes);
+    const value = try std.fmt.allocPrint(
+        alloc,
+        "{{\"filename\":\"scan.pdf\",\"mime_type\":\"application/pdf\",\"url\":\"data:application/pdf;base64,{s}\"}}",
+        .{encoded},
+    );
+    defer alloc.free(value);
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:pdf-ocr", .value = value }},
+        .sync_level = .enrichments,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), fake.reader_calls);
+    const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:pdf-ocr", "document_units_v1", "page:000001");
+    defer alloc.free(unit_key);
+    const unit_payload = try db.core.store.get(alloc, unit_key);
+    defer alloc.free(unit_payload);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"ocr_attempted\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"ocr_used\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"ocr_render_dpi\":150") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "scanned PDF transcription") != null);
+
+    const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:pdf-ocr", "asset", "document_units_v1");
+    defer alloc.free(manifest_key);
+    const manifest = try db.core.store.get(alloc, manifest_key);
+    defer alloc.free(manifest);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"ocr_attempted_count\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"ocr_selected_count\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"ocr_failed_count\":0") != null);
+}
+
 test "db async document extraction reuses generated OCR text across streaming passes" {
     const alloc = std.testing.allocator;
 
@@ -51728,6 +51983,27 @@ test "db document extraction skips stable unit local rewrites while replaying fu
         .sync_level = .full_index,
     });
     try std.testing.expectEqual(first_calls, counting.calls);
+
+    // A full-index merge precomputes this successful empty extraction before
+    // generated replay. The replay's stable-state shortcut must still account
+    // for the source document so artifact-backed vector coverage can converge.
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:empty", .value = "{\"url\":\"data:text/plain,\"}" }},
+        .sync_level = .full_index,
+    });
+    try db.runUntilIdle();
+    const coverage_stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, coverage_stats);
+    var saw_vector_coverage = false;
+    for (coverage_stats.indexes) |index_stats| {
+        if (!std.mem.eql(u8, index_stats.name, "dv_document_chunks")) continue;
+        saw_vector_coverage = true;
+        try std.testing.expect(index_stats.coverage_summary_ready);
+        try std.testing.expectEqual(@as(u64, 1), index_stats.coverage_produced_count);
+        try std.testing.expectEqual(@as(u64, 1), index_stats.coverage_skipped_count);
+        try std.testing.expectEqual(@as(u64, 0), index_stats.coverage_terminal_failed_count);
+    }
+    try std.testing.expect(saw_vector_coverage);
 
     var unit_result = try db.search(alloc, .{
         .index_name = "ft_document_units",
