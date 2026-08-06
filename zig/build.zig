@@ -1194,7 +1194,7 @@ pub fn build(b: *std.Build) void {
     const include_ha_tests_in_aggregates = b.option(bool, "ha-tests", "Include hot-standby HA suites in aggregate test steps") orelse true;
     const edition = b.option(BuildEdition, "edition", "Build edition: full or inference") orelse .full;
     const cli_focused_root = b.option(bool, "cli-focused-root", "Build the full CLI against its focused Antfly facade") orelse false;
-    const runtime_artifact_role = b.option(RuntimeArtifactRole, "runtime-artifact-role", "Build one focused server runtime artifact: data, inference, metadata, or standalone");
+    const runtime_artifact_role = b.option(RuntimeArtifactRole, "runtime-artifact-role", "Build one focused runtime artifact: cli, data, inference, metadata, or standalone");
     const linked_runtime_libraries = b.option(bool, "linked-runtime-libraries", "Code-generate server runtimes separately and link them into one executable") orelse false;
     const antfly_bin_name = b.option([]const u8, "antfly-bin-name", "Installed filename for the top-level Antfly CLI") orelse "antfly";
     if (linked_runtime_libraries and edition != .full) {
@@ -8497,12 +8497,15 @@ pub fn build(b: *std.Build) void {
                 // Zig's build runner uses these claims to run as many LLVM
                 // codegen steps concurrently as fit in available RAM. The
                 // focused ARM64 ReleaseFast measurements peaked near 10 GiB
-                // for data/metadata and 15 GiB for inference. These claims
-                // let --maxrss admit safe pairs without globally forcing -j1.
+                // for data/metadata, 7 GiB for the coarse CLI, and
+                // 15 GiB for inference. Together with a --maxrss budget below
+                // the pod request, these claims admit safe pairs without
+                // globally forcing -j1 or admitting data+metadata together.
                 .max_rss = switch (role) {
                     .inference => 16 * 1024 * 1024 * 1024,
                     .data, .metadata => 11 * 1024 * 1024 * 1024,
-                    .cli, .standalone => 13 * 1024 * 1024 * 1024,
+                    .cli => 8 * 1024 * 1024 * 1024,
+                    .standalone => 13 * 1024 * 1024 * 1024,
                 },
             });
             if (strip) {

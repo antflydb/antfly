@@ -53,8 +53,11 @@ jobs:
             "$RUNNER_TEMP/linked-runtime" \
             "$RUNNER_TEMP/linked-runtime-cache/local" \
             "$RUNNER_TEMP/linked-runtime-cache/global"
-          # Match the ARC pod's 24000Mi memory request; the host-reported
-          # total includes memory Kubernetes cannot safely give this pod.
+          # Keep 4000Mi of the ARC pod's 24000Mi request outside Zig's
+          # scheduling budget. Step max_rss values are scheduling claims, not
+          # a complete accounting of build-runner state and page cache. The
+          # lower budget still admits the measured CLI alongside one server
+          # role, but does not admit data and metadata together.
           cd zig
           /usr/bin/time -v -o "$RUNNER_TEMP/linked-runtime.time" \
             zig build \
@@ -69,7 +72,7 @@ jobs:
             --prefix "$RUNNER_TEMP/linked-runtime" \
             --cache-dir "$RUNNER_TEMP/linked-runtime-cache/local" \
             --global-cache-dir "$RUNNER_TEMP/linked-runtime-cache/global" \
-            --maxrss 25165824000 \
+            --maxrss 20971520000 \
             --summary all \
             2>&1 | tee "$RUNNER_TEMP/linked-runtime.log"
 
