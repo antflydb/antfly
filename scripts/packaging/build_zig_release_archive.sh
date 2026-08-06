@@ -110,9 +110,9 @@ work_root="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/antfly-zig-release-${target}"
 prefix="${work_root}/zig-out"
 stage="${work_root}/stage"
 local_cache="${work_root}/zig-cache"
-cache_root="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/zig-cache"
+cache_root="${ANTFLY_ZIG_CACHE_ROOT:-${RUNNER_TEMP:-${TMPDIR:-/tmp}}/zig-cache}"
 
-if [ -d /mnt/cache ] && [ -w /mnt/cache ]; then
+if [ -z "${ANTFLY_ZIG_CACHE_ROOT:-}" ] && [ -d /mnt/cache ] && [ -w /mnt/cache ]; then
   cache_root=/mnt/cache/zig
 fi
 
