@@ -262,11 +262,6 @@ pub const SparseEmbeddingPipeline = struct {
                 }
             }
 
-            // Replace -inf with 0
-            for (pooled) |*v| {
-                if (v.* == -std.math.inf(f32)) v.* = 0;
-            }
-
             results[b] = try spladeActivateAndSparsify(alloc, pooled, self.config.top_k, self.config.min_weight);
             initialized += 1;
         }
@@ -296,10 +291,6 @@ pub const SparseEmbeddingPipeline = struct {
                 for (0..vocab) |v| {
                     if (data[offset + v] > pooled[v]) pooled[v] = data[offset + v];
                 }
-            }
-
-            for (pooled) |*v| {
-                if (v.* == -std.math.inf(f32)) v.* = 0;
             }
 
             results[b] = try spladeActivateAndSparsify(alloc, pooled, self.config.top_k, self.config.min_weight);
@@ -485,7 +476,6 @@ fn spladeActivateAndSparsify(allocator: std.mem.Allocator, row: []const f32, top
         }
     }.lessThan);
 
-    // Build output arrays
     const indices = try allocator.alloc(u32, n);
     errdefer allocator.free(indices);
     const values = try allocator.alloc(f32, n);
@@ -527,6 +517,19 @@ test "splade activation drops non-positive logits" {
     try std.testing.expectEqual(@as(usize, 1), result.indices.len);
     try std.testing.expectEqual(@as(u32, 2), result.indices[0]);
     try std.testing.expectApproxEqAbs(@log(@as(f32, 1.5)), result.values[0], 1e-6);
+}
+
+test "splade activation keeps bounded top k without full collection" {
+    const alloc = std.testing.allocator;
+
+    const row = [_]f32{ 1.0, 9.0, 2.0, 8.0, 3.0 };
+    var result = try spladeActivateAndSparsify(alloc, &row, 2, 0.0);
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), result.indices.len);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 3 }, result.indices);
+    try std.testing.expectApproxEqAbs(@log(@as(f32, 10.0)), result.values[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@log(@as(f32, 9.0)), result.values[1], 1e-6);
 }
 
 test "sparse 3d pooling supports sequence-major imported outputs" {
