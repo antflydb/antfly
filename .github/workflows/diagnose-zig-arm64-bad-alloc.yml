@@ -9,11 +9,10 @@ permissions:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  ANTFLY_CACHE_AB_ONLY: true
 
 jobs:
   diagnose:
-    name: Isolate compiler server cache state
+    name: Validate one-time release retry
     if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: arc-antfly-publish-arm64
     timeout-minutes: 180
@@ -27,7 +26,7 @@ jobs:
       - name: Install Linux diagnostic dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential clang lld curl xz-utils git perl python3 linux-libc-dev ca-certificates gdb strace time
+          sudo apt-get install -y build-essential clang lld curl xz-utils git perl python3 linux-libc-dev ca-certificates
 
       - name: Install Zig
         run: |
@@ -36,13 +35,24 @@ jobs:
           tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
           echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
 
-      - name: Capture bad_alloc diagnostics
-        run: scripts/ci/diagnose_zig_arm64_bad_alloc.sh
+      - name: Build ARM64 release archive with bounded retry
+        run: |
+          scripts/packaging/build_zig_release_archive.sh \
+            --version 0.2.0-rc.26 \
+            --target aarch64-linux-musl \
+            --optimize ReleaseSmall \
+            --jobs 1 \
+            --archive-name antfly_0.2.0-rc.26_Linux_arm64.tar.gz \
+            --out-dir "$RUNNER_TEMP/zig-retry-validation" \
+            --metal false \
+            --system-blas false
 
-      - name: Upload compiler diagnostics
+      - name: Upload retry validation
         if: ${{ always() }}
         uses: actions/upload-artifact@v6
         with:
-          name: zig-arm64-bad-alloc-diagnostics
-          path: ${{ runner.temp }}/zig-arm64-bad-alloc
+          name: zig-arm64-release-retry-validation
+          path: |
+            ${{ runner.temp }}/zig-retry-validation
+            ${{ runner.temp }}/antfly-zig-release-aarch64-linux-musl/*-attempt-*.log
           if-no-files-found: error
