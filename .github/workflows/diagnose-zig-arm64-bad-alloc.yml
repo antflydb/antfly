@@ -84,18 +84,54 @@ jobs:
             --summary all \
             2>&1 | tee "$RUNNER_TEMP/linked-runtime.log"
 
-      - name: Verify single ARM64 artifact
+      - name: Build ARM64 ReleaseFast Lite C ABI
+        env:
+          ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/linked-runtime-cache/global
+          ZIG_LOCAL_CACHE_DIR: ${{ runner.temp }}/linked-runtime-cache/compiler-local
+        run: |
+          set -o pipefail
+          cd zig
+          /usr/bin/time -v -o "$RUNNER_TEMP/lite-capi.time" \
+            zig build \
+            --build-runner "$RUNNER_TEMP/zig-build-runner-maxrss.zig" \
+            lite-capi \
+            -Dtarget=aarch64-linux-musl \
+            -Doptimize=ReleaseFast \
+            -Dstrip=true \
+            -Dcpu=baseline \
+            -Dedition=full \
+            -Donnx=false \
+            -Dmetal=false \
+            -Dsystem-blas=false \
+            -Dlinked-runtime-libraries=true \
+            --prefix "$RUNNER_TEMP/linked-runtime" \
+            --cache-dir "$RUNNER_TEMP/linked-runtime-cache/local" \
+            --global-cache-dir "$RUNNER_TEMP/linked-runtime-cache/global" \
+            --maxrss 20971520000 \
+            --summary all \
+            2>&1 | tee "$RUNNER_TEMP/lite-capi.log"
+
+      - name: Verify ARM64 release artifacts
         run: |
           test "$(find "$RUNNER_TEMP/linked-runtime/bin" -maxdepth 1 -type f | wc -l)" -eq 1
           binary="$RUNNER_TEMP/linked-runtime/bin/antfly"
+          library="$RUNNER_TEMP/linked-runtime/lib/libantfly.so"
+          test -f "$library"
+          test -f "$RUNNER_TEMP/linked-runtime/include/antfly.h"
           file "$binary"
+          file "$library"
           readelf -h "$binary" | tee "$RUNNER_TEMP/linked-runtime.elf-header"
+          readelf -h "$library" | tee "$RUNNER_TEMP/lite-capi.elf-header"
           grep -Eq 'Machine:.*AArch64' "$RUNNER_TEMP/linked-runtime.elf-header"
+          grep -Eq 'Machine:.*AArch64' "$RUNNER_TEMP/lite-capi.elf-header"
           stat -c 'binary_size_bytes=%s' "$binary" | tee "$RUNNER_TEMP/linked-runtime.size"
+          stat -c 'lite_capi_size_bytes=%s' "$library" | tee "$RUNNER_TEMP/lite-capi.size"
 
       - name: Report compiler memory
         if: ${{ always() }}
-        run: cat "$RUNNER_TEMP/linked-runtime.time" || true
+        run: |
+          cat "$RUNNER_TEMP/linked-runtime.time" || true
+          cat "$RUNNER_TEMP/lite-capi.time" || true
 
       - name: Upload result
         if: ${{ always() }}
@@ -108,4 +144,8 @@ jobs:
             ${{ runner.temp }}/linked-runtime.time
             ${{ runner.temp }}/linked-runtime.elf-header
             ${{ runner.temp }}/linked-runtime.size
+            ${{ runner.temp }}/lite-capi.log
+            ${{ runner.temp }}/lite-capi.time
+            ${{ runner.temp }}/lite-capi.elf-header
+            ${{ runner.temp }}/lite-capi.size
           if-no-files-found: error
