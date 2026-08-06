@@ -38,6 +38,8 @@ jobs:
       - name: Build full ARM64 ReleaseFast archive
         env:
           ANTFLY_ZIG_CACHE_ROOT: ${{ runner.temp }}/cold-cache-native-release-fast
+          ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/cold-cache-native-release-fast/compiler-global
+          ZIG_LOCAL_CACHE_DIR: ${{ runner.temp }}/cold-cache-native-release-fast/compiler-local
         run: |
           /usr/bin/time -v -o "$RUNNER_TEMP/native-release-fast.time" \
             scripts/packaging/build_zig_release_archive.sh \
@@ -105,6 +107,8 @@ jobs:
       - name: Cross-compile full ARM64 archive
         env:
           ANTFLY_ZIG_CACHE_ROOT: ${{ runner.temp }}/cold-cache-cross-${{ matrix.label }}
+          ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/cold-cache-cross-${{ matrix.label }}/compiler-global
+          ZIG_LOCAL_CACHE_DIR: ${{ runner.temp }}/cold-cache-cross-${{ matrix.label }}/compiler-local
         run: |
           /usr/bin/time -v -o "$RUNNER_TEMP/cross-${{ matrix.label }}.time" \
             scripts/packaging/build_zig_release_archive.sh \
@@ -145,7 +149,7 @@ jobs:
           if-no-files-found: error
 
   smaller-graph:
-    name: Native ARM64 inference ReleaseFast graph
+    name: Native ARM64 focused CLI ReleaseFast graph
     if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: arc-antfly-publish-arm64
     timeout-minutes: 180
@@ -168,44 +172,48 @@ jobs:
           tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
           echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
 
-      - name: Build smaller inference graph with ReleaseFast
+      - name: Build focused full CLI graph with ReleaseFast
+        env:
+          ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/focused-cli-release-fast-cache/compiler-global
+          ZIG_LOCAL_CACHE_DIR: ${{ runner.temp }}/focused-cli-release-fast-cache/compiler-local
         run: |
           mkdir -p \
-            "$RUNNER_TEMP/inference-release-fast" \
-            "$RUNNER_TEMP/inference-release-fast-cache/local" \
-            "$RUNNER_TEMP/inference-release-fast-cache/global"
+            "$RUNNER_TEMP/focused-cli-release-fast" \
+            "$RUNNER_TEMP/focused-cli-release-fast-cache/local" \
+            "$RUNNER_TEMP/focused-cli-release-fast-cache/global"
           cd zig
-          /usr/bin/time -v -o "$RUNNER_TEMP/inference-release-fast.time" \
+          /usr/bin/time -v -o "$RUNNER_TEMP/focused-cli-release-fast.time" \
             zig build -j1 \
             -Dtarget=aarch64-linux-musl \
             -Doptimize=ReleaseFast \
             -Dstrip=true \
             -Dcpu=baseline \
-            -Dedition=inference \
-            -Dantfly-bin-name=antfly-inference \
+            -Dedition=full \
+            -Dcli-focused-root=true \
+            -Dantfly-bin-name=antfly-focused \
             -Dantfly-version=0.2.0-rc.26 \
             -Donnx=false \
             -Dmetal=false \
             -Dsystem-blas=false \
             install \
-            --prefix "$RUNNER_TEMP/inference-release-fast" \
-            --cache-dir "$RUNNER_TEMP/inference-release-fast-cache/local" \
-            --global-cache-dir "$RUNNER_TEMP/inference-release-fast-cache/global" \
-            2>&1 | tee "$RUNNER_TEMP/inference-release-fast.log"
-          file "$RUNNER_TEMP/inference-release-fast/bin/antfly-inference"
-          "$RUNNER_TEMP/inference-release-fast/bin/antfly-inference" --help
+            --prefix "$RUNNER_TEMP/focused-cli-release-fast" \
+            --cache-dir "$RUNNER_TEMP/focused-cli-release-fast-cache/local" \
+            --global-cache-dir "$RUNNER_TEMP/focused-cli-release-fast-cache/global" \
+            2>&1 | tee "$RUNNER_TEMP/focused-cli-release-fast.log"
+          file "$RUNNER_TEMP/focused-cli-release-fast/bin/antfly-focused"
+          "$RUNNER_TEMP/focused-cli-release-fast/bin/antfly-focused" --help
 
       - name: Report compiler memory
         if: ${{ always() }}
-        run: cat "$RUNNER_TEMP/inference-release-fast.time" || true
+        run: cat "$RUNNER_TEMP/focused-cli-release-fast.time" || true
 
       - name: Upload smaller-graph result
         if: ${{ always() }}
         uses: actions/upload-artifact@v6
         with:
-          name: zig-arm64-inference-release-fast
+          name: zig-arm64-focused-cli-release-fast
           path: |
-            ${{ runner.temp }}/inference-release-fast
-            ${{ runner.temp }}/inference-release-fast.log
-            ${{ runner.temp }}/inference-release-fast.time
+            ${{ runner.temp }}/focused-cli-release-fast
+            ${{ runner.temp }}/focused-cli-release-fast.log
+            ${{ runner.temp }}/focused-cli-release-fast.time
           if-no-files-found: error
