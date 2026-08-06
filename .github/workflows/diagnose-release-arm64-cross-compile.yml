@@ -1,0 +1,56 @@
+name: Diagnose release ARM64 cross compile
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  diagnose:
+    name: Build linux arm64 release archive via amd64 cross compile
+    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: arc-antfly-publish
+    timeout-minutes: 180
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          submodules: true
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang lld curl xz-utils git perl python3 linux-libc-dev ca-certificates
+
+      - name: Install x86_64 Zig
+        run: |
+          curl -L "https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz" -o "$RUNNER_TEMP/zig.tar.xz"
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+
+      - name: Build ARM64 release archive
+        run: |
+          scripts/packaging/build_zig_release_archive.sh \
+            --version 0.2.0-rc.26 \
+            --target aarch64-linux-musl \
+            --optimize ReleaseSmall \
+            --jobs 1 \
+            --archive-name antfly_0.2.0-rc.26_Linux_arm64.tar.gz \
+            --out-dir "$RUNNER_TEMP/arm64-cross-compile-validation" \
+            --metal false \
+            --system-blas false
+
+      - name: Upload cross compile validation
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: zig-arm64-cross-compile-validation
+          path: ${{ runner.temp }}/arm64-cross-compile-validation
+          if-no-files-found: error
