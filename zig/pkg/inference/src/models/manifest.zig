@@ -1114,25 +1114,30 @@ fn applyGgufTokenizerMetadata(
 
     const view = gguf_metadata.View.init(&parsed);
 
-    if (bert.parseGgufMetadata(view)) |config| {
-        manifest.hidden_size = config.hidden_size;
-        manifest.intermediate_size = config.intermediate_size;
-        manifest.max_position_embeddings = config.max_position_embeddings;
-        manifest.num_hidden_layers = config.num_hidden_layers;
-        manifest.num_attention_heads = config.num_attention_heads;
-        manifest.bert_vocab_size = config.vocab_size;
-        manifest.bert_type_vocab_size = config.type_vocab_size;
-        manifest.bert_layer_norm_eps = config.layer_norm_eps;
-        manifest.bert_model_type = config.model_type;
-        manifest.bert_pad_token_id = config.pad_token_id;
-    }
-    if (view.getU64("bert.pooling_type")) |pooling_type| {
-        manifest.pooling = switch (pooling_type) {
-            1 => .mean,
-            2 => .cls,
-            3 => .last,
-            else => manifest.pooling,
-        };
+    // Architecture metadata belongs to the selected weight artifact. A
+    // colocated GGUF export may still provide a tokenizer fallback, but it
+    // must not overwrite the config for higher-precedence safetensors.
+    if (manifest.usesGgufWeights()) {
+        if (bert.parseGgufMetadata(view)) |config| {
+            manifest.hidden_size = config.hidden_size;
+            manifest.intermediate_size = config.intermediate_size;
+            manifest.max_position_embeddings = config.max_position_embeddings;
+            manifest.num_hidden_layers = config.num_hidden_layers;
+            manifest.num_attention_heads = config.num_attention_heads;
+            manifest.bert_vocab_size = config.vocab_size;
+            manifest.bert_type_vocab_size = config.type_vocab_size;
+            manifest.bert_layer_norm_eps = config.layer_norm_eps;
+            manifest.bert_model_type = config.model_type;
+            manifest.bert_pad_token_id = config.pad_token_id;
+        }
+        if (view.getU64("bert.pooling_type")) |pooling_type| {
+            manifest.pooling = switch (pooling_type) {
+                1 => .mean,
+                2 => .cls,
+                3 => .last,
+                else => manifest.pooling,
+            };
+        }
     }
 
     const gguf_model_name = view.getString("tokenizer.ggml.model");
@@ -4285,6 +4290,39 @@ test "manifest applies BERT and T5 tokenizer metadata from GGUF" {
     try std.testing.expectEqual(@as(u32, 8192), manifest.max_position_embeddings);
     try std.testing.expectEqual(@as(u32, 24), manifest.num_hidden_layers);
     try std.testing.expectEqual(@as(u32, 16), manifest.num_attention_heads);
+    try std.testing.expectEqual(bert.ModelType.roberta, manifest.bert_model_type);
+}
+
+test "colocated GGUF does not overwrite selected safetensors BERT config" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const config_json =
+        \\{"model_type":"xlm-roberta","hidden_size":777,"intermediate_size":1554,"max_position_embeddings":8194,"num_hidden_layers":7,"num_attention_heads":7,"vocab_size":250002,"type_vocab_size":1,"pad_token_id":1}
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data = config_json });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.safetensors", .data = "" });
+    const gguf_bytes = try buildTestGgufWithBertT5Tokenizer(allocator);
+    defer allocator.free(gguf_bytes);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "quantized.gguf", .data = gguf_bytes });
+
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(model_dir);
+    var manifest = try loadFromDir(allocator, model_dir);
+    defer manifest.deinit();
+
+    try std.testing.expectEqual(NativeWeightArtifactKind.safetensors, manifest.nativeWeightArtifactKind().?);
+    try std.testing.expectEqual(@as(u32, 777), manifest.hidden_size);
+    try std.testing.expectEqual(@as(u32, 1554), manifest.intermediate_size);
+    try std.testing.expectEqual(@as(u32, 8194), manifest.max_position_embeddings);
+    try std.testing.expectEqual(@as(u32, 7), manifest.num_hidden_layers);
+    try std.testing.expectEqual(@as(u32, 7), manifest.num_attention_heads);
+    try std.testing.expectEqual(@as(u32, 250002), manifest.bert_vocab_size);
+    try std.testing.expectEqual(@as(u32, 1), manifest.bert_type_vocab_size);
+    try std.testing.expectEqual(bert.ModelType.roberta, manifest.bert_model_type);
+    try std.testing.expectEqual(PoolingStrategy.mean, manifest.pooling);
 }
 
 fn buildTestGgufWithGpt2Tokenizer(allocator: std.mem.Allocator) ![]u8 {

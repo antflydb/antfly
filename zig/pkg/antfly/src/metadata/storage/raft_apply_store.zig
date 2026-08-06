@@ -15,6 +15,7 @@
 const std = @import("std");
 const raft_engine = @import("raft_engine");
 const fs_paths = @import("../../common/fs_paths.zig");
+const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
 const group_ids = @import("../../common/group_ids.zig");
 const docstore = @import("../../storage/docstore.zig");
 const lsm_backend = @import("../../storage/lsm_backend.zig");
@@ -1007,7 +1008,7 @@ pub const RaftApplyStore = struct {
     };
 
     pub fn init(alloc: std.mem.Allocator, cfg: RaftApplyStoreConfig) !RaftApplyStore {
-        var io_impl = std.Io.Threaded.init(alloc, .{});
+        var io_impl = threaded_io_limits.initService(alloc);
         errdefer io_impl.deinit();
 
         const root_dir = try alloc.dupe(u8, cfg.root_dir);

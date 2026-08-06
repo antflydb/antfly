@@ -158,7 +158,10 @@ pub fn parseGgufMetadata(view: gguf_metadata.View) ?Config {
 pub fn isXlmRobertaGgufMetadata(view: gguf_metadata.View) bool {
     const tokenizer_model = view.getString("tokenizer.ggml.model") orelse return false;
     return (std.mem.eql(u8, tokenizer_model, "bert") or std.mem.eql(u8, tokenizer_model, "t5")) and
-        (view.getBool("tokenizer.ggml.add_space_prefix") orelse false) and
+        // SentencePiece conversion defaults to adding the dummy space prefix,
+        // and multiple stock GGUF converter versions omit this key when the
+        // default applies. An explicit false still opts out.
+        (view.getBool("tokenizer.ggml.add_space_prefix") orelse true) and
         (metaI64(view, "tokenizer.ggml.padding_token_id") orelse -1) == 1;
 }
 

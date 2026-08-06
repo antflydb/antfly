@@ -189,6 +189,11 @@ func readInferenceAPIError(resp *http.Response) error {
 		return fmt.Errorf("reading inference error response: %w", err)
 	}
 
+	var capacity oapi.TransientCapacity
+	if json.Unmarshal(body, &capacity) == nil && validInferenceCapacityError(&capacity) {
+		return inferenceCapacityError(&capacity)
+	}
+
 	var payload oapi.InferenceError
 	if json.Unmarshal(body, &payload) == nil && (payload.Error != "" || payload.Message != "") {
 		return newInferenceAPIError(resp.StatusCode, "", &payload)

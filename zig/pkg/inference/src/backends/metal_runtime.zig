@@ -36876,6 +36876,20 @@ test "metal native decoder runtime f16 BERT fused paths match decomposed device 
     var residual = try testDeviceTensorFromSlice(runtime, residual_values, &input_shape);
     defer residual.deinit();
 
+    // GLiNER2 can fall from a compiled planned region into an f16 MPS-backed
+    // linear while the coalesced encoder is still open. MPS creates its own
+    // encoder, so this transition must close the planned encoder instead of
+    // letting the driver abort the process.
+    try beginFrame(runtime);
+    errdefer if (hasActiveFrame(runtime)) cancelFrame(runtime) catch {};
+    try beginPlannedComputeScope(runtime, @intFromEnum(ComputeSource.dense_linear), .ffn);
+    var planned_mps_linear = (try tryApplyDenseRuntimeLinear(&provider, 0, input, rows, hidden, hidden)) orelse
+        return error.UnexpectedNull;
+    defer planned_mps_linear.deinit();
+    try endPlannedComputeScope(runtime);
+    try submitFrame(runtime);
+    try waitFrame(runtime);
+
     try beginFrame(runtime);
     errdefer if (hasActiveFrame(runtime)) cancelFrame(runtime) catch {};
     var packed_qkv = (try tryApplyDenseRuntimeLinearQkv(&provider, 0, 1, 2, input, rows, hidden, hidden, hidden)) orelse
@@ -36895,6 +36909,7 @@ test "metal native decoder runtime f16 BERT fused paths match decomposed device 
 
     var q_reference = (try tryApplyDenseRuntimeLinear(&provider, 0, input, rows, hidden, hidden)) orelse return error.UnexpectedNull;
     defer q_reference.deinit();
+    try Compare.close("planned-mps-linear", try tensorHostSlice(&q_reference), try tensorHostSlice(&planned_mps_linear));
     var k_reference = (try tryApplyDenseRuntimeLinear(&provider, 1, input, rows, hidden, hidden)) orelse return error.UnexpectedNull;
     defer k_reference.deinit();
     var v_reference = (try tryApplyDenseRuntimeLinear(&provider, 2, input, rows, hidden, hidden)) orelse return error.UnexpectedNull;

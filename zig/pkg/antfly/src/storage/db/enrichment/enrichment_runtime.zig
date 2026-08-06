@@ -477,6 +477,7 @@ fn isRetryableEnrichmentError(err: anyerror) bool {
         error.UnexpectedReadFailure,
         error.SendFailed,
         error.RecvFailed,
+        error.ResourceTemporarilyUnavailable,
         error.ResourceBudgetExceeded,
         error.GenerateBatchTransientFailure,
         => true,
@@ -488,8 +489,10 @@ fn isEnrichmentControlError(err: anyerror) bool {
     return err == error.EnrichmentRetryAborted;
 }
 
-test "enrichment treats missing local model as retryable" {
+test "enrichment distinguishes transient capacity from permanent resource limits" {
     try std.testing.expect(isRetryableEnrichmentError(error.ModelNotFound));
+    try std.testing.expect(isRetryableEnrichmentError(error.ResourceTemporarilyUnavailable));
+    try std.testing.expect(!isRetryableEnrichmentError(error.ResourceLimitExceeded));
 }
 
 fn noteTransientEmbedRetry(runtime: *EnrichmentRuntime, err: anyerror) void {

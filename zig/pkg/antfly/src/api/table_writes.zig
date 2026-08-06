@@ -20,6 +20,7 @@ const metadata_openapi = @import("antfly_metadata_openapi");
 const scraping = @import("antfly_scraping");
 const common_secrets = @import("../common/secrets.zig");
 const fs_paths = @import("../common/fs_paths.zig");
+const threaded_io_limits = @import("../common/threaded_io_limits.zig");
 const backups_api = @import("backups.zig");
 const metadata_admin = @import("../metadata/admin.zig");
 const metadata_mod = @import("../metadata/mod.zig");
@@ -5271,7 +5272,7 @@ pub const ProvisionedTableWriteSource = struct {
         return .{
             .replica_root_dir = replica_root_dir,
             .catalog = catalog,
-            .table_activity_threaded = Io.Threaded.init(std.heap.page_allocator, .{}),
+            .table_activity_threaded = threaded_io_limits.initService(std.heap.page_allocator),
         };
     }
 
@@ -14536,6 +14537,16 @@ pub const ProvisionedTableWriteSource = struct {
         return result;
     }
 };
+
+test "provisioned table write source has a finite worker ceiling" {
+    var source = ProvisionedTableWriteSource.init("unused", table_catalog.emptyCatalogSource());
+    defer source.deinit();
+
+    try std.testing.expectEqual(
+        std.Io.Limit.limited(threaded_io_limits.service),
+        source.table_activity_threaded.concurrent_limit,
+    );
+}
 
 fn enforceHAWriteGateOptional(gate: ?db_mod.HAWriteGate) !void {
     const configured = gate orelse return;

@@ -27,6 +27,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/antflydb/antfly/go/pkg/sdk/oapi"
 	"github.com/stretchr/testify/assert"
@@ -83,6 +84,27 @@ func TestInferenceClientGenerateStreamReturnsTypedHTTPError(t *testing.T) {
 	assert.Equal(t, "model needs 8 GiB (MEMORY_BUDGET_EXCEEDED)", apiErr.Message)
 	require.NotNil(t, apiErr.Retryable)
 	assert.True(t, *apiErr.Retryable)
+}
+
+func TestInferenceClientGenerateStreamReturnsCapacityError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "1")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = io.WriteString(w, `{"error":"MODEL_RESOURCE_BUSY","message":"inference capacity is busy","reason":"inference_capacity","retryable":true,"retry_after_ms":1000}`)
+	}))
+	defer server.Close()
+
+	client, err := NewInferenceClient(server.URL, server.Client())
+	require.NoError(t, err)
+	err = client.GenerateStream(context.Background(), oapi.InferenceGenerateRequest{Model: "test"}, func(oapi.InferenceGenerateChunk) error { return nil })
+
+	var capacityErr *InferenceCapacityError
+	require.ErrorAs(t, err, &capacityErr)
+	assert.Equal(t, "MODEL_RESOURCE_BUSY", capacityErr.Code)
+	assert.Equal(t, "inference_capacity", capacityErr.Reason)
+	assert.Equal(t, time.Second, capacityErr.RetryAfter)
+	assert.True(t, capacityErr.Temporary())
 }
 
 func TestScanSSEFramesAndErrors(t *testing.T) {

@@ -38950,7 +38950,8 @@ const GateDenseEmbedder = struct {
     allowed_successes: std.atomic.Value(usize) = .init(1),
     successful_requests: std.atomic.Value(usize) = .init(0),
     total_requests: std.atomic.Value(usize) = .init(0),
-    rate_limited_requests: std.atomic.Value(usize) = .init(0),
+    blocked_requests: std.atomic.Value(usize) = .init(0),
+    blocked_error: anyerror = error.EmbedRateLimited,
 
     fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
         if (needle.len == 0) return true;
@@ -38988,8 +38989,8 @@ const GateDenseEmbedder = struct {
         const previous_successes = self.successful_requests.fetchAdd(1, .acq_rel);
         if (previous_successes >= self.allowed_successes.load(.acquire)) {
             _ = self.successful_requests.fetchSub(1, .acq_rel);
-            _ = self.rate_limited_requests.fetchAdd(1, .monotonic);
-            return error.EmbedRateLimited;
+            _ = self.blocked_requests.fetchAdd(1, .monotonic);
+            return self.blocked_error;
         }
         if (dims != 3) return error.InvalidVectorDimensions;
         const vector = try alloc.alloc(f32, 3);
@@ -39012,12 +39013,12 @@ const GateDenseEmbedder = struct {
 
     fn snapshot(self: *GateDenseEmbedder) struct {
         total_requests: usize,
-        rate_limited_requests: usize,
+        blocked_requests: usize,
         successful_requests: usize,
     } {
         return .{
             .total_requests = self.total_requests.load(.acquire),
-            .rate_limited_requests = self.rate_limited_requests.load(.acquire),
+            .blocked_requests = self.blocked_requests.load(.acquire),
             .successful_requests = self.successful_requests.load(.acquire),
         };
     }
@@ -39039,6 +39040,37 @@ const CountingSparseEmbedder = struct {
             .sparse_embed_fn = embedSparse,
             .deinit_fn = null,
         };
+    }
+};
+
+const GateSparseEmbedder = struct {
+    deterministic: embedder_mod.DeterministicSparseEmbedder = .{},
+    allowed_successes: std.atomic.Value(usize) = .init(0),
+    successful_requests: std.atomic.Value(usize) = .init(0),
+    blocked_requests: std.atomic.Value(usize) = .init(0),
+    blocked_error: anyerror = error.ResourceTemporarilyUnavailable,
+
+    fn embedSparse(ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, text: []const u8) !embedder_mod.SparseEmbedding {
+        const self: *GateSparseEmbedder = @ptrCast(@alignCast(ptr));
+        const previous_successes = self.successful_requests.fetchAdd(1, .acq_rel);
+        if (previous_successes >= self.allowed_successes.load(.acquire)) {
+            _ = self.successful_requests.fetchSub(1, .acq_rel);
+            _ = self.blocked_requests.fetchAdd(1, .monotonic);
+            return self.blocked_error;
+        }
+        return try embedder_mod.DeterministicSparseEmbedder.embedSparse(&self.deterministic, alloc, embedding_name, text);
+    }
+
+    fn interface(self: *GateSparseEmbedder) embedder_mod.SparseEmbedder {
+        return .{
+            .ptr = self,
+            .sparse_embed_fn = embedSparse,
+            .deinit_fn = null,
+        };
+    }
+
+    fn allowAll(self: *GateSparseEmbedder) void {
+        self.allowed_successes.store(std.math.maxInt(usize), .release);
     }
 };
 
@@ -52630,12 +52662,12 @@ test "db managed dense enrichment remains searchable after transient rate limits
     var attempts: usize = 0;
     while (attempts < 200) : (attempts += 1) {
         const snapshot = gated.snapshot();
-        if (snapshot.rate_limited_requests > 0 and snapshot.successful_requests >= 1) break;
+        if (snapshot.blocked_requests > 0 and snapshot.successful_requests >= 1) break;
         sleepNs(10 * std.time.ns_per_ms);
     }
 
     const before_release = gated.snapshot();
-    try std.testing.expect(before_release.rate_limited_requests > 0);
+    try std.testing.expect(before_release.blocked_requests > 0);
     try std.testing.expect(before_release.successful_requests >= 1);
 
     gated.allowAll();
@@ -52676,6 +52708,242 @@ test "db managed dense enrichment remains searchable after transient rate limits
     try db.runUntilIdle();
 }
 
+test "db managed dense enrichment retries temporary model capacity without terminal coverage" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var gated = GateDenseEmbedder{
+        .allowed_successes = .init(0),
+        .blocked_error = error.ResourceTemporarilyUnavailable,
+    };
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = gated.interface(),
+            .inline_retry_max_attempts = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"cosine\",\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"semantic_idx\"}}",
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"alpha concept overview\"}" },
+            .{ .key = "doc:b", .value = "{\"body\":\"beta architecture notes\"}" },
+            .{ .key = "doc:c", .value = "{\"body\":\"gamma implementation details\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    var observed_retry = false;
+    var attempts: usize = 0;
+    while (attempts < default_test_wait_attempts) : (attempts += 1) {
+        const stats = try db.stats(alloc);
+        if (gated.snapshot().blocked_requests > 0 and stats.enrichment.retryable_error_count > 0) {
+            try std.testing.expect(stats.enrichment.retrying);
+            try std.testing.expect(!stats.enrichment.worker_failed);
+            try std.testing.expectEqual(@as(u64, 0), stats.enrichment.fatal_error_count);
+            for (stats.indexes) |index_stats| {
+                if (!std.mem.eql(u8, index_stats.name, "semantic_idx")) continue;
+                try std.testing.expect(!index_stats.enrichment_failed);
+                try std.testing.expectEqual(@as(u64, 0), index_stats.coverage_terminal_failed_count);
+            }
+            observed_retry = true;
+        }
+        types.freeDBStats(alloc, stats);
+        if (observed_retry) break;
+        sleepNs(10 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(observed_retry);
+
+    gated.allowAll();
+    try db.runUntilIdle();
+
+    const final_stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, final_stats);
+    try std.testing.expectEqual(@as(u64, 0), final_stats.enrichment.fatal_error_count);
+    try std.testing.expect(!final_stats.enrichment.worker_failed);
+    for (final_stats.indexes) |index_stats| {
+        if (!std.mem.eql(u8, index_stats.name, "semantic_idx")) continue;
+        try std.testing.expectEqual(@as(u64, 3), index_stats.doc_count);
+        try std.testing.expectEqual(@as(u64, 3), index_stats.coverage_produced_count);
+        try std.testing.expectEqual(@as(u64, 0), index_stats.coverage_terminal_failed_count);
+        try std.testing.expect(!index_stats.enrichment_failed);
+    }
+
+    var result = try db.search(alloc, .{
+        .index_name = "semantic_idx",
+        .dense = .{
+            .vector = &.{ 1.0, 0.0, 0.0 },
+            .k = 3,
+        },
+        .limit = 3,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 3), result.total_hits);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+}
+
+test "db managed sparse enrichment retries temporary model capacity without terminal coverage" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var gated = GateSparseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .sparse_embedder = gated.interface(),
+            .inline_retry_max_attempts = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "sp_v1",
+        .kind = .sparse_vector,
+        .config_json = "{\"field\":\"sparse_embedding\",\"generator\":{\"kind\":\"sparse_embedding\",\"source_field\":\"body\"}}",
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha concept overview\"}" }},
+        .sync_level = .write,
+    });
+
+    var observed_retry = false;
+    var attempts: usize = 0;
+    while (attempts < default_test_wait_attempts) : (attempts += 1) {
+        const stats = try db.stats(alloc);
+        if (gated.blocked_requests.load(.acquire) > 0 and stats.enrichment.retryable_error_count > 0) {
+            try std.testing.expect(stats.enrichment.retrying);
+            try std.testing.expect(!stats.enrichment.worker_failed);
+            try std.testing.expectEqual(@as(u64, 0), stats.enrichment.fatal_error_count);
+            for (stats.indexes) |index_stats| {
+                if (!std.mem.eql(u8, index_stats.name, "sp_v1")) continue;
+                try std.testing.expect(!index_stats.enrichment_failed);
+                try std.testing.expectEqual(@as(u64, 0), index_stats.coverage_terminal_failed_count);
+            }
+            observed_retry = true;
+        }
+        types.freeDBStats(alloc, stats);
+        if (observed_retry) break;
+        sleepNs(10 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(observed_retry);
+
+    gated.allowAll();
+    try db.runUntilIdle();
+
+    const final_stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, final_stats);
+    try std.testing.expectEqual(@as(u64, 0), final_stats.enrichment.fatal_error_count);
+    try std.testing.expect(!final_stats.enrichment.worker_failed);
+    for (final_stats.indexes) |index_stats| {
+        if (!std.mem.eql(u8, index_stats.name, "sp_v1")) continue;
+        try std.testing.expectEqual(@as(u64, 1), index_stats.doc_count);
+        try std.testing.expectEqual(@as(u64, 1), index_stats.coverage_produced_count);
+        try std.testing.expectEqual(@as(u64, 0), index_stats.coverage_terminal_failed_count);
+        try std.testing.expect(!index_stats.enrichment_failed);
+    }
+
+    var query = try gated.deterministic.interface().embedSparse(alloc, "sp_v1", "alpha concept overview");
+    defer query.deinit(alloc);
+    var result = try db.search(alloc, .{
+        .index_name = "sp_v1",
+        .query = .{ .sparse_knn = .{
+            .indices = query.indices,
+            .values = query.values,
+            .k = 1,
+        } },
+        .limit = 1,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+}
+
+test "db chunked dense enrichment retries temporary model capacity without terminal coverage" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var gated = GateDenseEmbedder{
+        .allowed_successes = .init(0),
+        .blocked_error = error.ResourceTemporarilyUnavailable,
+    };
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = gated.interface(),
+            .inline_retry_max_attempts = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"chunk_dense_v1\"}}",
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"abcdefghijklmno\"}" }},
+        .sync_level = .write,
+    });
+
+    var observed_retry = false;
+    var attempts: usize = 0;
+    while (attempts < default_test_wait_attempts) : (attempts += 1) {
+        const stats = try db.stats(alloc);
+        if (gated.snapshot().blocked_requests > 0 and stats.enrichment.retryable_error_count > 0) {
+            try std.testing.expectEqual(@as(u64, 0), stats.enrichment.fatal_error_count);
+            for (stats.indexes) |index_stats| {
+                if (!std.mem.eql(u8, index_stats.name, "dv_v1")) continue;
+                try std.testing.expect(!index_stats.enrichment_failed);
+                try std.testing.expectEqual(@as(u64, 0), index_stats.coverage_terminal_failed_count);
+            }
+            observed_retry = true;
+        }
+        types.freeDBStats(alloc, stats);
+        if (observed_retry) break;
+        sleepNs(10 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(observed_retry);
+
+    gated.allowAll();
+    try db.runUntilIdle();
+
+    const final_stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, final_stats);
+    try std.testing.expectEqual(@as(u64, 0), final_stats.enrichment.fatal_error_count);
+    for (final_stats.indexes) |index_stats| {
+        if (!std.mem.eql(u8, index_stats.name, "dv_v1")) continue;
+        try std.testing.expectEqual(@as(u64, 0), index_stats.coverage_terminal_failed_count);
+        try std.testing.expect(!index_stats.enrichment_failed);
+    }
+    try std.testing.expectEqual(@as(u64, 3), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
+
+    const query_vec = try gated.interface().embedDense(alloc, "chunk_dense_v1", "abcdefgh", 3);
+    defer alloc.free(query_vec);
+    var result = try db.search(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{ .vector = query_vec, .k = 3 },
+        .return_mode = .parent,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+}
+
 test "db managed dense delete quiesces rate-limited enrichment and recreates cleanly" {
     const alloc = std.testing.allocator;
 
@@ -52708,10 +52976,10 @@ test "db managed dense delete quiesces rate-limited enrichment and recreates cle
     });
 
     var attempts: usize = 0;
-    while (attempts < 200 and gated.snapshot().rate_limited_requests == 0) : (attempts += 1) {
+    while (attempts < 200 and gated.snapshot().blocked_requests == 0) : (attempts += 1) {
         sleepNs(10 * std.time.ns_per_ms);
     }
-    try std.testing.expect(gated.snapshot().rate_limited_requests > 0);
+    try std.testing.expect(gated.snapshot().blocked_requests > 0);
 
     const delete_started_ns = monotonicTimeNs();
     try std.testing.expect(try db.deleteIndex("semantic_idx"));
@@ -57202,10 +57470,10 @@ test "db restart after provider failure resumes enrichment from retained async r
         try std.testing.expect(failed_target_sequence > first_applied_sequence);
 
         var attempts: usize = 0;
-        while (attempts < default_test_wait_attempts and gated.snapshot().rate_limited_requests == 0) : (attempts += 1) {
+        while (attempts < default_test_wait_attempts and gated.snapshot().blocked_requests == 0) : (attempts += 1) {
             sleepPollInterval();
         }
-        try std.testing.expect(gated.snapshot().rate_limited_requests > 0);
+        try std.testing.expect(gated.snapshot().blocked_requests > 0);
 
         // Stop at the observed provider failure boundary, then let the
         // independent executor finish and attempt async truncation. This
@@ -57309,10 +57577,10 @@ test "db async replay truncation retains journal behind generated enrichment" {
     _ = try waitForAppliedSequenceAdvance(alloc, &db, "ft_v1", 0);
     _ = try waitForAppliedSequenceAdvance(alloc, &db, "semantic_idx", 0);
     var attempts: usize = 0;
-    while (attempts < default_test_wait_attempts and gated.snapshot().rate_limited_requests == 0) : (attempts += 1) {
+    while (attempts < default_test_wait_attempts and gated.snapshot().blocked_requests == 0) : (attempts += 1) {
         sleepPollInterval();
     }
-    try std.testing.expect(gated.snapshot().rate_limited_requests > 0);
+    try std.testing.expect(gated.snapshot().blocked_requests > 0);
     try std.testing.expectEqual(
         @as(u64, 0),
         try enrichment_state.loadAppliedSequence(alloc, db.core.store, enrichment_runtime_mod.scope_name),

@@ -1388,6 +1388,11 @@ const CgroupMemoryInfo = struct {
     available_bytes: ?usize = null,
 };
 
+const CgroupVersion = enum {
+    v1,
+    v2,
+};
+
 const CgroupHierarchyProbe = struct {
     info: CgroupMemoryInfo = .{},
     /// True when the initially addressed process directory contained at least
@@ -1546,6 +1551,39 @@ fn readLinuxUnsignedFile(path: []const u8) ?usize {
     return std.fmt.parseUnsigned(usize, raw, 10) catch null;
 }
 
+fn parseCgroupInactiveFileBytes(
+    bytes: []const u8,
+    version: CgroupVersion,
+) ?usize {
+    var inactive_file: ?usize = null;
+    var total_inactive_file: ?usize = null;
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line| {
+        var fields = std.mem.tokenizeAny(u8, line, " \t");
+        const key = fields.next() orelse continue;
+        const raw = fields.next() orelse continue;
+        const value = std.fmt.parseUnsigned(usize, raw, 10) catch continue;
+        if (std.mem.eql(u8, key, "inactive_file")) {
+            inactive_file = value;
+        } else if (std.mem.eql(u8, key, "total_inactive_file")) {
+            total_inactive_file = value;
+        }
+    }
+    return switch (version) {
+        .v1 => total_inactive_file orelse inactive_file,
+        .v2 => inactive_file,
+    };
+}
+
+fn readCgroupInactiveFileBytes(
+    path: []const u8,
+    version: CgroupVersion,
+) ?usize {
+    var buffer: [8192]u8 = undefined;
+    const bytes = readSmallLinuxFile(path, &buffer) orelse return null;
+    return parseCgroupInactiveFileBytes(bytes, version);
+}
+
 fn decodeMountInfoPath(destination: []u8, encoded: []const u8) ?usize {
     if (encoded.len == 0 or encoded[0] != '/') return null;
     var source_index: usize = 0;
@@ -1655,6 +1693,7 @@ fn probeCgroupMountInfoLine(
                 path,
                 "memory.max",
                 "memory.current",
+                .v2,
             );
             mergeAuthoritativeCgroupProbe(result, probe);
         }
@@ -1667,6 +1706,7 @@ fn probeCgroupMountInfoLine(
                 path,
                 "memory.limit_in_bytes",
                 "memory.usage_in_bytes",
+                .v1,
             );
             mergeAuthoritativeCgroupProbe(result, probe);
         }
@@ -1763,6 +1803,7 @@ fn accumulateCgroupLevel(
     result: *CgroupMemoryInfo,
     limit: ?usize,
     current: ?usize,
+    inactive_file_bytes: ?usize,
 ) void {
     const finite_limit = limit orelse return;
     // cgroup v1 uses a near-max integer as its unlimited sentinel.
@@ -1772,7 +1813,18 @@ fn accumulateCgroupLevel(
         result.current_bytes = current;
     }
     if (current) |usage| {
-        const available = finite_limit -| @min(usage, finite_limit);
+        const bounded_usage = @min(usage, finite_limit);
+        // memory.current and memory.usage_in_bytes include file-backed cache.
+        // The kernel can reclaim inactive file pages under cgroup pressure, so
+        // treating all of them as permanently resident makes a build-heavy
+        // container appear full even after the compiler exits. Use the same
+        // conservative working-set convention as container monitoring: only
+        // inactive_file is reclaimable, and never more than current usage.
+        const reclaimable = @min(
+            inactive_file_bytes orelse 0,
+            bounded_usage,
+        );
+        const available = finite_limit -| (bounded_usage - reclaimable);
         result.available_bytes = if (result.available_bytes) |existing|
             @min(existing, available)
         else
@@ -1786,6 +1838,7 @@ fn readCgroupHierarchy(
     process_path: []const u8,
     limit_filename: []const u8,
     current_filename: []const u8,
+    version: CgroupVersion,
 ) CgroupHierarchyProbe {
     const relative = cgroupPathRelativeToMount(process_path, mount_root) orelse return .{};
     var directory_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -1803,6 +1856,7 @@ fn readCgroupHierarchy(
     var result = CgroupHierarchyProbe{};
     var limit_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     var current_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var stat_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     while (directory.len >= hierarchy_root_len) {
         const limit_path = std.fmt.bufPrint(
             &limit_path_buffer,
@@ -1814,12 +1868,26 @@ fn readCgroupHierarchy(
             "{s}/{s}",
             .{ directory, current_filename },
         ) catch break;
+        const stat_path = std.fmt.bufPrint(
+            &stat_path_buffer,
+            "{s}/memory.stat",
+            .{directory},
+        ) catch break;
         const limit = readLinuxUnsignedFile(limit_path);
         const current = readLinuxUnsignedFile(current_path);
+        const inactive_file_bytes = readCgroupInactiveFileBytes(
+            stat_path,
+            version,
+        );
         if (directory.len == leaf_directory_len) {
             result.leaf_present = limit != null or current != null;
         }
-        accumulateCgroupLevel(&result.info, limit, current);
+        accumulateCgroupLevel(
+            &result.info,
+            limit,
+            current,
+            inactive_file_bytes,
+        );
         if (directory.len == hierarchy_root_len) break;
         const parent = std.fs.path.dirname(directory) orelse break;
         if (parent.len < hierarchy_root_len) break;
@@ -1848,6 +1916,7 @@ fn probeCgroupMemoryInfoLinux() CgroupMemoryInfo {
             path,
             "memory.max",
             "memory.current",
+            .v2,
         );
         if (canonicalCgroupProbeIsAuthoritative(probe)) return probe.info;
     }
@@ -1858,6 +1927,7 @@ fn probeCgroupMemoryInfoLinux() CgroupMemoryInfo {
             path,
             "memory.limit_in_bytes",
             "memory.usage_in_bytes",
+            .v1,
         );
         if (canonicalCgroupProbeIsAuthoritative(probe)) return probe.info;
     }
@@ -2211,6 +2281,28 @@ test "linux meminfo parser has a conservative legacy availability fallback" {
     try std.testing.expectEqual(@as(?usize, 1792 * 1024 * 1024), info.available_bytes);
 }
 
+test "cgroup memory stat parser uses hierarchical inactive file cache" {
+    const stat =
+        \\anon 1048576
+        \\file 8388608
+        \\inactive_file 4194304
+        \\total_inactive_file 6291456
+        \\
+    ;
+    try std.testing.expectEqual(
+        @as(?usize, 4194304),
+        parseCgroupInactiveFileBytes(stat, .v2),
+    );
+    try std.testing.expectEqual(
+        @as(?usize, 6291456),
+        parseCgroupInactiveFileBytes(stat, .v1),
+    );
+    try std.testing.expectEqual(
+        @as(?usize, 4194304),
+        parseCgroupInactiveFileBytes("inactive_file 4194304\n", .v1),
+    );
+}
+
 test "cgroup paths and limits constrain host memory" {
     const paths = parseCgroupPaths(
         \\0::/system.slice/antfly.service
@@ -2327,9 +2419,9 @@ test "cgroup mount candidates ignore ancestor-only probes" {
 test "cgroup hierarchy uses finite parent limit beneath unlimited leaf" {
     var hierarchy = CgroupMemoryInfo{};
     // A v2 "max" leaf is represented as null and must not stop the ancestor walk.
-    accumulateCgroupLevel(&hierarchy, null, gib(3));
-    accumulateCgroupLevel(&hierarchy, gib(8), gib(6));
-    accumulateCgroupLevel(&hierarchy, gib(16), gib(10));
+    accumulateCgroupLevel(&hierarchy, null, gib(3), null);
+    accumulateCgroupLevel(&hierarchy, gib(8), gib(6), null);
+    accumulateCgroupLevel(&hierarchy, gib(16), gib(10), null);
 
     try std.testing.expectEqual(@as(?usize, gib(8)), hierarchy.limit_bytes);
     try std.testing.expectEqual(@as(?usize, gib(2)), hierarchy.available_bytes);
@@ -2339,6 +2431,28 @@ test "cgroup hierarchy uses finite parent limit beneath unlimited leaf" {
     );
     try std.testing.expectEqual(gib(8), effective.total_bytes);
     try std.testing.expectEqual(@as(?usize, gib(2)), effective.available_bytes);
+}
+
+test "cgroup availability includes only reclaimable inactive file cache" {
+    var hierarchy = CgroupMemoryInfo{};
+    accumulateCgroupLevel(
+        &hierarchy,
+        gib(64),
+        gib(47),
+        gib(30),
+    );
+    try std.testing.expectEqual(@as(?usize, gib(47)), hierarchy.available_bytes);
+
+    const effective = applyCgroupMemoryInfo(
+        .{ .total_bytes = gib(128), .available_bytes = gib(80) },
+        hierarchy,
+    );
+    try std.testing.expectEqual(gib(64), effective.total_bytes);
+    try std.testing.expectEqual(@as(?usize, gib(47)), effective.available_bytes);
+
+    var saturated = CgroupMemoryInfo{};
+    accumulateCgroupLevel(&saturated, gib(8), gib(7), gib(12));
+    try std.testing.expectEqual(@as(?usize, gib(8)), saturated.available_bytes);
 }
 
 test "live memory headroom scales down for constrained containers" {

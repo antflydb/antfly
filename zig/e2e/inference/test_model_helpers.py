@@ -312,6 +312,32 @@ def test_generation_defaults_share_one_model():
     assert DEFAULT_GENERATOR_MODEL == DEFAULT_MULTIMODAL_GENERATOR_MODEL
 
 
+def test_targeted_multimodal_generator_gate(monkeypatch):
+    monkeypatch.delenv("RUN_LARGE_MODEL_TESTS", raising=False)
+    monkeypatch.delenv("RUN_MULTIMODAL_GENERATOR_TESTS", raising=False)
+    assert not models.run_multimodal_generator_tests()
+
+    monkeypatch.setenv("RUN_MULTIMODAL_GENERATOR_TESTS", "1")
+    assert models.run_multimodal_generator_tests()
+
+    monkeypatch.setenv("RUN_MULTIMODAL_GENERATOR_TESTS", "false")
+    monkeypatch.setenv("RUN_LARGE_MODEL_TESTS", "1")
+    assert models.run_multimodal_generator_tests()
+
+
+def test_targeted_clipclap_contract_gate(monkeypatch):
+    monkeypatch.delenv("RUN_LARGE_MODEL_TESTS", raising=False)
+    monkeypatch.delenv("RUN_CLIPCLAP_CONTRACT_TESTS", raising=False)
+    assert not models.run_clipclap_contract_tests()
+
+    monkeypatch.setenv("RUN_CLIPCLAP_CONTRACT_TESTS", "1")
+    assert models.run_clipclap_contract_tests()
+
+    monkeypatch.setenv("RUN_CLIPCLAP_CONTRACT_TESTS", "false")
+    monkeypatch.setenv("RUN_LARGE_MODEL_TESTS", "1")
+    assert models.run_clipclap_contract_tests()
+
+
 def test_multimodal_model_selection_uses_shared_gemma_default(monkeypatch, tmp_path):
     monkeypatch.delenv("ANTFLY_INFERENCE_MULTIMODAL_GENERATOR_MODEL", raising=False)
     monkeypatch.setenv("ANTFLY_INFERENCE_MODELS_DIR", str(tmp_path))

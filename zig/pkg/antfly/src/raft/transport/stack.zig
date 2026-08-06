@@ -18,6 +18,7 @@ const http_common = @import("http_common.zig");
 const http_driver = @import("http_driver.zig");
 const http_server = @import("http_server.zig");
 const http_snapshot = @import("http_snapshot.zig");
+const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
 
 pub const HttpTransportStackConfig = struct {
     driver: http_driver.HttpDriverConfig = .{},
@@ -47,7 +48,9 @@ pub const HttpTransportStack = struct {
         const driver_io = io orelse blk: {
             const io_impl = try alloc.create(std.Io.Threaded);
             errdefer alloc.destroy(io_impl);
-            io_impl.* = std.Io.Threaded.init(alloc, .{});
+            // Embedded hosts may omit a shared backend runtime. Keep that
+            // process-lifetime fallback finite as well.
+            io_impl.* = threaded_io_limits.initService(alloc);
             owned_io_impl = io_impl;
             break :blk io_impl.io();
         };
@@ -147,4 +150,8 @@ test "http transport stack compiles" {
     const hooks = stack.runtimeHooks();
     try std.testing.expect(hooks.transport != null);
     try std.testing.expect(hooks.snapshot_transport != null);
+    try std.testing.expectEqual(
+        std.Io.Limit.limited(threaded_io_limits.service),
+        stack.owned_io_impl.?.concurrent_limit,
+    );
 }

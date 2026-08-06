@@ -25705,6 +25705,10 @@ int termite_metal_decode_runtime_apply_linear_multi_row_device(
                 MPSMatrix *result = [[MPSMatrix alloc] initWithBuffer:output_buffer offset:output_offset descriptor:result_desc];
                 MPSMatrixMultiplication *mm = termite_metal_decode_runtime_cached_mps_mm(runtime, slot, rows, in_dim, out_dim);
                 if (left == nil || right == nil || result == nil || mm == nil) return -10;
+	                // MPS owns its compute encoder. End a coalesced planned
+	                // encoder before handing it the same command buffer;
+	                // otherwise AGX aborts instead of returning an error.
+	                termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(runtime);
 	                [mm encodeToCommandBuffer:command_buffer leftMatrix:left rightMatrix:right resultMatrix:result];
 	                termite_metal_maybe_trace_dense_linear_dispatch(
 	                    "linear_multi_row_device",
@@ -26396,6 +26400,7 @@ int termite_metal_decode_runtime_apply_dense_ffn_layer_norm_device(
             runtime->deberta_ffn_fused_fallbacks += 1;
             return -12;
         }
+        termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(runtime);
         [first_mm encodeToCommandBuffer:command_buffer leftMatrix:first_left rightMatrix:first_right resultMatrix:first_result];
 
         termite_metal_apply_activation_params activation_params = {
@@ -26438,6 +26443,7 @@ int termite_metal_decode_runtime_apply_dense_ffn_layer_norm_device(
             runtime->deberta_ffn_fused_fallbacks += 1;
             return -14;
         }
+        termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(runtime);
         [second_mm encodeToCommandBuffer:command_buffer leftMatrix:second_left rightMatrix:second_right resultMatrix:second_result];
 
         termite_metal_apply_layer_norm_params ln_params = {
@@ -26682,6 +26688,7 @@ int termite_metal_decode_runtime_apply_dense_linear_layer_norm_device(
         MPSMatrix *result = [[MPSMatrix alloc] initWithBuffer:projected_buffer offset:0 descriptor:result_desc];
         MPSMatrixMultiplication *mm = termite_metal_decode_runtime_cached_mps_mm(runtime, linear_slot, rows, in_dim, hidden_size);
         if (left == nil || right == nil || result == nil || mm == nil) return -12;
+        termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(runtime);
         [mm encodeToCommandBuffer:command_buffer leftMatrix:left rightMatrix:right resultMatrix:result];
 
         termite_metal_apply_layer_norm_params ln_params = {
@@ -29921,6 +29928,7 @@ int termite_metal_decode_runtime_apply_dense_linear_qkv_slots_scratch_device(
         MPSMatrix *result = [[MPSMatrix alloc] initWithBuffer:packed_output_buffer offset:0 descriptor:result_desc];
 	        MPSMatrixMultiplication *mm = termite_metal_decode_runtime_cached_dense_qkv_mps_mm(runtime, q_slot, rows, in_dim, total_out_dim);
 	        if (left == nil || right == nil || result == nil || mm == nil) return -16;
+	        termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(runtime);
 	        [mm encodeToCommandBuffer:command_buffer leftMatrix:left rightMatrix:right resultMatrix:result];
 	        termite_metal_maybe_trace_dense_linear_dispatch(
 	            "dense_qkv_packed",
@@ -30136,6 +30144,7 @@ int termite_metal_decode_runtime_apply_dense_linear_pair_slots_scratch_device(
         MPSMatrix *result = [[MPSMatrix alloc] initWithBuffer:packed_output_buffer offset:0 descriptor:result_desc];
         MPSMatrixMultiplication *mm = termite_metal_decode_runtime_cached_dense_pair_mps_mm(runtime, a_slot, rows, in_dim, total_out_dim);
         if (left == nil || right == nil || result == nil || mm == nil) return -15;
+        termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(runtime);
         [mm encodeToCommandBuffer:command_buffer leftMatrix:left rightMatrix:right resultMatrix:result];
 
         termite_metal_dense_pair_split_bias_params params = {

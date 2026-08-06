@@ -890,10 +890,21 @@ fn emitDecodedDeltaForTokenizer(
     const prefix_len = std.mem.indexOfDiff(u8, state.emitted_text, decoded_text) orelse @min(state.emitted_text.len, decoded_text.len);
     const delta = decoded_text[prefix_len..];
 
-    allocator.free(state.emitted_text);
-    state.emitted_text = try allocator.dupe(u8, decoded_text);
+    try replaceStreamingEmittedText(allocator, state, decoded_text);
     if (delta.len == 0) return true;
     return on_token_fn(on_token_ctx, delta);
+}
+
+fn replaceStreamingEmittedText(
+    allocator: std.mem.Allocator,
+    state: *StreamingTextState,
+    decoded_text: []const u8,
+) !void {
+    // Allocate first so an OOM leaves the old owned buffer intact for the
+    // request-level cleanup path.
+    const replacement = try allocator.dupe(u8, decoded_text);
+    allocator.free(state.emitted_text);
+    state.emitted_text = replacement;
 }
 
 pub const KvView = struct {
@@ -10492,6 +10503,21 @@ test "streaming completion emits bare-channel public content once" {
     const already_emitted = StreamingTextState{ .emitted_text = capture.text.items };
     try std.testing.expect(emitCompletedProjectionDelta(&already_emitted, &capture, Capture.callback, "public answer"));
     try std.testing.expectEqualStrings("public answer", capture.text.items);
+}
+
+test "streaming emitted text replacement preserves ownership on OOM" {
+    const allocator = std.testing.allocator;
+    const original = try allocator.dupe(u8, "already emitted");
+    var state = StreamingTextState{ .emitted_text = original };
+    defer allocator.free(state.emitted_text);
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        replaceStreamingEmittedText(failing.allocator(), &state, "replacement"),
+    );
+    try std.testing.expect(state.emitted_text.ptr == original.ptr);
+    try std.testing.expectEqualStrings("already emitted", state.emitted_text);
 }
 
 test "raw token diagnostics retain private generated ids" {

@@ -875,7 +875,10 @@ fn selectHttpCredential(
 ) ?*const scraping.HTTPCredentialConfig {
     if (credential_name) |name| {
         const credential = cfg.getHttp(name) orelse return null;
-        const base_url = credential.base_url orelse return credential;
+        // A named credential is still selected by table-controlled input. Do
+        // not let an explicit name turn an unscoped secret into a bearer
+        // credential for an arbitrary request URL.
+        const base_url = credential.base_url orelse return null;
         return if (httpCredentialScopeMatches(base_url, url)) credential else null;
     }
     var selected: ?*const scraping.HTTPCredentialConfig = null;
@@ -1154,6 +1157,32 @@ test "explicit HTTP credentials remain inside their configured scope" {
         "https://docs.internal.com.evil.test/api/document",
         "internal",
     ) == null);
+}
+
+test "explicit HTTP credentials without a base URL fail closed" {
+    const alloc = std.testing.allocator;
+    var cfg = scraping.RemoteContentConfig{};
+    defer cfg.deinit(alloc);
+
+    const name = try alloc.dupe(u8, "unscoped");
+    errdefer alloc.free(name);
+    try cfg.http.put(alloc, name, .{});
+
+    try std.testing.expect(selectHttpCredential(
+        &cfg,
+        "https://attacker.example/collect",
+        "unscoped",
+    ) == null);
+    try std.testing.expectError(
+        error.HttpCredentialNotFoundOrOutOfScope,
+        resolveRemoteContentFetchOptions(
+            alloc,
+            &cfg,
+            null,
+            "https://attacker.example/collect",
+            "unscoped",
+        ),
+    );
 }
 
 test "explicit remote credentials fail closed when missing or outside scope" {

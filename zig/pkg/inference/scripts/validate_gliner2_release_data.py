@@ -667,7 +667,7 @@ def main() -> int:
     parser.add_argument(
         "--smoke-dir",
         type=Path,
-        default=Path(__file__).resolve().parents[1] / "testdata",
+        default=Path(__file__).resolve().parents[1] / "testdata" / "gliner2",
     )
     args = parser.parse_args()
     try:
@@ -675,7 +675,7 @@ def main() -> int:
         eval_ = load_dataset(args.eval) if args.eval else None
         comparison_train = load_dataset(args.train, args.comparison_records) if args.comparison_records else None
         smoke_texts: set[bytes] = set()
-        smoke_paths = sorted(args.smoke_dir.glob("gliner2*smoke*.jsonl"))
+        smoke_paths = sorted(args.smoke_dir.glob("*smoke*.jsonl"))
         if not smoke_paths:
             raise ValueError(f"{args.smoke_dir}: no GLiNER2 smoke fixtures found")
         for path in smoke_paths:

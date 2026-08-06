@@ -735,6 +735,14 @@ jobs:
           SKIP_BUILD: "1"
         run: taskset -c ${{ steps.e2e_cpus.outputs.list }} scripts/ci/zig-e2e-base-linux.sh
 
+      - name: Run low-FD HTTP worker ratchet regression
+        working-directory: zig
+        env:
+          ANTFLY_REQUIRE_LOW_FD_HTTP_RATCHET: "1"
+        run: |
+          ulimit -n 256
+          taskset -c ${{ steps.e2e_cpus.outputs.list }} zig build http-low-fd-ratchet-test
+
       - name: Run low-FD Autograph regression
         env:
           SKIP_BUILD: "1"
@@ -847,6 +855,10 @@ jobs:
           ANTFLY_INFERENCE_FLORENCE_MODEL: antflydb/florence-2-base
           ANTFLY_INFERENCE_REQUEST_TIMEOUT: "300"
           ANTFLY_INFERENCE_MAX_LOADED_MODELS: "1"
+          # This is a release contract, not an optional capability probe. Keep
+          # it targeted so unrelated large-model suites do not inflate this job.
+          RUN_MULTIMODAL_GENERATOR_TESTS: "1"
+          RUN_CLIPCLAP_CONTRACT_TESTS: "1"
         run: |
           chmod +x ./zig-out/bin/antfly
           taskset -c ${{ steps.e2e_cpus.outputs.list }} uv run --project e2e/inference pytest -q --continue-on-collection-errors e2e/inference

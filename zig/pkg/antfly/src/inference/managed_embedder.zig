@@ -1923,7 +1923,12 @@ fn validateSparseBatch(embeddings: []const db_embedder.SparseEmbedding, expected
 }
 
 fn normalizeLocalEmbeddingError(err: anyerror) anyerror {
-    return if (err == error.QueueFull) error.EmbedTransientFailure else err;
+    return switch (err) {
+        error.QueueFull,
+        error.ResourceTemporarilyUnavailable,
+        => error.EmbedTransientFailure,
+        else => err,
+    };
 }
 
 fn embedWithEntryParts(
@@ -3633,6 +3638,16 @@ pub fn testLocalAdmissionOverloadNormalization() !void {
     try std.testing.expectError(error.EmbedTransientFailure, managed.embedQuery(std.testing.allocator, "dense_idx", "query"));
     try std.testing.expectError(error.EmbedTransientFailure, embedSparseWithEntry(std.testing.allocator, sparse_entry, "query"));
     try std.testing.expectError(error.EmbedTransientFailure, embedWithEntryParts(std.testing.allocator, multimodal_entry, &media_parts, 3));
+
+    local.failure = error.ResourceTemporarilyUnavailable;
+    try std.testing.expectError(error.EmbedTransientFailure, managed.embedQuery(std.testing.allocator, "dense_idx", "query"));
+    try std.testing.expectError(error.EmbedTransientFailure, embedSparseWithEntry(std.testing.allocator, sparse_entry, "query"));
+    try std.testing.expectError(error.EmbedTransientFailure, embedWithEntryParts(std.testing.allocator, multimodal_entry, &media_parts, 3));
+
+    local.failure = error.ResourceLimitExceeded;
+    try std.testing.expectError(error.ResourceLimitExceeded, managed.embedQuery(std.testing.allocator, "dense_idx", "query"));
+    try std.testing.expectError(error.ResourceLimitExceeded, embedSparseWithEntry(std.testing.allocator, sparse_entry, "query"));
+    try std.testing.expectError(error.ResourceLimitExceeded, embedWithEntryParts(std.testing.allocator, multimodal_entry, &media_parts, 3));
 
     local.failure = error.TestUnexpectedResult;
     try std.testing.expectError(error.TestUnexpectedResult, managed.embedQuery(std.testing.allocator, "dense_idx", "query"));

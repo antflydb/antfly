@@ -17,6 +17,7 @@ const builtin = @import("builtin");
 const raft_engine = @import("raft_engine");
 const platform = @import("antfly_platform");
 const fs_paths = @import("../../common/fs_paths.zig");
+const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
 const background_runtime = @import("../../storage/background_runtime.zig");
 const docstore = @import("../../storage/docstore.zig");
 const generation_lifecycle = @import("../../storage/db/generation_lifecycle.zig");
@@ -172,7 +173,7 @@ pub const RaftApplyStore = struct {
     };
 
     pub fn init(alloc: std.mem.Allocator, cfg: RaftApplyStoreConfig) !RaftApplyStore {
-        var io_impl = std.Io.Threaded.init(alloc, .{});
+        var io_impl = threaded_io_limits.initService(alloc);
         errdefer io_impl.deinit();
 
         const root_dir = try alloc.dupe(u8, cfg.root_dir);

@@ -105,9 +105,26 @@ fn generationPipelineSession(pipeline: anytype) ?backends_mod.Session {
     return null;
 }
 
+fn generationStreamShouldContinue(
+    write_failed: bool,
+    cancellation: ?*const std.atomic.Value(bool),
+) bool {
+    if (write_failed) return false;
+    if (cancellation) |signal| return !signal.load(.acquire);
+    return true;
+}
+
 test "generation pipeline session lookup is field safe" {
     var pipeline = struct {}{};
     try std.testing.expect(generationPipelineSession(&pipeline) == null);
+}
+
+test "generation stream continuation observes writes and peer cancellation" {
+    var cancellation = std.atomic.Value(bool).init(false);
+    try std.testing.expect(generationStreamShouldContinue(false, &cancellation));
+    cancellation.store(true, .release);
+    try std.testing.expect(!generationStreamShouldContinue(false, &cancellation));
+    try std.testing.expect(!generationStreamShouldContinue(true, null));
 }
 
 test "channel-aware Gemma generation stays on projected native backends" {
@@ -506,6 +523,56 @@ test "concurrent first prompt cache activations share the node budget" {
     try std.testing.expectEqual(@as(usize, 512), first.prompt_prefix_cache.config.max_bytes);
     try std.testing.expectEqual(@as(usize, 1024), first.prompt_prefix_cache.pending_config.?.max_bytes);
     try std.testing.expect(!second.prompt_prefix_cache.isParticipating());
+}
+
+test "deferred foreign prompt cache eviction does not collapse active share" {
+    const allocator = std.testing.allocator;
+    var manager = model_manager_mod.ModelManager.init(allocator, backends_mod.SessionManager.init(allocator));
+    defer manager.loaded.deinit(allocator);
+    defer manager.loaded_aliases.deinit(allocator);
+
+    var idle: model_manager_mod.LoadedModel = undefined;
+    idle.prompt_prefix_cache = runtime.kv.prompt_cache.PromptPrefixCache.init(allocator);
+    defer idle.prompt_prefix_cache.deinit();
+    var active: model_manager_mod.LoadedModel = undefined;
+    active.prompt_prefix_cache = runtime.kv.prompt_cache.PromptPrefixCache.init(allocator);
+    defer active.prompt_prefix_cache.deinit();
+    try manager.loaded.put(allocator, "idle", &idle);
+    try manager.loaded.put(allocator, "active", &active);
+
+    const node_config = runtime.kv.prompt_cache.Config{
+        .enabled = true,
+        .mode = .simple,
+        .min_tokens = 2,
+        .max_bytes = 1 << 20,
+    };
+    manager.rebalancePromptCaches(&idle, node_config);
+    const pool_id = (try idle.prompt_prefix_cache.ensurePool(.{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 2,
+        .num_layers_packed = 1,
+        .num_kv_heads = 1,
+        .head_dim = 64,
+    })).?;
+    const sequence_id = try idle.prompt_prefix_cache.managerPtr().attachSequence(pool_id);
+    defer idle.prompt_prefix_cache.managerPtr().releaseSequence(sequence_id) catch {};
+    try idle.prompt_prefix_cache.managerPtr().appendTokens(sequence_id, 1024);
+    const tokens = try allocator.alloc(i64, 1024);
+    defer allocator.free(tokens);
+    for (tokens, 0..) |*token, idx| token.* = @intCast(idx);
+    try idle.prompt_prefix_cache.storeFromSequence("idle", tokens, sequence_id);
+    try std.testing.expect(idle.prompt_prefix_cache.stats().live_bytes > node_config.max_bytes / 2);
+
+    manager.rebalancePromptCaches(&active, node_config);
+    try std.testing.expectEqual(
+        node_config.max_bytes / 2,
+        active.prompt_prefix_cache.config.max_bytes,
+    );
+    try std.testing.expectEqual(
+        node_config.max_bytes / 2,
+        idle.prompt_prefix_cache.pending_config.?.max_bytes,
+    );
 }
 
 fn chatTemplateKwargsValueIsValid(value: std.json.Value) bool {
@@ -933,77 +1000,180 @@ fn ensureDirectEmbeddingDeadline(deadline_ns: ?u64) !void {
     _ = try remainingDirectEmbeddingDeadlineMs(deadline_ns, embedTimingNowNs());
 }
 
-fn isRecoverableDenseRuntimeIntegrityError(err: anyerror) bool {
+fn isRecoverableEmbeddingRuntimeIntegrityError(err: anyerror) bool {
     return err == error.MissingWeight or err == error.WeightNotFound;
 }
 
-const DenseRuntimeAttemptFn = *const fn (
-    ctx: *anyopaque,
-    retire_on_integrity_failure: bool,
-) anyerror![][]f32;
+fn shouldAbortDensePartialFallback(err: anyerror) bool {
+    return err == error.OutOfMemory or isRecoverableEmbeddingRuntimeIntegrityError(err);
+}
 
-fn runDenseRuntimeWithRecovery(
+const LoadedEmbeddingRuntimeAttemptFn = *const fn (
     ctx: *anyopaque,
-    attempt: DenseRuntimeAttemptFn,
-) anyerror![][]f32 {
+    model: *model_manager_mod.LoadedModel,
+) anyerror!void;
+
+const LoadedEmbeddingRecoveryOptions = struct {
+    preferred_backends: ?[]const backends_mod.BackendType = null,
+    cache_default_alias: bool = true,
+    pin_on_success: bool = false,
+    failure_stage: ?*EmbeddingRuntimeFailureStage = null,
+};
+
+const EmbeddingRuntimeFailureStage = enum { acquire, execute };
+
+fn runEmbeddingRuntimeRecoveryLoop(adapter: anytype) !void {
     var recovery_attempted = false;
     while (true) {
-        const vectors = attempt(ctx, !recovery_attempted) catch |err| {
-            if (!recovery_attempted and isRecoverableDenseRuntimeIntegrityError(err)) {
-                recovery_attempted = true;
-                continue;
+        var handle = try adapter.acquire();
+        defer adapter.release(&handle);
+
+        adapter.execute(&handle) catch |err| {
+            if (isRecoverableEmbeddingRuntimeIntegrityError(err)) {
+                adapter.retire(&handle);
+                if (!recovery_attempted) {
+                    recovery_attempted = true;
+                    continue;
+                }
             }
             return err;
         };
-        return vectors;
+        adapter.succeed(&handle);
+        return;
     }
 }
 
-test "direct dense embedding recovery is limited to runtime weight integrity" {
-    try std.testing.expect(isRecoverableDenseRuntimeIntegrityError(error.MissingWeight));
-    try std.testing.expect(isRecoverableDenseRuntimeIntegrityError(error.WeightNotFound));
-    try std.testing.expect(!isRecoverableDenseRuntimeIntegrityError(error.ResourceLimitExceeded));
-    try std.testing.expect(!isRecoverableDenseRuntimeIntegrityError(error.Canceled));
+fn runLoadedEmbeddingRuntimeWithRecovery(
+    node: *Node,
+    model_path: []const u8,
+    options: LoadedEmbeddingRecoveryOptions,
+    ctx: *anyopaque,
+    attempt: LoadedEmbeddingRuntimeAttemptFn,
+) anyerror!void {
+    const Adapter = struct {
+        node: *Node,
+        model_path: []const u8,
+        options: LoadedEmbeddingRecoveryOptions,
+        ctx: *anyopaque,
+        attempt: LoadedEmbeddingRuntimeAttemptFn,
+
+        fn acquire(self: *@This()) !model_manager_mod.ModelHandle {
+            if (self.options.failure_stage) |stage| stage.* = .acquire;
+            return if (self.options.preferred_backends) |preferred_backends|
+                try self.node.model_manager.acquireFromDirWithPreferredBackends(
+                    self.model_path,
+                    preferred_backends,
+                    self.options.cache_default_alias,
+                )
+            else
+                try self.node.model_manager.acquireFromDir(self.model_path);
+        }
+
+        fn execute(self: *@This(), handle: *model_manager_mod.ModelHandle) !void {
+            if (self.options.failure_stage) |stage| stage.* = .execute;
+            try self.attempt(self.ctx, handle.get());
+        }
+
+        fn retire(_: *@This(), handle: *model_manager_mod.ModelHandle) void {
+            // The callback has unwound every model-owned asset lease before
+            // control returns here, so it is safe to detach the failed
+            // runtime. The loop retires the bounded retry as well if it is
+            // corrupt, preventing later requests from reusing a known-bad
+            // cache entry.
+            handle.retire();
+        }
+
+        fn release(_: *@This(), handle: *model_manager_mod.ModelHandle) void {
+            handle.release();
+        }
+
+        fn succeed(self: *@This(), handle: *model_manager_mod.ModelHandle) void {
+            if (self.options.pin_on_success) handle.pin();
+        }
+    };
+    var adapter = Adapter{
+        .node = node,
+        .model_path = model_path,
+        .options = options,
+        .ctx = ctx,
+        .attempt = attempt,
+    };
+    return runEmbeddingRuntimeRecoveryLoop(&adapter);
 }
 
-test "direct dense embedding retries one retired runtime without restart" {
+test "embedding runtime recovery retries once and retires every corrupt runtime" {
     const Probe = struct {
-        calls: usize = 0,
-        retire_flags: [2]bool = .{ false, false },
+        const FailureMode = enum { first_missing, persistent_missing, capacity };
+        const Handle = struct { active: bool = true };
 
-        fn run(ctx: *anyopaque, retire_on_integrity_failure: bool) ![][]f32 {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.retire_flags[self.calls] = retire_on_integrity_failure;
-            self.calls += 1;
-            if (self.calls == 1) return error.MissingWeight;
-            return std.testing.allocator.alloc([]f32, 0);
+        mode: FailureMode,
+        acquire_count: usize = 0,
+        execute_count: usize = 0,
+        retire_count: usize = 0,
+        release_count: usize = 0,
+        succeed_count: usize = 0,
+
+        fn acquire(self: *@This()) !Handle {
+            self.acquire_count += 1;
+            return .{};
+        }
+
+        fn execute(self: *@This(), _: *Handle) !void {
+            self.execute_count += 1;
+            switch (self.mode) {
+                .first_missing => if (self.execute_count == 1) return error.MissingWeight,
+                .persistent_missing => return error.MissingWeight,
+                .capacity => return error.ResourceTemporarilyUnavailable,
+            }
+        }
+
+        fn retire(self: *@This(), handle: *Handle) void {
+            std.debug.assert(handle.active);
+            handle.active = false;
+            self.retire_count += 1;
+        }
+
+        fn release(self: *@This(), handle: *Handle) void {
+            if (!handle.active) return;
+            handle.active = false;
+            self.release_count += 1;
+        }
+
+        fn succeed(self: *@This(), _: *Handle) void {
+            self.succeed_count += 1;
         }
     };
 
-    var probe = Probe{};
-    const vectors = try runDenseRuntimeWithRecovery(&probe, Probe.run);
-    defer std.testing.allocator.free(vectors);
-    try std.testing.expectEqual(@as(usize, 2), probe.calls);
-    try std.testing.expectEqualSlices(bool, &.{ true, false }, &probe.retire_flags);
+    var recovered = Probe{ .mode = .first_missing };
+    try runEmbeddingRuntimeRecoveryLoop(&recovered);
+    try std.testing.expectEqual(@as(usize, 2), recovered.acquire_count);
+    try std.testing.expectEqual(@as(usize, 2), recovered.execute_count);
+    try std.testing.expectEqual(@as(usize, 1), recovered.retire_count);
+    try std.testing.expectEqual(@as(usize, 1), recovered.release_count);
+    try std.testing.expectEqual(@as(usize, 1), recovered.succeed_count);
+
+    var persistent = Probe{ .mode = .persistent_missing };
+    try std.testing.expectError(error.MissingWeight, runEmbeddingRuntimeRecoveryLoop(&persistent));
+    try std.testing.expectEqual(@as(usize, 2), persistent.acquire_count);
+    try std.testing.expectEqual(@as(usize, 2), persistent.retire_count);
+    try std.testing.expectEqual(@as(usize, 0), persistent.release_count);
+
+    var capacity = Probe{ .mode = .capacity };
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, runEmbeddingRuntimeRecoveryLoop(&capacity));
+    try std.testing.expectEqual(@as(usize, 1), capacity.acquire_count);
+    try std.testing.expectEqual(@as(usize, 0), capacity.retire_count);
+    try std.testing.expectEqual(@as(usize, 1), capacity.release_count);
 }
 
-test "direct dense embedding bounds persistent integrity recovery" {
-    const Probe = struct {
-        calls: usize = 0,
-
-        fn run(ctx: *anyopaque, _: bool) ![][]f32 {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.calls += 1;
-            return error.MissingWeight;
-        }
-    };
-
-    var probe = Probe{};
-    try std.testing.expectError(
-        error.MissingWeight,
-        runDenseRuntimeWithRecovery(&probe, Probe.run),
-    );
-    try std.testing.expectEqual(@as(usize, 2), probe.calls);
+test "embedding runtime recovery is limited to weight integrity failures" {
+    try std.testing.expect(isRecoverableEmbeddingRuntimeIntegrityError(error.MissingWeight));
+    try std.testing.expect(isRecoverableEmbeddingRuntimeIntegrityError(error.WeightNotFound));
+    try std.testing.expect(!isRecoverableEmbeddingRuntimeIntegrityError(error.ResourceLimitExceeded));
+    try std.testing.expect(!isRecoverableEmbeddingRuntimeIntegrityError(error.Canceled));
+    try std.testing.expect(shouldAbortDensePartialFallback(error.MissingWeight));
+    try std.testing.expect(shouldAbortDensePartialFallback(error.WeightNotFound));
+    try std.testing.expect(shouldAbortDensePartialFallback(error.OutOfMemory));
+    try std.testing.expect(!shouldAbortDensePartialFallback(error.ResourceTemporarilyUnavailable));
 }
 
 test "dense embed download deadline is a nonzero remaining ceiling" {
@@ -2684,66 +2854,35 @@ pub const Node = struct {
         if (admission_manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
 
         const Attempt = struct {
-            node: *Node,
             allocator: std.mem.Allocator,
             deadline_ns: ?u64,
-            model_path: []const u8,
             texts: []const []const u8,
+            vectors: ?[][]f32 = null,
 
-            fn run(ctx: *anyopaque, retire_on_integrity_failure: bool) ![][]f32 {
+            fn run(ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
                 const attempt: *@This() = @ptrCast(@alignCast(ctx));
-                return attempt.node.embedDenseTextsDirectFromLoadedModel(
+                if (model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
+                var asset_lease = model.acquireEmbeddingAssetLease(false);
+                defer asset_lease.release();
+                const vectors = try embedDenseTextsOnLoadedModel(
                     attempt.allocator,
                     attempt.deadline_ns,
-                    attempt.model_path,
+                    model,
                     attempt.texts,
-                    retire_on_integrity_failure,
                 );
+                asset_lease.release();
+                errdefer freeDirectDenseVectors(attempt.allocator, vectors);
+                try ensureDirectEmbeddingDeadline(attempt.deadline_ns);
+                attempt.vectors = vectors;
             }
         };
         var attempt = Attempt{
-            .node = self,
             .allocator = allocator,
             .deadline_ns = deadline_ns,
-            .model_path = model_path,
             .texts = texts,
         };
-        return runDenseRuntimeWithRecovery(&attempt, Attempt.run);
-    }
-
-    fn embedDenseTextsDirectFromLoadedModel(
-        self: *Node,
-        allocator: std.mem.Allocator,
-        deadline_ns: ?u64,
-        model_path: []const u8,
-        texts: []const []const u8,
-        retire_on_integrity_failure: bool,
-    ) ![][]f32 {
-        try ensureDirectEmbeddingDeadline(deadline_ns);
-        var model_handle = try self.model_manager.acquireFromDir(model_path);
-        defer model_handle.release();
-        const model = model_handle.get();
-        if (model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
-        var asset_lease = model.acquireEmbeddingAssetLease(false);
-        defer asset_lease.release();
-        const vectors = embedDenseTextsOnLoadedModel(
-            allocator,
-            deadline_ns,
-            model,
-            texts,
-        ) catch |err| {
-            if (retire_on_integrity_failure and isRecoverableDenseRuntimeIntegrityError(err)) {
-                // The lease borrows the model-owned gate, so release it before
-                // retiring the final handle can destroy the failed runtime.
-                asset_lease.release();
-                model_handle.retire();
-            }
-            return err;
-        };
-        asset_lease.release();
-        errdefer freeDirectDenseVectors(allocator, vectors);
-        try ensureDirectEmbeddingDeadline(deadline_ns);
-        return vectors;
+        try runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{}, &attempt, Attempt.run);
+        return attempt.vectors.?;
     }
 
     fn embedDenseTextsOnLoadedModel(
@@ -2775,18 +2914,28 @@ pub const Node = struct {
         defer io_impl.deinit();
 
         const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "embedders");
-        var model_handle = try self.model_manager.acquireFromDir(model_path);
-        defer model_handle.release();
-        const model = model_handle.get();
-        if (!model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
-        var pipeline = sparse_embedding_mod.SparseEmbeddingPipeline{
-            .allocator = allocator,
-            .session = model.session,
-            .tok = model.getTokenizer(),
-            .config = sparse_embedding_mod.SparseEmbeddingConfig.fromManifest(&model.manifest),
-            .execution_lock = model.embeddingExecutionLock(),
+        defer self.allocator.free(model_path);
+        const Attempt = struct {
+            allocator: std.mem.Allocator,
+            texts: []const []const u8,
+            vectors: ?[]DirectSparseEmbedding = null,
+
+            fn run(ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
+                const attempt: *@This() = @ptrCast(@alignCast(ctx));
+                if (!model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
+                var pipeline = sparse_embedding_mod.SparseEmbeddingPipeline{
+                    .allocator = attempt.allocator,
+                    .session = model.session,
+                    .tok = model.getTokenizer(),
+                    .config = sparse_embedding_mod.SparseEmbeddingConfig.fromManifest(&model.manifest),
+                    .execution_lock = model.embeddingExecutionLock(),
+                };
+                attempt.vectors = try pipeline.embed(attempt.texts);
+            }
         };
-        return try pipeline.embed(texts);
+        var attempt = Attempt{ .allocator = allocator, .texts = texts };
+        try runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{}, &attempt, Attempt.run);
+        return attempt.vectors.?;
     }
 
     pub fn rerankTextsDirect(
@@ -3262,13 +3411,14 @@ pub const Node = struct {
     }
 
     pub fn warmModel(self: *Node, allocator: std.mem.Allocator, model: WarmModel) !void {
+        const materialize_optional_sessions = kernelJitMaterializesOptionalSessions(self.config.kernel_jit.mode);
         switch (model.kind) {
             .generator => try self.warmGeneratorWithBackend(allocator, model.name, model.backend),
-            .embedder => try self.warmEmbedder(allocator, model.name, model.backend),
+            .embedder => try self.warmEmbedder(allocator, model.name, model.backend, materialize_optional_sessions),
             .reranker => try self.warmReranker(allocator, model.name, model.backend),
             .chunker, .classifier, .rewriter, .reader, .transcriber, .extractor => try self.warmLoadOnlyModel(allocator, model),
         }
-        if (kernelJitMaterializesOptionalSessions(self.config.kernel_jit.mode)) {
+        if (materialize_optional_sessions and model.kind != .embedder) {
             try self.materializeWarmModelOptionalSessions(allocator, model);
         }
     }
@@ -3323,7 +3473,13 @@ pub const Node = struct {
         );
     }
 
-    fn warmEmbedder(self: *Node, allocator: std.mem.Allocator, model_name: []const u8, backend: ?backends_mod.BackendType) !void {
+    fn warmEmbedder(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        backend: ?backends_mod.BackendType,
+        materialize_optional_sessions: bool,
+    ) !void {
         if (model_name.len == 0) return error.InvalidGenerationRequest;
         const started_at_ns = embedTimingNowNs();
         std.log.info("warming inference embedder model={s}", .{model_name});
@@ -3332,38 +3488,58 @@ pub const Node = struct {
         var io_impl = std.Io.Threaded.init(allocator, .{});
         defer io_impl.deinit();
         const model_path = try self.resolveModelPath(io_impl.io(), model_name, "embedders");
-        var model_handle = if (backend) |value|
-            try self.model_manager.acquireFromDirWithPreferredBackends(model_path, singleBackendPreference(value), false)
-        else
-            try self.model_manager.acquireFromDir(model_path);
-        defer model_handle.release();
-        const model = model_handle.get();
+        defer self.allocator.free(model_path);
+        const Attempt = struct {
+            allocator: std.mem.Allocator,
+            texts: []const []const u8,
+            materialize_optional_sessions: bool,
+            fail_closed: bool,
 
-        if (model.manifest.hasCapability("sparse")) {
-            var pipeline = sparse_embedding_mod.SparseEmbeddingPipeline{
-                .allocator = allocator,
-                .session = model.session,
-                .tok = model.getTokenizer(),
-                .config = sparse_embedding_mod.SparseEmbeddingConfig.fromManifest(&model.manifest),
-                .execution_lock = model.embeddingExecutionLock(),
-            };
-            const sparse = try pipeline.embed(&texts);
-            defer {
-                for (sparse) |*item| item.deinit(allocator);
-                allocator.free(sparse);
+            fn run(ctx: *anyopaque, loaded: *model_manager_mod.LoadedModel) !void {
+                const attempt: *@This() = @ptrCast(@alignCast(ctx));
+                if (loaded.manifest.hasCapability("sparse")) {
+                    var pipeline = sparse_embedding_mod.SparseEmbeddingPipeline{
+                        .allocator = attempt.allocator,
+                        .session = loaded.session,
+                        .tok = loaded.getTokenizer(),
+                        .config = sparse_embedding_mod.SparseEmbeddingConfig.fromManifest(&loaded.manifest),
+                        .execution_lock = loaded.embeddingExecutionLock(),
+                    };
+                    const sparse = try pipeline.embed(attempt.texts);
+                    defer {
+                        for (sparse) |*item| item.deinit(attempt.allocator);
+                        attempt.allocator.free(sparse);
+                    }
+                } else {
+                    var asset_lease = loaded.acquireEmbeddingAssetLease(false);
+                    defer asset_lease.release();
+                    try loaded.ensureEmbeddingAssets(true, false, false);
+                    var pipeline = loaded.embeddingPipeline(attempt.allocator);
+                    const embeddings = try pipeline.embed(attempt.texts);
+                    defer {
+                        for (embeddings) |embedding| attempt.allocator.free(embedding);
+                        attempt.allocator.free(embeddings);
+                    }
+                }
+                if (attempt.materialize_optional_sessions) {
+                    try loaded.materializeDeclaredOptionalSessions();
+                    if (attempt.fail_closed and !loaded.declaredOptionalSessionsMaterialized()) {
+                        return error.KernelJitRequiredOptionalSessionUnmaterialized;
+                    }
+                }
             }
-        } else {
-            var asset_lease = model.acquireEmbeddingAssetLease(false);
-            defer asset_lease.release();
-            try model.ensureEmbeddingAssets(true, false, false);
-            var pipeline = model.embeddingPipeline(allocator);
-            const embeddings = try pipeline.embed(&texts);
-            defer {
-                for (embeddings) |embedding| allocator.free(embedding);
-                allocator.free(embeddings);
-            }
-        }
-        model_handle.pin();
+        };
+        var attempt = Attempt{
+            .allocator = allocator,
+            .texts = &texts,
+            .materialize_optional_sessions = materialize_optional_sessions,
+            .fail_closed = self.config.kernel_jit.mode.failClosed(),
+        };
+        try runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{
+            .preferred_backends = if (backend) |value| singleBackendPreference(value) else null,
+            .cache_default_alias = false,
+            .pin_on_success = true,
+        }, &attempt, Attempt.run);
         std.log.info("warmed inference embedder model={s} elapsed_ms={d}", .{ model_name, elapsedMs(started_at_ns, embedTimingNowNs()) });
     }
 
@@ -3568,33 +3744,48 @@ pub const Node = struct {
             self.updateQueueMetrics();
         }
 
-        var model_handle = try self.model_manager.acquireFromDir(model_path);
-        defer model_handle.release();
-        const model = model_handle.get();
-        if (model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
+        const Attempt = struct {
+            allocator: std.mem.Allocator,
+            parsed: *ParsedDenseEmbedInputs,
+            audio_decode_working_bytes: usize,
+            deadline_ns: ?u64,
+            vectors: ?[][]f32 = null,
 
-        var asset_lease = model.acquireEmbeddingAssetLease(parsed.audio.items.len > 0);
-        defer asset_lease.release();
-        try ensureDirectEmbeddingDeadline(deadline_ns);
-        var pipeline = try prepareInitialDenseEmbeddingPipeline(model, allocator, parsed);
-        pipeline.config.max_audio_decode_working_bytes = audio_decode_working_bytes;
-        var audio_asset_guard = AudioEmbeddingAssetGuard.init(
-            model,
-            parsed.audio.items.len > 0,
-        );
-        defer audio_asset_guard.deinit();
-        const vectors = try embedDenseInputs(
-            allocator,
-            &pipeline,
-            parsed,
-            model,
-            &audio_asset_guard,
-            &asset_lease,
-        );
-        asset_lease.release();
-        errdefer freeDirectDenseVectors(allocator, vectors);
-        try ensureDirectEmbeddingDeadline(deadline_ns);
-        return vectors;
+            fn run(ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
+                const attempt: *@This() = @ptrCast(@alignCast(ctx));
+                if (model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
+                var asset_lease = model.acquireEmbeddingAssetLease(attempt.parsed.audio.items.len > 0);
+                defer asset_lease.release();
+                try ensureDirectEmbeddingDeadline(attempt.deadline_ns);
+                var pipeline = try prepareInitialDenseEmbeddingPipeline(model, attempt.allocator, attempt.parsed);
+                pipeline.config.max_audio_decode_working_bytes = attempt.audio_decode_working_bytes;
+                var audio_asset_guard = AudioEmbeddingAssetGuard.init(
+                    model,
+                    attempt.parsed.audio.items.len > 0,
+                );
+                defer audio_asset_guard.deinit();
+                const vectors = try embedDenseInputs(
+                    attempt.allocator,
+                    &pipeline,
+                    attempt.parsed,
+                    model,
+                    &audio_asset_guard,
+                    &asset_lease,
+                );
+                asset_lease.release();
+                errdefer freeDirectDenseVectors(attempt.allocator, vectors);
+                try ensureDirectEmbeddingDeadline(attempt.deadline_ns);
+                attempt.vectors = vectors;
+            }
+        };
+        var attempt = Attempt{
+            .allocator = allocator,
+            .parsed = parsed,
+            .audio_decode_working_bytes = audio_decode_working_bytes,
+            .deadline_ns = deadline_ns,
+        };
+        try runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{}, &attempt, Attempt.run);
+        return attempt.vectors.?;
     }
 
     pub fn readImagesDirect(
@@ -4449,19 +4640,40 @@ pub const Node = struct {
                 });
             }
             if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
-            var model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
-                return modelLoadFailureResponse(ctx, err);
-            defer model_handle.release();
-            const model = model_handle.get();
-            var pipeline = sparse_embedding_mod.SparseEmbeddingPipeline{
-                .allocator = ctx.allocator,
-                .session = model.session,
-                .tok = model.getTokenizer(),
-                .config = sparse_embedding_mod.SparseEmbeddingConfig.fromManifest(&model.manifest),
-                .execution_lock = model.embeddingExecutionLock(),
+            const Attempt = struct {
+                allocator: std.mem.Allocator,
+                io: ?std.Io,
+                texts: []const []const u8,
+                vectors: ?[]DirectSparseEmbedding = null,
+                prompt_tokens: usize = 0,
+
+                fn run(attempt_ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
+                    const attempt: *@This() = @ptrCast(@alignCast(attempt_ctx));
+                    if (!model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
+                    var pipeline = sparse_embedding_mod.SparseEmbeddingPipeline{
+                        .allocator = attempt.allocator,
+                        .session = model.session,
+                        .tok = model.getTokenizer(),
+                        .config = sparse_embedding_mod.SparseEmbeddingConfig.fromManifest(&model.manifest),
+                        .execution_lock = model.embeddingExecutionLock(),
+                    };
+                    const vectors = try pipeline.embed(attempt.texts);
+                    errdefer {
+                        for (vectors) |*item| item.deinit(attempt.allocator);
+                        attempt.allocator.free(vectors);
+                    }
+                    attempt.prompt_tokens = countTokenizerTexts(attempt.allocator, attempt.io, model.getTokenizer(), attempt.texts) catch estimateTextsTokens(attempt.texts);
+                    attempt.vectors = vectors;
+                }
             };
-            const sparse_vecs = pipeline.embed(sparse_texts) catch |err|
+            var attempt = Attempt{
+                .allocator = ctx.allocator,
+                .io = self.session_manager.io,
+                .texts = sparse_texts,
+            };
+            runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{}, &attempt, Attempt.run) catch |err|
                 return inferenceFailureResponse(ctx, err);
+            const sparse_vecs = attempt.vectors.?;
             defer {
                 for (sparse_vecs) |*sv| @constCast(sv).deinit(ctx.allocator);
                 ctx.allocator.free(sparse_vecs);
@@ -4469,8 +4681,7 @@ pub const Node = struct {
 
             var arena = std.heap.ArenaAllocator.init(ctx.allocator);
             defer arena.deinit();
-            const prompt_tokens = countTokenizerTexts(ctx.allocator, self.session_manager.io, model.getTokenizer(), sparse_texts) catch estimateTextsTokens(sparse_texts);
-            const response = try buildEmbedSparseResponse(arena.allocator(), request.model, sparse_vecs, prompt_tokens);
+            const response = try buildEmbedSparseResponse(arena.allocator(), request.model, sparse_vecs, attempt.prompt_tokens);
             return ctx.json(response);
         }
 
@@ -4513,52 +4724,93 @@ pub const Node = struct {
         }
 
         if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
-        var model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
-            return modelLoadFailureResponse(ctx, err);
-        defer model_handle.release();
-        const model = model_handle.get();
-        var asset_lease = model.acquireEmbeddingAssetLease(inputs.audio.items.len > 0);
-        defer asset_lease.release();
-        var pipeline = prepareInitialDenseEmbeddingPipeline(model, ctx.allocator, &inputs) catch |err|
-            return inferenceFailureResponse(ctx, err);
-        var audio_asset_guard = AudioEmbeddingAssetGuard.init(
-            model,
-            inputs.audio.items.len > 0,
-        );
-        defer audio_asset_guard.deinit();
-        pipeline.config.max_audio_decode_working_bytes = audio_decode_working_bytes;
-        applyDenseEmbeddingRequestOptions(&pipeline, &model.manifest, request) catch |err| {
-            return ctx.status(400).json(.{
-                .@"error" = "INVALID_REQUEST",
-                .message = embedRequestOptionErrorMessage(err),
-            });
+        const ExecutionResult = union(EmbedErrorPolicy) {
+            fail_fast: [][]f32,
+            per_item: DenseEmbedPartialResult,
         };
+        const Attempt = struct {
+            allocator: std.mem.Allocator,
+            io: ?std.Io,
+            inputs: *ParsedDenseEmbedInputs,
+            request: ParsedEmbedRequest,
+            audio_decode_working_bytes: usize,
+            result: ?ExecutionResult = null,
+            prompt_tokens: usize = 0,
+
+            fn run(attempt_ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
+                const attempt: *@This() = @ptrCast(@alignCast(attempt_ctx));
+                if (model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
+                var asset_lease = model.acquireEmbeddingAssetLease(attempt.inputs.audio.items.len > 0);
+                defer asset_lease.release();
+                var pipeline = try prepareInitialDenseEmbeddingPipeline(model, attempt.allocator, attempt.inputs);
+                var audio_asset_guard = AudioEmbeddingAssetGuard.init(
+                    model,
+                    attempt.inputs.audio.items.len > 0,
+                );
+                defer audio_asset_guard.deinit();
+                pipeline.config.max_audio_decode_working_bytes = attempt.audio_decode_working_bytes;
+                try applyDenseEmbeddingRequestOptions(&pipeline, &model.manifest, attempt.request);
+                attempt.prompt_tokens = if (attempt.inputs.texts.items.len > 0)
+                    countParsedDenseEmbedTextTokens(attempt.allocator, attempt.io, model.getTokenizer(), attempt.inputs)
+                else
+                    estimateParsedDenseEmbedPromptTokens(attempt.inputs);
+
+                attempt.result = switch (attempt.request.error_policy) {
+                    .fail_fast => .{ .fail_fast = try embedDenseInputs(
+                        attempt.allocator,
+                        &pipeline,
+                        attempt.inputs,
+                        model,
+                        &audio_asset_guard,
+                        &asset_lease,
+                    ) },
+                    .per_item => .{ .per_item = try embedDenseInputsPartial(
+                        attempt.allocator,
+                        &pipeline,
+                        attempt.inputs,
+                        model,
+                        &audio_asset_guard,
+                        &asset_lease,
+                    ) },
+                };
+                asset_lease.release();
+            }
+        };
+        var attempt = Attempt{
+            .allocator = ctx.allocator,
+            .io = self.session_manager.io,
+            .inputs = &inputs,
+            .request = request,
+            .audio_decode_working_bytes = audio_decode_working_bytes,
+        };
+        var failure_stage: EmbeddingRuntimeFailureStage = .acquire;
         const pipeline_start = embedTimingStart();
+        runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{
+            .failure_stage = &failure_stage,
+        }, &attempt, Attempt.run) catch |err| {
+            if (err == error.UnsupportedEmbeddingTaskType) {
+                return ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = embedRequestOptionErrorMessage(err),
+                });
+            }
+            return switch (failure_stage) {
+                .acquire => modelLoadFailureResponse(ctx, err),
+                .execute => embedDenseInputFailureResponse(ctx, err),
+            };
+        };
+        logEmbedTiming("embed.pipeline", inputs.total_count, pipeline_start);
         var arena = std.heap.ArenaAllocator.init(ctx.allocator);
         defer arena.deinit();
         const response_build_start = embedTimingStart();
-        const prompt_tokens = if (inputs.texts.items.len > 0)
-            countParsedDenseEmbedTextTokens(ctx.allocator, self.session_manager.io, model.getTokenizer(), &inputs)
-        else
-            estimateParsedDenseEmbedPromptTokens(&inputs);
 
-        switch (request.error_policy) {
-            .fail_fast => {
-                const embeddings = embedDenseInputs(
-                    ctx.allocator,
-                    &pipeline,
-                    &inputs,
-                    model,
-                    &audio_asset_guard,
-                    &asset_lease,
-                ) catch |err| return embedDenseInputFailureResponse(ctx, err);
-                asset_lease.release();
-                logEmbedTiming("embed.pipeline", inputs.total_count, pipeline_start);
+        switch (attempt.result.?) {
+            .fail_fast => |embeddings| {
                 defer {
                     for (embeddings) |e| ctx.allocator.free(e);
                     ctx.allocator.free(embeddings);
                 }
-                const response = buildEmbedDenseResponse(arena.allocator(), request.model, embeddings, requested_dimensions, prompt_tokens) catch |err| switch (err) {
+                const response = buildEmbedDenseResponse(arena.allocator(), request.model, embeddings, requested_dimensions, attempt.prompt_tokens) catch |err| switch (err) {
                     error.InvalidEmbeddingDimensions => {
                         return ctx.status(400).json(.{
                             .@"error" = "INVALID_REQUEST",
@@ -4573,19 +4825,10 @@ pub const Node = struct {
                 logEmbedTiming("embed.response_json", inputs.total_count, response_json_start);
                 return http_response;
             },
-            .per_item => {
-                var partial = try embedDenseInputsPartial(
-                    ctx.allocator,
-                    &pipeline,
-                    &inputs,
-                    model,
-                    &audio_asset_guard,
-                    &asset_lease,
-                );
-                asset_lease.release();
-                logEmbedTiming("embed.pipeline", inputs.total_count, pipeline_start);
+            .per_item => |partial_value| {
+                var partial = partial_value;
                 defer partial.deinit(ctx.allocator);
-                const response = buildEmbedDensePartialResponse(arena.allocator(), request.model, &partial, requested_dimensions, prompt_tokens) catch |err| switch (err) {
+                const response = buildEmbedDensePartialResponse(arena.allocator(), request.model, &partial, requested_dimensions, attempt.prompt_tokens) catch |err| switch (err) {
                     error.InvalidEmbeddingDimensions => {
                         return ctx.status(400).json(.{
                             .@"error" = "INVALID_REQUEST",
@@ -6637,6 +6880,23 @@ pub const Node = struct {
         estimate: runtime.tier.memory.Estimate,
     };
 
+    fn mergeSerialBatchEstimate(
+        current: ?runtime.tier.memory.Estimate,
+        next: runtime.tier.memory.Estimate,
+    ) runtime.tier.memory.Estimate {
+        const existing = current orelse return next;
+        std.debug.assert(existing.kv_tier == next.kv_tier);
+        std.debug.assert(existing.scratch_tier == next.scratch_tier);
+        return .{
+            .prompt_tokens = @max(existing.prompt_tokens, next.prompt_tokens),
+            .retained_tokens = @max(existing.retained_tokens, next.retained_tokens),
+            .kv_bytes = @max(existing.kv_bytes, next.kv_bytes),
+            .kv_tier = existing.kv_tier,
+            .scratch_bytes = @max(existing.scratch_bytes, next.scratch_bytes),
+            .scratch_tier = existing.scratch_tier,
+        };
+    }
+
     fn acquireBatchAdmission(
         self: *Node,
         backend_class: runtime.tier.memory.BackendClass,
@@ -7114,6 +7374,52 @@ pub const Node = struct {
                 }
                 if (runnable_count == 0) continue;
 
+                // A shared GPU backend executes these requests serially, so
+                // one reservation covering the largest per-item KV and scratch
+                // working sets is sufficient. Acquire it before the model lock:
+                // admission may evict an idle model and destroy its backend.
+                var shared_batch_admission: ?BatchAdmission = null;
+                defer releaseBatchAdmission(&shared_run_budget, &shared_batch_admission);
+                if (execution_mode == .shared_serial) {
+                    while (runnable_count > 0 and shared_batch_admission == null) {
+                        var combined: ?runtime.tier.memory.Estimate = null;
+                        var largest_pos: ?usize = null;
+                        var largest_pressure: usize = 0;
+                        for (group_indices.items, 0..) |idx, pos| {
+                            if (!pending[idx]) continue;
+                            const estimate = resource_estimates[pos].?;
+                            combined = mergeSerialBatchEstimate(combined, estimate);
+                            const pressure = estimate.kv_bytes +| estimate.scratch_bytes;
+                            if (largest_pos == null or pressure > largest_pressure) {
+                                largest_pos = pos;
+                                largest_pressure = pressure;
+                            }
+                        }
+                        const estimate = combined orelse break;
+                        shared_batch_admission = self.acquireBatchAdmission(
+                            budget_backend_class,
+                            budget_limits,
+                            &shared_run_budget,
+                            estimate,
+                        ) catch |err| {
+                            // Preserve per-item batch semantics: if the largest
+                            // request cannot be admitted, reject it and retry a
+                            // reservation sized for the remaining requests.
+                            const pos = largest_pos.?;
+                            const idx = group_indices.items[pos];
+                            results[idx].@"error" = batchAdmissionError(err);
+                            pending[idx] = false;
+                            runnable_count -= 1;
+                            if (model.native_generate_coordinator) |coordinator| {
+                                coordinator.release(leases[pos]);
+                                leases[pos].request_id = 0;
+                            }
+                            continue;
+                        };
+                    }
+                    if (shared_batch_admission == null) continue;
+                }
+
                 // Match the single-request lock order: scheduler and resource
                 // admission must complete before the model mutex is acquired.
                 // Metal/CUDA backends reference stateful session-owned runtime
@@ -7130,27 +7436,6 @@ pub const Node = struct {
 
                 var shared_cb: ?ops.ComputeBackend = null;
                 if (execution_mode == .shared_serial) {
-                    var provision_admitted = false;
-                    for (group_indices.items, 0..) |idx, pos| {
-                        if (!pending[idx]) continue;
-                        admissions[pos] = self.acquireBatchAdmission(
-                            budget_backend_class,
-                            budget_limits,
-                            &shared_run_budget,
-                            resource_estimates[pos].?,
-                        ) catch |err| {
-                            results[idx].@"error" = batchAdmissionError(err);
-                            pending[idx] = false;
-                            if (model.native_generate_coordinator) |coordinator| {
-                                coordinator.release(leases[pos]);
-                                leases[pos].request_id = 0;
-                            }
-                            continue;
-                        };
-                        provision_admitted = true;
-                        break;
-                    }
-                    if (!provision_admitted) continue;
                     shared_cb = session_factory.getComputeBackendWithBudget(
                         model.session,
                         ctx.allocator,
@@ -7232,23 +7517,6 @@ pub const Node = struct {
                 for (group_indices.items, 0..) |idx, pos| {
                     if (!pending[idx]) continue;
                     const task_alloc = task_arenas[pos].allocator();
-                    if (execution_mode == .shared_serial and admissions[pos] == null) {
-                        const resource_estimate = resource_estimates[pos].?;
-                        admissions[pos] = self.acquireBatchAdmission(
-                            budget_backend_class,
-                            budget_limits,
-                            &shared_run_budget,
-                            resource_estimate,
-                        ) catch |err| {
-                            results[idx].@"error" = batchAdmissionError(err);
-                            pending[idx] = false;
-                            if (model.native_generate_coordinator) |coordinator| {
-                                coordinator.release(leases[pos]);
-                                leases[pos].request_id = 0;
-                            }
-                            continue;
-                        };
-                    }
                     if (execution_mode == .isolated_parallel) {
                         task_cbs[pos] = session_factory.getComputeBackendWithBudget(
                             model.session,
@@ -7308,7 +7576,6 @@ pub const Node = struct {
                                 leases[pos].request_id = 0;
                             }
                         }
-                        releaseBatchAdmission(&shared_run_budget, &admissions[pos]);
                         decode_states[pos].deinit();
                         decode_states[pos] = generation.NativeDecodeState.initContiguous(ctx.allocator);
                         try applyBatchGenerateTaskResult(
@@ -7708,7 +7975,13 @@ pub const Node = struct {
             model_name: []const u8,
             allocator: std.mem.Allocator,
             parser: ?*tool_parser_mod.Parser,
+            cancellation: ?*const std.atomic.Value(bool),
             errored: bool = false,
+
+            fn shouldContinue(raw_ctx: *anyopaque) bool {
+                const stream: *@This() = @ptrCast(@alignCast(raw_ctx));
+                return generationStreamShouldContinue(stream.errored, stream.cancellation);
+            }
 
             fn onToken(raw_ctx: *anyopaque, token_text: []const u8) bool {
                 const stream: *@This() = @ptrCast(@alignCast(raw_ctx));
@@ -7755,7 +8028,15 @@ pub const Node = struct {
             .model_name = model_name,
             .allocator = ctx.allocator,
             .parser = tool_parser,
+            .cancellation = ctx.cancellation,
         };
+
+        if (comptime @hasField(@TypeOf(pipeline.*), "continue_ctx") and
+            @hasField(@TypeOf(pipeline.*), "continue_fn"))
+        {
+            pipeline.continue_ctx = @ptrCast(&stream_ctx);
+            pipeline.continue_fn = StreamCtx.shouldContinue;
+        }
 
         emitRoleDelta(&writer, ctx.allocator, stream_id, stream_created, model_name) catch |err| {
             writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
@@ -11848,6 +12129,30 @@ test "generate batch shared backends own the outer model lock" {
     mutex.unlock();
 }
 
+test "serial batch admission covers each request without summing them" {
+    const first = runtime.tier.memory.Estimate{
+        .prompt_tokens = 100,
+        .retained_tokens = 120,
+        .kv_bytes = 900,
+        .kv_tier = .backend,
+        .scratch_bytes = 200,
+        .scratch_tier = .backend,
+    };
+    const second = runtime.tier.memory.Estimate{
+        .prompt_tokens = 300,
+        .retained_tokens = 320,
+        .kv_bytes = 400,
+        .kv_tier = .backend,
+        .scratch_bytes = 700,
+        .scratch_tier = .backend,
+    };
+    const merged = Node.mergeSerialBatchEstimate(first, second);
+    try std.testing.expectEqual(@as(usize, 300), merged.prompt_tokens);
+    try std.testing.expectEqual(@as(usize, 320), merged.retained_tokens);
+    try std.testing.expectEqual(@as(usize, 900), merged.kv_bytes);
+    try std.testing.expectEqual(@as(usize, 700), merged.scratch_bytes);
+}
+
 test "direct generation admission owns queue capacity exactly once" {
     var node = try Node.init(std.testing.allocator, .{ .max_concurrent_requests = 32 });
     defer node.deinit();
@@ -15021,7 +15326,8 @@ fn embedDenseInputsPartial(
                 for (inputs.audio.items, 0..) |item, i| {
                     result.embeddings[item.index] = embeddings[i];
                 }
-            } else |_| {
+            } else |err| {
+                if (shouldAbortDensePartialFallback(err)) return err;
                 try embedAudioInputsIndividually(allocator, pipeline, inputs.audio.items, audio_inputs, &errors, &result);
             }
         }
@@ -15032,9 +15338,11 @@ fn embedDenseInputsPartial(
             asset_lease.release();
         }
         if (primary_admission.text_error) |err| {
+            if (shouldAbortDensePartialFallback(err)) return err;
             try appendDenseEmbeddingItemErrors(allocator, &errors, inputs.texts.items, err, "model_admission");
         }
         if (primary_admission.image_error) |err| {
+            if (shouldAbortDensePartialFallback(err)) return err;
             try appendDenseEmbeddingItemErrors(allocator, &errors, inputs.images.items, err, "model_admission");
         }
     }
@@ -15050,7 +15358,7 @@ fn embedDenseInputsPartial(
                 result.embeddings[item.index] = embeddings[i];
             }
         } else |err| {
-            if (err == error.OutOfMemory) return err;
+            if (shouldAbortDensePartialFallback(err)) return err;
             try embedTextInputsIndividually(allocator, pipeline, inputs.texts.items, texts, &errors, &result);
         }
     }
@@ -15066,7 +15374,7 @@ fn embedDenseInputsPartial(
                 result.embeddings[item.index] = embeddings[i];
             }
         } else |err| {
-            if (err == error.OutOfMemory) return err;
+            if (shouldAbortDensePartialFallback(err)) return err;
             try embedImageInputsIndividually(allocator, pipeline, inputs.images.items, images, &errors, &result);
         }
     }
@@ -15125,7 +15433,7 @@ fn embedTextInputsIndividually(
 ) !void {
     for (items, 0..) |item, i| {
         const single = pipeline.embed(texts[i .. i + 1]) catch |single_err| {
-            if (single_err == error.OutOfMemory) return single_err;
+            if (shouldAbortDensePartialFallback(single_err)) return single_err;
             try errors.append(allocator, embedItemFailure(item.index, single_err, "text_inference"));
             continue;
         };
@@ -15149,7 +15457,7 @@ fn embedImageInputsIndividually(
 ) !void {
     for (items, 0..) |item, i| {
         const single = pipeline.embedImages(images[i .. i + 1]) catch |single_err| {
-            if (single_err == error.OutOfMemory) return single_err;
+            if (shouldAbortDensePartialFallback(single_err)) return single_err;
             try errors.append(allocator, embedItemFailure(item.index, single_err, "image_inference"));
             continue;
         };
@@ -15173,7 +15481,7 @@ fn embedAudioInputsIndividually(
 ) !void {
     for (items, 0..) |item, i| {
         const single = pipeline.embedEncodedAudio(audio_inputs[i .. i + 1]) catch |single_err| {
-            if (single_err == error.OutOfMemory) return single_err;
+            if (shouldAbortDensePartialFallback(single_err)) return single_err;
             try errors.append(allocator, embedItemFailure(item.index, single_err, "audio_inference"));
             continue;
         };

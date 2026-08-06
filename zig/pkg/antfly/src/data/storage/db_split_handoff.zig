@@ -15,6 +15,7 @@
 const std = @import("std");
 const data_store = @import("raft_apply_store.zig");
 const fs_paths = @import("../../common/fs_paths.zig");
+const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
 const shard_state_store = @import("shard_state_store.zig");
 const internal_keys = @import("../../storage/internal_keys.zig");
 const shard_mod = @import("../../storage/shard.zig");
@@ -189,7 +190,7 @@ pub const Destination = struct {
     }
 
     fn initWithCreateRoot(alloc: std.mem.Allocator, cfg: DestinationConfig, create_root: bool) !Destination {
-        var io_impl = std.Io.Threaded.init(alloc, .{});
+        var io_impl = threaded_io_limits.initService(alloc);
         errdefer io_impl.deinit();
 
         const root_dir = try alloc.dupe(u8, cfg.root_dir);
@@ -214,7 +215,7 @@ pub const Destination = struct {
     }
 
     pub fn initBorrowed(alloc: std.mem.Allocator, root_dir_raw: []const u8, lease: BorrowedDestinationDb) !Destination {
-        var io_impl = std.Io.Threaded.init(alloc, .{});
+        var io_impl = threaded_io_limits.initService(alloc);
         errdefer io_impl.deinit();
         return .{
             .alloc = alloc,

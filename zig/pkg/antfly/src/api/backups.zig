@@ -17,6 +17,7 @@ const platform_time = @import("antfly_platform").time;
 const metadata_openapi = @import("antfly_metadata_openapi");
 const fs_paths = @import("../common/fs_paths.zig");
 const group_ids = @import("../common/group_ids.zig");
+const threaded_io_limits = @import("../common/threaded_io_limits.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const object_storage = @import("../storage/object_storage.zig");
 const remote_uri = @import("../serverless/remote_uri.zig");
@@ -363,6 +364,26 @@ pub const OpenOptions = struct {
     io: ?std.Io = null,
 };
 
+fn createOwnedThreadedIo(alloc: std.mem.Allocator) !*std.Io.Threaded {
+    const owned = try alloc.create(std.Io.Threaded);
+    // CLI and embedded backup stores can live for the whole operation and
+    // issue concurrent HTTP work. Keep the fallback finite when a server
+    // runtime was not supplied.
+    owned.* = threaded_io_limits.initService(alloc);
+    return owned;
+}
+
+test "owned backup runtime has a finite worker ceiling" {
+    const owned = try createOwnedThreadedIo(std.testing.allocator);
+    defer std.testing.allocator.destroy(owned);
+    defer owned.deinit();
+
+    try std.testing.expectEqual(
+        std.Io.Limit.limited(threaded_io_limits.service),
+        owned.concurrent_limit,
+    );
+}
+
 const AwsCredentialContext = struct {
     alloc: std.mem.Allocator,
     io_impl: ?*std.Io.Threaded,
@@ -375,9 +396,7 @@ const AwsCredentialContext = struct {
         const owned_region = try alloc.dupe(u8, region);
         errdefer alloc.free(owned_region);
         const io_impl: ?*std.Io.Threaded = if (shared_io == null) blk: {
-            const owned = try alloc.create(std.Io.Threaded);
-            owned.* = std.Io.Threaded.init(alloc, .{});
-            break :blk owned;
+            break :blk try createOwnedThreadedIo(alloc);
         } else null;
         errdefer if (io_impl) |owned| {
             owned.deinit();
@@ -564,9 +583,7 @@ const RemoteBackupStore = struct {
 
     fn initGcsUri(alloc: std.mem.Allocator, bucket: []const u8, prefix: []const u8, options: OpenOptions) !RemoteBackupStore {
         const io_impl: ?*std.Io.Threaded = if (options.io == null) blk: {
-            const owned = try alloc.create(std.Io.Threaded);
-            owned.* = std.Io.Threaded.init(alloc, .{});
-            break :blk owned;
+            break :blk try createOwnedThreadedIo(alloc);
         } else null;
         errdefer if (io_impl) |owned| {
             owned.deinit();
@@ -624,9 +641,7 @@ const RemoteBackupStore = struct {
         options: OpenOptions,
     ) !RemoteBackupStore {
         const io_impl: ?*std.Io.Threaded = if (options.io == null) blk: {
-            const owned = try alloc.create(std.Io.Threaded);
-            owned.* = std.Io.Threaded.init(alloc, .{});
-            break :blk owned;
+            break :blk try createOwnedThreadedIo(alloc);
         } else null;
         errdefer if (io_impl) |owned| {
             owned.deinit();
@@ -692,9 +707,8 @@ const RemoteBackupStore = struct {
         bucket: []const u8,
         prefix: []const u8,
     ) !RemoteBackupStore {
-        const io_impl = try alloc.create(std.Io.Threaded);
+        const io_impl = try createOwnedThreadedIo(alloc);
         errdefer alloc.destroy(io_impl);
-        io_impl.* = std.Io.Threaded.init(alloc, .{});
         errdefer io_impl.deinit();
         const owned_bucket = try alloc.dupe(u8, bucket);
         errdefer alloc.free(owned_bucket);
@@ -1883,7 +1897,10 @@ fn resolveFilesystemLocationAlloc(alloc: std.mem.Allocator, configured_root: []c
     const relative = std.mem.trimStart(u8, uri_path, "/");
     if (relative.len > 0) try validateArtifactRelativePath(relative);
 
-    var io_impl: ?std.Io.Threaded = if (shared_io == null) std.Io.Threaded.init(alloc, .{}) else null;
+    var io_impl: ?std.Io.Threaded = if (shared_io == null)
+        threaded_io_limits.initService(alloc)
+    else
+        null;
     defer if (io_impl) |*owned| owned.deinit();
     const io = shared_io orelse io_impl.?.io();
     const canonical_root = try std.Io.Dir.realPathFileAbsoluteAlloc(io, configured_root, alloc);
