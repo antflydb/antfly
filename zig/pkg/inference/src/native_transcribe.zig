@@ -25,9 +25,9 @@ const model_manager_mod = @import("server/model_manager.zig");
 const native_backend_guard = @import("native_backend_guard.zig");
 const session_factory = @import("architectures/session_factory.zig");
 const transcription = @import("pipelines/transcription.zig");
+const whisper_prompt = @import("pipelines/whisper_prompt.zig");
 const enc_dec_mod = @import("pipelines/encoder_decoder.zig");
 const hf_tokenizer = @import("inference_hf_tokenizer");
-const tokenizer_mod = @import("inference_tokenizer");
 
 const print = std.debug.print;
 
@@ -72,7 +72,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         defer hf_tok.deinitSelf();
 
         const dec_config = enc_dec_mod.loadDecoderConfig(allocator, opts.model_dir) catch enc_dec_mod.DecoderConfig{};
-        const forced_ids = loadWhisperForcedDecoderIds(allocator, opts.model_dir, hf_tok.tokenizer(), opts.language);
+        const forced_ids = whisper_prompt.resolveForcedDecoderIds(allocator, opts.model_dir, hf_tok.tokenizer(), opts.language);
         defer if (forced_ids) |f| allocator.free(f);
 
         var pipeline = transcription.TranscriptionPipeline.init(
@@ -100,10 +100,12 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
 
     const model = try model_manager.loadFromDir(opts.model_dir);
     const whisper_cfg = session_factory.getWhisperConfig(model.session) orelse return error.InvalidModelForTranscription;
-    const forced_ids = if (model.hf_tok) |hf_tok|
-        loadWhisperForcedDecoderIds(allocator, opts.model_dir, hf_tok.tokenizer(), opts.language)
-    else
-        loadForcedDecoderIds(allocator, opts.model_dir);
+    const forced_ids = whisper_prompt.resolveForcedDecoderIds(
+        allocator,
+        opts.model_dir,
+        model.getTokenizer(),
+        opts.language,
+    );
     defer if (forced_ids) |f| allocator.free(f);
 
     var pipeline = transcription.TranscriptionPipeline.init(
@@ -171,116 +173,6 @@ fn writeResultJson(allocator: std.mem.Allocator, model_name: []const u8, text: [
     try buf.appendSlice(allocator, "}\n");
 
     print("{s}", .{buf.items});
-}
-
-fn loadForcedDecoderIds(allocator: std.mem.Allocator, model_dir: []const u8) ?[]const [2]i32 {
-    const path = std.fmt.allocPrint(allocator, "{s}/generation_config.json", .{model_dir}) catch return null;
-    defer allocator.free(path);
-
-    const data = c_file.readFile(allocator, path) catch return null;
-    defer allocator.free(data);
-
-    const key = "\"forced_decoder_ids\"";
-    const key_pos = std.mem.indexOf(u8, data, key) orelse return null;
-    const after_key = data[key_pos + key.len ..];
-
-    var pos: usize = 0;
-    while (pos < after_key.len and (after_key[pos] == ' ' or after_key[pos] == ':' or after_key[pos] == '\n' or after_key[pos] == '\r' or after_key[pos] == '\t')) pos += 1;
-    if (pos >= after_key.len or after_key[pos] == 'n') return null;
-    if (after_key[pos] != '[') return null;
-    pos += 1;
-
-    var result = std.ArrayListUnmanaged([2]i32).empty;
-    while (pos < after_key.len) {
-        while (pos < after_key.len and (after_key[pos] == ' ' or after_key[pos] == ',' or after_key[pos] == '\n' or after_key[pos] == '\r' or after_key[pos] == '\t')) pos += 1;
-        if (pos >= after_key.len or after_key[pos] == ']') break;
-        if (after_key[pos] != '[') break;
-        pos += 1;
-
-        while (pos < after_key.len and after_key[pos] == ' ') pos += 1;
-        const first = parseJsonInt(after_key[pos..]) orelse break;
-        pos += first.len;
-
-        while (pos < after_key.len and (after_key[pos] == ' ' or after_key[pos] == ',')) pos += 1;
-        const second = parseJsonInt(after_key[pos..]) orelse break;
-        pos += second.len;
-
-        while (pos < after_key.len and after_key[pos] != ']') pos += 1;
-        if (pos < after_key.len) pos += 1;
-
-        result.append(allocator, .{ @intCast(first.value), @intCast(second.value) }) catch return null;
-    }
-
-    if (result.items.len == 0) {
-        result.deinit(allocator);
-        return null;
-    }
-    return result.toOwnedSlice(allocator) catch null;
-}
-
-fn loadWhisperForcedDecoderIds(
-    allocator: std.mem.Allocator,
-    model_dir: []const u8,
-    tok: tokenizer_mod.Tokenizer,
-    language: ?[]const u8,
-) ?[]const [2]i32 {
-    if (loadForcedDecoderIds(allocator, model_dir)) |ids| return ids;
-    return inferWhisperForcedDecoderIds(allocator, tok, language);
-}
-
-fn inferWhisperForcedDecoderIds(
-    allocator: std.mem.Allocator,
-    tok: tokenizer_mod.Tokenizer,
-    language: ?[]const u8,
-) ?[]const [2]i32 {
-    const transcribe_id = encodeSingleSpecialToken(allocator, tok, "<|transcribe|>") orelse return null;
-    const no_timestamps_id = encodeSingleSpecialToken(allocator, tok, "<|notimestamps|>") orelse return null;
-
-    var result = std.ArrayListUnmanaged([2]i32).empty;
-    errdefer result.deinit(allocator);
-
-    var next_pos: i32 = 1;
-    if (language) |lang| {
-        const lang_token = std.fmt.allocPrint(allocator, "<|{s}|>", .{lang}) catch return null;
-        defer allocator.free(lang_token);
-        const lang_id = encodeSingleSpecialToken(allocator, tok, lang_token) orelse return null;
-        result.append(allocator, .{ next_pos, lang_id }) catch return null;
-        next_pos += 1;
-    }
-
-    result.append(allocator, .{ next_pos, transcribe_id }) catch return null;
-    result.append(allocator, .{ next_pos + 1, no_timestamps_id }) catch return null;
-    return result.toOwnedSlice(allocator) catch null;
-}
-
-fn encodeSingleSpecialToken(
-    allocator: std.mem.Allocator,
-    tok: tokenizer_mod.Tokenizer,
-    text: []const u8,
-) ?i32 {
-    const ids = tok.encode(allocator, text) catch return null;
-    defer allocator.free(ids);
-    if (ids.len != 1) return null;
-    return ids[0];
-}
-
-const ParsedInt = struct { value: i64, len: usize };
-
-fn parseJsonInt(s: []const u8) ?ParsedInt {
-    if (s.len == 0) return null;
-    var i: usize = 0;
-    var neg = false;
-    if (s[0] == '-') {
-        neg = true;
-        i = 1;
-    }
-    if (i >= s.len or s[i] < '0' or s[i] > '9') return null;
-    var val: i64 = 0;
-    while (i < s.len and s[i] >= '0' and s[i] <= '9') {
-        val = val * 10 + @as(i64, s[i] - '0');
-        i += 1;
-    }
-    return .{ .value = if (neg) -val else val, .len = i };
 }
 
 fn jsonEncodeString(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, s: []const u8) !void {

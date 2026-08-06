@@ -225,7 +225,9 @@ def test_read_florence_model_answers_text(api):
     results = resp["data"]
     assert len(results) == 1
     _assert_read_result_shape(results[0])
-    assert results[0]["text"].strip()
+    observed = _normalize_text(results[0]["text"])
+    assert "invoice" in observed, f"Florence OCR missed INVOICE: {results[0]['text']!r}"
+    assert "123" in observed, f"Florence OCR missed TOTAL 123: {results[0]['text']!r}"
 
 
 @pytest.mark.multimodal

@@ -2344,12 +2344,20 @@ pub const Node = struct {
         if (session_factory.getWhisperConfig(model.session) == null) return error.UnsupportedTranscriberProvider;
 
         const transcription = @import("../pipelines/transcription.zig");
+        const whisper_prompt = @import("../pipelines/whisper_prompt.zig");
+        const forced_ids = whisper_prompt.resolveForcedDecoderIds(
+            allocator,
+            model_path,
+            model.getTokenizer(),
+            request.language,
+        );
+        defer if (forced_ids) |ids| allocator.free(ids);
         var pipeline = transcription.TranscriptionPipeline.init(
             allocator,
             model.session,
             model.session,
             model.getTokenizer(),
-            .{ .language = request.language },
+            .{ .language = request.language, .forced_decoder_ids = forced_ids },
         );
 
         var downloaded = try downloadRemoteContent(self, allocator, request.url);
@@ -6799,8 +6807,8 @@ pub const Node = struct {
         // Parse decoder config for Whisper token IDs
         const dec_config = enc_dec_mod.loadDecoderConfig(ctx.allocator, model_path) catch enc_dec_mod.DecoderConfig{};
 
-        // Parse forced_decoder_ids from generation_config.json
-        const forced_ids = loadForcedDecoderIds(ctx.allocator, model_path);
+        const whisper_prompt = @import("../pipelines/whisper_prompt.zig");
+        const forced_ids = whisper_prompt.resolveForcedDecoderIds(ctx.allocator, model_path, tokenizer, body.language);
         defer if (forced_ids) |f| ctx.allocator.free(f);
 
         const transcription = @import("../pipelines/transcription.zig");
@@ -7351,6 +7359,18 @@ pub const Node = struct {
         const router = api.ServerRouter(Node).init(self);
         var prefixed = AiPrefixedServer(prefix, @TypeOf(server.*)){ .inner = server };
         try router.register(&prefixed);
+        // Keep the retired endpoint deterministic when inference routes share
+        // the standalone public server. Without an explicit tombstone, httpx
+        // reports 405 because nearby generated routes match the path shape,
+        // while the dedicated inference server reports 404.
+        try server.post(prefix ++ "/recognize", retiredRecognizeHandler);
+    }
+
+    fn retiredRecognizeHandler(ctx: *httpx.Context) anyerror!httpx.Response {
+        return ctx.status(404).json(.{
+            .@"error" = "NOT_FOUND",
+            .message = "resource not found",
+        });
     }
 
     fn registerRootOperationalRoutes(server: anytype) !void {
@@ -8947,6 +8967,7 @@ test "registerAiRoutesOn excludes Traditional ML predictor routes" {
     try std.testing.expect(server.hasRoute(.post, ai_api_prefix ++ "/embeddings"));
     try std.testing.expect(server.hasRoute(.post, ai_api_prefix ++ "/generate/batch"));
     try std.testing.expect(server.hasRoute(.get, ai_api_prefix ++ "/models"));
+    try std.testing.expect(server.hasRoute(.post, ai_api_prefix ++ "/recognize"));
     try std.testing.expect(!server.hasRoute(.post, ai_api_prefix ++ "/predict"));
     try std.testing.expect(!server.hasRoute(.get, ai_api_prefix ++ "/predictors"));
 }
@@ -11378,84 +11399,6 @@ test "shared json schema validator: array bounds" {
     defer value_parsed.deinit();
 
     try jsonschema.validateJsonSchemaValue(allocator, schema_parsed.value, value_parsed.value);
-}
-
-/// Parse forced_decoder_ids from generation_config.json.
-/// Returns null if file not found or no forced_decoder_ids field.
-fn loadForcedDecoderIds(allocator: std.mem.Allocator, model_dir: []const u8) ?[]const [2]i32 {
-    const path = std.fmt.allocPrint(allocator, "{s}/generation_config.json", .{model_dir}) catch return null;
-    defer allocator.free(path);
-
-    const data = c_file.readFile(allocator, path) catch return null;
-    defer allocator.free(data);
-
-    // Simple JSON extraction: find "forced_decoder_ids": [[1, 50362], ...]
-    const key = "\"forced_decoder_ids\"";
-    const key_pos = std.mem.indexOf(u8, data, key) orelse return null;
-    const after_key = data[key_pos + key.len ..];
-
-    // Skip whitespace and colon
-    var pos: usize = 0;
-    while (pos < after_key.len and (after_key[pos] == ' ' or after_key[pos] == ':' or after_key[pos] == '\n' or after_key[pos] == '\r' or after_key[pos] == '\t')) pos += 1;
-
-    if (pos >= after_key.len or after_key[pos] == 'n') return null; // null value
-
-    if (after_key[pos] != '[') return null;
-    pos += 1; // skip outer [
-
-    var result = std.ArrayListUnmanaged([2]i32).empty;
-
-    while (pos < after_key.len) {
-        // Skip whitespace
-        while (pos < after_key.len and (after_key[pos] == ' ' or after_key[pos] == ',' or after_key[pos] == '\n' or after_key[pos] == '\r' or after_key[pos] == '\t')) pos += 1;
-        if (pos >= after_key.len or after_key[pos] == ']') break;
-
-        if (after_key[pos] != '[') break;
-        pos += 1; // skip inner [
-
-        // Parse first int
-        while (pos < after_key.len and after_key[pos] == ' ') pos += 1;
-        const first = parseJsonInt(after_key[pos..]) orelse break;
-        pos += first.len;
-
-        // Skip comma
-        while (pos < after_key.len and (after_key[pos] == ' ' or after_key[pos] == ',')) pos += 1;
-
-        // Parse second int
-        const second = parseJsonInt(after_key[pos..]) orelse break;
-        pos += second.len;
-
-        // Skip to closing ]
-        while (pos < after_key.len and after_key[pos] != ']') pos += 1;
-        if (pos < after_key.len) pos += 1; // skip ]
-
-        result.append(allocator, .{ @intCast(first.value), @intCast(second.value) }) catch return null;
-    }
-
-    if (result.items.len == 0) {
-        result.deinit(allocator);
-        return null;
-    }
-    return result.toOwnedSlice(allocator) catch null;
-}
-
-const ParsedInt = struct { value: i64, len: usize };
-
-fn parseJsonInt(s: []const u8) ?ParsedInt {
-    if (s.len == 0) return null;
-    var i: usize = 0;
-    var neg = false;
-    if (s[0] == '-') {
-        neg = true;
-        i = 1;
-    }
-    if (i >= s.len or s[i] < '0' or s[i] > '9') return null;
-    var val: i64 = 0;
-    while (i < s.len and s[i] >= '0' and s[i] <= '9') {
-        val = val * 10 + @as(i64, s[i] - '0');
-        i += 1;
-    }
-    return .{ .value = if (neg) -val else val, .len = i };
 }
 
 fn appendIntJson(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, value: anytype) !void {
