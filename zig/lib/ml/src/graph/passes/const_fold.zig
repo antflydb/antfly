@@ -334,6 +334,7 @@ fn evalNode(
 
         // ── Slice (extract sub-tensor) ─────────────────────────
         .slice => |attrs| {
+            if (attrs.runtime_starts or attrs.runtime_limits) return null;
             return try evalSlice(allocator, in0_data, in0_shape, n.output_shape, attrs);
         },
 
@@ -1415,6 +1416,39 @@ test "fold slice of constant" {
     try std.testing.expectApproxEqAbs(@as(f32, 3.0), data[1], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 5.0), data[2], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 6.0), data[3], 1e-6);
+}
+
+test "does not fold a runtime-bound slice" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    var b = Builder.init(&g);
+
+    const data = try b.tensorConst(&.{ 1, 2, 3, 4 }, Shape.init(.f32, &.{4}));
+    const starts = try b.tensorConst(&.{0}, Shape.init(.i64, &.{1}));
+    const limits = try b.tensorConst(&.{2}, Shape.init(.i64, &.{1}));
+    var attrs: node_mod.SliceAttrs = .{};
+    attrs.num_axes = 1;
+    attrs.starts[0] = 0;
+    attrs.limits[0] = 2;
+    attrs.bound_axes[0] = 0;
+    attrs.num_bound_axes = 1;
+    attrs.runtime_limits = true;
+    const sliced = try g.addNode(.{
+        .op = .{ .slice = attrs },
+        .output_shape = Shape.init(.f32, &.{2}),
+        .inputs = .{ data, starts, limits, null_node },
+        .num_inputs = 3,
+    });
+    try g.markOutput(sliced);
+
+    var result = try fold(allocator, &g);
+    defer result.deinit();
+    g.deinit();
+
+    const output = result.graph.node(result.graph.outputs.items[0]);
+    try std.testing.expectEqual(@as(std.meta.Tag(node_mod.OpCode), .slice), std.meta.activeTag(output.op));
+    try std.testing.expect(output.op.slice.runtime_limits);
+    try std.testing.expectEqual(@as(u8, 3), output.num_inputs);
 }
 
 test "fold scalar broadcast binary" {

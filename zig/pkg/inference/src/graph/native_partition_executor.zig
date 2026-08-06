@@ -26,6 +26,7 @@ const interpreter = @import("interpreter.zig");
 const partition_mod = @import("partition.zig");
 const device_mesh_mod = @import("device_mesh.zig");
 const transpose_utils = @import("transpose_utils.zig");
+const runtime_slice = @import("runtime_slice.zig");
 
 const CT = contracts.CT;
 const ComputeBackend = ops_mod.ComputeBackend;
@@ -580,11 +581,7 @@ fn executeNativePlannedNode(
             var starts: [8]i64 = undefined;
             var limits: [8]i64 = undefined;
             var strides: [8]i64 = undefined;
-            for (0..rank) |d| {
-                starts[d] = attrs.starts[d];
-                limits[d] = attrs.limits[d];
-                strides[d] = attrs.strides[d];
-            }
+            try runtime_slice.resolve(allocator, cb, values, inputs, attrs, &starts, &limits, &strides);
             break :blk try cb.primSlice(valueAt(values, inputs[0]), starts[0..rank], limits[0..rank], strides[0..rank], input_shape);
         },
         .concat_prim => |attrs| blk: {

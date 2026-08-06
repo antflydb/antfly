@@ -97,17 +97,6 @@ pub const SparseEmbeddingPipeline = struct {
         const alloc = self.allocator;
         const max_len = self.config.max_length;
         const batch = execution_batch;
-        const tokens = std.math.mul(usize, batch, max_len) catch
-            return error.ResourceLimitExceeded;
-        var run_permit = try self.session.admit(.{
-            .batch = batch,
-            .sequence = max_len,
-            .input_bytes = std.math.mul(usize, tokens, 24) catch
-                return error.ResourceLimitExceeded,
-            .host_preprocess_bytes = std.math.mul(usize, tokens, 32) catch
-                return error.ResourceLimitExceeded,
-        });
-        defer run_permit.deinit();
 
         // Tokenize
         const all_ids = try alloc.alloc(i32, batch * max_len);
@@ -126,18 +115,41 @@ pub const SparseEmbeddingPipeline = struct {
             @memcpy(all_mask[i * max_len .. (i + 1) * max_len], all_mask[(texts.len - 1) * max_len .. texts.len * max_len]);
         }
 
+        const sequence_len = try sparseExecutionSequenceLength(
+            self.session.inputInfo(),
+            all_mask,
+            batch,
+            max_len,
+            self.session.backend() == .native,
+        );
+        if (sequence_len != max_len) {
+            compactTokenRows(all_ids, batch, max_len, sequence_len);
+            compactTokenRows(all_mask, batch, max_len, sequence_len);
+        }
+        const tokens = std.math.mul(usize, batch, sequence_len) catch
+            return error.ResourceLimitExceeded;
+        var run_permit = try self.session.admit(.{
+            .batch = batch,
+            .sequence = sequence_len,
+            .input_bytes = std.math.mul(usize, tokens, 24) catch
+                return error.ResourceLimitExceeded,
+            .host_preprocess_bytes = std.math.mul(usize, tokens, 32) catch
+                return error.ResourceLimitExceeded,
+        });
+        defer run_permit.deinit();
+
         // Convert to i64 for ONNX
-        const ids_i64 = try alloc.alloc(i64, batch * max_len);
+        const ids_i64 = try alloc.alloc(i64, tokens);
         defer alloc.free(ids_i64);
-        const mask_i64 = try alloc.alloc(i64, batch * max_len);
+        const mask_i64 = try alloc.alloc(i64, tokens);
         defer alloc.free(mask_i64);
 
-        for (0..batch * max_len) |j| {
+        for (0..tokens) |j| {
             ids_i64[j] = @intCast(all_ids[j]);
             mask_i64[j] = @intCast(all_mask[j]);
         }
 
-        const shape = [_]i64{ @intCast(batch), @intCast(max_len) };
+        const shape = [_]i64{ @intCast(batch), @intCast(sequence_len) };
         var input_ids_tensor = try Tensor.initInt64(alloc, "input_ids", &shape, ids_i64);
         defer input_ids_tensor.deinit();
         var attention_mask_tensor = try Tensor.initInt64(alloc, "attention_mask", &shape, mask_i64);
@@ -157,7 +169,7 @@ pub const SparseEmbeddingPipeline = struct {
         }
 
         const inputs = if (needs_token_type) blk: {
-            const zeros = try alloc.alloc(i64, batch * max_len);
+            const zeros = try alloc.alloc(i64, tokens);
             defer alloc.free(zeros);
             @memset(zeros, 0);
             token_type_tensor = try Tensor.initInt64(alloc, "token_type_ids", &shape, zeros);
@@ -185,8 +197,8 @@ pub const SparseEmbeddingPipeline = struct {
                     return error.UnexpectedOutputShape;
                 };
                 break :blk switch (layout) {
-                    .batch_seq => |dims| try self.sparseFromBatchSeq3D(data, all_mask, batch, dims.seq_len, max_len, dims.vocab),
-                    .seq_batch => |dims| try self.sparseFromSeqBatch3D(data, all_mask, batch, dims.seq_len, max_len, dims.vocab),
+                    .batch_seq => |dims| try self.sparseFromBatchSeq3D(data, all_mask, batch, dims.seq_len, sequence_len, dims.vocab),
+                    .seq_batch => |dims| try self.sparseFromSeqBatch3D(data, all_mask, batch, dims.seq_len, sequence_len, dims.vocab),
                 };
             },
             2 => try self.sparseFrom2D(data, batch, resolveSparse2DVocab(output_shape, data.len, batch) orelse {
@@ -327,6 +339,44 @@ pub const SparseEmbeddingPipeline = struct {
         return results;
     }
 };
+
+fn sparseExecutionSequenceLength(
+    input_info: []const backends.TensorInfo,
+    mask: []const i32,
+    batch: usize,
+    max_len: usize,
+    allow_dynamic: bool,
+) !usize {
+    if (batch == 0 or max_len == 0 or mask.len < batch * max_len) return error.InvalidInputShape;
+    for (input_info) |info| {
+        if (!std.mem.eql(u8, info.name, "input_ids")) continue;
+        if (info.shape.len >= 2 and info.shape[1] > 0) {
+            const fixed: usize = @intCast(info.shape[1]);
+            if (fixed > max_len) return error.InvalidInputShape;
+            return fixed;
+        }
+        if (!allow_dynamic) return max_len;
+        break;
+    }
+
+    var longest: usize = 0;
+    for (0..batch) |row| {
+        const row_mask = mask[row * max_len .. (row + 1) * max_len];
+        var active = row_mask.len;
+        while (active > 0 and row_mask[active - 1] == 0) active -= 1;
+        longest = @max(longest, active);
+    }
+    return @max(longest, 1);
+}
+
+fn compactTokenRows(data: []i32, batch: usize, source_stride: usize, target_stride: usize) void {
+    std.debug.assert(target_stride <= source_stride);
+    for (1..batch) |row| {
+        const source_start = row * source_stride;
+        const target_start = row * target_stride;
+        std.mem.copyForwards(i32, data[target_start .. target_start + target_stride], data[source_start .. source_start + target_stride]);
+    }
+}
 
 const Sparse3DLayout = union(enum) {
     batch_seq: struct { seq_len: usize, vocab: usize },
@@ -697,6 +747,89 @@ test "sparse embedding chunks and pads fixed-batch sessions" {
     }
 }
 
+test "sparse embedding batches dynamic native sessions and trims padded sequence" {
+    const alloc = std.testing.allocator;
+    var session_state = FakeDynamicBatchSparseSession{};
+    var tokenizer_state = FakeSparseTokenizer{};
+    var pipeline = SparseEmbeddingPipeline{
+        .allocator = alloc,
+        .session = session_state.session(),
+        .tok = tokenizer_state.tokenizer(),
+        .config = .{ .max_length = 8, .top_k = 4 },
+    };
+
+    const vectors = try pipeline.embed(&.{ "a", "bb", "ccc" });
+    defer freeSparseVectorSlice(alloc, vectors);
+
+    try std.testing.expectEqual(@as(usize, 1), session_state.run_count);
+    try std.testing.expectEqual(@as(usize, 3), session_state.last_batch);
+    try std.testing.expectEqual(@as(usize, 3), session_state.last_sequence);
+    try std.testing.expectEqual(@as(usize, 3), tokenizer_state.encode_count);
+    try std.testing.expectEqual(@as(usize, 3), vectors.len);
+}
+
+const FakeDynamicBatchSparseSession = struct {
+    run_count: usize = 0,
+    last_batch: usize = 0,
+    last_sequence: usize = 0,
+
+    fn session(self: *FakeDynamicBatchSparseSession) backends.Session {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .run = run,
+                .inputInfo = inputInfo,
+                .outputInfo = outputInfo,
+                .backend = backend,
+                .close = close,
+            },
+        };
+    }
+
+    fn run(raw: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator) anyerror![]Tensor {
+        const self: *FakeDynamicBatchSparseSession = @ptrCast(@alignCast(raw));
+        if (inputs.len != 2 or inputs[0].shape.len != 2) return error.TestUnexpectedResult;
+        const input_ids = &inputs[0];
+        const batch: usize = @intCast(input_ids.shape[0]);
+        const sequence: usize = @intCast(input_ids.shape[1]);
+        if (batch == 0 or sequence == 0) return error.TestUnexpectedResult;
+        self.run_count += 1;
+        self.last_batch = batch;
+        self.last_sequence = sequence;
+
+        const logits = try allocator.alloc(f32, batch * 4);
+        defer allocator.free(logits);
+        @memset(logits, 0);
+        for (0..batch) |row| {
+            const token_id = input_ids.asInt64()[row * sequence];
+            if (token_id < 0) return error.TestUnexpectedResult;
+            logits[row * 4 + @as(usize, @intCast(@mod(token_id, 4)))] = @floatFromInt(token_id);
+        }
+
+        const outputs = try allocator.alloc(Tensor, 1);
+        errdefer allocator.free(outputs);
+        outputs[0] = try Tensor.initFloat32(allocator, "logits", &.{ @intCast(batch), 4 }, logits);
+        return outputs;
+    }
+
+    fn inputInfo(_: *anyopaque) []const backends.TensorInfo {
+        return &.{
+            .{ .name = "input_ids", .dtype = .i64, .shape = &.{ -1, -1 } },
+            .{ .name = "attention_mask", .dtype = .i64, .shape = &.{ -1, -1 } },
+        };
+    }
+
+    fn outputInfo(_: *anyopaque) []const backends.TensorInfo {
+        return &.{.{ .name = "logits", .dtype = .f32, .shape = &.{ -1, 4 } }};
+    }
+
+    fn backend(_: *anyopaque) backends.BackendType {
+        return .native;
+    }
+
+    fn close(_: *anyopaque) void {}
+};
+
 fn FakeStaticBatchSparseSession(comptime fixed_batch: usize) type {
     if (fixed_batch == 0) @compileError("fixed batch must be positive");
     return struct {
@@ -809,10 +942,13 @@ const FakeSparseTokenizer = struct {
         const ids = try allocator.alloc(i32, max_length);
         errdefer allocator.free(ids);
         const mask = try allocator.alloc(i32, max_length);
-        ids[0] = raw_ids[0];
-        mask[0] = 1;
-        @memset(ids[1..], 0);
-        @memset(mask[1..], 0);
+        @memset(ids, 0);
+        @memset(mask, 0);
+        const active = @min(text.len, max_length);
+        for (0..active) |i| {
+            ids[i] = raw_ids[0];
+            mask[i] = 1;
+        }
         return .{ .ids = ids, .attention_mask = mask, .allocator = allocator };
     }
 

@@ -154,6 +154,13 @@ pub const SliceAttrs = struct {
     limits: [max_rank]i64 = .{0} ** max_rank,
     strides: [max_rank]i64 = .{1} ** max_rank,
     num_axes: u8 = 0,
+    /// ONNX Slice can derive starts/limits from runtime shape subgraphs.
+    /// When either flag is set, node inputs are [data, starts, limits] and
+    /// bound_axes maps those compact input tensors onto the full-rank attrs.
+    bound_axes: [max_rank]u8 = .{0} ** max_rank,
+    num_bound_axes: u8 = 0,
+    runtime_starts: bool = false,
+    runtime_limits: bool = false,
 };
 
 pub const ConcatAttrs = struct {

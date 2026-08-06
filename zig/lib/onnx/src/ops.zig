@@ -914,6 +914,25 @@ fn materializeConstantValues(builder: *Builder, node_id: NodeId, buf: []f32) ?[]
     }
 }
 
+fn nodeDependsOnRuntimeValue(builder: *Builder, node_id: NodeId, depth: usize) bool {
+    if (node_id == null_node) return false;
+    // Shape expressions are deliberately small. Treat unexpectedly deep DAGs
+    // as runtime-dependent rather than accidentally folding them to a stale
+    // import-time value.
+    if (depth >= 64) return true;
+    const n = builder.graph.node(node_id);
+    return switch (n.op) {
+        .constant => false,
+        .parameter, .fused_from_float32 => true,
+        else => blk: {
+            for (n.getInputs()) |input| {
+                if (nodeDependsOnRuntimeValue(builder, input, depth + 1)) break :blk true;
+            }
+            break :blk false;
+        },
+    };
+}
+
 fn foldSymbolicShapeArithmetic(op: OpCode, a: f32, b: f32) ?f32 {
     const a_int = std.math.lossyCast(i64, a);
     const b_int = std.math.lossyCast(i64, b);
@@ -1537,11 +1556,16 @@ fn convertSlice(allocator: std.mem.Allocator, builder: *Builder, node: *const No
 
     const in_shape = builder.graph.node(inputs[0]).output_shape;
 
-    // Materialize starts, ends from constant inputs (may be behind Cast/Reshape/Gather)
+    // Materialize starts, ends for static shape inference (they may be behind
+    // Cast/Reshape/Gather). Runtime-derived values stay connected to the Slice
+    // node and override these fallback attrs during execution.
     var starts_buf: [8]f32 = undefined;
     var ends_buf: [8]f32 = undefined;
     const starts_data = materializeConstantValues(builder, inputs[1], &starts_buf) orelse return error.ConstantMaterializationFailed;
     const ends_data = materializeConstantValues(builder, inputs[2], &ends_buf) orelse return error.ConstantMaterializationFailed;
+    if (starts_data.len != ends_data.len or starts_data.len > 8) return error.InvalidAttribute;
+    const runtime_starts = nodeDependsOnRuntimeValue(builder, inputs[1], 0);
+    const runtime_limits = nodeDependsOnRuntimeValue(builder, inputs[2], 0);
 
     var strides_data: ?[]const f32 = null;
     var axes_data: ?[]const f32 = null;
@@ -1552,6 +1576,10 @@ fn convertSlice(allocator: std.mem.Allocator, builder: *Builder, node: *const No
 
     var slice_attrs = ml.graph.node.SliceAttrs{};
     slice_attrs.num_axes = in_shape.rank();
+    slice_attrs.num_bound_axes = @intCast(starts_data.len);
+    slice_attrs.runtime_starts = runtime_starts;
+    slice_attrs.runtime_limits = runtime_limits;
+    var dynamic_bound_axes: [8]bool = .{false} ** 8;
 
     // Initialize with full range
     for (0..in_shape.rank()) |i| {
@@ -1567,6 +1595,8 @@ fn convertSlice(allocator: std.mem.Allocator, builder: *Builder, node: *const No
         if (ax_val < 0) ax_val += in_shape.rank();
         if (ax_val < 0 or ax_val >= in_shape.rank()) return error.InvalidAttribute;
         const ax: u8 = @intCast(ax_val);
+        slice_attrs.bound_axes[i] = ax;
+        dynamic_bound_axes[ax] = runtime_starts or runtime_limits;
         // Clamp to i64 range — ONNX uses INT64_MAX as "to the end" sentinel,
         // which overflows when round-tripped through f32.
         var start: i64 = clampF32ToI64(starts_data[i]);
@@ -1581,7 +1611,7 @@ fn convertSlice(allocator: std.mem.Allocator, builder: *Builder, node: *const No
             // Some exporters use end=-1 as a full-range sentinel for dynamic
             // prefix slices like [:seq_len]. Preserve that behavior here
             // rather than folding it to dim-1 and dropping the final element.
-            if (end == -1 and start == 0 and stride == 1) {
+            if (!runtime_limits and end == -1 and start == 0 and stride == 1) {
                 end = dim_size;
             }
             // Normalize negative indices
@@ -1602,6 +1632,10 @@ fn convertSlice(allocator: std.mem.Allocator, builder: *Builder, node: *const No
     // Compute output shape
     var out_dims: [8]i64 = .{0} ** 8;
     for (0..in_shape.rank()) |i| {
+        if (dynamic_bound_axes[i]) {
+            out_dims[i] = -1;
+            continue;
+        }
         const s = slice_attrs.starts[i];
         const e = slice_attrs.limits[i];
         const st = slice_attrs.strides[i];
@@ -1616,11 +1650,15 @@ fn convertSlice(allocator: std.mem.Allocator, builder: *Builder, node: *const No
     }
     const out_shape = Shape{ .dtype = in_shape.dtype, .dims = out_dims, .rank_ = in_shape.rank_ };
 
+    const runtime_bounds = runtime_starts or runtime_limits;
     return builder.graph.addNode(.{
         .op = .{ .slice = slice_attrs },
         .output_shape = out_shape,
-        .inputs = .{ inputs[0], null_node, null_node, null_node },
-        .num_inputs = 1,
+        .inputs = if (runtime_bounds)
+            .{ inputs[0], inputs[1], inputs[2], null_node }
+        else
+            .{ inputs[0], null_node, null_node, null_node },
+        .num_inputs = if (runtime_bounds) 3 else 1,
     });
 }
 
@@ -6573,6 +6611,45 @@ test "convertNode Slice preserves full-range -1 prefix end" {
     try std.testing.expectEqual(@as(i64, 1), out_shape.dim(0));
     try std.testing.expectEqual(@as(i64, 77), out_shape.dim(1));
     try std.testing.expect(std.meta.activeTag(g.node(result).op) == .slice);
+}
+
+test "convertNode Slice preserves runtime sequence bound from input shape" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    const input_ids = try b.parameter("input_ids", Shape.init(.i64, &.{ -1, -1 }));
+    const shape_node = NodeProto{ .op_type = "Shape" };
+    const input_shape = try convertNode(allocator, &b, &shape_node, &.{input_ids}, null);
+    const sequence_axis = try b.tensorConst(&.{1.0}, Shape.init(.i64, &.{}));
+    const gather_node = NodeProto{ .op_type = "Gather" };
+    const sequence_length = try convertNode(allocator, &b, &gather_node, &.{ input_shape, sequence_axis }, null);
+    const ends = try b.reshape(sequence_length, Shape.init(.i64, &.{1}));
+
+    var positions: [512]f32 = undefined;
+    for (&positions, 0..) |*position, i| position.* = @floatFromInt(i);
+    const position_ids = try b.tensorConst(&positions, Shape.init(.i64, &.{ 1, 512 }));
+    const starts = try b.tensorConst(&.{0.0}, Shape.init(.i64, &.{1}));
+    const axes = try b.tensorConst(&.{1.0}, Shape.init(.i64, &.{1}));
+    const steps = try b.tensorConst(&.{1.0}, Shape.init(.i64, &.{1}));
+    const slice_node = NodeProto{ .op_type = "Slice" };
+    const result = try convertNode(allocator, &b, &slice_node, &.{ position_ids, starts, ends, axes, steps }, null);
+
+    const imported = g.node(result);
+    try std.testing.expectEqual(@as(u8, 3), imported.num_inputs);
+    try std.testing.expectEqual(ends, imported.inputs[2]);
+    try std.testing.expectEqual(@as(i64, 1), imported.output_shape.dim(0));
+    try std.testing.expectEqual(@as(i64, -1), imported.output_shape.dim(1));
+    switch (imported.op) {
+        .slice => |attrs| {
+            try std.testing.expect(!attrs.runtime_starts);
+            try std.testing.expect(attrs.runtime_limits);
+            try std.testing.expectEqual(@as(u8, 1), attrs.num_bound_axes);
+            try std.testing.expectEqual(@as(u8, 1), attrs.bound_axes[0]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 // ── Coverage Tests: Comparison & Logical ────────────────────────────

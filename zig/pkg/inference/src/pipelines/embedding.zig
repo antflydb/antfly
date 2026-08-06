@@ -1847,7 +1847,8 @@ pub const TextSessionBatchPlan = struct {
 /// Return an execution plan only when the requested batch cannot be sent to
 /// the session directly. Fixed-shape models are processed at their declared
 /// batch size, padding only the final partial chunk. External ONNX sessions
-/// with dynamic shapes retain the conservative single-row execution path.
+/// and non-native imported graphs retain the conservative single-row path;
+/// imported native graphs preserve runtime batch dimensions and execute whole.
 pub fn textSessionBatchPlan(session: backends.Session, requested_batch: usize) ?TextSessionBatchPlan {
     if (requested_batch == 0) return null;
     for (session.inputInfo()) |info| {
@@ -1862,9 +1863,10 @@ pub fn textSessionBatchPlan(session: backends.Session, requested_batch: usize) ?
         break;
     }
     if (requested_batch <= 1) return null;
-    if (session.backend() == .onnx or
-        backends.imported_onnx_session.sharedBackendContext(session) != null)
-    {
+    if (session.backend() == .onnx) {
+        return .{ .batch_size = 1, .pad_final_batch = false };
+    }
+    if (backends.imported_onnx_session.sharedBackendContext(session) != null and session.backend() != .native) {
         return .{ .batch_size = 1, .pad_final_batch = false };
     }
     return null;
