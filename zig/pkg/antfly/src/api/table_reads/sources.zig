@@ -4405,6 +4405,7 @@ fn collectHostedSearchRequestTextStatsParallel(
     group_ids: []const u64,
     table_name: []const u8,
     body: []const u8,
+    req: db_mod.types.SearchRequest,
     consistency: raft_mod.ReadConsistency,
 ) ![]const distributed_stats_mod.TextFieldStats {
     const start_ns = platform_time.monotonicNs();
@@ -4422,6 +4423,7 @@ fn collectHostedSearchRequestTextStatsParallel(
             group_id: u64,
             table_name_inner: []const u8,
             body_inner: []const u8,
+            req_inner: db_mod.types.SearchRequest,
         ) void {
             const arena = slot.arena.allocator();
             var response = switch (route) {
@@ -4436,7 +4438,7 @@ fn collectHostedSearchRequestTextStatsParallel(
                     table_name_inner,
                     body_inner,
                 ),
-                .remote => |remote| textStatsRemote(source.executor, arena, remote.base_uri, group_id, table_name_inner, body_inner),
+                .remote => |remote| textStatsRemote(source.executor, arena, remote.base_uri, group_id, table_name_inner, body_inner, req_inner),
             } catch |err| {
                 slot.err = err;
                 return;
@@ -4457,7 +4459,7 @@ fn collectHostedSearchRequestTextStatsParallel(
         const end = @min(start + width, group_ids.len);
         var group: std.Io.Group = .init;
         for (group_ids[start..end], start..end) |group_id, i| {
-            group.async(io, Fiber.run, .{ self, &slots[i], routes[i], group_id, table_name, body });
+            group.async(io, Fiber.run, .{ self, &slots[i], routes[i], group_id, table_name, body, req });
         }
         group.await(io) catch {};
     }
@@ -7112,7 +7114,7 @@ fn collectHostedAlgebraicDistributedPartials(
                 break :blk try collectAlgebraicPartialsFromDbForRequest(alloc, &db, parsed);
             },
             .remote => |remote| blk: {
-                var response = (algebraicPartialsRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body) catch return null) orelse return null;
+                var response = (algebraicPartialsRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body, req) catch return null) orelse return null;
                 defer response.deinit(alloc);
                 break :blk try parseAlgebraicPartialsResponse(alloc, response.json);
             },
@@ -7383,7 +7385,7 @@ fn collectHostedSearchRequestTextStats(
     const plan = planFanout(.text_stats, self.io_impl, group_ids.len);
     recordFanoutPlan(.text_stats, plan);
     if (plan.parallel) {
-        return try collectHostedSearchRequestTextStatsParallel(self, alloc, self.io_impl.?.io(), plan.width, group_ids, table_name, body, consistency);
+        return try collectHostedSearchRequestTextStatsParallel(self, alloc, self.io_impl.?.io(), plan.width, group_ids, table_name, body, req, consistency);
     }
     if (plan.reason == .no_io) recordParallelFanoutFallback(.text_stats);
 
@@ -7399,7 +7401,7 @@ fn collectHostedSearchRequestTextStats(
         defer route.deinit(alloc);
         var response = switch (route) {
             .local => (try collectProvisionedHostedLocalTextStats(null, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body)) orelse return error.TableNotFound,
-            .remote => |remote| (try textStatsRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body)) orelse return error.TableNotFound,
+            .remote => |remote| (try textStatsRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body, req)) orelse return error.TableNotFound,
         };
         defer response.deinit(alloc);
         shard_stats[i] = try parseTextStatsResponse(alloc, response.json);
@@ -7517,7 +7519,7 @@ fn collectHostedAggregationTextStats(
         defer route.deinit(alloc);
         var response = switch (route) {
             .local => (try collectProvisionedHostedLocalTextStats(null, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body)) orelse return error.TableNotFound,
-            .remote => |remote| (try textStatsRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body)) orelse return error.TableNotFound,
+            .remote => |remote| (try textStatsRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body, req)) orelse return error.TableNotFound,
         };
         defer response.deinit(alloc);
         shard_stats[i] = try parseTextStatsResponse(alloc, response.json);
@@ -7560,7 +7562,7 @@ fn collectHostedAggregationBackgroundTextStats(
         defer route.deinit(alloc);
         var response = switch (route) {
             .local => (try collectProvisionedHostedLocalTextStats(null, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body)) orelse return error.TableNotFound,
-            .remote => |remote| (try textStatsRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body)) orelse return error.TableNotFound,
+            .remote => |remote| (try textStatsRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body, req)) orelse return error.TableNotFound,
         };
         defer response.deinit(alloc);
         shard_stats[i] = try parseBackgroundTextStatsResponse(alloc, response.json);
@@ -13584,6 +13586,89 @@ test "remote preflight rejects resolved doc filters before query encoding" {
         .resolved_doc_filter = &filter,
     }, 0));
     try std.testing.expectEqual(@as(usize, 0), state.calls);
+}
+
+test "remote shard query phases propagate deadline and request cancellation" {
+    const alloc = std.testing.allocator;
+
+    const ExecutorState = struct {
+        signal: *const std.atomic.Value(bool),
+        calls: usize = 0,
+
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expect(req.timeout_ms != null);
+            try std.testing.expect(req.timeout_ms.? > 0);
+            try std.testing.expect(req.timeout_ms.? <= 60_000);
+            const cancellation = req.cancellation orelse return error.TestExpectedCancellation;
+            try std.testing.expect(cancellation.signal() == self.signal);
+            try std.testing.expect(!cancellation.isCancelled());
+            return error.Timeout;
+        }
+    };
+
+    var cancelled = std.atomic.Value(bool).init(false);
+    var state = ExecutorState{ .signal = &cancelled };
+    const controlled_request = db_mod.types.SearchRequest{
+        .execution_deadline_ns = platform_time.monotonicNs() + 60 * std.time.ns_per_s,
+        .cancellation = &cancelled,
+    };
+    try std.testing.expectError(error.Timeout, queryRemote(
+        state.iface(),
+        alloc,
+        "http://remote.test",
+        11,
+        "docs",
+        controlled_request,
+    ));
+
+    var vector_request = controlled_request;
+    vector_request.index_name = "dense_idx";
+    vector_request.query = .{ .dense_knn = .{ .vector = &.{ 0.25, 0.5 }, .k = 7 } };
+    try std.testing.expectError(error.Timeout, queryRemote(
+        state.iface(),
+        alloc,
+        "http://remote.test",
+        11,
+        "docs",
+        vector_request,
+    ));
+    try std.testing.expectError(error.Timeout, preflightRemote(
+        state.iface(),
+        alloc,
+        "http://remote.test",
+        11,
+        "docs",
+        controlled_request,
+        0,
+    ));
+    try std.testing.expectError(error.Timeout, textStatsRemote(
+        state.iface(),
+        alloc,
+        "http://remote.test",
+        11,
+        "docs",
+        "{}",
+        controlled_request,
+    ));
+    try std.testing.expectError(error.Timeout, algebraicPartialsRemote(
+        state.iface(),
+        alloc,
+        "http://remote.test",
+        11,
+        "docs",
+        "{}",
+        controlled_request,
+    ));
+    try std.testing.expectEqual(@as(usize, 5), state.calls);
 }
 
 test "api.table_reads.docid explicit text stats requests preserve identity generation" {

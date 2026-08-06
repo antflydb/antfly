@@ -18,6 +18,7 @@ const builtin = @import("builtin");
 const platform = @import("antfly_platform");
 const byte_copy = @import("../../common/byte_copy.zig");
 const fs_paths = @import("../../common/fs_paths.zig");
+const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
 
 const Allocator = std.mem.Allocator;
 const CounterU64 = platform.atomic.Value(u64);
@@ -339,7 +340,7 @@ fn openNativePathLockFileWithCache(
     options: NativePathLockFileOptions,
     fd_cache: *FdCache,
 ) !NativePathLockFile {
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = threaded_io_limits.initService(allocator);
     errdefer io_impl.deinit();
 
     const open_descriptor_count = createPathDescriptorCount(path);
@@ -1470,7 +1471,9 @@ const NativeStorageState = struct {
         state.allocator = allocator;
         state.refs = .init(1);
         state.closing = .init(false);
-        state.threaded = std.Io.Threaded.init(allocator, .{});
+        // Native storage state may outlive its owning DB while range futures
+        // drain. Prevent that retained runtime from growing without a bound.
+        state.threaded = threaded_io_limits.initService(allocator);
         errdefer state.threaded.deinit();
         // NativeStorage.init is used by repository, recovery, and status
         // helpers as well as BackendRuntime-owned stores. All production
@@ -1783,7 +1786,7 @@ else blk: {
 
             pub fn initWithPool(allocator: Allocator, kind: RuntimeKind, pool: ?*NativeStoragePool) !NativeStorage {
                 var runtime = switch (kind) {
-                    .threaded => .{ .threaded = std.Io.Threaded.init(allocator, .{}) },
+                    .threaded => .{ .threaded = threaded_io_limits.initService(allocator) },
                     .evented => blk2: {
                         var evented: std.Io.Evented = undefined;
                         try std.Io.Evented.init(&evented, allocator, .{});
@@ -3435,6 +3438,17 @@ test "native atomic write sink supports patching and crc before finish" {
     try std.testing.expectEqualStrings("hello world", written);
 }
 
+test "native storage retained runtime has a finite worker ceiling" {
+    if (!supports_native_storage) return error.SkipZigTest;
+
+    var native = try NativeStorage.init(std.testing.allocator, .threaded);
+    defer native.deinit();
+    try std.testing.expectEqual(
+        std.Io.Limit.limited(threaded_io_limits.service),
+        native.state.threaded.concurrent_limit,
+    );
+}
+
 test "native fd cache retries an open that straddles a mutation fence" {
     if (!supports_posix_fd_cache or builtin.single_threaded) return error.SkipZigTest;
 
@@ -3442,6 +3456,7 @@ test "native fd cache retries an open that straddles a mutation fence" {
     defer pool.deinit();
     var native = try NativeStorage.initWithPool(std.testing.allocator, .threaded, &pool);
     defer native.deinit();
+
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();

@@ -41,6 +41,7 @@ const managed_embedder = @import("../../inference/managed_embedder.zig");
 const bedrock = @import("../../inference/bedrock.zig");
 const foreign_mod = @import("../../foreign/mod.zig");
 const scraping = @import("antfly_scraping");
+const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
 
 pub const BootstrapConfig = struct {
     pub const S3Options = object_store_support.S3Options;
@@ -170,7 +171,10 @@ const S3ClientPool = struct {
     fn init(alloc: Allocator) !S3ClientPool {
         const io_impl = try alloc.create(std.Io.Threaded);
         errdefer alloc.destroy(io_impl);
-        io_impl.* = std.Io.Threaded.init(alloc, .{});
+        // This pool lives for the complete serverless process and is shared by
+        // every object-store lane. Threaded retains concurrent workers, so
+        // give it finite headroom over the listener's default admitted fan-out.
+        io_impl.* = threaded_io_limits.initServerlessObjectStore(alloc);
         return .{ .alloc = alloc, .io_impl = io_impl };
     }
 
@@ -231,6 +235,16 @@ const S3ClientPool = struct {
         return client;
     }
 };
+
+test "serverless S3 client pool has a finite retained-worker ceiling" {
+    var pool = try S3ClientPool.init(std.testing.allocator);
+    defer pool.deinit();
+
+    try std.testing.expectEqual(
+        std.Io.Limit.limited(threaded_io_limits.serverless_object_store),
+        pool.io_impl.concurrent_limit,
+    );
+}
 
 fn s3OptionsEql(a: object_store_support.S3Options, b: object_store_support.S3Options) bool {
     return optionalStringEql(a.endpoint, b.endpoint) and

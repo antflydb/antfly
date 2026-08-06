@@ -29,6 +29,7 @@ const metadata_table_manager = @import("../../metadata/table_manager.zig");
 const metadata_table_provisioner = @import("../../metadata/table_provisioner.zig");
 const metadata_transition_state = @import("../../metadata/transition_state.zig");
 const raft_mod = @import("../../raft/mod.zig");
+const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
 const backup_restore = @import("../../raft/storage/backup_restore.zig");
 const raft_reconciler = @import("../../raft/reconciler.zig");
 const shard_state_store = @import("../../data/storage/shard_state_store.zig");
@@ -1265,7 +1266,7 @@ pub const ProvisionedTableWriteSource = struct {
         return .{
             .replica_root_dir = replica_root_dir,
             .catalog = catalog,
-            .table_activity_threaded = Io.Threaded.init(std.heap.page_allocator, .{}),
+            .table_activity_threaded = threaded_io_limits.initService(std.heap.page_allocator),
         };
     }
 
@@ -13204,6 +13205,16 @@ const DocumentChildRangeDispatchContext = struct {
         )) orelse return error.NotFound;
     }
 };
+
+test "provisioned table write source has a finite worker ceiling" {
+    var source = ProvisionedTableWriteSource.init("unused", table_catalog.emptyCatalogSource());
+    defer source.deinit();
+
+    try std.testing.expectEqual(
+        std.Io.Limit.limited(threaded_io_limits.service),
+        source.table_activity_threaded.concurrent_limit,
+    );
+}
 
 fn enforceHAWriteGateOptional(gate: ?db_mod.HAWriteGate) !void {
     const configured = gate orelse return;

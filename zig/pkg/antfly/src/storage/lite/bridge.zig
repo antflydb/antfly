@@ -23,6 +23,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const byte_copy = @import("../../common/byte_copy.zig");
 const fs_paths = @import("../../common/fs_paths.zig");
+const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
 const platform_sync = @import("antfly_platform").sync;
 const storage_io = @import("../lsm_backend/storage_io.zig");
 
@@ -105,7 +106,7 @@ pub const ContainerStorage = struct {
     }
 
     pub fn openWithOptions(allocator: Allocator, path: []const u8, options: Options) !ContainerStorage {
-        var io_impl = std.Io.Threaded.init(allocator, .{});
+        var io_impl = threaded_io_limits.initService(allocator);
         errdefer io_impl.deinit();
 
         const owned_path = try allocator.dupe(u8, path);

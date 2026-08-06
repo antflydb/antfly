@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const scraping = @import("antfly_scraping");
+const platform_time = @import("antfly_platform").time;
 
 const common_secrets = @import("../../common/secrets.zig");
 const db_mod = @import("../../storage/db/mod.zig");
@@ -34,6 +35,14 @@ const table_router = @import("../table_router.zig");
 
 pub const LookupResponse = document_sql_runtime.LookupResponse;
 pub const ScanResponse = document_sql_runtime.ScanResponse;
+
+pub fn checkQueryDeadline(req: db_mod.types.SearchRequest) !void {
+    if (req.cancellation) |value| {
+        if (value.load(.acquire)) return error.Cancelled;
+    }
+    const deadline_ns = req.execution_deadline_ns orelse return;
+    if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+}
 
 pub fn appendScanLine(
     alloc: std.mem.Allocator,

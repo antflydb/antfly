@@ -1770,6 +1770,7 @@ pub const APITestFilters = struct {
         "api.table_reads.remote_wire.test.",
         "api.table_reads.sources.test.",
         "api.http_internal_group_read_routes.test.",
+        "api http client forwards internal query controls and maps remote timeout",
         table_reads_docid_prefix,
     };
 
@@ -2561,6 +2562,17 @@ pub const RaftTestFilters = struct {
         "cluster simulation drives multiple concurrent real transition ids through multiplexed runtime",
         "cluster simulation isolates overlapping same-id split overwrites while other transitions complete",
         "cluster simulation removes queued merge transition mid-flight across node restart",
+    };
+};
+
+pub const HTTPTestFilters = struct {
+    pub const low_fd_ratchet_compile = [_][]const u8{
+        "common.",
+        "std http listener process threads and descriptors recover after cancellation storms",
+    };
+
+    pub const low_fd_ratchet_runtime = [_][]const u8{
+        "std http listener process threads and descriptors recover after cancellation storms",
     };
 };
 
@@ -5140,6 +5152,7 @@ pub fn addMainCaptureTestSteps(ctx: anytype) MainCaptureTestRuns {
             "cluster backup maintenance queue expires inactive repositories",
             "restore repository contention backoff is bounded and increasing",
             "restore retry deadline wakeup is interruptible without polling",
+            "owned backup runtime has a finite worker ceiling",
             "backup staging uses configured storage authority and exclusive generations",
             "owned restore verifies declared artifact identity instead of accepting staged bytes",
             "cluster restore repository errors preserve operational failure semantics",

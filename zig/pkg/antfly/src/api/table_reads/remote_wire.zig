@@ -37,6 +37,7 @@ const table_read_relational_rows = @import("relational_rows.zig");
 const LookupResponse = table_read_core.LookupResponse;
 const ParsedTextStatsHttpResponse = table_read_core.ParsedTextStatsHttpResponse;
 const ScanResponse = table_read_core.ScanResponse;
+const checkQueryDeadline = table_read_core.checkQueryDeadline;
 const relationalUniqueOwnerKeyAlloc = table_read_relational_rows.relationalUniqueOwnerKeyAlloc;
 const algebraic_ir = db_mod.algebraic.ir;
 const algebraic_law = db_mod.algebraic.law;
@@ -54,6 +55,23 @@ fn timeoutMsFromExecutionDeadlineNs(deadline_ns: ?u64) ?u64 {
 fn executionDeadlineNsFromTimeoutMs(timeout_ms: ?u64) ?u64 {
     const timeout = timeout_ms orelse return null;
     return platform_time.monotonicNs() +| timeout *| std.time.ns_per_ms;
+}
+
+fn queryRemainingTimeoutMs(req: db_mod.types.SearchRequest) !?u32 {
+    try checkQueryDeadline(req);
+    const deadline_ns = req.execution_deadline_ns orelse return null;
+    const now_ns = platform_time.monotonicNs();
+    if (now_ns >= deadline_ns) return error.Timeout;
+    const remaining_ns = deadline_ns - now_ns;
+    const rounded_ms = @max(
+        @as(u64, 1),
+        std.math.divCeil(u64, remaining_ns, std.time.ns_per_ms) catch 1,
+    );
+    return @intCast(@min(rounded_ms, @as(u64, std.math.maxInt(u32))));
+}
+
+fn queryRequestCancellation(req: db_mod.types.SearchRequest) http_common.RequestCancellation {
+    return .{ .borrowed = req.cancellation };
 }
 
 const TextStatsRequestMode = enum {
@@ -759,8 +777,11 @@ pub fn queryRemoteWithVectorWorkerBody(
 ) !db_mod.types.SearchResult {
     var client = http_client.ApiHttpClient.init(alloc, executor);
     if (searchRequestHasUnserializableResolvedDocFilter(req)) return error.UnsupportedQueryRequest;
+    const timeout_ms = try queryRemainingTimeoutMs(req);
+    var cancellation = queryRequestCancellation(req);
+    const cancellation_ptr = if (req.cancellation != null) &cancellation else null;
     if (vector_worker_body) |body| {
-        var result = try client.fetchGroupVectorWorker(base_uri, group_id, table_name, body);
+        var result = try client.fetchGroupVectorWorkerWithControl(base_uri, group_id, table_name, body, timeout_ms, cancellation_ptr);
         defer result.deinit(alloc);
         var parsed = try parseRemoteSearchResultForHostedQuery(alloc, result.body);
         parsed.identity_read_generation = req.identity_read_generation;
@@ -768,7 +789,7 @@ pub fn queryRemoteWithVectorWorkerBody(
     }
     const body = try encodeQueryRequest(alloc, req);
     defer alloc.free(body);
-    var result = try client.fetchGroupQuery(base_uri, group_id, table_name, body);
+    var result = try client.fetchGroupQueryWithControl(base_uri, group_id, table_name, body, timeout_ms, cancellation_ptr);
     defer result.deinit(alloc);
     var parsed = try parseRemoteSearchResultForHostedQuery(alloc, result.body);
     parsed.identity_read_generation = req.identity_read_generation;
@@ -786,9 +807,12 @@ pub fn preflightRemote(
 ) !db_mod.RuntimePreflightSummary {
     var client = http_client.ApiHttpClient.init(alloc, executor);
     if (searchRequestHasUnserializableResolvedDocFilter(req)) return error.UnsupportedQueryRequest;
+    const timeout_ms = try queryRemainingTimeoutMs(req);
+    var cancellation = queryRequestCancellation(req);
+    const cancellation_ptr = if (req.cancellation != null) &cancellation else null;
     const body = try encodeQueryRequest(alloc, req);
     defer alloc.free(body);
-    var summary = try client.fetchGroupQueryPreflight(base_uri, group_id, table_name, body, max_work);
+    var summary = try client.fetchGroupQueryPreflightWithControl(base_uri, group_id, table_name, body, max_work, timeout_ms, cancellation_ptr);
     summary.remote_shard_count = summary.shard_count;
     return summary;
 }
@@ -1205,9 +1229,13 @@ pub fn textStatsRemote(
     group_id: u64,
     table_name: []const u8,
     body: []const u8,
+    req: db_mod.types.SearchRequest,
 ) !?query_api.QueryResponse {
     var client = http_client.ApiHttpClient.init(alloc, executor);
-    var result = try client.fetchGroupTextStats(base_uri, group_id, table_name, body);
+    const timeout_ms = try queryRemainingTimeoutMs(req);
+    var cancellation = queryRequestCancellation(req);
+    const cancellation_ptr = if (req.cancellation != null) &cancellation else null;
+    var result = try client.fetchGroupTextStatsWithControl(base_uri, group_id, table_name, body, timeout_ms, cancellation_ptr);
     defer result.deinit(alloc);
     return .{ .json = try alloc.dupe(u8, result.body) };
 }
@@ -1219,9 +1247,13 @@ pub fn algebraicPartialsRemote(
     group_id: u64,
     table_name: []const u8,
     body: []const u8,
+    req: db_mod.types.SearchRequest,
 ) !?query_api.QueryResponse {
     var client = http_client.ApiHttpClient.init(alloc, executor);
-    var result = try client.fetchGroupAlgebraicPartials(base_uri, group_id, table_name, body);
+    const timeout_ms = try queryRemainingTimeoutMs(req);
+    var cancellation = queryRequestCancellation(req);
+    const cancellation_ptr = if (req.cancellation != null) &cancellation else null;
+    var result = try client.fetchGroupAlgebraicPartialsWithControl(base_uri, group_id, table_name, body, timeout_ms, cancellation_ptr);
     defer result.deinit(alloc);
     return .{ .json = try alloc.dupe(u8, result.body) };
 }

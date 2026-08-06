@@ -1,7 +1,7 @@
 {
   "decision_scope": {
-    "ours_sha": "fad01d3023b258a4ba8f0424b8d9aa5e61393d4c",
-    "incoming_sha": "f5c8fbf2c7f7460dd53c63c912e50dad16122181"
+    "ours_sha": "7594ae95db8a540d2b2a8df4bb33f0b1ff926dd3",
+    "incoming_sha": "8ad98e6aaeb25be2addd6df6a25fe449d12b7799"
   },
   "zig_relative_import_roots": [
     "zig"
@@ -1814,7 +1814,7 @@
       "reviewed_resolutions": {
         "container:DB": {
           "status": "container_fields_diverged",
-          "base_sha256": "efeabad5c23b11fbbc93d11a7c895da72da20250073627d16b4801f9b8d2d27e",
+          "base_sha256": "b8d637ce6dd681c26dac8764ff721bb1b6986b299e633e5da273ef2f751be740",
           "incoming_sha256": "b8d637ce6dd681c26dac8764ff721bb1b6986b299e633e5da273ef2f751be740",
           "current_sha256": "6cccc3d37c8fa1de009aaf2bdd8f1fdceea2d8121e7fc1dc1dfb075193f76201",
           "path": "zig/pkg/antfly/src/storage/db/db.zig",
@@ -2457,6 +2457,16 @@
           "owner": "ScanResponse",
           "path": "zig/pkg/antfly/src/sql/document_runtime.zig"
         }
+      },
+      "reviewed_resolutions": {
+        "function:queryRemote": {
+          "status": "three_way_conflict",
+          "base_sha256": "4a02b44428dd95e6152e5c0caa3dc0cf197453a70c7718943ea369c6cfae4479",
+          "incoming_sha256": "7d59ab9c6df41c99463a67f199445de30bd7195453c43590044d9ac66709b0cd",
+          "current_sha256": "1c48e5b5d10f9d008bc62ee8c5fc5a313a72c96b1fd2eb5710314f9e1ace6d9d",
+          "path": "zig/pkg/antfly/src/api/table_reads/sources.zig",
+          "reason": "The split query wrapper retains the branch-owned vector-worker request encoder and delegates both vector and ordinary query transport to queryRemoteWithVectorWorkerBody, which preserves main's remaining-deadline and borrowed-cancellation controls for both routes."
+        }
       }
     },
     "table_writes": {
@@ -2623,7 +2633,7 @@
       "reviewed_resolutions": {
         "container:StatusSource.VTable": {
           "status": "container_fields_diverged",
-          "base_sha256": "fa80be57a11dd98bb195c9e1c39526630b14eab1758d94ac141cf4a222ff9b96",
+          "base_sha256": "398d7e7b87e1a4b6e84fe108a82b2c1e9a0c62b798737fa5c1ce82331d4d82fc",
           "incoming_sha256": "398d7e7b87e1a4b6e84fe108a82b2c1e9a0c62b798737fa5c1ce82331d4d82fc",
           "current_sha256": "c7cbc5c27152634962df01545f490e7ec3fea6edb92d31cb0f6fd68d9d1209f3",
           "path": "zig/pkg/antfly/src/api/http_server.zig",
@@ -2929,11 +2939,11 @@
           "reason": "The delegated inference step list keeps the branch entity-training readiness name and all incoming GLiNER2, graph, benchmark, finetune, and runtime delegation registrations under the split build module."
         },
         "function:build": {
-          "base_sha256": "46204c3c912c8a4e608b7857c84328d9ea4b7b7912a0cb3930baca8bb1d04f56",
-          "incoming_sha256": "98e7779eb1b6de5b80dc14c22df01be379463af862432c5cd0f06596c26bab19",
-          "current_sha256": "68d247052c8c69625c78cec626e7c3579e3d61e3ae7800beeaec5c6203d07653",
+          "base_sha256": "98e7779eb1b6de5b80dc14c22df01be379463af862432c5cd0f06596c26bab19",
+          "incoming_sha256": "90bdfc614918151005ec41fc4ddb528a2f4b7414cab76cebd0ff07ecdd472729",
+          "current_sha256": "0505beeea45b2323952864b74cd2498fa68a4d0d8bf044ce9eac18ca52c5f449",
           "path": "zig/build.zig",
-          "reason": "The top-level build function composes the branch build-module refactor with incoming extraction OpenAPI modules, inference tooling, and test registrations; `zig build -l` confirms the assembled graph and the build-surface audit verifies the retained registrations."
+          "reason": "The top-level build function retains the branch build-module refactor and adds main's low-FD HTTP worker ratchet target through manifest-owned HTTPTestFilters; the focused build target and 256-descriptor direct regression both pass, and the build-surface audit verifies retained registrations."
         }
       }
     },
@@ -3111,6 +3121,7 @@
     "py/packages/sdk/templates/str_enum.py.jinja": "the template already maps incoming `$push` to PUSH and additionally maps branch `$pull` to PULL, so the branch result is a strict behavioral superset.",
     "py/packages/sdk/tests/test_client.py": "the enum stability test already asserts incoming PUSH and additionally asserts branch PULL, covering the merged generated contract.",
     "zig/pkg/antfly/src/api/table_writes.zig": "the branch split facade remains authoritative; the current declaration audit accounts for all 30 changed incoming declarations across split owners, including four hash-reviewed compositions and the incoming deletion.",
+    "zig/pkg/antfly/src/api/table_reads.zig": "the branch split facade remains authoritative; the current declaration audit accounts for every changed incoming declaration across split owners, including exact deadline/cancellation ports and the hash-reviewed queryRemote composition.",
     "zig/pkg/antfly/src/api/tables.zig": "tables.zig remains deleted without a shim; the current declaration audit maps all changed incoming behavior into metadata/catalog/table_ddl.zig and sql/schema_mutation.zig, including the reviewed schema-update composition.",
     "zig/pkg/antfly/src/storage/db/db.zig": "the branch split facade remains authoritative; the current declaration audit accounts for all 32 added, modified, and deleted incoming obligations across DB owners, with hash-reviewed compositions for every semantic divergence."
   },
@@ -3469,6 +3480,9 @@
     ]
   },
   "test_name_aliases": {
+    "std http listener responds before header timeout without async capacity": [
+      "std http listener serves timed requests without threaded async or concurrent capacity"
+    ],
     "api http client forwards internal query controls": [
       "api http client forwards internal query controls and maps remote timeout"
     ],

@@ -66,28 +66,29 @@ def _find_repo_root() -> Path:
 REPO_ROOT = _find_repo_root()
 INFERENCE_DIR = REPO_ROOT / "zig" / "pkg" / "inference"
 COMPARE_SCRIPT = INFERENCE_DIR / "scripts" / "compare_gliner2_lora_python_zig.py"
-TRAIN_FIXTURE = INFERENCE_DIR / "testdata" / "gliner2_ner_smoke.jsonl"
-ALL_TASK_FIXTURE = INFERENCE_DIR / "testdata" / "gliner2_all_task_smoke.jsonl"
+FIXTURE_DIR = INFERENCE_DIR / "testdata" / "gliner2"
+TRAIN_FIXTURE = FIXTURE_DIR / "ner_smoke.jsonl"
+ALL_TASK_FIXTURE = FIXTURE_DIR / "full_task_smoke.jsonl"
 
 # Phase 5 parity-envelope fixtures: strict first-batch gates per task family.
 # Multi-step adapter drift is covered separately by
 # test_gliner2_lora_all_task_multi_step_roundtrip with lr-scaled bounds.
 FULL_TASK_PARITY_FIXTURES = [
-    pytest.param("gliner2_ner_smoke.jsonl", 1, False, id="entity-only"),
-    pytest.param("gliner2_cls_smoke.jsonl", 1, True, id="cls"),
-    pytest.param("gliner2_json_smoke.jsonl", 1, False, id="json"),
-    pytest.param("gliner2_rel_smoke.jsonl", 1, False, id="rel"),
-    pytest.param("gliner2_alltask_smoke.jsonl", 1, True, id="alltask"),
-    pytest.param("gliner2_multicount_smoke.jsonl", 1, False, id="multicount"),
+    pytest.param("ner_smoke.jsonl", 1, False, id="entity-only"),
+    pytest.param("classification_smoke.jsonl", 1, True, id="cls"),
+    pytest.param("json_smoke.jsonl", 1, False, id="json"),
+    pytest.param("relation_smoke.jsonl", 1, False, id="rel"),
+    pytest.param("mixed_task_smoke.jsonl", 1, True, id="alltask"),
+    pytest.param("multicount_smoke.jsonl", 1, False, id="multicount"),
     # Exercises [DESCRIPTION]/[EXAMPLE]/[OUTPUT] schema conditioning: entity
     # and json field descriptions plus classification label descriptions and
     # few-shot examples. Parity relies on the harness pinning upstream's
     # example_mode randomness to eval-mode semantics.
-    pytest.param("gliner2_described_smoke.jsonl", 1, True, id="described"),
+    pytest.param("described_smoke.jsonl", 1, True, id="described"),
     # Explicit empty true_label lists exercise valid all-negative classification
     # targets. Missing entity/structure/relation mentions are invalid input, not
     # a parity behavior to certify.
-    pytest.param("gliner2_negative_smoke.jsonl", 1, True, id="negative-classification"),
+    pytest.param("negative_smoke.jsonl", 1, True, id="negative-classification"),
 ]
 
 MODEL_DIR = Path(os.environ.get("TERMITE_GLINER2_PARITY_MODEL_DIR", "/private/tmp/termite-models/gliner2"))
@@ -298,7 +299,7 @@ def test_gliner2_lora_metal_full_task_strict_parity(
     metal_reason = _metal_skip_reason()
     if metal_reason is not None:
         pytest.skip(metal_reason)
-    fixture = INFERENCE_DIR / "testdata" / fixture_name
+    fixture = FIXTURE_DIR / fixture_name
     assert fixture.exists(), f"fixture missing at {fixture}"
     out_dir = tmp_path / f"gliner2-lora-metal-full-task-{fixture.stem.replace('_', '-')}"
     cmd = [
@@ -489,7 +490,7 @@ def test_gliner2_lora_full_task_strict_parity(
     serialization/roundtrip is covered by the dedicated one-step and all-task
     multi-step tests, so this matrix stays focused on task semantics.
     """
-    fixture = INFERENCE_DIR / "testdata" / fixture_name
+    fixture = FIXTURE_DIR / fixture_name
     assert fixture.exists(), f"fixture missing at {fixture}"
     out_dir = tmp_path / f"gliner2-lora-full-task-{fixture.stem.replace('_', '-')}"
     cmd = [

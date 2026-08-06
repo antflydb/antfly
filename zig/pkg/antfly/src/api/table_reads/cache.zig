@@ -20,6 +20,7 @@ const metadata_table_provisioner = @import("../../metadata/table_provisioner.zig
 const metadata_transition_state = @import("../../metadata/transition_state.zig");
 const raft_reconciler = @import("../../raft/reconciler.zig");
 const common_secrets = @import("../../common/secrets.zig");
+const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
 const introducer_mod = @import("../../introducer.zig");
 const managed_embedder = @import("../../inference/managed_embedder.zig");
 const db_mod = @import("../../storage/db/mod.zig");
@@ -156,7 +157,7 @@ pub const ProvisionedTableReadCache = struct {
     pub fn init(alloc: std.mem.Allocator) ProvisionedTableReadCache {
         return .{
             .alloc = alloc,
-            .threaded = Io.Threaded.init(alloc, .{}),
+            .threaded = threaded_io_limits.initService(alloc),
         };
     }
 
@@ -813,6 +814,16 @@ pub const ProvisionedTableReadCache = struct {
         unreachable;
     }
 };
+
+test "provisioned table read cache has a finite worker ceiling" {
+    var cache = ProvisionedTableReadCache.init(std.testing.allocator);
+    defer cache.deinit();
+
+    try std.testing.expectEqual(
+        std.Io.Limit.limited(threaded_io_limits.service),
+        cache.threaded.concurrent_limit,
+    );
+}
 
 fn identityNamespacesEqual(left: ?db_mod.DocIdentityNamespace, right: ?db_mod.DocIdentityNamespace) bool {
     if (left == null or right == null) return left == null and right == null;

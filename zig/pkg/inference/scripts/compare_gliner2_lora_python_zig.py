@@ -69,7 +69,7 @@ def inference_dir() -> Path:
 
 
 def default_train_data() -> Path:
-    return inference_dir() / "testdata" / "gliner2_ner_smoke.jsonl"
+    return inference_dir() / "testdata" / "gliner2" / "ner_smoke.jsonl"
 
 
 def resolve_python_sampling_policy(deterministic: bool, requested: str) -> str:

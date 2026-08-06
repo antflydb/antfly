@@ -26,6 +26,7 @@ const types = @import("../types.zig");
 const async_runtime_mod = @import("async_runtime.zig");
 const change_journal_mod = @import("change_journal.zig");
 const derived_types = @import("derived_types.zig");
+const threaded_io_limits = @import("../../../common/threaded_io_limits.zig");
 
 pub const RuntimeError = async_runtime_mod.RuntimeError;
 pub const ApplyFn = async_runtime_mod.ApplyFn;
@@ -239,7 +240,10 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
     ) !DerivedRuntime {
         const threaded = try alloc.create(Io.Threaded);
         errdefer alloc.destroy(threaded);
-        threaded.* = Io.Threaded.init(alloc, .{});
+        // The owned fallback retains one concurrent worker per derived index.
+        // Database-backed production normally borrows the bounded background
+        // runtime, but standalone users require the same hard ceiling.
+        threaded.* = threaded_io_limits.initService(alloc);
         return initWithIo(
             alloc,
             threaded,
@@ -1357,6 +1361,11 @@ test "io threaded applied callback observes published watermark outside runtime 
     );
     capture.runtime = &runtime;
     defer runtime.deinit();
+
+    try std.testing.expectEqual(
+        Io.Limit.limited(threaded_io_limits.service),
+        runtime.threaded.concurrent_limit,
+    );
 
     try runtime.addWorker("text_idx", .{ .name = "text_idx", .kind = .full_text }, 0);
     runtime.notifySequence(1);

@@ -18,6 +18,7 @@ const platform_sync = @import("antfly_platform").sync;
 const httpx = @import("httpx");
 const antfly = @import("../root.zig");
 const group_ids = @import("../common/group_ids.zig");
+const threaded_io_limits = @import("../common/threaded_io_limits.zig");
 const inference = @import("inference_server");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const usermgr_openapi = @import("antfly_usermgr_openapi");
@@ -341,7 +342,7 @@ const PublicListenerLease = struct {
     path: []u8,
 
     fn acquire(alloc: std.mem.Allocator, bind_port: u16) !PublicListenerLease {
-        var io_impl = std.Io.Threaded.init(alloc, .{});
+        var io_impl = threaded_io_limits.initService(alloc);
         errdefer io_impl.deinit();
         // Lease by port rather than host spelling: wildcard/specific binds and
         // IPv6 aliases can overlap even when their input strings differ.

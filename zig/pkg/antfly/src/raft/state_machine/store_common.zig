@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const fs_paths = @import("../../common/fs_paths.zig");
+const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
 const mod = @import("mod.zig");
 
 pub fn ApplyStore(comptime namespace: []const u8) type {
@@ -42,7 +43,7 @@ pub fn ApplyStore(comptime namespace: []const u8) type {
         pub fn init(alloc: std.mem.Allocator, cfg: Config) !Self {
             return .{
                 .alloc = alloc,
-                .io_impl = std.Io.Threaded.init(alloc, .{}),
+                .io_impl = threaded_io_limits.initService(alloc),
                 .root_dir = try alloc.dupe(u8, cfg.root_dir),
             };
         }

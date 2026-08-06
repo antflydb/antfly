@@ -25,7 +25,10 @@ const raft_mod = @import("../../raft/mod.zig");
 const core = @import("core.zig");
 const cache = @import("cache.zig");
 const remote_wire = @import("remote_wire.zig");
-const platform_time = @import("antfly_platform").time;
+
+pub fn checkQueryDeadline(req: db_mod.types.SearchRequest) !void {
+    return core.checkQueryDeadline(req);
+}
 
 pub const RuntimeSourceAdapter = struct {
     source: core.TableReadSource,
@@ -303,14 +306,6 @@ pub fn aggregationFullResultBudgetFromRaw(raw: ?[*:0]u8) u32 {
 
 pub fn aggregationFullResultBudget() u32 {
     return aggregationFullResultBudgetFromRaw(std.c.getenv("ANTFLY_AGGREGATION_FULL_RESULT_BUDGET\x00"));
-}
-
-pub fn checkQueryDeadline(req: db_mod.types.SearchRequest) !void {
-    if (req.cancellation) |value| {
-        if (value.load(.acquire)) return error.Cancelled;
-    }
-    const deadline_ns = req.execution_deadline_ns orelse return;
-    if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
 }
 
 pub fn identityGenerationForAggregationFullResultRerun(

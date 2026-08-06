@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const fs_paths = @import("../../common/fs_paths.zig");
+const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
 const http_server = @import("../transport/http_server.zig");
 
 pub const FileSnapshotStoreConfig = struct {
@@ -31,7 +32,7 @@ pub const FileSnapshotStore = struct {
         return .{
             .alloc = alloc,
             .cfg = cfg,
-            .io_impl = std.Io.Threaded.init(alloc, .{}),
+            .io_impl = threaded_io_limits.initService(alloc),
             .root_dir = try alloc.dupe(u8, cfg.root_dir),
         };
     }

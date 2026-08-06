@@ -689,6 +689,18 @@ pub const ApiHttpClient = struct {
         table_name: []const u8,
         body: []const u8,
     ) !QueryResponse {
+        return self.fetchGroupQueryWithControl(base_uri, group_id, table_name, body, null, null);
+    }
+
+    pub fn fetchGroupQueryWithControl(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        timeout_ms: ?u32,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) !QueryResponse {
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
             table_name,
@@ -705,10 +717,13 @@ pub const ApiHttpClient = struct {
             .uri = uri,
             .content_type = "application/json",
             .body = body,
+            .timeout_ms = timeout_ms,
+            .cancellation = cancellation,
         });
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200 => {},
+            408 => return error.Timeout,
             409 => return remoteGroupConflictError(resp.body),
             503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
@@ -723,6 +738,19 @@ pub const ApiHttpClient = struct {
         table_name: []const u8,
         body: []const u8,
         max_work: u32,
+    ) !db_mod.RuntimePreflightSummary {
+        return self.fetchGroupQueryPreflightWithControl(base_uri, group_id, table_name, body, max_work, null, null);
+    }
+
+    pub fn fetchGroupQueryPreflightWithControl(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        max_work: u32,
+        timeout_ms: ?u32,
+        cancellation: ?*const http_common.RequestCancellation,
     ) !db_mod.RuntimePreflightSummary {
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
@@ -752,10 +780,13 @@ pub const ApiHttpClient = struct {
             .uri = uri,
             .content_type = "application/json",
             .body = preflight_body,
+            .timeout_ms = timeout_ms,
+            .cancellation = cancellation,
         });
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200 => {},
+            408 => return error.Timeout,
             400 => return remotePreflightError(resp.body),
             404 => return remotePreflightError(resp.body),
             409 => return remotePreflightError(resp.body),
@@ -1017,6 +1048,18 @@ pub const ApiHttpClient = struct {
         table_name: []const u8,
         body: []const u8,
     ) !QueryResponse {
+        return self.fetchGroupTextStatsWithControl(base_uri, group_id, table_name, body, null, null);
+    }
+
+    pub fn fetchGroupTextStatsWithControl(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        timeout_ms: ?u32,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) !QueryResponse {
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
             table_name,
@@ -1033,10 +1076,13 @@ pub const ApiHttpClient = struct {
             .uri = uri,
             .content_type = "application/json",
             .body = body,
+            .timeout_ms = timeout_ms,
+            .cancellation = cancellation,
         });
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200 => {},
+            408 => return error.Timeout,
             409 => return remoteGroupConflictError(resp.body),
             503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
@@ -1050,6 +1096,18 @@ pub const ApiHttpClient = struct {
         group_id: u64,
         table_name: []const u8,
         body: []const u8,
+    ) !QueryResponse {
+        return self.fetchGroupAlgebraicPartialsWithControl(base_uri, group_id, table_name, body, null, null);
+    }
+
+    pub fn fetchGroupAlgebraicPartialsWithControl(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        timeout_ms: ?u32,
+        cancellation: ?*const http_common.RequestCancellation,
     ) !QueryResponse {
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
@@ -1067,10 +1125,13 @@ pub const ApiHttpClient = struct {
             .uri = uri,
             .content_type = "application/json",
             .body = body,
+            .timeout_ms = timeout_ms,
+            .cancellation = cancellation,
         });
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200 => {},
+            408 => return error.Timeout,
             409 => return remoteGroupConflictError(resp.body),
             503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
@@ -1353,6 +1414,18 @@ pub const ApiHttpClient = struct {
         table_name: []const u8,
         body: []const u8,
     ) !QueryResponse {
+        return self.fetchGroupVectorWorkerWithControl(base_uri, group_id, table_name, body, null, null);
+    }
+
+    pub fn fetchGroupVectorWorkerWithControl(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        timeout_ms: ?u32,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) !QueryResponse {
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
             table_name,
@@ -1369,10 +1442,13 @@ pub const ApiHttpClient = struct {
             .uri = uri,
             .content_type = "application/json",
             .body = body,
+            .timeout_ms = timeout_ms,
+            .cancellation = cancellation,
         });
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200 => {},
+            408 => return error.Timeout,
             404 => return error.UnknownGroup,
             409 => return remoteGroupConflictError(resp.body),
             503 => return error.LeaderUnavailable,
@@ -3490,7 +3566,7 @@ test "api http client forwards internal query controls and maps remote timeout" 
             self.calls += 1;
             try std.testing.expectEqual(@as(u32, 37), req.timeout_ms.?);
             try std.testing.expectEqual(http_common.Method.POST, req.method);
-            if (std.mem.indexOf(u8, req.uri, "/graph-") != null) {
+            if (std.mem.indexOf(u8, req.uri, "/join-") == null) {
                 try std.testing.expect(req.cancellation != null);
             }
             return .{
@@ -3503,15 +3579,20 @@ test "api http client forwards internal query controls and maps remote timeout" 
     var executor = TimeoutExecutor{};
     var client = ApiHttpClient.init(std.testing.allocator, executor.executor());
     const base_uri = "http://127.0.0.1:1";
+    var cancellation = http_common.RequestCancellation{};
+    try std.testing.expectError(error.Timeout, client.fetchGroupQueryWithControl(base_uri, 7, "docs", "{}", 37, &cancellation));
+    try std.testing.expectError(error.Timeout, client.fetchGroupQueryPreflightWithControl(base_uri, 7, "docs", "{}", 0, 37, &cancellation));
+    try std.testing.expectError(error.Timeout, client.fetchGroupTextStatsWithControl(base_uri, 7, "docs", "{}", 37, &cancellation));
+    try std.testing.expectError(error.Timeout, client.fetchGroupVectorWorkerWithControl(base_uri, 7, "docs", "{}", 37, &cancellation));
+    try std.testing.expectError(error.Timeout, client.fetchGroupAlgebraicPartialsWithControl(base_uri, 7, "docs", "{}", 37, &cancellation));
     try std.testing.expectError(error.Timeout, client.fetchGroupJoinPartitionWithTimeout(base_uri, 7, "docs", "{}", 37));
     try std.testing.expectError(error.Timeout, client.fetchGroupJoinRowsWithTimeout(base_uri, 7, "docs", "{}", 37));
     try std.testing.expectError(error.Timeout, client.fetchGroupJoinUnmatchedWithTimeout(base_uri, 7, "docs", "{}", 37));
     try std.testing.expectError(error.Timeout, client.fetchGroupJoinFinalizeWithTimeout(base_uri, 7, "docs", "{}", 37));
-    var cancellation = http_common.RequestCancellation{};
     try std.testing.expectError(error.Timeout, client.fetchGroupGraphExpandWithControl(base_uri, 7, "docs", "{}", 37, &cancellation));
     try std.testing.expectError(error.Timeout, client.fetchGroupGraphHydrateWithControl(base_uri, 7, "docs", "{}", 37, &cancellation));
     try std.testing.expectError(error.Timeout, client.fetchGroupGraphEdgesWithControl(base_uri, 7, "docs", "{}", 37, &cancellation));
-    try std.testing.expectEqual(@as(usize, 7), executor.calls);
+    try std.testing.expectEqual(@as(usize, 12), executor.calls);
 }
 
 pub fn expectTableRepairCancelCallbackEncodesTableNameForTest() !void {

@@ -2541,11 +2541,12 @@ fn buildClapPlannedExportFiltered(
             TensorTransform.none
         else
             clipClapOnnxDenseExportTransformForTensor(record.descriptor.name, record.descriptor.shape);
-        const dimensions = switch (transform) {
-            .none => try reversedDimsFromShape(allocator, record.descriptor.shape),
-            .transpose_2d_dense => try dimsFromShape(allocator, record.descriptor.shape),
-            .onnx_gru_zrh_to_rzn => return error.UnsupportedDenseArchitectureForGgufExport,
-        };
+        const dimensions = try clapGgufDimensions(
+            allocator,
+            output_name_result.name,
+            record.descriptor.shape,
+            transform,
+        );
         errdefer allocator.free(dimensions);
 
         const tensor_quantization = if (source_is_gguf)
@@ -3848,6 +3849,35 @@ fn reversedDimsFromShape(allocator: std.mem.Allocator, shape: []const i64) ![]u6
         dims[i] = @intCast(dim);
     }
     return dims;
+}
+
+fn clapGgufDimensions(
+    allocator: std.mem.Allocator,
+    output_name: []const u8,
+    shape: []const i64,
+    transform: TensorTransform,
+) ![]u64 {
+    if (transform == .none and
+        std.mem.startsWith(u8, output_name, "audio_model.audio_encoder.layers.") and
+        std.mem.endsWith(u8, output_name, ".attention.self.relative_position_bias_table"))
+    {
+        if (shape.len == 0) return error.InvalidTensorShape;
+        var element_count: u64 = 1;
+        for (shape) |dim| {
+            if (dim <= 0) return error.InvalidTensorShape;
+            element_count = std.math.mul(u64, element_count, @intCast(dim)) catch
+                return error.InvalidTensorShape;
+        }
+        const dimensions = try allocator.alloc(u64, 1);
+        dimensions[0] = element_count;
+        return dimensions;
+    }
+
+    return switch (transform) {
+        .none => reversedDimsFromShape(allocator, shape),
+        .transpose_2d_dense => dimsFromShape(allocator, shape),
+        .onnx_gru_zrh_to_rzn => error.UnsupportedDenseArchitectureForGgufExport,
+    };
 }
 
 fn resolveExportArchitecture(
@@ -6550,7 +6580,7 @@ test "dense clap export writes clap metadata and tensors" {
     try compat.cwd().writeFile(compat.io(), .{
         .sub_path = config_path,
         .data =
-        \\{"model_type":"clap","projection_dim":4,"projection_hidden_act":"relu","logit_scale_init_value":14.285714,"text_config":{"vocab_size":32,"hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"intermediate_size":8,"max_position_embeddings":16,"type_vocab_size":1,"pad_token_id":1},"audio_config":{"hidden_size":8,"patch_embeds_hidden_size":4,"patch_embed_input_channels":1,"patch_size":4,"patch_stride":[4,4],"num_mel_bins":8,"spec_size":16,"window_size":4,"depths":[1,1,1,1],"num_attention_heads":[1,1,1,2],"mlp_ratio":2.0,"layer_norm_eps":1e-5,"enable_fusion":false}}
+        \\{"model_type":"clap","projection_dim":4,"projection_hidden_act":"relu","logit_scale_init_value":14.285714,"text_config":{"vocab_size":32,"hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"intermediate_size":8,"max_position_embeddings":16,"type_vocab_size":1,"pad_token_id":1},"audio_config":{"hidden_size":8,"patch_embeds_hidden_size":4,"patch_embed_input_channels":1,"patch_size":4,"patch_stride":[4,4],"num_mel_bins":8,"spec_size":16,"window_size":2,"depths":[1,1,1,1],"num_attention_heads":[2,1,1,2],"mlp_ratio":2.0,"layer_norm_eps":1e-5,"enable_fusion":false}}
         ,
     });
 
@@ -6566,6 +6596,11 @@ test "dense clap export writes clap metadata and tensors" {
         .{ .name = "clap.text_projection.linear2.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
         .{ .name = "clap.audio_model.audio_encoder.patch_embed.proj.weight", .shape = &.{ 4, 1, 4, 4 }, .data = &([_]f32{0.0} ** (4 * 1 * 4 * 4)) },
         .{ .name = "clap.audio_model.audio_encoder.patch_embed.proj.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
+        .{ .name = "clap.audio_model.audio_encoder.layers.0.blocks.0.attention.self.relative_position_bias_table", .shape = &.{ 9, 2 }, .data = &[_]f32{
+            0,  1,  2,  3,  4,  5,
+            6,  7,  8,  9,  10, 11,
+            12, 13, 14, 15, 16, 17,
+        } },
         .{ .name = "clap.audio_model.audio_encoder.batch_norm.weight", .shape = &.{8}, .data = &([_]f32{1.0} ** 8) },
         .{ .name = "clap.audio_model.audio_encoder.batch_norm.bias", .shape = &.{8}, .data = &([_]f32{0.0} ** 8) },
         .{ .name = "clap.audio_model.audio_encoder.batch_norm.running_mean", .shape = &.{8}, .data = &([_]f32{0.0} ** 8) },
@@ -6599,6 +6634,41 @@ test "dense clap export writes clap metadata and tensors" {
     try std.testing.expect(catalog.find("audio_model.audio_encoder.patch_embed.proj.weight") != null);
     try std.testing.expect(catalog.find("audio_projection.linear1.weight") != null);
     try std.testing.expect(catalog.find("logit_scale") != null);
+
+    const relative_bias_name = "audio_model.audio_encoder.layers.0.blocks.0.attention.self.relative_position_bias_table";
+    const relative_bias = catalog.find(relative_bias_name).?;
+    try std.testing.expectEqualSlices(u64, &.{18}, relative_bias.dimensions);
+    const relative_bias_len = gguf_mod.tensor_types.byteLen(relative_bias.tensor_type, relative_bias.dimensions).?;
+    const relative_bias_bytes = try c_file.readRegion(allocator, out_path, relative_bias.data_offset, @intCast(relative_bias_len));
+    defer allocator.free(relative_bias_bytes);
+    try std.testing.expectEqualSlices(
+        u8,
+        std.mem.sliceAsBytes(&[_]f32{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17 }),
+        relative_bias_bytes,
+    );
+
+    // GGUF-to-GGUF export applies the same canonical layout, so artifacts
+    // produced by older exporters are repaired without touching tensor data.
+    const roundtrip_dir = try std.fs.path.join(allocator, &.{ dir_path, "roundtrip" });
+    defer allocator.free(roundtrip_dir);
+    try compat.cwd().createDirPath(compat.io(), roundtrip_dir);
+    const roundtrip_source = try std.fs.path.join(allocator, &.{ roundtrip_dir, "model.gguf" });
+    defer allocator.free(roundtrip_source);
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = roundtrip_source, .data = raw });
+    const roundtrip_path = try std.fs.path.join(allocator, &.{ roundtrip_dir, "roundtrip.gguf" });
+    defer allocator.free(roundtrip_path);
+    try exportModelDirToGguf(allocator, roundtrip_dir, roundtrip_path, .none);
+
+    const roundtrip_raw = try c_file.readFile(allocator, roundtrip_path);
+    defer allocator.free(roundtrip_raw);
+    var roundtrip_parsed = try gguf_mod.format.parse(allocator, roundtrip_raw);
+    defer roundtrip_parsed.deinit(allocator);
+    const roundtrip_bias = gguf_mod.tensor_catalog.Catalog.init(&roundtrip_parsed).find(relative_bias_name).?;
+    try std.testing.expectEqualSlices(u64, &.{18}, roundtrip_bias.dimensions);
+    const roundtrip_bias_len = gguf_mod.tensor_types.byteLen(roundtrip_bias.tensor_type, roundtrip_bias.dimensions).?;
+    const roundtrip_bias_bytes = try c_file.readRegion(allocator, roundtrip_path, roundtrip_bias.data_offset, @intCast(roundtrip_bias_len));
+    defer allocator.free(roundtrip_bias_bytes);
+    try std.testing.expectEqualSlices(u8, relative_bias_bytes, roundtrip_bias_bytes);
 }
 
 test "exported clap gguf loads and runs through native text path" {

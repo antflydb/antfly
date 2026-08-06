@@ -31,6 +31,7 @@ const gguf_format = @import("../gguf/format.zig");
 const gguf_metadata = @import("../gguf/metadata.zig");
 const gguf_tensor_types = @import("../gguf/tensor_types.zig");
 const gguf_writer = @import("../gguf/writer.zig");
+const clipclap_format_mod = @import("../architectures/clipclap_format.zig");
 const projector_format_mod = @import("../architectures/projector_format.zig");
 const hf_tokenizer = @import("inference_hf_tokenizer");
 const sentencepiece = @import("inference_tokenizer").sentencepiece;
@@ -315,6 +316,25 @@ fn validateNativeCompanionsForBackend(
     // sessions, so all of those are part of the compatibility contract.
     if (candidate == .onnx) return null;
 
+    // ClipClap is a paired encoder contract, not a decoder/projector contract.
+    // Validate both headers together so two individually valid GGUFs with
+    // incompatible shared embedding widths can never be advertised or loaded.
+    const clipclap_audio_validated = candidate == .gguf and man.isClipclapGgufBundle();
+    if (clipclap_audio_validated) {
+        const clip_path = man.gguf_path orelse return .{
+            .level = .incompatible,
+            .code = .artifact_unreadable,
+            .message = "the ClipClap bundle is missing its CLIP GGUF",
+        };
+        const clap_path = man.audio_model_path orelse return .{
+            .level = .incompatible,
+            .code = .artifact_unreadable,
+            .message = "the ClipClap bundle is missing its CLAP GGUF",
+        };
+        if (try validateClipclapBundleForBackend(allocator, clip_path, clap_path, backend)) |summary|
+            return summary;
+    }
+
     var companions: [8]NativeCompanion = undefined;
     var companion_count: usize = 0;
     if (man.gguf_projector_path) |path| {
@@ -344,6 +364,11 @@ fn validateNativeCompanionsForBackend(
     };
     for (lazy_component_paths) |maybe_path| {
         const path = maybe_path orelse continue;
+        if (clipclap_audio_validated and man.audio_model_path != null and
+            std.mem.eql(u8, path, man.audio_model_path.?))
+        {
+            continue;
+        }
         const kind: NativeCompanionKind = if (std.mem.endsWith(u8, path, ".gguf"))
             .gguf
         else if (std.mem.endsWith(u8, path, ".safetensors"))
@@ -384,6 +409,96 @@ fn validateNativeCompanionsForBackend(
                     .message = "a required companion safetensors file is invalid or unreadable",
                 };
             },
+        }
+    }
+    return null;
+}
+
+fn validateClipclapBundleForBackend(
+    allocator: std.mem.Allocator,
+    clip_path: []const u8,
+    clap_path: []const u8,
+    backend: backends.BackendType,
+) !?CompatibilitySummary {
+    var clip_mapped = c_file.MmapRegion.init(allocator, clip_path) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return .{
+            .level = .incompatible,
+            .code = .artifact_unreadable,
+            .message = "the ClipClap CLIP GGUF is missing or unreadable",
+        };
+    };
+    defer clip_mapped.deinit();
+    var clap_mapped = c_file.MmapRegion.init(allocator, clap_path) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return .{
+            .level = .incompatible,
+            .code = .artifact_unreadable,
+            .message = "the ClipClap CLAP GGUF is missing or unreadable",
+        };
+    };
+    defer clap_mapped.deinit();
+
+    var clip_file = gguf_format.parseStructure(allocator, clip_mapped.data) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return .{
+            .level = .incompatible,
+            .code = .artifact_unreadable,
+            .message = "the ClipClap CLIP GGUF has invalid structure",
+        };
+    };
+    defer clip_file.deinit(allocator);
+    var clap_file = gguf_format.parseStructure(allocator, clap_mapped.data) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return .{
+            .level = .incompatible,
+            .code = .artifact_unreadable,
+            .message = "the ClipClap CLAP GGUF has invalid structure",
+        };
+    };
+    defer clap_file.deinit(allocator);
+
+    gguf_format.validateTensorDataRanges(&clip_file, clip_mapped.data.len) catch return .{
+        .level = .incompatible,
+        .code = .artifact_unreadable,
+        .message = "the ClipClap CLIP GGUF has invalid or truncated tensor data",
+    };
+    gguf_format.validateTensorDataRanges(&clap_file, clap_mapped.data.len) catch return .{
+        .level = .incompatible,
+        .code = .artifact_unreadable,
+        .message = "the ClipClap CLAP GGUF has invalid or truncated tensor data",
+    };
+    clip_mapped.adviseSequentialPrefix(@min(
+        std.math.cast(usize, clip_file.data_region_offset) orelse clip_mapped.data.len,
+        clip_mapped.data.len,
+    ));
+    clap_mapped.adviseSequentialPrefix(@min(
+        std.math.cast(usize, clap_file.data_region_offset) orelse clap_mapped.data.len,
+        clap_mapped.data.len,
+    ));
+
+    _ = clipclap_format_mod.inspectFilePair(&clip_file, &clap_file) catch |err| return switch (err) {
+        error.UnsupportedClipclapArchitecture, error.ClipclapProjectionMismatch => .{
+            .level = .incompatible,
+            .code = .unsupported_backend,
+            .message = "the ClipClap GGUF pair declares incompatible encoder architectures or projection widths",
+        },
+        else => .{
+            .level = .incompatible,
+            .code = .missing_required_tensor,
+            .message = "the ClipClap GGUF pair is missing required metadata or tensors, or declares an invalid tensor layout",
+        },
+    };
+
+    for ([_]*const gguf_format.File{ &clip_file, &clap_file }) |file| {
+        for (file.tensors) |tensor| {
+            if (!session_factory.ggufTensorTypeSupportsBackend(tensor.tensor_type, backend)) {
+                return .{
+                    .level = .incompatible,
+                    .code = .unsupported_tensor_type,
+                    .message = "the selected backend cannot materialize the ClipClap GGUF tensor contract",
+                };
+            }
         }
     }
     return null;
@@ -3371,7 +3486,7 @@ pub const ModelManager = struct {
                 &self.session_manager,
             );
             const backend_runtime = session_manager.resolveBackendRuntime(backend) catch |err| {
-                if (first_err == null) first_err = err;
+                rememberPreferredLoadError(&first_err, err);
                 continue;
             };
             session_manager.onnx_execution_provider = backend_runtime.onnx_execution_provider;
@@ -3381,7 +3496,7 @@ pub const ModelManager = struct {
             var admission_limits = runtime.tier.memory.Limits{};
             if (self.admission_enabled) {
                 const artifact_bytes = artifact_estimate.bytesForBackend(backend) catch |err| {
-                    if (first_err == null) first_err = err;
+                    rememberPreferredLoadError(&first_err, err);
                     continue;
                 };
                 const plan = if (artifact_estimate == .onnx)
@@ -3389,7 +3504,7 @@ pub const ModelManager = struct {
                 else
                     nativeModelLoadAdmission(artifact_bytes, backend_runtime.backend);
                 const admission_plan = plan catch |err| {
-                    if (first_err == null) first_err = err;
+                    rememberPreferredLoadError(&first_err, err);
                     continue;
                 };
                 resident_amounts = admission_plan.resident;
@@ -3405,7 +3520,7 @@ pub const ModelManager = struct {
                     admission_limits,
                     admission_plan.peak,
                 ) catch |err| {
-                    if (first_err == null) first_err = err;
+                    rememberPreferredLoadError(&first_err, err);
                     continue;
                 };
             }
@@ -3438,7 +3553,7 @@ pub const ModelManager = struct {
                 };
             } else |err| {
                 if (resource_lease) |*lease| lease.release();
-                if (first_err == null) first_err = err;
+                rememberPreferredLoadError(&first_err, err);
             }
         }
         return first_err orelse error.NoBackendAvailable;
@@ -4735,7 +4850,7 @@ fn loadSessionForPreferredBackends(
         var single_backend = [_]backends.BackendType{backend};
         var backend_session_manager = sessionManagerForPreferredBackends(manager.allocator, single_backend[0..], source_session_manager);
         const backend_runtime = backend_session_manager.resolveBackendRuntime(backend) catch |err| {
-            if (first_err == null) first_err = err;
+            rememberPreferredLoadError(&first_err, err);
             continue;
         };
         backend_session_manager.onnx_execution_provider = backend_runtime.onnx_execution_provider;
@@ -4744,7 +4859,7 @@ fn loadSessionForPreferredBackends(
         var admission_limits = runtime.tier.memory.Limits{};
         if (manager.admission_enabled) {
             const admission_plan = estimateModelLoadAdmission(man, backend_runtime) catch |err| {
-                if (first_err == null) first_err = err;
+                rememberPreferredLoadError(&first_err, err);
                 continue;
             };
             resident_amounts = admission_plan.resident;
@@ -4753,7 +4868,7 @@ fn loadSessionForPreferredBackends(
                 backend_runtime,
                 resident_amounts,
             ) catch |err| {
-                if (first_err == null) first_err = err;
+                rememberPreferredLoadError(&first_err, err);
                 continue;
             }) |cuda_limit| {
                 backend_session_manager.onnx_cuda_memory_limit_bytes = cuda_limit;
@@ -4763,7 +4878,7 @@ fn loadSessionForPreferredBackends(
                 admission_limits,
                 admission_plan.peak,
             ) catch |err| {
-                if (first_err == null) first_err = err;
+                rememberPreferredLoadError(&first_err, err);
                 continue;
             };
         }
@@ -4790,7 +4905,7 @@ fn loadSessionForPreferredBackends(
         } else |err| {
             if (resource_lease) |*lease| lease.release();
             std.log.warn("loadModel({s}) backend {s} failed: {s}", .{ model_dir, @tagName(backend), @errorName(err) });
-            if (first_err == null) first_err = err;
+            rememberPreferredLoadError(&first_err, err);
         }
     }
 
@@ -4806,6 +4921,50 @@ fn loadSessionForPreferredBackends(
     // NoModelFileFound only when nothing was even attempted.
     if (first_err) |err| return err;
     return error.NoModelFileFound;
+}
+
+fn loadErrorPriority(err: anyerror) u2 {
+    return switch (err) {
+        // Admission pressure is actionable at the HTTP boundary: callers can
+        // retry it after the current model request or eviction completes.
+        error.ResourceTemporarilyUnavailable => 3,
+        // A stable capacity-policy rejection is more useful than a backend
+        // probe miss, but must not replace a retryable alternative.
+        error.ResourceLimitExceeded => 2,
+        // These are expected while walking a preferred-backend list and carry
+        // less information than an actual import or model-contract failure.
+        error.NoBackendAvailable, error.UnsupportedBackend => 0,
+        else => 1,
+    };
+}
+
+fn rememberPreferredLoadError(selected: *?anyerror, candidate: anyerror) void {
+    const current = selected.* orelse {
+        selected.* = candidate;
+        return;
+    };
+    if (loadErrorPriority(candidate) > loadErrorPriority(current)) {
+        selected.* = candidate;
+    }
+}
+
+test "model loading preserves retryable admission errors across backend probes" {
+    var selected: ?anyerror = null;
+    rememberPreferredLoadError(&selected, error.NoBackendAvailable);
+    rememberPreferredLoadError(&selected, error.MissingWeight);
+    rememberPreferredLoadError(&selected, error.ResourceTemporarilyUnavailable);
+    rememberPreferredLoadError(&selected, error.ResourceLimitExceeded);
+    try std.testing.expectEqual(
+        @as(?anyerror, error.ResourceTemporarilyUnavailable),
+        selected,
+    );
+}
+
+test "model loading prefers actionable import errors over backend probe misses" {
+    var selected: ?anyerror = error.UnsupportedBackend;
+    rememberPreferredLoadError(&selected, error.ShapeMismatch);
+    rememberPreferredLoadError(&selected, error.NoBackendAvailable);
+    try std.testing.expectEqual(@as(?anyerror, error.ShapeMismatch), selected);
 }
 
 test "serving admission applies the node-wide host-memory override" {
@@ -5372,6 +5531,50 @@ test "native compatibility rejects unsupported companion GGUF tensor types" {
     )).?;
     try std.testing.expectEqual(model_compatibility.Level.incompatible, summary.level);
     try std.testing.expectEqual(model_compatibility.Code.unsupported_tensor_type, summary.code);
+}
+
+test "published Gemma 4 E2B decoder and projector pass native admission when configured" {
+    const allocator = std.testing.allocator;
+    const decoder_env = std.c.getenv("ANTFLY_TEST_GEMMA4_E2B_DECODER_GGUF") orelse
+        return error.SkipZigTest;
+    const projector_env = std.c.getenv("ANTFLY_TEST_GEMMA4_E2B_PROJECTOR_GGUF") orelse
+        return error.SkipZigTest;
+    const decoder_path = std.mem.span(decoder_env);
+    const projector_path = std.mem.span(projector_env);
+    const model_dir = std.fs.path.dirname(decoder_path) orelse ".";
+
+    var man = manifest_mod.ModelManifest{
+        .allocator = allocator,
+        .model_type = .generator,
+        .config_model_arch = try allocator.dupe(u8, "gemma4"),
+        .gguf_path = try allocator.dupe(u8, decoder_path),
+        .gguf_projector_path = try allocator.dupe(u8, projector_path),
+    };
+    defer man.deinit();
+
+    const summary = (try compatibilitySummaryForBackend(
+        allocator,
+        model_dir,
+        &man,
+        .native,
+    )).?;
+    try std.testing.expectEqual(model_compatibility.Level.compatible, summary.level);
+}
+
+test "published ClipClap GGUF pair passes native admission when configured" {
+    const allocator = std.testing.allocator;
+    const clip_env = std.c.getenv("ANTFLY_TEST_CLIPCLAP_CLIP_GGUF") orelse
+        return error.SkipZigTest;
+    const clap_env = std.c.getenv("ANTFLY_TEST_CLIPCLAP_CLAP_GGUF") orelse
+        return error.SkipZigTest;
+
+    const summary = try validateClipclapBundleForBackend(
+        allocator,
+        std.mem.span(clip_env),
+        std.mem.span(clap_env),
+        .native,
+    );
+    try std.testing.expect(summary == null);
 }
 
 test "native compatibility rejects a malformed split GLiNER safetensors head" {

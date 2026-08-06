@@ -1458,6 +1458,25 @@ pub fn build(b: *std.Build) void {
     });
     const run_raft_transport_tests = b.addRunArtifact(raft_transport_tests);
 
+    const http_low_fd_ratchet_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        // Compile the shared HTTP module for declaration reachability, but
+        // execute only the process-level regression below. The wider common
+        // and transport buckets contain high-cardinality socket tests that do
+        // not fit inside this target's 256-descriptor process limit.
+        .filters = &antfly_tests_build.HTTPTestFilters.low_fd_ratchet_compile,
+    });
+    const run_http_low_fd_ratchet_tests = addFilteredTestRunArtifactWithRuntimeFilters(
+        b,
+        http_low_fd_ratchet_tests,
+        &antfly_tests_build.HTTPTestFilters.low_fd_ratchet_runtime,
+    );
+    const http_low_fd_ratchet_test_step = b.step(
+        "http-low-fd-ratchet-test",
+        "Run the process-level low-FD HTTP worker ratchet regression",
+    );
+    http_low_fd_ratchet_test_step.dependOn(&run_http_low_fd_ratchet_tests.step);
+
     const lib_raft_sim_tests = b.addTest(.{
         .root_module = raft_sim_test_mod,
         .filters = &antfly_tests_build.RaftTestFilters.sim,

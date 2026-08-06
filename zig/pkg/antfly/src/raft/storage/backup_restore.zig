@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const fs_paths = @import("../../common/fs_paths.zig");
+const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
 const backups_api = @import("../../api/backups.zig");
 const db_mod = @import("../../storage/db/mod.zig");
 const doc_identity = @import("../../storage/db/doc_identity.zig");
@@ -51,7 +52,7 @@ const RestoreIoScope = struct {
         }
         const owned = try alloc.create(std.Io.Threaded);
         errdefer alloc.destroy(owned);
-        owned.* = std.Io.Threaded.init(alloc, .{});
+        owned.* = threaded_io_limits.initService(alloc);
         return .{ .alloc = alloc, .io_value = owned.io(), .owned = owned };
     }
 
