@@ -41,6 +41,7 @@ jobs:
           ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/cold-cache-native-release-fast/compiler-global
           ZIG_LOCAL_CACHE_DIR: ${{ runner.temp }}/cold-cache-native-release-fast/compiler-local
         run: |
+          set -o pipefail
           /usr/bin/time -v -o "$RUNNER_TEMP/native-release-fast.time" \
             scripts/packaging/build_zig_release_archive.sh \
             --version 0.2.0-rc.26 \
@@ -110,6 +111,7 @@ jobs:
           ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/cold-cache-cross-${{ matrix.label }}/compiler-global
           ZIG_LOCAL_CACHE_DIR: ${{ runner.temp }}/cold-cache-cross-${{ matrix.label }}/compiler-local
         run: |
+          set -o pipefail
           /usr/bin/time -v -o "$RUNNER_TEMP/cross-${{ matrix.label }}.time" \
             scripts/packaging/build_zig_release_archive.sh \
             --version 0.2.0-rc.26 \
@@ -177,6 +179,7 @@ jobs:
           ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/focused-cli-release-fast-cache/compiler-global
           ZIG_LOCAL_CACHE_DIR: ${{ runner.temp }}/focused-cli-release-fast-cache/compiler-local
         run: |
+          set -o pipefail
           mkdir -p \
             "$RUNNER_TEMP/focused-cli-release-fast" \
             "$RUNNER_TEMP/focused-cli-release-fast-cache/local" \
