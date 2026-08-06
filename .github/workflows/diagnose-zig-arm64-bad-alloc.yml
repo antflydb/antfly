@@ -1,4 +1,4 @@
-name: Diagnose Zig ARM64 bad_alloc
+name: Diagnose focused Zig ARM64 runtime artifacts
 
 on:
   pull_request:
@@ -11,78 +11,15 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  native-release-fast:
-    name: Native ARM64 full ReleaseFast
-    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
-    runs-on: arc-antfly-publish-arm64
-    timeout-minutes: 180
-    steps:
-      - name: Checkout PR head
-        uses: actions/checkout@v6
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          submodules: true
-
-      - name: Install Linux build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential clang lld curl xz-utils git perl python3 linux-libc-dev ca-certificates time file
-
-      - name: Install Zig
-        run: |
-          curl -L "https://ziglang.org/download/0.16.0/zig-aarch64-linux-0.16.0.tar.xz" -o "$RUNNER_TEMP/zig.tar.xz"
-          mkdir -p "$RUNNER_TEMP/zig"
-          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
-          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
-
-      - name: Build full ARM64 ReleaseFast archive
-        env:
-          ANTFLY_ZIG_CACHE_ROOT: ${{ runner.temp }}/cold-cache-native-release-fast
-          ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/cold-cache-native-release-fast/compiler-global
-          ZIG_LOCAL_CACHE_DIR: ${{ runner.temp }}/cold-cache-native-release-fast/compiler-local
-        run: |
-          set -o pipefail
-          /usr/bin/time -v -o "$RUNNER_TEMP/native-release-fast.time" \
-            scripts/packaging/build_zig_release_archive.sh \
-            --version 0.2.0-rc.26 \
-            --target aarch64-linux-musl \
-            --optimize ReleaseFast \
-            --jobs 1 \
-            --archive-name antfly_0.2.0-rc.26_Linux_arm64_release-fast.tar.gz \
-            --out-dir "$RUNNER_TEMP/native-release-fast" \
-            --metal false \
-            --system-blas false \
-            2>&1 | tee "$RUNNER_TEMP/native-release-fast.log"
-
-      - name: Report compiler memory
-        if: ${{ always() }}
-        run: cat "$RUNNER_TEMP/native-release-fast.time" || true
-
-      - name: Upload native ReleaseFast result
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v6
-        with:
-          name: zig-arm64-native-release-fast
-          path: |
-            ${{ runner.temp }}/native-release-fast
-            ${{ runner.temp }}/native-release-fast.log
-            ${{ runner.temp }}/native-release-fast.time
-            ${{ runner.temp }}/antfly-zig-release-aarch64-linux-musl/*-attempt-*.log
-          if-no-files-found: error
-
-  cross-compile:
-    name: Cross-compile ARM64 ${{ matrix.optimize }} on x86_64
+  focused-runtime:
+    name: ARM64 ReleaseFast artifact (${{ matrix.role }})
     if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: arc-antfly-publish
     timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - optimize: ReleaseFast
-            label: release-fast
-          - optimize: ReleaseSmall
-            label: release-small
+        role: [metadata, data, standalone]
     steps:
       - name: Checkout PR head
         uses: actions/checkout@v6
@@ -93,130 +30,68 @@ jobs:
       - name: Verify x86_64 host
         run: test "$(uname -m)" = x86_64
 
+      - name: Verify runtime import boundaries
+        run: |
+          python3 zig/tools/analyze_zig_import_graph.py --check-runtime-boundary --json
+          python3 -m unittest zig/tools/test_analyze_zig_import_graph.py
+
       - name: Install Linux build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential clang lld curl xz-utils git perl python3 linux-libc-dev ca-certificates time file binutils
 
-      - name: Install x86_64 Zig
+      - name: Install Zig
         run: |
           curl -L "https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz" -o "$RUNNER_TEMP/zig.tar.xz"
           mkdir -p "$RUNNER_TEMP/zig"
           tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
           echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
 
-      - name: Cross-compile full ARM64 archive
+      - name: Build focused ARM64 ReleaseFast artifact
         env:
-          ANTFLY_ZIG_CACHE_ROOT: ${{ runner.temp }}/cold-cache-cross-${{ matrix.label }}
-          ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/cold-cache-cross-${{ matrix.label }}/compiler-global
-          ZIG_LOCAL_CACHE_DIR: ${{ runner.temp }}/cold-cache-cross-${{ matrix.label }}/compiler-local
-        run: |
-          set -o pipefail
-          /usr/bin/time -v -o "$RUNNER_TEMP/cross-${{ matrix.label }}.time" \
-            scripts/packaging/build_zig_release_archive.sh \
-            --version 0.2.0-rc.26 \
-            --target aarch64-linux-musl \
-            --optimize "${{ matrix.optimize }}" \
-            --jobs 1 \
-            --archive-name "antfly_0.2.0-rc.26_Linux_arm64_${{ matrix.label }}.tar.gz" \
-            --out-dir "$RUNNER_TEMP/cross-${{ matrix.label }}" \
-            --metal false \
-            --system-blas false \
-            2>&1 | tee "$RUNNER_TEMP/cross-${{ matrix.label }}.log"
-
-      - name: Verify cross-compiled architecture
-        run: |
-          mkdir -p "$RUNNER_TEMP/extracted-${{ matrix.label }}"
-          tar -xzf "$RUNNER_TEMP/cross-${{ matrix.label }}/antfly_0.2.0-rc.26_Linux_arm64_${{ matrix.label }}.tar.gz" \
-            -C "$RUNNER_TEMP/extracted-${{ matrix.label }}"
-          file "$RUNNER_TEMP/extracted-${{ matrix.label }}/antfly"
-          readelf -h "$RUNNER_TEMP/extracted-${{ matrix.label }}/antfly" | tee "$RUNNER_TEMP/cross-${{ matrix.label }}.elf-header"
-          readelf -h "$RUNNER_TEMP/extracted-${{ matrix.label }}/antfly" | grep -Eq 'Machine:.*AArch64'
-
-      - name: Report compiler memory
-        if: ${{ always() }}
-        run: cat "$RUNNER_TEMP/cross-${{ matrix.label }}.time" || true
-
-      - name: Upload cross-compile result
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v6
-        with:
-          name: zig-arm64-cross-${{ matrix.label }}
-          path: |
-            ${{ runner.temp }}/cross-${{ matrix.label }}
-            ${{ runner.temp }}/cross-${{ matrix.label }}.log
-            ${{ runner.temp }}/cross-${{ matrix.label }}.time
-            ${{ runner.temp }}/cross-${{ matrix.label }}.elf-header
-            ${{ runner.temp }}/antfly-zig-release-aarch64-linux-musl/*-attempt-*.log
-          if-no-files-found: error
-
-  smaller-graph:
-    name: Native ARM64 focused CLI ReleaseFast graph
-    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
-    runs-on: arc-antfly-publish-arm64
-    timeout-minutes: 180
-    steps:
-      - name: Checkout PR head
-        uses: actions/checkout@v6
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          submodules: true
-
-      - name: Install Linux build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential clang lld curl xz-utils git perl python3 linux-libc-dev ca-certificates time file
-
-      - name: Install Zig
-        run: |
-          curl -L "https://ziglang.org/download/0.16.0/zig-aarch64-linux-0.16.0.tar.xz" -o "$RUNNER_TEMP/zig.tar.xz"
-          mkdir -p "$RUNNER_TEMP/zig"
-          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
-          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
-
-      - name: Build focused full CLI graph with ReleaseFast
-        env:
-          ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/focused-cli-release-fast-cache/compiler-global
-          ZIG_LOCAL_CACHE_DIR: ${{ runner.temp }}/focused-cli-release-fast-cache/compiler-local
+          ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/runtime-${{ matrix.role }}-cache/global
+          ZIG_LOCAL_CACHE_DIR: ${{ runner.temp }}/runtime-${{ matrix.role }}-cache/compiler-local
         run: |
           set -o pipefail
           mkdir -p \
-            "$RUNNER_TEMP/focused-cli-release-fast" \
-            "$RUNNER_TEMP/focused-cli-release-fast-cache/local" \
-            "$RUNNER_TEMP/focused-cli-release-fast-cache/global"
+            "$RUNNER_TEMP/runtime-${{ matrix.role }}" \
+            "$RUNNER_TEMP/runtime-${{ matrix.role }}-cache/local" \
+            "$RUNNER_TEMP/runtime-${{ matrix.role }}-cache/global"
           cd zig
-          /usr/bin/time -v -o "$RUNNER_TEMP/focused-cli-release-fast.time" \
-            zig build -j1 \
+          /usr/bin/time -v -o "$RUNNER_TEMP/runtime-${{ matrix.role }}.time" \
+            zig build runtime-artifact -j1 \
             -Dtarget=aarch64-linux-musl \
             -Doptimize=ReleaseFast \
             -Dstrip=true \
             -Dcpu=baseline \
-            -Dedition=full \
-            -Dcli-focused-root=true \
-            -Dantfly-bin-name=antfly-focused \
-            -Dantfly-version=0.2.0-rc.26 \
             -Donnx=false \
             -Dmetal=false \
             -Dsystem-blas=false \
-            install \
-            --prefix "$RUNNER_TEMP/focused-cli-release-fast" \
-            --cache-dir "$RUNNER_TEMP/focused-cli-release-fast-cache/local" \
-            --global-cache-dir "$RUNNER_TEMP/focused-cli-release-fast-cache/global" \
-            2>&1 | tee "$RUNNER_TEMP/focused-cli-release-fast.log"
-          file "$RUNNER_TEMP/focused-cli-release-fast/bin/antfly-focused"
-          "$RUNNER_TEMP/focused-cli-release-fast/bin/antfly-focused" --help
+            -Druntime-artifact-role=${{ matrix.role }} \
+            --prefix "$RUNNER_TEMP/runtime-${{ matrix.role }}" \
+            --cache-dir "$RUNNER_TEMP/runtime-${{ matrix.role }}-cache/local" \
+            --global-cache-dir "$RUNNER_TEMP/runtime-${{ matrix.role }}-cache/global" \
+            2>&1 | tee "$RUNNER_TEMP/runtime-${{ matrix.role }}.log"
+
+      - name: Verify artifact
+        run: |
+          file "$RUNNER_TEMP/runtime-${{ matrix.role }}/bin/antfly-${{ matrix.role }}"
+          readelf -h "$RUNNER_TEMP/runtime-${{ matrix.role }}/bin/antfly-${{ matrix.role }}" \
+            | tee "$RUNNER_TEMP/runtime-${{ matrix.role }}.elf-header"
+          grep -Eq 'Machine:.*AArch64' "$RUNNER_TEMP/runtime-${{ matrix.role }}.elf-header"
 
       - name: Report compiler memory
         if: ${{ always() }}
-        run: cat "$RUNNER_TEMP/focused-cli-release-fast.time" || true
+        run: cat "$RUNNER_TEMP/runtime-${{ matrix.role }}.time" || true
 
-      - name: Upload smaller-graph result
+      - name: Upload result
         if: ${{ always() }}
         uses: actions/upload-artifact@v6
         with:
-          name: zig-arm64-focused-cli-release-fast
+          name: zig-arm64-runtime-${{ matrix.role }}-release-fast
           path: |
-            ${{ runner.temp }}/focused-cli-release-fast
-            ${{ runner.temp }}/focused-cli-release-fast.log
-            ${{ runner.temp }}/focused-cli-release-fast.time
+            ${{ runner.temp }}/runtime-${{ matrix.role }}
+            ${{ runner.temp }}/runtime-${{ matrix.role }}.log
+            ${{ runner.temp }}/runtime-${{ matrix.role }}.time
+            ${{ runner.temp }}/runtime-${{ matrix.role }}.elf-header
           if-no-files-found: error

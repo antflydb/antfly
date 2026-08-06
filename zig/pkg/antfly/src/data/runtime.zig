@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
-const antfly = @import("../root.zig");
+const antfly = @import("runtime_root.zig");
 const indexes_api = @import("../api/indexes.zig");
 const json_helpers = @import("../api/json_helpers.zig");
 const fs_paths = @import("../common/fs_paths.zig");

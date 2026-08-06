@@ -39,6 +39,12 @@ const BuildEdition = enum {
     inference,
 };
 
+const RuntimeArtifactRole = enum {
+    data,
+    metadata,
+    standalone,
+};
+
 const snowball_languages = [_][]const u8{
     "danish",
     "dutch",
@@ -1184,6 +1190,7 @@ pub fn build(b: *std.Build) void {
     const include_ha_tests_in_aggregates = b.option(bool, "ha-tests", "Include hot-standby HA suites in aggregate test steps") orelse true;
     const edition = b.option(BuildEdition, "edition", "Build edition: full or inference") orelse .full;
     const cli_focused_root = b.option(bool, "cli-focused-root", "Build the full CLI against its focused Antfly facade") orelse false;
+    const runtime_artifact_role = b.option(RuntimeArtifactRole, "runtime-artifact-role", "Build one focused server runtime artifact: data, metadata, or standalone");
     const antfly_bin_name = b.option([]const u8, "antfly-bin-name", "Installed filename for the top-level Antfly CLI") orelse "antfly";
     if (antfly_bin_name.len == 0 or std.mem.indexOfAny(u8, antfly_bin_name, "/\\") != null) {
         @panic("-Dantfly-bin-name must be a non-empty filename, not a path");
@@ -8438,6 +8445,42 @@ pub fn build(b: *std.Build) void {
         .name = "antfly",
         .root_module = antfly_main_mod,
     });
+
+    if (runtime_artifact_role) |role| {
+        const role_options = b.addOptions();
+        role_options.addOption(RuntimeArtifactRole, "role", role);
+
+        const role_mod = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly/src/runtime_artifact_main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .sanitize_thread = sanitize_thread,
+        });
+        antfly_imports.configure(b, role_mod, false, link_libc);
+        role_mod.addOptions("runtime_artifact_options", role_options);
+        const role_usermgr_storage_mod = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        role_usermgr_storage_mod.addImport("antfly_root", role_mod);
+        role_usermgr_storage_mod.addImport("antfly_platform", platform_mod);
+        role_mod.addImport("usermgr_storage", role_usermgr_storage_mod);
+
+        const role_name = @tagName(role);
+        const role_exe = b.addExecutable(.{
+            .name = b.fmt("antfly-{s}", .{role_name}),
+            .root_module = role_mod,
+        });
+        if (strip) {
+            var visited = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
+            defer visited.deinit();
+            setStripRecursively(role_mod, &visited);
+        }
+        const install_role = b.addInstallArtifact(role_exe, .{});
+        const role_step = b.step("runtime-artifact", "Build and install one focused server runtime artifact");
+        role_step.dependOn(&install_role.step);
+    }
     if (strip) {
         var visited = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
         defer visited.deinit();
