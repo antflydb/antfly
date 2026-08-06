@@ -667,15 +667,26 @@ pub const AntflyApiHandler = struct {
         return ctx.text("");
     }
 
+    const CommitResponseMode = enum {
+        transaction,
+        multi_batch,
+    };
+
     pub fn multiBatchWrite(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const alloc = ctx.allocator;
         const body_data = (try ctx.body()) orelse {
             _ = ctx.status(400);
             return ctx.text("missing body");
         };
-        return try handleTableBatchOffEventLoop(ctx, self.api_server.cfg.backend_runtime, "", body_data, self.api_server.tableApi());
+        var commit_req = transactions_api.parseMultiBatchRequest(alloc, body_data) catch {
+            _ = ctx.status(400);
+            return ctx.text("invalid multi-batch request");
+        };
+        defer commit_req.deinit(alloc);
+        return try self.executeCommitRequest(ctx, authenticated_identity, &commit_req, .multi_batch);
     }
 
     pub fn commitTransaction(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -683,10 +694,6 @@ pub const AntflyApiHandler = struct {
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
-        const source = self.api_server.table_writes orelse {
-            _ = ctx.status(404);
-            return ctx.text("not found");
-        };
         const body_data = (try ctx.body()) orelse {
             _ = ctx.status(400);
             return ctx.text("invalid transaction commit request");
@@ -699,7 +706,22 @@ pub const AntflyApiHandler = struct {
             else => return err,
         };
         defer commit_req.deinit(alloc);
-        if (!(try self.api_server.transactionRequestAuthorized(authenticated_identity, commit_req))) {
+        return try self.executeCommitRequest(ctx, authenticated_identity, &commit_req, .transaction);
+    }
+
+    fn executeCommitRequest(
+        self: *AntflyApiHandler,
+        ctx: *httpx.Context,
+        authenticated_identity: ?AuthenticatedIdentity,
+        commit_req: *transactions_api.OwnedTransactionCommitRequest,
+        response_mode: CommitResponseMode,
+    ) !httpx.Response {
+        const alloc = ctx.allocator;
+        const source = self.api_server.table_writes orelse {
+            _ = ctx.status(404);
+            return ctx.text("not found");
+        };
+        if (!(try self.api_server.transactionRequestAuthorized(authenticated_identity, commit_req.*))) {
             _ = ctx.status(403);
             return ctx.text("forbidden");
         }
@@ -713,7 +735,7 @@ pub const AntflyApiHandler = struct {
             },
             else => return err,
         };
-        if (try self.api_server.validateCommitReadSet(commit_req)) |conflict| {
+        if (try self.api_server.validateCommitReadSet(commit_req.*)) |conflict| {
             var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
             defer arena_impl.deinit();
             const response = try transactions_api.buildCommitResponse(
@@ -726,7 +748,10 @@ pub const AntflyApiHandler = struct {
             return ctx.json(response);
         }
 
-        const outcome = (source.commitTransaction(alloc, distributed_tables, commit_req.sync_level) catch |err| switch (err) {
+        const outcome = ((switch (response_mode) {
+            .transaction => source.commitTransaction(alloc, distributed_tables, commit_req.sync_level),
+            .multi_batch => source.commitBatch(alloc, distributed_tables, commit_req.sync_level),
+        }) catch |err| switch (err) {
             error.InvalidBatchRequest => {
                 _ = ctx.status(400);
                 return ctx.text("invalid transaction commit request");
@@ -797,11 +822,20 @@ pub const AntflyApiHandler = struct {
             .committed => {
                 var arena_impl = std.heap.ArenaAllocator.init(alloc);
                 defer arena_impl.deinit();
-                const response = try transactions_api.buildCommitResponse(arena_impl.allocator(), "committed", null, commit_req.tables);
-                return ctx.json(response);
+                switch (response_mode) {
+                    .transaction => {
+                        const response = try transactions_api.buildCommitResponse(arena_impl.allocator(), "committed", null, commit_req.tables);
+                        return ctx.json(response);
+                    },
+                    .multi_batch => {
+                        const response = try transactions_api.buildMultiBatchResponse(arena_impl.allocator(), commit_req.tables);
+                        _ = ctx.status(201);
+                        return ctx.json(response);
+                    },
+                }
             },
             .conflict => |conflict| {
-                const enriched_conflict = try self.api_server.enrichCommitConflict(commit_req, conflict);
+                const enriched_conflict = try self.api_server.enrichCommitConflict(commit_req.*, conflict);
                 var arena_impl = std.heap.ArenaAllocator.init(alloc);
                 defer arena_impl.deinit();
                 const response = try transactions_api.buildCommitResponse(

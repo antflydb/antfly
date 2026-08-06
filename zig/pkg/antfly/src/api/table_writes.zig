@@ -3451,6 +3451,12 @@ pub const TableWriteSource = struct {
             tables: []const distributed_txn.TableCommitRequest,
             sync_level: db_mod.types.SyncLevel,
         ) anyerror!?distributed_txn.CommitOutcome = null,
+        commit_batch: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            tables: []const distributed_txn.TableCommitRequest,
+            sync_level: db_mod.types.SyncLevel,
+        ) anyerror!?distributed_txn.CommitOutcome = null,
         commit_transaction_with_id: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -3821,6 +3827,16 @@ pub const TableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
     ) !?distributed_txn.CommitOutcome {
         const fn_ptr = self.vtable.commit_transaction orelse return null;
+        return try fn_ptr(self.ptr, alloc, tables, sync_level);
+    }
+
+    pub fn commitBatch(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+    ) !?distributed_txn.CommitOutcome {
+        const fn_ptr = self.vtable.commit_batch orelse self.vtable.commit_transaction orelse return null;
         return try fn_ptr(self.ptr, alloc, tables, sync_level);
     }
 
@@ -4643,15 +4659,25 @@ pub const BoundTableWriteSource = struct {
         txn_id: db_mod.types.TxnId,
         begin_timestamp: u64,
         tables: []const distributed_txn.TableCommitRequest,
-        _: db_mod.types.SyncLevel,
+        sync_level: db_mod.types.SyncLevel,
     ) !?distributed_txn.CommitOutcome {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (tables.len != 1) return error.UnsupportedOperation;
         const table = tables[0];
         if (!std.mem.eql(u8, self.table_name, table.table_name)) return null;
+
+        if (table.predicates.len == 0) {
+            _ = (try batch(ptr, alloc, table.table_name, .{
+                .writes = transactionWritesAsBatchWrites(table.writes),
+                .deletes = table.deletes,
+                .transforms = table.transforms,
+                .sync_level = sync_level,
+            })) orelse return null;
+            return .{ .committed = .{ .participant_count = 1 } };
+        }
+
         const db = try self.activeDb();
         try validateTransactionAgainstLocalSchema(alloc, db, table.writes, table.deletes, table.transforms);
-
         const commit_version = begin_timestamp + 1;
 
         _ = try db.beginTransactionWithIdAndParticipants(txn_id, begin_timestamp, &.{});
@@ -11738,6 +11764,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .drop_index = dropIndex,
                 .drop_table = dropTable,
                 .commit_transaction = commitTransaction,
+                .commit_batch = commitBatch,
                 .commit_transaction_with_id = commitTransactionWithId,
                 .backup_table = backupTable,
                 .restore_table = restoreTable,
@@ -12955,7 +12982,7 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?distributed_txn.CommitOutcome {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try enforceHAWriteGateOptional(self.ha_write_gate);
-        if (try self.commitSingleGroupTransactionViaRaftBatcher(alloc, tables, sync_level)) |outcome| return outcome;
+        if (try self.commitSingleGroupTransaction(alloc, tables, sync_level)) |outcome| return outcome;
         var worker_impl = distributed_txn.LocalTableWriteParticipantWorker.init(self.source());
         const commit_version = begin_timestamp + 1;
         return try distributed_txn.executeMultiTableCommit(
@@ -12970,13 +12997,26 @@ pub const ProvisionedTableWriteSource = struct {
         );
     }
 
-    fn commitSingleGroupTransactionViaRaftBatcher(
+    fn commitBatch(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+    ) !?distributed_txn.CommitOutcome {
+        const outcome = (try commitTransaction(ptr, alloc, tables, sync_level)) orelse return null;
+        if (outcome == .committed and outcome.committed.participant_count > 1) {
+            const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+            try replayCommittedTransactionBatches(self.source(), alloc, tables, sync_level);
+        }
+        return outcome;
+    }
+
+    fn commitSingleGroupTransaction(
         self: *ProvisionedTableWriteSource,
         alloc: std.mem.Allocator,
         tables: []const distributed_txn.TableCommitRequest,
         sync_level: db_mod.types.SyncLevel,
     ) !?distributed_txn.CommitOutcome {
-        const batcher = self.raft_batcher orelse return null;
         if (tables.len == 0) return .{ .committed = .{ .participant_count = 0 } };
         if (tables.len != 1) return null;
         const table_req = tables[0];
@@ -13015,21 +13055,17 @@ pub const ProvisionedTableWriteSource = struct {
         };
         const group_id = group_id_opt orelse return .{ .committed = .{ .participant_count = 0 } };
 
-        var batch_writes: []db_mod.types.BatchWrite = &.{};
-        if (table_req.writes.len != 0) {
-            batch_writes = try alloc.alloc(db_mod.types.BatchWrite, table_req.writes.len);
-            defer alloc.free(batch_writes);
-            for (table_req.writes, 0..) |write, i| {
-                batch_writes[i] = .{ .key = write.key, .value = write.value };
-            }
-        }
-
-        try batcher.batchGroup(alloc, group_id, table_req.table_name, .{
-            .writes = batch_writes,
+        const req: db_mod.types.BatchRequest = .{
+            .writes = transactionWritesAsBatchWrites(table_req.writes),
             .deletes = table_req.deletes,
             .transforms = table_req.transforms,
             .sync_level = sync_level,
-        });
+        };
+        if (self.raft_batcher) |batcher| {
+            try batcher.batchGroup(alloc, group_id, table_req.table_name, req);
+        } else {
+            _ = try self.source().batch(alloc, table_req.table_name, req);
+        }
         return .{ .committed = .{ .participant_count = 1 } };
     }
 
@@ -14963,6 +14999,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .delete_artifact_enrichment = deleteArtifactEnrichment,
                 .drop_index = dropIndex,
                 .commit_transaction = commitTransaction,
+                .commit_batch = commitBatch,
                 .commit_transaction_with_id = commitTransactionWithId,
                 .backup_table = backupTable,
                 .backup_table_to_location = backupTableToLocation,
@@ -15191,15 +15228,30 @@ pub const HostedProvisionedTableWriteSource = struct {
         return try commitTransactionWithId(ptr, alloc, txn_id, nextTxnTimestamp(), tables, sync_level);
     }
 
+    fn commitBatch(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+    ) !?distributed_txn.CommitOutcome {
+        const outcome = (try commitTransaction(ptr, alloc, tables, sync_level)) orelse return null;
+        if (outcome == .committed and outcome.committed.participant_count > 1) {
+            const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+            try replayCommittedTransactionBatches(self.source(), alloc, tables, sync_level);
+        }
+        return outcome;
+    }
+
     fn commitTransactionWithId(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         txn_id: db_mod.types.TxnId,
         begin_timestamp: u64,
         tables: []const distributed_txn.TableCommitRequest,
-        _: db_mod.types.SyncLevel,
+        sync_level: db_mod.types.SyncLevel,
     ) !?distributed_txn.CommitOutcome {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (try self.commitSingleGroupTransaction(alloc, tables, sync_level)) |outcome| return outcome;
         var worker_impl = distributed_txn.HostedParticipantWorker.init(self.catalog, self.router, self.source(), self.executor);
         const commit_version = begin_timestamp + 1;
         return try distributed_txn.executeMultiTableCommit(
@@ -15212,6 +15264,59 @@ pub const HostedProvisionedTableWriteSource = struct {
             tables,
             if (comptime build_options.with_tla) tracing.stderrAntflyTraceWriter() else null,
         );
+    }
+
+    fn commitSingleGroupTransaction(
+        self: *HostedProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+    ) !?distributed_txn.CommitOutcome {
+        if (tables.len == 0) return .{ .committed = .{ .participant_count = 0 } };
+        if (tables.len != 1) return null;
+        const table_req = tables[0];
+        if (table_req.predicates.len != 0) return null;
+
+        var snapshot = try self.catalog.adminSnapshot();
+        defer self.catalog.freeAdminSnapshot(&snapshot);
+        const table = tables_api.findTableByName(&snapshot, table_req.table_name) orelse return null;
+        const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
+        defer metadata_admin.freeRangeRefs(alloc, ranges);
+        if (ranges.len == 0) return null;
+
+        var group_id_opt: ?u64 = null;
+        const resolveOpGroup = struct {
+            fn run(current: *?u64, range_refs: []const *const metadata_table_manager.RangeRecord, key: []const u8) !void {
+                const group_id = table_catalog.resolveGroupForKeyFromRanges(range_refs, key) orelse return error.NotFound;
+                if (current.*) |existing| {
+                    if (existing != group_id) return error.MultipleGroups;
+                } else {
+                    current.* = group_id;
+                }
+            }
+        }.run;
+
+        for (table_req.writes) |write| resolveOpGroup(&group_id_opt, ranges, write.key) catch |err| switch (err) {
+            error.MultipleGroups => return null,
+            else => return err,
+        };
+        for (table_req.deletes) |key| resolveOpGroup(&group_id_opt, ranges, key) catch |err| switch (err) {
+            error.MultipleGroups => return null,
+            else => return err,
+        };
+        for (table_req.transforms) |transform| resolveOpGroup(&group_id_opt, ranges, transform.key) catch |err| switch (err) {
+            error.MultipleGroups => return null,
+            else => return err,
+        };
+        _ = group_id_opt orelse return .{ .committed = .{ .participant_count = 0 } };
+
+        _ = (try self.source().batch(alloc, table_req.table_name, .{
+            .writes = transactionWritesAsBatchWrites(table_req.writes),
+            .deletes = table_req.deletes,
+            .transforms = table_req.transforms,
+            .sync_level = sync_level,
+        })) orelse return null;
+        return .{ .committed = .{ .participant_count = 1 } };
     }
 
     fn backupTable(
@@ -15947,6 +16052,24 @@ pub const HostedProvisionedTableWriteSource = struct {
         return result;
     }
 };
+
+fn replayCommittedTransactionBatches(
+    source: TableWriteSource,
+    alloc: std.mem.Allocator,
+    tables: []const distributed_txn.TableCommitRequest,
+    sync_level: db_mod.types.SyncLevel,
+) !void {
+    for (tables) |table| {
+        // Transaction prepare resolves transforms to final values. Reapplying
+        // those operations would execute non-idempotent transforms twice, so
+        // this compatibility publication is limited to writes and deletes.
+        _ = (try source.batch(alloc, table.table_name, .{
+            .writes = transactionWritesAsBatchWrites(table.writes),
+            .deletes = table.deletes,
+            .sync_level = sync_level,
+        })) orelse return error.TableNotFound;
+    }
+}
 
 const GroupBatch = struct {
     group_id: u64,
@@ -20257,6 +20380,16 @@ fn transactionWritesToBatchWrites(
         };
     }
     return out;
+}
+
+fn transactionWritesAsBatchWrites(
+    writes: []const db_mod.types.TransactionWrite,
+) []const db_mod.types.BatchWrite {
+    comptime {
+        std.debug.assert(@sizeOf(db_mod.types.TransactionWrite) == @sizeOf(db_mod.types.BatchWrite));
+        std.debug.assert(@alignOf(db_mod.types.TransactionWrite) == @alignOf(db_mod.types.BatchWrite));
+    }
+    return @ptrCast(writes);
 }
 
 fn validateTableBatchAgainstLocalSchema(

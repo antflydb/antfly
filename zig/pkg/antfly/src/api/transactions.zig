@@ -455,6 +455,10 @@ pub const CommitResponse = struct {
     tables: ?CommitTablesResponse = null,
 };
 
+pub const MultiBatchResponse = struct {
+    tables: CommitTablesResponse,
+};
+
 pub const SessionCommitResponse = struct {
     status: []const u8,
     transaction_id: []const u8,
@@ -2053,6 +2057,13 @@ pub fn buildCommitResponse(
     };
 }
 
+pub fn buildMultiBatchResponse(
+    alloc: std.mem.Allocator,
+    tables: []const TableCommitRequest,
+) !MultiBatchResponse {
+    return .{ .tables = try buildCommitTablesResponse(alloc, tables) };
+}
+
 pub fn buildSessionCommitResponse(
     alloc: std.mem.Allocator,
     txn_id: db_mod.types.TxnId,
@@ -2115,6 +2126,32 @@ pub fn parseCommitRequest(alloc: std.mem.Allocator, body: []const u8) !OwnedTran
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
     return try parseCommitValue(alloc, parsed.value);
+}
+
+pub fn parseMultiBatchRequest(alloc: std.mem.Allocator, body: []const u8) !OwnedTransactionCommitRequest {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+
+    const root = switch (parsed.value) {
+        .object => |obj| obj,
+        else => return error.InvalidTransactionCommitRequest,
+    };
+    var fields = root.iterator();
+    while (fields.next()) |field| {
+        if (!std.mem.eql(u8, field.key_ptr.*, "tables") and
+            !std.mem.eql(u8, field.key_ptr.*, "sync_level"))
+        {
+            return error.InvalidTransactionCommitRequest;
+        }
+    }
+
+    var req: OwnedTransactionCommitRequest = .{};
+    errdefer req.deinit(alloc);
+    req.tables = try parseTables(alloc, root.get("tables") orelse return error.InvalidTransactionCommitRequest);
+    if (root.get("sync_level")) |sync_level_value| {
+        req.sync_level = parseSyncLevel(sync_level_value) orelse return error.InvalidTransactionCommitRequest;
+    }
+    return req;
 }
 
 pub fn encodeCommitRequest(alloc: std.mem.Allocator, req: OwnedTransactionCommitRequest) ![]u8 {
@@ -3438,6 +3475,35 @@ test "transaction commit parser keeps table transforms" {
     try std.testing.expectEqual(@as(usize, 1), req.tables[0].batch.transforms.len);
     try std.testing.expect(req.tables[0].batch.transforms[0].upsert);
     try std.testing.expectEqual(db_mod.types.TransformOpType.max, req.tables[0].batch.transforms[0].operations[1].op);
+}
+
+test "multi batch parser accepts the public batch envelope without a read set" {
+    var req = try parseMultiBatchRequest(std.testing.allocator,
+        \\{
+        \\  "tables":{
+        \\    "docs":{"inserts":{"doc:a":{"title":"alpha"}}},
+        \\    "audit":{"deletes":["event:old"]}
+        \\  },
+        \\  "sync_level":"write"
+        \\}
+    );
+    defer req.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), req.read_set.len);
+    try std.testing.expectEqual(@as(usize, 2), req.tables.len);
+    try std.testing.expectEqual(db_mod.types.SyncLevel.write, req.sync_level);
+    try std.testing.expectEqualStrings("docs", req.tables[0].table_name);
+    try std.testing.expectEqual(@as(usize, 1), req.tables[0].batch.writes.len);
+    try std.testing.expectEqualStrings("audit", req.tables[1].table_name);
+    try std.testing.expectEqual(@as(usize, 1), req.tables[1].batch.deletes.len);
+}
+
+test "multi batch parser rejects transaction-only read sets" {
+    try std.testing.expectError(
+        error.InvalidTransactionCommitRequest,
+        parseMultiBatchRequest(std.testing.allocator,
+            \\{"read_set":[],"tables":{"docs":{"deletes":["doc:a"]}}}
+        ),
+    );
 }
 
 test "transaction session registry begins and removes sessions" {

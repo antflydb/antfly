@@ -149,7 +149,7 @@ def test_multi_shard_batch_commit(stateful_api):
     )
 
 
-def test_atomic_multi_key_update_preserves_balance_sum(stateful_api):
+def test_multi_key_batch_update_preserves_balance_sum(stateful_api):
     table_name = _create_table(stateful_api, "atomic_transfer")
 
     initial_docs = {
@@ -230,7 +230,7 @@ def test_multi_shard_transaction_recovery_health(stateful_api):
     assert visible_all == all_docs
 
 
-def test_multi_shard_batch_timeout_preserves_atomicity(stateful_api):
+def test_multi_shard_batch_timeout_has_no_partial_visibility(stateful_api):
     table_name = _create_table(stateful_api, "multi_shard_timeout")
 
     initial_docs = {

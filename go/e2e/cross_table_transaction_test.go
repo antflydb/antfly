@@ -58,8 +58,8 @@ func setupTwoTableCluster(t *testing.T) *TestCluster {
 	return cluster
 }
 
-// TestE2E_CrossTableTransaction_Commit verifies that MultiBatch atomically
-// writes to two tables in a single transaction.
+// TestE2E_CrossTableTransaction_Commit verifies that a successful MultiBatch
+// writes every requested document to both tables.
 func TestE2E_CrossTableTransaction_Commit(t *testing.T) {
 	skipInShortMode(t)
 	ctx := testContext(t, 5*time.Minute)
@@ -106,8 +106,8 @@ func TestE2E_CrossTableTransaction_Commit(t *testing.T) {
 	require.Equal(t, "gadget", doc["item"])
 }
 
-// TestE2E_CrossTableTransaction_MixedOps verifies atomicity of mixed insert+delete
-// across two tables.
+// TestE2E_CrossTableTransaction_MixedOps verifies a successful mixed
+// insert+delete MultiBatch across two tables.
 func TestE2E_CrossTableTransaction_MixedOps(t *testing.T) {
 	skipInShortMode(t)
 	ctx := testContext(t, 5*time.Minute)

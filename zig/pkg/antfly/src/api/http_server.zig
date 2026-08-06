@@ -8653,13 +8653,31 @@ pub const ApiHttpServer = struct {
                 return error.InternalFailure;
             },
         };
-        _ = (source.batch(alloc, table_name, req) catch |err| switch (err) {
+        comptime {
+            std.debug.assert(@sizeOf(db_mod.types.BatchWrite) == @sizeOf(db_mod.types.TransactionWrite));
+            std.debug.assert(@alignOf(db_mod.types.BatchWrite) == @alignOf(db_mod.types.TransactionWrite));
+        }
+        const txn_writes: []const db_mod.types.TransactionWrite = @ptrCast(req.writes);
+        const tables = [_]distributed_txn.TableCommitRequest{.{
+            .table_name = table_name,
+            .writes = txn_writes,
+            .deletes = req.deletes,
+            .transforms = req.transforms,
+            .predicates = req.predicates,
+        }};
+        const outcome = (source.commitBatch(alloc, &tables, req.sync_level) catch |err| switch (err) {
             error.InvalidBatchRequest,
             error.InvalidArgument,
             error.InvalidGraphEdges,
             error.UnsupportedTransformOperation,
             => return error.InvalidBatchRequest,
-            error.TableNotFound => return error.NotFound,
+            error.TableNotFound, error.UnknownGroup => return error.NotFound,
+            error.TopologyChanged,
+            error.DecisionConflict,
+            error.TxnNotFound,
+            error.InvalidTxnRecord,
+            => return error.Conflict,
+            error.UnsupportedOperation => return error.MethodNotAllowed,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
             error.EnrichmentRetryInProgress,
             error.ResourceBudgetExceeded,
@@ -8678,6 +8696,10 @@ pub const ApiHttpServer = struct {
                 return error.InternalFailure;
             },
         }) orelse return error.NotFound;
+        switch (outcome) {
+            .committed => {},
+            .conflict => return error.Conflict,
+        }
     }
 
     fn executePublicTableQueryRequest(

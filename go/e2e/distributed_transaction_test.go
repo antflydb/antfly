@@ -29,9 +29,9 @@ const (
 	txnTestNumShards = 4
 )
 
-// TestE2E_DistributedTransaction_MultiShardCommit verifies batch operation
-// touching multiple shards commits atomically via 2PC.
-func TestE2E_DistributedTransaction_MultiShardCommit(t *testing.T) {
+// TestE2E_Batch_MultiShardUpdate verifies a successful batch operation touching
+// multiple shards applies every requested update.
+func TestE2E_Batch_MultiShardUpdate(t *testing.T) {
 	skipInShortMode(t)
 	ctx := testContext(t, 3*time.Minute)
 
@@ -76,14 +76,14 @@ func TestE2E_DistributedTransaction_MultiShardCommit(t *testing.T) {
 	})
 	require.NoError(t, err, "Multi-shard batch update failed")
 
-	t.Log("Verifying all updates were applied atomically...")
+	t.Log("Verifying all updates were applied...")
 	err = cluster.VerifyKeyValues(ctx, txnTestTableName, updatedDocs)
 	require.NoError(t, err, "Updated documents verification failed")
 }
 
-// TestE2E_DistributedTransaction_AtomicMultiKeyUpdate tests the classic "bank transfer"
-// scenario - atomic update of multiple keys.
-func TestE2E_DistributedTransaction_AtomicMultiKeyUpdate(t *testing.T) {
+// TestE2E_Batch_MultiKeyUpdatePreservesBalance checks that a successful
+// multi-key update applies both requested balances and preserves their sum.
+func TestE2E_Batch_MultiKeyUpdatePreservesBalance(t *testing.T) {
 	skipInShortMode(t)
 	ctx := testContext(t, 3*time.Minute)
 
@@ -109,8 +109,8 @@ func TestE2E_DistributedTransaction_AtomicMultiKeyUpdate(t *testing.T) {
 	initialSum := 1000 + 0
 	t.Logf("Initial sum of balances: %d", initialSum)
 
-	// Perform atomic "transfer" via batch
-	t.Log("Performing atomic transfer: Alice -500 -> Bob +500...")
+	// Perform a two-key "transfer" via batch.
+	t.Log("Performing transfer: Alice -500 -> Bob +500...")
 	transferDocs := map[string]any{
 		"0_alice": map[string]any{"name": "Alice", "balance": 500},
 		"8_bob":   map[string]any{"name": "Bob", "balance": 500},
@@ -122,7 +122,7 @@ func TestE2E_DistributedTransaction_AtomicMultiKeyUpdate(t *testing.T) {
 	})
 	require.NoError(t, err, "Transfer failed")
 
-	t.Log("Verifying transfer was atomic...")
+	t.Log("Verifying both transfer updates were applied...")
 	err = cluster.VerifyKeyValues(ctx, txnTestTableName, transferDocs)
 	require.NoError(t, err, "Transfer verification failed")
 
@@ -140,9 +140,9 @@ func TestE2E_DistributedTransaction_AtomicMultiKeyUpdate(t *testing.T) {
 	require.Equal(t, initialSum, finalSum, "Balance conservation violated! Sum changed from %d to %d", initialSum, finalSum)
 }
 
-// TestE2E_DistributedTransaction_MultiShardAbort verifies that when context is
-// cancelled mid-transaction, no data is committed.
-func TestE2E_DistributedTransaction_MultiShardAbort(t *testing.T) {
+// TestE2E_Batch_TimeoutHasNoPartialVisibility verifies that an indeterminate
+// client timeout leaves the batch either fully applied or fully unchanged.
+func TestE2E_Batch_TimeoutHasNoPartialVisibility(t *testing.T) {
 	skipInShortMode(t)
 	ctx := testContext(t, 3*time.Minute)
 
@@ -198,8 +198,8 @@ func TestE2E_DistributedTransaction_MultiShardAbort(t *testing.T) {
 		t.Log("Warning: Batch completed despite short timeout - transaction may have succeeded")
 	}
 
-	// Verify all values unchanged (atomicity - nothing committed on abort)
-	t.Log("Verifying no partial updates occurred (atomicity)...")
+	// Verify the timed-out request did not leave a partially visible update.
+	t.Log("Verifying no partial updates occurred...")
 
 	// Give a moment for any async cleanup
 	time.Sleep(100 * time.Millisecond)
@@ -228,7 +228,7 @@ func TestE2E_DistributedTransaction_MultiShardAbort(t *testing.T) {
 	}
 
 	if allUnchanged {
-		t.Log("All values unchanged - abort maintained atomicity")
+		t.Log("All values unchanged after the timeout")
 	} else {
 		t.Log("Transaction completed before timeout - this is acceptable behavior")
 	}

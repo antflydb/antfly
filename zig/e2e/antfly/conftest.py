@@ -2063,14 +2063,11 @@ def stateful_api(request: pytest.FixtureRequest):
             return self._check(response)
 
         def multi_batch(self, tables: dict[str, dict], *, sync_level: str | None = None) -> dict:
-            payload: dict[str, object] = {
-                "read_set": [],
-                "tables": tables,
-            }
+            payload: dict[str, object] = {"tables": tables}
             if sync_level is not None:
                 payload["sync_level"] = sync_level
-            response = self._request("POST", "/transactions/commit", payload)
-            if response.status_code != 200:
+            response = self._request("POST", "/batch", payload)
+            if response.status_code != 201:
                 return self._check(response)
             return self._decode(response)
 

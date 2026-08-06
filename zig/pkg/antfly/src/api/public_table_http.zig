@@ -59,6 +59,7 @@ pub const TableApi = struct {
         InvalidBatchRequest,
         UnsupportedSyncLevel,
         NotFound,
+        Conflict,
         MethodNotAllowed,
         Backpressured,
         DenseRepairBackpressure,
@@ -602,6 +603,7 @@ pub fn handleTableBatch(
         error.InvalidBatchRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid batch request") },
         error.UnsupportedSyncLevel => return .{ .status = 400, .body = try alloc.dupe(u8, "unsupported sync_level") },
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
+        error.Conflict => return .{ .status = 409, .body = try alloc.dupe(u8, "batch transaction conflicted") },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.Backpressured => return .{ .status = 429, .body = try alloc.dupe(u8, "table backpressured") },
         error.DenseRepairBackpressure => return .{
