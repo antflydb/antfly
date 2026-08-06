@@ -8500,12 +8500,13 @@ pub fn build(b: *std.Build) void {
                 // Zig's build runner uses these claims to run as many LLVM
                 // codegen steps concurrently as fit in available RAM. The
                 // focused ARM64 ReleaseFast measurements peaked near 10 GiB
-                // for data/metadata; inference receives extra headroom for
-                // the standalone provider and route adapters it also owns.
+                // for data/metadata and 15 GiB for inference. These claims
+                // let --maxrss admit safe pairs without globally forcing -j1.
                 .max_rss = switch (role) {
-                    .inference => 18 * 1024 * 1024 * 1024,
+                    .inference => 16 * 1024 * 1024 * 1024,
                     .ha => 8 * 1024 * 1024 * 1024,
-                    .client, .data, .lite, .metadata, .serverless, .standalone => 13 * 1024 * 1024 * 1024,
+                    .data, .metadata => 11 * 1024 * 1024 * 1024,
+                    .client, .lite, .serverless, .standalone => 13 * 1024 * 1024 * 1024,
                 },
             });
             if (strip) {

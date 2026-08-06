@@ -53,6 +53,8 @@ jobs:
             "$RUNNER_TEMP/linked-runtime" \
             "$RUNNER_TEMP/linked-runtime-cache/local" \
             "$RUNNER_TEMP/linked-runtime-cache/global"
+          # Match the ARC pod's 24000Mi memory request; the host-reported
+          # total includes memory Kubernetes cannot safely give this pod.
           cd zig
           /usr/bin/time -v -o "$RUNNER_TEMP/linked-runtime.time" \
             zig build \
@@ -67,6 +69,7 @@ jobs:
             --prefix "$RUNNER_TEMP/linked-runtime" \
             --cache-dir "$RUNNER_TEMP/linked-runtime-cache/local" \
             --global-cache-dir "$RUNNER_TEMP/linked-runtime-cache/global" \
+            --maxrss 25165824000 \
             --summary all \
             2>&1 | tee "$RUNNER_TEMP/linked-runtime.log"
 
