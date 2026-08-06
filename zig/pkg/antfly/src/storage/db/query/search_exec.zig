@@ -12924,6 +12924,7 @@ fn searchDenseInternal(
         const route = denseSearchRoute(
             native_constraints.positive_filter,
             effective_native_filter_candidate_count,
+            index_stats.active_count,
             paging,
             executor.exact_dense_search != null,
         );
@@ -13147,6 +13148,7 @@ const DenseSearchRoute = struct {
 fn denseSearchRoute(
     positive_filter: bool,
     effective_candidate_count: usize,
+    active_count: u64,
     paging: ComponentPaging,
     exact_executor_available: bool,
 ) DenseSearchRoute {
@@ -13170,6 +13172,22 @@ fn denseSearchRoute(
         else
             "candidate_count_within_budget_builtin",
     };
+    // Rare positive subsets are a poor fit for graph traversal: the HBC
+    // centroids describe the whole corpus, so a traversal can spend most of
+    // its work on leaves whose members the filter rejects and still miss
+    // eligible neighbours. Exact scoring is both recall-safe and cheaper once
+    // the resolved set is at most one percent of the live index. Keep the
+    // absolute page-derived budget above for small indexes and use division
+    // here to avoid overflow in candidate_count * 100.
+    const selective_candidate_limit = active_count / 100;
+    if (selective_candidate_limit > 0 and effective_candidate_count <= selective_candidate_limit) return .{
+        .exact_native_filter = true,
+        .name = "exact_native_filter",
+        .reason = if (exact_executor_available)
+            "selectivity_within_exact_threshold"
+        else
+            "selectivity_within_exact_threshold_builtin",
+    };
     return .{
         .exact_native_filter = false,
         .name = "hbc",
@@ -13180,27 +13198,36 @@ fn denseSearchRoute(
 test "dense search route reports exact native filter budget decisions" {
     const paging = ComponentPaging{ .offset = 0, .limit = 100 };
 
-    const no_filter = denseSearchRoute(false, 0, paging, false);
+    const no_filter = denseSearchRoute(false, 0, 1_000_000, paging, false);
     try std.testing.expect(!no_filter.exact_native_filter);
     try std.testing.expectEqualStrings("hbc", no_filter.name);
     try std.testing.expectEqualStrings("no_native_filter", no_filter.reason);
 
-    const within_budget = denseSearchRoute(true, 500, paging, true);
+    const within_budget = denseSearchRoute(true, 500, 10_000, paging, true);
     try std.testing.expect(within_budget.exact_native_filter);
     try std.testing.expectEqualStrings("exact_native_filter", within_budget.name);
     try std.testing.expectEqualStrings("candidate_count_within_budget", within_budget.reason);
 
-    const builtin_fallback = denseSearchRoute(true, 500, paging, false);
+    const builtin_fallback = denseSearchRoute(true, 500, 10_000, paging, false);
     try std.testing.expect(builtin_fallback.exact_native_filter);
     try std.testing.expectEqualStrings("exact_native_filter", builtin_fallback.name);
     try std.testing.expectEqualStrings("candidate_count_within_budget_builtin", builtin_fallback.reason);
 
-    const over_budget = denseSearchRoute(true, 3201, paging, false);
+    const one_percent = denseSearchRoute(true, 10_000, 1_000_000, paging, true);
+    try std.testing.expect(one_percent.exact_native_filter);
+    try std.testing.expectEqualStrings("exact_native_filter", one_percent.name);
+    try std.testing.expectEqualStrings("selectivity_within_exact_threshold", one_percent.reason);
+
+    const one_percent_builtin = denseSearchRoute(true, 10_000, 1_000_000, paging, false);
+    try std.testing.expect(one_percent_builtin.exact_native_filter);
+    try std.testing.expectEqualStrings("selectivity_within_exact_threshold_builtin", one_percent_builtin.reason);
+
+    const over_budget = denseSearchRoute(true, 10_001, 1_000_000, paging, false);
     try std.testing.expect(!over_budget.exact_native_filter);
     try std.testing.expectEqualStrings("hbc", over_budget.name);
     try std.testing.expectEqualStrings("native_filter_candidate_budget_exceeded", over_budget.reason);
 
-    const exclusion_reduced = denseSearchRoute(true, 201, paging, true);
+    const exclusion_reduced = denseSearchRoute(true, 201, 10_000, paging, true);
     try std.testing.expect(exclusion_reduced.exact_native_filter);
     try std.testing.expectEqualStrings("candidate_count_within_budget", exclusion_reduced.reason);
 }
