@@ -29,6 +29,13 @@ const runtime = switch (role_options.role) {
     .metadata => @import("metadata/runtime.zig"),
     .standalone => @import("standalone/runtime.zig"),
 };
+// Lite's non-server commands share storage types with standalone, while
+// `lite serve` directly enters that runtime. Co-locating them prevents the
+// focused CLI library from compiling standalone and inference again.
+const lite_runtime = if (role_options.role == .standalone)
+    @import("cmd/lite.zig")
+else
+    struct {};
 const standalone_runtime = if (role_options.role == .inference)
     @import("standalone/runtime.zig")
 else
@@ -48,7 +55,7 @@ fn runtimeEntry(context: *const bridge.Context) callconv(.c) c_int {
     else
         "antfly";
 
-    runtime.runFromIterator(runtimeInit(init.*), argv0, args) catch |err| {
+    runRuntime(runtimeInit(init.*), command, argv0, args) catch |err| {
         const message = switch (err) {
             error.FileNotFound => "required file was not found; check the configured path",
             error.AddressInUse => "listen address is already in use",
@@ -59,6 +66,20 @@ fn runtimeEntry(context: *const bridge.Context) callconv(.c) c_int {
         return 1;
     };
     return 0;
+}
+
+fn runRuntime(
+    init: std.process.Init,
+    command: []const u8,
+    argv0: []const u8,
+    args: *std.process.Args.Iterator,
+) !void {
+    if (comptime role_options.role == .standalone) {
+        if (std.mem.eql(u8, command, "lite")) {
+            return lite_runtime.runFromIterator(init, argv0, args);
+        }
+    }
+    return runtime.runFromIterator(init, argv0, args);
 }
 
 comptime {

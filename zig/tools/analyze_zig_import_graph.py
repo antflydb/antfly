@@ -45,6 +45,10 @@ RUNTIME_BOUNDARIES = (
     "metadata/runtime.zig",
     "standalone/runtime.zig",
 )
+CODEGEN_BOUNDARIES = (
+    ("cli_runtime.zig", "standalone/runtime.zig"),
+    ("cli_runtime.zig", "inference_runtime/runtime.zig"),
+)
 
 
 @dataclass(frozen=True)
@@ -171,6 +175,11 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="fail if a production runtime can statically reach the public root.zig barrel",
     )
+    parser.add_argument(
+        "--check-codegen-boundary",
+        action="store_true",
+        help="fail if the focused CLI can statically reach standalone or inference runtime codegen",
+    )
     parser.add_argument("--largest", type=int, default=0, metavar="N", help="show the N largest files per graph")
     parser.add_argument("--json", action="store_true", help="emit the summary as JSON")
     return parser.parse_args(argv)
@@ -257,6 +266,20 @@ def check_runtime_boundary(graph: ImportGraph) -> bool:
     return clean
 
 
+def check_codegen_boundary(graph: ImportGraph) -> bool:
+    clean = True
+    for source_name, target_name in CODEGEN_BOUNDARIES:
+        source = graph.resolve_source(source_name)
+        target = graph.resolve_source(target_name)
+        path = graph.shortest_path(source, target)
+        if not path:
+            continue
+        clean = False
+        rendered = " -> ".join(graph.relative_name(item) for item in path)
+        print(f"codegen boundary violation: {rendered}", file=sys.stderr)
+    return clean
+
+
 def main(argv: list[str] | None = None) -> int:
     args = arguments(argv)
     try:
@@ -270,6 +293,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.show_path:
             show_paths(graph, args.show_path)
         if args.check_runtime_boundary and not check_runtime_boundary(graph):
+            return 1
+        if args.check_codegen_boundary and not check_codegen_boundary(graph):
             return 1
         return 0
     except ValueError as error:

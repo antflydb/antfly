@@ -76,7 +76,9 @@ fn mainImpl(init: std.process.Init) !void {
         if (std.mem.eql(u8, subcommand, "data")) return runLinkedRuntime(.data, subcommand, init, &args);
         if (std.mem.eql(u8, subcommand, "ha")) return runLinkedRuntime(.cli, subcommand, init, &args);
         if (std.mem.eql(u8, subcommand, "inference")) return runLinkedRuntime(.inference, subcommand, init, &args);
-        if (std.mem.eql(u8, subcommand, "lite")) return runLinkedRuntime(.cli, subcommand, init, &args);
+        // Lite serve embeds the standalone runtime, so keep the entire Lite
+        // command in that codegen unit instead of pulling it into the CLI.
+        if (std.mem.eql(u8, subcommand, "lite")) return runLinkedRuntime(.standalone, subcommand, init, &args);
         if (std.mem.eql(u8, subcommand, "metadata")) return runLinkedRuntime(.metadata, subcommand, init, &args);
         if (std.mem.eql(u8, subcommand, "serverless")) return runLinkedRuntime(.cli, subcommand, init, &args);
         if (std.mem.eql(u8, subcommand, "standalone")) return runLinkedRuntime(.standalone, subcommand, init, &args);

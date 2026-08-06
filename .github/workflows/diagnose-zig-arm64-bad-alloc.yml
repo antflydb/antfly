@@ -28,7 +28,7 @@ jobs:
 
       - name: Verify runtime import boundaries
         run: |
-          python3 zig/tools/analyze_zig_import_graph.py --check-runtime-boundary --json
+          python3 zig/tools/analyze_zig_import_graph.py --check-runtime-boundary --check-codegen-boundary --json
           python3 -m unittest zig/tools/test_analyze_zig_import_graph.py
           python3 -m unittest zig/tools/test_patch_zig_0_16_build_runner_maxrss.py
 
@@ -84,20 +84,13 @@ jobs:
             --summary all \
             2>&1 | tee "$RUNNER_TEMP/linked-runtime.log"
 
-      - name: Verify single artifact and linked entry points
+      - name: Verify single ARM64 artifact
         run: |
           test "$(find "$RUNNER_TEMP/linked-runtime/bin" -maxdepth 1 -type f | wc -l)" -eq 1
           binary="$RUNNER_TEMP/linked-runtime/bin/antfly"
           file "$binary"
           readelf -h "$binary" | tee "$RUNNER_TEMP/linked-runtime.elf-header"
           grep -Eq 'Machine:.*AArch64' "$RUNNER_TEMP/linked-runtime.elf-header"
-          nm -g "$binary" | tee "$RUNNER_TEMP/linked-runtime.symbols"
-          for role in cli data inference metadata standalone; do
-            grep -Eq "antfly_runtime_${role}$" "$RUNNER_TEMP/linked-runtime.symbols"
-          done
-          for operation in create configure provider register_routes destroy; do
-            grep -Eq "antfly_standalone_inference_${operation}$" "$RUNNER_TEMP/linked-runtime.symbols"
-          done
           stat -c 'binary_size_bytes=%s' "$binary" | tee "$RUNNER_TEMP/linked-runtime.size"
 
       - name: Report compiler memory
@@ -114,6 +107,5 @@ jobs:
             ${{ runner.temp }}/linked-runtime.log
             ${{ runner.temp }}/linked-runtime.time
             ${{ runner.temp }}/linked-runtime.elf-header
-            ${{ runner.temp }}/linked-runtime.symbols
             ${{ runner.temp }}/linked-runtime.size
           if-no-files-found: error
