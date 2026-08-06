@@ -23,13 +23,10 @@ const role_options = @import("runtime_artifact_options");
 const standalone_inference_bridge = @import("standalone/inference_bridge.zig");
 
 const runtime = switch (role_options.role) {
-    .client => @import("client_runtime.zig"),
+    .cli => @import("cli_runtime.zig"),
     .data => @import("data/runtime.zig"),
-    .ha => @import("cmd/ha.zig"),
     .inference => @import("inference_runtime/runtime.zig"),
-    .lite => @import("cmd/lite.zig"),
     .metadata => @import("metadata/runtime.zig"),
-    .serverless => @import("cmd/serverless.zig"),
     .standalone => @import("standalone/runtime.zig"),
 };
 const standalone_runtime = if (role_options.role == .inference)
@@ -46,7 +43,7 @@ fn runtimeEntry(context: *const bridge.Context) callconv(.c) c_int {
     const init: *const std.process.Init = @ptrCast(@alignCast(context.init));
     const args: *std.process.Args.Iterator = @ptrCast(@alignCast(context.args));
     const command = context.command_ptr[0..context.command_len];
-    const argv0 = if (role_options.role == .client)
+    const argv0 = if (role_options.role == .cli)
         command
     else
         "antfly";

@@ -74,11 +74,11 @@ fn mainImpl(init: std.process.Init) !void {
     // Server-side subcommands
     if (comptime linked_runtime_options.enabled) {
         if (std.mem.eql(u8, subcommand, "data")) return runLinkedRuntime(.data, subcommand, init, &args);
-        if (std.mem.eql(u8, subcommand, "ha")) return runLinkedRuntime(.ha, subcommand, init, &args);
+        if (std.mem.eql(u8, subcommand, "ha")) return runLinkedRuntime(.cli, subcommand, init, &args);
         if (std.mem.eql(u8, subcommand, "inference")) return runLinkedRuntime(.inference, subcommand, init, &args);
-        if (std.mem.eql(u8, subcommand, "lite")) return runLinkedRuntime(.lite, subcommand, init, &args);
+        if (std.mem.eql(u8, subcommand, "lite")) return runLinkedRuntime(.cli, subcommand, init, &args);
         if (std.mem.eql(u8, subcommand, "metadata")) return runLinkedRuntime(.metadata, subcommand, init, &args);
-        if (std.mem.eql(u8, subcommand, "serverless")) return runLinkedRuntime(.serverless, subcommand, init, &args);
+        if (std.mem.eql(u8, subcommand, "serverless")) return runLinkedRuntime(.cli, subcommand, init, &args);
         if (std.mem.eql(u8, subcommand, "standalone")) return runLinkedRuntime(.standalone, subcommand, init, &args);
     } else {
         if (std.mem.eql(u8, subcommand, "data")) return try cmd.data.runFromIterator(runtimeInit(init), argv0, &args);
@@ -105,7 +105,7 @@ fn mainImpl(init: std.process.Init) !void {
     for (cli_commands) |cli_cmd| {
         if (std.mem.eql(u8, subcommand, cli_cmd)) {
             if (comptime linked_runtime_options.enabled)
-                return runLinkedRuntime(.client, subcommand, init, &args);
+                return runLinkedRuntime(.cli, subcommand, init, &args);
             if (cliHelpRequested(&args)) {
                 cmd.cli.printCommandUsage(cli_cmd);
                 return;
@@ -122,15 +122,12 @@ fn mainImpl(init: std.process.Init) !void {
     return error.InvalidArguments;
 }
 
-const LinkedRuntimeRole = enum { client, data, ha, inference, lite, metadata, serverless, standalone };
+const LinkedRuntimeRole = enum { cli, data, inference, metadata, standalone };
 
-extern fn antfly_runtime_client(context: *const runtime_bridge.Context) callconv(.c) c_int;
+extern fn antfly_runtime_cli(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_data(context: *const runtime_bridge.Context) callconv(.c) c_int;
-extern fn antfly_runtime_ha(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_inference(context: *const runtime_bridge.Context) callconv(.c) c_int;
-extern fn antfly_runtime_lite(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_metadata(context: *const runtime_bridge.Context) callconv(.c) c_int;
-extern fn antfly_runtime_serverless(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_standalone(context: *const runtime_bridge.Context) callconv(.c) c_int;
 
 fn runLinkedRuntime(
@@ -146,13 +143,10 @@ fn runLinkedRuntime(
         .command_len = command.len,
     };
     const code = switch (role) {
-        .client => antfly_runtime_client(&context),
+        .cli => antfly_runtime_cli(&context),
         .data => antfly_runtime_data(&context),
-        .ha => antfly_runtime_ha(&context),
         .inference => antfly_runtime_inference(&context),
-        .lite => antfly_runtime_lite(&context),
         .metadata => antfly_runtime_metadata(&context),
-        .serverless => antfly_runtime_serverless(&context),
         .standalone => antfly_runtime_standalone(&context),
     };
     if (code != 0) std.process.exit(@intCast(code));
