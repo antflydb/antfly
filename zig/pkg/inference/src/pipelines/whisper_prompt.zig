@@ -18,35 +18,85 @@ pub const ForcedDecoderId = struct {
     token_id: ?i32,
 };
 
-/// Resolve Whisper's decoder prompt without changing the API semantics.
-/// Explicit request languages are forced. With no hint, nullable artifact
-/// slots remain dynamic and legacy concrete language slots are made dynamic so
-/// `/transcribe` continues to provide automatic language detection.
-pub fn resolveForcedDecoderIds(
+pub const LanguageToken = struct {
+    token_id: i32,
+    code: []const u8,
+};
+
+/// Immutable prompt metadata prepared once for a loaded Whisper model. Request
+/// handling only performs a small language-token lookup and writes at most
+/// three prompt entries into caller-owned stack storage.
+pub const PromptCache = struct {
     allocator: std.mem.Allocator,
-    model_dir: []const u8,
-    tokenizer: tokenizer_mod.Tokenizer,
-    language: ?[]const u8,
-) ![]const ForcedDecoderId {
-    if (language) |value| {
-        return buildExplicitLanguagePrompt(allocator, tokenizer, value) catch |err| switch (err) {
-            // English-only Whisper tokenizers intentionally have no language
-            // tokens. An explicit `en` hint is still valid; retain their
-            // artifact task prompt instead of rejecting the request.
-            error.UnsupportedWhisperLanguage => if (std.mem.eql(u8, value, "en"))
-                (try loadForcedDecoderIds(allocator, model_dir)) orelse return err
-            else
-                return err,
-            else => return err,
+    automatic_ids: []ForcedDecoderId,
+    language_tokens: []LanguageToken,
+    transcribe_id: i32,
+    no_timestamps_id: i32,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        model_dir: []const u8,
+        tokenizer: tokenizer_mod.Tokenizer,
+    ) !PromptCache {
+        var languages = std.ArrayListUnmanaged(LanguageToken).empty;
+        defer languages.deinit(allocator);
+        for (whisper_language_codes) |code| {
+            const token_id = encodeLanguageToken(allocator, tokenizer, code) orelse continue;
+            try languages.append(allocator, .{ .token_id = token_id, .code = code });
+        }
+        const language_tokens = try languages.toOwnedSlice(allocator);
+        errdefer allocator.free(language_tokens);
+
+        const transcribe_id = try requireSpecialToken(allocator, tokenizer, "<|transcribe|>");
+        const no_timestamps_id = try requireSpecialToken(allocator, tokenizer, "<|notimestamps|>");
+        const automatic_ids = if (try loadForcedDecoderIds(allocator, model_dir)) |ids| blk: {
+            makeLanguageSlotDynamic(ids, language_tokens);
+            break :blk ids;
+        } else try buildAutomaticLanguagePromptFromTokens(
+            allocator,
+            language_tokens,
+            transcribe_id,
+            no_timestamps_id,
+        );
+        errdefer allocator.free(automatic_ids);
+
+        return .{
+            .allocator = allocator,
+            .automatic_ids = automatic_ids,
+            .language_tokens = language_tokens,
+            .transcribe_id = transcribe_id,
+            .no_timestamps_id = no_timestamps_id,
         };
     }
 
-    if (try loadForcedDecoderIds(allocator, model_dir)) |ids| {
-        makeLanguageSlotDynamic(allocator, tokenizer, ids);
-        return ids;
+    pub fn deinit(self: *PromptCache) void {
+        self.allocator.free(self.automatic_ids);
+        self.allocator.free(self.language_tokens);
+        self.* = undefined;
     }
-    return buildAutomaticLanguagePrompt(allocator, tokenizer);
-}
+
+    pub fn resolve(
+        self: *const PromptCache,
+        scratch: *[3]ForcedDecoderId,
+        language: ?[]const u8,
+    ) ![]const ForcedDecoderId {
+        const requested = language orelse return self.automatic_ids;
+        if (findLanguageToken(self.language_tokens, requested)) |language_id| {
+            scratch.* = .{
+                .{ .position = 1, .token_id = language_id },
+                .{ .position = 2, .token_id = self.transcribe_id },
+                .{ .position = 3, .token_id = self.no_timestamps_id },
+            };
+            return scratch;
+        }
+        // English-only Whisper tokenizers intentionally omit language tokens.
+        // Their immutable artifact/default task prompt is already English.
+        if (std.mem.eql(u8, requested, "en") and self.language_tokens.len == 0) {
+            return self.automatic_ids;
+        }
+        return error.UnsupportedWhisperLanguage;
+    }
+};
 
 pub fn loadForcedDecoderIds(allocator: std.mem.Allocator, model_dir: []const u8) !?[]ForcedDecoderId {
     for ([_][]const u8{ "generation_config.json", "config.json" }) |filename| {
@@ -105,41 +155,24 @@ fn jsonI32(value: std.json.Value) ?i32 {
 }
 
 fn makeLanguageSlotDynamic(
-    allocator: std.mem.Allocator,
-    tokenizer: tokenizer_mod.Tokenizer,
     ids: []ForcedDecoderId,
+    language_tokens: []const LanguageToken,
 ) void {
     for (ids) |*entry| {
         if (entry.position != 1) return;
         const token_id = entry.token_id orelse return;
-        if (languageCodeForToken(allocator, tokenizer, token_id) != null) entry.token_id = null;
+        if (languageCodeForToken(language_tokens, token_id) != null) entry.token_id = null;
         return;
     }
 }
 
-fn buildExplicitLanguagePrompt(
+fn buildAutomaticLanguagePromptFromTokens(
     allocator: std.mem.Allocator,
-    tokenizer: tokenizer_mod.Tokenizer,
-    language: []const u8,
-) ![]const ForcedDecoderId {
-    const language_id = encodeLanguageToken(allocator, tokenizer, language) orelse
-        return error.UnsupportedWhisperLanguage;
-    const transcribe_id = try requireSpecialToken(allocator, tokenizer, "<|transcribe|>");
-    const no_timestamps_id = try requireSpecialToken(allocator, tokenizer, "<|notimestamps|>");
-    const result = try allocator.alloc(ForcedDecoderId, 3);
-    result[0] = .{ .position = 1, .token_id = language_id };
-    result[1] = .{ .position = 2, .token_id = transcribe_id };
-    result[2] = .{ .position = 3, .token_id = no_timestamps_id };
-    return result;
-}
-
-fn buildAutomaticLanguagePrompt(
-    allocator: std.mem.Allocator,
-    tokenizer: tokenizer_mod.Tokenizer,
-) ![]const ForcedDecoderId {
-    const transcribe_id = try requireSpecialToken(allocator, tokenizer, "<|transcribe|>");
-    const no_timestamps_id = try requireSpecialToken(allocator, tokenizer, "<|notimestamps|>");
-    const multilingual = encodeLanguageToken(allocator, tokenizer, "en") != null;
+    language_tokens: []const LanguageToken,
+    transcribe_id: i32,
+    no_timestamps_id: i32,
+) ![]ForcedDecoderId {
+    const multilingual = language_tokens.len > 0;
     const result = try allocator.alloc(ForcedDecoderId, if (multilingual) 3 else 2);
     if (multilingual) {
         result[0] = .{ .position = 1, .token_id = null };
@@ -184,14 +217,18 @@ fn encodeSingleSpecialToken(
 /// Map a generated Whisper language token back to the ISO code returned by the
 /// public API. The list is the complete multilingual Whisper language set.
 pub fn languageCodeForToken(
-    allocator: std.mem.Allocator,
-    tokenizer: tokenizer_mod.Tokenizer,
+    language_tokens: []const LanguageToken,
     token_id: i32,
 ) ?[]const u8 {
-    for (whisper_language_codes) |language| {
-        if (encodeLanguageToken(allocator, tokenizer, language)) |candidate| {
-            if (candidate == token_id) return language;
-        }
+    for (language_tokens) |language| {
+        if (language.token_id == token_id) return language.code;
+    }
+    return null;
+}
+
+fn findLanguageToken(language_tokens: []const LanguageToken, code: []const u8) ?i32 {
+    for (language_tokens) |language| {
+        if (std.mem.eql(u8, language.code, code)) return language.token_id;
     }
     return null;
 }
@@ -205,19 +242,18 @@ pub const DetectedLanguage = struct {
 /// unrestricted decoder argmax. Compare only language-token logits so ordinary
 /// text and task tokens cannot occupy the nullable language slot.
 pub fn detectLanguageToken(
-    allocator: std.mem.Allocator,
-    tokenizer: tokenizer_mod.Tokenizer,
+    language_tokens: []const LanguageToken,
     logits: []const f32,
 ) ?DetectedLanguage {
     var best: ?DetectedLanguage = null;
     var best_logit: f32 = -std.math.inf(f32);
-    for (whisper_language_codes) |language| {
-        const token_id = encodeLanguageToken(allocator, tokenizer, language) orelse continue;
+    for (language_tokens) |language| {
+        const token_id = language.token_id;
         if (token_id < 0 or @as(usize, @intCast(token_id)) >= logits.len) continue;
         const logit = logits[@intCast(token_id)];
         if (std.math.isNan(logit)) continue;
         if (best == null or logit > best_logit) {
-            best = .{ .token_id = token_id, .code = language };
+            best = .{ .token_id = token_id, .code = language.code };
             best_logit = logit;
         }
     }
@@ -271,6 +307,20 @@ test "forced decoder ids reject unsorted or invalid positions" {
 }
 
 test "language detection ignores higher non-language logits" {
+    const languages = [_]LanguageToken{
+        .{ .token_id = 10, .code = "en" },
+        .{ .token_id = 11, .code = "es" },
+    };
+    var logits = [_]f32{0} ** 16;
+    logits[10] = 1;
+    logits[11] = 4;
+    logits[15] = 100;
+    const detected = detectLanguageToken(&languages, &logits).?;
+    try std.testing.expectEqual(@as(i32, 11), detected.token_id);
+    try std.testing.expectEqualStrings("es", detected.code);
+}
+
+test "prompt cache resolves automatic and explicit languages without request tokenization" {
     const allocator = std.testing.allocator;
     const hf_tokenizer = @import("inference_hf_tokenizer");
     var tokenizer = try hf_tokenizer.HfTokenizer.loadFromBytes(allocator,
@@ -278,11 +328,16 @@ test "language detection ignores higher non-language logits" {
     );
     defer tokenizer.deinitSelf();
 
-    var logits = [_]f32{0} ** 16;
-    logits[10] = 1;
-    logits[11] = 4;
-    logits[15] = 100;
-    const detected = detectLanguageToken(allocator, tokenizer.tokenizer(), &logits).?;
-    try std.testing.expectEqual(@as(i32, 11), detected.token_id);
-    try std.testing.expectEqualStrings("es", detected.code);
+    var cache = try PromptCache.init(allocator, "/definitely/not/a/model", tokenizer.tokenizer());
+    defer cache.deinit();
+    try std.testing.expectEqual(@as(usize, 2), cache.language_tokens.len);
+
+    var scratch: [3]ForcedDecoderId = undefined;
+    const automatic = try cache.resolve(&scratch, null);
+    try std.testing.expectEqual(@as(?i32, null), automatic[0].token_id);
+    const spanish = try cache.resolve(&scratch, "es");
+    try std.testing.expectEqual(@as(?i32, 11), spanish[0].token_id);
+    try std.testing.expectEqual(@as(?i32, 12), spanish[1].token_id);
+    try std.testing.expectEqual(@as(?i32, 13), spanish[2].token_id);
+    try std.testing.expectError(error.UnsupportedWhisperLanguage, cache.resolve(&scratch, "zz"));
 }

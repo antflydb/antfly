@@ -2297,7 +2297,7 @@ pub const Node = struct {
         }
 
         const results = try reader.readBatch(image_datas, .{
-            .prompt = request.prompt,
+            .prompt = normalizeReadPrompt(request.prompt),
             .max_tokens = max_tokens,
         });
         defer {
@@ -2341,23 +2341,29 @@ pub const Node = struct {
         var model_handle = try self.model_manager.acquireFromDir(model_path);
         defer model_handle.release();
         const model = model_handle.get();
-        if (session_factory.getWhisperConfig(model.session) == null) return error.UnsupportedTranscriberProvider;
+        const whisper_config = session_factory.getWhisperConfig(model.session) orelse return error.UnsupportedTranscriberProvider;
 
         const transcription = @import("../pipelines/transcription.zig");
         const whisper_prompt = @import("../pipelines/whisper_prompt.zig");
-        const forced_ids = try whisper_prompt.resolveForcedDecoderIds(
-            allocator,
-            model_path,
-            model.getTokenizer(),
-            request.language,
-        );
-        defer allocator.free(forced_ids);
+        const prompt_cache = if (model.whisper_prompt_cache) |*cache|
+            cache
+        else
+            return error.InvalidWhisperDecoderConfig;
+        var prompt_scratch: [3]whisper_prompt.ForcedDecoderId = undefined;
+        const forced_ids = try prompt_cache.resolve(&prompt_scratch, request.language);
         var pipeline = transcription.TranscriptionPipeline.init(
             allocator,
             model.session,
             model.session,
             model.getTokenizer(),
-            .{ .language = request.language, .forced_decoder_ids = forced_ids },
+            .{
+                .max_length = @intCast(whisper_config.max_target_positions),
+                .decoder_start_token_id = whisper_config.decoder_start_token_id,
+                .eos_token_id = whisper_config.eos_token_id,
+                .language = request.language,
+                .forced_decoder_ids = forced_ids,
+                .language_tokens = prompt_cache.language_tokens,
+            },
         );
 
         var downloaded = try downloadRemoteContent(self, allocator, request.url);
@@ -5877,7 +5883,16 @@ pub const Node = struct {
         var config = rebel_mod.loadConfig(ctx.allocator, model_path) catch |err|
             return modelLoadFailureResponse(ctx, err);
 
-        const dec_config = enc_dec_mod.loadDecoderConfig(ctx.allocator, model_path) catch enc_dec_mod.DecoderConfig{};
+        const dec_config: enc_dec_mod.DecoderConfig = if (loaded_model_handle) |*handle| blk: {
+            const config = session_factory.getWhisperConfig(handle.get().session).?;
+            break :blk .{
+                .max_length = @intCast(config.max_target_positions),
+                .decoder_start_token_id = config.decoder_start_token_id,
+                .eos_token_id = config.eos_token_id,
+                .pad_token_id = config.pad_token_id,
+                .vocab_size = @intCast(config.vocab_size),
+            };
+        } else enc_dec_mod.loadDecoderConfig(ctx.allocator, model_path) catch enc_dec_mod.DecoderConfig{};
         if (dec_config.max_length > 0) config.max_length = dec_config.max_length;
 
         var component_loader = self.model_manager.componentLoaderForPaths(
@@ -6652,7 +6667,7 @@ pub const Node = struct {
         }
 
         const results = reader.readBatch(image_datas, .{
-            .prompt = body.prompt,
+            .prompt = normalizeReadPrompt(body.prompt),
             .max_tokens = max_tokens,
         }) catch |err| switch (err) {
             error.InvalidMaxTokens => return ctx.status(400).json(.{
@@ -6678,7 +6693,7 @@ pub const Node = struct {
             filled = i + 1;
         }
 
-        const prompt_tokens = if (body.prompt) |prompt| estimateTextTokens(prompt) * body.images.len else 0;
+        const prompt_tokens = if (normalizeReadPrompt(body.prompt)) |prompt| estimateTextTokens(prompt) * body.images.len else 0;
         return ctx.json(api.ReadResponse{
             .object = "list",
             .data = results_out,
@@ -6746,6 +6761,7 @@ pub const Node = struct {
         const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
         const tokenizer_mod = @import("inference_tokenizer");
         const hf_tokenizer = @import("inference_hf_tokenizer");
+        const whisper_prompt = @import("../pipelines/whisper_prompt.zig");
         var encoder_session: backends_mod.Session = undefined;
         var decoder_session: backends_mod.Session = undefined;
         var encoder_managed: ?model_manager_mod.ManagedSession = null;
@@ -6757,6 +6773,9 @@ pub const Node = struct {
         defer if (hf_tok_owned) |hf_tok| hf_tok.deinitSelf();
         var loaded_model_handle: ?model_manager_mod.ModelHandle = null;
         defer if (loaded_model_handle) |*handle| handle.release();
+        var owned_prompt_cache: ?whisper_prompt.PromptCache = null;
+        defer if (owned_prompt_cache) |*cache| cache.deinit();
+        var prompt_cache: ?*const whisper_prompt.PromptCache = null;
 
         if (enc_dec_mod.findEncoderDecoderPaths(ctx.allocator, model_path)) |paths| {
             defer ctx.allocator.free(paths.encoder);
@@ -6802,24 +6821,23 @@ pub const Node = struct {
             encoder_session = model.session;
             decoder_session = model.session;
             tokenizer = model.getTokenizer();
+            prompt_cache = if (model.whisper_prompt_cache) |*cache| cache else null;
         }
 
         // Parse decoder config for Whisper token IDs
         const dec_config = enc_dec_mod.loadDecoderConfig(ctx.allocator, model_path) catch enc_dec_mod.DecoderConfig{};
 
-        const whisper_prompt = @import("../pipelines/whisper_prompt.zig");
-        const forced_ids = whisper_prompt.resolveForcedDecoderIds(ctx.allocator, model_path, tokenizer, body.language) catch |err| switch (err) {
-            error.UnsupportedWhisperLanguage => return ctx.status(400).json(.{
+        if (prompt_cache == null) {
+            owned_prompt_cache = whisper_prompt.PromptCache.init(ctx.allocator, model_path, tokenizer) catch |err|
+                return ctx.status(500).json(.{ .@"error" = "INVALID_MODEL", .message = @errorName(err) });
+            prompt_cache = &owned_prompt_cache.?;
+        }
+        var prompt_scratch: [3]whisper_prompt.ForcedDecoderId = undefined;
+        const forced_ids = prompt_cache.?.resolve(&prompt_scratch, body.language) catch
+            return ctx.status(400).json(.{
                 .@"error" = "INVALID_REQUEST",
                 .message = "language is not supported by this Whisper model",
-            }),
-            else => return ctx.status(500).json(.{
-                .@"error" = "INVALID_MODEL",
-                .message = @errorName(err),
-            }),
-        };
-        defer ctx.allocator.free(forced_ids);
-
+            });
         const transcription = @import("../pipelines/transcription.zig");
         var pipeline = transcription.TranscriptionPipeline.init(
             ctx.allocator,
@@ -6832,6 +6850,7 @@ pub const Node = struct {
                 .eos_token_id = dec_config.eos_token_id,
                 .language = body.language,
                 .forced_decoder_ids = forced_ids,
+                .language_tokens = prompt_cache.?.language_tokens,
             },
         );
 
@@ -8767,6 +8786,13 @@ test "read max tokens preserves omission and rejects unsafe signed values" {
     try std.testing.expectError(error.InvalidMaxTokens, validateReadMaxTokens(0));
     try std.testing.expectError(error.InvalidMaxTokens, validateReadMaxTokens(@intCast(max_read_tokens + 1)));
     try std.testing.expectError(error.InvalidMaxTokens, validateReadMaxTokens(std.math.maxInt(i64)));
+}
+
+test "read prompt treats empty public values as an omitted OCR prompt" {
+    try std.testing.expectEqual(@as(?[]const u8, null), normalizeReadPrompt(null));
+    try std.testing.expectEqual(@as(?[]const u8, null), normalizeReadPrompt(""));
+    try std.testing.expectEqual(@as(?[]const u8, null), normalizeReadPrompt(" \t\n"));
+    try std.testing.expectEqualStrings("<OCR>", normalizeReadPrompt("<OCR>").?);
 }
 
 test "read queue units scale with image batch and decode length" {
@@ -11195,6 +11221,11 @@ fn validateReadMaxTokens(value: ?i64) !?usize {
     const requested = value orelse return null;
     if (requested < 1 or requested > @as(i64, @intCast(max_read_tokens))) return error.InvalidMaxTokens;
     return @intCast(requested);
+}
+
+fn normalizeReadPrompt(prompt: ?[]const u8) ?[]const u8 {
+    const value = prompt orelse return null;
+    return if (std.mem.trim(u8, value, " \t\r\n").len == 0) null else value;
 }
 
 fn estimateReadQueueUnits(image_count: usize, max_tokens: ?usize) usize {

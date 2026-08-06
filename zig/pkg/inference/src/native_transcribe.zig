@@ -72,8 +72,10 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         defer hf_tok.deinitSelf();
 
         const dec_config = enc_dec_mod.loadDecoderConfig(allocator, opts.model_dir) catch enc_dec_mod.DecoderConfig{};
-        const forced_ids = try whisper_prompt.resolveForcedDecoderIds(allocator, opts.model_dir, hf_tok.tokenizer(), opts.language);
-        defer allocator.free(forced_ids);
+        var prompt_cache = try whisper_prompt.PromptCache.init(allocator, opts.model_dir, hf_tok.tokenizer());
+        defer prompt_cache.deinit();
+        var prompt_scratch: [3]whisper_prompt.ForcedDecoderId = undefined;
+        const forced_ids = try prompt_cache.resolve(&prompt_scratch, opts.language);
 
         var pipeline = transcription.TranscriptionPipeline.init(
             allocator,
@@ -86,6 +88,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                 .eos_token_id = dec_config.eos_token_id,
                 .language = opts.language,
                 .forced_decoder_ids = forced_ids,
+                .language_tokens = prompt_cache.language_tokens,
             },
         );
 
@@ -100,13 +103,12 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
 
     const model = try model_manager.loadFromDir(opts.model_dir);
     const whisper_cfg = session_factory.getWhisperConfig(model.session) orelse return error.InvalidModelForTranscription;
-    const forced_ids = try whisper_prompt.resolveForcedDecoderIds(
-        allocator,
-        opts.model_dir,
-        model.getTokenizer(),
-        opts.language,
-    );
-    defer allocator.free(forced_ids);
+    const prompt_cache = if (model.whisper_prompt_cache) |*cache|
+        cache
+    else
+        return error.InvalidWhisperDecoderConfig;
+    var prompt_scratch: [3]whisper_prompt.ForcedDecoderId = undefined;
+    const forced_ids = try prompt_cache.resolve(&prompt_scratch, opts.language);
 
     var pipeline = transcription.TranscriptionPipeline.init(
         allocator,
@@ -114,11 +116,12 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         model.session,
         model.getTokenizer(),
         .{
-            .max_length = 448,
+            .max_length = @intCast(whisper_cfg.max_target_positions),
             .decoder_start_token_id = whisper_cfg.decoder_start_token_id,
             .eos_token_id = whisper_cfg.eos_token_id,
             .language = opts.language,
             .forced_decoder_ids = forced_ids,
+            .language_tokens = prompt_cache.language_tokens,
         },
     );
 

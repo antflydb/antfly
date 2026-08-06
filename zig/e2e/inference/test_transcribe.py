@@ -26,6 +26,7 @@ from .helpers import assert_openai_list_response, make_wav_b64
 pytestmark = pytest.mark.model_integration
 
 _WHISPER_QUALITY_WAV = Path(__file__).with_name("testdata") / "whisper_quality.wav"
+_WHISPER_SPANISH_QUALITY_WAV = Path(__file__).with_name("testdata") / "whisper_spanish_quality.wav"
 
 
 @pytest.mark.multimodal
@@ -58,4 +59,17 @@ def test_whisper_tiny_transcribes_spoken_phrase(api):
 
     transcript = " ".join(resp["data"][0]["text"].lower().split())
     for expected_word in ("quick", "brown", "fox", "lazy", "dog"):
+        assert expected_word in transcript, f"missing {expected_word!r} from transcript: {transcript!r}"
+
+
+@pytest.mark.multimodal
+def test_whisper_tiny_autodetects_spanish(api):
+    """Automatic language detection must not regress to an English artifact prompt."""
+    audio_uri = "data:audio/wav;base64," + base64.b64encode(_WHISPER_SPANISH_QUALITY_WAV.read_bytes()).decode()
+    resp = api.transcribe(audio=audio_uri, model="openai/whisper-tiny")
+    assert_openai_list_response(resp, expected_len=1)
+    assert resp["data"][0].get("language") == "es"
+
+    transcript = " ".join(resp["data"][0]["text"].lower().split())
+    for expected_word in ("buenos", "prueba", "reconocimiento", "idioma"):
         assert expected_word in transcript, f"missing {expected_word!r} from transcript: {transcript!r}"

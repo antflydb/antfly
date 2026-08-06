@@ -42,6 +42,8 @@ pub const TranscribeConfig = struct {
     /// Decoder prompt entries from generation_config.json. A null token leaves
     /// that position model-generated (Whisper uses this for language detection).
     forced_decoder_ids: ?[]const whisper_prompt.ForcedDecoderId = null,
+    /// Immutable language-token vocabulary prepared with the loaded model.
+    language_tokens: []const whisper_prompt.LanguageToken = &.{},
 };
 
 pub const TranscribeResult = struct {
@@ -233,7 +235,7 @@ pub const TranscriptionPipeline = struct {
                 forced[forced_index].token_id == null and
                 generated_position == 1;
             const best_token: i32 = if (dynamic_language_slot)
-                if (whisper_prompt.detectLanguageToken(allocator, self.tokenizer, last_logits)) |detected| blk: {
+                if (whisper_prompt.detectLanguageToken(self.config.language_tokens, last_logits)) |detected| blk: {
                     detected_language = detected.code;
                     break :blk detected.token_id;
                 } else @intCast(best_id)

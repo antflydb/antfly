@@ -149,6 +149,7 @@ const inference_delegated_steps = [_][]const u8{
 
 const release_scale_test_filters = [_][]const u8{
     "db dense default dynamic 0.2 percent numeric filter exact scores bounded candidates",
+    "one percent native filter routes through integrated dense search exactly",
     "db one real delete keeps filtered full text on complement path across restart",
     "db production ingest preserves high-frequency keyword recall across clean restarts",
 };

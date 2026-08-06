@@ -36,6 +36,7 @@ const projector_format_mod = @import("../architectures/projector_format.zig");
 const hf_tokenizer = @import("inference_hf_tokenizer");
 const sentencepiece = @import("inference_tokenizer").sentencepiece;
 const tokenizer_mod = @import("inference_tokenizer");
+const whisper_prompt = @import("../pipelines/whisper_prompt.zig");
 const embedding_mod = @import("../pipelines/embedding.zig");
 const EmbeddingPipeline = embedding_mod.EmbeddingPipeline;
 const EmbeddingConfig = embedding_mod.EmbeddingConfig;
@@ -2049,6 +2050,7 @@ pub const LoadedModel = struct {
     model_dir: []const u8,
     allocator: std.mem.Allocator,
     chat_tmpl: ?*ChatTemplate = null,
+    whisper_prompt_cache: ?whisper_prompt.PromptCache = null,
     /// The model shipped a chat template that we could not parse, so chat requests fall
     /// back to raw prompting. Distinct from `chat_tmpl == null` with no template at all.
     chat_template_failed: bool = false,
@@ -2477,6 +2479,7 @@ pub const LoadedModel = struct {
         if (self.text_projection_resource_lease) |*lease| lease.release();
         if (self.visual_projection_resource_lease) |*lease| lease.release();
         if (self.audio_projection_resource_lease) |*lease| lease.release();
+        if (self.whisper_prompt_cache) |*cache| cache.deinit();
         if (self.hf_tok) |ht| ht.deinitSelf();
         if (self.sp_tok) |sp| {
             sp.deinit();
@@ -4060,6 +4063,16 @@ pub const ModelManager = struct {
         var session_owned = true;
         errdefer if (session_owned) session.close();
 
+        var whisper_prompt_cache: ?whisper_prompt.PromptCache = if (session_factory.getWhisperConfig(session) != null)
+            try whisper_prompt.PromptCache.init(
+                self.allocator,
+                model_dir,
+                if (hf_tok) |ht| ht.tokenizer() else sp_tok.?.tokenizer(),
+            )
+        else
+            null;
+        errdefer if (whisper_prompt_cache) |*cache| cache.deinit();
+
         // Load chat template if available (for generator models)
         var chat_template_failed = false;
         var chat_tmpl: ?*ChatTemplate = if (man.chat_template) |ct_source| blk2: {
@@ -4138,6 +4151,7 @@ pub const ModelManager = struct {
             .model_dir = owned_model_dir,
             .allocator = self.allocator,
             .chat_tmpl = chat_tmpl,
+            .whisper_prompt_cache = whisper_prompt_cache,
             .chat_template_failed = chat_template_failed,
             .shared_moe_cache = shared_moe_cache,
             .shared_prefetch = shared_prefetch,
@@ -4162,6 +4176,7 @@ pub const ModelManager = struct {
         tokenizer_resource_lease = null;
         session_owned = false;
         chat_tmpl = null;
+        whisper_prompt_cache = null;
         shared_moe_cache = null;
         shared_prefetch = null;
         native_generate_coordinator = null;

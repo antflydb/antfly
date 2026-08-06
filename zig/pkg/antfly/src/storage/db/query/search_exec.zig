@@ -65,6 +65,8 @@ const default_exact_native_filter_candidate_budget: u32 = 1024;
 // requests above them continue through filtered HBC.
 const default_selective_exact_candidate_budget: usize = 32 * 1024;
 const default_selective_exact_component_budget: usize = 16 * 1024 * 1024;
+const exact_native_filter_cancellation_stride: usize = 64;
+const exact_native_filter_metadata_batch_size: usize = 1024;
 const default_distributed_sort_shard_window_budget: u32 = 100_000;
 const default_sorted_segment_scan_budget: u64 = 100_000;
 const sorted_segment_deadline_check_interval: u64 = 1024;
@@ -13326,6 +13328,7 @@ fn exactScoreNativeDenseFilter(
     entry: *index_manager_mod.IndexManager.DenseIndex,
     req: vectorindex_mod.SearchRequest,
 ) !dense_exact.SearchOutcome {
+    try checkVectorSearchCancelled(req);
     var candidates = try dense_exact.CandidateDifference.init(alloc, req.filter_ids, req.exclude_ids);
     defer candidates.deinit();
     const unique_candidate_ids = candidates.values;
@@ -13353,7 +13356,18 @@ fn exactScoreNativeDenseFilter(
     defer alloc.free(candidate_metadata);
     if (candidate_metadata.len > 0) {
         @memset(candidate_metadata, null);
-        try entry.index.getMetadataManySortedInTxn(&txn, unique_candidate_ids, candidate_metadata);
+        var metadata_start: usize = 0;
+        while (metadata_start < unique_candidate_ids.len) {
+            try checkVectorSearchCancelled(req);
+            const metadata_end = @min(metadata_start + exact_native_filter_metadata_batch_size, unique_candidate_ids.len);
+            try entry.index.getMetadataManySortedInTxn(
+                &txn,
+                unique_candidate_ids[metadata_start..metadata_end],
+                candidate_metadata[metadata_start..metadata_end],
+            );
+            metadata_start = metadata_end;
+        }
+        try checkVectorSearchCancelled(req);
     }
 
     const vector_scratch = try alloc.alloc(f32, entry.dims);
@@ -13362,6 +13376,7 @@ fn exactScoreNativeDenseFilter(
     var vectors_scored: u64 = 0;
 
     for (unique_candidate_ids, 0..) |vector_id, i| {
+        if (i % exact_native_filter_cancellation_stride == 0) try checkVectorSearchCancelled(req);
         if (req.filter_prefix.len > 0) {
             const metadata = candidate_metadata[i] orelse continue;
             if (!std.mem.startsWith(u8, metadata, req.filter_prefix)) continue;
@@ -13391,6 +13406,12 @@ fn exactScoreNativeDenseFilter(
         .results = results,
         .vectors_scored = vectors_scored,
     };
+}
+
+inline fn checkVectorSearchCancelled(req: vectorindex_mod.SearchRequest) !void {
+    if (req.cancellation) |cancellation| {
+        if (cancellation.load(.acquire)) return error.Cancelled;
+    }
 }
 
 test "built-in exact dense scorer filters metadata before vector reads" {
@@ -13518,10 +13539,15 @@ test "one percent filtered route preserves exact recall with candidate-linear IO
 
     const VectorLoadCounter = struct {
         count: usize = 0,
+        cancel_after: usize = 0,
+        cancellation: ?*std.atomic.Value(bool) = null,
 
         fn onLoad(ctx_ptr: ?*anyopaque, _: *hbc_mod.HBCIndex, _: u64) void {
             const self: *@This() = @ptrCast(@alignCast(ctx_ptr.?));
             self.count += 1;
+            if (self.cancel_after > 0 and self.count >= self.cancel_after) {
+                self.cancellation.?.store(true, .release);
+            }
         }
     };
     var counter = VectorLoadCounter{};
@@ -13544,6 +13570,136 @@ test "one percent filtered route preserves exact recall with candidate-linear IO
     for (hits, 0..) |hit, rank| {
         try std.testing.expectEqual(@as(u64, @intCast(candidate_count - rank)), hit.vector_id);
     }
+
+    var cancellation = std.atomic.Value(bool).init(false);
+    counter = .{
+        .cancel_after = exact_native_filter_cancellation_stride,
+        .cancellation = &cancellation,
+    };
+    try std.testing.expectError(error.Cancelled, exactScoreNativeDenseFilter(alloc, &entry, .{
+        .query = &query,
+        .k = result_count,
+        .filter_ids = filter_ids,
+        .cancellation = &cancellation,
+    }));
+    try std.testing.expectEqual(exact_native_filter_cancellation_stride, counter.count);
+}
+
+test "one percent native filter routes through integrated dense search exactly" {
+    const alloc = std.testing.allocator;
+    const active_count: usize = 110_000;
+    const candidate_count: usize = active_count / 100;
+    const dims: usize = 2;
+    const result_count: usize = 10;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/integrated-selective-exact", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var index = try hbc_mod.HBCIndex.open(alloc, path_z.ptr, .{
+        .dims = dims,
+        .leaf_size = 128,
+        .branching_factor = 16,
+    });
+    var index_owned = true;
+    defer if (index_owned) index.close();
+
+    const vectors = try alloc.alloc(f32, active_count * dims);
+    defer alloc.free(vectors);
+    @memset(vectors, 0);
+    const items = try alloc.alloc(hbc_mod.BatchInsertItem, active_count);
+    defer alloc.free(items);
+    const filter_ids = try alloc.alloc(u64, candidate_count);
+    defer alloc.free(filter_ids);
+    for (items, 0..) |*item, i| {
+        const vector_id: u64 = @intCast(i + 1);
+        const vector = vectors[i * dims ..][0..dims];
+        vector[0] = @floatFromInt(vector_id);
+        item.* = .{ .vector_id = vector_id, .vector = vector, .metadata = "doc" };
+        if (i >= active_count - candidate_count) filter_ids[i - (active_count - candidate_count)] = vector_id;
+    }
+    try index.bulkBuildWithMetadata(items);
+
+    var apply_mutex = std.atomic.Mutex.unlocked;
+    var entry = index_manager_mod.IndexManager.DenseIndex{
+        .apply_mutex = &apply_mutex,
+        .config = .{ .name = "dense", .kind = .dense_vector, .config_json = "{}" },
+        .field_name = @constCast("embedding"),
+        .dims = dims,
+        .metric = .l2_squared,
+        .external = false,
+        .chunk_name = null,
+        .embedding_name = null,
+        .index = index,
+    };
+    index_owned = false;
+    defer entry.index.close();
+
+    const Harness = struct {
+        entry: *index_manager_mod.IndexManager.DenseIndex,
+
+        fn self(ctx: ?*anyopaque) *@This() {
+            return @ptrCast(@alignCast(ctx.?));
+        }
+        fn textIndex(_: ?*anyopaque, _: ?[]const u8) anyerror!?*index_manager_mod.IndexManager.TextIndex {
+            return null;
+        }
+        fn denseIndex(ctx: ?*anyopaque, _: ?[]const u8) anyerror!?*index_manager_mod.IndexManager.DenseIndex {
+            return self(ctx).entry;
+        }
+        fn unexpectedDocKey(_: ?*anyopaque, _: []const u8, _: u64) anyerror!?[]u8 {
+            return error.UnexpectedTestCall;
+        }
+        fn unexpectedVectorId(_: ?*anyopaque, _: []const u8, _: []const u8) anyerror!?u64 {
+            return error.UnexpectedTestCall;
+        }
+        fn unexpectedLoad(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, _: []const u8) anyerror![]u8 {
+            return error.UnexpectedTestCall;
+        }
+        fn unexpectedHbc(_: ?*anyopaque, _: *index_manager_mod.IndexManager.DenseIndex, _: vectorindex_mod.SearchRequest) anyerror!vectorindex_mod.SearchResults {
+            return error.UnexpectedHbcRoute;
+        }
+        fn unexpectedHbcProfiled(_: ?*anyopaque, _: *index_manager_mod.IndexManager.DenseIndex, _: vectorindex_mod.SearchRequest) anyerror!vectorindex_mod.ProfiledSearchResults {
+            return error.UnexpectedHbcRoute;
+        }
+        fn postprocess(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, raw: types.SearchResult, _: bool) anyerror!types.SearchResult {
+            return raw;
+        }
+    };
+    var harness = Harness{ .entry = &entry };
+    const executor = DenseSearchExecutor{
+        .ctx = &harness,
+        .text_index_entry = Harness.textIndex,
+        .dense_index = Harness.denseIndex,
+        .lookup_doc_key = Harness.unexpectedDocKey,
+        .lookup_vector_id = Harness.unexpectedVectorId,
+        .load_projected_document = Harness.unexpectedLoad,
+        .hbc_search = Harness.unexpectedHbc,
+        .hbc_search_profiled = Harness.unexpectedHbcProfiled,
+        .postprocess = Harness.postprocess,
+    };
+
+    var query = [_]f32{ 0, 0 };
+    query[0] = @floatFromInt(active_count);
+    var profiled = try searchDenseProfiled(alloc, .{
+        .index_name = "dense",
+        .limit = result_count,
+        .include_stored = false,
+        .filter_ids = filter_ids,
+    }, .{
+        .vector = &query,
+        .k = result_count,
+    }, executor);
+    defer profiled.result.deinit();
+
+    try std.testing.expectEqualStrings("exact_native_filter", profiled.profile.search_route);
+    try std.testing.expectEqualStrings("selectivity_within_exact_threshold_builtin", profiled.profile.route_reason);
+    try std.testing.expectEqual(@as(u64, candidate_count), profiled.profile.hbc_exact_vectors_scored);
+    try std.testing.expectEqual(result_count, profiled.result.hits.len);
+    try std.testing.expectEqualStrings("exact", profiled.result.sort_profile.?.exactness);
 }
 
 fn countActiveDenseVectorIdsAlloc(
