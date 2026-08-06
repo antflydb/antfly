@@ -563,6 +563,7 @@ const AntflyRootImports = struct {
     platform_link_libc: bool,
     platform_target: std.Build.ResolvedTarget,
     filesystem_capacity_source_file: std.Build.LazyPath,
+    standalone_runtime_options: *std.Build.Step.Options,
 
     const import_table = [_]struct { name: []const u8, field: []const u8 }{
         .{ .name = "lmdb_engine", .field = "lmdb_engine" },
@@ -632,6 +633,7 @@ const AntflyRootImports = struct {
 
     fn configure(self: @This(), b: *std.Build, mod: *std.Build.Module, include_lmdb_c: bool, link_libc: bool) void {
         mod.addOptions("build_options", self.build_options);
+        mod.addOptions("standalone_runtime_options", self.standalone_runtime_options);
         inline for (import_table) |entry| {
             mod.addImport(entry.name, @field(self, entry.field));
         }
@@ -1193,6 +1195,7 @@ pub fn build(b: *std.Build) void {
     const cli_focused_root = b.option(bool, "cli-focused-root", "Build the full CLI against its focused Antfly facade") orelse false;
     const runtime_artifact_role = b.option(RuntimeArtifactRole, "runtime-artifact-role", "Build one focused server runtime artifact: data, inference, metadata, or standalone");
     const linked_runtime_libraries = b.option(bool, "linked-runtime-libraries", "Code-generate server runtimes separately and link them into one executable") orelse false;
+    const standalone_embedded_inference = b.option(bool, "standalone-embedded-inference", "Compile the embedded inference node into the standalone runtime") orelse true;
     const antfly_bin_name = b.option([]const u8, "antfly-bin-name", "Installed filename for the top-level Antfly CLI") orelse "antfly";
     if (linked_runtime_libraries and edition != .full) {
         @panic("-Dlinked-runtime-libraries=true requires -Dedition=full");
@@ -1701,6 +1704,8 @@ pub fn build(b: *std.Build) void {
     const inference_fixed_tokenizer_data_mod = inference_graph.inference_fixed_tokenizer_data_mod;
     const inference_chunker_mod = inference_graph.inference_chunker_mod;
     const inference_server_mod = inference_graph.inference_mod;
+    const standalone_runtime_options = b.addOptions();
+    standalone_runtime_options.addOption(bool, "embedded_inference", standalone_embedded_inference);
 
     const hf_tokenizer_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -1819,6 +1824,7 @@ pub fn build(b: *std.Build) void {
         .platform_link_libc = link_libc,
         .platform_target = target,
         .filesystem_capacity_source_file = b.path("lib/platform/src/filesystem_capacity.c"),
+        .standalone_runtime_options = standalone_runtime_options,
     };
 
     // Library module

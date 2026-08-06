@@ -64,6 +64,7 @@ jobs:
             -Dmetal=false \
             -Dsystem-blas=false \
             -Dlinked-runtime-libraries=true \
+            -Dstandalone-embedded-inference=false \
             --prefix "$RUNNER_TEMP/linked-runtime" \
             --cache-dir "$RUNNER_TEMP/linked-runtime-cache/local" \
             --global-cache-dir "$RUNNER_TEMP/linked-runtime-cache/global" \
