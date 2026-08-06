@@ -58,6 +58,13 @@ fn getenv(name: [*:0]const u8) ?[]const u8 {
 const default_balanced_search_effort: f32 = 0.5;
 const default_late_visibility_exact_candidate_budget: u32 = 100_000;
 const default_exact_native_filter_candidate_budget: u32 = 1024;
+// Exact filtered search performs one storage lookup and one distance evaluation
+// per candidate. Bound both sources of work: candidate count protects the
+// storage path while component count keeps high-dimensional indexes from
+// consuming disproportionate CPU. These are routing budgets, not result caps;
+// requests above them continue through filtered HBC.
+const default_selective_exact_candidate_budget: usize = 32 * 1024;
+const default_selective_exact_component_budget: usize = 16 * 1024 * 1024;
 const default_distributed_sort_shard_window_budget: u32 = 100_000;
 const default_sorted_segment_scan_budget: u64 = 100_000;
 const sorted_segment_deadline_check_interval: u64 = 1024;
@@ -12925,6 +12932,7 @@ fn searchDenseInternal(
             native_constraints.positive_filter,
             effective_native_filter_candidate_count,
             index_stats.active_count,
+            entry.dims,
             paging,
             executor.exact_dense_search != null,
         );
@@ -13149,6 +13157,7 @@ fn denseSearchRoute(
     positive_filter: bool,
     effective_candidate_count: usize,
     active_count: u64,
+    vector_dims: usize,
     paging: ComponentPaging,
     exact_executor_available: bool,
 ) DenseSearchRoute {
@@ -13162,9 +13171,10 @@ fn denseSearchRoute(
         .name = "hbc",
         .reason = "empty_native_filter",
     };
-    const paging_budget = pagingCandidateWindow(paging) *| 32;
-    const budget = @max(paging_budget, default_exact_native_filter_candidate_budget);
-    if (effective_candidate_count <= budget) return .{
+    const paging_budget: usize = pagingCandidateWindow(paging) *| 32;
+    const requested_budget = @max(paging_budget, default_exact_native_filter_candidate_budget);
+    const work_budget = selectiveExactCandidateWorkBudget(vector_dims);
+    if (effective_candidate_count <= @min(requested_budget, work_budget)) return .{
         .exact_native_filter = true,
         .name = "exact_native_filter",
         .reason = if (exact_executor_available)
@@ -13175,19 +13185,35 @@ fn denseSearchRoute(
     // Rare positive subsets are a poor fit for graph traversal: the HBC
     // centroids describe the whole corpus, so a traversal can spend most of
     // its work on leaves whose members the filter rejects and still miss
-    // eligible neighbours. Exact scoring is both recall-safe and cheaper once
-    // the resolved set is at most one percent of the live index. Keep the
-    // absolute page-derived budget above for small indexes and use division
-    // here to avoid overflow in candidate_count * 100.
-    const selective_candidate_limit = active_count / 100;
-    if (selective_candidate_limit > 0 and effective_candidate_count <= selective_candidate_limit) return .{
-        .exact_native_filter = true,
-        .name = "exact_native_filter",
-        .reason = if (exact_executor_available)
-            "selectivity_within_exact_threshold"
-        else
-            "selectivity_within_exact_threshold_builtin",
-    };
+    // eligible neighbours. Exact scoring is recall-safe for these subsets, but
+    // selectivity alone is not a cost bound on a large index. Require both the
+    // relative threshold and the dimension-aware absolute work budget. Use
+    // division for the relative threshold to avoid candidate_count * 100
+    // overflow.
+    const selective_candidate_limit: usize = @intCast(@min(active_count / 100, std.math.maxInt(usize)));
+    if (selective_candidate_limit > 0 and
+        effective_candidate_count <= selective_candidate_limit and
+        effective_candidate_count <= work_budget)
+    {
+        return .{
+            .exact_native_filter = true,
+            .name = "exact_native_filter",
+            .reason = if (exact_executor_available)
+                "selectivity_within_exact_threshold"
+            else
+                "selectivity_within_exact_threshold_builtin",
+        };
+    }
+    if ((effective_candidate_count <= requested_budget or
+        (selective_candidate_limit > 0 and effective_candidate_count <= selective_candidate_limit)) and
+        effective_candidate_count > work_budget)
+    {
+        return .{
+            .exact_native_filter = false,
+            .name = "hbc",
+            .reason = "selective_exact_work_budget_exceeded",
+        };
+    }
     return .{
         .exact_native_filter = false,
         .name = "hbc",
@@ -13195,41 +13221,56 @@ fn denseSearchRoute(
     };
 }
 
+fn selectiveExactCandidateWorkBudget(vector_dims: usize) usize {
+    const dimensions = @max(vector_dims, 1);
+    const component_limited = @max(default_selective_exact_component_budget / dimensions, 1);
+    return @min(default_selective_exact_candidate_budget, component_limited);
+}
+
 test "dense search route reports exact native filter budget decisions" {
     const paging = ComponentPaging{ .offset = 0, .limit = 100 };
 
-    const no_filter = denseSearchRoute(false, 0, 1_000_000, paging, false);
+    const no_filter = denseSearchRoute(false, 0, 1_000_000, 768, paging, false);
     try std.testing.expect(!no_filter.exact_native_filter);
     try std.testing.expectEqualStrings("hbc", no_filter.name);
     try std.testing.expectEqualStrings("no_native_filter", no_filter.reason);
 
-    const within_budget = denseSearchRoute(true, 500, 10_000, paging, true);
+    const within_budget = denseSearchRoute(true, 500, 10_000, 768, paging, true);
     try std.testing.expect(within_budget.exact_native_filter);
     try std.testing.expectEqualStrings("exact_native_filter", within_budget.name);
     try std.testing.expectEqualStrings("candidate_count_within_budget", within_budget.reason);
 
-    const builtin_fallback = denseSearchRoute(true, 500, 10_000, paging, false);
+    const builtin_fallback = denseSearchRoute(true, 500, 10_000, 768, paging, false);
     try std.testing.expect(builtin_fallback.exact_native_filter);
     try std.testing.expectEqualStrings("exact_native_filter", builtin_fallback.name);
     try std.testing.expectEqualStrings("candidate_count_within_budget_builtin", builtin_fallback.reason);
 
-    const one_percent = denseSearchRoute(true, 10_000, 1_000_000, paging, true);
+    const one_percent = denseSearchRoute(true, 10_000, 1_000_000, 768, paging, true);
     try std.testing.expect(one_percent.exact_native_filter);
     try std.testing.expectEqualStrings("exact_native_filter", one_percent.name);
     try std.testing.expectEqualStrings("selectivity_within_exact_threshold", one_percent.reason);
 
-    const one_percent_builtin = denseSearchRoute(true, 10_000, 1_000_000, paging, false);
+    const one_percent_builtin = denseSearchRoute(true, 10_000, 1_000_000, 768, paging, false);
     try std.testing.expect(one_percent_builtin.exact_native_filter);
     try std.testing.expectEqualStrings("selectivity_within_exact_threshold_builtin", one_percent_builtin.reason);
 
-    const over_budget = denseSearchRoute(true, 10_001, 1_000_000, paging, false);
+    const over_budget = denseSearchRoute(true, 10_001, 1_000_000, 768, paging, false);
     try std.testing.expect(!over_budget.exact_native_filter);
     try std.testing.expectEqualStrings("hbc", over_budget.name);
     try std.testing.expectEqualStrings("native_filter_candidate_budget_exceeded", over_budget.reason);
 
-    const exclusion_reduced = denseSearchRoute(true, 201, 10_000, paging, true);
+    const exclusion_reduced = denseSearchRoute(true, 201, 10_000, 768, paging, true);
     try std.testing.expect(exclusion_reduced.exact_native_filter);
     try std.testing.expectEqualStrings("candidate_count_within_budget", exclusion_reduced.reason);
+
+    const oversized_one_percent = denseSearchRoute(true, 1_000_000, 100_000_000, 768, paging, true);
+    try std.testing.expect(!oversized_one_percent.exact_native_filter);
+    try std.testing.expectEqualStrings("hbc", oversized_one_percent.name);
+    try std.testing.expectEqualStrings("selective_exact_work_budget_exceeded", oversized_one_percent.reason);
+
+    try std.testing.expectEqual(@as(usize, 32 * 1024), selectiveExactCandidateWorkBudget(2));
+    try std.testing.expectEqual(@as(usize, 16 * 1024), selectiveExactCandidateWorkBudget(1024));
+    try std.testing.expectEqual(@as(usize, 1), selectiveExactCandidateWorkBudget(std.math.maxInt(usize)));
 }
 
 fn pagingCandidateWindow(paging: ComponentPaging) u32 {
@@ -13416,6 +13457,93 @@ test "built-in exact dense scorer filters metadata before vector reads" {
     try std.testing.expectEqual(@as(usize, 2), hits.len);
     try std.testing.expectEqual(@as(u64, 1), hits[0].vector_id);
     try std.testing.expectEqual(@as(u64, 2), hits[1].vector_id);
+}
+
+test "one percent filtered route preserves exact recall with candidate-linear IO" {
+    const alloc = std.testing.allocator;
+    const candidate_count: usize = 1100;
+    const dims: usize = 8;
+    const result_count: usize = 10;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/selective-exact-recall", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var index = try hbc_mod.HBCIndex.open(alloc, path_z.ptr, .{
+        .dims = dims,
+        .leaf_size = 64,
+        .branching_factor = 8,
+    });
+    var index_owned = true;
+    defer if (index_owned) index.close();
+
+    const vectors = try alloc.alloc(f32, candidate_count * dims);
+    defer alloc.free(vectors);
+    @memset(vectors, 0);
+    const items = try alloc.alloc(hbc_mod.BatchInsertItem, candidate_count);
+    defer alloc.free(items);
+    const filter_ids = try alloc.alloc(u64, candidate_count);
+    defer alloc.free(filter_ids);
+    for (items, 0..) |*item, i| {
+        const vector_id: u64 = @intCast(i + 1);
+        const vector = vectors[i * dims ..][0..dims];
+        vector[0] = @floatFromInt(vector_id);
+        item.* = .{ .vector_id = vector_id, .vector = vector };
+        filter_ids[i] = vector_id;
+    }
+    try index.bulkBuildWithMetadata(items);
+
+    var apply_mutex = std.atomic.Mutex.unlocked;
+    var entry = index_manager_mod.IndexManager.DenseIndex{
+        .apply_mutex = &apply_mutex,
+        .config = .{ .name = "dense", .kind = .dense_vector, .config_json = "{}" },
+        .field_name = @constCast("embedding"),
+        .dims = dims,
+        .metric = .l2_squared,
+        .external = false,
+        .chunk_name = null,
+        .embedding_name = null,
+        .index = index,
+    };
+    index_owned = false;
+    defer entry.index.close();
+
+    const paging = ComponentPaging{ .offset = 0, .limit = result_count };
+    const route = denseSearchRoute(true, candidate_count, candidate_count * 100, dims, paging, false);
+    try std.testing.expect(route.exact_native_filter);
+    try std.testing.expectEqualStrings("selectivity_within_exact_threshold_builtin", route.reason);
+
+    const VectorLoadCounter = struct {
+        count: usize = 0,
+
+        fn onLoad(ctx_ptr: ?*anyopaque, _: *hbc_mod.HBCIndex, _: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx_ptr.?));
+            self.count += 1;
+        }
+    };
+    var counter = VectorLoadCounter{};
+    hbc_mod.setTestGetVectorViewOrScratchHook(&counter, VectorLoadCounter.onLoad);
+    defer hbc_mod.setTestGetVectorViewOrScratchHook(null, null);
+
+    var query = [_]f32{0} ** dims;
+    query[0] = @floatFromInt(candidate_count);
+    var outcome = try exactScoreNativeDenseFilter(alloc, &entry, .{
+        .query = &query,
+        .k = result_count,
+        .filter_ids = filter_ids,
+    });
+    defer outcome.results.deinit();
+
+    try std.testing.expectEqual(@as(u64, candidate_count), outcome.vectors_scored);
+    try std.testing.expectEqual(candidate_count, counter.count);
+    const hits = outcome.results.getHits();
+    try std.testing.expectEqual(result_count, hits.len);
+    for (hits, 0..) |hit, rank| {
+        try std.testing.expectEqual(@as(u64, @intCast(candidate_count - rank)), hit.vector_id);
+    }
 }
 
 fn countActiveDenseVectorIdsAlloc(

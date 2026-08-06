@@ -54,6 +54,7 @@ def test_whisper_tiny_transcribes_spoken_phrase(api):
     audio_uri = "data:audio/wav;base64," + base64.b64encode(_WHISPER_QUALITY_WAV.read_bytes()).decode()
     resp = api.transcribe(audio=audio_uri, model="openai/whisper-tiny")
     assert_openai_list_response(resp, expected_len=1)
+    assert resp["data"][0].get("language") == "en"
 
     transcript = " ".join(resp["data"][0]["text"].lower().split())
     for expected_word in ("quick", "brown", "fox", "lazy", "dog"):

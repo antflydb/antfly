@@ -1489,8 +1489,8 @@ fn buildFlorencePromptIds(
 }
 
 fn normalizeFlorencePrompt(prompt: []const u8) []const u8 {
-    // /read is an OCR endpoint, so an omitted prompt must select Florence's
-    // OCR task instead of feeding an empty decoder prefix.
+    // /read is an OCR endpoint, so an explicitly empty prompt follows the same
+    // OCR default as an omitted prompt (which the caller represents as <OCR>).
     if (prompt.len == 0 or std.mem.eql(u8, prompt, "<OCR>")) return "What is the text in the image?";
     if (std.mem.eql(u8, prompt, "<OCR_WITH_REGION>")) return "What is the text in the image, with regions?";
     if (std.mem.eql(u8, prompt, "<CAPTION>")) return "What does the image describe?";
@@ -1502,7 +1502,7 @@ fn normalizeFlorencePrompt(prompt: []const u8) []const u8 {
     return prompt;
 }
 
-test "Florence defaults an omitted read prompt to OCR" {
+test "Florence defaults an empty read prompt to OCR" {
     try std.testing.expectEqualStrings("What is the text in the image?", normalizeFlorencePrompt(""));
     try std.testing.expectEqualStrings("What is the text in the image?", normalizeFlorencePrompt("<OCR>"));
 }

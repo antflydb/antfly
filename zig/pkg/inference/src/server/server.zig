@@ -2345,13 +2345,13 @@ pub const Node = struct {
 
         const transcription = @import("../pipelines/transcription.zig");
         const whisper_prompt = @import("../pipelines/whisper_prompt.zig");
-        const forced_ids = whisper_prompt.resolveForcedDecoderIds(
+        const forced_ids = try whisper_prompt.resolveForcedDecoderIds(
             allocator,
             model_path,
             model.getTokenizer(),
             request.language,
         );
-        defer if (forced_ids) |ids| allocator.free(ids);
+        defer allocator.free(forced_ids);
         var pipeline = transcription.TranscriptionPipeline.init(
             allocator,
             model.session,
@@ -6808,8 +6808,17 @@ pub const Node = struct {
         const dec_config = enc_dec_mod.loadDecoderConfig(ctx.allocator, model_path) catch enc_dec_mod.DecoderConfig{};
 
         const whisper_prompt = @import("../pipelines/whisper_prompt.zig");
-        const forced_ids = whisper_prompt.resolveForcedDecoderIds(ctx.allocator, model_path, tokenizer, body.language);
-        defer if (forced_ids) |f| ctx.allocator.free(f);
+        const forced_ids = whisper_prompt.resolveForcedDecoderIds(ctx.allocator, model_path, tokenizer, body.language) catch |err| switch (err) {
+            error.UnsupportedWhisperLanguage => return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "language is not supported by this Whisper model",
+            }),
+            else => return ctx.status(500).json(.{
+                .@"error" = "INVALID_MODEL",
+                .message = @errorName(err),
+            }),
+        };
+        defer ctx.allocator.free(forced_ids);
 
         const transcription = @import("../pipelines/transcription.zig");
         var pipeline = transcription.TranscriptionPipeline.init(

@@ -72,8 +72,8 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         defer hf_tok.deinitSelf();
 
         const dec_config = enc_dec_mod.loadDecoderConfig(allocator, opts.model_dir) catch enc_dec_mod.DecoderConfig{};
-        const forced_ids = whisper_prompt.resolveForcedDecoderIds(allocator, opts.model_dir, hf_tok.tokenizer(), opts.language);
-        defer if (forced_ids) |f| allocator.free(f);
+        const forced_ids = try whisper_prompt.resolveForcedDecoderIds(allocator, opts.model_dir, hf_tok.tokenizer(), opts.language);
+        defer allocator.free(forced_ids);
 
         var pipeline = transcription.TranscriptionPipeline.init(
             allocator,
@@ -100,13 +100,13 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
 
     const model = try model_manager.loadFromDir(opts.model_dir);
     const whisper_cfg = session_factory.getWhisperConfig(model.session) orelse return error.InvalidModelForTranscription;
-    const forced_ids = whisper_prompt.resolveForcedDecoderIds(
+    const forced_ids = try whisper_prompt.resolveForcedDecoderIds(
         allocator,
         opts.model_dir,
         model.getTokenizer(),
         opts.language,
     );
-    defer if (forced_ids) |f| allocator.free(f);
+    defer allocator.free(forced_ids);
 
     var pipeline = transcription.TranscriptionPipeline.init(
         allocator,

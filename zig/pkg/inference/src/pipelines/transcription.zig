@@ -29,6 +29,7 @@ const build_options = @import("build_options");
 const backends = @import("../backends/backends.zig");
 const tokenizer_mod = @import("inference_tokenizer");
 const audio = @import("audio.zig");
+const whisper_prompt = @import("whisper_prompt.zig");
 
 pub const TranscribeConfig = struct {
     max_length: usize = 448,
@@ -38,9 +39,9 @@ pub const TranscribeConfig = struct {
     chunk_length_s: usize = 30,
     decoder_start_token_id: i32 = 50258,
     eos_token_id: i32 = 50257,
-    /// Forced decoder IDs as [position, token_id] pairs from generation_config.json.
-    /// If set, these are placed at the given positions after decoder_start_token_id.
-    forced_decoder_ids: ?[]const [2]i32 = null,
+    /// Decoder prompt entries from generation_config.json. A null token leaves
+    /// that position model-generated (Whisper uses this for language detection).
+    forced_decoder_ids: ?[]const whisper_prompt.ForcedDecoderId = null,
 };
 
 pub const TranscribeResult = struct {
@@ -159,21 +160,19 @@ pub const TranscriptionPipeline = struct {
 
         // 2. Autoregressive decode
         const max_len = self.config.max_length;
+        if (max_len == 0) return error.InvalidTranscriptionMaxLength;
         var dec_ids = try allocator.alloc(i64, max_len);
         defer allocator.free(dec_ids);
 
-        // Initial decoder tokens: decoder_start_token_id + forced_decoder_ids
+        // Initial decoder token. Concrete prompt positions are appended without
+        // a model invocation; nullable positions are generated autoregressively.
         dec_ids[0] = self.config.decoder_start_token_id;
         var dec_len: usize = 1;
-        if (self.config.forced_decoder_ids) |forced| {
-            for (forced) |pair| {
-                const pos: usize = @intCast(pair[0]);
-                if (pos < max_len) {
-                    dec_ids[pos] = @intCast(pair[1]);
-                    if (pos >= dec_len) dec_len = pos + 1;
-                }
-            }
-        }
+        const forced = self.config.forced_decoder_ids orelse &.{};
+        try validateForcedDecoderIds(forced, max_len);
+        const prompt_end = forcedDecoderPromptEnd(forced);
+        var forced_index: usize = 0;
+        var detected_language: ?[]const u8 = null;
 
         // Encoder mask
         const enc_mask = try allocator.alloc(i64, enc_seq_len);
@@ -181,6 +180,16 @@ pub const TranscriptionPipeline = struct {
         @memset(enc_mask, 1);
 
         while (dec_len < max_len) {
+            if (forced_index < forced.len and forced[forced_index].position == dec_len) {
+                if (forced[forced_index].token_id) |token_id| {
+                    dec_ids[dec_len] = token_id;
+                    dec_len += 1;
+                    forced_index += 1;
+                    continue;
+                }
+            }
+
+            const generated_position = dec_len;
             const dec_seq: i64 = @intCast(dec_len);
             const dec_shape = [_]i64{ 1, dec_seq };
 
@@ -219,18 +228,31 @@ pub const TranscriptionPipeline = struct {
                 }
             }
 
-            if (@as(i32, @intCast(best_id)) == self.config.eos_token_id) break;
+            const dynamic_language_slot = forced_index < forced.len and
+                forced[forced_index].position == generated_position and
+                forced[forced_index].token_id == null and
+                generated_position == 1;
+            const best_token: i32 = if (dynamic_language_slot)
+                if (whisper_prompt.detectLanguageToken(allocator, self.tokenizer, last_logits)) |detected| blk: {
+                    detected_language = detected.code;
+                    break :blk detected.token_id;
+                } else @intCast(best_id)
+            else
+                @intCast(best_id);
+            // Prompt slots are control tokens. Do not terminate before the
+            // artifact-defined prompt is complete even if a malformed model
+            // predicts EOS for a dynamic slot.
+            if (best_token == self.config.eos_token_id and generated_position >= prompt_end) break;
 
-            dec_ids[dec_len] = @intCast(best_id);
+            dec_ids[dec_len] = best_token;
             dec_len += 1;
+            if (forced_index < forced.len and forced[forced_index].position == generated_position) {
+                forced_index += 1;
+            }
         }
 
         // 3. Decode tokens to text (skip forced prefix tokens)
-        const prefix_len: usize = if (self.config.forced_decoder_ids) |forced|
-            (if (forced.len > 0) @as(usize, @intCast(forced[forced.len - 1][0])) + 1 else 1)
-        else
-            1;
-        const text_start: usize = prefix_len;
+        const text_start: usize = @min(prompt_end, dec_len);
         const text_len = if (dec_len > text_start) dec_len - text_start else 0;
 
         const token_ids = try allocator.alloc(i32, text_len);
@@ -238,10 +260,51 @@ pub const TranscriptionPipeline = struct {
         for (0..text_len) |i| token_ids[i] = @intCast(dec_ids[text_start + i]);
 
         const text = try self.tokenizer.decode(allocator, token_ids);
-        return .{ .text = text, .language = null, .allocator = allocator };
+        errdefer allocator.free(text);
+        const language = if (self.config.language) |language|
+            try allocator.dupe(u8, language)
+        else if (detected_language) |language|
+            try allocator.dupe(u8, language)
+        else
+            null;
+        return .{ .text = text, .language = language, .allocator = allocator };
     }
 
     pub fn deinit(_: *TranscriptionPipeline) void {
         // Sessions and tokenizer are borrowed — caller manages their lifetime.
     }
 };
+
+fn forcedDecoderPromptEnd(forced: []const whisper_prompt.ForcedDecoderId) usize {
+    return if (forced.len == 0) 1 else forced[forced.len - 1].position +| 1;
+}
+
+fn validateForcedDecoderIds(forced: []const whisper_prompt.ForcedDecoderId, max_len: usize) !void {
+    var previous_position: usize = 0;
+    for (forced) |entry| {
+        if (entry.position == 0 or entry.position <= previous_position or entry.position >= max_len) {
+            return error.InvalidWhisperDecoderPrompt;
+        }
+        previous_position = entry.position;
+    }
+}
+
+test "Whisper decoder prompts retain dynamic language slots without gaps" {
+    const forced = [_]whisper_prompt.ForcedDecoderId{
+        .{ .position = 1, .token_id = null },
+        .{ .position = 2, .token_id = 50359 },
+        .{ .position = 3, .token_id = 50363 },
+    };
+    try validateForcedDecoderIds(&forced, 16);
+    try std.testing.expectEqual(@as(usize, 4), forcedDecoderPromptEnd(&forced));
+}
+
+test "Whisper decoder prompts reject unsorted and out of bounds entries" {
+    try std.testing.expectError(error.InvalidWhisperDecoderPrompt, validateForcedDecoderIds(&.{
+        .{ .position = 2, .token_id = 10 },
+        .{ .position = 1, .token_id = null },
+    }, 8));
+    try std.testing.expectError(error.InvalidWhisperDecoderPrompt, validateForcedDecoderIds(&.{
+        .{ .position = 8, .token_id = 10 },
+    }, 8));
+}
