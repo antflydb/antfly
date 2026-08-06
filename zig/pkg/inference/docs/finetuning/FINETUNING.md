@@ -331,7 +331,7 @@ and `_transform_schema` description/example shuffles to eval-mode semantics —
 entities/JSON emit every present `[DESCRIPTION]` segment, classifications emit
 `[DESCRIPTION]` plus `[EXAMPLE]`/`[OUTPUT]` — which is exactly the
 deterministic form the Zig data pipeline always emits.
-`gliner2_described_smoke.jsonl` exercises that surface in the full-task parity
+`testdata/gliner2/described_smoke.jsonl` exercises that surface in the full-task parity
 gates. Stock-stochastic outcome studies leave upstream training-mode
 conditioning untouched and record that fact in their evidence.
 

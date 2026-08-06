@@ -24,7 +24,7 @@ test "GLiNER2 smoke NER fixture has stable stats and span shape" {
     const allocator = std.testing.allocator;
     const entity_types = [_][]const u8{ "person", "organization", "location" };
 
-    var loaded = try gliner2_data.loadExamples(allocator, "testdata/gliner2_ner_smoke.jsonl", null);
+    var loaded = try gliner2_data.loadExamples(allocator, "testdata/gliner2/ner_smoke.jsonl", null);
     defer loaded.deinit();
 
     const stats = try gliner2_data.computeStats(allocator, loaded.examples);
@@ -81,7 +81,7 @@ test "GLiNER2 smoke NER fixture has stable stats and span shape" {
 test "simple example encoded length matches the full batch attention mask" {
     const allocator = std.testing.allocator;
     const entity_types = [_][]const u8{ "person", "organization", "location" };
-    var loaded = try gliner2_data.loadExamples(allocator, "testdata/gliner2_ner_smoke.jsonl", null);
+    var loaded = try gliner2_data.loadExamples(allocator, "testdata/gliner2/ner_smoke.jsonl", null);
     defer loaded.deinit();
     var tokenizer = try gliner2_data.Tokenizer.initDefault(allocator);
     defer tokenizer.deinit(allocator);
@@ -103,7 +103,7 @@ test "GLiNER2 dataset readiness exposes non-toy gate failures" {
     const allocator = std.testing.allocator;
     const entity_types = [_][]const u8{ "person", "organization", "location" };
 
-    var loaded = try gliner2_data.loadExamples(allocator, "testdata/gliner2_ner_smoke.jsonl", null);
+    var loaded = try gliner2_data.loadExamples(allocator, "testdata/gliner2/ner_smoke.jsonl", null);
     defer loaded.deinit();
 
     var smoke = try gliner2_data.evaluateDatasetReadiness(
@@ -179,7 +179,7 @@ test "GLiNER2 dataset readiness exposes non-toy gate failures" {
 test "GLiNER2 upstream all-task fixture exposes extractive span labels" {
     const allocator = std.testing.allocator;
 
-    var loaded = try gliner2_data.loadExamples(allocator, "testdata/gliner2_all_task_smoke.jsonl", null);
+    var loaded = try gliner2_data.loadExamples(allocator, "testdata/gliner2/full_task_smoke.jsonl", null);
     defer loaded.deinit();
 
     const stats = try gliner2_data.computeStats(allocator, loaded.examples);
@@ -208,7 +208,7 @@ test "GLiNER2 upstream all-task fixture exposes extractive span labels" {
 test "GLiNER2 upstream all-task fixture preserves task-level labels" {
     const allocator = std.testing.allocator;
 
-    var loaded = try gliner2_data.loadTrainingRecords(allocator, "testdata/gliner2_all_task_smoke.jsonl", null);
+    var loaded = try gliner2_data.loadTrainingRecords(allocator, "testdata/gliner2/full_task_smoke.jsonl", null);
     defer loaded.deinit();
 
     try std.testing.expectEqual(@as(usize, 4), loaded.records.len);
@@ -255,7 +255,7 @@ test "GLiNER2 upstream all-task fixture preserves task-level labels" {
 
 test "grouped structures mirror upstream dedup empty and relation completeness rules" {
     const allocator = std.testing.allocator;
-    var loaded = try gliner2_data.loadTrainingRecords(allocator, "testdata/gliner2_structure_edge_smoke.jsonl", null);
+    var loaded = try gliner2_data.loadTrainingRecords(allocator, "testdata/gliner2/structure_edge_smoke.jsonl", null);
     defer loaded.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), loaded.records.len);
@@ -293,7 +293,7 @@ test "grouped structures mirror upstream dedup empty and relation completeness r
 
 test "choice prefixes preserve raw occurrences and all matching selected positions" {
     const allocator = std.testing.allocator;
-    var loaded = try gliner2_data.loadTrainingRecords(allocator, "testdata/gliner2_choice_structure_edge_smoke.jsonl", null);
+    var loaded = try gliner2_data.loadTrainingRecords(allocator, "testdata/gliner2/choice_structure_edge_smoke.jsonl", null);
     defer loaded.deinit();
 
     const record = loaded.records[0];
@@ -318,7 +318,7 @@ test "choice prefixes preserve raw occurrences and all matching selected positio
 
 test "legacy entity rows become one upstream entities task" {
     const allocator = std.testing.allocator;
-    var loaded = try gliner2_data.loadTrainingRecords(allocator, "testdata/gliner2_ner_smoke.jsonl", null);
+    var loaded = try gliner2_data.loadTrainingRecords(allocator, "testdata/gliner2/ner_smoke.jsonl", null);
     defer loaded.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), loaded.records[0].tasks.len);
@@ -353,7 +353,7 @@ test "legacy entity rows reject Unicode annotations instead of using ASCII match
 
 test "entity schemas preserve empty labels as negative supervision" {
     const allocator = std.testing.allocator;
-    var loaded = try gliner2_data.loadTrainingRecords(allocator, "testdata/gliner2_negative_entity_schema_smoke.jsonl", null);
+    var loaded = try gliner2_data.loadTrainingRecords(allocator, "testdata/gliner2/negative_entity_schema_smoke.jsonl", null);
     defer loaded.deinit();
 
     for (loaded.records) |record| {
@@ -389,7 +389,7 @@ test "upstream annotations require token-sequence matches" {
     const allocator = std.testing.allocator;
     try std.testing.expectError(
         error.AnnotationNotFound,
-        gliner2_data.loadTrainingRecords(allocator, "testdata/gliner2_substring_annotation_smoke.jsonl", null),
+        gliner2_data.loadTrainingRecords(allocator, "testdata/gliner2/substring_annotation_smoke.jsonl", null),
     );
 }
 
@@ -397,11 +397,11 @@ test "classification schemas fail closed on invalid labels and duplicate tasks" 
     const allocator = std.testing.allocator;
     try std.testing.expectError(
         error.UnknownClassificationTrueLabel,
-        gliner2_data.loadTrainingRecords(allocator, "testdata/gliner2_invalid_classification_smoke.jsonl", null),
+        gliner2_data.loadTrainingRecords(allocator, "testdata/gliner2/invalid_classification_smoke.jsonl", null),
     );
     try std.testing.expectError(
         error.DuplicateClassificationTaskName,
-        gliner2_data.loadTrainingRecords(allocator, "testdata/gliner2_duplicate_classification_smoke.jsonl", null),
+        gliner2_data.loadTrainingRecords(allocator, "testdata/gliner2/duplicate_classification_smoke.jsonl", null),
     );
 }
 
@@ -604,7 +604,7 @@ test "choice schemas reject selections outside the declared choices" {
     const allocator = std.testing.allocator;
     try std.testing.expectError(
         error.ChoiceValueNotInChoices,
-        gliner2_data.loadTrainingRecords(allocator, "testdata/gliner2_invalid_choice_smoke.jsonl", null),
+        gliner2_data.loadTrainingRecords(allocator, "testdata/gliner2/invalid_choice_smoke.jsonl", null),
     );
 }
 
@@ -612,18 +612,18 @@ test "upstream records reject empty tasks and malformed structures" {
     const allocator = std.testing.allocator;
     try std.testing.expectError(
         error.NoGliner2Tasks,
-        gliner2_data.loadTrainingRecords(allocator, "testdata/gliner2_empty_task_smoke.jsonl", null),
+        gliner2_data.loadTrainingRecords(allocator, "testdata/gliner2/empty_task_smoke.jsonl", null),
     );
     try std.testing.expectError(
         error.InvalidStructureOccurrence,
-        gliner2_data.loadTrainingRecords(allocator, "testdata/gliner2_invalid_structure_smoke.jsonl", null),
+        gliner2_data.loadTrainingRecords(allocator, "testdata/gliner2/invalid_structure_smoke.jsonl", null),
     );
 }
 
 test "GLiNER2 upstream all-task label vocab includes classification and structured labels" {
     const allocator = std.testing.allocator;
 
-    var loaded = try gliner2_data.loadTrainingRecords(allocator, "testdata/gliner2_all_task_smoke.jsonl", null);
+    var loaded = try gliner2_data.loadTrainingRecords(allocator, "testdata/gliner2/full_task_smoke.jsonl", null);
     defer loaded.deinit();
 
     const labels = try gliner2_data.buildUpstreamTaskLabelVocab(allocator, loaded.records, null);
@@ -672,7 +672,7 @@ test "GLiNER2 upstream all-task label vocab includes classification and structur
 test "GLiNER2 upstream task batch carries schema markers and structured span labels" {
     const allocator = std.testing.allocator;
 
-    var loaded = try gliner2_data.loadTrainingRecords(allocator, "testdata/gliner2_all_task_smoke.jsonl", null);
+    var loaded = try gliner2_data.loadTrainingRecords(allocator, "testdata/gliner2/full_task_smoke.jsonl", null);
     defer loaded.deinit();
 
     const labels = try gliner2_data.buildUpstreamTaskLabelVocab(allocator, loaded.records, null);
@@ -715,7 +715,7 @@ test "GLiNER2 upstream task batch carries schema markers and structured span lab
 
 test "upstream record encoded length matches the full batch attention mask" {
     const allocator = std.testing.allocator;
-    var loaded = try gliner2_data.loadTrainingRecords(allocator, "testdata/gliner2_all_task_smoke.jsonl", null);
+    var loaded = try gliner2_data.loadTrainingRecords(allocator, "testdata/gliner2/full_task_smoke.jsonl", null);
     defer loaded.deinit();
     var tokenizer = try gliner2_data.Tokenizer.initDefault(allocator);
     defer tokenizer.deinit(allocator);
@@ -738,7 +738,7 @@ test "upstream record encoded length matches the full batch attention mask" {
 
 test "GLiNER2 upstream batches use bounded per-sample schema slots" {
     const allocator = std.testing.allocator;
-    var loaded = try gliner2_data.loadTrainingRecords(allocator, "testdata/gliner2_all_task_smoke.jsonl", null);
+    var loaded = try gliner2_data.loadTrainingRecords(allocator, "testdata/gliner2/full_task_smoke.jsonl", null);
     defer loaded.deinit();
 
     const dataset_labels = try gliner2_data.buildUpstreamTaskLabelVocab(allocator, loaded.records, null);
@@ -971,7 +971,7 @@ test "upstream span word buckets retain rows for every schema task" {
 test "GLiNER2 negative fixture is explicit and unresolved annotations fail" {
     const allocator = std.testing.allocator;
 
-    var loaded = try gliner2_data.loadTrainingRecords(allocator, "testdata/gliner2_negative_smoke.jsonl", null);
+    var loaded = try gliner2_data.loadTrainingRecords(allocator, "testdata/gliner2/negative_smoke.jsonl", null);
     defer loaded.deinit();
     const stats = gliner2_data.computeUpstreamTaskStats(loaded.records);
     try std.testing.expectEqual(@as(usize, 3), loaded.records.len);
@@ -1454,7 +1454,7 @@ test "GLiNER2 fitted simple length preserves words with many schema labels" {
 test "GLiNER2 label class capacity rejects collapsed label mappings" {
     const allocator = std.testing.allocator;
 
-    var loaded = try gliner2_data.loadExamples(allocator, "testdata/gliner2_ner_smoke.jsonl", null);
+    var loaded = try gliner2_data.loadExamples(allocator, "testdata/gliner2/ner_smoke.jsonl", null);
     defer loaded.deinit();
 
     try std.testing.expectEqual(@as(usize, 3), try gliner2_data.validateLabelClassCapacity(allocator, loaded.examples, 4));

@@ -3486,7 +3486,7 @@ pub const ModelManager = struct {
                 &self.session_manager,
             );
             const backend_runtime = session_manager.resolveBackendRuntime(backend) catch |err| {
-                if (first_err == null) first_err = err;
+                rememberPreferredLoadError(&first_err, err);
                 continue;
             };
             session_manager.onnx_execution_provider = backend_runtime.onnx_execution_provider;
@@ -3496,7 +3496,7 @@ pub const ModelManager = struct {
             var admission_limits = runtime.tier.memory.Limits{};
             if (self.admission_enabled) {
                 const artifact_bytes = artifact_estimate.bytesForBackend(backend) catch |err| {
-                    if (first_err == null) first_err = err;
+                    rememberPreferredLoadError(&first_err, err);
                     continue;
                 };
                 const plan = if (artifact_estimate == .onnx)
@@ -3504,7 +3504,7 @@ pub const ModelManager = struct {
                 else
                     nativeModelLoadAdmission(artifact_bytes, backend_runtime.backend);
                 const admission_plan = plan catch |err| {
-                    if (first_err == null) first_err = err;
+                    rememberPreferredLoadError(&first_err, err);
                     continue;
                 };
                 resident_amounts = admission_plan.resident;
@@ -3520,7 +3520,7 @@ pub const ModelManager = struct {
                     admission_limits,
                     admission_plan.peak,
                 ) catch |err| {
-                    if (first_err == null) first_err = err;
+                    rememberPreferredLoadError(&first_err, err);
                     continue;
                 };
             }
@@ -3553,7 +3553,7 @@ pub const ModelManager = struct {
                 };
             } else |err| {
                 if (resource_lease) |*lease| lease.release();
-                if (first_err == null) first_err = err;
+                rememberPreferredLoadError(&first_err, err);
             }
         }
         return first_err orelse error.NoBackendAvailable;
@@ -4850,7 +4850,7 @@ fn loadSessionForPreferredBackends(
         var single_backend = [_]backends.BackendType{backend};
         var backend_session_manager = sessionManagerForPreferredBackends(manager.allocator, single_backend[0..], source_session_manager);
         const backend_runtime = backend_session_manager.resolveBackendRuntime(backend) catch |err| {
-            if (first_err == null) first_err = err;
+            rememberPreferredLoadError(&first_err, err);
             continue;
         };
         backend_session_manager.onnx_execution_provider = backend_runtime.onnx_execution_provider;
@@ -4859,7 +4859,7 @@ fn loadSessionForPreferredBackends(
         var admission_limits = runtime.tier.memory.Limits{};
         if (manager.admission_enabled) {
             const admission_plan = estimateModelLoadAdmission(man, backend_runtime) catch |err| {
-                if (first_err == null) first_err = err;
+                rememberPreferredLoadError(&first_err, err);
                 continue;
             };
             resident_amounts = admission_plan.resident;
@@ -4868,7 +4868,7 @@ fn loadSessionForPreferredBackends(
                 backend_runtime,
                 resident_amounts,
             ) catch |err| {
-                if (first_err == null) first_err = err;
+                rememberPreferredLoadError(&first_err, err);
                 continue;
             }) |cuda_limit| {
                 backend_session_manager.onnx_cuda_memory_limit_bytes = cuda_limit;
@@ -4878,7 +4878,7 @@ fn loadSessionForPreferredBackends(
                 admission_limits,
                 admission_plan.peak,
             ) catch |err| {
-                if (first_err == null) first_err = err;
+                rememberPreferredLoadError(&first_err, err);
                 continue;
             };
         }
@@ -4905,7 +4905,7 @@ fn loadSessionForPreferredBackends(
         } else |err| {
             if (resource_lease) |*lease| lease.release();
             std.log.warn("loadModel({s}) backend {s} failed: {s}", .{ model_dir, @tagName(backend), @errorName(err) });
-            if (first_err == null) first_err = err;
+            rememberPreferredLoadError(&first_err, err);
         }
     }
 
@@ -4921,6 +4921,50 @@ fn loadSessionForPreferredBackends(
     // NoModelFileFound only when nothing was even attempted.
     if (first_err) |err| return err;
     return error.NoModelFileFound;
+}
+
+fn loadErrorPriority(err: anyerror) u2 {
+    return switch (err) {
+        // Admission pressure is actionable at the HTTP boundary: callers can
+        // retry it after the current model request or eviction completes.
+        error.ResourceTemporarilyUnavailable => 3,
+        // A stable capacity-policy rejection is more useful than a backend
+        // probe miss, but must not replace a retryable alternative.
+        error.ResourceLimitExceeded => 2,
+        // These are expected while walking a preferred-backend list and carry
+        // less information than an actual import or model-contract failure.
+        error.NoBackendAvailable, error.UnsupportedBackend => 0,
+        else => 1,
+    };
+}
+
+fn rememberPreferredLoadError(selected: *?anyerror, candidate: anyerror) void {
+    const current = selected.* orelse {
+        selected.* = candidate;
+        return;
+    };
+    if (loadErrorPriority(candidate) > loadErrorPriority(current)) {
+        selected.* = candidate;
+    }
+}
+
+test "model loading preserves retryable admission errors across backend probes" {
+    var selected: ?anyerror = null;
+    rememberPreferredLoadError(&selected, error.NoBackendAvailable);
+    rememberPreferredLoadError(&selected, error.MissingWeight);
+    rememberPreferredLoadError(&selected, error.ResourceTemporarilyUnavailable);
+    rememberPreferredLoadError(&selected, error.ResourceLimitExceeded);
+    try std.testing.expectEqual(
+        @as(?anyerror, error.ResourceTemporarilyUnavailable),
+        selected,
+    );
+}
+
+test "model loading prefers actionable import errors over backend probe misses" {
+    var selected: ?anyerror = error.UnsupportedBackend;
+    rememberPreferredLoadError(&selected, error.ShapeMismatch);
+    rememberPreferredLoadError(&selected, error.NoBackendAvailable);
+    try std.testing.expectEqual(@as(?anyerror, error.ShapeMismatch), selected);
 }
 
 test "serving admission applies the node-wide host-memory override" {
