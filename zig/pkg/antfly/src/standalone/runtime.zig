@@ -24,7 +24,9 @@ const usermgr_openapi = @import("antfly_usermgr_openapi");
 const fs_paths = @import("../common/fs_paths.zig");
 const platform_time = @import("antfly_platform").time;
 const platform = @import("antfly_platform");
+const inference_bridge = @import("inference_bridge.zig");
 const standalone_runtime_options = @import("standalone_runtime_options");
+const inline_inference_codegen = !standalone_runtime_options.linked_inference;
 
 const AntflyApiHandler = antfly.public_api.httpx_handler.AntflyApiHandler;
 const http_common = antfly.common.http;
@@ -1383,15 +1385,15 @@ pub fn runFromIterator(
     );
     defer storage_maintenance.deinit();
 
-    // Standalone always owns a local Antfly node. Antfly-managed embeddings use it
-    // directly, and the public Antfly routes are registered on the unified
-    // server for compatibility with external clients.
-    var resolved_warm_models = if (comptime standalone_runtime_options.embedded_inference)
+    // Standalone always owns a local Antfly node. In the linked build its heavy
+    // implementation is code-generated in the inference archive and reached
+    // through an opaque internal ABI; the shipped artifact remains one binary.
+    var resolved_warm_models = if (comptime inline_inference_codegen)
         try resolveInferenceWarmModels(alloc, cli, if (loaded_config) |*cfg| cfg else null)
     else
         ResolvedWarmModels{ .items = &.{} };
     defer resolved_warm_models.deinit(alloc);
-    var antfly_node = if (comptime standalone_runtime_options.embedded_inference) blk: {
+    var antfly_node = if (comptime inline_inference_codegen) blk: {
         var antfly_node_cfg = inference.server.NodeConfig{
             .models_dir = resolveInferenceModelsDir(cli, if (loaded_config) |*cfg| cfg else null) orelse
                 antfly.inference_runtime.defaultModelsDirForDataDir(alloc, data_dir),
@@ -1410,13 +1412,29 @@ pub fn runFromIterator(
                     std.math.cast(usize, value) orelse return error.InvalidInferenceModelCacheConfig;
         }
         break :blk try inference.server.Node.init(alloc, antfly_node_cfg);
-    } else {};
+    } else blk: {
+        var handle: ?*anyopaque = null;
+        const context = inference_bridge.CreateContext{
+            .init = &init,
+            .cli = &cli,
+            .loaded_config = if (loaded_config) |*cfg| cfg else null,
+            .data_dir_ptr = data_dir.ptr,
+            .data_dir_len = data_dir.len,
+            .out_handle = &handle,
+        };
+        if (inference_bridge.antfly_standalone_inference_create(&context) != 0)
+            return error.InferenceRuntimeStartupFailed;
+        break :blk handle orelse return error.InferenceRuntimeStartupFailed;
+    };
     // Until DataServer exists, error cleanup is owned here. Once its
     // ResourceManager is attached below, the regular defer is registered
     // after DataServer's so tokenizer budget callbacks are torn down first.
-    var antfly_node_needs_errdeinit = standalone_runtime_options.embedded_inference;
-    errdefer if (comptime standalone_runtime_options.embedded_inference) {
-        if (antfly_node_needs_errdeinit) antfly_node.deinit();
+    var antfly_node_needs_errdeinit = true;
+    errdefer if (antfly_node_needs_errdeinit) {
+        if (comptime inline_inference_codegen)
+            antfly_node.deinit()
+        else
+            inference_bridge.antfly_standalone_inference_destroy(antfly_node);
     };
 
     var active_audio_runtime = try antfly.common.audio_runtime.ActiveRuntime.init(
@@ -1593,19 +1611,20 @@ pub fn runFromIterator(
         .backend_runtime = node_backend_runtime.ptr(),
     }, local_metadata.catalogSource(), local_metadata.statusSource());
     defer data_server.deinit();
-    if (comptime standalone_runtime_options.embedded_inference) antfly_node_needs_errdeinit = false;
+    antfly_node_needs_errdeinit = false;
     defer {
-        if (comptime standalone_runtime_options.embedded_inference) {
-            // DataServer sources, recovery workers, and durable API jobs retain the
-            // embedded provider. Drain them while the node is valid, then release
-            // tokenizer reservations while DataServer's ResourceManager is valid.
-            // The earlier data_server.deinit defer performs final storage teardown.
-            data_server.quiesceBackgroundWork();
-            antfly_node.deinit();
-        }
+        // DataServer sources, recovery workers, and durable API jobs retain the
+        // embedded provider. Drain them while the node is valid, then release
+        // tokenizer reservations while DataServer's ResourceManager is valid.
+        // The earlier data_server.deinit defer performs final storage teardown.
+        data_server.quiesceBackgroundWork();
+        if (comptime inline_inference_codegen)
+            antfly_node.deinit()
+        else
+            inference_bridge.antfly_standalone_inference_destroy(antfly_node);
     }
 
-    if (comptime standalone_runtime_options.embedded_inference) {
+    if (comptime inline_inference_codegen) {
         antfly_node.configureAdmissionResourceBudget(inferenceAdmissionResourceBudget(
             &data_server.provisioned_storage.resource_manager,
         ));
@@ -1626,6 +1645,26 @@ pub fn runFromIterator(
             return err;
         };
         data_server.setAntflyProvider(localAntflyProvider(&antfly_node));
+    } else {
+        var attached_io: std.Io = undefined;
+        const io_ptr: ?*const anyopaque = if (node_backend_runtime.ptr().io()) |io| blk: {
+            attached_io = io;
+            break :blk &attached_io;
+        } else null;
+        const configure_context = inference_bridge.ConfigureContext{
+            .handle = antfly_node,
+            .resource_manager = &data_server.provisioned_storage.resource_manager,
+            .io = io_ptr,
+        };
+        if (inference_bridge.antfly_standalone_inference_configure(&configure_context) != 0)
+            return error.InferenceRuntimeStartupFailed;
+
+        var provider: antfly.inference.managed_embedder.AntflyProvider = undefined;
+        inference_bridge.antfly_standalone_inference_provider(&.{
+            .handle = antfly_node,
+            .out_provider = &provider,
+        });
+        data_server.setAntflyProvider(provider);
     }
 
     // Initialize API server (wires caches + sources) without binding a listener.
@@ -1690,7 +1729,7 @@ pub fn runFromIterator(
     defer if (health_server) |hs| hs.deinit();
 
     const public_io = node_backend_runtime.ptr().io() orelse return error.BackendRuntimeUnavailable;
-    const thread = if (comptime standalone_runtime_options.embedded_inference)
+    const thread = if (comptime inline_inference_codegen)
         std.Thread.spawn(.{}, serveUnifiedWithInference, .{
             alloc,
             public_io,
@@ -1703,12 +1742,13 @@ pub fn runFromIterator(
             &unified_lifecycle,
         })
     else
-        std.Thread.spawn(.{}, serveUnifiedWithoutInference, .{
+        std.Thread.spawn(.{}, serveUnifiedWithLinkedInference, .{
             alloc,
             public_io,
             bind_host,
             bind_port,
             &handler,
+            antfly_node,
             api_server,
             &unified_api_ready,
             &unified_lifecycle,
@@ -1829,6 +1869,97 @@ pub fn runLite(
     }
     var args = std.process.Args.Iterator.init(.{ .vector = argv.items });
     try runFromIterator(init, "antfly standalone", &args);
+}
+
+const LinkedInferenceState = struct {
+    alloc: std.mem.Allocator,
+    node: inference.server.Node,
+    warm_models: ResolvedWarmModels,
+};
+
+/// Creates the standalone inference implementation inside the independently
+/// code-generated inference runtime. The C wrapper is exported by
+/// runtime_artifact_lib.zig; keeping the implementation here avoids a second
+/// copy of the provider and route adapters.
+pub fn linkedInferenceCreate(context: *const inference_bridge.CreateContext) !*anyopaque {
+    const init: *const std.process.Init = @ptrCast(@alignCast(context.init));
+    const cli: *const CliConfig = @ptrCast(@alignCast(context.cli));
+    const loaded_config: ?*const antfly.common.config.Config = if (context.loaded_config) |cfg|
+        @ptrCast(@alignCast(cfg))
+    else
+        null;
+    const data_dir = context.data_dir_ptr[0..context.data_dir_len];
+    const alloc = init.gpa;
+
+    const state = try alloc.create(LinkedInferenceState);
+    errdefer alloc.destroy(state);
+    var warm_models = try resolveInferenceWarmModels(alloc, cli.*, loaded_config);
+    errdefer warm_models.deinit(alloc);
+
+    var node_config = inference.server.NodeConfig{
+        .models_dir = resolveInferenceModelsDir(cli.*, loaded_config) orelse
+            antfly.inference_runtime.defaultModelsDirForDataDir(alloc, data_dir),
+        .ml_dir = resolveInferenceMlDir(cli.*, loaded_config) orelse
+            antfly.inference_runtime.defaultMlDirForDataDir(alloc, data_dir),
+        .generation_budget_overrides = resolveInferenceBudgetOverrides(cli.*),
+        .preload = warm_models.items,
+    };
+    if (loaded_config) |cfg| {
+        if (cfg.effectiveAntflyContentSecurity()) |security| node_config.content_security = security.*;
+        if (cfg.inference.s3_credentials) |creds| node_config.s3_credentials = creds;
+        if (cfg.inference.keep_alive) |value|
+            node_config.keep_alive_ms = try parseInferenceKeepAliveMs(value);
+        if (cfg.inference.max_loaded_models) |value|
+            node_config.max_loaded_models =
+                std.math.cast(usize, value) orelse return error.InvalidInferenceModelCacheConfig;
+    }
+
+    state.* = .{
+        .alloc = alloc,
+        .node = try inference.server.Node.init(alloc, node_config),
+        .warm_models = warm_models,
+    };
+    return state;
+}
+
+pub fn linkedInferenceConfigure(context: *const inference_bridge.ConfigureContext) !void {
+    const state: *LinkedInferenceState = @ptrCast(@alignCast(context.handle));
+    const manager: *antfly.resource_manager.ResourceManager = @ptrCast(@alignCast(context.resource_manager));
+    state.node.configureAdmissionResourceBudget(inferenceAdmissionResourceBudget(manager));
+    state.node.config.prompt_cache_resource_usage_observer = promptCacheResourceUsageObserver(manager);
+    try state.node.configureTokenizerCaches(.{
+        .bulk_slots_per_shard = 16 * 1024,
+        .resource_budget = tokenizerCacheResourceBudget(manager),
+    });
+    if (context.io) |io_ptr| {
+        const io: *const std.Io = @ptrCast(@alignCast(io_ptr));
+        state.node.attachIo(io.*);
+    }
+    state.node.warmConfiguredModels(state.alloc) catch |err| {
+        std.log.err("standalone startup failed step=warm_inference_models err={}", .{err});
+        return err;
+    };
+}
+
+pub fn linkedInferenceProvider(context: *const inference_bridge.ProviderContext) void {
+    const state: *LinkedInferenceState = @ptrCast(@alignCast(context.handle));
+    const provider: *antfly.inference.managed_embedder.AntflyProvider = @ptrCast(@alignCast(context.out_provider));
+    provider.* = localAntflyProvider(&state.node);
+}
+
+pub fn linkedInferenceRegisterRoutes(context: *const inference_bridge.RoutesContext) !void {
+    const state: *LinkedInferenceState = @ptrCast(@alignCast(context.handle));
+    const server: *httpx.Server = @ptrCast(@alignCast(context.server));
+    try state.node.registerRoutesOn(inference.server.public_api_prefix, server);
+    try state.node.registerAiRoutesOn(inference.server.ai_api_prefix, server);
+}
+
+pub fn linkedInferenceDestroy(handle: *anyopaque) void {
+    const state: *LinkedInferenceState = @ptrCast(@alignCast(handle));
+    const alloc = state.alloc;
+    state.node.deinit();
+    state.warm_models.deinit(alloc);
+    alloc.destroy(state);
 }
 
 fn localAntflyProvider(node: *inference.server.Node) antfly.inference.managed_embedder.AntflyProvider {
@@ -2412,17 +2543,18 @@ fn serveUnifiedWithInference(
     lifecycle.publishStopped();
 }
 
-fn serveUnifiedWithoutInference(
+fn serveUnifiedWithLinkedInference(
     alloc: std.mem.Allocator,
     io: std.Io,
     bind_host: []const u8,
     bind_port: u16,
     handler: *AntflyApiHandler,
+    inference_handle: *anyopaque,
     api_server: *antfly.public_api.http_server.ApiHttpServer,
     unified_api_ready: *std.atomic.Value(bool),
     lifecycle: *UnifiedServerLifecycle,
 ) void {
-    serveUnifiedInner(false, alloc, io, bind_host, bind_port, handler, {}, api_server, unified_api_ready, lifecycle) catch |err| {
+    serveUnifiedInner(false, alloc, io, bind_host, bind_port, handler, inference_handle, api_server, unified_api_ready, lifecycle) catch |err| {
         unified_api_ready.store(false, .release);
         lifecycle.publishFailure(err);
         std.debug.print("unified server error: {}\n", .{err});
@@ -2433,13 +2565,13 @@ fn serveUnifiedWithoutInference(
 }
 
 fn serveUnifiedInner(
-    comptime embedded_inference: bool,
+    comptime inline_inference: bool,
     alloc: std.mem.Allocator,
     io: std.Io,
     bind_host: []const u8,
     bind_port: u16,
     handler: *AntflyApiHandler,
-    antfly_node: if (embedded_inference) *inference.server.Node else void,
+    antfly_node: if (inline_inference) *inference.server.Node else *anyopaque,
     api_server: *antfly.public_api.http_server.ApiHttpServer,
     unified_api_ready: *std.atomic.Value(bool),
     lifecycle: *UnifiedServerLifecycle,
@@ -2450,9 +2582,14 @@ fn serveUnifiedInner(
     defer lifecycle.detach(&server);
 
     // Register inference AI routes under /ai/v1 and Traditional ML routes under /ml/v1.
-    if (comptime embedded_inference) {
+    if (comptime inline_inference) {
         try antfly_node.registerRoutesOn(inference.server.public_api_prefix, &server);
         try antfly_node.registerAiRoutesOn(inference.server.ai_api_prefix, &server);
+    } else {
+        if (inference_bridge.antfly_standalone_inference_register_routes(&.{
+            .handle = antfly_node,
+            .server = &server,
+        }) != 0) return error.InferenceRouteRegistrationFailed;
     }
 
     // Register antfly public API routes under /db/v1

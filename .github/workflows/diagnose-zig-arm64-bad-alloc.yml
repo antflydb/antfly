@@ -55,7 +55,7 @@ jobs:
             "$RUNNER_TEMP/linked-runtime-cache/global"
           cd zig
           /usr/bin/time -v -o "$RUNNER_TEMP/linked-runtime.time" \
-            zig build -j1 \
+            zig build \
             -Dtarget=aarch64-linux-musl \
             -Doptimize=ReleaseFast \
             -Dstrip=true \
@@ -64,7 +64,6 @@ jobs:
             -Dmetal=false \
             -Dsystem-blas=false \
             -Dlinked-runtime-libraries=true \
-            -Dstandalone-embedded-inference=false \
             --prefix "$RUNNER_TEMP/linked-runtime" \
             --cache-dir "$RUNNER_TEMP/linked-runtime-cache/local" \
             --global-cache-dir "$RUNNER_TEMP/linked-runtime-cache/global" \
@@ -80,6 +79,9 @@ jobs:
           nm -g "$binary" | tee "$RUNNER_TEMP/linked-runtime.symbols"
           for role in data inference metadata standalone; do
             grep -Eq "antfly_runtime_${role}$" "$RUNNER_TEMP/linked-runtime.symbols"
+          done
+          for operation in create configure provider register_routes destroy; do
+            grep -Eq "antfly_standalone_inference_${operation}$" "$RUNNER_TEMP/linked-runtime.symbols"
           done
           stat -c 'binary_size_bytes=%s' "$binary" | tee "$RUNNER_TEMP/linked-runtime.size"
 
