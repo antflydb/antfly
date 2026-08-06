@@ -5127,6 +5127,8 @@ pub fn build(b: *std.Build) void {
         .root_module = api_table_reads_docid_test_mod,
         .filters = &.{
             "aggregation completeness requires exact total relation",
+            "api http client forwards internal query controls and maps remote timeout",
+            "remote shard query phases propagate deadline and request cancellation",
             "provisioned table read cache has a finite worker ceiling",
             "provisioned read cache invalidates repeated ownership moves with pinned leases",
             "provisioned read cache exclusive access drains active read leases",

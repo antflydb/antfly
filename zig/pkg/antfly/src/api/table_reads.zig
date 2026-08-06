@@ -125,6 +125,23 @@ fn checkQueryDeadline(req: db_mod.types.SearchRequest) !void {
     if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
 }
 
+fn queryRemainingTimeoutMs(req: db_mod.types.SearchRequest) !?u32 {
+    try checkQueryDeadline(req);
+    const deadline_ns = req.execution_deadline_ns orelse return null;
+    const now_ns = platform_time.monotonicNs();
+    if (now_ns >= deadline_ns) return error.Timeout;
+    const remaining_ns = deadline_ns - now_ns;
+    const rounded_ms = @max(
+        @as(u64, 1),
+        std.math.divCeil(u64, remaining_ns, std.time.ns_per_ms) catch 1,
+    );
+    return @intCast(@min(rounded_ms, @as(u64, std.math.maxInt(u32))));
+}
+
+fn queryRequestCancellation(req: db_mod.types.SearchRequest) http_common.RequestCancellation {
+    return .{ .borrowed = req.cancellation };
+}
+
 fn nsToUsFloat(ns: u64) f64 {
     return @as(f64, @floatFromInt(ns)) / 1000.0;
 }
@@ -4664,6 +4681,7 @@ fn collectHostedSearchRequestTextStatsParallel(
     group_ids: []const u64,
     table_name: []const u8,
     body: []const u8,
+    req: db_mod.types.SearchRequest,
     consistency: raft_mod.ReadConsistency,
 ) ![]const distributed_stats_mod.TextFieldStats {
     const start_ns = platform_time.monotonicNs();
@@ -4681,6 +4699,7 @@ fn collectHostedSearchRequestTextStatsParallel(
             group_id: u64,
             table_name_inner: []const u8,
             body_inner: []const u8,
+            req_inner: db_mod.types.SearchRequest,
         ) void {
             const arena = slot.arena.allocator();
             var response = switch (route) {
@@ -4695,7 +4714,7 @@ fn collectHostedSearchRequestTextStatsParallel(
                     table_name_inner,
                     body_inner,
                 ),
-                .remote => |remote| textStatsRemote(source.executor, arena, remote.base_uri, group_id, table_name_inner, body_inner),
+                .remote => |remote| textStatsRemote(source.executor, arena, remote.base_uri, group_id, table_name_inner, body_inner, req_inner),
             } catch |err| {
                 slot.err = err;
                 return;
@@ -4716,7 +4735,7 @@ fn collectHostedSearchRequestTextStatsParallel(
         const end = @min(start + width, group_ids.len);
         var group: std.Io.Group = .init;
         for (group_ids[start..end], start..end) |group_id, i| {
-            group.async(io, Fiber.run, .{ self, &slots[i], routes[i], group_id, table_name, body });
+            group.async(io, Fiber.run, .{ self, &slots[i], routes[i], group_id, table_name, body, req });
         }
         group.await(io) catch {};
     }
@@ -11556,7 +11575,7 @@ fn collectHostedAlgebraicDistributedPartials(
                 break :blk try collectAlgebraicPartialsFromDbForRequest(alloc, &db, parsed);
             },
             .remote => |remote| blk: {
-                var response = (algebraicPartialsRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body) catch return null) orelse return null;
+                var response = (algebraicPartialsRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body, req) catch return null) orelse return null;
                 defer response.deinit(alloc);
                 break :blk try parseAlgebraicPartialsResponse(alloc, response.json);
             },
@@ -13011,7 +13030,7 @@ fn collectHostedSearchRequestTextStats(
     const plan = planFanout(.text_stats, self.io_impl, group_ids.len);
     recordFanoutPlan(.text_stats, plan);
     if (plan.parallel) {
-        return try collectHostedSearchRequestTextStatsParallel(self, alloc, self.io_impl.?.io(), plan.width, group_ids, table_name, body, consistency);
+        return try collectHostedSearchRequestTextStatsParallel(self, alloc, self.io_impl.?.io(), plan.width, group_ids, table_name, body, req, consistency);
     }
     if (plan.reason == .no_io) recordParallelFanoutFallback(.text_stats);
 
@@ -13027,7 +13046,7 @@ fn collectHostedSearchRequestTextStats(
         defer route.deinit(alloc);
         var response = switch (route) {
             .local => (try collectProvisionedHostedLocalTextStats(null, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body)) orelse return error.TableNotFound,
-            .remote => |remote| (try textStatsRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body)) orelse return error.TableNotFound,
+            .remote => |remote| (try textStatsRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body, req)) orelse return error.TableNotFound,
         };
         defer response.deinit(alloc);
         shard_stats[i] = try parseTextStatsResponse(alloc, response.json);
@@ -13145,7 +13164,7 @@ fn collectHostedAggregationTextStats(
         defer route.deinit(alloc);
         var response = switch (route) {
             .local => (try collectProvisionedHostedLocalTextStats(null, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body)) orelse return error.TableNotFound,
-            .remote => |remote| (try textStatsRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body)) orelse return error.TableNotFound,
+            .remote => |remote| (try textStatsRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body, req)) orelse return error.TableNotFound,
         };
         defer response.deinit(alloc);
         shard_stats[i] = try parseTextStatsResponse(alloc, response.json);
@@ -13188,7 +13207,7 @@ fn collectHostedAggregationBackgroundTextStats(
         defer route.deinit(alloc);
         var response = switch (route) {
             .local => (try collectProvisionedHostedLocalTextStats(null, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body)) orelse return error.TableNotFound,
-            .remote => |remote| (try textStatsRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body)) orelse return error.TableNotFound,
+            .remote => |remote| (try textStatsRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body, req)) orelse return error.TableNotFound,
         };
         defer response.deinit(alloc);
         shard_stats[i] = try parseBackgroundTextStatsResponse(alloc, response.json);
@@ -13557,9 +13576,12 @@ fn queryRemote(
 ) !db_mod.types.SearchResult {
     var client = http_client.ApiHttpClient.init(alloc, executor);
     if (searchRequestHasUnserializableResolvedDocFilter(req)) return error.UnsupportedQueryRequest;
+    const timeout_ms = try queryRemainingTimeoutMs(req);
+    var cancellation = queryRequestCancellation(req);
+    const cancellation_ptr = if (req.cancellation != null) &cancellation else null;
     if (try encodeAlgebraicVectorWorkerRequestForSearchRequestAlloc(alloc, req)) |body| {
         defer alloc.free(body);
-        var result = try client.fetchGroupVectorWorker(base_uri, group_id, table_name, body);
+        var result = try client.fetchGroupVectorWorkerWithControl(base_uri, group_id, table_name, body, timeout_ms, cancellation_ptr);
         defer result.deinit(alloc);
         var parsed = try parseRemoteSearchResult(alloc, result.body);
         parsed.identity_read_generation = req.identity_read_generation;
@@ -13567,7 +13589,7 @@ fn queryRemote(
     }
     const body = try encodeQueryRequest(alloc, req);
     defer alloc.free(body);
-    var result = try client.fetchGroupQuery(base_uri, group_id, table_name, body);
+    var result = try client.fetchGroupQueryWithControl(base_uri, group_id, table_name, body, timeout_ms, cancellation_ptr);
     defer result.deinit(alloc);
     var parsed = try parseRemoteSearchResult(alloc, result.body);
     parsed.identity_read_generation = req.identity_read_generation;
@@ -13585,9 +13607,12 @@ fn preflightRemote(
 ) !db_mod.RuntimePreflightSummary {
     var client = http_client.ApiHttpClient.init(alloc, executor);
     if (searchRequestHasUnserializableResolvedDocFilter(req)) return error.UnsupportedQueryRequest;
+    const timeout_ms = try queryRemainingTimeoutMs(req);
+    var cancellation = queryRequestCancellation(req);
+    const cancellation_ptr = if (req.cancellation != null) &cancellation else null;
     const body = try encodeQueryRequest(alloc, req);
     defer alloc.free(body);
-    var summary = try client.fetchGroupQueryPreflight(base_uri, group_id, table_name, body, max_work);
+    var summary = try client.fetchGroupQueryPreflightWithControl(base_uri, group_id, table_name, body, max_work, timeout_ms, cancellation_ptr);
     summary.remote_shard_count = summary.shard_count;
     return summary;
 }
@@ -13599,9 +13624,13 @@ fn textStatsRemote(
     group_id: u64,
     table_name: []const u8,
     body: []const u8,
+    req: db_mod.types.SearchRequest,
 ) !?query_api.QueryResponse {
     var client = http_client.ApiHttpClient.init(alloc, executor);
-    var result = try client.fetchGroupTextStats(base_uri, group_id, table_name, body);
+    const timeout_ms = try queryRemainingTimeoutMs(req);
+    var cancellation = queryRequestCancellation(req);
+    const cancellation_ptr = if (req.cancellation != null) &cancellation else null;
+    var result = try client.fetchGroupTextStatsWithControl(base_uri, group_id, table_name, body, timeout_ms, cancellation_ptr);
     defer result.deinit(alloc);
     return .{ .json = try alloc.dupe(u8, result.body) };
 }
@@ -13613,9 +13642,13 @@ fn algebraicPartialsRemote(
     group_id: u64,
     table_name: []const u8,
     body: []const u8,
+    req: db_mod.types.SearchRequest,
 ) !?query_api.QueryResponse {
     var client = http_client.ApiHttpClient.init(alloc, executor);
-    var result = try client.fetchGroupAlgebraicPartials(base_uri, group_id, table_name, body);
+    const timeout_ms = try queryRemainingTimeoutMs(req);
+    var cancellation = queryRequestCancellation(req);
+    const cancellation_ptr = if (req.cancellation != null) &cancellation else null;
+    var result = try client.fetchGroupAlgebraicPartialsWithControl(base_uri, group_id, table_name, body, timeout_ms, cancellation_ptr);
     defer result.deinit(alloc);
     return .{ .json = try alloc.dupe(u8, result.body) };
 }
@@ -18304,6 +18337,89 @@ test "vector worker preflight annotation tracks eligibility and symbolic filters
     annotateVectorWorkerPreflight(alloc, &non_vector, .{ .query = .{ .match_all = {} } });
     try std.testing.expectEqual(@as(u32, 0), non_vector.vector_worker_candidate_count);
     try std.testing.expectEqual(@as(u32, 0), non_vector.vector_worker_fallback_count);
+}
+
+test "remote shard query phases propagate deadline and request cancellation" {
+    const alloc = std.testing.allocator;
+
+    const ExecutorState = struct {
+        signal: *const std.atomic.Value(bool),
+        calls: usize = 0,
+
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expect(req.timeout_ms != null);
+            try std.testing.expect(req.timeout_ms.? > 0);
+            try std.testing.expect(req.timeout_ms.? <= 60_000);
+            const cancellation = req.cancellation orelse return error.TestExpectedCancellation;
+            try std.testing.expect(cancellation.signal() == self.signal);
+            try std.testing.expect(!cancellation.isCancelled());
+            return error.Timeout;
+        }
+    };
+
+    var cancelled = std.atomic.Value(bool).init(false);
+    var state = ExecutorState{ .signal = &cancelled };
+    const controlled_request = db_mod.types.SearchRequest{
+        .execution_deadline_ns = platform_time.monotonicNs() + 60 * std.time.ns_per_s,
+        .cancellation = &cancelled,
+    };
+    try std.testing.expectError(error.Timeout, queryRemote(
+        state.iface(),
+        alloc,
+        "http://remote.test",
+        11,
+        "docs",
+        controlled_request,
+    ));
+
+    var vector_request = controlled_request;
+    vector_request.index_name = "dense_idx";
+    vector_request.query = .{ .dense_knn = .{ .vector = &.{ 0.25, 0.5 }, .k = 7 } };
+    try std.testing.expectError(error.Timeout, queryRemote(
+        state.iface(),
+        alloc,
+        "http://remote.test",
+        11,
+        "docs",
+        vector_request,
+    ));
+    try std.testing.expectError(error.Timeout, preflightRemote(
+        state.iface(),
+        alloc,
+        "http://remote.test",
+        11,
+        "docs",
+        controlled_request,
+        0,
+    ));
+    try std.testing.expectError(error.Timeout, textStatsRemote(
+        state.iface(),
+        alloc,
+        "http://remote.test",
+        11,
+        "docs",
+        "{}",
+        controlled_request,
+    ));
+    try std.testing.expectError(error.Timeout, algebraicPartialsRemote(
+        state.iface(),
+        alloc,
+        "http://remote.test",
+        11,
+        "docs",
+        "{}",
+        controlled_request,
+    ));
+    try std.testing.expectEqual(@as(usize, 5), state.calls);
 }
 
 test "remote simple vector query uses vector worker route" {
