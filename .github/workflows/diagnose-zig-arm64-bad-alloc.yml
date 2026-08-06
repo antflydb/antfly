@@ -30,6 +30,7 @@ jobs:
         run: |
           python3 zig/tools/analyze_zig_import_graph.py --check-runtime-boundary --json
           python3 -m unittest zig/tools/test_analyze_zig_import_graph.py
+          python3 -m unittest zig/tools/test_patch_zig_0_16_build_runner_maxrss.py
 
       - name: Install Linux build dependencies
         run: |
@@ -42,6 +43,12 @@ jobs:
           mkdir -p "$RUNNER_TEMP/zig"
           tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
           echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+
+      - name: Backport Zig max_rss scheduler fix
+        run: |
+          python3 zig/tools/patch_zig_0_16_build_runner_maxrss.py \
+            "$RUNNER_TEMP/zig/lib/compiler/build_runner.zig" \
+            "$RUNNER_TEMP/zig-build-runner-maxrss.zig"
 
       - name: Build linked ARM64 ReleaseFast executable
         env:
@@ -61,6 +68,7 @@ jobs:
           cd zig
           /usr/bin/time -v -o "$RUNNER_TEMP/linked-runtime.time" \
             zig build \
+            --build-runner "$RUNNER_TEMP/zig-build-runner-maxrss.zig" \
             -Dtarget=aarch64-linux-musl \
             -Doptimize=ReleaseFast \
             -Dstrip=true \
