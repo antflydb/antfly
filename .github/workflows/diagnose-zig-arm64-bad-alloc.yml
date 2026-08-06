@@ -67,6 +67,7 @@ jobs:
             --prefix "$RUNNER_TEMP/linked-runtime" \
             --cache-dir "$RUNNER_TEMP/linked-runtime-cache/local" \
             --global-cache-dir "$RUNNER_TEMP/linked-runtime-cache/global" \
+            --summary all \
             2>&1 | tee "$RUNNER_TEMP/linked-runtime.log"
 
       - name: Verify single artifact and linked entry points
@@ -77,7 +78,7 @@ jobs:
           readelf -h "$binary" | tee "$RUNNER_TEMP/linked-runtime.elf-header"
           grep -Eq 'Machine:.*AArch64' "$RUNNER_TEMP/linked-runtime.elf-header"
           nm -g "$binary" | tee "$RUNNER_TEMP/linked-runtime.symbols"
-          for role in data inference metadata standalone; do
+          for role in client data ha inference lite metadata serverless standalone; do
             grep -Eq "antfly_runtime_${role}$" "$RUNNER_TEMP/linked-runtime.symbols"
           done
           for operation in create configure provider register_routes destroy; do

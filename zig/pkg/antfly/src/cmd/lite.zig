@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const antfly = @import("antfly-zig");
+const antfly = @import("../cli_root.zig");
 const antfly_client = @import("antfly-client");
 const cli = @import("cli/mod.zig");
 const httpx = @import("httpx");

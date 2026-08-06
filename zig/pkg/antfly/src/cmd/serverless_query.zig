@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const antfly = @import("antfly-zig");
+const antfly = @import("../cli_root.zig");
 const serverless_main = @import("../serverless_main.zig");
 
 pub fn run(init: std.process.Init) !void {
