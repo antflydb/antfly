@@ -41,6 +41,7 @@ const BuildEdition = enum {
 
 const RuntimeArtifactRole = enum {
     data,
+    inference,
     metadata,
     standalone,
 };
@@ -1190,8 +1191,12 @@ pub fn build(b: *std.Build) void {
     const include_ha_tests_in_aggregates = b.option(bool, "ha-tests", "Include hot-standby HA suites in aggregate test steps") orelse true;
     const edition = b.option(BuildEdition, "edition", "Build edition: full or inference") orelse .full;
     const cli_focused_root = b.option(bool, "cli-focused-root", "Build the full CLI against its focused Antfly facade") orelse false;
-    const runtime_artifact_role = b.option(RuntimeArtifactRole, "runtime-artifact-role", "Build one focused server runtime artifact: data, metadata, or standalone");
+    const runtime_artifact_role = b.option(RuntimeArtifactRole, "runtime-artifact-role", "Build one focused server runtime artifact: data, inference, metadata, or standalone");
+    const linked_runtime_libraries = b.option(bool, "linked-runtime-libraries", "Code-generate server runtimes separately and link them into one executable") orelse false;
     const antfly_bin_name = b.option([]const u8, "antfly-bin-name", "Installed filename for the top-level Antfly CLI") orelse "antfly";
+    if (linked_runtime_libraries and edition != .full) {
+        @panic("-Dlinked-runtime-libraries=true requires -Dedition=full");
+    }
     if (antfly_bin_name.len == 0 or std.mem.indexOfAny(u8, antfly_bin_name, "/\\") != null) {
         @panic("-Dantfly-bin-name must be a non-empty filename, not a path");
     }
@@ -8401,6 +8406,8 @@ pub fn build(b: *std.Build) void {
     recall_harness_step.dependOn(&run_recall_harness.step);
 
     const antfly_main_mod = if (edition == .full) blk: {
+        const linked_runtime_options = b.addOptions();
+        linked_runtime_options.addOption(bool, "enabled", linked_runtime_libraries);
         const mod = b.createModule(.{
             .root_source_file = b.path("pkg/antfly/src/main.zig"),
             .target = target,
@@ -8416,6 +8423,7 @@ pub fn build(b: *std.Build) void {
         mod.addImport("antfly_platform", platform_mod);
         mod.addImport("handlebars", handlebars_mod);
         mod.addOptions("build_options", build_options);
+        mod.addOptions("linked_runtime_options", linked_runtime_options);
         break :blk mod;
     } else blk: {
         const inference_cli_mod = b.createModule(.{
@@ -8445,6 +8453,42 @@ pub fn build(b: *std.Build) void {
         .name = "antfly",
         .root_module = antfly_main_mod,
     });
+
+    if (linked_runtime_libraries) {
+        inline for (std.meta.tags(RuntimeArtifactRole)) |role| {
+            const role_options = b.addOptions();
+            role_options.addOption(RuntimeArtifactRole, "role", role);
+
+            const role_mod = b.createModule(.{
+                .root_source_file = b.path("pkg/antfly/src/runtime_artifact_lib.zig"),
+                .target = target,
+                .optimize = optimize,
+                .sanitize_thread = sanitize_thread,
+            });
+            antfly_imports.configure(b, role_mod, false, link_libc);
+            role_mod.addOptions("runtime_artifact_options", role_options);
+            const role_usermgr_storage_mod = b.createModule(.{
+                .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
+                .target = target,
+                .optimize = optimize,
+            });
+            role_usermgr_storage_mod.addImport("antfly_root", role_mod);
+            role_usermgr_storage_mod.addImport("antfly_platform", platform_mod);
+            role_mod.addImport("usermgr_storage", role_usermgr_storage_mod);
+
+            const role_library = b.addLibrary(.{
+                .name = b.fmt("antfly-runtime-{s}", .{@tagName(role)}),
+                .root_module = role_mod,
+                .linkage = .static,
+            });
+            if (strip) {
+                var visited = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
+                defer visited.deinit();
+                setStripRecursively(role_mod, &visited);
+            }
+            antfly_main.root_module.linkLibrary(role_library);
+        }
+    }
 
     if (runtime_artifact_role) |role| {
         const role_options = b.addOptions();

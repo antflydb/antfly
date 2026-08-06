@@ -1,4 +1,4 @@
-name: Diagnose focused Zig ARM64 runtime artifacts
+name: Diagnose linked Zig ARM64 runtime libraries
 
 on:
   pull_request:
@@ -11,15 +11,11 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  focused-runtime:
-    name: ARM64 ReleaseFast artifact (${{ matrix.role }})
+  linked-runtime:
+    name: ARM64 ReleaseFast single linked executable
     if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: arc-antfly-publish
     timeout-minutes: 180
-    strategy:
-      fail-fast: false
-      matrix:
-        role: [metadata, data, standalone]
     steps:
       - name: Checkout PR head
         uses: actions/checkout@v6
@@ -47,19 +43,19 @@ jobs:
           tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
           echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
 
-      - name: Build focused ARM64 ReleaseFast artifact
+      - name: Build linked ARM64 ReleaseFast executable
         env:
-          ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/runtime-${{ matrix.role }}-cache/global
-          ZIG_LOCAL_CACHE_DIR: ${{ runner.temp }}/runtime-${{ matrix.role }}-cache/compiler-local
+          ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/linked-runtime-cache/global
+          ZIG_LOCAL_CACHE_DIR: ${{ runner.temp }}/linked-runtime-cache/compiler-local
         run: |
           set -o pipefail
           mkdir -p \
-            "$RUNNER_TEMP/runtime-${{ matrix.role }}" \
-            "$RUNNER_TEMP/runtime-${{ matrix.role }}-cache/local" \
-            "$RUNNER_TEMP/runtime-${{ matrix.role }}-cache/global"
+            "$RUNNER_TEMP/linked-runtime" \
+            "$RUNNER_TEMP/linked-runtime-cache/local" \
+            "$RUNNER_TEMP/linked-runtime-cache/global"
           cd zig
-          /usr/bin/time -v -o "$RUNNER_TEMP/runtime-${{ matrix.role }}.time" \
-            zig build runtime-artifact -j1 \
+          /usr/bin/time -v -o "$RUNNER_TEMP/linked-runtime.time" \
+            zig build -j1 \
             -Dtarget=aarch64-linux-musl \
             -Doptimize=ReleaseFast \
             -Dstrip=true \
@@ -67,31 +63,39 @@ jobs:
             -Donnx=false \
             -Dmetal=false \
             -Dsystem-blas=false \
-            -Druntime-artifact-role=${{ matrix.role }} \
-            --prefix "$RUNNER_TEMP/runtime-${{ matrix.role }}" \
-            --cache-dir "$RUNNER_TEMP/runtime-${{ matrix.role }}-cache/local" \
-            --global-cache-dir "$RUNNER_TEMP/runtime-${{ matrix.role }}-cache/global" \
-            2>&1 | tee "$RUNNER_TEMP/runtime-${{ matrix.role }}.log"
+            -Dlinked-runtime-libraries=true \
+            --prefix "$RUNNER_TEMP/linked-runtime" \
+            --cache-dir "$RUNNER_TEMP/linked-runtime-cache/local" \
+            --global-cache-dir "$RUNNER_TEMP/linked-runtime-cache/global" \
+            2>&1 | tee "$RUNNER_TEMP/linked-runtime.log"
 
-      - name: Verify artifact
+      - name: Verify single artifact and linked entry points
         run: |
-          file "$RUNNER_TEMP/runtime-${{ matrix.role }}/bin/antfly-${{ matrix.role }}"
-          readelf -h "$RUNNER_TEMP/runtime-${{ matrix.role }}/bin/antfly-${{ matrix.role }}" \
-            | tee "$RUNNER_TEMP/runtime-${{ matrix.role }}.elf-header"
-          grep -Eq 'Machine:.*AArch64' "$RUNNER_TEMP/runtime-${{ matrix.role }}.elf-header"
+          test "$(find "$RUNNER_TEMP/linked-runtime/bin" -maxdepth 1 -type f | wc -l)" -eq 1
+          binary="$RUNNER_TEMP/linked-runtime/bin/antfly"
+          file "$binary"
+          readelf -h "$binary" | tee "$RUNNER_TEMP/linked-runtime.elf-header"
+          grep -Eq 'Machine:.*AArch64' "$RUNNER_TEMP/linked-runtime.elf-header"
+          nm -g "$binary" | tee "$RUNNER_TEMP/linked-runtime.symbols"
+          for role in data inference metadata standalone; do
+            grep -Eq "antfly_runtime_${role}$" "$RUNNER_TEMP/linked-runtime.symbols"
+          done
+          stat -c 'binary_size_bytes=%s' "$binary" | tee "$RUNNER_TEMP/linked-runtime.size"
 
       - name: Report compiler memory
         if: ${{ always() }}
-        run: cat "$RUNNER_TEMP/runtime-${{ matrix.role }}.time" || true
+        run: cat "$RUNNER_TEMP/linked-runtime.time" || true
 
       - name: Upload result
         if: ${{ always() }}
         uses: actions/upload-artifact@v6
         with:
-          name: zig-arm64-runtime-${{ matrix.role }}-release-fast
+          name: zig-arm64-linked-runtime-release-fast
           path: |
-            ${{ runner.temp }}/runtime-${{ matrix.role }}
-            ${{ runner.temp }}/runtime-${{ matrix.role }}.log
-            ${{ runner.temp }}/runtime-${{ matrix.role }}.time
-            ${{ runner.temp }}/runtime-${{ matrix.role }}.elf-header
+            ${{ runner.temp }}/linked-runtime
+            ${{ runner.temp }}/linked-runtime.log
+            ${{ runner.temp }}/linked-runtime.time
+            ${{ runner.temp }}/linked-runtime.elf-header
+            ${{ runner.temp }}/linked-runtime.symbols
+            ${{ runner.temp }}/linked-runtime.size
           if-no-files-found: error
