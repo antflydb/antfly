@@ -24,6 +24,11 @@ pub const StdHttpExecutorConfig = struct {
     write_buffer_size: usize = 1024,
     max_response_bytes: usize = 4 << 20,
     thread_stack_size: usize = std_http_listener.default_request_stack_size,
+    /// Hard ceiling for retained workers used by timeout/cancellation-aware
+    /// requests. Callers normally stay well below this through listener and
+    /// query admission; the finite limit prevents an abnormal fan-out from
+    /// permanently growing the owned Threaded executor without bound.
+    io_concurrent_limit: u32 = std_http_listener.default_process_io_concurrent_limit,
     keep_alive: bool = false,
     /// Proactively retire pooled HTTP/1.1 connections before a server-side
     /// keep-alive cap closes them. 0 means unlimited client-side reuse.
@@ -52,7 +57,10 @@ pub const StdHttpExecutor = struct {
 
     pub fn initInPlace(self: *StdHttpExecutor, alloc: std.mem.Allocator, cfg: StdHttpExecutorConfig) void {
         const io_impl = alloc.create(std.Io.Threaded) catch @panic("OOM");
-        io_impl.* = std.Io.Threaded.init(alloc, .{ .stack_size = cfg.thread_stack_size });
+        io_impl.* = std.Io.Threaded.init(alloc, .{
+            .stack_size = cfg.thread_stack_size,
+            .concurrent_limit = .limited(cfg.io_concurrent_limit),
+        });
         const io_vtable = threaded_connect_io.createVTable(alloc, io_impl) catch @panic("OOM");
         self.* = .{
             .alloc = alloc,
@@ -473,6 +481,15 @@ test "std http executor module compiles" {
     _ = StdHttpExecutor;
 }
 
+test "std http executor owns a finite controlled request worker budget" {
+    var executor = StdHttpExecutor.init(std.testing.allocator, .{
+        .io_concurrent_limit = 7,
+    });
+    defer executor.deinit();
+
+    try std.testing.expectEqual(std.Io.Limit.limited(7), executor.io_impl.concurrent_limit);
+}
+
 test "std http executor forwards only end-to-end request headers" {
     const headers = [_]common.RequestHeader{
         .{ .name = "Host", .value = "source.invalid" },
@@ -595,4 +612,87 @@ test "std http executor cancellation interrupts a request queued for the pooled 
     request_joined = true;
     try std.testing.expect(cancelled_while_queued);
     try std.testing.expectEqual(@as(u8, 1), request_state.outcome.load(.acquire));
+}
+
+test "std http executor cancellation interrupts an active response wait" {
+    const App = struct {
+        entered: std.atomic.Value(bool) = .init(false),
+        exited: std.atomic.Value(bool) = .init(false),
+
+        fn executor(self: *@This()) common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const cancellation = req.cancellation orelse return error.TestExpectedCancellation;
+            self.entered.store(true, .release);
+            while (!cancellation.isCancelled()) {
+                sleepTestMs(std.Io.Threaded.global_single_threaded.io(), 1);
+            }
+            self.exited.store(true, .release);
+            return .{ .status = 200, .body = try alloc.dupe(u8, "cancelled") };
+        }
+    };
+
+    const RequestTask = struct {
+        executor: common.RequestExecutor,
+        uri: []const u8,
+        cancellation: *const common.RequestCancellation,
+        outcome: std.atomic.Value(u8) = .init(0),
+
+        fn run(self: *@This()) void {
+            var response = self.executor.execute(std.heap.page_allocator, .{
+                .method = .GET,
+                .uri = self.uri,
+                .cancellation = self.cancellation,
+            }) catch |err| {
+                self.outcome.store(if (err == error.Cancelled) 1 else 2, .release);
+                return;
+            };
+            response.deinit(std.heap.page_allocator);
+            self.outcome.store(3, .release);
+        }
+    };
+
+    var app = App{};
+    var listener = std_http_listener.StdHttpListener.init(std.testing.allocator, .{
+        .serve_in_connection_threads = true,
+    }, app.executor());
+    defer listener.deinit();
+    try listener.start();
+
+    const uri = try listener.baseUri(std.testing.allocator);
+    defer std.testing.allocator.free(uri);
+    var executor = StdHttpExecutor.init(std.testing.allocator, .{});
+    defer executor.deinit();
+    var cancellation = common.RequestCancellation{};
+    var task = RequestTask{
+        .executor = executor.executor(),
+        .uri = uri,
+        .cancellation = &cancellation,
+    };
+    var task_io = std.Io.Threaded.init(std.testing.allocator, .{
+        .concurrent_limit = .limited(1),
+    });
+    defer task_io.deinit();
+    var group: std.Io.Group = .init;
+    try group.concurrent(task_io.io(), RequestTask.run, .{&task});
+    var group_active = true;
+    defer if (group_active) group.cancel(task_io.io());
+
+    for (0..2_000) |_| {
+        if (app.entered.load(.acquire)) break;
+        sleepTestMs(std.Io.Threaded.global_single_threaded.io(), 1);
+    }
+    try std.testing.expect(app.entered.load(.acquire));
+    cancellation.cancel();
+    for (0..2_000) |_| {
+        if (task.outcome.load(.acquire) != 0 and app.exited.load(.acquire)) break;
+        sleepTestMs(std.Io.Threaded.global_single_threaded.io(), 1);
+    }
+    try std.testing.expectEqual(@as(u8, 1), task.outcome.load(.acquire));
+    try std.testing.expect(app.exited.load(.acquire));
+    try group.await(task_io.io());
+    group_active = false;
 }

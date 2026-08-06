@@ -17,6 +17,7 @@ const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
 const common = @import("http_common.zig");
 const PeerObserver = @import("peer_disconnect_observer.zig").Observer;
+const threaded_io_limits = @import("../threaded_io_limits.zig");
 
 pub const default_max_request_bytes: usize = 32 * 1024 * 1024;
 pub const default_request_stack_size: usize = 8 * 1024 * 1024;
@@ -24,6 +25,7 @@ pub const default_header_read_timeout_ms: u32 = 30_000;
 pub const default_body_read_timeout_ms: u32 = 120_000;
 pub const default_accept_error_backoff_initial_ms: u32 = 5;
 pub const default_accept_error_backoff_max_ms: u32 = 1_000;
+pub const default_process_io_concurrent_limit: u32 = threaded_io_limits.service;
 
 const ProcessIo = struct {
     var lock: std.atomic.Mutex = .unlocked;
@@ -38,6 +40,10 @@ const ProcessIo = struct {
             const io_impl = std.heap.page_allocator.create(std.Io.Threaded) catch @panic("OOM");
             io_impl.* = std.Io.Threaded.init(std.heap.page_allocator, .{
                 .stack_size = default_request_stack_size,
+                // Public listeners multiplex deadlines and peer observation
+                // outside the executor. Keep a finite backstop for any other
+                // concurrent work submitted through this process-wide runtime.
+                .concurrent_limit = .limited(default_process_io_concurrent_limit),
             });
             runtime = io_impl;
         }
@@ -108,8 +114,11 @@ pub const StdHttpListener = struct {
         rejected_requests_total: u64,
         accept_errors_total: u64,
         cancellation_watcher_start_failures_total: u64,
+        deadline_observer_failures_total: u64,
+        deadline_expirations_total: u64,
         peer_disconnects_total: u64,
         active_peer_observers: usize,
+        active_deadline_observers: usize,
     };
 
     const IoOwner = enum {
@@ -133,6 +142,8 @@ pub const StdHttpListener = struct {
     rejected_requests_total: std.atomic.Value(u64) = .init(0),
     accept_errors_total: std.atomic.Value(u64) = .init(0),
     cancellation_watcher_start_failures_total: std.atomic.Value(u64) = .init(0),
+    deadline_observer_failures_total: std.atomic.Value(u64) = .init(0),
+    deadline_expirations_total: std.atomic.Value(u64) = .init(0),
     peer_disconnects_total: std.atomic.Value(u64) = .init(0),
     peer_observer: ?PeerObserver = null,
     active_streams_lock: std.atomic.Mutex = .unlocked,
@@ -304,8 +315,11 @@ pub const StdHttpListener = struct {
             .rejected_requests_total = self.rejected_requests_total.load(.acquire),
             .accept_errors_total = self.accept_errors_total.load(.acquire),
             .cancellation_watcher_start_failures_total = self.cancellation_watcher_start_failures_total.load(.acquire),
+            .deadline_observer_failures_total = self.deadline_observer_failures_total.load(.acquire),
+            .deadline_expirations_total = self.deadline_expirations_total.load(.acquire),
             .peer_disconnects_total = self.peer_disconnects_total.load(.acquire),
-            .active_peer_observers = if (self.peer_observer) |*observer| observer.activeCount() else 0,
+            .active_peer_observers = if (self.peer_observer) |*observer| observer.activePeerCount() else 0,
+            .active_deadline_observers = if (self.peer_observer) |*observer| observer.activeDeadlineCount() else 0,
         };
     }
 
@@ -519,6 +533,45 @@ pub const StdHttpListener = struct {
         const timeout_ms = self.cfg.header_read_timeout_ms;
         if (timeout_ms == 0) return try server.receiveHead();
 
+        if (comptime builtin.os.tag != .windows and builtin.os.tag != .freestanding) {
+            var deadline: PeerObserver.Deadline = .{};
+            const observer = if (self.peer_observer) |*value| value else {
+                _ = self.deadline_observer_failures_total.fetchAdd(1, .monotonic);
+                return error.ObserverUnavailable;
+            };
+            var registration = observer.registerDeadline(
+                stream.socket.handle,
+                timeout_ms,
+                &deadline,
+                &self.deadline_expirations_total,
+            ) catch |err| {
+                _ = self.deadline_observer_failures_total.fetchAdd(1, .monotonic);
+                return err;
+            };
+            const receive_result = server.receiveHead();
+            // Retire the registration before inspecting its outcome. This is
+            // the completion/expiration arbitration point: once deinit()
+            // returns, the observer no longer owns the stack-backed deadline
+            // and cannot shut down a successfully completed socket between
+            // the state check and this function returning.
+            switch (registration.finishDeadline(&deadline)) {
+                .completed => {},
+                .observer_failed => {
+                    _ = self.deadline_observer_failures_total.fetchAdd(1, .monotonic);
+                    _ = receive_result catch {};
+                    return error.ObserverUnavailable;
+                },
+                .expired => {
+                    _ = receive_result catch {};
+                    return error.Timeout;
+                },
+            }
+            return try receive_result;
+        }
+
+        // Windows retains the threaded timeout race until the socket observer
+        // has a native wait-set implementation there. POSIX production paths
+        // never submit one sleeping Io.concurrent task per connection.
         const RaceState = enum(u8) {
             pending,
             receive_complete,
@@ -892,6 +945,40 @@ pub const StdHttpListener = struct {
         const timeout_ms = self.cfg.body_read_timeout_ms;
         if (timeout_ms == 0 or stream == null) return try body_reader.allocRemaining(self.alloc, .limited(self.cfg.max_request_bytes));
 
+        if (comptime builtin.os.tag != .windows and builtin.os.tag != .freestanding) {
+            var deadline: PeerObserver.Deadline = .{};
+            const observer = if (self.peer_observer) |*value| value else {
+                _ = self.deadline_observer_failures_total.fetchAdd(1, .monotonic);
+                return error.ObserverUnavailable;
+            };
+            var registration = observer.registerDeadline(
+                stream.?.socket.handle,
+                timeout_ms,
+                &deadline,
+                &self.deadline_expirations_total,
+            ) catch |err| {
+                _ = self.deadline_observer_failures_total.fetchAdd(1, .monotonic);
+                return err;
+            };
+            const read_result = body_reader.allocRemaining(self.alloc, .limited(self.cfg.max_request_bytes));
+            // See receiveHeadWithTimeout: unregister synchronously so normal
+            // completion and expiration have one mutex-ordered winner.
+            switch (registration.finishDeadline(&deadline)) {
+                .completed => {},
+                .observer_failed => {
+                    _ = self.deadline_observer_failures_total.fetchAdd(1, .monotonic);
+                    if (read_result) |body| self.alloc.free(body) else |_| {}
+                    return error.ObserverUnavailable;
+                },
+                .expired => {
+                    if (read_result) |body| self.alloc.free(body) else |_| {}
+                    return error.Timeout;
+                },
+            }
+            return try read_result;
+        }
+
+        // See receiveHeadWithTimeout: this fallback is non-POSIX only.
         const RaceState = enum(u8) {
             pending,
             read_complete,
@@ -2014,7 +2101,7 @@ test "std http listener saturated connection slots queue instead of resetting" {
     try std.testing.expectEqual(@as(u16, 200), slow_req.status.load(.acquire));
 }
 
-test "std http listener responds before header timeout without async capacity" {
+test "std http listener serves timed requests without threaded async or concurrent capacity" {
     const std_http_executor = @import("std_http_executor.zig");
 
     const App = struct {
@@ -2039,13 +2126,17 @@ test "std http listener responds before header timeout without async capacity" {
     defer executor.deinit();
     const request_executor = executor.executor();
 
-    var listener = StdHttpListener.init(std.heap.page_allocator, .{
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{
+        .async_limit = .nothing,
+        .concurrent_limit = .nothing,
+    });
+    defer io_impl.deinit();
+    var listener = StdHttpListener.initShared(std.heap.page_allocator, .{
         .serve_in_connection_threads = true,
         .header_read_timeout_ms = 10_000,
         .body_read_timeout_ms = 10_000,
-    }, app.executor());
+    }, app.executor(), &io_impl);
     defer listener.deinit();
-    listener.io_impl.setAsyncLimit(.nothing);
     try listener.start();
 
     const base_uri = try listener.baseUri(std.testing.allocator);
@@ -2098,11 +2189,16 @@ test "std http listener header timeout releases accepted idle connection slot" {
     defer executor.deinit();
     const request_executor = executor.executor();
 
-    var listener = StdHttpListener.init(std.heap.page_allocator, .{
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{
+        .async_limit = .nothing,
+        .concurrent_limit = .nothing,
+    });
+    defer io_impl.deinit();
+    var listener = StdHttpListener.initShared(std.heap.page_allocator, .{
         .serve_in_connection_threads = true,
         .max_connection_threads = 1,
         .header_read_timeout_ms = 25,
-    }, app.executor());
+    }, app.executor(), &io_impl);
     defer listener.deinit();
     try listener.start();
 
@@ -2131,6 +2227,10 @@ test "std http listener header timeout releases accepted idle connection slot" {
     });
     defer response.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), response.status);
+    const stats = listener.runtimeStats();
+    try std.testing.expect(stats.deadline_expirations_total >= 1);
+    try std.testing.expectEqual(@as(u64, 0), stats.deadline_observer_failures_total);
+    try std.testing.expectEqual(@as(usize, 0), stats.active_deadline_observers);
 }
 
 test "std http listener body timeout releases accepted slow body connection slot" {
@@ -2160,12 +2260,17 @@ test "std http listener body timeout releases accepted slow body connection slot
     defer executor.deinit();
     const request_executor = executor.executor();
 
-    var listener = StdHttpListener.init(std.heap.page_allocator, .{
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{
+        .async_limit = .nothing,
+        .concurrent_limit = .nothing,
+    });
+    defer io_impl.deinit();
+    var listener = StdHttpListener.initShared(std.heap.page_allocator, .{
         .serve_in_connection_threads = true,
         .max_connection_threads = 1,
         .header_read_timeout_ms = 5_000,
         .body_read_timeout_ms = 50,
-    }, app.executor());
+    }, app.executor(), &io_impl);
     defer listener.deinit();
     try listener.start();
 
@@ -2204,6 +2309,118 @@ test "std http listener body timeout releases accepted slow body connection slot
     });
     defer response.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), response.status);
+    const stats = listener.runtimeStats();
+    try std.testing.expect(stats.deadline_expirations_total >= 1);
+    try std.testing.expectEqual(@as(u64, 0), stats.deadline_observer_failures_total);
+    try std.testing.expectEqual(@as(usize, 0), stats.active_deadline_observers);
+}
+
+fn countLinuxProcEntries(path: []const u8) !usize {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = try std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true });
+    defer dir.close(io);
+    var iterator = dir.iterate();
+    var count: usize = 0;
+    while (try iterator.next(io)) |_| count += 1;
+    return count;
+}
+
+test "std http listener process threads and descriptors recover after cancellation storms" {
+    if (comptime builtin.os.tag != .linux) return;
+
+    if (std.c.getenv("ANTFLY_REQUIRE_LOW_FD_HTTP_RATCHET") != null) {
+        const nofile = try std.posix.getrlimit(.NOFILE);
+        try std.testing.expectEqual(@as(u64, 256), nofile.cur);
+    }
+
+    const App = struct {
+        fn executor(self: *@This()) common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(_: *anyopaque, alloc: std.mem.Allocator, _: common.HttpRequest) !common.HttpResponse {
+            return .{ .status = 200, .body = try alloc.dupe(u8, "ok") };
+        }
+    };
+
+    const batch_size = 48;
+    const rounds = 4;
+    const thread_slack = 4;
+    const fd_slack = 8;
+    var app = App{};
+    var listener = StdHttpListener.init(std.heap.page_allocator, .{
+        .serve_in_connection_threads = true,
+        .max_connection_threads = 64,
+        .header_read_timeout_ms = 30_000,
+    }, app.executor());
+    defer listener.deinit();
+    try listener.start();
+    const bound_addr = listener.boundAddress().?;
+    const client_io = std.Io.Threaded.global_single_threaded.io();
+
+    // Let the accept and observer owners reach their steady idle state before
+    // measuring the process. The accept loop reserves one connection slot
+    // while blocked in accept(); no client socket is active at this point.
+    sleepMs(100);
+    const baseline_threads = try countLinuxProcEntries("/proc/self/task");
+    const baseline_fds = try countLinuxProcEntries("/proc/self/fd");
+    var recovered_thread_min: usize = std.math.maxInt(usize);
+    var recovered_thread_max: usize = 0;
+
+    for (0..rounds) |_| {
+        var clients = [_]?std.Io.net.Stream{null} ** batch_size;
+        defer for (&clients) |*maybe_stream| {
+            if (maybe_stream.*) |*stream| stream.close(client_io);
+        };
+
+        for (&clients) |*slot| slot.* = try bound_addr.connect(client_io, .{ .mode = .stream });
+
+        var loaded = false;
+        for (0..400) |_| {
+            const stats = listener.runtimeStats();
+            if (stats.active_deadline_observers >= batch_size and
+                stats.active_connection_threads >= batch_size)
+            {
+                loaded = true;
+                break;
+            }
+            sleepMs(5);
+        }
+        try std.testing.expect(loaded);
+        try std.testing.expect((try countLinuxProcEntries("/proc/self/task")) >= baseline_threads + batch_size);
+
+        for (&clients) |*maybe_stream| {
+            if (maybe_stream.*) |*stream| {
+                stream.shutdown(client_io, .both) catch {};
+                stream.close(client_io);
+                maybe_stream.* = null;
+            }
+        }
+
+        var recovered = false;
+        var recovered_threads: usize = 0;
+        for (0..2_000) |_| {
+            const stats = listener.runtimeStats();
+            const threads = try countLinuxProcEntries("/proc/self/task");
+            const fds = try countLinuxProcEntries("/proc/self/fd");
+            if (stats.active_deadline_observers == 0 and
+                stats.active_peer_observers == 0 and
+                stats.active_connection_threads <= 1 and
+                threads <= baseline_threads + thread_slack and
+                fds <= baseline_fds + fd_slack)
+            {
+                recovered = true;
+                recovered_threads = threads;
+                break;
+            }
+            sleepMs(5);
+        }
+        try std.testing.expect(recovered);
+        recovered_thread_min = @min(recovered_thread_min, recovered_threads);
+        recovered_thread_max = @max(recovered_thread_max, recovered_threads);
+    }
+
+    try std.testing.expect(recovered_thread_max - recovered_thread_min <= thread_slack);
 }
 
 test "std http listener stop interrupts accepted header read" {

@@ -643,6 +643,7 @@ test "http frame driver propagates isolated worker executor configuration" {
         .read_buffer_size = 12_345,
         .write_buffer_size = 2_345,
         .max_response_bytes = 65_535,
+        .io_concurrent_limit = 23,
         .keep_alive = true,
         .max_requests_per_connection = 17,
     };
@@ -659,6 +660,7 @@ test "http frame driver propagates isolated worker executor configuration" {
     try std.testing.expectEqual(executor_config.read_buffer_size, actual.read_buffer_size);
     try std.testing.expectEqual(executor_config.write_buffer_size, actual.write_buffer_size);
     try std.testing.expectEqual(executor_config.max_response_bytes, actual.max_response_bytes);
+    try std.testing.expectEqual(executor_config.io_concurrent_limit, actual.io_concurrent_limit);
     try std.testing.expectEqual(executor_config.keep_alive, actual.keep_alive);
     try std.testing.expectEqual(executor_config.max_requests_per_connection, actual.max_requests_per_connection);
 }

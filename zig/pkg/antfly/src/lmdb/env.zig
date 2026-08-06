@@ -65,6 +65,10 @@ const use_evented_async_runtime =
     std.Io.Evented != void;
 
 const AsyncRuntime = if (use_evented_async_runtime) std.Io.Evented else std.Io.Threaded;
+// This module is built independently from the Antfly root module, so it cannot
+// import common/threaded_io_limits.zig. Keep the LMDB commit runtime finite at
+// the same conservative process-lifetime ceiling.
+const threaded_async_runtime_concurrent_limit: u32 = 256;
 pub const uses_evented_async_runtime = use_evented_async_runtime;
 pub const AsyncRuntimeType = AsyncRuntime;
 
@@ -626,8 +630,22 @@ pub fn initAsyncRuntime(runtime: *AsyncRuntime) Error!void {
     if (comptime use_evented_async_runtime) {
         try AsyncRuntime.init(runtime, heapAllocator(), .{});
     } else {
-        runtime.* = AsyncRuntime.init(heapAllocator(), .{});
+        runtime.* = AsyncRuntime.init(heapAllocator(), .{
+            .concurrent_limit = .limited(threaded_async_runtime_concurrent_limit),
+        });
     }
+}
+
+test "lmdb threaded async runtime has a finite worker ceiling" {
+    if (comptime use_evented_async_runtime) return error.SkipZigTest;
+
+    var runtime: AsyncRuntime = undefined;
+    try initAsyncRuntime(&runtime);
+    defer deinitAsyncRuntime(&runtime);
+    try std.testing.expectEqual(
+        std.Io.Limit.limited(threaded_async_runtime_concurrent_limit),
+        runtime.concurrent_limit,
+    );
 }
 
 pub fn deinitAsyncRuntime(runtime: *AsyncRuntime) void {
