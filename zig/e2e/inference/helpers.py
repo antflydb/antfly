@@ -49,6 +49,14 @@ def assert_openai_list_response(resp: dict, expected_len: int | None = None) -> 
     assert usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"], resp
 
 
+def assert_extraction_response(resp: dict, expected_len: int | None = None) -> None:
+    assert resp["object"] == "extraction", resp
+    assert isinstance(resp["model"], str), resp
+    assert isinstance(resp["data"], list), resp
+    if expected_len is not None:
+        assert len(resp["data"]) == expected_len, resp
+
+
 # -- Test data generators --
 
 # 1x1 white PNG, pre-encoded
@@ -436,6 +444,54 @@ def make_solid_png_uri(r: int, g: int, b: int, size: int = 8) -> str:
 
     row = b"\x00" + bytes([r, g, b]) * size
     raw = row * size
+    ihdr = struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0)
+    png = b"".join([
+        b"\x89PNG\r\n\x1a\n",
+        chunk(b"IHDR", ihdr),
+        chunk(b"IDAT", zlib.compress(raw)),
+        chunk(b"IEND", b""),
+    ])
+    return f"data:image/png;base64,{base64.b64encode(png).decode()}"
+
+
+def make_shape_png_uri(shape: str, color: tuple[int, int, int], size: int = 128) -> str:
+    """Generate a deterministic semantic retrieval fixture on a white canvas."""
+    if shape not in {"circle", "square", "triangle"}:
+        raise ValueError(f"unsupported fixture shape: {shape}")
+    canvas = bytearray([255] * (size * size * 3))
+    margin = size // 4
+    center = size // 2
+    radius = size // 4
+
+    def inside(x: int, y: int) -> bool:
+        if shape == "circle":
+            return (x - center) ** 2 + (y - center) ** 2 <= radius ** 2
+        if shape == "square":
+            return margin <= x < size - margin and margin <= y < size - margin
+        if not (margin <= y < size - margin):
+            return False
+        half_width = (y - margin) * radius // max(1, size - 2 * margin - 1)
+        return center - half_width <= x <= center + half_width
+
+    for y in range(size):
+        for x in range(size):
+            if inside(x, y):
+                idx = (y * size + x) * 3
+                canvas[idx:idx + 3] = bytes(color)
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data))
+            + tag
+            + data
+            + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+        )
+
+    stride = size * 3
+    raw = b"".join(
+        b"\x00" + bytes(canvas[y * stride:(y + 1) * stride])
+        for y in range(size)
+    )
     ihdr = struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0)
     png = b"".join([
         b"\x89PNG\r\n\x1a\n",

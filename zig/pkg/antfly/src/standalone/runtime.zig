@@ -553,6 +553,7 @@ const LocalStandaloneMetadata = struct {
                 .restore_table = restoreTable,
                 .drop_table = dropTable,
                 .update_schema = updateSchema,
+                .update_schema_versioned = updateSchemaVersioned,
                 .create_index = createIndex,
                 .drop_index = dropIndex,
                 .apply_relational_sql_ddl_plan_with_session = applyRelationalSqlDdlPlanWithSession,
@@ -1175,17 +1176,23 @@ const LocalStandaloneMetadata = struct {
     }
 
     fn updateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
+        _ = try updateSchemaVersioned(ptr, alloc, table_name, schema_json);
+    }
+
+    fn updateSchemaVersioned(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !u32 {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         const table = self.findTableByNameLocked(table_name) orelse return error.TableNotFound;
         const updated = try catalog_table_ddl.applySchemaUpdateRecord(alloc, table, schema_json);
         defer antfly.metadata.table_manager.freeTable(alloc, updated);
+        const version = try catalog_table_ddl.schemaVersion(updated.schema_json);
         var mutation = try self.beginCatalogMutationLocked();
         defer mutation.deinit(self);
         try self.manager.applyTableCatalogUpdateWithSchemaRewriteJobs(.{ .table = updated });
         self.epoch +|= 1;
         try mutation.commit(self);
+        return version;
     }
 
     fn createIndex(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
@@ -2071,7 +2078,10 @@ pub fn runFromIterator(
         ),
     });
     if (node_backend_runtime.ptr().io()) |io| antfly_node.attachIo(io);
-    try antfly_node.warmConfiguredModels(alloc);
+    antfly_node.warmConfiguredModels(alloc) catch |err| {
+        std.log.err("standalone startup failed step=warm_inference_models err={}", .{err});
+        return err;
+    };
     data_server.setAntflyProvider(localAntflyProvider(&antfly_node));
 
     // Initialize API server (wires caches + sources) without binding a listener.

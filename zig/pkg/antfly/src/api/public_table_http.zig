@@ -91,6 +91,12 @@ pub const TableApi = struct {
         EmbedRateLimited,
         EmbedTransientFailure,
         EmbedUpstreamFailure,
+        InvalidManifest,
+        InvalidTableFile,
+        TableBlockChecksumMismatch,
+        CorruptInput,
+        UnsupportedVersion,
+        Corrupted,
         InternalFailure,
     };
 
@@ -148,6 +154,7 @@ pub const TableApi = struct {
         InvalidIndexRequest,
         ProbeUnavailable,
         ModelNotFound,
+        Backpressured,
         InternalFailure,
     };
 
@@ -543,6 +550,29 @@ pub const OwnedResponse = struct {
     }
 };
 
+pub fn isNonRetryableTableStorageReadError(err: anyerror) bool {
+    return switch (err) {
+        error.InvalidManifest,
+        error.InvalidTableFile,
+        error.TableBlockChecksumMismatch,
+        error.CorruptInput,
+        error.UnsupportedVersion,
+        error.Corrupted,
+        => true,
+        else => false,
+    };
+}
+
+pub fn tableStorageUnreadableBody(alloc: std.mem.Allocator, err: anyerror) ![]u8 {
+    std.debug.assert(isNonRetryableTableStorageReadError(err));
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .code = "table_storage_unreadable",
+        .@"error" = @errorName(err),
+        .message = "table storage unreadable",
+        .retryable = false,
+    }, .{});
+}
+
 fn unsupportedExactSortBody(alloc: std.mem.Allocator) ![]u8 {
     const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse db_mod.SortRejectionDiagnostic{};
     const public_rejection = query_contract.publicExactSortRejection(diagnostic.reason, diagnostic.detail);
@@ -733,6 +763,20 @@ pub fn handleTableQueryRequest(
             error.EmbedUpstreamFailure => {
                 std.log.warn("public table query embedding upstream failure table={s}", .{table_name});
                 return .{ .status = 502, .body = try alloc.dupe(u8, "query embedding provider failed") };
+            },
+            error.InvalidManifest,
+            error.InvalidTableFile,
+            error.TableBlockChecksumMismatch,
+            error.CorruptInput,
+            error.UnsupportedVersion,
+            error.Corrupted,
+            => {
+                std.log.err("public table query storage unreadable table={s} err={}", .{ table_name, err });
+                return .{
+                    .status = 500,
+                    .body = try tableStorageUnreadableBody(alloc, err),
+                    .json = true,
+                };
             },
             error.UnsupportedExactSort => {
                 std.log.warn("public table query unsupported exact sort table={s} err={}", .{ table_name, err });
@@ -1011,6 +1055,12 @@ pub fn handleTableCreateIndex(
         error.InvalidIndexRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "unsupported index configuration") },
         error.ProbeUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "index validation probe unavailable") },
         error.ModelNotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "{\"error\":\"MODEL_NOT_FOUND\",\"message\":\"model not found\"}") },
+        error.Backpressured => return .{
+            .status = 429,
+            .body = try alloc.dupe(u8, "{\"code\":\"storage_resource_exhausted\",\"message\":\"storage descriptors are temporarily exhausted\",\"retryable\":true,\"retry_after_ms\":1000}"),
+            .json = true,
+            .retry_after_seconds = 1,
+        },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "index create failed") },
     };
     return .{ .status = 201, .body = try alloc.dupe(u8, "{}") };
@@ -1650,6 +1700,52 @@ test "public table graph metric action handler returns status response" {
     try std.testing.expectEqualStrings("{\"status\":{\"state\":\"fresh\",\"maintenance_paused\":true}}", resp.body);
 }
 
+test "public create index exposes retryable storage descriptor exhaustion" {
+    const Backend = struct {
+        fn iface(self: *@This()) TableApi {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .execute_table_batch = executeTableBatch,
+                    .execute_table_query_request = unsupportedQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = executeCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableBatch(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+        ) TableApi.ExecuteBatchError!void {}
+
+        fn executeCreateIndex(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+        ) TableApi.ExecuteCreateIndexError!void {
+            return error.Backpressured;
+        }
+    };
+
+    var backend = Backend{};
+    var resp = try handleTableCreateIndex(std.testing.allocator, "docs", "search", "{}", backend.iface());
+    defer resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 429), resp.status);
+    try std.testing.expect(resp.json);
+    try std.testing.expectEqual(@as(?u32, 1), resp.retry_after_seconds);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "storage_resource_exhausted") != null);
+}
+
 test "public table batch handler rejects unsupported missing-document transform before execution" {
     const Backend = struct {
         called: bool = false,
@@ -2113,6 +2209,8 @@ test "public table query handler preserves retryable failure status" {
         .{ .err = error.EmbedTransientFailure, .status = 503, .body = "query embedding temporarily unavailable" },
         .{ .err = error.EmbedUpstreamFailure, .status = 502, .body = "query embedding provider failed" },
         .{ .err = error.IndexRebuilding, .status = 503, .body = "{\"code\":\"index_rebuilding\",\"message\":\"required index is rebuilding\",\"retryable\":true}", .json = true },
+        .{ .err = error.InvalidManifest, .status = 500, .body = "{\"code\":\"table_storage_unreadable\",\"error\":\"InvalidManifest\",\"message\":\"table storage unreadable\",\"retryable\":false}", .json = true },
+        .{ .err = error.CorruptInput, .status = 500, .body = "{\"code\":\"table_storage_unreadable\",\"error\":\"CorruptInput\",\"message\":\"table storage unreadable\",\"retryable\":false}", .json = true },
     };
 
     for (cases) |tc| {

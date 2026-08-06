@@ -48,6 +48,8 @@ SAME_PATH_CONST_FALSE_POSITIVES = {
 
 SAME_PATH_FUNCTION_FALSE_POSITIVES: dict[str, set[str]] = {}
 
+SAME_PATH_FUNCTION_ALIASES: dict[str, dict[str, set[str]]] = {}
+
 SAME_PATH_CONST_ALIASES = {
     "zig/pkg/antfly/src/openapi/generated/antfly_client_openapi/root.zig": {
         "InferenceTextChunkOptions": {"TextChunkOptions"},
@@ -189,6 +191,7 @@ def load_manifest_policy(path: pathlib.Path) -> None:
         MOVED_CURRENT_PATHS.update({key: list(value) for key, value in data["moved_paths"].items() if isinstance(value, list)})
     merge_set_map(SAME_PATH_CONST_FALSE_POSITIVES, data.get("same_path_const_false_positives", {}))
     merge_set_map(SAME_PATH_FUNCTION_FALSE_POSITIVES, data.get("same_path_function_false_positives", {}))
+    merge_nested_set_map(SAME_PATH_FUNCTION_ALIASES, data.get("same_path_function_aliases", {}))
     merge_nested_set_map(SAME_PATH_CONST_ALIASES, data.get("same_path_const_aliases", {}))
     merge_set_map(TEST_NAME_ALIASES, data.get("test_name_aliases", {}))
     merge_set_map(CHANGED_HELPER_CURRENT_ALIASES, data.get("changed_helper_aliases", {}))
@@ -1123,6 +1126,31 @@ def check_surface_symbols(origin: str) -> list[CheckResult]:
 
 def helper_alias_present(name: str, current: str) -> bool:
     return any(token in current for token in CHANGED_HELPER_CURRENT_ALIASES.get(name, set()))
+
+
+def current_symbol_alias_exists(alias: str, same_path_text: str, kind: str) -> bool:
+    """Resolve a same-path or `path::symbol` merge-audit alias."""
+
+    target_text = same_path_text
+    symbol = alias
+    if "::" in alias:
+        target_path, symbol = alias.rsplit("::", 1)
+        try:
+            target_text = git_index_or_worktree_text(target_path)
+        except (RuntimeError, OSError, UnicodeDecodeError):
+            return False
+
+    if kind == "fn":
+        return re.search(
+            rf"\b(?:pub\s+)?fn\s+{re.escape(symbol)}\b",
+            target_text,
+        ) is not None
+    if kind == "const":
+        return re.search(
+            rf"\bpub\s+const\s+{re.escape(symbol)}\b",
+            target_text,
+        ) is not None
+    raise ValueError(f"unsupported Zig alias kind: {kind}")
 
 
 def check_changed_split_helper_names(origin: str) -> list[CheckResult]:
@@ -2968,16 +2996,26 @@ def check_same_path_public_surface(origin: str, files: list[ChangedFile]) -> lis
         except (RuntimeError, OSError, UnicodeDecodeError):
             continue
         allow_missing = DB_PUB_FN_FALSE_POSITIVES if path == "zig/pkg/antfly/src/storage/db/db.zig" else set()
-        fn_missing = sorted(
-            (pub_fns(old) - pub_fns(new))
+        new_public_functions = pub_fns(new)
+        fn_missing = []
+        for name in sorted(
+            pub_fns(old)
             - allow_missing
             - SAME_PATH_FUNCTION_FALSE_POSITIVES.get(path, set())
-        )
+        ):
+            aliases = SAME_PATH_FUNCTION_ALIASES.get(path, {}).get(name, set())
+            if name in new_public_functions or any(
+                current_symbol_alias_exists(alias, new, "fn") for alias in aliases
+            ):
+                continue
+            fn_missing.append(name)
         new_members = pub_members(new)
         const_missing_items: list[str] = []
         for name in sorted(pub_consts(old) - SAME_PATH_CONST_FALSE_POSITIVES.get(path, set())):
             aliases = SAME_PATH_CONST_ALIASES.get(path, {}).get(name, set())
-            if name in new_members or aliases & new_members:
+            if name in new_members or any(
+                current_symbol_alias_exists(alias, new, "const") for alias in aliases
+            ):
                 continue
             const_missing_items.append(name)
         const_missing = const_missing_items
@@ -3221,6 +3259,87 @@ def check_split_zig_tests(origin: str, global_current_tests: set[str]) -> list[C
     return checks
 
 
+def mask_zig_comments_and_strings(text: str, *, mask_strings: bool = True) -> str:
+    """Replace Zig comments and optionally literals with spaces, preserving lines."""
+
+    chars = list(text)
+    index = 0
+    block_depth = 0
+    quote: str | None = None
+    escaped = False
+    line_has_code = False
+
+    while index < len(chars):
+        char = chars[index]
+        following = chars[index + 1] if index + 1 < len(chars) else ""
+
+        if char == "\n":
+            escaped = False
+            line_has_code = False
+            index += 1
+            continue
+
+        if block_depth:
+            if char == "/" and following == "*":
+                chars[index] = chars[index + 1] = " "
+                block_depth += 1
+                index += 2
+            elif char == "*" and following == "/":
+                chars[index] = chars[index + 1] = " "
+                block_depth -= 1
+                index += 2
+            else:
+                chars[index] = " "
+                index += 1
+            continue
+
+        if quote:
+            if mask_strings:
+                chars[index] = " "
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            index += 1
+            continue
+
+        if not line_has_code and char in " \t\r":
+            index += 1
+            continue
+        if not line_has_code and char == "\\" and following == "\\":
+            if mask_strings:
+                while index < len(chars) and chars[index] != "\n":
+                    chars[index] = " "
+                    index += 1
+            else:
+                while index < len(chars) and chars[index] != "\n":
+                    index += 1
+            continue
+        line_has_code = True
+
+        if char == "/" and following == "/":
+            while index < len(chars) and chars[index] != "\n":
+                chars[index] = " "
+                index += 1
+            continue
+        if char == "/" and following == "*":
+            chars[index] = chars[index + 1] = " "
+            block_depth = 1
+            index += 2
+            continue
+        if char in {'"', "'"}:
+            quote = char
+            if mask_strings:
+                chars[index] = " "
+            index += 1
+            continue
+        index += 1
+
+    return "".join(chars)
+
+
 def check_current_imported_function_refs(files: list[ChangedFile]) -> list[CheckResult]:
     """Find calls to local imported module functions that no longer exist.
 
@@ -3247,7 +3366,8 @@ def check_current_imported_function_refs(files: list[ChangedFile]) -> list[Check
             continue
 
         imports: dict[str, str] = {}
-        for alias, import_path in import_re.findall(text):
+        comment_free_text = mask_zig_comments_and_strings(text, mask_strings=False)
+        for alias, import_path in import_re.findall(comment_free_text):
             if not alias[:1].islower():
                 continue
             resolved = resolve_local_import(path, import_path)
@@ -3256,7 +3376,8 @@ def check_current_imported_function_refs(files: list[ChangedFile]) -> list[Check
         if not imports:
             continue
 
-        for alias, member in re.findall(r"(?<!\.)\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\s*\(", text):
+        code_text = mask_zig_comments_and_strings(text)
+        for alias, member in re.findall(r"(?<!\.)\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\s*\(", code_text):
             imported_path = imports.get(alias)
             if not imported_path:
                 continue

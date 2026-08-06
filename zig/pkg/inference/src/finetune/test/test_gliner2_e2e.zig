@@ -19,7 +19,7 @@
 //
 // After N training steps the loss must decrease, proving that:
 //   - deberta_graph builds a valid forward graph (with disentangled attention)
-//   - GLiNER2's token-classification head (classifier.weight + classifier.bias)
+//   - GLiNER2's token-classification head (task_classifier.weight + task_classifier.bias)
 //     is wired on top of the encoder output
 //   - LoRA injection finds and wraps query_proj/value_proj projections
 //   - autodiff produces real gradients through the full encoder + head
@@ -124,7 +124,7 @@ fn populateGliner2Weights(allocator: std.mem.Allocator, store: *WeightStore, rng
     // Per layer: q/k/v proj w+b (6) + attn output dense w+b (2)
     //          + attn output LN w+b (2) + intermediate dense w+b (2)
     //          + output dense w+b (2) + output LN w+b (2) = 16.
-    // Head: classifier.weight (1) + classifier.bias (1) = 2.
+    // Head: task_classifier.weight (1) + task_classifier.bias (1) = 2.
     const total_params: u32 = 6 + 16 * NUM_LAYERS + 2;
     try store.resident_weights.ensureTotalCapacity(allocator, total_params);
 
@@ -139,8 +139,8 @@ fn populateGliner2Weights(allocator: std.mem.Allocator, store: *WeightStore, rng
     try putWeight(allocator, store, "encoder.LayerNorm.bias", &.{H}, rng);
 
     // ── Classifier head ──
-    try putWeight(allocator, store, "classifier.weight", &.{ C, H }, rng);
-    try putWeight(allocator, store, "classifier.bias", &.{C}, rng);
+    try putWeight(allocator, store, "task_classifier.weight", &.{ C, H }, rng);
+    try putWeight(allocator, store, "task_classifier.bias", &.{C}, rng);
 
     // ── Encoder layers (v3 names) ──
     for (0..NUM_LAYERS) |layer| {
@@ -217,7 +217,7 @@ test "GLiNER2 e2e: loss decreases over training steps" {
 
     // 3. Create the RealAutodiffTrainer with LoRA targeting query_proj + value_proj.
     const lora_targets = [_][]const u8{ "query_proj", "value_proj" };
-    const regular_trainable_params = [_][]const u8{ "classifier.weight", "classifier.bias" };
+    const regular_trainable_params = [_][]const u8{ "task_classifier.weight", "task_classifier.bias" };
     var trainer = try real_autodiff.RealAutodiffTrainer.init(
         allocator,
         &cb,
@@ -362,7 +362,7 @@ test "GLiNER2 inference: fixed text produces deterministic token logits" {
     var cb = native.computeBackend();
 
     const lora_targets = [_][]const u8{ "query_proj", "value_proj" };
-    const regular_trainable_params = [_][]const u8{ "classifier.weight", "classifier.bias" };
+    const regular_trainable_params = [_][]const u8{ "task_classifier.weight", "task_classifier.bias" };
     var trainer = try real_autodiff.RealAutodiffTrainer.init(
         allocator,
         &cb,
@@ -418,9 +418,9 @@ test "GLiNER2 inference: fixed text produces deterministic token logits" {
 
     const classifier_bias = [_]f32{ -0.75, -0.25, 0.0, 0.5, 1.25 };
     for (trainer.regular_params.items) |*slot| {
-        if (std.mem.eql(u8, slot.name, "classifier.weight")) {
+        if (std.mem.eql(u8, slot.name, "task_classifier.weight")) {
             @memset(slot.weights, 0.0);
-        } else if (std.mem.eql(u8, slot.name, "classifier.bias")) {
+        } else if (std.mem.eql(u8, slot.name, "task_classifier.bias")) {
             try std.testing.expectEqual(classifier_bias.len, slot.weights.len);
             @memcpy(slot.weights, &classifier_bias);
         }
@@ -465,16 +465,16 @@ test "GLiNER2 inference: fixed text produces deterministic token logits" {
     try compat.cwd().createDirPath(compat.io(), out_dir);
     defer compat.cwd().deleteTree(compat.io(), out_dir) catch {};
 
-    const weight_slot = regularParamSlot(&trainer, "classifier.weight") orelse return error.MissingClassifierHead;
-    const bias_slot = regularParamSlot(&trainer, "classifier.bias") orelse return error.MissingClassifierHead;
+    const weight_slot = regularParamSlot(&trainer, "task_classifier.weight") orelse return error.MissingClassifierHead;
+    const bias_slot = regularParamSlot(&trainer, "task_classifier.bias") orelse return error.MissingClassifierHead;
     const task_head_params = [_]gliner2_bundle.AutodiffAdapterParam{
         .{
-            .name = weight_slot.name,
+            .name = "classifier.weight",
             .dims = weight_slot.dims,
             .weights = weight_slot.weights,
         },
         .{
-            .name = bias_slot.name,
+            .name = "classifier.bias",
             .dims = bias_slot.dims,
             .weights = bias_slot.weights,
         },

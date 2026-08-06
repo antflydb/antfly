@@ -2075,7 +2075,6 @@ pub const ConnectedModelType = enum {
     generator,
     reranker,
     chunker,
-    recognizer,
     classifier,
     rewriter,
     reader,
@@ -2089,7 +2088,6 @@ pub const ConnectedModelType = enum {
             .generator => "generator",
             .reranker => "reranker",
             .chunker => "chunker",
-            .recognizer => "recognizer",
             .classifier => "classifier",
             .rewriter => "rewriter",
             .reader => "reader",
@@ -2110,7 +2108,6 @@ pub const ConnectedModelType = enum {
             .{ "generator", .generator },
             .{ "reranker", .reranker },
             .{ "chunker", .chunker },
-            .{ "recognizer", .recognizer },
             .{ "classifier", .classifier },
             .{ "rewriter", .rewriter },
             .{ "reader", .reader },
@@ -3364,18 +3361,18 @@ pub const EmbeddingsIndexStats = struct {
     total_nodes: ?i64 = null,
     /// Number of unique terms in the inverted index (sparse only)
     total_terms: ?i64 = null,
-    /// Whether the index enricher is currently backfilling
+    /// Whether enrichment, publication, or replay work is still pending. Documents that do not contain the indexed field are terminal skipped outcomes and do not keep this true.
     rebuilding: ?bool = null,
     repair: ?IndexRepairStatus = null,
     /// Number of documents pending enrichment in the WAL
     wal_backlog: ?i64 = null,
     /// Whether the index is actively rebuilding, replaying, enriching, or catching up.
     backfill_active: ?bool = null,
-    /// Backfill progress as a ratio from 0.0 to 1.0
+    /// Fraction of source documents with a terminal materialization outcome, including produced embeddings and intentionally skipped documents. Reaches 1.0 when no source work is pending and replay is current.
     backfill_progress: ?f64 = null,
     /// Total items processed during backfill
     backfill_items_processed: ?i64 = null,
-    /// Operational readiness state such as ready, running, retrying, or failed.
+    /// Operational readiness state. Clients should use ready (or rebuilding=false) for query readiness; replay watermarks diagnose replay progress but do not replace this signal.
     backfill_state: ?[]const u8 = null,
     /// Number of physical vectors or sparse entries visible to the index; chunked indexes may contain multiple entries per source document.
     doc_count: ?i64 = null,
@@ -4017,6 +4014,7 @@ pub const ExtractionOptions = struct {
     include_confidence: ?bool = null,
     include_spans: ?bool = null,
     reader: ?ExtractionReaderOptions = null,
+    resolver: ?ExtractionResolverOptions = null,
 };
 
 pub const ExtractionReaderOptions = struct {
@@ -4038,6 +4036,7 @@ pub const ExtractionRelationEndpoint = struct {
     id: ?[]const u8 = null,
 };
 
+/// Optional source and target labels constrain relation endpoints. A target requires a source.
 pub const ExtractionRelationSchema = struct {
     type: []const u8,
     source: ?[]const u8 = null,
@@ -4049,6 +4048,16 @@ pub const ExtractionRequest = struct {
     inputs: []const ExtractionInput,
     schema: ExtractionSchema,
     options: ?ExtractionOptions = null,
+};
+
+/// Optional cross-input entity and relation deduplication.
+pub const ExtractionResolverOptions = struct {
+    similarity_threshold: ?f32 = null,
+    type_must_match: ?bool = null,
+    min_entity_confidence: ?f32 = null,
+    min_relation_confidence: ?f32 = null,
+    deduplicate_relations: ?bool = null,
+    track_provenance: ?bool = null,
 };
 
 pub const ExtractionResponseObject = enum {
@@ -4080,6 +4089,7 @@ pub const ExtractionResponse = struct {
     usage: ?std.json.Value = null,
 };
 
+/// Selects one extraction operation family per request. Entity labels may accompany relation schemas so relation extraction can return its participating entities in the same response.
 pub const ExtractionSchema = struct {
     entities: ?[]const []const u8 = null,
     relations: ?[]const ExtractionRelationSchema = null,
@@ -4090,7 +4100,7 @@ pub const ExtractionSchema = struct {
 pub const ExtractionStructureField = std.json.Value;
 
 pub const ExtractionStructureSchema = struct {
-    fields: ?std.json.ArrayHashMap(ExtractionStructureField) = null,
+    fields: std.json.ArrayHashMap(ExtractionStructureField),
 };
 
 pub const ExtractionToken = struct {
@@ -6328,7 +6338,7 @@ pub const InferenceConfig = struct {
     api_url: []const u8,
     /// API key used when calling an authenticated shared Antfly inference API.
     api_key: ?[]const u8 = null,
-    /// Base directory containing model subdirectories. Antfly inference auto-discovers models from: - `{models_dir}/embedders/` - Embedding models (ONNX) - `{models_dir}/chunkers/` - Chunking models (ONNX) - `{models_dir}/rerankers/` - Reranking models (ONNX) - `{models_dir}/recognizers/` - Recognition models (ONNX) - `{models_dir}/rewriters/` - Seq2Seq rewriter models (ONNX) Defaults to ~/.antfly/inference/models (set via viper). If not set, only built-in fixed chunking is available.
+    /// Base directory containing model subdirectories. Antfly inference auto-discovers models from: - `{models_dir}/embedders/` - Embedding models (ONNX) - `{models_dir}/chunkers/` - Chunking models (ONNX) - `{models_dir}/rerankers/` - Reranking models (ONNX) - `{models_dir}/extractors/` - Entity, relation, and structured extraction models - `{models_dir}/rewriters/` - Seq2Seq rewriter models (ONNX) Defaults to ~/.antfly/inference/models (set via viper). If not set, only built-in fixed chunking is available.
     models_dir: ?[]const u8 = null,
     /// Base directory containing Traditional ML predictor subdirectories. The `/ml/v1/*` API auto-discovers predictors from `{ml_dir}/{name}/tabular_model.json`. Defaults to ~/.antfly/inference/ml.
     ml_dir: ?[]const u8 = null,
@@ -6377,7 +6387,7 @@ pub const InferenceConnection = struct {
     names: ?[]const []const u8 = null,
     /// Model types this instance is configured for.
     configured_model_types: ?[]const ConnectedModelType = null,
-    /// Models reported by the provider, grouped by model type. Keys are pluralized ConnectedModelType values ("embedders", "generators", "rerankers", "chunkers", "recognizers", "classifiers", "rewriters", "readers", "transcribers", "extractors") plus "other" for models the provider's listing API does not classify by task. Populated only when the request includes the "models" expansion.
+    /// Models reported by the provider, grouped by model type. Keys are pluralized ConnectedModelType values ("embedders", "generators", "rerankers", "chunkers", "classifiers", "rewriters", "readers", "transcribers", "extractors") plus "other" for models the provider's listing API does not classify by task. Populated only when the request includes the "models" expansion.
     models: ?std.json.ArrayHashMap([]const ConnectedModel) = null,
 };
 
@@ -6615,6 +6625,7 @@ pub const InferenceEmbeddingItemErrorStage = enum {
     text_inference,
     image_inference,
     audio_inference,
+    model_admission,
     inference,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -6626,6 +6637,7 @@ pub const InferenceEmbeddingItemErrorStage = enum {
             .text_inference => "text_inference",
             .image_inference => "image_inference",
             .audio_inference => "audio_inference",
+            .model_admission => "model_admission",
             .inference => "inference",
         };
         try jw.write(s);
@@ -6644,6 +6656,7 @@ pub const InferenceEmbeddingItemErrorStage = enum {
             .{ "text_inference", .text_inference },
             .{ "image_inference", .image_inference },
             .{ "audio_inference", .audio_inference },
+            .{ "model_admission", .model_admission },
             .{ "inference", .inference },
         });
         return map.get(s) orelse error.UnexpectedToken;
@@ -6664,6 +6677,8 @@ pub const InferenceEmbeddingItemError = struct {
     retryable: bool,
     /// HTTP-style status classification for this item
     status: i64,
+    /// Minimum retry delay in milliseconds for a retryable transient failure
+    retry_after_ms: ?i64 = null,
 };
 
 /// Object type, always "embedding"
@@ -6707,9 +6722,43 @@ pub const InferenceEmbeddingUsage = struct {
     total_tokens: i64,
 };
 
+/// Machine-readable capacity source when the failure is retryable
+pub const InferenceErrorReason = enum {
+    inference_capacity,
+    request_queue,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .inference_capacity => "inference_capacity",
+            .request_queue => "request_queue",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "inference_capacity", .inference_capacity },
+            .{ "request_queue", .request_queue },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const InferenceError = struct {
-    /// Error message
+    /// Stable machine-readable error code
     @"error": []const u8,
+    /// Human-readable error description
+    message: ?[]const u8 = null,
+    /// Machine-readable capacity source when the failure is retryable
+    reason: ?InferenceErrorReason = null,
+    /// Whether retrying the same request may succeed
+    retryable: ?bool = null,
+    /// Minimum retry delay in milliseconds
+    retry_after_ms: ?i64 = null,
 };
 
 /// Reason why generation stopped
@@ -6762,7 +6811,9 @@ pub const InferenceFunctionDefinition = struct {
 pub const InferenceGenerateBatchError = struct {
     code: []const u8,
     message: []const u8,
-    retryable: ?bool = null,
+    retryable: bool,
+    /// Minimum retry delay in milliseconds for a retryable capacity failure.
+    retry_after_ms: ?i64 = null,
 };
 
 /// Batch execution mode. Only synchronous batches are implemented.
@@ -7264,7 +7315,6 @@ pub const InferenceModelKind = enum {
     reranker,
     chunker,
     classifier,
-    recognizer,
     rewriter,
     reader,
     transcriber,
@@ -7277,7 +7327,6 @@ pub const InferenceModelKind = enum {
             .reranker => "reranker",
             .chunker => "chunker",
             .classifier => "classifier",
-            .recognizer => "recognizer",
             .rewriter => "rewriter",
             .reader => "reader",
             .transcriber => "transcriber",
@@ -7297,7 +7346,6 @@ pub const InferenceModelKind = enum {
             .{ "reranker", .reranker },
             .{ "chunker", .chunker },
             .{ "classifier", .classifier },
-            .{ "recognizer", .recognizer },
             .{ "rewriter", .rewriter },
             .{ "reader", .reader },
             .{ "transcriber", .transcriber },
@@ -7389,8 +7437,6 @@ pub const InferenceModelsResponse = struct {
     extractors: std.json.ArrayHashMap(InferenceModelInfo),
     /// Available generator/LLM models from models_dir/generators/
     generators: std.json.ArrayHashMap(InferenceModelInfo),
-    /// Available recognizer models from models_dir/recognizers/
-    recognizers: std.json.ArrayHashMap(InferenceModelInfo),
     /// Available Seq2Seq rewriter models from models_dir/rewriters/
     rewriters: std.json.ArrayHashMap(InferenceModelInfo),
     /// Available reader/OCR models from models_dir/readers/
@@ -8034,6 +8080,46 @@ pub const InferenceTranscribeResponse = struct {
     /// Name of model used for transcription
     model: []const u8,
     usage: InferenceGenerateUsage,
+};
+
+/// Machine-readable capacity source
+pub const InferenceTransientCapacityErrorReason = enum {
+    inference_capacity,
+    request_queue,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .inference_capacity => "inference_capacity",
+            .request_queue => "request_queue",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "inference_capacity", .inference_capacity },
+            .{ "request_queue", .request_queue },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Actionable retry contract for temporary inference-capacity failures.
+pub const InferenceTransientCapacityError = struct {
+    /// Stable machine-readable error code
+    @"error": []const u8,
+    /// Human-readable error description
+    message: []const u8,
+    /// Machine-readable capacity source
+    reason: InferenceTransientCapacityErrorReason,
+    /// Always true for a transient-capacity response
+    retryable: bool,
+    /// Minimum retry delay in milliseconds
+    retry_after_ms: i64,
 };
 
 /// Logging configuration for inference services
@@ -14441,7 +14527,7 @@ pub const TableSchemaStorageMode = enum {
 
 /// Schema definition for a table with multiple document types
 pub const TableSchema = struct {
-    /// Version of the schema. Used for migrations.
+    /// Backend-managed schema generation used for migrations. Omit it from create and update requests.
     version: ?i64 = null,
     /// Storage profile for the table. - "document" (default): schemaless JSON documents with optional, soft schema validation. All indexes are derived from the document. - "relational": required closed schema with typed columns. Documents must match a declared type; declared scalar properties are stored as typed columns for columnar predicate pushdown and aggregation. A field typed "json" stores a subtree that is still indexed like a document. Implies enforce_types and closed document types.
     storage_mode: ?TableSchemaStorageMode = null,
@@ -14499,6 +14585,41 @@ pub const TableStatus = struct {
     storage_status: StorageStatus,
     /// Table-level generated artifact enrichments registered outside a specific index.
     artifact_enrichments: ?[]const EnrichmentConfig = null,
+};
+
+/// Stable client-routing code for unreadable table storage.
+pub const TableStorageUnreadableErrorCode = enum {
+    table_storage_unreadable,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .table_storage_unreadable => "table_storage_unreadable",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "table_storage_unreadable", .table_storage_unreadable },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// A non-retryable table-storage integrity or format failure.
+pub const TableStorageUnreadableError = struct {
+    /// Stable client-routing code for unreadable table storage.
+    code: TableStorageUnreadableErrorCode,
+    /// Concrete storage error class, such as InvalidManifest.
+    @"error": []const u8,
+    /// Human-readable summary.
+    message: []const u8,
+    /// Always false; recovery requires repair, restore, or table replacement.
+    retryable: bool,
 };
 
 /// Tablespace catalog object. SQL `CREATE TABLESPACE` maps to this lifecycle surface.

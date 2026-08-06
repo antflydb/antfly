@@ -133,7 +133,7 @@ func (r *NERRegistry) discoverModels() error {
 		return nil
 	}
 
-	discovered, err := modelregistry.DiscoverModelsInDir(r.modelsDir, modelregistry.ModelTypeRecognizer, zapLogf(r.base.logger))
+	discovered, err := modelregistry.DiscoverModelsInDir(r.modelsDir, modelregistry.ModelTypeExtractor, zapLogf(r.base.logger))
 	if err != nil {
 		return fmt.Errorf("discovering NER models: %w", err)
 	}

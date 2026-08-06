@@ -85,7 +85,7 @@ pub const Config = struct {
     api_url: []const u8,
     /// API key used when calling an authenticated shared Antfly inference API.
     api_key: ?[]const u8 = null,
-    /// Base directory containing model subdirectories. Antfly inference auto-discovers models from: - `{models_dir}/embedders/` - Embedding models (ONNX) - `{models_dir}/chunkers/` - Chunking models (ONNX) - `{models_dir}/rerankers/` - Reranking models (ONNX) - `{models_dir}/recognizers/` - Recognition models (ONNX) - `{models_dir}/rewriters/` - Seq2Seq rewriter models (ONNX) Defaults to ~/.antfly/inference/models (set via viper). If not set, only built-in fixed chunking is available.
+    /// Base directory containing model subdirectories. Antfly inference auto-discovers models from: - `{models_dir}/embedders/` - Embedding models (ONNX) - `{models_dir}/chunkers/` - Chunking models (ONNX) - `{models_dir}/rerankers/` - Reranking models (ONNX) - `{models_dir}/extractors/` - Entity, relation, and structured extraction models - `{models_dir}/rewriters/` - Seq2Seq rewriter models (ONNX) Defaults to ~/.antfly/inference/models (set via viper). If not set, only built-in fixed chunking is available.
     models_dir: ?[]const u8 = null,
     /// Base directory containing Traditional ML predictor subdirectories. The `/ml/v1/*` API auto-discovers predictors from `{ml_dir}/{name}/tabular_model.json`. Defaults to ~/.antfly/inference/ml.
     ml_dir: ?[]const u8 = null,
@@ -218,41 +218,6 @@ pub const EmbedResponse = struct {
 pub const Error = struct {
     /// Error message
     @"error": []const u8,
-};
-
-pub const ExtractFieldValue = struct {
-    /// The extracted text value
-    value: []const u8,
-    /// Confidence score (only present when include_confidence=true)
-    score: ?f32 = null,
-    /// Character offset where value begins (only present when include_spans=true)
-    start: ?i64 = null,
-    /// Character offset where value ends (only present when include_spans=true)
-    end: ?i64 = null,
-};
-
-pub const ExtractRequest = struct {
-    /// Name of recognizer model with 'extraction' capability
-    model: []const u8,
-    /// Texts to extract structured data from
-    texts: []const []const u8,
-    /// Extraction schema mapping structure names to field definitions. Each field is defined as "field_name::type" where type is "str" or "list". Optional choice fields: "field_name::[opt1|opt2]::str". If no type is specified, defaults to "str".
-    schema: std.json.ArrayHashMap([]const []const u8),
-    /// Score threshold for span extraction (0.0-1.0)
-    threshold: ?f32 = null,
-    /// If true, don't allow nested/overlapping entities
-    flat_ner: ?bool = null,
-    /// If true, include confidence scores in output
-    include_confidence: ?bool = null,
-    /// If true, include character offset spans in output
-    include_spans: ?bool = null,
-};
-
-pub const ExtractResponse = struct {
-    /// Name of model used for extraction
-    model: []const u8,
-    /// Array of extraction results (one per input text). Each result maps structure names to arrays of extracted instances. Each instance maps field names to ExtractFieldValue (for ::str fields) or arrays of ExtractFieldValue (for ::list fields).
-    results: []const std.json.ArrayHashMap([]const std.json.Value),
 };
 
 /// Reason why generation stopped
@@ -679,7 +644,6 @@ pub const ModelKind = enum {
     reranker,
     chunker,
     classifier,
-    recognizer,
     rewriter,
     reader,
     transcriber,
@@ -692,7 +656,6 @@ pub const ModelKind = enum {
             .reranker => "reranker",
             .chunker => "chunker",
             .classifier => "classifier",
-            .recognizer => "recognizer",
             .rewriter => "rewriter",
             .reader => "reader",
             .transcriber => "transcriber",
@@ -712,7 +675,6 @@ pub const ModelKind = enum {
             .{ "reranker", .reranker },
             .{ "chunker", .chunker },
             .{ "classifier", .classifier },
-            .{ "recognizer", .recognizer },
             .{ "rewriter", .rewriter },
             .{ "reader", .reader },
             .{ "transcriber", .transcriber },
@@ -804,8 +766,6 @@ pub const ModelsResponse = struct {
     extractors: std.json.ArrayHashMap(ModelInfo),
     /// Available generator/LLM models from models_dir/generators/
     generators: std.json.ArrayHashMap(ModelInfo),
-    /// Available recognizer models from models_dir/recognizers/
-    recognizers: std.json.ArrayHashMap(ModelInfo),
     /// Available Seq2Seq rewriter models from models_dir/rewriters/
     rewriters: std.json.ArrayHashMap(ModelInfo),
     /// Available reader/OCR models from models_dir/readers/
@@ -881,51 +841,6 @@ pub const ReadResult = struct {
     regions: ?[]const TextRegion = null,
 };
 
-pub const RecognizeEntity = struct {
-    /// The entity text
-    text: []const u8,
-    /// Entity type (PER, ORG, LOC, MISC)
-    label: []const u8,
-    /// Character offset where entity begins
-    start: i64,
-    /// Character offset where entity ends (exclusive)
-    end: i64,
-    /// Confidence score (0.0 to 1.0)
-    score: f32,
-};
-
-pub const RecognizeRequest = struct {
-    /// Name of recognizer model from models_dir/recognizers/
-    model: []const u8,
-    /// Texts to extract entities from
-    texts: []const []const u8,
-    /// Custom entity labels to extract (GLiNER models only). When using a GLiNER model, you can specify any entity types to extract, enabling zero-shot NER without model retraining. If not provided, the model's default labels are used.
-    labels: ?[]const []const u8 = null,
-    /// Relation types to extract (for models with 'relations' capability). Only used when the model supports relation extraction (GLiNER multitask, REBEL). If not provided, the model extracts all relations it can detect.
-    relation_labels: ?[]const []const u8 = null,
-    resolver: ?ResolverConfig = null,
-};
-
-pub const RecognizeResponse = struct {
-    /// Name of model used for NER
-    model: []const u8,
-    /// Array of entity arrays (one per input text)
-    entities: []const []const RecognizeEntity,
-    /// Array of relation arrays (one per input text). Only present when using a model with 'relations' capability (GLiNER multitask, REBEL).
-    relations: ?[]const []const Relation = null,
-};
-
-pub const Relation = struct {
-    /// The subject/head entity in the relationship
-    head: RecognizeEntity,
-    /// The object/tail entity in the relationship
-    tail: RecognizeEntity,
-    /// The relationship type
-    label: []const u8,
-    /// Confidence score for the relation (0.0 to 1.0)
-    score: f32,
-};
-
 pub const RerankRequest = struct {
     /// Name of reranking model from models_dir/rerankers/
     model: []const u8,
@@ -940,22 +855,6 @@ pub const RerankResponse = struct {
     model: []const u8,
     /// Relevance scores (one per prompt, same order as input)
     scores: []const f32,
-};
-
-/// Configuration for entity resolution. When present in a RecognizeRequest, the response entities and relations are deduplicated via entity resolution (e.g., "Elon Musk" and "Musk" are merged into a single entity).
-pub const ResolverConfig = struct {
-    /// Jaro-Winkler similarity threshold for merging entities (0.0-1.0)
-    similarity_threshold: ?f32 = null,
-    /// Whether entity types must match for merging
-    type_must_match: ?bool = null,
-    /// Minimum confidence score for entities to be included
-    min_entity_confidence: ?f32 = null,
-    /// Minimum confidence score for relations to be included
-    min_relation_confidence: ?f32 = null,
-    /// Whether to deduplicate relations after entity resolution
-    deduplicate_relations: ?bool = null,
-    /// Whether to track mention provenance for resolved entities
-    track_provenance: ?bool = null,
 };
 
 pub const RewriteRequest = struct {

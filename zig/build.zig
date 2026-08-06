@@ -817,6 +817,8 @@ pub fn build(b: *std.Build) void {
             .onnx_graph = termite_onnx_graph_mod,
             .pjrt = termite_pjrt_mod,
             .generating_openapi = generating_openapi_mod,
+            .extraction_openapi = extraction_openapi_mod,
+            .extracting = extracting_mod,
         },
     });
     const inference_build_options_mod = inference_graph.build_options_mod;

@@ -119,6 +119,7 @@ pub const TestSpec = struct {
     description: []const u8,
     imports: []const Import = &.{},
     native_link: NativeLink = .none,
+    filters: []const []const u8 = &.{},
 };
 
 pub fn addCommand(ctx: Context, spec: CommandSpec) void {
@@ -149,6 +150,7 @@ pub fn addTest(ctx: Context, spec: TestSpec) *std.Build.Step {
             .target = ctx.target,
             .optimize = ctx.optimize,
         }),
+        .filters = spec.filters,
     });
     addImports(ctx, test_exe.root_module, spec.imports);
     configureNative(ctx, test_exe, spec.native_link, spec.imports);

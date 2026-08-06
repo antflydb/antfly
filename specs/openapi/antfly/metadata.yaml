@@ -1504,6 +1504,32 @@ components:
       required:
         - kind
         - session_id
+    TableStorageUnreadableError:
+      type: object
+      additionalProperties: false
+      description: A non-retryable table-storage integrity or format failure.
+      required:
+        - code
+        - error
+        - message
+        - retryable
+      properties:
+        code:
+          type: string
+          enum:
+            - table_storage_unreadable
+          description: Stable client-routing code for unreadable table storage.
+        error:
+          type: string
+          description: Concrete storage error class, such as InvalidManifest.
+        message:
+          type: string
+          description: Human-readable summary.
+        retryable:
+          type: boolean
+          enum:
+            - false
+          description: Always false; recovery requires repair, restore, or table replacement.
     ExactSortError:
       type: object
       additionalProperties: false
@@ -1699,7 +1725,6 @@ components:
         - generator
         - reranker
         - chunker
-        - recognizer
         - classifier
         - rewriter
         - reader
@@ -1765,7 +1790,7 @@ components:
           description: |
             Models reported by the provider, grouped by model type. Keys are
             pluralized ConnectedModelType values ("embedders", "generators",
-            "rerankers", "chunkers", "recognizers", "classifiers", "rewriters",
+            "rerankers", "chunkers", "classifiers", "rewriters",
             "readers", "transcribers", "extractors") plus "other" for models
             the provider's listing API does not classify by task. Populated
             only when the request includes the "models" expansion.
@@ -10328,6 +10353,14 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    QueryInternalServerError:
+      description: Query failure. Storage integrity failures use a stable non-retryable error payload.
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - $ref: "#/components/schemas/Error"
+              - $ref: "#/components/schemas/TableStorageUnreadableError"
 
 paths:
   /status:
@@ -10454,7 +10487,7 @@ paths:
           description: Requires the connection capability `models.<operation>`.
           schema:
             type: string
-            enum: [embed, generate, rerank, chunk, recognize, extract, rewrite, read, transcribe]
+            enum: [embed, generate, rerank, chunk, extract, rewrite, read, transcribe]
       requestBody:
         required: true
         content:
@@ -11400,11 +11433,7 @@ paths:
         "422":
           $ref: "#/components/responses/UnsupportedExactSort"
         "500":
-          description: Internal server error
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
+          $ref: "#/components/responses/QueryInternalServerError"
   /eval:
     post:
       summary: Standalone evaluation endpoint
@@ -12816,7 +12845,7 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound" # If table doesn't exist
         "500":
-          $ref: "#/components/responses/InternalServerError"
+          $ref: "#/components/responses/QueryInternalServerError"
   /tables/{tableName}/batch:
     parameters:
       - name: tableName

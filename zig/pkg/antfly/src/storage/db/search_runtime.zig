@@ -29,6 +29,7 @@ const embedder_mod = @import("enrichment/embedder.zig");
 const enrichment_artifact_codec = @import("enrichment/artifact_codec.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
 const index_mod = @import("../../index.zig");
+const introducer_mod = @import("../../introducer.zig");
 const lsm_backend_mod = @import("../lsm_backend/mod.zig");
 const planning_adapter_mod = @import("planning_adapter.zig");
 const planning_bindings_mod = @import("planning_bindings.zig");
@@ -8211,8 +8212,15 @@ test "db delete full text index drains active merge before closing generation" {
     defer db.close();
     try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
 
+    const runtime = db.text_merge_runtime orelse return error.TestUnexpectedResult;
+    // Prevent the fast maintenance worker from consuming every candidate
+    // before the blocking hook is installed. This also makes the test
+    // independent of scheduler speed and host load.
+    try std.testing.expect(runtime.pause());
+
     try db.beginBulkIngestSession();
-    errdefer db.abortBulkIngestSession();
+    var bulk_session_active = true;
+    defer if (bulk_session_active) db.abortBulkIngestSession();
     for (0..12) |i| {
         const key = try std.fmt.allocPrint(alloc, "doc:{d}", .{i});
         defer alloc.free(key);
@@ -8224,6 +8232,10 @@ test "db delete full text index drains active merge before closing generation" {
         });
     }
 
+    try db.finishBulkIngestSessionWithOptions(.{ .compact = false });
+    bulk_session_active = false;
+    try std.testing.expect(db.pendingWorkStats().text_merge.pending_segments > 0);
+
     text_merge_runtime_mod.test_task_begin_entered.store(false, .release);
     text_merge_runtime_mod.test_release_after_task_begin.store(false, .release);
     text_merge_runtime_mod.test_block_after_task_begin.store(true, .release);
@@ -8233,15 +8245,15 @@ test "db delete full text index drains active merge before closing generation" {
         text_merge_runtime_mod.test_block_after_task_begin.store(false, .release);
         text_merge_runtime_mod.test_stop_entered.store(false, .release);
     }
-    try db.finishBulkIngestSessionWithOptions(.{ .compact = false });
+    try runtime.resumeAfterPause();
 
     var merge_started = false;
-    for (0..200_000) |_| {
+    for (0..5_000) |_| {
         if (text_merge_runtime_mod.test_task_begin_entered.load(.acquire)) {
             merge_started = true;
             break;
         }
-        std.Thread.yield() catch {};
+        try db.async_context.io.?.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
     }
     if (!merge_started) return error.TestTimeout;
 
@@ -8269,12 +8281,12 @@ test "db delete full text index drains active merge before closing generation" {
     };
 
     var stop_entered = false;
-    for (0..200_000) |_| {
+    for (0..5_000) |_| {
         if (text_merge_runtime_mod.test_stop_entered.load(.acquire)) {
             stop_entered = true;
             break;
         }
-        std.Thread.yield() catch {};
+        try db.async_context.io.?.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
     }
     if (!stop_entered) return error.TestTimeout;
 
@@ -14780,6 +14792,894 @@ test "db search runtime text schema runUntilIdle drains scheduled text merges af
     defer result.deinit();
 
     try std.testing.expectEqual(@as(u32, 12), result.total_hits);
+}
+
+test "db text merge descriptor admission failures retry without quarantine" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
+    // Publish enough independent segments to make a merge immediately
+    // schedulable without relying on a background index worker.
+    for (0..12) |i| {
+        var id_buf: [32]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buf, "doc:{d}", .{i});
+        var stored_buf: [96]u8 = undefined;
+        const stored = try std.fmt.bufPrint(&stored_buf, "{{\"body\":\"admission retry {d}\"}}", .{i});
+        var body_buf: [48]u8 = undefined;
+        const body = try std.fmt.bufPrint(&body_buf, "admission retry {d}", .{i});
+        const fields = [_]introducer_mod.TextField{.{ .field_name = "body", .text = body }};
+        const docs = [_]introducer_mod.TextDocument{.{
+            .id = id,
+            .stored_data = stored,
+            .text_fields = &fields,
+            .doc_ordinal = @intCast(i + 1),
+        }};
+        _ = try db.indexTextKernelDocuments("ft_v1", &docs);
+    }
+
+    const resources = db.core.batchExecutionResources();
+    var runtime = try text_merge_runtime_mod.TextMergeRuntime.init(
+        alloc,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{ .enabled = true },
+    );
+    defer runtime.deinit();
+    defer text_merge_runtime_mod.test_execute_admission_failures_remaining.store(0, .release);
+    defer text_merge_runtime_mod.test_finish_admission_failures_remaining.store(0, .release);
+
+    text_merge_runtime_mod.test_execute_admission_failures_remaining.store(1, .release);
+    try std.testing.expect(!try runtime.runOnce());
+    var stats = runtime.stats();
+    try std.testing.expectEqual(@as(u64, 0), stats.failed_merges);
+    try std.testing.expectEqual(@as(u64, 0), stats.quarantined_merges);
+    try std.testing.expectEqual(@as(u64, 0), stats.in_flight_merges);
+
+    text_merge_runtime_mod.test_finish_admission_failures_remaining.store(1, .release);
+    try std.testing.expect(!try runtime.runOnce());
+    stats = runtime.stats();
+    try std.testing.expectEqual(@as(u64, 0), stats.failed_merges);
+    try std.testing.expectEqual(@as(u64, 0), stats.quarantined_merges);
+    try std.testing.expectEqual(@as(u64, 0), stats.in_flight_merges);
+
+    // Both canceled tasks must remain immediately schedulable. A subsequent
+    // healthy pass drains the debt without waiting for quarantine expiry.
+    while (try runtime.runOnce()) {}
+    stats = runtime.stats();
+    try std.testing.expectEqual(@as(u64, 0), stats.failed_merges);
+    try std.testing.expectEqual(@as(u64, 0), stats.quarantined_merges);
+    try std.testing.expectEqual(@as(u64, 0), stats.pending_indexes);
+}
+
+test "db text merge shutdown cancels a worker blocked on descriptor admission" {
+    const DB = @import("mod.zig").DB;
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+    const resources = db.core.batchExecutionResources();
+    const io = db.backend_runtime.io() orelse return error.SkipZigTest;
+
+    var pool = lsm_backend_mod.storage_io.NativeStoragePool.initWithCapacityForTest(alloc, 2);
+    defer pool.deinit();
+    try pool.reserveDescriptorsForTest(io, 2);
+    var held_descriptors = true;
+    defer if (held_descriptors) pool.releaseDescriptorsForTest(io, 2);
+
+    var runtime = try text_merge_runtime_mod.TextMergeRuntime.init(
+        alloc,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{ .enabled = true },
+    );
+    defer runtime.deinit();
+    runtime.setNativeStoragePoolForTest(&pool);
+
+    text_merge_runtime_mod.test_wait_for_fd_admission.store(true, .release);
+    text_merge_runtime_mod.test_fd_admission_entered.store(false, .release);
+    text_merge_runtime_mod.test_fd_admission_canceled.store(false, .release);
+    defer {
+        text_merge_runtime_mod.test_wait_for_fd_admission.store(false, .release);
+        text_merge_runtime_mod.test_fd_admission_entered.store(false, .release);
+        text_merge_runtime_mod.test_fd_admission_canceled.store(false, .release);
+    }
+    try runtime.start();
+
+    var admission_blocked = false;
+    for (0..5_000) |_| {
+        const stats = pool.snapshotStats();
+        if (text_merge_runtime_mod.test_fd_admission_entered.load(.acquire) and stats.fd_admission_waiters == 1) {
+            admission_blocked = true;
+            break;
+        }
+        try io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+    }
+    if (!admission_blocked) return error.TestTimeout;
+
+    const Stop = struct {
+        runtime: *text_merge_runtime_mod.TextMergeRuntime,
+        completed: std.atomic.Value(bool) = .init(false),
+        stopped: bool = false,
+
+        fn run(self: *@This()) void {
+            self.stopped = self.runtime.stop();
+            self.completed.store(true, .release);
+        }
+    };
+    var stop = Stop{ .runtime = &runtime };
+    const stop_thread = try std.Thread.spawn(.{}, Stop.run, .{&stop});
+    var stop_joined = false;
+    defer if (!stop_joined) {
+        if (held_descriptors) {
+            pool.releaseDescriptorsForTest(io, 2);
+            held_descriptors = false;
+        }
+        stop_thread.join();
+    };
+
+    for (0..1_000) |_| {
+        if (stop.completed.load(.acquire)) break;
+        try io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+    }
+    if (!stop.completed.load(.acquire)) return error.TestTimeout;
+    stop_thread.join();
+    stop_joined = true;
+
+    try std.testing.expect(stop.stopped);
+    try std.testing.expect(text_merge_runtime_mod.test_fd_admission_canceled.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), pool.snapshotStats().fd_admission_waiters);
+    pool.releaseDescriptorsForTest(io, 2);
+    held_descriptors = false;
+    try std.testing.expectEqual(@as(usize, 0), pool.snapshotStats().fd_admitted_descriptors);
+}
+
+test "db text merge backpressure drains sustained segment debt to low watermark" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    // Build the backlog without an automatic merge worker so the admission
+    // boundary and producer assistance are deterministic.
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
+    for (0..24) |i| {
+        var id_buf: [32]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buf, "doc:{d}", .{i});
+        var stored_buf: [96]u8 = undefined;
+        const stored = try std.fmt.bufPrint(&stored_buf, "{{\"body\":\"common token {d}\"}}", .{i});
+        var body_buf: [48]u8 = undefined;
+        const body = try std.fmt.bufPrint(&body_buf, "common token {d}", .{i});
+        const fields = [_]introducer_mod.TextField{.{ .field_name = "body", .text = body }};
+        const docs = [_]introducer_mod.TextDocument{.{
+            .id = id,
+            .stored_data = stored,
+            .text_fields = &fields,
+            .doc_ordinal = @intCast(i + 1),
+        }};
+        _ = try db.indexTextKernelDocuments("ft_v1", &docs);
+    }
+
+    const before = db.core.index_manager.textMergeStatsSnapshot();
+    try std.testing.expect(before.pending_segments > 8);
+
+    const resources = db.core.batchExecutionResources();
+    var held_task = (try resources.index_manager.beginTextMergeTask()) orelse return error.TestUnexpectedResult;
+    var held_task_active = true;
+    defer if (held_task_active) {
+        resources.index_manager.cancelTextMergeTask(&held_task);
+        held_task.deinit(resources.index_manager.alloc);
+    };
+
+    var bounded_runtime = try text_merge_runtime_mod.TextMergeRuntime.init(
+        alloc,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .max_pending_segments = 8,
+            .resume_pending_segments = 4,
+            .max_pending_bytes = 0,
+            .backpressure_max_wait_ms = 3,
+        },
+    );
+    try bounded_runtime.start();
+    const bounded_outcome = bounded_runtime.applyBackpressure();
+    try std.testing.expectEqual(text_merge_runtime_mod.BackpressureOutcome.timed_out, bounded_outcome);
+    try std.testing.expectError(error.TextMergeBackpressureTimeout, bounded_runtime.acquireProducerPermit("ft_v1", 1, 1));
+    try std.testing.expectEqual(@as(u64, 2), bounded_runtime.stats().backpressure_timeouts);
+    bounded_runtime.deinit();
+
+    var byte_only_runtime = try text_merge_runtime_mod.TextMergeRuntime.init(
+        alloc,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .max_pending_segments = 0,
+            .resume_pending_segments = 0,
+            .max_pending_bytes = 1,
+            .backpressure_max_wait_ms = 3,
+        },
+    );
+    try byte_only_runtime.start();
+    try std.testing.expectError(error.TextMergeBackpressureTimeout, byte_only_runtime.acquireProducerPermit("ft_v1", 0, 1));
+    byte_only_runtime.deinit();
+
+    resources.index_manager.cancelTextMergeTask(&held_task);
+    held_task.deinit(resources.index_manager.alloc);
+    held_task_active = false;
+
+    var runtime = try text_merge_runtime_mod.TextMergeRuntime.init(
+        alloc,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .max_pending_segments = 8,
+            .resume_pending_segments = 4,
+            .max_pending_bytes = 0,
+        },
+    );
+    defer runtime.deinit();
+    try runtime.start();
+
+    const outcome = runtime.applyBackpressure();
+    try std.testing.expectEqual(text_merge_runtime_mod.BackpressureOutcome.drained, outcome);
+
+    const after = runtime.stats();
+    try std.testing.expect(after.pending_segments <= 4);
+    const active_text_index = resources.index_manager.textIndex("ft_v1") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, @intCast(active_text_index.snapshot().segments.len)), after.active_segments);
+    try std.testing.expectEqual(after.active_segments, after.max_active_segments_per_index);
+    try std.testing.expectEqual(@as(u64, 1), after.backpressure_events);
+    try std.testing.expect(after.merge_input_segments_total >= 10);
+
+    // Admission includes the target index's steady live segments even when it
+    // is no longer marked compaction-pending. This is the actual query fan-out
+    // bound; pending-only accounting allowed the live baseline plus another
+    // full watermark of concurrent publications.
+    var fanout_runtime = try text_merge_runtime_mod.TextMergeRuntime.init(
+        alloc,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .max_pending_segments = after.active_segments + 1,
+            .resume_pending_segments = after.active_segments,
+            .max_pending_bytes = 0,
+            .backpressure_max_wait_ms = 3,
+        },
+    );
+    defer fanout_runtime.deinit();
+    var fanout_permit = try fanout_runtime.acquireProducerPermit("ft_v1", 1, 0);
+    try std.testing.expectError(
+        error.TextMergeBackpressureTimeout,
+        fanout_runtime.acquireProducerPermit("ft_v1", 1, 0),
+    );
+    fanout_permit.release();
+
+    var admission_runtime = try text_merge_runtime_mod.TextMergeRuntime.init(
+        alloc,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .max_pending_segments = 8,
+            .resume_pending_segments = 4,
+            .max_pending_bytes = 100,
+            .backpressure_max_wait_ms = 100,
+        },
+    );
+    defer admission_runtime.deinit();
+    try admission_runtime.start();
+
+    var first_permit = try admission_runtime.acquireProducerPermit("ft_v1", 1, 80);
+    try std.testing.expectError(error.TextMergeBackpressureTimeout, admission_runtime.acquireProducerPermit("ft_v1", 1, 30));
+    first_permit.release();
+    try std.testing.expectEqual(@as(usize, 0), admission_runtime.producer_segment_reservations_by_index.count());
+
+    // Admission sleeps on a release epoch rather than rescanning the complete
+    // segment catalog at a fixed polling interval.
+    var held_permit = try admission_runtime.acquireProducerPermit("ft_v1", 1, 80);
+    const Waiter = struct {
+        runtime: *text_merge_runtime_mod.TextMergeRuntime,
+        acquired: std.atomic.Value(bool) = .init(false),
+        failed: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            var permit = self.runtime.acquireProducerPermit("ft_v1", 1, 30) catch {
+                self.failed.store(true, .release);
+                return;
+            };
+            self.acquired.store(true, .release);
+            permit.release();
+        }
+    };
+    var waiter = Waiter{ .runtime = &admission_runtime };
+    const events_before = admission_runtime.stats().backpressure_events;
+    var waiter_thread = try std.Thread.spawn(.{}, Waiter.run, .{&waiter});
+    var waiter_joined = false;
+    defer if (!waiter_joined) {
+        held_permit.release();
+        waiter_thread.join();
+    };
+    const waiter_deadline = monotonicTimeNs() +| std.time.ns_per_s;
+    while (admission_runtime.stats().backpressure_events == events_before and monotonicTimeNs() < waiter_deadline) {
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expect(admission_runtime.stats().backpressure_events > events_before);
+    held_permit.release();
+    waiter_thread.join();
+    waiter_joined = true;
+    try std.testing.expect(waiter.acquired.load(.acquire));
+    try std.testing.expect(!waiter.failed.load(.acquire));
+
+    // Weighted FIFO admission prevents a younger small publication from
+    // overtaking an older catch-up batch, even when the small request would fit
+    // in the currently available capacity.
+    var fair_runtime = try text_merge_runtime_mod.TextMergeRuntime.init(
+        alloc,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .max_pending_segments = 100,
+            .resume_pending_segments = 50,
+            .max_pending_bytes = 0,
+            .backpressure_max_wait_ms = 2_000,
+        },
+    );
+    defer fair_runtime.deinit();
+
+    // An older waiter blocked only on index A's segment ceiling must not
+    // become a global queue head that stalls independent index B.
+    var cross_index_blocker = try fair_runtime.acquireProducerPermit("admission-a", 100, 0);
+    var cross_index_acquired = std.atomic.Value(bool).init(false);
+    const CrossIndexWaiter = struct {
+        runtime: *text_merge_runtime_mod.TextMergeRuntime,
+        acquired: *std.atomic.Value(bool),
+
+        fn run(self: *@This()) void {
+            var permit = self.runtime.acquireProducerPermit("admission-a", 1, 0) catch return;
+            self.acquired.store(true, .release);
+            permit.release();
+        }
+    };
+    var cross_index_waiter = CrossIndexWaiter{ .runtime = &fair_runtime, .acquired = &cross_index_acquired };
+    const cross_events_before = fair_runtime.stats().backpressure_events;
+    const cross_index_thread = try std.Thread.spawn(.{}, CrossIndexWaiter.run, .{&cross_index_waiter});
+    var cross_index_joined = false;
+    defer if (!cross_index_joined) {
+        cross_index_blocker.release();
+        cross_index_thread.join();
+    };
+    const cross_wait_deadline = monotonicTimeNs() +| std.time.ns_per_s;
+    while (fair_runtime.stats().backpressure_events == cross_events_before and monotonicTimeNs() < cross_wait_deadline) std.Thread.yield() catch {};
+    try std.testing.expect(fair_runtime.stats().backpressure_events > cross_events_before);
+    var independent_index_permit = try fair_runtime.acquireProducerPermit("admission-b", 100, 0);
+    independent_index_permit.release();
+    try std.testing.expect(!cross_index_acquired.load(.acquire));
+    cross_index_blocker.release();
+    cross_index_thread.join();
+    cross_index_joined = true;
+    try std.testing.expect(cross_index_acquired.load(.acquire));
+
+    // A waiter blocked on both dimensions still owns FIFO priority for the
+    // process-wide byte dimension. A younger request for another index must
+    // not consume the remaining bytes merely because the older waiter is also
+    // blocked on its index-local segment ceiling.
+    const mixed_byte_limit = resources.index_manager.textMergeStatsSnapshot().pending_bytes +| 100;
+    var mixed_runtime = try text_merge_runtime_mod.TextMergeRuntime.init(
+        alloc,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .max_pending_segments = 100,
+            .resume_pending_segments = 50,
+            .max_pending_bytes = mixed_byte_limit,
+            .backpressure_max_wait_ms = 2_000,
+        },
+    );
+    defer mixed_runtime.deinit();
+    var mixed_segment_blocker = try mixed_runtime.acquireProducerPermit("mixed-a", 100, 0);
+    var mixed_segment_blocker_active = true;
+    defer if (mixed_segment_blocker_active) mixed_segment_blocker.release();
+    var mixed_byte_blocker = try mixed_runtime.acquireProducerPermit("mixed-byte", 0, 80);
+    var mixed_byte_blocker_active = true;
+    defer if (mixed_byte_blocker_active) mixed_byte_blocker.release();
+
+    const MixedWaiter = struct {
+        runtime: *text_merge_runtime_mod.TextMergeRuntime,
+        index_name: []const u8,
+        segment_count: u64,
+        byte_count: u64,
+        acquisition_counter: *std.atomic.Value(u32),
+        acquisition_order: *std.atomic.Value(u32),
+        release_gate: *const std.atomic.Value(bool),
+        failed: *std.atomic.Value(bool),
+
+        fn run(self: *@This()) void {
+            var permit = self.runtime.acquireProducerPermit(self.index_name, self.segment_count, self.byte_count) catch {
+                self.failed.store(true, .release);
+                return;
+            };
+            self.acquisition_order.store(self.acquisition_counter.fetchAdd(1, .acq_rel) + 1, .release);
+            while (!self.release_gate.load(.acquire)) std.Thread.yield() catch {};
+            permit.release();
+        }
+    };
+    var mixed_acquisition_counter = std.atomic.Value(u32).init(0);
+    var mixed_older_order = std.atomic.Value(u32).init(0);
+    var mixed_younger_order = std.atomic.Value(u32).init(0);
+    var mixed_release = std.atomic.Value(bool).init(false);
+    var mixed_older_failed = std.atomic.Value(bool).init(false);
+    var mixed_younger_failed = std.atomic.Value(bool).init(false);
+    var mixed_older = MixedWaiter{
+        .runtime = &mixed_runtime,
+        .index_name = "mixed-a",
+        .segment_count = 1,
+        .byte_count = 90,
+        .acquisition_counter = &mixed_acquisition_counter,
+        .acquisition_order = &mixed_older_order,
+        .release_gate = &mixed_release,
+        .failed = &mixed_older_failed,
+    };
+    const mixed_events_before = mixed_runtime.stats().backpressure_events;
+    const mixed_older_thread = try std.Thread.spawn(.{}, MixedWaiter.run, .{&mixed_older});
+    var mixed_older_joined = false;
+    defer if (!mixed_older_joined) {
+        if (mixed_segment_blocker_active) {
+            mixed_segment_blocker.release();
+            mixed_segment_blocker_active = false;
+        }
+        if (mixed_byte_blocker_active) {
+            mixed_byte_blocker.release();
+            mixed_byte_blocker_active = false;
+        }
+        mixed_release.store(true, .release);
+        mixed_older_thread.join();
+    };
+    const mixed_older_wait_deadline = monotonicTimeNs() +| std.time.ns_per_s;
+    while (mixed_runtime.stats().backpressure_events == mixed_events_before and monotonicTimeNs() < mixed_older_wait_deadline) std.Thread.yield() catch {};
+    try std.testing.expect(mixed_runtime.stats().backpressure_events > mixed_events_before);
+
+    var mixed_younger = MixedWaiter{
+        .runtime = &mixed_runtime,
+        .index_name = "mixed-b",
+        .segment_count = 1,
+        .byte_count = 20,
+        .acquisition_counter = &mixed_acquisition_counter,
+        .acquisition_order = &mixed_younger_order,
+        .release_gate = &mixed_release,
+        .failed = &mixed_younger_failed,
+    };
+    const mixed_younger_thread = try std.Thread.spawn(.{}, MixedWaiter.run, .{&mixed_younger});
+    var mixed_younger_joined = false;
+    defer if (!mixed_younger_joined) {
+        if (mixed_segment_blocker_active) {
+            mixed_segment_blocker.release();
+            mixed_segment_blocker_active = false;
+        }
+        if (mixed_byte_blocker_active) {
+            mixed_byte_blocker.release();
+            mixed_byte_blocker_active = false;
+        }
+        mixed_release.store(true, .release);
+        mixed_younger_thread.join();
+    };
+    const mixed_younger_wait_deadline = monotonicTimeNs() +| std.time.ns_per_s;
+    while (mixed_runtime.stats().backpressure_events < mixed_events_before + 2 and monotonicTimeNs() < mixed_younger_wait_deadline) std.Thread.yield() catch {};
+    try std.testing.expect(mixed_runtime.stats().backpressure_events >= mixed_events_before + 2);
+    try std.testing.expectEqual(@as(u32, 0), mixed_older_order.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), mixed_younger_order.load(.acquire));
+
+    mixed_segment_blocker.release();
+    mixed_segment_blocker_active = false;
+    mixed_byte_blocker.release();
+    mixed_byte_blocker_active = false;
+    const mixed_older_acquired_deadline = monotonicTimeNs() +| std.time.ns_per_s;
+    while (mixed_older_order.load(.acquire) == 0 and monotonicTimeNs() < mixed_older_acquired_deadline) std.Thread.yield() catch {};
+    try std.testing.expectEqual(@as(u32, 1), mixed_older_order.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), mixed_younger_order.load(.acquire));
+    try std.testing.expect(!mixed_older_failed.load(.acquire));
+    try std.testing.expect(!mixed_younger_failed.load(.acquire));
+    mixed_release.store(true, .release);
+    mixed_older_thread.join();
+    mixed_older_joined = true;
+    const mixed_younger_acquired_deadline = monotonicTimeNs() +| std.time.ns_per_s;
+    while (mixed_younger_order.load(.acquire) == 0 and monotonicTimeNs() < mixed_younger_acquired_deadline) std.Thread.yield() catch {};
+    try std.testing.expectEqual(@as(u32, 2), mixed_younger_order.load(.acquire));
+    mixed_younger_thread.join();
+    mixed_younger_joined = true;
+
+    var blocking_permit = try fair_runtime.acquireProducerPermit("admission-test", 80, 0);
+    var blocking_active = true;
+    defer if (blocking_active) blocking_permit.release();
+
+    const FairWaiter = struct {
+        runtime: *text_merge_runtime_mod.TextMergeRuntime,
+        segment_count: u64,
+        acquired: *std.atomic.Value(bool),
+        release_gate: ?*const std.atomic.Value(bool),
+
+        fn run(self: *@This()) void {
+            var permit = self.runtime.acquireProducerPermit("admission-test", self.segment_count, 0) catch return;
+            self.acquired.store(true, .release);
+            if (self.release_gate) |gate| {
+                while (!gate.load(.acquire)) std.Thread.yield() catch {};
+            }
+            permit.release();
+        }
+    };
+    var large_acquired = std.atomic.Value(bool).init(false);
+    var small_acquired = std.atomic.Value(bool).init(false);
+    var release_large = std.atomic.Value(bool).init(false);
+    const fair_events_before = fair_runtime.stats().backpressure_events;
+    var large_waiter = FairWaiter{
+        .runtime = &fair_runtime,
+        .segment_count = 95,
+        .acquired = &large_acquired,
+        .release_gate = &release_large,
+    };
+    const large_thread = try std.Thread.spawn(.{}, FairWaiter.run, .{&large_waiter});
+    var large_joined = false;
+    defer if (!large_joined) {
+        if (blocking_active) {
+            blocking_permit.release();
+            blocking_active = false;
+        }
+        release_large.store(true, .release);
+        large_thread.join();
+    };
+    const large_wait_deadline = monotonicTimeNs() +| std.time.ns_per_s;
+    while (fair_runtime.stats().backpressure_events < fair_events_before + 1 and monotonicTimeNs() < large_wait_deadline) std.Thread.yield() catch {};
+    try std.testing.expect(fair_runtime.stats().backpressure_events >= fair_events_before + 1);
+
+    var small_waiter = FairWaiter{
+        .runtime = &fair_runtime,
+        .segment_count = 10,
+        .acquired = &small_acquired,
+        .release_gate = null,
+    };
+    const small_thread = try std.Thread.spawn(.{}, FairWaiter.run, .{&small_waiter});
+    var small_joined = false;
+    defer if (!small_joined) {
+        if (blocking_active) {
+            blocking_permit.release();
+            blocking_active = false;
+        }
+        release_large.store(true, .release);
+        small_thread.join();
+    };
+    const small_wait_deadline = monotonicTimeNs() +| std.time.ns_per_s;
+    while (fair_runtime.stats().backpressure_events < fair_events_before + 2 and monotonicTimeNs() < small_wait_deadline) std.Thread.yield() catch {};
+    try std.testing.expect(fair_runtime.stats().backpressure_events >= fair_events_before + 2);
+    try std.testing.expect(!small_acquired.load(.acquire));
+
+    blocking_permit.release();
+    blocking_active = false;
+    const fair_deadline = monotonicTimeNs() +| std.time.ns_per_s;
+    while (!large_acquired.load(.acquire) and monotonicTimeNs() < fair_deadline) std.Thread.yield() catch {};
+    try std.testing.expect(large_acquired.load(.acquire));
+    try std.testing.expect(!small_acquired.load(.acquire));
+    release_large.store(true, .release);
+    large_thread.join();
+    large_joined = true;
+    small_thread.join();
+    small_joined = true;
+    try std.testing.expect(small_acquired.load(.acquire));
+
+    // Runtime cancellation is not a capacity timeout and must leave the FIFO
+    // queue usable by subsequent producers.
+    var cancel_blocker = try fair_runtime.acquireProducerPermit("admission-test", 80, 0);
+    var cancel_blocker_active = true;
+    defer if (cancel_blocker_active) cancel_blocker.release();
+    const CancelWaiter = struct {
+        runtime: *text_merge_runtime_mod.TextMergeRuntime,
+        outcome: *std.atomic.Value(u8),
+
+        fn run(self: *@This()) void {
+            var permit = self.runtime.acquireProducerPermit("admission-test", 30, 0) catch |err| {
+                self.outcome.store(if (err == error.Canceled) 1 else 2, .release);
+                return;
+            };
+            permit.release();
+            self.outcome.store(3, .release);
+        }
+    };
+    var cancel_outcome = std.atomic.Value(u8).init(0);
+    var cancel_waiter = CancelWaiter{ .runtime = &fair_runtime, .outcome = &cancel_outcome };
+    const cancel_events_before = fair_runtime.stats().backpressure_events;
+    const timeouts_before = fair_runtime.stats().backpressure_timeouts;
+    const fair_io = db.backend_runtime.io_impl.?.io();
+    var cancel_group: std.Io.Group = .init;
+    try cancel_group.concurrent(fair_io, CancelWaiter.run, .{&cancel_waiter});
+    var cancel_group_active = true;
+    defer if (cancel_group_active) cancel_group.cancel(fair_io);
+    const cancel_wait_deadline = monotonicTimeNs() +| std.time.ns_per_s;
+    while (fair_runtime.stats().backpressure_events == cancel_events_before and monotonicTimeNs() < cancel_wait_deadline) std.Thread.yield() catch {};
+    try std.testing.expect(fair_runtime.stats().backpressure_events > cancel_events_before);
+    cancel_group.cancel(fair_io);
+    cancel_group_active = false;
+    try std.testing.expectEqual(@as(u8, 1), cancel_outcome.load(.acquire));
+    try std.testing.expectEqual(timeouts_before, fair_runtime.stats().backpressure_timeouts);
+    cancel_blocker.release();
+    cancel_blocker_active = false;
+    var post_cancel_permit = try fair_runtime.acquireProducerPermit("admission-test", 1, 0);
+    post_cancel_permit.release();
+
+    // Segment reservations are isolated by index, while the byte budget stays
+    // shared. A large publication cannot create cross-index head-of-line
+    // blocking for query-fanout capacity.
+    var index_a_permit = try fair_runtime.acquireProducerPermit("admission-a", 95, 0);
+    var index_b_permit = try fair_runtime.acquireProducerPermit("admission-b", 95, 0);
+    index_b_permit.release();
+    index_a_permit.release();
+
+    // Segment publications must be chunked by callers and can never bypass
+    // the hard fanout limit. A byte-oversized indivisible chunk may still make
+    // exclusive progress when its segment reservation is within the limit.
+    try std.testing.expectError(
+        error.TextPublicationExceedsSegmentLimit,
+        admission_runtime.acquireProducerPermit("ft_v1", 9, 0),
+    );
+    var oversized_byte_permit = try admission_runtime.acquireProducerPermit("ft_v1", 1, 200);
+    oversized_byte_permit.release();
+
+    // Pausing the background worker for a structural mutation must not poison
+    // foreground admission while capacity is available.
+    try std.testing.expect(admission_runtime.pause());
+    var paused_permit = try admission_runtime.acquireProducerPermit("ft_v1", 1, 10);
+    paused_permit.release();
+    try admission_runtime.resumeAfterPause();
+
+    const text_index = db.core.index_manager.textIndex("ft_v1") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 24), text_index.snapshot().liveDocCount());
+}
+
+test "db text merge producer admission isolates quarantined dimensions" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+    });
+    defer db.close();
+    try db.addIndex(.{ .name = "quarantined", .kind = .full_text, .config_json = "{}" });
+    try db.addIndex(.{ .name = "healthy", .kind = .full_text, .config_json = "{}" });
+
+    const resources = db.core.batchExecutionResources();
+    const index_opts: index_manager_mod.IndexBatchOptions = .{
+        .compact_text = false,
+        .defer_text_compaction = true,
+    };
+    {
+        db.core.lockApply();
+        defer db.core.unlockApply();
+        const writes = [_]types.BatchWrite{
+            .{ .key = "doc:0", .value = "{\"body\":\"quarantine admission\"}" },
+            .{ .key = "doc:0-live", .value = "{\"body\":\"quarantine admission\"}" },
+        };
+        try resources.store.putBatch(&.{
+            .{ .key = writes[0].key, .value = writes[0].value },
+            .{ .key = writes[1].key, .value = writes[1].value },
+        }, &.{});
+        try resources.index_manager.indexTextBatchByNameWithOptions(resources.store, "quarantined", &writes, index_opts);
+    }
+    {
+        db.core.lockApply();
+        defer db.core.unlockApply();
+        const writes = [_]types.BatchWrite{.{ .key = "doc:1", .value = "{\"body\":\"quarantine admission\"}" }};
+        try resources.store.putBatch(&.{.{ .key = writes[0].key, .value = writes[0].value }}, &.{});
+        try resources.index_manager.indexTextBatchByNameWithOptions(resources.store, "quarantined", &writes, index_opts);
+    }
+
+    // A deletion makes the two-segment index merge-eligible below the normal
+    // tier threshold, giving the test an exact all-quarantined backlog.
+    db.core.lockApply();
+    db.core.index_manager.deleteTextBatchByNameWithOptions(
+        "quarantined",
+        &.{"doc:0"},
+        .{ .compact_text = false, .defer_text_compaction = true },
+    ) catch |err| {
+        db.core.unlockApply();
+        return err;
+    };
+    db.core.unlockApply();
+
+    var failed_task = (try resources.index_manager.beginTextMergeTask()) orelse return error.TestUnexpectedResult;
+    defer failed_task.deinit(alloc);
+    try std.testing.expectEqualStrings("quarantined", failed_task.index_name);
+    resources.index_manager.noteTextMergeFailure(&failed_task, error.InvalidChunk);
+
+    const quarantined_stats = resources.index_manager.textMergeStatsSnapshotForIndex("quarantined");
+    try std.testing.expectEqual(@as(u64, 2), quarantined_stats.pending_segments);
+    try std.testing.expectEqual(quarantined_stats.pending_segments, quarantined_stats.quarantined_segments);
+
+    var runtime = try text_merge_runtime_mod.TextMergeRuntime.init(
+        alloc,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .max_pending_segments = 3,
+            .resume_pending_segments = 2,
+            .max_pending_bytes = 0,
+            .backpressure_max_wait_ms = 3,
+        },
+    );
+    defer runtime.deinit();
+
+    // Quarantine is not itself a publication fence: work that fits remains
+    // admissible both on the failed index and on an independent index.
+    var below_limit = try runtime.acquireProducerPermit("quarantined", 1, 0);
+    below_limit.release();
+    var independent = try runtime.acquireProducerPermit("healthy", 3, 0);
+    try std.testing.expectError(
+        error.TextMergeBackpressureTimeout,
+        runtime.acquireProducerPermit("healthy", 1, 0),
+    );
+    independent.release();
+
+    // Once the per-index segment dimension is actually blocked, an
+    // all-quarantined target reports the terminal merge failure immediately.
+    try std.testing.expectError(
+        error.TextMergeBackpressureUnavailable,
+        runtime.acquireProducerPermit("quarantined", 2, 0),
+    );
+
+    var byte_runtime = try text_merge_runtime_mod.TextMergeRuntime.init(
+        alloc,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .max_pending_segments = 0,
+            .resume_pending_segments = 0,
+            .max_pending_bytes = 1,
+            .backpressure_max_wait_ms = 3,
+        },
+    );
+    defer byte_runtime.deinit();
+    try std.testing.expectError(
+        error.TextMergeBackpressureUnavailable,
+        byte_runtime.acquireProducerPermit("healthy", 0, 1),
+    );
+}
+
+test "db text kernel admits natural segments below hard segment limit" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .text_merge = .{
+            .enabled = true,
+            .idle_interval_ms = 10_000,
+            .error_interval_ms = 10_000,
+            .max_pending_segments = 4,
+            .resume_pending_segments = 2,
+            .max_pending_bytes = 0,
+        },
+    });
+    defer db.close();
+    try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+
+    const runtime = db.text_merge_runtime orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 2), runtime.producerSegmentReservationLimit());
+    try std.testing.expect(runtime.pause());
+
+    const fields = [_]introducer_mod.TextField{.{ .field_name = "body", .text = "bounded publication" }};
+    const docs = [_]introducer_mod.TextDocument{
+        .{ .id = "doc:0", .stored_data = "{}", .text_fields = &fields, .doc_ordinal = 1 },
+        .{ .id = "doc:1", .stored_data = "{}", .text_fields = &fields, .doc_ordinal = 2 },
+        .{ .id = "doc:2", .stored_data = "{}", .text_fields = &fields, .doc_ordinal = 3 },
+        .{ .id = "doc:3", .stored_data = "{}", .text_fields = &fields, .doc_ordinal = 4 },
+        .{ .id = "doc:4", .stored_data = "{}", .text_fields = &fields, .doc_ordinal = 5 },
+    };
+    try std.testing.expectEqual(@as(usize, 1), try db.indexTextKernelDocuments("ft_v1", &docs));
+    const stats = db.core.index_manager.textMergeStatsSnapshotForIndex("ft_v1");
+    try std.testing.expectEqual(@as(u64, 1), stats.active_segments);
+    try std.testing.expect(stats.active_segments <= 4);
+}
+
+test "db derived text replay admits natural segments below hard segment limit" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .text_merge = .{
+            .enabled = true,
+            .idle_interval_ms = 10_000,
+            .error_interval_ms = 10_000,
+            .max_pending_segments = 4,
+            .resume_pending_segments = 2,
+            .max_pending_bytes = 0,
+        },
+    });
+    defer db.close();
+    try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+
+    const runtime = db.text_merge_runtime orelse return error.TestUnexpectedResult;
+    try std.testing.expect(runtime.pause());
+    defer runtime.resumeAfterPause() catch {};
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:0", .value = "{\"body\":\"bounded publication zero\"}" },
+            .{ .key = "doc:1", .value = "{\"body\":\"bounded publication one\"}" },
+            .{ .key = "doc:2", .value = "{\"body\":\"bounded publication two\"}" },
+            .{ .key = "doc:3", .value = "{\"body\":\"bounded publication three\"}" },
+            .{ .key = "doc:4", .value = "{\"body\":\"bounded publication four\"}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    const stats = db.core.index_manager.textMergeStatsSnapshotForIndex("ft_v1");
+    try std.testing.expectEqual(@as(u64, 1), stats.active_segments);
+    try std.testing.expect(stats.active_segments <= 4);
+    var result = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "body", .text = "bounded" } },
+        .limit = 10,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 5), result.total_hits);
 }
 
 test "db search runtime text schema runUntilIdle drains scheduled text merges without index workers" {

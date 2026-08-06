@@ -3135,7 +3135,7 @@ export interface paths {
         };
         /**
          * List available models
-         * @description Returns lists of available embedding, chunking, reranking, generator, NER, rewriter, reader, and transcriber models.
+         * @description Returns lists of available embedding, chunking, reranking, generator, extractor, rewriter, reader, and transcriber models.
          *
          *     ## Embedders
          *
@@ -3158,10 +3158,10 @@ export interface paths {
          *     - LLM models from `models_dir/generators/`
          *     - Empty if no models configured
          *
-         *     ## Recognizers
+         *     ## Extractors
          *
-         *     - ONNX models from `models_dir/recognizers/`
-         *     - Includes GLiNER models for zero-shot recognition
+         *     - Extraction-capable models from the managed model registry
+         *     - Includes GLiNER models for zero-shot entity and relation extraction
          *
          *     ## Rewriters
          *
@@ -3502,6 +3502,23 @@ export interface components {
                 [key: string]: unknown;
             } | null;
         };
+        /** @description A non-retryable table-storage integrity or format failure. */
+        TableStorageUnreadableError: {
+            /**
+             * @description Stable client-routing code for unreadable table storage.
+             * @enum {string}
+             */
+            code: "table_storage_unreadable";
+            /** @description Concrete storage error class, such as InvalidManifest. */
+            error: string;
+            /** @description Human-readable summary. */
+            message: string;
+            /**
+             * @description Always false; recovery requires repair, restore, or table replacement.
+             * @enum {boolean}
+             */
+            retryable: false;
+        };
         ExactSortError: {
             /**
              * @description Stable error class.
@@ -3648,7 +3665,7 @@ export interface components {
          *     classify.
          * @enum {string}
          */
-        ConnectedModelType: "embedder" | "generator" | "reranker" | "chunker" | "recognizer" | "classifier" | "rewriter" | "reader" | "transcriber" | "extractor" | "other";
+        ConnectedModelType: "embedder" | "generator" | "reranker" | "chunker" | "classifier" | "rewriter" | "reader" | "transcriber" | "extractor" | "other";
         ConnectedModel: {
             /** @description Model identifier as reported by the provider. */
             name: string;
@@ -3676,7 +3693,7 @@ export interface components {
             /**
              * @description Models reported by the provider, grouped by model type. Keys are
              *     pluralized ConnectedModelType values ("embedders", "generators",
-             *     "rerankers", "chunkers", "recognizers", "classifiers", "rewriters",
+             *     "rerankers", "chunkers", "classifiers", "rewriters",
              *     "readers", "transcribers", "extractors") plus "other" for models
              *     the provider's listing API does not classify by task. Populated
              *     only when the request includes the "models" expansion.
@@ -11139,9 +11156,9 @@ export interface components {
         TableSchema: {
             /**
              * Format: uint32
-             * @description Version of the schema. Used for migrations.
+             * @description Backend-managed schema generation used for migrations. Omit it from create and update requests.
              */
-            version?: number;
+            readonly version?: number;
             /**
              * @description Storage profile for the table.
              *     - "document" (default): schemaless JSON documents with optional,
@@ -11738,7 +11755,7 @@ export interface components {
              * @description Number of unique terms in the inverted index (sparse only)
              */
             total_terms?: number;
-            /** @description Whether the index enricher is currently backfilling */
+            /** @description Whether enrichment, publication, or replay work is still pending. Documents that do not contain the indexed field are terminal skipped outcomes and do not keep this true. */
             rebuilding?: boolean;
             repair?: components["schemas"]["IndexRepairStatus"];
             /**
@@ -11750,7 +11767,7 @@ export interface components {
             backfill_active?: boolean;
             /**
              * Format: double
-             * @description Backfill progress as a ratio from 0.0 to 1.0
+             * @description Fraction of source documents with a terminal materialization outcome, including produced embeddings and intentionally skipped documents. Reaches 1.0 when no source work is pending and replay is current.
              */
             backfill_progress?: number;
             /**
@@ -11758,7 +11775,7 @@ export interface components {
              * @description Total items processed during backfill
              */
             backfill_items_processed?: number;
-            /** @description Operational readiness state such as ready, running, retrying, or failed. */
+            /** @description Operational readiness state. Clients should use ready (or rebuilding=false) for query readiness; replay watermarks diagnose replay progress but do not replace this signal. */
             backfill_state?: string;
             /**
              * Format: uint64
@@ -13838,8 +13855,38 @@ export interface components {
             retrieved_ids?: string[];
         };
         InferenceError: {
-            /** @description Error message */
+            /** @description Stable machine-readable error code */
             error: string;
+            /** @description Human-readable error description */
+            message?: string;
+            /**
+             * @description Machine-readable capacity source when the failure is retryable
+             * @enum {string}
+             */
+            reason?: "inference_capacity" | "request_queue";
+            /** @description Whether retrying the same request may succeed */
+            retryable?: boolean;
+            /** @description Minimum retry delay in milliseconds */
+            retry_after_ms?: number;
+        };
+        /** @description Actionable retry contract for temporary inference-capacity failures. */
+        InferenceTransientCapacityError: {
+            /** @description Stable machine-readable error code */
+            error: string;
+            /** @description Human-readable error description */
+            message: string;
+            /**
+             * @description Machine-readable capacity source
+             * @enum {string}
+             */
+            reason: "inference_capacity" | "request_queue";
+            /**
+             * @description Always true for a transient-capacity response
+             * @enum {boolean}
+             */
+            retryable: true;
+            /** @description Minimum retry delay in milliseconds */
+            retry_after_ms: number;
         };
         InferencePredictRequest: {
             /** @description Predictor name from the model catalog. */
@@ -13959,11 +14006,13 @@ export interface components {
              * @description Pipeline stage that classified the failure
              * @enum {string}
              */
-            stage: "parse" | "fetch" | "image_decode" | "audio_decode" | "text_inference" | "image_inference" | "audio_inference" | "inference";
+            stage: "parse" | "fetch" | "image_decode" | "audio_decode" | "text_inference" | "image_inference" | "audio_inference" | "model_admission" | "inference";
             /** @description Whether retrying the same item may succeed */
             retryable: boolean;
             /** @description HTTP-style status classification for this item */
             status: number;
+            /** @description Minimum retry delay in milliseconds for a retryable transient failure */
+            retry_after_ms?: number | null;
         };
         /** @description Counts for per-item embedding responses */
         InferenceEmbeddingBatchSummary: {
@@ -14328,10 +14377,6 @@ export interface components {
             generators: {
                 [key: string]: components["schemas"]["InferenceModelInfo"];
             };
-            /** @description Available recognizer models from models_dir/recognizers/ */
-            recognizers: {
-                [key: string]: components["schemas"]["InferenceModelInfo"];
-            };
             /** @description Available Seq2Seq rewriter models from models_dir/rewriters/ */
             rewriters: {
                 [key: string]: components["schemas"]["InferenceModelInfo"];
@@ -14600,7 +14645,9 @@ export interface components {
             code: string;
             message: string;
             /** @default false */
-            retryable?: boolean;
+            retryable: boolean;
+            /** @description Minimum retry delay in milliseconds for a retryable capacity failure. */
+            retry_after_ms?: number | null;
         };
         InferenceGenerateBatchResultItem: {
             custom_id: string;
@@ -14691,7 +14738,7 @@ export interface components {
          * @description Model registry kind.
          * @enum {string}
          */
-        InferenceModelKind: "generator" | "embedder" | "reranker" | "chunker" | "classifier" | "recognizer" | "rewriter" | "reader" | "transcriber" | "extractor";
+        InferenceModelKind: "generator" | "embedder" | "reranker" | "chunker" | "classifier" | "rewriter" | "reader" | "transcriber" | "extractor";
         /**
          * @description Optional backend preference for model loading or request execution.
          *     `auto` keeps the node default behavior.
@@ -14794,7 +14841,7 @@ export interface components {
              *     - `{models_dir}/embedders/` - Embedding models (ONNX)
              *     - `{models_dir}/chunkers/` - Chunking models (ONNX)
              *     - `{models_dir}/rerankers/` - Reranking models (ONNX)
-             *     - `{models_dir}/recognizers/` - Recognition models (ONNX)
+             *     - `{models_dir}/extractors/` - Entity, relation, and structured extraction models
              *     - `{models_dir}/rewriters/` - Seq2Seq rewriter models (ONNX)
              *
              *     Defaults to ~/.antfly/inference/models (set via viper). If not set, only built-in fixed chunking is available.
@@ -15300,6 +15347,7 @@ export interface components {
                 [key: string]: unknown;
             };
         };
+        /** @description Optional source and target labels constrain relation endpoints. A target requires a source. */
         ExtractionRelationSchema: {
             type: string;
             source?: string;
@@ -15311,16 +15359,25 @@ export interface components {
             /** @default false */
             multi_label?: boolean;
         };
-        ExtractionStructureField: string | {
+        ExtractionStructureField: string | ({
+            /** @enum {string} */
+            type?: "str" | "string" | "list" | "array";
+            enum?: string[];
+        } & {
             [key: string]: unknown;
-        };
+        });
         ExtractionStructureSchema: {
-            fields?: {
+            fields: {
                 [key: string]: components["schemas"]["ExtractionStructureField"];
             };
         } & {
             [key: string]: unknown;
         };
+        /**
+         * @description Selects one extraction operation family per request. Entity labels may
+         *     accompany relation schemas so relation extraction can return its
+         *     participating entities in the same response.
+         */
         ExtractionSchema: {
             entities?: string[];
             relations?: components["schemas"]["ExtractionRelationSchema"][];
@@ -15339,6 +15396,30 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        /** @description Optional cross-input entity and relation deduplication. */
+        ExtractionResolverOptions: {
+            /**
+             * Format: float
+             * @default 0.85
+             */
+            similarity_threshold?: number;
+            /** @default true */
+            type_must_match?: boolean;
+            /**
+             * Format: float
+             * @default 0
+             */
+            min_entity_confidence?: number;
+            /**
+             * Format: float
+             * @default 0
+             */
+            min_relation_confidence?: number;
+            /** @default true */
+            deduplicate_relations?: boolean;
+            /** @default true */
+            track_provenance?: boolean;
+        };
         ExtractionOptions: {
             /** Format: float */
             threshold?: number;
@@ -15346,6 +15427,7 @@ export interface components {
             include_confidence?: boolean;
             include_spans?: boolean;
             reader?: components["schemas"]["ExtractionReaderOptions"];
+            resolver?: components["schemas"]["ExtractionResolverOptions"];
         } & {
             [key: string]: unknown;
         };
@@ -15551,6 +15633,26 @@ export interface components {
                 "application/json": components["schemas"]["Error"];
             };
         };
+        /** @description Query failure. Storage integrity failures use a stable non-retryable error payload. */
+        QueryInternalServerError: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"] | components["schemas"]["TableStorageUnreadableError"];
+            };
+        };
+        /** @description Inference capacity is temporarily unavailable */
+        TransientCapacity: {
+            headers: {
+                /** @description Minimum number of seconds clients should wait before retrying */
+                "Retry-After": number;
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["InferenceTransientCapacityError"];
+            };
+        };
     };
     parameters: {
         TransactionId: string;
@@ -15685,7 +15787,7 @@ export interface operations {
             path: {
                 connection_id: string;
                 /** @description Requires the connection capability `models.<operation>`. */
-                operation: "embed" | "generate" | "rerank" | "chunk" | "recognize" | "extract" | "rewrite" | "read" | "transcribe";
+                operation: "embed" | "generate" | "rerank" | "chunk" | "extract" | "rewrite" | "read" | "transcribe";
             };
             cookie?: never;
         };
@@ -16550,15 +16652,7 @@ export interface operations {
                 };
             };
             422: components["responses"]["UnsupportedExactSort"];
-            /** @description Internal server error */
-            500: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Error"];
-                };
-            };
+            500: components["responses"]["QueryInternalServerError"];
         };
     };
     evaluate: {
@@ -17867,7 +17961,7 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
             422: components["responses"]["UnsupportedExactSort"];
-            500: components["responses"]["InternalServerError"];
+            500: components["responses"]["QueryInternalServerError"];
         };
     };
     batchWrite: {
@@ -20331,6 +20425,7 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
+            503: components["responses"]["TransientCapacity"];
         };
     };
     chunkText: {
@@ -20373,6 +20468,7 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
+            503: components["responses"]["TransientCapacity"];
         };
     };
     rerankMultimodalPrompts: {
@@ -20424,6 +20520,7 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
+            503: components["responses"]["TransientCapacity"];
         };
     };
     rerankPrompts: {
@@ -20475,15 +20572,7 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Reranking service unavailable (no models configured) */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
+            503: components["responses"]["TransientCapacity"];
         };
     };
     generateContent: {
@@ -20539,15 +20628,7 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Generation service unavailable (no models configured) */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
+            503: components["responses"]["TransientCapacity"];
         };
     };
     generateBatchContent: {
@@ -20590,15 +20671,7 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Generation service unavailable */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
+            503: components["responses"]["TransientCapacity"];
         };
     };
     chatCompletions: {
@@ -20654,15 +20727,7 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Generation service unavailable (no models configured) */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
+            503: components["responses"]["TransientCapacity"];
         };
     };
     rewriteText: {
@@ -20714,15 +20779,7 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Generation service unavailable (no models configured) */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
+            503: components["responses"]["TransientCapacity"];
         };
     };
     readImages: {
@@ -20774,15 +20831,7 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Reader service unavailable (no models configured) */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
+            503: components["responses"]["TransientCapacity"];
         };
     };
     transcribeAudio: {
@@ -20834,15 +20883,7 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Transcription service unavailable (no models configured) */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
+            503: components["responses"]["TransientCapacity"];
         };
     };
     extract: {
@@ -20894,15 +20935,7 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Extraction service unavailable (no models configured) */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
+            503: components["responses"]["TransientCapacity"];
         };
     };
     listModels: {
@@ -20992,6 +21025,7 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
+            503: components["responses"]["TransientCapacity"];
         };
     };
     listPredictors: {

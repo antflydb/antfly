@@ -173,7 +173,7 @@ test "serverless server starts managed runtime and serves listener requests" {
     defer ingest.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 1), ingest.start_lsn);
 
-    try waitForPublishedTable(tables, base_uri, "docs", 1, 250);
+    try waitForPublishedTable(tables, base_uri, "docs", 1, publish_wait_attempts);
 
     var query = try tables.queryPublished(base_uri, "docs");
     defer query.deinit();
@@ -383,7 +383,7 @@ test "serverless server public table routes preserve published and latest cutove
     defer build_v1.deinit(alloc);
     try std.testing.expect(build_v1.published);
 
-    try waitForPublishedTable(tables, base_uri, "docs", 1, 250);
+    try waitForPublishedTable(tables, base_uri, "docs", 1, publish_wait_attempts);
 
     var published_v1 = try tables.queryPublished(base_uri, "docs");
     defer published_v1.deinit();
@@ -428,7 +428,7 @@ test "serverless server public table routes preserve published and latest cutove
     defer build_v2.deinit(alloc);
     try std.testing.expect(build_v2.published);
 
-    try waitForPublishedTable(tables, base_uri, "docs", 2, 250);
+    try waitForPublishedTable(tables, base_uri, "docs", 2, publish_wait_attempts);
 
     var published_v2 = try tables.queryPublished(base_uri, "docs");
     defer published_v2.deinit();
@@ -551,7 +551,7 @@ test "serverless server hides remapped serving namespaces behind public table ro
     defer build.deinit(alloc);
     try std.testing.expectEqualStrings("docs", build.table_name);
 
-    try waitForPublishedTable(tables, base_uri, "docs", 1, 250);
+    try waitForPublishedTable(tables, base_uri, "docs", 1, publish_wait_attempts);
 
     var status = try internal.buildTableStatus(base_uri, "docs");
     defer status.deinit(alloc);
@@ -684,7 +684,7 @@ test "serverless server public table graph routes stay pinned until publish cuto
     defer build_v1.deinit(alloc);
     try std.testing.expect(build_v1.published);
 
-    try waitForPublishedTable(tables, base_uri, "docs", 1, 250);
+    try waitForPublishedTable(tables, base_uri, "docs", 1, publish_wait_attempts);
 
     var neighbors_v1 = try tables.graphNeighbors(base_uri, "docs", .{
         .doc_id = @constCast("doc-a"),
@@ -734,7 +734,7 @@ test "serverless server public table graph routes stay pinned until publish cuto
     defer build_v2.deinit(alloc);
     try std.testing.expect(build_v2.published);
 
-    try waitForPublishedTable(tables, base_uri, "docs", 2, 250);
+    try waitForPublishedTable(tables, base_uri, "docs", 2, publish_wait_attempts);
 
     var shortest_after = try tables.graphShortestPath(base_uri, "docs", .{
         .start_doc_id = @constCast("doc-a"),
@@ -818,7 +818,7 @@ test "serverless server serves requests over env-configured s3 backend" {
     defer ingest.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 1), ingest.start_lsn);
 
-    try waitForPublishedTable(tables, base_uri, "docs", 1, 400);
+    try waitForPublishedTable(tables, base_uri, "docs", 1, publish_wait_attempts);
 
     var query = try tables.queryPublished(base_uri, "docs");
     defer query.deinit();
@@ -882,7 +882,7 @@ test "serverless server serves requests over env-configured gs backend" {
     defer ingest.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 1), ingest.start_lsn);
 
-    try waitForPublishedTable(tables, base_uri, "docs", 1, 400);
+    try waitForPublishedTable(tables, base_uri, "docs", 1, publish_wait_attempts);
 
     var query = try tables.queryPublished(base_uri, "docs");
     defer query.deinit();
@@ -892,6 +892,10 @@ test "serverless server serves requests over env-configured gs backend" {
     try std.testing.expectEqualStrings("doc-gs", query.value.documents[0].doc_id);
     try std.testing.expectEqualStrings("charlie", query.value.documents[0].body);
 }
+
+// Publishing is asynchronous and ReleaseSafe CI runners can be heavily loaded.
+// Poll for up to five seconds while keeping the common successful path fast.
+const publish_wait_attempts = 1_000;
 
 fn waitForPublishedTable(
     tables: @import("../serverless_http_client.zig").ServerlessTableHttpClient,

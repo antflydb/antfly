@@ -25,7 +25,7 @@ const delegated_steps = [_]DelegatedStep{
     .{ .public_name = "bench-paged-attention", .package_step = "bench-paged-attention" },
     .{ .public_name = "bench-training", .package_step = "bench-training" },
     .{ .public_name = "bench-gliner2-native", .package_step = "bench-gliner2-native" },
-    .{ .public_name = "gliner2-production-readiness", .package_step = "gliner2-production-readiness" },
+    .{ .public_name = "gliner2-entity-training-readiness", .package_step = "gliner2-entity-training-readiness" },
     .{ .public_name = "finetune-test", .package_step = "finetune-test" },
     .{ .public_name = "lib-onnx-test", .package_step = "lib-onnx-test" },
     .{ .public_name = "test", .package_step = "test" },

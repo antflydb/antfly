@@ -1,7 +1,7 @@
 {
   "decision_scope": {
-    "ours_sha": "cf24057dc43a96ea6afd49ed97735e165fcffd29",
-    "incoming_sha": "ceffa48f58962a2a1695ad39313a0a5067bd05a1"
+    "ours_sha": "fad01d3023b258a4ba8f0424b8d9aa5e61393d4c",
+    "incoming_sha": "f5c8fbf2c7f7460dd53c63c912e50dad16122181"
   },
   "zig_relative_import_roots": [
     "zig"
@@ -102,6 +102,14 @@
             "binding:builtin": {
               "incoming_sha256": "34f42bc8ca6e757ba1c89f1130d3363d7b09a68717261c26443d040e518dbc4e",
               "reason": "Catch-up policy no longer reads builtin directly; platform-owned runtime helpers carry the target-specific behavior."
+            }
+          }
+        },
+        "zig/pkg/antfly/src/storage/db/promotion_runtime.zig": {
+          "intentional_declaration_deletions": {
+            "binding:platform_sync": {
+              "incoming_sha256": "6d2d00b2b1b6a17874506d95f1c6115ed6eb130c3ee679e5e846de002da78714",
+              "reason": "Promotion runtime imports antfly_platform as platform and calls platform.sync.lockAtomic, preserving the same synchronization behavior while sharing the branch-wide platform namespace."
             }
           }
         },
@@ -1169,10 +1177,6 @@
           "incoming_sha256": "6050734dbfedfd797a80883fa576b92618016b9a0214d248ce3518a24ece8703",
           "reason": "search result shaping applies TTL through visibility-aware ordinal filtering rather than materializing legacy doc-id sets."
         },
-        "function:applyDerivedBatchToIndex": {
-          "incoming_sha256": "e6ed205fbf3d7ecffa15ebd7f6e0a5dad0852844f361648e34d2a47c8a2e9043",
-          "reason": "applyDerivedBatchToIndexContext and applyDerivedBatchToIndexAsync own the same operation without constructing a partial legacy context."
-        },
         "function:applySplitGraphArtifactsForIndex": {
           "incoming_sha256": "b9e5878921a0449bef710f5bb0e7c266b7edeb4f377c8eccfaedd7da2f0a8b27",
           "reason": "applySplitGraphArtifacts and applySplitGraphArtifactsInRange provide the indexed graph mutation path under the split owner."
@@ -1770,14 +1774,115 @@
           "destination_prefix": "db write path bulk ingest table "
         }
       ],
+      "reviewed_compositions": {
+        "function:applyDerivedBatchTargetsContextProfiled": {
+          "base_sha256": "8829f6f49c9f0f07fa82177a5b0e0e7de742b0488560cbf87966e5a2ffea3fd4",
+          "incoming_sha256": "ad5b879ab56afc9f0d2bd9406c0fdd3eb724a7de7b9442972c864c7156bd1360",
+          "current_sha256": "706f2f399a7fc95a123950bbe0704a083094de278ee1801a2e71d393c3ae37d6",
+          "path": "zig/pkg/antfly/src/storage/db/derived_async.zig",
+          "reason": "The split target dispatcher preserves branch relational-base-row derivation and adopts incoming text-merge runtime coordination before dispatching every derived target."
+        },
+        "function:applyDerivedBatchToIndexContextProfiled": {
+          "base_sha256": "8efb16e5d897f2ac4ea32b42f51b5b4a77f65eb027084b702994dafc1305e819",
+          "incoming_sha256": "67afee8b5ab7d13b42ff972f08a99990fa08b176da91ab357f4f129cdd074a51",
+          "current_sha256": "852d19fcce92dfc3f28b5e16b7e1e67d6fb57354ed0267b470128e43e210888c",
+          "path": "zig/pkg/antfly/src/storage/db/derived_async.zig",
+          "reason": "Full-text derived writes retain branch relational materialization while adopting incoming chunk planning, producer permits, context revalidation, apply, and merge-runtime notification outside the general apply lock."
+        },
+        "function:DB.indexTextKernelDocuments": {
+          "base_sha256": "6a973d220c0bbfff9ae05bec5355f986289173c887c695e4c77460003ad37262",
+          "incoming_sha256": "0d0d5b2bfb3ef8df07e6ffdd1b4b3ee1aec5a049aa0ae0395521faf023382c99",
+          "current_sha256": "47b8f1900dc71f37b83612df31083f00e9d5d8f151af3e2cb1de231b3168918d",
+          "path": "zig/pkg/antfly/src/storage/db/write_path.zig",
+          "reason": "The split write path preserves branch text-kernel write semantics and adopts incoming producer planning, bounded admission, and text-merge runtime notifications."
+        },
+        "function:DB.snapshotLsmNativeStorageStats": {
+          "base_sha256": "666854507fc6c66827d6f208ac0c79c0a01e834585296b35a50a7c4f9bba4133",
+          "incoming_sha256": "5dddfe50d980415547951dd26058d2ef0c4eb9655e76c75cd31478c9cbe43d15",
+          "current_sha256": "fcfe3265e4d96a7b13137ca3eb462de71c1aa7c0886365246f39c1d1bc1d5c8b",
+          "path": "zig/pkg/antfly/src/storage/db/db.zig",
+          "reason": "The DB facade exposes incoming direct native-backend storage statistics while retaining the split core/backend ownership model."
+        },
+        "function:DB.trySnapshotLsmNativeStorageStats": {
+          "base_sha256": "4d8ba6bbbb2d1794d701311acdff5060483b880f4b577bac20f63aa8b9494a09",
+          "incoming_sha256": "1bdf1e8f4dc6d28929a95a1df7aaedf85becb2d53d326a9bcfb189722160d6fa",
+          "current_sha256": "1895db827dd661af93d2c27fc3eb429d38a7ec92e08f356b5a471b07bae9ec58",
+          "path": "zig/pkg/antfly/src/storage/db/db.zig",
+          "reason": "The best-effort DB facade reads incoming native-backend statistics directly and preserves the split runtime's nullable error boundary."
+        }
+      },
       "reviewed_resolutions": {
         "container:DB": {
           "status": "container_fields_diverged",
-          "base_sha256": "8ba5a1d10e4482e8f58b0b71d78c6582fa9c6a2e597eaad9c8445149dc33702d",
-          "incoming_sha256": "efeabad5c23b11fbbc93d11a7c895da72da20250073627d16b4801f9b8d2d27e",
+          "base_sha256": "efeabad5c23b11fbbc93d11a7c895da72da20250073627d16b4801f9b8d2d27e",
+          "incoming_sha256": "b8d637ce6dd681c26dac8764ff721bb1b6986b299e633e5da273ef2f751be740",
           "current_sha256": "6cccc3d37c8fa1de009aaf2bdd8f1fdceea2d8121e7fc1dc1dfb075193f76201",
           "path": "zig/pkg/antfly/src/storage/db/db.zig",
-          "reason": "The merged DB container retains every incoming field; quarantine_retry_thread is intentionally represented by the branch-owned quarantine_retry_future, which is awaited during close, alongside the branch split-runtime fields."
+          "reason": "The split DB container retains incoming text-merge runtime state and shared native-storage pool integration alongside branch relational, catalog, visibility, transaction, and split-runtime ownership fields."
+        },
+        "function:collectTextDocumentWritesForIndex": {
+          "status": "added_name_collision",
+          "base_sha256": null,
+          "incoming_sha256": "afdb27202b3c43bb28951719874d258d9fa5bcb23706150ef0516422b47adc5a",
+          "current_sha256": "e67aac7590bbcefbaa7601d6cab0673612440c855ca6435da6b1ddba93148b36",
+          "path": "zig/pkg/antfly/src/storage/db/derived_async.zig",
+          "reason": "The incoming collector is retained in the split derived owner and additionally materializes relational keys and values through branch relational-base-row semantics."
+        },
+        "test:db bulk ingest keeps full text merge maintenance live": {
+          "status": "added_name_collision",
+          "base_sha256": null,
+          "incoming_sha256": "79c66f3f77b1121261796bef6c2da453283daae9614f9e1be2a18d5efc4dc19c",
+          "current_sha256": "751c0ac45464fe688f6bee6735493e0f90b0bfc4ff206d4eb42b108d375d8ac5",
+          "path": "zig/pkg/antfly/src/storage/db/write_path.zig",
+          "reason": "The incoming regression is moved intact to the split write-path owner with local DB qualification; its focused incremental target passes."
+        },
+        "test:db derived text replay admits natural segments below hard segment limit": {
+          "status": "added_name_collision",
+          "base_sha256": null,
+          "incoming_sha256": "c601441682ce1991dfd17301120ecf98ba400e22b06ce5d317a5665ccf8c3203",
+          "current_sha256": "698e3ba79d5f74e0ad56a387a1670e16e248626ff592f6989871a4824bc2b52e",
+          "path": "zig/pkg/antfly/src/storage/db/search_runtime.zig",
+          "reason": "The incoming regression is retained in the split search owner; differences are only local DB/import qualification and split apply-lock access."
+        },
+        "test:db text kernel admits natural segments below hard segment limit": {
+          "status": "added_name_collision",
+          "base_sha256": null,
+          "incoming_sha256": "6a0b90b130d079a0c2169cc708e9d8c9ca93a5e070ba58429c519b3b0a8f8e77",
+          "current_sha256": "4045ef62aa7c487830e11d9bb9bced7e9b80cc72a7ee9c4249e358d7da521993",
+          "path": "zig/pkg/antfly/src/storage/db/search_runtime.zig",
+          "reason": "The incoming regression is retained in the split search owner with the branch module-qualified DB and core apply-lock APIs."
+        },
+        "test:db text merge backpressure drains sustained segment debt to low watermark": {
+          "status": "added_name_collision",
+          "base_sha256": null,
+          "incoming_sha256": "78acdf1b5c75c8ee36d8ab207c068cbf0f1b5c60e18fee29a7329057c6422d6d",
+          "current_sha256": "b4595e4623d2bb62ef705e996a8baabed9e7e6a656b8704a80f2a8a01c2eb88a",
+          "path": "zig/pkg/antfly/src/storage/db/search_runtime.zig",
+          "reason": "The incoming backpressure regression is retained in the split search owner with only split-module DB qualification."
+        },
+        "test:db text merge descriptor admission failures retry without quarantine": {
+          "status": "added_name_collision",
+          "base_sha256": null,
+          "incoming_sha256": "53dbd810b5c07b3ea072259e678331011bee1198c4aaf9fc91112973db597e13",
+          "current_sha256": "99485b9a1e9f9fd1826f04f22812b1ec0aa0d59ce54a0891a98bf264d51791a1",
+          "path": "zig/pkg/antfly/src/storage/db/search_runtime.zig",
+          "reason": "The incoming descriptor-admission retry regression is retained in the split search owner with only split-module qualification."
+        },
+        "test:db text merge producer admission isolates quarantined dimensions": {
+          "status": "added_name_collision",
+          "base_sha256": null,
+          "incoming_sha256": "d8de16a81e6c1c7aaa3eabec3df290f13f00db967967cd085feb297472d74674",
+          "current_sha256": "a4092cc978a96bc4416a8ebf614a0b53aa1bf70aa71d73d44fddf51cb16fd1eb",
+          "path": "zig/pkg/antfly/src/storage/db/search_runtime.zig",
+          "reason": "The incoming per-dimension producer-admission regression is retained in the split search owner with only split-module qualification."
+        },
+        "test:db text merge shutdown cancels a worker blocked on descriptor admission": {
+          "status": "added_name_collision",
+          "base_sha256": null,
+          "incoming_sha256": "ce2bce044bcccc716e30d43b095c6b031b94d2a9a9f8e902d9ef6b539910dfa6",
+          "current_sha256": "6bf39c1521df442eefd01ad871000d9b490e6595873953a9118646bf63a1cec9",
+          "path": "zig/pkg/antfly/src/storage/db/search_runtime.zig",
+          "reason": "The incoming shutdown-cancellation regression is retained in the split search owner with only split-module qualification."
         },
         "function:DB.appendGraphTransformWrite": {
           "status": "added_name_collision",
@@ -2293,6 +2398,15 @@
           "incoming_sha256": "04c2f13332f17c71db69d722ca38b0c5ea9602abf3e01ee5e8bcde477d0aed66",
           "reason": "metadataFieldCapability replaces per-field manual JSON assembly with a typed generated object and preserves every incoming capability field plus branch lifecycle fields."
         }
+      },
+      "reviewed_compositions": {
+        "function:applySchemaUpdateRecord": {
+          "base_sha256": "a5b9f66552ebc84cb8e24ee014082c9fa9ef3e1002350b072b75c55cc0559f36",
+          "incoming_sha256": "d6c7c8a9844347b372783dce011097db2881782adc153e40cd2cf2f625e31b3f",
+          "current_sha256": "7a41bdadffabc065a52fd2ed7a3ab8b0f2ab91cf6bc36eca8e07bc59a2c8f62b",
+          "path": "zig/pkg/antfly/src/metadata/catalog/table_ddl.zig",
+          "reason": "The moved table-DDL owner composes incoming dynamic typing and relational validation with branch algebraic schema regeneration, semantic equality, and checked schema-version advancement."
+        }
       }
     },
     "public_text_query": {
@@ -2436,6 +2550,36 @@
         "test:write cache transfers adoptable provisioned db to raft apply source": "zig/pkg/antfly/src/api/table_writes/sources.zig",
         "test:writer cache bulk transition fences only its table": "zig/pkg/antfly/src/api/table_writes/sources.zig"
       },
+      "reviewed_compositions": {
+        "function:HostedProvisionedTableWriteSource.createIndex": {
+          "base_sha256": "5f3f9c78c8b71ca6a1c7f92afe010df575a185dfc88e1793fda55b502342980b",
+          "incoming_sha256": "b89951a7690b955dbc98144af2bdf1b94d8d46dd1970c3546a038e0795850ab0",
+          "current_sha256": "9519ae47b4a0a7fe760b377b5f6ed86de35cb8d989af14e041bd8387d3f6984c",
+          "path": "zig/pkg/antfly/src/api/table_writes/sources.zig",
+          "reason": "Hosted index creation preserves branch configuration validation and adopts incoming bounded retries for transient persistent-descriptor admission pressure."
+        },
+        "function:HostedProvisionedTableWriteSource.dropIndex": {
+          "base_sha256": "3c24b4a201372ba16d63a7de0ec16beffe1ef16b7833b94d891a7954054c07bf",
+          "incoming_sha256": "7103304c9c85ef25ba44952d94d54c0a22b2af0c20a6f119ec58f5def91ab43d",
+          "current_sha256": "0ad1e715af6014098be9a0f680342df77419c377aade54f2951a5b6ab89b17a7",
+          "path": "zig/pkg/antfly/src/api/table_writes/sources.zig",
+          "reason": "Hosted index deletion preserves branch configuration validation and adopts incoming bounded retries for transient persistent-descriptor admission pressure."
+        },
+        "function:ProvisionedTableWriteSource.getOrOpenCachedDbModeAtGeneration": {
+          "base_sha256": "a98c8ccf9729c64826fdeea4a207607047287d9a7a85cb2a9b31b7182eb4faed",
+          "incoming_sha256": "0923c9f51392c94ab792f7469d271b0e450b19d7a4c0ddcce2f1511729445c84",
+          "current_sha256": "98037f4d800f54ef79e9e3fb2b6ef47c8aec72fdd433c79a9bd0e89d89dfd873",
+          "path": "zig/pkg/antfly/src/api/table_writes/sources.zig",
+          "reason": "Prepared writer open composes incoming same-cache and cross-cache descriptor reclamation with branch startup preemption, generation metadata, visibility hooks, and readonly/query modes; a single preemption-credit retry closes the transitive capacity gap without unbounded retries."
+        },
+        "test:provisioned table write source create table provisions local indexes and schema": {
+          "base_sha256": "023271c8321f7628184279ba6dd91379a087a67066c55db05098d7b36b83c532",
+          "incoming_sha256": "f9a884f8c22bebc6b00782de714c5d4b11db28709a6b35dd27df8eb1e155cbab",
+          "current_sha256": "f1c02f49d8a1d87193dbf15e865f255ccb89474b8a4af5b38409766a9bf3edde",
+          "path": "zig/pkg/antfly/src/api/table_writes/sources.zig",
+          "reason": "The merged create-table regression preserves branch schema and local-index assertions while adopting incoming authoritative generation and descriptor-safe provisioning behavior."
+        }
+      },
       "reviewed_resolutions": {
         "function:BoundTableWriteSource.commitTransactionWithId": {
           "status": "three_way_conflict",
@@ -2460,22 +2604,30 @@
       "destinations": [
         "zig/pkg/antfly/src/api/http_server.zig"
       ],
+      "reviewed_compositions": {
+        "function:ApiHttpServer.dispatchPublicTableRoutes": {
+          "base_sha256": "d0c303b891e4d5386beda8d819cdb6560849d55ffd9b622385358aace2421ecf",
+          "incoming_sha256": "b9fc010696ed32ac208fa663aa628c19ea2042dd1aff92c8ec783533956dd39d",
+          "current_sha256": "0e372be0a6e06f96813890e84a03c0f363a78f0a62c5974be45ecba9dfbdcbfa",
+          "path": "zig/pkg/antfly/src/api/http_server.zig",
+          "reason": "The public router preserves branch catalog, SQL, relational-row, graph, status, and cancellation dispatch while adopting incoming authoritative schema-generation and storage-unreadable handling."
+        },
+        "function:StatusSource.makeServiceVTable": {
+          "base_sha256": "677b7eb0a6d3da299f08ce6e0da166240cbc909cd81388bbbc5d6ddb950f1efd",
+          "incoming_sha256": "feebb7a3c3d9b27d7786ecf43455d01af83f8196ed270c1d00c965f60e6b48ca",
+          "current_sha256": "8922575e921449dfe2735165179a07a7fd75e39da131a27cec6a9f9f4550fb59",
+          "path": "zig/pkg/antfly/src/api/http_server.zig",
+          "reason": "The status-source adapter retains branch catalog callbacks and maps incoming schema-versioned updates, generation authority, and storage diagnostics through the composed vtable."
+        }
+      },
       "reviewed_resolutions": {
         "container:StatusSource.VTable": {
           "status": "container_fields_diverged",
           "base_sha256": "fa80be57a11dd98bb195c9e1c39526630b14eab1758d94ac141cf4a222ff9b96",
-          "incoming_sha256": "fa80be57a11dd98bb195c9e1c39526630b14eab1758d94ac141cf4a222ff9b96",
-          "current_sha256": "94029a80b0a1e504836acd3e6fbbbfc676442de7f3249d7abf20a0e760fa8d42",
+          "incoming_sha256": "398d7e7b87e1a4b6e84fe108a82b2c1e9a0c62b798737fa5c1ce82331d4d82fc",
+          "current_sha256": "c7cbc5c27152634962df01545f490e7ec3fea6edb92d31cb0f6fd68d9d1209f3",
           "path": "zig/pkg/antfly/src/api/http_server.zig",
-          "reason": "The merged status source retains every incoming callback and adds the branch create_table callback used by split catalog ownership."
-        },
-        "function:ApiHttpServer.dispatchPublicTableRoutes": {
-          "status": "three_way_conflict",
-          "base_sha256": "a763db2fee752b23acbd40003583dc1b21080160e4a804e6a973d3d3e3486e82",
-          "incoming_sha256": "d0c303b891e4d5386beda8d819cdb6560849d55ffd9b622385358aace2421ecf",
-          "current_sha256": "f07f383d7dd04467fa18fc9508721de9b45144a6f7ae06326029ca39566113e3",
-          "path": "zig/pkg/antfly/src/api/http_server.zig",
-          "reason": "The merged public router preserves main's peer-disconnect cancellation propagation while retaining branch query, SQL, relational row, graph, and catalog route dispatch."
+          "reason": "The composed status vtable retains all incoming schema-generation and storage-status callbacks and all branch catalog, query, SQL, and table lifecycle callbacks."
         },
         "function:ApiHttpServer.executeForeignPublicTableQueryIfAny": {
           "status": "three_way_conflict",
@@ -2769,12 +2921,19 @@
         }
       },
       "reviewed_compositions": {
+        "binding:inference_delegated_steps": {
+          "base_sha256": "942c1c3cd56ad8624a23fbf23e43ea7c785cc782f0207831a200f65369540855",
+          "incoming_sha256": "fc70501a1950843b0f0a5a1559302788818f5949411a7532d28e659ff192cbe4",
+          "current_sha256": "90b03c4593bf7eaf4ed091472580e1b521c8c3ca7c20e3786e4407e911b8ae84",
+          "path": "zig/pkg/antfly/build/inference.zig",
+          "reason": "The delegated inference step list keeps the branch entity-training readiness name and all incoming GLiNER2, graph, benchmark, finetune, and runtime delegation registrations under the split build module."
+        },
         "function:build": {
-          "base_sha256": "97d48aa9c1b6be771527b2d0f827f1f44aa2726b344917d0aada3af1cf1130f6",
-          "incoming_sha256": "46204c3c912c8a4e608b7857c84328d9ea4b7b7912a0cb3930baca8bb1d04f56",
-          "current_sha256": "f84dac99c42f6fea1d557e1a7b21d4956327f6ffc5496d7ba1fe56c678654d20",
+          "base_sha256": "46204c3c912c8a4e608b7857c84328d9ea4b7b7912a0cb3930baca8bb1d04f56",
+          "incoming_sha256": "98e7779eb1b6de5b80dc14c22df01be379463af862432c5cd0f06596c26bab19",
+          "current_sha256": "68d247052c8c69625c78cec626e7c3579e3d61e3ae7800beeaec5c6203d07653",
           "path": "zig/build.zig",
-          "reason": "The top-level build function composes the branch build-module refactor with every new main registration. The independent build-surface audit reports zero missing incoming and branch-retention artifacts, steps, imports, options, libraries, and dependencies."
+          "reason": "The top-level build function composes the branch build-module refactor with incoming extraction OpenAPI modules, inference tooling, and test registrations; `zig build -l` confirms the assembled graph and the build-surface audit verifies the retained registrations."
         }
       }
     },
@@ -2945,34 +3104,17 @@
       "zig/pkg/antfly/src/storage/db/write_path.zig"
     ]
   },
-  "expected_incoming_only_integration_diffs": {
-    "zig/pkg/antfly/src/foreign/postgres_source.zig": "incoming cancellation-aware query callbacks are retained through the branch QueryParams ownership and execution_deadline_ns contract; the merged fake executors accept and propagate the cancellation argument.",
-    "zig/lib/platform/src/clock.zig": "incoming clock behavior is retained through the branch platform abstraction, including shared overflow-safe time conversion and scheduler-aware synchronization/yielding.",
-    "zig/pkg/antfly/src/api/cluster.zig": "the incoming test expectation is preserved with the merged generated OpenAPI field name `health` replacing the former `status` spelling.",
-    "zig/pkg/antfly/src/inference/vertex.zig": "the incoming max-token test is preserved through the branch options-struct API as `.max_tokens = 256`, with the same request assertion.",
-    "zig/pkg/antfly/src/lite_cmd_test.zig": "the incoming lite import test is retained while the branch adds its decomposed SQL coverage; no incoming test body was removed.",
-    "zig/pkg/antfly/src/openapi/generated/antfly_common_openapi/root.zig": "regenerated from the merged OpenAPI specifications; `make generated-check` verifies reproducibility.",
-    "zig/pkg/antfly/src/openapi/generated/antfly_common_openapi/types.zig": "regenerated from the merged OpenAPI specifications; `make generated-check` verifies reproducibility.",
-    "zig/pkg/antfly/src/standalone/runtime.zig": "incoming standalone runtime behavior is composed with the branch relational and decomposed runtime implementation; the focused build-surface and split audits verify the retained entry points.",
-    "zig/pkg/antfly/src/storage/db/enrichment/enrichment_worker.zig": "the only result delta from incoming is Zig formatter normalization of the enrichment slice literal.",
-    "zig/pkg/antfly/src/storage/hbc_adapter.zig": "incoming cache behavior is retained and the branch additionally exposes cache-cap updates that clear all affected caches before applying new limits."
-  },
+  "expected_incoming_only_integration_diffs": {},
   "expected_ours_only_resolutions": {
-    "zig/pkg/antfly/src/api/public_text_query.zig": "the branch facade is authoritative; the mandatory public_text_query declaration audit maps all 48 incoming declarations to the facade and query implementation with zero unresolved declarations.",
-    "zig/pkg/antfly/src/api/table_catalog.zig": "the obsolete facade remains removed without a shim; the mandatory table_catalog declaration audit maps all 63 incoming declarations to metadata catalog routing/source/service/server ownership with zero unresolved declarations.",
-    "zig/pkg/antfly/src/api/table_reads.zig": "the branch split facade remains authoritative; the incoming delta is integrated into table_reads owners and the staged symbol, vtable, test-name, and declaration audits report no missing incoming surface.",
-    "zig/pkg/antfly/src/api/table_writes.zig": "the branch split facade remains authoritative; the incoming delta is integrated into table_writes owners and the staged symbol, vtable, test-name, and declaration audits report no missing incoming surface.",
-    "zig/pkg/antfly/src/api/tables.zig": "tables.zig remains removed without a shim; the mandatory tables declaration audit maps all 229 incoming declarations to metadata table DDL and SQL schema mutation ownership with zero unresolved declarations.",
-    "zig/pkg/antfly/src/api_artifact_reprocess_jobs_test_root.zig": "the branch test root intentionally retains two callback and cancellation regression tests that incoming removed; their helpers and test bodies remain compiled."
+    "py/packages/sdk/src/antfly/client_generated/models/replication_transform_op.py": "the branch already carries incoming `$push` support and additionally preserves `$pull`; regeneration from the merged metadata specification retains both operators in the generated docstring.",
+    "py/packages/sdk/src/antfly/client_generated/models/transform_op_type.py": "the branch already carries incoming `$push` support and additionally preserves `$pull`; regeneration emits stable PUSH and PULL enum members.",
+    "py/packages/sdk/templates/str_enum.py.jinja": "the template already maps incoming `$push` to PUSH and additionally maps branch `$pull` to PULL, so the branch result is a strict behavioral superset.",
+    "py/packages/sdk/tests/test_client.py": "the enum stability test already asserts incoming PUSH and additionally asserts branch PULL, covering the merged generated contract.",
+    "zig/pkg/antfly/src/api/table_writes.zig": "the branch split facade remains authoritative; the current declaration audit accounts for all 30 changed incoming declarations across split owners, including four hash-reviewed compositions and the incoming deletion.",
+    "zig/pkg/antfly/src/api/tables.zig": "tables.zig remains deleted without a shim; the current declaration audit maps all changed incoming behavior into metadata/catalog/table_ddl.zig and sql/schema_mutation.zig, including the reviewed schema-update composition.",
+    "zig/pkg/antfly/src/storage/db/db.zig": "the branch split facade remains authoritative; the current declaration audit accounts for all 32 added, modified, and deleted incoming obligations across DB owners, with hash-reviewed compositions for every semantic divergence."
   },
-  "expected_main_only_resolutions": {
-    "py/packages/sdk/src/antfly/client_generated/models/embeddings_index_stats.py": "the exact incoming generated model is accepted and is reproducible from the merged specifications via `make generated-check`.",
-    "zig/pkg/antfly/src/api/connections.zig": "incoming's expanded connection implementation is accepted exactly; the branch-only delta was a test fixture API-key string and its behavioral coverage remains.",
-    "zig/pkg/antfly/src/foreign/postgres_source.zig": "the exact incoming file already contains the branch ownership-safe QueryParams cleanup, execution_deadline_ns forwarding, and deadline assertion.",
-    "zig/pkg/antfly/src/search/pattern_filter.zig": "incoming's facade is canonical; the branch typed array-any and JSON-containment behavior moved to query/graph_exec.zig with compiled-filter support and regression tests.",
-    "zig/pkg/antfly/src/segment.zig": "the branch had no declaration-level changes relative to the baseline, so the incoming segment implementation is accepted exactly.",
-    "zig/pkg/antfly/src/storage/db/backfill_state.zig": "incoming supersedes the branch nonce/temp-path fix with random exclusive temporary files, bounded collision retries, sync-before-rename, parent sync, checksums, owner generations, and crash-boundary tests."
-  },
+  "expected_main_only_resolutions": {},
   "expected_generated_without_spec_changes": {},
   "manual_review_required_paths": {
     "openapi.yaml": "top-level public OpenAPI join output must be reviewed with merged specs and generated clients.",
@@ -3065,6 +3207,28 @@
       "endIndexRepairBarrier"
     ]
   },
+  "same_path_function_aliases": {
+    "zig/pkg/antfly/src/sql/schema_mutation.zig": {
+      "documentSchemasChanged": [
+        "zig/pkg/antfly/src/metadata/catalog/table_ddl.zig::schemasSemanticallyEqual"
+      ]
+    },
+    "zig/pkg/antfly/src/storage/db/derived_async.zig": {
+      "applyTextDocumentsForIndex": [
+        "collectTextDocumentWritesForIndex"
+      ]
+    },
+    "zig/pkg/antfly/src/storage/db/lifecycle.zig": {
+      "snapshotLsmNativeStorageStatsLocked": [
+        "snapshotLsmNativeStorageStats"
+      ]
+    },
+    "zig/pkg/inference/src/server/server.zig": {
+      "recognizeEntities": [
+        "extractEntitiesAndRelations"
+      ]
+    }
+  },
   "same_path_const_aliases": {
     "zig/pkg/antfly/src/openapi/generated/antfly_client_openapi/root.zig": {
       "InferenceTextChunkOptions": [
@@ -3080,6 +3244,146 @@
       ],
       "InferenceVADOptions": [
         "VADOptions"
+      ]
+    },
+    "zig/pkg/antfly/src/openapi/generated/antfly_inference_config_openapi/root.zig": {
+      "ExtractFieldValue": [
+        "zig/pkg/antfly/src/openapi/generated/antfly_extraction_openapi/root.zig::ExtractionStructureField"
+      ],
+      "ExtractRequest": [
+        "zig/pkg/antfly/src/openapi/generated/antfly_extraction_openapi/root.zig::ExtractionRequest"
+      ],
+      "ExtractResponse": [
+        "zig/pkg/antfly/src/openapi/generated/antfly_extraction_openapi/root.zig::ExtractionResponse"
+      ],
+      "RecognizeEntity": [
+        "zig/pkg/antfly/src/openapi/generated/antfly_extraction_openapi/root.zig::ExtractionEntity"
+      ],
+      "RecognizeRequest": [
+        "zig/pkg/antfly/src/openapi/generated/antfly_extraction_openapi/root.zig::ExtractionRequest"
+      ],
+      "RecognizeResponse": [
+        "zig/pkg/antfly/src/openapi/generated/antfly_extraction_openapi/root.zig::ExtractionResponse"
+      ],
+      "Relation": [
+        "zig/pkg/antfly/src/openapi/generated/antfly_extraction_openapi/root.zig::ExtractionRelation"
+      ],
+      "ResolverConfig": [
+        "zig/pkg/antfly/src/openapi/generated/antfly_extraction_openapi/root.zig::ExtractionResolverOptions"
+      ]
+    },
+    "zig/pkg/antfly/src/openapi/generated/antfly_inference_config_openapi/types.zig": {
+      "ExtractFieldValue": [
+        "zig/pkg/antfly/src/openapi/generated/antfly_extraction_openapi/types.zig::ExtractionStructureField"
+      ],
+      "ExtractRequest": [
+        "zig/pkg/antfly/src/openapi/generated/antfly_extraction_openapi/types.zig::ExtractionRequest"
+      ],
+      "ExtractResponse": [
+        "zig/pkg/antfly/src/openapi/generated/antfly_extraction_openapi/types.zig::ExtractionResponse"
+      ],
+      "RecognizeEntity": [
+        "zig/pkg/antfly/src/openapi/generated/antfly_extraction_openapi/types.zig::ExtractionEntity"
+      ],
+      "RecognizeRequest": [
+        "zig/pkg/antfly/src/openapi/generated/antfly_extraction_openapi/types.zig::ExtractionRequest"
+      ],
+      "RecognizeResponse": [
+        "zig/pkg/antfly/src/openapi/generated/antfly_extraction_openapi/types.zig::ExtractionResponse"
+      ],
+      "Relation": [
+        "zig/pkg/antfly/src/openapi/generated/antfly_extraction_openapi/types.zig::ExtractionRelation"
+      ],
+      "ResolverConfig": [
+        "zig/pkg/antfly/src/openapi/generated/antfly_extraction_openapi/types.zig::ExtractionResolverOptions"
+      ]
+    },
+    "zig/pkg/inference/src/api/generated/inference_api/root.zig": {
+      "ExtractFieldValue": [
+        "zig/pkg/antfly/src/openapi/generated/antfly_extraction_openapi/root.zig::ExtractionStructureField"
+      ],
+      "ExtractObject": [
+        "zig/pkg/antfly/src/openapi/generated/antfly_extraction_openapi/root.zig::ExtractionObject"
+      ],
+      "ExtractObjectObject": [
+        "zig/pkg/antfly/src/openapi/generated/antfly_extraction_openapi/root.zig::ExtractionResponseObject"
+      ],
+      "ExtractRequest": [
+        "zig/pkg/antfly/src/openapi/generated/antfly_extraction_openapi/root.zig::ExtractionRequest"
+      ],
+      "ExtractResponse": [
+        "zig/pkg/antfly/src/openapi/generated/antfly_extraction_openapi/root.zig::ExtractionResponse"
+      ],
+      "ExtractResponseObject": [
+        "zig/pkg/antfly/src/openapi/generated/antfly_extraction_openapi/root.zig::ExtractionResponseObject"
+      ],
+      "RecognizeEntity": [
+        "zig/pkg/antfly/src/openapi/generated/antfly_extraction_openapi/root.zig::ExtractionEntity"
+      ],
+      "RecognizeObject": [
+        "zig/pkg/antfly/src/openapi/generated/antfly_extraction_openapi/root.zig::ExtractionObject"
+      ],
+      "RecognizeObjectObject": [
+        "zig/pkg/antfly/src/openapi/generated/antfly_extraction_openapi/root.zig::ExtractionResponseObject"
+      ],
+      "RecognizeRequest": [
+        "zig/pkg/antfly/src/openapi/generated/antfly_extraction_openapi/root.zig::ExtractionRequest"
+      ],
+      "RecognizeResponse": [
+        "zig/pkg/antfly/src/openapi/generated/antfly_extraction_openapi/root.zig::ExtractionResponse"
+      ],
+      "RecognizeResponseObject": [
+        "zig/pkg/antfly/src/openapi/generated/antfly_extraction_openapi/root.zig::ExtractionResponseObject"
+      ],
+      "Relation": [
+        "zig/pkg/antfly/src/openapi/generated/antfly_extraction_openapi/root.zig::ExtractionRelation"
+      ],
+      "ResolverConfig": [
+        "zig/pkg/antfly/src/openapi/generated/antfly_extraction_openapi/root.zig::ExtractionResolverOptions"
+      ]
+    },
+    "zig/pkg/inference/src/api/generated/inference_api/types.zig": {
+      "ExtractFieldValue": [
+        "zig/pkg/antfly/src/openapi/generated/antfly_extraction_openapi/types.zig::ExtractionStructureField"
+      ],
+      "ExtractObject": [
+        "zig/pkg/antfly/src/openapi/generated/antfly_extraction_openapi/types.zig::ExtractionObject"
+      ],
+      "ExtractObjectObject": [
+        "zig/pkg/antfly/src/openapi/generated/antfly_extraction_openapi/types.zig::ExtractionResponseObject"
+      ],
+      "ExtractRequest": [
+        "zig/pkg/antfly/src/openapi/generated/antfly_extraction_openapi/types.zig::ExtractionRequest"
+      ],
+      "ExtractResponse": [
+        "zig/pkg/antfly/src/openapi/generated/antfly_extraction_openapi/types.zig::ExtractionResponse"
+      ],
+      "ExtractResponseObject": [
+        "zig/pkg/antfly/src/openapi/generated/antfly_extraction_openapi/types.zig::ExtractionResponseObject"
+      ],
+      "RecognizeEntity": [
+        "zig/pkg/antfly/src/openapi/generated/antfly_extraction_openapi/types.zig::ExtractionEntity"
+      ],
+      "RecognizeObject": [
+        "zig/pkg/antfly/src/openapi/generated/antfly_extraction_openapi/types.zig::ExtractionObject"
+      ],
+      "RecognizeObjectObject": [
+        "zig/pkg/antfly/src/openapi/generated/antfly_extraction_openapi/types.zig::ExtractionResponseObject"
+      ],
+      "RecognizeRequest": [
+        "zig/pkg/antfly/src/openapi/generated/antfly_extraction_openapi/types.zig::ExtractionRequest"
+      ],
+      "RecognizeResponse": [
+        "zig/pkg/antfly/src/openapi/generated/antfly_extraction_openapi/types.zig::ExtractionResponse"
+      ],
+      "RecognizeResponseObject": [
+        "zig/pkg/antfly/src/openapi/generated/antfly_extraction_openapi/types.zig::ExtractionResponseObject"
+      ],
+      "Relation": [
+        "zig/pkg/antfly/src/openapi/generated/antfly_extraction_openapi/types.zig::ExtractionRelation"
+      ],
+      "ResolverConfig": [
+        "zig/pkg/antfly/src/openapi/generated/antfly_extraction_openapi/types.zig::ExtractionResolverOptions"
       ]
     },
     "zig/pkg/antfly/src/storage/db/enrichment/enrichment_runtime.zig": {
@@ -3572,6 +3876,43 @@
     ],
     "swarm runtime registers public SQL route under db api prefix once": [
       "standalone runtime registers public SQL route under db api prefix once"
+    ],
+    "managed embeddings coverage debt does not fabricate replay debt": [
+      "managed embeddings skipped terminal sources complete backfill without fabricating replay debt"
+    ],
+    "provisioned table restore retry skips exact incomplete restore state with active writer": [
+      "provisioned table restore retry repairs exact incomplete restore state through active writer"
+    ],
+    "metadata.schema update keeps version for template-only changes": [
+      "metadata.schema update versions template-only changes",
+      "metadata.schema update versions and refreshes algebraic dynamic templates without recreate"
+    ],
+    "metadata.schema update refreshes algebraic dynamic templates without recreate": [
+      "metadata.schema update versions and refreshes algebraic dynamic templates without recreate"
+    ],
+    "text merge task skips stale source after concurrent delete": [
+      "text merge task carries concurrent deletes into publication"
+    ],
+    "PromotionRuntime blocked wait observes sink wake generation": [
+      "PromotionRuntime blocked retry observes sink wake generation"
+    ],
+    "db write path bulk ingest full_text sync defers text merge work until finish": [
+      "db bulk ingest keeps full text merge maintenance live"
+    ],
+    "bulk ingest full_text sync defers text merge work until finish": [
+      "db bulk ingest keeps full text merge maintenance live"
+    ],
+    "db bulk ingest full_text sync defers text merge work until finish": [
+      "db bulk ingest keeps full text merge maintenance live"
+    ],
+    "db full_text sync defers text merge work until finish": [
+      "db bulk ingest keeps full text merge maintenance live"
+    ],
+    "full_text sync defers text merge work until finish": [
+      "db bulk ingest keeps full text merge maintenance live"
+    ],
+    "taskMatchesModelListing derives extractors from recognizer capabilities": [
+      "taskMatchesModelListing exposes extraction-capable models only as extractors"
     ]
   },
   "generated_workflows": [

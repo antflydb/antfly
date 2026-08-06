@@ -25,6 +25,9 @@ Usage:
     ANTFLY_INFERENCE_MODELS_DIR=/path/to/models uv run --project e2e/inference pytest e2e/inference
     ANTFLY_INFERENCE_ML_DIR=/path/to/ml uv run --project e2e/inference pytest e2e/inference
 
+    # Optional inference server model-cache limit:
+    ANTFLY_INFERENCE_MAX_LOADED_MODELS=1 uv run --project e2e/inference pytest e2e/inference
+
     # Lazily pull missing models with a local antfly binary (opt-in):
     ANTFLY_INFERENCE_DOWNLOAD=1 uv run --project e2e/inference pytest e2e/inference
 
@@ -32,22 +35,41 @@ Usage:
     ANTFLY_INFERENCE_URL=https://inference.example.com ANTFLY_INFERENCE_TOKEN=... uv run --project e2e/inference pytest e2e/inference
 """
 
+import math
 import os
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
+import threading
 import time
 
 import pytest
 import requests
 
-from .models import bootstrap_models_for_listing, inference_command, maybe_pull_missing_model, ml_dir, models_dir
+from .models import (
+    DEFAULT_EXTRACTOR_MODEL,
+    bootstrap_models_for_listing,
+    inference_command,
+    maybe_pull_missing_model,
+    ml_dir,
+    models_dir,
+)
 
 API_PREFIX = "/ai/v1"
 ML_API_PREFIX = "/ml/v1"
 DEFAULT_REQUEST_TIMEOUT = float(os.environ.get("ANTFLY_INFERENCE_REQUEST_TIMEOUT", "30"))
-SERVER_OUTPUT_LIMIT = 4000
+SERVER_OUTPUT_LIMIT = 64 * 1024
+CAPACITY_RETRY_TIMEOUT = float(
+    os.environ.get("ANTFLY_INFERENCE_CAPACITY_RETRY_TIMEOUT", "30")
+)
+CAPACITY_RETRY_MAX_ATTEMPTS = int(
+    os.environ.get("ANTFLY_INFERENCE_CAPACITY_RETRY_MAX_ATTEMPTS", "5")
+)
+MIN_CAPACITY_RETRY_DELAY = 0.05
+MAX_CAPACITY_RETRY_DELAY = 5.0
+_LOCAL_SERVERS_BY_URL: dict[str, "InferenceServer"] = {}
 
 
 def env_first(*names: str) -> str | None:
@@ -91,11 +113,81 @@ def wait_for_server(url: str, timeout: float = 30.0) -> bool:
     return False
 
 
+def _response_json(response) -> dict:
+    if not response.headers.get("content-type", "").startswith("application/json"):
+        return {}
+    try:
+        value = response.json()
+    except ValueError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def capacity_retry_delay(response, fallback_delay: float) -> float | None:
+    """Return the bounded retry delay for an admission rejection, if any."""
+
+    if response.status_code != 503:
+        return None
+    body = _response_json(response)
+    if body.get("error") != "MODEL_RESOURCE_BUSY" or body.get("retryable") is not True:
+        return None
+    retry_after_ms = body.get("retry_after_ms")
+    if type(retry_after_ms) in (int, float):
+        delay = float(retry_after_ms) / 1000
+    else:
+        try:
+            delay = float(response.headers["Retry-After"])
+        except (KeyError, TypeError, ValueError):
+            delay = fallback_delay
+    if not math.isfinite(delay) or delay < 0:
+        delay = fallback_delay
+    return min(max(delay, MIN_CAPACITY_RETRY_DELAY), MAX_CAPACITY_RETRY_DELAY)
+
+
+def retry_transient_capacity(
+    response,
+    send,
+    timeout: float = CAPACITY_RETRY_TIMEOUT,
+    max_attempts: int = CAPACITY_RETRY_MAX_ATTEMPTS,
+    *,
+    clock=time.monotonic,
+    sleeper=time.sleep,
+):
+    """Retry requests rejected before execution by transient admission pressure."""
+
+    deadline = clock() + max(0.0, timeout)
+    fallback_delay = 0.25
+    attempts = 0
+    while (delay := capacity_retry_delay(response, fallback_delay)) is not None:
+        if attempts >= max(0, max_attempts):
+            break
+        now = clock()
+        if now + delay > deadline:
+            break
+        response.close()
+        sleeper(delay)
+        response = send()
+        attempts += 1
+        fallback_delay = min(fallback_delay * 2, MAX_CAPACITY_RETRY_DELAY)
+    return response
+
+
 class InferenceServer:
     """Manages a local inference server process."""
 
-    def __init__(self, command_prefix: list[str], models_path: str, ml_path: str, host: str, port: int):
+    def __init__(
+        self,
+        command_prefix: list[str],
+        models_path: str,
+        ml_path: str,
+        host: str,
+        port: int,
+        max_loaded_models: str | None = None,
+    ):
         self.url = f"http://{host}:{port}"
+        self.failure_reported = False
+        self.http_failure_reported = False
+        self._diagnostic_lock = threading.Lock()
         self.output = tempfile.TemporaryFile(mode="w+b")
         self.proc = subprocess.Popen(
             [
@@ -109,6 +201,11 @@ class InferenceServer:
                 models_path,
                 "--ml-dir",
                 ml_path,
+                *(
+                    ["--max-loaded-models", max_loaded_models]
+                    if max_loaded_models is not None
+                    else []
+                ),
             ],
             stdout=self.output,
             stderr=subprocess.STDOUT,
@@ -120,8 +217,45 @@ class InferenceServer:
             raise RuntimeError(f"Server failed to start at {self.url}\n{out}")
 
     def read_output(self) -> str:
-        self.output.seek(0)
-        return self.output.read(SERVER_OUTPUT_LIMIT).decode(errors="replace")
+        self.output.flush()
+        descriptor = self.output.fileno()
+        size = os.fstat(descriptor).st_size
+        offset = max(0, size - SERVER_OUTPUT_LIMIT)
+        if hasattr(os, "pread"):
+            data = os.pread(descriptor, SERVER_OUTPUT_LIMIT, offset)
+        elif self.proc.poll() is not None:  # pragma: no cover - Windows fallback after exit.
+            position = self.output.tell()
+            try:
+                self.output.seek(offset)
+                data = self.output.read(SERVER_OUTPUT_LIMIT)
+            finally:
+                self.output.seek(position)
+        else:  # pragma: no cover - never move a live child's shared file offset.
+            return "<output tail unavailable while this platform's server is running>"
+        return data.decode(errors="replace")
+
+    def failure_diagnostic(self) -> str:
+        returncode = self.proc.poll()
+        if returncode is None:
+            status = "still running"
+        elif returncode < 0:
+            try:
+                signal_name = signal.Signals(-returncode).name
+            except ValueError:
+                signal_name = "unknown signal"
+            status = f"terminated by {signal_name} ({returncode})"
+        else:
+            status = f"exited with status {returncode}"
+        return f"Local inference server {status}. Output tail:\n{self.read_output()}"
+
+    def report_http_failure_once(self) -> None:
+        """Expose backend logs for a live local server without moving its write offset."""
+
+        with self._diagnostic_lock:
+            if self.http_failure_reported:
+                return
+            self.http_failure_reported = True
+            print(self.failure_diagnostic(), file=sys.stderr, flush=True)
 
     def stop(self, close_output: bool = True):
         if self.proc and self.proc.poll() is None:
@@ -159,9 +293,23 @@ def base_url():
     ml_path = str(ml_dir())
 
     port = find_free_port()
-    server = InferenceServer(command_prefix, models_path, ml_path, "127.0.0.1", port)
+    server = InferenceServer(
+        command_prefix,
+        models_path,
+        ml_path,
+        "127.0.0.1",
+        port,
+        max_loaded_models=env_first("ANTFLY_INFERENCE_MAX_LOADED_MODELS"),
+    )
+    _LOCAL_SERVERS_BY_URL[server.url] = server
     yield server.url
-    server.stop()
+    _LOCAL_SERVERS_BY_URL.pop(server.url, None)
+    unexpected_exit = server.proc.poll() is not None
+    diagnostic = server.failure_diagnostic() if unexpected_exit else None
+    server.stop(close_output=False)
+    server.output.close()
+    if unexpected_exit and not server.failure_reported:
+        pytest.fail(diagnostic, pytrace=False)
 
 
 @pytest.fixture(scope="session")
@@ -174,11 +322,11 @@ def api(base_url):
         session.headers["Authorization"] = f"Bearer {token}"
 
     def _check(r):
-        """Raise for status, but skip test on 404 or model-unavailable errors."""
+        """Raise for status, skipping only explicit model-unavailable errors."""
         if r.status_code == 404:
             body = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
-            msg = body.get("error", "model not found")
-            pytest.skip(f"Model unavailable: {msg}")
+            if body.get("error") == "MODEL_NOT_FOUND":
+                pytest.skip(f"Model unavailable: {body.get('message', 'model not found')}")
         if r.status_code == 400:
             body = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
             err = body.get("error", "")
@@ -194,14 +342,41 @@ def api(base_url):
             self.s = session
             self.url = base_url
 
-        def _request(self, method: str, path: str, *, json=None, retry_on_missing_model: bool = True, **kwargs):
+        def _request(
+            self,
+            method: str,
+            path: str,
+            *,
+            json=None,
+            retry_on_missing_model: bool = True,
+            **kwargs,
+        ):
             request = getattr(self.s, method)
             normalized_path = api_path(path)
             kwargs.setdefault("timeout", DEFAULT_REQUEST_TIMEOUT)
-            response = request(f"{self.url}{normalized_path}", json=json, **kwargs)
-            if retry_on_missing_model and maybe_pull_missing_model(normalized_path, json, response):
+            local_server = _LOCAL_SERVERS_BY_URL.get(self.url)
+
+            def send():
+                try:
+                    return request(f"{self.url}{normalized_path}", json=json, **kwargs)
+                except requests.RequestException as exc:
+                    if (
+                        local_server is not None
+                        and local_server.proc.poll() is not None
+                    ):
+                        local_server.failure_reported = True
+                        raise AssertionError(local_server.failure_diagnostic()) from exc
+                    raise
+
+            response = send()
+            if retry_on_missing_model and maybe_pull_missing_model(
+                normalized_path, json, response
+            ):
                 response.close()
-                response = request(f"{self.url}{normalized_path}", json=json, **kwargs)
+                response = send()
+            response = retry_transient_capacity(response, send)
+            if response.status_code >= 500 and local_server is not None:
+                local_server.report_http_failure_once()
             return response
 
         def post(self, path: str, json=None, **kwargs):
@@ -265,18 +440,22 @@ def api(base_url):
             _check(r)
             return r.json()
 
-        def recognize(self, text: list[str], model: str = "", labels: list[str] | None = None, **kwargs):
-            relation_labels = kwargs.pop("relation_labels", None)
+        def extract_entities(self, text: list[str], model: str = "", labels: list[str] | None = None, relations: list[str | dict] | None = None, **kwargs):
             body: dict = {
-                "model": model or "fastino/gliner2-base-v1",
-                "texts": text,
-                **kwargs,
+                "model": model or DEFAULT_EXTRACTOR_MODEL,
+                "inputs": [{"content": value} for value in text],
+                "schema": {},
             }
             if labels is not None:
-                body["labels"] = labels
-            if relation_labels is not None:
-                body["relation_labels"] = relation_labels
-            r = self.post("/recognize", json=body)
+                body["schema"]["entities"] = labels
+            if relations is not None:
+                body["schema"]["relations"] = [
+                    value if isinstance(value, dict) else {"type": value}
+                    for value in relations
+                ]
+            if kwargs:
+                body["options"] = kwargs
+            r = self.post("/extract", json=body)
             _check(r)
             return r.json()
 
@@ -301,15 +480,27 @@ def api(base_url):
             return r.json()
 
         def extract(self, texts: list[str] | None = None, images: list[str] | None = None, schema: dict | None = None, model: str = "", **kwargs):
+            structures = {}
+            for structure_name, field_defs in (schema or {}).items():
+                fields = {}
+                for field_def in field_defs:
+                    parts = field_def.split("::")
+                    field_name = parts[0]
+                    field_type = "list" if "list" in parts[1:] or "array" in parts[1:] else "str"
+                    fields[field_name] = field_type
+                structures[structure_name] = {"fields": fields}
+            inputs = []
+            if texts is not None:
+                inputs.extend({"content": text} for text in texts)
+            if images is not None:
+                inputs.extend({"content": [{"type": "image_url", "image_url": {"url": image}}]} for image in images)
             body = {
                 "model": model,
-                "schema": schema or {},
-                **kwargs,
+                "inputs": inputs,
+                "schema": {"structures": structures},
             }
-            if texts is not None:
-                body["texts"] = texts
-            if images is not None:
-                body["images"] = [{"url": image} if isinstance(image, str) else image for image in images]
+            if kwargs:
+                body["options"] = kwargs
             r = self.post("/extract", json=body)
             _check(r)
             return r.json()

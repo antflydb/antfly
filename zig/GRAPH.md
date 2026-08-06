@@ -36,8 +36,8 @@ edges.
 - Reuse existing graph edge artifact rows as the durable source of graph edge
   truth.
 - Reuse existing managed graph replay to update private graph stores.
-- Keep graph queries model-free. Queries should never call extractors,
-  recognizers, readers, generators, or transcribers synchronously.
+- Keep graph queries model-free. Queries should never call extractors, readers,
+  generators, or transcribers synchronously.
 - Keep V1 document-key compatible with current graph query, hydration, identity,
   split, and merge behavior.
 

@@ -609,6 +609,9 @@ const JsonTransactionRecoveryStats = struct {
 
 const JsonTextMergeStats = struct {
     enabled: bool,
+    active_indexes: u64,
+    active_segments: u64,
+    max_active_segments_per_index: u64,
     pending_indexes: u64,
     pending_segments: u64,
     pending_bytes: u64,
@@ -4011,6 +4014,9 @@ fn jsonDBStatsProjection(stats: db_mod.types.DBStats, indexes: []JsonDBIndexStat
         },
         .text_merge = .{
             .enabled = stats.text_merge.enabled,
+            .active_indexes = stats.text_merge.active_indexes,
+            .active_segments = stats.text_merge.active_segments,
+            .max_active_segments_per_index = stats.text_merge.max_active_segments_per_index,
             .pending_indexes = stats.text_merge.pending_indexes,
             .pending_segments = stats.text_merge.pending_segments,
             .pending_bytes = stats.text_merge.pending_bytes,

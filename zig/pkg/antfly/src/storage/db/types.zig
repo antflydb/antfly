@@ -4540,6 +4540,9 @@ pub const TransactionRecoveryStats = struct {
 
 pub const TextMergeStats = struct {
     enabled: bool = false,
+    active_indexes: u64 = 0,
+    active_segments: u64 = 0,
+    max_active_segments_per_index: u64 = 0,
     pending_indexes: u64 = 0,
     pending_segments: u64 = 0,
     pending_bytes: u64 = 0,
@@ -4569,6 +4572,8 @@ pub const TextMergeStats = struct {
     deferred_for_pressure: u64 = 0,
     backpressure_events: u64 = 0,
     backpressure_ns: u64 = 0,
+    backpressure_timeouts: u64 = 0,
+    backpressure_failures: u64 = 0,
     max_pending_segments: u64 = 0,
     max_pending_bytes: u64 = 0,
 };
@@ -4676,6 +4681,9 @@ pub const GraphMetricRuntimeStats = struct {
 
 pub fn accumulateTextMergeStats(dst: *TextMergeStats, src: TextMergeStats) void {
     dst.enabled = dst.enabled or src.enabled;
+    dst.active_indexes +|= src.active_indexes;
+    dst.active_segments +|= src.active_segments;
+    dst.max_active_segments_per_index = @max(dst.max_active_segments_per_index, src.max_active_segments_per_index);
     dst.pending_indexes +|= src.pending_indexes;
     dst.pending_segments +|= src.pending_segments;
     dst.pending_bytes +|= src.pending_bytes;
@@ -4705,6 +4713,8 @@ pub fn accumulateTextMergeStats(dst: *TextMergeStats, src: TextMergeStats) void 
     dst.deferred_for_pressure +|= src.deferred_for_pressure;
     dst.backpressure_events +|= src.backpressure_events;
     dst.backpressure_ns +|= src.backpressure_ns;
+    dst.backpressure_timeouts +|= src.backpressure_timeouts;
+    dst.backpressure_failures +|= src.backpressure_failures;
     dst.max_pending_segments = @max(dst.max_pending_segments, src.max_pending_segments);
     dst.max_pending_bytes = @max(dst.max_pending_bytes, src.max_pending_bytes);
 }

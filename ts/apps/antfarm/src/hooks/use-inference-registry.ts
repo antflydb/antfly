@@ -13,7 +13,7 @@ type InferenceTaskKey =
   | "rerankers"
   | "chunkers"
   | "generators"
-  | "recognizers"
+  | "extractors"
   | "rewriters"
   | "readers"
   | "transcribers"
@@ -24,7 +24,7 @@ const TASK_TO_TYPE: Record<InferenceTaskKey, ModelType> = {
   rerankers: "reranker",
   chunkers: "chunker",
   generators: "generator",
-  recognizers: "recognizer",
+  extractors: "extractor",
   rewriters: "rewriter",
   readers: "reader",
   transcribers: "transcriber",
@@ -36,7 +36,7 @@ const MODEL_TYPE_NAMES: Record<ModelType, string> = {
   embedder: "embedding",
   reranker: "reranking",
   chunker: "chunking",
-  recognizer: "recognition",
+  extractor: "extraction",
   rewriter: "rewriting",
   generator: "generation",
   reader: "reader",
@@ -78,9 +78,9 @@ const MODEL_TYPES: ModelTypeInfo[] = [
     icon: "Scissors",
   },
   {
-    type: "recognizer",
-    name: "Recognizer",
-    description: "Entity recognition, relation extraction, and question answering",
+    type: "extractor",
+    name: "Extractor",
+    description: "Entity extraction, relation extraction, and question answering",
     icon: "Tag",
   },
   {

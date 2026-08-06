@@ -51,7 +51,8 @@ components:
         version:
           type: integer
           format: uint32
-          description: Version of the schema. Used for migrations.
+          readOnly: true
+          description: Backend-managed schema generation used for migrations. Omit it from create and update requests.
         storage_mode:
           type: string
           enum: [document, relational]

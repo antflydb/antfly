@@ -906,6 +906,21 @@ pub fn parseStoredCreateTableRequest(alloc: std.mem.Allocator, body: []const u8)
     return parseCreateTableRequestWithOptions(alloc, body, true);
 }
 
+pub fn validateCreateSchemaVersion(value: std.json.Value, comptime allow_normalized_version_zero: bool) !void {
+    if (value != .object) return error.InvalidCreateTableRequest;
+    const version = value.object.get("version") orelse return;
+    switch (version) {
+        .null => return,
+        .integer => |integer| {
+            // The public create contract is intentionally stricter than the
+            // trusted metadata hop. Metadata receives the normalized v0 schema
+            // produced by the public API, but no caller may choose a generation.
+            if (!allow_normalized_version_zero or integer != 0) return error.SchemaVersionManagedByBackend;
+        },
+        else => return error.InvalidCreateTableRequest,
+    }
+}
+
 fn parseCreateTableRequestWithOptions(
     alloc: std.mem.Allocator,
     body: []const u8,
@@ -959,6 +974,7 @@ fn parseCreateTableRequestWithOptions(
                 else => return err,
             };
             defer alloc.free(validated_schema);
+            try validateCreateSchemaVersion(value, allow_private_index_fields);
             const normalized_schema = normalizeSchemaVersion(alloc, validated_schema, 0) catch |err| switch (err) {
                 error.InvalidSchemaUpdateRequest => return error.InvalidCreateTableRequest,
                 else => return err,
@@ -1753,30 +1769,31 @@ pub fn applySchemaUpdateRecord(
 ) !metadata_table_manager.TableRecord {
     try validateRelationalStorageModeUpdateAlloc(alloc, table.schema_json, schema_json);
 
+    const current_version = try schemaVersion(table.schema_json);
+    const schema_changed = !try schemasSemanticallyEqual(alloc, table.schema_json, schema_json);
+    const next_version = if (schema_changed)
+        std.math.add(u32, current_version, 1) catch return error.SchemaVersionExhausted
+    else
+        current_version;
+
     var updated = try metadata_table_manager.cloneTable(alloc, table.*);
     errdefer metadata_table_manager.freeTable(alloc, updated);
-
-    const current_version = try schemaVersion(table.schema_json);
-    const doc_schemas_changed = try documentSchemasChanged(alloc, table.schema_json, schema_json);
-    const next_version = if (doc_schemas_changed) current_version + 1 else current_version;
 
     const normalized_schema_json = try normalizeSchemaVersion(alloc, schema_json, next_version);
     var normalized_schema_json_owned = true;
     errdefer if (normalized_schema_json_owned) alloc.free(normalized_schema_json);
-    try validateRuntimeDerivableSchemaJson(alloc, normalized_schema_json);
     alloc.free(updated.schema_json);
     updated.schema_json = normalized_schema_json;
     normalized_schema_json_owned = false;
 
     // Refresh schema-derived algebraic configs (dynamic_field_rules + capability
-    // fingerprint) on every update, including template-only changes that do not
-    // bump the version, so the algebraic sidecar tracks dynamic templates without
-    // a recreate.
+    // fingerprint) on every update so the algebraic sidecar tracks equivalent
+    // source-schema rewrites without requiring a recreate.
     const refreshed_indexes_json = try regenerateAlgebraicIndexesFromSchemaAlloc(alloc, table.name, updated.indexes_json, updated.schema_json);
     alloc.free(updated.indexes_json);
     updated.indexes_json = refreshed_indexes_json;
 
-    if (doc_schemas_changed) {
+    if (schema_changed) {
         if (table.read_schema_json.len == 0) {
             const normalized_read_schema_json = if (table.schema_json.len > 0)
                 try normalizeSchemaVersion(alloc, table.schema_json, current_version)
@@ -2595,8 +2612,13 @@ fn applyRelationalDdlSchemaRecordAlloc(
     errdefer metadata_table_manager.freeTable(alloc, updated);
 
     const current_version = try schemaVersion(table.schema_json);
-    const doc_schemas_changed = try documentSchemasChanged(alloc, table.schema_json, schema_json);
-    const next_version = if (table.schema_json.len == 0) 0 else if (doc_schemas_changed) current_version + 1 else current_version;
+    const schema_changed = table.schema_json.len == 0 or !try schemasSemanticallyEqual(alloc, table.schema_json, schema_json);
+    const next_version = if (table.schema_json.len == 0)
+        0
+    else if (schema_changed)
+        std.math.add(u32, current_version, 1) catch return error.SchemaVersionExhausted
+    else
+        current_version;
 
     const normalized_schema_json = try normalizeSchemaVersion(alloc, schema_json, next_version);
     alloc.free(updated.schema_json);
@@ -2606,7 +2628,7 @@ fn applyRelationalDdlSchemaRecordAlloc(
     alloc.free(updated.indexes_json);
     updated.indexes_json = refreshed_indexes_json;
 
-    if (doc_schemas_changed and table.schema_json.len > 0) {
+    if (schema_changed and table.schema_json.len > 0) {
         if (table.read_schema_json.len == 0) {
             const normalized_read_schema_json = try normalizeSchemaVersion(alloc, table.schema_json, current_version);
             alloc.free(updated.read_schema_json);
@@ -4527,7 +4549,20 @@ fn appendRuntimeSchemaObject(
     const ttl_text = try std.fmt.allocPrint(alloc, "{d}", .{schema.ttl_duration_ns});
     defer alloc.free(ttl_text);
     try out.appendSlice(alloc, ttl_text);
-    try out.appendSlice(alloc, ",\"dynamic_templates\":[");
+    try out.appendSlice(alloc, ",\"enforce_types\":");
+    try out.appendSlice(alloc, if (schema.enforce_types) "true" else "false");
+    try out.appendSlice(alloc, ",\"index_sort\":[");
+    for (schema.index_sort, 0..) |field, i| {
+        if (i > 0) try out.append(alloc, ',');
+        try out.append(alloc, '{');
+        try appendJsonString(alloc, out, "field");
+        try out.append(alloc, ':');
+        try appendJsonString(alloc, out, field.field);
+        try out.appendSlice(alloc, ",\"order\":");
+        try appendJsonString(alloc, out, if (field.desc) "desc" else "asc");
+        try out.append(alloc, '}');
+    }
+    try out.appendSlice(alloc, "],\"dynamic_templates\":[");
     for (schema.dynamic_templates, 0..) |tmpl, i| {
         if (i > 0) try out.append(alloc, ',');
         try out.append(alloc, '{');
@@ -4625,6 +4660,11 @@ fn appendRuntimeSchemaObject(
             if (open_idx > 0) try out.append(alloc, ',');
             try appendJsonString(alloc, out, path);
         }
+        try out.appendSlice(alloc, "],\"infer_type_dynamic_paths\":[");
+        for (doc.infer_type_dynamic_paths, 0..) |path, infer_idx| {
+            if (infer_idx > 0) try out.append(alloc, ',');
+            try appendJsonString(alloc, out, path);
+        }
         try out.appendSlice(alloc, "]}");
     }
     try out.appendSlice(alloc, "]}");
@@ -4680,16 +4720,206 @@ fn queryNeedsPrimaryTextIndex(req: db_mod.types.SearchRequest) bool {
     };
 }
 
-fn schemaVersion(schema_json: []const u8) !u32 {
+pub fn schemaVersion(schema_json: []const u8) !u32 {
     return try sql_schema_mutation.schemaVersion(schema_json);
-}
-
-fn documentSchemasChanged(alloc: std.mem.Allocator, current_schema_json: []const u8, next_schema_json: []const u8) !bool {
-    return try sql_schema_mutation.documentSchemasChanged(alloc, current_schema_json, next_schema_json);
 }
 
 pub fn normalizeSchemaVersion(alloc: std.mem.Allocator, schema_json: []const u8, version: u32) ![]u8 {
     return try sql_schema_mutation.normalizeSchemaVersion(alloc, schema_json, version);
+}
+
+pub fn schemasSemanticallyEqual(alloc: std.mem.Allocator, current_schema_json: []const u8, next_schema_json: []const u8) !bool {
+    // Version is backend-owned, so derive both schemas at the same synthetic
+    // generation and compare their canonical runtime behavior. This treats
+    // omitted fields and their explicit defaults as equal, ignores object key
+    // order, and still preserves meaningful ordering such as template rules.
+    const current_normalized = try normalizeSchemaVersion(alloc, current_schema_json, 0);
+    defer alloc.free(current_normalized);
+    const next_normalized = try normalizeSchemaVersion(alloc, next_schema_json, 0);
+    defer alloc.free(next_normalized);
+
+    const next_runtime_json = try compileRuntimeSchemaJson(alloc, next_normalized);
+    defer alloc.free(next_runtime_json);
+    const current_runtime_json = compileRuntimeSchemaJson(alloc, current_normalized) catch |err| switch (err) {
+        // Let a valid update repair catalog state written by an older schema
+        // implementation. Allocation failure remains operational and must not
+        // be mistaken for a semantic difference.
+        error.OutOfMemory => return err,
+        else => return false,
+    };
+    defer alloc.free(current_runtime_json);
+
+    if (!try sourceSchemasSemanticallyEqual(alloc, current_normalized, next_normalized)) return false;
+
+    var current = try json_helpers.parseJsonValueAlloc(alloc, current_runtime_json);
+    defer current.deinit();
+    var next = try json_helpers.parseJsonValueAlloc(alloc, next_runtime_json);
+    defer next.deinit();
+
+    const current_canonical = try canonicalSchemaJsonAlloc(alloc, current.value, null, .runtime);
+    defer alloc.free(current_canonical);
+    const next_canonical = try canonicalSchemaJsonAlloc(alloc, next.value, null, .runtime);
+    defer alloc.free(next_canonical);
+    return std.mem.eql(u8, current_canonical, next_canonical);
+}
+
+const CanonicalSchemaKind = enum {
+    source,
+    runtime,
+};
+
+fn sourceSchemasSemanticallyEqual(
+    alloc: std.mem.Allocator,
+    current_schema_json: []const u8,
+    next_schema_json: []const u8,
+) !bool {
+    var current = try json_helpers.parseJsonValueAlloc(alloc, current_schema_json);
+    defer current.deinit();
+    var next = try json_helpers.parseJsonValueAlloc(alloc, next_schema_json);
+    defer next.deinit();
+    normalizeSourceSchemaTopLevelDefaults(&current.value);
+    normalizeSourceSchemaTopLevelDefaults(&next.value);
+
+    const current_canonical = try canonicalSchemaJsonAlloc(alloc, current.value, null, .source);
+    defer alloc.free(current_canonical);
+    const next_canonical = try canonicalSchemaJsonAlloc(alloc, next.value, null, .source);
+    defer alloc.free(next_canonical);
+    return std.mem.eql(u8, current_canonical, next_canonical);
+}
+
+fn normalizeSourceSchemaTopLevelDefaults(value: *std.json.Value) void {
+    if (value.* != .object) return;
+    const object = &value.object;
+    const removable = [_][]const u8{
+        "default_type",
+        "ttl_duration_ns",
+        "ttl_field",
+        "enforce_types",
+        "document_schemas",
+        "dynamic_templates",
+        "index_sort",
+    };
+    for (removable) |name| {
+        const field = object.get(name) orelse continue;
+        const is_default = if (field == .null)
+            true
+        else if (std.mem.eql(u8, name, "default_type"))
+            field == .string and field.string.len == 0
+        else if (std.mem.eql(u8, name, "ttl_duration_ns"))
+            field == .integer and field.integer == 0
+        else if (std.mem.eql(u8, name, "ttl_field"))
+            field == .string and std.mem.eql(u8, field.string, "_timestamp")
+        else if (std.mem.eql(u8, name, "enforce_types"))
+            field == .bool and !field.bool
+        else if (std.mem.eql(u8, name, "document_schemas"))
+            field == .object and field.object.count() == 0
+        else
+            field == .array and field.array.items.len == 0;
+        if (is_default) _ = object.orderedRemove(name);
+    }
+}
+
+fn schemaArrayIsUnordered(kind: CanonicalSchemaKind, field_name: ?[]const u8) bool {
+    const name = field_name orelse return false;
+    return switch (kind) {
+        .source => std.mem.eql(u8, name, "required") or
+            std.mem.eql(u8, name, "enum") or
+            std.mem.eql(u8, name, "type") or
+            std.mem.eql(u8, name, "x-antfly-types") or
+            std.mem.eql(u8, name, "x-antfly-include-in-all") or
+            std.mem.eql(u8, name, "allOf") or
+            std.mem.eql(u8, name, "anyOf") or
+            std.mem.eql(u8, name, "oneOf"),
+        // Keep dynamic_rules ordered: the document mapper uses first-match
+        // precedence, so swapping two overlapping rules changes indexing.
+        .runtime => std.mem.eql(u8, name, "field_capabilities") or
+            std.mem.eql(u8, name, "full_text_documents") or
+            std.mem.eql(u8, name, "fields") or
+            std.mem.eql(u8, name, "variants") or
+            std.mem.eql(u8, name, "open_dynamic_paths") or
+            std.mem.eql(u8, name, "infer_type_dynamic_paths"),
+    };
+}
+
+fn canonicalSchemaJsonAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+    field_name: ?[]const u8,
+    kind: CanonicalSchemaKind,
+) std.mem.Allocator.Error![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try appendCanonicalSchemaJson(alloc, &out, value, field_name, kind);
+    return try out.toOwnedSlice(alloc);
+}
+
+fn appendCanonicalSchemaJson(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    value: std.json.Value,
+    field_name: ?[]const u8,
+    kind: CanonicalSchemaKind,
+) std.mem.Allocator.Error!void {
+    switch (value) {
+        .object => |object| {
+            const keys = try alloc.alloc([]const u8, object.count());
+            defer alloc.free(keys);
+            var key_index: usize = 0;
+            var it = object.iterator();
+            while (it.next()) |entry| : (key_index += 1) keys[key_index] = entry.key_ptr.*;
+            std.mem.sort([]const u8, keys, {}, struct {
+                fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
+                    return std.mem.order(u8, lhs, rhs) == .lt;
+                }
+            }.lessThan);
+
+            try out.append(alloc, '{');
+            for (keys, 0..) |key, index| {
+                if (index > 0) try out.append(alloc, ',');
+                try appendJsonString(alloc, out, key);
+                try out.append(alloc, ':');
+                try appendCanonicalSchemaJson(alloc, out, object.get(key).?, key, kind);
+            }
+            try out.append(alloc, '}');
+        },
+        .array => |array| {
+            try out.append(alloc, '[');
+            if (schemaArrayIsUnordered(kind, field_name)) {
+                // Canonicalize and sort once instead of performing quadratic
+                // pairwise matching for schemas with many derived fields.
+                const items = try alloc.alloc([]u8, array.items.len);
+                var initialized: usize = 0;
+                defer {
+                    for (items[0..initialized]) |item| alloc.free(item);
+                    alloc.free(items);
+                }
+                for (array.items) |item| {
+                    items[initialized] = try canonicalSchemaJsonAlloc(alloc, item, null, kind);
+                    initialized += 1;
+                }
+                std.mem.sort([]u8, items, {}, struct {
+                    fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
+                        return std.mem.order(u8, lhs, rhs) == .lt;
+                    }
+                }.lessThan);
+                for (items, 0..) |item, index| {
+                    if (index > 0) try out.append(alloc, ',');
+                    try out.appendSlice(alloc, item);
+                }
+            } else {
+                for (array.items, 0..) |item, index| {
+                    if (index > 0) try out.append(alloc, ',');
+                    try appendCanonicalSchemaJson(alloc, out, item, null, kind);
+                }
+            }
+            try out.append(alloc, ']');
+        },
+        else => {
+            const encoded = try stringifyJsonValue(alloc, value);
+            defer alloc.free(encoded);
+            try out.appendSlice(alloc, encoded);
+        },
+    }
 }
 
 fn upsertVersionedFullTextIndex(
@@ -6903,6 +7133,27 @@ test "create table parser preserves supported metadata fields" {
     try std.testing.expectEqualStrings("[{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"users\"}]", parsed.replication_sources_json.?);
 }
 
+test "create table rejects caller-managed schema versions" {
+    const body =
+        "{\"schema\":{\"version\":7,\"document_schemas\":{\"file\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true}}}}}";
+    try std.testing.expectError(
+        error.SchemaVersionManagedByBackend,
+        parseCreateTableRequest(std.testing.allocator, body),
+    );
+    try std.testing.expectError(
+        error.SchemaVersionManagedByBackend,
+        parseStoredCreateTableRequest(std.testing.allocator, body),
+    );
+
+    var stored = try parseStoredCreateTableRequest(
+        std.testing.allocator,
+        "{\"schema\":{\"version\":0},\"indexes\":{\"full_text_index_v0\":{\"type\":\"full_text\"}}}",
+    );
+    defer stored.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("{\"version\":0}", stored.schema_json.?);
+    try std.testing.expectEqualStrings(default_indexes_json, stored.indexes_json.?);
+}
+
 test "create table raw parser merges default full text with quickstart embedding index" {
     var parsed = try parseCreateTableRequest(std.testing.allocator,
         \\{
@@ -7930,6 +8181,189 @@ test "metadata.schema update preserves read schema and adds versioned full-text 
     try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"full_text_index_v0\":{\"type\":\"full_text\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"embed_idx\":{\"type\":\"embeddings\",\"dimension\":384}") != null);
     try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"full_text_index_v1\":{\"name\":\"full_text_index_v1\",\"type\":\"full_text\"}") != null);
+}
+
+test "metadata.schema update versions template-only changes" {
+    const table: metadata_table_manager.TableRecord = .{
+        .table_id = 7,
+        .name = "docs",
+        .schema_json = "{\"version\":2,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\"}}},\"dynamic_templates\":{\"body\":{\"mapping\":{\"type\":\"text\"}}}}",
+        .read_schema_json = "{\"version\":1,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"string\"}}}}}}",
+        .indexes_json = "{\"full_text_index_v1\":{\"type\":\"full_text\"},\"full_text_index_v2\":{\"type\":\"full_text\"}}",
+        .replication_sources_json = "[]",
+        .placement_role = "data",
+    };
+
+    const updated = try applySchemaUpdateRecord(
+        std.testing.allocator,
+        &table,
+        "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\"}}},\"dynamic_templates\":{\"body\":{\"mapping\":{\"type\":\"keyword\"}}}}",
+    );
+    defer metadata_table_manager.freeTable(std.testing.allocator, updated);
+
+    try std.testing.expect(std.mem.indexOf(u8, updated.schema_json, "\"version\":3") != null);
+    try std.testing.expectEqualStrings(table.read_schema_json, updated.read_schema_json);
+    try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"full_text_index_v2\":{\"type\":\"full_text\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"full_text_index_v3\":{\"name\":\"full_text_index_v3\",\"type\":\"full_text\"}") != null);
+}
+
+test "metadata.schema update avoids a generation for semantically identical JSON" {
+    const table: metadata_table_manager.TableRecord = .{
+        .table_id = 7,
+        .name = "docs",
+        .schema_json = "{\"version\":2,\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true,\"required\":[\"title\",\"body\"],\"properties\":{\"title\":{\"type\":\"string\"},\"body\":{\"type\":\"string\"}}}}}}",
+        .read_schema_json = "{\"version\":1}",
+        .indexes_json = "{\"full_text_index_v1\":{\"type\":\"full_text\"},\"full_text_index_v2\":{\"type\":\"full_text\"}}",
+        .replication_sources_json = "[]",
+        .placement_role = "data",
+    };
+
+    const updated = try applySchemaUpdateRecord(
+        std.testing.allocator,
+        &table,
+        "{\"document_schemas\":{\"doc\":{\"schema\":{\"properties\":{\"body\":{\"type\":\"string\"},\"title\":{\"type\":\"string\"}},\"required\":[\"body\",\"title\"],\"additionalProperties\":true,\"type\":\"object\"}}},\"version\":999,\"default_type\":\"doc\",\"enforce_types\":false}",
+    );
+    defer metadata_table_manager.freeTable(std.testing.allocator, updated);
+
+    try std.testing.expect(std.mem.indexOf(u8, updated.schema_json, "\"version\":2") != null);
+    try std.testing.expectEqualStrings(table.read_schema_json, updated.read_schema_json);
+    try std.testing.expectEqualStrings(table.indexes_json, updated.indexes_json);
+}
+
+test "metadata.schema update avoids a generation for explicit runtime defaults" {
+    const table: metadata_table_manager.TableRecord = .{
+        .table_id = 7,
+        .name = "docs",
+        .schema_json = "{\"version\":2}",
+        .read_schema_json = "{\"version\":1}",
+        .indexes_json = "{\"full_text_index_v1\":{\"type\":\"full_text\"},\"full_text_index_v2\":{\"type\":\"full_text\"}}",
+        .replication_sources_json = "[]",
+        .placement_role = "data",
+    };
+
+    const updated = try applySchemaUpdateRecord(
+        std.testing.allocator,
+        &table,
+        "{\"version\":999,\"default_type\":\"\",\"enforce_types\":false}",
+    );
+    defer metadata_table_manager.freeTable(std.testing.allocator, updated);
+
+    try std.testing.expect(std.mem.indexOf(u8, updated.schema_json, "\"version\":2") != null);
+    try std.testing.expectEqualStrings(table.read_schema_json, updated.read_schema_json);
+    try std.testing.expectEqualStrings(table.indexes_json, updated.indexes_json);
+}
+
+test "metadata.schema update versions dynamic rule precedence changes" {
+    const table: metadata_table_manager.TableRecord = .{
+        .table_id = 7,
+        .name = "docs",
+        .schema_json =
+        \\{"version":2,"document_schemas":{"doc":{"schema":{"type":"object","patternProperties":{
+        \\  "^tag_.*":{"type":"string","x-antfly-types":["text"]},
+        \\  ".*":{"type":"string","x-antfly-types":["keyword"]}
+        \\}}}}}
+        ,
+        .read_schema_json = "{\"version\":1}",
+        .indexes_json = "{\"full_text_index_v1\":{\"type\":\"full_text\"},\"full_text_index_v2\":{\"type\":\"full_text\"}}",
+        .replication_sources_json = "[]",
+        .placement_role = "data",
+    };
+
+    const updated = try applySchemaUpdateRecord(std.testing.allocator, &table,
+        \\{"document_schemas":{"doc":{"schema":{"type":"object","patternProperties":{
+        \\  ".*":{"type":"string","x-antfly-types":["keyword"]},
+        \\  "^tag_.*":{"type":"string","x-antfly-types":["text"]}
+        \\}}}}}
+    );
+    defer metadata_table_manager.freeTable(std.testing.allocator, updated);
+
+    try std.testing.expect(std.mem.indexOf(u8, updated.schema_json, "\"version\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"full_text_index_v3\"") != null);
+}
+
+test "metadata.schema update versions inferred dynamic path changes" {
+    const table: metadata_table_manager.TableRecord = .{
+        .table_id = 7,
+        .name = "docs",
+        .schema_json =
+        \\{"version":2,"document_schemas":{"doc":{"schema":{"type":"object","properties":{
+        \\  "meta":{"type":"object"}
+        \\}}}}}
+        ,
+        .read_schema_json = "{\"version\":1}",
+        .indexes_json = "{\"full_text_index_v1\":{\"type\":\"full_text\"},\"full_text_index_v2\":{\"type\":\"full_text\"}}",
+        .replication_sources_json = "[]",
+        .placement_role = "data",
+    };
+
+    const updated = try applySchemaUpdateRecord(std.testing.allocator, &table,
+        \\{"document_schemas":{"doc":{"schema":{"type":"object","properties":{
+        \\  "meta":{"type":"object","additionalProperties":true,"x-antfly-dynamic-indexing":{"mode":"infer_types"}}
+        \\}}}}}
+    );
+    defer metadata_table_manager.freeTable(std.testing.allocator, updated);
+
+    try std.testing.expect(std.mem.indexOf(u8, updated.schema_json, "\"version\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"full_text_index_v3\"") != null);
+}
+
+test "metadata.schema update versions validation-only changes" {
+    const table: metadata_table_manager.TableRecord = .{
+        .table_id = 7,
+        .name = "docs",
+        .schema_json =
+        \\{"version":2,"document_schemas":{"doc":{"schema":{"type":"object","properties":{
+        \\  "title":{"type":"string","minLength":1}
+        \\}}}}}
+        ,
+        .read_schema_json = "{\"version\":1}",
+        .indexes_json = "{\"full_text_index_v1\":{\"type\":\"full_text\"},\"full_text_index_v2\":{\"type\":\"full_text\"}}",
+        .replication_sources_json = "[]",
+        .placement_role = "data",
+    };
+
+    const updated = try applySchemaUpdateRecord(std.testing.allocator, &table,
+        \\{"document_schemas":{"doc":{"schema":{"type":"object","properties":{
+        \\  "title":{"type":"string","minLength":2}
+        \\}}}}}
+    );
+    defer metadata_table_manager.freeTable(std.testing.allocator, updated);
+
+    try std.testing.expect(std.mem.indexOf(u8, updated.schema_json, "\"version\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"full_text_index_v3\"") != null);
+}
+
+test "metadata.schema update rejects generation overflow" {
+    const table: metadata_table_manager.TableRecord = .{
+        .table_id = 7,
+        .name = "docs",
+        .schema_json = "{\"version\":4294967295}",
+        .indexes_json = "{\"full_text_index_v4294967295\":{\"type\":\"full_text\"}}",
+        .replication_sources_json = "[]",
+        .placement_role = "data",
+    };
+
+    try std.testing.expectError(
+        error.SchemaVersionExhausted,
+        applySchemaUpdateRecord(std.testing.allocator, &table, "{\"default_type\":\"doc\"}"),
+    );
+}
+
+test "metadata.schema update can repair a legacy non-derivable schema" {
+    const table: metadata_table_manager.TableRecord = .{
+        .table_id = 7,
+        .name = "docs",
+        .schema_json = "{\"version\":1,\"index_sort\":[{\"field\":\"_id\",\"order\":\"desc\"}]}",
+        .indexes_json = "{\"full_text_index_v1\":{\"type\":\"full_text\"}}",
+        .replication_sources_json = "[]",
+        .placement_role = "data",
+    };
+
+    const updated = try applySchemaUpdateRecord(std.testing.allocator, &table, "{}");
+    defer metadata_table_manager.freeTable(std.testing.allocator, updated);
+
+    try std.testing.expectEqualStrings("{\"version\":2}", updated.schema_json);
+    try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"full_text_index_v2\"") != null);
 }
 
 test "metadata.schema update rejects schemas that cannot derive runtime mappings" {
@@ -9155,31 +9589,7 @@ test "metadata.schema update does not duplicate an existing algebraic index" {
     try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"my_alg\"") != null);
 }
 
-test "metadata.schema update keeps version for template-only changes" {
-    const table: metadata_table_manager.TableRecord = .{
-        .table_id = 7,
-        .name = "docs",
-        .schema_json = "{\"version\":2,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\"}}},\"dynamic_templates\":{\"body\":{\"mapping\":{\"type\":\"text\"}}}}",
-        .read_schema_json = "{\"version\":1,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"string\"}}}}}}",
-        .indexes_json = "{\"full_text_index_v1\":{\"type\":\"full_text\"},\"full_text_index_v2\":{\"type\":\"full_text\"}}",
-        .replication_sources_json = "[]",
-        .placement_role = "data",
-    };
-
-    const updated = try applySchemaUpdateRecord(
-        std.testing.allocator,
-        &table,
-        "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\"}}},\"dynamic_templates\":{\"body\":{\"mapping\":{\"type\":\"keyword\"}}}}",
-    );
-    defer metadata_table_manager.freeTable(std.testing.allocator, updated);
-
-    try std.testing.expect(std.mem.indexOf(u8, updated.schema_json, "\"version\":2") != null);
-    try std.testing.expectEqualStrings(table.read_schema_json, updated.read_schema_json);
-    try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"full_text_index_v2\":{\"type\":\"full_text\"}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"full_text_index_v3\"") == null);
-}
-
-test "metadata.schema update refreshes algebraic dynamic templates without recreate" {
+test "metadata.schema update versions and refreshes algebraic dynamic templates without recreate" {
     const table: metadata_table_manager.TableRecord = .{
         .table_id = 8,
         .name = "docs",
@@ -9202,10 +9612,11 @@ test "metadata.schema update refreshes algebraic dynamic templates without recre
     );
     defer metadata_table_manager.freeTable(std.testing.allocator, updated);
 
-    // Version is preserved (no document_schemas change) ...
-    try std.testing.expect(std.mem.indexOf(u8, updated.schema_json, "\"version\":2") != null);
-    // ... but the durable algebraic config now carries the numeric rule, proving
-    // the dynamic template propagated without a recreate or version bump.
+    // Dynamic templates affect runtime schema behavior, so the update advances
+    // the schema version while retaining the branch's algebraic refresh.
+    try std.testing.expect(std.mem.indexOf(u8, updated.schema_json, "\"version\":3") != null);
+    // The durable algebraic config carries the numeric rule, proving the
+    // dynamic template propagated without an index recreate.
     try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"match\":\"ext_*\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"type\":\"number\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"capability_fingerprint\"") != null);

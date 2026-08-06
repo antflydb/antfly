@@ -1138,6 +1138,7 @@ pub const StatusSource = struct {
         set_namespace_tablespace: ?*const fn (ptr: *anyopaque, database_name: []const u8, namespace_name: []const u8, tablespace_name: ?[]const u8) anyerror!void = null,
         create_namespace: ?*const fn (ptr: *anyopaque, database_name: []const u8, namespace_name: []const u8) anyerror!void = null,
         drop_namespace: ?*const fn (ptr: *anyopaque, database_name: []const u8, namespace_name: []const u8) anyerror!void = null,
+        update_schema_versioned: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!u32 = null,
         create_index: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) anyerror!void = null,
         create_catalog_index: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, target: catalog_resources.TableTarget, index_name: []const u8, index_json: []const u8) anyerror!void = null,
         drop_index: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) anyerror!void = null,
@@ -1232,9 +1233,15 @@ pub const StatusSource = struct {
         return error.UnsupportedOperation;
     }
 
-    pub fn updateSchema(self: StatusSource, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
+    /// Returns the generation committed by an authoritative backend when the
+    /// source supports versioned results. Legacy/direct sources return null.
+    pub fn updateSchema(self: StatusSource, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !?u32 {
+        if (self.vtable.update_schema_versioned) |fn_ptr| {
+            return try fn_ptr(self.ptr, alloc, table_name, schema_json);
+        }
         const fn_ptr = self.vtable.update_schema orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, alloc, table_name, schema_json);
+        try fn_ptr(self.ptr, alloc, table_name, schema_json);
+        return null;
     }
 
     pub fn applyRelationalSqlDdlPlanWithSessionAndFunctionBindings(
@@ -1560,6 +1567,10 @@ pub const StatusSource = struct {
             }
 
             fn updateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!void {
+                _ = try updateSchemaOnService(cast(ptr), alloc, table_name, schema_json);
+            }
+
+            fn updateSchemaVersioned(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!u32 {
                 return try updateSchemaOnService(cast(ptr), alloc, table_name, schema_json);
             }
 
@@ -1836,6 +1847,7 @@ pub const StatusSource = struct {
             .set_namespace_tablespace = Gen.setNamespaceTablespace,
             .create_namespace = Gen.createNamespace,
             .drop_namespace = Gen.dropNamespace,
+            .update_schema_versioned = Gen.updateSchemaVersioned,
             .create_index = Gen.createIndex,
             .create_catalog_index = Gen.createCatalogIndex,
             .drop_index = Gen.dropIndex,
@@ -1992,7 +2004,7 @@ fn dropCatalogTableOnService(svc: anytype, alloc: std.mem.Allocator, target: cat
     try svc.runRound();
 }
 
-fn updateSchemaOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
+fn updateSchemaOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !u32 {
     var snapshot = try svc.adminSnapshot();
     defer svc.freeAdminSnapshot(&snapshot);
     const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
@@ -2000,8 +2012,10 @@ fn updateSchemaOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []c
 
     const updated = try tables_api.applySchemaUpdateRecord(alloc, table, schema_json);
     defer metadata_table_manager.freeTable(alloc, updated);
+    const version = try tables_api.schemaVersion(updated.schema_json);
     try svc.replaceTableDefinition(table.*, updated);
     try svc.runRound();
+    return version;
 }
 
 fn applyTableCatalogUpdateWithoutSchemaRewriteJobsOnService(
@@ -18159,10 +18173,7 @@ pub const ApiHttpServer = struct {
                         return err;
                     }
                     std.log.debug("create table request rejected: {} body_len={d}", .{ err, req.body.len });
-                    if (err == error.InvalidCreateTableSchemaRequest) {
-                        return try textResponse(self.alloc, 400, table_contract.createTableRequestErrorMessage(req.body));
-                    }
-                    return try textResponse(self.alloc, 400, "invalid create table request");
+                    return try textResponse(self.alloc, 400, table_contract.createTableRequestErrorMessage(err, req.body));
                 };
                 defer create_req.deinit(self.alloc);
                 const normalized_indexes_json = table_writes.normalizeManagedEmbeddingIndexDimensionsJsonWithOptions(
@@ -18299,26 +18310,28 @@ pub const ApiHttpServer = struct {
             if (routes.Routes.matchTableSchema(uri_parts.path)) |table_schema| {
                 const table_name = try decodeRequestPathParamAlloc(self.alloc, table_schema.table_name);
                 defer self.alloc.free(table_name);
-                const invalid_schema_message = table_contract.schemaUpdateRequestErrorMessage(req.body);
-                const schema_json = table_contract.parseSchemaUpdateRequest(self.alloc, req.body) catch {
+                var invalid_schema_message = table_contract.schemaUpdateRequestErrorMessage(error.InvalidSchemaUpdateRequest, req.body);
+                const schema_json = table_contract.parseSchemaUpdateRequest(self.alloc, req.body) catch |err| {
+                    invalid_schema_message = table_contract.schemaUpdateRequestErrorMessage(err, req.body);
                     return try textResponse(self.alloc, 400, invalid_schema_message);
                 };
                 defer self.alloc.free(schema_json);
 
                 const table_before = try self.loadOwnedTableRecord(self.alloc, table_name);
                 if (table_before == null) {
-                    self.source.updateSchema(self.alloc, table_name, schema_json) catch |err| switch (err) {
+                    _ = self.source.updateSchema(self.alloc, table_name, schema_json) catch |err| switch (err) {
                         error.InvalidSchemaUpdateRequest => return try textResponse(self.alloc, 400, invalid_schema_message),
                         error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
                         error.TableGenerationChanged => return try textResponse(self.alloc, 409, "table mutation conflict; retry request"),
                         error.TableTransitionActive => return try textResponse(self.alloc, 409, "table transition active"),
                         error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
-                        error.UnsupportedOperation => {
+                        error.UnsupportedOperation => blk: {
                             const table_writes_source = self.table_writes orelse return try textResponse(self.alloc, 404, "not found");
                             _ = table_writes_source.updateSchema(self.alloc, table_name, schema_json) catch |write_err| switch (write_err) {
                                 error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => return try textResponse(self.alloc, 400, invalid_schema_message),
                                 else => return write_err,
                             } orelse return try textResponse(self.alloc, 404, "not found");
+                            break :blk null;
                         },
                         else => return err,
                     };
@@ -18330,26 +18343,28 @@ pub const ApiHttpServer = struct {
                 defer metadata_table_manager.freeTable(self.alloc, table_before.?);
 
                 var local_schema_applied = false;
-                self.source.updateSchema(self.alloc, table_name, schema_json) catch |err| switch (err) {
+                const committed_version = self.source.updateSchema(self.alloc, table_name, schema_json) catch |err| switch (err) {
                     error.InvalidSchemaUpdateRequest => return try textResponse(self.alloc, 400, invalid_schema_message),
                     error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
                     error.TableGenerationChanged => return try textResponse(self.alloc, 409, "table mutation conflict; retry request"),
                     error.TableTransitionActive => return try textResponse(self.alloc, 409, "table transition active"),
                     error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
-                    error.UnsupportedOperation => {
+                    error.UnsupportedOperation => blk: {
                         const table_writes_source = self.table_writes orelse return try textResponse(self.alloc, 405, "method not allowed");
                         _ = table_writes_source.updateSchema(self.alloc, table_name, schema_json) catch |write_err| switch (write_err) {
                             error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => return try textResponse(self.alloc, 400, invalid_schema_message),
                             else => return write_err,
                         };
                         local_schema_applied = true;
+                        break :blk null;
                     },
                     else => return err,
                 };
-                const expected_table = try tables_api.applySchemaUpdateRecord(self.alloc, &table_before.?, schema_json);
-                defer metadata_table_manager.freeTable(self.alloc, expected_table);
-                self.waitForMetadataProjection(table_name, expected_table.schema_json, expected_table.indexes_json) catch |err| switch (err) {
+                var expectation = try self.schemaProjectionExpectationAlloc(self.alloc, &table_before.?, schema_json, committed_version);
+                defer expectation.deinit(self.alloc);
+                self.waitForSchemaUpdateProjection(table_name, expectation, committed_version) catch |err| switch (err) {
                     error.TableVisibilityTimeout => return try textResponse(self.alloc, 500, "schema update did not converge"),
+                    error.TableGenerationChanged => return try textResponse(self.alloc, 409, "schema update was superseded; retry request"),
                     else => return err,
                 };
                 self.reconcileProjectedSchemaUpdate(self.alloc, table_name, schema_json, local_schema_applied) catch |write_err| switch (write_err) {
@@ -18425,6 +18440,7 @@ pub const ApiHttpServer = struct {
                     error.HAReadRequiresPrimary, error.ReadRequiresPrimary => return try textResponse(self.alloc, 503, "read requires primary"),
                     error.LeaderUnavailable => return try textResponse(self.alloc, 503, "read unavailable"),
                     error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => return try textResponse(self.alloc, 503, "standby read unavailable"),
+                    error.PersistentDescriptorAdmissionExhausted => return try textResponse(self.alloc, 503, "storage read temporarily unavailable"),
                     else => {
                         std.log.err("public table lookup failed table={s} key={s} err={}", .{ table_name, decoded_key, err });
                         return try textResponse(self.alloc, 500, "lookup failed");
@@ -18849,6 +18865,72 @@ pub const ApiHttpServer = struct {
         defer arena_impl.deinit();
         const value = try buildLocalSchemaUpdateStatus(arena_impl.allocator(), table_name, schema_json);
         return try std.json.Stringify.valueAlloc(self.alloc, value, .{});
+    }
+
+    pub const SchemaProjectionExpectation = struct {
+        schema_json: []u8,
+        indexes_json: ?[]u8 = null,
+
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            alloc.free(self.schema_json);
+            if (self.indexes_json) |value| alloc.free(value);
+            self.* = undefined;
+        }
+    };
+
+    /// Build a projection target from the generation actually committed by
+    /// metadata. Falling back to local prediction is retained only for legacy
+    /// sources that cannot return an authoritative generation.
+    pub fn schemaProjectionExpectationAlloc(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        table_before: *const metadata_table_manager.TableRecord,
+        schema_json: []const u8,
+        committed_version: ?u32,
+    ) !SchemaProjectionExpectation {
+        _ = self;
+        if (committed_version) |version| {
+            return .{ .schema_json = try tables_api.normalizeSchemaVersion(alloc, schema_json, version) };
+        }
+
+        const expected = try tables_api.applySchemaUpdateRecord(alloc, table_before, schema_json);
+        defer metadata_table_manager.freeTable(alloc, expected);
+        const expected_schema_json = try alloc.dupe(u8, expected.schema_json);
+        errdefer alloc.free(expected_schema_json);
+        const expected_indexes_json = try alloc.dupe(u8, expected.indexes_json);
+        return .{
+            .schema_json = expected_schema_json,
+            .indexes_json = expected_indexes_json,
+        };
+    }
+
+    pub fn waitForSchemaUpdateProjection(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        expectation: SchemaProjectionExpectation,
+        committed_version: ?u32,
+    ) !void {
+        const version = committed_version orelse
+            return self.waitForMetadataProjection(table_name, expectation.schema_json, expectation.indexes_json);
+
+        const timeout_ns = 30 * std.time.ns_per_s;
+        const poll_interval_ns = 50 * std.time.ns_per_ms;
+        const start_ns = platform_time.monotonicNs();
+        while (true) {
+            const projected = try self.loadOwnedTableRecord(self.alloc, table_name);
+            if (projected) |table| {
+                defer metadata_table_manager.freeTable(self.alloc, table);
+                const projected_version = try tables_api.schemaVersion(table.schema_json);
+                if (projected_version > version) return error.TableGenerationChanged;
+                if (projected_version == version and
+                    try tables_api.schemasSemanticallyEqual(self.alloc, table.schema_json, expectation.schema_json))
+                {
+                    return;
+                }
+            }
+            if (platform_time.monotonicNs() -| start_ns >= timeout_ns) return error.TableVisibilityTimeout;
+            sleepNs(poll_interval_ns);
+        }
     }
 
     /// Starts local materialization only after the metadata definition is
@@ -21449,7 +21531,13 @@ pub const ApiHttpServer = struct {
             => return error.InvalidBatchRequest,
             error.TableNotFound => return error.NotFound,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
-            error.EnrichmentRetryInProgress, error.ResourceBudgetExceeded => return error.Backpressured,
+            error.EnrichmentRetryInProgress,
+            error.ResourceBudgetExceeded,
+            error.PersistentDescriptorAdmissionExhausted,
+            error.TextMergeBackpressureTimeout,
+            error.TextMergeBackpressureUnavailable,
+            error.TextMergeRuntimeShutdown,
+            => return error.Backpressured,
             error.DenseRepairBackpressure => return error.DenseRepairBackpressure,
             error.LeaderUnavailable, error.WriteUnavailable => return error.WriteUnavailable,
             error.HAReadOnlyStandby => return error.HAReadOnlyStandby,
@@ -21483,7 +21571,11 @@ pub const ApiHttpServer = struct {
             error.IndexRebuilding => return error.IndexRebuilding,
             error.HAReadRequiresPrimary, error.ReadRequiresPrimary => return error.ReadRequiresPrimary,
             error.LeaderUnavailable => return error.LeaderUnavailable,
-            error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => return error.ReadUnavailable,
+            error.HAReadWaitForApply,
+            error.HAReadWaitForMetadata,
+            error.ReadUnavailable,
+            error.PersistentDescriptorAdmissionExhausted,
+            => return error.ReadUnavailable,
             error.ModelNotFound => return error.ModelNotFound,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
@@ -21492,6 +21584,12 @@ pub const ApiHttpServer = struct {
             error.EmbedRateLimited => return error.EmbedRateLimited,
             error.EmbedTransientFailure => return error.EmbedTransientFailure,
             error.EmbedUpstreamFailure => return error.EmbedUpstreamFailure,
+            error.InvalidManifest => return error.InvalidManifest,
+            error.InvalidTableFile => return error.InvalidTableFile,
+            error.TableBlockChecksumMismatch => return error.TableBlockChecksumMismatch,
+            error.CorruptInput => return error.CorruptInput,
+            error.UnsupportedVersion => return error.UnsupportedVersion,
+            error.Corrupted => return error.Corrupted,
             else => {
                 std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
@@ -21649,10 +21747,21 @@ pub const ApiHttpServer = struct {
                 error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
                 error.IndexRebuilding => return error.IndexRebuilding,
                 error.HAReadRequiresPrimary, error.ReadRequiresPrimary => return error.ReadRequiresPrimary,
-                error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => return error.ReadUnavailable,
                 error.LeaderUnavailable => return error.LeaderUnavailable,
+                error.HAReadWaitForApply,
+                error.HAReadWaitForMetadata,
+                error.ReadUnavailable,
+                error.PersistentDescriptorAdmissionExhausted,
+                => return error.ReadUnavailable,
                 error.Timeout => return error.Timeout,
                 error.Cancelled => return error.Cancelled,
+                error.InvalidManifest,
+                error.InvalidTableFile,
+                error.TableBlockChecksumMismatch,
+                error.CorruptInput,
+                error.UnsupportedVersion,
+                error.Corrupted,
+                => return err,
                 else => {
                     std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
                     return error.InternalFailure;
@@ -21684,10 +21793,21 @@ pub const ApiHttpServer = struct {
             error.IndexRebuilding => return error.IndexRebuilding,
             error.TableNotFound, error.NotFound => return error.NotFound,
             error.HAReadRequiresPrimary, error.ReadRequiresPrimary => return error.ReadRequiresPrimary,
-            error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => return error.ReadUnavailable,
+            error.HAReadWaitForApply,
+            error.HAReadWaitForMetadata,
+            error.ReadUnavailable,
+            error.PersistentDescriptorAdmissionExhausted,
+            => return error.ReadUnavailable,
             error.Timeout => return error.Timeout,
             error.LeaderUnavailable => return error.LeaderUnavailable,
             error.Cancelled => return error.Cancelled,
+            error.InvalidManifest,
+            error.InvalidTableFile,
+            error.TableBlockChecksumMismatch,
+            error.CorruptInput,
+            error.UnsupportedVersion,
+            error.Corrupted,
+            => return err,
             else => {
                 std.log.err("foreign public table query execution failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
@@ -21747,10 +21867,21 @@ pub const ApiHttpServer = struct {
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.IndexRebuilding => return error.IndexRebuilding,
             error.HAReadRequiresPrimary, error.ReadRequiresPrimary => return error.ReadRequiresPrimary,
-            error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => return error.ReadUnavailable,
             error.LeaderUnavailable => return error.LeaderUnavailable,
+            error.HAReadWaitForApply,
+            error.HAReadWaitForMetadata,
+            error.ReadUnavailable,
+            error.PersistentDescriptorAdmissionExhausted,
+            => return error.ReadUnavailable,
             error.Timeout => return error.Timeout,
             error.Cancelled => return error.Cancelled,
+            error.InvalidManifest,
+            error.InvalidTableFile,
+            error.TableBlockChecksumMismatch,
+            error.CorruptInput,
+            error.UnsupportedVersion,
+            error.Corrupted,
+            => return err,
             else => {
                 std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
@@ -22909,6 +23040,7 @@ pub const ApiHttpServer = struct {
                 _ = table_writes_source.createIndex(alloc, table_name, index_name, stored_index_json) catch |err| switch (err) {
                     error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
                     error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+                    error.PersistentDescriptorAdmissionExhausted, error.ResourceBudgetExceeded => return error.Backpressured,
                     else => {
                         std.log.err("public create index local apply failed table={s} index={s} err={}", .{ table_name, index_name, err });
                         return error.InternalFailure;
@@ -23074,7 +23206,11 @@ pub const ApiHttpServer = struct {
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
             error.HAReadRequiresPrimary => return error.ReadRequiresPrimary,
             error.LeaderUnavailable => return error.LeaderUnavailable,
-            error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => return error.ReadUnavailable,
+            error.HAReadWaitForApply,
+            error.HAReadWaitForMetadata,
+            error.ReadUnavailable,
+            error.PersistentDescriptorAdmissionExhausted,
+            => return error.ReadUnavailable,
             error.InvalidArgument => return error.NotFound,
             else => {
                 std.log.err("public document artifact manifest lookup failed table={s} doc={s} artifact={s} err={}", .{ table_name, doc_key, artifact_name, err });
@@ -23095,7 +23231,11 @@ pub const ApiHttpServer = struct {
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
             error.HAReadRequiresPrimary => return error.ReadRequiresPrimary,
             error.LeaderUnavailable => return error.LeaderUnavailable,
-            error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => return error.ReadUnavailable,
+            error.HAReadWaitForApply,
+            error.HAReadWaitForMetadata,
+            error.ReadUnavailable,
+            error.PersistentDescriptorAdmissionExhausted,
+            => return error.ReadUnavailable,
             error.InvalidArgument => return error.NotFound,
             else => {
                 std.log.err("public document artifact manifest list failed table={s} doc={s} err={}", .{ table_name, doc_key, err });
@@ -27438,7 +27578,22 @@ pub const ApiHttpServer = struct {
             error.DocIdentityNamespaceMismatch => try textResponse(self.alloc, 503, "doc identity unavailable"),
             error.IndexRebuilding => try indexRebuildingResponse(self.alloc),
             error.HAReadRequiresPrimary, error.ReadRequiresPrimary => try textResponse(self.alloc, 503, "read requires primary"),
-            error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => try textResponse(self.alloc, 503, "standby read unavailable"),
+            error.HAReadWaitForApply,
+            error.HAReadWaitForMetadata,
+            error.ReadUnavailable,
+            => try textResponse(self.alloc, 503, "standby read unavailable"),
+            error.PersistentDescriptorAdmissionExhausted => try textResponse(self.alloc, 503, "storage read temporarily unavailable"),
+            error.InvalidManifest,
+            error.InvalidTableFile,
+            error.TableBlockChecksumMismatch,
+            error.CorruptInput,
+            error.UnsupportedVersion,
+            error.Corrupted,
+            => .{
+                .status = 500,
+                .content_type = try self.alloc.dupe(u8, "application/json"),
+                .body = try public_table_http.tableStorageUnreadableBody(self.alloc, err),
+            },
             else => {
                 std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
                 return try textResponse(self.alloc, 500, "query failed");
@@ -30281,6 +30436,11 @@ fn testMetadataServiceSourceWithoutLifecycle(svc: *metadata_service.MetadataServ
 
         fn updateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!void {
             const service: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+            _ = try updateSchemaOnService(service, alloc, table_name, schema_json);
+        }
+
+        fn updateSchemaVersioned(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!u32 {
+            const service: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
             return try updateSchemaOnService(service, alloc, table_name, schema_json);
         }
 
@@ -30304,6 +30464,7 @@ fn testMetadataServiceSourceWithoutLifecycle(svc: *metadata_service.MetadataServ
             .create_table = V.createTable,
             .drop_table = V.dropTable,
             .update_schema = V.updateSchema,
+            .update_schema_versioned = V.updateSchemaVersioned,
             .create_index = V.createIndex,
             .drop_index = V.dropIndex,
         },
@@ -47935,6 +48096,16 @@ test "api http server updates local table schema through bound write source" {
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, table_source.source());
 
+    var managed_version_resp = try server.handle(.{
+        .method = .PUT,
+        .uri = "/tables/docs/schema",
+        .content_type = "application/json",
+        .body = "{\"version\":7}",
+    });
+    defer managed_version_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 400), managed_version_resp.status);
+    try std.testing.expectEqualStrings("schema.version is managed by Antfly; omit it", managed_version_resp.body);
+
     const schema_body = "{\"default_type\":\"doc\",\"enforce_types\":true,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\"}}}}}}";
     var update_resp = try server.handle(.{
         .method = .PUT,
@@ -51640,12 +51811,14 @@ test "api http server preserves public query availability errors" {
         query_error: anyerror,
         status: u16,
         body: []const u8,
+        json: bool = false,
     }{
         .{ .query_error = error.DocIdentityNamespaceMismatch, .status = 503, .body = "doc identity unavailable" },
         .{ .query_error = error.ReadUnavailable, .status = 503, .body = "standby read unavailable" },
         .{ .query_error = error.ReadRequiresPrimary, .status = 503, .body = "read requires primary" },
-        .{ .query_error = error.IndexRebuilding, .status = 503, .body = "{\"code\":\"index_rebuilding\",\"message\":\"required index is rebuilding\",\"retryable\":true}" },
+        .{ .query_error = error.IndexRebuilding, .status = 503, .body = "{\"code\":\"index_rebuilding\",\"message\":\"required index is rebuilding\",\"retryable\":true}", .json = true },
         .{ .query_error = error.TableNotFound, .status = 404, .body = "not found" },
+        .{ .query_error = error.InvalidManifest, .status = 500, .body = "{\"code\":\"table_storage_unreadable\",\"error\":\"InvalidManifest\",\"message\":\"table storage unreadable\",\"retryable\":false}", .json = true },
     };
     for (cases) |case| {
         var reads = FakeReads{ .query_error = case.query_error };
@@ -51659,6 +51832,7 @@ test "api http server preserves public query availability errors" {
 
         try std.testing.expectEqual(case.status, resp.status);
         try std.testing.expectEqualStrings(case.body, resp.body);
+        try std.testing.expectEqualStrings(if (case.json) "application/json" else "text/plain", resp.content_type.?);
 
         var multi_resp = try server.handlePublicTableMultiQuery("docs",
             \\{"query":{"match_all":{}}}
@@ -51666,6 +51840,7 @@ test "api http server preserves public query availability errors" {
         defer multi_resp.deinit(alloc);
         try std.testing.expectEqual(case.status, multi_resp.status);
         try std.testing.expectEqualStrings(case.body, multi_resp.body);
+        try std.testing.expectEqualStrings(if (case.json) "application/json" else "text/plain", multi_resp.content_type.?);
     }
 }
 
@@ -54118,6 +54293,142 @@ test "api http server create table with local writes waits for projected presenc
     try std.testing.expectEqual(@as(u32, 0), source.lifecycle_wait_calls.load(.monotonic));
 }
 
+test "schema projection expectation uses backend committed generation" {
+    const FakeSource = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+    const source = StatusSource{
+        .ptr = undefined,
+        .vtable = &.{ .status = FakeSource.status },
+    };
+    var server = ApiHttpServer.init(std.testing.allocator, .{}, source, null, null);
+    const table: metadata_table_manager.TableRecord = .{
+        .table_id = 7,
+        .name = "docs",
+        .schema_json = "{\"version\":1}",
+        .indexes_json = "{\"full_text_index_v1\":{\"type\":\"full_text\"}}",
+        .replication_sources_json = "[]",
+        .placement_role = "data",
+    };
+
+    var authoritative = try server.schemaProjectionExpectationAlloc(
+        std.testing.allocator,
+        &table,
+        "{\"default_type\":\"doc\"}",
+        3,
+    );
+    defer authoritative.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 3), try tables_api.schemaVersion(authoritative.schema_json));
+    try std.testing.expectEqual(@as(?[]u8, null), authoritative.indexes_json);
+
+    var legacy = try server.schemaProjectionExpectationAlloc(
+        std.testing.allocator,
+        &table,
+        "{\"default_type\":\"doc\"}",
+        null,
+    );
+    defer legacy.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 2), try tables_api.schemaVersion(legacy.schema_json));
+    try std.testing.expect(legacy.indexes_json != null);
+    try std.testing.expect(std.mem.indexOf(u8, legacy.indexes_json.?, "full_text_index_v2") != null);
+}
+
+test "status source prefers authoritative schema generation result" {
+    const FakeSource = struct {
+        legacy_calls: usize = 0,
+        versioned_calls: usize = 0,
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn legacy(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.legacy_calls += 1;
+        }
+
+        fn versioned(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8) !u32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.versioned_calls += 1;
+            return 7;
+        }
+    };
+
+    var fake = FakeSource{};
+    const source = StatusSource{
+        .ptr = &fake,
+        .vtable = &.{
+            .status = FakeSource.status,
+            .update_schema = FakeSource.legacy,
+            .update_schema_versioned = FakeSource.versioned,
+        },
+    };
+    try std.testing.expectEqual(@as(?u32, 7), try source.updateSchema(std.testing.allocator, "docs", "{}"));
+    try std.testing.expectEqual(@as(usize, 0), fake.legacy_calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.versioned_calls);
+}
+
+test "schema projection detects a superseding backend generation" {
+    const FakeSource = struct {
+        table: metadata_table_manager.TableRecord = .{
+            .table_id = 7,
+            .name = "docs",
+            .schema_json = "{\"version\":3,\"default_type\":\"doc\"}",
+            .indexes_json = "{\"full_text_index_v3\":{\"type\":\"full_text\"}}",
+            .placement_role = "data",
+        },
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @as([*]metadata_table_manager.TableRecord, @ptrCast(&self.table))[0..1],
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var fake = FakeSource{};
+    var server = ApiHttpServer.init(std.testing.allocator, .{}, fake.iface(), null, null);
+    var expectation = try server.schemaProjectionExpectationAlloc(
+        std.testing.allocator,
+        &fake.table,
+        "{\"default_type\":\"doc\"}",
+        3,
+    );
+    defer expectation.deinit(std.testing.allocator);
+
+    try server.waitForSchemaUpdateProjection("docs", expectation, 3);
+    fake.table.schema_json = "{\"version\":4,\"default_type\":\"other\"}";
+    try std.testing.expectError(
+        error.TableGenerationChanged,
+        server.waitForSchemaUpdateProjection("docs", expectation, 3),
+    );
+}
+
 test "api http server rejects unsupported table index before metadata publication" {
     const FakeSource = struct {
         create_calls: usize = 0,
@@ -54153,6 +54464,45 @@ test "api http server rejects unsupported table index before metadata publicatio
     defer resp.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u16, 400), resp.status);
+    try std.testing.expectEqual(@as(usize, 0), source.create_calls);
+}
+
+test "api http server rejects caller-managed schema version before metadata publication" {
+    const FakeSource = struct {
+        create_calls: usize = 0,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .create_table = createTable,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn createTable(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: tables_api.CreateTableRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.create_calls += 1;
+        }
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
+    var resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs",
+        .content_type = "application/json",
+        .body = "{\"schema\":{\"version\":7}}",
+    });
+    defer resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 400), resp.status);
+    try std.testing.expectEqualStrings("schema.version is managed by Antfly; omit it", resp.body);
     try std.testing.expectEqual(@as(usize, 0), source.create_calls);
 }
 
@@ -54598,9 +54948,12 @@ test "api index status uses read runtime status without consulting write source"
     try std.testing.expectEqual(@as(?u64, 9), parsed.value.status.doc_count);
     try std.testing.expectEqual(@as(?u64, 9), parsed.value.status.total_indexed);
     try std.testing.expectEqual(@as(?u64, 17), parsed.value.status.node_count);
-    try std.testing.expectEqual(@as(?u64, 7), parsed.value.status.replay_applied_sequence);
+    // This legacy-shaped observation has no generation-scoped coverage
+    // witness. Preserve its authoritative replay debt instead of inferring
+    // readiness from physical index cardinality alone.
+    try std.testing.expectEqual(@as(?u64, 3), parsed.value.status.replay_applied_sequence);
     try std.testing.expectEqual(@as(?u64, 7), parsed.value.status.replay_target_sequence);
-    try std.testing.expectEqual(@as(?bool, false), parsed.value.status.replay_catch_up_required);
+    try std.testing.expectEqual(@as(?bool, true), parsed.value.status.replay_catch_up_required);
     const shard_status = parsed.value.shard_status.?;
     const shard_10 = shard_status.@"10".?;
     try std.testing.expectEqual(@as(?u64, 9), shard_10.doc_count);

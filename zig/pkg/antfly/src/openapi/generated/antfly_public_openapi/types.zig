@@ -1205,7 +1205,6 @@ pub const ConnectedModelType = enum {
     generator,
     reranker,
     chunker,
-    recognizer,
     classifier,
     rewriter,
     reader,
@@ -1219,7 +1218,6 @@ pub const ConnectedModelType = enum {
             .generator => "generator",
             .reranker => "reranker",
             .chunker => "chunker",
-            .recognizer => "recognizer",
             .classifier => "classifier",
             .rewriter => "rewriter",
             .reader => "reader",
@@ -1240,7 +1238,6 @@ pub const ConnectedModelType = enum {
             .{ "generator", .generator },
             .{ "reranker", .reranker },
             .{ "chunker", .chunker },
-            .{ "recognizer", .recognizer },
             .{ "classifier", .classifier },
             .{ "rewriter", .rewriter },
             .{ "reader", .reader },
@@ -2193,7 +2190,7 @@ pub const InferenceConnection = struct {
     names: ?[]const []const u8 = null,
     /// Model types this instance is configured for.
     configured_model_types: ?[]const ConnectedModelType = null,
-    /// Models reported by the provider, grouped by model type. Keys are pluralized ConnectedModelType values ("embedders", "generators", "rerankers", "chunkers", "recognizers", "classifiers", "rewriters", "readers", "transcribers", "extractors") plus "other" for models the provider's listing API does not classify by task. Populated only when the request includes the "models" expansion.
+    /// Models reported by the provider, grouped by model type. Keys are pluralized ConnectedModelType values ("embedders", "generators", "rerankers", "chunkers", "classifiers", "rewriters", "readers", "transcribers", "extractors") plus "other" for models the provider's listing API does not classify by task. Populated only when the request includes the "models" expansion.
     models: ?std.json.ArrayHashMap([]const ConnectedModel) = null,
 };
 
@@ -6986,6 +6983,41 @@ pub const TableStatus = struct {
     storage_status: StorageStatus,
     /// Table-level generated artifact enrichments registered outside a specific index.
     artifact_enrichments: ?[]const antfly_indexes_openapi.EnrichmentConfig = null,
+};
+
+/// Stable client-routing code for unreadable table storage.
+pub const TableStorageUnreadableErrorCode = enum {
+    table_storage_unreadable,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .table_storage_unreadable => "table_storage_unreadable",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "table_storage_unreadable", .table_storage_unreadable },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// A non-retryable table-storage integrity or format failure.
+pub const TableStorageUnreadableError = struct {
+    /// Stable client-routing code for unreadable table storage.
+    code: TableStorageUnreadableErrorCode,
+    /// Concrete storage error class, such as InvalidManifest.
+    @"error": []const u8,
+    /// Human-readable summary.
+    message: []const u8,
+    /// Always false; recovery requires repair, restore, or table replacement.
+    retryable: bool,
 };
 
 /// Tablespace catalog object. SQL `CREATE TABLESPACE` maps to this lifecycle surface.

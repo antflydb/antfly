@@ -32,9 +32,9 @@ const workflow_commands = [_]common.CommandSpec{
         .native_link = .default,
     },
     .{
-        .name = "gliner2-production-readiness",
+        .name = "gliner2-entity-training-readiness",
         .root_source_file = "src/finetune/run_gliner2_production_readiness.zig",
-        .description = "Run the GLiNER2 production-readiness gate: dataset checks, training, artifact validation, semantic eval, and optional materialization",
+        .description = "Run scoped GLiNER2 entity-training checks: dataset checks, training, artifact validation, entity eval, and optional materialization",
         .imports = &.{ .build_options, .ml, .inference_internal, .inference_hf_tokenizer, .protobuf, .inference_linalg },
         .native_link = .default,
     },

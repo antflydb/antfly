@@ -1201,7 +1201,7 @@ pub const TableSchemaStorageMode = enum {
 
 /// Schema definition for a table with multiple document types
 pub const TableSchema = struct {
-    /// Version of the schema. Used for migrations.
+    /// Backend-managed schema generation used for migrations. Omit it from create and update requests.
     version: ?i64 = null,
     /// Storage profile for the table. - "document" (default): schemaless JSON documents with optional, soft schema validation. All indexes are derived from the document. - "relational": required closed schema with typed columns. Documents must match a declared type; declared scalar properties are stored as typed columns for columnar predicate pushdown and aggregation. A field typed "json" stores a subtree that is still indexed like a document. Implies enforce_types and closed document types.
     storage_mode: ?TableSchemaStorageMode = null,

@@ -49,6 +49,7 @@ const internal_keys = @import("../internal_keys.zig");
 const lsm_backend_mod = @import("../lsm_backend/mod.zig");
 const mapper = @import("document_mapper.zig");
 const mem_backend_mod = @import("../mem_backend.zig");
+const text_merge_runtime_mod = @import("maintenance/text_merge_runtime.zig");
 const promotion_runtime_mod = @import("promotion_runtime.zig");
 const range_cardinality = @import("range_cardinality.zig");
 const replay_source_mod = @import("derived/replay_source.zig");
@@ -1132,18 +1133,29 @@ pub fn attachInlineUpsertDocumentValues(
     }
 }
 
-pub fn applyTextDocumentsForIndex(
+const CollectedTextDocumentWrites = struct {
+    alloc: Allocator,
+    writes: std.ArrayListUnmanaged(types.BatchWrite) = .empty,
+    owned_values: std.ArrayListUnmanaged([]u8) = .empty,
+    missing_required: usize = 0,
+
+    fn deinit(self: *@This()) void {
+        for (self.owned_values.items) |value| self.alloc.free(value);
+        self.owned_values.deinit(self.alloc);
+        self.writes.deinit(self.alloc);
+        self.* = undefined;
+    }
+};
+
+fn collectTextDocumentWritesForIndex(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
-    index_manager: *index_manager_mod.IndexManager,
     documents: []const derived_types.DerivedDocument,
     index_name: []const u8,
+    chunk_backed: bool,
     byte_range: types.ByteRange,
-    delete_keys: []const []const u8,
     opts: CollectTextDocumentWritesOptions,
-    index_opts: index_manager_mod.IndexBatchOptions,
-) !usize {
-    const chunk_name = index_manager.textChunkName(index_name);
+) !CollectedTextDocumentWrites {
     const PendingTextWrite = struct {
         doc_key: []const u8,
         store_key: []u8,
@@ -1156,17 +1168,8 @@ pub fn applyTextDocumentsForIndex(
         pending.deinit(alloc);
     }
 
-    var writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
-    defer writes.deinit(alloc);
-
-    // Owned JSON buffers for store-read documents that were materialized from a
-    // relational typed row. Inline/cleaned values are borrowed and not tracked
-    // here; only freshly reconstructed bytes need freeing.
-    var materialized_values = std.ArrayListUnmanaged([]u8).empty;
-    defer {
-        for (materialized_values.items) |buf| alloc.free(buf);
-        materialized_values.deinit(alloc);
-    }
+    var result = CollectedTextDocumentWrites{ .alloc = alloc };
+    errdefer result.deinit();
 
     const trust_inline = if (opts.prefer_inline_when_store_tip_matches_sequence) |sequence|
         store.nextReplaySequence(sequence + 1) == sequence + 1
@@ -1176,9 +1179,9 @@ pub fn applyTextDocumentsForIndex(
     for (documents) |doc| {
         if (doc.action != .upsert) continue;
         if (!replayDocumentKeyInRange(byte_range, doc.key)) continue;
-        if (!documentTargetsTextIndex(doc, index_name, chunk_name != null)) continue;
+        if (!documentTargetsTextIndex(doc, index_name, chunk_backed)) continue;
         if (trust_inline and doc.cleaned_value != null) {
-            try writes.append(alloc, .{
+            try result.writes.append(alloc, .{
                 .key = doc.key,
                 .value = doc.cleaned_value.?,
             });
@@ -1191,15 +1194,10 @@ pub fn applyTextDocumentsForIndex(
         });
     }
 
-    if (pending.items.len == 0) {
-        try index_manager.applyTextBatchByNameWithOptions(store, index_name, delete_keys, writes.items, index_opts);
-        return 0;
-    }
+    if (pending.items.len == 0) return result;
 
     var txn = try store.beginProbeTxn();
     defer txn.abort();
-    var missing_required: usize = 0;
-
     const SortContext = struct {};
     std.mem.sort(PendingTextWrite, pending.items, SortContext{}, struct {
         fn lessThan(_: SortContext, lhs: PendingTextWrite, rhs: PendingTextWrite) bool {
@@ -1221,25 +1219,33 @@ pub fn applyTextDocumentsForIndex(
     for (pending.items, 0..) |item, i| {
         const raw = read_values[i] orelse item.inline_value orelse {
             if (try replayDocumentIsDurablyDeleted(alloc, &txn, item.doc_key)) continue;
-            missing_required += 1;
+            result.missing_required += 1;
             continue;
         };
-        // A store-read relational document must be a typed row. Inline values
-        // are already cleaned JSON and document-mode store values are borrowed.
-        const value = if (read_values[i] != null and opts.relational_base_rows) blk: {
-            const json = try mapper.materializeRelationalRowValueAlloc(alloc, raw);
-            try materialized_values.append(alloc, json);
-            break :blk json;
+        const stable_value = if (read_values[i] != null) blk: {
+            const owned = if (opts.relational_base_rows)
+                try mapper.materializeRelationalRowValueAlloc(alloc, raw)
+            else
+                try alloc.dupe(u8, raw);
+            result.owned_values.append(alloc, owned) catch |err| {
+                alloc.free(owned);
+                return err;
+            };
+            break :blk owned;
         } else raw;
-        try writes.append(alloc, .{
+        result.writes.append(alloc, .{
             .key = item.doc_key,
-            .value = value,
-        });
+            .value = stable_value,
+        }) catch |err| {
+            if (read_values[i] != null) {
+                const owned = result.owned_values.pop().?;
+                alloc.free(owned);
+            }
+            return err;
+        };
     }
 
-    if (missing_required != 0) return missing_required;
-    try index_manager.applyTextBatchByNameWithOptions(store, index_name, delete_keys, writes.items, index_opts);
-    return missing_required;
+    return result;
 }
 
 fn documentTargetsTextIndex(doc: derived_types.DerivedDocument, index_name: []const u8, is_chunk_index: bool) bool {
@@ -2722,6 +2728,19 @@ pub fn Impl(comptime DB: type) type {
             }
         }
 
+        fn applyDerivedBatchToIndex(self: *DB, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef) !void {
+            const resources = self.core.asyncResources();
+            const ctx = AsyncContext{
+                .alloc = self.alloc,
+                .store = resources.store,
+                .applied_sequence_checkpoint_path = resources.applied_sequence_checkpoint_path,
+                .index_manager = resources.index_manager,
+                .apply_mutex = resources.apply_mutex,
+                .text_merge_runtime = self.text_merge_runtime,
+            };
+            try applyDerivedBatchToIndexContext(&ctx, batch, index_ref);
+        }
+
         pub fn applyDerivedBatchToIndexContext(ctx: *const AsyncContext, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef) !void {
             try applyDerivedBatchToIndexContextProfiled(ctx, batch, index_ref, null);
         }
@@ -2918,36 +2937,105 @@ pub fn Impl(comptime DB: type) type {
         }
 
         pub fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef, profile: ?*BatchProfile) !void {
+            if (index_ref.kind == .full_text) {
+                const apply_start_ns = monotonicTimeNs();
+                const text_replay_options: index_manager_mod.IndexBatchOptions = .{
+                    .compact_text = false,
+                    .compact_text_segment_threshold = null,
+                    .defer_text_compaction = true,
+                };
+                const delete_keys = try collectTextReplayDeleteKeys(ctx.alloc, batch);
+                defer if (delete_keys.len > 0) ctx.alloc.free(delete_keys);
+                var publication_context = try ctx.index_manager.acquireTextPublicationContext(ctx.alloc, index_ref.name);
+                defer publication_context.deinit();
+                var collected = try collectTextDocumentWritesForIndex(
+                    ctx.alloc,
+                    ctx.store,
+                    batch.documents,
+                    index_ref.name,
+                    publication_context.chunk_backed,
+                    ctx.index_manager.byte_range,
+                    .{
+                        .prefer_inline_when_store_tip_matches_sequence = batch.sequence,
+                        .relational_base_rows = ctx.relational_base_rows,
+                    },
+                );
+                defer collected.deinit();
+                if (collected.missing_required != 0) return error.ReplayDocumentNotVisible;
+
+                const reservation_limit = if (ctx.text_merge_runtime) |runtime| runtime.producerSegmentReservationLimit() else std.math.maxInt(usize);
+                var write_start: usize = 0;
+                var applied_first_chunk = false;
+                while (!applied_first_chunk or write_start < collected.writes.items.len) {
+                    const plan_base = write_start;
+                    var publication_plan = try ctx.index_manager.planTextBatchPublication(
+                        index_ref.name,
+                        publication_context,
+                        collected.writes.items[plan_base..],
+                        reservation_limit,
+                    );
+                    defer publication_plan.deinit();
+
+                    var relative_start: usize = 0;
+                    var replan_suffix = false;
+                    for (publication_plan.chunks) |planned| {
+                        const write_end = plan_base + planned.end;
+                        const write_chunk = collected.writes.items[plan_base + relative_start .. write_end];
+                        var applied_chunk = false;
+                        var merge_permit: ?text_merge_runtime_mod.TextMergeRuntime.ProducerPermit = null;
+                        if (ctx.text_merge_runtime) |runtime| {
+                            merge_permit = try runtime.acquireProducerPermit(
+                                index_ref.name,
+                                planned.estimate.segment_count,
+                                planned.estimate.byte_count,
+                            );
+                        }
+                        defer if (merge_permit) |*permit| permit.release();
+
+                        var index_apply_guard = try ctx.index_manager.lockManagedIndexApply(index_ref);
+                        defer index_apply_guard.unlock();
+                        const before_apply = try ctx.index_manager.refreshTextPublicationContextAssumeCatalogLocked(
+                            index_ref.name,
+                            &publication_context,
+                        );
+                        if (before_apply == .projection_changed) {
+                            replan_suffix = true;
+                        } else {
+                            try ctx.index_manager.applyTextBatchByNameWithOptions(
+                                ctx.store,
+                                index_ref.name,
+                                if (applied_first_chunk) &.{} else delete_keys,
+                                write_chunk,
+                                text_replay_options,
+                            );
+                            applied_chunk = true;
+                            const after_apply = try ctx.index_manager.refreshTextPublicationContextAssumeCatalogLocked(
+                                index_ref.name,
+                                &publication_context,
+                            );
+                            replan_suffix = after_apply == .projection_changed;
+                            if (ctx.text_merge_runtime) |runtime| runtime.notify();
+                        }
+
+                        if (!applied_chunk) break;
+                        applied_first_chunk = true;
+                        write_start = write_end;
+                        relative_start = planned.end;
+                        if (replan_suffix and write_start < collected.writes.items.len) break;
+                    }
+
+                    if (write_start == collected.writes.items.len) break;
+                    std.debug.assert(replan_suffix);
+                }
+                std.debug.assert(applied_first_chunk and write_start == collected.writes.items.len);
+                if (profile) |active_profile| DB.WritePathCallbacks.record_profile_ns(profile, &active_profile.full_text_apply_ns, apply_start_ns);
+                return;
+            }
+
             var index_apply_guard = try ctx.index_manager.lockManagedIndexApply(index_ref);
             defer index_apply_guard.unlock();
             switch (index_ref.kind) {
-                .full_text => {
-                    const apply_start_ns = monotonicTimeNs();
-                    const text_replay_options: index_manager_mod.IndexBatchOptions = .{
-                        .compact_text = false,
-                        .compact_text_segment_threshold = null,
-                        .defer_text_compaction = true,
-                    };
-                    const delete_keys = try collectTextReplayDeleteKeys(ctx.alloc, batch);
-                    defer if (delete_keys.len > 0) ctx.alloc.free(delete_keys);
-
-                    const missing_required = try applyTextDocumentsForIndex(
-                        ctx.alloc,
-                        ctx.store,
-                        ctx.index_manager,
-                        batch.documents,
-                        index_ref.name,
-                        ctx.index_manager.byte_range,
-                        delete_keys,
-                        .{
-                            .prefer_inline_when_store_tip_matches_sequence = batch.sequence,
-                            .relational_base_rows = ctx.relational_base_rows,
-                        },
-                        text_replay_options,
-                    );
-                    if (missing_required != 0) return error.ReplayDocumentNotVisible;
-                    if (profile) |active_profile| DB.WritePathCallbacks.record_profile_ns(profile, &active_profile.full_text_apply_ns, apply_start_ns);
-                },
+                .full_text => unreachable,
                 .dense_vector => {
                     const dense_apply_start_ns = monotonicTimeNs();
                     const dense_finish_options = denseCatchUpFinishOptions();
@@ -3359,9 +3447,7 @@ pub fn Impl(comptime DB: type) type {
             var ctx = self.batchContext();
             try applyDerivedBatchContextProfiled(&ctx, batch, profile);
             if (self.text_merge_runtime) |runtime| {
-                if (self.async_context.text_merge_deferred.load(.acquire)) return;
                 runtime.notify();
-                runtime.applyBackpressure();
             }
             if (self.sparse_compaction_runtime) |runtime| runtime.notify();
             if (self.graph_metric_runtime) |runtime| runtime.notify();
@@ -3375,9 +3461,7 @@ pub fn Impl(comptime DB: type) type {
             var ctx = self.batchContext();
             try applyDerivedBatchTargetsContextProfiled(&ctx, batch, index_names, profile);
             if (self.text_merge_runtime) |runtime| {
-                if (self.async_context.text_merge_deferred.load(.acquire)) return;
                 runtime.notify();
-                runtime.applyBackpressure();
             }
             if (self.sparse_compaction_runtime) |runtime| runtime.notify();
             if (self.graph_metric_runtime) |runtime| runtime.notify();
@@ -3417,6 +3501,7 @@ pub fn Impl(comptime DB: type) type {
                         .index_manager = ctx.index_manager,
                         .apply_mutex = ctx.apply_mutex,
                         .dense_bulk_session_scope = ctx.dense_bulk_session_scope,
+                        .text_merge_runtime = if (ctx.async_context) |active| active.text_merge_runtime else null,
                         .relational_base_rows = ctx.relational_base_rows,
                     };
                     try DB.DerivedAsyncCallbacks.apply_derived_batch_to_index_context_profiled(&async_ctx, batch, index_ref, profile);
@@ -3956,6 +4041,7 @@ pub fn Impl(comptime DB: type) type {
                 .dense_bulk_session_scope = replay_ctx.dense_bulk_session_scope,
                 .relational_base_rows = ctx.relational_base_rows,
                 .require_graph_resolution_contract = true,
+                .text_merge_runtime = if (ctx.async_context) |active| active.text_merge_runtime else null,
             };
             if (DB.WritePathCallbacks.bench_metrics_enabled()) {
                 var profile = BatchProfile{};
@@ -4330,9 +4416,7 @@ pub fn Impl(comptime DB: type) type {
                 });
             }
             if (index_ref.kind == .full_text) if (ctx.text_merge_runtime) |runtime| {
-                if (ctx.text_merge_deferred.load(.acquire)) return true;
                 runtime.notify();
-                runtime.applyBackpressure();
             };
             if (index_ref.kind == .sparse_vector) if (ctx.sparse_compaction_runtime) |runtime| {
                 runtime.notify();

@@ -279,30 +279,6 @@ pub fn schemaVersion(schema_json: []const u8) !u32 {
     };
 }
 
-pub fn documentSchemasChanged(alloc: std.mem.Allocator, current_schema_json: []const u8, next_schema_json: []const u8) !bool {
-    const current = try extractCanonicalObjectField(alloc, current_schema_json, "document_schemas");
-    defer if (current) |value| alloc.free(value);
-    const next = try extractCanonicalObjectField(alloc, next_schema_json, "document_schemas");
-    defer if (next) |value| alloc.free(value);
-
-    if (current == null and next == null) return false;
-    if (current == null or next == null) return true;
-    return !std.mem.eql(u8, current.?, next.?);
-}
-
-fn extractCanonicalObjectField(alloc: std.mem.Allocator, schema_json: []const u8, field_name: []const u8) !?[]u8 {
-    if (schema_json.len == 0) return null;
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, schema_json, .{});
-    defer parsed.deinit();
-
-    const root = switch (parsed.value) {
-        .object => |object| object,
-        else => return error.InvalidSchemaUpdateRequest,
-    };
-    const value = root.get(field_name) orelse return null;
-    return try stringifyJsonValue(alloc, value);
-}
-
 pub fn normalizeSchemaVersion(alloc: std.mem.Allocator, schema_json: []const u8, version: u32) ![]u8 {
     const source = if (schema_json.len > 0) schema_json else "{}";
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, source, .{});

@@ -21,6 +21,7 @@
 const std = @import("std");
 const httpx = @import("httpx");
 const builtin = @import("builtin");
+const managed_receipt = @import("managed_receipt.zig");
 
 pub const default_max_artifact_bytes: u64 = 64 * 1024 * 1024 * 1024;
 pub const default_max_model_bytes: u64 = 128 * 1024 * 1024 * 1024;
@@ -43,21 +44,15 @@ pub const HubConfig = struct {
     max_model_bytes: u64 = default_max_model_bytes,
 };
 
-pub const managed_download_in_progress_filename = ".antfly-download-in-progress";
-pub const managed_download_plan_filename = ".antfly-download-plan.json";
-pub const managed_download_complete_filename = ".antfly-download-complete.json";
+pub const managed_download_in_progress_filename = managed_receipt.in_progress_filename;
+pub const managed_download_plan_filename = managed_receipt.plan_filename;
+pub const managed_download_complete_filename = managed_receipt.complete_filename;
 pub const managed_download_lock_filename = ".antfly-download.lock";
+const managed_download_staging_suffix = ".antfly-download-staging";
+const managed_download_backup_suffix = ".antfly-download-backup";
 
-const ManagedArtifactReceipt = struct {
-    path: []const u8,
-    size: u64,
-    sha256: ?[]const u8 = null,
-};
-
-const ManagedDownloadReceipt = struct {
-    version: u32 = 1,
-    artifacts: []const ManagedArtifactReceipt,
-};
+const ManagedArtifactReceipt = managed_receipt.ArtifactReceipt;
+const ManagedDownloadReceipt = managed_receipt.DownloadReceipt;
 
 pub const ManagedDownloadState = enum {
     unmanaged,
@@ -104,6 +99,7 @@ pub const HubFile = struct {
     name: []const u8,
     size: ?u64 = null,
     sha256: ?[]const u8 = null,
+    git_blob_sha1: ?[]const u8 = null,
 };
 
 pub const PayloadSupportSummary = struct {
@@ -147,6 +143,7 @@ const always_files = [_][]const u8{
     "added_tokens.json",
     "gliner_config.json",
     "termite_bundle.json",
+    "antfly_inference_bundle.json",
     "spm.model",
     "model_manifest.json",
     "antfly_metadata.json",
@@ -263,9 +260,12 @@ const gguf_quant_preference = [_][]const u8{
     "Q2_K",
 };
 
-/// Preferred external multimodal projector GGUF payloads, best quality first.
+/// Preferred external multimodal projector GGUF payloads for automatic pulls.
+/// Q8 is effectively lossless for projector inference while avoiding the
+/// roughly 2x residency and download cost of F16/BF16. Users who need a dense
+/// projector can still select it explicitly with `--projector BF16`.
 const gguf_projector_preference = [_][]const u8{
-    "f16", "bf16", "F16", "BF16", "Q8_0", "q8_0", "Q6_K", "q6_k", "Q5_K_M", "q5_k_m", "Q4_K_M", "q4_k_m",
+    "Q8_0", "q8_0", "Q6_K", "q6_k", "Q5_K_M", "q5_k_m", "Q4_K_M", "q4_k_m", "f16", "bf16", "F16", "BF16",
 };
 
 fn basename(path: []const u8) []const u8 {
@@ -1011,9 +1011,9 @@ fn writeSyntheticMetadata(
     io: std.Io,
     dest_dir: []const u8,
     plan: SyntheticMetadataPlan,
-) !void {
+) !?ManagedArtifactReceipt {
     switch (plan) {
-        .none => {},
+        .none => return null,
         .paddleocr => |payload| {
             const metadata =
                 try std.fmt.allocPrint(allocator,
@@ -1037,7 +1037,11 @@ fn writeSyntheticMetadata(
 
             const metadata_path = try std.fmt.allocPrint(allocator, "{s}/antfly_metadata.json", .{dest_dir});
             defer allocator.free(metadata_path);
-            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = metadata_path, .data = metadata });
+            try writeFileAtomically(allocator, io, metadata_path, metadata);
+            return .{
+                .path = "antfly_metadata.json",
+                .size = metadata.len,
+            };
         },
     }
 }
@@ -1048,6 +1052,10 @@ pub const DownloadProgress = struct {
     total_bytes: ?u64,
     files_done: usize,
     files_total: usize,
+    /// True when the artifact was verified locally and no response body was
+    /// transferred. The byte counters describe completed artifact bytes, not
+    /// necessarily network traffic.
+    cached: bool = false,
 };
 
 pub const ProgressCallback = *const fn (progress: DownloadProgress, ctx: ?*anyopaque) void;
@@ -1112,6 +1120,175 @@ fn managedPath(
     return std.fs.path.join(allocator, &.{ dest_dir, filename });
 }
 
+fn managedSiblingPath(
+    allocator: std.mem.Allocator,
+    destination: []const u8,
+    suffix: []const u8,
+) ![]u8 {
+    const leaf = try std.fmt.allocPrint(allocator, ".{s}{s}", .{ std.fs.path.basename(destination), suffix });
+    defer allocator.free(leaf);
+    return std.fs.path.join(allocator, &.{ std.fs.path.dirname(destination) orelse ".", leaf });
+}
+
+pub fn managedModelLockPathAlloc(
+    allocator: std.mem.Allocator,
+    destination: []const u8,
+) ![]u8 {
+    return managedSiblingPath(allocator, destination, managed_download_lock_filename);
+}
+
+fn pathExists(dir: std.Io.Dir, io: std.Io, path: []const u8) !bool {
+    dir.access(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return true;
+}
+
+fn removeTreeIfExists(dir: std.Io.Dir, io: std.Io, path: []const u8) !void {
+    if (!try pathExists(dir, io, path)) return;
+    try dir.deleteTree(io, path);
+}
+
+fn seedManagedArtifactsWithHardLinks(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    source_dir: []const u8,
+    staging_dir: []const u8,
+) !void {
+    var receipt = managed_receipt.loadValidated(allocator, io, source_dir) catch |err| switch (err) {
+        error.InvalidManagedDownload,
+        error.IncompleteManagedDownload,
+        error.ModelArtifactOutsideRoot,
+        => return,
+        else => return err,
+    } orelse return;
+    defer receipt.deinit();
+
+    const cwd = std.Io.Dir.cwd();
+    for (receipt.artifacts) |artifact| {
+        const staging_path = try std.fs.path.join(allocator, &.{ staging_dir, artifact.path });
+        defer allocator.free(staging_path);
+        if (std.fs.path.dirname(staging_path)) |parent| try cwd.createDirPath(io, parent);
+
+        // Hard links let a repair reuse verified multi-gigabyte weights without
+        // copying them. Downloads install replacements with atomic rename, so
+        // changing the staged file can never mutate the published inode.
+        std.Io.Dir.hardLink(cwd, artifact.canonical_path, cwd, staging_path, io, .{ .follow_symlinks = false }) catch continue;
+    }
+}
+
+/// A pull transaction built beside the published model directory.
+///
+/// Downloads never mutate the active cache. Verified existing artifacts are
+/// hard-linked into the staging tree for zero-copy reuse, and the completed
+/// tree is published with same-filesystem renames. An interrupted publication
+/// is recovered on the next pull from the retained backup directory.
+pub const ManagedModelTransaction = struct {
+    allocator: std.mem.Allocator,
+    destination: []u8,
+    staging: []u8,
+    backup: []u8,
+    committed: bool = false,
+
+    pub fn begin(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        destination: []const u8,
+    ) !ManagedModelTransaction {
+        const owned_destination = try allocator.dupe(u8, destination);
+        errdefer allocator.free(owned_destination);
+        const staging = try managedSiblingPath(allocator, destination, managed_download_staging_suffix);
+        errdefer allocator.free(staging);
+        const backup = try managedSiblingPath(allocator, destination, managed_download_backup_suffix);
+        errdefer allocator.free(backup);
+        const transaction = ManagedModelTransaction{
+            .allocator = allocator,
+            .destination = owned_destination,
+            .staging = staging,
+            .backup = backup,
+        };
+
+        const cwd = std.Io.Dir.cwd();
+        const destination_exists = try pathExists(cwd, io, transaction.destination);
+        const backup_exists = try pathExists(cwd, io, transaction.backup);
+        var recovered_publication = false;
+        if (backup_exists) {
+            if (!destination_exists) {
+                try std.Io.Dir.rename(cwd, transaction.backup, cwd, transaction.destination, io);
+            } else if (managedDownloadState(allocator, io, transaction.destination) == .complete) {
+                try removeTreeIfExists(cwd, io, transaction.backup);
+            } else {
+                try removeTreeIfExists(cwd, io, transaction.destination);
+                try std.Io.Dir.rename(cwd, transaction.backup, cwd, transaction.destination, io);
+            }
+            recovered_publication = true;
+        }
+        if (recovered_publication) {
+            try syncManagedDirectory(io, std.fs.path.dirname(transaction.destination) orelse ".");
+        }
+
+        if (!try pathExists(cwd, io, transaction.staging)) {
+            try cwd.createDirPath(io, transaction.staging);
+        }
+        try seedManagedArtifactsWithHardLinks(allocator, io, transaction.destination, transaction.staging);
+        try beginManagedDownload(allocator, io, transaction.staging);
+        return transaction;
+    }
+
+    pub fn commit(self: *ManagedModelTransaction, io: std.Io) !void {
+        if (self.committed) return error.ManagedDownloadAlreadyCommitted;
+        if (managedDownloadState(self.allocator, io, self.staging) != .complete) {
+            return error.IncompleteManagedDownload;
+        }
+
+        const cwd = std.Io.Dir.cwd();
+        try removeTreeIfExists(cwd, io, self.backup);
+        const had_destination = try pathExists(cwd, io, self.destination);
+        if (had_destination) {
+            try std.Io.Dir.rename(cwd, self.destination, cwd, self.backup, io);
+        }
+        std.Io.Dir.rename(cwd, self.staging, cwd, self.destination, io) catch |err| {
+            if (had_destination) {
+                std.Io.Dir.rename(cwd, self.backup, cwd, self.destination, io) catch {};
+            }
+            return err;
+        };
+
+        const parent = std.fs.path.dirname(self.destination) orelse ".";
+        syncManagedDirectory(io, parent) catch |err| {
+            removeTreeIfExists(cwd, io, self.destination) catch {};
+            if (had_destination) {
+                std.Io.Dir.rename(cwd, self.backup, cwd, self.destination, io) catch {};
+            }
+            return err;
+        };
+
+        // Publication is durable at this point. Backup cleanup is best effort:
+        // retaining it is safe, and the next transaction will remove it.
+        self.committed = true;
+        if (had_destination) {
+            removeTreeIfExists(cwd, io, self.backup) catch return;
+            syncManagedDirectory(io, parent) catch {};
+        }
+    }
+
+    pub fn deinit(self: *ManagedModelTransaction, io: std.Io) void {
+        _ = io;
+        // Failed pulls intentionally retain the hidden staging tree. Verified
+        // final artifacts and digest-bound .part files can then be reused by
+        // the next locked attempt without exposing them through discovery.
+        self.freePaths();
+        self.* = undefined;
+    }
+
+    fn freePaths(self: *ManagedModelTransaction) void {
+        self.allocator.free(self.destination);
+        self.allocator.free(self.staging);
+        self.allocator.free(self.backup);
+    }
+};
+
 fn writeFileAtomically(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1132,6 +1309,66 @@ fn writeFileAtomically(
     }
     try std.Io.Dir.rename(cwd, temp_path, cwd, path, io);
     try syncManagedDirectory(io, std.fs.path.dirname(path) orelse ".");
+}
+
+/// Atomically replace a private staging artifact and update its validated plan.
+/// Callers must hold the model pull lock; published directories must never use
+/// this API because the artifact and plan renames are intentionally separate.
+pub fn writeManagedArtifactAndUpdatePlan(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dest_dir: []const u8,
+    relative_path: []const u8,
+    data: []const u8,
+) !void {
+    if (!managed_receipt.artifactPathIsSafe(relative_path)) return error.InvalidModelArtifactPath;
+
+    var validated = try managed_receipt.loadValidatedPlan(allocator, io, dest_dir);
+    defer validated.deinit();
+
+    var artifacts = std.ArrayListUnmanaged(ManagedArtifactReceipt).empty;
+    defer artifacts.deinit(allocator);
+    try artifacts.ensureTotalCapacity(allocator, validated.artifacts.len + 1);
+    var replaced = false;
+    for (validated.artifacts) |artifact| {
+        if (std.mem.eql(u8, artifact.path, relative_path)) {
+            try artifacts.append(allocator, .{
+                .path = relative_path,
+                .size = data.len,
+            });
+            replaced = true;
+        } else {
+            try artifacts.append(allocator, .{
+                .path = artifact.path,
+                .size = artifact.size,
+                .sha256 = artifact.sha256,
+            });
+        }
+    }
+    if (!replaced) {
+        if (validated.artifacts.len >= managed_receipt.max_artifact_count) {
+            return error.InvalidManagedDownload;
+        }
+        try artifacts.append(allocator, .{
+            .path = relative_path,
+            .size = data.len,
+        });
+    }
+
+    const receipt_json = try std.json.Stringify.valueAlloc(
+        allocator,
+        ManagedDownloadReceipt{ .artifacts = artifacts.items },
+        .{},
+    );
+    defer allocator.free(receipt_json);
+    if (receipt_json.len > managed_receipt.max_receipt_bytes) return error.InvalidManagedDownload;
+    const artifact_path = try managedPath(allocator, dest_dir, relative_path);
+    defer allocator.free(artifact_path);
+    const plan_path = try managedPath(allocator, dest_dir, managed_download_plan_filename);
+    defer allocator.free(plan_path);
+
+    try writeFileAtomically(allocator, io, artifact_path, data);
+    try writeFileAtomically(allocator, io, plan_path, receipt_json);
 }
 
 fn syncManagedDirectory(io: std.Io, path: []const u8) !void {
@@ -1210,24 +1447,6 @@ pub fn completeManagedDownload(
     try syncManagedDirectory(io, dest_dir);
 }
 
-fn managedArtifactPathIsSafe(path: []const u8) bool {
-    if (path.len == 0 or std.fs.path.isAbsolute(path)) return false;
-    // Hub repository paths are POSIX-style on every platform. Rejecting
-    // backslashes avoids treating an attacker-controlled receipt differently
-    // on Windows.
-    if (std.mem.indexOfScalar(u8, path, '\\') != null) return false;
-    var parts = std.mem.splitScalar(u8, path, '/');
-    while (parts.next()) |part| {
-        if (part.len == 0 or
-            std.mem.eql(u8, part, ".") or
-            std.mem.eql(u8, part, ".."))
-        {
-            return false;
-        }
-    }
-    return true;
-}
-
 /// Return the publication state of a model directory managed by `pull`.
 ///
 /// A completion receipt is accepted only when every recorded artifact still
@@ -1240,103 +1459,12 @@ pub fn managedDownloadState(
     io: std.Io,
     dest_dir: []const u8,
 ) ManagedDownloadState {
-    const in_progress_path = managedPath(
-        allocator,
-        dest_dir,
-        managed_download_in_progress_filename,
-    ) catch return .incomplete;
-    defer allocator.free(in_progress_path);
-    const plan_path = managedPath(
-        allocator,
-        dest_dir,
-        managed_download_plan_filename,
-    ) catch return .incomplete;
-    defer allocator.free(plan_path);
-    const complete_path = managedPath(
-        allocator,
-        dest_dir,
-        managed_download_complete_filename,
-    ) catch return .incomplete;
-    defer allocator.free(complete_path);
-
-    const cwd = std.Io.Dir.cwd();
-    if (cwd.access(io, in_progress_path, .{})) |_| return .incomplete else |err| switch (err) {
-        error.FileNotFound => {},
-        else => return .incomplete,
+    var receipt = managed_receipt.loadValidated(allocator, io, dest_dir) catch return .incomplete;
+    if (receipt) |*validated| {
+        validated.deinit();
+        return .complete;
     }
-    if (cwd.access(io, plan_path, .{})) |_| return .incomplete else |err| switch (err) {
-        error.FileNotFound => {},
-        else => return .incomplete,
-    }
-
-    const receipt_json = cwd.readFileAlloc(
-        io,
-        complete_path,
-        allocator,
-        .limited(16 * 1024 * 1024),
-    ) catch |err| switch (err) {
-        error.FileNotFound => {
-            // Close the race with beginManagedDownload, which publishes the
-            // marker before deleting an old completion receipt.
-            if (managedPublicationFilesBlocked(cwd, io, in_progress_path, plan_path)) {
-                return .incomplete;
-            }
-            return .unmanaged;
-        },
-        else => return .incomplete,
-    };
-    defer allocator.free(receipt_json);
-    var parsed = std.json.parseFromSlice(
-        ManagedDownloadReceipt,
-        allocator,
-        receipt_json,
-        .{ .ignore_unknown_fields = true },
-    ) catch return .incomplete;
-    defer parsed.deinit();
-    if (parsed.value.version != 1 or parsed.value.artifacts.len == 0) {
-        return .incomplete;
-    }
-
-    var has_supported_payload = false;
-    for (parsed.value.artifacts) |artifact| {
-        if (!managedArtifactPathIsSafe(artifact.path)) return .incomplete;
-        const artifact_path = std.fs.path.join(
-            allocator,
-            &.{ dest_dir, artifact.path },
-        ) catch return .incomplete;
-        defer allocator.free(artifact_path);
-        const actual_size = requiredFileSize(cwd, io, artifact_path) catch
-            return .incomplete;
-        if (actual_size != artifact.size) return .incomplete;
-        if (std.mem.endsWith(u8, artifact.path, ".gguf") or
-            std.mem.endsWith(u8, artifact.path, ".onnx") or
-            std.mem.endsWith(u8, artifact.path, ".safetensors"))
-        {
-            has_supported_payload = true;
-        }
-    }
-    if (!has_supported_payload) return .incomplete;
-    if (managedPublicationFilesBlocked(cwd, io, in_progress_path, plan_path)) {
-        return .incomplete;
-    }
-    return .complete;
-}
-
-fn managedPublicationFilesBlocked(
-    cwd: std.Io.Dir,
-    io: std.Io,
-    in_progress_path: []const u8,
-    plan_path: []const u8,
-) bool {
-    if (cwd.access(io, in_progress_path, .{})) |_| return true else |err| switch (err) {
-        error.FileNotFound => {},
-        else => return true,
-    }
-    if (cwd.access(io, plan_path, .{})) |_| return true else |err| switch (err) {
-        error.FileNotFound => {},
-        else => return true,
-    }
-    return false;
+    return .unmanaged;
 }
 
 pub fn managedDownloadPublicationBlocked(
@@ -1344,24 +1472,7 @@ pub fn managedDownloadPublicationBlocked(
     io: std.Io,
     dest_dir: []const u8,
 ) bool {
-    const in_progress_path = managedPath(
-        allocator,
-        dest_dir,
-        managed_download_in_progress_filename,
-    ) catch return true;
-    defer allocator.free(in_progress_path);
-    const plan_path = managedPath(
-        allocator,
-        dest_dir,
-        managed_download_plan_filename,
-    ) catch return true;
-    defer allocator.free(plan_path);
-    return managedPublicationFilesBlocked(
-        std.Io.Dir.cwd(),
-        io,
-        in_progress_path,
-        plan_path,
-    );
+    return managed_receipt.publicationBlocked(allocator, io, dest_dir);
 }
 
 /// Download a model from HuggingFace Hub.
@@ -1389,6 +1500,7 @@ pub fn downloadModel(
         for (files) |f| {
             allocator.free(f.name);
             if (f.sha256) |sum| allocator.free(sum);
+            if (f.git_blob_sha1) |sum| allocator.free(sum);
         }
         allocator.free(files);
     }
@@ -1562,7 +1674,7 @@ pub fn downloadModel(
             }, progress.context);
         }
 
-        try downloadFile(allocator, io, owner, name, filename, dest_dir, artifact_config, progress, i, resolved.items.len, total_bytes, file_meta.sha256);
+        const cached = try downloadFile(allocator, io, owner, name, filename, dest_dir, artifact_config, progress, i, resolved.items.len, total_bytes, file_meta.sha256, file_meta.git_blob_sha1);
 
         const dest_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dest_dir, filename });
         defer allocator.free(dest_path);
@@ -1571,16 +1683,11 @@ pub fn downloadModel(
             remaining_model_bytes,
             artifact_size,
         );
-        // Registry.pull may rewrite model_manifest.json after this function
-        // returns, so it is deliberately excluded from the immutable artifact
-        // receipt finalized by the registry.
-        if (!std.mem.eql(u8, filename, "model_manifest.json")) {
-            try receipts.append(allocator, .{
-                .path = filename,
-                .size = artifact_size,
-                .sha256 = file_meta.sha256,
-            });
-        }
+        try receipts.append(allocator, .{
+            .path = filename,
+            .size = artifact_size,
+            .sha256 = file_meta.sha256,
+        });
 
         if (progress.callback) |cb| {
             cb(.{
@@ -1589,11 +1696,21 @@ pub fn downloadModel(
                 .total_bytes = progress_total_bytes,
                 .files_done = i + 1,
                 .files_total = to_download.items.len,
+                .cached = cached,
             }, progress.context);
         }
     }
 
-    try writeSyntheticMetadata(allocator, io, dest_dir, synthetic_metadata);
+    if (try writeSyntheticMetadata(allocator, io, dest_dir, synthetic_metadata)) |metadata_receipt| {
+        var replaced = false;
+        for (receipts.items) |*receipt| {
+            if (!std.mem.eql(u8, receipt.path, metadata_receipt.path)) continue;
+            receipt.* = metadata_receipt;
+            replaced = true;
+            break;
+        }
+        if (!replaced) try receipts.append(allocator, metadata_receipt);
+    }
 
     const receipt_json = try std.json.Stringify.valueAlloc(
         allocator,
@@ -1601,6 +1718,12 @@ pub fn downloadModel(
         .{},
     );
     defer allocator.free(receipt_json);
+    if (receipts.items.len == 0 or
+        receipts.items.len > managed_receipt.max_artifact_count or
+        receipt_json.len > managed_receipt.max_receipt_bytes)
+    {
+        return error.InvalidManagedDownload;
+    }
     const plan_path = try managedPath(allocator, dest_dir, managed_download_plan_filename);
     defer allocator.free(plan_path);
     try writeFileAtomically(allocator, io, plan_path, receipt_json);
@@ -1706,7 +1829,10 @@ pub fn listModelFiles(
     name: []const u8,
     config: HubConfig,
 ) ![]HubFile {
-    const url = try std.fmt.allocPrint(allocator, "{s}/api/models/{s}/{s}", .{ config.base_url, owner, name });
+    // `blobs=true` is required for artifact sizes and content digests. Without it,
+    // Hugging Face returns only filenames and every completed managed pull must be
+    // downloaded again because the receipt cannot prove artifact identity.
+    const url = try modelInfoUrlAlloc(allocator, config.base_url, owner, name);
     defer allocator.free(url);
 
     var client = httpx.Client.initWithConfig(allocator, io, .{
@@ -1750,25 +1876,58 @@ pub fn listModelFiles(
 
     const body = resp.body orelse return error.EmptyResponse;
 
-    // Parse JSON response — extract siblings[].rfilename
+    return parseHubFiles(allocator, body);
+}
+
+fn modelInfoUrlAlloc(allocator: std.mem.Allocator, base_url: []const u8, owner: []const u8, name: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/api/models/{s}/{s}?blobs=true", .{ base_url, owner, name });
+}
+
+fn parseHubFiles(allocator: std.mem.Allocator, body: []const u8) ![]HubFile {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
     defer parsed.deinit();
 
-    const obj = parsed.value.object;
-    const siblings = (obj.get("siblings") orelse return error.InvalidResponse).array;
+    if (parsed.value != .object) return error.InvalidResponse;
+    const siblings_value = parsed.value.object.get("siblings") orelse return error.InvalidResponse;
+    if (siblings_value != .array) return error.InvalidResponse;
 
     var files = std.ArrayListUnmanaged(HubFile).empty;
-    for (siblings.items) |sibling| {
+    errdefer {
+        for (files.items) |file| {
+            allocator.free(file.name);
+            if (file.sha256) |sum| allocator.free(sum);
+            if (file.git_blob_sha1) |sum| allocator.free(sum);
+        }
+        files.deinit(allocator);
+    }
+    for (siblings_value.array.items) |sibling| {
         if (sibling == .object) {
             if (sibling.object.get("rfilename")) |rf| {
                 if (rf == .string) {
+                    if (!managed_receipt.artifactPathIsSafe(rf.string)) {
+                        return error.InvalidModelArtifactPath;
+                    }
                     var file = HubFile{
                         .name = try allocator.dupe(u8, rf.string),
                     };
+                    errdefer {
+                        allocator.free(file.name);
+                        if (file.sha256) |sum| allocator.free(sum);
+                        if (file.git_blob_sha1) |sum| allocator.free(sum);
+                    }
 
                     if (sibling.object.get("size")) |size_val| {
                         if (size_val == .integer and size_val.integer >= 0) {
                             file.size = @intCast(size_val.integer);
+                        }
+                    }
+
+                    if (sibling.object.get("blobId")) |blob_id| {
+                        if (blob_id == .string and isSha1Hex(blob_id.string)) {
+                            // Git blob IDs provide revision identity for ordinary Hub
+                            // files. They are a cache-consistency check, not a modern
+                            // cryptographic trust boundary; LFS payloads use SHA-256.
+                            file.git_blob_sha1 = try allocator.dupe(u8, blob_id.string);
                         }
                     }
 
@@ -1779,9 +1938,10 @@ pub fn listModelFiles(
                                     file.size = @intCast(lfs_size.integer);
                                 }
                             }
-                            if (lfs.object.get("oid")) |oid| {
-                                if (oid == .string and oid.string.len == 64) {
-                                    file.sha256 = try allocator.dupe(u8, oid.string);
+                            const digest = lfs.object.get("sha256") orelse lfs.object.get("oid");
+                            if (digest) |sha| {
+                                if (sha == .string and isSha256Hex(sha.string)) {
+                                    file.sha256 = try allocator.dupe(u8, sha.string);
                                 }
                             }
                         }
@@ -1794,6 +1954,22 @@ pub fn listModelFiles(
     }
 
     return try files.toOwnedSlice(allocator);
+}
+
+fn isSha256Hex(value: []const u8) bool {
+    if (value.len != 64) return false;
+    for (value) |byte| {
+        if (!std.ascii.isHex(byte)) return false;
+    }
+    return true;
+}
+
+fn isSha1Hex(value: []const u8) bool {
+    if (value.len != 40) return false;
+    for (value) |byte| {
+        if (!std.ascii.isHex(byte)) return false;
+    }
+    return true;
 }
 
 pub fn readModelFileAlloc(
@@ -2011,7 +2187,9 @@ fn downloadFile(
     files_total: usize,
     total_bytes: ?u64,
     expected_sha256: ?[]const u8,
-) !void {
+    expected_git_blob_sha1: ?[]const u8,
+) !bool {
+    if (!managed_receipt.artifactPathIsSafe(filename)) return error.InvalidModelArtifactPath;
     const max_response_size = try downloadResponseLimit(config);
     if (total_bytes) |total| {
         if (total > config.max_artifact_bytes) return error.DownloadSizeLimitExceeded;
@@ -2020,8 +2198,8 @@ fn downloadFile(
     var dest = std.Io.Dir.cwd();
     const dest_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dest_dir, filename });
     defer allocator.free(dest_path);
-    if (try existingFinalFileSatisfies(dest, io, dest_path, expected_sha256)) {
-        return;
+    if (try existingFinalFileSatisfies(dest, io, dest_path, expected_sha256, expected_git_blob_sha1)) {
+        return true;
     }
 
     var headers_buf: [4][2][]const u8 = undefined;
@@ -2064,14 +2242,14 @@ fn downloadFile(
     // to the current revision—even when its size happens to equal the
     // advertised size. Small non-LFS sidecars are restarted instead of
     // risking a mixed-version artifact.
-    if (resume_from > 0 and expected_sha256 == null) {
+    if (resume_from > 0 and expected_sha256 == null and expected_git_blob_sha1 == null) {
         dest.deleteFile(io, temp_path) catch {};
         resume_from = 0;
     }
     if (total_bytes) |total| {
         if (resume_from == total) {
-            try finalizeDownloadedFile(dest, io, temp_path, dest_path, expected_sha256);
-            return;
+            try finalizeDownloadedFile(dest, io, temp_path, dest_path, expected_sha256, expected_git_blob_sha1);
+            return true;
         }
         if (resume_from > total) {
             dest.deleteFile(io, temp_path) catch {};
@@ -2221,7 +2399,8 @@ fn downloadFile(
         break;
     }
 
-    try finalizeDownloadedFile(dest, io, temp_path, dest_path, expected_sha256);
+    try finalizeDownloadedFile(dest, io, temp_path, dest_path, expected_sha256, expected_git_blob_sha1);
+    return false;
 }
 
 fn finalizeDownloadedFile(
@@ -2230,9 +2409,15 @@ fn finalizeDownloadedFile(
     temp_path: []const u8,
     dest_path: []const u8,
     expected_sha256: ?[]const u8,
+    expected_git_blob_sha1: ?[]const u8,
 ) !void {
     if (expected_sha256) |sum| {
         verifyFileSha256(dest, io, temp_path, sum) catch |err| {
+            dest.deleteFile(io, temp_path) catch {};
+            return err;
+        };
+    } else if (expected_git_blob_sha1) |sum| {
+        verifyFileGitBlobSha1(dest, io, temp_path, sum) catch |err| {
             dest.deleteFile(io, temp_path) catch {};
             return err;
         };
@@ -2253,6 +2438,7 @@ fn existingFinalFileSatisfies(
     io: std.Io,
     path: []const u8,
     expected_sha256: ?[]const u8,
+    expected_git_blob_sha1: ?[]const u8,
 ) !bool {
     dir.access(io, path, .{}) catch |err| switch (err) {
         error.FileNotFound => return false,
@@ -2260,6 +2446,10 @@ fn existingFinalFileSatisfies(
     };
     if (expected_sha256) |sum| {
         verifyFileSha256(dir, io, path, sum) catch return false;
+        return true;
+    }
+    if (expected_git_blob_sha1) |sum| {
+        verifyFileGitBlobSha1(dir, io, path, sum) catch return false;
         return true;
     }
     // A size match alone is not an identity check. Re-fetch artifacts without
@@ -2308,6 +2498,34 @@ fn verifyFileSha256(dir: std.Io.Dir, io: std.Io, path: []const u8, expected_hex:
     if (!std.mem.eql(u8, &actual_hex, expected_hex)) {
         return error.ChecksumMismatch;
     }
+}
+
+fn verifyFileGitBlobSha1(dir: std.Io.Dir, io: std.Io, path: []const u8, expected_hex: []const u8) !void {
+    if (!isSha1Hex(expected_hex)) return error.ChecksumMismatch;
+
+    var file = try dir.openFile(io, path, .{});
+    defer file.close(io);
+    const stat = try file.stat(io);
+
+    var hasher = std.crypto.hash.Sha1.init(.{});
+    var header_buffer: [64]u8 = undefined;
+    const header = try std.fmt.bufPrint(&header_buffer, "blob {d}\x00", .{stat.size});
+    hasher.update(header);
+
+    var buf: [64 * 1024]u8 = undefined;
+    while (true) {
+        const n = file.readStreaming(io, &.{buf[0..]}) catch |err| switch (err) {
+            error.EndOfStream => 0,
+            else => return err,
+        };
+        if (n == 0) break;
+        hasher.update(buf[0..n]);
+    }
+
+    var digest: [std.crypto.hash.Sha1.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    const actual_hex = std.fmt.bytesToHex(digest, .lower);
+    if (!std.mem.eql(u8, &actual_hex, expected_hex)) return error.ChecksumMismatch;
 }
 
 test "appendMultiStageArtifacts selects multistage OCR payloads and sidecars" {
@@ -2600,7 +2818,25 @@ test "projector-only selection finds mmproj gguf" {
     try std.testing.expect(try appendBestGgufProjectorFile(allocator, &to_download, &files));
 
     try std.testing.expectEqual(@as(usize, 1), to_download.items.len);
-    try std.testing.expectEqualStrings("mmproj-gemma-4-e2b-it-f16.gguf", to_download.items[0].name);
+    try std.testing.expectEqualStrings("nested/mmproj-gemma-4-e2b-it-q8_0.gguf", to_download.items[0].name);
+}
+
+test "automatic projector selection prefers q8 while dense remains explicit" {
+    const allocator = std.testing.allocator;
+    const files = [_]HubFile{
+        .{ .name = "mmproj-gemma-4-E2B-it-BF16.gguf", .size = 928 * 1024 * 1024 },
+        .{ .name = "mmproj-gemma-4-E2B-it-Q8_0.gguf", .size = 480 * 1024 * 1024 },
+    };
+
+    var automatic = std.ArrayListUnmanaged(HubFile).empty;
+    defer automatic.deinit(allocator);
+    try std.testing.expect(try appendSelectedGgufProjectorFile(allocator, &automatic, &files, .auto));
+    try std.testing.expectEqualStrings("mmproj-gemma-4-E2B-it-Q8_0.gguf", automatic.items[0].name);
+
+    var explicit = std.ArrayListUnmanaged(HubFile).empty;
+    defer explicit.deinit(allocator);
+    try std.testing.expect(try appendSelectedGgufProjectorFile(allocator, &explicit, &files, .{ .match = "BF16" }));
+    try std.testing.expectEqualStrings("mmproj-gemma-4-E2B-it-BF16.gguf", explicit.items[0].name);
 }
 
 test "gguf selection honors requested projector suffix" {
@@ -2737,6 +2973,93 @@ test "verify file sha256 matches expected digest" {
     try verifyFileSha256(tmp.dir, std.testing.io, "payload.bin", "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9");
 }
 
+test "completed artifact cache reuses only digest-verified files" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "payload.bin",
+        .data = "hello world",
+    });
+
+    const matching = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+    const mismatched = "0000000000000000000000000000000000000000000000000000000000000000";
+    try std.testing.expect(try existingFinalFileSatisfies(tmp.dir, std.testing.io, "payload.bin", matching, null));
+    try std.testing.expect(!(try existingFinalFileSatisfies(tmp.dir, std.testing.io, "payload.bin", mismatched, null)));
+    try std.testing.expect(!(try existingFinalFileSatisfies(tmp.dir, std.testing.io, "payload.bin", null, null)));
+}
+
+test "completed artifact cache reuses Git blob verified files" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "payload.bin",
+        .data = "hello world",
+    });
+
+    const matching = "95d09f2b10159347eece71399a7e2e907ea3df4f";
+    const mismatched = "0000000000000000000000000000000000000000";
+    try std.testing.expect(try existingFinalFileSatisfies(tmp.dir, std.testing.io, "payload.bin", null, matching));
+    try std.testing.expect(!(try existingFinalFileSatisfies(tmp.dir, std.testing.io, "payload.bin", null, mismatched)));
+}
+
+test "hub blob metadata records sha256 identities for cache reuse" {
+    const allocator = std.testing.allocator;
+    const digest = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+    const body =
+        "{\"siblings\":[" ++
+        "{\"rfilename\":\"model.safetensors\",\"size\":11,\"blobId\":\"0123456789abcdef0123456789abcdef01234567\",\"lfs\":{\"size\":795300000,\"sha256\":\"" ++ digest ++ "\"}}," ++
+        "{\"rfilename\":\"legacy.bin\",\"lfs\":{\"oid\":\"" ++ digest ++ "\"}}," ++
+        "{\"rfilename\":\"config.json\",\"size\":42,\"blobId\":\"abcdef0123456789abcdef0123456789abcdef01\"}]}";
+
+    const files = try parseHubFiles(allocator, body);
+    defer {
+        for (files) |file| {
+            allocator.free(file.name);
+            if (file.sha256) |sum| allocator.free(sum);
+            if (file.git_blob_sha1) |sum| allocator.free(sum);
+        }
+        allocator.free(files);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), files.len);
+    try std.testing.expectEqual(@as(?u64, 795300000), files[0].size);
+    try std.testing.expectEqualStrings(digest, files[0].sha256.?);
+    try std.testing.expectEqualStrings(digest, files[1].sha256.?);
+    try std.testing.expectEqualStrings("abcdef0123456789abcdef0123456789abcdef01", files[2].git_blob_sha1.?);
+}
+
+test "hub model metadata request opts into blob identities" {
+    const url = try modelInfoUrlAlloc(std.testing.allocator, "https://huggingface.co", "antflydb", "gliner2-base-v1");
+    defer std.testing.allocator.free(url);
+    try std.testing.expectEqualStrings(
+        "https://huggingface.co/api/models/antflydb/gliner2-base-v1?blobs=true",
+        url,
+    );
+}
+
+test "hub blob metadata rejects malformed digests without losing file metadata" {
+    const allocator = std.testing.allocator;
+    const body =
+        "{\"siblings\":[{\"rfilename\":\"config.json\",\"size\":42," ++
+        "\"lfs\":{\"sha256\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}}]}";
+
+    const files = try parseHubFiles(allocator, body);
+    defer {
+        for (files) |file| {
+            allocator.free(file.name);
+            if (file.sha256) |sum| allocator.free(sum);
+            if (file.git_blob_sha1) |sum| allocator.free(sum);
+        }
+        allocator.free(files);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), files.len);
+    try std.testing.expectEqual(@as(?u64, 42), files[0].size);
+    try std.testing.expect(files[0].sha256 == null);
+}
+
 const python_download_server_script =
     "import pathlib\n" ++
     "import socketserver\n" ++
@@ -2844,6 +3167,27 @@ test "aggregate model budget uses checked arithmetic" {
     );
 }
 
+test "downloadFile rejects artifact paths outside the model root before network access" {
+    try std.testing.expectError(
+        error.InvalidModelArtifactPath,
+        downloadFile(
+            std.testing.allocator,
+            std.testing.io,
+            "owner",
+            "model",
+            "../escape.gguf",
+            "unused",
+            .{ .base_url = "http://127.0.0.1:1" },
+            .{},
+            0,
+            1,
+            null,
+            null,
+            null,
+        ),
+    );
+}
+
 test "managed download publication keeps incomplete state fail closed" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -2903,6 +3247,215 @@ test "managed download publication keeps incomplete state fail closed" {
         ManagedDownloadState.incomplete,
         managedDownloadState(allocator, io, dest_dir),
     );
+}
+
+test "managed staging artifact replacement updates the publication receipt" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dest_dir = try testTmpPath(allocator, tmp, "managed-update");
+    defer allocator.free(dest_dir);
+    try beginManagedDownload(allocator, io, dest_dir);
+    const decoder_path = try managedPath(allocator, dest_dir, "model.gguf");
+    defer allocator.free(decoder_path);
+    try writeFileAtomically(allocator, io, decoder_path, "decoder");
+    const plan_path = try managedPath(allocator, dest_dir, managed_download_plan_filename);
+    defer allocator.free(plan_path);
+    try writeFileAtomically(
+        allocator,
+        io,
+        plan_path,
+        "{\"version\":1,\"artifacts\":[{\"path\":\"model.gguf\",\"size\":7}]}",
+    );
+
+    const manifest_json = "{\"type\":\"generator\"}";
+    try writeManagedArtifactAndUpdatePlan(
+        allocator,
+        io,
+        dest_dir,
+        "model_manifest.json",
+        manifest_json,
+    );
+    var plan = try managed_receipt.loadValidatedPlan(allocator, io, dest_dir);
+    defer plan.deinit();
+    const manifest_artifact = plan.find("model_manifest.json") orelse
+        return error.TestExpectedManifestArtifact;
+    try std.testing.expectEqual(@as(u64, manifest_json.len), manifest_artifact.size);
+
+    try completeManagedDownload(allocator, io, dest_dir);
+    try std.testing.expectEqual(ManagedDownloadState.complete, managedDownloadState(allocator, io, dest_dir));
+}
+
+test "managed model transaction reuses artifacts and publishes completed repair" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dest_dir = try testTmpPath(allocator, tmp, "transactional-model");
+    defer allocator.free(dest_dir);
+    try cwd.createDirPath(io, dest_dir);
+    const decoder_path = try std.fs.path.join(allocator, &.{ dest_dir, "model.gguf" });
+    defer allocator.free(decoder_path);
+    try cwd.writeFile(io, .{ .sub_path = decoder_path, .data = "decoder" });
+    const complete_path = try managedPath(allocator, dest_dir, managed_download_complete_filename);
+    defer allocator.free(complete_path);
+    try cwd.writeFile(io, .{
+        .sub_path = complete_path,
+        .data = "{\"version\":1,\"artifacts\":[{\"path\":\"model.gguf\",\"size\":7}]}",
+    });
+    try std.testing.expectEqual(ManagedDownloadState.complete, managedDownloadState(allocator, io, dest_dir));
+
+    var transaction = try ManagedModelTransaction.begin(allocator, io, dest_dir);
+    defer transaction.deinit(io);
+    const staged_decoder_path = try std.fs.path.join(allocator, &.{ transaction.staging, "model.gguf" });
+    defer allocator.free(staged_decoder_path);
+    var published_decoder = try cwd.openFile(io, decoder_path, .{});
+    defer published_decoder.close(io);
+    var staged_decoder = try cwd.openFile(io, staged_decoder_path, .{});
+    defer staged_decoder.close(io);
+    try std.testing.expectEqual((try published_decoder.stat(io)).inode, (try staged_decoder.stat(io)).inode);
+
+    const projector_path = try std.fs.path.join(allocator, &.{ transaction.staging, "nested/mmproj-model-Q8_0.gguf" });
+    defer allocator.free(projector_path);
+    try cwd.createDirPath(io, std.fs.path.dirname(projector_path).?);
+    try cwd.writeFile(io, .{ .sub_path = projector_path, .data = "projector" });
+    const plan_path = try managedPath(allocator, transaction.staging, managed_download_plan_filename);
+    defer allocator.free(plan_path);
+    try writeFileAtomically(
+        allocator,
+        io,
+        plan_path,
+        "{\"version\":1,\"artifacts\":[{\"path\":\"model.gguf\",\"size\":7},{\"path\":\"nested/mmproj-model-Q8_0.gguf\",\"size\":9}]}",
+    );
+    try completeManagedDownload(allocator, io, transaction.staging);
+    try transaction.commit(io);
+
+    try std.testing.expectEqual(ManagedDownloadState.complete, managedDownloadState(allocator, io, dest_dir));
+    const published_projector_path = try std.fs.path.join(allocator, &.{ dest_dir, "nested/mmproj-model-Q8_0.gguf" });
+    defer allocator.free(published_projector_path);
+    try cwd.access(io, published_projector_path, .{});
+}
+
+test "managed model transaction never reuses receipt symlinks outside model root" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dest_dir = try testTmpPath(allocator, tmp, "symlink-model");
+    defer allocator.free(dest_dir);
+    try cwd.createDirPath(io, dest_dir);
+    const outside_path = try testTmpPath(allocator, tmp, "outside.gguf");
+    defer allocator.free(outside_path);
+    try cwd.writeFile(io, .{ .sub_path = outside_path, .data = "outside" });
+    const decoder_path = try std.fs.path.join(allocator, &.{ dest_dir, "model.gguf" });
+    defer allocator.free(decoder_path);
+    try cwd.symLink(io, "../outside.gguf", decoder_path, .{});
+    const complete_path = try managedPath(allocator, dest_dir, managed_download_complete_filename);
+    defer allocator.free(complete_path);
+    try cwd.writeFile(io, .{
+        .sub_path = complete_path,
+        .data = "{\"version\":1,\"artifacts\":[{\"path\":\"model.gguf\",\"size\":7}]}",
+    });
+
+    try std.testing.expectEqual(ManagedDownloadState.incomplete, managedDownloadState(allocator, io, dest_dir));
+    var transaction = try ManagedModelTransaction.begin(allocator, io, dest_dir);
+    defer transaction.deinit(io);
+    const staged_decoder_path = try std.fs.path.join(allocator, &.{ transaction.staging, "model.gguf" });
+    defer allocator.free(staged_decoder_path);
+    try std.testing.expectError(error.FileNotFound, cwd.openFile(io, staged_decoder_path, .{}));
+}
+
+test "managed model transaction failure preserves last known good cache" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dest_dir = try testTmpPath(allocator, tmp, "failed-transactional-model");
+    defer allocator.free(dest_dir);
+    try cwd.createDirPath(io, dest_dir);
+    const decoder_path = try std.fs.path.join(allocator, &.{ dest_dir, "model.gguf" });
+    defer allocator.free(decoder_path);
+    try cwd.writeFile(io, .{ .sub_path = decoder_path, .data = "known-good" });
+    const complete_path = try managedPath(allocator, dest_dir, managed_download_complete_filename);
+    defer allocator.free(complete_path);
+    try cwd.writeFile(io, .{
+        .sub_path = complete_path,
+        .data = "{\"version\":1,\"artifacts\":[{\"path\":\"model.gguf\",\"size\":10}]}",
+    });
+
+    var transaction = try ManagedModelTransaction.begin(allocator, io, dest_dir);
+    const staged_decoder_path = try std.fs.path.join(allocator, &.{ transaction.staging, "model.gguf" });
+    defer allocator.free(staged_decoder_path);
+    const staged_replacement_path = try std.fmt.allocPrint(allocator, "{s}.part", .{staged_decoder_path});
+    defer allocator.free(staged_replacement_path);
+    try cwd.writeFile(io, .{ .sub_path = staged_replacement_path, .data = "replacement" });
+    try std.Io.Dir.rename(cwd, staged_replacement_path, cwd, staged_decoder_path, io);
+    const retained_staging_path = try allocator.dupe(u8, transaction.staging);
+    defer allocator.free(retained_staging_path);
+    transaction.deinit(io);
+
+    try std.testing.expectEqual(ManagedDownloadState.complete, managedDownloadState(allocator, io, dest_dir));
+    const decoder = try cwd.readFileAlloc(io, decoder_path, allocator, .limited(64));
+    defer allocator.free(decoder);
+    try std.testing.expectEqualStrings("known-good", decoder);
+
+    var resumed = try ManagedModelTransaction.begin(allocator, io, dest_dir);
+    defer resumed.deinit(io);
+    try std.testing.expectEqualStrings(retained_staging_path, resumed.staging);
+    const resumed_decoder_path = try std.fs.path.join(allocator, &.{ resumed.staging, "model.gguf" });
+    defer allocator.free(resumed_decoder_path);
+    const resumed_decoder = try cwd.readFileAlloc(io, resumed_decoder_path, allocator, .limited(64));
+    defer allocator.free(resumed_decoder);
+    try std.testing.expectEqualStrings("replacement", resumed_decoder);
+}
+
+test "managed model transaction recovers interrupted directory publication" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dest_dir = try testTmpPath(allocator, tmp, "interrupted-transactional-model");
+    defer allocator.free(dest_dir);
+    try cwd.createDirPath(io, dest_dir);
+    const decoder_path = try std.fs.path.join(allocator, &.{ dest_dir, "model.gguf" });
+    defer allocator.free(decoder_path);
+    try cwd.writeFile(io, .{ .sub_path = decoder_path, .data = "known-good" });
+    const complete_path = try managedPath(allocator, dest_dir, managed_download_complete_filename);
+    defer allocator.free(complete_path);
+    try cwd.writeFile(io, .{
+        .sub_path = complete_path,
+        .data = "{\"version\":1,\"artifacts\":[{\"path\":\"model.gguf\",\"size\":10}]}",
+    });
+
+    const backup_path = try managedSiblingPath(allocator, dest_dir, managed_download_backup_suffix);
+    defer allocator.free(backup_path);
+    const stale_staging_path = try managedSiblingPath(allocator, dest_dir, managed_download_staging_suffix);
+    defer allocator.free(stale_staging_path);
+    try std.Io.Dir.rename(cwd, dest_dir, cwd, backup_path, io);
+    try cwd.createDirPath(io, stale_staging_path);
+    const partial_path = try std.fs.path.join(allocator, &.{ stale_staging_path, "model.gguf.part" });
+    defer allocator.free(partial_path);
+    try cwd.writeFile(io, .{ .sub_path = partial_path, .data = "partial" });
+
+    var transaction = try ManagedModelTransaction.begin(allocator, io, dest_dir);
+    defer transaction.deinit(io);
+    try std.testing.expectEqual(ManagedDownloadState.complete, managedDownloadState(allocator, io, dest_dir));
+    try std.testing.expectError(error.FileNotFound, cwd.openDir(io, backup_path, .{}));
+    try cwd.access(io, partial_path, .{});
+    try std.testing.expectEqualStrings(stale_staging_path, transaction.staging);
+    const staged_decoder_path = try std.fs.path.join(allocator, &.{ transaction.staging, "model.gguf" });
+    defer allocator.free(staged_decoder_path);
+    try cwd.access(io, staged_decoder_path, .{});
 }
 
 test "content range validation requires exact resume boundaries" {
@@ -2975,6 +3528,7 @@ test "downloadFile rejects artifacts above the configured disk limit before netw
             1,
             129,
             null,
+            null,
         ),
     );
 }
@@ -3009,6 +3563,7 @@ test "downloadFile removes an oversized partial before network access" {
             .{},
             0,
             1,
+            null,
             null,
             null,
         ),
@@ -3067,6 +3622,7 @@ test "downloadFile removes a fresh partial after streamed size overflow" {
             1,
             null,
             null,
+            null,
         ),
     );
     const part_path = try std.fs.path.join(allocator, &.{ dest_dir, "model.onnx.part" });
@@ -3109,6 +3665,7 @@ test "downloadFile verifies a complete partial before installing it" {
             1,
             3,
             "0000000000000000000000000000000000000000000000000000000000000000",
+            null,
         ),
     );
     try std.testing.expectError(
@@ -3178,9 +3735,9 @@ test "downloadFile resumes from partial file with 206 response" {
 
     const base_url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{port});
     defer allocator.free(base_url);
-    try downloadFile(allocator, io, "owner", "name", "tokenizer.json", dest_dir, .{
+    _ = try downloadFile(allocator, io, "owner", "name", "tokenizer.json", dest_dir, .{
         .base_url = base_url,
-    }, .{}, 0, 1, payload.len, "f6b6d844d9e70a622a4b1f2eab9cd77aa2b09280930adc897fad746fdf2c6a1c");
+    }, .{}, 0, 1, payload.len, "f6b6d844d9e70a622a4b1f2eab9cd77aa2b09280930adc897fad746fdf2c6a1c", null);
 
     const final_path = try std.fs.path.join(allocator, &.{ dest_dir, "tokenizer.json" });
     defer allocator.free(final_path);
@@ -3237,9 +3794,9 @@ test "downloadFile restarts when a 206 content range is inconsistent" {
 
     const base_url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{port});
     defer allocator.free(base_url);
-    try downloadFile(allocator, io, "owner", "name", "tokenizer.json", dest_dir, .{
+    _ = try downloadFile(allocator, io, "owner", "name", "tokenizer.json", dest_dir, .{
         .base_url = base_url,
-    }, .{}, 0, 1, payload.len, "f6b6d844d9e70a622a4b1f2eab9cd77aa2b09280930adc897fad746fdf2c6a1c");
+    }, .{}, 0, 1, payload.len, "f6b6d844d9e70a622a4b1f2eab9cd77aa2b09280930adc897fad746fdf2c6a1c", null);
 
     const final_path = try std.fs.path.join(allocator, &.{ dest_dir, "tokenizer.json" });
     defer allocator.free(final_path);
@@ -3293,9 +3850,9 @@ test "downloadFile discards a streamed range error before retrying fresh" {
 
     const base_url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{port});
     defer allocator.free(base_url);
-    try downloadFile(allocator, io, "owner", "name", "tokenizer.json", dest_dir, .{
+    _ = try downloadFile(allocator, io, "owner", "name", "tokenizer.json", dest_dir, .{
         .base_url = base_url,
-    }, .{}, 0, 1, payload.len, "f6b6d844d9e70a622a4b1f2eab9cd77aa2b09280930adc897fad746fdf2c6a1c");
+    }, .{}, 0, 1, payload.len, "f6b6d844d9e70a622a4b1f2eab9cd77aa2b09280930adc897fad746fdf2c6a1c", null);
 
     const final_path = try std.fs.path.join(allocator, &.{ dest_dir, "tokenizer.json" });
     defer allocator.free(final_path);
@@ -3321,9 +3878,10 @@ test "downloadFile skips existing complete destination before network" {
     defer allocator.free(final_path);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = final_path, .data = payload });
 
-    try downloadFile(allocator, io, "owner", "name", "model.gguf", dest_dir, .{
+    const cached = try downloadFile(allocator, io, "owner", "name", "model.gguf", dest_dir, .{
         .base_url = "http://127.0.0.1:1",
-    }, .{}, 0, 1, payload.len, "5d4601650452897026e60f1d6996d5b2941f3e3634ffebe6cc11458508c756f2");
+    }, .{}, 0, 1, payload.len, "5d4601650452897026e60f1d6996d5b2941f3e3634ffebe6cc11458508c756f2", null);
+    try std.testing.expect(cached);
 
     const part_path = try std.fs.path.join(allocator, &.{ dest_dir, "model.gguf.part" });
     defer allocator.free(part_path);
@@ -3351,9 +3909,10 @@ test "downloadFile skips existing large artifact with pointer-sized metadata" {
     defer allocator.free(final_path);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = final_path, .data = &payload });
 
-    try downloadFile(allocator, io, "owner", "name", "model.gguf", dest_dir, .{
+    const cached = try downloadFile(allocator, io, "owner", "name", "model.gguf", dest_dir, .{
         .base_url = "http://127.0.0.1:1",
-    }, .{}, 0, 1, 102, "8fc662ff2c1d2293998c59eff63476a828c715345d33d0219a1260be634422d1");
+    }, .{}, 0, 1, 102, "8fc662ff2c1d2293998c59eff63476a828c715345d33d0219a1260be634422d1", null);
+    try std.testing.expect(cached);
 
     const part_path = try std.fs.path.join(allocator, &.{ dest_dir, "model.gguf.part" });
     defer allocator.free(part_path);
@@ -3435,12 +3994,12 @@ test "downloadFile restarts cleanly when range is ignored" {
 
     const base_url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{port});
     defer allocator.free(base_url);
-    try downloadFile(allocator, io, "owner", "name", "tokenizer.json", dest_dir, .{
+    _ = try downloadFile(allocator, io, "owner", "name", "tokenizer.json", dest_dir, .{
         .base_url = base_url,
         // Force the bounded writer to detect the ignored Range response before
         // getToWriter can return its HTTP 200 status.
         .max_artifact_bytes = payload.len,
-    }, .{}, 0, 1, payload.len, "b237163979797d22f20311e364eb817ae436427249a000f222051f65b6fcadc9");
+    }, .{}, 0, 1, payload.len, "b237163979797d22f20311e364eb817ae436427249a000f222051f65b6fcadc9", null);
 
     const final_path = try std.fs.path.join(allocator, &.{ dest_dir, "tokenizer.json" });
     defer allocator.free(final_path);
@@ -3497,7 +4056,7 @@ test "downloadFile deletes partial file on checksum mismatch" {
     defer allocator.free(base_url);
     try std.testing.expectError(error.ChecksumMismatch, downloadFile(allocator, io, "owner", "name", "tokenizer.json", dest_dir, .{
         .base_url = base_url,
-    }, .{}, 0, 1, payload.len, "0000000000000000000000000000000000000000000000000000000000000000"));
+    }, .{}, 0, 1, payload.len, "0000000000000000000000000000000000000000000000000000000000000000", null));
 
     const final_path = try std.fs.path.join(allocator, &.{ dest_dir, "tokenizer.json" });
     defer allocator.free(final_path);

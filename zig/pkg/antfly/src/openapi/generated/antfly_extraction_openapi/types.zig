@@ -56,6 +56,7 @@ pub const ExtractionOptions = struct {
     include_confidence: ?bool = null,
     include_spans: ?bool = null,
     reader: ?ExtractionReaderOptions = null,
+    resolver: ?ExtractionResolverOptions = null,
 };
 
 pub const ExtractionProvider = enum {
@@ -108,6 +109,7 @@ pub const ExtractionRelationEndpoint = struct {
     id: ?[]const u8 = null,
 };
 
+/// Optional source and target labels constrain relation endpoints. A target requires a source.
 pub const ExtractionRelationSchema = struct {
     type: []const u8,
     source: ?[]const u8 = null,
@@ -119,6 +121,16 @@ pub const ExtractionRequest = struct {
     inputs: []const ExtractionInput,
     schema: ExtractionSchema,
     options: ?ExtractionOptions = null,
+};
+
+/// Optional cross-input entity and relation deduplication.
+pub const ExtractionResolverOptions = struct {
+    similarity_threshold: ?f32 = null,
+    type_must_match: ?bool = null,
+    min_entity_confidence: ?f32 = null,
+    min_relation_confidence: ?f32 = null,
+    deduplicate_relations: ?bool = null,
+    track_provenance: ?bool = null,
 };
 
 pub const ExtractionResponseObject = enum {
@@ -150,6 +162,7 @@ pub const ExtractionResponse = struct {
     usage: ?std.json.Value = null,
 };
 
+/// Selects one extraction operation family per request. Entity labels may accompany relation schemas so relation extraction can return its participating entities in the same response.
 pub const ExtractionSchema = struct {
     entities: ?[]const []const u8 = null,
     relations: ?[]const ExtractionRelationSchema = null,
@@ -160,7 +173,7 @@ pub const ExtractionSchema = struct {
 pub const ExtractionStructureField = std.json.Value;
 
 pub const ExtractionStructureSchema = struct {
-    fields: ?std.json.ArrayHashMap(ExtractionStructureField) = null,
+    fields: std.json.ArrayHashMap(ExtractionStructureField),
 };
 
 pub const ExtractionToken = struct {

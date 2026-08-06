@@ -349,21 +349,24 @@ class SplitDeclarationAuditTest(unittest.TestCase):
             stale = {
                 "function:unused": {
                     "incoming_sha256": "0" * 64,
-                    "reason": "Stale review.",
+                    "reason": "Prior-merge review.",
                 }
             }
             with mock.patch.object(audit, "ref_text", side_effect=ref_text):
-                with self.assertRaisesRegex(ValueError, "stale incoming_sha256"):
-                    audit.analyze(
-                        "monolith.zig",
-                        "base",
-                        "incoming",
-                        [destination],
-                        0.7,
-                        0.05,
-                        include_unchanged=True,
-                        intentional_declaration_deletions=stale,
-                    )
+                stale_obligations, _ = audit.analyze(
+                    "monolith.zig",
+                    "base",
+                    "incoming",
+                    [destination],
+                    0.7,
+                    0.05,
+                    include_unchanged=True,
+                    intentional_declaration_deletions=stale,
+                )
+            self.assertEqual(
+                ["missing_carried"],
+                [item.status for item in stale_obligations],
+            )
 
             destination.write_text(body)
             with mock.patch.object(audit, "ref_text", side_effect=ref_text):
@@ -595,6 +598,56 @@ class SplitDeclarationAuditTest(unittest.TestCase):
             [item.status for item in obligations],
         )
         self.assertIn("repair_ctx->repair", obligations[0].detail)
+
+    def test_unchanged_parent_container_field_migration_is_dormant(self) -> None:
+        parent = """const Options = struct {
+    repair_ctx: ?*anyopaque = null,
+};
+"""
+        current = """const Options = struct {
+    repair: RepairOptions = .{},
+};
+"""
+        migration = {
+            "container:Options": {
+                "repair_ctx": {
+                    "target": "repair",
+                    "reason": "Reviewed against the prior parent range.",
+                }
+            }
+        }
+        with tempfile.TemporaryDirectory(
+            prefix="merge-audit-dormant-container-fields-",
+            dir=audit.ROOT,
+        ) as raw_dir:
+            path = pathlib.Path(raw_dir) / "split.zig"
+            path.write_text(current)
+            with mock.patch.object(audit, "ref_text", return_value=parent):
+                obligations, _ = audit.analyze(
+                    "monolith.zig",
+                    "base",
+                    "incoming",
+                    [path],
+                    0.7,
+                    0.05,
+                    container_field_migrations=migration,
+                )
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "do not identify live container obligations",
+                ):
+                    audit.analyze(
+                        "monolith.zig",
+                        "base",
+                        "incoming",
+                        [path],
+                        0.7,
+                        0.05,
+                        container_field_migrations={
+                            "container:Typo": migration["container:Options"],
+                        },
+                    )
+        self.assertEqual([], obligations)
 
     def test_relative_imports_are_compared_by_resolved_repository_path(self) -> None:
         incoming = audit.Declaration(
@@ -1861,6 +1914,91 @@ pub fn Impl(comptime DB: type) type {
         self.assertEqual("deleted_retained_reviewed", removed.status)
         self.assertIn("branch API still depends on it", removed.detail)
 
+    def test_retained_deletion_from_prior_baseline_is_dormant(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="merge-audit-dormant-retention-",
+            dir=audit.ROOT,
+        ) as raw_dir:
+            path = pathlib.Path(raw_dir) / "split.zig"
+            path.write_text("")
+            with mock.patch.object(audit, "ref_text", return_value=""):
+                obligations, _ = audit.analyze(
+                    "monolith.zig",
+                    "base",
+                    "incoming",
+                    [path],
+                    0.7,
+                    0.05,
+                    retained_deletions={
+                        "function:removed": {
+                            "base_sha256": audit.sha256_text(
+                                "fn removed() void {}\n"
+                            ),
+                            "current_sha256": "0" * 64,
+                            "path": str(path.relative_to(audit.ROOT)),
+                            "reason": "Reviewed against a prior baseline.",
+                        }
+                    },
+                )
+        self.assertEqual([], obligations)
+
+    def test_intentional_deletion_from_prior_incoming_is_dormant(self) -> None:
+        prior_body = "fn removed() void {}\n"
+        with tempfile.TemporaryDirectory(
+            prefix="merge-audit-dormant-intentional-deletion-",
+            dir=audit.ROOT,
+        ) as raw_dir:
+            path = pathlib.Path(raw_dir) / "split.zig"
+            path.write_text("")
+            prior_review = {
+                "incoming_sha256": audit.sha256_text(prior_body),
+                "reason": "Reviewed against a prior incoming baseline.",
+            }
+            with mock.patch.object(audit, "ref_text", return_value=""):
+                obligations, _ = audit.analyze(
+                    "monolith.zig",
+                    "base",
+                    "incoming",
+                    [path],
+                    0.7,
+                    0.05,
+                    intentional_declaration_deletions={
+                        "function:removed": prior_review,
+                    },
+                )
+        self.assertEqual([], obligations)
+
+    def test_unknown_intentional_deletion_with_live_digest_fails(self) -> None:
+        live_body = "fn live() void {}\n"
+        with tempfile.TemporaryDirectory(
+            prefix="merge-audit-live-intentional-deletion-typo-",
+            dir=audit.ROOT,
+        ) as raw_dir:
+            path = pathlib.Path(raw_dir) / "split.zig"
+            path.write_text("")
+            def ref_text(ref: str, _: str) -> str:
+                return "" if ref == "base" else live_body
+
+            with mock.patch.object(audit, "ref_text", side_effect=ref_text):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "do not identify absent incoming declarations",
+                ):
+                    audit.analyze(
+                        "monolith.zig",
+                        "base",
+                        "incoming",
+                        [path],
+                        0.7,
+                        0.05,
+                        intentional_declaration_deletions={
+                            "function:typo": {
+                                "incoming_sha256": audit.sha256_text(live_body),
+                                "reason": "Misspelled live declaration key.",
+                            },
+                        },
+                    )
+
     def test_reviewed_composition_requires_exact_live_three_way_conflict(self) -> None:
         base = "fn value() u8 { return 1; }\n"
         incoming = "fn value() u8 { return 2; }\n"
@@ -1892,6 +2030,21 @@ pub fn Impl(comptime DB: type) type {
                     0.7,
                     0.05,
                     reviewed_compositions={"function:value": review},
+                )
+                prior_parent_review = {
+                    **review,
+                    "base_sha256": "0" * 64,
+                }
+                prior_obligations, _ = audit.analyze(
+                    "monolith.zig",
+                    "base",
+                    "incoming",
+                    [path],
+                    0.7,
+                    0.05,
+                    reviewed_compositions={
+                        "function:value": prior_parent_review,
+                    },
                 )
                 with self.assertRaisesRegex(
                     ValueError,
@@ -1930,6 +2083,7 @@ pub fn Impl(comptime DB: type) type {
         )
         self.assertEqual("three_way_composition_reviewed", obligation.status)
         self.assertIn("split graph composes both sides", obligation.detail)
+        self.assertEqual("three_way_conflict", prior_obligations[0].status)
 
     def test_reviewed_resolution_requires_exact_live_semantic_conflict(self) -> None:
         base = "fn value() u8 { return baseline(); }\n"
@@ -1998,6 +2152,40 @@ pub fn Impl(comptime DB: type) type {
         )
         self.assertEqual("semantic_resolution_reviewed", obligation.status)
         self.assertIn("incoming durability", obligation.detail)
+
+    def test_reviewed_resolution_from_prior_parent_pair_is_dormant(self) -> None:
+        prior_base = "fn value() u8 { return 1; }\n"
+        current_parent = "fn value() u8 { return 2; }\n"
+        current = "fn value() u8 { return 3; }\n"
+        with tempfile.TemporaryDirectory(
+            prefix="merge-audit-dormant-reviewed-resolution-",
+            dir=audit.ROOT,
+        ) as raw_dir:
+            path = pathlib.Path(raw_dir) / "split.zig"
+            path.write_text(current)
+            review = {
+                "status": "three_way_conflict",
+                "base_sha256": audit.sha256_text(prior_base),
+                "incoming_sha256": audit.sha256_text(current_parent),
+                "current_sha256": audit.sha256_text(current),
+                "path": str(path.relative_to(audit.ROOT)),
+                "reason": "Reviewed against the preceding parent pair.",
+            }
+            with mock.patch.object(
+                audit,
+                "ref_text",
+                return_value=current_parent,
+            ):
+                obligations, _ = audit.analyze(
+                    "monolith.zig",
+                    "base",
+                    "incoming",
+                    [path],
+                    0.7,
+                    0.05,
+                    reviewed_resolutions={"function:value": review},
+                )
+        self.assertEqual([], obligations)
 
     def test_reviewed_resolution_accepts_null_base_for_added_collision(self) -> None:
         base = ""
@@ -2140,6 +2328,33 @@ pub fn Impl(comptime DB: type) type {
             ["incoming name"],
             audit.candidate_names(function_declaration, aliases),
         )
+
+    def test_test_alias_pairing_prefers_source_present_in_base(self) -> None:
+        base = audit.all_declarations(
+            'test "old b" { try verify(); }\n',
+            "base.zig",
+        )
+        incoming = audit.all_declarations(
+            'test "current" { try verify(); }\n',
+            "incoming.zig",
+        )
+        aliases = {
+            "old a": ["current"],
+            "old b": ["current"],
+        }
+        pairs = audit.pair_declarations(
+            base,
+            incoming,
+            include_unchanged=True,
+            test_name_aliases=aliases,
+        )
+        self.assertEqual(1, len(pairs))
+        self.assertEqual("old b", pairs[0][0].name)
+        self.assertEqual([], audit.removed_declarations(
+            base,
+            incoming,
+            test_name_aliases=aliases,
+        ))
 
     def test_split_test_name_rewrites_are_path_scoped(self) -> None:
         declaration = audit.Declaration(

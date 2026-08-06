@@ -27,7 +27,8 @@ class TableSchema:
     """Schema definition for a table with multiple document types
 
     Attributes:
-        version (int | Unset): Version of the schema. Used for migrations.
+        version (int | Unset): Backend-managed schema generation used for migrations. Omit it from create and update
+            requests.
         storage_mode (TableSchemaStorageMode | Unset): Storage profile for the table.
             - "document" (default): schemaless JSON documents with optional,
               soft schema validation. All indexes are derived from the document.

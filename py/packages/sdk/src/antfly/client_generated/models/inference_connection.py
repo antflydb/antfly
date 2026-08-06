@@ -30,7 +30,7 @@ class InferenceConnection:
         configured_model_types (list[ConnectedModelType] | Unset): Model types this instance is configured for.
         models (InferenceConnectionModels | Unset): Models reported by the provider, grouped by model type. Keys are
             pluralized ConnectedModelType values ("embedders", "generators",
-            "rerankers", "chunkers", "recognizers", "classifiers", "rewriters",
+            "rerankers", "chunkers", "classifiers", "rewriters",
             "readers", "transcribers", "extractors") plus "other" for models
             the provider's listing API does not classify by task. Populated
             only when the request includes the "models" expansion.

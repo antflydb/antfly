@@ -1159,6 +1159,14 @@ def pair_declarations(
     declaration_name_aliases: dict[str, list[str]] | None = None,
     test_name_aliases: dict[str, list[str]] | None = None,
 ) -> list[tuple[Declaration | None, Declaration, int]]:
+    active_test_name_aliases = {
+        source: aliases
+        for source, aliases in (test_name_aliases or {}).items()
+        if any(
+            declaration.kind == "test" and declaration.name == source
+            for declaration in base
+        )
+    }
     base_by_name: dict[tuple[str, str, str | None], list[Declaration]] = defaultdict(list)
     incoming_by_name: dict[tuple[str, str, str | None], list[Declaration]] = defaultdict(list)
     for declaration in base:
@@ -1166,7 +1174,7 @@ def pair_declarations(
             canonical_declaration_identity(
                 declaration,
                 declaration_name_aliases,
-                test_name_aliases,
+                active_test_name_aliases,
             )
         ].append(declaration)
     for declaration in incoming:
@@ -1174,7 +1182,7 @@ def pair_declarations(
             canonical_declaration_identity(
                 declaration,
                 declaration_name_aliases,
-                test_name_aliases,
+                active_test_name_aliases,
             )
         ].append(declaration)
     changed: list[tuple[Declaration | None, Declaration, int]] = []
@@ -1221,6 +1229,14 @@ def removed_declarations(
     test_name_aliases: dict[str, list[str]] | None = None,
 ) -> list[tuple[Declaration, int]]:
     """Return base declarations with no same-identity incoming partner."""
+    active_test_name_aliases = {
+        source: aliases
+        for source, aliases in (test_name_aliases or {}).items()
+        if any(
+            declaration.kind == "test" and declaration.name == source
+            for declaration in base
+        )
+    }
     base_by_name: dict[
         tuple[str, str, str | None], list[Declaration]
     ] = defaultdict(list)
@@ -1232,7 +1248,7 @@ def removed_declarations(
             canonical_declaration_identity(
                 declaration,
                 declaration_name_aliases,
-                test_name_aliases,
+                active_test_name_aliases,
             )
         ].append(declaration)
     for declaration in incoming:
@@ -1240,7 +1256,7 @@ def removed_declarations(
             canonical_declaration_identity(
                 declaration,
                 declaration_name_aliases,
-                test_name_aliases,
+                active_test_name_aliases,
             )
         ].append(declaration)
 
@@ -1824,8 +1840,11 @@ def analyze(
     replacements: dict[str, list[CandidateEdit]] = defaultdict(list)
     reviewed_composition_keys: set[str] = set()
     reviewed_resolution_keys: set[str] = set()
+    inactive_reviewed_composition_keys: set[str] = set()
+    inactive_reviewed_resolution_keys: set[str] = set()
     reviewed_container_field_migration_keys: set[str] = set()
     reviewed_intentional_deletion_keys: set[str] = set()
+    inactive_intentional_deletion_keys: set[str] = set()
 
     def apply_reviewed_resolution(
         obligation: Obligation,
@@ -1834,7 +1853,7 @@ def analyze(
         current: Declaration,
     ) -> None:
         review = reviewed_resolutions.get(obligation.key)
-        if review is None:
+        if review is None or obligation.key in inactive_reviewed_resolution_keys:
             return
         if obligation.status not in REVIEWABLE_RESOLUTION_STATUSES:
             raise ValueError(
@@ -1868,6 +1887,30 @@ def analyze(
         declaration_name_aliases=declaration_name_aliases,
         test_name_aliases=test_name_aliases,
     )
+    changed_parent_review_pairs = {
+        (
+            parent_base.digest if parent_base is not None else None,
+            parent_incoming.digest,
+        )
+        for parent_base, parent_incoming, _ in changed
+    }
+    parent_container_keys = {
+        f"container:{declaration.owner + '.' if declaration.owner else ''}"
+        f"{declaration.name}"
+        for declaration in [*base_declarations, *incoming_declarations]
+        if declaration.kind == "container"
+    }
+    changed_obligation_keys: set[str] = set()
+
+    def review_matches_current_changed_parent_pair(
+        review: dict[str, object],
+    ) -> bool:
+        pair = (
+            review["base_sha256"],
+            review["incoming_sha256"],
+        )
+        return pair in changed_parent_review_pairs
+
     for base, incoming, ordinal in changed:
         qualified_name = (
             f"{incoming.owner}.{incoming.name}"
@@ -1877,6 +1920,7 @@ def analyze(
         key = f"{incoming.kind}:{qualified_name}"
         if incoming_counts[declaration_identity(incoming)] > 1:
             key += f"#{ordinal}"
+        changed_obligation_keys.add(key)
         if base is None:
             change = "added"
         elif normalized(base.body) == normalized(incoming.body):
@@ -1902,17 +1946,28 @@ def analyze(
             base_body=base.body if include_review_bodies and base else None,
             incoming_body=incoming.body if include_review_bodies else None,
         )
+        for reviews, inactive_keys in (
+            (reviewed_compositions, inactive_reviewed_composition_keys),
+            (reviewed_resolutions, inactive_reviewed_resolution_keys),
+        ):
+            review = reviews.get(key)
+            if review is not None and (
+                review["base_sha256"] != (base.digest if base is not None else None)
+                or review["incoming_sha256"] != incoming.digest
+            ):
+                inactive_keys.add(key)
         intentional_deletion = intentional_declaration_deletions.get(key)
+        if (
+            intentional_deletion is not None
+            and intentional_deletion["incoming_sha256"] != incoming.digest
+        ):
+            inactive_intentional_deletion_keys.add(key)
+            intentional_deletion = None
         if intentional_deletion is not None:
             if candidates:
                 raise ValueError(
                     f"intentional declaration deletion {key!r} still has a "
                     "split destination candidate"
-                )
-            if intentional_deletion["incoming_sha256"] != incoming.digest:
-                raise ValueError(
-                    f"intentional declaration deletion {key!r} has stale "
-                    "incoming_sha256"
                 )
             reviewed_intentional_deletion_keys.add(key)
             obligation.status = "intentional_deletion"
@@ -2529,7 +2584,10 @@ def analyze(
         if merge_status != 0:
             obligation.status = "three_way_conflict"
             obligation.detail = "declaration-level three-way merge requires review"
-            if obligation.key in reviewed_compositions:
+            if (
+                obligation.key in reviewed_compositions
+                and obligation.key not in inactive_reviewed_composition_keys
+            ):
                 review = reviewed_compositions[obligation.key]
                 expected = {
                     "base_sha256": base.digest,
@@ -2606,6 +2664,12 @@ def analyze(
         if base_counts[declaration_identity(base)] > 1:
             key += f"#{ordinal}"
         candidates = current_candidates(base)
+        if key in reviewed_compositions:
+            inactive_reviewed_composition_keys.add(key)
+        if key in reviewed_resolutions:
+            inactive_reviewed_resolution_keys.add(key)
+        if key in intentional_declaration_deletions:
+            inactive_intentional_deletion_keys.add(key)
         obligation = Obligation(
             key=key,
             kind=base.kind,
@@ -2719,48 +2783,83 @@ def analyze(
     unknown_retained_deletions = (
         set(retained_deletions) - reviewed_retained_deletions
     )
-    if unknown_retained_deletions:
+    live_base_digests = {declaration.digest for declaration in base_declarations}
+    active_unknown_retained_deletions = {
+        key
+        for key in unknown_retained_deletions
+        if retained_deletions[key]["base_sha256"] in live_base_digests
+    }
+    if active_unknown_retained_deletions:
         raise ValueError(
             "retained deletion entries do not identify uniquely retained, "
             "conflict-free deleted declarations: "
-            + ", ".join(sorted(unknown_retained_deletions))
+            + ", ".join(sorted(active_unknown_retained_deletions))
         )
     unknown_reviewed_compositions = (
-        set(reviewed_compositions) - reviewed_composition_keys
+        set(reviewed_compositions)
+        - reviewed_composition_keys
+        - inactive_reviewed_composition_keys
     )
-    if unknown_reviewed_compositions:
+    active_unknown_reviewed_compositions = {
+        key
+        for key in unknown_reviewed_compositions
+        if review_matches_current_changed_parent_pair(reviewed_compositions[key])
+    }
+    if active_unknown_reviewed_compositions:
         raise ValueError(
             "reviewed composition entries do not identify live three-way "
             "conflicts: "
-            + ", ".join(sorted(unknown_reviewed_compositions))
+            + ", ".join(sorted(active_unknown_reviewed_compositions))
         )
     unknown_reviewed_resolutions = (
-        set(reviewed_resolutions) - reviewed_resolution_keys
+        set(reviewed_resolutions)
+        - reviewed_resolution_keys
+        - inactive_reviewed_resolution_keys
     )
-    if unknown_reviewed_resolutions:
+    active_unknown_reviewed_resolutions = {
+        key
+        for key in unknown_reviewed_resolutions
+        if review_matches_current_changed_parent_pair(reviewed_resolutions[key])
+    }
+    if active_unknown_reviewed_resolutions:
         raise ValueError(
             "reviewed resolution entries do not identify live reviewable "
             "semantic conflicts: "
-            + ", ".join(sorted(unknown_reviewed_resolutions))
+            + ", ".join(sorted(active_unknown_reviewed_resolutions))
         )
     unknown_container_field_migrations = (
         set(container_field_migrations) - reviewed_container_field_migration_keys
     )
-    if unknown_container_field_migrations:
+    active_unknown_container_field_migrations = {
+        key
+        for key in unknown_container_field_migrations
+        if key in changed_obligation_keys or key not in parent_container_keys
+    }
+    if active_unknown_container_field_migrations:
         raise ValueError(
             "container field migration entries do not identify live container "
             "obligations: "
-            + ", ".join(sorted(unknown_container_field_migrations))
+            + ", ".join(sorted(active_unknown_container_field_migrations))
         )
     unknown_intentional_deletions = (
         set(intentional_declaration_deletions)
         - reviewed_intentional_deletion_keys
+        - inactive_intentional_deletion_keys
     )
-    if unknown_intentional_deletions:
+    live_incoming_digests = {
+        incoming.digest for _, incoming, _ in changed
+    }
+    active_unknown_intentional_deletions = {
+        key
+        for key in unknown_intentional_deletions
+        if intentional_declaration_deletions[key]["incoming_sha256"]
+        in live_incoming_digests
+    }
+    if active_unknown_intentional_deletions:
         raise ValueError(
             "intentional declaration deletion entries do not identify absent "
             "incoming declarations: "
-            + ", ".join(sorted(unknown_intentional_deletions))
+            + ", ".join(sorted(active_unknown_intentional_deletions))
         )
     return obligations, replacements
 

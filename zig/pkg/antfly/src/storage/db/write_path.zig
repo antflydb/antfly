@@ -65,6 +65,7 @@ else
 const transactions_mod = @import("../transactions.zig");
 const ttl_mod = @import("../ttl.zig");
 const ttl_runtime_mod = @import("maintenance/ttl_runtime.zig");
+const text_merge_runtime_mod = @import("maintenance/text_merge_runtime.zig");
 const types = @import("types.zig");
 
 const Allocator = std.mem.Allocator;
@@ -5399,13 +5400,13 @@ test "db write path bulk ingest dense auto replays packed external embedding str
     try std.testing.expectEqual(@as(u64, 2), stats.indexes[0].doc_count);
 }
 
-test "db write path bulk ingest full_text sync defers text merge work until finish" {
+test "db bulk ingest keeps full text merge maintenance live" {
     const DB = @import("mod.zig").DB;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
-    defer TestHelpers.cleanupTempDir(path);
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .text_merge = .{
@@ -5421,6 +5422,11 @@ test "db write path bulk ingest full_text sync defers text merge work until fini
         .kind = .full_text,
         .config_json = "{}",
     });
+
+    const runtime = db.text_merge_runtime orelse return error.TestUnexpectedResult;
+    // Keep background execution deterministic; runOnce below proves that the
+    // dense bulk deferral flag no longer suppresses text maintenance.
+    try std.testing.expect(runtime.pause());
 
     try db.beginBulkIngestSession();
     errdefer db.abortBulkIngestSession();
@@ -5441,8 +5447,8 @@ test "db write path bulk ingest full_text sync defers text merge work until fini
     try std.testing.expect(before.pending_segments > 0);
     try std.testing.expect(db.async_context.text_merge_deferred.load(.acquire));
 
-    const runtime = db.text_merge_runtime orelse return error.TestUnexpectedResult;
-    try std.testing.expect(!(try runtime.runOnce()));
+    try std.testing.expect(try runtime.runOnce());
+    try runtime.resumeAfterPause();
 
     try db.finishBulkIngestSessionWithOptions(.{ .compact = false });
     try std.testing.expect(!db.async_context.text_merge_deferred.load(.acquire));
@@ -9208,19 +9214,29 @@ pub fn Impl(comptime DB: type) type {
             if (DB.WritePathCallbacks.open_mode_requires_read_only_backends(self.open_mode)) {
                 return error.ReadOnly;
             }
-            self.core.lockApply();
-            const segment_count = self.core.index_manager.indexTextKernelDocuments(
-                index_name,
-                docs,
-            ) catch |err| {
+            const reservation_limit = if (self.text_merge_runtime) |runtime| runtime.producerSegmentReservationLimit() else std.math.maxInt(usize);
+            var publication_plan = try self.core.index_manager.planTextKernelPublication(self.alloc, docs, reservation_limit);
+            defer publication_plan.deinit();
+            var segment_count: usize = 0;
+            var start: usize = 0;
+            for (publication_plan.chunks) |planned| {
+                const chunk = docs[start..planned.end];
+                var merge_permit: ?text_merge_runtime_mod.TextMergeRuntime.ProducerPermit = null;
+                if (self.text_merge_runtime) |runtime| {
+                    merge_permit = try runtime.acquireProducerPermit(index_name, planned.estimate.segment_count, planned.estimate.byte_count);
+                }
+                defer if (merge_permit) |*permit| permit.release();
+                self.core.lockApply();
+                const published = self.core.index_manager.indexTextKernelDocuments(index_name, chunk) catch |err| {
+                    self.core.unlockApply();
+                    return err;
+                };
                 self.core.unlockApply();
-                return err;
-            };
-            self.core.unlockApply();
-            if (self.text_merge_runtime) |runtime| {
-                runtime.notify();
-                runtime.applyBackpressure();
+                segment_count += published;
+                if (self.text_merge_runtime) |runtime| runtime.notify();
+                start = planned.end;
             }
+            std.debug.assert(start == docs.len);
             return segment_count;
         }
 

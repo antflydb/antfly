@@ -27,12 +27,13 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from functools import partial
+import hashlib
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 import subprocess
 import threading
-from urllib.parse import unquote
+from urllib.parse import parse_qs, unquote, urlsplit
 
 import numpy as np
 import pytest
@@ -216,16 +217,29 @@ def _serve_fake_hf(files, owner="acme", repo="stump-model"):
 
     class FakeHuggingFaceHandler(QuietSimpleHTTPRequestHandler):
         def do_GET(self):  # noqa: N802
-            path = unquote(self.path)
+            request_url = urlsplit(self.path)
+            path = unquote(request_url.path)
             api_path = f"/api/models/{owner}/{repo}"
             resolve_prefix = f"/{owner}/{repo}/resolve/main/"
             if path == api_path:
-                body = json.dumps({
-                    "siblings": [
-                        {"rfilename": name, "size": len(data)}
-                        for name, data in payloads.items()
-                    ]
-                }).encode("utf-8")
+                if parse_qs(request_url.query).get("blobs") != ["true"]:
+                    self.send_error(400, "blobs=true is required")
+                    return
+                body = json.dumps(
+                    {
+                        "siblings": [
+                            {
+                                "rfilename": name,
+                                "size": len(data),
+                                "blobId": hashlib.sha1(
+                                    f"blob {len(data)}\0".encode() + data,
+                                    usedforsecurity=False,
+                                ).hexdigest(),
+                            }
+                            for name, data in payloads.items()
+                        ]
+                    }
+                ).encode("utf-8")
                 self.send_response(200)
                 self.send_header("content-type", "application/json")
                 self.send_header("content-length", str(len(body)))

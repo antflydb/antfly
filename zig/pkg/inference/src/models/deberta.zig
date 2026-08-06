@@ -63,6 +63,15 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config
         };
     }
 
+    // deberta_graph.zig builds the relative-position projections Q_r/K_r by
+    // reusing the content query/key weights (DeBERTa-v3 share_att_key=true).
+    // A checkpoint that declares separate positional projections
+    // (share_att_key=false) would be silently mis-projected, so fail closed.
+    // An absent key keeps the v3 assumption every supported bundle relies on.
+    if (obj.get("share_att_key")) |v| {
+        if (v == .bool and !v.bool) return error.UnsupportedDebertaShareAttKey;
+    }
+
     return config;
 }
 
@@ -192,6 +201,17 @@ test "parse config infers num_labels from id2label" {
     ;
     const config = try parseConfig(allocator, json_str);
     try std.testing.expectEqual(@as(u32, 3), config.num_labels);
+}
+
+test "parse config fails closed on share_att_key=false" {
+    const allocator = std.testing.allocator;
+    const shared = try parseConfig(allocator,
+        \\{"model_type":"deberta-v3","hidden_size":768,"share_att_key":true}
+    );
+    try std.testing.expectEqual(@as(u32, 768), shared.hidden_size);
+    try std.testing.expectError(error.UnsupportedDebertaShareAttKey, parseConfig(allocator,
+        \\{"model_type":"deberta-v2","hidden_size":768,"share_att_key":false}
+    ));
 }
 
 test "isDebertaModel matches supported model types" {

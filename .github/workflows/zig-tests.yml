@@ -717,12 +717,26 @@ jobs:
           SKIP_BUILD: "1"
         run: taskset -c ${{ steps.e2e_cpus.outputs.list }} scripts/ci/zig-e2e-base-linux.sh
 
+      - name: Run low-FD Autograph regression
+        env:
+          SKIP_BUILD: "1"
+          ANTFLY_E2E_NOFILE_LIMIT: "256"
+          ANTFLY_E2E_REGRESSION_REPEATS: "3"
+        run: >-
+          taskset -c ${{ steps.e2e_cpus.outputs.list }}
+          scripts/ci/zig-e2e-regression-loop.sh
+          e2e/antfly/test_resolution.py::test_multinode_autograph_resolves_promotes_and_hydrates_entities
+
   e2e-full:
     name: e2e-full
     needs: changes
-    if: github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch' || github.event.schedule == '0 8 * * *'
+    if: |
+      github.event_name == 'merge_group' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      github.event_name == 'workflow_dispatch' ||
+      github.event.schedule == '0 8 * * *'
     runs-on: arc-antfly-heavy
-    timeout-minutes: 90
+    timeout-minutes: 120
     env:
       ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
@@ -731,6 +745,9 @@ jobs:
       # Keep production optimization while preserving runtime-safety checks and
       # std.debug.assert invariants exercised by the full E2E suite.
       ANTFLY_CI_ZIG_OPTIMIZE: ReleaseSafe
+      # Match release artifact symbol handling without disabling ReleaseSafe
+      # checks or std.debug.assert invariants.
+      ANTFLY_CI_ZIG_STRIP: "true"
     steps:
       - uses: actions/checkout@v6
         with:
@@ -799,8 +816,28 @@ jobs:
           echo "ANTFLY_WASMTIME_LIB=$lib" >> "$GITHUB_ENV"
           echo "LD_LIBRARY_PATH=$root/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
 
+      - name: Run Antfly inference full E2E
+        id: inference_full_e2e
+        continue-on-error: true
+        working-directory: zig
+        env:
+          ANTFLY_BIN: ./zig-out/bin/antfly
+          ANTFLY_INFERENCE_DOWNLOAD: "1"
+          # Gemma 4 covers ordinary, tool-calling, and multimodal generation;
+          # keep one decoder artifact across every generation endpoint.
+          ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL: ggml-org/gemma-4-e2b-it-gguf
+          ANTFLY_INFERENCE_FLORENCE_MODEL: antflydb/florence-2-base
+          ANTFLY_INFERENCE_REQUEST_TIMEOUT: "300"
+          ANTFLY_INFERENCE_MAX_LOADED_MODELS: "1"
+        run: |
+          chmod +x ./zig-out/bin/antfly
+          taskset -c ${{ steps.e2e_cpus.outputs.list }} uv run --project e2e/inference pytest -q --continue-on-collection-errors e2e/inference
+
+      # Run the non-inference suite second so large model imports see the
+      # runner's maximum available memory after the build has exited.
       - name: Run Antfly full E2E
         id: antfly_full_e2e
+        if: always()
         continue-on-error: true
         working-directory: zig
         env:
@@ -809,18 +846,6 @@ jobs:
         run: |
           chmod +x ./zig-out/bin/antfly
           taskset -c ${{ steps.e2e_cpus.outputs.list }} uv run --project e2e/antfly pytest -q --continue-on-collection-errors e2e/antfly
-
-      - name: Run Antfly inference full E2E
-        id: inference_full_e2e
-        if: always()
-        continue-on-error: true
-        working-directory: zig
-        env:
-          ANTFLY_BIN: ./zig-out/bin/antfly
-          ANTFLY_INFERENCE_DOWNLOAD: "1"
-          ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL: unsloth/Qwen3-1.7B-GGUF
-          ANTFLY_INFERENCE_FLORENCE_MODEL: antflydb/florence-2-base
-        run: taskset -c ${{ steps.e2e_cpus.outputs.list }} uv run --project e2e/inference pytest -q --continue-on-collection-errors e2e/inference
 
       - name: Report full E2E result
         if: always()

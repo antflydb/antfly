@@ -104,7 +104,11 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
         } else {
             const owned = try std.heap.page_allocator.create(storage_io.NativeStorage);
             errdefer std.heap.page_allocator.destroy(owned);
-            owned.* = try storage_io.NativeStorage.init(std.heap.page_allocator, backend_options.io_runtime);
+            owned.* = try storage_io.NativeStorage.initWithPool(
+                std.heap.page_allocator,
+                backend_options.io_runtime,
+                backend_options.native_storage_pool,
+            );
             backend.storage_owner = owned;
             backend.storage = owned.storage();
         }

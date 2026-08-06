@@ -696,6 +696,9 @@ pub const DBTestFilters = struct {
     // owning module or stable prefix instead of adding a one-off title.
     pub const root = [_][]const u8{
         "storage.db.db.test.",
+        "storage.db.promotion_runtime.test.",
+        "supported transform on a missing document remains a no-op without upsert",
+        "unsupported transform on a missing document is rejected before no-op resolution",
     };
 
     pub const enrichment = [_][]const u8{
@@ -1635,7 +1638,7 @@ pub const APITestFilters = struct {
         "batch identity metadata fails closed at ordinal capacity",
         "identity namespace reassignment preserves snapshot generations and rejects stale writers",
         "near-u32 ordinal pressure preserves sparse high ordinal state through reassignment",
-        "provisioned table restore retry skips exact incomplete restore state with active writer",
+        "provisioned table restore retry repairs exact incomplete restore state through active writer",
         "storage.db.lifecycle.test.db lifecycle doc identity ",
         "storage.db.write_path.test.db write path doc identity ",
         "storage.db.transactions.test.db transactions doc identity ",
@@ -1788,6 +1791,7 @@ pub const APITestFilters = struct {
 
     pub const public_table_http_docid = [_][]const u8{
         "public table batch handler maps doc identity unavailable errors",
+        "public create index exposes retryable storage descriptor exhaustion",
         "public table query handler maps doc identity unavailable errors",
         "public table query handler maps HA read gate errors",
         "public table query view handler maps doc identity unavailable errors",
@@ -2666,6 +2670,8 @@ pub const DataTestFilters = struct {
         "data runtime status refresh publishes synthetic missing status for absent local group db",
         "data runtime status refresh budget reuses cached group status instead of opening db",
         "data runtime status refresh reuses managed writer snapshot instead of reopening table db",
+        "runtime status observation cannot erase a startup catch-up retry",
+        "data raft batch forwarding escapes a leaderless local placement",
         "data runtime keeps status refresh dirty for non-startup async index work",
         "data runtime runRound does not refresh provisioned replica root inline while worker is active",
         "data runtime data changes mark provisioned startup catch-up dirty",
@@ -4694,7 +4700,7 @@ const main_derived_coverage_filters = [_][]const u8{
     "derived coverage reasons deduplicate overlapping freshness signals",
     "managed embeddings readiness ignores inactive stale catch-up after rate-limit recovery",
     "single embeddings index encoder keeps retrying coverage gaps catch-up coherent",
-    "managed embeddings coverage debt does not fabricate replay debt",
+    "managed embeddings skipped terminal sources complete backfill without fabricating replay debt",
     "enrichment aggregation preserves telemetry and fences mixed checkpoint identity",
     "table storage status indexes one distributed snapshot by table and owner",
     "distributed join uses row estimates when byte statistics are unavailable",

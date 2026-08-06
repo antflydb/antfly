@@ -217,12 +217,14 @@ from .extraction_relation import ExtractionRelation
 from .extraction_relation_endpoint import ExtractionRelationEndpoint
 from .extraction_relation_schema import ExtractionRelationSchema
 from .extraction_request import ExtractionRequest
+from .extraction_resolver_options import ExtractionResolverOptions
 from .extraction_response import ExtractionResponse
 from .extraction_response_object import ExtractionResponseObject
 from .extraction_response_usage import ExtractionResponseUsage
 from .extraction_schema import ExtractionSchema
 from .extraction_schema_structures import ExtractionSchemaStructures
 from .extraction_structure_field_type_1 import ExtractionStructureFieldType1
+from .extraction_structure_field_type_1_type import ExtractionStructureFieldType1Type
 from .extraction_structure_schema import ExtractionStructureSchema
 from .extraction_structure_schema_fields import ExtractionStructureSchemaFields
 from .extraction_token import ExtractionToken
@@ -358,6 +360,7 @@ from .inference_embedding_object import InferenceEmbeddingObject
 from .inference_embedding_object_object import InferenceEmbeddingObjectObject
 from .inference_embedding_usage import InferenceEmbeddingUsage
 from .inference_error import InferenceError
+from .inference_error_reason import InferenceErrorReason
 from .inference_finish_reason import InferenceFinishReason
 from .inference_function_definition import InferenceFunctionDefinition
 from .inference_function_definition_parameters import InferenceFunctionDefinitionParameters
@@ -408,7 +411,6 @@ from .inference_models_response_extractors import InferenceModelsResponseExtract
 from .inference_models_response_generators import InferenceModelsResponseGenerators
 from .inference_models_response_object import InferenceModelsResponseObject
 from .inference_models_response_readers import InferenceModelsResponseReaders
-from .inference_models_response_recognizers import InferenceModelsResponseRecognizers
 from .inference_models_response_rerankers import InferenceModelsResponseRerankers
 from .inference_models_response_rewriters import InferenceModelsResponseRewriters
 from .inference_models_response_transcribers import InferenceModelsResponseTranscribers
@@ -461,6 +463,8 @@ from .inference_transcribe_object_object import InferenceTranscribeObjectObject
 from .inference_transcribe_request import InferenceTranscribeRequest
 from .inference_transcribe_response import InferenceTranscribeResponse
 from .inference_transcribe_response_object import InferenceTranscribeResponseObject
+from .inference_transient_capacity_error import InferenceTransientCapacityError
+from .inference_transient_capacity_error_reason import InferenceTransientCapacityErrorReason
 from .inferenceschemas_config import InferenceschemasConfig
 from .install_extension_request import InstallExtensionRequest
 from .install_manifest import InstallManifest
@@ -795,6 +799,8 @@ from .table_schema_document_schemas import TableSchemaDocumentSchemas
 from .table_schema_storage_mode import TableSchemaStorageMode
 from .table_statistics import TableStatistics
 from .table_statistics_field_stats import TableStatisticsFieldStats
+from .table_storage_unreadable_error import TableStorageUnreadableError
+from .table_storage_unreadable_error_code import TableStorageUnreadableErrorCode
 from .tablespace_catalog_record import TablespaceCatalogRecord
 from .tavily_search_config import TavilySearchConfig
 from .tavily_search_config_search_depth import TavilySearchConfigSearchDepth
@@ -1077,12 +1083,14 @@ __all__ = (
     "ExtractionRelationEndpoint",
     "ExtractionRelationSchema",
     "ExtractionRequest",
+    "ExtractionResolverOptions",
     "ExtractionResponse",
     "ExtractionResponseObject",
     "ExtractionResponseUsage",
     "ExtractionSchema",
     "ExtractionSchemaStructures",
     "ExtractionStructureFieldType1",
+    "ExtractionStructureFieldType1Type",
     "ExtractionStructureSchema",
     "ExtractionStructureSchemaFields",
     "ExtractionToken",
@@ -1218,6 +1226,7 @@ __all__ = (
     "InferenceEmbedResponse",
     "InferenceEmbedResponseObject",
     "InferenceError",
+    "InferenceErrorReason",
     "InferenceFinishReason",
     "InferenceFunctionDefinition",
     "InferenceFunctionDefinitionParameters",
@@ -1268,7 +1277,6 @@ __all__ = (
     "InferenceModelsResponseGenerators",
     "InferenceModelsResponseObject",
     "InferenceModelsResponseReaders",
-    "InferenceModelsResponseRecognizers",
     "InferenceModelsResponseRerankers",
     "InferenceModelsResponseRewriters",
     "InferenceModelsResponseTranscribers",
@@ -1322,6 +1330,8 @@ __all__ = (
     "InferenceTranscribeRequest",
     "InferenceTranscribeResponse",
     "InferenceTranscribeResponseObject",
+    "InferenceTransientCapacityError",
+    "InferenceTransientCapacityErrorReason",
     "InstalledExtension",
     "InstalledExtensionStatus",
     "InstallExtensionRequest",
@@ -1656,6 +1666,8 @@ __all__ = (
     "TablespaceCatalogRecord",
     "TableStatistics",
     "TableStatisticsFieldStats",
+    "TableStorageUnreadableError",
+    "TableStorageUnreadableErrorCode",
     "TavilySearchConfig",
     "TavilySearchConfigSearchDepth",
     "TemplateFieldMapping",

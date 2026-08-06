@@ -410,6 +410,7 @@ pub fn makeLsmBackgroundExecutor(runtime: *background_runtime_mod.BackendRuntime
 }
 
 pub fn installLsmReadRuntime(options: *lsm_backend_mod.Options, runtime: *background_runtime_mod.BackendRuntime) void {
+    if (options.native_storage_pool == null) options.native_storage_pool = runtime.nativeStoragePool();
     if (options.read_runtime != null) return;
     if (runtime.io()) |io| options.read_runtime = lsm_backend_mod.storage_io.ReadRuntime.init(io);
 }
@@ -1638,7 +1639,6 @@ pub fn Impl(comptime DB: type) type {
                 self.runtime_alloc,
                 resources.index_manager,
                 resources.apply_mutex,
-                &self.async_context.text_merge_deferred,
                 self.backend_runtime,
                 cfg,
             );
@@ -4413,27 +4413,11 @@ pub fn Impl(comptime DB: type) type {
         }
 
         pub fn snapshotLsmNativeStorageStats(self: *DB) lsm_backend_mod.NativeStorageStats {
-            self.core.lockApplyShared();
-            defer self.core.unlockApplyShared();
-            return Self.snapshotLsmNativeStorageStatsLocked(self);
+            return self.backend_runtime.snapshotNativeStorageStats();
         }
 
         pub fn trySnapshotLsmNativeStorageStats(self: *DB) ?lsm_backend_mod.NativeStorageStats {
-            if (!self.core.tryLockApplyShared()) return null;
-            defer self.core.unlockApplyShared();
-            return Self.snapshotLsmNativeStorageStatsLocked(self);
-        }
-
-        pub fn snapshotLsmNativeStorageStatsLocked(self: *DB) lsm_backend_mod.NativeStorageStats {
-            var native_storage_stats = lsm_backend_mod.NativeStorageStats{};
-            if (self.core.primary_store_owner.snapshotLsmNativeStorageStats()) |primary_stats| {
-                native_storage_stats.fd_cache_entries +|= primary_stats.fd_cache_entries;
-                native_storage_stats.fd_cache_capacity +|= primary_stats.fd_cache_capacity;
-            }
-            const index_stats = self.core.index_manager.snapshotLsmNativeStorageStats();
-            native_storage_stats.fd_cache_entries +|= index_stats.fd_cache_entries;
-            native_storage_stats.fd_cache_capacity +|= index_stats.fd_cache_capacity;
-            return native_storage_stats;
+            return self.backend_runtime.snapshotNativeStorageStats();
         }
 
         pub fn runLsmMaintenanceStep(self: *DB) !bool {

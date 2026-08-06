@@ -66,6 +66,7 @@ pub const Tensor = struct {
     pub fn initFloat32(allocator: std.mem.Allocator, name: []const u8, shape: []const i64, data: []const f32) !Tensor {
         const bytes = std.mem.sliceAsBytes(data);
         const owned_bytes = try allocator.dupe(u8, bytes);
+        errdefer allocator.free(owned_bytes);
         const owned_shape = try allocator.dupe(i64, shape);
         return .{
             .data = owned_bytes,
@@ -81,6 +82,7 @@ pub const Tensor = struct {
     pub fn initInt64(allocator: std.mem.Allocator, name: []const u8, shape: []const i64, data: []const i64) !Tensor {
         const bytes = std.mem.sliceAsBytes(data);
         const owned_bytes = try allocator.dupe(u8, bytes);
+        errdefer allocator.free(owned_bytes);
         const owned_shape = try allocator.dupe(i64, shape);
         return .{
             .data = owned_bytes,
@@ -96,6 +98,7 @@ pub const Tensor = struct {
     pub fn initInt8(allocator: std.mem.Allocator, name: []const u8, shape: []const i64, data: []const i8) !Tensor {
         const bytes = std.mem.sliceAsBytes(data);
         const owned_bytes = try allocator.dupe(u8, bytes);
+        errdefer allocator.free(owned_bytes);
         const owned_shape = try allocator.dupe(i64, shape);
         return .{
             .data = owned_bytes,
@@ -111,6 +114,7 @@ pub const Tensor = struct {
     pub fn initInt16(allocator: std.mem.Allocator, name: []const u8, shape: []const i64, data: []const i16) !Tensor {
         const bytes = std.mem.sliceAsBytes(data);
         const owned_bytes = try allocator.dupe(u8, bytes);
+        errdefer allocator.free(owned_bytes);
         const owned_shape = try allocator.dupe(i64, shape);
         return .{
             .data = owned_bytes,
@@ -126,6 +130,7 @@ pub const Tensor = struct {
     pub fn initFloat64(allocator: std.mem.Allocator, name: []const u8, shape: []const i64, data: []const f64) !Tensor {
         const bytes = std.mem.sliceAsBytes(data);
         const owned_bytes = try allocator.dupe(u8, bytes);
+        errdefer allocator.free(owned_bytes);
         const owned_shape = try allocator.dupe(i64, shape);
         return .{
             .data = owned_bytes,
@@ -140,6 +145,7 @@ pub const Tensor = struct {
 
     pub fn initBool(allocator: std.mem.Allocator, name: []const u8, shape: []const i64, data: []const u8) !Tensor {
         const owned_bytes = try allocator.dupe(u8, data);
+        errdefer allocator.free(owned_bytes);
         const owned_shape = try allocator.dupe(i64, shape);
         return .{
             .data = owned_bytes,
@@ -204,6 +210,21 @@ pub const Tensor = struct {
         return count;
     }
 
+    /// Return a non-owning view suitable for passing an existing tensor under
+    /// a different input name. The source tensor remains responsible for its
+    /// buffers and any attached lifetime hook; deinitializing the view is a
+    /// no-op. Shallow-copying a Tensor is not sufficient because it would copy
+    /// the lifetime hook without retaining it and can therefore release a
+    /// shared admission lease more than once.
+    pub fn borrowedView(self: *const Tensor, name: []const u8) Tensor {
+        var view = self.*;
+        view.name = name;
+        view.owns_data = false;
+        view.owns_shape = false;
+        view.lifetime = null;
+        return view;
+    }
+
     pub fn deinit(self: *Tensor) void {
         if (self.owns_data) self.allocator.free(self.data);
         if (self.owns_shape) self.allocator.free(self.shape);
@@ -230,4 +251,30 @@ test "tensor scalar dtype sizes" {
     try std.testing.expectEqual(@as(usize, 1), DType.i8.byteSize());
     try std.testing.expectEqual(@as(usize, 2), DType.i16.byteSize());
     try std.testing.expectEqual(@as(usize, 8), DType.f64.byteSize());
+}
+
+test "borrowed tensor view does not release source lifetime" {
+    const ReleaseCounter = struct {
+        count: usize = 0,
+
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.count += 1;
+        }
+    };
+
+    var counter = ReleaseCounter{};
+    var source = try Tensor.initFloat32(std.testing.allocator, "source", &.{1}, &.{1.0});
+    source.lifetime = .{ .context = &counter, .release = ReleaseCounter.release };
+
+    var view = source.borrowedView("renamed");
+    try std.testing.expectEqualStrings("renamed", view.name);
+    try std.testing.expect(!view.owns_data);
+    try std.testing.expect(!view.owns_shape);
+    try std.testing.expect(view.lifetime == null);
+
+    view.deinit();
+    try std.testing.expectEqual(@as(usize, 0), counter.count);
+    source.deinit();
+    try std.testing.expectEqual(@as(usize, 1), counter.count);
 }

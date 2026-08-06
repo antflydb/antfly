@@ -15,8 +15,8 @@
 // Fused-to-primitive lowering pass.
 //
 // Replaces fused ops with their decomposed primitive subgraphs (already
-// present in the graph via vjp_alternate pointers). Produces a new graph
-// containing only primitive ops, suitable for autograd differentiation.
+// present in the graph via vjp_alternate pointers). Some fused ops are
+// deliberately preserved because they have custom VJPs or backend kernels.
 //
 // Fused ops WITHOUT a vjp_alternate are passed through unchanged (they
 // need hand-written VJPs or are not differentiable).
@@ -46,8 +46,8 @@ pub const LowerResult = struct {
 };
 
 /// Lower a graph by replacing fused ops (that have vjp_alternate) with
-/// their decomposed primitive subgraphs. Returns a new graph where all
-/// such fused ops are replaced by their primitive equivalents.
+/// their decomposed primitive subgraphs. Returns a new graph where lowerable
+/// fused ops are replaced by their primitive equivalents.
 ///
 /// The returned id_map translates old node IDs to new node IDs.
 pub fn lower(allocator: std.mem.Allocator, graph: *const Graph) !LowerResult {
@@ -62,6 +62,10 @@ pub fn lower(allocator: std.mem.Allocator, graph: *const Graph) !LowerResult {
     }
     for (0..count) |i| {
         const n = graph.node(@intCast(i));
+        if (n.op == .fused_gelu or n.op == .fused_gelu_exact or n.op == .fused_softmax) continue;
+        // Fused disentangled attention keeps its fused forward kernel and is
+        // differentiated by a custom VJP rule (not vjp_alternate lowering).
+        if (n.op == .fused_disentangled_attention or n.op == .fused_disentangled_attention_backward) continue;
         if (n.op.isFused() and n.vjp_alternate != null_node) {
             redirect[i] = n.vjp_alternate;
         }
@@ -303,10 +307,11 @@ test "lower chains of fused ops" {
     var lowered = try lower(allocator, &g);
     defer lowered.deinit();
 
-    // All nodes should be primitive
+    // Lowerable fused nodes should become primitives; activation kernels with
+    // custom differentiation are intentionally preserved.
     for (0..lowered.graph.nodeCount()) |i| {
         const n = lowered.graph.node(@intCast(i));
-        try std.testing.expect(n.op.isPrimitive());
+        try std.testing.expect(n.op.isPrimitive() or n.op == .fused_gelu or n.op == .fused_gelu_exact or n.op == .fused_softmax);
     }
 
     // Should have more nodes than the fused version (decomposed)

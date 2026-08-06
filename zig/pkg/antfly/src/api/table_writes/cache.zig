@@ -3260,6 +3260,48 @@ pub const ProvisionedTableWriteCache = struct {
         removed.deinit(self.alloc);
     }
 
+    pub fn evictOneInactiveEntryForDescriptorPressureLocked(
+        self: *ProvisionedTableWriteCache,
+        excluded_group_id: u64,
+        excluded_table_name: []const u8,
+    ) !bool {
+        lockAtomic(&self.entry_lifecycle_mutex);
+        defer self.entry_lifecycle_mutex.unlock();
+        return try self.evictOneInactiveEntryForDescriptorPressureAssumeLifecycleLocked(
+            excluded_group_id,
+            excluded_table_name,
+        );
+    }
+
+    pub fn evictOneInactiveEntryForDescriptorPressureAssumeLifecycleLocked(
+        self: *ProvisionedTableWriteCache,
+        excluded_group_id: ?u64,
+        excluded_table_name: []const u8,
+    ) !bool {
+        var entry_index: usize = 0;
+        while (entry_index < self.entries.items.len) : (entry_index += 1) {
+            const entry = self.entries.items[entry_index];
+            if (excluded_group_id) |excluded| {
+                if (entry.group_id == excluded and
+                    std.mem.eql(u8, entry.table_name, excluded_table_name)) continue;
+            }
+            if (self.bulkIngestSessionActiveForTable(entry.table_name)) continue;
+
+            const inactive = entry.active_leases == 0 and
+                !entry.bulk_ingest_session_open and
+                !entry.auto_bulk_ingest_session_open and
+                !entry.auto_bulk_ingest_finishing;
+            if (!inactive) continue;
+
+            try self.closing_entries.ensureUnusedCapacity(self.alloc, 1);
+            _ = self.entries.orderedRemove(entry_index);
+            entry.retired = true;
+            self.queueEntryForCloseAssumeLifecycleLocked(entry);
+            return true;
+        }
+        return false;
+    }
+
     pub fn notifyTableEvictions(self: *ProvisionedTableWriteCache) void {
         const hook = self.table_eviction_hook orelse return;
         for (self.table_metadata.items) |metadata| hook.notify(self, metadata.table_name);

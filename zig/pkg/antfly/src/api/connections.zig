@@ -194,7 +194,6 @@ fn inferenceCapability(operation: []const u8) ?[]const u8 {
         .{ "generate", "models.generate" },
         .{ "rerank", "models.rerank" },
         .{ "chunk", "models.chunk" },
-        .{ "recognize", "models.recognize" },
         .{ "extract", "models.extract" },
         .{ "rewrite", "models.rewrite" },
         .{ "read", "models.read" },

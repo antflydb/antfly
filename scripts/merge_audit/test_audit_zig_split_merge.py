@@ -55,6 +55,63 @@ class ManifestPolicyTests(unittest.TestCase):
             audit.SAME_PATH_FUNCTION_FALSE_POSITIVES.clear()
             audit.SAME_PATH_FUNCTION_FALSE_POSITIVES.update(original)
 
+    def test_path_qualified_symbol_alias_requires_live_destination(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            destination = root / "src/destination.zig"
+            destination.parent.mkdir(parents=True)
+            destination.write_text(
+                "pub const CurrentType = struct {};\n"
+                "fn currentHelper() void {}\n"
+            )
+            with mock.patch.object(audit, "ROOT", root):
+                self.assertTrue(audit.current_symbol_alias_exists(
+                    "src/destination.zig::CurrentType", "", "const"
+                ))
+                self.assertTrue(audit.current_symbol_alias_exists(
+                    "src/destination.zig::currentHelper", "", "fn"
+                ))
+                self.assertFalse(audit.current_symbol_alias_exists(
+                    "src/destination.zig::Missing", "", "const"
+                ))
+
+
+class ImportedFunctionReferenceTests(unittest.TestCase):
+    def test_comments_and_literals_do_not_create_member_calls(self):
+        text = (
+            'const imported = @import("imported.zig");\n'
+            '// imported.missing()\n'
+            'const message = "imported.alsoMissing()";\n'
+            '/* imported.blockMissing() */\n'
+            '\\\\imported.multilineMissing()\n'
+            'pub fn run() void { imported.present(); }\n'
+        )
+        masked = audit.mask_zig_comments_and_strings(text)
+        self.assertIn("imported.present()", masked)
+        self.assertNotIn("imported.missing()", masked)
+        self.assertNotIn("imported.alsoMissing()", masked)
+        self.assertNotIn("imported.blockMissing()", masked)
+        self.assertNotIn("imported.multilineMissing()", masked)
+
+    def test_real_missing_imported_member_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp).resolve()
+            src = root / "src"
+            src.mkdir()
+            (src / "imported.zig").write_text("pub fn present() void {}\n")
+            (src / "caller.zig").write_text(
+                'const imported = @import("imported.zig");\n'
+                '// imported.commentOnly()\n'
+                'pub fn run() void { imported.missing(); }\n'
+            )
+            with mock.patch.object(audit, "ROOT", root):
+                result = audit.check_current_imported_function_refs([
+                    audit.ChangedFile("src/caller.zig", "staged")
+                ])[0]
+            self.assertFalse(result.ok)
+            self.assertIn("imported.missing", result.detail)
+            self.assertNotIn("commentOnly", result.detail)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -4392,6 +4392,7 @@ pub const vtable_impl = ComputeBackend.VTable{
     .moeSelectRoutes = null,
     .layerNorm = &layerNormOp,
     .layerNormConsumeInput = &layerNormConsumeInputOp,
+    .layerNormBackward = &layerNormBackwardOp,
     .rmsNorm = &rmsNormOp,
     .rmsNormConsumeInput = &rmsNormConsumeInputOp,
     .gelu = &geluOp,
@@ -4418,6 +4419,7 @@ pub const vtable_impl = ComputeBackend.VTable{
     .crossAttention = &crossAttentionOp,
     .relativePositionBias = &relativePositionBiasOp,
     .disentangledRelativeAttention = &disentangledRelativeAttentionOp,
+    .disentangledRelativeAttentionBackward = &disentangledRelativeAttentionBackwardOp,
     .windowedSelfAttention = &windowedSelfAttentionOp,
     .channelSelfAttention = &channelSelfAttentionOp,
     .tokenGridConv2d = &tokenGridConv2dOp,
@@ -4434,6 +4436,7 @@ pub const vtable_impl = ComputeBackend.VTable{
     .exportTensorData = &exportTensorDataOp,
     .tensorDType = &tensorDTypeOp,
     .tensorShape = &tensorShapeOp,
+    .tensorShapeMatches = &tensorShapeMatchesOp,
     .evalTensor = &evalTensorOp,
     .argmaxLastRow = &argmaxLastRowOp,
     .sliceLastDim = &sliceLastDimOp,
@@ -4468,6 +4471,8 @@ pub const vtable_impl = ComputeBackend.VTable{
     .logSoftmaxConsume = &logSoftmaxConsumeOp,
     .softmaxOp = &primSoftmaxOp,
     .logSoftmaxOp = &primLogSoftmaxOp,
+    .maskedBceWithLogitsLoss = &maskedBceWithLogitsLossOp,
+    .maskedBceWithLogitsBackward = &maskedBceWithLogitsBackwardOp,
 };
 
 fn backendKind(_: *anyopaque) BackendKind {
@@ -5581,6 +5586,102 @@ fn layerNormConsumeInputOp(_: *anyopaque, input: CT, gamma: CT, beta: CT, dim: u
     const buf = uniqueOwnedDenseBuf(input) orelse return null;
     activations_mod.layerNorm(buf.data, getData(gamma), getData(beta), dim, eps);
     return input;
+}
+
+pub const LayerNormBackwardGrads = struct {
+    dx: []f32,
+    dgamma: []f32,
+    dbeta: []f32,
+};
+
+/// Host reference for the backward of `fused_layer_norm` over the last axis.
+/// Recomputes mean/inv_std the SAME single-pass way the forward
+/// (`activations.layerNorm`) does, so gradients match bit-for-bit.
+///   y_i  = (x_i - μ)·inv_std·γ_i + β_i,   x̂_i = (x_i - μ)·inv_std
+///   g_i  = dy_i·γ_i
+///   dx_i    = inv_std·[ g_i − mean_j(g) − x̂_i·mean_j(g·x̂) ]
+///   dγ_i    = Σ_rows dy_i·x̂_i
+///   dβ_i    = Σ_rows dy_i
+pub fn debertaLayerNormBackwardHost(
+    allocator: std.mem.Allocator,
+    input: []const f32,
+    gamma: []const f32,
+    dy: []const f32,
+    rows: usize,
+    dim: usize,
+    eps: f32,
+) !LayerNormBackwardGrads {
+    if (dim == 0) return error.InvalidTensorShape;
+    if (input.len < rows * dim or dy.len < rows * dim or gamma.len < dim) return error.InvalidTensorShape;
+    const dx = try allocator.alloc(f32, rows * dim);
+    errdefer allocator.free(dx);
+    const dgamma = try allocator.alloc(f32, dim);
+    errdefer allocator.free(dgamma);
+    const dbeta = try allocator.alloc(f32, dim);
+    errdefer allocator.free(dbeta);
+    @memset(dgamma, 0.0);
+    @memset(dbeta, 0.0);
+
+    const dim_f: f32 = @floatFromInt(dim);
+    const inv_dim: f32 = 1.0 / dim_f;
+
+    for (0..rows) |r| {
+        const x = input[r * dim .. (r + 1) * dim];
+        const gy = dy[r * dim .. (r + 1) * dim];
+
+        var sum: f32 = 0.0;
+        var sumsq: f32 = 0.0;
+        for (x) |xi| {
+            sum += xi;
+            sumsq += xi * xi;
+        }
+        const mean = sum * inv_dim;
+        const variance = @max(sumsq * inv_dim - mean * mean, 0.0);
+        const inv_std = 1.0 / @sqrt(variance + eps);
+
+        var mean_g: f32 = 0.0;
+        var mean_g_xhat: f32 = 0.0;
+        for (0..dim) |i| {
+            const xhat = (x[i] - mean) * inv_std;
+            const g = gy[i] * gamma[i];
+            mean_g += g;
+            mean_g_xhat += g * xhat;
+            dgamma[i] += gy[i] * xhat;
+            dbeta[i] += gy[i];
+        }
+        mean_g *= inv_dim;
+        mean_g_xhat *= inv_dim;
+
+        for (0..dim) |i| {
+            const xhat = (x[i] - mean) * inv_std;
+            const g = gy[i] * gamma[i];
+            dx[r * dim + i] = inv_std * (g - mean_g - xhat * mean_g_xhat);
+        }
+    }
+
+    return .{ .dx = dx, .dgamma = dgamma, .dbeta = dbeta };
+}
+
+/// `fused_layer_norm_backward` vtable impl. Inputs: input/gamma/beta/dy
+/// (beta unused for grads). Returns the packed adjoint
+/// `[rows + 2, dim]`: rows 0..rows = dx, row `rows` = dgamma, row `rows+1` = dbeta.
+fn layerNormBackwardOp(ctx: *anyopaque, input: CT, gamma: CT, beta: CT, dy: CT, dim: usize, eps: f32) anyerror!CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    _ = beta;
+    const in_data = getData(input);
+    if (dim == 0 or in_data.len % dim != 0) return error.InvalidTensorShape;
+    const rows = in_data.len / dim;
+    const grads = try debertaLayerNormBackwardHost(self.allocator, in_data, getData(gamma), getData(dy), rows, dim, eps);
+    defer self.allocator.free(grads.dx);
+    defer self.allocator.free(grads.dgamma);
+    defer self.allocator.free(grads.dbeta);
+
+    const packed_grads = try self.allocator.alloc(f32, (rows + 2) * dim);
+    errdefer self.allocator.free(packed_grads);
+    @memcpy(packed_grads[0 .. rows * dim], grads.dx[0 .. rows * dim]);
+    @memcpy(packed_grads[rows * dim .. (rows + 1) * dim], grads.dgamma[0..dim]);
+    @memcpy(packed_grads[(rows + 1) * dim .. (rows + 2) * dim], grads.dbeta[0..dim]);
+    return self.makeBuf(packed_grads, true);
 }
 
 fn geluOp(ctx: *anyopaque, input: CT) anyerror!CT {
@@ -34394,6 +34495,42 @@ fn disentangledRelativeAttentionOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT
     return self.makeBuf(output, true);
 }
 
+fn disentangledRelativeAttentionBackwardOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, q_r_ct: CT, k_r_ct: CT, mask: []const i64, dO_ct: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const grads = try debertaDisentangledAttentionBackwardHost(
+        self.allocator,
+        getData(q_ct),
+        getData(k_ct),
+        getData(v_ct),
+        getData(q_r_ct),
+        getData(k_r_ct),
+        mask,
+        getData(dO_ct),
+        batch,
+        seq_len,
+        num_heads,
+        head_dim,
+    );
+    defer self.allocator.free(grads.dQ);
+    defer self.allocator.free(grads.dK);
+    defer self.allocator.free(grads.dV);
+    defer self.allocator.free(grads.dQ_r);
+    defer self.allocator.free(grads.dK_r);
+
+    // Pack [dQ ; dK ; dV ; dQ_r ; dK_r] along axis 0 → [3*B*S + 2*num_rel, H].
+    const H = num_heads * head_dim;
+    const bs_h = batch * seq_len * H;
+    const rel_h = (seq_len * 2 - 1) * H;
+    const packed_grads = try self.allocator.alloc(f32, 3 * bs_h + 2 * rel_h);
+    errdefer self.allocator.free(packed_grads);
+    @memcpy(packed_grads[0..bs_h], grads.dQ[0..bs_h]);
+    @memcpy(packed_grads[bs_h .. 2 * bs_h], grads.dK[0..bs_h]);
+    @memcpy(packed_grads[2 * bs_h .. 3 * bs_h], grads.dV[0..bs_h]);
+    @memcpy(packed_grads[3 * bs_h .. 3 * bs_h + rel_h], grads.dQ_r[0..rel_h]);
+    @memcpy(packed_grads[3 * bs_h + rel_h .. 3 * bs_h + 2 * rel_h], grads.dK_r[0..rel_h]);
+    return self.makeBuf(packed_grads, true);
+}
+
 fn debertaDisentangledAttentionBlasMaterialized(
     allocator: std.mem.Allocator,
     Q: []const f32,
@@ -34528,6 +34665,462 @@ test "materialized DeBERTa attention matches shared linalg reference" {
     try std.testing.expectEqual(want.len, got.len);
     for (want, got) |a, b| {
         try std.testing.expectApproxEqAbs(a, b, 1e-4);
+    }
+}
+
+/// Host/CPU reference for the BACKWARD pass (VJP) of DeBERTa disentangled
+/// relative attention. Correctness anchor: recomputes the softmax probs p_ij
+/// exactly like the forward host reference, then backpropagates dO through
+/// O = P V, P = softmax(S), S = scale*(c2c + c2p + p2c).
+///   dV[b,j,h]  = sum_i p_ij dO[b,i,h]
+///   dP_ij      = dO[b,i,h] . V[b,j,h]
+///   dscore_ij  = p_ij (dP_ij - sum_j' p_ij' dP_ij')
+///   dQ[b,i,h]  = scale sum_j dscore_ij (K[b,j,h] + K_r[r,h])
+///   dK[b,j,h]  = scale sum_i dscore_ij (Q[b,i,h] + Q_r[r,h])
+///   dK_r[r,h] += scale sum_{(b,i,j):i-j+seq-1=r} dscore_ij Q[b,i,h]
+///   dQ_r[r,h] += scale sum_{(b,i,j):i-j+seq-1=r} dscore_ij K[b,j,h]
+pub const DebertaBackwardGrads = struct {
+    dQ: []f32,
+    dK: []f32,
+    dV: []f32,
+    dQ_r: []f32,
+    dK_r: []f32,
+};
+
+pub fn debertaDisentangledAttentionBackwardHost(
+    allocator: std.mem.Allocator,
+    Q: []const f32,
+    K: []const f32,
+    V: []const f32,
+    Q_r: []const f32,
+    K_r: []const f32,
+    mask: []const i64,
+    dO: []const f32,
+    batch: usize,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+) !DebertaBackwardGrads {
+    if (num_heads == 0 or head_dim == 0) return error.InvalidAttentionShape;
+
+    const H = std.math.mul(usize, num_heads, head_dim) catch return error.InvalidAttentionShape;
+    const tokens = std.math.mul(usize, batch, seq_len) catch return error.InvalidAttentionShape;
+    const output_len = std.math.mul(usize, tokens, H) catch return error.InvalidAttentionShape;
+
+    const rel_len = std.math.sub(usize, std.math.mul(usize, seq_len, 2) catch return error.InvalidAttentionShape, 1) catch return error.InvalidAttentionShape;
+    const rel_expected = std.math.mul(usize, rel_len, H) catch return error.InvalidAttentionShape;
+
+    const dQ = try allocator.alloc(f32, output_len);
+    errdefer allocator.free(dQ);
+    const dK = try allocator.alloc(f32, output_len);
+    errdefer allocator.free(dK);
+    const dV = try allocator.alloc(f32, output_len);
+    errdefer allocator.free(dV);
+    const dQ_r = try allocator.alloc(f32, rel_expected);
+    errdefer allocator.free(dQ_r);
+    const dK_r = try allocator.alloc(f32, rel_expected);
+    errdefer allocator.free(dK_r);
+    @memset(dQ, 0.0);
+    @memset(dK, 0.0);
+    @memset(dV, 0.0);
+    @memset(dQ_r, 0.0);
+    @memset(dK_r, 0.0);
+
+    if (batch == 0 or seq_len == 0) {
+        return .{ .dQ = dQ, .dK = dK, .dV = dV, .dQ_r = dQ_r, .dK_r = dK_r };
+    }
+
+    if (Q.len < output_len or K.len < output_len or V.len < output_len or dO.len < output_len) return error.InvalidAttentionShape;
+    if (Q_r.len < rel_expected or K_r.len < rel_expected) return error.InvalidAttentionShape;
+    const mask_expected = std.math.mul(usize, batch, seq_len) catch return error.InvalidAttentionShape;
+    if (mask.len < mask_expected) return error.InvalidAttentionShape;
+
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)) * 3.0);
+
+    const probs = try allocator.alloc(f32, seq_len * seq_len);
+    defer allocator.free(probs);
+    const dscore = try allocator.alloc(f32, seq_len * seq_len);
+    defer allocator.free(dscore);
+
+    for (0..batch) |b| {
+        const mask_base = b * seq_len;
+        var all_keys_valid = true;
+        for (mask[mask_base..][0..seq_len]) |m| {
+            if (m == 0) {
+                all_keys_valid = false;
+                break;
+            }
+        }
+
+        for (0..num_heads) |h| {
+            const head_off = h * head_dim;
+
+            for (0..seq_len) |qi| {
+                const q_base = (b * seq_len + qi) * H + head_off;
+                const rel_base = qi + seq_len - 1;
+                const row = probs[qi * seq_len ..][0..seq_len];
+
+                var row_max: f32 = -std.math.inf(f32);
+                for (0..seq_len) |ki| {
+                    if (!all_keys_valid and mask[mask_base + ki] == 0) {
+                        row[ki] = -std.math.inf(f32);
+                        continue;
+                    }
+                    const k_base = (b * seq_len + ki) * H + head_off;
+                    const rel_idx = rel_base - ki;
+                    const qr_base = rel_idx * H + head_off;
+                    var c2c: f32 = 0.0;
+                    var c2p: f32 = 0.0;
+                    var p2c: f32 = 0.0;
+                    for (0..head_dim) |d| {
+                        const qd = Q[q_base + d];
+                        const kd = K[k_base + d];
+                        c2c += qd * kd;
+                        c2p += qd * K_r[qr_base + d];
+                        p2c += Q_r[qr_base + d] * kd;
+                    }
+                    const s = scale * (c2c + c2p + p2c);
+                    row[ki] = s;
+                    if (s > row_max) row_max = s;
+                }
+
+                var sum: f32 = 0.0;
+                for (0..seq_len) |ki| {
+                    if (row[ki] == -std.math.inf(f32)) {
+                        row[ki] = 0.0;
+                    } else {
+                        const e = @exp(row[ki] - row_max);
+                        row[ki] = e;
+                        sum += e;
+                    }
+                }
+                if (sum > 0.0) {
+                    const inv = 1.0 / sum;
+                    for (0..seq_len) |ki| row[ki] *= inv;
+                }
+            }
+
+            for (0..seq_len) |qi| {
+                const o_base = (b * seq_len + qi) * H + head_off;
+                const p_row = probs[qi * seq_len ..][0..seq_len];
+                const ds_row = dscore[qi * seq_len ..][0..seq_len];
+
+                var dot_pdP: f32 = 0.0;
+                for (0..seq_len) |ki| {
+                    const p = p_row[ki];
+                    const v_base = (b * seq_len + ki) * H + head_off;
+                    var dP: f32 = 0.0;
+                    for (0..head_dim) |d| {
+                        dP += dO[o_base + d] * V[v_base + d];
+                    }
+                    ds_row[ki] = dP;
+                    dot_pdP += p * dP;
+
+                    for (0..head_dim) |d| {
+                        dV[v_base + d] += p * dO[o_base + d];
+                    }
+                }
+                for (0..seq_len) |ki| {
+                    ds_row[ki] = p_row[ki] * (ds_row[ki] - dot_pdP);
+                }
+            }
+
+            for (0..seq_len) |qi| {
+                const q_base = (b * seq_len + qi) * H + head_off;
+                const rel_base = qi + seq_len - 1;
+                const ds_row = dscore[qi * seq_len ..][0..seq_len];
+                for (0..seq_len) |ki| {
+                    const g = ds_row[ki];
+                    if (g == 0.0) continue;
+                    const sg = scale * g;
+                    const k_base = (b * seq_len + ki) * H + head_off;
+                    const rel_idx = rel_base - ki;
+                    const r_base = rel_idx * H + head_off;
+                    for (0..head_dim) |d| {
+                        const kd = K[k_base + d];
+                        const qd = Q[q_base + d];
+                        dQ[q_base + d] += sg * (kd + K_r[r_base + d]);
+                        dK[k_base + d] += sg * (qd + Q_r[r_base + d]);
+                        dK_r[r_base + d] += sg * qd;
+                        dQ_r[r_base + d] += sg * kd;
+                    }
+                }
+            }
+        }
+    }
+
+    return .{ .dQ = dQ, .dK = dK, .dV = dV, .dQ_r = dQ_r, .dK_r = dK_r };
+}
+
+fn layerNormBackwardFiniteDiffCase(rows: usize, dim: usize, eps: f32, seed: u64) !void {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(seed);
+    var rnd = prng.random();
+
+    const x = try allocator.alloc(f32, rows * dim);
+    defer allocator.free(x);
+    const gamma = try allocator.alloc(f32, dim);
+    defer allocator.free(gamma);
+    const beta = try allocator.alloc(f32, dim);
+    defer allocator.free(beta);
+    const dy = try allocator.alloc(f32, rows * dim);
+    defer allocator.free(dy);
+    for (x) |*v| v.* = rnd.floatNorm(f32);
+    for (gamma) |*v| v.* = 1.0 + rnd.floatNorm(f32) * 0.3;
+    for (beta) |*v| v.* = rnd.floatNorm(f32) * 0.3;
+    for (dy) |*v| v.* = rnd.floatNorm(f32);
+
+    const grads = try debertaLayerNormBackwardHost(allocator, x, gamma, dy, rows, dim, eps);
+    defer allocator.free(grads.dx);
+    defer allocator.free(grads.dgamma);
+    defer allocator.free(grads.dbeta);
+
+    const lossFn = struct {
+        fn f(a: std.mem.Allocator, xx: []const f32, gg: []const f32, bb: []const f32, dd: []const f32, d: usize, e: f32) !f32 {
+            const tmp = try a.dupe(f32, xx);
+            defer a.free(tmp);
+            activations_mod.layerNorm(tmp, gg, bb, d, e);
+            var s: f32 = 0.0;
+            for (tmp, dd) |o, gv| s += o * gv;
+            return s;
+        }
+    }.f;
+
+    const h: f32 = 1e-3;
+    const Param = struct { buf: []f32, grad: []const f32, name: []const u8 };
+    const params = [_]Param{
+        .{ .buf = x, .grad = grads.dx, .name = "dx" },
+        .{ .buf = gamma, .grad = grads.dgamma, .name = "dgamma" },
+        .{ .buf = beta, .grad = grads.dbeta, .name = "dbeta" },
+    };
+    for (params) |p| {
+        for (p.buf, 0..) |*elem, idx| {
+            const orig = elem.*;
+            elem.* = orig + h;
+            const lp = try lossFn(allocator, x, gamma, beta, dy, dim, eps);
+            elem.* = orig - h;
+            const lm = try lossFn(allocator, x, gamma, beta, dy, dim, eps);
+            elem.* = orig;
+            const num_grad = (lp - lm) / (2.0 * h);
+            const ana_grad = p.grad[idx];
+            const denom = @max(@as(f32, 1.0), @max(@abs(num_grad), @abs(ana_grad)));
+            const rel = @abs(num_grad - ana_grad) / denom;
+            if (rel > 2e-2) {
+                std.debug.print("layer_norm backward mismatch {s}[{d}] num={d} ana={d} rel={d}\n", .{ p.name, idx, num_grad, ana_grad, rel });
+                return error.LayerNormBackwardFiniteDiffMismatch;
+            }
+        }
+    }
+}
+
+test "fused_layer_norm backward matches finite differences (single row)" {
+    try layerNormBackwardFiniteDiffCase(1, 8, 1e-5, 0xA11CE);
+}
+
+test "fused_layer_norm backward matches finite differences (multi-row)" {
+    try layerNormBackwardFiniteDiffCase(5, 6, 1e-5, 0xBADF00D);
+}
+
+test "DeBERTa backward matches finite differences (all keys valid)" {
+    const allocator = std.testing.allocator;
+    const batch = 1;
+    const seq_len = 4;
+    const num_heads = 1;
+    const head_dim = 4;
+    const H = num_heads * head_dim;
+    const rel_len = seq_len * 2 - 1;
+    const tok = batch * seq_len;
+
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE);
+    const rnd = prng.random();
+
+    const q = try allocator.alloc(f32, tok * H);
+    defer allocator.free(q);
+    const k = try allocator.alloc(f32, tok * H);
+    defer allocator.free(k);
+    const v = try allocator.alloc(f32, tok * H);
+    defer allocator.free(v);
+    const q_r = try allocator.alloc(f32, rel_len * H);
+    defer allocator.free(q_r);
+    const k_r = try allocator.alloc(f32, rel_len * H);
+    defer allocator.free(k_r);
+    const d_o = try allocator.alloc(f32, tok * H);
+    defer allocator.free(d_o);
+
+    for (q) |*x| x.* = rnd.floatNorm(f32) * 0.3;
+    for (k) |*x| x.* = rnd.floatNorm(f32) * 0.3;
+    for (v) |*x| x.* = rnd.floatNorm(f32) * 0.3;
+    for (q_r) |*x| x.* = rnd.floatNorm(f32) * 0.3;
+    for (k_r) |*x| x.* = rnd.floatNorm(f32) * 0.3;
+    for (d_o) |*x| x.* = rnd.floatNorm(f32);
+
+    const mask = [_]i64{ 1, 1, 1, 1 };
+
+    const grads = try debertaDisentangledAttentionBackwardHost(
+        allocator,
+        q,
+        k,
+        v,
+        q_r,
+        k_r,
+        &mask,
+        d_o,
+        batch,
+        seq_len,
+        num_heads,
+        head_dim,
+    );
+    defer allocator.free(grads.dQ);
+    defer allocator.free(grads.dK);
+    defer allocator.free(grads.dV);
+    defer allocator.free(grads.dQ_r);
+    defer allocator.free(grads.dK_r);
+
+    const eps: f32 = 1e-3;
+
+    const lossFn = struct {
+        fn f(a: std.mem.Allocator, qq: []const f32, kk: []const f32, vv: []const f32, qr: []const f32, kr: []const f32, m: []const i64, dgo: []const f32, bb: usize, sl: usize, nh: usize, hd: usize) !f32 {
+            const out = try linalg.debertaDisentangledAttentionHost(a, qq, kk, vv, qr, kr, m, bb, sl, nh, hd);
+            defer a.free(out);
+            var s: f32 = 0.0;
+            for (out, dgo) |o, gg| s += o * gg;
+            return s;
+        }
+    }.f;
+
+    const Param = struct { buf: []f32, grad: []const f32, name: []const u8 };
+    const params = [_]Param{
+        .{ .buf = q, .grad = grads.dQ, .name = "dQ" },
+        .{ .buf = k, .grad = grads.dK, .name = "dK" },
+        .{ .buf = v, .grad = grads.dV, .name = "dV" },
+        .{ .buf = q_r, .grad = grads.dQ_r, .name = "dQ_r" },
+        .{ .buf = k_r, .grad = grads.dK_r, .name = "dK_r" },
+    };
+
+    for (params) |p| {
+        for (p.buf, 0..) |*elem, idx| {
+            const orig = elem.*;
+            elem.* = orig + eps;
+            const lp = try lossFn(allocator, q, k, v, q_r, k_r, &mask, d_o, batch, seq_len, num_heads, head_dim);
+            elem.* = orig - eps;
+            const lm = try lossFn(allocator, q, k, v, q_r, k_r, &mask, d_o, batch, seq_len, num_heads, head_dim);
+            elem.* = orig;
+
+            const num_grad = (lp - lm) / (2.0 * eps);
+            const ana_grad = p.grad[idx];
+            const denom = @max(@as(f32, 1.0), @max(@abs(num_grad), @abs(ana_grad)));
+            const rel_err = @abs(num_grad - ana_grad) / denom;
+            std.testing.expect(rel_err < 1e-2) catch |e| {
+                std.debug.print("{s}[{d}] num={d} ana={d} rel={d}\n", .{ p.name, idx, num_grad, ana_grad, rel_err });
+                return e;
+            };
+        }
+    }
+}
+
+test "DeBERTa backward matches finite differences (with padded key)" {
+    const allocator = std.testing.allocator;
+    const batch = 1;
+    const seq_len = 4;
+    const num_heads = 1;
+    const head_dim = 4;
+    const H = num_heads * head_dim;
+    const rel_len = seq_len * 2 - 1;
+    const tok = batch * seq_len;
+
+    var prng = std.Random.DefaultPrng.init(0xBADF00D);
+    const rnd = prng.random();
+
+    const q = try allocator.alloc(f32, tok * H);
+    defer allocator.free(q);
+    const k = try allocator.alloc(f32, tok * H);
+    defer allocator.free(k);
+    const v = try allocator.alloc(f32, tok * H);
+    defer allocator.free(v);
+    const q_r = try allocator.alloc(f32, rel_len * H);
+    defer allocator.free(q_r);
+    const k_r = try allocator.alloc(f32, rel_len * H);
+    defer allocator.free(k_r);
+    const d_o = try allocator.alloc(f32, tok * H);
+    defer allocator.free(d_o);
+
+    for (q) |*x| x.* = rnd.floatNorm(f32) * 0.3;
+    for (k) |*x| x.* = rnd.floatNorm(f32) * 0.3;
+    for (v) |*x| x.* = rnd.floatNorm(f32) * 0.3;
+    for (q_r) |*x| x.* = rnd.floatNorm(f32) * 0.3;
+    for (k_r) |*x| x.* = rnd.floatNorm(f32) * 0.3;
+    for (d_o) |*x| x.* = rnd.floatNorm(f32);
+
+    const mask = [_]i64{ 1, 1, 0, 1 };
+
+    const grads = try debertaDisentangledAttentionBackwardHost(
+        allocator,
+        q,
+        k,
+        v,
+        q_r,
+        k_r,
+        &mask,
+        d_o,
+        batch,
+        seq_len,
+        num_heads,
+        head_dim,
+    );
+    defer allocator.free(grads.dQ);
+    defer allocator.free(grads.dK);
+    defer allocator.free(grads.dV);
+    defer allocator.free(grads.dQ_r);
+    defer allocator.free(grads.dK_r);
+
+    {
+        const j_pad = 2;
+        const base = (0 * seq_len + j_pad) * H;
+        for (0..head_dim) |d| {
+            try std.testing.expectEqual(@as(f32, 0.0), grads.dK[base + d]);
+            try std.testing.expectEqual(@as(f32, 0.0), grads.dV[base + d]);
+        }
+    }
+
+    const eps: f32 = 1e-3;
+
+    const lossFn = struct {
+        fn f(a: std.mem.Allocator, qq: []const f32, kk: []const f32, vv: []const f32, qr: []const f32, kr: []const f32, m: []const i64, dgo: []const f32, bb: usize, sl: usize, nh: usize, hd: usize) !f32 {
+            const out = try linalg.debertaDisentangledAttentionHost(a, qq, kk, vv, qr, kr, m, bb, sl, nh, hd);
+            defer a.free(out);
+            var s: f32 = 0.0;
+            for (out, dgo) |o, gg| s += o * gg;
+            return s;
+        }
+    }.f;
+
+    const Param = struct { buf: []f32, grad: []const f32, name: []const u8 };
+    const params = [_]Param{
+        .{ .buf = q, .grad = grads.dQ, .name = "dQ" },
+        .{ .buf = k, .grad = grads.dK, .name = "dK" },
+        .{ .buf = v, .grad = grads.dV, .name = "dV" },
+        .{ .buf = q_r, .grad = grads.dQ_r, .name = "dQ_r" },
+        .{ .buf = k_r, .grad = grads.dK_r, .name = "dK_r" },
+    };
+
+    for (params) |p| {
+        for (p.buf, 0..) |*elem, idx| {
+            const orig = elem.*;
+            elem.* = orig + eps;
+            const lp = try lossFn(allocator, q, k, v, q_r, k_r, &mask, d_o, batch, seq_len, num_heads, head_dim);
+            elem.* = orig - eps;
+            const lm = try lossFn(allocator, q, k, v, q_r, k_r, &mask, d_o, batch, seq_len, num_heads, head_dim);
+            elem.* = orig;
+
+            const num_grad = (lp - lm) / (2.0 * eps);
+            const ana_grad = p.grad[idx];
+            const denom = @max(@as(f32, 1.0), @max(@abs(num_grad), @abs(ana_grad)));
+            const rel_err = @abs(num_grad - ana_grad) / denom;
+            std.testing.expect(rel_err < 1e-2) catch |e| {
+                std.debug.print("{s}[{d}] num={d} ana={d} rel={d}\n", .{ p.name, idx, num_grad, ana_grad, rel_err });
+                return e;
+            };
+        }
     }
 }
 
@@ -37621,8 +38214,10 @@ fn primConcatPrimOp(ctx: *anyopaque, a: CT, b: CT, axis: u8, a_shape: []const i6
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const a_data = getData(a);
     const b_data = getData(b);
-    const effective_a_shape = storedOrDeclaredShape(a, a_shape);
-    const effective_b_shape = storedOrDeclaredShape(b, b_shape);
+    const effective_a_shape_raw = storedOrDeclaredShape(a, a_shape);
+    const effective_b_shape_raw = storedOrDeclaredShape(b, b_shape);
+    const effective_a_shape = if (effective_a_shape_raw.len != effective_b_shape_raw.len and a_shape.len == b_shape.len) a_shape else effective_a_shape_raw;
+    const effective_b_shape = if (effective_a_shape_raw.len != effective_b_shape_raw.len and a_shape.len == b_shape.len) b_shape else effective_b_shape_raw;
     var resolved_a_shape_buf: [8]i64 = undefined;
     var resolved_b_shape_buf: [8]i64 = undefined;
     const resolved_a_shape = if (resolveShapeFromTensorMetadata(a, effective_a_shape, a_data.len)) |resolved| blk: {
@@ -37858,6 +38453,91 @@ fn fromFloat32Op(ctx: *anyopaque, data: []const f32) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const owned = try self.allocator.dupe(f32, data);
     return self.makeBuf(owned, true);
+}
+
+fn bceSigmoid(x: f32) f32 {
+    return if (x >= 0) 1.0 / (1.0 + @exp(-x)) else blk: {
+        const e = @exp(x);
+        break :blk e / (1.0 + e);
+    };
+}
+
+fn maskedBceWithLogitsLossOp(ctx: *anyopaque, request: *const ops.MaskedBceWithLogitsRequest) anyerror!CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const logits = getData(request.logits);
+    const labels = getData(request.labels);
+    const mask = getData(request.mask);
+    if (labels.len != logits.len or mask.len != logits.len) return error.ShapeMismatch;
+
+    var numerator: f32 = 0.0;
+    var denom: f32 = 0.0;
+    for (logits, 0..) |logit, i| {
+        const m = mask[i];
+        // `mask` is a per-position loss weight (validity gate for m==0, and a real
+        // weight for m>0 — e.g. hard-negative weighting). It must NOT scale the
+        // logit/label into the BCE: BCE runs on the raw logit, and m weights the
+        // resulting loss + reduction denominator. (For m in {0,1} this is identical
+        // to the previous logit*m form, so 0/1-mask parity is unchanged.) Skip m==0
+        // so a non-finite masked logit (Inf*0 = NaN) cannot poison the scalar loss.
+        if (m == 0) continue;
+        const label = labels[i];
+        const bce = @max(logit, 0.0) - label * logit + @log(1.0 + @exp(-@abs(logit)));
+        const label_weight = label * request.positive_weight + (1.0 - label) * request.negative_weight;
+        numerator += bce * label_weight * m;
+        denom += m * label_weight;
+    }
+
+    const value = if (request.mean_reduction) numerator / (denom + request.eps) else numerator;
+    const output = try self.allocator.alloc(f32, 1);
+    output[0] = value;
+    const result = try self.makeOwnedBuf(output);
+    errdefer freeTensor(self, result);
+    return self.withLogicalShape(result, request.output_shape);
+}
+
+fn maskedBceWithLogitsBackwardOp(ctx: *anyopaque, request: *const ops.MaskedBceWithLogitsBackwardRequest) anyerror!CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const logits = getData(request.logits);
+    const labels = getData(request.labels);
+    const mask = getData(request.mask);
+    const upstream = getData(request.upstream);
+    if (labels.len != logits.len or mask.len != logits.len or upstream.len == 0) return error.ShapeMismatch;
+
+    var denom: f32 = 0.0;
+    if (request.mean_reduction) {
+        for (labels, 0..) |label, i| {
+            const m = mask[i];
+            if (m == 0) continue;
+            const label_weight = label * request.positive_weight + (1.0 - label) * request.negative_weight;
+            denom += m * label_weight;
+        }
+        denom += request.eps;
+    }
+
+    const scale = if (request.mean_reduction) upstream[0] / denom else upstream[0];
+    const output = try self.allocator.alloc(f32, logits.len);
+    var raw_output: ?[]f32 = output;
+    errdefer if (raw_output) |raw| self.allocator.free(raw);
+    for (logits, 0..) |logit, i| {
+        const m = mask[i];
+        // Masked positions have zero gradient; write 0 explicitly (output is
+        // freshly allocated, not zeroed) and skip the arithmetic so a non-finite
+        // masked logit (Inf*0 = NaN) cannot leak into the gradient.
+        if (m == 0) {
+            output[i] = 0;
+            continue;
+        }
+        // Gradient of the raw-logit forward: d/dlogit [ m * label_weight * BCE(logit) ]
+        // = m * label_weight * (sigmoid(logit) - label). Matches the forward's use of
+        // the raw logit with m as a pure loss weight (identical to the old form at m==1).
+        const label = labels[i];
+        const label_weight = label * request.positive_weight + (1.0 - label) * request.negative_weight;
+        output[i] = scale * label_weight * m * (bceSigmoid(logit) - label);
+    }
+    const result = try self.makeBuf(output, true);
+    raw_output = null;
+    errdefer freeTensor(self, result);
+    return self.withLogicalShape(result, request.logits_shape);
 }
 
 fn fromFloat32ShapeOp(ctx: *anyopaque, data: []const f32, shape: []const i32) anyerror!CT {
@@ -38111,6 +38791,23 @@ fn tensorShapeOp(_: *anyopaque, tensor: CT, allocator: std.mem.Allocator) anyerr
         }
     }
     return error.UnsupportedShape;
+}
+
+fn tensorShapeMatchesOp(_: *anyopaque, tensor: CT, shape: []const i64) anyerror!?bool {
+    const buf = toBuf(tensor);
+    const actual = if (buf.logical_shape) |logical|
+        logical
+    else if (buf.quantized_storage) |storage|
+        storage.shape
+    else if (buf.source_tensor) |source|
+        source.shape
+    else
+        return null;
+    if (actual.len != shape.len) return false;
+    for (actual, shape) |actual_dim, expected_dim| {
+        if (actual_dim != expected_dim) return false;
+    }
+    return true;
 }
 
 fn sliceLastDimOp(_: *anyopaque, tensor: CT, start: usize, stop: usize) anyerror!CT {
@@ -46419,6 +47116,78 @@ test "sdpa rejects mixed token-major and head-major layouts" {
         error.InvalidInputShape,
         sdpaOp(&compute, q_ct, k_ct, v_ct, &.{ 1, 1 }, null, 1, 2, 2, 2),
     );
+}
+
+test "ComputeBackend masked BCE with logits forward and backward" {
+    const allocator = std.testing.allocator;
+    var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &weight_store, null);
+    const cb = ComputeBackend{ .ptr = &compute, .vtable = &vtable_impl };
+
+    var logits_data = [_]f32{ -2.0, 0.0, 3.0, 1.0 };
+    var labels_data = [_]f32{ 0.0, 1.0, 1.0, 0.0 };
+    var mask_data = [_]f32{ 1.0, 1.0, 0.0, 0.5 };
+    var upstream_data = [_]f32{1.25};
+    const logits = try compute.makeBuf(logits_data[0..], false);
+    defer freeTensor(&compute, logits);
+    const labels = try compute.makeBuf(labels_data[0..], false);
+    defer freeTensor(&compute, labels);
+    const mask = try compute.makeBuf(mask_data[0..], false);
+    defer freeTensor(&compute, mask);
+    const upstream = try compute.makeBuf(upstream_data[0..], false);
+    defer freeTensor(&compute, upstream);
+
+    const positive_weight: f32 = 2.0;
+    const negative_weight: f32 = 0.5;
+    const eps: f32 = 1e-6;
+    // mask weights the loss + denominator; it does NOT scale the logit into the BCE
+    // (so a mask != 1, e.g. the 0.5 below, is a genuine per-position loss weight, not
+    // a logit rescale). This mirrors the corrected op semantics.
+    var expected_num: f32 = 0.0;
+    var expected_den: f32 = 0.0;
+    for (logits_data, 0..) |logit, i| {
+        const m = mask_data[i];
+        const label = labels_data[i];
+        const bce = @max(logit, 0.0) - label * logit + @log(1.0 + @exp(-@abs(logit)));
+        const label_weight = label * positive_weight + (1.0 - label) * negative_weight;
+        expected_num += bce * label_weight * m;
+        expected_den += m * label_weight;
+    }
+    const expected_loss = expected_num / (expected_den + eps);
+
+    const loss = try cb.maskedBceWithLogitsLoss(&.{
+        .logits = logits,
+        .labels = labels,
+        .mask = mask,
+        .positive_weight = positive_weight,
+        .negative_weight = negative_weight,
+        .eps = eps,
+        .mean_reduction = true,
+        .output_shape = &.{ 1, 1 },
+    });
+    defer freeTensor(&compute, loss);
+    try std.testing.expectApproxEqAbs(expected_loss, getData(loss)[0], 1e-6);
+
+    const grad = try cb.maskedBceWithLogitsBackward(&.{
+        .logits = logits,
+        .labels = labels,
+        .mask = mask,
+        .upstream = upstream,
+        .positive_weight = positive_weight,
+        .negative_weight = negative_weight,
+        .eps = eps,
+        .mean_reduction = true,
+        .logits_shape = &.{ 2, 2 },
+    });
+    defer freeTensor(&compute, grad);
+    const grad_data = getData(grad);
+    for (logits_data, 0..) |logit, i| {
+        const m = mask_data[i];
+        const label = labels_data[i];
+        const label_weight = label * positive_weight + (1.0 - label) * negative_weight;
+        const expected = upstream_data[0] / (expected_den + eps) * label_weight * m * (bceSigmoid(logit) - label);
+        try std.testing.expectApproxEqAbs(expected, grad_data[i], 1e-6);
+    }
 }
 
 test "ComputeBackend scaledDotProductAttention call site exercises flash layout" {

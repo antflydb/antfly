@@ -6,8 +6,6 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-from ..types import UNSET, Unset
-
 if TYPE_CHECKING:
     from ..models.extraction_structure_schema_fields import ExtractionStructureSchemaFields
 
@@ -19,22 +17,22 @@ T = TypeVar("T", bound="ExtractionStructureSchema")
 class ExtractionStructureSchema:
     """
     Attributes:
-        fields (ExtractionStructureSchemaFields | Unset):
+        fields (ExtractionStructureSchemaFields):
     """
 
-    fields: ExtractionStructureSchemaFields | Unset = UNSET
+    fields: ExtractionStructureSchemaFields
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        fields: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.fields, Unset):
-            fields = self.fields.to_dict()
+        fields = self.fields.to_dict()
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({})
-        if fields is not UNSET:
-            field_dict["fields"] = fields
+        field_dict.update(
+            {
+                "fields": fields,
+            }
+        )
 
         return field_dict
 
@@ -43,12 +41,7 @@ class ExtractionStructureSchema:
         from ..models.extraction_structure_schema_fields import ExtractionStructureSchemaFields
 
         d = dict(src_dict)
-        _fields = d.pop("fields", UNSET)
-        fields: ExtractionStructureSchemaFields | Unset
-        if isinstance(_fields, Unset):
-            fields = UNSET
-        else:
-            fields = ExtractionStructureSchemaFields.from_dict(_fields)
+        fields = ExtractionStructureSchemaFields.from_dict(d.pop("fields"))
 
         extraction_structure_schema = cls(
             fields=fields,

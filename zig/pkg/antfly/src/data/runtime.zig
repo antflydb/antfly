@@ -1555,6 +1555,9 @@ fn writeFullTextMemoryMetrics(writer: *std.Io.Writer, stats: antfly.db.TextMemor
 
 fn writeTextMergeMetrics(writer: *std.Io.Writer, stats: antfly.db.types.TextMergeStats) !void {
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_enabled", "gauge", "Whether text merge scheduling is enabled for cached write DBs", if (stats.enabled) 1 else 0);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_active_indexes", "gauge", "Full-text indexes contributing segments to query fan-out", stats.active_indexes);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_active_segments", "gauge", "All active full-text segments contributing to query fan-out", stats.active_segments);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_max_active_segments_per_index", "gauge", "Largest active segment fan-out of any full-text index", stats.max_active_segments_per_index);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_pending_indexes", "gauge", "Cached write full-text indexes with pending merge debt", stats.pending_indexes);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_pending_segments", "gauge", "Cached write full-text segments in pending merge debt", stats.pending_segments);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_pending_bytes", "gauge", "Cached write full-text segment bytes in pending merge debt", stats.pending_bytes);
@@ -1583,6 +1586,8 @@ fn writeTextMergeMetrics(writer: *std.Io.Writer, stats: antfly.db.types.TextMerg
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_deferred_for_pressure_total", "counter", "Cached write full-text merge attempts deferred for resource pressure", stats.deferred_for_pressure);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_backpressure_events_total", "counter", "Cached write full-text merge backpressure events", stats.backpressure_events);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_backpressure_ns_total", "counter", "Nanoseconds spent under full-text merge backpressure", stats.backpressure_ns);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_backpressure_timeouts_total", "counter", "Full-text merge backpressure deadlines reached", stats.backpressure_timeouts);
+    try health_metrics.appendPromMetric(writer, "antfly_text_merge_backpressure_failures_total", "counter", "Full-text merge backpressure attempts terminated by a merge failure", stats.backpressure_failures);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_max_pending_segments", "gauge", "Maximum pending full-text segments observed by merge scheduling", stats.max_pending_segments);
     try health_metrics.appendPromMetric(writer, "antfly_text_merge_max_pending_bytes", "gauge", "Maximum pending full-text segment bytes observed by merge scheduling", stats.max_pending_bytes);
 }
@@ -1898,7 +1903,16 @@ fn writeLsmCacheMetrics(writer: *std.Io.Writer, stats: lsm_backend_mod.CacheStat
 fn writeLsmNativeStorageMetrics(writer: *std.Io.Writer, stats: ?lsm_backend_mod.NativeStorageStats) !void {
     const value = stats orelse lsm_backend_mod.NativeStorageStats{};
     try health_metrics.appendPromMetric(writer, "antfly_lsm_native_fd_cache_entries", "gauge", "Native LSM storage file descriptors currently retained in the storage IO cache", @intCast(value.fd_cache_entries));
-    try health_metrics.appendPromMetric(writer, "antfly_lsm_native_fd_cache_capacity", "gauge", "Maximum native LSM storage file descriptors retained in the storage IO cache", @intCast(value.fd_cache_capacity));
+    // Preserve the original capacity series for dashboards while publishing
+    // storage-wide names for the admission domain shared by LSM and mmap.
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_native_fd_cache_capacity", "gauge", "Shared native storage descriptor admission capacity", @intCast(value.fd_admission_capacity));
+    try health_metrics.appendPromMetric(writer, "antfly_storage_native_fd_admitted", "gauge", "Native storage descriptors holding admission permits, including cached, transient, and lock files", @intCast(value.fd_admitted_descriptors));
+    try health_metrics.appendPromMetric(writer, "antfly_storage_native_fd_persistent", "gauge", "Backend-lifetime native storage lock descriptors currently admitted", @intCast(value.fd_persistent_descriptors));
+    try health_metrics.appendPromMetric(writer, "antfly_storage_native_fd_admission_capacity", "gauge", "Maximum native storage descriptors admitted across cached, transient, and lock-file opens", @intCast(value.fd_admission_capacity));
+    try health_metrics.appendPromMetric(writer, "antfly_storage_native_fd_persistent_reserve", "gauge", "Descriptor admission headroom reserved from transient operations for backend-lifetime lock files", @intCast(value.fd_persistent_reserve));
+    try health_metrics.appendPromMetric(writer, "antfly_storage_native_fd_admission_waiters", "gauge", "Native storage operations waiting for descriptor admission", @intCast(value.fd_admission_waiters));
+    try health_metrics.appendPromMetric(writer, "antfly_storage_native_fd_admission_waits_total", "counter", "Native storage descriptor admission waits", value.fd_admission_waits);
+    try health_metrics.appendPromMetric(writer, "antfly_storage_native_fd_persistent_admission_failures_total", "counter", "Backend-lifetime descriptor opens rejected because the storage admission budget was exhausted", value.fd_persistent_admission_failures);
 }
 
 fn writeProcessMemoryMetrics(writer: *std.Io.Writer, stats: process_memory_mod.Stats) !void {
@@ -4800,6 +4814,7 @@ pub const DataServer = struct {
                             // Split runtime can briefly observe placement before the
                             // local replica root is fully provisioned on disk.
                             error.LsmRootWriterAlreadyOpen,
+                            error.PersistentDescriptorAdmissionExhausted,
                             error.FileNotFound,
                             error.UnknownGroup,
                             error.LmdbUnexpected,
@@ -4824,6 +4839,7 @@ pub const DataServer = struct {
                             // Treat those as transient and retry on the next provision tick.
                             error.LsmRootWriterAlreadyOpen,
                             error.WriterLocked,
+                            error.PersistentDescriptorAdmissionExhausted,
                             error.FileNotFound,
                             error.UnknownGroup,
                             error.LmdbUnexpected,
@@ -4965,6 +4981,7 @@ pub const DataServer = struct {
         if (!self.haOwnerJobCanRun(.compaction_publish)) return;
         _ = self.liveRuntimeWriteSource().runLsmMaintenanceRound() catch |err| switch (err) {
             error.LsmRootWriterAlreadyOpen,
+            error.PersistentDescriptorAdmissionExhausted,
             error.ReadOnly,
             error.FileNotFound,
             error.LmdbUnexpected,
@@ -5473,8 +5490,30 @@ pub const DataServer = struct {
                 return;
             }
 
-            if (allow_remote_forward and local_status_missing) {
-                if (try self.forwardRaftBatchToPlacementReplica(alloc, group_id, table_name, req, local_node_id, deadline_ns, refresh_metadata)) return;
+            // A hosted replica can temporarily have a stale, leaderless local
+            // view even while another placement replica knows the leader. Let
+            // only the originating request, which refreshes metadata, escape
+            // that view. An internal group request may still follow the known
+            // leader below, but must not bounce through leaderless replicas.
+            if (shouldForwardRaftBatchToPlacementReplica(
+                allow_remote_forward,
+                refresh_metadata,
+                local_status_missing,
+                leader_node_id,
+            )) {
+                const escape_leaderless_local = refresh_metadata and
+                    !local_status_missing and
+                    leader_node_id == null;
+                if (try self.forwardRaftBatchToPlacementReplica(
+                    alloc,
+                    group_id,
+                    table_name,
+                    req,
+                    local_node_id,
+                    deadline_ns,
+                    refresh_metadata,
+                    escape_leaderless_local,
+                )) return;
             }
 
             if (allow_remote_forward) {
@@ -5590,6 +5629,7 @@ pub const DataServer = struct {
         local_node_id: u64,
         deadline_ns: u64,
         refresh_metadata: bool,
+        allow_local_placement_source: bool,
     ) !bool {
         const remote_metadata = self.remote_metadata orelse return false;
         var snapshot = if (refresh_metadata)
@@ -5598,26 +5638,23 @@ pub const DataServer = struct {
             (try remote_metadata.cachedSnapshot()) orelse return error.MetadataSnapshotUnavailable;
         defer freeAdminSnapshotOwned(self.alloc, &snapshot);
 
-        var local_has_placement = false;
-        var target_node_id: ?u64 = null;
+        var preferred_node_id: ?u64 = null;
         if (findMergedSnapshotGroupStatus(snapshot.merged_group_statuses, group_id)) |status| {
             if (status.leader_known and status.leader_store_id != 0) {
                 if (findSnapshotStore(snapshot.stores, status.leader_store_id)) |store| {
-                    target_node_id = store.node_id;
+                    preferred_node_id = store.node_id;
                 }
             }
         }
-        for (snapshot.placement_intents) |intent| {
-            if (intent.record.group_id != group_id) continue;
-            if (intent.record.local_node_id == local_node_id) {
-                local_has_placement = true;
-                continue;
-            }
-            if (target_node_id == null) target_node_id = intent.record.local_node_id;
-        }
-        if (local_has_placement or target_node_id == null or target_node_id.? == local_node_id) return false;
+        const target_node_id = remoteRaftBatchPlacementNode(
+            group_id,
+            local_node_id,
+            preferred_node_id,
+            snapshot.placement_intents,
+            allow_local_placement_source,
+        ) orelse return false;
 
-        const target_store = findSnapshotStoreByNodeId(snapshot.stores, target_node_id.?) orelse return false;
+        const target_store = findSnapshotStoreByNodeId(snapshot.stores, target_node_id) orelse return false;
         if (target_store.api_url.len == 0) return false;
 
         var executor = antfly.raft.transport.StdHttpExecutor.init(alloc, .{});
@@ -5641,6 +5678,42 @@ pub const DataServer = struct {
         };
         response.deinit(alloc);
         return true;
+    }
+
+    fn shouldForwardRaftBatchToPlacementReplica(
+        allow_remote_forward: bool,
+        refresh_metadata: bool,
+        local_status_missing: bool,
+        leader_node_id: ?u64,
+    ) bool {
+        if (!allow_remote_forward) return false;
+        if (local_status_missing) return true;
+        return refresh_metadata and leader_node_id == null;
+    }
+
+    fn remoteRaftBatchPlacementNode(
+        group_id: u64,
+        local_node_id: u64,
+        preferred_node_id: ?u64,
+        placement_intents: []const antfly.raft.PlacementIntent,
+        allow_local_placement_source: bool,
+    ) ?u64 {
+        var fallback: ?u64 = null;
+        var preferred: ?u64 = null;
+        var local_has_placement = false;
+        for (placement_intents) |intent| {
+            if (intent.record.group_id != group_id) continue;
+            const node_id = intent.record.local_node_id;
+            if (node_id == local_node_id) {
+                local_has_placement = true;
+                continue;
+            }
+            if (!antfly.raft.placementMayLeadMembershipTransition(intent)) continue;
+            if (preferred_node_id != null and node_id == preferred_node_id.?) preferred = node_id;
+            if (fallback == null) fallback = node_id;
+        }
+        if (local_has_placement and !allow_local_placement_source) return null;
+        return preferred orelse fallback;
     }
 
     fn dataRaftBatchHttpTimeoutMs(deadline_ns: u64) u32 {
@@ -9452,6 +9525,10 @@ pub const DataServer = struct {
 
     fn runProvisionedStartupCatchUp(self: *DataServer) ProvisionedStartupCatchUpStats {
         const started_epoch = self.provisioned_startup_catch_up_epoch.load(.acquire);
+        // Consume the work that launched this pass. Producers only raise this
+        // level-triggered bit, so work published while the scan is running
+        // remains armed for the next pass.
+        _ = self.provisioned_startup_catch_up_dirty.swap(false, .acq_rel);
         const started_ns = platform_time.monotonicNs();
         const started_at_ms: u64 = @intCast(@divTrunc(started_ns, std.time.ns_per_ms));
         self.provisioned_startup_catch_up_last_run_at_ms.store(started_at_ms, .monotonic);
@@ -9472,10 +9549,7 @@ pub const DataServer = struct {
                 started_epoch,
                 self.provisioned_startup_catch_up_epoch.load(.acquire),
             );
-            // Publish the deadline before dirty; the release store makes both
-            // fields visible as one scheduler decision.
-            self.provisioned_startup_catch_up_not_before_ms.store(completion.not_before_ms, .monotonic);
-            self.provisioned_startup_catch_up_dirty.store(completion.dirty, .release);
+            self.publishProvisionedStartupCatchUpCompletion(completion);
         }
         defer _ = self.provisioned_startup_catch_up_completed.fetchAdd(1, .monotonic);
 
@@ -10543,7 +10617,13 @@ pub const DataServer = struct {
             refresh_retry_pending = retry_result.hasRejectedTables() or retry_result.removals_deferred;
         }
         refresh_retry_pending = refresh_retry_pending or publish_result.removals_deferred;
-        self.provisioned_startup_catch_up_dirty.store(startup_catch_up_debt_present, .release);
+        // Runtime status is an observational producer of catch-up work, not
+        // the owner of the scheduler's retry state. A synthetic or temporarily
+        // unavailable runtime has no debt to report, but that absence must not
+        // erase a retry concurrently published by a failed catch-up pass. Only
+        // the catch-up worker's authoritative, complete inspection may clear
+        // this bit.
+        self.noteProvisionedStartupCatchUpDebt(startup_catch_up_debt_present);
         self.runtime_status_last_refresh_at_ms.store(
             @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms)),
             .monotonic,
@@ -10573,6 +10653,18 @@ pub const DataServer = struct {
             }
         }
         return false;
+    }
+
+    fn noteProvisionedStartupCatchUpDebt(self: *DataServer, debt_present: bool) void {
+        if (debt_present) self.provisioned_startup_catch_up_dirty.store(true, .release);
+    }
+
+    fn publishProvisionedStartupCatchUpCompletion(self: *DataServer, completion: StartupCatchUpCompletion) void {
+        // Publish the deadline before dirty; the release store makes both
+        // fields visible as one scheduler decision. Never write false here:
+        // that would erase a producer wake published during this pass.
+        self.provisioned_startup_catch_up_not_before_ms.store(completion.not_before_ms, .monotonic);
+        if (completion.dirty) self.provisioned_startup_catch_up_dirty.store(true, .release);
     }
 
     fn cachedRuntimeStatusHasStartupCatchUpDebt(self: *DataServer, table_name: []const u8, group_id: u64) !?bool {
@@ -13544,6 +13636,7 @@ fn groupHasActiveTransition(
 fn isTransientStatusDbConflict(err: anyerror) bool {
     return err == error.LsmRootWriterAlreadyOpen or
         err == error.WriterLocked or
+        err == error.PersistentDescriptorAdmissionExhausted or
         err == error.TableReadChurn;
 }
 
@@ -19774,6 +19867,46 @@ test "data runtime keeps status refresh dirty for non-startup async index work" 
     try std.testing.expect(!DataServer.runtimeStatusStartupCatchUpDebtPresent(bulk_statuses[0..]));
 }
 
+test "runtime status observation cannot erase a startup catch-up retry" {
+    var server: DataServer = .{
+        .alloc = std.testing.allocator,
+        .provisioned_storage = undefined,
+        .read_source = undefined,
+        .write_source = undefined,
+        .status_source = undefined,
+        .api_server_cfg = undefined,
+        .query_async_limit = .limited(8),
+        .listener_cfg = undefined,
+    };
+
+    // A failed catch-up pass owns this retry. A concurrent synthetic status
+    // observation cannot prove that the durable replay debt was cleared.
+    server.provisioned_startup_catch_up_dirty.store(true, .release);
+    server.noteProvisionedStartupCatchUpDebt(false);
+    try std.testing.expect(server.provisioned_startup_catch_up_dirty.load(.acquire));
+
+    // Positive observations still wake an otherwise idle scheduler.
+    server.provisioned_startup_catch_up_dirty.store(false, .release);
+    server.noteProvisionedStartupCatchUpDebt(true);
+    try std.testing.expect(server.provisioned_startup_catch_up_dirty.load(.acquire));
+
+    // A producer wake raised while a successful pass is running must survive
+    // that pass's no-debt completion.
+    server.publishProvisionedStartupCatchUpCompletion(.{
+        .dirty = false,
+        .not_before_ms = 0,
+    });
+    try std.testing.expect(server.provisioned_startup_catch_up_dirty.load(.acquire));
+
+    server.provisioned_startup_catch_up_dirty.store(false, .release);
+    server.publishProvisionedStartupCatchUpCompletion(.{
+        .dirty = true,
+        .not_before_ms = 42,
+    });
+    try std.testing.expect(server.provisioned_startup_catch_up_dirty.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 42), server.provisioned_startup_catch_up_not_before_ms.load(.acquire));
+}
+
 test "data runtime defers replica-root reconcile only while startup catch-up owns the shard" {
     var server: DataServer = .{
         .alloc = std.testing.allocator,
@@ -21203,10 +21336,26 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
     try std.testing.expect(std.mem.indexOf(u8, cache_output, "antfly_lsm_cache_waits_total{kind=\"run_table_block\"}") != null);
 
     writer = .fixed(&writer_buf);
-    try writeLsmNativeStorageMetrics(&writer, .{ .fd_cache_entries = 7, .fd_cache_capacity = 1024 });
+    try writeLsmNativeStorageMetrics(&writer, .{
+        .fd_cache_entries = 7,
+        .fd_admitted_descriptors = 9,
+        .fd_persistent_descriptors = 2,
+        .fd_admission_capacity = 1024,
+        .fd_persistent_reserve = 64,
+        .fd_admission_waiters = 3,
+        .fd_admission_waits = 11,
+        .fd_persistent_admission_failures = 1,
+    });
     const native_storage_output = writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, native_storage_output, "antfly_lsm_native_fd_cache_entries 7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, native_storage_output, "antfly_storage_native_fd_admitted 9") != null);
+    try std.testing.expect(std.mem.indexOf(u8, native_storage_output, "antfly_storage_native_fd_persistent 2") != null);
     try std.testing.expect(std.mem.indexOf(u8, native_storage_output, "antfly_lsm_native_fd_cache_capacity 1024") != null);
+    try std.testing.expect(std.mem.indexOf(u8, native_storage_output, "antfly_storage_native_fd_admission_capacity 1024") != null);
+    try std.testing.expect(std.mem.indexOf(u8, native_storage_output, "antfly_storage_native_fd_persistent_reserve 64") != null);
+    try std.testing.expect(std.mem.indexOf(u8, native_storage_output, "antfly_storage_native_fd_admission_waiters 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, native_storage_output, "antfly_storage_native_fd_admission_waits_total 11") != null);
+    try std.testing.expect(std.mem.indexOf(u8, native_storage_output, "antfly_storage_native_fd_persistent_admission_failures_total 1") != null);
 
     writer = .fixed(&writer_buf);
     try writeProcessMemoryMetrics(&writer, .{
@@ -21441,6 +21590,9 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
     writer = .fixed(&writer_buf);
     try writeTextMergeMetrics(&writer, .{
         .enabled = true,
+        .active_indexes = 2,
+        .active_segments = 14,
+        .max_active_segments_per_index = 9,
         .pending_indexes = 1,
         .pending_segments = 3,
         .pending_bytes = 4096,
@@ -21461,6 +21613,8 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
     });
     const text_merge_output = writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, text_merge_output, "antfly_text_merge_enabled 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text_merge_output, "antfly_text_merge_active_segments 14") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text_merge_output, "antfly_text_merge_max_active_segments_per_index 9") != null);
     try std.testing.expect(std.mem.indexOf(u8, text_merge_output, "antfly_text_merge_pending_bytes 4096") != null);
     try std.testing.expect(std.mem.indexOf(u8, text_merge_output, "antfly_text_merge_pending_heap_bytes 1024") != null);
     try std.testing.expect(std.mem.indexOf(u8, text_merge_output, "antfly_text_merge_pending_mmap_bytes 3072") != null);
@@ -24114,4 +24268,49 @@ test "data raft forwarding classifies deadline and transport failures as retryab
     try std.testing.expect(DataServer.isRetryableDataRaftForwardError(error.ConnectionResetByPeer));
     try std.testing.expect(DataServer.isRetryableDataRaftForwardError(error.LeaderUnavailable));
     try std.testing.expect(!DataServer.isRetryableDataRaftForwardError(error.OutOfMemory));
+}
+
+test "data raft batch forwarding escapes a leaderless local placement" {
+    const intents = [_]antfly.raft.PlacementIntent{
+        .{ .record = .{ .group_id = 7001, .replica_id = 1, .local_node_id = 101 } },
+        .{ .record = .{ .group_id = 7001, .replica_id = 2, .local_node_id = 102 } },
+        .{ .record = .{ .group_id = 7001, .replica_id = 3, .local_node_id = 103 } },
+        .{ .record = .{ .group_id = 7002, .replica_id = 4, .local_node_id = 104 } },
+        .{ .record = .{ .group_id = 7003, .replica_id = 5, .local_node_id = 105 }, .serving_state = .planned },
+        .{ .record = .{ .group_id = 7003, .replica_id = 6, .local_node_id = 106 } },
+    };
+
+    try std.testing.expectEqual(
+        @as(?u64, 102),
+        DataServer.remoteRaftBatchPlacementNode(7001, 101, null, &intents, true),
+    );
+    try std.testing.expectEqual(
+        @as(?u64, 103),
+        DataServer.remoteRaftBatchPlacementNode(7001, 101, 103, &intents, true),
+    );
+    try std.testing.expectEqual(
+        @as(?u64, null),
+        DataServer.remoteRaftBatchPlacementNode(7002, 104, null, &intents, true),
+    );
+    try std.testing.expectEqual(
+        @as(?u64, null),
+        DataServer.remoteRaftBatchPlacementNode(7001, 101, 103, &intents, false),
+    );
+    try std.testing.expectEqual(
+        @as(?u64, 106),
+        DataServer.remoteRaftBatchPlacementNode(7003, 999, null, &intents, false),
+    );
+
+    try std.testing.expect(DataServer.shouldForwardRaftBatchToPlacementReplica(
+        true,
+        true,
+        false,
+        null,
+    ));
+    try std.testing.expect(!DataServer.shouldForwardRaftBatchToPlacementReplica(
+        true,
+        false,
+        false,
+        null,
+    ));
 }

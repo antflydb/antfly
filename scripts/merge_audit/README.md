@@ -295,6 +295,13 @@ renamed containers and other declarations. Owner aliases apply to nested
 methods, and the old/new symbol names are canonicalized in declaration bodies,
 so a type rename does not turn every preserved method into a false gap.
 
+For changed same-path Zig files outside a split migration,
+`same_path_function_aliases` and `same_path_const_aliases` document intentional
+symbol replacements. An alias can be a local symbol name or
+`path/to/file.zig::symbol` when the replacement moved to another generated or
+hand-written owner. The audit verifies that the destination symbol exists;
+use the false-positive lists only for removals with no replacement.
+
 For systematic names introduced by a split, a migration's
 `test_name_rewrites` maps an exact destination path plus `source_prefix` and
 `destination_prefix`. The path-scoped rewrite only selects the candidate; the
