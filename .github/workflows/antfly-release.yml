@@ -35,9 +35,9 @@ jobs:
             zig_optimize: ReleaseFast
             zig_jobs: ""
           - artifact_name: antfly-zig-linux-arm64
-            runner: arc-antfly-publish-arm64
+            runner: arc-antfly-publish
             os: linux
-            zig_arch: aarch64
+            zig_arch: x86_64
             zig_target: aarch64-linux-musl
             archive_os: Linux
             archive_arch: arm64
