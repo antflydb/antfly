@@ -205,6 +205,9 @@ func TestBatchSendsContentLengthRequestAndParsesResponse(t *testing.T) {
 	if result.Inserted != 1 {
 		t.Fatalf("Inserted = %d, want 1", result.Inserted)
 	}
+	if result.Status != "committed" {
+		t.Fatalf("Status = %q, want committed", result.Status)
+	}
 	if gotPath != "/db/v1/tables/files/batch" {
 		t.Fatalf("path = %q, want /db/v1/tables/files/batch", gotPath)
 	}
@@ -213,6 +216,52 @@ func TestBatchSendsContentLengthRequestAndParsesResponse(t *testing.T) {
 	}
 	if !strings.Contains(gotBody, `"doc-1"`) || !strings.Contains(gotBody, `"title":"hello"`) {
 		t.Fatalf("request body = %q, want encoded insert", gotBody)
+	}
+}
+
+func TestBatchReportsAcceptedPendingStatusForLegacyResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"inserted":1}`))
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+	result, err := client.Batch(context.Background(), "files", BatchRequest{
+		Inserts: map[string]any{"doc-1": map[string]any{"title": "hello"}},
+	})
+	if err != nil {
+		t.Fatalf("Batch: %v", err)
+	}
+	if result.Status != "committed_pending" {
+		t.Fatalf("Status = %q, want committed_pending", result.Status)
+	}
+}
+
+func TestMultiBatchPreservesAcceptedRecoveryStatus(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"status":"committed_recovery_pending","tables":{}}`))
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+	result, err := client.MultiBatch(context.Background(), MultiBatchRequest{
+		Tables: map[string]BatchRequest{"files": {Inserts: map[string]any{"doc-1": map[string]any{"title": "hello"}}}},
+	})
+	if err != nil {
+		t.Fatalf("MultiBatch: %v", err)
+	}
+	if result.Status != "committed_recovery_pending" {
+		t.Fatalf("Status = %q, want committed_recovery_pending", result.Status)
 	}
 }
 

@@ -44,6 +44,10 @@ pub const TxnResolveRequest = struct {
     txn_id: db_mod.types.TxnId,
     status: db_mod.types.TxnStatus,
     commit_version: u64,
+    /// Non-zero only during the initial commit-resolution pass. Participant
+    /// recovery and aborts must remain possible after a topology transition
+    /// has already published.
+    topology_epoch: u64 = 0,
     sync_level: db_mod.types.SyncLevel = .propose,
 };
 
@@ -251,7 +255,7 @@ pub const HostedParticipantWorker = struct {
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader)) orelse return error.UnknownGroup;
         defer route.deinit(alloc);
         switch (route) {
-            .local => _ = (try self.writes.txnResolveGroupLocal(alloc, group_id, table_name, req.txn_id, req.status, req.commit_version, req.sync_level)) orelse return error.UnknownGroup,
+            .local => _ = (try self.writes.txnResolveGroupLocal(alloc, group_id, table_name, req.txn_id, req.status, req.commit_version, req.topology_epoch, req.sync_level)) orelse return error.UnknownGroup,
             .remote => |remote| {
                 var client = http_client_mod.ApiHttpClient.init(alloc, self.executor);
                 const body = try encodeTxnResolveRequest(alloc, req);
@@ -329,7 +333,7 @@ pub const LocalTableWriteParticipantWorker = struct {
 
     fn resolveGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest) !void {
         const self: *LocalTableWriteParticipantWorker = @ptrCast(@alignCast(ptr));
-        _ = (try self.writes.txnResolveGroupLocal(alloc, group_id, table_name, req.txn_id, req.status, req.commit_version, req.sync_level)) orelse return error.UnknownGroup;
+        _ = (try self.writes.txnResolveGroupLocal(alloc, group_id, table_name, req.txn_id, req.status, req.commit_version, req.topology_epoch, req.sync_level)) orelse return error.UnknownGroup;
     }
 
     fn statusGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId) !db_mod.types.TxnStatus {
@@ -457,26 +461,27 @@ fn executeMultiTableCommitOnce(
     }
 
     for (tables) |table| {
-        const topology_epoch = try table_catalog.transactionTopologyEpoch(alloc, catalog, table.table_name);
-        if (topology_epoch == 0) return error.TableNotFound;
+        var routing = (try table_catalog.transactionRoutingSnapshot(alloc, catalog, table.table_name)) orelse return error.TableNotFound;
+        defer routing.deinit(alloc);
+        const topology_epoch = routing.topology_epoch;
 
         for (table.writes) |write| {
-            const group_id = (try table_catalog.resolveGroupForKeyPinned(alloc, catalog, table.table_name, write.key, topology_epoch)) orelse return error.UnknownGroup;
+            const group_id = routing.resolveGroupForKey(write.key) orelse return error.UnknownGroup;
             const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
             try participant.writes.append(alloc, write);
         }
         for (table.deletes) |key| {
-            const group_id = (try table_catalog.resolveGroupForKeyPinned(alloc, catalog, table.table_name, key, topology_epoch)) orelse return error.UnknownGroup;
+            const group_id = routing.resolveGroupForKey(key) orelse return error.UnknownGroup;
             const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
             try participant.deletes.append(alloc, key);
         }
         for (table.predicates) |predicate| {
-            const group_id = (try table_catalog.resolveGroupForKeyPinned(alloc, catalog, table.table_name, predicate.key, topology_epoch)) orelse return error.UnknownGroup;
+            const group_id = routing.resolveGroupForKey(predicate.key) orelse return error.UnknownGroup;
             const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
             try participant.predicates.append(alloc, predicate);
         }
         for (table.transforms) |transform| {
-            const group_id = (try table_catalog.resolveGroupForKeyPinned(alloc, catalog, table.table_name, transform.key, topology_epoch)) orelse return error.UnknownGroup;
+            const group_id = routing.resolveGroupForKey(transform.key) orelse return error.UnknownGroup;
             const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
             try participant.transforms.append(alloc, transform);
         }
@@ -618,6 +623,10 @@ fn executeMultiTableCommitOnce(
             .txn_id = txn_id,
             .status = .committed,
             .commit_version = commit_version,
+            // Fence every first-pass resolution against the topology pinned at
+            // admission. Recovery deliberately uses epoch zero: a durable
+            // commit decision must remain resolvable after a topology change.
+            .topology_epoch = if (!resume_committed) participant.topology_epoch else 0,
             .sync_level = sync_level,
         }) catch |err| switch (err) {
             error.DecisionConflict => {
@@ -980,8 +989,8 @@ pub fn encodeTxnResolveRequest(alloc: std.mem.Allocator, req: TxnResolveRequest)
     };
     return try std.fmt.allocPrint(
         alloc,
-        "{{\"txn_id\":\"{s}\",\"status\":\"{s}\",\"commit_version\":{d},\"sync_level\":\"{s}\"}}",
-        .{ &txn_hex, status_text, req.commit_version, @tagName(req.sync_level) },
+        "{{\"txn_id\":\"{s}\",\"status\":\"{s}\",\"commit_version\":{d},\"topology_epoch\":{d},\"sync_level\":\"{s}\"}}",
+        .{ &txn_hex, status_text, req.commit_version, req.topology_epoch, @tagName(req.sync_level) },
     );
 }
 
@@ -1101,6 +1110,10 @@ pub fn parseTxnResolveRequest(alloc: std.mem.Allocator, body: []const u8) !TxnRe
         .txn_id = try parseTxnIdHex(requireString(obj, "txn_id")),
         .status = parseTxnStatus(requireString(obj, "status")) orelse return error.InvalidTxnRequest,
         .commit_version = requireInteger(obj, "commit_version"),
+        .topology_epoch = if (obj.get("topology_epoch")) |value| switch (value) {
+            .integer => |integer| if (integer >= 0) @intCast(integer) else return error.InvalidTxnRequest,
+            else => return error.InvalidTxnRequest,
+        } else 0,
         .sync_level = if (obj.get("sync_level")) |value| db_mod.types.parsePublicSyncLevelText(switch (value) {
             .string => |text| text,
             else => return error.InvalidTxnRequest,
@@ -1376,16 +1389,19 @@ test "txn resolve codec preserves sync level and accepts legacy requests" {
         .txn_id = txn_id,
         .status = .committed,
         .commit_version = 42,
+        .topology_epoch = 7,
         .sync_level = .full_index,
     });
     defer alloc.free(encoded);
     const decoded = try parseTxnResolveRequest(alloc, encoded);
+    try std.testing.expectEqual(@as(u64, 7), decoded.topology_epoch);
     try std.testing.expectEqual(db_mod.types.SyncLevel.full_index, decoded.sync_level);
 
     const legacy = try parseTxnResolveRequest(
         alloc,
         "{\"txn_id\":\"00112233445566778899aabbccddeeff\",\"status\":\"committed\",\"commit_version\":42}",
     );
+    try std.testing.expectEqual(@as(u64, 0), legacy.topology_epoch);
     try std.testing.expectEqual(db_mod.types.SyncLevel.propose, legacy.sync_level);
 }
 
@@ -1603,6 +1619,7 @@ test "distributed txn coordinator groups by range and commits all participants" 
 
         fn resolve(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, _: []const u8, req: TxnResolveRequest) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(req.topology_epoch != 0);
             try self.resolves.append(std.testing.allocator, .{ .group_id = group_id, .status = req.status });
         }
 
@@ -1716,6 +1733,7 @@ test "stable distributed transaction retry resumes a durable commit decision" {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.resolve_calls += 1;
             try std.testing.expectEqual(db_mod.types.TxnStatus.committed, req.status);
+            try std.testing.expectEqual(@as(u64, 0), req.topology_epoch);
         }
 
         fn status(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {

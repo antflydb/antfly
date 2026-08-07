@@ -733,6 +733,26 @@ pub const TxnManager = struct {
         return (try self.listTransactionsPage(alloc, null, std.math.maxInt(usize))).items;
     }
 
+    /// Checks for an unresolved transaction without materializing the full
+    /// transaction summary set. Topology transitions use this on a cold path,
+    /// but terminal history can still be large.
+    pub fn hasPendingTransactions(self: *TxnManager) !bool {
+        var read = try self.store.beginRead();
+        defer read.abort();
+        var cursor = try read.openCursor();
+        defer cursor.close();
+        var entry = try cursor.seekAtOrAfter(records_prefix);
+        while (entry) |record_entry| {
+            if (!std.mem.startsWith(u8, record_entry.key, records_prefix)) break;
+            if (record_entry.key.len == records_prefix.len + 16) {
+                const record = try decodeRecord(record_entry.value);
+                if (record.status == .pending) return true;
+            }
+            entry = try cursor.next();
+        }
+        return false;
+    }
+
     pub fn listTransactionsPage(
         self: *TxnManager,
         alloc: Allocator,

@@ -171,6 +171,51 @@ pub fn resolveGroupForKeyFromRanges(
     return null;
 }
 
+/// Owns one catalog snapshot and its sorted table-range projection for the
+/// lifetime of transaction routing. This keeps every key in a table pinned to
+/// the same topology without taking a catalog snapshot for each operation.
+pub const TransactionRoutingSnapshot = struct {
+    catalog: CatalogSource,
+    snapshot: metadata_api.AdminSnapshot,
+    ranges: []const *const metadata_table_manager.RangeRecord,
+    topology_epoch: u64,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        metadata_admin.freeRangeRefs(alloc, self.ranges);
+        self.catalog.freeAdminSnapshot(&self.snapshot);
+        self.* = undefined;
+    }
+
+    pub fn resolveGroupForKey(self: *const @This(), key: []const u8) ?u64 {
+        return resolveGroupForKeyFromRanges(self.ranges, key);
+    }
+};
+
+/// Captures and validates the table topology once for a transaction routing
+/// pass. The returned range pointers remain valid until `deinit`.
+pub fn transactionRoutingSnapshot(
+    alloc: std.mem.Allocator,
+    catalog: CatalogSource,
+    table_name: []const u8,
+) !?TransactionRoutingSnapshot {
+    var snapshot = try catalog.adminSnapshot();
+    errdefer catalog.freeAdminSnapshot(&snapshot);
+    const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
+    try validateTransactionTopologyStableSnapshot(&snapshot, table.*);
+
+    const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
+    errdefer metadata_admin.freeRangeRefs(alloc, ranges);
+    if (ranges.len == 0) return null;
+    sortRangeRefs(ranges);
+
+    return .{
+        .catalog = catalog,
+        .snapshot = snapshot,
+        .ranges = ranges,
+        .topology_epoch = topologyEpochFromSortedRanges(table.*, ranges),
+    };
+}
+
 /// Whether a table with this name currently exists in the catalog. Used by
 /// cross-table graph hydration to fail closed (skip) rather than error when a
 /// node references a dropped table.
@@ -203,6 +248,13 @@ fn topologyEpochFromSnapshot(
     defer metadata_admin.freeRangeRefs(alloc, ranges);
 
     sortRangeRefs(ranges);
+    return topologyEpochFromSortedRanges(table, ranges);
+}
+
+fn topologyEpochFromSortedRanges(
+    table: metadata_table_manager.TableRecord,
+    ranges: []const *const metadata_table_manager.RangeRecord,
+) u64 {
     var hasher = std.hash.Wyhash.init(0);
     hasher.update(table.name);
     hasher.update(std.mem.asBytes(&table.table_id));

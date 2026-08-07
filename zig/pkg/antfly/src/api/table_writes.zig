@@ -3522,6 +3522,7 @@ pub const TableWriteSource = struct {
             txn_id: db_mod.types.TxnId,
             status: db_mod.types.TxnStatus,
             commit_version: u64,
+            topology_epoch: u64,
             sync_level: db_mod.types.SyncLevel,
         ) anyerror!?void = null,
         txn_status_group_local: ?*const fn (
@@ -3910,10 +3911,11 @@ pub const TableWriteSource = struct {
         txn_id: db_mod.types.TxnId,
         status: db_mod.types.TxnStatus,
         commit_version: u64,
+        topology_epoch: u64,
         sync_level: db_mod.types.SyncLevel,
     ) !?void {
         const fn_ptr = self.vtable.txn_resolve_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, txn_id, status, commit_version, sync_level);
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level);
     }
 
     pub fn txnStatusGroupLocal(
@@ -4910,6 +4912,7 @@ pub const BoundTableWriteSource = struct {
         txn_id: db_mod.types.TxnId,
         status: db_mod.types.TxnStatus,
         commit_version: u64,
+        _: u64,
         sync_level: db_mod.types.SyncLevel,
     ) !?void {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
@@ -5732,6 +5735,7 @@ pub const ProvisionedTableWriteSource = struct {
             txn_id,
             status,
             commit_version,
+            0,
             .propose,
         )) orelse return error.UnknownGroup;
     }
@@ -13722,6 +13726,12 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try enforceHAWriteGateOptional(self.ha_write_gate);
+        // Keep the epoch check and durable begin in the same transition
+        // admission window. Otherwise a split can publish after validation
+        // but before this transaction becomes visible to the pending-txn
+        // transition fence.
+        self.beginGroupOperation(table_name, group_id);
+        defer self.endGroupOperation(table_name, group_id);
         try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
         if (self.raft_batcher) |batcher| {
             try batcher.batchGroupLocal(alloc, group_id, table_name, .{
@@ -13736,8 +13746,6 @@ pub const ProvisionedTableWriteSource = struct {
             });
             return {};
         }
-        self.beginGroupOperation(table_name, group_id);
-        defer self.endGroupOperation(table_name, group_id);
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         if (self.write_cache) |cache| {
@@ -13781,6 +13789,8 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try enforceHAWriteGateOptional(self.ha_write_gate);
+        self.beginGroupOperation(table_name, group_id);
+        defer self.endGroupOperation(table_name, group_id);
         try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
         if (self.raft_batcher) |batcher| {
             try batcher.batchGroupLocal(alloc, group_id, table_name, .{
@@ -13792,8 +13802,6 @@ pub const ProvisionedTableWriteSource = struct {
             });
             return {};
         }
-        self.beginGroupOperation(table_name, group_id);
-        defer self.endGroupOperation(table_name, group_id);
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         if (self.write_cache) |cache| {
@@ -13822,10 +13830,19 @@ pub const ProvisionedTableWriteSource = struct {
         txn_id: db_mod.types.TxnId,
         status: db_mod.types.TxnStatus,
         commit_version: u64,
+        topology_epoch: u64,
         sync_level: db_mod.types.SyncLevel,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try enforceHAWriteGateOptional(self.ha_write_gate);
+        // Serialize the final epoch validation with split/merge transition
+        // admission. If a transition is already waiting, it wins admission;
+        // otherwise this resolve remains ahead of the transition until the
+        // durable decision has been applied.
+        self.beginGroupOperation(table_name, group_id);
+        defer self.endGroupOperation(table_name, group_id);
+        if (topology_epoch != 0)
+            try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
         if (self.raft_batcher) |batcher| {
             try batcher.batchGroupLocal(alloc, group_id, table_name, .{
                 .sync_level = sync_level,
@@ -13837,8 +13854,6 @@ pub const ProvisionedTableWriteSource = struct {
             });
             return {};
         }
-        self.beginGroupOperation(table_name, group_id);
-        defer self.endGroupOperation(table_name, group_id);
         if (status == .committed) {
             lockAtomic(&self.local_db_mutex);
             self.invalidateReadCache(table_name);
@@ -15688,12 +15703,28 @@ pub const HostedProvisionedTableWriteSource = struct {
         table_name: []const u8,
         req: db_mod.types.BatchRequest,
     ) !?void {
+        return try batchGroupLocalFenced(ptr, alloc, group_id, table_name, req, 0);
+    }
+
+    fn batchGroupLocalFenced(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_mod.types.BatchRequest,
+        topology_epoch: u64,
+    ) !?void {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
         var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default_async);
         defer cached.deinit(hosted_cache.write_cache.alloc);
+        // Keep the catalog fence and transaction mutation inside one root
+        // writer lease. Split/merge cannot snapshot this root between the
+        // epoch check and making the transaction durable.
+        if (topology_epoch != 0)
+            try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
         try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, req.writes, req.deletes, req.transforms);
         if (req.transaction != null) {
             try cached.db.ensureTransactionRecoveryRuntime(self.transactionRecoveryConfig());
@@ -15713,9 +15744,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         retain_terminal: bool,
         participants: []const []const u8,
     ) !?void {
-        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
-        return try batchGroupLocal(ptr, alloc, group_id, table_name, .{
+        return try batchGroupLocalFenced(ptr, alloc, group_id, table_name, .{
             .transaction = .{ .begin = .{
                 .txn_id = txn_id,
                 .begin_timestamp = begin_timestamp,
@@ -15724,7 +15753,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .retain_terminal = retain_terminal,
                 .participants = participants,
             } },
-        });
+        }, topology_epoch);
     }
 
     fn txnPrepareGroupLocal(
@@ -15736,15 +15765,13 @@ pub const HostedProvisionedTableWriteSource = struct {
         topology_epoch: u64,
         req: db_mod.types.TransactionIntentRequest,
     ) !?void {
-        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
-        return try batchGroupLocal(ptr, alloc, group_id, table_name, .{
+        return try batchGroupLocalFenced(ptr, alloc, group_id, table_name, .{
             .writes = transactionWritesAsBatchWrites(req.writes),
             .deletes = req.deletes,
             .transforms = req.transforms,
             .predicates = req.predicates,
             .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch } },
-        });
+        }, topology_epoch);
     }
 
     fn txnResolveGroupLocal(
@@ -15755,16 +15782,17 @@ pub const HostedProvisionedTableWriteSource = struct {
         txn_id: db_mod.types.TxnId,
         status: db_mod.types.TxnStatus,
         commit_version: u64,
+        topology_epoch: u64,
         sync_level: db_mod.types.SyncLevel,
     ) !?void {
-        return try batchGroupLocal(ptr, alloc, group_id, table_name, .{
+        return try batchGroupLocalFenced(ptr, alloc, group_id, table_name, .{
             .sync_level = sync_level,
             .transaction = .{ .resolve = .{
                 .txn_id = txn_id,
                 .status = status,
                 .commit_version = commit_version,
             } },
-        });
+        }, topology_epoch);
     }
 
     fn txnStatusGroupLocal(
@@ -21406,7 +21434,7 @@ test "bound table write source resolves internal group transactions into visible
     _ = try source.source().txnPrepareGroupLocal(alloc, 7, "docs", txn_id, 0, .{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
     });
-    _ = try source.source().txnResolveGroupLocal(alloc, 7, "docs", txn_id, .committed, 10_001, .propose);
+    _ = try source.source().txnResolveGroupLocal(alloc, 7, "docs", txn_id, .committed, 10_001, 0, .propose);
 
     const unresolved = try db.getUnresolvedTransactionParticipants(alloc, txn_id);
     defer transactions_mod.freeParticipantList(alloc, unresolved);
@@ -24746,7 +24774,7 @@ test "provisioned txn commit reuses cached writer state" {
     _ = try source.source().txnPrepareGroupLocal(alloc, 7001, "docs", txn_id, 0, .{
         .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"beta\"}" }},
     });
-    _ = try source.source().txnResolveGroupLocal(alloc, 7001, "docs", txn_id, .committed, 10_001, .propose);
+    _ = try source.source().txnResolveGroupLocal(alloc, 7001, "docs", txn_id, .committed, 10_001, 0, .propose);
 
     try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
     try std.testing.expect(source.isWriteCacheDirtyForTable("docs"));

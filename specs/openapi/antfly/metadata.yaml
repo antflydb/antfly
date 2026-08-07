@@ -4257,6 +4257,10 @@ components:
     BatchResponse:
       type: object
       properties:
+        status:
+          type: string
+          enum: [committed, committed_pending]
+          description: Durable commit and visibility/participant recovery state.
         inserted:
           type: integer
           description: Number of documents successfully inserted
@@ -4330,6 +4334,10 @@ components:
         status:
           type: string
           description: Durable commit and visibility/propagation state.
+          enum:
+            - committed
+            - committed_visibility_pending
+            - committed_recovery_pending
         tables:
           type: object
           description: Per-table batch results

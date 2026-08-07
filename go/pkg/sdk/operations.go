@@ -222,6 +222,14 @@ func (c *AntflyClient) BatchWithOptions(ctx context.Context, tableName string, r
 		}
 	}
 
+	if result.Status == "" {
+		if resp.StatusCode == http.StatusAccepted {
+			result.Status = "committed_pending"
+		} else {
+			result.Status = "committed"
+		}
+	}
+
 	return &result, nil
 }
 
@@ -877,6 +885,13 @@ func (c *AntflyClient) MultiBatchWithOptions(ctx context.Context, request MultiB
 	if len(respBody) > 0 {
 		if err := json.Unmarshal(respBody, &result); err != nil {
 			return nil, fmt.Errorf("parsing multi-batch result: %w", err)
+		}
+	}
+	if result.Status == "" {
+		if resp.StatusCode == http.StatusAccepted {
+			result.Status = "committed_pending"
+		} else {
+			result.Status = "committed"
 		}
 	}
 

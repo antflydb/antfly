@@ -617,7 +617,7 @@ pub fn handleTableBatch(
         error.WriteUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "write unavailable") },
         error.CommittedPending => return .{
             .status = 202,
-            .body = try batch_api.encodeBatchResponse(alloc, batch_req.result()),
+            .body = try batch_api.encodeBatchResponse(alloc, batch_req.resultWithStatus("committed_pending")),
         },
         error.DocIdentityUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "doc identity unavailable") },
         error.HAReadOnlyStandby => return .{ .status = 409, .body = try alloc.dupe(u8, "standby is read-only") },

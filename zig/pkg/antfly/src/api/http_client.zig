@@ -2769,6 +2769,7 @@ fn remoteGroupTxnPrepareConflictError(body: []const u8) anyerror {
 
 fn remoteGroupTxnResolveConflictError(body: []const u8) anyerror {
     if (isDocIdentityNamespaceMismatchConflictMessage(body)) return error.DocIdentityNamespaceMismatch;
+    if (std.mem.eql(u8, body, "topology changed") or std.mem.eql(u8, body, "TopologyChanged")) return error.TopologyChanged;
     if (std.mem.eql(u8, body, "decision conflict")) return error.DecisionConflict;
     return error.UnexpectedHttpStatus;
 }

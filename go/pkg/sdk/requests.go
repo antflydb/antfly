@@ -55,6 +55,11 @@ type BatchRequest struct {
 
 // BatchResult represents the result of a batch operation with detailed failure information
 type BatchResult struct {
+	// Status is "committed" or "committed_pending". A pending result has a
+	// durable commit decision but has not yet reached the requested visibility
+	// or participant-recovery barrier.
+	Status string `json:"status,omitempty"`
+
 	// Deleted Number of documents successfully deleted
 	Deleted int `json:"deleted,omitempty"`
 
@@ -304,6 +309,11 @@ type MultiBatchRequest struct {
 
 // MultiBatchResult represents the result of a cross-table batch operation.
 type MultiBatchResult struct {
+	// Status is "committed", "committed_visibility_pending", or
+	// "committed_recovery_pending". "committed_pending" is used as a generic
+	// fallback when an older server returns HTTP 202 without a status field.
+	Status string `json:"status,omitempty"`
+
 	// Tables maps table names to their batch results.
 	Tables map[string]BatchResult `json:"tables,omitempty"`
 }

@@ -7135,6 +7135,7 @@ pub const DataServer = struct {
         destination_group_id: u64,
         table_contract: antfly.metadata.TransitionTableContract,
     ) !antfly.raft.SplitCoordinatorRuntime {
+        if (source_group_id == destination_group_id) return error.InvalidBatchRequest;
         const source_root_dir = try antfly.metadata.groupDbPathFromReplicaRoot(self.alloc, self.write_source.replica_root_dir, source_group_id);
         defer self.alloc.free(source_root_dir);
         const dest_root_dir = try antfly.metadata.groupDbPathFromReplicaRoot(self.alloc, self.write_source.replica_root_dir, destination_group_id);
@@ -7145,18 +7146,30 @@ pub const DataServer = struct {
             source_group_id,
             table_contract,
         );
+        var source_lease: ?antfly.data.storage.db_split_handoff.BorrowedDestinationDb = try self.leaseTransitionDbForTableGroup(
+            source_group_id,
+            table_contract,
+            .source,
+            .exact,
+        );
+        errdefer if (source_lease) |lease| lease.release();
+        if (try source_lease.?.db.hasPendingTransactions()) return error.TransactionTopologyBusy;
         const destination_namespace = identityNamespaceFromTransitionContract(
             table_contract,
             .target,
         );
-        const dest_lease = try self.leaseTransitionDbForTableGroup(
+        var dest_lease: ?antfly.data.storage.db_split_handoff.BorrowedDestinationDb = try self.leaseTransitionDbForTableGroup(
             destination_group_id,
             table_contract,
             .target,
             .exact,
         );
-        errdefer dest_lease.release();
+        errdefer if (dest_lease) |lease| lease.release();
         dest_db_options.identity_namespace = destination_namespace;
+        const owned_source_lease = source_lease.?;
+        const owned_dest_lease = dest_lease.?;
+        source_lease = null;
+        dest_lease = null;
         return try antfly.raft.SplitCoordinatorRuntime.init(self.alloc, .{
             .transition_id = transition_id,
             .attempt_epoch = attempt_epoch,
@@ -7165,8 +7178,9 @@ pub const DataServer = struct {
             .source_group_id = source_group_id,
             .dest_group_id = destination_group_id,
             .source_store = self.localTransitionApplyStore(),
+            .source_lease = owned_source_lease,
             .dest = .{ .root_dir = dest_root_dir, .db = dest_db_options },
-            .dest_lease = dest_lease,
+            .dest_lease = owned_dest_lease,
         });
     }
 
@@ -7294,6 +7308,7 @@ pub const DataServer = struct {
         allow_doc_identity_reassignment: bool,
         table_contract: antfly.metadata.TransitionTableContract,
     ) !antfly.raft.MergeCoordinatorRuntime {
+        if (donor_group_id == receiver_group_id) return error.InvalidBatchRequest;
         const donor_root_dir = try antfly.metadata.groupDbPathFromReplicaRoot(self.alloc, self.write_source.replica_root_dir, donor_group_id);
         defer self.alloc.free(donor_root_dir);
         const receiver_root_dir = try antfly.metadata.groupDbPathFromReplicaRoot(self.alloc, self.write_source.replica_root_dir, receiver_group_id);
@@ -7310,24 +7325,47 @@ pub const DataServer = struct {
             donor_group_id,
             table_contract,
         );
-        const receiver_lease = try self.leaseTransitionDbForTableGroup(
-            receiver_group_id,
-            table_contract,
-            .target,
-            if (allow_doc_identity_reassignment)
-                .reassign_same_table
-            else
-                .exact,
-        );
-        errdefer receiver_lease.release();
+        var donor_lease: ?antfly.data.storage.db_split_handoff.BorrowedDestinationDb = null;
+        errdefer if (donor_lease) |lease| lease.release();
+        var receiver_lease: ?antfly.data.storage.db_split_handoff.BorrowedDestinationDb = null;
+        errdefer if (receiver_lease) |lease| lease.release();
+
+        // Concurrent merges can overlap. Acquire group transition leases in a
+        // global order so inverse donor/receiver pairs cannot deadlock.
+        if (donor_group_id < receiver_group_id) {
+            donor_lease = try self.leaseTransitionDbForTableGroup(donor_group_id, table_contract, .source, .exact);
+            if (try donor_lease.?.db.hasPendingTransactions()) return error.TransactionTopologyBusy;
+            receiver_lease = try self.leaseTransitionDbForTableGroup(
+                receiver_group_id,
+                table_contract,
+                .target,
+                if (allow_doc_identity_reassignment) .reassign_same_table else .exact,
+            );
+            if (try receiver_lease.?.db.hasPendingTransactions()) return error.TransactionTopologyBusy;
+        } else {
+            receiver_lease = try self.leaseTransitionDbForTableGroup(
+                receiver_group_id,
+                table_contract,
+                .target,
+                if (allow_doc_identity_reassignment) .reassign_same_table else .exact,
+            );
+            if (try receiver_lease.?.db.hasPendingTransactions()) return error.TransactionTopologyBusy;
+            donor_lease = try self.leaseTransitionDbForTableGroup(donor_group_id, table_contract, .source, .exact);
+            if (try donor_lease.?.db.hasPendingTransactions()) return error.TransactionTopologyBusy;
+        }
+        const owned_donor_lease = donor_lease.?;
+        const owned_receiver_lease = receiver_lease.?;
+        donor_lease = null;
+        receiver_lease = null;
         return try antfly.raft.MergeCoordinatorRuntime.init(self.alloc, .{
             .donor_root_dir = donor_root_dir,
             .receiver_root_dir = receiver_root_dir,
             .donor_group_id = donor_group_id,
             .receiver_group_id = receiver_group_id,
             .donor_store = self.localTransitionApplyStore(),
+            .donor_lease = owned_donor_lease,
             .receiver = .{ .root_dir = receiver_root_dir, .db = receiver_db_options },
-            .receiver_lease = receiver_lease,
+            .receiver_lease = owned_receiver_lease,
             .receiver_identity_reassignment_namespace = receiver_namespace,
         });
     }
@@ -7601,6 +7639,7 @@ pub const DataServer = struct {
         watermark: ?antfly.data.AppliedDataBatch,
         capture_handoff: bool,
     ) !SplitProjectionReconcileResult {
+        if (try db.hasPendingTransactions()) return error.TransactionTopologyBusy;
         const root_incarnation = try db.durableRootIncarnation();
         if (capture_handoff) {
             const expected = watermark orelse return error.SplitSourceProjectionNotReady;

@@ -550,6 +550,8 @@ pub const BatchRequest = struct {
 };
 
 pub const BatchResponse = struct {
+    /// Durable commit and visibility/participant recovery state.
+    status: ?[]const u8 = null,
     /// Number of documents successfully inserted
     inserted: ?i64 = null,
     /// Number of documents successfully deleted

@@ -14057,6 +14057,13 @@ pub const DB = struct {
         return try self.core.getCommitVersion(txn_id);
     }
 
+    /// Returns whether this shard still has a transaction awaiting a terminal
+    /// decision. Split and merge handoff must not snapshot or retire a shard
+    /// while prepared intents are pinned to its current topology.
+    pub fn hasPendingTransactions(self: *DB) !bool {
+        return try self.core.hasPendingTransactions();
+    }
+
     pub fn markTransactionParticipantResolved(self: *DB, txn_id: transactions_mod.TxnId, participant: []const u8) !void {
         lockApply(self);
         defer self.core.unlockApply();
@@ -75961,7 +75968,9 @@ test "db exposes local transaction lifecycle" {
 
     const begin_ts: u64 = 1_700_000_000_000_000_000;
     const commit_ts: u64 = begin_ts + 1;
+    try std.testing.expect(!try db.hasPendingTransactions());
     const txn_id = try db.beginTransaction(begin_ts);
+    try std.testing.expect(try db.hasPendingTransactions());
     try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try db.getTransactionStatus(txn_id));
 
     try db.writeIntents(txn_id, &.{
@@ -75969,6 +75978,7 @@ test "db exposes local transaction lifecycle" {
     }, &.{});
 
     try db.commitTransaction(txn_id, commit_ts);
+    try std.testing.expect(!try db.hasPendingTransactions());
     try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try db.getTransactionStatus(txn_id));
     try std.testing.expectEqual(commit_ts, try db.getCommitVersion(txn_id));
     try std.testing.expectEqual(@as(?u64, 1), try range_cardinality.load(alloc, db.core.store));
@@ -75988,10 +75998,12 @@ test "db exposes local transaction lifecycle" {
     }
 
     const delete_txn = try db.beginTransaction(commit_ts + 1);
+    try std.testing.expect(try db.hasPendingTransactions());
     try db.writeIntents(delete_txn, &.{
         .{ .key = "doc:txn", .value = null },
     }, &.{});
     try db.commitTransaction(delete_txn, commit_ts + 2);
+    try std.testing.expect(!try db.hasPendingTransactions());
     try std.testing.expect((try db.get(alloc, "doc:txn")) == null);
     try std.testing.expectEqual(@as(?u64, 0), try range_cardinality.load(alloc, db.core.store));
 
