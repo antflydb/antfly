@@ -15,19 +15,18 @@
 const builtin = @import("builtin");
 const std = @import("std");
 const structlog = @import("structlog");
-const cmd = @import("cmd/mod.zig");
-const httpx = @import("httpx");
-const antfly_client = @import("antfly-client");
 const platform = @import("antfly_platform");
 const build_options = @import("build_options");
 const linked_runtime_options = @import("linked_runtime_options");
 const runtime_bridge = @import("runtime_bridge.zig");
+const cmd = if (linked_runtime_options.enabled) struct {} else @import("cmd/mod.zig");
+const httpx = if (linked_runtime_options.enabled) struct {} else @import("httpx");
 
 // usermgr/storage_imports.zig depends back on these through the executable
 // root in the monolithic diagnostic control. They stay unreferenced in the
 // linked dispatcher, so that build does not pull either storage graph in.
-pub const storage_backend_erased = @import("storage/backend_erased.zig");
-pub const lsm_backend = @import("storage/lsm_backend/mod.zig");
+pub const storage_backend_erased = if (linked_runtime_options.enabled) struct {} else @import("storage/backend_erased.zig");
+pub const lsm_backend = if (linked_runtime_options.enabled) struct {} else @import("storage/lsm_backend/mod.zig");
 
 const antfly_cloud_binary = "antfly-cloud";
 
@@ -80,7 +79,7 @@ fn mainImpl(init: std.process.Init) !void {
         // command in that codegen unit instead of pulling it into the CLI.
         if (std.mem.eql(u8, subcommand, "lite")) return runLinkedRuntime(.standalone, subcommand, init, &args);
         if (std.mem.eql(u8, subcommand, "metadata")) return runLinkedRuntime(.metadata, subcommand, init, &args);
-        if (std.mem.eql(u8, subcommand, "serverless")) return runLinkedRuntime(.cli, subcommand, init, &args);
+        if (std.mem.eql(u8, subcommand, "serverless")) return runLinkedRuntime(.serverless, subcommand, init, &args);
         if (std.mem.eql(u8, subcommand, "standalone")) return runLinkedRuntime(.standalone, subcommand, init, &args);
     } else {
         if (std.mem.eql(u8, subcommand, "data")) return try cmd.data.runFromIterator(runtimeInit(init), argv0, &args);
@@ -124,12 +123,13 @@ fn mainImpl(init: std.process.Init) !void {
     return error.InvalidArguments;
 }
 
-const LinkedRuntimeRole = enum { cli, data, inference, metadata, standalone };
+const LinkedRuntimeRole = enum { cli, data, inference, metadata, serverless, standalone };
 
 extern fn antfly_runtime_cli(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_data(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_inference(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_metadata(context: *const runtime_bridge.Context) callconv(.c) c_int;
+extern fn antfly_runtime_serverless(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_standalone(context: *const runtime_bridge.Context) callconv(.c) c_int;
 
 fn runLinkedRuntime(
@@ -149,6 +149,7 @@ fn runLinkedRuntime(
         .data => antfly_runtime_data(&context),
         .inference => antfly_runtime_inference(&context),
         .metadata => antfly_runtime_metadata(&context),
+        .serverless => antfly_runtime_serverless(&context),
         .standalone => antfly_runtime_standalone(&context),
     };
     if (code != 0) std.process.exit(@intCast(code));
@@ -304,6 +305,7 @@ test "main cmd compiles" {
 }
 
 test "client help is recognized before command execution" {
+    if (comptime linked_runtime_options.enabled) return;
     var argv = [_][*:0]const u8{ "--table", "docs", "--help" };
     var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
     try std.testing.expect(cliHelpRequested(&args));

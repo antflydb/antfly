@@ -47,6 +47,13 @@ const RuntimeArtifactRole = enum {
     standalone,
 };
 
+const RuntimeLibraryUnit = enum {
+    api_kernel,
+    cli,
+    distributed,
+    inference,
+};
+
 const snowball_languages = [_][]const u8{
     "danish",
     "dutch",
@@ -3416,15 +3423,17 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    antfly_imports.configure(b, cmd_test_mod, true, true);
+    const cmd_usermgr_storage_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    cmd_usermgr_storage_mod.addImport("antfly_root", cmd_test_mod);
+    cmd_usermgr_storage_mod.addImport("antfly_platform", platform_mod);
+    cmd_test_mod.addImport("usermgr_storage", cmd_usermgr_storage_mod);
     cmd_test_mod.addImport("antfly-zig", lib_mod);
     cmd_test_mod.addImport("antfly-client", antfly_client_pkg_mod);
-    cmd_test_mod.addImport("httpx", httpx_mod);
-    cmd_test_mod.addImport("antfly_vellum", vellum_mod);
-    cmd_test_mod.addImport("raft_engine", raft_engine_mod);
-    cmd_test_mod.addImport("structlog", structlog_mod);
-    cmd_test_mod.addImport("antfly_platform", platform_mod);
-    cmd_test_mod.addImport("handlebars", handlebars_mod);
-    cmd_test_mod.addOptions("build_options", build_options);
     const cmd_tests = b.addTest(.{
         .root_module = cmd_test_mod,
         .filters = &.{ "cmd.lite", "cmd.serverless", "cmd.cli.backup", "cmd.cli.index", "cmd.cli.mod" },
@@ -3442,15 +3451,17 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    antfly_imports.configure(b, lite_cmd_test_mod, true, true);
+    const lite_cmd_usermgr_storage_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lite_cmd_usermgr_storage_mod.addImport("antfly_root", lite_cmd_test_mod);
+    lite_cmd_usermgr_storage_mod.addImport("antfly_platform", platform_mod);
+    lite_cmd_test_mod.addImport("usermgr_storage", lite_cmd_usermgr_storage_mod);
     lite_cmd_test_mod.addImport("antfly-zig", lib_mod);
     lite_cmd_test_mod.addImport("antfly-client", antfly_client_pkg_mod);
-    lite_cmd_test_mod.addImport("httpx", httpx_mod);
-    lite_cmd_test_mod.addImport("antfly_vellum", vellum_mod);
-    lite_cmd_test_mod.addImport("raft_engine", raft_engine_mod);
-    lite_cmd_test_mod.addImport("structlog", structlog_mod);
-    lite_cmd_test_mod.addImport("antfly_platform", platform_mod);
-    lite_cmd_test_mod.addImport("handlebars", handlebars_mod);
-    lite_cmd_test_mod.addOptions("build_options", build_options);
     const lite_cmd_tests = b.addTest(.{
         .root_module = lite_cmd_test_mod,
         .filters = &.{ "cmd.lite", "cmd.cli.backup", "cmd.cli.index", "cmd.cli.mod" },
@@ -5988,6 +5999,7 @@ pub fn build(b: *std.Build) void {
             "parse cli accepts inference budget overrides",
             "inference config falls back to common config",
             "inference admission bridge charges combined native residency to resource manager",
+            "standalone inference keep alive parses compound durations and zero",
             "standalone runtime resolves paths from common storage base dir",
             "standalone runtime resolves extension package store env before local default",
             "standalone Lite enforces one shard and one replica",
@@ -8468,9 +8480,9 @@ pub fn build(b: *std.Build) void {
     });
 
     if (linked_runtime_libraries) {
-        inline for (std.meta.tags(RuntimeArtifactRole)) |role| {
-            const role_options = b.addOptions();
-            role_options.addOption(RuntimeArtifactRole, "role", role);
+        inline for (std.meta.tags(RuntimeLibraryUnit)) |unit| {
+            const unit_options = b.addOptions();
+            unit_options.addOption(RuntimeLibraryUnit, "unit", unit);
 
             const role_mod = b.createModule(.{
                 .root_source_file = b.path("pkg/antfly/src/runtime_artifact_lib.zig"),
@@ -8480,7 +8492,7 @@ pub fn build(b: *std.Build) void {
             });
             antfly_imports.configure(b, role_mod, false, link_libc);
             role_mod.addImport("antfly-client", antfly_client_pkg_mod);
-            role_mod.addOptions("runtime_artifact_options", role_options);
+            role_mod.addOptions("runtime_library_options", unit_options);
             const role_usermgr_storage_mod = b.createModule(.{
                 .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
                 .target = target,
@@ -8491,21 +8503,20 @@ pub fn build(b: *std.Build) void {
             role_mod.addImport("usermgr_storage", role_usermgr_storage_mod);
 
             const role_library = b.addLibrary(.{
-                .name = b.fmt("antfly-runtime-{s}", .{@tagName(role)}),
+                .name = b.fmt("antfly-runtime-{s}", .{@tagName(unit)}),
                 .root_module = role_mod,
                 .linkage = .static,
                 // Zig's build runner uses these claims to run as many LLVM
                 // codegen steps concurrently as fit in available RAM. The
-                // focused ARM64 ReleaseFast measurements peaked near 10 GiB
-                // for data/metadata, 7 GiB for the coarse CLI, and
-                // 15 GiB for inference. Together with a --maxrss budget below
-                // the pod request, these claims admit safe pairs without
-                // globally forcing -j1 or admitting data+metadata together.
-                .max_rss = switch (role) {
+                // claims below conservatively cover the focused ARM64
+                // ReleaseFast units. Together with a --maxrss budget below
+                // the pod request, they admit safe independent pairs without
+                // globally serializing codegen.
+                .max_rss = switch (unit) {
+                    .api_kernel => 13 * 1024 * 1024 * 1024,
                     .inference => 16 * 1024 * 1024 * 1024,
-                    .data, .metadata => 11 * 1024 * 1024 * 1024,
+                    .distributed => 14 * 1024 * 1024 * 1024,
                     .cli => 8 * 1024 * 1024 * 1024,
-                    .standalone => 13 * 1024 * 1024 * 1024,
                 },
             });
             if (strip) {

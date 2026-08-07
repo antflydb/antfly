@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const cluster = @import("cluster.zig");
-const metadata_mod = @import("../metadata/mod.zig");
+const metadata_mod = @import("../metadata/domain.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
 const db_api = @import("../storage/db/db.zig");
 const db_mod = @import("../storage/db/mod.zig");

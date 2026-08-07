@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const data = @import("../data/mod.zig");
+const data = @import("../data/domain.zig");
 const raft_state_machine = @import("../raft/state_machine/mod.zig");
 
 pub const TransitionKind = enum {

@@ -158,7 +158,7 @@ test "metadata transition driver steps split and merge through runtime interface
 
         fn observeMerge(ptr: *anyopaque, record: transition_state.MergeTransitionRecord) !transition_state.MergeObservation {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            const status: @import("../data/mod.zig").MergeTransitionStatus = .{
+            const status: @import("../data/domain.zig").MergeTransitionStatus = .{
                 .phase = switch (self.merge_phase) {
                     .prepare => .prepare,
                     .bootstrap_peer => .bootstrap_peer,

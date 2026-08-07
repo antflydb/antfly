@@ -16,7 +16,7 @@
 
 pub const admin = @import("../admin/mod.zig");
 pub const common = @import("../common/mod.zig");
-pub const data = @import("mod.zig");
+pub const data = @import("domain.zig");
 pub const db = @import("../storage/db/mod.zig");
 pub const extensions = @import("../extensions/mod.zig");
 pub const ha = @import("../storage/ha/mod.zig");
@@ -24,11 +24,11 @@ pub const inference = @import("../inference/mod.zig");
 pub const internal = @import("../internal/mod.zig");
 pub const internal_keys = @import("../storage/internal_keys.zig");
 pub const lsm_backend = @import("../storage/lsm_backend/mod.zig");
-pub const metadata = @import("../metadata/mod.zig");
+pub const metadata = @import("../metadata/domain.zig");
 pub const metadata_api = @import("../metadata/api.zig");
 pub const metadata_http_client = @import("../metadata/http_client.zig");
 pub const metadata_service = @import("../metadata/service.zig");
-pub const public_api = @import("../api/mod.zig");
+pub const public_api = @import("../api/runtime.zig");
 pub const raft = @import("../raft/mod.zig");
 pub const readers = @import("antfly_readers");
 pub const shard = @import("../storage/shard.zig");
