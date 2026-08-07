@@ -736,6 +736,10 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(400);
                 return ctx.text("invalid transaction commit request");
             },
+            error.TableNotFound => {
+                _ = ctx.status(404);
+                return ctx.text("not found");
+            },
             else => return err,
         };
         if (try self.api_server.validateCommitReadSet(commit_req.*)) |conflict| {
@@ -3794,6 +3798,117 @@ const SchemaReconcileWriteSource = struct {
         return {};
     }
 };
+
+test "httpx multi batch route uses the batch commit hook and public response contract" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
+
+    const FakeWrites = struct {
+        batch_calls: usize = 0,
+        transaction_calls: usize = 0,
+        batch_commit_calls: usize = 0,
+
+        fn source(self: *@This()) table_writes.TableWriteSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .batch = batch,
+                    .commit_transaction = commitTransaction,
+                    .commit_batch = commitBatch,
+                },
+            };
+        }
+
+        fn batch(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+        ) anyerror!?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.batch_calls += 1;
+            return error.TestUnexpectedResult;
+        }
+
+        fn commitTransaction(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const distributed_txn.TableCommitRequest,
+            _: db_mod.types.SyncLevel,
+        ) anyerror!?distributed_txn.CommitOutcome {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.transaction_calls += 1;
+            return error.TestUnexpectedResult;
+        }
+
+        fn commitBatch(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            tables: []const distributed_txn.TableCommitRequest,
+            sync_level: db_mod.types.SyncLevel,
+        ) anyerror!?distributed_txn.CommitOutcome {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.batch_commit_calls += 1;
+            try std.testing.expectEqual(@as(usize, 2), tables.len);
+            try std.testing.expectEqualStrings("users", tables[0].table_name);
+            try std.testing.expectEqualStrings("orders", tables[1].table_name);
+            try std.testing.expectEqual(@as(usize, 1), tables[0].writes.len);
+            try std.testing.expectEqual(@as(usize, 1), tables[1].deletes.len);
+            try std.testing.expectEqual(db_mod.types.SyncLevel.write, sync_level);
+            return .{ .committed = .{ .participant_count = 2 } };
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var status = AuthStatusSource{};
+    var writes = FakeWrites{};
+    var api_server = ApiHttpServer.init(alloc, .{}, status.iface(), null, writes.source());
+    var e2e_server: HttpxE2eServer = undefined;
+    try e2e_server.init(alloc, &api_server);
+    defer e2e_server.deinit();
+
+    var client_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer client_io.deinit();
+    var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base_url = try e2e_server.baseUrl(alloc);
+    defer alloc.free(base_url);
+    const batch_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/batch", .{base_url});
+    defer alloc.free(batch_url);
+    const headers = [_][2][]const u8{.{ "content-type", "application/json" }};
+
+    var response = try requestWithRetry(
+        &client,
+        client_io.io(),
+        .POST,
+        batch_url,
+        "{\"tables\":{\"users\":{\"inserts\":{\"user:1\":{\"name\":\"Alice\"}}},\"orders\":{\"deletes\":[\"order:old\"]}},\"sync_level\":\"write\"}",
+        &headers,
+        20,
+    );
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 201), response.status.code);
+    try std.testing.expectEqualStrings("application/json", response.contentType().?);
+    var parsed = try std.json.parseFromSlice(transactions_api.MultiBatchResponse, alloc, response.body.?, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u32, 1), parsed.value.tables.map.get("users").?.inserted);
+    try std.testing.expectEqual(@as(u32, 1), parsed.value.tables.map.get("orders").?.deleted);
+    try std.testing.expectEqual(@as(usize, 1), writes.batch_commit_calls);
+    try std.testing.expectEqual(@as(usize, 0), writes.transaction_calls);
+    try std.testing.expectEqual(@as(usize, 0), writes.batch_calls);
+
+    var rejected = try requestWithRetry(
+        &client,
+        client_io.io(),
+        .POST,
+        batch_url,
+        "{\"read_set\":[],\"tables\":{\"users\":{\"deletes\":[\"user:1\"]}}}",
+        &headers,
+        20,
+    );
+    defer rejected.deinit();
+    try std.testing.expectEqual(@as(u16, 400), rejected.status.code);
+    try std.testing.expectEqual(@as(usize, 1), writes.batch_commit_calls);
+}
 
 test "httpx internal request conversion preserves protocol headers" {
     const alloc = std.testing.allocator;

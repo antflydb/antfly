@@ -4407,6 +4407,7 @@ pub fn build(b: *std.Build) void {
         "public table query handler preserves structured filter diagnostics",
         "api http server serves retrieval agent response envelope",
         "api http server serves table batch writes",
+        "api http server routes table batches through the batch commit hook",
         "auto bulk max-window request waits for idle finish",
         "auto bulk group writes release leases so idle finish can publish",
         "auto bulk background finish skips entries with active foreground leases",
@@ -4514,6 +4515,7 @@ pub fn build(b: *std.Build) void {
         "distributed join preserves native public filters when adding join predicates",
         "scan request errors map to stable client responses",
         "httpx antfly scan honors optional body and documented bad requests",
+        "httpx multi batch route uses the batch commit hook and public response contract",
         "httpx query admission rejects saturated queries without blocking control routes",
         "httpx query admission releases a cancelled query slot",
         "httpx rejects pipelined H1 query work when disconnect ownership is ambiguous",
@@ -4524,9 +4526,11 @@ pub fn build(b: *std.Build) void {
         "api http invalid filter query response names the offending node",
         "api http unsupported filter query response names the offending node",
         "public api smoke e2e creates table inserts and queries documents",
+        "provisioned table write source routes batch writes across ranges",
         "public api e2e recreates managed embeddings index after corrupt artifact",
         "public api split e2e uses distributed global text stats for bm25 and significant_terms",
         "public api multi-node e2e routes CRUD from a non-host node",
+        "public api multi-node e2e commits cross-table transactions atomically",
     };
     const public_api_parity_runtime_filters = selectTestFilters(b, &public_api_parity_default_filters);
     const public_api_parity_tests = b.addTest(.{
