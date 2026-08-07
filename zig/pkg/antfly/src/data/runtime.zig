@@ -3607,6 +3607,11 @@ pub const DataServer = struct {
     store_capacity_probe_failures: std.atomic.Value(u64) = .init(0),
     last_store_status_report_at_ms: u64 = 0,
     last_data_raft_metadata_sync_at_ms: u64 = 0,
+    data_raft_metadata_sync_requested: std.atomic.Value(bool) = .init(false),
+    /// Guarded by data_raft_reconcile_mutex. Zero epochs are deliberately not
+    /// cached because test/bootstrap snapshots can reuse zero for distinct
+    /// desired states.
+    last_data_raft_reconciled_metadata_epoch: ?u64 = null,
     last_data_raft_storage_ownership_fingerprint: ?u64 = null,
     last_data_raft_status_fingerprint: ?u64 = null,
     provision_ticks: usize = 0,
@@ -4072,7 +4077,15 @@ pub const DataServer = struct {
         }
         api_server_cfg.shard_ops = self.localShardOperationAdapter();
         api_server_cfg.shard_db_adapter = self.localShardDbAdapter();
-        api_server_cfg.routed_raft_batch_writer = self.routedRaftBatchWriter();
+        // Legacy, non-Raft data servers must keep ordinary /batch requests on
+        // TableWriteSource.batchGroupLocal. Installing this adapter there
+        // would divert every no-header rolling-upgrade request into
+        // proposeRaftBatchGroupWithLeaderWait, which is unsupported without a
+        // data-Raft host.
+        api_server_cfg.routed_raft_batch_writer = if (self.data_raft != null)
+            self.routedRaftBatchWriter()
+        else
+            null;
         api_server_cfg.backend_runtime = self.backend_runtime;
         api_server_cfg.resource_manager = &self.provisioned_storage.resource_manager;
         self.configureHAPublicGateState();
@@ -4795,7 +4808,8 @@ pub const DataServer = struct {
         self.requestLsmMaintenanceBackground() catch try self.runLsmMaintenanceForegroundRound();
         if (self.data_raft != null and self.remote_metadata != null) {
             const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
-            if (self.last_data_raft_metadata_sync_at_ms == 0 or
+            const requested = self.data_raft_metadata_sync_requested.swap(false, .acq_rel);
+            if (requested or self.last_data_raft_metadata_sync_at_ms == 0 or
                 now_ms -| self.last_data_raft_metadata_sync_at_ms >= data_raft_metadata_sync_interval_ms)
             {
                 self.last_data_raft_metadata_sync_at_ms = now_ms;
@@ -5476,15 +5490,15 @@ pub const DataServer = struct {
         const deadline_ns = platform_time.monotonicNs() +| leader_wait_ns;
         try ensureDataRaftBatchRouteActive(route);
         if (route.refresh_metadata) {
-            self.syncDataRaftFromRemoteMetadataWithBudget(deadline_ns, route.cancellation) catch |err| switch (err) {
+            self.refreshDataRaftMetadataForBatchWithBudget(deadline_ns, route.cancellation) catch |err| switch (err) {
                 error.Timeout => return error.LeaderUnavailable,
                 else => return err,
             };
         } else if (raft.host.http_host.host.raftStatus(group_id) == null and self.remote_metadata != null) {
-            const remote_metadata = self.remote_metadata.?;
-            var snapshot = (try remote_metadata.cachedSnapshot()) orelse return error.MetadataSnapshotUnavailable;
-            defer freeAdminSnapshotOwned(self.alloc, &snapshot);
-            try self.syncDataRaftFromSnapshot(&snapshot);
+            // A forwarded request must never wait behind durable topology
+            // reconciliation. The cached placement snapshot still lets it
+            // route immediately while the control worker converges this host.
+            self.requestDataRaftMetadataSync();
         }
         try ensureDataRaftBatchRouteActive(route);
         const routing_start_ns = platform_time.monotonicNs();
@@ -5528,8 +5542,12 @@ pub const DataServer = struct {
                         try raft.host.http_host.propose(group_id, encoded);
                         target_index = if (raft.host.http_host.host.raftStatus(group_id)) |status|
                             status.last_index
-                        else
-                            return error.UnknownGroup;
+                        else {
+                            // The proposal call succeeded, so losing the local
+                            // status snapshot cannot be reported as a safe
+                            // retry: the entry may already be replicated.
+                            return error.RaftBatchWriteOutcomeUnknown;
+                        };
                     }
                 } else {
                     const status = raft.host.http_host.host.raftStatus(group_id);
@@ -5570,10 +5588,24 @@ pub const DataServer = struct {
 
             if (target_index) |index| {
                 if (req.sync_level != .propose) {
-                    try self.waitForLocalRaftBatchApply(group_id, index, deadline_ns);
+                    self.waitForLocalRaftBatchApply(group_id, index, deadline_ns) catch |err| {
+                        std.log.warn("data raft batch outcome unknown after proposal group_id={} index={} phase=apply_wait err={s}", .{
+                            group_id,
+                            index,
+                            @errorName(err),
+                        });
+                        return error.RaftBatchWriteOutcomeUnknown;
+                    };
                 }
                 const sync_source = if (self.data_raft_apply) |apply_sm| &apply_sm.write_source else &self.write_source;
-                try sync_source.syncReplicatedBatchGroupLocal(alloc, group_id, table_name, req.sync_level);
+                sync_source.syncReplicatedBatchGroupLocal(alloc, group_id, table_name, req.sync_level) catch |err| {
+                    std.log.warn("data raft batch outcome unknown after proposal group_id={} index={} phase=sync_visibility err={s}", .{
+                        group_id,
+                        index,
+                        @errorName(err),
+                    });
+                    return error.RaftBatchWriteOutcomeUnknown;
+                };
                 return;
             }
 
@@ -5644,23 +5676,29 @@ pub const DataServer = struct {
                                     forwarding,
                                     route.cancellation,
                                 ) catch |err| {
-                                    if (isRetryableDataRaftForwardError(err)) {
-                                        failed_known_leader_node_id = target_node_id;
-                                        last_placement_target_node_id = target_node_id;
-                                        if (platform_time.monotonicNs() >= deadline_ns) {
-                                            self.logRaftBatchForwardTimeout(
-                                                group_id,
-                                                local_node_id,
-                                                target_node_id,
-                                                "known_leader",
-                                                err,
-                                            );
-                                            return error.LeaderUnavailable;
-                                        }
-                                        sleepDataRaftBatchLeaderRetry();
-                                        continue;
+                                    switch (classifyDataRaftForwardError(err)) {
+                                        .safe_to_retry => {
+                                            failed_known_leader_node_id = target_node_id;
+                                            last_placement_target_node_id = target_node_id;
+                                            if (platform_time.monotonicNs() >= deadline_ns) {
+                                                self.logRaftBatchForwardTimeout(
+                                                    group_id,
+                                                    local_node_id,
+                                                    target_node_id,
+                                                    "known_leader",
+                                                    err,
+                                                );
+                                                return error.LeaderUnavailable;
+                                            }
+                                            sleepDataRaftBatchLeaderRetry();
+                                            continue;
+                                        },
+                                        .outcome_unknown => {
+                                            logRaftBatchForwardOutcomeUnknown(group_id, local_node_id, target_node_id, "known_leader", err);
+                                            return error.RaftBatchWriteOutcomeUnknown;
+                                        },
+                                        .terminal => return err,
                                     }
-                                    return err;
                                 };
                                 response.deinit(alloc);
                                 return;
@@ -5675,7 +5713,7 @@ pub const DataServer = struct {
 
             const now_ns = platform_time.monotonicNs();
             if (route.refresh_metadata and leader_node_id == null and now_ns -| last_metadata_sync_ns >= data_raft_metadata_resync_interval_ns) {
-                self.syncDataRaftFromRemoteMetadataWithBudget(deadline_ns, route.cancellation) catch |err| switch (err) {
+                self.refreshDataRaftMetadataForBatchWithBudget(deadline_ns, route.cancellation) catch |err| switch (err) {
                     error.Timeout => return error.LeaderUnavailable,
                     else => return err,
                 };
@@ -5815,20 +5853,26 @@ pub const DataServer = struct {
             forwarding,
             route.cancellation,
         ) catch |err| {
-            if (isRetryableDataRaftForwardError(err)) {
-                if (platform_time.monotonicNs() >= deadline_ns) {
-                    self.logRaftBatchForwardTimeout(
-                        group_id,
-                        local_node_id,
-                        target_node_id,
-                        "placement_fallback",
-                        err,
-                    );
-                    return error.LeaderUnavailable;
-                }
-                return false;
+            switch (classifyDataRaftForwardError(err)) {
+                .safe_to_retry => {
+                    if (platform_time.monotonicNs() >= deadline_ns) {
+                        self.logRaftBatchForwardTimeout(
+                            group_id,
+                            local_node_id,
+                            target_node_id,
+                            "placement_fallback",
+                            err,
+                        );
+                        return error.LeaderUnavailable;
+                    }
+                    return false;
+                },
+                .outcome_unknown => {
+                    logRaftBatchForwardOutcomeUnknown(group_id, local_node_id, target_node_id, "placement_fallback", err);
+                    return error.RaftBatchWriteOutcomeUnknown;
+                },
+                .terminal => return err,
             }
-            return err;
         };
         response.deinit(alloc);
         return true;
@@ -5854,16 +5898,6 @@ pub const DataServer = struct {
         if (route.cancellation) |cancellation| {
             if (cancellation.isCancelled()) return error.Cancelled;
         }
-    }
-
-    fn ensureDataRaftBatchBudgetActive(
-        deadline_ns: u64,
-        cancellation: ?*const antfly.raft.transport.http_common.RequestCancellation,
-    ) !void {
-        if (cancellation) |value| {
-            if (value.isCancelled()) return error.Cancelled;
-        }
-        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
     }
 
     fn dataRaftLocalCampaignGraceNs(leader_wait_ns: u64) u64 {
@@ -5962,6 +5996,19 @@ pub const DataServer = struct {
         self.logRaftBatchLeaderTimeout(group_id);
     }
 
+    fn logRaftBatchForwardOutcomeUnknown(
+        group_id: u64,
+        local_node_id: u64,
+        target_node_id: u64,
+        route: []const u8,
+        err: anyerror,
+    ) void {
+        std.log.warn(
+            "data raft batch forward outcome unknown group_id={} source_node_id={} target_node_id={} route={s} err={s}",
+            .{ group_id, local_node_id, target_node_id, route, @errorName(err) },
+        );
+    }
+
     fn dataRaftBatchHttpTimeoutMs(deadline_ns: u64) u32 {
         const now_ns = platform_time.monotonicNs();
         if (now_ns >= deadline_ns) return 1;
@@ -5970,20 +6017,32 @@ pub const DataServer = struct {
         return @intCast(@min(rounded_ms, std.math.maxInt(u32)));
     }
 
-    fn isRetryableDataRaftForwardError(err: anyerror) bool {
+    const DataRaftForwardErrorClass = enum {
+        safe_to_retry,
+        outcome_unknown,
+        terminal,
+    };
+
+    fn classifyDataRaftForwardError(err: anyerror) DataRaftForwardErrorClass {
         return switch (err) {
             error.LeaderUnavailable,
+            error.ConnectionRefused,
+            error.RaftBatchForwardingUnsupported,
+            => .safe_to_retry,
+            // These can be observed after the peer accepted and committed the
+            // request. Replaying a batch containing inc/push transforms would
+            // apply it twice, so callers must receive an explicit ambiguous
+            // outcome instead of transparent failover.
+            error.RaftBatchWriteOutcomeUnknown,
             error.UnexpectedHttpStatus,
             error.HttpConnectionClosing,
             error.ConnectionResetByPeer,
-            error.ConnectionRefused,
             error.BrokenPipe,
             error.EndOfStream,
             error.ConnectionTimedOut,
             error.Timeout,
-            error.RaftBatchForwardingUnsupported,
-            => true,
-            else => false,
+            => .outcome_unknown,
+            else => .terminal,
         };
     }
 
@@ -8712,7 +8771,14 @@ pub const DataServer = struct {
         try self.syncDataRaftFromSnapshot(&snapshot);
     }
 
-    fn syncDataRaftFromRemoteMetadataWithBudget(
+    fn requestDataRaftMetadataSync(self: *DataServer) void {
+        self.data_raft_metadata_sync_requested.store(true, .release);
+    }
+
+    /// Refresh only the immutable routing snapshot on an API request thread.
+    /// Durable reconciliation can block on restore and catalog fsync, so the
+    /// control worker owns it and requests merely signal immediate work.
+    fn refreshDataRaftMetadataForBatchWithBudget(
         self: *DataServer,
         deadline_ns: u64,
         cancellation: ?*const antfly.raft.transport.http_common.RequestCancellation,
@@ -8724,8 +8790,7 @@ pub const DataServer = struct {
             .cancellation = cancellation,
         });
         defer freeAdminSnapshotOwned(self.alloc, &snapshot);
-        try ensureDataRaftBatchBudgetActive(deadline_ns, cancellation);
-        try self.syncDataRaftFromSnapshot(&snapshot);
+        self.requestDataRaftMetadataSync();
     }
 
     fn syncDataRaftFromSnapshot(self: *DataServer, snapshot: *const antfly.metadata_api.AdminSnapshot) !void {
@@ -8735,6 +8800,8 @@ pub const DataServer = struct {
 
         lockAtomic(&self.data_raft_reconcile_mutex);
         defer self.data_raft_reconcile_mutex.unlock();
+
+        const metadata_epoch = snapshot.status.metadata_epoch;
 
         var placement_topology = try PlacementTopologyIndex.initForSnapshot(
             self.alloc,
@@ -8765,6 +8832,13 @@ pub const DataServer = struct {
             local_intent.peer_node_ids = owned_voters;
             local_intent.learner_node_ids = owned_learners;
             try local_intents.append(self.alloc, local_intent);
+        }
+        if (metadata_epoch != 0 and self.last_data_raft_reconciled_metadata_epoch == metadata_epoch) {
+            // Raft leadership can change without a metadata epoch. Preserve
+            // status publication while skipping restore, descriptor rebuild,
+            // peer replacement, and catalog fsync for identical topology.
+            self.observeDataRaftStatusFingerprint(dataRaftLocalStatusFingerprint(raft, local_intents.items));
+            return;
         }
         // A split destination is placed before cutover publishes its range.
         // Persist its table generation before the Raft host can admit messages
@@ -8875,6 +8949,7 @@ pub const DataServer = struct {
         }
 
         self.observeDataRaftStatusFingerprint(dataRaftLocalStatusFingerprint(raft, local_intents.items));
+        if (metadata_epoch != 0) self.last_data_raft_reconciled_metadata_epoch = metadata_epoch;
     }
 
     fn provisionSplitDestinationsBeforeRaftAdmission(
@@ -15495,6 +15570,7 @@ test "data server can register a store without enabling data raft" {
 
     try server.initApiServer();
     try std.testing.expect(server.write_source.raft_batcher == null);
+    try std.testing.expect(server.http_server.?.cfg.routed_raft_batch_writer == null);
 }
 
 test "data server registered data raft uses wal state backend by default" {
@@ -15517,6 +15593,12 @@ test "data server registered data raft uses wal state backend by default" {
     const data_raft = server.data_raft orelse return error.MissingDataRaft;
     try std.testing.expect(data_raft.host.owned_wal_replica_provider != null);
     try std.testing.expect(data_raft.host.owned_file_replica_provider == null);
+
+    try std.testing.expect(!server.data_raft_metadata_sync_requested.load(.acquire));
+    server.requestDataRaftMetadataSync();
+    server.requestDataRaftMetadataSync();
+    try std.testing.expect(server.data_raft_metadata_sync_requested.swap(false, .acq_rel));
+    try std.testing.expect(!server.data_raft_metadata_sync_requested.swap(false, .acq_rel));
 }
 
 test "data raft ticker advances consensus independently of control rounds" {
@@ -15539,7 +15621,7 @@ test "data raft ticker advances consensus independently of control rounds" {
     defer server.deinit();
 
     const snapshot = antfly.metadata_api.AdminSnapshot{
-        .status = .{ .metadata_group_id = 9, .metrics = .{} },
+        .status = .{ .metadata_group_id = 9, .metadata_epoch = 17, .metrics = .{} },
         .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{.{
             .table_id = 7,
             .name = "docs",
@@ -15568,6 +15650,10 @@ test "data raft ticker advances consensus independently of control rounds" {
         .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
         .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
     };
+    try server.syncDataRaftFromSnapshot(&snapshot);
+    try std.testing.expectEqual(@as(?u64, 17), server.last_data_raft_reconciled_metadata_epoch);
+    // Identical desired state still observes live Raft status, but skips the
+    // durable reconcile phases.
     try server.syncDataRaftFromSnapshot(&snapshot);
 
     var io_impl = std.Io.Threaded.init(alloc, .{});
@@ -24569,12 +24655,14 @@ test "remote metadata source shares backend runtime io across a bounded executor
     try std.testing.expect(source.httpExecutor().ptr == @as(*anyopaque, @ptrCast(&source.http_executors[0])));
 }
 
-test "data raft forwarding classifies deadline and transport failures as retryable" {
-    try std.testing.expect(DataServer.isRetryableDataRaftForwardError(error.Timeout));
-    try std.testing.expect(DataServer.isRetryableDataRaftForwardError(error.ConnectionResetByPeer));
-    try std.testing.expect(DataServer.isRetryableDataRaftForwardError(error.LeaderUnavailable));
-    try std.testing.expect(DataServer.isRetryableDataRaftForwardError(error.RaftBatchForwardingUnsupported));
-    try std.testing.expect(!DataServer.isRetryableDataRaftForwardError(error.OutOfMemory));
+test "data raft forwarding distinguishes safe retries from ambiguous outcomes" {
+    try std.testing.expectEqual(.safe_to_retry, DataServer.classifyDataRaftForwardError(error.LeaderUnavailable));
+    try std.testing.expectEqual(.safe_to_retry, DataServer.classifyDataRaftForwardError(error.ConnectionRefused));
+    try std.testing.expectEqual(.safe_to_retry, DataServer.classifyDataRaftForwardError(error.RaftBatchForwardingUnsupported));
+    try std.testing.expectEqual(.outcome_unknown, DataServer.classifyDataRaftForwardError(error.Timeout));
+    try std.testing.expectEqual(.outcome_unknown, DataServer.classifyDataRaftForwardError(error.ConnectionResetByPeer));
+    try std.testing.expectEqual(.outcome_unknown, DataServer.classifyDataRaftForwardError(error.RaftBatchWriteOutcomeUnknown));
+    try std.testing.expectEqual(.terminal, DataServer.classifyDataRaftForwardError(error.OutOfMemory));
 }
 
 test "data raft batch forwarding bounds routing campaigns deadlines and deterministic fallback" {

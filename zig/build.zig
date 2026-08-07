@@ -3795,7 +3795,7 @@ pub fn build(b: *std.Build) void {
         "data server can register a store without enabling data raft",
         "data server registered data raft uses wal state backend by default",
         "data raft ticker advances consensus independently of control rounds",
-        "data raft forwarding classifies deadline and transport failures as retryable",
+        "data raft forwarding distinguishes safe retries from ambiguous outcomes",
         "data raft batch forwarding bounds routing campaigns deadlines and deterministic fallback",
         "internal batch forwarding headers are all-or-none and strictly parsed",
         "metadata http client shares deadline and cancellation across retries",
@@ -5159,6 +5159,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "public table batch handler maps doc identity unavailable errors",
             "public table batch handler maps write unavailable errors",
+            "public table batch handler preserves ambiguous write outcomes",
             "public table batch handler maps HA write gate errors",
             "public table batch handler returns concise dense repair backpressure",
             "public create index exposes retryable storage descriptor exhaustion",

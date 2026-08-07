@@ -1697,6 +1697,9 @@ pub const ApiHttpClient = struct {
         });
         defer resp.deinit(self.alloc);
         if (resp.status != 201) {
+            if (std.mem.eql(u8, std.mem.trim(u8, resp.body, " \t\r\n"), "write outcome unknown")) {
+                return error.RaftBatchWriteOutcomeUnknown;
+            }
             if (resp.status == 409) return remoteGroupConflictError(resp.body);
             if (resp.status == 404) return if (forwarding != null) error.RaftBatchForwardingUnsupported else error.UnknownGroup;
             if (resp.status == 503) return error.LeaderUnavailable;
@@ -2986,6 +2989,10 @@ test "api http client preserves group doc identity conflicts" {
     conflict_executor.status = 503;
     conflict_executor.body = "write unavailable";
     try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupBatch(base_uri, 7, "docs", "{}"));
+
+    conflict_executor.status = 409;
+    conflict_executor.body = "write outcome unknown";
+    try std.testing.expectError(error.RaftBatchWriteOutcomeUnknown, client.fetchGroupBatch(base_uri, 7, "docs", "{}"));
 }
 
 test "api http client forwards bounded raft batch routing context without allocation" {

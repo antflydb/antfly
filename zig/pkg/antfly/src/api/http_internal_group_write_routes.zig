@@ -375,6 +375,12 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
             writes.batchGroupLocal(ctx.alloc, batch_route.group_id, batch_route.table_name, batch_req.req)) catch |err| switch (err) {
             error.InvalidBatchRequest => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid batch request"),
             error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
+            error.RaftBatchWriteOutcomeUnknown => {
+                // A generic 5xx retry policy could duplicate a transform that
+                // already committed. Conflict is deliberately non-retryable;
+                // the body preserves the machine-readable outcome class.
+                return try http_route_helpers.textResponse(ctx.alloc, 409, "write outcome unknown");
+            },
             error.LeaderUnavailable, error.GroupLeaderUnavailable, error.MetadataSnapshotUnavailable => {
                 return try http_route_helpers.textResponse(ctx.alloc, 503, "group leader unavailable");
             },
@@ -1064,6 +1070,7 @@ test "internal group write routes validate batch requests" {
 test "internal group write route dispatches bounded raft forwarding context" {
     const Capture = struct {
         forwarding: ?internal_batch_forwarding.Context = null,
+        failure: ?anyerror = null,
 
         fn write(
             ptr: *anyopaque,
@@ -1079,6 +1086,7 @@ test "internal group write route dispatches bounded raft forwarding context" {
             try std.testing.expectEqualStrings("docs", table_name);
             try std.testing.expect(cancellation != null);
             self.forwarding = forwarding;
+            if (self.failure) |err| return err;
             return {};
         }
     };
@@ -1147,6 +1155,43 @@ test "internal group write route dispatches bounded raft forwarding context" {
 
     try std.testing.expectEqual(@as(u16, 400), missing_headers_resp.status);
     try std.testing.expect(capture.forwarding == null);
+
+    capture.failure = error.RaftBatchWriteOutcomeUnknown;
+    var unknown_resp = (try handle(.{
+        .alloc = std.testing.allocator,
+        .shard_ops = null,
+        .writes = TestWriteSource.source(),
+        .routed_raft_batch_writer = .{ .ptr = &capture, .write = Capture.write },
+        .batch_validator = TestWriteSource.batchValidator(),
+        .txn_validator = TestWriteSource.txnValidator(),
+    }, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/batch-routed-v1",
+        .headers = &headers,
+        .body = "{}",
+        .cancellation = &cancellation,
+    }, "/internal/v1/groups/7/tables/docs/batch-routed-v1")).?;
+    defer unknown_resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 409), unknown_resp.status);
+    try std.testing.expectEqualStrings("write outcome unknown", unknown_resp.body);
+
+    var local_fallback_resp = (try handle(.{
+        .alloc = std.testing.allocator,
+        .shard_ops = null,
+        .writes = TestWriteSource.source(),
+        .batch_validator = TestWriteSource.batchValidator(),
+        .txn_validator = TestWriteSource.txnValidator(),
+    }, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/batch",
+        .body = "{}",
+    }, "/internal/v1/groups/7/tables/docs/batch")).?;
+    defer local_fallback_resp.deinit(std.testing.allocator);
+
+    // The fake source reports no matching group, proving the request reached
+    // batchGroupLocal instead of the absent routed writer.
+    try std.testing.expectEqual(@as(u16, 404), local_fallback_resp.status);
 }
 
 test "internal group write routes validate transaction status requests" {

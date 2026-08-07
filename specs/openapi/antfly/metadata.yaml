@@ -9123,8 +9123,28 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          description: |
+            The server could not determine whether the write was committed
+            after a forwarding or confirmation failure. It may already be
+            committed; clients must reconcile state and must not blindly
+            replay non-idempotent transforms.
+          content:
+            text/plain:
+              schema:
+                type: string
+                enum:
+                  - write outcome unknown
         "429":
           $ref: "#/components/responses/DenseRepairBackpressure"
+        "503":
+          description: No writable Raft leader was available before proposal.
+          content:
+            text/plain:
+              schema:
+                type: string
+                enum:
+                  - write unavailable
         "500":
           $ref: "#/components/responses/InternalServerError"
   /tables/{tableName}/merge:
