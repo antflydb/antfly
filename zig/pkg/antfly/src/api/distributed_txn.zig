@@ -409,14 +409,11 @@ pub fn executeMultiTableCommit(
     sync_level: db_mod.types.SyncLevel,
     trace_writer: ?tracing.AntflyTraceWriter,
 ) !CommitOutcome {
-    var attempt: usize = 0;
-    while (attempt < 2) : (attempt += 1) {
-        return executeMultiTableCommitOnce(alloc, catalog, worker, txn_id, begin_timestamp, commit_version, tables, sync_level, attempt > 0, trace_writer) catch |err| switch (err) {
-            error.TopologyChanged, error.UnknownGroup => if (attempt == 0) continue else return err,
-            else => return err,
-        };
-    }
-    unreachable;
+    // A transaction id is a single protocol instance. Retrying the entire
+    // begin/prepare/resolve sequence with the same id can reset participants
+    // that already made a terminal decision, so topology failures are left to
+    // the caller to retry with a fresh transaction id.
+    return executeMultiTableCommitOnce(alloc, catalog, worker, txn_id, begin_timestamp, commit_version, tables, sync_level, trace_writer);
 }
 
 fn executeMultiTableCommitOnce(
@@ -428,7 +425,6 @@ fn executeMultiTableCommitOnce(
     commit_version: u64,
     tables: []const TableCommitRequest,
     sync_level: db_mod.types.SyncLevel,
-    surface_unavailable_conflict: bool,
     trace_writer: ?tracing.AntflyTraceWriter,
 ) !CommitOutcome {
     var participants = std.ArrayListUnmanaged(ParticipantTxn).empty;
@@ -475,11 +471,14 @@ fn executeMultiTableCommitOnce(
     var begun = std.ArrayListUnmanaged(ParticipantRef).empty;
     defer begun.deinit(alloc);
 
+    var abort_on_error = true;
     errdefer {
-        if (trace_writer) |tw| {
-            tw.traceEvent(&.{ .name = "AbortTransaction", .txn_id = txn_id, .shard_id = "" });
+        if (abort_on_error) {
+            if (trace_writer) |tw| {
+                tw.traceEvent(&.{ .name = "AbortTransaction", .txn_id = txn_id, .shard_id = "" });
+            }
+            abortBegunRefs(alloc, worker, txn_id, commit_version, begun.items) catch {};
         }
-        abortBegunRefs(alloc, worker, txn_id, commit_version, begun.items) catch {};
     }
 
     for (participants.items) |participant| {
@@ -490,10 +489,8 @@ fn executeMultiTableCommitOnce(
             .participants = participant_ids,
         }) catch |err| switch (err) {
             error.UnknownGroup => {
-                if (surface_unavailable_conflict) {
-                    return .{ .conflict = try participantUnavailableConflict(alloc, participant, .begin) };
-                }
-                return err;
+                try abortBegunRefs(alloc, worker, txn_id, commit_version, begun.items);
+                return .{ .conflict = participantUnavailableConflict(participant, .begin) };
             },
             else => return err,
         };
@@ -519,20 +516,14 @@ fn executeMultiTableCommitOnce(
                 return .{ .conflict = participantConflict(participant) };
             },
             error.UnknownGroup => {
-                if (surface_unavailable_conflict) {
-                    if (trace_writer) |tw| {
-                        tw.traceEvent(&.{ .name = "AbortTransaction", .txn_id = txn_id, .shard_id = "" });
-                    }
-                    try abortBegunRefs(alloc, worker, txn_id, commit_version, begun.items);
-                    return .{ .conflict = try participantUnavailableConflict(alloc, participant, .prepare) };
-                }
-                return err;
+                try abortBegunRefs(alloc, worker, txn_id, commit_version, begun.items);
+                return .{ .conflict = participantUnavailableConflict(participant, .prepare) };
             },
             else => return err,
         };
     }
 
-    for (participants.items) |participant| {
+    resolve_participants: for (participants.items, 0..) |participant, participant_index| {
         worker.resolveGroup(alloc, participant.group_id, participant.table_name, .{
             .txn_id = txn_id,
             .status = .committed,
@@ -549,6 +540,9 @@ fn executeMultiTableCommitOnce(
                         .reason = "participant decision conflict",
                     });
                 }
+                if (participant_index == 0) {
+                    try abortBegunRefs(alloc, worker, txn_id, commit_version, begun.items);
+                }
                 return .{ .conflict = participantDecisionConflict(participant, .resolve) };
             },
             error.TxnNotFound, error.InvalidTxnRecord => {
@@ -561,20 +555,49 @@ fn executeMultiTableCommitOnce(
                         .reason = "participant transaction state missing",
                     });
                 }
+                if (participant_index == 0) {
+                    // The decision participant has no durable transaction
+                    // record, so no commit decision exists yet.
+                    try abortBegunRefs(alloc, worker, txn_id, commit_version, begun.items);
+                }
                 return .{ .conflict = participantTornStateConflict(participant, .resolve) };
             },
-            error.UnknownGroup => {
-                if (surface_unavailable_conflict) {
-                    if (trace_writer) |tw| {
-                        tw.traceEvent(&.{ .name = "AbortTransaction", .txn_id = txn_id, .shard_id = "" });
-                    }
-                    try abortBegunRefs(alloc, worker, txn_id, commit_version, begun.items);
-                    return .{ .conflict = try participantUnavailableConflict(alloc, participant, .resolve) };
+            else => {
+                if (participant_index != 0) return err;
+
+                // A resolve can report an error after its local atomic commit
+                // (for example while mirroring or waiting for an index). Read
+                // the participant record before deciding whether abort is
+                // still legal.
+                const durable_status = worker.statusGroup(
+                    alloc,
+                    participant.group_id,
+                    participant.table_name,
+                    txn_id,
+                ) catch {
+                    // The outcome is uncertain. Recovery will consult the
+                    // participant record; aborting here could contradict a
+                    // commit that already became durable.
+                    abort_on_error = false;
+                    return err;
+                };
+                switch (durable_status) {
+                    .committed => {
+                        abort_on_error = false;
+                        continue :resolve_participants;
+                    },
+                    .pending => return err,
+                    .aborted => {
+                        try abortBegunRefs(alloc, worker, txn_id, commit_version, begun.items);
+                        return .{ .conflict = participantDecisionConflict(participant, .resolve) };
+                    },
                 }
-                return err;
             },
-            else => return err,
         };
+        // The first participant is the durable transaction decision. Once it
+        // commits, all remaining retries are commit-only and must never enter
+        // the abort cleanup path.
+        if (participant_index == 0) abort_on_error = false;
     }
 
     if (trace_writer) |tw| {
@@ -1272,8 +1295,7 @@ fn participantConflict(participant: ParticipantTxn) CommitConflict {
     };
 }
 
-fn participantUnavailableConflict(alloc: std.mem.Allocator, participant: ParticipantTxn, phase: ParticipantPhase) !CommitConflict {
-    _ = alloc;
+fn participantUnavailableConflict(participant: ParticipantTxn, phase: ParticipantPhase) CommitConflict {
     return .{
         .table_name = participant.table_name,
         .key = "",
@@ -1502,7 +1524,7 @@ test "distributed txn coordinator aborts begun participants on prepare failure" 
     for (recorder.resolves.items) |status| try std.testing.expectEqual(db_mod.types.TxnStatus.aborted, status);
 }
 
-test "distributed txn coordinator retries once on topology change" {
+test "distributed txn coordinator never restarts a transaction id on topology change" {
     const FakeCatalog = struct {
         call_count: usize = 0,
 
@@ -1585,7 +1607,7 @@ test "distributed txn coordinator retries once on topology change" {
     var catalog = FakeCatalog{};
     var recorder = Recorder{};
     const txn_id = try parseTxnIdHex("11112222333344445555666677778888");
-    const outcome = try executeMultiTableCommit(
+    try std.testing.expectError(error.TopologyChanged, executeMultiTableCommit(
         std.testing.allocator,
         catalog.iface(),
         recorder.worker(),
@@ -1598,13 +1620,12 @@ test "distributed txn coordinator retries once on topology change" {
         }},
         .full_index,
         null,
-    );
-    try std.testing.expect(outcome == .committed);
-    try std.testing.expectEqual(@as(usize, 2), recorder.prepare_calls);
-    try std.testing.expectEqual(db_mod.types.SyncLevel.full_index, recorder.resolved_sync_level);
+    ));
+    try std.testing.expectEqual(@as(usize, 1), recorder.prepare_calls);
+    try std.testing.expectEqual(db_mod.types.SyncLevel.propose, recorder.resolved_sync_level);
 }
 
-test "distributed txn coordinator stops after single topology retry" {
+test "distributed txn coordinator returns topology failure without retry" {
     const FakeCatalog = struct {
         fn iface() table_catalog.CatalogSource {
             return .{
@@ -1676,7 +1697,7 @@ test "distributed txn coordinator stops after single topology retry" {
     ));
 }
 
-test "distributed txn coordinator surfaces participant group on repeated unknown-group failure" {
+test "distributed txn coordinator returns unknown group without restarting the transaction" {
     const FakeCatalog = struct {
         fn iface() table_catalog.CatalogSource {
             return .{
@@ -1757,7 +1778,94 @@ test "distributed txn coordinator surfaces participant group on repeated unknown
     try std.testing.expectEqualStrings("docs", outcome.conflict.table_name);
     try std.testing.expectEqual(@as(?u64, 7001), outcome.conflict.group_id);
     try std.testing.expectEqual(.begin, outcome.conflict.phase.?);
-    try std.testing.expectEqual(@as(usize, 2), recorder.begin_calls);
+    try std.testing.expectEqual(@as(usize, 1), recorder.begin_calls);
+}
+
+test "distributed txn coordinator never aborts after durable commit decision" {
+    const FakeCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{ .ptr = undefined, .vtable = &.{
+                .admin_snapshot = adminSnapshot,
+                .free_admin_snapshot = freeAdminSnapshot,
+            } };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !@import("../metadata/api.zig").AdminSnapshot {
+            const metadata_table_manager = @import("../metadata/table_manager.zig");
+            const raft_reconciler = @import("../raft/reconciler.zig");
+            const metadata_transition_state = @import("../metadata/transition_state.zig");
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{ .table_id = 7, .name = "docs", .placement_role = "data" }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = "doc:m" },
+                    .{ .group_id = 7002, .table_id = 7, .start_key = "doc:m", .end_key = null },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *@import("../metadata/api.zig").AdminSnapshot) void {}
+    };
+
+    const Recorder = struct {
+        first_committed: bool = false,
+        abort_calls: usize = 0,
+
+        fn worker(self: *@This()) ParticipantWorker {
+            return .{ .ptr = self, .vtable = &.{
+                .begin_group = begin,
+                .prepare_group = prepare,
+                .resolve_group = resolve,
+                .status_group = status,
+            } };
+        }
+
+        fn begin(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnBeginRequest) !void {}
+        fn prepare(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnPrepareRequest) !void {}
+        fn resolve(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, _: []const u8, req: TxnResolveRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (req.status == .aborted) {
+                self.abort_calls += 1;
+                return;
+            }
+            if (group_id == 7001) {
+                self.first_committed = true;
+                return error.InjectedPostCommitAckFailure;
+            }
+            return error.InjectedResolveFailure;
+        }
+        fn status(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (group_id == 7001 and self.first_committed) return .committed;
+            return .pending;
+        }
+    };
+
+    var recorder = Recorder{};
+    const txn_id = try parseTxnIdHex("1234567890abcdef1234567890abcdef");
+    try std.testing.expectError(error.InjectedResolveFailure, executeMultiTableCommit(
+        std.testing.allocator,
+        FakeCatalog.iface(),
+        recorder.worker(),
+        txn_id,
+        10_000,
+        10_001,
+        &.{.{
+            .table_name = "docs",
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"a\"}" },
+                .{ .key = "doc:z", .value = "{\"title\":\"z\"}" },
+            },
+        }},
+        .propose,
+        null,
+    ));
+    try std.testing.expect(recorder.first_committed);
+    try std.testing.expectEqual(@as(usize, 0), recorder.abort_calls);
 }
 
 test "distributed txn coordinator surfaces resolve decision conflicts deterministically" {
@@ -1796,6 +1904,7 @@ test "distributed txn coordinator surfaces resolve decision conflicts determinis
         begin_calls: usize = 0,
         prepare_calls: usize = 0,
         resolve_calls: usize = 0,
+        abort_calls: usize = 0,
 
         fn worker(self: *@This()) ParticipantWorker {
             return .{
@@ -1821,10 +1930,13 @@ test "distributed txn coordinator surfaces resolve decision conflicts determinis
 
         fn resolve(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.resolve_calls += 1;
             try std.testing.expectEqual(@as(u64, 7001), group_id);
             try std.testing.expectEqualStrings("docs", table_name);
-            try std.testing.expectEqual(db_mod.types.TxnStatus.committed, req.status);
+            if (req.status == .aborted) {
+                self.abort_calls += 1;
+                return;
+            }
+            self.resolve_calls += 1;
             return error.DecisionConflict;
         }
 
@@ -1857,6 +1969,7 @@ test "distributed txn coordinator surfaces resolve decision conflicts determinis
     try std.testing.expectEqual(@as(usize, 1), recorder.begin_calls);
     try std.testing.expectEqual(@as(usize, 1), recorder.prepare_calls);
     try std.testing.expectEqual(@as(usize, 1), recorder.resolve_calls);
+    try std.testing.expectEqual(@as(usize, 1), recorder.abort_calls);
 }
 
 test "db transaction recovery runtime resolves table-group participants through distributed txn resolver" {

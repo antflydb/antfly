@@ -97,6 +97,18 @@ pub const ResolutionExtraBatch = struct {
     writes: []const docstore.KVPair = &.{},
     deletes: []const []const u8 = &.{},
     replay: ?ReplayAppend = null,
+    expected_intent_revision: ?u64 = null,
+};
+
+pub const ResolutionOutcome = struct {
+    applied: bool,
+    replay_sequence: u64,
+};
+
+pub const IntentSnapshotValidation = struct {
+    status: TxnStatus,
+    has_intents: bool,
+    replay_sequence: u64,
 };
 
 pub const ReplayAppend = struct {
@@ -107,6 +119,7 @@ pub const ReplayAppend = struct {
 pub const IntentBatch = struct {
     writes: []docstore.KVPair = &.{},
     deletes: [][]const u8 = &.{},
+    revision: u64 = 0,
 
     pub fn deinit(self: *IntentBatch, alloc: Allocator) void {
         for (self.writes) |write| {
@@ -126,6 +139,8 @@ const TxnRecord = struct {
     commit_version: u64,
     created_at: u64,
     finalized_at: u64,
+    intent_revision: u64 = 0,
+    replay_sequence: u64 = 0,
 
     fn visibleVersion(self: TxnRecord) u64 {
         if (self.commit_version > 0) return self.commit_version;
@@ -135,6 +150,7 @@ const TxnRecord = struct {
 
 const txn_record_v0_size = 17;
 const txn_record_v1_size = 33;
+const txn_record_v2_size = 49;
 
 // ============================================================================
 // TxnManager
@@ -181,6 +197,17 @@ pub const TxnManager = struct {
 
     pub fn initTransactionWithParticipants(self: *TxnManager, txn_id: TxnId, timestamp: u64, participants: []const []const u8) !void {
         const key = makeRecordKey(txn_id);
+        const existing = self.loadTransactionRecord(txn_id) catch |err| switch (err) {
+            TxnError.TxnNotFound => null,
+            else => return err,
+        };
+        if (existing) |record| {
+            if (record.status != .pending or record.begin_timestamp != timestamp) return TxnError.DecisionConflict;
+            const persisted = try self.getParticipants(self.alloc, txn_id);
+            defer freeParticipantList(self.alloc, persisted);
+            if (!participantListsEqual(persisted, participants)) return TxnError.DecisionConflict;
+            return;
+        }
         const record = TxnRecord{
             .status = .pending,
             .begin_timestamp = timestamp,
@@ -188,10 +215,24 @@ pub const TxnManager = struct {
             .created_at = timestamp,
             .finalized_at = 0,
         };
-        try self.saveTransactionRecord(key, record);
-        if (participants.len > 0) {
-            try self.saveParticipantSet(participants_prefix, txn_id, participants);
+        const record_value = try self.encodeRecord(record);
+        defer self.alloc.free(record_value);
+        const participant_key = makeSidecarKey(participants_prefix, txn_id);
+        const resolved_key = makeSidecarKey(resolved_participants_prefix, txn_id);
+        const participant_value = if (participants.len > 0) try encodeParticipantList(self.alloc, participants) else null;
+        defer if (participant_value) |value| self.alloc.free(value);
+        var writes: [2]docstore.KVPair = undefined;
+        writes[0] = .{ .key = &key, .value = record_value };
+        var write_count: usize = 1;
+        if (participant_value) |value| {
+            writes[1] = .{ .key = &participant_key, .value = value };
+            write_count += 1;
         }
+        const deletes: []const []const u8 = if (participants.len > 0)
+            &.{&resolved_key}
+        else
+            &.{ &participant_key, &resolved_key };
+        try self.applyBatch(writes[0..write_count], deletes, null);
         if (self.trace_writer) |tw| {
             tw.traceEvent(&.{
                 .name = "InitTransaction",
@@ -209,6 +250,9 @@ pub const TxnManager = struct {
         intents: []const WriteIntent,
         predicates: []const VersionPredicate,
     ) !void {
+        var record = try self.loadTransactionRecord(txn_id);
+        if (record.status != .pending) return TxnError.DecisionConflict;
+
         // Emit CheckPredicates before checks: TLA+ spec models this as an
         // always-succeeding snapshot step; WriteIntentFails detects conflicts.
         if (self.trace_writer) |tw| {
@@ -261,6 +305,12 @@ pub const TxnManager = struct {
             try writes.append(self.alloc, .{ .key = intent_key, .value = val });
         }
 
+        record.intent_revision = std.math.add(u64, record.intent_revision, 1) catch return error.TransactionRevisionOverflow;
+        const record_key = makeRecordKey(txn_id);
+        const record_value = try self.encodeRecord(record);
+        try write_vals.append(self.alloc, record_value);
+        try writes.append(self.alloc, .{ .key = &record_key, .value = record_value });
+
         try self.applyBatch(writes.items, &.{}, null);
 
         self.traceWriteIntentSuccess(txn_id, intents, predicates);
@@ -280,9 +330,12 @@ pub const TxnManager = struct {
         status: TxnStatus,
         timestamp: u64,
         extra_batch: ResolutionExtraBatch,
-    ) !bool {
+    ) !ResolutionOutcome {
         const rec_key = makeRecordKey(txn_id);
         var record = try self.loadTransactionRecord(txn_id);
+        if (extra_batch.expected_intent_revision) |expected| {
+            if (record.intent_revision != expected) return error.IntentSnapshotChanged;
+        }
         const was_terminal = record.status != .pending;
         applyResolveDecision(&record, status, timestamp) catch |err| {
             if (err == TxnError.DecisionConflict) {
@@ -313,7 +366,10 @@ pub const TxnManager = struct {
         // durable must not apply the caller's derived batch again. In
         // particular, doing so could overwrite a newer user write with the
         // transaction's old value.
-        if (was_terminal and intent_entries.len == 0) return false;
+        if (was_terminal and intent_entries.len == 0) return .{
+            .applied = false,
+            .replay_sequence = record.replay_sequence,
+        };
 
         var writes = std.ArrayListUnmanaged(docstore.KVPair).empty;
         defer writes.deinit(self.alloc);
@@ -363,6 +419,9 @@ pub const TxnManager = struct {
             }
         }
 
+        if (status == .committed) {
+            if (extra_batch.replay) |replay| record.replay_sequence = replay.sequence;
+        }
         const rec_val = try self.encodeRecord(record);
         defer self.alloc.free(rec_val);
         try writes.append(self.alloc, .{ .key = &rec_key, .value = rec_val });
@@ -385,10 +444,17 @@ pub const TxnManager = struct {
                 .reason = if (status == .committed) "committed" else "aborted",
             });
         }
-        return true;
+        return .{
+            .applied = true,
+            .replay_sequence = record.replay_sequence,
+        };
     }
 
     pub fn collectIntentBatch(self: *TxnManager, alloc: Allocator, txn_id: TxnId) !IntentBatch {
+        // Read the revision before scanning. Intent writes publish the record
+        // revision and intent rows in one backend batch, so validation under
+        // the DB apply lock detects any prepare that raced with this snapshot.
+        const record = try self.loadTransactionRecord(txn_id);
         var intent_prefix_buf: [intents_prefix.len + 17]u8 = undefined;
         @memcpy(intent_prefix_buf[0..intents_prefix.len], intents_prefix);
         @memcpy(intent_prefix_buf[intents_prefix.len..][0..16], &txn_id);
@@ -431,7 +497,7 @@ pub const TxnManager = struct {
                 writes_initialized += 1;
             }
         }
-        return .{ .writes = writes, .deletes = deletes };
+        return .{ .writes = writes, .deletes = deletes, .revision = record.intent_revision };
     }
 
     pub fn hasIntents(self: *TxnManager, txn_id: TxnId) !bool {
@@ -447,6 +513,16 @@ pub const TxnManager = struct {
         defer cursor.close();
         const entry = (try cursor.seekAtOrAfter(prefix)) orelse return false;
         return std.mem.startsWith(u8, entry.key, prefix);
+    }
+
+    pub fn validateIntentSnapshot(self: *TxnManager, txn_id: TxnId, expected_revision: u64) !IntentSnapshotValidation {
+        const record = try self.loadTransactionRecord(txn_id);
+        if (record.intent_revision != expected_revision) return error.IntentSnapshotChanged;
+        return .{
+            .status = record.status,
+            .has_intents = try self.hasIntents(txn_id),
+            .replay_sequence = record.replay_sequence,
+        };
     }
 
     pub fn collectIntentDocumentKeys(
@@ -731,12 +807,14 @@ pub const TxnManager = struct {
     }
 
     fn encodeRecord(self: *TxnManager, record: TxnRecord) ![]u8 {
-        const buf = try self.alloc.alloc(u8, txn_record_v1_size);
+        const buf = try self.alloc.alloc(u8, txn_record_v2_size);
         buf[0] = @intFromEnum(record.status);
         std.mem.writeInt(u64, buf[1..9], record.begin_timestamp, .little);
         std.mem.writeInt(u64, buf[9..17], record.commit_version, .little);
         std.mem.writeInt(u64, buf[17..25], record.created_at, .little);
         std.mem.writeInt(u64, buf[25..33], record.finalized_at, .little);
+        std.mem.writeInt(u64, buf[33..41], record.intent_revision, .little);
+        std.mem.writeInt(u64, buf[41..49], record.replay_sequence, .little);
         return buf;
     }
 
@@ -1021,6 +1099,17 @@ fn resolveDecisionConflictReason(current: TxnStatus, requested: TxnStatus) []con
 }
 
 fn decodeRecord(raw: []const u8) !TxnRecord {
+    if (raw.len == txn_record_v2_size) {
+        return .{
+            .status = @enumFromInt(raw[0]),
+            .begin_timestamp = std.mem.readInt(u64, raw[1..9], .little),
+            .commit_version = std.mem.readInt(u64, raw[9..17], .little),
+            .created_at = std.mem.readInt(u64, raw[17..25], .little),
+            .finalized_at = std.mem.readInt(u64, raw[25..33], .little),
+            .intent_revision = std.mem.readInt(u64, raw[33..41], .little),
+            .replay_sequence = std.mem.readInt(u64, raw[41..49], .little),
+        };
+    }
     if (raw.len == txn_record_v1_size) {
         return .{
             .status = @enumFromInt(raw[0]),
@@ -1042,6 +1131,14 @@ fn decodeRecord(raw: []const u8) !TxnRecord {
         };
     }
     return TxnError.InvalidTxnRecord;
+}
+
+fn participantListsEqual(a: []const []const u8, b: []const []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (!std.mem.eql(u8, left, right)) return false;
+    }
+    return true;
 }
 
 fn encodeParticipantList(alloc: Allocator, participants: []const []const u8) ![]u8 {
@@ -1283,6 +1380,53 @@ test "transaction record preserves begin timestamp separately from commit versio
     try std.testing.expectEqual(commit_ts, record.commit_version);
     try std.testing.expectEqual(commit_ts, record.visibleVersion());
     try std.testing.expectEqual(commit_ts, record.finalized_at);
+}
+
+test "transaction protocol fences begin prepare snapshot and idempotent resolution" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "txn-protocol-fencing");
+    defer alloc.free(path);
+    cleanupTestDir(path);
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+    defer cleanupTestDir(path);
+
+    var mgr = try TxnManager.init(alloc, &store);
+    defer mgr.deinit();
+    const txn_id: TxnId = .{ 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 1, 2, 3, 4, 5, 6 };
+
+    try mgr.initTransactionWithParticipants(txn_id, 10_000, &.{ "docs:1", "docs:2" });
+    try mgr.initTransactionWithParticipants(txn_id, 10_000, &.{ "docs:1", "docs:2" });
+    try std.testing.expectError(TxnError.DecisionConflict, mgr.initTransactionWithParticipants(txn_id, 10_000, &.{"docs:1"}));
+
+    try mgr.writeIntents(txn_id, &.{.{ .key = "doc:a", .value = "a" }}, &.{});
+    var first_snapshot = try mgr.collectIntentBatch(alloc, txn_id);
+    defer first_snapshot.deinit(alloc);
+    try mgr.writeIntents(txn_id, &.{.{ .key = "doc:b", .value = "b" }}, &.{});
+    try std.testing.expectError(error.IntentSnapshotChanged, mgr.validateIntentSnapshot(txn_id, first_snapshot.revision));
+    try std.testing.expectError(error.IntentSnapshotChanged, mgr.resolveIntentsWithExtraBatch(
+        txn_id,
+        .committed,
+        11_000,
+        .{ .expected_intent_revision = first_snapshot.revision },
+    ));
+
+    var final_snapshot = try mgr.collectIntentBatch(alloc, txn_id);
+    defer final_snapshot.deinit(alloc);
+    const committed = try mgr.resolveIntentsWithExtraBatch(txn_id, .committed, 11_000, .{
+        .expected_intent_revision = final_snapshot.revision,
+        .replay = .{ .sequence = 7, .payload = "opaque" },
+    });
+    try std.testing.expect(committed.applied);
+    try std.testing.expectEqual(@as(u64, 7), committed.replay_sequence);
+
+    try std.testing.expectError(TxnError.DecisionConflict, mgr.writeIntents(txn_id, &.{.{ .key = "doc:c", .value = "c" }}, &.{}));
+    try std.testing.expectError(TxnError.DecisionConflict, mgr.initTransactionWithParticipants(txn_id, 10_000, &.{ "docs:1", "docs:2" }));
+    const repeated = try mgr.resolveIntentsWithExtraBatch(txn_id, .committed, 11_000, .{
+        .expected_intent_revision = final_snapshot.revision,
+    });
+    try std.testing.expect(!repeated.applied);
+    try std.testing.expectEqual(@as(u64, 7), repeated.replay_sequence);
 }
 
 test "transaction init + abort" {

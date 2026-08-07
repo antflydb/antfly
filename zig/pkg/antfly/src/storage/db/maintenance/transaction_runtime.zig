@@ -38,6 +38,13 @@ pub const Config = struct {
     clock: platform_clock.Clock = platform_clock.Clock.real(),
     resolver_ctx: ?*anyopaque = null,
     resolve_participant_fn: ?resolution_mod.ResolveParticipantFn = null,
+    local_resolution_ctx: ?*anyopaque = null,
+    resolve_local_fn: ?*const fn (
+        ctx: *anyopaque,
+        txn_id: transactions_mod.TxnId,
+        status: transactions_mod.TxnStatus,
+        commit_version: u64,
+    ) anyerror!void = null,
     resolution_extra_hooks: transactions_mod.TxnManager.RecoveryExtraBatchHooks = .{},
 };
 
@@ -251,6 +258,12 @@ fn runRecoveryWithConfig(
 
     for (txns) |txn| {
         if (txn.status == .pending) continue;
+
+        if (try manager.hasIntents(txn.txn_id)) {
+            if (config.resolve_local_fn) |resolve_local| {
+                try resolve_local(config.local_resolution_ctx orelse return error.MissingLocalTransactionResolver, txn.txn_id, txn.status, txn.commit_version);
+            }
+        }
 
         const unresolved = try manager.getUnresolvedParticipants(alloc, txn.txn_id);
         defer transactions_mod.freeParticipantList(alloc, unresolved);

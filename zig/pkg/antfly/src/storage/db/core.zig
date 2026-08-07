@@ -1259,7 +1259,7 @@ pub const DBCore = struct {
         status: transactions_mod.TxnStatus,
         commit_version: u64,
         extra_batch: transactions_mod.ResolutionExtraBatch,
-    ) !bool {
+    ) !transactions_mod.ResolutionOutcome {
         var manager = try self.initTxnManager();
         defer manager.deinit();
         return try manager.resolveIntentsWithExtraBatch(txn_id, status, commit_version, extra_batch);
@@ -1275,6 +1275,16 @@ pub const DBCore = struct {
         var manager = try self.initTxnManager();
         defer manager.deinit();
         return try manager.hasIntents(txn_id);
+    }
+
+    pub fn validateTransactionIntentSnapshot(
+        self: *DBCore,
+        txn_id: transactions_mod.TxnId,
+        expected_revision: u64,
+    ) !transactions_mod.IntentSnapshotValidation {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        return try manager.validateIntentSnapshot(txn_id, expected_revision);
     }
 
     pub fn collectTransactionIntentDocumentKeys(
@@ -1311,6 +1321,12 @@ pub const DBCore = struct {
         var manager = try self.initTxnManager();
         defer manager.deinit();
         return try manager.getParticipants(alloc, txn_id);
+    }
+
+    pub fn listTransactions(self: *DBCore, alloc: Allocator) ![]transactions_mod.TxnSummary {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        return try manager.listTransactions(alloc);
     }
 
     pub fn getUnresolvedTransactionParticipants(self: *DBCore, alloc: Allocator, txn_id: transactions_mod.TxnId) ![][]u8 {
