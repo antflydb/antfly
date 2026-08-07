@@ -25905,11 +25905,6 @@ test "provisioned table write source routes batch writes across ranges" {
     const right_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7002);
     defer alloc.free(right_path);
 
-    var left_db = try db_mod.DB.open(alloc, left_path, .{});
-    defer left_db.close();
-    var right_db = try db_mod.DB.open(alloc, right_path, .{});
-    defer right_db.close();
-
     const FakeCatalog = struct {
         fn iface() table_catalog.CatalogSource {
             return .{
@@ -25939,7 +25934,18 @@ test "provisioned table write source routes batch writes across ranges" {
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
     };
 
+    var backend_runtime = try db_mod.background_runtime.BackendRuntime.init(
+        alloc,
+        .{ .backend = .manual },
+    );
+    defer backend_runtime.deinit();
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    write_cache.backend_runtime = &backend_runtime;
     var source = ProvisionedTableWriteSource.init(path, FakeCatalog.iface());
+    defer source.deinit();
+    source.backend_runtime = &backend_runtime;
+    source.write_cache = &write_cache;
     _ = try source.source().batch(alloc, "docs", .{
         .writes = &.{
             .{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" },
@@ -25947,18 +25953,128 @@ test "provisioned table write source routes batch writes across ranges" {
         },
     });
 
-    left_db.close();
-    left_db = try db_mod.DB.open(alloc, left_path, .{});
-    right_db.close();
-    right_db = try db_mod.DB.open(alloc, right_path, .{});
+    {
+        var cached = try source.getOrOpenCachedDbMode(alloc, &write_cache, left_path, 7001, "docs", .default_async, null, null);
+        defer cached.deinit(alloc);
+        const value = (try cached.db.get(alloc, "doc:a")) orelse return error.TestUnexpectedResult;
+        defer alloc.free(value);
+        try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", value);
+    }
+    {
+        var cached = try source.getOrOpenCachedDbMode(alloc, &write_cache, right_path, 7002, "docs", .default_async, null, null);
+        defer cached.deinit(alloc);
+        const value = (try cached.db.get(alloc, "doc:z")) orelse return error.TestUnexpectedResult;
+        defer alloc.free(value);
+        try std.testing.expectEqualStrings("{\"title\":\"zeta\"}", value);
+    }
 
-    var left = (try left_db.lookup(alloc, "doc:a", .{})).?;
-    defer left.deinit(alloc);
-    try std.testing.expect(std.mem.indexOf(u8, left.json, "\"alpha\"") != null);
+    const FailSecondPrepare = struct {
+        base: distributed_txn.ParticipantWorker,
+        prepare_calls: usize = 0,
 
-    var right = (try right_db.lookup(alloc, "doc:z", .{})).?;
-    defer right.deinit(alloc);
-    try std.testing.expect(std.mem.indexOf(u8, right.json, "\"zeta\"") != null);
+        fn worker(self: *@This()) distributed_txn.ParticipantWorker {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .begin_group = begin,
+                    .prepare_group = prepare,
+                    .resolve_group = resolve,
+                    .status_group = status,
+                },
+            };
+        }
+
+        fn begin(ptr: *anyopaque, worker_alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: distributed_txn.TxnBeginRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try self.base.beginGroup(worker_alloc, group_id, table_name, req);
+        }
+
+        fn prepare(ptr: *anyopaque, worker_alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: distributed_txn.TxnPrepareRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.prepare_calls += 1;
+            if (self.prepare_calls == 2) return error.IntentConflict;
+            try self.base.prepareGroup(worker_alloc, group_id, table_name, req);
+        }
+
+        fn resolve(ptr: *anyopaque, worker_alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: distributed_txn.TxnResolveRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try self.base.resolveGroup(worker_alloc, group_id, table_name, req);
+        }
+
+        fn status(ptr: *anyopaque, worker_alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId) !db_mod.types.TxnStatus {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try self.base.statusGroup(worker_alloc, group_id, table_name, txn_id);
+        }
+    };
+    var local_worker = distributed_txn.LocalTableWriteParticipantWorker.init(source.source());
+    var failing_worker = FailSecondPrepare{ .base = local_worker.worker() };
+    const failed_txn_id = try distributed_txn.parseTxnIdHex("aabbccddeeff00112233445566778899");
+    const failed_begin_timestamp = platform_time.realtimeNs();
+    const failed_outcome = try distributed_txn.executeMultiTableCommit(
+        alloc,
+        FakeCatalog.iface(),
+        failing_worker.worker(),
+        failed_txn_id,
+        failed_begin_timestamp,
+        failed_begin_timestamp +| 1,
+        &.{.{
+            .table_name = "docs",
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"partial\"}" },
+                .{ .key = "doc:z", .value = "{\"title\":\"must abort\"}" },
+            },
+        }},
+        .write,
+        null,
+    );
+    try std.testing.expect(failed_outcome == .conflict);
+    try std.testing.expectEqual(@as(usize, 2), failing_worker.prepare_calls);
+
+    {
+        var cached = try source.getOrOpenCachedDbMode(alloc, &write_cache, left_path, 7001, "docs", .default_async, null, null);
+        defer cached.deinit(alloc);
+        const value = (try cached.db.get(alloc, "doc:a")) orelse return error.TestUnexpectedResult;
+        defer alloc.free(value);
+        try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", value);
+    }
+    {
+        var cached = try source.getOrOpenCachedDbMode(alloc, &write_cache, right_path, 7002, "docs", .default_async, null, null);
+        defer cached.deinit(alloc);
+        const value = (try cached.db.get(alloc, "doc:z")) orelse return error.TestUnexpectedResult;
+        defer alloc.free(value);
+        try std.testing.expectEqualStrings("{\"title\":\"zeta\"}", value);
+    }
+
+    // Reusing both keys through the real batch commit hook proves that aborting
+    // the transaction removed the prepared intent on the first range as well
+    // as the pending transaction record on the second.
+    const retried_outcome = (try source.source().commitBatch(
+        alloc,
+        &.{.{
+            .table_name = "docs",
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"left committed\"}" },
+                .{ .key = "doc:z", .value = "{\"title\":\"right committed\"}" },
+            },
+        }},
+        .write,
+    )).?;
+    try std.testing.expect(retried_outcome == .committed);
+
+    {
+        var cached = try source.getOrOpenCachedDbMode(alloc, &write_cache, left_path, 7001, "docs", .default_async, null, null);
+        defer cached.deinit(alloc);
+        const value = (try cached.db.get(alloc, "doc:a")) orelse return error.TestUnexpectedResult;
+        defer alloc.free(value);
+        try std.testing.expectEqualStrings("{\"title\":\"left committed\"}", value);
+    }
+    {
+        var cached = try source.getOrOpenCachedDbMode(alloc, &write_cache, right_path, 7002, "docs", .default_async, null, null);
+        defer cached.deinit(alloc);
+        const value = (try cached.db.get(alloc, "doc:z")) orelse return error.TestUnexpectedResult;
+        defer alloc.free(value);
+        try std.testing.expectEqualStrings("{\"title\":\"right committed\"}", value);
+    }
 }
 
 const ProvisionedWriteCoalesceTestCatalog = struct {

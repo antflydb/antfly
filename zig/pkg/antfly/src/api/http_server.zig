@@ -4764,6 +4764,7 @@ pub const ApiHttpServer = struct {
                     error.InvalidGraphEdges,
                     error.UnsupportedTransformOperation,
                     => return try textResponse(self.alloc, 400, "invalid transaction commit request"),
+                    error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
                     else => return err,
                 };
                 if (try self.validateCommitReadSet(commit_req)) |conflict| {
@@ -24250,6 +24251,105 @@ test "api http server serves table batch writes" {
     defer compact_lookup.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, compact_lookup.json, "\"vec_data\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, compact_lookup.json, "_embeddings") == null);
+}
+
+test "api http server routes table batches through the batch commit hook" {
+    const FakeStatus = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .status = status },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+
+    const FakeWrites = struct {
+        batch_calls: usize = 0,
+        transaction_calls: usize = 0,
+        batch_commit_calls: usize = 0,
+
+        fn source(self: *@This()) table_writes.TableWriteSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .batch = batch,
+                    .commit_transaction = commitTransaction,
+                    .commit_batch = commitBatch,
+                },
+            };
+        }
+
+        fn batch(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+        ) anyerror!?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.batch_calls += 1;
+            return error.TestUnexpectedResult;
+        }
+
+        fn commitTransaction(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const distributed_txn.TableCommitRequest,
+            _: db_mod.types.SyncLevel,
+        ) anyerror!?distributed_txn.CommitOutcome {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.transaction_calls += 1;
+            return error.TestUnexpectedResult;
+        }
+
+        fn commitBatch(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            tables: []const distributed_txn.TableCommitRequest,
+            sync_level: db_mod.types.SyncLevel,
+        ) anyerror!?distributed_txn.CommitOutcome {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.batch_commit_calls += 1;
+            try std.testing.expectEqual(@as(usize, 1), tables.len);
+            try std.testing.expectEqualStrings("docs", tables[0].table_name);
+            try std.testing.expectEqual(@as(usize, 1), tables[0].writes.len);
+            try std.testing.expectEqualStrings("doc:a", tables[0].writes[0].key);
+            try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", tables[0].writes[0].value);
+            try std.testing.expectEqual(@as(usize, 1), tables[0].deletes.len);
+            try std.testing.expectEqualStrings("doc:gone", tables[0].deletes[0]);
+            try std.testing.expectEqual(db_mod.types.SyncLevel.write, sync_level);
+            return .{ .committed = .{ .participant_count = 2 } };
+        }
+    };
+
+    var status = FakeStatus{};
+    var writes = FakeWrites{};
+    var server = ApiHttpServer.init(std.testing.allocator, .{}, status.iface(), null, writes.source());
+    const batch_body = try test_contract_helpers.normalizeBatchRequest(
+        std.testing.allocator,
+        "{\"inserts\":{\"doc:a\":{\"title\":\"alpha\"}},\"deletes\":[\"doc:gone\"],\"sync_level\":\"write\"}",
+    );
+    defer std.testing.allocator.free(batch_body);
+
+    var resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs/batch",
+        .content_type = "application/json",
+        .body = batch_body,
+    });
+    defer resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 201), resp.status);
+    var parsed = try std.json.parseFromSlice(metadata_openapi.BatchResponse, std.testing.allocator, resp.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 1), parsed.value.inserted.?);
+    try std.testing.expectEqual(@as(i64, 1), parsed.value.deleted.?);
+    try std.testing.expectEqual(@as(usize, 1), writes.batch_commit_calls);
+    try std.testing.expectEqual(@as(usize, 0), writes.transaction_calls);
+    try std.testing.expectEqual(@as(usize, 0), writes.batch_calls);
 }
 
 test "api http server serves table batch transforms" {

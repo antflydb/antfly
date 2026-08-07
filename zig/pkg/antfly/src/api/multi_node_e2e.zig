@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const platform_time = @import("antfly_platform").time;
 const indexes_openapi = @import("antfly_indexes_openapi");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const raft_engine = @import("raft_engine");
@@ -1947,14 +1948,22 @@ test "public api multi-node e2e commits cross-table transactions atomically" {
         if (users_group == 0 or orders_group == 0) continue;
 
         for (0..4) |i| {
-            if (cluster.node(i).status(users_group) != .active or cluster.node(i).status(orders_group) != .active) {
+            if (cluster.node(i).status(users_group) == .active and cluster.node(i).status(orders_group) == .active) {
                 client_index = i;
                 break;
             }
         }
         if (client_index != null) break;
     }
-    const client_base = api_base_uris[client_index orelse 0];
+    const hosted_index = client_index orelse return error.TestExpectedEqual;
+    try cluster.node(hosted_index).campaignGroup(users_group);
+    try cluster.node(hosted_index).campaignGroup(orders_group);
+    for (0..12) |_| try cluster.stepAll();
+    const hosted_node_id: u64 = @intCast(hosted_index + 1);
+    try std.testing.expectEqual(hosted_node_id, cluster.cluster.node(hosted_index).leaderId(users_group).?);
+    try std.testing.expectEqual(hosted_node_id, cluster.cluster.node(hosted_index).leaderId(orders_group).?);
+
+    const client_base = api_base_uris[hosted_index];
     try std.testing.expect(users_group != 0);
     try std.testing.expect(orders_group != 0);
 
@@ -1964,6 +1973,95 @@ test "public api multi-node e2e commits cross-table transactions atomically" {
     defer std.heap.page_allocator.free(seed_orders_body);
     var seeded_orders = try client.fetchBatch(client_base, "orders", seed_orders_body);
     defer seeded_orders.deinit(std.heap.page_allocator);
+
+    // Fail the later hosted participant after the earlier participant has
+    // prepared. The real hosted worker handles begin/prepare/abort around the
+    // injected failure, so this proves that no partial write or intent leaks.
+    const FailSecondPrepare = struct {
+        base: distributed_txn.ParticipantWorker,
+        prepare_calls: usize = 0,
+
+        fn worker(self: *@This()) distributed_txn.ParticipantWorker {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .begin_group = begin,
+                    .prepare_group = prepare,
+                    .resolve_group = resolve,
+                    .status_group = status,
+                },
+            };
+        }
+
+        fn begin(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: distributed_txn.TxnBeginRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try self.base.beginGroup(alloc, group_id, table_name, req);
+        }
+
+        fn prepare(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: distributed_txn.TxnPrepareRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.prepare_calls += 1;
+            if (self.prepare_calls == 2) return error.IntentConflict;
+            try self.base.prepareGroup(alloc, group_id, table_name, req);
+        }
+
+        fn resolve(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: distributed_txn.TxnResolveRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try self.base.resolveGroup(alloc, group_id, table_name, req);
+        }
+
+        fn status(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId) !db_mod.types.TxnStatus {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try self.base.statusGroup(alloc, group_id, table_name, txn_id);
+        }
+    };
+    var hosted_worker = distributed_txn.HostedParticipantWorker.init(
+        catalog_sources[hosted_index].iface(),
+        routers[hosted_index].iface(),
+        write_sources[hosted_index].source(),
+        forward_executor.executor(),
+    );
+    var failing_worker = FailSecondPrepare{ .base = hosted_worker.worker() };
+    const failed_txn_id = try distributed_txn.parseTxnIdHex("11223344556677889900aabbccddeeff");
+    const failed_begin_timestamp = platform_time.realtimeNs();
+    const conflicted_outcome = try distributed_txn.executeMultiTableCommit(
+        std.heap.page_allocator,
+        catalog_sources[hosted_index].iface(),
+        failing_worker.worker(),
+        failed_txn_id,
+        failed_begin_timestamp,
+        failed_begin_timestamp +| 1,
+        &.{
+            .{ .table_name = "users", .writes = &.{.{ .key = "user:blocked", .value = "{\"name\":\"must abort\"}" }} },
+            .{ .table_name = "orders", .writes = &.{.{ .key = "order:blocked", .value = "{\"item\":\"must abort\"}" }} },
+        },
+        .write,
+        null,
+    );
+    try std.testing.expect(conflicted_outcome == .conflict);
+    try std.testing.expectEqual(@as(usize, 2), failing_worker.prepare_calls);
+    try std.testing.expectError(error.UnexpectedHttpStatus, client.fetchLookup(client_base, "users", "user:blocked", null));
+    try std.testing.expectError(error.UnexpectedHttpStatus, client.fetchLookup(client_base, "orders", "order:blocked", null));
+
+    const retried_outcome = (try write_sources[hosted_index].source().commitBatch(
+        std.heap.page_allocator,
+        &.{
+            .{ .table_name = "users", .writes = &.{.{ .key = "user:blocked", .value = "{\"name\":\"committed after abort\"}" }} },
+            .{ .table_name = "orders", .writes = &.{.{ .key = "order:blocked", .value = "{\"item\":\"committed after abort\"}" }} },
+        },
+        .write,
+    )).?;
+    try std.testing.expect(retried_outcome == .committed);
+    var retried_user = try client.fetchLookup(client_base, "users", "user:blocked", null);
+    defer retried_user.deinit(std.heap.page_allocator);
+    var parsed_retried_user = try parseJsonBody(UserName, retried_user.body);
+    defer parsed_retried_user.deinit();
+    try std.testing.expectEqualStrings("committed after abort", parsed_retried_user.value.name);
+    var retried_order = try client.fetchLookup(client_base, "orders", "order:blocked", null);
+    defer retried_order.deinit(std.heap.page_allocator);
+    var parsed_retried_order = try parseJsonBody(OrderItem, retried_order.body);
+    defer parsed_retried_order.deinit();
+    try std.testing.expectEqualStrings("committed after abort", parsed_retried_order.value.item);
 
     const users_insert_batch = try test_contract_helpers.normalizeBatchRequest(std.heap.page_allocator,
         \\{"inserts":{"user:1":{"name":"Alice","email":"alice@example.com"},"user:2":{"name":"Bob","email":"bob@example.com"}}}
@@ -1993,12 +2091,12 @@ test "public api multi-node e2e commits cross-table transactions atomically" {
 
     var user_one = try client.fetchLookup(client_base, "users", "user:1", null);
     defer user_one.deinit(std.heap.page_allocator);
-    var parsed_user_one = try parseJsonBody(UserName, user_one.body);
+    var parsed_user_one = try parseJsonBodyIgnoreUnknown(UserName, user_one.body);
     defer parsed_user_one.deinit();
     try std.testing.expectEqualStrings("Alice", parsed_user_one.value.name);
     var order_one = try client.fetchLookup(client_base, "orders", "order:1", null);
     defer order_one.deinit(std.heap.page_allocator);
-    var parsed_order_one = try parseJsonBody(OrderItem, order_one.body);
+    var parsed_order_one = try parseJsonBodyIgnoreUnknown(OrderItem, order_one.body);
     defer parsed_order_one.deinit();
     try std.testing.expectEqualStrings("widget", parsed_order_one.value.item);
 
