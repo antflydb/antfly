@@ -1173,11 +1173,7 @@ pub const RaftApplyStore = struct {
         const out = try alloc.alloc(raft_reconciler.PlacementIntent, count);
         var initialized: usize = 0;
         errdefer {
-            for (out[0..initialized]) |intent| {
-                var record = intent.record;
-                record.deinit(alloc);
-                if (intent.peer_node_ids.len > 0) alloc.free(intent.peer_node_ids);
-            }
+            for (out[0..initialized]) |intent| freePlacementIntent(alloc, intent);
             alloc.free(out);
         }
 
@@ -4437,9 +4433,7 @@ fn clonePlacementIntent(alloc: std.mem.Allocator, intent: raft_reconciler.Placem
 }
 
 fn freePlacementIntent(alloc: std.mem.Allocator, intent: raft_reconciler.PlacementIntent) void {
-    var record = intent.record;
-    record.deinit(alloc);
-    if (intent.peer_node_ids.len > 0) alloc.free(intent.peer_node_ids);
+    raft_reconciler.freeIntentOwned(alloc, intent);
 }
 
 fn decodeNodeRecord(alloc: std.mem.Allocator, encoded: []const u8) !metadata.NodeRecord {

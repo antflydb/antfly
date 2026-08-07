@@ -642,27 +642,29 @@ fn reportRuntimeDocIdentityForActiveReplicas(
                 .group_id = group_id,
                 .doc_count = stats.doc_count,
                 .disk_bytes = 1,
+                .disk_bytes_known = true,
                 .empty = stats.doc_count == 0,
                 .updated_at_millis = now_ms,
                 .local_leader = currentGroupLeaderIndex(cluster, group_id) == i,
                 .local_voter = true,
                 .voter_count = 1,
             });
-            try runtime_statuses.append(alloc, .{
+            try runtime_statuses.append(alloc, try metadata_table_manager.cloneRuntimeGroupStatusReport(alloc, .{
                 .table_id = stats.doc_identity.namespace_table_id,
-                .table_name = try alloc.dupe(u8, table_name),
+                .table_name = table_name,
                 .group_id = group_id,
                 .store_id = @intCast(i + 1),
                 .node_id = @intCast(i + 1),
                 .updated_at_ns = now_ms * std.time.ns_per_ms,
-                .source = try alloc.dupe(u8, "metadata-sim"),
-                .freshness = try alloc.dupe(u8, "fresh"),
+                .source = "metadata-sim",
+                .freshness = "fresh",
                 .doc_count = stats.doc_count,
                 .disk_bytes = 1,
+                .disk_bytes_known = true,
                 .created_at_millis = now_ms,
                 .index_count = stats.index_count,
                 .doc_identity = runtimeDocIdentityStatusReportFromStats(stats.doc_identity),
-            });
+            }));
         }
 
         if (runtime_statuses.items.len == 0 and group_statuses.items.len == 0) continue;
@@ -1734,6 +1736,7 @@ fn makeGroupStatus(
         .group_id = group_id,
         .doc_count = doc_count,
         .disk_bytes = disk_bytes,
+        .disk_bytes_known = true,
         .empty = false,
         .updated_at_millis = currentGroupStatusTimestampMs(),
     };
@@ -9288,14 +9291,18 @@ test "metadata http cluster simulation survives leader restart before forced aut
     try cluster.stepAll();
 
     try cluster.node(leader_index).requestReallocation(1);
-    try std.testing.expect((try cluster.node(leader_index).getProjectedReallocationRequest()) != null);
+    const requested = (try cluster.node(leader_index).getProjectedReallocationRequest()) orelse return error.TestExpectedEqual;
 
     try cluster.restartNode(leader_index);
     const new_leader = (try cluster.waitForMetadataLeader(32)) orelse return error.TestExpectedEqual;
 
     const summary = try requireLeasedReconcile(cluster.node(new_leader), &auto_loop);
     try std.testing.expectEqual(@as(usize, 1), summary.split_admissions);
-    try std.testing.expect((try cluster.node(new_leader).getProjectedReallocationRequest()) == null);
+    // The request is level-triggered. Split admission makes the forced scan
+    // intentionally inconclusive, so leadership handoff must preserve the
+    // same request for a later post-transition scan instead of consuming it.
+    const preserved = (try cluster.node(new_leader).getProjectedReallocationRequest()) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(requested.request_id, preserved.request_id);
 }
 
 test "metadata http cluster simulation publishes split topology after finalize" {
@@ -10487,7 +10494,7 @@ test "metadata http cluster simulation forwards public table io after merge fina
     try std.testing.expectError(error.UnexpectedHttpStatus, client.fetchLookup(client_base, "docs", "doc:z", null));
 }
 
-test "metadata http cluster simulation reconverges placement from committed node membership" {
+test "metadata http cluster simulation stages placement from committed node membership" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -10563,10 +10570,25 @@ test "metadata http cluster simulation reconverges placement from committed node
 
     const reconcile_summary = try requireLeasedReconcile(cluster.node(leader_index), workflow.controlLoop());
     try std.testing.expectEqual(@as(usize, 3), reconcile_summary.placement_upserts);
-    try std.testing.expectEqual(@as(usize, 1), reconcile_summary.placement_removals);
-    try std.testing.expect(try cluster.waitForNodeGroupStatus(0, 4701, .absent, 40));
+    try std.testing.expectEqual(@as(usize, 0), reconcile_summary.placement_removals);
+    // Legacy node records provide placement candidates but no store-status
+    // channel. Reconciliation can safely expand the Raft membership and stage
+    // the source for draining, but must not retire it without store evidence.
+    try std.testing.expect(try cluster.waitForNodeGroupStatus(0, 4701, .active, 1));
     try std.testing.expect(try cluster.waitForNodeGroupStatus(1, 4701, .active, 1));
     try std.testing.expect(try cluster.waitForNodeGroupStatus(2, 4701, .active, 40));
+
+    const intents = try cluster.node(leader_index).listProjectedPlacementIntents(std.testing.allocator);
+    defer cluster.node(leader_index).freeProjectedPlacementIntents(std.testing.allocator, intents);
+    var saw_draining_one = false;
+    var saw_bootstrapping_three = false;
+    for (intents) |intent| {
+        if (intent.record.group_id != 4701) continue;
+        if (intent.record.local_node_id == 1 and intent.serving_state == .draining) saw_draining_one = true;
+        if (intent.record.local_node_id == 3 and intent.serving_state == .bootstrapping) saw_bootstrapping_three = true;
+    }
+    try std.testing.expect(saw_draining_one);
+    try std.testing.expect(saw_bootstrapping_three);
 
     const nodes = try cluster.node(leader_index).listProjectedNodes(std.testing.allocator);
     defer cluster.node(leader_index).freeProjectedNodes(std.testing.allocator, nodes);
@@ -10658,8 +10680,15 @@ test "metadata http cluster simulation reconverges placement from committed live
 
     const reconcile_summary = try requireLeasedReconcile(cluster.node(leader_index), workflow.controlLoop());
     try std.testing.expectEqual(@as(usize, 3), reconcile_summary.placement_upserts);
-    try std.testing.expectEqual(@as(usize, 1), reconcile_summary.placement_removals);
-    try std.testing.expect(try cluster.waitForNodeGroupStatus(0, 4801, .absent, 40));
+    try std.testing.expectEqual(@as(usize, 0), reconcile_summary.placement_removals);
+    try std.testing.expect(try reconcileUntilNodeGroupStatus(
+        &cluster,
+        workflow.controlLoop(),
+        0,
+        4801,
+        .absent,
+        40,
+    ));
     try std.testing.expect(try cluster.waitForNodeGroupStatus(1, 4801, .active, 1));
     try std.testing.expect(try cluster.waitForNodeGroupStatus(2, 4801, .active, 40));
 
@@ -10750,8 +10779,8 @@ test "metadata http cluster simulation drains node through shutdown API" {
 
     const reconcile_summary = try requireLeasedReconcile(cluster.node(leader_index), workflow.controlLoop());
     try std.testing.expectEqual(@as(usize, 3), reconcile_summary.placement_upserts);
-    try std.testing.expectEqual(@as(usize, 1), reconcile_summary.placement_removals);
-    try std.testing.expect(try cluster.waitForNodeGroupStatus(0, 4821, .absent, 64));
+    try std.testing.expectEqual(@as(usize, 0), reconcile_summary.placement_removals);
+    try std.testing.expect(try reconcileUntilNodeGroupStatus(&cluster, workflow.controlLoop(), 0, 4821, .absent, 64));
     try std.testing.expect(try cluster.waitForNodeGroupStatus(1, 4821, .active, 1));
     try std.testing.expect(try cluster.waitForNodeGroupStatus(2, 4821, .active, 64));
 
@@ -10966,8 +10995,8 @@ test "metadata http cluster simulation rebalances after store capacity churn" {
 
     const summary = try requireLeasedReconcile(cluster.node(leader_index), workflow.controlLoop());
     try std.testing.expectEqual(@as(usize, 3), summary.placement_upserts);
-    try std.testing.expectEqual(@as(usize, 1), summary.placement_removals);
-    try std.testing.expect(try cluster.waitForNodeGroupStatus(0, 5001, .absent, 40));
+    try std.testing.expectEqual(@as(usize, 0), summary.placement_removals);
+    try std.testing.expect(try reconcileUntilNodeGroupStatus(&cluster, workflow.controlLoop(), 0, 5001, .absent, 40));
     try std.testing.expect(try cluster.waitForNodeGroupStatus(1, 5001, .active, 1));
     try std.testing.expect(try cluster.waitForNodeGroupStatus(2, 5001, .active, 40));
 }
@@ -11063,8 +11092,8 @@ test "metadata http cluster simulation survives leader restart after reported st
     const new_leader = (try cluster.waitForMetadataLeader(32)) orelse return error.TestExpectedEqual;
     const summary = try requireLeasedReconcile(cluster.node(new_leader), workflow.controlLoop());
     try std.testing.expectEqual(@as(usize, 3), summary.placement_upserts);
-    try std.testing.expectEqual(@as(usize, 1), summary.placement_removals);
-    try std.testing.expect(try cluster.waitForNodeGroupStatus(0, 5201, .absent, 40));
+    try std.testing.expectEqual(@as(usize, 0), summary.placement_removals);
+    try std.testing.expect(try reconcileUntilNodeGroupStatus(&cluster, workflow.controlLoop(), 0, 5201, .absent, 40));
     try std.testing.expect(try cluster.waitForNodeGroupStatus(1, 5201, .active, 1));
     try std.testing.expect(try cluster.waitForNodeGroupStatus(2, 5201, .active, 40));
 }
@@ -11743,7 +11772,7 @@ test "metadata http cluster simulation rebalances away from high lease pressure"
 
     const summary = try requireLeasedReconcile(cluster.node(leader_index), workflow.controlLoop());
     try std.testing.expectEqual(@as(usize, 3), summary.placement_upserts);
-    try std.testing.expectEqual(@as(usize, 1), summary.placement_removals);
+    try std.testing.expectEqual(@as(usize, 0), summary.placement_removals);
     try std.testing.expectEqual(@as(usize, 0), summary.repair_placement_groups);
     try std.testing.expectEqual(@as(usize, 1), summary.rebalance_placement_groups);
     const status = try cluster.node(leader_index).metadataStatus();
@@ -11753,7 +11782,7 @@ test "metadata http cluster simulation rebalances away from high lease pressure"
     var admin_snapshot = try cluster.node(leader_index).adminSnapshot();
     defer cluster.node(leader_index).freeAdminSnapshot(&admin_snapshot);
     try std.testing.expectEqual(status.rebalance_placement_groups, admin_snapshot.status.rebalance_placement_groups);
-    try std.testing.expect(try cluster.waitForNodeGroupStatus(0, 5301, .absent, 40));
+    try std.testing.expect(try reconcileUntilNodeGroupStatus(&cluster, workflow.controlLoop(), 0, 5301, .absent, 40));
     try std.testing.expect(try cluster.waitForNodeGroupStatus(1, 5301, .active, 1));
     try std.testing.expect(try cluster.waitForNodeGroupStatus(2, 5301, .active, 40));
 }
@@ -11832,7 +11861,9 @@ test "metadata http cluster simulation repairs replica count after store recover
     try cluster.stepAll();
 
     const repair_summary = try requireLeasedReconcile(cluster.node(leader_index), workflow.controlLoop());
-    try std.testing.expectEqual(@as(usize, 2), repair_summary.placement_upserts);
+    // Adding the missing voter updates the new learner and both retained
+    // voters so every placement carries the same expanded peer set.
+    try std.testing.expectEqual(@as(usize, 3), repair_summary.placement_upserts);
     try std.testing.expectEqual(@as(usize, 0), repair_summary.placement_removals);
     try std.testing.expectEqual(@as(usize, 1), repair_summary.repair_placement_groups);
     try std.testing.expectEqual(@as(usize, 0), repair_summary.rebalance_placement_groups);
@@ -12243,7 +12274,8 @@ test "metadata http cluster simulation rebalances one table while preserving ano
 
     const summary = try requireLeasedReconcile(cluster.node(leader_index), workflow.controlLoop());
     try std.testing.expectEqual(@as(usize, 3), summary.placement_upserts);
-    try std.testing.expectEqual(@as(usize, 1), summary.placement_removals);
+    try std.testing.expectEqual(@as(usize, 0), summary.placement_removals);
+    try std.testing.expect(try reconcileUntilNodeGroupStatus(&cluster, workflow.controlLoop(), 1, 5601, .absent, 40));
 
     const intents_after = try cluster.node(leader_index).listProjectedPlacementIntents(std.testing.allocator);
     defer cluster.node(leader_index).freeProjectedPlacementIntents(std.testing.allocator, intents_after);
@@ -12364,10 +12396,25 @@ test "metadata http cluster simulation prefers healthy stores before degraded on
 
     const summary = try requireLeasedReconcile(cluster.node(leader_index), workflow.controlLoop());
     try std.testing.expectEqual(@as(usize, 3), summary.placement_upserts);
-    try std.testing.expectEqual(@as(usize, 1), summary.placement_removals);
+    try std.testing.expectEqual(@as(usize, 0), summary.placement_removals);
+    // The degraded store is a last-resort target. It may join the expanded
+    // membership, but it cannot pass the healthy-target cutover gate, so the
+    // healthy source must remain serving until target health recovers.
     try std.testing.expect(try cluster.waitForNodeGroupStatus(0, 5801, .active, 40));
-    try std.testing.expect(try cluster.waitForNodeGroupStatus(1, 5801, .absent, 1));
+    try std.testing.expect(try cluster.waitForNodeGroupStatus(1, 5801, .active, 1));
     try std.testing.expect(try cluster.waitForNodeGroupStatus(2, 5801, .active, 1));
+
+    const intents = try cluster.node(leader_index).listProjectedPlacementIntents(std.testing.allocator);
+    defer cluster.node(leader_index).freeProjectedPlacementIntents(std.testing.allocator, intents);
+    var saw_degraded_target = false;
+    var saw_draining_source = false;
+    for (intents) |intent| {
+        if (intent.record.group_id != 5801) continue;
+        if (intent.record.local_node_id == 1 and intent.serving_state == .bootstrapping) saw_degraded_target = true;
+        if (intent.record.local_node_id == 2 and intent.serving_state == .draining) saw_draining_source = true;
+    }
+    try std.testing.expect(saw_degraded_target);
+    try std.testing.expect(saw_draining_source);
 }
 
 test "metadata http cluster simulation prefers cross-domain placement for a range" {
@@ -12550,7 +12597,8 @@ test "metadata http cluster simulation mixes health domain and minimal-movement 
 
     const summary = try requireLeasedReconcile(cluster.node(leader_index), workflow.controlLoop());
     try std.testing.expectEqual(@as(usize, 3), summary.placement_upserts);
-    try std.testing.expectEqual(@as(usize, 1), summary.placement_removals);
+    try std.testing.expectEqual(@as(usize, 0), summary.placement_removals);
+    try std.testing.expect(try reconcileUntilNodeGroupStatus(&cluster, workflow.controlLoop(), 1, 6001, .absent, 40));
 
     const intents_after = try cluster.node(leader_index).listProjectedPlacementIntents(std.testing.allocator);
     defer cluster.node(leader_index).freeProjectedPlacementIntents(std.testing.allocator, intents_after);
@@ -12708,7 +12756,8 @@ test "metadata http cluster simulation respects table placement roles under chur
 
     const summary = try requireLeasedReconcile(cluster.node(leader_index), workflow.controlLoop());
     try std.testing.expectEqual(@as(usize, 3), summary.placement_upserts);
-    try std.testing.expectEqual(@as(usize, 1), summary.placement_removals);
+    try std.testing.expectEqual(@as(usize, 0), summary.placement_removals);
+    try std.testing.expect(try reconcileUntilNodeGroupStatus(&cluster, workflow.controlLoop(), 1, 6201, .absent, 40));
     {
         const intents = try cluster.node(leader_index).listProjectedPlacementIntents(std.testing.allocator);
         defer cluster.node(leader_index).freeProjectedPlacementIntents(std.testing.allocator, intents);
@@ -12918,9 +12967,9 @@ test "metadata http cluster simulation rebalances after store class promotion an
 
     const summary = try requireLeasedReconcile(cluster.node(leader_index), workflow.controlLoop());
     try std.testing.expectEqual(@as(usize, 3), summary.placement_upserts);
-    try std.testing.expectEqual(@as(usize, 1), summary.placement_removals);
-    try std.testing.expect(try cluster.waitForNodeGroupStatus(0, 6501, .active, 40));
+    try std.testing.expectEqual(@as(usize, 0), summary.placement_removals);
+    try std.testing.expect(try reconcileUntilNodeGroupStatus(&cluster, workflow.controlLoop(), 3, 6501, .absent, 40));
+    try std.testing.expect(try cluster.waitForNodeGroupStatus(0, 6501, .active, 1));
     try std.testing.expect(try cluster.waitForNodeGroupStatus(1, 6501, .active, 1));
     try std.testing.expectEqual(raft_host.HostedReplicaStatus.absent, cluster.node(2).status(6501));
-    try std.testing.expect(try cluster.waitForNodeGroupStatus(3, 6501, .absent, 40));
 }
