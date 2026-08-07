@@ -88,12 +88,20 @@ pub const RequestFailure = struct {
     kind: enrichment_types.GeneratedEnrichmentKind,
     index_name: []const u8,
     artifact_name: []const u8,
+    /// Non-empty when one logical embedding request materializes a set of
+    /// chunk-scoped artifacts rather than one document-scoped artifact.
+    source_artifact_name: []const u8 = "",
     doc_key: []const u8,
     error_name: []const u8,
     attempts: u64,
     sequence: u64,
 };
 pub const FailureRecorder = *const fn (ptr: *anyopaque, failure: RequestFailure) anyerror!void;
+pub const FailurePendingCheck = *const fn (
+    ptr: *anyopaque,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    index_name: []const u8,
+) anyerror!bool;
 pub const NotifyFn = *const fn (ptr: *anyopaque, sequence: u64) void;
 pub const StatusHook = struct {
     ptr: *anyopaque,
@@ -1350,6 +1358,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     write_fn: GeneratedRecordWriter,
     failure_ctx: ?*anyopaque = null,
     failure_fn: ?FailureRecorder = null,
+    failure_pending_fn: ?FailurePendingCheck = null,
     notify_ctx: *anyopaque,
     notify_fn: NotifyFn,
     config: Config,
@@ -1399,6 +1408,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         write_fn: GeneratedRecordWriter,
         failure_ctx: ?*anyopaque,
         failure_fn: ?FailureRecorder,
+        failure_pending_fn: ?FailurePendingCheck,
         notify_ctx: *anyopaque,
         notify_fn: NotifyFn,
         _: *background_runtime_mod.BackendRuntime,
@@ -1417,6 +1427,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .write_fn = write_fn,
             .failure_ctx = failure_ctx,
             .failure_fn = failure_fn,
+            .failure_pending_fn = failure_pending_fn,
             .notify_ctx = notify_ctx,
             .notify_fn = notify_fn,
             .config = .{
@@ -1629,6 +1640,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     write_fn: GeneratedRecordWriter,
     failure_ctx: ?*anyopaque = null,
     failure_fn: ?FailureRecorder = null,
+    failure_pending_fn: ?FailurePendingCheck = null,
     notify_ctx: *anyopaque,
     notify_fn: NotifyFn,
     config: Config,
@@ -1685,6 +1697,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         write_fn: GeneratedRecordWriter,
         failure_ctx: ?*anyopaque,
         failure_fn: ?FailureRecorder,
+        failure_pending_fn: ?FailurePendingCheck,
         notify_ctx: *anyopaque,
         notify_fn: NotifyFn,
         backend_runtime: *background_runtime_mod.BackendRuntime,
@@ -1707,6 +1720,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .write_fn = write_fn,
             .failure_ctx = failure_ctx,
             .failure_fn = failure_fn,
+            .failure_pending_fn = failure_pending_fn,
             .notify_ctx = notify_ctx,
             .notify_fn = notify_fn,
             .config = .{
@@ -2111,6 +2125,38 @@ fn freeAffectedIndexes(runtime: *EnrichmentRuntime, indexes: [][]u8) void {
     runtime.alloc.free(indexes);
 }
 
+fn runtimeRetryInProgress(runtime: *EnrichmentRuntime) bool {
+    const maybe_io = if (runtime.io_impl) |io_impl| io_impl.io() else null;
+    if (maybe_io) |io| runtime.mutex.lockUncancelable(io);
+    defer if (maybe_io) |io| runtime.mutex.unlock(io);
+    return runtime.retrying;
+}
+
+/// A terminal request can be followed by a different request that still needs
+/// to yield. On the next pass, consult the durable repair ledger before calling
+/// the provider again. This makes progress monotonic across batch boundaries
+/// and process restarts without adding a point lookup to the healthy hot path.
+fn skipPersistedRequestFailure(
+    runtime: *EnrichmentRuntime,
+    window: *GeneratedReplayWindow,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+) !bool {
+    const pending_fn = runtime.failure_pending_fn orelse return false;
+    const failure_ctx = runtime.failure_ctx orelse return false;
+    if (!runtimeRetryInProgress(runtime)) return false;
+
+    const indexes = try affectedIndexesForRequestAlloc(runtime, request);
+    defer freeAffectedIndexes(runtime, indexes);
+    for (indexes) |index_name| {
+        if (!try pending_fn(failure_ctx, request, index_name)) return false;
+    }
+
+    if (runtime.coverage_apply_mutex != null) {
+        try queueDerivedCoverageOutcome(runtime, window, request.doc_key, indexes, .terminal_failed);
+    }
+    return true;
+}
+
 fn recordIsolatedRequestError(runtime: *EnrichmentRuntime, window: ?*GeneratedReplayWindow, request: enrichment_types.GeneratedEnrichmentRequest, err: anyerror) !void {
     std.log.warn("enrichment request failed index={s} artifact={s}: {s}", .{ request.index_name, requestEmbeddingName(request), @errorName(err) });
     const owned_indexes = if (runtime.coverage_apply_mutex != null)
@@ -2137,6 +2183,10 @@ fn recordIsolatedRequestError(runtime: *EnrichmentRuntime, window: ?*GeneratedRe
                 .artifact_name = switch (request.kind) {
                     .dense_embedding, .sparse_embedding => requestEmbeddingName(request),
                     .asset, .chunk_text => requestArtifactName(request),
+                },
+                .source_artifact_name = switch (request.kind) {
+                    .dense_embedding, .sparse_embedding => if (requestHasChunking(request)) requestArtifactName(request) else "",
+                    .asset, .chunk_text => "",
                 },
                 .doc_key = request.doc_key,
                 .error_name = @errorName(err),
@@ -2577,6 +2627,7 @@ fn processPendingDocumentGroup(
         // Publish completed generated writes before the next external embedder call can enter retry backoff.
         if (window.hasDerivedItems()) try flushGeneratedReplayWindow(runtime, window);
         processed_request_count.* += 1;
+        if (try skipPersistedRequestFailure(runtime, window, request)) continue;
         if (requestCanBatchPlainDense(request)) {
             try deferred_plain_dense.append(runtime.alloc, request);
             continue;
@@ -2776,8 +2827,11 @@ fn flushAssetProducerBatch(
     for (items.items, 0..) |*item, idx| requests[idx] = item.asRequest();
 
     var produced = producer.produceBatch(runtime.alloc, requests) catch |err| {
-        if (err == error.OutOfMemory) return err;
-        if (shouldYieldRequestError(runtime, err)) return err;
+        if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
+        // Batch execution is an optimization boundary, not a logical repair
+        // identity. Fall back immediately so durable retry ownership belongs to
+        // each source request and cannot oscillate between batch and singleton
+        // fingerprints across worker passes.
         return try flushAssetProducerBatchSequential(runtime, producer, items.items, window);
     };
     if (produced.len != items.items.len) {
@@ -5871,7 +5925,7 @@ fn processChunkedDenseWindow(
                 continue;
             }
 
-            for (source_set.sources) |source| {
+            source_loop: for (source_set.sources) |source| {
                 const source_hash = enrichment_artifact_codec.hashSource(source.text);
                 const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(runtime.alloc, source.key, embedding_artifact_name);
                 defer runtime.alloc.free(embedding_key);
@@ -5900,9 +5954,13 @@ fn processChunkedDenseWindow(
                 });
                 batch_source_bytes += source.text.len;
                 if (chunk_items.items.len >= max_batch_items or batch_source_bytes >= max_batch_bytes) {
-                    _ = try flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, seed.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window, false);
+                    const complete = try flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, seed.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window, false);
                     try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
                     batch_source_bytes = 0;
+                    // The failed batch already parked this logical request.
+                    // Avoid paying for every remaining chunk after a terminal
+                    // provider outcome; later requests retain independent work.
+                    if (!complete) break :source_loop;
                 }
             }
         }
@@ -9672,6 +9730,104 @@ test "generic generated asset batch fallback isolates malformed batch envelope" 
     const second = try storeGetAlloc(&runtime, "artifact:two");
     defer alloc.free(second);
     try std.testing.expectEqualStrings("ok:two", second);
+}
+
+test "asset batch fallback keeps the logical request retry budget" {
+    const alloc = std.testing.allocator;
+
+    const AlwaysTransientProducer = struct {
+        batch_count: usize = 0,
+        single_count: usize = 0,
+
+        fn producer(self: *@This()) asset_producer_mod.Producer {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .produce = produce,
+                    .produce_batch = produceBatch,
+                },
+            };
+        }
+
+        fn produce(ptr: *anyopaque, _: Allocator, _: asset_producer_mod.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.single_count += 1;
+            return error.EmbedRateLimited;
+        }
+
+        fn produceBatch(ptr: *anyopaque, _: Allocator, _: []const asset_producer_mod.Request) ![][]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.batch_count += 1;
+            return error.EmbedRateLimited;
+        }
+    };
+
+    const TestItem = struct {
+        fn make(a: Allocator) !AssetProducerBatchItem {
+            return .{
+                .request = .{
+                    .kind = .asset,
+                    .index_name = "asset_idx",
+                    .artifact_name = "generated_v1",
+                    .doc_key = "doc:1",
+                    .source_field = "body",
+                    .content_type = "text/plain",
+                    .sequence = 7,
+                },
+                .producer_type = .generator,
+                .config_json = try a.dupe(u8, "{\"provider\":\"test\"}"),
+                .raw_doc = try a.dupe(u8, "{}"),
+                .source_text = try a.dupe(u8, "one"),
+                .artifact_key = try a.dupe(u8, "artifact:one"),
+                .state_key = try a.dupe(u8, "state:one"),
+                .state_value = try a.dupe(u8, "{\"state\":\"done\"}"),
+            };
+        }
+    };
+
+    var producer_impl = AlwaysTransientProducer{};
+    var failure_capture = TestFailureCapture{};
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .failure_ctx = &failure_capture,
+        .failure_fn = TestFailureCapture.record,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{
+            .asset_producer = producer_impl.producer(),
+            .worker_retry_max_attempts = 2,
+        },
+        .ownership = undefined,
+    };
+    defer clearIsolatedFailedIndexes(&runtime);
+    var window = GeneratedReplayWindow{ .alloc = alloc };
+    defer window.deinit();
+
+    var first = std.ArrayListUnmanaged(AssetProducerBatchItem).empty;
+    defer first.deinit(alloc);
+    try first.append(alloc, try TestItem.make(alloc));
+    try std.testing.expectError(error.EmbedRateLimited, flushAssetProducerBatch(&runtime, &first, &window));
+    runtime.retry_failure_fingerprint = runtime.active_failure_fingerprint;
+    runtime.consecutive_retry_count = 1;
+    runtime.retrying = true;
+
+    var second = std.ArrayListUnmanaged(AssetProducerBatchItem).empty;
+    defer second.deinit(alloc);
+    try second.append(alloc, try TestItem.make(alloc));
+    try flushAssetProducerBatch(&runtime, &second, &window);
+
+    try std.testing.expectEqual(@as(usize, 2), producer_impl.batch_count);
+    try std.testing.expectEqual(@as(usize, 2), producer_impl.single_count);
+    try std.testing.expectEqual(@as(usize, 1), failure_capture.count);
+    try std.testing.expectEqual(@as(u64, 2), failure_capture.failure.?.attempts);
 }
 
 test "document extraction generated OCR batch fallback isolates permanent unit failure" {

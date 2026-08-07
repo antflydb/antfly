@@ -1636,7 +1636,12 @@ fn aggregateEnrichmentStats(
     dst.retryable_error_count +|= src.retryable_error_count;
     dst.fatal_error_count +|= src.fatal_error_count;
     dst.consecutive_retry_count = @max(dst.consecutive_retry_count, src.consecutive_retry_count);
-    if (src.retrying) dst.next_retry_at_ms = @max(dst.next_retry_at_ms, src.next_retry_at_ms);
+    // This field answers when the next shard becomes eligible, so aggregate
+    // the earliest retrying observation. A later "all shards eligible" time is
+    // a different gauge and must not delay the operator-visible next action.
+    if (src.retrying and (!dst.retrying or src.next_retry_at_ms < dst.next_retry_at_ms)) {
+        dst.next_retry_at_ms = src.next_retry_at_ms;
+    }
     dst.retrying = dst.retrying or src.retrying;
     dst.worker_failed = dst.worker_failed or src.worker_failed;
     dst.worker_started = dst.worker_started or src.worker_started;
@@ -2579,6 +2584,9 @@ test "enrichment aggregation preserves telemetry and fences mixed checkpoint ide
         .projection_checkpoint_generation = 41,
         .projection_checkpoint_config_hash = std.math.maxInt(u64) - 7,
         .processed_requests = std.math.maxInt(u64) - 1,
+        .consecutive_retry_count = 2,
+        .next_retry_at_ms = 5000,
+        .retrying = true,
         .active_embed_batch_items = 3,
         .active_embed_batch_started_ms = 200,
         .last_embed_batch_items = 4,
@@ -2595,6 +2603,9 @@ test "enrichment aggregation preserves telemetry and fences mixed checkpoint ide
         .projection_checkpoint_generation = 42,
         .projection_checkpoint_config_hash = 99,
         .processed_requests = 10,
+        .consecutive_retry_count = 4,
+        .next_retry_at_ms = 2000,
+        .retrying = true,
         .active_embed_batch_items = 5,
         .active_embed_batch_started_ms = 100,
         .last_embed_batch_items = 8,
@@ -2606,6 +2617,9 @@ test "enrichment aggregation preserves telemetry and fences mixed checkpoint ide
     try std.testing.expectEqual(std.math.maxInt(u64), aggregate.processed_requests);
     try std.testing.expectEqual(@as(u64, 24), aggregate.target_sequence);
     try std.testing.expectEqual(@as(u64, 16), aggregate.applied_sequence);
+    try std.testing.expectEqual(@as(u32, 4), aggregate.consecutive_retry_count);
+    try std.testing.expectEqual(@as(u64, 2000), aggregate.next_retry_at_ms);
+    try std.testing.expect(aggregate.retrying);
     try std.testing.expectEqual(@as(u64, 16), aggregate.projection_checkpoint_applied_sequence);
     try std.testing.expectEqualStrings("repair_required", aggregate.projection_checkpoint_status);
     try std.testing.expect(!aggregate.projection_checkpoint_identity_consistent);
