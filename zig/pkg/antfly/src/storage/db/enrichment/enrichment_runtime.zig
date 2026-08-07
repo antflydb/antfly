@@ -548,6 +548,17 @@ fn requestFailureFingerprint(request: enrichment_types.GeneratedEnrichmentReques
     return finishFailureFingerprint(&hasher);
 }
 
+fn sameRequestFailureIdentity(
+    lhs: enrichment_types.GeneratedEnrichmentRequest,
+    rhs: enrichment_types.GeneratedEnrichmentRequest,
+) bool {
+    return lhs.kind == rhs.kind and
+        lhs.sequence == rhs.sequence and
+        std.mem.eql(u8, lhs.doc_key, rhs.doc_key) and
+        std.mem.eql(u8, requestArtifactName(lhs), requestArtifactName(rhs)) and
+        std.mem.eql(u8, requestEmbeddingName(lhs), requestEmbeddingName(rhs));
+}
+
 fn batchFailureFingerprint(items: anytype) u64 {
     var hasher = std.hash.Wyhash.init(0x616e74666c795f62);
     var count_bytes: [8]u8 = undefined;
@@ -2157,10 +2168,12 @@ fn recordIsolatedRequestError(runtime: *EnrichmentRuntime, window: ?*GeneratedRe
 
 const TestFailureCapture = struct {
     failure: ?RequestFailure = null,
+    count: usize = 0,
 
     fn record(ptr: *anyopaque, failure: RequestFailure) !void {
         const self: *TestFailureCapture = @ptrCast(@alignCast(ptr));
         self.failure = failure;
+        self.count += 1;
     }
 };
 
@@ -2254,6 +2267,147 @@ test "isolated enrichment request error does not mark worker failed" {
     try std.testing.expectEqual(@as(u64, 7), failure.attempts);
     try std.testing.expectEqual(@as(u64, 11), failure.sequence);
     clearIsolatedFailedIndexes(&runtime);
+}
+
+test "chunked dense terminal failure is recorded once per parent request" {
+    var failure_capture = TestFailureCapture{};
+    var runtime = EnrichmentRuntime{
+        .alloc = std.testing.allocator,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .failure_ctx = &failure_capture,
+        .failure_fn = TestFailureCapture.record,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .ownership = undefined,
+    };
+    defer clearIsolatedFailedIndexes(&runtime);
+    const first_request = enrichment_types.GeneratedEnrichmentRequest{
+        .kind = .dense_embedding,
+        .index_name = "semantic",
+        .embedding_name = "dense_v1",
+        .artifact_name = "body_chunks_v1",
+        .doc_key = "doc:1",
+        .source_field = "body",
+        .sequence = 7,
+    };
+    const second_request = enrichment_types.GeneratedEnrichmentRequest{
+        .kind = .dense_embedding,
+        .index_name = "semantic",
+        .embedding_name = "dense_v1",
+        .artifact_name = "body_chunks_v1",
+        .doc_key = "doc:2",
+        .source_field = "body",
+        .sequence = 7,
+    };
+    var first_key = [_]u8{'a'};
+    var second_key = [_]u8{'b'};
+    var third_key = [_]u8{'c'};
+    const items = [_]ChunkedDenseWindowItem{
+        .{ .request = first_request, .parent_doc_key = "doc:1", .source_field = "body", .artifact_name = "dense_v1", .chunk_key = &first_key, .source_hash = 1 },
+        .{ .request = first_request, .parent_doc_key = "doc:1", .source_field = "body", .artifact_name = "dense_v1", .chunk_key = &second_key, .source_hash = 2 },
+        .{ .request = second_request, .parent_doc_key = "doc:2", .source_field = "body", .artifact_name = "dense_v1", .chunk_key = &third_key, .source_hash = 3 },
+    };
+
+    try recordUniqueChunkedDenseRequestErrors(&runtime, null, &items, error.InvalidEmbeddingResponse);
+
+    try std.testing.expectEqual(@as(usize, 2), failure_capture.count);
+    try std.testing.expectEqualStrings("doc:2", failure_capture.failure.?.doc_key);
+}
+
+test "malformed chunked dense batch is isolated without failing the worker" {
+    const MalformedBatchEmbedder = struct {
+        fn embed(_: *anyopaque, alloc: Allocator, _: []const u8, _: []const u8, dims: u32) ![]f32 {
+            return try alloc.alloc(f32, dims);
+        }
+
+        fn embedBatch(_: *anyopaque, alloc: Allocator, _: []const u8, _: []const []const u8, dims: u32) ![]const []const f32 {
+            const vectors = try alloc.alloc([]const f32, 1);
+            errdefer alloc.free(vectors);
+            vectors[0] = try alloc.alloc(f32, dims);
+            return vectors;
+        }
+
+        fn interface(self: *@This()) embedder_mod.DenseEmbedder {
+            return .{
+                .ptr = self,
+                .dense_embed_fn = embed,
+                .dense_embed_batch_fn = embedBatch,
+            };
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var failure_capture = TestFailureCapture{};
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .failure_ctx = &failure_capture,
+        .failure_fn = TestFailureCapture.record,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .ownership = undefined,
+    };
+    defer clearIsolatedFailedIndexes(&runtime);
+    const request = enrichment_types.GeneratedEnrichmentRequest{
+        .kind = .dense_embedding,
+        .index_name = "semantic",
+        .embedding_name = "dense_v1",
+        .artifact_name = "body_chunks_v1",
+        .doc_key = "doc:1",
+        .source_field = "body",
+        .expected_dims = 3,
+        .sequence = 7,
+    };
+    var texts = std.ArrayListUnmanaged([]const u8).empty;
+    defer texts.deinit(alloc);
+    try texts.append(alloc, "one");
+    try texts.append(alloc, "two");
+    var items = std.ArrayListUnmanaged(ChunkedDenseWindowItem).empty;
+    defer {
+        freeChunkedDenseWindowItems(alloc, items.items);
+        items.deinit(alloc);
+    }
+    try items.append(alloc, .{ .request = request, .parent_doc_key = "doc:1", .source_field = "body", .artifact_name = "dense_v1", .chunk_key = try alloc.dupe(u8, "chunk:1"), .source_hash = 1 });
+    try items.append(alloc, .{ .request = request, .parent_doc_key = "doc:1", .source_field = "body", .artifact_name = "dense_v1", .chunk_key = try alloc.dupe(u8, "chunk:2"), .source_hash = 2 });
+    var window = GeneratedReplayWindow{ .alloc = alloc };
+    defer window.deinit();
+    var malformed = MalformedBatchEmbedder{};
+
+    const complete = try flushChunkedDenseItems(
+        &runtime,
+        malformed.interface(),
+        "dense_v1",
+        3,
+        &.{"semantic"},
+        &texts,
+        &items,
+        &window,
+        false,
+    );
+
+    try std.testing.expect(!complete);
+    try std.testing.expectEqual(@as(usize, 0), texts.items.len);
+    try std.testing.expectEqual(@as(usize, 0), items.items.len);
+    try std.testing.expectEqual(@as(usize, 1), failure_capture.count);
+    try std.testing.expectEqual(@as(u64, 1), runtime.fatal_error_count);
+    try std.testing.expectEqual(@as(u64, 0), runtime.embed_batches_completed);
+    try std.testing.expect(!runtime.worker_failed);
 }
 
 fn workerMain(runtime: *EnrichmentRuntime) void {
@@ -4970,6 +5124,25 @@ fn clearChunkedDenseBatch(
     chunk_texts.clearRetainingCapacity();
 }
 
+fn recordUniqueChunkedDenseRequestErrors(
+    runtime: *EnrichmentRuntime,
+    window: ?*GeneratedReplayWindow,
+    items: []const ChunkedDenseWindowItem,
+    err: anyerror,
+) !void {
+    // processChunkedDenseWindow appends every request's chunks contiguously.
+    // Deduplicating adjacent physical request identities therefore avoids an
+    // allocation and hash-table construction on the provider failure path.
+    var previous: ?enrichment_types.GeneratedEnrichmentRequest = null;
+    for (items) |item| {
+        if (previous) |prior| {
+            if (sameRequestFailureIdentity(prior, item.request)) continue;
+        }
+        try recordIsolatedRequestError(runtime, window, item.request, err);
+        previous = item.request;
+    }
+}
+
 fn flushChunkedDenseItems(
     runtime: *EnrichmentRuntime,
     dense_embedder: embedder_mod.DenseEmbedder,
@@ -4993,13 +5166,18 @@ fn flushChunkedDenseItems(
     const vectors = embedDenseBatchWithRetry(dense_embedder, runtime, embedding_artifact_name, batch_texts, expected_dims) catch |err| {
         noteEmbedBatchFinished(runtime, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
         if (shouldYieldRequestError(runtime, err)) return err;
-        for (batch_items) |item| try recordIsolatedRequestError(runtime, window, item.request, err);
+        try recordUniqueChunkedDenseRequestErrors(runtime, window, batch_items, err);
         clearChunkedDenseBatch(runtime.alloc, chunk_texts, chunk_items, owns_texts);
         return false;
     };
-    noteEmbedBatchFinished(runtime, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), true);
     defer embedder_mod.freeDenseEmbeddingBatch(runtime.alloc, vectors);
-    if (vectors.len != batch_items.len) return error.InvalidEmbeddingResponse;
+    if (vectors.len != batch_items.len) {
+        noteEmbedBatchFinished(runtime, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
+        try recordUniqueChunkedDenseRequestErrors(runtime, window, batch_items, error.InvalidEmbeddingResponse);
+        clearChunkedDenseBatch(runtime.alloc, chunk_texts, chunk_items, owns_texts);
+        return false;
+    }
+    noteEmbedBatchFinished(runtime, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), true);
 
     var embeddings = try runtime.alloc.alloc(derived_types.DerivedDenseEmbeddingWrite, batch_items.len);
     var initialized_embeddings: usize = 0;
@@ -5534,9 +5712,12 @@ fn flushPlainDenseItems(
         noteEmbedBatchFinished(runtime, items.len, total_source_bytes, max_source_bytes, elapsedNsSince(runtime, embed_started_ns), false);
         return err;
     };
-    noteEmbedBatchFinished(runtime, items.len, total_source_bytes, max_source_bytes, elapsedNsSince(runtime, embed_started_ns), true);
     defer embedder_mod.freeDenseEmbeddingBatch(runtime.alloc, vectors);
-    if (vectors.len != items.len) return error.InvalidEmbeddingResponse;
+    if (vectors.len != items.len) {
+        noteEmbedBatchFinished(runtime, items.len, total_source_bytes, max_source_bytes, elapsedNsSince(runtime, embed_started_ns), false);
+        return error.InvalidEmbeddingResponse;
+    }
+    noteEmbedBatchFinished(runtime, items.len, total_source_bytes, max_source_bytes, elapsedNsSince(runtime, embed_started_ns), true);
 
     for (items, vectors) |item, vector| {
         try writeEmbeddingArtifact(runtime, .{
@@ -5671,7 +5852,10 @@ fn processChunkedDenseWindow(
 
             const chunk_artifact_name = requestArtifactName(request);
             if (requestUsesMaterializedChunkArtifact(runtime, chunk_artifact_name)) {
-                try processMaterializedChunkDenseRequest(runtime, request, chunk_artifact_name, embedding_artifact_name, dense_embedder, consumer_indexes, window);
+                processMaterializedChunkDenseRequest(runtime, request, chunk_artifact_name, embedding_artifact_name, dense_embedder, consumer_indexes, window) catch |err| {
+                    if (shouldYieldRequestError(runtime, err)) return err;
+                    try recordIsolatedRequestError(runtime, window, request, err);
+                };
                 continue;
             }
 
@@ -6398,9 +6582,12 @@ fn buildChunkDenseEmbeddingsFromSources(
             noteEmbedBatchFinished(runtime, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
             return err;
         };
-        noteEmbedBatchFinished(runtime, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), true);
         errdefer embedder_mod.freeDenseEmbeddingBatch(runtime.alloc, vectors);
-        if (vectors.len != batch_keys.len) return error.InvalidEmbeddingResponse;
+        if (vectors.len != batch_keys.len) {
+            noteEmbedBatchFinished(runtime, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
+            return error.InvalidEmbeddingResponse;
+        }
+        noteEmbedBatchFinished(runtime, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), true);
 
         for (batch_keys, vectors) |chunk_key, vector| {
             try embeddings.append(runtime.alloc, .{
@@ -6523,9 +6710,12 @@ fn buildChunkSparseEmbeddingsFromSources(
             noteEmbedBatchFinished(runtime, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
             return err;
         };
-        noteEmbedBatchFinished(runtime, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), true);
         errdefer embedder_mod.freeSparseEmbeddingBatch(runtime.alloc, sparse_batch);
-        if (sparse_batch.len != batch_keys.len) return error.InvalidEmbeddingResponse;
+        if (sparse_batch.len != batch_keys.len) {
+            noteEmbedBatchFinished(runtime, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
+            return error.InvalidEmbeddingResponse;
+        }
+        noteEmbedBatchFinished(runtime, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), true);
 
         for (batch_keys, batch_hashes, sparse_batch) |chunk_key, source_hash, sparse| {
             try writeSparseEmbeddingArtifact(runtime, chunk_key, requestEmbeddingName(request), source_hash, sparse.indices, sparse.values);
@@ -9514,7 +9704,10 @@ test "document extraction generated OCR batch fallback isolates permanent unit f
         fn produceBatch(ptr: *anyopaque, _: Allocator, _: []const asset_producer_mod.Request) ![][]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.batch_count += 1;
-            return error.BatchEnvelopeRejected;
+            // A known terminal request error triggers sequential isolation.
+            // Unknown provider errors intentionally remain retryable so a
+            // transient batch outage cannot fan out into N immediate calls.
+            return error.BadUnitInput;
         }
     };
 

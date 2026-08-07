@@ -20874,7 +20874,7 @@ test "bound table sources inspect and reprocess document artifact manifests" {
     defer after.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 2), after.generation);
 
-    try std.testing.expectEqual(@as(?bool, false), try write_source.source().reprocessDocumentArtifact(
+    try std.testing.expectError(error.NotFound, write_source.source().reprocessDocumentArtifact(
         alloc,
         "docs",
         "doc:missing",

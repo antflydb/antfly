@@ -7677,7 +7677,10 @@ pub const DB = struct {
     ) !bool {
         var cfg = (try self.getEnrichment(alloc, .asset, artifact_name)) orelse return false;
         defer cfg.deinit(alloc);
-        const value = try self.get(alloc, doc_key) orelse return false;
+        // A missing producer definition means this artifact cannot currently be
+        // regenerated. A missing source document is a distinct, actionable
+        // repair outcome and must reach the repair API as `missing_source_docs`.
+        const value = try self.get(alloc, doc_key) orelse return error.NotFound;
         defer alloc.free(value);
 
         const writes = [_]types.BatchWrite{.{ .key = doc_key, .value = value }};
@@ -10680,6 +10683,7 @@ pub const DB = struct {
         failed: u64 = 0,
         unsupported: u64 = 0,
         unresolved: u64 = 0,
+        in_progress: u64 = 0,
         indexes_rebuilt: u64 = 0,
         indexes_degraded_before: u64 = 0,
         indexes_degraded_after: u64 = 0,
@@ -10696,6 +10700,7 @@ pub const DB = struct {
         result.failed = repair.failed;
         result.unsupported = repair.unsupported;
         result.unresolved = repair.unresolved;
+        result.in_progress = repair.in_progress;
         result.indexes_rebuilt = repair.indexes_rebuilt;
         result.indexes_degraded_before = repair.indexes_degraded_before;
         result.indexes_degraded_after = repair.indexes_degraded_after;
@@ -11690,6 +11695,7 @@ pub const DB = struct {
                 result.failed = advanced.failed;
                 result.unsupported = advanced.unsupported;
                 result.unresolved = advanced.unresolved;
+                result.in_progress = advanced.in_progress;
                 result.indexes_rebuilt = advanced.indexes_rebuilt;
                 result.indexes_degraded_before = advanced.indexes_degraded_before;
                 result.indexes_degraded_after = advanced.indexes_degraded_after;
@@ -11713,6 +11719,9 @@ pub const DB = struct {
             result.scanned += 1;
             result.in_progress += 1;
             result.unresolved += 1;
+            // A contended durable repair remains degraded. Do not publish the
+            // zero-value gauge as an authoritative healthy observation.
+            result.indexes_degraded_after = 1;
             result.debt_remaining = true;
             return result;
         }
@@ -50326,7 +50335,7 @@ test "db document extraction manifest inspection and reprocess API" {
     try std.testing.expect(std.mem.indexOf(u8, routed_unit_payload, "\"_artifact_route_status\":\"remote_committed\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, routed_unit_payload, "\"_artifact_owner_group_id\":7001") != null);
 
-    try std.testing.expect(!try db.reprocessDocumentArtifact(alloc, "doc:missing", "document_units_v1"));
+    try std.testing.expectError(error.NotFound, db.reprocessDocumentArtifact(alloc, "doc:missing", "document_units_v1"));
     try std.testing.expect((try db.getDocumentArtifactManifest(alloc, "doc:missing", "document_units_v1")) == null);
     var missing_list = try db.listDocumentArtifactManifests(alloc, "doc:missing");
     defer missing_list.deinit(alloc);
@@ -51816,7 +51825,10 @@ test "db graph generation repair preserves corrupt artifact debt after rebuild" 
     defer repair.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 1), repair.scanned);
     try std.testing.expectEqual(@as(u64, 1), repair.indexes_rebuilt);
-    try std.testing.expectEqual(@as(u64, 1), repair.repaired);
+    // The generation rebuild completed, but the corrupt source artifact remains
+    // durable debt. `repaired` is the stronger healthy outcome, not a duplicate
+    // count of completed rebuild work.
+    try std.testing.expectEqual(@as(u64, 0), repair.repaired);
     try std.testing.expectEqual(@as(u64, 1), repair.unresolved);
     try std.testing.expect(repair.debt_remaining);
 
@@ -51914,6 +51926,7 @@ test "db index repair serializes duplicate repairs for one index" {
     try std.testing.expectEqual(@as(u64, 1), repair.unresolved);
     try std.testing.expect(repair.debt_remaining);
     try std.testing.expectEqual(@as(u64, 0), repair.indexes_rebuilt);
+    try std.testing.expectEqual(@as(u64, 1), repair.indexes_degraded_after);
 }
 
 test "db index repair recovers quarantined index load before rebuild" {
@@ -54075,7 +54088,10 @@ test "db dense repair reprocesses corrupt managed source before rebuilding" {
     try std.testing.expect(reset.attempted);
     try std.testing.expect(reset.deferred);
     const recovered = try db.advanceIndexRepairIntent(alloc, repair_id, .{});
-    try std.testing.expect(recovered.repaired);
+    try std.testing.expect(recovered.has_repair_outcome);
+    try std.testing.expectEqual(@as(u64, 1), recovered.indexes_rebuilt);
+    try std.testing.expect(!recovered.repaired);
+    try std.testing.expect(recovered.debt_remaining);
     try std.testing.expect(!try db.hasPendingIndexRepairIntents(alloc));
 
     const query_vec = try counting.interface().embedDense(alloc, "semantic_idx", "alpha concept overview", 3);
@@ -55874,6 +55890,59 @@ test "db shared enrichment repair regenerates one physical artifact once" {
     const completion_key = try internal_keys.artifactRepairCompletionKeyAlloc(alloc, "embedding", artifact_key_hex);
     defer alloc.free(completion_key);
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, completion_key));
+}
+
+test "db asset repair reports a missing source document precisely" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtime_workers = false });
+    defer db.close();
+    try db.addEnrichment(.{
+        .name = "body_copy_v1",
+        .kind = .asset,
+        .field = "body",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"copy\"}",
+    });
+
+    const artifact_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:missing", "asset", "body_copy_v1");
+    defer alloc.free(artifact_key);
+    try recordArtifactRepairIssueContextDetailed(
+        db.async_context,
+        .asset,
+        "",
+        "doc:missing",
+        "",
+        "",
+        "",
+        "body_copy_v1",
+        artifact_key,
+        null,
+        1,
+        .enrichment_failed,
+        1,
+        "PermanentPromptFailure",
+    );
+
+    var repair = try db.repairArtifactIssuesWithRequest(alloc, .{
+        .target = .artifact,
+        .artifact_kind = .asset,
+        .limit = 1,
+    });
+    defer repair.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), repair.scanned);
+    try std.testing.expectEqual(@as(u64, 1), repair.missing_source_docs);
+    try std.testing.expectEqual(@as(u64, 0), repair.failed);
+    try std.testing.expectEqual(@as(u64, 1), repair.unresolved);
+    try std.testing.expect(repair.debt_remaining);
+
+    const issues = try db.listArtifactRepairIssues(alloc, .asset, null, 1);
+    defer types.freeArtifactRepairIssues(alloc, issues);
+    try std.testing.expectEqual(@as(usize, 1), issues.len);
+    try std.testing.expectEqualStrings("source_document_missing", issues[0].last_error);
 }
 
 test "db enrichment repair never clears a newer failure revision" {
