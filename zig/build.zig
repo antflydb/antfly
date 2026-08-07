@@ -4182,6 +4182,8 @@ pub fn build(b: *std.Build) void {
             "idempotent begin upgrades a legacy transaction coordinator role",
             "transaction recovery delegates stale coordinator abort to replicated resolver",
             "replicated recovery is coordinator-owned and acknowledges through hooks",
+            "transaction recovery drains terminal HA outbox without remaining intents",
+            "non-replicated transaction recovery honors the per-run page limit",
             "retained terminal transactions honor the extended retry cutoff",
         },
     });
@@ -5072,6 +5074,7 @@ pub fn build(b: *std.Build) void {
             "distributed txn coordinator never aborts after durable commit decision",
             "db transaction recovery runtime resolves table-group participants through distributed txn resolver",
             "bound stable single-group transaction retry does not reapply transforms",
+            "bound single-group batch reports prepared intent conflicts",
             "internal group write routes map shard doc identity mismatch to conflict",
             "api http client preserves group doc identity conflicts",
             "bound table write source backs up and restores a local table",

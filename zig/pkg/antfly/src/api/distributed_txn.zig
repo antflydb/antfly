@@ -311,6 +311,10 @@ pub const ExecuteOptions = struct {
     /// Preserve the terminal coordinator decision for an externally supplied
     /// transaction ID's retry window.
     retain_terminal: bool = false,
+    /// Only callers with an externally reusable transaction ID can safely
+    /// surface a post-decision error. An ephemeral caller would retry under a
+    /// new ID and reapply non-idempotent transforms.
+    report_post_commit_failure: bool = true,
 };
 
 pub fn executeCrossGroup(
@@ -650,10 +654,16 @@ fn executeMultiTableCommitOnce(
         tw.traceEvent(&.{ .name = "CommitTransaction", .txn_id = txn_id, .shard_id = "", .timestamp = commit_version });
     }
 
-    if (post_commit_failure) |failure| switch (failure) {
-        .visibility => return error.CommitVisibilityNotSatisfied,
-        .propagation => return error.CommitPropagationIncomplete,
-    };
+    if (post_commit_failure) |failure| {
+        if (options.report_post_commit_failure) switch (failure) {
+            .visibility => return error.CommitVisibilityNotSatisfied,
+            .propagation => return error.CommitPropagationIncomplete,
+        };
+        std.log.warn("transaction commit acknowledged with deferred {s} txn_id={x}", .{
+            @tagName(failure),
+            txn_id,
+        });
+    }
 
     return .{ .committed = .{ .participant_count = participants.items.len } };
 }
@@ -2076,6 +2086,33 @@ test "distributed txn coordinator never aborts after durable commit decision" {
         .propose,
         null,
     ));
+    try std.testing.expect(recorder.first_committed);
+    try std.testing.expectEqual(@as(usize, 0), recorder.abort_calls);
+
+    // Callers using an ephemeral server-generated ID must not receive a
+    // retryable failure after the decision is durable: a retry would use a new
+    // ID and could apply transforms twice.
+    recorder = .{ .second_conflict = true };
+    const ephemeral_txn_id = try parseTxnIdHex("00112233445566778899aabbccddeeff");
+    const ephemeral = try executeMultiTableCommitWithOptions(
+        std.testing.allocator,
+        FakeCatalog.iface(),
+        recorder.worker(),
+        ephemeral_txn_id,
+        30_000,
+        30_001,
+        &.{.{
+            .table_name = "docs",
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"a\"}" },
+                .{ .key = "doc:z", .value = "{\"title\":\"z\"}" },
+            },
+        }},
+        .propose,
+        null,
+        .{ .report_post_commit_failure = false },
+    );
+    try std.testing.expect(ephemeral == .committed);
     try std.testing.expect(recorder.first_committed);
     try std.testing.expectEqual(@as(usize, 0), recorder.abort_calls);
 }

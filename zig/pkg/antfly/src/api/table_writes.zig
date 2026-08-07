@@ -4667,12 +4667,15 @@ pub const BoundTableWriteSource = struct {
     ) !?distributed_txn.CommitOutcome {
         if (tables.len == 1 and tables[0].predicates.len == 0) {
             const table = tables[0];
-            _ = (try batch(ptr, alloc, table.table_name, .{
+            _ = (batch(ptr, alloc, table.table_name, .{
                 .writes = transactionWritesAsBatchWrites(table.writes),
                 .deletes = table.deletes,
                 .transforms = table.transforms,
                 .sync_level = sync_level,
-            })) orelse return null;
+            }) catch |err| switch (err) {
+                error.IntentConflict, error.VersionConflict => return .{ .conflict = boundConflict(table, err) },
+                else => return err,
+            }) orelse return null;
             return .{ .committed = .{ .participant_count = 1 } };
         }
         const txn_id = nextTxnId();
@@ -4753,7 +4756,17 @@ pub const BoundTableWriteSource = struct {
                 else => return err,
             }
         };
-        try db.resolveTransactionIntentsWithSyncLevel(txn_id, .committed, commit_version, sync_level);
+        db.resolveTransactionIntentsWithSyncLevel(txn_id, .committed, commit_version, sync_level) catch |err| {
+            const durable_status = db.getTransactionStatus(txn_id) catch return err;
+            if (durable_status == .committed and !retain_terminal) {
+                std.log.warn("ephemeral bound transaction acknowledged after durable commit barrier failure txn_id={x} err={s}", .{
+                    txn_id,
+                    @errorName(err),
+                });
+                return .{ .committed = .{ .participant_count = 1 } };
+            }
+            return err;
+        };
         return .{ .committed = .{ .participant_count = 1 } };
     }
 
@@ -13170,7 +13183,10 @@ pub const ProvisionedTableWriteSource = struct {
             tables,
             sync_level,
             if (comptime build_options.with_tla) tracing.stderrAntflyTraceWriter() else null,
-            .{ .retain_terminal = retain_terminal },
+            .{
+                .retain_terminal = retain_terminal,
+                .report_post_commit_failure = retain_terminal,
+            },
         );
     }
 
@@ -13182,12 +13198,14 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?distributed_txn.CommitOutcome {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try enforceHAWriteGateOptional(self.ha_write_gate);
-        if (try self.commitSingleGroupTransaction(alloc, tables, sync_level)) |outcome| return outcome;
+        if (self.raft_batcher != null) {
+            if (try self.commitSingleGroupTransactionViaRaftBatcher(alloc, tables, sync_level)) |outcome| return outcome;
+        }
         const txn_id = nextTxnId();
         return try commitProvisionedTransaction(ptr, alloc, txn_id, nextTxnTimestamp(), tables, sync_level, false);
     }
 
-    fn commitSingleGroupTransaction(
+    fn commitSingleGroupTransactionViaRaftBatcher(
         self: *ProvisionedTableWriteSource,
         alloc: std.mem.Allocator,
         tables: []const distributed_txn.TableCommitRequest,
@@ -13231,17 +13249,17 @@ pub const ProvisionedTableWriteSource = struct {
         };
         const group_id = group_id_opt orelse return .{ .committed = .{ .participant_count = 0 } };
 
+        const batcher = self.raft_batcher orelse return null;
         const req: db_mod.types.BatchRequest = .{
             .writes = transactionWritesAsBatchWrites(table_req.writes),
             .deletes = table_req.deletes,
             .transforms = table_req.transforms,
             .sync_level = sync_level,
         };
-        if (self.raft_batcher) |batcher| {
-            try batcher.batchGroup(alloc, group_id, table_req.table_name, req);
-        } else {
-            _ = try self.source().batch(alloc, table_req.table_name, req);
-        }
+        batcher.batchGroup(alloc, group_id, table_req.table_name, req) catch |err| switch (err) {
+            error.IntentConflict, error.VersionConflict => return .{ .conflict = boundConflict(table_req, err) },
+            else => return err,
+        };
         return .{ .committed = .{ .participant_count = 1 } };
     }
 
@@ -15494,8 +15512,6 @@ pub const HostedProvisionedTableWriteSource = struct {
         tables: []const distributed_txn.TableCommitRequest,
         sync_level: db_mod.types.SyncLevel,
     ) !?distributed_txn.CommitOutcome {
-        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (try self.commitSingleGroupTransaction(alloc, tables, sync_level)) |outcome| return outcome;
         const txn_id = nextTxnId();
         return try commitHostedTransaction(ptr, alloc, txn_id, nextTxnTimestamp(), tables, sync_level, false);
     }
@@ -15533,61 +15549,11 @@ pub const HostedProvisionedTableWriteSource = struct {
             tables,
             sync_level,
             if (comptime build_options.with_tla) tracing.stderrAntflyTraceWriter() else null,
-            .{ .retain_terminal = retain_terminal },
+            .{
+                .retain_terminal = retain_terminal,
+                .report_post_commit_failure = retain_terminal,
+            },
         );
-    }
-
-    fn commitSingleGroupTransaction(
-        self: *HostedProvisionedTableWriteSource,
-        alloc: std.mem.Allocator,
-        tables: []const distributed_txn.TableCommitRequest,
-        sync_level: db_mod.types.SyncLevel,
-    ) !?distributed_txn.CommitOutcome {
-        if (tables.len == 0) return .{ .committed = .{ .participant_count = 0 } };
-        if (tables.len != 1) return null;
-        const table_req = tables[0];
-        if (table_req.predicates.len != 0) return null;
-
-        var snapshot = try self.catalog.adminSnapshot();
-        defer self.catalog.freeAdminSnapshot(&snapshot);
-        const table = tables_api.findTableByName(&snapshot, table_req.table_name) orelse return null;
-        const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
-        defer metadata_admin.freeRangeRefs(alloc, ranges);
-        if (ranges.len == 0) return null;
-
-        var group_id_opt: ?u64 = null;
-        const resolveOpGroup = struct {
-            fn run(current: *?u64, range_refs: []const *const metadata_table_manager.RangeRecord, key: []const u8) !void {
-                const group_id = table_catalog.resolveGroupForKeyFromRanges(range_refs, key) orelse return error.NotFound;
-                if (current.*) |existing| {
-                    if (existing != group_id) return error.MultipleGroups;
-                } else {
-                    current.* = group_id;
-                }
-            }
-        }.run;
-
-        for (table_req.writes) |write| resolveOpGroup(&group_id_opt, ranges, write.key) catch |err| switch (err) {
-            error.MultipleGroups => return null,
-            else => return err,
-        };
-        for (table_req.deletes) |key| resolveOpGroup(&group_id_opt, ranges, key) catch |err| switch (err) {
-            error.MultipleGroups => return null,
-            else => return err,
-        };
-        for (table_req.transforms) |transform| resolveOpGroup(&group_id_opt, ranges, transform.key) catch |err| switch (err) {
-            error.MultipleGroups => return null,
-            else => return err,
-        };
-        _ = group_id_opt orelse return .{ .committed = .{ .participant_count = 0 } };
-
-        _ = (try self.source().batch(alloc, table_req.table_name, .{
-            .writes = transactionWritesAsBatchWrites(table_req.writes),
-            .deletes = table_req.deletes,
-            .transforms = table_req.transforms,
-            .sync_level = sync_level,
-        })) orelse return null;
-        return .{ .committed = .{ .participant_count = 1 } };
     }
 
     fn backupTable(
@@ -21399,6 +21365,34 @@ test "bound stable single-group transaction retry does not reapply transforms" {
     defer parsed.deinit();
     try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("count").?.integer);
     try std.testing.expectEqual(db_mod.types.TxnStatus.committed, try db.getTransactionStatus(txn_id));
+}
+
+test "bound single-group batch reports prepared intent conflicts" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/bound-batch-intent-conflict", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "doc:counter", .value = "{\"count\":0}" }} });
+    const txn_id = try db.beginTransaction(10_000);
+    try db.writeTransaction(txn_id, .{ .transforms = &.{.{
+        .key = "doc:counter",
+        .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }},
+    }} });
+
+    var source = BoundTableWriteSource.init("docs", &db);
+    const outcome = (try source.source().commitBatch(alloc, &.{.{
+        .table_name = "docs",
+        .transforms = &.{.{
+            .key = "doc:counter",
+            .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }},
+        }},
+    }}, .propose)) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(outcome == .conflict);
+    try db.abortTransaction(txn_id, 10_001);
 }
 
 test "bound table write source provisions default full text index on create" {

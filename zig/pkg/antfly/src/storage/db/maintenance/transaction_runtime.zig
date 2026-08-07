@@ -359,7 +359,9 @@ fn runRecoveryPageWithConfig(
             if (!owns(config.resolver_ctx.?, owner)) continue;
         };
 
-        if (try manager.hasIntents(txn.txn_id)) {
+        const has_intents = try manager.hasIntents(txn.txn_id);
+        const has_ha_outbox = if (config.replicated_metadata) false else try manager.hasHAOutbox(txn.txn_id);
+        if (has_intents or has_ha_outbox) {
             if (config.replicated_metadata) {
                 summary.notification_attempts += 1;
                 config.resolve_participant_fn.?(
@@ -421,7 +423,8 @@ fn runRecoveryPageWithConfig(
     if (config.replicated_metadata) return summary;
 
     const cutoff = now_ns -| config.cutoff_ns;
-    summary.recovery = try manager.recoverTransactionsWithExtraBatchHooksAndOptions(
+    summary.recovery = try manager.recoverTransactionSummariesWithExtraBatchHooksAndOptions(
+        page.items,
         cutoff,
         now_ns,
         config.resolution_extra_hooks,
@@ -541,6 +544,80 @@ test "transaction recovery runtime recoverOnce works with memory backend store" 
     });
     try std.testing.expectEqual(@as(u64, 1), stats.auto_aborted);
     try std.testing.expectEqual(transactions_mod.TxnStatus.aborted, try manager.getTransactionStatus(txn_id));
+}
+
+test "transaction recovery drains terminal HA outbox without remaining intents" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var runtime_store = try backend.runtimeStore(alloc, .{ .name = "ha-outbox" });
+    defer runtime_store.deinit();
+
+    const txn_id: transactions_mod.TxnId = .{5} ** 16;
+    var manager = try transactions_mod.TxnManager.init(alloc, &runtime_store);
+    defer manager.deinit();
+    try manager.initTransaction(txn_id, 1_000);
+    try manager.writeIntents(txn_id, &.{.{ .key = "doc:a", .value = "{}" }}, &.{});
+    const outbox_key = transactions_mod.makeTransactionHABatchOutboxKey(txn_id);
+    _ = try manager.resolveIntentsWithExtraBatch(txn_id, .committed, 2_000, .{
+        .writes = &.{.{ .key = &outbox_key, .value = "encoded-ha-batch" }},
+    });
+    try std.testing.expect(!try manager.hasIntents(txn_id));
+    try std.testing.expect(try manager.hasHAOutbox(txn_id));
+
+    const Recorder = struct {
+        store: *backend_erased.Store,
+        calls: usize = 0,
+
+        fn resolveLocal(ptr: *anyopaque, actual_txn_id: transactions_mod.TxnId, status: transactions_mod.TxnStatus, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqual(txn_id, actual_txn_id);
+            try std.testing.expectEqual(transactions_mod.TxnStatus.committed, status);
+            var local_manager = try transactions_mod.TxnManager.init(std.testing.allocator, self.store);
+            defer local_manager.deinit();
+            try local_manager.clearHAOutbox(actual_txn_id, .batch);
+        }
+    };
+    var recorder = Recorder{ .store = &runtime_store };
+    const summary = try runRecoveryPageWithConfig(alloc, runtime_store, .{
+        .enabled = true,
+        .resolver_ctx = &recorder,
+        .resolve_participant_fn = TestResolver.resolve,
+        .local_resolution_ctx = &recorder,
+        .resolve_local_fn = Recorder.resolveLocal,
+    }, 3_000, null, 1);
+    try std.testing.expectEqual(@as(usize, 1), recorder.calls);
+    try std.testing.expectEqual(@as(u64, 1), summary.recovery.scanned_records);
+    try std.testing.expect(!try manager.hasHAOutbox(txn_id));
+}
+
+test "non-replicated transaction recovery honors the per-run page limit" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var runtime_store = try backend.runtimeStore(alloc, .{ .name = "bounded-local" });
+    defer runtime_store.deinit();
+
+    var manager = try transactions_mod.TxnManager.init(alloc, &runtime_store);
+    defer manager.deinit();
+    const txn_ids = [_]transactions_mod.TxnId{ .{1} ** 16, .{2} ** 16, .{3} ** 16 };
+    for (txn_ids) |txn_id| {
+        try manager.initTransactionWithParticipantsCreatedAtAndRole(txn_id, 1_000, 1_000, &.{}, true);
+    }
+    var ctx: u8 = 0;
+    const summary = try runRecoveryPageWithConfig(alloc, runtime_store, .{
+        .enabled = true,
+        .cutoff_ns = 1_000,
+        .resolver_ctx = &ctx,
+        .resolve_participant_fn = TestResolver.resolve,
+    }, 5_000, null, 1);
+    try std.testing.expectEqual(@as(u64, 1), summary.recovery.scanned_records);
+    try std.testing.expectEqual(@as(u64, 1), summary.recovery.auto_aborted);
+    try std.testing.expect(summary.next_scan_after != null);
+    try std.testing.expectEqual(transactions_mod.TxnStatus.aborted, try manager.getTransactionStatus(txn_ids[0]));
+    try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try manager.getTransactionStatus(txn_ids[1]));
+    try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try manager.getTransactionStatus(txn_ids[2]));
 }
 
 test "transaction recovery runtime recoverOnce works with lsm backend store" {

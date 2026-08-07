@@ -108,6 +108,8 @@ pub const TxnSummary = struct {
     commit_version: u64,
     created_at: u64,
     finalized_at: u64,
+    prepared: bool,
+    prepared_known: bool,
     coordinator: bool,
     coordinator_known: bool,
     retain_terminal: bool = false,
@@ -765,6 +767,8 @@ pub const TxnManager = struct {
                 .commit_version = record.commit_version,
                 .created_at = record.created_at,
                 .finalized_at = record.finalized_at,
+                .prepared = record.prepared,
+                .prepared_known = record.prepared_known,
                 .coordinator = record.coordinator,
                 .coordinator_known = record.coordinator_known,
                 .retain_terminal = record.retain_terminal,
@@ -876,19 +880,32 @@ pub const TxnManager = struct {
         extra_hooks: RecoveryExtraBatchHooks,
         options: RecoveryOptions,
     ) !RecoveryStats {
+        const summaries = try self.listTransactions(self.alloc);
+        defer self.alloc.free(summaries);
+        return try self.recoverTransactionSummariesWithExtraBatchHooksAndOptions(
+            summaries,
+            cutoff_timestamp,
+            resolution_timestamp,
+            extra_hooks,
+            options,
+        );
+    }
+
+    pub fn recoverTransactionSummariesWithExtraBatchHooksAndOptions(
+        self: *TxnManager,
+        summaries: []const TxnSummary,
+        cutoff_timestamp: u64,
+        resolution_timestamp: u64,
+        extra_hooks: RecoveryExtraBatchHooks,
+        options: RecoveryOptions,
+    ) !RecoveryStats {
         var stats: RecoveryStats = .{};
-        const records = try self.scanPrefix(self.alloc, records_prefix);
-        defer backend_scan.freeResults(self.alloc, records);
-
-        for (records) |entry| {
-            if (entry.key.len != records_prefix.len + 16) continue;
-
-            const record = try decodeRecord(entry.value);
-            const txn_id: TxnId = entry.key[records_prefix.len..][0..16].*;
+        for (summaries) |summary| {
+            const txn_id = summary.txn_id;
             stats.scanned_records += 1;
 
-            if (record.status == .pending) {
-                if (record.created_at > 0 and record.created_at < cutoff_timestamp) {
+            if (summary.status == .pending) {
+                if (summary.created_at > 0 and summary.created_at < cutoff_timestamp) {
                     if (!options.presume_abort_distributed) {
                         const participants = try self.getParticipants(self.alloc, txn_id);
                         defer freeParticipantList(self.alloc, participants);
@@ -897,7 +914,7 @@ pub const TxnManager = struct {
                             continue;
                         }
                     }
-                    if ((record.prepared or !record.prepared_known) and (!record.coordinator or !record.coordinator_known)) {
+                    if ((summary.prepared or !summary.prepared_known) and (!summary.coordinator or !summary.coordinator_known)) {
                         const participants = try self.getParticipants(self.alloc, txn_id);
                         defer freeParticipantList(self.alloc, participants);
                         if (participants.len > 0) {
@@ -925,9 +942,9 @@ pub const TxnManager = struct {
             }
 
             if (try self.hasAnyIntents(txn_id)) {
-                const resolve_ts = switch (record.status) {
-                    .committed => record.visibleVersion(),
-                    .aborted => if (record.finalized_at > 0) record.finalized_at else resolution_timestamp,
+                const resolve_ts = switch (summary.status) {
+                    .committed => if (summary.commit_version > 0) summary.commit_version else summary.begin_timestamp,
+                    .aborted => if (summary.finalized_at > 0) summary.finalized_at else resolution_timestamp,
                     .pending => unreachable,
                 };
                 var extra_batch: ResolutionExtraBatch = .{};
@@ -936,10 +953,10 @@ pub const TxnManager = struct {
                     if (extra_hooks.cleanup) |cleanup| cleanup(extra_hooks.ctx, extra_batch);
                 };
                 if (extra_hooks.build) |build| {
-                    extra_batch = try build(extra_hooks.ctx, self, txn_id, record.status, resolve_ts);
+                    extra_batch = try build(extra_hooks.ctx, self, txn_id, summary.status, resolve_ts);
                     extra_batch_initialized = true;
                 }
-                _ = try self.resolveIntentsWithExtraBatch(txn_id, record.status, resolve_ts, extra_batch);
+                _ = try self.resolveIntentsWithExtraBatch(txn_id, summary.status, resolve_ts, extra_batch);
                 stats.resolved_finalized += 1;
             }
 
