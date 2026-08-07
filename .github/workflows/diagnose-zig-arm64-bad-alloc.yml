@@ -107,6 +107,11 @@ jobs:
           fi
           stat -c 'binary_size_bytes=%s' "$binary" | tee "$RUNNER_TEMP/linked-runtime.size"
           stat -c 'lite_capi_size_bytes=%s' "$library" | tee "$RUNNER_TEMP/lite-capi.size"
+          library_size=$(stat -c '%s' "$library")
+          if [ "$library_size" -ge 20971520 ]; then
+            echo "libantfly.so exceeded the 20MiB retained-code budget: $library_size bytes" >&2
+            exit 1
+          fi
 
       - name: Report compiler memory
         if: ${{ always() }}
