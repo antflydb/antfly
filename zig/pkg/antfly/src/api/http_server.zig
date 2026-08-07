@@ -2349,8 +2349,8 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn runSessionMaintenanceOnce(self: *ApiHttpServer) !void {
-        self.retryPendingTransactionCommitAcknowledgements(32) catch |err| {
-            std.log.warn("failed to retry stable transaction coordinator acknowledgements err={s}", .{@errorName(err)});
+        self.retryPendingTransactionRecovery(32) catch |err| {
+            std.log.warn("failed to advance stable transaction recovery err={s}", .{@errorName(err)});
         };
         try self.maybeCleanupExpiredSessions();
         try self.maybeRenewOwnedSessionLeases();
@@ -2371,24 +2371,107 @@ pub const ApiHttpServer = struct {
         }
     }
 
-    fn retryPendingTransactionCommitAcknowledgements(self: *ApiHttpServer, limit: usize) !void {
+    fn retryPendingTransactionRecovery(self: *ApiHttpServer, limit: usize) !void {
         const source = self.table_writes orelse return;
-        const pending = try self.txn_sessions.listPendingTerminalAcknowledgements(self.alloc, limit);
-        defer transactions_api.deinitPendingTerminalAcknowledgements(self.alloc, pending);
+        const pending = try self.txn_sessions.listPendingRecoveryIds(self.alloc, limit);
+        defer self.alloc.free(pending);
         const local_node_id = self.localSessionNodeId();
-        for (pending) |acknowledgement| {
-            if (acknowledgement.owner_node_id != local_node_id) continue;
-            const acknowledged = source.acknowledgeTransactionCommit(
-                self.alloc,
-                acknowledgement.txn_id,
-                acknowledgement.coordinator_group_id,
-                acknowledgement.coordinator_table_name,
-            ) catch |err| {
-                std.log.warn("stable transaction coordinator acknowledgement maintenance deferred txn_id={x} err={s}", .{ acknowledgement.txn_id, @errorName(err) });
+        const now_ns = platform_time.realtimeNs();
+        for (pending) |txn_id| {
+            var recovery = (self.txn_sessions.claimPendingRecovery(self.alloc, txn_id, local_node_id, now_ns) catch |err| {
+                std.log.warn("stable transaction recovery claim deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
                 continue;
-            };
-            if (acknowledged == null) continue;
-            _ = (try self.txn_sessions.markTerminalCoordinatorAcknowledged(self.alloc, acknowledgement.txn_id)) orelse continue;
+            }) orelse continue;
+            defer recovery.deinit(self.alloc);
+            switch (recovery) {
+                .acknowledge => |acknowledgement| {
+                    const acknowledged = source.acknowledgeTransactionCommit(
+                        self.alloc,
+                        acknowledgement.txn_id,
+                        acknowledgement.coordinator_group_id,
+                        acknowledgement.coordinator_table_name,
+                    ) catch |err| {
+                        std.log.warn("stable transaction coordinator acknowledgement maintenance deferred txn_id={x} err={s}", .{ acknowledgement.txn_id, @errorName(err) });
+                        continue;
+                    };
+                    if (acknowledged == null) continue;
+                    _ = (self.txn_sessions.markTerminalCoordinatorAcknowledged(self.alloc, acknowledgement.txn_id) catch |err| {
+                        std.log.warn("stable transaction acknowledgement receipt persistence deferred txn_id={x} err={s}", .{ acknowledgement.txn_id, @errorName(err) });
+                        continue;
+                    }) orelse continue;
+                },
+                .commit => |*commit| {
+                    const distributed_tables = commit.request.distributedTables(self.alloc) catch |err| {
+                        std.log.err("invalid sealed stable transaction during recovery txn_id={x} err={s}", .{ txn_id, @errorName(err) });
+                        _ = self.txn_sessions.remove(self.alloc, txn_id);
+                        continue;
+                    };
+                    defer if (distributed_tables.len > 0) self.alloc.free(distributed_tables);
+                    const outcome = (source.commitTransactionWithId(
+                        self.alloc,
+                        txn_id,
+                        commit.begin_timestamp,
+                        distributed_tables,
+                        commit.sync_level,
+                    ) catch |err| switch (err) {
+                        error.InvalidBatchRequest,
+                        error.InvalidArgument,
+                        error.InvalidGraphEdges,
+                        error.UnsupportedTransformOperation,
+                        error.TopologyChanged,
+                        error.DecisionConflict,
+                        error.DocIdentityNamespaceMismatch,
+                        error.UnsupportedOperation,
+                        error.TableNotFound,
+                        error.UnknownGroup,
+                        => {
+                            _ = self.txn_sessions.remove(self.alloc, txn_id);
+                            continue;
+                        },
+                        else => {
+                            std.log.warn("stable transaction commit recovery deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
+                            continue;
+                        },
+                    }) orelse continue;
+                    switch (outcome) {
+                        .conflict => {
+                            // A replayed transaction ID can only conflict when
+                            // the coordinator durably chose abort.
+                            _ = self.txn_sessions.remove(self.alloc, txn_id);
+                        },
+                        .committed => |committed| {
+                            const status: transactions_api.TerminalCommitStatus = if (committed.propagation_pending)
+                                .committed_recovery_pending
+                            else if (committed.visibility_pending)
+                                .committed_visibility_pending
+                            else
+                                .committed;
+                            _ = (self.txn_sessions.recordTerminalCommit(
+                                self.alloc,
+                                txn_id,
+                                status,
+                                committed.coordinator_group_id,
+                                committed.coordinator_table_name,
+                            ) catch |err| {
+                                std.log.warn("stable transaction terminal handoff persistence deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
+                                continue;
+                            }) orelse continue;
+                            if (committed.coordinator_group_id) |group_id| {
+                                const table_name = committed.coordinator_table_name orelse continue;
+                                const acknowledged = source.acknowledgeTransactionCommit(self.alloc, txn_id, group_id, table_name) catch |err| {
+                                    std.log.warn("stable transaction recovered coordinator acknowledgement deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
+                                    continue;
+                                };
+                                if (acknowledged == null) continue;
+                                _ = (self.txn_sessions.markTerminalCoordinatorAcknowledged(self.alloc, txn_id) catch |err| {
+                                    std.log.warn("stable transaction recovered acknowledgement receipt persistence deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
+                                    continue;
+                                }) orelse continue;
+                            }
+                        },
+                    }
+                },
+            }
         }
     }
 
@@ -5217,6 +5300,15 @@ pub const ApiHttpServer = struct {
                     return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 409, response);
                 }
 
+                // This durable marker closes the crash window between the
+                // first successful 2PC decision and persistence of the API
+                // terminal response. Maintenance can safely replay the sealed
+                // request with the same transaction ID after this point.
+                _ = (self.txn_sessions.markCommitExecutionStarted(self.alloc, txn_id) catch |err| switch (err) {
+                    error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
+                    else => return err,
+                }) orelse return try textResponse(self.alloc, 404, "not found");
+
                 const outcome = (source.commitTransactionWithId(self.alloc, txn_id, session.begin_timestamp, distributed_tables, session.sync_level) catch |err| switch (err) {
                     error.InvalidBatchRequest,
                     error.InvalidArgument,
@@ -5230,6 +5322,7 @@ pub const ApiHttpServer = struct {
                         return try textResponse(self.alloc, 400, "invalid transaction commit request");
                     },
                     error.TopologyChanged => {
+                        _ = self.txn_sessions.remove(self.alloc, txn_id);
                         var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
                         defer arena_impl.deinit();
                         const response = try transactions_api.buildSessionCommitResponse(
@@ -5242,6 +5335,7 @@ pub const ApiHttpServer = struct {
                         return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 409, response);
                     },
                     error.DecisionConflict => {
+                        _ = self.txn_sessions.remove(self.alloc, txn_id);
                         var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
                         defer arena_impl.deinit();
                         const response = try transactions_api.buildSessionCommitResponse(
@@ -5254,6 +5348,7 @@ pub const ApiHttpServer = struct {
                         return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 409, response);
                     },
                     error.DocIdentityNamespaceMismatch => {
+                        _ = self.txn_sessions.remove(self.alloc, txn_id);
                         var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
                         defer arena_impl.deinit();
                         const response = try transactions_api.buildSessionCommitResponse(
@@ -5265,9 +5360,16 @@ pub const ApiHttpServer = struct {
                         );
                         return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 409, response);
                     },
-                    error.UnsupportedOperation => return try textResponse(self.alloc, 405, "method not allowed"),
-                    error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+                    error.UnsupportedOperation => {
+                        _ = self.txn_sessions.remove(self.alloc, txn_id);
+                        return try textResponse(self.alloc, 405, "method not allowed");
+                    },
+                    error.TableNotFound => {
+                        _ = self.txn_sessions.remove(self.alloc, txn_id);
+                        return try textResponse(self.alloc, 404, "not found");
+                    },
                     error.UnknownGroup => {
+                        _ = self.txn_sessions.remove(self.alloc, txn_id);
                         var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
                         defer arena_impl.deinit();
                         const response = try transactions_api.buildSessionCommitResponse(
@@ -26091,6 +26193,110 @@ test "api http server retries stable terminal commits without replaying writes" 
     try std.testing.expectEqual(@as(u16, 409), abort.status);
 }
 
+test "api session maintenance recovers crash window after durable 2pc commit" {
+    const alloc = std.testing.allocator;
+    const session_path = "/tmp/antfly-api-http-session-post-commit-recovery";
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), session_path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), session_path) catch {};
+
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{ .ptr = undefined, .vtable = &.{ .status = status } };
+        }
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+    const FakeWrites = struct {
+        durable: ?*transactions_api.DurableSessionStore = null,
+        commit_calls: usize = 0,
+        acknowledge_calls: usize = 0,
+
+        fn source(self: *@This()) table_writes.TableWriteSource {
+            return .{ .ptr = self, .vtable = &.{
+                .batch = batch,
+                .commit_transaction_with_id = commitTransactionWithId,
+                .acknowledge_transaction_commit = acknowledgeTransactionCommit,
+            } };
+        }
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+            return error.TestUnexpectedResult;
+        }
+        fn commitTransactionWithId(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: db_mod.types.TxnId,
+            _: u64,
+            _: []const distributed_txn.TableCommitRequest,
+            _: db_mod.types.SyncLevel,
+        ) anyerror!?distributed_txn.CommitOutcome {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.commit_calls += 1;
+            if (self.commit_calls == 1) self.durable.?.fail_writes_for_test = true;
+            return .{ .committed = .{
+                .participant_count = 1,
+                .coordinator_group_id = 7001,
+                .coordinator_table_name = "docs",
+            } };
+        }
+        fn acknowledgeTransactionCommit(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: db_mod.types.TxnId,
+            _: u64,
+            _: []const u8,
+        ) anyerror!?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.acknowledge_calls += 1;
+            return {};
+        }
+    };
+
+    var source = FakeSource{};
+    var writes = FakeWrites{};
+    var server = try ApiHttpServer.initWithConfig(alloc, .{ .session_store_path = session_path }, source.iface(), null, writes.source());
+    defer server.deinit();
+    writes.durable = server.opened_session_store.?.durableStore();
+
+    var begin = try server.handle(.{ .method = .POST, .uri = routes.Routes.transactions_begin, .content_type = "application/json", .body = "{}" });
+    defer begin.deinit(alloc);
+    var parsed_begin = try std.json.parseFromSlice(transactions_api.BeginResponse, alloc, begin.body, .{});
+    defer parsed_begin.deinit();
+    const commit_uri = try std.fmt.allocPrint(alloc, "{s}{s}{s}", .{
+        routes.Routes.transactions_prefix,
+        parsed_begin.value.transaction_id,
+        routes.Routes.transactions_commit_suffix,
+    });
+    defer alloc.free(commit_uri);
+    const batch_body = try test_contract_helpers.normalizeBatchRequest(alloc, "{\"inserts\":{\"counter\":{\"value\":1}}}");
+    defer alloc.free(batch_body);
+    const body = try test_contract_helpers.encodeTransactionCommitRequest(
+        alloc,
+        &.{},
+        &.{.{ .table_name = "docs", .batch_json = batch_body }},
+        null,
+    );
+    defer alloc.free(body);
+
+    var first = try server.handle(.{ .method = .POST, .uri = commit_uri, .content_type = "application/json", .body = body });
+    defer first.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 503), first.status);
+    try std.testing.expectEqual(@as(usize, 1), writes.commit_calls);
+    try std.testing.expectEqual(@as(usize, 0), writes.acknowledge_calls);
+
+    writes.durable.?.fail_writes_for_test = false;
+    try server.runSessionMaintenanceOnce();
+    try std.testing.expectEqual(@as(usize, 2), writes.commit_calls);
+    try std.testing.expectEqual(@as(usize, 1), writes.acknowledge_calls);
+
+    var retry = try server.handle(.{ .method = .POST, .uri = commit_uri, .content_type = "application/json", .body = body });
+    defer retry.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), retry.status);
+    try std.testing.expectEqual(@as(usize, 2), writes.commit_calls);
+}
+
 test "api http server enforces configured savepoint limits and exposes remaining capacity" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-api-http-session-savepoint-limit";
@@ -33070,7 +33276,7 @@ test "api http server prefers metadata-owned restore over inline write-source re
         fn unsupportedTxnPrepareGroupLocal(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: db_mod.types.TransactionIntentRequest) anyerror!?void {
             return error.UnsupportedOperation;
         }
-        fn unsupportedTxnResolveGroupLocal(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: db_mod.types.TxnStatus, _: u64, _: db_mod.types.SyncLevel) anyerror!?void {
+        fn unsupportedTxnResolveGroupLocal(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: db_mod.types.TxnStatus, _: u64, _: u64, _: db_mod.types.SyncLevel) anyerror!?void {
             return error.UnsupportedOperation;
         }
     };

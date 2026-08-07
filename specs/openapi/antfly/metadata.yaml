@@ -8027,8 +8027,20 @@ paths:
                 $ref: "#/components/schemas/MultiBatchResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "409":
+          description: Transaction aborted because a predicate, topology fence, or participant state conflicted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TransactionCommitResponse"
         "404":
           $ref: "#/components/responses/NotFound"
+        "503":
+          description: Transaction outcome or requested visibility is temporarily unavailable; retry is safe
+          content:
+            text/plain:
+              schema:
+                type: string
         "500":
           $ref: "#/components/responses/InternalServerError"
   /transactions/commit:
@@ -9161,10 +9173,22 @@ paths:
                 $ref: "#/components/schemas/BatchResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "409":
+          description: Batch transaction conflicted or the serving replica is fenced
+          content:
+            text/plain:
+              schema:
+                type: string
         "404":
           $ref: "#/components/responses/NotFound"
         "429":
           $ref: "#/components/responses/DenseRepairBackpressure"
+        "503":
+          description: Write routing, document identity, or commit visibility is temporarily unavailable
+          content:
+            text/plain:
+              schema:
+                type: string
         "500":
           $ref: "#/components/responses/InternalServerError"
   /tables/{tableName}/merge:

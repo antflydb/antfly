@@ -383,13 +383,16 @@ fn runRecoveryPageWithConfig(
         const unresolved = try manager.getUnresolvedParticipants(alloc, txn.txn_id);
         defer transactions_mod.freeParticipantList(alloc, unresolved);
         var all_resolved = true;
+        const retained_cutoff = now_ns -| config.retained_terminal_ns;
 
         for (unresolved) |participant| {
             // Retained coordinators use their self-acknowledgement as the
             // durable handoff from the API session registry. Recovery must not
-            // invent it before that terminal API result exists.
+            // invent it during the advertised retry window. Once that window
+            // has elapsed, the API session has expired and storage must release
+            // the topology fence even if its node-local registry was lost.
             if (txn.status == .committed and txn.coordinator and txn.retain_terminal and owner_participant != null and
-                std.mem.eql(u8, participant, owner_participant.?))
+                std.mem.eql(u8, participant, owner_participant.?) and txn.finalized_at >= retained_cutoff)
             {
                 all_resolved = false;
                 continue;
@@ -416,7 +419,6 @@ fn runRecoveryPageWithConfig(
         }
         if (config.replicated_metadata and all_resolved) {
             const cutoff = now_ns -| config.cutoff_ns;
-            const retained_cutoff = now_ns -| config.retained_terminal_ns;
             if (txn.finalized_at < (if (txn.retain_terminal) retained_cutoff else cutoff)) {
                 try config.cleanup_transaction_fn.?(
                     config.resolver_ctx.?,
@@ -740,7 +742,7 @@ test "replicated recovery is coordinator-owned and acknowledges through hooks" {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.resolve_calls += 1;
             try std.testing.expectEqual(txn_id, actual_txn_id);
-            try std.testing.expectEqualStrings(remote, participant);
+            try std.testing.expect(std.mem.eql(u8, remote, participant) or std.mem.eql(u8, coordinator, participant));
             try std.testing.expectEqual(transactions_mod.TxnStatus.committed, status);
         }
 
@@ -749,7 +751,7 @@ test "replicated recovery is coordinator-owned and acknowledges through hooks" {
             self.ack_calls += 1;
             try std.testing.expectEqual(txn_id, actual_txn_id);
             try std.testing.expectEqualStrings(coordinator, owner);
-            try std.testing.expectEqualStrings(remote, participant);
+            try std.testing.expect(std.mem.eql(u8, remote, participant) or std.mem.eql(u8, coordinator, participant));
         }
 
         fn cleanup(ptr: *anyopaque, _: transactions_mod.TxnId, _: []const u8, _: u64, _: u64) !void {
@@ -786,4 +788,24 @@ test "replicated recovery is coordinator-owned and acknowledges through hooks" {
     try std.testing.expectEqual(@as(usize, 2), unresolved.len);
     try std.testing.expectEqualStrings(coordinator, unresolved[0]);
     try std.testing.expectEqualStrings(remote, unresolved[1]);
+
+    // After the complete stable-session retry window, storage recovery is the
+    // final safety net for a permanently lost node-local API registry.
+    clock.setRealtimeNs(30_000);
+    const expired_stats = try recoverOnce(alloc, &runtime_store, .{
+        .enabled = true,
+        .clock = clock.clock(),
+        .cutoff_ns = 1_000,
+        .retained_terminal_ns = 20_000,
+        .resolver_ctx = &recorder,
+        .resolve_participant_fn = Recorder.resolve,
+        .replicated_metadata = true,
+        .owns_recovery_fn = Recorder.owns,
+        .acknowledge_participant_fn = Recorder.acknowledge,
+        .cleanup_transaction_fn = Recorder.cleanup,
+    });
+    try std.testing.expectEqual(@as(usize, 3), recorder.resolve_calls);
+    try std.testing.expectEqual(@as(usize, 3), recorder.ack_calls);
+    try std.testing.expectEqual(@as(usize, 1), recorder.cleanup_calls);
+    try std.testing.expectEqual(@as(u64, 2), expired_stats.notification_successes);
 }
