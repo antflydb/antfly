@@ -5883,16 +5883,7 @@ pub const Node = struct {
         var config = rebel_mod.loadConfig(ctx.allocator, model_path) catch |err|
             return modelLoadFailureResponse(ctx, err);
 
-        const dec_config: enc_dec_mod.DecoderConfig = if (loaded_model_handle) |*handle| blk: {
-            const config = session_factory.getWhisperConfig(handle.get().session).?;
-            break :blk .{
-                .max_length = @intCast(config.max_target_positions),
-                .decoder_start_token_id = config.decoder_start_token_id,
-                .eos_token_id = config.eos_token_id,
-                .pad_token_id = config.pad_token_id,
-                .vocab_size = @intCast(config.vocab_size),
-            };
-        } else enc_dec_mod.loadDecoderConfig(ctx.allocator, model_path) catch enc_dec_mod.DecoderConfig{};
+        const dec_config = enc_dec_mod.loadDecoderConfig(ctx.allocator, model_path) catch enc_dec_mod.DecoderConfig{};
         if (dec_config.max_length > 0) config.max_length = dec_config.max_length;
 
         var component_loader = self.model_manager.componentLoaderForPaths(
@@ -6760,7 +6751,6 @@ pub const Node = struct {
         // Find encoder/decoder sessions
         const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
         const tokenizer_mod = @import("inference_tokenizer");
-        const hf_tokenizer = @import("inference_hf_tokenizer");
         const whisper_prompt = @import("../pipelines/whisper_prompt.zig");
         var encoder_session: backends_mod.Session = undefined;
         var decoder_session: backends_mod.Session = undefined;
@@ -6769,12 +6759,11 @@ pub const Node = struct {
         var decoder_managed: ?model_manager_mod.ManagedSession = null;
         defer if (decoder_managed) |*managed| managed.deinit();
         var tokenizer: tokenizer_mod.Tokenizer = undefined;
-        var hf_tok_owned: ?*hf_tokenizer.HfTokenizer = null;
-        defer if (hf_tok_owned) |hf_tok| hf_tok.deinitSelf();
+        var decoder_config: enc_dec_mod.DecoderConfig = undefined;
         var loaded_model_handle: ?model_manager_mod.ModelHandle = null;
         defer if (loaded_model_handle) |*handle| handle.release();
-        var owned_prompt_cache: ?whisper_prompt.PromptCache = null;
-        defer if (owned_prompt_cache) |*cache| cache.deinit();
+        var whisper_assets_handle: ?model_manager_mod.WhisperAssetsHandle = null;
+        defer if (whisper_assets_handle) |*handle| handle.release();
         var prompt_cache: ?*const whisper_prompt.PromptCache = null;
 
         if (enc_dec_mod.findEncoderDecoderPaths(ctx.allocator, model_path)) |paths| {
@@ -6794,46 +6783,39 @@ pub const Node = struct {
             decoder_managed = strict_loader.load(paths.decoder) catch |err|
                 return modelLoadFailureResponse(ctx, err);
             decoder_session = decoder_managed.?.session;
-
-            const tok_path = std.fmt.allocPrint(ctx.allocator, "{s}/tokenizer.json", .{model_path}) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = @errorName(err) });
-            defer ctx.allocator.free(tok_path);
-
-            const tok_bytes = c_file.readFile(ctx.allocator, tok_path) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = @errorName(err) });
-            defer ctx.allocator.free(tok_bytes);
-
-            hf_tok_owned = hf_tokenizer.HfTokenizer.loadFromBytes(ctx.allocator, tok_bytes) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = @errorName(err) });
-            if (hf_tok_owned) |hf_tok| {
-                tokenizer = hf_tok.tokenizer();
-            }
+            whisper_assets_handle = self.model_manager.acquireWhisperCompositeAssets(model_path) catch |err|
+                return modelLoadFailureResponse(ctx, err);
+            const assets = whisper_assets_handle.?.get();
+            tokenizer = assets.tokenizer();
+            decoder_config = assets.decoder_config;
+            prompt_cache = &assets.prompt_cache;
         } else |_| {
             loaded_model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
                 return modelLoadFailureResponse(ctx, err);
             const model = loaded_model_handle.?.get();
-            if (session_factory.getWhisperConfig(model.session) == null) {
+            const whisper_config = session_factory.getWhisperConfig(model.session) orelse {
                 return ctx.status(400).json(.{
                     .@"error" = "INVALID_MODEL",
                     .message = "model does not support transcription",
                 });
-            }
+            };
             encoder_session = model.session;
             decoder_session = model.session;
             tokenizer = model.getTokenizer();
             prompt_cache = if (model.whisper_prompt_cache) |*cache| cache else null;
+            decoder_config = .{
+                .max_length = @intCast(whisper_config.max_target_positions),
+                .decoder_start_token_id = whisper_config.decoder_start_token_id,
+                .eos_token_id = whisper_config.eos_token_id,
+                .pad_token_id = whisper_config.pad_token_id,
+                .vocab_size = @intCast(whisper_config.vocab_size),
+            };
         }
 
-        // Parse decoder config for Whisper token IDs
-        const dec_config = enc_dec_mod.loadDecoderConfig(ctx.allocator, model_path) catch enc_dec_mod.DecoderConfig{};
-
-        if (prompt_cache == null) {
-            owned_prompt_cache = whisper_prompt.PromptCache.init(ctx.allocator, model_path, tokenizer) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "INVALID_MODEL", .message = @errorName(err) });
-            prompt_cache = &owned_prompt_cache.?;
-        }
+        const effective_prompt_cache = prompt_cache orelse
+            return ctx.status(500).json(.{ .@"error" = "INVALID_MODEL", .message = "WhisperPromptCacheUnavailable" });
         var prompt_scratch: [3]whisper_prompt.ForcedDecoderId = undefined;
-        const forced_ids = prompt_cache.?.resolve(&prompt_scratch, body.language) catch
+        const forced_ids = effective_prompt_cache.resolve(&prompt_scratch, body.language) catch
             return ctx.status(400).json(.{
                 .@"error" = "INVALID_REQUEST",
                 .message = "language is not supported by this Whisper model",
@@ -6845,12 +6827,12 @@ pub const Node = struct {
             decoder_session,
             tokenizer,
             .{
-                .max_length = dec_config.max_length,
-                .decoder_start_token_id = dec_config.decoder_start_token_id,
-                .eos_token_id = dec_config.eos_token_id,
+                .max_length = decoder_config.max_length,
+                .decoder_start_token_id = decoder_config.decoder_start_token_id,
+                .eos_token_id = decoder_config.eos_token_id,
                 .language = body.language,
                 .forced_decoder_ids = forced_ids,
-                .language_tokens = prompt_cache.?.language_tokens,
+                .language_tokens = effective_prompt_cache.language_tokens,
             },
         );
 
