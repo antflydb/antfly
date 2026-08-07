@@ -13688,6 +13688,7 @@ test "one percent native filter routes through integrated dense search exactly" 
         .index_name = "dense",
         .limit = result_count,
         .include_stored = false,
+        .profile = true,
         .filter_ids = filter_ids,
     }, .{
         .vector = &query,

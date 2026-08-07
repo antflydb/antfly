@@ -25,6 +25,7 @@ const backends = @import("../backends/backends.zig");
 const model_caps = @import("../models/capabilities.zig");
 const manifest_mod = @import("../models/manifest.zig");
 const model_compatibility = @import("../models/compatibility.zig");
+const managed_receipt = @import("../registry/managed_receipt.zig");
 const safetensors_mod = @import("../models/safetensors.zig");
 const c_file = @import("../util/c_file.zig");
 const gguf_format = @import("../gguf/format.zig");
@@ -2861,11 +2862,16 @@ pub const WhisperCompositeAssets = struct {
     managed_tokenizer: ManagedHfTokenizer,
     prompt_cache: whisper_prompt.PromptCache,
     decoder_config: encoder_decoder.DecoderConfig,
+    generation: ComponentPlanKey,
     active_handles: usize = 0,
     last_used_ns: u64 = 0,
 
     pub fn tokenizer(self: *const WhisperCompositeAssets) tokenizer_mod.Tokenizer {
         return self.managed_tokenizer.tokenizer.tokenizer();
+    }
+
+    fn reclaimableAdmission(self: *const WhisperCompositeAssets) runtime.tier.memory.AdmissionAmounts {
+        return if (self.managed_tokenizer.resource_lease) |lease| lease.amounts else .{};
     }
 
     fn deinit(self: *WhisperCompositeAssets) void {
@@ -2901,7 +2907,7 @@ pub const ModelManager = struct {
     };
 
     const EvictedWhisperAssets = struct {
-        key: []const u8,
+        key: ComponentPlanKey,
         assets: *WhisperCompositeAssets,
     };
 
@@ -2926,8 +2932,8 @@ pub const ModelManager = struct {
     eviction_io: ?std.Io = null,
     eviction_loop_started: bool = false,
     in_flight_loads: std.StringHashMapUnmanaged(*LoadFlight) = .empty,
-    whisper_assets: std.StringHashMapUnmanaged(*WhisperCompositeAssets) = .empty,
-    in_flight_whisper_assets: std.StringHashMapUnmanaged(*WhisperAssetsLoadFlight) = .empty,
+    whisper_assets: std.AutoHashMapUnmanaged(ComponentPlanKey, *WhisperCompositeAssets) = .empty,
+    in_flight_whisper_assets: std.AutoHashMapUnmanaged(ComponentPlanKey, *WhisperAssetsLoadFlight) = .empty,
     component_plan_cache: std.AutoHashMapUnmanaged(
         ComponentPlanKey,
         *ComponentPlanCacheEntry,
@@ -3099,7 +3105,7 @@ pub const ModelManager = struct {
             self.keep_alive_ms,
             std.time.ns_per_ms,
         ) catch std.math.maxInt(u64);
-        var victim_key: ?[]const u8 = null;
+        var victim_key: ?ComponentPlanKey = null;
         var victim: ?*WhisperCompositeAssets = null;
         var oldest_ns: u64 = std.math.maxInt(u64);
         var it = self.whisper_assets.iterator();
@@ -3144,27 +3150,62 @@ pub const ModelManager = struct {
     ) void {
         evicted.assets.deinit();
         self.allocator.destroy(evicted.assets);
-        self.allocator.free(evicted.key);
     }
 
-    /// Called with eviction_lock held. Prefer the existing loaded-model LRU,
-    /// then release idle composite tokenizer state if it is the remaining
-    /// admission consumer.
-    fn evictOneIdleForAdmission(self: *ModelManager) bool {
+    fn admissionReclaimRelevant(
+        reclaimable: runtime.tier.memory.AdmissionAmounts,
+        requested: runtime.tier.memory.AdmissionAmounts,
+    ) bool {
+        if (requested.hostTotalBytes() > 0 and reclaimable.hostTotalBytes() > 0) return true;
+        if (requested.backendTotalBytes() > 0 and reclaimable.backendTotalBytes() > 0) return true;
+        if (requested.kvTotalBytes() > 0 and reclaimable.kvTotalBytes() > 0) return true;
+        if (requested.scratchTotalBytes() > 0 and reclaimable.scratchTotalBytes() > 0) return true;
+        return false;
+    }
+
+    fn takeLruWhisperAssetsForAdmissionLocked(
+        self: *ModelManager,
+        requested: runtime.tier.memory.AdmissionAmounts,
+    ) ?EvictedWhisperAssets {
+        var victim_key: ?ComponentPlanKey = null;
+        var victim: ?*WhisperCompositeAssets = null;
+        var oldest_ns: u64 = std.math.maxInt(u64);
+        var it = self.whisper_assets.iterator();
+        while (it.next()) |entry| {
+            const assets = entry.value_ptr.*;
+            if (assets.active_handles != 0 or self.whisperAssetsIsInFlightLocked(assets)) continue;
+            if (!admissionReclaimRelevant(assets.reclaimableAdmission(), requested)) continue;
+            if (victim == null or assets.last_used_ns < oldest_ns) {
+                victim_key = entry.key_ptr.*;
+                victim = assets;
+                oldest_ns = assets.last_used_ns;
+            }
+        }
+        const selected = victim orelse return null;
+        const removed = self.whisper_assets.fetchRemove(victim_key.?) orelse unreachable;
+        std.debug.assert(removed.value == selected);
+        return .{ .key = removed.key, .assets = selected };
+    }
+
+    /// Called with eviction_lock held. Reclaim matching lightweight tokenizer
+    /// state before tearing down a heavyweight model. The admission attempt is
+    /// retried after every victim, so a model is still selected immediately when
+    /// tokenizer residency cannot relieve the constrained resource class.
+    fn evictOneIdleForAdmission(
+        self: *ModelManager,
+        requested: runtime.tier.memory.AdmissionAmounts,
+    ) bool {
         self.lockLoadedModels();
         const now_ns = platform.time.monotonicNs();
-        const model = self.takeLruModelLocked(now_ns, false);
-        const assets = if (model == null)
-            self.takeLruWhisperAssetsLocked(now_ns, false)
-        else
-            null;
+        const assets = self.takeLruWhisperAssetsForAdmissionLocked(requested);
+        const model = if (assets == null) self.takeLruModelLocked(now_ns, false) else null;
         self.unlockLoadedModels();
-        if (model) |evicted| {
-            self.destroyEvictedModel(evicted);
-            return true;
-        }
         if (assets) |evicted| {
             self.destroyEvictedWhisperAssets(evicted);
+            return true;
+        }
+        if (model) |evicted| {
+            self.destroyEvictedModel(evicted);
             return true;
         }
         return false;
@@ -3195,7 +3236,7 @@ pub const ModelManager = struct {
                         error.ResourceTemporarilyUnavailable => {},
                         else => return retry_err,
                     }
-                    if (!self.evictOneIdleForAdmission())
+                    if (!self.evictOneIdleForAdmission(amounts))
                         return error.ResourceTemporarilyUnavailable;
                 }
             },
@@ -3207,6 +3248,8 @@ pub const ModelManager = struct {
         self: *ModelManager,
         requests: []const runtime.tier.memory.AdmissionRequest,
     ) !runtime.tier.memory.AdmissionLease {
+        var requested = runtime.tier.memory.AdmissionAmounts{};
+        for (requests) |request| requested = try requested.merge(request.amounts);
         return self.admission.tryAcquireRequests(requests, true) catch |first_err| switch (first_err) {
             error.ResourceTemporarilyUnavailable => {
                 spinLock(&self.eviction_lock);
@@ -3218,7 +3261,7 @@ pub const ModelManager = struct {
                         error.ResourceTemporarilyUnavailable => {},
                         else => return retry_err,
                     }
-                    if (!self.evictOneIdleForAdmission())
+                    if (!self.evictOneIdleForAdmission(requested))
                         return error.ResourceTemporarilyUnavailable;
                 }
             },
@@ -3805,7 +3848,6 @@ pub const ModelManager = struct {
         while (whisper_assets_it.next()) |entry| {
             entry.value_ptr.*.deinit();
             self.allocator.destroy(entry.value_ptr.*);
-            self.allocator.free(entry.key_ptr.*);
         }
         self.whisper_assets.deinit(self.allocator);
         var it = self.loaded.iterator();
@@ -3921,7 +3963,7 @@ pub const ModelManager = struct {
 
     fn releaseWhisperAssetsLoadFlight(
         self: *ModelManager,
-        flight_key: []const u8,
+        flight_key: ComponentPlanKey,
         flight: *WhisperAssetsLoadFlight,
     ) void {
         self.lockLoadedModels();
@@ -3935,13 +3977,12 @@ pub const ModelManager = struct {
         std.debug.assert(removed.value == flight);
         self.unlockLoadedModels();
 
-        self.allocator.free(removed.key);
         self.allocator.destroy(flight);
     }
 
     fn waitForWhisperAssetsLoadFlight(
         self: *ModelManager,
-        flight_key: []const u8,
+        flight_key: ComponentPlanKey,
         flight: *WhisperAssetsLoadFlight,
     ) !WhisperAssetsHandle {
         flight.completed.waitUncancelable(flight.io);
@@ -3961,34 +4002,132 @@ pub const ModelManager = struct {
         };
     }
 
+    const ResolvedWhisperSidecars = struct {
+        allocator: std.mem.Allocator,
+        tokenizer_path: []u8,
+        config_path: []u8,
+        generation_config_path: ?[]u8,
+
+        fn deinit(self: *ResolvedWhisperSidecars) void {
+            self.allocator.free(self.tokenizer_path);
+            self.allocator.free(self.config_path);
+            if (self.generation_config_path) |path| self.allocator.free(path);
+            self.* = undefined;
+        }
+    };
+
+    fn resolveWhisperSidecars(
+        self: *ModelManager,
+        model_dir: []const u8,
+    ) !ResolvedWhisperSidecars {
+        var manifest = try manifest_mod.loadFromDir(self.allocator, model_dir);
+        defer manifest.deinit();
+        const tokenizer_path = manifest.tokenizer_json_path orelse
+            return error.TokenizerNotFound;
+        const config_path = manifest.config_path orelse
+            return error.InvalidWhisperDecoderConfig;
+
+        const owned_tokenizer_path = try self.allocator.dupe(u8, tokenizer_path);
+        errdefer self.allocator.free(owned_tokenizer_path);
+        const owned_config_path = try self.allocator.dupe(u8, config_path);
+        errdefer self.allocator.free(owned_config_path);
+
+        var receipt = try managed_receipt.loadValidated(
+            self.allocator,
+            self.componentPlanIo(),
+            model_dir,
+        );
+        defer if (receipt) |*validated| validated.deinit();
+        const generation_config_path: ?[]u8 = if (receipt) |*validated|
+            if (validated.find("generation_config.json")) |artifact|
+                try self.allocator.dupe(u8, artifact.canonical_path)
+            else
+                null
+        else
+            managed_receipt.resolveContainedArtifactPath(
+                self.allocator,
+                self.componentPlanIo(),
+                model_dir,
+                "generation_config.json",
+            ) catch |err| switch (err) {
+                error.FileNotFound => null,
+                else => return err,
+            };
+
+        return .{
+            .allocator = self.allocator,
+            .tokenizer_path = owned_tokenizer_path,
+            .config_path = owned_config_path,
+            .generation_config_path = generation_config_path,
+        };
+    }
+
+    fn whisperAssetGenerationSignature(
+        self: *ModelManager,
+        model_dir: []const u8,
+        component_paths: []const []const u8,
+    ) !ComponentPlanKey {
+        var dependencies = std.ArrayListUnmanaged([]const u8).empty;
+        defer dependencies.deinit(self.allocator);
+        try dependencies.appendSlice(self.allocator, component_paths);
+
+        const sidecar_names = [_][]const u8{
+            "tokenizer.json",
+            "config.json",
+            "generation_config.json",
+            managed_receipt.complete_filename,
+            managed_receipt.in_progress_filename,
+            managed_receipt.plan_filename,
+        };
+        var owned_paths = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (owned_paths.items) |path| self.allocator.free(path);
+            owned_paths.deinit(self.allocator);
+        }
+        try owned_paths.ensureTotalCapacity(self.allocator, sidecar_names.len);
+        for (sidecar_names) |name| {
+            const path = try std.fs.path.join(self.allocator, &.{ model_dir, name });
+            owned_paths.appendAssumeCapacity(path);
+            try dependencies.append(self.allocator, path);
+        }
+        return componentDependencySignature(self.componentPlanIo(), dependencies.items);
+    }
+
     fn loadWhisperCompositeAssetsUncached(
         self: *ModelManager,
         model_dir: []const u8,
+        component_paths: []const []const u8,
+        asset_generation: ComponentPlanKey,
     ) !*WhisperCompositeAssets {
-        const tokenizer_path = try std.fs.path.join(
-            self.allocator,
-            &.{ model_dir, "tokenizer.json" },
-        );
-        defer self.allocator.free(tokenizer_path);
+        var sidecars = try self.resolveWhisperSidecars(model_dir);
+        defer sidecars.deinit();
 
-        var managed_tokenizer = try self.loadManagedHfTokenizerFile(tokenizer_path);
+        var managed_tokenizer = try self.loadManagedHfTokenizerFile(sidecars.tokenizer_path);
         errdefer managed_tokenizer.deinit();
-        var prompt_cache = try whisper_prompt.PromptCache.init(
+        var prompt_cache = try whisper_prompt.PromptCache.initFromPaths(
             self.allocator,
-            model_dir,
+            sidecars.generation_config_path,
+            sidecars.config_path,
             managed_tokenizer.tokenizer.tokenizer(),
         );
         errdefer prompt_cache.deinit();
-        const decoder_config = encoder_decoder.loadDecoderConfig(
+        const decoder_config = try encoder_decoder.loadDecoderConfigFile(
             self.allocator,
+            sidecars.config_path,
+        );
+        const verified_generation = try self.whisperAssetGenerationSignature(
             model_dir,
-        ) catch encoder_decoder.DecoderConfig{};
+            component_paths,
+        );
+        if (!std.mem.eql(u8, asset_generation[0..], verified_generation[0..]))
+            return error.ModelArtifactsChanging;
 
         const assets = try self.allocator.create(WhisperCompositeAssets);
         assets.* = .{
             .managed_tokenizer = managed_tokenizer.take(),
             .prompt_cache = prompt_cache,
             .decoder_config = decoder_config,
+            .generation = asset_generation,
         };
         prompt_cache = undefined;
         return assets;
@@ -3996,7 +4135,7 @@ pub const ModelManager = struct {
 
     fn publishWhisperCompositeAssets(
         self: *ModelManager,
-        model_dir: []const u8,
+        asset_generation: ComponentPlanKey,
         assets: *WhisperCompositeAssets,
     ) !WhisperAssetsHandle {
         var assets_owned = true;
@@ -4004,15 +4143,11 @@ pub const ModelManager = struct {
             assets.deinit();
             self.allocator.destroy(assets);
         };
-        const key = try self.allocator.dupe(u8, model_dir);
-        var key_owned = true;
-        defer if (key_owned) self.allocator.free(key);
-
         spinLock(&self.eviction_lock);
         defer self.eviction_lock.unlock();
         while (true) {
             self.lockLoadedModels();
-            if (self.whisper_assets.get(model_dir)) |existing| {
+            if (self.whisper_assets.get(asset_generation)) |existing| {
                 existing.active_handles += 1;
                 self.unlockLoadedModels();
                 assets.deinit();
@@ -4046,8 +4181,7 @@ pub const ModelManager = struct {
             };
             assets.active_handles = 1;
             assets.last_used_ns = platform.time.monotonicNs();
-            self.whisper_assets.putAssumeCapacity(key, assets);
-            key_owned = false;
+            self.whisper_assets.putAssumeCapacity(asset_generation, assets);
             self.unlockLoadedModels();
             assets_owned = false;
             return .{ .manager = self, .assets = assets };
@@ -4060,17 +4194,22 @@ pub const ModelManager = struct {
     pub fn acquireWhisperCompositeAssets(
         self: *ModelManager,
         model_dir: []const u8,
+        component_paths: []const []const u8,
     ) !WhisperAssetsHandle {
+        const asset_generation = try self.whisperAssetGenerationSignature(
+            model_dir,
+            component_paths,
+        );
         self.lockLoadedModels();
-        if (self.whisper_assets.get(model_dir)) |assets| {
+        if (self.whisper_assets.get(asset_generation)) |assets| {
             assets.active_handles += 1;
             self.unlockLoadedModels();
             return .{ .manager = self, .assets = assets };
         }
-        if (self.in_flight_whisper_assets.get(model_dir)) |flight| {
+        if (self.in_flight_whisper_assets.get(asset_generation)) |flight| {
             flight.refs += 1;
             self.unlockLoadedModels();
-            return self.waitForWhisperAssetsLoadFlight(model_dir, flight);
+            return self.waitForWhisperAssetsLoadFlight(asset_generation, flight);
         }
 
         const flight = self.allocator.create(WhisperAssetsLoadFlight) catch |err| {
@@ -4080,36 +4219,50 @@ pub const ModelManager = struct {
         const coordination_io = self.session_manager.io orelse
             std.Io.Threaded.global_single_threaded.io();
         flight.* = .{ .io = coordination_io };
-        const flight_key = self.allocator.dupe(u8, model_dir) catch |err| {
-            self.allocator.destroy(flight);
-            self.unlockLoadedModels();
-            return err;
-        };
         self.in_flight_whisper_assets.put(
             self.allocator,
-            flight_key,
+            asset_generation,
             flight,
         ) catch |err| {
-            self.allocator.free(flight_key);
             self.allocator.destroy(flight);
             self.unlockLoadedModels();
             return err;
         };
         self.unlockLoadedModels();
 
-        const assets = self.loadWhisperCompositeAssetsUncached(model_dir) catch |err| {
+        const assets = self.loadWhisperCompositeAssetsUncached(
+            model_dir,
+            component_paths,
+            asset_generation,
+        ) catch |err| {
             self.finishWhisperAssetsLoadFlight(flight, null, err);
-            self.releaseWhisperAssetsLoadFlight(model_dir, flight);
+            self.releaseWhisperAssetsLoadFlight(asset_generation, flight);
             return err;
         };
-        const handle = self.publishWhisperCompositeAssets(model_dir, assets) catch |err| {
+        const handle = self.publishWhisperCompositeAssets(asset_generation, assets) catch |err| {
             self.finishWhisperAssetsLoadFlight(flight, null, err);
-            self.releaseWhisperAssetsLoadFlight(model_dir, flight);
+            self.releaseWhisperAssetsLoadFlight(asset_generation, flight);
             return err;
         };
         self.finishWhisperAssetsLoadFlight(flight, handle.assets, null);
-        self.releaseWhisperAssetsLoadFlight(model_dir, flight);
+        self.releaseWhisperAssetsLoadFlight(asset_generation, flight);
         return handle;
+    }
+
+    /// Verify that sessions loaded after asset acquisition still describe the
+    /// same immutable publication. A model pull may atomically replace the
+    /// directory between those operations; fail the request instead of pairing
+    /// sessions and token IDs from different generations.
+    pub fn validateWhisperAssetsCurrent(
+        self: *ModelManager,
+        handle: *const WhisperAssetsHandle,
+        model_dir: []const u8,
+        component_paths: []const []const u8,
+    ) !void {
+        const current = try self.whisperAssetGenerationSignature(model_dir, component_paths);
+        const assets = handle.get();
+        if (!std.mem.eql(u8, assets.generation[0..], current[0..]))
+            return error.ModelArtifactsChanging;
     }
 
     /// Acquire a model for the duration of one operation. The returned handle
@@ -5064,6 +5217,15 @@ test "tokenizer admission reserves parse peak and retains live structures" {
         plan.resident.host_weight_bytes,
     );
     try std.testing.expect(plan.peak.host_weight_bytes > plan.resident.host_weight_bytes);
+}
+
+test "admission eviction only considers resources that can relieve the request" {
+    const host_tokenizer = runtime.tier.memory.AdmissionAmounts{ .host_weight_bytes = 64 };
+    const host_request = runtime.tier.memory.AdmissionAmounts{ .host_weight_bytes = 32 };
+    const backend_request = runtime.tier.memory.AdmissionAmounts{ .backend_weight_bytes = 32 };
+
+    try std.testing.expect(ModelManager.admissionReclaimRelevant(host_tokenizer, host_request));
+    try std.testing.expect(!ModelManager.admissionReclaimRelevant(host_tokenizer, backend_request));
 }
 
 fn addArtifactBytes(total: *usize, allocator: std.mem.Allocator, maybe_path: ?[]const u8) !void {
@@ -6131,38 +6293,54 @@ test "split Whisper assets remain model-lifetime cached across request handles" 
 
     var manager = ModelManager.init(allocator, backends.SessionManager.init(allocator));
     defer manager.deinit();
-    manager.configureModelCache(0, 1);
+    manager.configureModelCache(0, 2);
 
-    var first = try manager.acquireWhisperCompositeAssets(root);
+    var first = try manager.acquireWhisperCompositeAssets(root, &.{});
     defer first.release();
     const cached = first.get();
     try std.testing.expectEqual(@as(usize, 99), cached.decoder_config.max_length);
     try std.testing.expectEqual(@as(i32, 7), cached.decoder_config.decoder_start_token_id);
     try std.testing.expectEqual(@as(usize, 2), cached.prompt_cache.language_tokens.len);
 
-    // A warm acquire must not reopen or parse tokenizer/config artifacts.
+    // A republished directory gets a distinct immutable generation even while
+    // requests still hold the previous tokenizer and prompt metadata.
     try dir.dir.writeFile(std.testing.io, .{
         .sub_path = "tokenizer.json",
-        .data = "not-json",
+        .data =
+        \\{"version":"1.0","added_tokens":[{"id":0,"content":"<unk>"},{"id":10,"content":"<|en|>"},{"id":11,"content":"<|es|>"},{"id":12,"content":"<|transcribe|>"},{"id":13,"content":"<|notimestamps|>"},{"id":14,"content":"new-generation"}],"model":{"type":"BPE","vocab":{"<unk>":0,"<|en|>":10,"<|es|>":11,"<|transcribe|>":12,"<|notimestamps|>":13,"new-generation":14},"merges":[]}}
+        ,
     });
-    var second = try manager.acquireWhisperCompositeAssets(root);
+    try dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "config.json",
+        .data =
+        \\{"decoder_start_token_id":17,"eos_token_id":8,"max_length":77}
+        ,
+    });
+    var second = try manager.acquireWhisperCompositeAssets(root, &.{});
     defer second.release();
-    try std.testing.expectEqual(cached, second.get());
-    try std.testing.expectEqual(@as(usize, 1), manager.whisper_assets.count());
+    try std.testing.expect(cached != second.get());
+    try std.testing.expectEqual(@as(i32, 17), second.get().decoder_config.decoder_start_token_id);
+    try std.testing.expectEqual(@as(usize, 77), second.get().decoder_config.max_length);
+    try std.testing.expectEqual(@as(usize, 2), manager.whisper_assets.count());
+    try std.testing.expectError(
+        error.ModelArtifactsChanging,
+        manager.validateWhisperAssetsCurrent(&first, root, &.{}),
+    );
+    try manager.validateWhisperAssetsCurrent(&second, root, &.{});
 
     // Capacity pressure cannot invalidate an entry while either request holds it.
     try std.testing.expectError(
         error.ResourceTemporarilyUnavailable,
-        manager.acquireWhisperCompositeAssets(other_root),
+        manager.acquireWhisperCompositeAssets(other_root, &.{}),
     );
     second.release();
     first.release();
 
-    // Once idle, the LRU entry is reclaimable and all admission-owned tokenizer
-    // memory moves to the replacement entry.
-    var replacement = try manager.acquireWhisperCompositeAssets(other_root);
+    // Once idle, the oldest generation is reclaimable and all admission-owned
+    // tokenizer memory moves to the replacement entry.
+    var replacement = try manager.acquireWhisperCompositeAssets(other_root, &.{});
     defer replacement.release();
-    try std.testing.expectEqual(@as(usize, 1), manager.whisper_assets.count());
+    try std.testing.expectEqual(@as(usize, 2), manager.whisper_assets.count());
     try std.testing.expectEqual(@as(usize, 88), replacement.get().decoder_config.max_length);
 }
 

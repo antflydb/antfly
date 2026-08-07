@@ -1168,6 +1168,15 @@ fn modelResourceBusyResponse(ctx: *httpx.Context) !httpx.Response {
     );
 }
 
+fn modelArtifactsChangingResponse(ctx: *httpx.Context) !httpx.Response {
+    return transientCapacityFailureResponse(
+        ctx,
+        "MODEL_ARTIFACTS_CHANGING",
+        "model artifacts are being published; retry with a consistent generation",
+        "model_publication",
+    );
+}
+
 fn modelLoadFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
     return switch (err) {
         error.UnknownModelCompatibility => ctx.status(400).json(.{
@@ -1183,6 +1192,7 @@ fn modelLoadFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response 
             .message = "model resource plan exceeds the configured inference budget",
         }),
         error.ResourceTemporarilyUnavailable => modelResourceBusyResponse(ctx),
+        error.ModelArtifactsChanging => modelArtifactsChangingResponse(ctx),
         else => ctx.status(500).json(.{
             .@"error" = "MODEL_LOAD_FAILED",
             .message = @errorName(err),
@@ -6770,6 +6780,10 @@ pub const Node = struct {
             defer ctx.allocator.free(paths.encoder);
             defer ctx.allocator.free(paths.decoder);
 
+            whisper_assets_handle = self.model_manager.acquireWhisperCompositeAssets(
+                model_path,
+                &.{ paths.encoder, paths.decoder },
+            ) catch |err| return modelLoadFailureResponse(ctx, err);
             var component_loader = self.model_manager.componentLoaderForPaths(
                 model_path,
                 self.session_manager.preferred_backends,
@@ -6783,8 +6797,11 @@ pub const Node = struct {
             decoder_managed = strict_loader.load(paths.decoder) catch |err|
                 return modelLoadFailureResponse(ctx, err);
             decoder_session = decoder_managed.?.session;
-            whisper_assets_handle = self.model_manager.acquireWhisperCompositeAssets(model_path) catch |err|
-                return modelLoadFailureResponse(ctx, err);
+            self.model_manager.validateWhisperAssetsCurrent(
+                &whisper_assets_handle.?,
+                model_path,
+                &.{ paths.encoder, paths.decoder },
+            ) catch |err| return modelLoadFailureResponse(ctx, err);
             const assets = whisper_assets_handle.?.get();
             tokenizer = assets.tokenizer();
             decoder_config = assets.decoder_config;
@@ -8830,6 +8847,24 @@ test "fail-fast embedding capacity response exposes retry contract" {
         @as(i64, transient_capacity_retry_after_ms),
         parsed.value.retry_after_ms,
     );
+}
+
+test "changing model publication returns an explicit retry contract" {
+    const allocator = std.testing.allocator;
+    var request = try httpx.Request.init(allocator, .POST, "/ai/v1/transcribe");
+    defer request.deinit();
+    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    defer ctx.deinit();
+
+    var response = try modelLoadFailureResponse(&ctx, error.ModelArtifactsChanging);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 503), response.status.code);
+    try std.testing.expectEqualStrings(
+        transient_capacity_retry_after_seconds,
+        response.header("Retry-After").?,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "MODEL_ARTIFACTS_CHANGING") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"retryable\":true") != null);
 }
 
 test "registerRoutesOn prefixes embed aliases and metrics route" {

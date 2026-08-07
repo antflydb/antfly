@@ -38,6 +38,30 @@ pub const PromptCache = struct {
         model_dir: []const u8,
         tokenizer: tokenizer_mod.Tokenizer,
     ) !PromptCache {
+        const generation_config_path = try std.fs.path.join(
+            allocator,
+            &.{ model_dir, "generation_config.json" },
+        );
+        defer allocator.free(generation_config_path);
+        const config_path = try std.fs.path.join(allocator, &.{ model_dir, "config.json" });
+        defer allocator.free(config_path);
+        return initFromPaths(
+            allocator,
+            generation_config_path,
+            config_path,
+            tokenizer,
+        );
+    }
+
+    /// Build prompt metadata from already-resolved artifact paths. Managed
+    /// serving uses this entry point so completion receipts remain authoritative
+    /// and a stale, unreceipted sidecar can never influence decoding.
+    pub fn initFromPaths(
+        allocator: std.mem.Allocator,
+        generation_config_path: ?[]const u8,
+        config_path: ?[]const u8,
+        tokenizer: tokenizer_mod.Tokenizer,
+    ) !PromptCache {
         var languages = std.ArrayListUnmanaged(LanguageToken).empty;
         defer languages.deinit(allocator);
         for (whisper_language_codes) |code| {
@@ -49,7 +73,11 @@ pub const PromptCache = struct {
 
         const transcribe_id = try requireSpecialToken(allocator, tokenizer, "<|transcribe|>");
         const no_timestamps_id = try requireSpecialToken(allocator, tokenizer, "<|notimestamps|>");
-        const automatic_ids = if (try loadForcedDecoderIds(allocator, model_dir)) |ids| blk: {
+        const automatic_ids = if (try loadForcedDecoderIdsFromPaths(
+            allocator,
+            generation_config_path,
+            config_path,
+        )) |ids| blk: {
             makeLanguageSlotDynamic(ids, language_tokens);
             break :blk ids;
         } else try buildAutomaticLanguagePromptFromTokens(
@@ -99,10 +127,23 @@ pub const PromptCache = struct {
 };
 
 pub fn loadForcedDecoderIds(allocator: std.mem.Allocator, model_dir: []const u8) !?[]ForcedDecoderId {
-    for ([_][]const u8{ "generation_config.json", "config.json" }) |filename| {
-        const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ model_dir, filename });
-        defer allocator.free(path);
+    const generation_config_path = try std.fs.path.join(
+        allocator,
+        &.{ model_dir, "generation_config.json" },
+    );
+    defer allocator.free(generation_config_path);
+    const config_path = try std.fs.path.join(allocator, &.{ model_dir, "config.json" });
+    defer allocator.free(config_path);
+    return loadForcedDecoderIdsFromPaths(allocator, generation_config_path, config_path);
+}
 
+fn loadForcedDecoderIdsFromPaths(
+    allocator: std.mem.Allocator,
+    generation_config_path: ?[]const u8,
+    config_path: ?[]const u8,
+) !?[]ForcedDecoderId {
+    for ([_]?[]const u8{ generation_config_path, config_path }) |maybe_path| {
+        const path = maybe_path orelse continue;
         const data = c_file.readFile(allocator, path) catch continue;
         defer allocator.free(data);
         if (try parseForcedDecoderIds(allocator, data)) |ids| return ids;
