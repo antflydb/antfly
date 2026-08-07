@@ -344,15 +344,7 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
     node.attachIo(io);
 
     try node.warmConfiguredModels(allocator);
-    if (platform.env.getenvUsize("ANTFLY_INFERENCE_TEST_FORCE_RUN_ADMISSION_DENIALS")) |count| {
-        if (count > 0) {
-            std.log.warn(
-                "enabling test-only forced inference run admission denials count={d}",
-                .{count},
-            );
-            node.configureForcedRunAdmissionDenialsForTesting(count);
-        }
-    }
+    node.configureForcedRunAdmissionDenialsFromEnvironmentForTesting();
     print("listening on {s}:{d}\n", .{ host, port });
     try node.serve(allocator, io, host, port);
 

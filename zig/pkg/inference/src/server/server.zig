@@ -1540,6 +1540,20 @@ pub const Node = struct {
         self.model_manager.configureForcedRunAdmissionDenialsForTesting(count);
     }
 
+    pub fn configureForcedRunAdmissionDenialsFromEnvironmentForTesting(
+        self: *Node,
+    ) void {
+        const count = platform.env.getenvUsize(
+            "ANTFLY_INFERENCE_TEST_FORCE_RUN_ADMISSION_DENIALS",
+        ) orelse return;
+        if (count == 0) return;
+        std.log.warn(
+            "enabling test-only forced inference run admission denials count={d}",
+            .{count},
+        );
+        self.configureForcedRunAdmissionDenialsForTesting(count);
+    }
+
     /// Configure the std.Io tokenizer scheduler and optional consumer-local
     /// tables before model load. Table memory is admitted by the cache
     /// resource budget configured above.

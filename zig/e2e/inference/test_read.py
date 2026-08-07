@@ -289,9 +289,17 @@ def test_read_recovers_after_forced_run_admission_denials():
             raise AssertionError(server.failure_diagnostic()) from exc
 
     try:
+        startup_marker = (
+            "enabling test-only forced inference run admission denials "
+            f"count={forced_denials}"
+        )
+        assert startup_marker in server.read_output(), server.failure_diagnostic()
+
         for _ in range(forced_denials):
             response = post_read()
-            assert response.status_code == 503, response.text[:2000]
+            assert response.status_code == 503, (
+                f"{response.text[:2000]}\n{server.failure_diagnostic()}"
+            )
             body = response.json()
             assert body["error"] == "MODEL_RESOURCE_BUSY"
             assert body["retryable"] is True
