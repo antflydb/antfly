@@ -385,6 +385,15 @@ fn runRecoveryPageWithConfig(
         var all_resolved = true;
 
         for (unresolved) |participant| {
+            // Retained coordinators use their self-acknowledgement as the
+            // durable handoff from the API session registry. Recovery must not
+            // invent it before that terminal API result exists.
+            if (txn.status == .committed and txn.coordinator and txn.retain_terminal and owner_participant != null and
+                std.mem.eql(u8, participant, owner_participant.?))
+            {
+                all_resolved = false;
+                continue;
+            }
             summary.notification_attempts += 1;
             config.resolve_participant_fn.?(config.resolver_ctx.?, txn.txn_id, participant, txn.status, txn.commit_version) catch {
                 summary.notification_failures += 1;
@@ -716,7 +725,6 @@ test "replicated recovery is coordinator-owned and acknowledges through hooks" {
         true,
     );
     try manager.resolveIntents(txn_id, .committed, 2_000);
-    try manager.markParticipantResolved(txn_id, coordinator);
 
     const Recorder = struct {
         resolve_calls: usize = 0,
@@ -770,10 +778,12 @@ test "replicated recovery is coordinator-owned and acknowledges through hooks" {
     try std.testing.expectEqual(@as(usize, 0), recorder.cleanup_calls);
     try std.testing.expectEqual(@as(u64, 1), stats.notification_successes);
 
-    // The worker only requested a replicated acknowledgement; it did not
-    // mutate the local coordinator metadata behind Raft's back.
+    // Recovery requested remote propagation only. It neither invented the
+    // stable API handoff acknowledgement for the coordinator itself nor
+    // mutated coordinator metadata behind Raft's back.
     const unresolved = try manager.getUnresolvedParticipants(alloc, txn_id);
     defer transactions_mod.freeParticipantList(alloc, unresolved);
-    try std.testing.expectEqual(@as(usize, 1), unresolved.len);
-    try std.testing.expectEqualStrings(remote, unresolved[0]);
+    try std.testing.expectEqual(@as(usize, 2), unresolved.len);
+    try std.testing.expectEqualStrings(coordinator, unresolved[0]);
+    try std.testing.expectEqualStrings(remote, unresolved[1]);
 }

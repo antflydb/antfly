@@ -566,3 +566,26 @@ func TestTransactionCommitUsesWriteOptions(t *testing.T) {
 		t.Fatalf("requests = %d, want no request sent after local request limit failure", requests)
 	}
 }
+
+func TestTransactionCommitPreservesAcceptedRecoveryStatus(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"status":"committed_recovery_pending","tables":{}}`))
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+	result, err := client.NewTransaction().Commit(context.Background(), map[string]BatchRequest{
+		"files": {Inserts: map[string]any{"doc-1": map[string]any{"title": "hello"}}},
+	})
+	if err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if result.Status != "committed_recovery_pending" {
+		t.Fatalf("Status = %q, want committed_recovery_pending", result.Status)
+	}
+}

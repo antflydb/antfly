@@ -1398,6 +1398,12 @@ pub const DBCore = struct {
         return try manager.getCommitVersion(txn_id);
     }
 
+    pub fn transactionDefersCoordinatorAcknowledgement(self: *DBCore, txn_id: transactions_mod.TxnId) !bool {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        return try manager.defersCoordinatorAcknowledgement(txn_id);
+    }
+
     pub fn markTransactionParticipantResolved(self: *DBCore, txn_id: transactions_mod.TxnId, participant: []const u8) !void {
         var manager = try self.initTxnManager();
         defer manager.deinit();

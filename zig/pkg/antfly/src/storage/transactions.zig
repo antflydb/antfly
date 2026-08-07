@@ -729,6 +729,13 @@ pub const TxnManager = struct {
         return (try self.loadTransactionRecord(txn_id)).visibleVersion();
     }
 
+    /// Stable API sessions keep the coordinator's self-acknowledgement pending
+    /// until their terminal response is durable in the session registry.
+    pub fn defersCoordinatorAcknowledgement(self: *TxnManager, txn_id: TxnId) !bool {
+        const record = try self.loadTransactionRecord(txn_id);
+        return record.coordinator and record.retain_terminal and record.status == .committed;
+    }
+
     pub fn listTransactions(self: *TxnManager, alloc: Allocator) ![]TxnSummary {
         return (try self.listTransactionsPage(alloc, null, std.math.maxInt(usize))).items;
     }
@@ -2420,20 +2427,24 @@ test "topology fence retains committed coordinator recovery obligations" {
     var mgr = try TxnManager.init(alloc, &store);
     defer mgr.deinit();
     const txn_id: TxnId = .{ 4, 2, 4, 2, 4, 2, 4, 2, 4, 2, 4, 2, 4, 2, 4, 2 };
-    try mgr.initTransactionWithParticipantsCreatedAtAndRole(
+    try mgr.initTransactionWithParticipantsCreatedAtRoleAndRetention(
         txn_id,
         1_000,
         900,
         &.{ "local", "remote" },
         true,
+        true,
     );
     try mgr.resolveIntents(txn_id, .committed, 2_000);
-    try mgr.markParticipantResolved(txn_id, "local");
+    try std.testing.expect(try mgr.defersCoordinatorAcknowledgement(txn_id));
 
-    // The user write is committed, but retiring this coordinator now would
-    // discard the only durable owner of remote commit propagation.
+    // A retained stable coordinator keeps its own acknowledgement unresolved
+    // until the API session result is durable. Even after remote propagation
+    // completes, topology must remain fenced across that handoff window.
     try std.testing.expect(try mgr.hasTopologySensitiveTransactions());
     try mgr.markParticipantResolved(txn_id, "remote");
+    try std.testing.expect(try mgr.hasTopologySensitiveTransactions());
+    try mgr.markParticipantResolved(txn_id, "local");
     try std.testing.expect(!try mgr.hasTopologySensitiveTransactions());
 
     // HA delivery debt is equally topology-sensitive even after every 2PC

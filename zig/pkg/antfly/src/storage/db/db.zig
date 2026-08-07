@@ -14057,6 +14057,10 @@ pub const DB = struct {
         return try self.core.getCommitVersion(txn_id);
     }
 
+    pub fn transactionDefersCoordinatorAcknowledgement(self: *DB, txn_id: transactions_mod.TxnId) !bool {
+        return try self.core.transactionDefersCoordinatorAcknowledgement(txn_id);
+    }
+
     /// Returns whether split or merge handoff would strand a pending decision,
     /// unresolved participant, intent, or HA recovery outbox.
     pub fn hasTopologySensitiveTransactions(self: *DB) !bool {

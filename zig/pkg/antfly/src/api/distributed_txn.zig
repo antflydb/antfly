@@ -349,6 +349,11 @@ pub const LocalTableWriteParticipantWorker = struct {
 
 pub const ExecuteResult = struct {
     participant_count: usize,
+    /// Stable sessions persist their terminal result before acknowledging the
+    /// coordinator itself. These coordinates identify that durable decision
+    /// record without recomputing it from mutable table routing.
+    coordinator_group_id: ?u64 = null,
+    coordinator_table_name: ?[]const u8 = null,
     /// The commit decision is durable, but at least one participant still
     /// needs phase-two delivery by foreground retry or recovery.
     propagation_pending: bool = false,
@@ -751,7 +756,11 @@ fn executeMultiTableCommitOnce(
         tw.traceEvent(&.{ .name = "CommitTransaction", .txn_id = txn_id, .shard_id = "", .timestamp = commit_version });
     }
 
-    var result: ExecuteResult = .{ .participant_count = participants.items.len };
+    var result: ExecuteResult = .{
+        .participant_count = participants.items.len,
+        .coordinator_group_id = if (participants.items.len > 0) participants.items[0].group_id else null,
+        .coordinator_table_name = if (participants.items.len > 0) participants.items[0].table_name else null,
+    };
     if (post_commit_failure) |failure| {
         if (options.report_post_commit_failure) switch (failure) {
             .visibility => return error.CommitVisibilityNotSatisfied,
@@ -1442,6 +1451,10 @@ fn abortParticipants(
         .txn_id = txn_id,
         .status = .aborted,
         .commit_version = timestamp,
+        // An abort is a transaction decision just like a commit. Do not tell
+        // the client it lost until the coordinator decision is committed and
+        // applied; follower delivery remains recoverable from that record.
+        .sync_level = .write,
     }) catch {
         const status = worker.statusGroup(
             alloc,
@@ -2009,7 +2022,9 @@ test "distributed txn coordinator never restarts a transaction id on topology ch
         null,
     ));
     try std.testing.expectEqual(@as(usize, 1), recorder.prepare_calls);
-    try std.testing.expectEqual(db_mod.types.SyncLevel.propose, recorder.resolved_sync_level);
+    // Abort decisions must be durable before the coordinator reports the
+    // prepare failure; an earlier participant may already have begun.
+    try std.testing.expectEqual(db_mod.types.SyncLevel.write, recorder.resolved_sync_level);
 }
 
 test "distributed txn coordinator returns topology failure without retry" {

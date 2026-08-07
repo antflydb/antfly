@@ -3466,6 +3466,13 @@ pub const TableWriteSource = struct {
             tables: []const distributed_txn.TableCommitRequest,
             sync_level: db_mod.types.SyncLevel,
         ) anyerror!?distributed_txn.CommitOutcome = null,
+        acknowledge_transaction_commit: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            txn_id: db_mod.types.TxnId,
+            coordinator_group_id: u64,
+            coordinator_table_name: []const u8,
+        ) anyerror!?void = null,
         batch: *const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -3864,6 +3871,17 @@ pub const TableWriteSource = struct {
         return try fn_ptr(self.ptr, alloc, txn_id, begin_timestamp, tables, sync_level);
     }
 
+    pub fn acknowledgeTransactionCommit(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+        coordinator_group_id: u64,
+        coordinator_table_name: []const u8,
+    ) !?void {
+        const fn_ptr = self.vtable.acknowledge_transaction_commit orelse return null;
+        return try fn_ptr(self.ptr, alloc, txn_id, coordinator_group_id, coordinator_table_name);
+    }
+
     pub fn batchGroupLocal(
         self: TableWriteSource,
         alloc: std.mem.Allocator,
@@ -4246,6 +4264,7 @@ pub const BoundTableWriteSource = struct {
                 .commit_transaction = commitTransaction,
                 .commit_batch = commitBatch,
                 .commit_transaction_with_id = commitTransactionWithId,
+                .acknowledge_transaction_commit = acknowledgeTransactionCommit,
                 .batch = batch,
                 .begin_bulk_ingest = beginBulkIngest,
                 .finish_bulk_ingest = finishBulkIngest,
@@ -4716,6 +4735,21 @@ pub const BoundTableWriteSource = struct {
         return try commitBoundTransaction(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, true);
     }
 
+    fn acknowledgeTransactionCommit(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+        _: u64,
+        coordinator_table_name: []const u8,
+    ) !?void {
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, self.table_name, coordinator_table_name)) return null;
+        const participant = try distributed_txn.participantIdForGroup(alloc, coordinator_table_name, 0);
+        defer alloc.free(participant);
+        try (try self.activeDb()).markTransactionParticipantResolved(txn_id, participant);
+        return {};
+    }
+
     fn commitBoundTransaction(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -4781,12 +4815,15 @@ pub const BoundTableWriteSource = struct {
         };
         db.resolveTransactionIntentsWithSyncLevel(txn_id, .committed, commit_version, sync_level) catch |err| {
             const durable_status = db.getTransactionStatus(txn_id) catch return err;
-            if (durable_status == .committed and !retain_terminal) {
-                std.log.warn("ephemeral bound transaction acknowledged after durable commit barrier failure txn_id={x} err={s}", .{
+            if (durable_status == .committed) {
+                std.log.warn("bound transaction acknowledged after durable commit barrier failure txn_id={x} err={s}", .{
                     txn_id,
                     @errorName(err),
                 });
-                return .{ .committed = .{ .participant_count = 1 } };
+                return .{ .committed = .{
+                    .participant_count = 1,
+                    .visibility_pending = retain_terminal,
+                } };
             }
             return err;
         };
@@ -11979,6 +12016,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .commit_transaction = commitTransaction,
                 .commit_batch = commitBatch,
                 .commit_transaction_with_id = commitTransactionWithId,
+                .acknowledge_transaction_commit = acknowledgeTransactionCommit,
                 .backup_table = backupTable,
                 .restore_table = restoreTable,
                 .begin_restore_lifecycle = beginRestoreLifecycle,
@@ -13201,6 +13239,25 @@ pub const ProvisionedTableWriteSource = struct {
         return try commitProvisionedTransaction(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, true);
     }
 
+    fn acknowledgeTransactionCommit(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+        coordinator_group_id: u64,
+        coordinator_table_name: []const u8,
+    ) !?void {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const participant = try distributed_txn.participantIdForGroup(alloc, coordinator_table_name, coordinator_group_id);
+        defer alloc.free(participant);
+        return try self.source().txnAcknowledgeGroupLocal(
+            alloc,
+            coordinator_group_id,
+            coordinator_table_name,
+            txn_id,
+            participant,
+        );
+    }
+
     fn commitProvisionedTransaction(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -13226,7 +13283,7 @@ pub const ProvisionedTableWriteSource = struct {
             if (comptime build_options.with_tla) tracing.stderrAntflyTraceWriter() else null,
             .{
                 .retain_terminal = retain_terminal,
-                .report_post_commit_failure = retain_terminal,
+                .report_post_commit_failure = false,
             },
         );
     }
@@ -15368,6 +15425,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .commit_transaction = commitTransaction,
                 .commit_batch = commitBatch,
                 .commit_transaction_with_id = commitTransactionWithId,
+                .acknowledge_transaction_commit = acknowledgeTransactionCommit,
                 .backup_table = backupTable,
                 .backup_table_to_location = backupTableToLocation,
                 .restore_table = restoreTable,
@@ -15617,6 +15675,24 @@ pub const HostedProvisionedTableWriteSource = struct {
         return try commitHostedTransaction(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, true);
     }
 
+    fn acknowledgeTransactionCommit(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+        coordinator_group_id: u64,
+        coordinator_table_name: []const u8,
+    ) !?void {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const participant = try distributed_txn.participantIdForGroup(alloc, coordinator_table_name, coordinator_group_id);
+        defer alloc.free(participant);
+        var worker = distributed_txn.HostedParticipantWorker.init(self.catalog, self.router, self.source(), self.executor);
+        try worker.worker().acknowledgeGroup(alloc, coordinator_group_id, coordinator_table_name, .{
+            .txn_id = txn_id,
+            .participant = participant,
+        });
+        return {};
+    }
+
     fn commitHostedTransaction(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -15641,7 +15717,7 @@ pub const HostedProvisionedTableWriteSource = struct {
             if (comptime build_options.with_tla) tracing.stderrAntflyTraceWriter() else null,
             .{
                 .retain_terminal = retain_terminal,
-                .report_post_commit_failure = retain_terminal,
+                .report_post_commit_failure = false,
             },
         );
     }
@@ -16566,10 +16642,19 @@ fn applyReplicatedTransactionMutation(
             );
             const local_participant = try distributed_txn.participantIdForGroup(alloc, table_name, group_id);
             defer alloc.free(local_participant);
-            db.markTransactionParticipantResolved(resolve.txn_id, local_participant) catch |err| switch (err) {
-                transactions_mod.TxnError.TxnNotFound => if (resolve.status != .aborted) return err,
+            // Retained coordinators keep their own acknowledgement pending
+            // until the API session registry has durably recorded the terminal
+            // response. That acknowledgement is the topology-safe handoff.
+            const defer_coordinator_ack = db.transactionDefersCoordinatorAcknowledgement(resolve.txn_id) catch |err| switch (err) {
+                transactions_mod.TxnError.TxnNotFound => if (resolve.status == .aborted) false else return err,
                 else => return err,
             };
+            if (!defer_coordinator_ack) {
+                db.markTransactionParticipantResolved(resolve.txn_id, local_participant) catch |err| switch (err) {
+                    transactions_mod.TxnError.TxnNotFound => if (resolve.status != .aborted) return err,
+                    else => return err,
+                };
+            }
         },
         .acknowledge => |ack| db.markTransactionParticipantResolved(ack.txn_id, ack.participant) catch |err| switch (err) {
             // Cleanup and acknowledgements are independently retryable Raft

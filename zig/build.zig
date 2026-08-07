@@ -4787,7 +4787,9 @@ pub fn build(b: *std.Build) void {
         .root_module = api_session_maintenance_test_mod,
         .filters = &.{
             "durable session mutations publish only after persistence succeeds",
+            "durable transaction sessions retain terminal commit coordinator handoff",
             "transaction session commit request is sealed across retries",
+            "api http server retries stable terminal commits without replaying writes",
             "transaction session registry adopts durable session ownership",
             "transaction session registry only adopts durable sessions after lease expiry",
             "transaction session registry reports status and cleans expired durable sessions",

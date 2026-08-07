@@ -3230,11 +3230,11 @@ pub const TransactionCommitRequest = struct {
 
 /// Result of an OCC transaction commit attempt.
 pub const TransactionCommitResponse = struct {
-    /// Whether the transaction was committed or aborted due to a conflict
+    /// Durable transaction outcome. Pending committed states mean the commit decision is durable while its requested visibility barrier or participant recovery is still completing.
     status: []const u8,
     /// Details about the conflict that caused an abort (only present when status is "aborted")
     conflict: ?std.json.Value = null,
-    /// Per-table batch results (only present when status is "committed")
+    /// Per-table batch results (present for every committed status)
     tables: ?std.json.ArrayHashMap(BatchResponse) = null,
 };
 
@@ -3260,11 +3260,11 @@ pub const TransactionSessionCleanupResponse = struct {
 };
 
 pub const TransactionSessionCommitResponse = struct {
-    /// Whether the transaction was committed or aborted due to a conflict
+    /// Durable transaction outcome. Pending committed states mean the commit decision is durable while its requested visibility barrier or participant recovery is still completing.
     status: []const u8,
     /// Details about the conflict that caused an abort (only present when status is "aborted")
     conflict: ?std.json.Value = null,
-    /// Per-table batch results (only present when status is "committed")
+    /// Per-table batch results (present for every committed status)
     tables: ?std.json.ArrayHashMap(BatchResponse) = null,
     transaction_id: []const u8,
 };

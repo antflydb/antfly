@@ -2470,6 +2470,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/TransactionCommitResponse'
+        '202':
+          description: Transaction committed durably with visibility or participant recovery pending
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionCommitResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
         '404':
@@ -2798,6 +2804,12 @@ paths:
       responses:
         '200':
           description: Session committed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionSessionCommitResponse'
+        '202':
+          description: Session committed durably with visibility or participant recovery pending
           content:
             application/json:
               schema:
@@ -10542,8 +10554,15 @@ components:
           type: string
           enum:
             - committed
+            - committed_visibility_pending
+            - committed_recovery_pending
             - aborted
-          description: Whether the transaction was committed or aborted due to a conflict
+          description: >
+            Durable transaction outcome. Pending committed states mean the
+
+            commit decision is durable while its requested visibility barrier
+
+            or participant recovery is still completing.
         conflict:
           type: object
           description: Details about the conflict that caused an abort (only present when status is "aborted")
@@ -10559,7 +10578,7 @@ components:
               description: Human-readable conflict description
         tables:
           type: object
-          description: Per-table batch results (only present when status is "committed")
+          description: Per-table batch results (present for every committed status)
           additionalProperties:
             $ref: '#/components/schemas/BatchResponse'
     TransactionBeginRequest:

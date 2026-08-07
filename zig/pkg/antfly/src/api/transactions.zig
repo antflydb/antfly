@@ -250,6 +250,60 @@ pub const SessionInfo = struct {
     sync_level: db_mod.types.SyncLevel,
 };
 
+pub const TerminalCommitStatus = enum {
+    committed,
+    committed_visibility_pending,
+    committed_recovery_pending,
+
+    pub fn text(self: TerminalCommitStatus) []const u8 {
+        return @tagName(self);
+    }
+};
+
+/// A durable API-level terminal result. The coordinator location is retained
+/// with the result because current routing may change after the topology fence
+/// is released. `coordinator_table_name` is owned by this value.
+pub const TerminalCommit = struct {
+    status: TerminalCommitStatus,
+    coordinator_group_id: ?u64 = null,
+    coordinator_table_name: ?[]u8 = null,
+    coordinator_acknowledged: bool = false,
+
+    pub fn deinit(self: *TerminalCommit, alloc: std.mem.Allocator) void {
+        if (self.coordinator_table_name) |table_name| alloc.free(table_name);
+        self.* = undefined;
+    }
+
+    pub fn clone(self: TerminalCommit, alloc: std.mem.Allocator) !TerminalCommit {
+        return .{
+            .status = self.status,
+            .coordinator_group_id = self.coordinator_group_id,
+            .coordinator_table_name = if (self.coordinator_table_name) |table_name| try alloc.dupe(u8, table_name) else null,
+            .coordinator_acknowledged = self.coordinator_acknowledged,
+        };
+    }
+};
+
+pub const PendingTerminalAcknowledgement = struct {
+    txn_id: db_mod.types.TxnId,
+    owner_node_id: u64,
+    coordinator_group_id: u64,
+    coordinator_table_name: []u8,
+
+    pub fn deinit(self: *PendingTerminalAcknowledgement, alloc: std.mem.Allocator) void {
+        alloc.free(self.coordinator_table_name);
+        self.* = undefined;
+    }
+};
+
+pub fn deinitPendingTerminalAcknowledgements(
+    alloc: std.mem.Allocator,
+    acknowledgements: []PendingTerminalAcknowledgement,
+) void {
+    for (acknowledgements) |*acknowledgement| acknowledgement.deinit(alloc);
+    alloc.free(acknowledgements);
+}
+
 pub const SessionStatus = struct {
     txn_id: db_mod.types.TxnId,
     owner_node_id: u64,
@@ -509,6 +563,8 @@ pub const Session = struct {
     /// present, the effective request is sealed in `staged`; retries must carry
     /// the same body (or omit it if the first attempt omitted it).
     commit_body_digest: ?[32]u8 = null,
+    /// Persisted before releasing the retained coordinator's topology fence.
+    terminal_commit: ?TerminalCommit = null,
     read_snapshots: std.StringArrayHashMapUnmanaged(SessionReadSnapshot) = .empty,
     next_savepoint_id: u64 = 1,
     savepoints: std.AutoHashMapUnmanaged(u64, Savepoint) = .empty,
@@ -524,6 +580,7 @@ pub const Session = struct {
     pub fn deinit(self: *Session, alloc: std.mem.Allocator) void {
         if (self.principal) |principal| alloc.free(principal);
         if (self.staged) |*staged| staged.deinit(alloc);
+        if (self.terminal_commit) |*terminal| terminal.deinit(alloc);
         deinitReadSnapshotMap(alloc, &self.read_snapshots);
         var it = self.savepoints.iterator();
         while (it.next()) |entry| entry.value_ptr.deinit(alloc);
@@ -544,6 +601,7 @@ pub const Session = struct {
         };
         errdefer out.deinit(alloc);
         if (self.staged) |staged| out.staged = try staged.clone(alloc);
+        if (self.terminal_commit) |terminal| out.terminal_commit = try terminal.clone(alloc);
         out.read_snapshots = try cloneReadSnapshotMap(alloc, self.read_snapshots);
         try out.savepoints.ensureUnusedCapacity(alloc, self.savepoints.count());
         var it = self.savepoints.iterator();
@@ -1267,6 +1325,167 @@ pub const SessionRegistry = struct {
         return out;
     }
 
+    /// Atomically persists the terminal API result before the coordinator's
+    /// retained self-acknowledgement is sent. Repeated calls may update the
+    /// externally visible pending state, but may not redirect the durable
+    /// decision acknowledgement to a different coordinator.
+    pub fn recordTerminalCommit(
+        self: *SessionRegistry,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+        status: TerminalCommitStatus,
+        coordinator_group_id: ?u64,
+        coordinator_table_name: ?[]const u8,
+    ) !?void {
+        if ((coordinator_group_id == null) != (coordinator_table_name == null)) return error.InvalidTransactionSessionRecord;
+        const session_lock = self.sessionLock(txn_id);
+        session_lock.lock();
+        defer session_lock.unlock();
+
+        var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
+        errdefer candidate.deinit(alloc);
+        const coordinator_acknowledged = if (candidate.terminal_commit) |terminal| blk: {
+            if (terminal.coordinator_group_id != coordinator_group_id or
+                !optionalStringsEqual(terminal.coordinator_table_name, coordinator_table_name))
+            {
+                return error.TransactionCoordinatorMismatch;
+            }
+            break :blk terminal.coordinator_acknowledged;
+        } else false;
+        if (candidate.terminal_commit) |*terminal| terminal.deinit(alloc);
+        candidate.terminal_commit = null;
+        const owned_coordinator_table_name = if (coordinator_table_name) |table_name| try alloc.dupe(u8, table_name) else null;
+        candidate.terminal_commit = .{
+            .status = status,
+            .coordinator_group_id = coordinator_group_id,
+            .coordinator_table_name = owned_coordinator_table_name,
+            .coordinator_acknowledged = coordinator_acknowledged,
+        };
+        touchSession(&candidate);
+        try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
+        try self.persistLocked(candidate);
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
+        self.publishCandidateLocked(alloc, publish_target, &candidate);
+        return {};
+    }
+
+    /// Records the durable acknowledgement receipt after the replicated
+    /// coordinator command succeeds. This prevents later API retries from
+    /// consulting a coordinator route that topology is now free to retire.
+    pub fn markTerminalCoordinatorAcknowledged(
+        self: *SessionRegistry,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+    ) !?void {
+        const session_lock = self.sessionLock(txn_id);
+        session_lock.lock();
+        defer session_lock.unlock();
+
+        var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
+        errdefer candidate.deinit(alloc);
+        const terminal = if (candidate.terminal_commit) |*value| value else return error.InvalidTransactionSessionRecord;
+        if (terminal.coordinator_group_id == null) return error.InvalidTransactionSessionRecord;
+        if (terminal.coordinator_acknowledged) return {};
+        terminal.coordinator_acknowledged = true;
+        touchSession(&candidate);
+        try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
+        try self.persistLocked(candidate);
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
+        self.publishCandidateLocked(alloc, publish_target, &candidate);
+        return {};
+    }
+
+    pub fn getTerminalCommit(
+        self: *SessionRegistry,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+    ) !?TerminalCommit {
+        const session_lock = self.sessionLock(txn_id);
+        session_lock.lock();
+        defer session_lock.unlock();
+        var session = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
+        defer session.deinit(alloc);
+        const terminal = session.terminal_commit orelse return null;
+        return try terminal.clone(alloc);
+    }
+
+    /// Returns a bounded batch of durable coordinator handoffs for background
+    /// retry. This prevents an unavailable coordinator route at response time
+    /// from turning into a permanent topology fence if the client disappears.
+    pub fn listPendingTerminalAcknowledgements(
+        self: *SessionRegistry,
+        alloc: std.mem.Allocator,
+        limit: usize,
+    ) ![]PendingTerminalAcknowledgement {
+        var pending = std.ArrayListUnmanaged(PendingTerminalAcknowledgement).empty;
+        errdefer {
+            for (pending.items) |*acknowledgement| acknowledgement.deinit(alloc);
+            pending.deinit(alloc);
+        }
+        if (limit == 0) return try pending.toOwnedSlice(alloc);
+
+        if (self.durable) |durable| {
+            const Scan = struct {
+                allocator: std.mem.Allocator,
+                limit: usize,
+                pending: *std.ArrayListUnmanaged(PendingTerminalAcknowledgement),
+
+                fn visit(raw: *anyopaque, key: []const u8, value: []const u8) anyerror!bool {
+                    const scan: *@This() = @ptrCast(@alignCast(raw));
+                    if (key.len <= session_prefix.len) return true;
+                    const txn_id = try distributed_txn.parseTxnIdHex(key[session_prefix.len..]);
+                    var session = try decodeSessionRecord(scan.allocator, txn_id, value);
+                    defer session.deinit(scan.allocator);
+                    const terminal = session.terminal_commit orelse return true;
+                    if (terminal.coordinator_acknowledged) return true;
+                    const group_id = terminal.coordinator_group_id orelse return true;
+                    const table_name = terminal.coordinator_table_name orelse return true;
+                    const owned_table_name = try scan.allocator.dupe(u8, table_name);
+                    scan.pending.append(scan.allocator, .{
+                        .txn_id = txn_id,
+                        .owner_node_id = session.owner_node_id,
+                        .coordinator_group_id = group_id,
+                        .coordinator_table_name = owned_table_name,
+                    }) catch |err| {
+                        scan.allocator.free(owned_table_name);
+                        return err;
+                    };
+                    return scan.pending.items.len < scan.limit;
+                }
+            };
+            var scan = Scan{ .allocator = alloc, .limit = limit, .pending = &pending };
+            try durable.scanPrefixWithContext(session_prefix, &scan, Scan.visit);
+        } else {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            var it = self.sessions.iterator();
+            while (it.next()) |entry| {
+                const terminal = entry.value_ptr.terminal_commit orelse continue;
+                if (terminal.coordinator_acknowledged) continue;
+                const group_id = terminal.coordinator_group_id orelse continue;
+                const table_name = terminal.coordinator_table_name orelse continue;
+                const owned_table_name = try alloc.dupe(u8, table_name);
+                pending.append(alloc, .{
+                    .txn_id = entry.key_ptr.*,
+                    .owner_node_id = entry.value_ptr.owner_node_id,
+                    .coordinator_group_id = group_id,
+                    .coordinator_table_name = owned_table_name,
+                }) catch |err| {
+                    alloc.free(owned_table_name);
+                    return err;
+                };
+                if (pending.items.len >= limit) break;
+            }
+        }
+        return try pending.toOwnedSlice(alloc);
+    }
+
     pub fn createSavepoint(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) !?SavepointInfo {
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
@@ -1548,6 +1767,9 @@ pub const SessionRegistry = struct {
             var current = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse continue;
             defer current.deinit(alloc);
             if (current.last_touched_timestamp >= cutoff_ns) continue;
+            if (current.terminal_commit) |terminal| {
+                if (terminal.coordinator_group_id != null and !terminal.coordinator_acknowledged) continue;
+            }
             try self.deletePersistent(txn_id);
             self.releaseLease(txn_id, current.owner_node_id) catch {};
             self.mutex.lock();
@@ -3344,6 +3566,28 @@ fn encodeSessionRecord(alloc: std.mem.Allocator, session: Session) ![]u8 {
     } else {
         try out.appendSlice(alloc, "null");
     }
+    try out.appendSlice(alloc, ",\"terminal_commit\":");
+    if (session.terminal_commit) |terminal| {
+        try out.appendSlice(alloc, "{\"status\":");
+        try appendJsonString(alloc, &out, terminal.status.text());
+        try out.appendSlice(alloc, ",\"coordinator_group_id\":");
+        if (terminal.coordinator_group_id) |group_id| {
+            try out.print(alloc, "{d}", .{group_id});
+        } else {
+            try out.appendSlice(alloc, "null");
+        }
+        try out.appendSlice(alloc, ",\"coordinator_table_name\":");
+        if (terminal.coordinator_table_name) |table_name| {
+            try appendJsonString(alloc, &out, table_name);
+        } else {
+            try out.appendSlice(alloc, "null");
+        }
+        try out.appendSlice(alloc, ",\"coordinator_acknowledged\":");
+        try out.appendSlice(alloc, if (terminal.coordinator_acknowledged) "true" else "false");
+        try out.append(alloc, '}');
+    } else {
+        try out.appendSlice(alloc, "null");
+    }
     try out.appendSlice(alloc, ",\"read_snapshots\":[");
     var snapshots_it = session.read_snapshots.iterator();
     var first_snapshot = true;
@@ -3438,6 +3682,41 @@ fn decodeSessionRecord(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, bod
             else => return error.InvalidTransactionSessionRecord,
         }
     }
+    if (obj.get("terminal_commit")) |terminal_value| {
+        if (terminal_value != .null) {
+            const terminal_obj = switch (terminal_value) {
+                .object => |value| value,
+                else => return error.InvalidTransactionSessionRecord,
+            };
+            const status_text = switch (terminal_obj.get("status") orelse return error.InvalidTransactionSessionRecord) {
+                .string => |value| value,
+                else => return error.InvalidTransactionSessionRecord,
+            };
+            const coordinator_group_id: ?u64 = switch (terminal_obj.get("coordinator_group_id") orelse return error.InvalidTransactionSessionRecord) {
+                .integer => |value| try nonNegativeRecordInteger(value),
+                .null => null,
+                else => return error.InvalidTransactionSessionRecord,
+            };
+            const coordinator_table_name_text: ?[]const u8 = switch (terminal_obj.get("coordinator_table_name") orelse return error.InvalidTransactionSessionRecord) {
+                .string => |value| value,
+                .null => null,
+                else => return error.InvalidTransactionSessionRecord,
+            };
+            if ((coordinator_group_id == null) != (coordinator_table_name_text == null)) return error.InvalidTransactionSessionRecord;
+            const status = std.meta.stringToEnum(TerminalCommitStatus, status_text) orelse return error.InvalidTransactionSessionRecord;
+            const coordinator_acknowledged = if (terminal_obj.get("coordinator_acknowledged")) |value| switch (value) {
+                .bool => |acknowledged| acknowledged,
+                else => return error.InvalidTransactionSessionRecord,
+            } else false;
+            const coordinator_table_name = if (coordinator_table_name_text) |value| try alloc.dupe(u8, value) else null;
+            session.terminal_commit = .{
+                .status = status,
+                .coordinator_group_id = coordinator_group_id,
+                .coordinator_table_name = coordinator_table_name,
+                .coordinator_acknowledged = coordinator_acknowledged,
+            };
+        }
+    }
     if (obj.get("read_snapshots")) |snapshots_value| {
         try decodeReadSnapshotsInto(alloc, snapshots_value, &session.read_snapshots);
     }
@@ -3471,6 +3750,11 @@ fn decodeSessionRecord(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, bod
 }
 
 fn principalsEqual(left: ?[]const u8, right: ?[]const u8) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return std.mem.eql(u8, left.?, right.?);
+}
+
+fn optionalStringsEqual(left: ?[]const u8, right: ?[]const u8) bool {
     if (left == null or right == null) return left == null and right == null;
     return std.mem.eql(u8, left.?, right.?);
 }
@@ -3700,6 +3984,56 @@ test "durable session mutations publish only after persistence succeeds" {
         owned.deinit(std.testing.allocator);
     }
     try std.testing.expectEqual(@as(usize, 0), details.status.staged_write_count);
+}
+
+test "durable transaction sessions retain terminal commit coordinator handoff" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/txn-session-terminal", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+    const path_z = try std.testing.allocator.dupeZ(u8, path);
+    defer std.testing.allocator.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(std.testing.allocator, path_z, .{});
+    defer store.close();
+    var durable = DurableSessionStore.init(std.testing.allocator, &store);
+
+    var txn_id: db_mod.types.TxnId = undefined;
+    {
+        var writer = SessionRegistry.init(&durable);
+        defer writer.deinit(std.testing.allocator);
+        const session = try writer.begin(std.testing.allocator, .{ .sync_level = .write }, 7);
+        txn_id = session.txn_id;
+        try std.testing.expect((try writer.recordTerminalCommit(
+            std.testing.allocator,
+            txn_id,
+            .committed_visibility_pending,
+            7001,
+            "docs",
+        )) != null);
+    }
+
+    var reader = SessionRegistry.init(&durable);
+    defer reader.deinit(std.testing.allocator);
+    var terminal = (try reader.getTerminalCommit(std.testing.allocator, txn_id)).?;
+    defer terminal.deinit(std.testing.allocator);
+    try std.testing.expectEqual(TerminalCommitStatus.committed_visibility_pending, terminal.status);
+    try std.testing.expectEqual(@as(?u64, 7001), terminal.coordinator_group_id);
+    try std.testing.expectEqualStrings("docs", terminal.coordinator_table_name.?);
+    try std.testing.expect(!terminal.coordinator_acknowledged);
+    try std.testing.expectError(error.TransactionCoordinatorMismatch, reader.recordTerminalCommit(
+        std.testing.allocator,
+        txn_id,
+        .committed,
+        7002,
+        "docs",
+    ));
+    try std.testing.expectEqual(@as(usize, 0), try reader.cleanupExpired(std.testing.allocator, std.math.maxInt(u64)));
+    try std.testing.expect((try reader.markTerminalCoordinatorAcknowledged(std.testing.allocator, txn_id)) != null);
+    var acknowledged = (try reader.getTerminalCommit(std.testing.allocator, txn_id)).?;
+    defer acknowledged.deinit(std.testing.allocator);
+    try std.testing.expect(acknowledged.coordinator_acknowledged);
+    try std.testing.expectEqual(@as(usize, 1), try reader.cleanupExpired(std.testing.allocator, std.math.maxInt(u64)));
 }
 
 test "durable session limits bound count and encoded record size" {

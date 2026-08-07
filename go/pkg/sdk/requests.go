@@ -320,7 +320,8 @@ type MultiBatchResult struct {
 
 // TransactionCommitResult represents the result of an OCC transaction commit.
 type TransactionCommitResult struct {
-	// Status is "committed" or "aborted".
+	// Status is "committed", "committed_visibility_pending",
+	// "committed_recovery_pending", or "aborted".
 	Status string `json:"status"`
 
 	// Conflict details (only present when status is "aborted").

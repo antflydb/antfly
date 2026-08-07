@@ -851,7 +851,14 @@ pub const AntflyApiHandler = struct {
                 defer arena_impl.deinit();
                 switch (response_mode) {
                     .transaction => {
-                        const response = try transactions_api.buildCommitResponse(arena_impl.allocator(), "committed", null, commit_req.tables);
+                        const status: []const u8 = if (committed.propagation_pending)
+                            "committed_recovery_pending"
+                        else if (committed.visibility_pending)
+                            "committed_visibility_pending"
+                        else
+                            "committed";
+                        const response = try transactions_api.buildCommitResponse(arena_impl.allocator(), status, null, commit_req.tables);
+                        if (committed.propagation_pending or committed.visibility_pending) _ = ctx.status(202);
                         return ctx.json(response);
                     },
                     .multi_batch => {
@@ -3885,6 +3892,7 @@ test "httpx multi batch route uses the batch commit hook and public response con
         batch_commit_calls: usize = 0,
         fail_batch_commit: bool = false,
         defer_batch_commit: bool = false,
+        defer_transaction_commit: bool = false,
 
         fn source(self: *@This()) table_writes.TableWriteSource {
             return .{
@@ -3916,6 +3924,10 @@ test "httpx multi batch route uses the batch commit hook and public response con
         ) anyerror!?distributed_txn.CommitOutcome {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.transaction_calls += 1;
+            if (self.defer_transaction_commit) return .{ .committed = .{
+                .participant_count = 2,
+                .visibility_pending = true,
+            } };
             return error.TestUnexpectedResult;
         }
 
@@ -3963,6 +3975,8 @@ test "httpx multi batch route uses the batch commit hook and public response con
     defer alloc.free(base_url);
     const batch_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/batch", .{base_url});
     defer alloc.free(batch_url);
+    const transaction_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/transactions/commit", .{base_url});
+    defer alloc.free(transaction_url);
     const headers = [_][2][]const u8{.{ "content-type", "application/json" }};
 
     var response = try requestWithRetry(
@@ -4001,6 +4015,24 @@ test "httpx multi batch route uses the batch commit hook and public response con
     defer pending_parsed.deinit();
     try std.testing.expectEqualStrings("committed_recovery_pending", pending_parsed.value.status);
     writes.defer_batch_commit = false;
+
+    writes.defer_transaction_commit = true;
+    var transaction_pending = try requestWithRetry(
+        &client,
+        client_io.io(),
+        .POST,
+        transaction_url,
+        "{\"read_set\":[],\"tables\":{\"users\":{\"inserts\":{\"user:3\":{\"name\":\"Carol\"}}}}}",
+        &headers,
+        20,
+    );
+    defer transaction_pending.deinit();
+    try std.testing.expectEqual(@as(u16, 202), transaction_pending.status.code);
+    var transaction_pending_parsed = try std.json.parseFromSlice(transactions_api.CommitResponse, alloc, transaction_pending.body.?, .{});
+    defer transaction_pending_parsed.deinit();
+    try std.testing.expectEqualStrings("committed_visibility_pending", transaction_pending_parsed.value.status);
+    try std.testing.expectEqual(@as(usize, 1), writes.transaction_calls);
+    writes.defer_transaction_commit = false;
 
     var rejected = try requestWithRetry(
         &client,

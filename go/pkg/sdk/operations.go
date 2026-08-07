@@ -1019,8 +1019,9 @@ func (tx *Transaction) CommitWithOptions(ctx context.Context, writes map[string]
 		return nil, fmt.Errorf("commit transaction response exceeded %d bytes", opts.MaxResponseBytes)
 	}
 
-	// Both 200 (committed) and 409 (conflict/aborted) return TransactionCommitResponse
-	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusConflict {
+	// 200 is fully visible, 202 is durably committed with post-commit work
+	// pending, and 409 is conflict/aborted. All carry the same response shape.
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusAccepted || resp.StatusCode == http.StatusConflict {
 		var result TransactionCommitResult
 		if err := json.Unmarshal(respBody, &result); err != nil {
 			return nil, fmt.Errorf("parsing commit result: %w", err)
