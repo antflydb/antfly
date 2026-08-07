@@ -70,7 +70,10 @@ pub const LoadedVisionReader = struct {
             return loadEncoderDecoderPaths(allocator, model_path, paths.encoder, paths.decoder, dec_config, loadPreprocessorConfig(allocator, model_path), &loader, null);
         } else |_| {}
 
-        var model_handle = try model_manager.acquireFromDir(model_path);
+        var model_handle = model_manager.acquireFromDir(model_path) catch |err| {
+            std.log.err("reader native model load failed model={s} err={t}", .{ model_path, err });
+            return err;
+        };
         errdefer model_handle.release();
         const model = model_handle.get();
         const florence_config = session_factory.getFlorenceConfig(model.session) orelse {
