@@ -2339,6 +2339,7 @@ pub fn build(b: *std.Build) void {
         .root_module = capi_link_mod,
         .max_rss = 2 * 1024 * 1024 * 1024,
     });
+    capi_lib.link_gc_sections = true;
     const install_capi_lib = b.addInstallArtifact(capi_lib, .{});
 
     const lite_capi_link_mod = b.createModule(.{
@@ -2355,6 +2356,7 @@ pub fn build(b: *std.Build) void {
         .root_module = lite_capi_link_mod,
         .max_rss = 2 * 1024 * 1024 * 1024,
     });
+    lite_capi_lib.link_gc_sections = true;
     const install_lite_capi_lib = b.addInstallArtifact(lite_capi_lib, .{});
     const install_lite_capi_header = b.addInstallFileWithDir(
         b.path("pkg/antfly/include/antfly.h"),
@@ -8753,6 +8755,14 @@ pub fn build(b: *std.Build) void {
                     .inference => 8 * 1024 * 1024 * 1024,
                 },
             });
+            if (unit == .distributed) {
+                // The executable and C ABI libraries share this one optimized
+                // PIC object. Give the final links enough section granularity
+                // to retain only the C ABI roots in the shared libraries while
+                // the executable retains the runtime entry points as well.
+                role_artifact.link_function_sections = true;
+                role_artifact.link_data_sections = true;
+            }
             // Zig's build runner uses these claims to run as many LLVM codegen
             // steps concurrently as fit in available RAM. The distributed
             // archive is PIC because the executable and C ABI libraries share

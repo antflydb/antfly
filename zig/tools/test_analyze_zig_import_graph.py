@@ -145,6 +145,50 @@ class ImportGraphTest(unittest.TestCase):
         self.assertFalse(report.has_file_list)
         self.assertIsNone(analyzer.report_stats(report)["repo_zig_files"])
 
+    def test_time_report_comparison_reports_shared_fraction_of_smaller_graph(self):
+        shared = self.write("zig/pkg/antfly/src/shared.zig", "pub const shared = true;\n")
+        base_only = self.write("zig/pkg/antfly/src/base.zig", "pub const base = true;\n")
+        candidate_only = self.write("zig/pkg/antfly/src/candidate.zig", "pub const candidate = true;\n")
+        base = analyzer.TimeReport("base", self.root / "base.json", {}, frozenset({shared, base_only}), True)
+        candidate = analyzer.TimeReport(
+            "candidate",
+            self.root / "candidate.json",
+            {},
+            frozenset({shared, candidate_only}),
+            True,
+        )
+
+        stats = analyzer.comparison_stats(base, candidate)
+
+        self.assertEqual(1, stats["shared_files"])
+        self.assertEqual(1, stats["shared_lines"])
+        self.assertEqual(0.5, stats["shared_fraction_of_smaller_graph"])
+
+    def test_aggregate_overlap_counts_duplicate_instances_and_groups(self):
+        storage = self.write("zig/pkg/antfly/src/storage/db.zig", "one\ntwo\n")
+        httpx = self.write("zig/lib/httpx/src/httpx.zig", "one\n")
+        unique = self.write("zig/pkg/antfly/src/unique.zig", "one\n")
+        reports = [
+            analyzer.TimeReport("one", self.root / "one.json", {}, frozenset({storage, httpx}), True),
+            analyzer.TimeReport("two", self.root / "two.json", {}, frozenset({storage, httpx, unique}), True),
+            analyzer.TimeReport("three", self.root / "three.json", {}, frozenset({storage}), True),
+        ]
+
+        stats = analyzer.aggregate_overlap_stats(reports, self.root)
+
+        self.assertTrue(stats["available"])
+        self.assertEqual(6, stats["file_instances"])
+        self.assertEqual(3, stats["unique_files"])
+        self.assertEqual(3, stats["duplicate_instances"])
+        groups = {row["name"]: row for row in stats["groups"]}
+        self.assertEqual(2, groups["zig/pkg/antfly/src/storage"]["duplicate_instances"])
+        self.assertEqual(4, groups["zig/pkg/antfly/src/storage"]["duplicate_lines"])
+        self.assertEqual(1, groups["zig/lib/httpx"]["duplicate_instances"])
+
+    def test_aggregate_overlap_requires_file_lists_from_every_report(self):
+        report = analyzer.TimeReport("old", self.root / "old.json", {}, frozenset(), False)
+
+        self.assertFalse(analyzer.aggregate_overlap_stats([report])["available"])
 
 if __name__ == "__main__":
     unittest.main()

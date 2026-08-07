@@ -4,7 +4,8 @@
 The source graph follows literal relative ``@import("*.zig")`` edges. It makes
 accidental barrel imports and surprising paths visible, but includes imports in
 lazy declarations and tests. A Zig ``--time-report`` JSON is the authoritative
-view of files that a particular compiler invocation actually analyzed.
+view of files that a particular compiler invocation actually analyzed. Passing
+multiple reports also ranks duplicate analyzed/code-generated source groups.
 """
 
 from __future__ import annotations
@@ -325,6 +326,74 @@ def grouped_files(paths: Iterable[Path], repo_root: Path = REPO_ROOT) -> list[tu
     )
 
 
+def aggregate_overlap_stats(
+    reports: Iterable[TimeReport],
+    repo_root: Path = REPO_ROOT,
+) -> dict[str, object]:
+    repo_root = repo_root.resolve()
+    materialized = tuple(reports)
+    available = bool(materialized) and all(report.has_file_list for report in materialized)
+    result: dict[str, object] = {"available": available}
+    if not available:
+        return result
+
+    occurrences = collections.Counter(
+        path
+        for report in materialized
+        for path in report.repo_files
+    )
+    duplicated = {path: count for path, count in occurrences.items() if count > 1}
+    groups: dict[str, list[tuple[Path, int]]] = collections.defaultdict(list)
+    for path, count in duplicated.items():
+        groups[source_group(path, repo_root)].append((path, count))
+
+    result.update(
+        {
+            "report_count": len(materialized),
+            "file_instances": sum(occurrences.values()),
+            "unique_files": len(occurrences),
+            "duplicate_instances": sum(count - 1 for count in occurrences.values()),
+            "duplicated_files": len(duplicated),
+            "groups": sorted(
+                (
+                    {
+                        "name": name,
+                        "files": len(entries),
+                        "lines": sum(source_lines(path) for path, _ in entries),
+                        "duplicate_instances": sum(count - 1 for _, count in entries),
+                        "duplicate_lines": sum(
+                            (count - 1) * source_lines(path)
+                            for path, count in entries
+                        ),
+                    }
+                    for name, entries in groups.items()
+                ),
+                key=lambda row: (-int(row["duplicate_lines"]), str(row["name"])),
+            ),
+        }
+    )
+    return result
+
+
+def print_aggregate_overlap(reports: Iterable[TimeReport], top_groups: int) -> None:
+    stats = aggregate_overlap_stats(reports)
+    if not stats["available"]:
+        return
+    print(f"\naggregate compiler overlap ({stats['report_count']} reports)")
+    print(f"repository file instances\t{stats['file_instances']}")
+    print(f"unique repository files\t{stats['unique_files']}")
+    print(f"duplicate instances\t{stats['duplicate_instances']}")
+    print("top duplicated repository groups\tfiles\tduplicate instances\tlines\tduplicate lines")
+    groups = stats["groups"]
+    assert isinstance(groups, list)
+    for row in groups[:top_groups]:
+        assert isinstance(row, dict)
+        print(
+            f"{row['name']}\t{row['files']}\t{row['duplicate_instances']}\t"
+            f"{row['lines']}\t{row['duplicate_lines']}"
+        )
+
+
 def print_time_report(report: TimeReport, top_groups: int) -> None:
     stats = report_stats(report)
     print(f"\ntime report {report.name}: {report.path}")
@@ -425,6 +494,7 @@ def json_report(
     union_stats = graph.stats(role_union)
     report["server_role_union"] = {"files": union_stats.files, "lines": union_stats.lines}
     report["time_reports"] = {item.name: report_stats(item) for item in time_reports}
+    report["aggregate_compiler_overlap"] = aggregate_overlap_stats(time_reports)
     report["comparisons"] = [comparison_stats(base, candidate) for base, candidate in comparisons]
     return report
 
@@ -533,6 +603,7 @@ def main(argv: list[str] | None = None) -> int:
             print_report(graph, graphs, args.largest)
             for report in reports.values():
                 print_time_report(report, args.top_groups)
+            print_aggregate_overlap(reports.values(), args.top_groups)
             for base, candidate in comparisons:
                 print_comparison(base, candidate, args.top_groups)
         if args.show_path:
