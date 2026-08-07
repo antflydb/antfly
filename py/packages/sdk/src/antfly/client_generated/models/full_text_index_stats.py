@@ -34,7 +34,7 @@ class FullTextIndexStats:
         backfill_active (bool | Unset): Whether the index is actively rebuilding, replaying, or catching up.
         backfill_progress (float | Unset): Progress of ongoing rebuild as fraction [0.0, 1.0]
         backfill_items_processed (int | Unset): Number of documents indexed during current rebuild
-        backfill_state (str | Unset): Operational readiness state such as ready, running, retrying, or failed.
+        backfill_state (str | Unset): Operational readiness state such as ready, running, retrying, degraded, or failed.
         doc_count (int | Unset): Number of documents visible to the index.
         term_count (int | Unset): Number of indexed terms when available.
         replay_applied_sequence (int | Unset): Highest replay sequence applied to the index runtime.

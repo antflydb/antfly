@@ -33,12 +33,17 @@ class DerivedCoverageStatus:
         terminal_failed (int): Source documents whose generation failed non-retryably.
         covered (int): Raw terminal source outcomes counted by the configured policy. This may exceed source_total only
             while observation_complete is false with counter_mismatch.
-        pending (int | None): Source documents without a policy-accepted terminal outcome. Null when observations are
-            incomplete and the global value is unknown.
+        settled (int): Source documents with any durable terminal outcome: produced, intentionally skipped, or
+            terminally failed.
+        uncovered (int | None): Source documents without an outcome accepted by the configured coverage policy. Null
+            when observations are incomplete.
+        pending (int | None): Source documents that have not reached any terminal outcome and may still be processing.
+            Null when observations are incomplete.
         complete (bool): Whether observations are complete, replay has reached its target, and every observed source has
             an outcome accepted by the policy.
         healthy (bool): Whether coverage is complete without terminal failures.
-        degraded (bool): Whether coverage is complete under best_effort but includes terminal failures.
+        degraded (bool): Whether all sources are settled but one or more have terminal failures requiring operator
+            attention.
     """
 
     policy: DerivedCoverageStatusPolicy
@@ -52,6 +57,8 @@ class DerivedCoverageStatus:
     skipped: int
     terminal_failed: int
     covered: int
+    settled: int
+    uncovered: int | None
     pending: int | None
     complete: bool
     healthy: bool
@@ -83,6 +90,11 @@ class DerivedCoverageStatus:
 
         covered = self.covered
 
+        settled = self.settled
+
+        uncovered: int | None
+        uncovered = self.uncovered
+
         pending: int | None
         pending = self.pending
 
@@ -107,6 +119,8 @@ class DerivedCoverageStatus:
                 "skipped": skipped,
                 "terminal_failed": terminal_failed,
                 "covered": covered,
+                "settled": settled,
+                "uncovered": uncovered,
                 "pending": pending,
                 "complete": complete,
                 "healthy": healthy,
@@ -148,6 +162,15 @@ class DerivedCoverageStatus:
 
         covered = d.pop("covered")
 
+        settled = d.pop("settled")
+
+        def _parse_uncovered(data: object) -> int | None:
+            if data is None:
+                return data
+            return cast(int | None, data)
+
+        uncovered = _parse_uncovered(d.pop("uncovered"))
+
         def _parse_pending(data: object) -> int | None:
             if data is None:
                 return data
@@ -173,6 +196,8 @@ class DerivedCoverageStatus:
             skipped=skipped,
             terminal_failed=terminal_failed,
             covered=covered,
+            settled=settled,
+            uncovered=uncovered,
             pending=pending,
             complete=complete,
             healthy=healthy,
