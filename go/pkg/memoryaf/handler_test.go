@@ -191,11 +191,37 @@ func TestStoreMemory_WithExtractor(t *testing.T) {
 	h.Close()
 
 	mc.mu.Lock()
+	defer mc.mu.Unlock()
 	// 1 batch for the memory insert + 2 for entity extraction (nodes + edges).
 	if len(mc.batches) != 3 {
 		t.Errorf("expected 3 batches (insert + entity nodes + edges), got %d", len(mc.batches))
+		return
 	}
-	mc.mu.Unlock()
+	entityBatch := mc.batches[1]
+	if len(entityBatch.Inserts) != 0 {
+		t.Fatalf("entity upsert must not overwrite existing documents: %+v", entityBatch.Inserts)
+	}
+	if len(entityBatch.Transforms) != 2 {
+		t.Fatalf("expected 2 entity transforms, got %+v", entityBatch.Transforms)
+	}
+	for _, transform := range entityBatch.Transforms {
+		if !transform.Upsert {
+			t.Fatalf("entity transform must upsert missing nodes: %+v", transform)
+		}
+		foundFirstSeen := false
+		foundIncrement := false
+		for _, op := range transform.Operations {
+			if op.Path == "$.first_seen" {
+				foundFirstSeen = op.Op == client.TransformOpTypeSetOnInsert
+			}
+			if op.Path == "$.mention_count" && op.Op == client.TransformOpTypeInc {
+				foundIncrement = true
+			}
+		}
+		if !foundFirstSeen || !foundIncrement {
+			t.Fatalf("entity transform must preserve first_seen and increment mentions: %+v", transform)
+		}
+	}
 }
 
 func TestGetMemory(t *testing.T) {
@@ -500,6 +526,81 @@ func TestBuildFilterQuery_ExplicitVisibility(t *testing.T) {
 	// Should NOT contain the team disjunction.
 	if strings.Contains(s, "disjuncts") {
 		t.Errorf("explicit visibility should not produce disjunction: %s", s)
+	}
+}
+
+func TestBuildFilterQuery_AdminDefaultIncludesAllMemoriesOnly(t *testing.T) {
+	admin := &UserContext{UserID: "admin1", Role: "admin"}
+	q := buildFilterQuery(filterOpts{}, admin)
+	if q == nil {
+		t.Fatal("expected an admin memory-only visibility filter")
+	}
+	data, _ := json.Marshal(q)
+	s := string(data)
+	if !strings.Contains(s, VisibilityTeam) || !strings.Contains(s, VisibilityPrivate) {
+		t.Fatalf("expected admin filter to include team and private memories, got: %s", s)
+	}
+	if strings.Contains(s, "admin1") || strings.Contains(s, "created_by") {
+		t.Fatalf("admin filter must not be owner-restricted, got: %s", s)
+	}
+}
+
+func TestAdminReadPathsUseNamespaceWideMemoryFilter(t *testing.T) {
+	mc := newMockClient()
+	mc.queryFn = func(body []byte) ([]byte, error) {
+		var req map[string]any
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Fatalf("unmarshal query: %v", err)
+		}
+		filterJSON, _ := json.Marshal(req["filter_query"])
+		filter := string(filterJSON)
+		if !strings.Contains(filter, VisibilityTeam) || !strings.Contains(filter, VisibilityPrivate) {
+			t.Fatalf("admin query must include both memory visibilities: %s", filter)
+		}
+		if strings.Contains(filter, "admin1") || strings.Contains(filter, "created_by") {
+			t.Fatalf("admin query must not be owner-restricted: %s", filter)
+		}
+
+		if aggregations, ok := req["aggregations"].(map[string]any); ok {
+			response := queryResponse{Responses: []queryResult{{
+				Hits: queryHits{Total: exactQueryHitsTotal(2)},
+				Aggregations: map[string]aggregationResult{
+					"by_session": {Buckets: []aggregationBucket{{Key: "shared-session", DocCount: 2}}},
+				},
+			}}}
+			if len(aggregations) > 1 {
+				response.Responses[0].Aggregations["by_visibility"] = aggregationResult{Buckets: []aggregationBucket{
+					{Key: VisibilityTeam, DocCount: 1},
+					{Key: VisibilityPrivate, DocCount: 1},
+				}}
+			}
+			return json.Marshal(response)
+		}
+
+		return mockQueryHit("mem:private", map[string]any{
+			"content":    "another user's private memory",
+			"created_by": "user2",
+			"visibility": VisibilityPrivate,
+		}), nil
+	}
+	h := newTestHandler(mc, nil)
+	admin := UserContext{UserID: "admin1", Namespace: "default", Role: "admin"}
+
+	memories, err := h.ListMemories(context.Background(), ListMemoriesArgs{}, admin)
+	if err != nil || len(memories) != 1 {
+		t.Fatalf("ListMemories admin override: memories=%+v err=%v", memories, err)
+	}
+	results, err := h.SearchMemories(context.Background(), SearchMemoriesArgs{Query: "private"}, admin)
+	if err != nil || len(results) != 1 {
+		t.Fatalf("SearchMemories admin override: results=%+v err=%v", results, err)
+	}
+	stats, err := h.GetStats(context.Background(), MemoryStatsArgs{}, admin)
+	if err != nil || stats.TotalMemories != 2 || stats.ByVisibility[VisibilityPrivate] != 1 {
+		t.Fatalf("GetStats admin override: stats=%+v err=%v", stats, err)
+	}
+	sessions, err := h.ListSessions(context.Background(), ListSessionsArgs{}, admin)
+	if err != nil || len(sessions) != 1 || sessions[0].MemoryCount != 2 {
+		t.Fatalf("ListSessions admin override: sessions=%+v err=%v", sessions, err)
 	}
 }
 

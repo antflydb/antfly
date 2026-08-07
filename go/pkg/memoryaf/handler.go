@@ -316,8 +316,14 @@ func buildFilterQuery(opts filterOpts, ctx *UserContext) *query.Query {
 		clauses = append(clauses, conj)
 	} else if ctx != nil && opts.Visibility == "" {
 		teamQ := query.NewTerm(VisibilityTeam, "visibility")
-		ownerQ := query.NewTerm(ctx.UserID, "created_by")
-		disj := query.DisjunctionQuery{Disjuncts: []query.Query{teamQ, ownerQ}}.ToQuery()
+		secondQ := query.NewTerm(ctx.UserID, "created_by")
+		if ctx.Role == "admin" {
+			// Keep a memory-only predicate for administrators rather than
+			// dropping visibility filtering entirely. Entity documents share the
+			// table but do not have a visibility field and must not affect stats.
+			secondQ = query.NewTerm(VisibilityPrivate, "visibility")
+		}
+		disj := query.DisjunctionQuery{Disjuncts: []query.Query{teamQ, secondQ}}.ToQuery()
 		clauses = append(clauses, disj)
 	} else if opts.Visibility != "" {
 		clauses = append(clauses, query.NewTerm(opts.Visibility, "visibility"))
@@ -1181,36 +1187,34 @@ func (h *Handler) extractAndLinkEntities(ctx context.Context, memoryID, content,
 	mKey := memoryKey(memoryID)
 	now := time.Now().UTC().Format(time.RFC3339)
 
-	// Build entity node inserts and transforms together to reduce round-trips.
-	inserts := make(map[string]any, len(filtered)+1)
+	// Upsert entity nodes entirely through transforms. This preserves the
+	// RFC3339 first_seen string without relying on numeric $min and avoids an
+	// insert overwriting an existing entity's counters or timestamps.
 	var transforms []client.Transform
 	edgesByType := make(map[string][]map[string]any, 1)
 	for _, entity := range filtered {
 		eKey := entityKey(entity.Label, entity.Text)
-		inserts[eKey] = map[string]any{
-			"entity_type":   entityDocType,
-			"text":          entity.Text,
-			"label":         entity.Label,
-			"mention_count": 0,
-			"first_seen":    now,
-			"last_seen":     now,
-		}
 		edgesByType["mentions"] = append(edgesByType["mentions"], map[string]any{
 			"target": eKey,
 			"weight": entity.Score,
 		})
 		transforms = append(transforms, client.Transform{
-			Key: eKey,
+			Key:    eKey,
+			Upsert: true,
 			Operations: []client.TransformOp{
+				{Op: client.TransformOpTypeSetOnInsert, Path: "$.entity_type", Value: entityDocType},
+				{Op: client.TransformOpTypeSetOnInsert, Path: "$.text", Value: entity.Text},
+				{Op: client.TransformOpTypeSetOnInsert, Path: "$.label", Value: entity.Label},
+				{Op: client.TransformOpTypeSetOnInsert, Path: "$.mention_count", Value: 0},
+				{Op: client.TransformOpTypeSetOnInsert, Path: "$.first_seen", Value: now},
 				{Op: client.TransformOpTypeInc, Path: "$.mention_count", Value: 1},
-				{Op: client.TransformOpTypeMin, Path: "$.first_seen", Value: now},
 				{Op: client.TransformOpTypeSet, Path: "$.last_seen", Value: now},
 			},
 		})
 	}
 
-	// Batch 1: entity node upserts + mention count transforms.
-	if _, err := h.client.Batch(ctx, table, client.BatchRequest{Inserts: inserts, Transforms: transforms}); err != nil {
+	// Batch 1: atomic entity node upserts and counter/timestamp transforms.
+	if _, err := h.client.Batch(ctx, table, client.BatchRequest{Transforms: transforms}); err != nil {
 		h.logger.Warn("entity node batch failed", zap.Error(err))
 	}
 

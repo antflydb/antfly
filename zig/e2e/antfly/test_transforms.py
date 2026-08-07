@@ -101,6 +101,39 @@ def test_transform_max_keeps_latest_value(stateful_api):
     assert doc["data"] == "updated with v10"
 
 
+def test_transform_min_keeps_lowest_value_and_upserts(stateful_api):
+    table_name = f"transforms_min_{time.time_ns()}"
+    stateful_api.create_table(table_name, num_shards=1)
+    stateful_api.batch_write(
+        table_name,
+        inserts={"item-1": {"name": "test-item", "priority": 5}},
+        sync_level="write",
+    )
+
+    stateful_api.batch_write(
+        table_name,
+        transforms=[_transform("item-1", _op("$min", "priority", 10), _op("$min", "missing", 7))],
+        sync_level="write",
+    )
+    doc = stateful_api.lookup_key(table_name, "item-1")
+    assert doc["priority"] == 5
+    assert doc["missing"] == 7
+
+    stateful_api.batch_write(
+        table_name,
+        transforms=[_transform("item-1", _op("$min", "priority", 2))],
+        sync_level="write",
+    )
+    assert stateful_api.lookup_key(table_name, "item-1")["priority"] == 2
+
+    stateful_api.batch_write(
+        table_name,
+        transforms=[_transform("upsert-item", _op("$min", "priority", 4), upsert=True)],
+        sync_level="write",
+    )
+    assert stateful_api.lookup_key(table_name, "upsert-item")["priority"] == 4
+
+
 def test_transform_upsert_with_max(stateful_api):
     table_name = f"transforms_upsert_{time.time_ns()}"
     stateful_api.create_table(table_name, num_shards=1)
@@ -280,7 +313,7 @@ def test_transform_multiple_operators(stateful_api):
 
 @pytest.mark.parametrize(
     "operator",
-    ("$push", "$pull", "$pop", "$mul", "$min", "$currentDate", "$rename"),
+    ("$push", "$pull", "$pop", "$mul", "$currentDate", "$rename"),
 )
 def test_unsupported_transform_is_rejected_without_partial_mutation(stateful_api, operator):
     table_name = f"transforms_unsupported_{time.time_ns()}"

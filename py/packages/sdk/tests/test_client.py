@@ -8,7 +8,10 @@ from httpx import Timeout
 
 from antfly import AntflyClient, AntflyException  # noqa: E402
 from antfly.client import normalize_base_url  # noqa: E402
+from antfly.client_generated.models.batch_request import BatchRequest  # noqa: E402
 from antfly.client_generated.models.sort_profile import SortProfile  # noqa: E402
+from antfly.client_generated.models.transform import Transform  # noqa: E402
+from antfly.client_generated.models.transform_op import TransformOp  # noqa: E402
 from antfly.client_generated.models.transform_op_type import TransformOpType  # noqa: E402
 from antfly.client_generated.types import Unset  # noqa: E402
 
@@ -24,8 +27,27 @@ class TestAntflyClient:
             "INC": "$inc",
             "PUSH": "$push",
             "ADD_TO_SET": "$addToSet",
+            "MIN": "$min",
             "MAX": "$max",
         }
+
+    def test_min_transform_serializes_from_generated_models(self) -> None:
+        request = BatchRequest(
+            transforms=[
+                Transform(
+                    key="doc-1",
+                    operations=[TransformOp(op=TransformOpType.MIN, path="priority", value=4)],
+                )
+            ]
+        )
+
+        assert request.to_dict()["transforms"] == [
+            {
+                "key": "doc-1",
+                "operations": [{"op": "$min", "path": "priority", "value": 4}],
+                "upsert": False,
+            }
+        ]
 
     def test_sort_profile_uses_closed_public_diagnostic_shape(self) -> None:
         """SortProfile keeps stable fields typed and drops internal counters."""

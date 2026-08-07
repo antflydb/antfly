@@ -894,7 +894,7 @@ pub const BatchRequest = struct {
     inserts: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Array of document IDs to delete. Documents are removed from all indexes. Notes: - Non-existent keys are silently ignored - Deletions are processed before inserts in the same batch - Keys are permanently removed from storage and indexes
     deletes: ?[]const []const u8 = null,
-    /// Array of transform operations for in-place document updates using MongoDB-style operators. Transform operations allow you to modify documents without read-modify-write races: - Operations are applied atomically on the server - Multiple operations per document are applied in sequence - Supports numeric and set-like operations ($inc, $max, $addToSet) Common use cases: - Increment counters (views, likes, votes) - Update timestamps ($set) - Add unique array values ($addToSet) - Update nested fields without overwriting the entire document
+    /// Array of transform operations for in-place document updates using MongoDB-style operators. Transform operations allow you to modify documents without read-modify-write races: - Operations are applied atomically on the server - Multiple operations per document are applied in sequence - Supports numeric and set-like operations ($inc, $min, $max, $addToSet) Common use cases: - Increment counters (views, likes, votes) - Update timestamps ($set) - Add unique array values ($addToSet) - Update nested fields without overwriting the entire document
     transforms: ?[]const Transform = null,
     sync_level: ?SyncLevel = null,
 };
@@ -6943,7 +6943,7 @@ pub const ReplicationSourceStatus = struct {
 };
 
 pub const ReplicationTransformOp = struct {
-    /// Transform operation. Supported ops: `$set`, `$setOnInsert`, `$unset`, `$inc`, `$push`, `$addToSet`, `$max`. Replication-specific: `$merge` (flatten JSONB into top-level fields), `$delete_document` (delete entire Antfly doc, `on_delete` only).
+    /// Transform operation. Supported ops: `$set`, `$setOnInsert`, `$unset`, `$inc`, `$push`, `$addToSet`, `$min`, `$max`. Replication-specific: `$merge` (flatten JSONB into top-level fields), `$delete_document` (delete entire Antfly doc, `on_delete` only).
     op: []const u8,
     /// Antfly document field path. Required for `$set`, `$unset`, etc.
     path: ?[]const u8 = null,
@@ -8386,6 +8386,7 @@ pub const TransformOpType = enum {
     @"$inc",
     @"$push",
     @"$add_to_set",
+    @"$min",
     @"$max",
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -8396,6 +8397,7 @@ pub const TransformOpType = enum {
             .@"$inc" => "$inc",
             .@"$push" => "$push",
             .@"$add_to_set" => "$addToSet",
+            .@"$min" => "$min",
             .@"$max" => "$max",
         };
         try jw.write(s);
@@ -8413,6 +8415,7 @@ pub const TransformOpType = enum {
             .{ "$inc", .@"$inc" },
             .{ "$push", .@"$push" },
             .{ "$addToSet", .@"$add_to_set" },
+            .{ "$min", .@"$min" },
             .{ "$max", .@"$max" },
         });
         return map.get(s) orelse error.UnexpectedToken;
