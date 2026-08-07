@@ -4764,7 +4764,6 @@ pub const ApiHttpServer = struct {
                     error.InvalidGraphEdges,
                     error.UnsupportedTransformOperation,
                     => return try textResponse(self.alloc, 400, "invalid transaction commit request"),
-                    error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
                     else => return err,
                 };
                 if (try self.validateCommitReadSet(commit_req)) |conflict| {

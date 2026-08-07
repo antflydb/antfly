@@ -736,10 +736,6 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(400);
                 return ctx.text("invalid transaction commit request");
             },
-            error.TableNotFound => {
-                _ = ctx.status(404);
-                return ctx.text("not found");
-            },
             else => return err,
         };
         if (try self.api_server.validateCommitReadSet(commit_req.*)) |conflict| {

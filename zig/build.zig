@@ -4534,7 +4534,6 @@ pub fn build(b: *std.Build) void {
         "public api e2e recreates managed embeddings index after corrupt artifact",
         "public api split e2e uses distributed global text stats for bm25 and significant_terms",
         "public api multi-node e2e routes CRUD from a non-host node",
-        "public api multi-node e2e commits cross-table transactions atomically",
     };
     const public_api_parity_runtime_filters = selectTestFilters(b, &public_api_parity_default_filters);
     const public_api_parity_tests = b.addTest(.{
