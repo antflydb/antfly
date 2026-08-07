@@ -686,10 +686,10 @@ fn restorePersistedRuntimeStatus(runtime: anytype, persisted_status: enrichment_
     runtime.fatal_error_count = persisted_status.fatal_error_count;
     runtime.skipped_source_count = persisted_status.skipped_source_count;
     runtime.consecutive_retry_count = persisted_status.consecutive_retry_count;
-    runtime.next_retry_at_ms = persisted_status.next_retry_at_ms;
     runtime.retry_failure_fingerprint = persisted_status.retry_failure_fingerprint;
     runtime.active_failure_fingerprint = 0;
     runtime.retrying = persisted_status.retrying and !persisted_status.worker_failed;
+    runtime.next_retry_at_ms = if (runtime.retrying) persisted_status.next_retry_at_ms else 0;
     runtime.worker_failed = persisted_status.worker_failed;
     runtime.target_sequence = @max(runtime.applied_sequence, persisted_status.target_sequence);
 }
@@ -753,12 +753,14 @@ test "enrichment runtime restore does not resume persisted fatal failure" {
         .target_sequence = 4,
         .error_count = 1,
         .fatal_error_count = 1,
+        .next_retry_at_ms = 1234,
         .retrying = true,
         .worker_failed = true,
     });
 
     try std.testing.expectEqual(@as(u64, 7), runtime.target_sequence);
     try std.testing.expect(!runtime.retrying);
+    try std.testing.expectEqual(@as(u64, 0), runtime.next_retry_at_ms);
     try std.testing.expect(runtime.worker_failed);
 }
 
@@ -1900,6 +1902,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         self.error_count += 1;
         self.fatal_error_count += 1;
         self.retrying = false;
+        self.next_retry_at_ms = 0;
         self.worker_failed = true;
         if (self.last_error_name == null) self.last_error_name = @errorName(err);
         status = runtimeStatusSnapshot(self);
@@ -2022,13 +2025,10 @@ fn freeAffectedIndexes(runtime: *EnrichmentRuntime, indexes: [][]u8) void {
     runtime.alloc.free(indexes);
 }
 
-fn recordIsolatedRequestError(runtime: *EnrichmentRuntime, window: ?*GeneratedReplayWindow, request: enrichment_types.GeneratedEnrichmentRequest, err: anyerror) void {
+fn recordIsolatedRequestError(runtime: *EnrichmentRuntime, window: ?*GeneratedReplayWindow, request: enrichment_types.GeneratedEnrichmentRequest, err: anyerror) !void {
     std.log.warn("enrichment request failed index={s} artifact={s}: {s}", .{ request.index_name, requestEmbeddingName(request), @errorName(err) });
     const owned_indexes = if (runtime.coverage_apply_mutex != null)
-        affectedIndexesForRequestAlloc(runtime, request) catch |index_err| blk: {
-            std.log.err("failed to resolve enrichment request consumers index={s} doc={s}: {s}", .{ request.index_name, request.doc_key, @errorName(index_err) });
-            break :blk null;
-        }
+        try affectedIndexesForRequestAlloc(runtime, request)
     else
         null;
     defer if (owned_indexes) |indexes| freeAffectedIndexes(runtime, indexes);
@@ -2037,17 +2037,15 @@ fn recordIsolatedRequestError(runtime: *EnrichmentRuntime, window: ?*GeneratedRe
     const attempt_number = requestAttemptNumber(runtime);
 
     if (runtime.coverage_apply_mutex != null) {
-        if (window) |active_window| queueDerivedCoverageOutcome(runtime, active_window, request.doc_key, indexes, .terminal_failed) catch |coverage_err| {
-            std.log.err("failed to persist terminal coverage outcome index={s} doc={s}: {s}", .{ request.index_name, request.doc_key, @errorName(coverage_err) });
+        if (window) |active_window| {
+            try queueDerivedCoverageOutcome(runtime, active_window, request.doc_key, indexes, .terminal_failed);
         } else for (indexes) |index_name| {
-            markDerivedCoverageTerminalFailedForIndex(runtime, index_name, request.doc_key) catch |coverage_err| {
-                std.log.err("failed to persist terminal coverage outcome index={s} doc={s}: {s}", .{ index_name, request.doc_key, @errorName(coverage_err) });
-            };
+            try markDerivedCoverageTerminalFailedForIndex(runtime, index_name, request.doc_key);
         }
     }
     for (indexes) |index_name| {
         if (runtime.failure_ctx) |failure_ctx| {
-            if (runtime.failure_fn) |failure_fn| failure_fn(failure_ctx, .{
+            if (runtime.failure_fn) |failure_fn| try failure_fn(failure_ctx, .{
                 .kind = request.kind,
                 .index_name = index_name,
                 .artifact_name = switch (request.kind) {
@@ -2058,9 +2056,7 @@ fn recordIsolatedRequestError(runtime: *EnrichmentRuntime, window: ?*GeneratedRe
                 .error_name = @errorName(err),
                 .attempts = attempt_number,
                 .sequence = request.sequence,
-            }) catch |record_err| {
-                std.log.err("failed to park enrichment request index={s} doc={s}: {s}", .{ index_name, request.doc_key, @errorName(record_err) });
-            };
+            });
         }
     }
     if (runtime.io_impl) |io_impl| {
@@ -2069,6 +2065,7 @@ fn recordIsolatedRequestError(runtime: *EnrichmentRuntime, window: ?*GeneratedRe
         runtime.error_count += 1;
         runtime.fatal_error_count += 1;
         runtime.retrying = false;
+        runtime.next_retry_at_ms = 0;
         runtime.worker_failed = false;
         for (indexes) |index_name| if (index_name.len > 0) markIsolatedFailedIndex(runtime, index_name);
         runtime.mutex.unlock(io);
@@ -2076,6 +2073,7 @@ fn recordIsolatedRequestError(runtime: *EnrichmentRuntime, window: ?*GeneratedRe
         runtime.error_count += 1;
         runtime.fatal_error_count += 1;
         runtime.retrying = false;
+        runtime.next_retry_at_ms = 0;
         runtime.worker_failed = false;
         for (indexes) |index_name| if (index_name.len > 0) markIsolatedFailedIndex(runtime, index_name);
     }
@@ -2090,6 +2088,47 @@ const TestFailureCapture = struct {
         self.failure = failure;
     }
 };
+
+const TestFailureRecorderError = struct {
+    fn record(_: *anyopaque, _: RequestFailure) !void {
+        return error.TestRepairLedgerUnavailable;
+    }
+};
+
+test "isolated enrichment request does not advance when durable parking fails" {
+    var recorder = TestFailureRecorderError{};
+    var runtime = EnrichmentRuntime{
+        .alloc = std.testing.allocator,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .failure_ctx = &recorder,
+        .failure_fn = TestFailureRecorderError.record,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .ownership = undefined,
+    };
+    runtime.retrying = true;
+    runtime.next_retry_at_ms = 1234;
+
+    try std.testing.expectError(error.TestRepairLedgerUnavailable, recordIsolatedRequestError(&runtime, null, .{
+        .kind = .dense_embedding,
+        .index_name = "semantic",
+        .embedding_name = "dense_v1",
+        .doc_key = "doc:1",
+        .source_field = "body",
+        .sequence = 7,
+    }, error.EmbedRateLimited));
+    try std.testing.expect(runtime.retrying);
+    try std.testing.expectEqual(@as(u64, 1234), runtime.next_retry_at_ms);
+    try std.testing.expectEqual(@as(u64, 0), runtime.error_count);
+}
 
 test "isolated enrichment request error does not mark worker failed" {
     var failure_capture = TestFailureCapture{};
@@ -2117,7 +2156,7 @@ test "isolated enrichment request error does not mark worker failed" {
     runtime.active_failure_fingerprint = 41;
     runtime.target_sequence = 17;
 
-    recordIsolatedRequestError(&runtime, null, .{
+    try recordIsolatedRequestError(&runtime, null, .{
         .kind = .dense_embedding,
         .index_name = "bad_visual",
         .embedding_name = "clipclap",
@@ -2321,22 +2360,22 @@ fn processPendingDocumentGroup(
         switch (request.kind) {
             .asset => processAsset(runtime, request, deferred_assets, window) catch |err| {
                 if (shouldYieldRequestError(runtime, err)) return err;
-                recordIsolatedRequestError(runtime, window, request, err);
+                try recordIsolatedRequestError(runtime, window, request, err);
                 continue;
             },
             .chunk_text => processChunkText(runtime, request, chunk_cache, window) catch |err| {
                 if (shouldYieldRequestError(runtime, err)) return err;
-                recordIsolatedRequestError(runtime, window, request, err);
+                try recordIsolatedRequestError(runtime, window, request, err);
                 continue;
             },
             .dense_embedding => processDenseEmbedding(runtime, request, chunk_cache, window) catch |err| {
                 if (shouldYieldRequestError(runtime, err)) return err;
-                recordIsolatedRequestError(runtime, window, request, err);
+                try recordIsolatedRequestError(runtime, window, request, err);
                 continue;
             },
             .sparse_embedding => processSparseEmbedding(runtime, request, chunk_cache, window) catch |err| {
                 if (shouldYieldRequestError(runtime, err)) return err;
-                recordIsolatedRequestError(runtime, window, request, err);
+                try recordIsolatedRequestError(runtime, window, request, err);
                 continue;
             },
         }
@@ -2533,7 +2572,7 @@ fn flushAssetProducerBatch(
             produced[idx] = "";
             if (err == error.OutOfMemory) return err;
             if (shouldYieldRequestError(runtime, err)) return err;
-            recordIsolatedRequestError(runtime, window, item.request, err);
+            try recordIsolatedRequestError(runtime, window, item.request, err);
             continue;
         };
         runtime.alloc.free(output);
@@ -2553,14 +2592,14 @@ fn flushAssetProducerBatchSequential(
         const produced = producer.produce(runtime.alloc, request) catch |err| {
             if (err == error.OutOfMemory) return err;
             if (shouldYieldRequestError(runtime, err)) return err;
-            recordIsolatedRequestError(runtime, window, item.request, err);
+            try recordIsolatedRequestError(runtime, window, item.request, err);
             continue;
         };
         defer runtime.alloc.free(produced);
         applyAssetProducerBatchOutput(runtime, item, produced, window) catch |err| {
             if (err == error.OutOfMemory) return err;
             if (shouldYieldRequestError(runtime, err)) return err;
-            recordIsolatedRequestError(runtime, window, item.request, err);
+            try recordIsolatedRequestError(runtime, window, item.request, err);
         };
     }
 }
@@ -4879,7 +4918,7 @@ fn flushChunkedDenseItems(
     const vectors = embedDenseBatchWithRetry(dense_embedder, runtime, embedding_artifact_name, batch_texts, expected_dims) catch |err| {
         noteEmbedBatchFinished(runtime, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
         if (shouldYieldRequestError(runtime, err)) return err;
-        for (batch_items) |item| recordIsolatedRequestError(runtime, window, item.request, err);
+        for (batch_items) |item| try recordIsolatedRequestError(runtime, window, item.request, err);
         clearChunkedDenseBatch(runtime.alloc, chunk_texts, chunk_items, owns_texts);
         return false;
     };
@@ -5502,7 +5541,7 @@ fn processPlainDenseWindow(
 
         flushPlainDenseItems(runtime, dense_embedder, embedding_artifact_name, seed.expected_dims, consumer_indexes, items.items, window) catch |err| {
             if (shouldYieldRequestError(runtime, err)) return err;
-            for (items.items) |item| recordIsolatedRequestError(runtime, window, item.request, err);
+            for (items.items) |item| try recordIsolatedRequestError(runtime, window, item.request, err);
             continue;
         };
     }

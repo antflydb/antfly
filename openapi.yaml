@@ -8255,7 +8255,8 @@ components:
         - unresolved
         - in_progress
         - indexes_rebuilt
-        - indexes_degraded
+        - indexes_degraded_before
+        - indexes_degraded_after
         - controls_applied
         - limit
         - has_more
@@ -8303,10 +8304,16 @@ components:
           type: integer
           format: uint64
           description: Number of indexes rebuilt by this pass when target is index.
-        indexes_degraded:
+        indexes_degraded_before:
           type: integer
           format: uint64
-          description: Number of selected indexes that were already degraded or quarantined before repair.
+          description: Number of selected indexes that were degraded or quarantined when this repair pass
+            began.
+        indexes_degraded_after:
+          type: integer
+          format: uint64
+          description: Number of selected indexes that remain degraded or quarantined when this repair
+            pass returns.
         controls_applied:
           type: integer
           format: uint64

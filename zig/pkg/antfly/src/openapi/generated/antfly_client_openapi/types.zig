@@ -7974,8 +7974,10 @@ pub const TableRepairRunResult = struct {
     in_progress: i64,
     /// Number of indexes rebuilt by this pass when target is index.
     indexes_rebuilt: i64,
-    /// Number of selected indexes that were already degraded or quarantined before repair.
-    indexes_degraded: i64,
+    /// Number of selected indexes that were degraded or quarantined when this repair pass began.
+    indexes_degraded_before: i64,
+    /// Number of selected indexes that remain degraded or quarantined when this repair pass returns.
+    indexes_degraded_after: i64,
     /// Number of existing index repairs that accepted the requested control.
     controls_applied: i64,
     /// Effective repair limit.

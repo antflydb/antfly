@@ -2349,7 +2349,10 @@ pub const ArtifactRepairResult = struct {
     unresolved: u64 = 0,
     in_progress: u64 = 0,
     indexes_rebuilt: u64 = 0,
-    indexes_degraded: u64 = 0,
+    /// Selected indexes that were degraded when this repair pass began.
+    indexes_degraded_before: u64 = 0,
+    /// Selected indexes that remain degraded when this repair pass returns.
+    indexes_degraded_after: u64 = 0,
     controls_applied: u64 = 0,
     limit: u32 = 0,
     next_cursor: ?[]u8 = null,

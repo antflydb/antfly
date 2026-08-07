@@ -1636,7 +1636,7 @@ fn aggregateEnrichmentStats(
     dst.retryable_error_count +|= src.retryable_error_count;
     dst.fatal_error_count +|= src.fatal_error_count;
     dst.consecutive_retry_count = @max(dst.consecutive_retry_count, src.consecutive_retry_count);
-    dst.next_retry_at_ms = @max(dst.next_retry_at_ms, src.next_retry_at_ms);
+    if (src.retrying) dst.next_retry_at_ms = @max(dst.next_retry_at_ms, src.next_retry_at_ms);
     dst.retrying = dst.retrying or src.retrying;
     dst.worker_failed = dst.worker_failed or src.worker_failed;
     dst.worker_started = dst.worker_started or src.worker_started;

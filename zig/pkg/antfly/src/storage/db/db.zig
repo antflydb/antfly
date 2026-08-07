@@ -7737,6 +7737,41 @@ pub const DB = struct {
         return try artifactRepairIssueKindKeyForIssueAlloc(alloc, issue);
     }
 
+    fn artifactRepairCompletionKeyForIssueAlloc(
+        self: *DB,
+        alloc: Allocator,
+        issue: types.ArtifactRepairIssue,
+    ) ![]u8 {
+        _ = self;
+        const issue_id = try artifactRepairIssueIdAlloc(alloc, issue);
+        defer alloc.free(issue_id);
+        return try internal_keys.artifactRepairCompletionKeyAlloc(alloc, @tagName(issue.artifact_kind), issue_id);
+    }
+
+    fn loadArtifactRepairCompletionSequence(
+        self: *DB,
+        alloc: Allocator,
+        completion_key: []const u8,
+    ) !?u64 {
+        const raw = self.core.store.get(alloc, completion_key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        defer alloc.free(raw);
+        if (raw.len != @sizeOf(u64)) return error.InvalidArtifactRepairCompletion;
+        return std.mem.readInt(u64, raw[0..@sizeOf(u64)], .little);
+    }
+
+    fn saveArtifactRepairCompletionSequence(
+        self: *DB,
+        completion_key: []const u8,
+        sequence: u64,
+    ) !void {
+        var encoded: [@sizeOf(u64)]u8 = undefined;
+        std.mem.writeInt(u64, &encoded, sequence, .little);
+        try self.core.store.put(completion_key, &encoded);
+    }
+
     fn encodeArtifactRepairIssueAlloc(self: *DB, alloc: Allocator, issue: types.ArtifactRepairIssue) ![]u8 {
         _ = self;
         return try encodeArtifactRepairIssueValueAlloc(alloc, issue);
@@ -10469,7 +10504,8 @@ pub const DB = struct {
         unsupported: u64 = 0,
         unresolved: u64 = 0,
         indexes_rebuilt: u64 = 0,
-        indexes_degraded: u64 = 0,
+        indexes_degraded_before: u64 = 0,
+        indexes_degraded_after: u64 = 0,
         debt_remaining: bool = false,
     };
 
@@ -10484,7 +10520,8 @@ pub const DB = struct {
         result.unsupported = repair.unsupported;
         result.unresolved = repair.unresolved;
         result.indexes_rebuilt = repair.indexes_rebuilt;
-        result.indexes_degraded = repair.indexes_degraded;
+        result.indexes_degraded_before = repair.indexes_degraded_before;
+        result.indexes_degraded_after = repair.indexes_degraded_after;
         result.debt_remaining = repair.debt_remaining;
     }
 
@@ -10862,7 +10899,7 @@ pub const DB = struct {
                 var repair = types.ArtifactRepairResult{ .indexes_rebuilt = 1 };
                 try self.finalizeCommittedIndexRepairOutcome(alloc, entry.intent.index_name, 0, &repair);
                 applyCommittedRepairOutcomeToAdvance(&result, repair);
-                result.repaired = repair.indexes_degraded == 0 and !repair.debt_remaining;
+                result.repaired = repair.indexes_degraded_after == 0 and !repair.debt_remaining;
                 return result;
             }
             const rolled_back = try self.rollbackUnavailableActivatedIndexRepair(alloc, repair_id);
@@ -11059,7 +11096,7 @@ pub const DB = struct {
         // during the rebuild remains in its own durable queue and must not
         // resurrect the already-completed generation intent.
         if (repair.indexes_rebuilt != 0 or repair.repaired != 0) {
-            result.repaired = repair.indexes_degraded == 0 and !repair.debt_remaining;
+            result.repaired = repair.indexes_degraded_after == 0 and !repair.debt_remaining;
             return result;
         }
 
@@ -11160,7 +11197,7 @@ pub const DB = struct {
             const advanced = try self.advanceIndexRepairIntent(alloc, candidate.repair_id, options);
             result.attempted += @intFromBool(advanced.attempted);
             result.repaired += @intFromBool(advanced.repaired);
-            result.degraded += @intFromBool(advanced.indexes_degraded != 0);
+            result.degraded += @intFromBool(advanced.indexes_degraded_after != 0);
             result.deferred += @intFromBool(advanced.deferred);
             result.disk_waits += @intFromBool(advanced.disk_wait);
             result.busy += @intFromBool(advanced.busy);
@@ -11237,6 +11274,35 @@ pub const DB = struct {
                 continue;
             }
 
+            // Consumer-specific debt records for one physical artifact share
+            // a single local execution lease and a durable completion fence.
+            // This prevents concurrent requests, later cursor pages, and
+            // restart from paying for the same provider call more than once.
+            const completion_key = try self.artifactRepairCompletionKeyForIssueAlloc(alloc, issue.*);
+            defer alloc.free(completion_key);
+            if (!(try self.beginIndexRepairLease(completion_key))) {
+                result.in_progress += 1;
+                result.unresolved += 1;
+                result.debt_remaining = true;
+                continue;
+            }
+            defer self.endIndexRepairLease(completion_key);
+
+            if (issue.reason == .enrichment_failed and issue.sequence != 0) {
+                const completed_sequence = try self.loadArtifactRepairCompletionSequence(alloc, completion_key);
+                if (completed_sequence != null and completed_sequence.? >= issue.sequence) {
+                    if (try self.artifactNowReadable(alloc, issue.*)) {
+                        try self.clearArtifactRepairIssue(alloc, issue.*);
+                        result.repaired += 1;
+                        continue;
+                    }
+                    self.core.store.delete(completion_key) catch |err| switch (err) {
+                        error.NotFound => {},
+                        else => return err,
+                    };
+                }
+            }
+
             const reprocessed = self.reprocessArtifactIssue(alloc, issue.*) catch |err| switch (err) {
                 error.NotFound => {
                     try replaceRepairIssueLastError(alloc, issue, "source_document_missing");
@@ -11269,6 +11335,9 @@ pub const DB = struct {
             }
             result.reprocessed += 1;
             if (try self.artifactNowReadable(alloc, issue.*)) {
+                if (issue.reason == .enrichment_failed and issue.sequence != 0) {
+                    try self.saveArtifactRepairCompletionSequence(completion_key, issue.sequence);
+                }
                 try self.clearArtifactRepairIssue(alloc, issue.*);
                 result.repaired += 1;
             } else {
@@ -11317,6 +11386,8 @@ pub const DB = struct {
             result.scanned = 1;
             result.controls_applied = @intFromBool(applied);
             result.debt_remaining = applied;
+            result.indexes_degraded_before = @intFromBool(applied);
+            result.indexes_degraded_after = @intFromBool(applied);
             return result;
         }
 
@@ -11331,6 +11402,7 @@ pub const DB = struct {
         }
 
         const repair_required = try self.indexGenerationRepairRequired(alloc, cfg.name);
+        result.indexes_degraded_before = @intFromBool(repair_required);
         if (!repair_required and !req.force) return result;
         if ((req.repair_job_id == null) != (req.repair_job_created_at_ms == null)) return error.InvalidArgument;
         const repair_job_created_at_ms = req.repair_job_created_at_ms orelse 0;
@@ -11384,7 +11456,8 @@ pub const DB = struct {
         // admitted state machine used by the owner-side scheduler.
         if (durable_repair_id) |repair_id| if (!options.executing_durable_index_repair) {
             result.scanned = 1;
-            if (had_load_failure) result.indexes_degraded = 1;
+            result.indexes_degraded_before = @intFromBool(repair_required);
+            result.indexes_degraded_after = 1;
             if (req.force) {
                 var current = try self.loadIndexRepairEntryById(alloc, repair_id);
                 defer current.deinit(alloc);
@@ -11413,7 +11486,8 @@ pub const DB = struct {
                 result.unsupported = advanced.unsupported;
                 result.unresolved = advanced.unresolved;
                 result.indexes_rebuilt = advanced.indexes_rebuilt;
-                result.indexes_degraded = advanced.indexes_degraded;
+                result.indexes_degraded_before = advanced.indexes_degraded_before;
+                result.indexes_degraded_after = advanced.indexes_degraded_after;
                 result.debt_remaining = advanced.debt_remaining;
             } else if (advanced.repaired) {
                 result.repaired = 1;
@@ -11499,7 +11573,8 @@ pub const DB = struct {
                 return result;
             };
         }
-        if (had_load_failure) result.indexes_degraded += 1;
+        result.indexes_degraded_before = @intFromBool(repair_required);
+        result.indexes_degraded_after = 1;
         if (self.core.index_manager.loadFailure(cfg.name) != null) {
             const recovery_action = self.core.index_manager.recoveryActionForIndex(cfg.name).?;
             switch (recovery_action) {
@@ -11523,6 +11598,7 @@ pub const DB = struct {
             }
         }
         if (had_load_failure and self.core.index_manager.loadFailure(cfg.name) == null and (cfg.kind == .full_text or cfg.kind == .algebraic) and !try self.indexGenerationRepairRequired(alloc, cfg.name)) {
+            result.indexes_degraded_after = 0;
             result.repaired += 1;
             return result;
         }
@@ -12547,12 +12623,15 @@ pub const DB = struct {
         if (generation_repair_required or coverage != .complete) {
             result.unresolved += 1;
             result.debt_remaining = true;
-            if (coverage == .degraded) result.indexes_degraded += 1;
+            result.indexes_degraded_after = 1;
         }
 
         // "Rebuilt" describes completed work. "Repaired" is the stronger
         // operator promise that no known or indeterminate debt remains.
-        if (!result.debt_remaining) result.repaired += 1;
+        result.indexes_degraded_after = @intFromBool(result.debt_remaining);
+        if (!result.debt_remaining) {
+            result.repaired += 1;
+        }
     }
 
     fn denseCoverageRegressionRepairRequired(self: *DB, alloc: Allocator, index_name: []const u8) !bool {
@@ -32675,6 +32754,7 @@ fn saveArtifactRepairIssueToStoreWithSummary(
     key: []const u8,
     issue: types.ArtifactRepairIssue,
     new_issue: bool,
+    extra_deletes: []const []const u8,
 ) !void {
     const kind_key = try artifactRepairIssueKindKeyForIssueAlloc(alloc, issue);
     defer alloc.free(kind_key);
@@ -32685,7 +32765,7 @@ fn saveArtifactRepairIssueToStoreWithSummary(
             .{ .key = key, .value = encoded },
             .{ .key = kind_key, .value = encoded },
         };
-        try store.putBatch(writes[0..], &.{});
+        try store.putBatch(writes[0..], extra_deletes);
         return;
     }
 
@@ -32706,6 +32786,7 @@ fn saveArtifactRepairIssueToStoreWithSummary(
 
     try writes.append(alloc, .{ .key = key, .value = encoded });
     try writes.append(alloc, .{ .key = kind_key, .value = encoded });
+    try deletes.appendSlice(alloc, extra_deletes);
     try appendArtifactRepairSummaryDirtyForStore(alloc, store, &writes, &deletes, &owned_delete_keys);
     try store.putBatch(writes.items, deletes.items);
 }
@@ -32763,7 +32844,7 @@ fn recordEmbeddingArtifactRepairIssueContext(
         issue.source_artifact_name = try ctx.alloc.dupe(u8, identity.source_artifact_name orelse "");
     }
 
-    try saveArtifactRepairIssueToStoreWithSummary(ctx.alloc, ctx.store, issue_key, issue, existing == null);
+    try saveArtifactRepairIssueToStoreWithSummary(ctx.alloc, ctx.store, issue_key, issue, existing == null, &.{});
     if (ctx.repair_issue_counter) |counter| _ = counter.fetchAdd(1, .monotonic);
 }
 
@@ -32818,10 +32899,20 @@ fn recordArtifactRepairIssueContextDetailed(
         };
     defer issue.deinit(ctx.alloc);
 
+    const merged_generation_attempts = mergeGenerationFailureAttempts(
+        issue.reason,
+        issue.sequence,
+        issue.generation_error,
+        issue.generation_attempts,
+        reason,
+        sequence,
+        generation_error,
+        generation_attempts,
+    );
     issue.artifact_kind = artifact_kind;
     issue.sequence = sequence;
     issue.reason = reason;
-    issue.generation_attempts = @max(issue.generation_attempts, generation_attempts);
+    issue.generation_attempts = merged_generation_attempts;
     issue.chunk_id = chunk_id;
     issue.repairable = artifactRepairKindHasAutomatedReprocessor(artifact_kind);
     issue.last_seen_ns = now_ns;
@@ -32840,14 +32931,76 @@ fn recordArtifactRepairIssueContextDetailed(
     if (issue.unsupported_reason.len == 0 and !issue.repairable) {
         issue.unsupported_reason = try ctx.alloc.dupe(u8, artifactRepairUnsupportedReason(artifact_kind));
     }
-    if (generation_error.len > 0 and !std.mem.eql(u8, issue.generation_error, generation_error)) {
-        const owned_generation_error = try ctx.alloc.dupe(u8, generation_error);
+    if (!std.mem.eql(u8, issue.generation_error, generation_error)) {
+        const owned_generation_error = if (generation_error.len > 0)
+            try ctx.alloc.dupe(u8, generation_error)
+        else
+            "";
         if (issue.generation_error.len > 0) ctx.alloc.free(@constCast(issue.generation_error));
         issue.generation_error = owned_generation_error;
     }
 
-    try saveArtifactRepairIssueToStoreWithSummary(ctx.alloc, ctx.store, issue_key, issue, existing == null);
+    const completion_key = try internal_keys.artifactRepairCompletionKeyAlloc(ctx.alloc, kind_name, artifact_key_hex);
+    defer ctx.alloc.free(completion_key);
+    try saveArtifactRepairIssueToStoreWithSummary(
+        ctx.alloc,
+        ctx.store,
+        issue_key,
+        issue,
+        existing == null,
+        &.{completion_key},
+    );
     if (ctx.repair_issue_counter) |counter| _ = counter.fetchAdd(1, .monotonic);
+}
+
+fn mergeGenerationFailureAttempts(
+    previous_reason: types.ArtifactRepairReason,
+    previous_sequence: u64,
+    previous_error: []const u8,
+    previous_attempts: u64,
+    reason: types.ArtifactRepairReason,
+    sequence: u64,
+    generation_error: []const u8,
+    generation_attempts: u64,
+) u64 {
+    const same_window = previous_reason == .enrichment_failed and
+        reason == .enrichment_failed and
+        previous_sequence == sequence and
+        std.mem.eql(u8, previous_error, generation_error);
+    return if (same_window) @max(previous_attempts, generation_attempts) else generation_attempts;
+}
+
+test "artifact repair enrichment generation attempts are exact per failure window" {
+    try std.testing.expectEqual(@as(u64, 6), mergeGenerationFailureAttempts(
+        .enrichment_failed,
+        41,
+        "EmbedRateLimited",
+        6,
+        .enrichment_failed,
+        41,
+        "EmbedRateLimited",
+        4,
+    ));
+    try std.testing.expectEqual(@as(u64, 1), mergeGenerationFailureAttempts(
+        .enrichment_failed,
+        41,
+        "EmbedRateLimited",
+        6,
+        .enrichment_failed,
+        42,
+        "EmbedRateLimited",
+        1,
+    ));
+    try std.testing.expectEqual(@as(u64, 2), mergeGenerationFailureAttempts(
+        .enrichment_failed,
+        42,
+        "EmbedRateLimited",
+        6,
+        .enrichment_failed,
+        42,
+        "ProviderUnavailable",
+        2,
+    ));
 }
 
 fn recordArtifactRepairIssueContext(
@@ -50297,7 +50450,7 @@ test "db artifact repair summary store writer invalidates partial rebuild" {
         defer issue.deinit(alloc);
         const key = try artifactRepairIssueKeyForIssueAlloc(alloc, issue);
         defer alloc.free(key);
-        try saveArtifactRepairIssueToStoreWithSummary(alloc, db.core.store, key, issue, true);
+        try saveArtifactRepairIssueToStoreWithSummary(alloc, db.core.store, key, issue, true, &.{});
 
         const progress_key = try internal_keys.artifactRepairSummaryProgressKeyAlloc(alloc);
         defer alloc.free(progress_key);
@@ -51491,7 +51644,8 @@ test "db index repair recovers quarantined index load before rebuild" {
         });
         defer repair.deinit(alloc);
         try std.testing.expectEqual(@as(u64, 1), repair.scanned);
-        try std.testing.expectEqual(@as(u64, 1), repair.indexes_degraded);
+        try std.testing.expectEqual(@as(u64, 1), repair.indexes_degraded_before);
+        try std.testing.expectEqual(@as(u64, 0), repair.indexes_degraded_after);
         try std.testing.expectEqual(@as(u64, 1), repair.repaired);
         try std.testing.expectEqual(@as(u64, 0), repair.failed);
         try std.testing.expectEqual(@as(u64, 0), repair.unresolved);
@@ -51557,7 +51711,8 @@ test "db index repair rebuilds full text after quarantined root recreation" {
     });
     defer repair.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 1), repair.scanned);
-    try std.testing.expectEqual(@as(u64, 1), repair.indexes_degraded);
+    try std.testing.expectEqual(@as(u64, 1), repair.indexes_degraded_before);
+    try std.testing.expectEqual(@as(u64, 0), repair.indexes_degraded_after);
     try std.testing.expectEqual(@as(u64, 1), repair.indexes_rebuilt);
     try std.testing.expectEqual(@as(u64, 1), repair.repaired);
     try std.testing.expect(!repair.debt_remaining);
@@ -55325,7 +55480,7 @@ test "db shared enrichment failure parks repair debt for every consumer" {
         .repair_job_created_at_ms = 1_777_777,
     });
     try std.testing.expectEqual(@as(u64, 1), repair.indexes_rebuilt);
-    try std.testing.expectEqual(@as(u64, 1), repair.indexes_degraded);
+    try std.testing.expectEqual(@as(u64, 1), repair.indexes_degraded_after);
     try std.testing.expectEqual(@as(u64, 0), repair.repaired);
     try std.testing.expect(repair.debt_remaining);
 
@@ -55340,9 +55495,76 @@ test "db shared enrichment failure parks repair debt for every consumer" {
         .repair_job_created_at_ms = 1_777_777,
     });
     try std.testing.expectEqual(@as(u64, 1), replayed.indexes_rebuilt);
-    try std.testing.expectEqual(@as(u64, 1), replayed.indexes_degraded);
+    try std.testing.expectEqual(@as(u64, 1), replayed.indexes_degraded_after);
     try std.testing.expectEqual(@as(u64, 0), replayed.repaired);
     try std.testing.expect(replayed.debt_remaining);
+}
+
+test "db shared enrichment repair regenerates one physical artifact once" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var gated = GateDenseEmbedder{};
+    gated.allowed_successes.store(0, .release);
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_optional_runtime_workers = false,
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = gated.interface(),
+            .inline_retry_max_attempts = 1,
+            .worker_retry_max_attempts = 2,
+        },
+    });
+    defer db.close();
+
+    const shared_cfg = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"shared_dense_v1\"}}";
+    try db.addIndex(.{ .name = "dv_a", .kind = .dense_vector, .config_json = shared_cfg });
+    try db.addIndex(.{ .name = "dv_b", .kind = .dense_vector, .config_json = shared_cfg });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"shared repair\"}" }},
+        .sync_level = .write,
+    });
+    const sequence = db.core.nextEnrichmentSequence();
+    try std.testing.expectError(error.EnrichmentRetryInProgress, db.runEnrichmentUntil(sequence));
+    sleepNs(550 * std.time.ns_per_ms);
+    try db.runEnrichmentUntil(sequence);
+
+    const before = gated.snapshot();
+    gated.allowAll();
+    var first = try db.repairArtifactIssuesWithRequest(alloc, .{
+        .target = .artifact,
+        .artifact_kind = .embedding,
+        .limit = 1,
+    });
+    defer first.deinit(alloc);
+    try std.testing.expect(first.has_more);
+    try std.testing.expect(first.next_cursor != null);
+    var second = try db.repairArtifactIssuesWithRequest(alloc, .{
+        .target = .artifact,
+        .artifact_kind = .embedding,
+        .limit = 1,
+        .cursor = first.next_cursor,
+    });
+    defer second.deinit(alloc);
+    const after = gated.snapshot();
+
+    try std.testing.expectEqual(@as(u64, 1), first.scanned);
+    try std.testing.expectEqual(@as(u64, 1), first.reprocessed);
+    try std.testing.expectEqual(@as(u64, 1), first.repaired);
+    try std.testing.expect(first.debt_remaining);
+    try std.testing.expectEqual(@as(u64, 1), second.scanned);
+    try std.testing.expectEqual(@as(u64, 0), second.reprocessed);
+    try std.testing.expectEqual(@as(u64, 1), second.repaired);
+    try std.testing.expect(!second.debt_remaining);
+    try std.testing.expectEqual(@as(usize, 1), after.total_requests - before.total_requests);
+    try std.testing.expectEqual(@as(usize, 1), after.successful_requests - before.successful_requests);
+
+    const remaining = try db.listArtifactRepairIssues(alloc, .embedding, null, 0);
+    defer types.freeArtifactRepairIssues(alloc, remaining);
+    try std.testing.expectEqual(@as(usize, 0), remaining.len);
 }
 
 test "db shared embedding enrichment feeds multiple dense indexes with durable lsm primary backend" {

@@ -3261,9 +3261,14 @@ export interface components {
             indexes_rebuilt: number;
             /**
              * Format: uint64
-             * @description Number of selected indexes that were already degraded or quarantined before repair.
+             * @description Number of selected indexes that were degraded or quarantined when this repair pass began.
              */
-            indexes_degraded: number;
+            indexes_degraded_before: number;
+            /**
+             * Format: uint64
+             * @description Number of selected indexes that remain degraded or quarantined when this repair pass returns.
+             */
+            indexes_degraded_after: number;
             /**
              * Format: uint64
              * @description Number of existing index repairs that accepted the requested control.

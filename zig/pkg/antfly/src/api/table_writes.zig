@@ -385,7 +385,8 @@ fn mergeArtifactRepairResult(dst: *db_mod.types.ArtifactRepairResult, src: db_mo
     dst.unresolved += src.unresolved;
     dst.in_progress += src.in_progress;
     dst.indexes_rebuilt += src.indexes_rebuilt;
-    dst.indexes_degraded += src.indexes_degraded;
+    dst.indexes_degraded_before += src.indexes_degraded_before;
+    dst.indexes_degraded_after += src.indexes_degraded_after;
     dst.controls_applied += src.controls_applied;
     dst.debt_remaining = dst.debt_remaining or src.debt_remaining;
 }
@@ -538,7 +539,8 @@ fn parseArtifactRepairResultAlloc(alloc: std.mem.Allocator, body: []const u8) !d
         .unresolved = parsed.value.unresolved,
         .in_progress = parsed.value.in_progress,
         .indexes_rebuilt = parsed.value.indexes_rebuilt,
-        .indexes_degraded = parsed.value.indexes_degraded,
+        .indexes_degraded_before = parsed.value.indexes_degraded_before,
+        .indexes_degraded_after = parsed.value.indexes_degraded_after,
         .limit = parsed.value.limit,
         .next_cursor = if (parsed.value.next_cursor) |cursor| try alloc.dupe(u8, cursor) else null,
         .has_more = parsed.value.has_more,
