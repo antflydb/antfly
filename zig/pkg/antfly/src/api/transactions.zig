@@ -1696,17 +1696,28 @@ pub const SessionRegistry = struct {
             self.mutex.lock();
             defer self.mutex.unlock();
             var it = self.sessions.iterator();
+            var scan_offset = self.memory_recovery_scan_offset;
             var skipped: usize = 0;
-            while (skipped < self.memory_recovery_scan_offset and it.next() != null) skipped += 1;
+            while (skipped < scan_offset and it.next() != null) skipped += 1;
+            // Hash-map deletions can shrink the collection between maintenance
+            // passes. Restart immediately instead of returning an avoidable
+            // empty page when the ordinal cursor is now beyond the end.
+            if (skipped < scan_offset) {
+                scan_offset = 0;
+                it = self.sessions.iterator();
+            }
             var scanned: usize = 0;
-            const scan_limit = @max(limit, 1) * 4;
+            const scan_limit = @max(limit, 1) *| 4;
+            var exhausted = true;
             while (it.next()) |entry| {
                 scanned += 1;
                 if (sessionNeedsRecovery(entry.value_ptr.*)) try pending.append(alloc, entry.key_ptr.*);
-                if (pending.items.len >= limit) break;
-                if (scanned >= scan_limit) break;
+                if (pending.items.len >= limit or scanned >= scan_limit) {
+                    exhausted = false;
+                    break;
+                }
             }
-            self.memory_recovery_scan_offset = if (scanned < scan_limit) 0 else self.memory_recovery_scan_offset + scanned;
+            self.memory_recovery_scan_offset = if (exhausted) 0 else scan_offset +| scanned;
         }
         return try pending.toOwnedSlice(alloc);
     }
@@ -4532,6 +4543,34 @@ test "durable recovery scan rotates fairly beyond one maintenance batch" {
         break;
     };
     try std.testing.expect(found_target);
+}
+
+test "in-memory recovery scan rotates fairly when the first page remains pending" {
+    const alloc = std.testing.allocator;
+    var registry = SessionRegistry.init(null);
+    defer registry.deinit(alloc);
+    var request = try parseCommitRequest(alloc,
+        \\{"read_set":[],"tables":{"docs":{"inserts":{"doc:a":{"value":1}}}}}
+    );
+    defer request.deinit(alloc);
+
+    for (0..33) |_| {
+        const session = try registry.begin(alloc, .{ .sync_level = .write }, 1);
+        var sealed = (try registry.cloneCommitRequest(alloc, session.txn_id, &request)) orelse return error.TestExpectedEqual;
+        sealed.deinit(alloc);
+        _ = (try registry.markCommitExecutionStarted(alloc, session.txn_id)) orelse return error.TestExpectedEqual;
+    }
+
+    const first = try registry.listPendingRecoveryIds(alloc, 32);
+    defer alloc.free(first);
+    try std.testing.expectEqual(@as(usize, 32), first.len);
+
+    const second = try registry.listPendingRecoveryIds(alloc, 32);
+    defer alloc.free(second);
+    try std.testing.expectEqual(@as(usize, 1), second.len);
+    for (first) |txn_id| {
+        try std.testing.expect(!std.mem.eql(u8, &txn_id, &second[0]));
+    }
 }
 
 test "background recovery adopts an expired shared-store owner lease" {

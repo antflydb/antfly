@@ -265,6 +265,73 @@ func TestMultiBatchPreservesAcceptedRecoveryStatus(t *testing.T) {
 	}
 }
 
+func TestMultiBatchReturnsStructuredConflict(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"status":"aborted","conflict":{"table":"files","key":"doc-1","message":"version conflict"}}`))
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+	result, err := client.MultiBatch(context.Background(), MultiBatchRequest{
+		Tables: map[string]BatchRequest{"files": {Inserts: map[string]any{"doc-1": map[string]any{"title": "hello"}}}},
+	})
+	if err != nil {
+		t.Fatalf("MultiBatch: %v", err)
+	}
+	if result.Status != "aborted" {
+		t.Fatalf("Status = %q, want aborted", result.Status)
+	}
+	if result.Conflict == nil {
+		t.Fatal("Conflict = nil, want structured conflict")
+	}
+	if result.Conflict.Table != "files" || result.Conflict.Key != "doc-1" || result.Conflict.Message != "version conflict" {
+		t.Fatalf("Conflict = %#v, want files/doc-1 version conflict", result.Conflict)
+	}
+}
+
+func TestMultiBatchRejectsMalformedConflictResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"status":"committed"}`))
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+	_, err = client.MultiBatch(context.Background(), MultiBatchRequest{Tables: map[string]BatchRequest{}})
+	if err == nil || !strings.Contains(err.Error(), `unexpected status "committed"`) {
+		t.Fatalf("MultiBatch error = %v, want unexpected conflict status", err)
+	}
+}
+
+func TestMultiBatchRejectsOversizedConflictResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"status":"aborted","conflict":{"message":"response exceeds the configured limit"}}`))
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+	_, err = client.MultiBatchWithOptions(context.Background(), MultiBatchRequest{Tables: map[string]BatchRequest{}}, WriteOptions{
+		MaxResponseBytes: 16,
+	})
+	if err == nil || !strings.Contains(err.Error(), "multi-batch response exceeded 16 bytes") {
+		t.Fatalf("MultiBatchWithOptions error = %v, want response limit error", err)
+	}
+}
+
 func TestBatchRejectsOversizedSuccessResponse(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)

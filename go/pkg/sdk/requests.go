@@ -309,10 +309,15 @@ type MultiBatchRequest struct {
 
 // MultiBatchResult represents the result of a cross-table batch operation.
 type MultiBatchResult struct {
-	// Status is "committed", "committed_visibility_pending", or
-	// "committed_recovery_pending". "committed_pending" is used as a generic
-	// fallback when an older server returns HTTP 202 without a status field.
+	// Status is "committed", "committed_visibility_pending",
+	// "committed_recovery_pending", or "aborted". "committed_pending" is
+	// used as a generic fallback when an older server returns HTTP 202 without
+	// a status field.
 	Status string `json:"status,omitempty"`
+
+	// Conflict describes why the atomic batch was aborted. It is present only
+	// when Status is "aborted".
+	Conflict *TransactionConflict `json:"conflict,omitempty"`
 
 	// Tables maps table names to their batch results.
 	Tables map[string]BatchResult `json:"tables,omitempty"`
@@ -331,7 +336,7 @@ type TransactionCommitResult struct {
 	Tables map[string]BatchResult `json:"tables,omitempty"`
 }
 
-// TransactionConflict describes a version conflict that caused a transaction abort.
+// TransactionConflict describes the conflict that caused a transaction abort.
 type TransactionConflict struct {
 	Table   string `json:"table,omitempty"`
 	Key     string `json:"key,omitempty"`

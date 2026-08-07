@@ -849,13 +849,17 @@ func (c *AntflyClient) RetrievalAgent(ctx context.Context, req RetrievalAgentReq
 	return result, nil
 }
 
-// MultiBatch performs a cross-table batch operation atomically.
+// MultiBatch performs a cross-table batch operation atomically. Transaction
+// conflicts return a result with Status "aborted" and a populated Conflict;
+// they are outcomes, not transport errors.
 func (c *AntflyClient) MultiBatch(ctx context.Context, request MultiBatchRequest) (*MultiBatchResult, error) {
 	return c.MultiBatchWithOptions(ctx, request, WriteOptions{})
 }
 
 // MultiBatchWithOptions performs a cross-table batch operation atomically with
-// request and response size bounds.
+// request and response size bounds. Transaction conflicts return a result with
+// Status "aborted" and a populated Conflict; they are outcomes, not transport
+// errors.
 func (c *AntflyClient) MultiBatchWithOptions(ctx context.Context, request MultiBatchRequest, opts WriteOptions) (*MultiBatchResult, error) {
 	opts = normalizeWriteOptions(opts)
 	batchBody, err := boundedJSONBody(request, opts.MaxRequestBytes)
@@ -869,7 +873,7 @@ func (c *AntflyClient) MultiBatchWithOptions(ctx context.Context, request MultiB
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode >= 300 {
+	if resp.StatusCode >= 300 && resp.StatusCode != http.StatusConflict {
 		return nil, fmt.Errorf("multi-batch failed: %w", readErrorResponse(resp))
 	}
 
@@ -886,6 +890,12 @@ func (c *AntflyClient) MultiBatchWithOptions(ctx context.Context, request MultiB
 		if err := json.Unmarshal(respBody, &result); err != nil {
 			return nil, fmt.Errorf("parsing multi-batch result: %w", err)
 		}
+	}
+	if resp.StatusCode == http.StatusConflict {
+		if result.Status != "aborted" {
+			return nil, fmt.Errorf("parsing multi-batch conflict: unexpected status %q", result.Status)
+		}
+		return &result, nil
 	}
 	if result.Status == "" {
 		if resp.StatusCode == http.StatusAccepted {

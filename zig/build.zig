@@ -4791,6 +4791,7 @@ pub fn build(b: *std.Build) void {
             "transaction session commit request is sealed across retries",
             "durable recovery index tracks only validated commit execution and terminal handoff",
             "durable recovery scan rotates fairly beyond one maintenance batch",
+            "in-memory recovery scan rotates fairly when the first page remains pending",
             "background recovery adopts an expired shared-store owner lease",
             "api http server retries stable terminal commits without replaying writes",
             "api session maintenance recovers crash window after durable 2pc commit",
