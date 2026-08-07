@@ -1040,7 +1040,7 @@ pub fn parseTxnBeginRequest(alloc: std.mem.Allocator, body: []const u8) !TxnBegi
         else => return error.InvalidTxnRequest,
     };
     const txn_id = try parseTxnIdHex(requireString(obj, "txn_id"));
-    const begin_timestamp = requireInteger(obj, "begin_timestamp");
+    const begin_timestamp = try requireU64(obj, "begin_timestamp");
     const participants_value = obj.get("participants") orelse return error.InvalidTxnRequest;
     const participants = switch (participants_value) {
         .array => |arr| arr,
@@ -1062,7 +1062,7 @@ pub fn parseTxnBeginRequest(alloc: std.mem.Allocator, body: []const u8) !TxnBegi
     return .{
         .txn_id = txn_id,
         .begin_timestamp = begin_timestamp,
-        .topology_epoch = requireInteger(obj, "topology_epoch"),
+        .topology_epoch = try optionalU64(obj, "topology_epoch"),
         .retain_terminal = if (obj.get("retain_terminal")) |value| switch (value) {
             .bool => |flag| flag,
             else => return error.InvalidTxnRequest,
@@ -1095,7 +1095,7 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
     errdefer freeTxnPredicates(alloc, predicates);
     return .{
         .txn_id = txn_id,
-        .topology_epoch = requireInteger(obj, "topology_epoch"),
+        .topology_epoch = try optionalU64(obj, "topology_epoch"),
         .req = .{
             .writes = writes,
             .deletes = deletes,
@@ -1123,11 +1123,8 @@ pub fn parseTxnResolveRequest(alloc: std.mem.Allocator, body: []const u8) !TxnRe
     return .{
         .txn_id = try parseTxnIdHex(requireString(obj, "txn_id")),
         .status = parseTxnStatus(requireString(obj, "status")) orelse return error.InvalidTxnRequest,
-        .commit_version = requireInteger(obj, "commit_version"),
-        .topology_epoch = if (obj.get("topology_epoch")) |value| switch (value) {
-            .integer => |integer| if (integer >= 0) @intCast(integer) else return error.InvalidTxnRequest,
-            else => return error.InvalidTxnRequest,
-        } else 0,
+        .commit_version = try requireU64(obj, "commit_version"),
+        .topology_epoch = try optionalU64(obj, "topology_epoch"),
         .sync_level = if (obj.get("sync_level")) |value| db_mod.types.parsePublicSyncLevelText(switch (value) {
             .string => |text| text,
             else => return error.InvalidTxnRequest,
@@ -1352,9 +1349,10 @@ fn parseTxnPredicates(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod
             .object => |obj| obj,
             else => return error.InvalidTxnRequest,
         };
+        const expected_version = try requireU64(obj, "expected_version");
         out[i] = .{
             .key = try alloc.dupe(u8, requireString(obj, "key")),
-            .expected_version = requireInteger(obj, "expected_version"),
+            .expected_version = expected_version,
         };
         initialized += 1;
     }
@@ -1449,12 +1447,84 @@ test "transaction request parsers release owned prefixes after malformed input" 
     }
 }
 
-fn requireInteger(obj: std.json.ObjectMap, key: []const u8) u64 {
-    const value = obj.get(key) orelse return 0;
-    return switch (value) {
-        .integer => |i| @intCast(i),
-        else => 0,
+test "transaction request parsers reject invalid unsigned integers and accept legacy epochs" {
+    const alloc = std.testing.allocator;
+    const malformed_begin_requests = [_][]const u8{
+        \\{"txn_id":"00112233445566778899aabbccddeeff","topology_epoch":2,"participants":[]}
+        ,
+        \\{"txn_id":"00112233445566778899aabbccddeeff","begin_timestamp":"1","topology_epoch":2,"participants":[]}
+        ,
+        \\{"txn_id":"00112233445566778899aabbccddeeff","begin_timestamp":-1,"topology_epoch":2,"participants":[]}
+        ,
+        \\{"txn_id":"00112233445566778899aabbccddeeff","begin_timestamp":1,"topology_epoch":-1,"participants":[]}
+        ,
     };
+    for (malformed_begin_requests) |body| {
+        try std.testing.expectError(error.InvalidTxnRequest, parseTxnBeginRequest(alloc, body));
+    }
+
+    const malformed_prepare_requests = [_][]const u8{
+        \\{"txn_id":"00112233445566778899aabbccddeeff","topology_epoch":"2","writes":[],"deletes":[],"transforms":[],"predicates":[]}
+        ,
+        \\{"txn_id":"00112233445566778899aabbccddeeff","topology_epoch":-1,"writes":[],"deletes":[],"transforms":[],"predicates":[]}
+        ,
+        \\{"txn_id":"00112233445566778899aabbccddeeff","writes":[],"deletes":[],"transforms":[],"predicates":[{"key":"doc:a"}]}
+        ,
+        \\{"txn_id":"00112233445566778899aabbccddeeff","writes":[],"deletes":[],"transforms":[],"predicates":[{"key":"doc:a","expected_version":"1"}]}
+        ,
+        \\{"txn_id":"00112233445566778899aabbccddeeff","writes":[],"deletes":[],"transforms":[],"predicates":[{"key":"doc:a","expected_version":-1}]}
+        ,
+    };
+    for (malformed_prepare_requests) |body| {
+        try std.testing.expectError(error.InvalidTxnRequest, parseTxnPrepareRequest(alloc, body));
+    }
+
+    const malformed_resolve_requests = [_][]const u8{
+        \\{"txn_id":"00112233445566778899aabbccddeeff","status":"committed"}
+        ,
+        \\{"txn_id":"00112233445566778899aabbccddeeff","status":"committed","commit_version":"1"}
+        ,
+        \\{"txn_id":"00112233445566778899aabbccddeeff","status":"committed","commit_version":-1}
+        ,
+        \\{"txn_id":"00112233445566778899aabbccddeeff","status":"committed","commit_version":1,"topology_epoch":"2"}
+        ,
+        \\{"txn_id":"00112233445566778899aabbccddeeff","status":"committed","commit_version":1,"topology_epoch":-1}
+        ,
+    };
+    for (malformed_resolve_requests) |body| {
+        try std.testing.expectError(error.InvalidTxnRequest, parseTxnResolveRequest(alloc, body));
+    }
+
+    var legacy_begin = try parseTxnBeginRequest(
+        alloc,
+        \\{"txn_id":"00112233445566778899aabbccddeeff","begin_timestamp":1,"participants":[]}
+        ,
+    );
+    defer freeTxnBeginRequest(alloc, &legacy_begin);
+    try std.testing.expectEqual(@as(u64, 0), legacy_begin.topology_epoch);
+
+    var legacy_prepare = try parseTxnPrepareRequest(
+        alloc,
+        \\{"txn_id":"00112233445566778899aabbccddeeff","writes":[],"deletes":[],"transforms":[],"predicates":[]}
+        ,
+    );
+    defer freeTxnPrepareRequest(alloc, &legacy_prepare);
+    try std.testing.expectEqual(@as(u64, 0), legacy_prepare.topology_epoch);
+}
+
+fn parseU64(value: std.json.Value) !u64 {
+    return switch (value) {
+        .integer => |integer| if (integer >= 0) @intCast(integer) else error.InvalidTxnRequest,
+        else => error.InvalidTxnRequest,
+    };
+}
+
+fn requireU64(obj: std.json.ObjectMap, key: []const u8) !u64 {
+    return try parseU64(obj.get(key) orelse return error.InvalidTxnRequest);
+}
+
+fn optionalU64(obj: std.json.ObjectMap, key: []const u8) !u64 {
+    return try parseU64(obj.get(key) orelse return 0);
 }
 
 fn parseTxnStatus(text: []const u8) ?db_mod.types.TxnStatus {
