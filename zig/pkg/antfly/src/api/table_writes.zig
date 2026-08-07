@@ -4884,7 +4884,10 @@ pub const BoundTableWriteSource = struct {
         try db.resolveTransactionIntentsWithSyncLevel(txn_id, status, commit_version, sync_level);
         const participant = try distributed_txn.participantIdForGroup(db.alloc, table_name, group_id);
         defer db.alloc.free(participant);
-        try db.markTransactionParticipantResolved(txn_id, participant);
+        db.markTransactionParticipantResolved(txn_id, participant) catch |err| switch (err) {
+            transactions_mod.TxnError.TxnNotFound => if (status != .aborted) return err,
+            else => return err,
+        };
     }
 
     fn txnStatusGroupLocal(
@@ -16480,7 +16483,10 @@ fn applyReplicatedTransactionMutation(
             );
             const local_participant = try distributed_txn.participantIdForGroup(alloc, table_name, group_id);
             defer alloc.free(local_participant);
-            try db.markTransactionParticipantResolved(resolve.txn_id, local_participant);
+            db.markTransactionParticipantResolved(resolve.txn_id, local_participant) catch |err| switch (err) {
+                transactions_mod.TxnError.TxnNotFound => if (resolve.status != .aborted) return err,
+                else => return err,
+            };
         },
         .acknowledge => |ack| db.markTransactionParticipantResolved(ack.txn_id, ack.participant) catch |err| switch (err) {
             // Cleanup and acknowledgements are independently retryable Raft

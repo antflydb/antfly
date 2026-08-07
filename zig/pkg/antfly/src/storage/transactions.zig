@@ -41,9 +41,16 @@ const ttl = @import("ttl.zig");
 // ============================================================================
 
 const intents_prefix = "\x00\x00__txn_intents__:";
+// Key-oriented companion index for O(1) conflict checks on ordinary writes.
+// The value is the owning transaction ID. It is installed and removed in the
+// same backend batch as the corresponding intent, so the DB apply mutex makes
+// lock acquisition and ordinary batch admission linearizable.
+const intent_locks_prefix = "\x00\x00__txn_intent_locks__:";
 const records_prefix = "\x00\x00__txn_records__:";
 const participants_prefix = "\x00\x00__txn_participants__:";
 const resolved_participants_prefix = "\x00\x00__txn_resolved_participants__:";
+const ha_batch_outbox_prefix = "\x00\x00__txn_ha_batch_outbox__:";
+const ha_replay_outbox_prefix = "\x00\x00__txn_ha_replay_outbox__:";
 
 // ============================================================================
 // Types
@@ -106,6 +113,11 @@ pub const TxnSummary = struct {
     retain_terminal: bool = false,
 };
 
+pub const TxnSummaryPage = struct {
+    items: []TxnSummary,
+    next_after: ?TxnId,
+};
+
 pub const ResolutionExtraBatch = struct {
     writes: []const docstore.KVPair = &.{},
     deletes: []const []const u8 = &.{},
@@ -123,6 +135,19 @@ pub const IntentSnapshotValidation = struct {
     has_intents: bool,
     replay_sequence: u64,
 };
+
+pub const HAOutbox = struct {
+    batch_payload: ?[]u8 = null,
+    replay_payload: ?[]u8 = null,
+
+    pub fn deinit(self: *HAOutbox, alloc: Allocator) void {
+        if (self.batch_payload) |payload| alloc.free(payload);
+        if (self.replay_payload) |payload| alloc.free(payload);
+        self.* = undefined;
+    }
+};
+
+pub const HAOutboxKind = enum { batch, replay };
 
 pub const ReplayAppend = struct {
     sequence: u64,
@@ -395,6 +420,12 @@ pub const TxnManager = struct {
             try write_vals.append(self.alloc, val);
 
             try writes.append(self.alloc, .{ .key = intent_key, .value = val });
+
+            const lock_key = try self.makeIntentLockKey(intent.key);
+            try write_keys.append(self.alloc, lock_key);
+            const owner = try self.alloc.dupe(u8, &txn_id);
+            try write_vals.append(self.alloc, owner);
+            try writes.append(self.alloc, .{ .key = lock_key, .value = owner });
         }
 
         record.intent_revision = std.math.add(u64, record.intent_revision, 1) catch return error.TransactionRevisionOverflow;
@@ -480,6 +511,10 @@ pub const TxnManager = struct {
         // Always delete the intent keys
         for (intent_entries) |entry| {
             try deletes.append(self.alloc, entry.key);
+            const user_key = entry.key[intents_prefix.len + 17 ..];
+            const lock_key = try self.makeIntentLockKey(user_key);
+            try owned_apply_keys.append(self.alloc, lock_key);
+            try deletes.append(self.alloc, lock_key);
         }
 
         if (status == .committed) {
@@ -621,6 +656,41 @@ pub const TxnManager = struct {
         };
     }
 
+    pub fn loadHAOutbox(self: *TxnManager, alloc: Allocator, txn_id: TxnId) !HAOutbox {
+        const batch_key = makeTransactionHABatchOutboxKey(txn_id);
+        const replay_key = makeTransactionHAReplayOutboxKey(txn_id);
+        var out: HAOutbox = .{};
+        errdefer out.deinit(alloc);
+        out.batch_payload = self.getAlloc(alloc, &batch_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        out.replay_payload = self.getAlloc(alloc, &replay_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        return out;
+    }
+
+    pub fn hasHAOutbox(self: *TxnManager, txn_id: TxnId) !bool {
+        const batch_key = makeTransactionHABatchOutboxKey(txn_id);
+        const replay_key = makeTransactionHAReplayOutboxKey(txn_id);
+        return try self.keyExists(&batch_key) or try self.keyExists(&replay_key);
+    }
+
+    pub fn clearHAOutbox(self: *TxnManager, txn_id: TxnId, kind: HAOutboxKind) !void {
+        switch (kind) {
+            .batch => {
+                const key = makeTransactionHABatchOutboxKey(txn_id);
+                try self.applyBatch(&.{}, &.{&key}, null);
+            },
+            .replay => {
+                const key = makeTransactionHAReplayOutboxKey(txn_id);
+                try self.applyBatch(&.{}, &.{&key}, null);
+            },
+        }
+    }
+
     pub fn collectIntentDocumentKeys(
         self: *TxnManager,
         alloc: Allocator,
@@ -658,16 +728,38 @@ pub const TxnManager = struct {
     }
 
     pub fn listTransactions(self: *TxnManager, alloc: Allocator) ![]TxnSummary {
-        const records = try self.scanPrefix(alloc, records_prefix);
-        defer backend_scan.freeResults(alloc, records);
+        return (try self.listTransactionsPage(alloc, null, std.math.maxInt(usize))).items;
+    }
 
+    pub fn listTransactionsPage(
+        self: *TxnManager,
+        alloc: Allocator,
+        after: ?TxnId,
+        limit: usize,
+    ) !TxnSummaryPage {
+        if (limit == 0) return .{ .items = try alloc.alloc(TxnSummary, 0), .next_after = after };
         var items = std.ArrayListUnmanaged(TxnSummary).empty;
         errdefer items.deinit(alloc);
-        for (records) |entry| {
-            if (entry.key.len != records_prefix.len + 16) continue;
-            const record = try decodeRecord(entry.value);
+        var read = try self.store.beginRead();
+        defer read.abort();
+        var cursor = try read.openCursor();
+        defer cursor.close();
+        var entry = if (after) |txn_id| blk: {
+            const key = makeRecordKey(txn_id);
+            const found = (try cursor.seekAtOrAfter(&key)) orelse break :blk null;
+            break :blk if (std.mem.eql(u8, found.key, &key)) try cursor.next() else found;
+        } else try cursor.seekAtOrAfter(records_prefix);
+        var last: ?TxnId = null;
+        while (entry) |record_entry| {
+            if (!std.mem.startsWith(u8, record_entry.key, records_prefix)) break;
+            if (record_entry.key.len != records_prefix.len + 16) {
+                entry = try cursor.next();
+                continue;
+            }
+            const record = try decodeRecord(record_entry.value);
+            const txn_id = record_entry.key[records_prefix.len..][0..16].*;
             try items.append(alloc, .{
-                .txn_id = entry.key[records_prefix.len..][0..16].*,
+                .txn_id = txn_id,
                 .status = record.status,
                 .begin_timestamp = record.begin_timestamp,
                 .commit_version = record.commit_version,
@@ -677,8 +769,15 @@ pub const TxnManager = struct {
                 .coordinator_known = record.coordinator_known,
                 .retain_terminal = record.retain_terminal,
             });
+            last = txn_id;
+            entry = try cursor.next();
+            if (items.items.len >= limit) break;
         }
-        return try items.toOwnedSlice(alloc);
+        const has_more = if (entry) |next| std.mem.startsWith(u8, next.key, records_prefix) else false;
+        return .{
+            .items = try items.toOwnedSlice(alloc),
+            .next_after = if (has_more) last else null,
+        };
     }
 
     pub fn markParticipantResolved(self: *TxnManager, txn_id: TxnId, participant: []const u8) !void {
@@ -856,7 +955,9 @@ pub const TxnManager = struct {
                 options.retained_cutoff_timestamp orelse cutoff_timestamp
             else
                 cutoff_timestamp;
-            if (refreshed.status != .pending and refreshed.finalized_at < cleanup_cutoff and !try self.hasAnyIntents(txn_id)) {
+            if (refreshed.status != .pending and refreshed.finalized_at < cleanup_cutoff and
+                !try self.hasAnyIntents(txn_id) and !try self.hasHAOutbox(txn_id))
+            {
                 try self.deleteTransactionMetadata(txn_id);
                 stats.cleaned_records += 1;
                 if (self.trace_writer) |tw| {
@@ -906,30 +1007,20 @@ pub const TxnManager = struct {
 
     /// Check if any other pending transaction has an intent on this key.
     fn hasPendingIntentForKey(self: *TxnManager, user_key: []const u8, exclude_txn: ?TxnId) !bool {
-        // Scan all intents
-        const all_intents = try self.scanPrefix(self.alloc, intents_prefix);
-        defer backend_scan.freeResults(self.alloc, all_intents);
+        const lock_key = try self.makeIntentLockKey(user_key);
+        defer self.alloc.free(lock_key);
+        const owner = self.getAlloc(self.alloc, lock_key) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+        defer self.alloc.free(owner);
+        if (owner.len != @sizeOf(TxnId)) return TxnError.InvalidTxnRecord;
+        if (exclude_txn) |txn_id| if (std.mem.eql(u8, owner, &txn_id)) return false;
+        return true;
+    }
 
-        for (all_intents) |entry| {
-            // Parse txn_id from key: intents_prefix(20) + txn_id(16) + ':' + user_key
-            if (entry.key.len < intents_prefix.len + 17) continue;
-            const entry_txn_id = entry.key[intents_prefix.len..][0..16];
-            const entry_user_key = entry.key[intents_prefix.len + 17 ..];
-
-            // Skip our own txn
-            if (exclude_txn) |txn_id| {
-                if (std.mem.eql(u8, entry_txn_id, &txn_id)) continue;
-            }
-
-            // Check if same key
-            if (!std.mem.eql(u8, entry_user_key, user_key)) continue;
-
-            // Check if the other txn is still pending
-            const status = self.getTransactionStatus(entry_txn_id.*) catch continue;
-            if (status == .pending) return true;
-        }
-
-        return false;
+    pub fn checkOrdinaryWriteConflict(self: *TxnManager, key: []const u8) !void {
+        if (try self.hasPendingIntentForKey(key, null)) return TxnError.IntentConflict;
     }
 
     /// Build an intent key: intents_prefix + txn_id + ':' + user_key
@@ -940,6 +1031,13 @@ pub const TxnManager = struct {
         @memcpy(key[intents_prefix.len..][0..16], &txn_id);
         key[intents_prefix.len + 16] = ':';
         @memcpy(key[intents_prefix.len + 17 ..], user_key);
+        return key;
+    }
+
+    fn makeIntentLockKey(self: *TxnManager, user_key: []const u8) ![]u8 {
+        const key = try self.alloc.alloc(u8, intent_locks_prefix.len + user_key.len);
+        @memcpy(key[0..intent_locks_prefix.len], intent_locks_prefix);
+        @memcpy(key[intent_locks_prefix.len..], user_key);
         return key;
     }
 
@@ -986,7 +1084,7 @@ pub const TxnManager = struct {
             TxnError.TxnNotFound => return false,
             else => return err,
         };
-        if (record.status == .pending or try self.hasAnyIntents(txn_id)) return false;
+        if (record.status == .pending or try self.hasAnyIntents(txn_id) or try self.hasHAOutbox(txn_id)) return false;
         const cutoff = if (record.retain_terminal) retained_cutoff_timestamp else cutoff_timestamp;
         if (record.finalized_at >= cutoff) return false;
         const unresolved = try self.getUnresolvedParticipants(self.alloc, txn_id);
@@ -1014,7 +1112,9 @@ pub const TxnManager = struct {
         const record_key = makeRecordKey(txn_id);
         const participant_key = makeSidecarKey(participants_prefix, txn_id);
         const resolved_key = makeSidecarKey(resolved_participants_prefix, txn_id);
-        try self.applyBatch(&.{}, &.{ &record_key, &participant_key, &resolved_key }, null);
+        const ha_batch_key = makeTransactionHABatchOutboxKey(txn_id);
+        const ha_replay_key = makeTransactionHAReplayOutboxKey(txn_id);
+        try self.applyBatch(&.{}, &.{ &record_key, &participant_key, &resolved_key, &ha_batch_key, &ha_replay_key }, null);
     }
 
     fn saveParticipantSet(self: *TxnManager, comptime prefix: []const u8, txn_id: TxnId, participants: []const []const u8) !void {
@@ -1055,6 +1155,16 @@ pub const TxnManager = struct {
         defer txn.abort();
         const value = try txn.get(key);
         return try alloc.dupe(u8, value);
+    }
+
+    fn keyExists(self: *TxnManager, key: []const u8) !bool {
+        var txn = try self.store.beginRead();
+        defer txn.abort();
+        _ = txn.get(key) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+        return true;
     }
 
     fn putValue(self: *TxnManager, key: []const u8, value: []const u8) !void {
@@ -1224,6 +1334,14 @@ fn makeSidecarKey(comptime prefix: []const u8, txn_id: TxnId) [prefix.len + 16]u
     @memcpy(key_buf[0..prefix.len], prefix);
     @memcpy(key_buf[prefix.len..], &txn_id);
     return key_buf;
+}
+
+pub fn makeTransactionHABatchOutboxKey(txn_id: TxnId) [ha_batch_outbox_prefix.len + 16]u8 {
+    return makeSidecarKey(ha_batch_outbox_prefix, txn_id);
+}
+
+pub fn makeTransactionHAReplayOutboxKey(txn_id: TxnId) [ha_replay_outbox_prefix.len + 16]u8 {
+    return makeSidecarKey(ha_replay_outbox_prefix, txn_id);
 }
 
 fn applyResolveDecision(record: *TxnRecord, status: TxnStatus, timestamp: u64) TxnError!void {
@@ -1689,6 +1807,19 @@ test "idempotent begin upgrades a legacy transaction coordinator role" {
     try std.testing.expectEqual(@as(usize, 1), txns.len);
     try std.testing.expect(txns[0].coordinator_known);
     try std.testing.expect(txns[0].coordinator);
+
+    const txn_id_2: TxnId = .{7} ** 16;
+    const txn_id_3: TxnId = .{8} ** 16;
+    try mgr.initTransaction(txn_id_2, 1_001);
+    try mgr.initTransaction(txn_id_3, 1_002);
+    const first_page = try mgr.listTransactionsPage(alloc, null, 2);
+    defer alloc.free(first_page.items);
+    try std.testing.expectEqual(@as(usize, 2), first_page.items.len);
+    try std.testing.expect(first_page.next_after != null);
+    const second_page = try mgr.listTransactionsPage(alloc, first_page.next_after, 2);
+    defer alloc.free(second_page.items);
+    try std.testing.expectEqual(@as(usize, 1), second_page.items.len);
+    try std.testing.expect(second_page.next_after == null);
 }
 
 test "transaction init + abort" {

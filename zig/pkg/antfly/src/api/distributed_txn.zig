@@ -451,7 +451,7 @@ fn executeMultiTableCommitOnce(
             if (trace_writer) |tw| {
                 tw.traceEvent(&.{ .name = "AbortTransaction", .txn_id = txn_id, .shard_id = "" });
             }
-            abortBegunRefs(alloc, worker, txn_id, commit_version, begun.items) catch {};
+            if (begun.items.len > 0) abortParticipants(alloc, worker, txn_id, commit_version, participants.items) catch {};
         }
     }
 
@@ -464,7 +464,7 @@ fn executeMultiTableCommitOnce(
             .participants = participant_ids,
         }) catch |err| switch (err) {
             error.UnknownGroup => {
-                try abortBegunRefs(alloc, worker, txn_id, commit_version, begun.items);
+                if (begun.items.len > 0) try abortParticipants(alloc, worker, txn_id, commit_version, participants.items);
                 abort_on_error = false;
                 return .{ .conflict = participantUnavailableConflict(participant, .begin) };
             },
@@ -493,12 +493,12 @@ fn executeMultiTableCommitOnce(
                         .pending => {},
                     }
                 }
-                if (begun.items.len > 0) try abortBegunRefs(alloc, worker, txn_id, commit_version, begun.items);
+                if (begun.items.len > 0) try abortParticipants(alloc, worker, txn_id, commit_version, participants.items);
                 abort_on_error = false;
                 return error.TransactionBeginFailed;
             },
             else => {
-                if (begun.items.len > 0) try abortBegunRefs(alloc, worker, txn_id, commit_version, begun.items);
+                if (begun.items.len > 0) try abortParticipants(alloc, worker, txn_id, commit_version, participants.items);
                 abort_on_error = false;
                 std.log.warn("transaction begin failed table={s} group_id={} err={s}", .{
                     participant.table_name, participant.group_id, @errorName(err),
@@ -524,17 +524,17 @@ fn executeMultiTableCommitOnce(
                 if (trace_writer) |tw| {
                     tw.traceEvent(&.{ .name = "AbortTransaction", .txn_id = txn_id, .shard_id = "" });
                 }
-                try abortBegunRefs(alloc, worker, txn_id, commit_version, begun.items);
+                try abortParticipants(alloc, worker, txn_id, commit_version, participants.items);
                 abort_on_error = false;
                 return .{ .conflict = participantConflict(participant) };
             },
             error.UnknownGroup => {
-                try abortBegunRefs(alloc, worker, txn_id, commit_version, begun.items);
+                try abortParticipants(alloc, worker, txn_id, commit_version, participants.items);
                 abort_on_error = false;
                 return .{ .conflict = participantUnavailableConflict(participant, .prepare) };
             },
             else => {
-                try abortBegunRefs(alloc, worker, txn_id, commit_version, begun.items);
+                try abortParticipants(alloc, worker, txn_id, commit_version, participants.items);
                 abort_on_error = false;
                 return err;
             },
@@ -560,7 +560,7 @@ fn executeMultiTableCommitOnce(
                     });
                 }
                 if (participant_index == 0) {
-                    try abortBegunRefs(alloc, worker, txn_id, commit_version, begun.items);
+                    try abortParticipants(alloc, worker, txn_id, commit_version, participants.items);
                     abort_on_error = false;
                     return .{ .conflict = participantDecisionConflict(participant, .resolve) };
                 }
@@ -580,7 +580,7 @@ fn executeMultiTableCommitOnce(
                 if (participant_index == 0) {
                     // The decision participant has no durable transaction
                     // record, so no commit decision exists yet.
-                    try abortBegunRefs(alloc, worker, txn_id, commit_version, begun.items);
+                    try abortParticipants(alloc, worker, txn_id, commit_version, participants.items);
                     abort_on_error = false;
                     return .{ .conflict = participantTornStateConflict(participant, .resolve) };
                 }
@@ -628,12 +628,12 @@ fn executeMultiTableCommitOnce(
                         continue :resolve_participants;
                     },
                     .pending => {
-                        try abortBegunRefs(alloc, worker, txn_id, commit_version, begun.items);
+                        try abortParticipants(alloc, worker, txn_id, commit_version, participants.items);
                         abort_on_error = false;
                         return err;
                     },
                     .aborted => {
-                        try abortBegunRefs(alloc, worker, txn_id, commit_version, begun.items);
+                        try abortParticipants(alloc, worker, txn_id, commit_version, participants.items);
                         abort_on_error = false;
                         return .{ .conflict = participantDecisionConflict(participant, .resolve) };
                     },
@@ -1263,19 +1263,19 @@ test "txn resolve codec preserves sync level and accepts legacy requests" {
     try std.testing.expectEqual(db_mod.types.SyncLevel.propose, legacy.sync_level);
 }
 
-fn abortBegunRefs(
+fn abortParticipants(
     alloc: std.mem.Allocator,
     worker: ParticipantWorker,
     txn_id: db_mod.types.TxnId,
     timestamp: u64,
-    refs: []const ParticipantRef,
+    participants: []const ParticipantTxn,
 ) !void {
-    if (refs.len == 0) return;
+    if (participants.len == 0) return;
 
     // The first participant is the coordinator. Do not report an aborted
     // transaction until its abort decision is durable; otherwise a prepared
     // transaction can be stranded forever while the client is told it lost.
-    const coordinator = refs[0];
+    const coordinator = participants[0];
     worker.resolveGroup(alloc, coordinator.group_id, coordinator.table_name, .{
         .txn_id = txn_id,
         .status = .aborted,
@@ -1292,12 +1292,21 @@ fn abortBegunRefs(
 
     // Once the coordinator decision is durable, follower delivery is
     // idempotent recovery work and must not contradict that decision.
-    for (refs[1..]) |ref| {
-        worker.resolveGroup(alloc, ref.group_id, ref.table_name, .{
+    for (participants[1..]) |participant| {
+        worker.resolveGroup(alloc, participant.group_id, participant.table_name, .{
             .txn_id = txn_id,
             .status = .aborted,
             .commit_version = timestamp,
-        }) catch {};
+        }) catch |err| {
+            // Continue notifying later participants. The durable coordinator
+            // record remains authoritative and recovery will retry any
+            // unavailable participant.
+            std.log.warn("transaction abort delivery failed table={s} group_id={} err={s}", .{
+                participant.table_name,
+                participant.group_id,
+                @errorName(err),
+            });
+        };
     }
 }
 
@@ -1619,6 +1628,7 @@ test "distributed txn coordinator aborts begun participants on prepare failure" 
     };
 
     const Recorder = struct {
+        fail_begin: bool = false,
         resolves: std.ArrayListUnmanaged(db_mod.types.TxnStatus) = .empty,
 
         fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
@@ -1637,10 +1647,14 @@ test "distributed txn coordinator aborts begun participants on prepare failure" 
             };
         }
 
-        fn begin(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnBeginRequest) !void {}
+        fn begin(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, _: []const u8, _: TxnBeginRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.fail_begin and group_id == 7002) return error.InjectedBeginFailure;
+        }
 
-        fn prepare(_: *anyopaque, _: std.mem.Allocator, group_id: u64, _: []const u8, _: TxnPrepareRequest) !void {
-            if (group_id == 7002) return error.IntentConflict;
+        fn prepare(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, _: []const u8, _: TxnPrepareRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!self.fail_begin and group_id == 7002) return error.IntentConflict;
         }
 
         fn resolve(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, req: TxnResolveRequest) !void {
@@ -1657,6 +1671,27 @@ test "distributed txn coordinator aborts begun participants on prepare failure" 
     defer recorder.deinit(std.testing.allocator);
     const txn_id = try parseTxnIdHex("ffeeddccbbaa99887766554433221100");
     try std.testing.expectError(error.IntentConflict, executeCrossGroup(
+        std.testing.allocator,
+        FakeCatalog.iface(),
+        recorder.worker(),
+        "docs",
+        txn_id,
+        10_000,
+        10_001,
+        .{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"a\"}" },
+                .{ .key = "doc:z", .value = "{\"title\":\"z\"}" },
+            },
+        },
+        null,
+    ));
+    try std.testing.expectEqual(@as(usize, 2), recorder.resolves.items.len);
+    for (recorder.resolves.items) |status| try std.testing.expectEqual(db_mod.types.TxnStatus.aborted, status);
+
+    recorder.resolves.clearRetainingCapacity();
+    recorder.fail_begin = true;
+    try std.testing.expectError(error.TransactionBeginFailed, executeCrossGroup(
         std.testing.allocator,
         FakeCatalog.iface(),
         recorder.worker(),

@@ -3119,9 +3119,49 @@ pub const DB = struct {
         try mirrorHABatchMutationCommitContext(&ctx, request);
     }
 
+    fn mirrorHAEncodedBatchMutationCommit(self: *DB, payload: []const u8) !void {
+        var ctx = self.batchContext();
+        try mirrorHAEncodedBatchMutationCommitContext(&ctx, payload);
+    }
+
     fn mirrorHAReplayPayloadCommit(self: *DB, payload: []const u8) !void {
         var ctx = self.batchContext();
         try mirrorHAReplayPayloadCommitContext(&ctx, payload);
+    }
+
+    fn flushTransactionHAOutbox(self: *DB, txn_id: transactions_mod.TxnId) !void {
+        var outbox = try self.core.loadTransactionHAOutbox(self.alloc, txn_id);
+        defer outbox.deinit(self.alloc);
+        if (outbox.batch_payload == null and outbox.replay_payload == null) return;
+
+        // An outbox entry is a durable synchronous-replication obligation. Do
+        // not silently discard it if a restart temporarily removes or
+        // downgrades the corresponding mirror configuration.
+        if (outbox.batch_payload != null) {
+            const mirror = self.ha_async_batch_mirror orelse return error.HAMirrorUnavailable;
+            if (!haMirrorSyncEnabled(mirror)) return error.HAMirrorUnavailable;
+        }
+        if (outbox.replay_payload != null) {
+            const mirror = self.ha_async_effect_mirror orelse return error.HAMirrorUnavailable;
+            if (!haMirrorSyncEnabled(mirror)) return error.HAMirrorUnavailable;
+        }
+        try self.enforceHAWriteGate();
+        var ctx = self.batchContext();
+        if (outbox.batch_payload != null) try preflightHAMirrorSyncCommitContext(&ctx, ctx.ha_async_batch_mirror);
+        if (outbox.replay_payload != null) try preflightHAMirrorSyncCommitContext(&ctx, ctx.ha_async_effect_mirror);
+
+        if (outbox.batch_payload) |payload| {
+            try self.mirrorHAEncodedBatchMutationCommit(payload);
+            lockApply(self);
+            defer self.core.unlockApply();
+            try self.core.clearTransactionHAOutbox(txn_id, .batch);
+        }
+        if (outbox.replay_payload) |payload| {
+            try self.mirrorHAReplayPayloadCommit(payload);
+            lockApply(self);
+            defer self.core.unlockApply();
+            try self.core.clearTransactionHAOutbox(txn_id, .replay);
+        }
     }
 
     fn mirrorHASchemaMetadataCommit(self: *DB, table_schema: schema_mod.TableSchema) !void {
@@ -5463,6 +5503,7 @@ pub const DB = struct {
                 );
                 self.core.unlockApply();
                 apply_mutex_held = false;
+                if (!opts.bypass_ha_write_gate) try self.flushTransactionHAOutbox(resolution.txn_id);
                 try self.waitForResolvedTransactionSync(req.sync_level, outcome.replay_sequence);
                 return;
             }
@@ -5513,6 +5554,13 @@ pub const DB = struct {
             .sync_level = req.sync_level,
         };
         if (profile) |active_profile| recordProfileNs(profile, &active_profile.merge_effective_req_ns, merge_effective_req_start_ns);
+
+        // Prepared transaction intents fence the ordinary single-group fast
+        // path too. The key-oriented intent index keeps this O(touched keys)
+        // instead of scanning every outstanding transaction.
+        if (opts.transaction_resolution == null) {
+            try self.core.checkOrdinaryWriteConflicts(effective_ops.writes, effective_ops.deletes);
+        }
 
         if (effective_req.predicates.len > 0) {
             const predicates_start_ns = monotonicTimeNs();
@@ -6092,6 +6140,33 @@ pub const DB = struct {
         );
         try store_writes.appendSlice(self.alloc, opts.extra_store_writes);
         try delete_keys.appendSlice(self.alloc, identity_visibility_deletes.items);
+
+        // A synchronous HA append can fail after the local transaction commit.
+        // Persist the exact committed payloads in the same backend batch so an
+        // idempotent resolve retry can finish mirroring without reconstructing
+        // data from already-deleted intents.
+        var transaction_ha_batch_payload: ?[]const u8 = null;
+        var transaction_ha_replay_payload: ?[]const u8 = null;
+        if (opts.transaction_resolution) |resolution| if (!opts.bypass_ha_write_gate) {
+            if (self.ha_async_batch_mirror) |mirror| if (haMirrorSyncEnabled(mirror)) {
+                const payload = try ha_effects_mod.encodeBatchMutationRequestAlloc(self.alloc, effective_req);
+                try owned_store_values.append(self.alloc, payload);
+                const key_array = transactions_mod.makeTransactionHABatchOutboxKey(resolution.txn_id);
+                const key = try self.alloc.dupe(u8, &key_array);
+                try owned_store_keys.append(self.alloc, key);
+                try store_writes.append(self.alloc, .{ .key = key, .value = payload });
+                transaction_ha_batch_payload = payload;
+            };
+            if (self.ha_async_effect_mirror) |mirror| if (haMirrorSyncEnabled(mirror)) {
+                const payload = try self.alloc.dupe(u8, replay_payload);
+                try owned_store_values.append(self.alloc, payload);
+                const key_array = transactions_mod.makeTransactionHAReplayOutboxKey(resolution.txn_id);
+                const key = try self.alloc.dupe(u8, &key_array);
+                try owned_store_keys.append(self.alloc, key);
+                try store_writes.append(self.alloc, .{ .key = key, .value = payload });
+                transaction_ha_replay_payload = payload;
+            };
+        };
         const replay_append: ?docstore_mod.DocStore.ReplayAppend = if (opts.suppress_derived_replay_append)
             null
         else
@@ -6137,8 +6212,14 @@ pub const DB = struct {
             persisted_range_end_owned = null;
         }
         if (!opts.bypass_ha_write_gate) {
-            try self.mirrorHABatchMutationCommit(effective_req);
-            try self.mirrorHAReplayPayloadCommit(replay_payload);
+            if (transaction_ha_batch_payload) |payload| {
+                try self.mirrorHAEncodedBatchMutationCommit(payload);
+                try self.core.clearTransactionHAOutbox(opts.transaction_resolution.?.txn_id, .batch);
+            } else try self.mirrorHABatchMutationCommit(effective_req);
+            if (transaction_ha_replay_payload) |payload| {
+                try self.mirrorHAReplayPayloadCommit(payload);
+                try self.core.clearTransactionHAOutbox(opts.transaction_resolution.?.txn_id, .replay);
+            } else try self.mirrorHAReplayPayloadCommit(replay_payload);
         }
         if (pending_identity_visibility_summary) |summary| {
             self.identity_visibility_summary_cache = summary;
@@ -13908,7 +13989,13 @@ pub const DB = struct {
         if (status != .committed) {
             lockApply(self);
             defer self.core.unlockApply();
-            _ = try self.core.resolveTransactionIntentsWithExtraBatch(txn_id, status, commit_version, .{});
+            _ = self.core.resolveTransactionIntentsWithExtraBatch(txn_id, status, commit_version, .{}) catch |err| switch (err) {
+                // An abort decision for a participant that was declared but
+                // never enlisted is already satisfied. Treat it as an
+                // idempotent no-op so coordinator recovery can acknowledge it.
+                transactions_mod.TxnError.TxnNotFound => return,
+                else => return err,
+            };
             return;
         }
 
@@ -13929,6 +14016,7 @@ pub const DB = struct {
                     return err;
                 };
                 self.core.unlockApply();
+                try self.flushTransactionHAOutbox(txn_id);
                 try self.waitForResolvedTransactionSync(sync_level, outcome.replay_sequence);
                 return;
             }
@@ -14008,7 +14096,8 @@ pub const DB = struct {
         defer self.alloc.free(txns);
         var resolved_finalized: u64 = 0;
         for (txns) |txn| {
-            if (txn.status == .pending or !(try self.core.transactionHasIntents(txn.txn_id))) continue;
+            if (txn.status == .pending or
+                (!(try self.core.transactionHasIntents(txn.txn_id)) and !(try self.core.transactionHasHAOutbox(txn.txn_id)))) continue;
             const resolve_version = if (txn.status == .committed and txn.commit_version != 0)
                 txn.commit_version
             else
@@ -30572,6 +30661,25 @@ fn mirrorHABatchMutationCommitContext(ctx: *const BatchExecutionContext, request
         lockAtomic(ctx.log_mutex);
         defer ctx.log_mutex.*.unlock();
         const lsn = ha_effects_mod.appendBatchMutationRequest(ctx.alloc, mirror.primary, request, .{
+            .shard_id = ctx.identity_namespace.shard_id,
+            .table_id = ctx.identity_namespace.table_id,
+        }) catch |err| {
+            noteHAMirrorFailure(mirror, "batch mutation", err);
+            if (haMirrorSyncEnabled(mirror)) return err;
+            return;
+        };
+        if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
+        break :blk lsn;
+    };
+    try evaluateHAMirrorCommitGate(mirror, lsn);
+}
+
+fn mirrorHAEncodedBatchMutationCommitContext(ctx: *const BatchExecutionContext, payload: []const u8) !void {
+    const mirror = ctx.ha_async_batch_mirror orelse return;
+    const lsn = blk: {
+        lockAtomic(ctx.log_mutex);
+        defer ctx.log_mutex.*.unlock();
+        const lsn = ha_effects_mod.appendEncodedBatchMutationRequest(mirror.primary, payload, .{
             .shard_id = ctx.identity_namespace.shard_id,
             .table_id = ctx.identity_namespace.table_id,
         }) catch |err| {
@@ -58391,6 +58499,74 @@ test "storage.ha db primary progress sync wait returns would block without repor
     try std.testing.expectEqual(@as(u64, 0), slot.received_lsn);
 }
 
+test "db transaction HA retry drains durable mirror outbox" {
+    const alloc = std.testing.allocator;
+    var db_path_buf: [256]u8 = undefined;
+    const db_path = tempPath(&db_path_buf);
+    defer cleanupTempDir(db_path);
+    var ha_log_path_buf: [256]u8 = undefined;
+    const ha_log_path = tempPath(&ha_log_path_buf);
+    defer cleanupTempDir(ha_log_path);
+    var ha_slots_path_buf: [256]u8 = undefined;
+    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    defer cleanupTempDir(ha_slots_path);
+
+    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
+        .cluster_id = 263,
+        .shard_id = 4,
+        .table_id = 10,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer primary.close();
+    try primary.createSlot("standby-a", 0);
+    const AckOnRetry = struct {
+        calls: usize = 0,
+        fn wait(ctx: *anyopaque, active_primary: *ha_primary_mod.Primary, target_lsn: u64, _: ha_primary_mod.SyncPolicy) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            if (self.calls == 1) return error.InjectedMirrorWaitFailure;
+            try active_primary.standbyStatusUpdate("standby-a", 1, target_lsn, target_lsn);
+        }
+    };
+    var ack = AckOnRetry{};
+    const standby_names = [_][]const u8{"standby-a"};
+    var db = try DB.open(alloc, std.mem.span(db_path), .{
+        .ha_async_batch_mirror = .{
+            .primary = &primary,
+            .sync_policy = .{
+                .mode = .remote_write,
+                .standby_names = &standby_names,
+                .failure_policy = .block,
+            },
+            .sync_wait_ctx = &ack,
+            .sync_wait_fn = AckOnRetry.wait,
+        },
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    const txn_id = try db.beginTransaction(20_000);
+    try db.writeTransaction(txn_id, .{ .writes = &.{.{
+        .key = "doc:ha-txn",
+        .value = "{\"title\":\"committed\"}",
+    }} });
+    try std.testing.expectError(error.InjectedMirrorWaitFailure, db.commitTransaction(txn_id, 20_001));
+    try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try db.getTransactionStatus(txn_id));
+    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
+
+    const configured_mirror = db.ha_async_batch_mirror;
+    db.ha_async_batch_mirror = null;
+    try std.testing.expectError(error.HAMirrorUnavailable, db.commitTransaction(txn_id, 20_001));
+    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
+    db.ha_async_batch_mirror = configured_mirror;
+
+    try db.commitTransaction(txn_id, 20_001);
+    try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
+    try db.commitTransaction(txn_id, 20_001);
+    try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
+}
+
 test "storage.ha db primary progress sync wait survives primary restart before ack" {
     const alloc = std.testing.allocator;
 
@@ -76147,6 +76323,37 @@ test "db transaction resolves transforms against pending same-transaction writes
         .float => |value| try std.testing.expectEqual(@as(f64, 5), value),
         else => return error.TestExpectedEqual,
     }
+}
+
+test "db transaction intents fence ordinary batch transforms" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "doc:counter", .value = "{\"count\":0}" }} });
+
+    const txn_id = try db.beginTransaction(10_000);
+    try db.writeTransaction(txn_id, .{ .transforms = &.{.{
+        .key = "doc:counter",
+        .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }},
+    }} });
+
+    try std.testing.expectError(error.IntentConflict, db.batch(.{ .transforms = &.{.{
+        .key = "doc:counter",
+        .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }},
+    }} }));
+
+    try db.commitTransaction(txn_id, 10_001);
+    try db.batch(.{ .transforms = &.{.{
+        .key = "doc:counter",
+        .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }},
+    }} });
+    const raw = (try db.get(alloc, "doc:counter")) orelse return error.TestExpectedEqual;
+    defer alloc.free(raw);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"count\":2") != null);
 }
 
 test "db bulk ingest write commits document writes before finish" {

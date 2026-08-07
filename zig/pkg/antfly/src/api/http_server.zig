@@ -4946,6 +4946,7 @@ pub const ApiHttpServer = struct {
 
                 const session = (self.txn_sessions.stageRead(self.alloc, txn_id, &stage_req, owned_snapshot.stage()) catch |err| switch (err) {
                     error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
+                    error.TransactionCommitSealed => return try textResponse(self.alloc, 409, "transaction commit is sealed"),
                     error.SessionRecordTooLarge => return try textResponse(self.alloc, 413, "transaction session exceeds durable size limit"),
                     else => return err,
                 }) orelse return try textResponse(self.alloc, 404, "not found");
@@ -4972,6 +4973,7 @@ pub const ApiHttpServer = struct {
 
                 const session = (self.txn_sessions.stage(self.alloc, txn_id, &stage_req) catch |err| switch (err) {
                     error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
+                    error.TransactionCommitSealed => return try textResponse(self.alloc, 409, "transaction commit is sealed"),
                     error.SessionRecordTooLarge => return try textResponse(self.alloc, 413, "transaction session exceeds durable size limit"),
                     else => return err,
                 }) orelse return try textResponse(self.alloc, 404, "not found");
@@ -4998,6 +5000,7 @@ pub const ApiHttpServer = struct {
 
                 const session = (self.txn_sessions.stage(self.alloc, txn_id, &stage_req) catch |err| switch (err) {
                     error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
+                    error.TransactionCommitSealed => return try textResponse(self.alloc, 409, "transaction commit is sealed"),
                     error.SessionRecordTooLarge => return try textResponse(self.alloc, 413, "transaction session exceeds durable size limit"),
                     else => return err,
                 }) orelse return try textResponse(self.alloc, 404, "not found");
@@ -5016,6 +5019,7 @@ pub const ApiHttpServer = struct {
                 }
                 const info = (self.txn_sessions.createSavepoint(self.alloc, txn_id) catch |err| switch (err) {
                     error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
+                    error.TransactionCommitSealed => return try textResponse(self.alloc, 409, "transaction commit is sealed"),
                     error.SavepointLimitExceeded => return try textResponse(self.alloc, 409, "savepoint limit exceeded"),
                     error.SessionRecordTooLarge => return try textResponse(self.alloc, 413, "transaction session exceeds durable size limit"),
                     else => return err,
@@ -5035,6 +5039,7 @@ pub const ApiHttpServer = struct {
                 }
                 const info = (self.txn_sessions.rollbackToSavepoint(self.alloc, txn_id, session_route.savepoint_id) catch |err| switch (err) {
                     error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
+                    error.TransactionCommitSealed => return try textResponse(self.alloc, 409, "transaction commit is sealed"),
                     error.SessionRecordTooLarge => return try textResponse(self.alloc, 413, "transaction session exceeds durable size limit"),
                     else => return err,
                 }) orelse return try textResponse(self.alloc, 404, "not found");
@@ -5064,6 +5069,7 @@ pub const ApiHttpServer = struct {
                 }
                 const session = (self.txn_sessions.stage(self.alloc, txn_id, &stage_req) catch |err| switch (err) {
                     error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
+                    error.TransactionCommitSealed => return try textResponse(self.alloc, 409, "transaction commit is sealed"),
                     error.SessionRecordTooLarge => return try textResponse(self.alloc, 413, "transaction session exceeds durable size limit"),
                     else => return err,
                 }) orelse return try textResponse(self.alloc, 404, "not found");
@@ -5094,6 +5100,9 @@ pub const ApiHttpServer = struct {
                     };
                 }
                 var commit_req = (self.txn_sessions.cloneCommitRequest(self.alloc, txn_id, if (parsed_req) |*value| value else null) catch |err| switch (err) {
+                    error.TransactionCommitRequestMismatch => {
+                        return try textResponse(self.alloc, 409, "transaction commit retry body does not match the sealed request");
+                    },
                     error.SessionLeaseLost => {
                         var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
                         defer arena_impl.deinit();

@@ -38,6 +38,10 @@ pub const Config = struct {
     /// Stable transaction sessions may be retried for seven days. Retain the
     /// terminal decision for an extra day so boundary retries cannot reapply.
     retained_terminal_ns: u64 = 8 * std.time.ns_per_day,
+    /// Bound each background pass; a cursor rotates across the keyspace so
+    /// retained idempotency decisions cannot create unbounded allocations or
+    /// periodic CPU spikes.
+    max_records_per_run: usize = 16_384,
     clock: platform_clock.Clock = platform_clock.Clock.real(),
     resolver_ctx: ?*anyopaque = null,
     resolve_participant_fn: ?resolution_mod.ResolveParticipantFn = null,
@@ -129,6 +133,7 @@ pub const Runtime = if (builtin.os.tag == .freestanding) struct {
     shutdown: bool = false,
     stats_value: types.TransactionRecoveryStats = .{},
     future: ?Io.Future(void) = null,
+    scan_after: ?transactions_mod.TxnId = null,
 
     pub fn init(
         alloc: Allocator,
@@ -278,10 +283,20 @@ const RunSummary = struct {
     notification_attempts: u64 = 0,
     notification_successes: u64 = 0,
     notification_failures: u64 = 0,
+    next_scan_after: ?transactions_mod.TxnId = null,
 };
 
 fn runRecovery(runtime: *Runtime, now_ns: u64) !RunSummary {
-    return try runRecoveryWithConfig(runtime.alloc, runtime.store, runtime.config, now_ns);
+    const summary = try runRecoveryPageWithConfig(
+        runtime.alloc,
+        runtime.store,
+        runtime.config,
+        now_ns,
+        runtime.scan_after,
+        @max(1, runtime.config.max_records_per_run),
+    );
+    runtime.scan_after = summary.next_scan_after;
+    return summary;
 }
 
 fn runRecoveryWithConfig(
@@ -290,13 +305,25 @@ fn runRecoveryWithConfig(
     config: Config,
     now_ns: u64,
 ) !RunSummary {
+    return try runRecoveryPageWithConfig(alloc, store, config, now_ns, null, std.math.maxInt(usize));
+}
+
+fn runRecoveryPageWithConfig(
+    alloc: Allocator,
+    store: anytype,
+    config: Config,
+    now_ns: u64,
+    after: ?transactions_mod.TxnId,
+    limit: usize,
+) !RunSummary {
     var summary: RunSummary = .{};
     var manager = try transactions_mod.TxnManager.init(alloc, try backend_erased.storeFrom(alloc, store));
     defer manager.deinit();
-    const txns = try manager.listTransactions(alloc);
-    defer alloc.free(txns);
+    const page = try manager.listTransactionsPage(alloc, after, limit);
+    defer alloc.free(page.items);
+    summary.next_scan_after = page.next_after;
 
-    transaction: for (txns) |txn| {
+    transaction: for (page.items) |txn| {
         summary.recovery.scanned_records += 1;
         if (txn.status == .pending) {
             const cutoff = now_ns -| config.cutoff_ns;

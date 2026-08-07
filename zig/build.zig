@@ -3195,6 +3195,7 @@ pub fn build(b: *std.Build) void {
         "table contract rejects unsupported index kinds before admission",
         "provisioned primary lookup lease fails on identity namespace mismatch",
         "inference pull recognizes help before model resolution",
+        "inference run recognizes help before server startup",
         "inference pull classifies order independent value flags",
         "inference pull rejects flags from the other model domain",
         "api http public sort capability gate validates mapped sortable fields",
@@ -4783,6 +4784,7 @@ pub fn build(b: *std.Build) void {
         .root_module = api_session_maintenance_test_mod,
         .filters = &.{
             "durable session mutations publish only after persistence succeeds",
+            "transaction session commit request is sealed across retries",
             "transaction session registry adopts durable session ownership",
             "transaction session registry only adopts durable sessions after lease expiry",
             "transaction session registry reports status and cleans expired durable sessions",

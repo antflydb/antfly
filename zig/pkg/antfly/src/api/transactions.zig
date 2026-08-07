@@ -504,6 +504,10 @@ pub const Session = struct {
     last_touched_timestamp: u64,
     sync_level: db_mod.types.SyncLevel,
     staged: ?OwnedTransactionCommitRequest = null,
+    /// Digest of the optional body supplied to the first commit attempt. Once
+    /// present, the effective request is sealed in `staged`; retries must carry
+    /// the same body (or omit it if the first attempt omitted it).
+    commit_body_digest: ?[32]u8 = null,
     read_snapshots: std.StringArrayHashMapUnmanaged(SessionReadSnapshot) = .empty,
     next_savepoint_id: u64 = 1,
     savepoints: std.AutoHashMapUnmanaged(u64, Savepoint) = .empty,
@@ -535,6 +539,7 @@ pub const Session = struct {
             .last_touched_timestamp = self.last_touched_timestamp,
             .sync_level = self.sync_level,
             .next_savepoint_id = self.next_savepoint_id,
+            .commit_body_digest = self.commit_body_digest,
         };
         errdefer out.deinit(alloc);
         if (self.staged) |staged| out.staged = try staged.clone(alloc);
@@ -1147,6 +1152,7 @@ pub const SessionRegistry = struct {
 
         var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
         errdefer candidate.deinit(alloc);
+        if (candidate.commit_body_digest != null) return error.TransactionCommitSealed;
         if (candidate.staged == null) {
             candidate.staged = try req.clone(alloc);
         } else {
@@ -1191,6 +1197,7 @@ pub const SessionRegistry = struct {
 
         var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
         errdefer candidate.deinit(alloc);
+        if (candidate.commit_body_digest != null) return error.TransactionCommitSealed;
         try upsertReadSnapshot(alloc, &candidate.read_snapshots, snapshot);
         if (candidate.staged == null) {
             candidate.staged = try req.clone(alloc);
@@ -1219,6 +1226,21 @@ pub const SessionRegistry = struct {
         defer session_lock.unlock();
         var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
         errdefer candidate.deinit(alloc);
+        const body_digest = try commitBodyDigest(alloc, extra_req);
+        if (candidate.commit_body_digest) |sealed_digest| {
+            if (!std.mem.eql(u8, &sealed_digest, &body_digest)) return error.TransactionCommitRequestMismatch;
+            const sealed = candidate.staged orelse return error.InvalidTransactionSessionRecord;
+            var out = try sealed.clone(alloc);
+            errdefer out.deinit(alloc);
+            touchSession(&candidate);
+            try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
+            try self.persistLocked(candidate);
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
+            self.publishCandidateLocked(alloc, publish_target, &candidate);
+            return out;
+        }
         var out: OwnedTransactionCommitRequest = if (candidate.staged) |staged|
             try staged.clone(alloc)
         else
@@ -1231,6 +1253,9 @@ pub const SessionRegistry = struct {
             out.deinit(alloc);
             return null;
         }
+        if (candidate.staged) |*staged| staged.deinit(alloc);
+        candidate.staged = try out.clone(alloc);
+        candidate.commit_body_digest = body_digest;
         touchSession(&candidate);
         try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
         try self.persistLocked(candidate);
@@ -1247,6 +1272,7 @@ pub const SessionRegistry = struct {
         defer session_lock.unlock();
         var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
         errdefer candidate.deinit(alloc);
+        if (candidate.commit_body_digest != null) return error.TransactionCommitSealed;
         if (self.max_savepoints) |limit| {
             if (candidate.savepoints.count() >= limit) return error.SavepointLimitExceeded;
         }
@@ -1281,6 +1307,7 @@ pub const SessionRegistry = struct {
         defer session_lock.unlock();
         var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
         errdefer candidate.deinit(alloc);
+        if (candidate.commit_body_digest != null) return error.TransactionCommitSealed;
         if (!candidate.savepoints.contains(savepoint_id)) return null;
         const savepoint = candidate.savepoints.getPtr(savepoint_id).?;
         if (candidate.staged) |*staged| staged.deinit(alloc);
@@ -3308,6 +3335,13 @@ fn encodeSessionRecord(alloc: std.mem.Allocator, session: Session) ![]u8 {
     } else {
         try out.appendSlice(alloc, "null");
     }
+    try out.appendSlice(alloc, ",\"commit_body_digest\":");
+    if (session.commit_body_digest) |digest| {
+        const hex = std.fmt.bytesToHex(digest, .lower);
+        try appendJsonString(alloc, &out, &hex);
+    } else {
+        try out.appendSlice(alloc, "null");
+    }
     try out.appendSlice(alloc, ",\"read_snapshots\":[");
     var snapshots_it = session.read_snapshots.iterator();
     var first_snapshot = true;
@@ -3390,6 +3424,18 @@ fn decodeSessionRecord(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, bod
     if (obj.get("staged")) |staged_value| {
         if (staged_value != .null) session.staged = try parseCommitValue(alloc, staged_value);
     }
+    if (obj.get("commit_body_digest")) |digest_value| {
+        switch (digest_value) {
+            .string => |encoded| {
+                if (encoded.len != 64) return error.InvalidTransactionSessionRecord;
+                var digest: [32]u8 = undefined;
+                _ = std.fmt.hexToBytes(&digest, encoded) catch return error.InvalidTransactionSessionRecord;
+                session.commit_body_digest = digest;
+            },
+            .null => {},
+            else => return error.InvalidTransactionSessionRecord,
+        }
+    }
     if (obj.get("read_snapshots")) |snapshots_value| {
         try decodeReadSnapshotsInto(alloc, snapshots_value, &session.read_snapshots);
     }
@@ -3425,6 +3471,17 @@ fn decodeSessionRecord(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, bod
 fn principalsEqual(left: ?[]const u8, right: ?[]const u8) bool {
     if (left == null or right == null) return left == null and right == null;
     return std.mem.eql(u8, left.?, right.?);
+}
+
+fn commitBodyDigest(
+    alloc: std.mem.Allocator,
+    req: ?*const OwnedTransactionCommitRequest,
+) ![32]u8 {
+    const encoded = if (req) |value| try encodeCommitRequest(alloc, value.*) else try alloc.dupe(u8, "null");
+    defer alloc.free(encoded);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(encoded, &digest, .{});
+    return digest;
 }
 
 fn newSessionTxnId(owner_node_id: u64) db_mod.types.TxnId {
@@ -3693,6 +3750,54 @@ test "transaction session registry adopts durable session ownership" {
     try std.testing.expect(try adopter.adopt(std.testing.allocator, session.txn_id, 12));
     const status = (try adopter.getStatus(std.testing.allocator, session.txn_id)).?;
     try std.testing.expectEqual(@as(u64, 12), status.owner_node_id);
+}
+
+test "transaction session commit request is sealed across retries" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/txn-session-commit-seal-store", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var durable = DurableSessionStore.init(alloc, &store);
+
+    var writer = SessionRegistry.init(&durable);
+    defer writer.deinit(alloc);
+    const session = try writer.begin(alloc, .{ .sync_level = .write }, 9);
+    const txn_id = session.txn_id;
+
+    var first_body = try parseCommitRequest(alloc,
+        \\{"read_set":[],"tables":{"docs":{"inserts":{"doc:a":{"value":1}}}}}
+    );
+    defer first_body.deinit(alloc);
+    var changed_body = try parseCommitRequest(alloc,
+        \\{"read_set":[],"tables":{"docs":{"inserts":{"doc:a":{"value":2}}}}}
+    );
+    defer changed_body.deinit(alloc);
+
+    var first = (try writer.cloneCommitRequest(alloc, txn_id, &first_body)) orelse return error.TestExpectedEqual;
+    defer first.deinit(alloc);
+
+    // Re-open through an empty registry to prove that both the sealed request
+    // and its digest survive process-local cache loss.
+    var reader = SessionRegistry.init(&durable);
+    defer reader.deinit(alloc);
+    var retry = (try reader.cloneCommitRequest(alloc, txn_id, &first_body)) orelse return error.TestExpectedEqual;
+    defer retry.deinit(alloc);
+    try std.testing.expectEqualStrings(first.tables[0].batch.writes[0].value, retry.tables[0].batch.writes[0].value);
+    try std.testing.expectError(
+        error.TransactionCommitRequestMismatch,
+        reader.cloneCommitRequest(alloc, txn_id, &changed_body),
+    );
+    try std.testing.expectError(
+        error.TransactionCommitSealed,
+        reader.stage(alloc, txn_id, &changed_body),
+    );
 }
 
 test "transaction session registry only adopts durable sessions after lease expiry" {

@@ -1015,6 +1015,10 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(409);
                 return ctx.text("session lease lost");
             },
+            error.TransactionCommitSealed => {
+                _ = ctx.status(409);
+                return ctx.text("transaction commit is sealed");
+            },
             else => return err,
         }) orelse {
             _ = ctx.status(404);
@@ -1122,6 +1126,10 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(409);
                 return ctx.text("session lease lost");
             },
+            error.TransactionCommitSealed => {
+                _ = ctx.status(409);
+                return ctx.text("transaction commit is sealed");
+            },
             else => return err,
         }) orelse {
             _ = ctx.status(404);
@@ -1187,6 +1195,10 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(409);
                 return ctx.text("session lease lost");
             },
+            error.TransactionCommitSealed => {
+                _ = ctx.status(409);
+                return ctx.text("transaction commit is sealed");
+            },
             else => return err,
         }) orelse {
             _ = ctx.status(404);
@@ -1224,6 +1236,10 @@ pub const AntflyApiHandler = struct {
             error.SessionLeaseLost => {
                 _ = ctx.status(409);
                 return ctx.text("session lease lost");
+            },
+            error.TransactionCommitSealed => {
+                _ = ctx.status(409);
+                return ctx.text("transaction commit is sealed");
             },
             error.SavepointLimitExceeded => {
                 _ = ctx.status(409);
@@ -1270,6 +1286,10 @@ pub const AntflyApiHandler = struct {
             error.SessionLeaseLost => {
                 _ = ctx.status(409);
                 return ctx.text("session lease lost");
+            },
+            error.TransactionCommitSealed => {
+                _ = ctx.status(409);
+                return ctx.text("transaction commit is sealed");
             },
             else => return err,
         }) orelse {
@@ -1325,6 +1345,10 @@ pub const AntflyApiHandler = struct {
             };
         }
         var commit_req = (self.api_server.txn_sessions.cloneCommitRequest(alloc, txn_id, if (parsed_req) |*value| value else null) catch |err| switch (err) {
+            error.TransactionCommitRequestMismatch => {
+                _ = ctx.status(409);
+                return ctx.text("transaction commit retry body does not match the sealed request");
+            },
             error.SessionLeaseLost => {
                 var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
                 defer arena_impl.deinit();

@@ -79,6 +79,14 @@ pub fn appendBatchMutationRequest(
     const payload = try encodeBatchMutationRequestAlloc(alloc, request);
     defer alloc.free(payload);
 
+    return try appendEncodedBatchMutationRequest(primary, payload, options);
+}
+
+pub fn appendEncodedBatchMutationRequest(
+    primary: *primary_mod.Primary,
+    payload: []const u8,
+    options: AppendBatchMutationOptions,
+) !u64 {
     return try primary.append(.{
         .kind = .batch_mutation,
         .payload_codec = .json,

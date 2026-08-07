@@ -1294,6 +1294,17 @@ pub const DBCore = struct {
         try manager.checkVersionPredicates(predicates, exclude_txn_id);
     }
 
+    pub fn checkOrdinaryWriteConflicts(
+        self: *DBCore,
+        writes: []const types.BatchWrite,
+        deletes: []const []const u8,
+    ) !void {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        for (writes) |write| try manager.checkOrdinaryWriteConflict(write.key);
+        for (deletes) |key| try manager.checkOrdinaryWriteConflict(key);
+    }
+
     pub fn resolveTransactionIntents(
         self: *DBCore,
         txn_id: transactions_mod.TxnId,
@@ -1335,6 +1346,32 @@ pub const DBCore = struct {
         var manager = try self.initTxnManager();
         defer manager.deinit();
         return try manager.validateIntentSnapshot(txn_id, expected_revision);
+    }
+
+    pub fn loadTransactionHAOutbox(
+        self: *DBCore,
+        alloc: Allocator,
+        txn_id: transactions_mod.TxnId,
+    ) !transactions_mod.HAOutbox {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        return try manager.loadHAOutbox(alloc, txn_id);
+    }
+
+    pub fn transactionHasHAOutbox(self: *DBCore, txn_id: transactions_mod.TxnId) !bool {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        return try manager.hasHAOutbox(txn_id);
+    }
+
+    pub fn clearTransactionHAOutbox(
+        self: *DBCore,
+        txn_id: transactions_mod.TxnId,
+        kind: transactions_mod.HAOutboxKind,
+    ) !void {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        try manager.clearHAOutbox(txn_id, kind);
     }
 
     pub fn collectTransactionIntentDocumentKeys(
