@@ -3795,7 +3795,7 @@ pub fn build(b: *std.Build) void {
         "data server can register a store without enabling data raft",
         "data server registered data raft uses wal state backend by default",
         "data raft ticker advances consensus independently of control rounds",
-        "data raft batch forwarding escapes a leaderless local placement",
+        "data raft batch forwarding gives local election grace and chooses deterministic fallback",
         "data server wires configured HA executors into API server",
         "data server mirrors managed primary writes into HA replication log",
         "data server fail-closed sync policy rejects primary writes before local commit",

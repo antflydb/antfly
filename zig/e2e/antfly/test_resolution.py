@@ -120,17 +120,10 @@ def resolution_cluster():
 
 class _Api:
     def __init__(self, base_url: str, server: MultiNodeScalingCluster):
-        urls = [base_url, *server.data_api_urls]
-        self._urls = list(dict.fromkeys(url.rstrip("/") for url in urls))
-        self._url_index = 0
-        self.url = self._urls[self._url_index]
+        self.url = base_url.rstrip("/")
         self.s = requests.Session()
         self.s.headers["Content-Type"] = "application/json"
         self._server = server
-
-    def _advance_url(self) -> None:
-        self._url_index = (self._url_index + 1) % len(self._urls)
-        self.url = self._urls[self._url_index]
 
     def _check(self, response: requests.Response) -> dict:
         if response.status_code >= 400:
@@ -195,6 +188,7 @@ class _Api:
                     f"table={table!r} key={doc_id!r} sync_level={sync_level!r} "
                     f"last_retryable_response={last_retryable_response!r}"
                     f"\n[native stacks]\n{stacks}"
+                    f"\n[metadata snapshot]\n{self._server.metadata_snapshot_diagnostic()}"
                     f"\n[logs]\n{self._server.debug_logs()}"
                 ) from exc
             try:
@@ -207,6 +201,7 @@ class _Api:
                 raise AssertionError(
                     f"batch insert timed out/failed table={table!r} key={doc_id!r} "
                     f"sync_level={sync_level!r}: {exc!r}\n[native stacks]\n{stacks}"
+                    f"\n[metadata snapshot]\n{self._server.metadata_snapshot_diagnostic()}"
                     f"\n[logs]\n{self._server.debug_logs()}"
                 ) from exc
             if (
@@ -218,11 +213,6 @@ class _Api:
                 last_retryable_response = (
                     f"{response.status_code} {response.text.strip()} from {self.url}"
                 )
-                # Any data node can route a public write to the shard leader,
-                # but one node may temporarily have a stale leader or placement
-                # view. Retry through the next live node instead of pinning the
-                # entire deadline to that stale routing view.
-                self._advance_url()
                 deadline.sleep()
                 continue
             return self._check(response)
@@ -316,37 +306,6 @@ class _Deadline:
         remaining = self.remaining()
         if remaining > 0.0:
             time.sleep(min(POLL_INTERVAL_S, remaining))
-
-
-def test_insert_fails_over_from_write_unavailable(monkeypatch: pytest.MonkeyPatch):
-    class _Server:
-        data_api_urls = ["http://data-a/db/v1", "http://data-b/db/v1"]
-
-    api = _Api(_Server.data_api_urls[0], _Server())
-    calls: list[str] = []
-    responses = [
-        (503, b"write unavailable"),
-        (201, b""),
-    ]
-
-    def post(url: str, **_: Any) -> requests.Response:
-        calls.append(url)
-        status, body = responses.pop(0)
-        response = requests.Response()
-        response.status_code = status
-        response._content = body
-        response.url = url
-        return response
-
-    monkeypatch.setattr(api.s, "post", post)
-    deadline = _Deadline(10.0)
-    monkeypatch.setattr(deadline, "sleep", lambda: None)
-
-    assert api.insert("documents", "doc:b", {}, deadline=deadline) == {}
-    assert calls == [
-        "http://data-a/db/v1/tables/documents/batch",
-        "http://data-b/db/v1/tables/documents/batch",
-    ]
 
 
 def _wait_for_entities(api: _Api, expected_names: dict[str, str], *, deadline: _Deadline) -> dict[str, dict]:

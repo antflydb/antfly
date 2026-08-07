@@ -292,6 +292,12 @@ const data_raft_batch_leader_wait_ns: u64 = 5 * std.time.ns_per_s;
 const data_raft_batch_leader_retry_sleep_ns: u64 = 50 * std.time.ns_per_ms;
 const data_raft_metadata_resync_interval_ns: u64 = 500 * std.time.ns_per_ms;
 const data_raft_campaign_retry_interval_ns: u64 = 500 * std.time.ns_per_ms;
+// Give the local voter one uncontested campaign window before escaping a
+// stale leaderless view through another placement. This is long enough for a
+// healthy in-cluster pre-vote/election round while leaving most of the bounded
+// write deadline available to a remote quorum when the local voter is stale or
+// partitioned.
+const data_raft_local_campaign_grace_ns: u64 = 500 * std.time.ns_per_ms;
 const data_raft_metadata_sync_interval_ms: u64 = 250;
 const metadata_bootstrap_retry_base_ms: u64 = 250;
 const metadata_bootstrap_retry_max_ms: u64 = 5 * std.time.ms_per_s;
@@ -5429,6 +5435,7 @@ pub const DataServer = struct {
         const deadline_ns = platform_time.monotonicNs() + leader_wait_ns;
         var last_metadata_sync_ns = platform_time.monotonicNs();
         var last_local_campaign_ns: u64 = 0;
+        var local_leaderless_voter_since_ns: u64 = 0;
         while (true) {
             const preflighted_local_leader = raft.host.http_host.host.isLocalLeader(group_id);
             if (preflighted_local_leader) {
@@ -5440,6 +5447,7 @@ pub const DataServer = struct {
             var leader_node_id: ?u64 = null;
             var local_node_id: u64 = 0;
             var local_status_missing = false;
+            var local_status_is_voter = false;
             var retry_for_leader_preflight = false;
 
             {
@@ -5465,7 +5473,11 @@ pub const DataServer = struct {
                 } else {
                     const status = raft.host.http_host.host.raftStatus(group_id);
                     local_status_missing = status == null;
+                    local_status_is_voter = localRaftStatusIsVoter(status, local_node_id);
                     leader_node_id = if (status) |raft_status| raft_status.soft.leader_id else null;
+                    if (leader_node_id == null and local_status_is_voter and local_leaderless_voter_since_ns == 0) {
+                        local_leaderless_voter_since_ns = platform_time.monotonicNs();
+                    }
                     if (leader_node_id == null and localRaftStatusShouldBootstrapCampaign(status, local_node_id)) {
                         const now_ns = platform_time.monotonicNs();
                         if (last_local_campaign_ns == 0 or
@@ -5495,19 +5507,22 @@ pub const DataServer = struct {
             }
 
             // A hosted replica can temporarily have a stale, leaderless local
-            // view even while another placement replica knows the leader. Let
-            // only the originating request, which refreshes metadata, escape
-            // that view. An internal group request may still follow the known
-            // leader below, but must not bounce through leaderless replicas.
+            // view even while another placement replica knows the leader. Give
+            // a local voter one uncontested election window, then let only the
+            // originating request escape that stale view. An internal group
+            // request may follow a known leader below, but must not placement-
+            // bounce and synchronize another round of campaigns.
+            const local_campaign_grace_elapsed = local_leaderless_voter_since_ns != 0 and
+                platform_time.monotonicNs() -| local_leaderless_voter_since_ns >= data_raft_local_campaign_grace_ns;
             if (shouldForwardRaftBatchToPlacementReplica(
                 allow_remote_forward,
                 refresh_metadata,
                 local_status_missing,
+                local_status_is_voter,
+                local_campaign_grace_elapsed,
                 leader_node_id,
             )) {
-                const escape_leaderless_local = refresh_metadata and
-                    !local_status_missing and
-                    leader_node_id == null;
+                const escape_leaderless_local = refresh_metadata and leader_node_id == null;
                 if (try self.forwardRaftBatchToPlacementReplica(
                     alloc,
                     group_id,
@@ -5539,8 +5554,16 @@ pub const DataServer = struct {
                                 dataRaftBatchHttpTimeoutMs(deadline_ns),
                             ) catch |err| {
                                 if (isRetryableDataRaftForwardError(err)) {
-                                    if (platform_time.monotonicNs() >= deadline_ns)
+                                    if (platform_time.monotonicNs() >= deadline_ns) {
+                                        self.logRaftBatchForwardTimeout(
+                                            group_id,
+                                            local_node_id,
+                                            target_node_id,
+                                            "known_leader",
+                                            err,
+                                        );
                                         return error.LeaderUnavailable;
+                                    }
                                     sleepDataRaftBatchLeaderRetry();
                                     continue;
                                 }
@@ -5674,8 +5697,16 @@ pub const DataServer = struct {
             dataRaftBatchHttpTimeoutMs(deadline_ns),
         ) catch |err| {
             if (isRetryableDataRaftForwardError(err)) {
-                if (platform_time.monotonicNs() >= deadline_ns)
+                if (platform_time.monotonicNs() >= deadline_ns) {
+                    self.logRaftBatchForwardTimeout(
+                        group_id,
+                        local_node_id,
+                        target_node_id,
+                        "placement_fallback",
+                        err,
+                    );
                     return error.LeaderUnavailable;
+                }
                 return false;
             }
             return err;
@@ -5688,11 +5719,18 @@ pub const DataServer = struct {
         allow_remote_forward: bool,
         refresh_metadata: bool,
         local_status_missing: bool,
+        local_status_is_voter: bool,
+        local_campaign_grace_elapsed: bool,
         leader_node_id: ?u64,
     ) bool {
-        if (!allow_remote_forward) return false;
-        if (local_status_missing) return true;
-        return refresh_metadata and leader_node_id == null;
+        if (!allow_remote_forward or !refresh_metadata) return false;
+        if (leader_node_id != null) return false;
+        if (local_status_missing or !local_status_is_voter) return true;
+        // Immediate forwarding makes the target internal request campaign at
+        // the same instant as this voter, which can repeatedly split votes.
+        // After one bounded local window, forwarding restores availability if
+        // this replica is stale or partitioned from the healthy quorum.
+        return local_campaign_grace_elapsed;
     }
 
     fn remoteRaftBatchPlacementNode(
@@ -5714,10 +5752,25 @@ pub const DataServer = struct {
             }
             if (!antfly.raft.placementMayLeadMembershipTransition(intent)) continue;
             if (preferred_node_id != null and node_id == preferred_node_id.?) preferred = node_id;
-            if (fallback == null) fallback = node_id;
+            if (fallback == null or node_id < fallback.?) fallback = node_id;
         }
         if (local_has_placement and !allow_local_placement_source) return null;
         return preferred orelse fallback;
+    }
+
+    fn logRaftBatchForwardTimeout(
+        self: *DataServer,
+        group_id: u64,
+        local_node_id: u64,
+        target_node_id: u64,
+        route: []const u8,
+        err: anyerror,
+    ) void {
+        std.log.warn(
+            "data raft batch forward exhausted deadline group_id={} source_node_id={} target_node_id={} route={s} err={s}",
+            .{ group_id, local_node_id, target_node_id, route, @errorName(err) },
+        );
+        self.logRaftBatchLeaderTimeout(group_id);
     }
 
     fn dataRaftBatchHttpTimeoutMs(deadline_ns: u64) u32 {
@@ -24268,11 +24321,11 @@ test "data raft forwarding classifies deadline and transport failures as retryab
     try std.testing.expect(!DataServer.isRetryableDataRaftForwardError(error.OutOfMemory));
 }
 
-test "data raft batch forwarding escapes a leaderless local placement" {
+test "data raft batch forwarding gives local election grace and chooses deterministic fallback" {
     const intents = [_]antfly.raft.PlacementIntent{
         .{ .record = .{ .group_id = 7001, .replica_id = 1, .local_node_id = 101 } },
-        .{ .record = .{ .group_id = 7001, .replica_id = 2, .local_node_id = 102 } },
         .{ .record = .{ .group_id = 7001, .replica_id = 3, .local_node_id = 103 } },
+        .{ .record = .{ .group_id = 7001, .replica_id = 2, .local_node_id = 102 } },
         .{ .record = .{ .group_id = 7002, .replica_id = 4, .local_node_id = 104 } },
         .{ .record = .{ .group_id = 7003, .replica_id = 5, .local_node_id = 105 }, .serving_state = .planned },
         .{ .record = .{ .group_id = 7003, .replica_id = 6, .local_node_id = 106 } },
@@ -24302,13 +24355,57 @@ test "data raft batch forwarding escapes a leaderless local placement" {
     try std.testing.expect(DataServer.shouldForwardRaftBatchToPlacementReplica(
         true,
         true,
+        true,
+        false,
+        false,
+        null,
+    ));
+    try std.testing.expect(DataServer.shouldForwardRaftBatchToPlacementReplica(
+        true,
+        true,
+        false,
+        false,
         false,
         null,
     ));
     try std.testing.expect(!DataServer.shouldForwardRaftBatchToPlacementReplica(
         true,
+        true,
+        false,
+        true,
+        false,
+        null,
+    ));
+    try std.testing.expect(DataServer.shouldForwardRaftBatchToPlacementReplica(
+        true,
+        true,
+        false,
+        true,
+        true,
+        null,
+    ));
+    try std.testing.expect(!DataServer.shouldForwardRaftBatchToPlacementReplica(
+        true,
+        false,
+        true,
         false,
         false,
         null,
+    ));
+    try std.testing.expect(!DataServer.shouldForwardRaftBatchToPlacementReplica(
+        false,
+        true,
+        true,
+        false,
+        false,
+        null,
+    ));
+    try std.testing.expect(!DataServer.shouldForwardRaftBatchToPlacementReplica(
+        true,
+        true,
+        false,
+        false,
+        true,
+        102,
     ));
 }
