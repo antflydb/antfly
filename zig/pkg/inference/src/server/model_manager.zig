@@ -3032,6 +3032,7 @@ pub const ModelManager = struct {
         self: *ModelManager,
         now_ns: u64,
         expired_only: bool,
+        admission_pressure: ?runtime.tier.memory.AdmissionPressure,
     ) ?EvictedModel {
         const ttl_ns = std.math.mul(
             u64,
@@ -3048,6 +3049,9 @@ pub const ModelManager = struct {
                 self.modelIsInFlightLocked(model))
             {
                 continue;
+            }
+            if (admission_pressure) |pressure| {
+                if (!loadedModelAdmissionReclaimRelevant(model, pressure)) continue;
             }
             const age_ns = if (now_ns >= model.last_used_ns)
                 now_ns - model.last_used_ns
@@ -3179,6 +3183,26 @@ pub const ModelManager = struct {
         };
     }
 
+    fn loadedModelAdmissionReclaimRelevant(
+        model: *const LoadedModel,
+        pressure: runtime.tier.memory.AdmissionPressure,
+    ) bool {
+        const lease_slots = [_]*const ?runtime.tier.memory.AdmissionLease{
+            &model.resource_lease,
+            &model.tokenizer_resource_lease,
+            &model.vision_resource_lease,
+            &model.audio_resource_lease,
+            &model.text_projection_resource_lease,
+            &model.visual_projection_resource_lease,
+            &model.audio_projection_resource_lease,
+        };
+        for (lease_slots) |lease_slot| {
+            const lease = lease_slot.* orelse continue;
+            if (admissionReclaimRelevant(lease, pressure)) return true;
+        }
+        return false;
+    }
+
     fn takeLruWhisperAssetsForAdmissionLocked(
         self: *ModelManager,
         pressure: runtime.tier.memory.AdmissionPressure,
@@ -3215,7 +3239,10 @@ pub const ModelManager = struct {
         self.lockLoadedModels();
         const now_ns = platform.time.monotonicNs();
         const assets = self.takeLruWhisperAssetsForAdmissionLocked(pressure);
-        const model = if (assets == null) self.takeLruModelLocked(now_ns, false) else null;
+        const model = if (assets == null)
+            self.takeLruModelLocked(now_ns, false, pressure)
+        else
+            null;
         self.unlockLoadedModels();
         if (assets) |evicted| {
             self.destroyEvictedWhisperAssets(evicted);
@@ -3307,7 +3334,7 @@ pub const ModelManager = struct {
         const now_ns = platform.time.monotonicNs();
         while (true) {
             self.lockLoadedModels();
-            const evicted = self.takeLruModelLocked(now_ns, true);
+            const evicted = self.takeLruModelLocked(now_ns, true, null);
             self.unlockLoadedModels();
             if (evicted == null) break;
             self.destroyEvictedModel(evicted.?);
@@ -4794,6 +4821,7 @@ pub const ModelManager = struct {
                 const evicted = self.takeLruModelLocked(
                     platform.time.monotonicNs(),
                     false,
+                    null,
                 );
                 self.unlockLoadedModels();
                 if (evicted == null)
@@ -4839,6 +4867,21 @@ fn backendVariantCacheKey(
     return std.fmt.allocPrint(allocator, "{s}\nbackend={s}", .{ model_dir, @tagName(backend) });
 }
 
+fn admissionEvictionTestModel(last_used_ns: u64) LoadedModel {
+    var model: LoadedModel = undefined;
+    model.active_handles = 0;
+    model.last_used_ns = last_used_ns;
+    model.pinned = false;
+    model.resource_lease = null;
+    model.tokenizer_resource_lease = null;
+    model.vision_resource_lease = null;
+    model.audio_resource_lease = null;
+    model.text_projection_resource_lease = null;
+    model.visual_projection_resource_lease = null;
+    model.audio_projection_resource_lease = null;
+    return model;
+}
+
 test "model cache eviction skips active and pinned models and removes aliases" {
     const allocator = std.testing.allocator;
     var manager = ModelManager.init(allocator, backends.SessionManager.init(allocator));
@@ -4875,7 +4918,7 @@ test "model cache eviction skips active and pinned models and removes aliases" {
     );
 
     manager.lockLoadedModels();
-    const evicted = manager.takeLruModelLocked(100, false);
+    const evicted = manager.takeLruModelLocked(100, false, null);
     manager.unlockLoadedModels();
     try std.testing.expect(evicted != null);
     try std.testing.expect(evicted.?.model == &idle);
@@ -4890,6 +4933,64 @@ test "model cache eviction skips active and pinned models and removes aliases" {
     manager.unlockLoadedModels();
     try std.testing.expect(after_eviction == null);
     allocator.free(evicted.?.key);
+}
+
+test "admission eviction skips older models outside the rejected domain" {
+    const allocator = std.testing.allocator;
+    var manager = ModelManager.init(allocator, backends.SessionManager.init(allocator));
+    defer {
+        var it = manager.loaded.iterator();
+        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+        manager.loaded.deinit(allocator);
+        manager.loaded_aliases.deinit(allocator);
+        manager.in_flight_loads.deinit(allocator);
+    }
+
+    const cpu_host = runtime.tier.memory.AdmissionAmounts{ .host_weight_bytes = 64 };
+    const gpu_backend = runtime.tier.memory.AdmissionAmounts{ .backend_weight_bytes = 64 };
+    var older_cpu = admissionEvictionTestModel(1);
+    older_cpu.resource_lease = .{
+        .controller = null,
+        .amounts = cpu_host,
+        .amounts_by_backend = .{ cpu_host, .{} },
+        .retain_backend_class = null,
+        .live_reserved_bytes = 0,
+    };
+    var newer_gpu = admissionEvictionTestModel(10);
+    // Sidecar leases must participate in victim selection just like the primary
+    // model lease; multimodal models can hold most of their GPU residency here.
+    newer_gpu.vision_resource_lease = .{
+        .controller = null,
+        .amounts = gpu_backend,
+        .amounts_by_backend = .{ .{}, gpu_backend },
+        .retain_backend_class = null,
+        .live_reserved_bytes = 0,
+    };
+
+    try manager.loaded.put(allocator, try allocator.dupe(u8, "older-cpu"), &older_cpu);
+    try manager.loaded.put(allocator, try allocator.dupe(u8, "newer-gpu"), &newer_gpu);
+
+    manager.lockLoadedModels();
+    const evicted = manager.takeLruModelLocked(
+        100,
+        false,
+        .{ .domain_backend = .gpu },
+    );
+    manager.unlockLoadedModels();
+    try std.testing.expect(evicted != null);
+    try std.testing.expect(evicted.?.model == &newer_gpu);
+    allocator.free(evicted.?.key);
+
+    manager.lockLoadedModels();
+    const no_relevant_victim = manager.takeLruModelLocked(
+        100,
+        false,
+        .{ .domain_backend = .gpu },
+    );
+    manager.unlockLoadedModels();
+    try std.testing.expect(no_relevant_victim == null);
+    try std.testing.expectEqual(@as(usize, 1), manager.loaded.count());
+    try std.testing.expect(manager.loaded.get("older-cpu") == &older_cpu);
 }
 
 test "model cache idle expiration can be disabled" {
@@ -4911,13 +5012,13 @@ test "model cache idle expiration can be disabled" {
 
     manager.keep_alive_ms = 0;
     manager.lockLoadedModels();
-    const disabled = manager.takeLruModelLocked(std.time.ns_per_s, true);
+    const disabled = manager.takeLruModelLocked(std.time.ns_per_s, true, null);
     manager.unlockLoadedModels();
     try std.testing.expect(disabled == null);
 
     manager.keep_alive_ms = 1;
     manager.lockLoadedModels();
-    const expired = manager.takeLruModelLocked(std.time.ns_per_s, true);
+    const expired = manager.takeLruModelLocked(std.time.ns_per_s, true, null);
     manager.unlockLoadedModels();
     try std.testing.expect(expired != null);
     try std.testing.expect(expired.?.model == &idle);
