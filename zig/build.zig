@@ -4185,6 +4185,7 @@ pub fn build(b: *std.Build) void {
             "transaction recovery drains terminal HA outbox without remaining intents",
             "non-replicated transaction recovery honors the per-run page limit",
             "retained terminal transactions honor the extended retry cutoff",
+            "topology fence retains committed coordinator recovery obligations",
         },
     });
     const run_lib_db_txn_tests = addFilteredTestRunArtifact(b, lib_db_txn_tests);

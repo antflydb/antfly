@@ -7153,7 +7153,7 @@ pub const DataServer = struct {
             .exact,
         );
         errdefer if (source_lease) |lease| lease.release();
-        if (try source_lease.?.db.hasPendingTransactions()) return error.TransactionTopologyBusy;
+        if (try source_lease.?.db.hasTopologySensitiveTransactions()) return error.TransactionTopologyBusy;
         const destination_namespace = identityNamespaceFromTransitionContract(
             table_contract,
             .target,
@@ -7334,14 +7334,14 @@ pub const DataServer = struct {
         // global order so inverse donor/receiver pairs cannot deadlock.
         if (donor_group_id < receiver_group_id) {
             donor_lease = try self.leaseTransitionDbForTableGroup(donor_group_id, table_contract, .source, .exact);
-            if (try donor_lease.?.db.hasPendingTransactions()) return error.TransactionTopologyBusy;
+            if (try donor_lease.?.db.hasTopologySensitiveTransactions()) return error.TransactionTopologyBusy;
             receiver_lease = try self.leaseTransitionDbForTableGroup(
                 receiver_group_id,
                 table_contract,
                 .target,
                 if (allow_doc_identity_reassignment) .reassign_same_table else .exact,
             );
-            if (try receiver_lease.?.db.hasPendingTransactions()) return error.TransactionTopologyBusy;
+            if (try receiver_lease.?.db.hasTopologySensitiveTransactions()) return error.TransactionTopologyBusy;
         } else {
             receiver_lease = try self.leaseTransitionDbForTableGroup(
                 receiver_group_id,
@@ -7349,9 +7349,9 @@ pub const DataServer = struct {
                 .target,
                 if (allow_doc_identity_reassignment) .reassign_same_table else .exact,
             );
-            if (try receiver_lease.?.db.hasPendingTransactions()) return error.TransactionTopologyBusy;
+            if (try receiver_lease.?.db.hasTopologySensitiveTransactions()) return error.TransactionTopologyBusy;
             donor_lease = try self.leaseTransitionDbForTableGroup(donor_group_id, table_contract, .source, .exact);
-            if (try donor_lease.?.db.hasPendingTransactions()) return error.TransactionTopologyBusy;
+            if (try donor_lease.?.db.hasTopologySensitiveTransactions()) return error.TransactionTopologyBusy;
         }
         const owned_donor_lease = donor_lease.?;
         const owned_receiver_lease = receiver_lease.?;
@@ -7639,7 +7639,7 @@ pub const DataServer = struct {
         watermark: ?antfly.data.AppliedDataBatch,
         capture_handoff: bool,
     ) !SplitProjectionReconcileResult {
-        if (try db.hasPendingTransactions()) return error.TransactionTopologyBusy;
+        if (try db.hasTopologySensitiveTransactions()) return error.TransactionTopologyBusy;
         const root_incarnation = try db.durableRootIncarnation();
         if (capture_handoff) {
             const expected = watermark orelse return error.SplitSourceProjectionNotReady;

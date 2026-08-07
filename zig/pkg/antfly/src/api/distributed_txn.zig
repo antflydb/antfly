@@ -627,7 +627,13 @@ fn executeMultiTableCommitOnce(
             // admission. Recovery deliberately uses epoch zero: a durable
             // commit decision must remain resolvable after a topology change.
             .topology_epoch = if (!resume_committed) participant.topology_epoch else 0,
-            .sync_level = sync_level,
+            // The first participant is the transaction decision record. It must
+            // be committed and applied before any other participant can learn a
+            // commit decision, even when the public request selected the faster
+            // proposal-only acknowledgement level. Later participants retain
+            // the caller's requested visibility contract and are recoverable
+            // from the durable coordinator decision.
+            .sync_level = if (participant_index == 0 and sync_level == .propose) .write else sync_level,
         }) catch |err| switch (err) {
             error.DecisionConflict => {
                 if (trace_writer) |tw| {
@@ -1582,7 +1588,11 @@ test "distributed txn coordinator groups by range and commits all participants" 
     const Recorder = struct {
         begins: std.ArrayListUnmanaged(u64) = .empty,
         prepares: std.ArrayListUnmanaged(u64) = .empty,
-        resolves: std.ArrayListUnmanaged(struct { group_id: u64, status: db_mod.types.TxnStatus }) = .empty,
+        resolves: std.ArrayListUnmanaged(struct {
+            group_id: u64,
+            status: db_mod.types.TxnStatus,
+            sync_level: db_mod.types.SyncLevel,
+        }) = .empty,
         acknowledgements: std.ArrayListUnmanaged(u64) = .empty,
 
         fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
@@ -1620,7 +1630,11 @@ test "distributed txn coordinator groups by range and commits all participants" 
         fn resolve(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, _: []const u8, req: TxnResolveRequest) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expect(req.topology_epoch != 0);
-            try self.resolves.append(std.testing.allocator, .{ .group_id = group_id, .status = req.status });
+            try self.resolves.append(std.testing.allocator, .{
+                .group_id = group_id,
+                .status = req.status,
+                .sync_level = req.sync_level,
+            });
         }
 
         fn status(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
@@ -1664,6 +1678,8 @@ test "distributed txn coordinator groups by range and commits all participants" 
     try std.testing.expectEqual(@as(usize, 2), recorder.resolves.items.len);
     try std.testing.expectEqual(@as(usize, 1), recorder.acknowledgements.items.len);
     for (recorder.resolves.items) |resolved| try std.testing.expectEqual(db_mod.types.TxnStatus.committed, resolved.status);
+    try std.testing.expectEqual(db_mod.types.SyncLevel.write, recorder.resolves.items[0].sync_level);
+    try std.testing.expectEqual(db_mod.types.SyncLevel.propose, recorder.resolves.items[1].sync_level);
 }
 
 test "stable distributed transaction retry resumes a durable commit decision" {

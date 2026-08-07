@@ -733,12 +733,25 @@ pub const TxnManager = struct {
         return (try self.listTransactionsPage(alloc, null, std.math.maxInt(usize))).items;
     }
 
-    /// Checks for an unresolved transaction without materializing the full
-    /// transaction summary set. Topology transitions use this on a cold path,
-    /// but terminal history can still be large.
-    pub fn hasPendingTransactions(self: *TxnManager) !bool {
+    /// Returns whether a topology transition would strand transaction state.
+    /// This stays allocation-free and uses a single backend read snapshot:
+    /// transitions are cold-path operations, but retained terminal decisions
+    /// can make the transaction history large.
+    pub fn hasTopologySensitiveTransactions(self: *TxnManager) !bool {
         var read = try self.store.beginRead();
         defer read.abort();
+
+        // Resolution normally removes intents and HA outboxes atomically before
+        // a transaction becomes quiescent. Check the global prefixes once rather
+        // than opening an intent cursor for every retained terminal record.
+        if (try readHasPrefix(&read, intents_prefix) or
+            try readHasPrefix(&read, intent_locks_prefix) or
+            try readHasPrefix(&read, ha_batch_outbox_prefix) or
+            try readHasPrefix(&read, ha_replay_outbox_prefix))
+        {
+            return true;
+        }
+
         var cursor = try read.openCursor();
         defer cursor.close();
         var entry = try cursor.seekAtOrAfter(records_prefix);
@@ -747,6 +760,17 @@ pub const TxnManager = struct {
             if (record_entry.key.len == records_prefix.len + 16) {
                 const record = try decodeRecord(record_entry.value);
                 if (record.status == .pending) return true;
+
+                const txn_id = record_entry.key[records_prefix.len..][0..16].*;
+                const participant_key = makeSidecarKey(participants_prefix, txn_id);
+                const resolved_key = makeSidecarKey(resolved_participants_prefix, txn_id);
+                const participant_count = try participantListCountInRead(&read, &participant_key);
+                const resolved_count = try participantListCountInRead(&read, &resolved_key);
+                if (resolved_count > participant_count) return TxnError.InvalidTxnRecord;
+                // markParticipantResolved only appends unique, enlisted members,
+                // so equal validated counts prove that the participant set is
+                // fully acknowledged without allocating or comparing strings.
+                if (resolved_count != participant_count) return true;
             }
             entry = try cursor.next();
         }
@@ -1371,6 +1395,39 @@ fn makeSidecarKey(comptime prefix: []const u8, txn_id: TxnId) [prefix.len + 16]u
     @memcpy(key_buf[0..prefix.len], prefix);
     @memcpy(key_buf[prefix.len..], &txn_id);
     return key_buf;
+}
+
+fn readHasPrefix(read: *backend_erased.ReadTxn, prefix: []const u8) !bool {
+    var cursor = try read.openCursor();
+    defer cursor.close();
+    const entry = (try cursor.seekAtOrAfter(prefix)) orelse return false;
+    return std.mem.startsWith(u8, entry.key, prefix);
+}
+
+fn participantListCountInRead(
+    read: *backend_erased.ReadTxn,
+    key: []const u8,
+) !usize {
+    const raw = read.get(key) catch |err| switch (err) {
+        error.NotFound => return 0,
+        else => return err,
+    };
+    if (raw.len < 4) return TxnError.InvalidTxnRecord;
+    var count_buf: [4]u8 = undefined;
+    @memcpy(&count_buf, raw[0..4]);
+    const count: usize = std.mem.readInt(u32, &count_buf, .little);
+    var offset: usize = 4;
+    for (0..count) |_| {
+        if (raw.len - offset < 4) return TxnError.InvalidTxnRecord;
+        var len_buf: [4]u8 = undefined;
+        @memcpy(&len_buf, raw[offset .. offset + 4]);
+        const len: usize = std.mem.readInt(u32, &len_buf, .little);
+        offset += 4;
+        if (len > raw.len - offset) return TxnError.InvalidTxnRecord;
+        offset += len;
+    }
+    if (offset != raw.len) return TxnError.InvalidTxnRecord;
+    return count;
 }
 
 pub fn makeTransactionHABatchOutboxKey(txn_id: TxnId) [ha_batch_outbox_prefix.len + 16]u8 {
@@ -2349,6 +2406,43 @@ test "transaction participants track unresolved members" {
     defer freeParticipantList(alloc, unresolved_after);
     try std.testing.expectEqual(@as(usize, 1), unresolved_after.len);
     try std.testing.expectEqualStrings("shard-b", unresolved_after[0]);
+}
+
+test "topology fence retains committed coordinator recovery obligations" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "txn-topology-recovery-fence");
+    defer alloc.free(path);
+    cleanupTestDir(path);
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+    defer cleanupTestDir(path);
+
+    var mgr = try TxnManager.init(alloc, &store);
+    defer mgr.deinit();
+    const txn_id: TxnId = .{ 4, 2, 4, 2, 4, 2, 4, 2, 4, 2, 4, 2, 4, 2, 4, 2 };
+    try mgr.initTransactionWithParticipantsCreatedAtAndRole(
+        txn_id,
+        1_000,
+        900,
+        &.{ "local", "remote" },
+        true,
+    );
+    try mgr.resolveIntents(txn_id, .committed, 2_000);
+    try mgr.markParticipantResolved(txn_id, "local");
+
+    // The user write is committed, but retiring this coordinator now would
+    // discard the only durable owner of remote commit propagation.
+    try std.testing.expect(try mgr.hasTopologySensitiveTransactions());
+    try mgr.markParticipantResolved(txn_id, "remote");
+    try std.testing.expect(!try mgr.hasTopologySensitiveTransactions());
+
+    // HA delivery debt is equally topology-sensitive even after every 2PC
+    // participant has acknowledged the decision.
+    const outbox_key = makeTransactionHABatchOutboxKey(txn_id);
+    try mgr.putValue(&outbox_key, "pending-mirror-delivery");
+    try std.testing.expect(try mgr.hasTopologySensitiveTransactions());
+    try mgr.clearHAOutbox(txn_id, .batch);
+    try std.testing.expect(!try mgr.hasTopologySensitiveTransactions());
 }
 
 test "recoverTransactions preserves finalized record while participants remain unresolved" {

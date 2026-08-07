@@ -1427,10 +1427,10 @@ pub const DBCore = struct {
         return try manager.listTransactions(alloc);
     }
 
-    pub fn hasPendingTransactions(self: *DBCore) !bool {
+    pub fn hasTopologySensitiveTransactions(self: *DBCore) !bool {
         var manager = try self.initTxnManager();
         defer manager.deinit();
-        return try manager.hasPendingTransactions();
+        return try manager.hasTopologySensitiveTransactions();
     }
 
     pub fn getUnresolvedTransactionParticipants(self: *DBCore, alloc: Allocator, txn_id: transactions_mod.TxnId) ![][]u8 {
