@@ -48,9 +48,7 @@ const RuntimeArtifactRole = enum {
 };
 
 const RuntimeLibraryUnit = enum {
-    api_kernel,
-    cli,
-    distributed,
+    application,
     inference,
 };
 
@@ -8708,15 +8706,13 @@ pub fn build(b: *std.Build) void {
                 .linkage = .static,
                 // Zig's build runner uses these claims to run as many LLVM
                 // codegen steps concurrently as fit in available RAM. The
-                // claims below conservatively cover the focused ARM64
-                // ReleaseFast units. Together with a --maxrss budget below
-                // the pod request, they admit safe independent pairs without
-                // globally serializing codegen.
+                // claims below conservatively cover the ARM64 ReleaseFast
+                // units. A --maxrss budget below the pod request keeps the two
+                // large LLVM emissions serial while leaving headroom for the
+                // build runner, linker, and page cache.
                 .max_rss = switch (unit) {
-                    .api_kernel => 13 * 1024 * 1024 * 1024,
+                    .application => 18 * 1024 * 1024 * 1024,
                     .inference => 16 * 1024 * 1024 * 1024,
-                    .distributed => 14 * 1024 * 1024 * 1024,
-                    .cli => 8 * 1024 * 1024 * 1024,
                 },
             });
             if (strip) {
