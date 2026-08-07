@@ -22,25 +22,28 @@ const platform = @import("antfly_platform");
 const bridge = @import("runtime_bridge.zig");
 const unit_options = @import("runtime_library_options");
 const standalone_inference_bridge = @import("standalone/inference_bridge.zig");
-const restore_staging_exports = if (unit_options.unit == .application)
+const restore_staging_exports = if (unit_options.unit == .distributed)
     @import("standalone/restore_staging_exports.zig")
 else
     struct {};
-const api_kernel_exports = if (unit_options.unit == .application)
+const api_kernel_exports = if (unit_options.unit == .api_kernel)
     @import("api/kernel_exports.zig")
 else
     struct {};
 
-const cli_runtime = if (unit_options.unit == .application) @import("cli_runtime.zig") else struct {};
-const data_runtime = if (unit_options.unit == .application) @import("data/runtime.zig") else struct {};
-const metadata_runtime = if (unit_options.unit == .application) @import("metadata/runtime.zig") else struct {};
-const serverless_runtime = if (unit_options.unit == .application) @import("cmd/serverless.zig") else struct {};
+const cli_runtime = if (unit_options.unit == .cli) @import("cli_runtime.zig") else struct {};
+const data_runtime = if (unit_options.unit == .distributed) @import("data/runtime.zig") else struct {};
+const metadata_runtime = if (unit_options.unit == .distributed) @import("metadata/runtime.zig") else struct {};
+const serverless_runtime = if (unit_options.unit == .distributed) @import("cmd/serverless.zig") else struct {};
 const inference_runtime = if (unit_options.unit == .inference) @import("inference_runtime/runtime.zig") else struct {};
-const standalone_runtime = if (unit_options.unit == .application) @import("standalone/runtime.zig") else struct {};
+// Standalone adds about 35 seconds when co-generated with the server roles but
+// costs 6 minutes and 8 GiB as a separate ARM64 Linux unit. Keep it co-located
+// until the shared storage kernel removes that duplicated LLVM work.
+const standalone_runtime = if (unit_options.unit == .distributed) @import("standalone/runtime.zig") else struct {};
 // Lite's non-server commands share storage types with standalone, while
 // `lite serve` directly enters that runtime. Co-locating them prevents the
 // focused CLI library from compiling standalone and inference again.
-const lite_runtime = if (unit_options.unit == .application)
+const lite_runtime = if (unit_options.unit == .distributed)
     @import("cmd/lite.zig")
 else
     struct {};
@@ -131,7 +134,7 @@ fn standaloneEntry(context: *const bridge.Context) callconv(.c) c_int {
 
 comptime {
     switch (unit_options.unit) {
-        .application => {
+        .api_kernel => {
             @export(&api_kernel_exports.create, .{ .name = "antfly_api_kernel_create" });
             @export(&api_kernel_exports.destroy, .{ .name = "antfly_api_kernel_destroy" });
             @export(&api_kernel_exports.requestStats, .{ .name = "antfly_api_kernel_request_stats" });
@@ -153,7 +156,9 @@ comptime {
             @export(&api_kernel_exports.handlerStats, .{ .name = "antfly_api_kernel_handler_stats" });
             @export(&api_kernel_exports.handlerRegisterRoutes, .{ .name = "antfly_api_kernel_handler_register_routes" });
             @export(&api_kernel_exports.handlerDestroy, .{ .name = "antfly_api_kernel_handler_destroy" });
-            @export(&cliEntry, .{ .name = "antfly_runtime_cli" });
+        },
+        .cli => @export(&cliEntry, .{ .name = "antfly_runtime_cli" }),
+        .distributed => {
             @export(&dataEntry, .{ .name = "antfly_runtime_data" });
             @export(&metadataEntry, .{ .name = "antfly_runtime_metadata" });
             @export(&serverlessEntry, .{ .name = "antfly_runtime_serverless" });

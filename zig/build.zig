@@ -48,7 +48,9 @@ const RuntimeArtifactRole = enum {
 };
 
 const RuntimeLibraryUnit = enum {
-    application,
+    api_kernel,
+    cli,
+    distributed,
     inference,
 };
 
@@ -2294,29 +2296,47 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("pkg/antfly/src/capi/db.zig"),
         .target = target,
         .optimize = optimize,
+        .pic = true,
     });
     capi_mod.addImport("antfly-zig", lib_mod);
     capi_mod.addImport("structlog", structlog_mod);
 
+    // Compile the DB/storage C ABI as a reusable PIC object. Today the
+    // shared library is its first consumer; keeping code generation separate
+    // from the final link provides the compiled boundary that the executable's
+    // storage adapters can consume incrementally without re-analyzing db.zig.
+    const capi_object = b.addObject(.{
+        .name = "antfly-storage-kernel",
+        .root_module = capi_mod,
+        .max_rss = 8 * 1024 * 1024 * 1024,
+    });
+    const capi_link_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = link_libc,
+        .strip = strip,
+    });
+    capi_link_mod.addObject(capi_object);
     const capi_lib = b.addLibrary(.{
         .linkage = .dynamic,
         .name = "antfly_zig_capi",
-        .root_module = capi_mod,
+        .root_module = capi_link_mod,
+        .max_rss = 1024 * 1024 * 1024,
     });
     const install_capi_lib = b.addInstallArtifact(capi_lib, .{});
 
-    const lite_capi_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/capi/db.zig"),
+    const lite_capi_link_mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
+        .link_libc = link_libc,
+        .strip = strip,
     });
-    lite_capi_mod.addImport("antfly-zig", lib_mod);
-    lite_capi_mod.addImport("structlog", structlog_mod);
-
+    lite_capi_link_mod.addObject(capi_object);
     const lite_capi_lib = b.addLibrary(.{
         .linkage = .dynamic,
         .name = "antfly",
-        .root_module = lite_capi_mod,
+        .root_module = lite_capi_link_mod,
+        .max_rss = 1024 * 1024 * 1024,
     });
     const install_lite_capi_lib = b.addInstallArtifact(lite_capi_lib, .{});
     const install_lite_capi_header = b.addInstallFileWithDir(
@@ -8706,13 +8726,16 @@ pub fn build(b: *std.Build) void {
                 .linkage = .static,
                 // Zig's build runner uses these claims to run as many LLVM
                 // codegen steps concurrently as fit in available RAM. The
-                // claims below conservatively cover the ARM64 ReleaseFast
-                // units. A --maxrss budget below the pod request keeps the two
-                // large LLVM emissions serial while leaving headroom for the
-                // build runner, linker, and page cache.
+                // claims include headroom over fresh native Linux and macOS
+                // ARM64 ReleaseFast measurements. A --maxrss budget below the
+                // pod request admits API, CLI, and distributed together while
+                // retaining runner/linker/page-cache headroom; inference runs
+                // with the separately claimed PIC storage kernel.
                 .max_rss = switch (unit) {
-                    .application => 18 * 1024 * 1024 * 1024,
-                    .inference => 16 * 1024 * 1024 * 1024,
+                    .api_kernel => 5 * 1024 * 1024 * 1024,
+                    .cli => 3 * 1024 * 1024 * 1024,
+                    .distributed => 11 * 1024 * 1024 * 1024,
+                    .inference => 8 * 1024 * 1024 * 1024,
                 },
             });
             if (strip) {
@@ -8764,7 +8787,7 @@ pub fn build(b: *std.Build) void {
         var visited = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
         defer visited.deinit();
         setStripRecursively(antfly_main_mod, &visited);
-        setStripRecursively(lite_capi_mod, &visited);
+        setStripRecursively(capi_mod, &visited);
     }
     const antfly_main_tests = b.addTest(.{
         .root_module = antfly_main_mod,
