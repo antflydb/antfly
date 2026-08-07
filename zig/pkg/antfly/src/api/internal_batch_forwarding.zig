@@ -29,17 +29,6 @@ pub const Context = struct {
     campaign_allowed: bool,
 };
 
-/// A no-header request can originate from a pre-protocol node during a rolling
-/// upgrade. It may execute locally, but it must not start another request-
-/// driven campaign or forward again because neither ownership nor hop state is
-/// available from the caller. Upstream socket cancellation still bounds this
-/// conservative compatibility wait.
-pub const legacy_context = Context{
-    .remaining_ms = max_remaining_ms,
-    .forwards_remaining = 0,
-    .campaign_allowed = false,
-};
-
 pub fn parse(req: http_common.HttpRequest) !?Context {
     const remaining_raw = req.header(remaining_ms_header);
     const forwards_raw = req.header(forwards_remaining_header);

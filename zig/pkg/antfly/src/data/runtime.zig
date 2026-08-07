@@ -5539,15 +5539,26 @@ pub const DataServer = struct {
                     } else {
                         const encoded = try data_raft_batch.encode(alloc, table_name, req);
                         defer alloc.free(encoded);
-                        try raft.host.http_host.propose(group_id, encoded);
-                        target_index = if (raft.host.http_host.host.raftStatus(group_id)) |status|
-                            status.last_index
-                        else {
-                            // The proposal call succeeded, so losing the local
-                            // status snapshot cannot be reported as a safe
-                            // retry: the entry may already be replicated.
-                            return error.RaftBatchWriteOutcomeUnknown;
+                        var accepted_index: ?u64 = null;
+                        raft.host.http_host.proposeWithReceipt(group_id, encoded, &accepted_index) catch |err| {
+                            if (accepted_index) |index| {
+                                // Once the entry has an index, replication
+                                // dispatch failures cannot turn this into a
+                                // rejected request. Continue through the normal
+                                // confirmation path; background Raft rounds will
+                                // retry peer delivery.
+                                std.log.warn("data raft proposal accepted before dispatch failure group_id={} index={} err={s}", .{
+                                    group_id,
+                                    index,
+                                    @errorName(err),
+                                });
+                                target_index = index;
+                            } else {
+                                return err;
+                            }
                         };
+                        target_index = target_index orelse accepted_index orelse
+                            return error.RaftBatchWriteOutcomeUnknown;
                     }
                 } else {
                     const status = raft.host.http_host.host.raftStatus(group_id);
@@ -8835,9 +8846,11 @@ pub const DataServer = struct {
         }
         if (metadata_epoch != 0 and self.last_data_raft_reconciled_metadata_epoch == metadata_epoch) {
             // Raft leadership can change without a metadata epoch. Preserve
-            // status publication while skipping restore, descriptor rebuild,
-            // peer replacement, and catalog fsync for identical topology.
-            self.observeDataRaftStatusFingerprint(dataRaftLocalStatusFingerprint(raft, local_intents.items));
+            // leader maintenance and status publication while skipping
+            // restore, descriptor rebuild, peer replacement, and catalog
+            // fsync for identical topology.
+            const status_fingerprint = self.maintainDataRaftLeadership(snapshot, local_intents.items, registration.node_id);
+            self.observeDataRaftStatusFingerprint(status_fingerprint);
             return;
         }
         // A split destination is placed before cutover publishes its range.
@@ -8918,38 +8931,57 @@ pub const DataServer = struct {
             return err;
         };
 
+        {
+            lockAtomic(&self.data_raft_mutex);
+            defer self.data_raft_mutex.unlock();
+            _ = try reconcile.commit();
+            if (apply_group_transition) |*transition| transition.commit();
+            if (updates.items.len > 0) try raft.host.applyBatch(updates.items);
+        }
+        const status_fingerprint = self.maintainDataRaftLeadership(snapshot, local_intents.items, registration.node_id);
+        self.observeDataRaftStatusFingerprint(status_fingerprint);
+        if (metadata_epoch != 0) self.last_data_raft_reconciled_metadata_epoch = metadata_epoch;
+    }
+
+    /// Runs topology-stable leadership maintenance independently of durable
+    /// reconciliation. Campaign attempts are intentionally retried on every
+    /// control interval while their predicate remains true: transient
+    /// allocation or host errors must not wait for an unrelated metadata epoch.
+    fn maintainDataRaftLeadership(
+        self: *DataServer,
+        snapshot: *const antfly.metadata_api.AdminSnapshot,
+        local_intents: []const antfly.raft.PlacementIntent,
+        local_node_id: u64,
+    ) u64 {
+        const raft = self.data_raft orelse return 0;
         lockAtomic(&self.data_raft_mutex);
         defer self.data_raft_mutex.unlock();
-        _ = try reconcile.commit();
-        if (apply_group_transition) |*transition| transition.commit();
-        if (updates.items.len > 0) try raft.host.applyBatch(updates.items);
-        for (local_intents.items) |intent| {
+
+        for (local_intents) |intent| {
             const status = raft.host.http_host.host.raftStatus(intent.record.group_id);
-            if (staleLeaderShouldHandoff(snapshot.placement_intents, status, intent, registration.node_id)) {
+            if (staleLeaderShouldHandoff(snapshot.placement_intents, status, intent, local_node_id)) {
                 raft.host.http_host.campaignGroup(intent.record.group_id) catch |err| {
                     std.log.warn("data raft stale leader handoff campaign failed group_id={} node_id={} err={}", .{
                         intent.record.group_id,
-                        registration.node_id,
+                        local_node_id,
                         err,
                     });
                     continue;
                 };
                 continue;
             }
-            if (!localIntentPreferredCampaigner(intent, registration.node_id)) continue;
-            if (!localRaftStatusShouldBootstrapCampaign(status, registration.node_id)) continue;
+            if (!localIntentPreferredCampaigner(intent, local_node_id)) continue;
+            if (!localRaftStatusShouldBootstrapCampaign(status, local_node_id)) continue;
             raft.host.http_host.campaignGroup(intent.record.group_id) catch |err| {
                 std.log.warn("data raft bootstrap campaign failed group_id={} node_id={} err={}", .{
                     intent.record.group_id,
-                    registration.node_id,
+                    local_node_id,
                     err,
                 });
                 continue;
             };
         }
-
-        self.observeDataRaftStatusFingerprint(dataRaftLocalStatusFingerprint(raft, local_intents.items));
-        if (metadata_epoch != 0) self.last_data_raft_reconciled_metadata_epoch = metadata_epoch;
+        return dataRaftLocalStatusFingerprint(raft, local_intents);
     }
 
     fn provisionSplitDestinationsBeforeRaftAdmission(
@@ -15619,6 +15651,7 @@ test "data raft ticker advances consensus independently of control rounds" {
         },
     }, "http://127.0.0.1:2");
     defer server.deinit();
+    const data_raft = server.data_raft orelse return error.MissingDataRaft;
 
     const snapshot = antfly.metadata_api.AdminSnapshot{
         .status = .{ .metadata_group_id = 9, .metadata_epoch = 17, .metrics = .{} },
@@ -15652,9 +15685,18 @@ test "data raft ticker advances consensus independently of control rounds" {
     };
     try server.syncDataRaftFromSnapshot(&snapshot);
     try std.testing.expectEqual(@as(?u64, 17), server.last_data_raft_reconciled_metadata_epoch);
-    // Identical desired state still observes live Raft status, but skips the
-    // durable reconcile phases.
+
+    // Simulate leadership loss after durable topology convergence. An
+    // unchanged metadata epoch must still run the lightweight campaign phase.
+    {
+        lockAtomic(&server.data_raft_mutex);
+        defer server.data_raft_mutex.unlock();
+        const group = data_raft.host.http_host.host.runtime_host.group(77) orelse return error.UnknownGroup;
+        group.raw_node.raft.soft_state = .{ .leader_id = null, .role = .follower };
+    }
+    try std.testing.expect(!server.localDataRaftLeaderReady(77));
     try server.syncDataRaftFromSnapshot(&snapshot);
+    try std.testing.expect(server.localDataRaftLeaderReady(77));
 
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
