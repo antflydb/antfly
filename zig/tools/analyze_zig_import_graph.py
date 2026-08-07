@@ -359,11 +359,16 @@ def comparison_stats(base: TimeReport, candidate: TimeReport) -> dict[str, objec
         "file_comparison_available": base.has_file_list and candidate.has_file_list,
     }
     if base.has_file_list and candidate.has_file_list:
+        shared = base.repo_files & candidate.repo_files
         added = candidate.repo_files - base.repo_files
         removed = base.repo_files - candidate.repo_files
+        smaller_graph_files = min(len(base.repo_files), len(candidate.repo_files))
         result.update(
             {
                 "repo_zig_files_delta": len(candidate.repo_files) - len(base.repo_files),
+                "shared_files": len(shared),
+                "shared_lines": sum(source_lines(path) for path in shared),
+                "shared_fraction_of_smaller_graph": len(shared) / smaller_graph_files if smaller_graph_files else 0,
                 "added_files": len(added),
                 "added_lines": sum(source_lines(path) for path in added),
                 "removed_files": len(removed),
@@ -384,6 +389,10 @@ def print_comparison(base: TimeReport, candidate: TimeReport, top_groups: int) -
         print("file comparison unavailable: both reports must contain all_files")
         return
 
+    print(
+        f"shared\t{stats['shared_files']} files\t{stats['shared_lines']} lines\t"
+        f"{stats['shared_fraction_of_smaller_graph']:.1%} of smaller graph"
+    )
     added = candidate.repo_files - base.repo_files
     removed = base.repo_files - candidate.repo_files
     print(f"repository Zig files delta\t{stats['repo_zig_files_delta']:+d}")

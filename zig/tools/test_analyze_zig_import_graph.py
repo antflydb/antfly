@@ -145,6 +145,25 @@ class ImportGraphTest(unittest.TestCase):
         self.assertFalse(report.has_file_list)
         self.assertIsNone(analyzer.report_stats(report)["repo_zig_files"])
 
+    def test_time_report_comparison_reports_shared_fraction_of_smaller_graph(self):
+        shared = self.write("zig/pkg/antfly/src/shared.zig", "pub const shared = true;\n")
+        base_only = self.write("zig/pkg/antfly/src/base.zig", "pub const base = true;\n")
+        candidate_only = self.write("zig/pkg/antfly/src/candidate.zig", "pub const candidate = true;\n")
+        base = analyzer.TimeReport("base", self.root / "base.json", {}, frozenset({shared, base_only}), True)
+        candidate = analyzer.TimeReport(
+            "candidate",
+            self.root / "candidate.json",
+            {},
+            frozenset({shared, candidate_only}),
+            True,
+        )
+
+        stats = analyzer.comparison_stats(base, candidate)
+
+        self.assertEqual(1, stats["shared_files"])
+        self.assertEqual(1, stats["shared_lines"])
+        self.assertEqual(0.5, stats["shared_fraction_of_smaller_graph"])
+
 
 if __name__ == "__main__":
     unittest.main()
