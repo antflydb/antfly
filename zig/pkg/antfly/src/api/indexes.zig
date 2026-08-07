@@ -1814,13 +1814,12 @@ fn evaluateCoverage(
     observation_complete: bool,
     replay_current: bool,
 ) CoverageEvaluation {
-    const policy_covered = switch (policy) {
-        .strict => produced,
-        .partial => produced +| skipped,
-        .best_effort => produced +| skipped +| terminal_failed,
-        .external => produced,
-    };
-    const health = db_mod.types.evaluateDerivedCoverageHealth(
+    const assessment = db_mod.types.evaluateDerivedCoverageAssessment(
+        switch (policy) {
+            .strict, .external => .strict,
+            .partial => .partial,
+            .best_effort => .best_effort,
+        },
         source_total,
         produced,
         skipped,
@@ -1828,19 +1827,16 @@ fn evaluateCoverage(
         observation_complete,
         replay_current,
     );
-    const counters_valid = health.counters_valid;
-    const all_sources_terminal = health.all_sources_terminal;
-    const complete = observation_complete and replay_current and counters_valid and all_sources_terminal and policy_covered == source_total;
     return .{
-        .covered = policy_covered,
-        .settled = health.settled,
-        .uncovered = if (observation_complete and counters_valid) source_total -| policy_covered else null,
-        .pending = health.pending,
-        .complete = complete,
-        .healthy = complete and terminal_failed == 0,
-        .degraded = health.degraded,
-        .source_visible = source_total == 0 or policy_covered > 0,
-        .counters_valid = counters_valid,
+        .covered = assessment.covered,
+        .settled = assessment.health.settled,
+        .uncovered = if (observation_complete and assessment.health.counters_valid) source_total -| assessment.covered else null,
+        .pending = assessment.health.pending,
+        .complete = assessment.complete,
+        .healthy = assessment.healthy,
+        .degraded = assessment.degraded,
+        .source_visible = source_total == 0 or assessment.covered > 0,
+        .counters_valid = assessment.health.counters_valid,
     };
 }
 

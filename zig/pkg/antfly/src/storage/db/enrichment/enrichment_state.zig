@@ -45,6 +45,10 @@ pub const RuntimeStatus = struct {
     skipped_source_count: u64 = 0,
     consecutive_retry_count: u32 = 0,
     next_retry_at_ms: u64 = 0,
+    /// Stable identity of the request or compatible batch that owns the
+    /// consecutive retry budget. Zero is reserved for pipeline/infrastructure
+    /// failures that cannot safely be attributed to one source request.
+    retry_failure_fingerprint: u64 = 0,
     retrying: bool = false,
     worker_failed: bool = false,
 };
@@ -52,6 +56,7 @@ pub const RuntimeStatus = struct {
 const runtime_status_v1_len = 34;
 const runtime_status_v2_len = 42;
 const runtime_status_v3_len = 54;
+const runtime_status_v4_len = 62;
 
 fn appliedSequenceKey(alloc: Allocator, scope: []const u8) ![]u8 {
     return try std.fmt.allocPrint(alloc, "{s}{s}", .{ applied_seq_prefix, scope });
@@ -162,7 +167,7 @@ pub fn loadRuntimeStatus(alloc: Allocator, store: anytype, scope: []const u8) !R
     };
     const raw = try alloc.dupe(u8, borrowed);
     defer alloc.free(raw);
-    if (raw.len != runtime_status_v1_len and raw.len != runtime_status_v2_len and raw.len != runtime_status_v3_len) return error.InvalidEnrichmentState;
+    if (raw.len != runtime_status_v1_len and raw.len != runtime_status_v2_len and raw.len != runtime_status_v3_len and raw.len != runtime_status_v4_len) return error.InvalidEnrichmentState;
     var status = RuntimeStatus{
         .target_sequence = std.mem.readInt(u64, raw[0..8], .little),
         .error_count = std.mem.readInt(u64, raw[8..16], .little),
@@ -174,9 +179,12 @@ pub fn loadRuntimeStatus(alloc: Allocator, store: anytype, scope: []const u8) !R
     if (raw.len >= runtime_status_v2_len) {
         status.skipped_source_count = std.mem.readInt(u64, raw[32..40], .little);
     }
-    if (raw.len == runtime_status_v3_len) {
+    if (raw.len == runtime_status_v3_len or raw.len == runtime_status_v4_len) {
         status.consecutive_retry_count = std.mem.readInt(u32, raw[40..44], .little);
         status.next_retry_at_ms = std.mem.readInt(u64, raw[44..52], .little);
+    }
+    if (raw.len == runtime_status_v4_len) {
+        status.retry_failure_fingerprint = std.mem.readInt(u64, raw[52..60], .little);
     }
     return status;
 }
@@ -184,7 +192,7 @@ pub fn loadRuntimeStatus(alloc: Allocator, store: anytype, scope: []const u8) !R
 pub fn saveRuntimeStatus(store: anytype, scope: []const u8, status: RuntimeStatus) !void {
     const key = try runtimeStatusKey(std.heap.page_allocator, scope);
     defer std.heap.page_allocator.free(key);
-    var buf: [runtime_status_v3_len]u8 = undefined;
+    var buf: [runtime_status_v4_len]u8 = undefined;
     std.mem.writeInt(u64, buf[0..8], status.target_sequence, .little);
     std.mem.writeInt(u64, buf[8..16], status.error_count, .little);
     std.mem.writeInt(u64, buf[16..24], status.retryable_error_count, .little);
@@ -192,8 +200,9 @@ pub fn saveRuntimeStatus(store: anytype, scope: []const u8, status: RuntimeStatu
     std.mem.writeInt(u64, buf[32..40], status.skipped_source_count, .little);
     std.mem.writeInt(u32, buf[40..44], status.consecutive_retry_count, .little);
     std.mem.writeInt(u64, buf[44..52], status.next_retry_at_ms, .little);
-    buf[52] = if (status.retrying) 1 else 0;
-    buf[53] = if (status.worker_failed) 1 else 0;
+    std.mem.writeInt(u64, buf[52..60], status.retry_failure_fingerprint, .little);
+    buf[60] = if (status.retrying) 1 else 0;
+    buf[61] = if (status.worker_failed) 1 else 0;
     var runtime = try initRuntimeStore(std.heap.page_allocator, store);
     defer runtime.deinit();
     var txn = try runtime.store.beginWrite();
@@ -315,6 +324,7 @@ test "enrichment state lsm point loads do not clone mutable snapshot" {
         .skipped_source_count = 4,
         .consecutive_retry_count = 5,
         .next_retry_at_ms = 12_345,
+        .retry_failure_fingerprint = 98_765,
         .retrying = true,
     });
 
@@ -323,6 +333,7 @@ test "enrichment state lsm point loads do not clone mutable snapshot" {
     const status = try loadRuntimeStatus(std.testing.allocator, runtime, "generated");
     try std.testing.expectEqual(@as(u64, 31), status.target_sequence);
     try std.testing.expectEqual(@as(u64, 4), status.skipped_source_count);
+    try std.testing.expectEqual(@as(u64, 98_765), status.retry_failure_fingerprint);
     try std.testing.expect(status.retrying);
     const after = backend.snapshotMaintenanceStats();
     try std.testing.expectEqual(before.mutable_snapshot_clone_calls, after.mutable_snapshot_clone_calls);
@@ -343,6 +354,7 @@ test "enrichment runtime status persists source target sequence" {
         .skipped_source_count = 4,
         .consecutive_retry_count = 5,
         .next_retry_at_ms = 12_345,
+        .retry_failure_fingerprint = 98_765,
         .retrying = true,
     });
     const loaded = try loadRuntimeStatus(std.testing.allocator, runtime, "generated");
@@ -353,6 +365,34 @@ test "enrichment runtime status persists source target sequence" {
     try std.testing.expectEqual(@as(u64, 4), loaded.skipped_source_count);
     try std.testing.expectEqual(@as(u32, 5), loaded.consecutive_retry_count);
     try std.testing.expectEqual(@as(u64, 12_345), loaded.next_retry_at_ms);
+    try std.testing.expectEqual(@as(u64, 98_765), loaded.retry_failure_fingerprint);
     try std.testing.expect(loaded.retrying);
     try std.testing.expect(!loaded.worker_failed);
+}
+
+test "enrichment runtime status reads the legacy retry format" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+
+    var store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer store.deinit();
+    const key = try runtimeStatusKey(alloc, "generated");
+    defer alloc.free(key);
+    var legacy: [runtime_status_v3_len]u8 = @splat(0);
+    std.mem.writeInt(u64, legacy[0..8], 17, .little);
+    std.mem.writeInt(u32, legacy[40..44], 3, .little);
+    std.mem.writeInt(u64, legacy[44..52], 42_000, .little);
+    legacy[52] = 1;
+    var txn = try store.beginWrite();
+    errdefer txn.abort();
+    try txn.put(key, &legacy);
+    try txn.commit();
+
+    const loaded = try loadRuntimeStatus(alloc, store, "generated");
+    try std.testing.expectEqual(@as(u64, 17), loaded.target_sequence);
+    try std.testing.expectEqual(@as(u32, 3), loaded.consecutive_retry_count);
+    try std.testing.expectEqual(@as(u64, 42_000), loaded.next_retry_at_ms);
+    try std.testing.expectEqual(@as(u64, 0), loaded.retry_failure_fingerprint);
+    try std.testing.expect(loaded.retrying);
 }

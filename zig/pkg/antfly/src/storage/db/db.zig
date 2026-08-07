@@ -10473,6 +10473,21 @@ pub const DB = struct {
         debt_remaining: bool = false,
     };
 
+    fn applyCommittedRepairOutcomeToAdvance(
+        result: *IndexRepairAdvanceResult,
+        repair: types.ArtifactRepairResult,
+    ) void {
+        result.has_repair_outcome = true;
+        result.artifacts_repaired = repair.repaired;
+        result.missing_source_docs = repair.missing_source_docs;
+        result.failed = repair.failed;
+        result.unsupported = repair.unsupported;
+        result.unresolved = repair.unresolved;
+        result.indexes_rebuilt = repair.indexes_rebuilt;
+        result.indexes_degraded = repair.indexes_degraded;
+        result.debt_remaining = repair.debt_remaining;
+    }
+
     const DurableIndexRepairRunControl = struct {
         db: *DB,
         index_name: []const u8,
@@ -10844,7 +10859,10 @@ pub const DB = struct {
             }
             if (try self.reconcileActivatedIndexRepair(alloc, repair_id)) {
                 result.attempted = true;
-                result.repaired = true;
+                var repair = types.ArtifactRepairResult{ .indexes_rebuilt = 1 };
+                try self.finalizeCommittedIndexRepairOutcome(alloc, entry.intent.index_name, 0, &repair);
+                applyCommittedRepairOutcomeToAdvance(&result, repair);
+                result.repaired = repair.indexes_degraded == 0 and !repair.debt_remaining;
                 return result;
             }
             const rolled_back = try self.rollbackUnavailableActivatedIndexRepair(alloc, repair_id);
@@ -11034,15 +11052,7 @@ pub const DB = struct {
             return result;
         };
         result.documents_reprocessed = repair.reprocessed;
-        result.has_repair_outcome = true;
-        result.artifacts_repaired = repair.repaired;
-        result.missing_source_docs = repair.missing_source_docs;
-        result.failed = repair.failed;
-        result.unsupported = repair.unsupported;
-        result.unresolved = repair.unresolved;
-        result.indexes_rebuilt = repair.indexes_rebuilt;
-        result.indexes_degraded = repair.indexes_degraded;
-        result.debt_remaining = repair.debt_remaining;
+        applyCommittedRepairOutcomeToAdvance(&result, repair);
 
         // A committed replacement wins a cancellation observed after the
         // final pointer/checkpoint publication. Artifact debt discovered
@@ -11432,7 +11442,8 @@ pub const DB = struct {
         result.scanned += 1;
         if (durable_repair_id) |repair_id| {
             if (try self.reconcileActivatedIndexRepair(alloc, repair_id)) {
-                result.repaired += 1;
+                result.indexes_rebuilt += 1;
+                try self.finalizeCommittedIndexRepairOutcome(alloc, cfg.name, 0, &result);
                 return result;
             }
             _ = try self.rollbackUnavailableActivatedIndexRepair(alloc, repair_id);
@@ -12432,26 +12443,78 @@ pub const DB = struct {
         return false;
     }
 
-    fn indexHasSettledIncompleteCoverage(self: *DB, alloc: Allocator, index_name: []const u8) !bool {
-        const cfg = self.core.index_manager.get(index_name) orelse return false;
-        if (cfg.kind != .dense_vector and cfg.kind != .sparse_vector) return false;
-        const generation = self.core.index_manager.coverageGenerationForIndex(index_name) orelse return false;
+    const CommittedCoverageDisposition = enum {
+        complete,
+        degraded,
+        indeterminate,
+    };
+
+    const IndexDerivedCoverageOwnership = union(enum) {
+        external,
+        managed: types.DerivedCoveragePolicy,
+    };
+
+    fn indexDerivedCoverageOwnership(alloc: Allocator, cfg: types.IndexConfig) ?IndexDerivedCoverageOwnership {
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, cfg.config_json, .{}) catch return null;
+        defer parsed.deinit();
+        if (parsed.value != .object) return null;
+        if (parsed.value.object.get("external")) |external| {
+            if (external != .bool) return null;
+            if (external.bool) return .external;
+        }
+        const configured = parsed.value.object.get("coverage_policy") orelse return .{ .managed = .strict };
+        if (configured != .string) return null;
+        if (std.mem.eql(u8, configured.string, "strict")) return .{ .managed = .strict };
+        if (std.mem.eql(u8, configured.string, "partial")) return .{ .managed = .partial };
+        if (std.mem.eql(u8, configured.string, "best_effort")) return .{ .managed = .best_effort };
+        return null;
+    }
+
+    fn committedIndexCoverageDisposition(self: *DB, alloc: Allocator, index_name: []const u8) !CommittedCoverageDisposition {
+        const cfg = self.core.index_manager.get(index_name) orelse return .indeterminate;
+        if (cfg.kind != .dense_vector and cfg.kind != .sparse_vector) return .complete;
+        const managed_direct_field = switch (cfg.kind) {
+            .dense_vector => self.core.index_manager.denseIndexUsesManagedDirectField(index_name),
+            .sparse_vector => self.core.index_manager.sparseIndexUsesManagedDirectField(index_name),
+            else => unreachable,
+        };
+        // Direct-field vectors are rebuilt from primary rows and do not emit
+        // enrichment outcome counters. Their replay/generation health is
+        // already covered by indexGenerationRepairRequired above.
+        if (managed_direct_field) return .complete;
+        const ownership = indexDerivedCoverageOwnership(alloc, cfg.*) orelse return .indeterminate;
+        const policy = switch (ownership) {
+            .external => return .complete,
+            .managed => |value| value,
+        };
+        const generation = self.core.index_manager.coverageGenerationForIndex(index_name) orelse return .indeterminate;
         const produced = try loadDerivedCoverageOutcomeCounterFromStore(alloc, self.core.store, index_name, generation, "produced");
         const skipped = try loadDerivedCoverageOutcomeCounterFromStore(alloc, self.core.store, index_name, generation, "skipped");
         const terminal_failed = try loadDerivedCoverageOutcomeCounterFromStore(alloc, self.core.store, index_name, generation, "terminal_failed");
-        if (produced == null or skipped == null or terminal_failed == null) return false;
 
         const source_total = try range_cardinality.loadOrCount(alloc, self.core.store, self.core.index_manager.byte_range);
         const applied_sequence = try self.managedIndexAppliedSequence(alloc, index_name);
         const target_sequence = try self.projectionStatsTargetSequence(alloc, cfg.*, applied_sequence);
-        return types.evaluateDerivedCoverageHealth(
+        const replay_current = applied_sequence >= target_sequence;
+        if (produced == null or skipped == null or terminal_failed == null) {
+            // An empty source can legitimately predate creation of the compact
+            // counter tuple. Any non-empty or still-replaying source remains
+            // unknown and must not be reported repaired.
+            return if (source_total == 0 and replay_current) .complete else .indeterminate;
+        }
+        const assessment = types.evaluateDerivedCoverageAssessment(
+            policy,
             source_total,
             produced.?,
             skipped.?,
             terminal_failed.?,
             true,
-            applied_sequence >= target_sequence,
-        ).degraded;
+            replay_current,
+        );
+        if (!assessment.health.counters_valid or !assessment.complete) {
+            return if (assessment.degraded) .degraded else .indeterminate;
+        }
+        return if (assessment.degraded) .degraded else .complete;
     }
 
     /// Classify a generation after its replacement is durably committed.
@@ -12480,11 +12543,11 @@ pub const DB = struct {
         result.debt_remaining = result.debt_remaining or !repair_summary_ready or unresolved_artifacts != 0;
 
         const generation_repair_required = try self.indexGenerationRepairRequired(alloc, index_name);
-        const coverage_degraded = try self.indexHasSettledIncompleteCoverage(alloc, index_name);
-        if (generation_repair_required or coverage_degraded) {
+        const coverage = try self.committedIndexCoverageDisposition(alloc, index_name);
+        if (generation_repair_required or coverage != .complete) {
             result.unresolved += 1;
             result.debt_remaining = true;
-            if (coverage_degraded) result.indexes_degraded += 1;
+            if (coverage == .degraded) result.indexes_degraded += 1;
         }
 
         // "Rebuilt" describes completed work. "Repaired" is the stronger
@@ -51860,6 +51923,21 @@ test "db document extraction skips stable unit local rewrites while replaying fu
     }
     try std.testing.expectEqual(@as(usize, 1), asset_vector_indexes.len);
     try std.testing.expectEqualStrings("dv_document_chunks", asset_vector_indexes[0]);
+    const asset_consumers = try db.core.index_manager.indexesDependingOnArtifact(alloc, "document_units_v1");
+    defer {
+        for (asset_consumers) |index_name| alloc.free(index_name);
+        alloc.free(asset_consumers);
+    }
+    try std.testing.expectEqual(@as(usize, 3), asset_consumers.len);
+    var found_units_text = false;
+    var found_chunks_text = false;
+    var found_chunks_dense = false;
+    for (asset_consumers) |index_name| {
+        found_units_text = found_units_text or std.mem.eql(u8, index_name, "ft_document_units");
+        found_chunks_text = found_chunks_text or std.mem.eql(u8, index_name, "ft_document_chunks");
+        found_chunks_dense = found_chunks_dense or std.mem.eql(u8, index_name, "dv_document_chunks");
+    }
+    try std.testing.expect(found_units_text and found_chunks_text and found_chunks_dense);
 
     const first_value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBnYW1tYQ==\"}";
     try db.batch(.{
@@ -56154,6 +56232,49 @@ test "db addEnrichment allows unrelated definitions after field sparse index" {
         .field = "url",
         .content_type = "application/json",
     });
+}
+
+test "db enrichment artifact consumer resolution includes graph and default full text indexes" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "full_text_index_v0",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    try db.addEnrichment(.{
+        .name = "relations_v1",
+        .kind = .asset,
+        .field = "body",
+        .content_type = "application/json",
+        .full_text_index = true,
+    });
+    try db.addIndex(.{
+        .name = "knowledge_graph",
+        .kind = .graph,
+        .config_json = "{\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\",\"format\":\"extraction_relation\"}}",
+    });
+
+    const consumers = try db.core.index_manager.indexesDependingOnArtifact(alloc, "relations_v1");
+    defer {
+        for (consumers) |index_name| alloc.free(index_name);
+        alloc.free(consumers);
+    }
+    try std.testing.expectEqual(@as(usize, 2), consumers.len);
+    var found_text = false;
+    var found_graph = false;
+    for (consumers) |index_name| {
+        found_text = found_text or std.mem.eql(u8, index_name, "full_text_index_v0");
+        found_graph = found_graph or std.mem.eql(u8, index_name, "knowledge_graph");
+    }
+    try std.testing.expect(found_text and found_graph);
 }
 
 test "db asset enrichment full_text_index feeds default full text index after full_index sync" {

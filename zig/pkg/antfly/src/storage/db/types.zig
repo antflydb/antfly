@@ -2043,6 +2043,24 @@ pub const DerivedCoverageHealth = struct {
     degraded: bool,
 };
 
+pub const DerivedCoveragePolicy = enum {
+    strict,
+    partial,
+    best_effort,
+};
+
+/// One authoritative interpretation of durable derived-coverage counters.
+/// Status endpoints and repair completion must use the same policy semantics:
+/// a settled source that the policy does not cover is degraded debt, not a
+/// healthy repair merely because the worker has no pending input.
+pub const DerivedCoverageAssessment = struct {
+    covered: u64,
+    health: DerivedCoverageHealth,
+    complete: bool,
+    healthy: bool,
+    degraded: bool,
+};
+
 pub fn evaluateDerivedCoverageHealth(
     source_total: u64,
     produced: u64,
@@ -2074,6 +2092,59 @@ pub fn evaluateDerivedCoverageHealth(
         .all_sources_terminal = all_sources_terminal,
         .degraded = observation_complete and replay_current and all_sources_terminal and terminal_failed > 0,
     };
+}
+
+pub fn evaluateDerivedCoverageAssessment(
+    policy: DerivedCoveragePolicy,
+    source_total: u64,
+    produced: u64,
+    skipped: u64,
+    terminal_failed: u64,
+    observation_complete: bool,
+    replay_current: bool,
+) DerivedCoverageAssessment {
+    const covered = switch (policy) {
+        .strict => produced,
+        .partial => std.math.add(u64, produced, skipped) catch std.math.maxInt(u64),
+        .best_effort => blk: {
+            const produced_and_skipped = std.math.add(u64, produced, skipped) catch break :blk std.math.maxInt(u64);
+            break :blk std.math.add(u64, produced_and_skipped, terminal_failed) catch std.math.maxInt(u64);
+        },
+    };
+    const health = evaluateDerivedCoverageHealth(
+        source_total,
+        produced,
+        skipped,
+        terminal_failed,
+        observation_complete,
+        replay_current,
+    );
+    const complete = observation_complete and replay_current and health.counters_valid and
+        health.all_sources_terminal and covered == source_total;
+    return .{
+        .covered = covered,
+        .health = health,
+        .complete = complete,
+        .healthy = complete and terminal_failed == 0,
+        .degraded = observation_complete and replay_current and health.all_sources_terminal and
+            (terminal_failed > 0 or covered != source_total),
+    };
+}
+
+test "derived coverage assessment honors completion policy" {
+    const strict = evaluateDerivedCoverageAssessment(.strict, 2, 1, 1, 0, true, true);
+    try std.testing.expect(!strict.complete);
+    try std.testing.expect(strict.degraded);
+
+    const partial = evaluateDerivedCoverageAssessment(.partial, 2, 1, 1, 0, true, true);
+    try std.testing.expect(partial.complete);
+    try std.testing.expect(partial.healthy);
+    try std.testing.expect(!partial.degraded);
+
+    const best_effort = evaluateDerivedCoverageAssessment(.best_effort, 2, 1, 0, 1, true, true);
+    try std.testing.expect(best_effort.complete);
+    try std.testing.expect(!best_effort.healthy);
+    try std.testing.expect(best_effort.degraded);
 }
 
 pub const ArtifactRepairIssue = struct {
