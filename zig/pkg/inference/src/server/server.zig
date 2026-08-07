@@ -1533,6 +1533,13 @@ pub const Node = struct {
         self.model_manager.configureAdmissionResourceBudget(resource_budget);
     }
 
+    pub fn configureForcedRunAdmissionDenialsForTesting(
+        self: *Node,
+        count: usize,
+    ) void {
+        self.model_manager.configureForcedRunAdmissionDenialsForTesting(count);
+    }
+
     /// Configure the std.Io tokenizer scheduler and optional consumer-local
     /// tables before model load. Table memory is admitted by the cache
     /// resource budget configured above.
