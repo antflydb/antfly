@@ -269,7 +269,7 @@ func TestMultiBatchReturnsStructuredConflict(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusConflict)
-		_, _ = w.Write([]byte(`{"status":"aborted","conflict":{"table":"files","key":"doc-1","message":"version conflict"}}`))
+		_, _ = w.Write([]byte(`{"status":"aborted","conflict":{"table":"files","key":"doc-1","message":"participant unavailable","kind":"participant_unavailable","retryable":true,"retry_after_ms":50,"retry_scope":"participant","expected_version":41,"current_version":42,"participant":{"group_id":7,"phase":"prepare"}}}`))
 	}))
 	defer server.Close()
 
@@ -289,8 +289,25 @@ func TestMultiBatchReturnsStructuredConflict(t *testing.T) {
 	if result.Conflict == nil {
 		t.Fatal("Conflict = nil, want structured conflict")
 	}
-	if result.Conflict.Table != "files" || result.Conflict.Key != "doc-1" || result.Conflict.Message != "version conflict" {
-		t.Fatalf("Conflict = %#v, want files/doc-1 version conflict", result.Conflict)
+	assertCompleteTransactionConflict(t, result.Conflict)
+}
+
+func assertCompleteTransactionConflict(t *testing.T, conflict *TransactionConflict) {
+	t.Helper()
+	if conflict.Table != "files" || conflict.Key != "doc-1" || conflict.Message != "participant unavailable" {
+		t.Fatalf("Conflict identity = %#v", conflict)
+	}
+	if conflict.Kind != TransactionConflictParticipantUnavailable || !conflict.Retryable {
+		t.Fatalf("Conflict classification = %#v", conflict)
+	}
+	if conflict.RetryAfterMS == nil || *conflict.RetryAfterMS != 50 || conflict.RetryScope != TransactionConflictRetryScopeParticipant {
+		t.Fatalf("Conflict retry metadata = %#v", conflict)
+	}
+	if conflict.ExpectedVersion == nil || *conflict.ExpectedVersion != 41 || conflict.CurrentVersion == nil || *conflict.CurrentVersion != 42 {
+		t.Fatalf("Conflict versions = %#v", conflict)
+	}
+	if conflict.Participant == nil || conflict.Participant.GroupID == nil || *conflict.Participant.GroupID != 7 || conflict.Participant.Phase != TransactionConflictPhasePrepare {
+		t.Fatalf("Conflict participant = %#v", conflict)
 	}
 }
 
@@ -655,4 +672,28 @@ func TestTransactionCommitPreservesAcceptedRecoveryStatus(t *testing.T) {
 	if result.Status != "committed_recovery_pending" {
 		t.Fatalf("Status = %q, want committed_recovery_pending", result.Status)
 	}
+}
+
+func TestTransactionCommitPreservesStructuredConflict(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"status":"aborted","conflict":{"table":"files","key":"doc-1","message":"participant unavailable","kind":"participant_unavailable","retryable":true,"retry_after_ms":50,"retry_scope":"participant","expected_version":41,"current_version":42,"participant":{"group_id":7,"phase":"prepare"}}}`))
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+	result, err := client.NewTransaction().Commit(context.Background(), map[string]BatchRequest{
+		"files": {Inserts: map[string]any{"doc-1": map[string]any{"title": "hello"}}},
+	})
+	if err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if result.Status != "aborted" || result.Conflict == nil {
+		t.Fatalf("Commit result = %#v, want aborted conflict", result)
+	}
+	assertCompleteTransactionConflict(t, result.Conflict)
 }

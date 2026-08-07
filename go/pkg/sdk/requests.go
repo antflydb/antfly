@@ -336,9 +336,55 @@ type TransactionCommitResult struct {
 	Tables map[string]BatchResult `json:"tables,omitempty"`
 }
 
-// TransactionConflict describes the conflict that caused a transaction abort.
+// TransactionConflictKind is the stable machine-readable transaction conflict classification.
+type TransactionConflictKind string
+
+const (
+	TransactionConflictVersionConflict        TransactionConflictKind = "version_conflict"
+	TransactionConflictIntentConflict         TransactionConflictKind = "intent_conflict"
+	TransactionConflictTopologyChanged        TransactionConflictKind = "topology_changed"
+	TransactionConflictParticipantUnavailable TransactionConflictKind = "participant_unavailable"
+	TransactionConflictDocIdentityUnavailable TransactionConflictKind = "doc_identity_unavailable"
+	TransactionConflictSessionLeaseLost       TransactionConflictKind = "session_lease_lost"
+	TransactionConflictTransactionConflict    TransactionConflictKind = "transaction_conflict"
+	TransactionConflictTornState              TransactionConflictKind = "torn_state"
+)
+
+// TransactionConflictPhase identifies the 2PC participant phase that reported a conflict.
+type TransactionConflictPhase string
+
+const (
+	TransactionConflictPhaseBegin   TransactionConflictPhase = "begin"
+	TransactionConflictPhasePrepare TransactionConflictPhase = "prepare"
+	TransactionConflictPhaseResolve TransactionConflictPhase = "resolve"
+)
+
+// TransactionConflictRetryScope identifies the component that should be refreshed before retrying.
+type TransactionConflictRetryScope string
+
+const (
+	TransactionConflictRetryScopeTopology    TransactionConflictRetryScope = "topology"
+	TransactionConflictRetryScopeParticipant TransactionConflictRetryScope = "participant"
+	TransactionConflictRetryScopeDocIdentity TransactionConflictRetryScope = "doc_identity"
+	TransactionConflictRetryScopeSession     TransactionConflictRetryScope = "session"
+)
+
+// TransactionConflictParticipant identifies where a distributed transaction conflict occurred.
+type TransactionConflictParticipant struct {
+	GroupID *uint64                  `json:"group_id,omitempty"`
+	Phase   TransactionConflictPhase `json:"phase,omitempty"`
+}
+
+// TransactionConflict describes the conflict that caused a transaction abort and whether it is safe to retry.
 type TransactionConflict struct {
-	Table   string `json:"table,omitempty"`
-	Key     string `json:"key,omitempty"`
-	Message string `json:"message,omitempty"`
+	Table           string                          `json:"table,omitempty"`
+	Key             string                          `json:"key,omitempty"`
+	Message         string                          `json:"message,omitempty"`
+	Kind            TransactionConflictKind         `json:"kind,omitempty"`
+	Retryable       bool                            `json:"retryable"`
+	RetryAfterMS    *uint32                         `json:"retry_after_ms,omitempty"`
+	RetryScope      TransactionConflictRetryScope   `json:"retry_scope,omitempty"`
+	ExpectedVersion *uint64                         `json:"expected_version,omitempty"`
+	CurrentVersion  *uint64                         `json:"current_version,omitempty"`
+	Participant     *TransactionConflictParticipant `json:"participant,omitempty"`
 }

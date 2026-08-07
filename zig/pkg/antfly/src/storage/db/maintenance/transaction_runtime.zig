@@ -376,7 +376,21 @@ fn runRecoveryPageWithConfig(
                 };
                 summary.notification_successes += 1;
             } else if (config.resolve_local_fn) |resolve_local| {
-                try resolve_local(config.local_resolution_ctx orelse return error.MissingLocalTransactionResolver, txn.txn_id, txn.status, txn.commit_version);
+                summary.notification_attempts += 1;
+                resolve_local(
+                    config.local_resolution_ctx orelse return error.MissingLocalTransactionResolver,
+                    txn.txn_id,
+                    txn.status,
+                    txn.commit_version,
+                ) catch {
+                    // A corrupt or otherwise poison transaction must not pin the
+                    // bounded cursor and starve every record behind it. Leave its
+                    // durable effects intact for the next keyspace rotation while
+                    // allowing independent transactions in this page to recover.
+                    summary.notification_failures += 1;
+                    continue :transaction;
+                };
+                summary.notification_successes += 1;
             }
         }
 
@@ -601,6 +615,64 @@ test "transaction recovery drains terminal HA outbox without remaining intents" 
     try std.testing.expectEqual(@as(usize, 1), recorder.calls);
     try std.testing.expectEqual(@as(u64, 1), summary.recovery.scanned_records);
     try std.testing.expect(!try manager.hasHAOutbox(txn_id));
+}
+
+test "transaction recovery advances past a failed local resolution" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var runtime_store = try backend.runtimeStore(alloc, .{ .name = "local-resolution-fairness" });
+    defer runtime_store.deinit();
+
+    const poison_txn: transactions_mod.TxnId = .{1} ** 16;
+    const healthy_txn: transactions_mod.TxnId = .{2} ** 16;
+    const later_txn: transactions_mod.TxnId = .{3} ** 16;
+    var manager = try transactions_mod.TxnManager.init(alloc, &runtime_store);
+    defer manager.deinit();
+    for ([_]transactions_mod.TxnId{ poison_txn, healthy_txn }) |txn_id| {
+        try manager.initTransaction(txn_id, 1_000);
+        try manager.writeIntents(txn_id, &.{.{ .key = "doc:a", .value = "{}" }}, &.{});
+        const outbox_key = transactions_mod.makeTransactionHABatchOutboxKey(txn_id);
+        _ = try manager.resolveIntentsWithExtraBatch(txn_id, .committed, 2_000, .{
+            .writes = &.{.{ .key = &outbox_key, .value = "encoded-ha-batch" }},
+        });
+    }
+    try manager.initTransaction(later_txn, 2_500);
+
+    const Recorder = struct {
+        store: *backend_erased.Store,
+        calls: [2]transactions_mod.TxnId = undefined,
+        call_count: usize = 0,
+
+        fn resolveLocal(ptr: *anyopaque, txn_id: transactions_mod.TxnId, _: transactions_mod.TxnStatus, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls[self.call_count] = txn_id;
+            self.call_count += 1;
+            if (std.mem.eql(u8, &txn_id, &poison_txn)) return error.PoisonTransaction;
+
+            var local_manager = try transactions_mod.TxnManager.init(std.testing.allocator, self.store);
+            defer local_manager.deinit();
+            try local_manager.clearHAOutbox(txn_id, .batch);
+        }
+    };
+    var recorder = Recorder{ .store = &runtime_store };
+    const summary = try runRecoveryPageWithConfig(alloc, runtime_store, .{
+        .enabled = true,
+        .resolver_ctx = &recorder,
+        .resolve_participant_fn = TestResolver.resolve,
+        .local_resolution_ctx = &recorder,
+        .resolve_local_fn = Recorder.resolveLocal,
+    }, 3_000, null, 2);
+
+    try std.testing.expectEqual(@as(usize, 2), recorder.call_count);
+    try std.testing.expectEqual(poison_txn, recorder.calls[0]);
+    try std.testing.expectEqual(healthy_txn, recorder.calls[1]);
+    try std.testing.expectEqual(@as(u64, 2), summary.notification_attempts);
+    try std.testing.expectEqual(@as(u64, 1), summary.notification_failures);
+    try std.testing.expectEqual(@as(u64, 1), summary.notification_successes);
+    try std.testing.expect(try manager.hasHAOutbox(poison_txn));
+    try std.testing.expect(!try manager.hasHAOutbox(healthy_txn));
+    try std.testing.expect(summary.next_scan_after != null);
 }
 
 test "non-replicated transaction recovery honors the per-run page limit" {

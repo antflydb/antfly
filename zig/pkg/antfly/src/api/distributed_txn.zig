@@ -1046,13 +1046,18 @@ pub fn parseTxnBeginRequest(alloc: std.mem.Allocator, body: []const u8) !TxnBegi
         .array => |arr| arr,
         else => return error.InvalidTxnRequest,
     };
-    var out = try alloc.alloc([]const u8, participants.items.len);
-    errdefer alloc.free(out);
+    const out = try alloc.alloc([]const u8, participants.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |participant| alloc.free(@constCast(participant));
+        if (out.len > 0) alloc.free(out);
+    }
     for (participants.items, 0..) |item, i| {
         out[i] = try alloc.dupe(u8, switch (item) {
             .string => |s| s,
             else => return error.InvalidTxnRequest,
         });
+        initialized += 1;
     }
     return .{
         .txn_id = txn_id,
@@ -1081,13 +1086,13 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
     };
     const txn_id = try parseTxnIdHex(requireString(obj, "txn_id"));
     const writes = try parseTxnWrites(alloc, obj.get("writes") orelse return error.InvalidTxnRequest);
-    errdefer if (writes.len > 0) alloc.free(writes);
+    errdefer freeTxnWrites(alloc, writes);
     const deletes = try parseTxnDeletes(alloc, obj.get("deletes") orelse return error.InvalidTxnRequest);
-    errdefer if (deletes.len > 0) alloc.free(deletes);
+    errdefer freeTxnDeletes(alloc, deletes);
     const transforms = try parseTxnTransforms(alloc, obj.get("transforms") orelse return error.InvalidTxnRequest);
     errdefer freeTxnTransforms(alloc, transforms);
     const predicates = try parseTxnPredicates(alloc, obj.get("predicates") orelse return error.InvalidTxnRequest);
-    errdefer if (predicates.len > 0) alloc.free(predicates);
+    errdefer freeTxnPredicates(alloc, predicates);
     return .{
         .txn_id = txn_id,
         .topology_epoch = requireInteger(obj, "topology_epoch"),
@@ -1101,16 +1106,10 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
 }
 
 pub fn freeTxnPrepareRequest(alloc: std.mem.Allocator, req: *TxnPrepareRequest) void {
-    for (req.req.writes) |write| {
-        alloc.free(@constCast(write.key));
-        alloc.free(@constCast(write.value));
-    }
-    if (req.req.writes.len > 0) alloc.free(req.req.writes);
-    for (req.req.deletes) |key| alloc.free(@constCast(key));
-    if (req.req.deletes.len > 0) alloc.free(req.req.deletes);
+    freeTxnWrites(alloc, req.req.writes);
+    freeTxnDeletes(alloc, req.req.deletes);
     freeTxnTransforms(alloc, req.req.transforms);
-    for (req.req.predicates) |predicate| alloc.free(@constCast(predicate.key));
-    if (req.req.predicates.len > 0) alloc.free(req.req.predicates);
+    freeTxnPredicates(alloc, req.req.predicates);
     req.* = undefined;
 }
 
@@ -1181,21 +1180,39 @@ fn parseTxnWrites(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod.typ
         .array => |arr| arr,
         else => return error.InvalidTxnRequest,
     };
-    var out = try alloc.alloc(db_mod.types.TransactionWrite, arr.items.len);
+    const out = try alloc.alloc(db_mod.types.TransactionWrite, arr.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |write| {
+            alloc.free(@constCast(write.key));
+            alloc.free(@constCast(write.value));
+        }
+        if (out.len > 0) alloc.free(out);
+    }
     for (arr.items, 0..) |item, i| {
         const obj = switch (item) {
             .object => |obj| obj,
             else => return error.InvalidTxnRequest,
         };
+        const key = try alloc.dupe(u8, requireString(obj, "key"));
+        errdefer alloc.free(key);
+        const raw_value = obj.get("value") orelse return error.InvalidTxnRequest;
+        const encoded_value = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(raw_value, .{})});
         out[i] = .{
-            .key = try alloc.dupe(u8, requireString(obj, "key")),
-            .value = blk: {
-                const raw_value = obj.get("value") orelse return error.InvalidTxnRequest;
-                break :blk try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(raw_value, .{})});
-            },
+            .key = key,
+            .value = encoded_value,
         };
+        initialized += 1;
     }
     return out;
+}
+
+fn freeTxnWrites(alloc: std.mem.Allocator, writes: []const db_mod.types.TransactionWrite) void {
+    for (writes) |write| {
+        alloc.free(@constCast(write.key));
+        alloc.free(@constCast(write.value));
+    }
+    if (writes.len > 0) alloc.free(@constCast(writes));
 }
 
 fn parseTxnDeletes(alloc: std.mem.Allocator, value: std.json.Value) ![]const []const u8 {
@@ -1203,14 +1220,25 @@ fn parseTxnDeletes(alloc: std.mem.Allocator, value: std.json.Value) ![]const []c
         .array => |arr| arr,
         else => return error.InvalidTxnRequest,
     };
-    var out = try alloc.alloc([]const u8, arr.items.len);
+    const out = try alloc.alloc([]const u8, arr.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |key| alloc.free(@constCast(key));
+        if (out.len > 0) alloc.free(out);
+    }
     for (arr.items, 0..) |item, i| {
         out[i] = try alloc.dupe(u8, switch (item) {
             .string => |s| s,
             else => return error.InvalidTxnRequest,
         });
+        initialized += 1;
     }
     return out;
+}
+
+fn freeTxnDeletes(alloc: std.mem.Allocator, deletes: []const []const u8) void {
+    for (deletes) |key| alloc.free(@constCast(key));
+    if (deletes.len > 0) alloc.free(@constCast(deletes));
 }
 
 fn parseTxnTransforms(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod.types.DocumentTransform {
@@ -1271,14 +1299,15 @@ fn parseTxnTransforms(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod
                 .operations = ops[i .. i + 1],
             }) catch return error.InvalidTxnRequest;
         }
+        const upsert = if (obj.get("upsert")) |upsert_value| switch (upsert_value) {
+            .bool => |flag| flag,
+            .null => false,
+            else => return error.InvalidTxnRequest,
+        } else false;
         out[initialized] = .{
             .key = try alloc.dupe(u8, key),
             .operations = ops,
-            .upsert = if (obj.get("upsert")) |upsert_value| switch (upsert_value) {
-                .bool => |flag| flag,
-                .null => false,
-                else => return error.InvalidTxnRequest,
-            } else false,
+            .upsert = upsert,
         };
         initialized += 1;
     }
@@ -1312,7 +1341,12 @@ fn parseTxnPredicates(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod
         .array => |arr| arr,
         else => return error.InvalidTxnRequest,
     };
-    var out = try alloc.alloc(db_mod.types.TransactionVersionPredicate, arr.items.len);
+    const out = try alloc.alloc(db_mod.types.TransactionVersionPredicate, arr.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |predicate| alloc.free(@constCast(predicate.key));
+        if (out.len > 0) alloc.free(out);
+    }
     for (arr.items, 0..) |item, i| {
         const obj = switch (item) {
             .object => |obj| obj,
@@ -1322,8 +1356,14 @@ fn parseTxnPredicates(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod
             .key = try alloc.dupe(u8, requireString(obj, "key")),
             .expected_version = requireInteger(obj, "expected_version"),
         };
+        initialized += 1;
     }
     return out;
+}
+
+fn freeTxnPredicates(alloc: std.mem.Allocator, predicates: []const db_mod.types.TransactionVersionPredicate) void {
+    for (predicates) |predicate| alloc.free(@constCast(predicate.key));
+    if (predicates.len > 0) alloc.free(@constCast(predicates));
 }
 
 fn requireString(obj: std.json.ObjectMap, key: []const u8) []const u8 {
@@ -1380,6 +1420,33 @@ test "txn prepare parser round-trips transforms" {
     try std.testing.expectEqualStrings("doc:a", parsed.req.transforms[0].key);
     try std.testing.expectEqual(db_mod.types.TransformOpType.set, parsed.req.transforms[0].operations[0].op);
     try std.testing.expectEqualStrings("\"updated\"", parsed.req.transforms[0].operations[0].value_json.?);
+}
+
+test "transaction request parsers release owned prefixes after malformed input" {
+    const alloc = std.testing.allocator;
+    const malformed_begin_requests = [_][]const u8{
+        \\{"txn_id":"00112233445566778899aabbccddeeff","begin_timestamp":1,"topology_epoch":2,"participants":["table2:4:docs:group:7",7]}
+        ,
+        \\{"txn_id":"00112233445566778899aabbccddeeff","begin_timestamp":1,"topology_epoch":2,"retain_terminal":"invalid","participants":["table2:4:docs:group:7"]}
+        ,
+    };
+    for (malformed_begin_requests) |body| {
+        try std.testing.expectError(error.InvalidTxnRequest, parseTxnBeginRequest(alloc, body));
+    }
+
+    const malformed_prepare_requests = [_][]const u8{
+        \\{"txn_id":"00112233445566778899aabbccddeeff","topology_epoch":2,"writes":[{"key":"doc:a","value":{"title":"alpha"}},{"key":"doc:b"}],"deletes":[],"transforms":[],"predicates":[]}
+        ,
+        \\{"txn_id":"00112233445566778899aabbccddeeff","topology_epoch":2,"writes":[{"key":"doc:a","value":{"title":"alpha"}}],"deletes":["doc:b",7],"transforms":[],"predicates":[]}
+        ,
+        \\{"txn_id":"00112233445566778899aabbccddeeff","topology_epoch":2,"writes":[{"key":"doc:a","value":{"title":"alpha"}}],"deletes":["doc:b"],"transforms":[{"key":"doc:c","operations":[{"op":"$set","path":"status","value":"ready"}],"upsert":"invalid"}],"predicates":[]}
+        ,
+        \\{"txn_id":"00112233445566778899aabbccddeeff","topology_epoch":2,"writes":[{"key":"doc:a","value":{"title":"alpha"}}],"deletes":["doc:b"],"transforms":[{"key":"doc:c","operations":[{"op":"$set","path":"status","value":"ready"}],"upsert":true}],"predicates":[{"key":"doc:d","expected_version":1},7]}
+        ,
+    };
+    for (malformed_prepare_requests) |body| {
+        try std.testing.expectError(error.InvalidTxnRequest, parseTxnPrepareRequest(alloc, body));
+    }
 }
 
 fn requireInteger(obj: std.json.ObjectMap, key: []const u8) u64 {
