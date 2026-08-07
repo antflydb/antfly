@@ -2157,6 +2157,7 @@ components:
         - missing_artifact
         - corrupt_artifact
         - unreadable_artifact
+        - enrichment_failed
     RepairTarget:
       type: string
       description: Repair subsystem to inspect or run.

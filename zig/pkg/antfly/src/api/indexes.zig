@@ -1635,6 +1635,8 @@ fn aggregateEnrichmentStats(
     dst.error_count +|= src.error_count;
     dst.retryable_error_count +|= src.retryable_error_count;
     dst.fatal_error_count +|= src.fatal_error_count;
+    dst.consecutive_retry_count = @max(dst.consecutive_retry_count, src.consecutive_retry_count);
+    dst.next_retry_at_ms = @max(dst.next_retry_at_ms, src.next_retry_at_ms);
     dst.retrying = dst.retrying or src.retrying;
     dst.worker_failed = dst.worker_failed or src.worker_failed;
     dst.worker_started = dst.worker_started or src.worker_started;
@@ -1765,6 +1767,8 @@ const EmbeddingsRuntimeView = struct {
 
 const CoverageEvaluation = struct {
     covered: u64,
+    settled: u64,
+    uncovered: ?u64,
     pending: ?u64,
     complete: bool,
     healthy: bool,
@@ -1822,10 +1826,12 @@ fn evaluateCoverage(
     const complete = observation_complete and replay_current and counters_valid and all_sources_terminal and policy_covered == source_total;
     return .{
         .covered = policy_covered,
-        .pending = if (observation_complete and counters_valid) source_total -| policy_covered else null,
+        .settled = outcome_total orelse 0,
+        .uncovered = if (observation_complete and counters_valid) source_total -| policy_covered else null,
+        .pending = if (observation_complete and counters_valid) source_total -| (outcome_total orelse 0) else null,
         .complete = complete,
         .healthy = complete and terminal_failed == 0,
-        .degraded = complete and terminal_failed > 0,
+        .degraded = observation_complete and replay_current and counters_valid and all_sources_terminal and terminal_failed > 0,
         .source_visible = source_total == 0 or policy_covered > 0,
         .counters_valid = counters_valid,
     };
@@ -1834,8 +1840,11 @@ fn evaluateCoverage(
 test "derived coverage evaluation is policy exact and observation gated" {
     const strict = evaluateCoverage(.strict, 3, 1, 1, 1, true, true);
     try std.testing.expectEqual(@as(u64, 1), strict.covered);
-    try std.testing.expectEqual(@as(?u64, 2), strict.pending);
+    try std.testing.expectEqual(@as(u64, 3), strict.settled);
+    try std.testing.expectEqual(@as(?u64, 2), strict.uncovered);
+    try std.testing.expectEqual(@as(?u64, 0), strict.pending);
     try std.testing.expect(!strict.complete);
+    try std.testing.expect(strict.degraded);
 
     const partial = evaluateCoverage(.partial, 3, 1, 2, 0, true, true);
     try std.testing.expectEqual(@as(u64, 3), partial.covered);
@@ -1870,6 +1879,27 @@ test "derived coverage evaluation is policy exact and observation gated" {
     const external_complete = evaluateCoverage(.external, 3, 3, 0, 0, true, true);
     try std.testing.expect(external_complete.complete);
     try std.testing.expect(external_complete.healthy);
+}
+
+test "settled terminal enrichment debt is degraded rather than rebuilding" {
+    const item = AggregatedIndexStatus{
+        .coverage_produced_count = 2,
+        .coverage_terminal_failed_count = 1,
+        .coverage_generation = 42,
+        .coverage_config_hash = 99,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+        .backfill_active = true,
+        .replay_applied_sequence = 5,
+        .replay_target_sequence = 5,
+    };
+    const view = embeddingsRuntimeView(item, 3, .strict, false, 42, 99, .{
+        .enabled = true,
+        .applied_sequence = 5,
+        .target_sequence = 5,
+    }, true);
+    try std.testing.expect(!view.backfill_active);
+    try std.testing.expectEqual(@as(f64, 1.0), view.backfill_progress);
 }
 
 test "derived coverage aggregation rejects mixed config observations" {
@@ -2238,6 +2268,8 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: E
         !coverage_incomplete and replay_current
     else
         materialization_complete;
+    const all_sources_settled = !coverage_incomplete and replay_current and
+        coverageAllSourcesTerminal(table_doc_count, produced_count, skipped_count, terminal_failed_count);
     if (if (observation_current) enrichment else null) |stats| {
         const index_applied_sequence = view.replay_applied_sequence;
         const index_target_sequence = view.replay_target_sequence;
@@ -2266,6 +2298,13 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: E
     else
         false;
     if (readiness_complete and !enrichment_pending) {
+        view.replay_applied_sequence = @max(view.replay_applied_sequence, view.replay_target_sequence);
+        view.replay_catch_up_required = false;
+        view.backfill_active = false;
+        view.backfill_progress = 1.0;
+        return view;
+    }
+    if (all_sources_settled and !enrichment_pending) {
         view.replay_applied_sequence = @max(view.replay_applied_sequence, view.replay_target_sequence);
         view.replay_catch_up_required = false;
         view.backfill_active = false;
@@ -2407,11 +2446,11 @@ fn embeddingsArtifactPublishComplete(item: anytype, sparse: bool, expected_doc_c
     return item.doc_count >= expected_doc_count and embeddingsArtifactVisible(item, sparse);
 }
 
-fn backfillState(index_type: ApiIndexType, active: bool, enrichment_failed: bool, replay_applied_sequence: u64, replay_target_sequence: u64, enrichment: ?db_mod.types.EnrichmentStats) []const u8 {
+fn backfillState(index_type: ApiIndexType, active: bool, enrichment_degraded: bool, replay_applied_sequence: u64, replay_target_sequence: u64, enrichment: ?db_mod.types.EnrichmentStats) []const u8 {
     if (index_type == .embeddings) {
         _ = replay_applied_sequence;
         _ = replay_target_sequence;
-        if (enrichment_failed) return "failed";
+        if (enrichment_degraded) return "degraded";
         if (active) {
             if (enrichment) |stats| {
                 if (stats.worker_failed) return "failed";
@@ -2457,6 +2496,10 @@ fn appendEnrichmentRuntimeStatus(alloc: std.mem.Allocator, out: *std.ArrayListUn
     try appendIntValue(alloc, out, stats.retryable_error_count);
     try out.appendSlice(alloc, ",\"fatal_error_count\":");
     try appendIntValue(alloc, out, stats.fatal_error_count);
+    try out.appendSlice(alloc, ",\"consecutive_retry_count\":");
+    try appendIntValue(alloc, out, stats.consecutive_retry_count);
+    try out.appendSlice(alloc, ",\"next_retry_at_ms\":");
+    try appendIntValue(alloc, out, stats.next_retry_at_ms);
     try out.appendSlice(alloc, ",\"retrying\":");
     try out.appendSlice(alloc, if (stats.retrying) "true" else "false");
     try out.appendSlice(alloc, ",\"worker_failed\":");
@@ -2609,6 +2652,9 @@ fn appendSingleIndexRuntimeStatus(
     const visible_edge_count = if (embeddings_materialization_current) item.edge_count else 0;
     const visible_node_count = if (embeddings_materialization_current) item.node_count else 0;
     const visible_root_node = if (embeddings_materialization_current) item.root_node else 0;
+    const enrichment_terminal_failed = embeddings_materialization_current and
+        @hasField(@TypeOf(item), "coverage_terminal_failed_count") and
+        item.coverage_terminal_failed_count > 0;
     const embeddings_view = if (index_type == .embeddings)
         embeddingsRuntimeView(item, table_doc_count, embeddings_coverage_policy, embeddings_sparse, coverage_generation, coverage_config_hash, enrichment, coverage_runtime_present)
     else
@@ -2734,7 +2780,7 @@ fn appendSingleIndexRuntimeStatus(
     } else if (repair_state != null and std.mem.eql(u8, repair_state.?, "waiting")) {
         try appendJsonString(alloc, out, "retrying");
     } else {
-        try appendJsonString(alloc, out, backfillState(index_type, backfill_active, embeddings_materialization_current and item.enrichment_failed, replay_applied_sequence, replay_target_sequence, visible_enrichment));
+        try appendJsonString(alloc, out, backfillState(index_type, backfill_active, (embeddings_materialization_current and item.enrichment_failed) or enrichment_terminal_failed, replay_applied_sequence, replay_target_sequence, visible_enrichment));
     }
     if (load_error) |err_name| {
         const msg = try std.fmt.allocPrint(alloc, "load failed: {s}", .{err_name});
@@ -2822,6 +2868,14 @@ fn appendSingleIndexRuntimeStatus(
         try appendIntValue(alloc, out, terminal_failed_count);
         try out.appendSlice(alloc, ",\"covered\":");
         try appendIntValue(alloc, out, coverage.covered);
+        try out.appendSlice(alloc, ",\"settled\":");
+        try appendIntValue(alloc, out, coverage.settled);
+        try out.appendSlice(alloc, ",\"uncovered\":");
+        if (coverage.uncovered) |uncovered| {
+            try appendIntValue(alloc, out, uncovered);
+        } else {
+            try out.appendSlice(alloc, "null");
+        }
         try out.appendSlice(alloc, ",\"pending\":");
         if (coverage.pending) |pending| {
             try appendIntValue(alloc, out, pending);
@@ -4671,7 +4725,7 @@ test "single embeddings index encoder scopes isolated enrichment failure to one 
 
     const failed_encoded = (try encodeSingleIndex(alloc, &snapshot, "docs", "visual_idx", &local_status)).?;
     defer alloc.free(failed_encoded);
-    try std.testing.expect(std.mem.indexOf(u8, failed_encoded, "\"backfill_state\":\"failed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, failed_encoded, "\"backfill_state\":\"degraded\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, failed_encoded, "\"worker_failed\":false") != null);
 
     const healthy_encoded = (try encodeSingleIndex(alloc, &snapshot, "docs", "semantic_idx", &local_status)).?;
@@ -4952,7 +5006,7 @@ test "managed embeddings skipped terminal sources complete backfill without fabr
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_catch_up_required\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"policy\":\"strict\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"source_total\":16,\"produced\":12,\"skipped\":4") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"pending\":4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"settled\":16,\"uncovered\":4,\"pending\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"complete\":false") != null);
 }
 

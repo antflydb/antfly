@@ -3747,6 +3747,8 @@ pub const DB = struct {
             self.core.batchExecutionResources().apply_mutex,
             append_ctx,
             appendGeneratedBatchFromEnrichment,
+            append_ctx,
+            recordEnrichmentRequestFailure,
             self.executor,
             notifyDerivedExecutorSequence,
             self.backend_runtime,
@@ -15915,6 +15917,8 @@ pub const DB = struct {
             .error_count = status.error_count,
             .retryable_error_count = status.retryable_error_count,
             .fatal_error_count = status.fatal_error_count,
+            .consecutive_retry_count = status.consecutive_retry_count,
+            .next_retry_at_ms = status.next_retry_at_ms,
             .retrying = status.retrying,
             .worker_failed = status.worker_failed,
         };
@@ -15922,6 +15926,7 @@ pub const DB = struct {
 
     const ReplayDrainOptions = struct {
         truncate_replay: bool = true,
+        wait_for_enrichment_retries: bool = false,
     };
 
     fn runDerivedUntilWithOptions(self: *DB, sequence: u64, options: ReplayDrainOptions) !void {
@@ -15954,6 +15959,20 @@ pub const DB = struct {
             }
             runtime.notifySequence(sequence);
             try runtime.waitForApplied(sequence);
+        }
+    }
+
+    fn runEnrichmentUntilForDrain(self: *DB, sequence: u64, options: ReplayDrainOptions) !void {
+        while (true) {
+            self.runEnrichmentUntil(sequence) catch |err| switch (err) {
+                error.EnrichmentRetryInProgress => {
+                    if (!options.wait_for_enrichment_retries) return err;
+                    sleepNs(25 * std.time.ns_per_ms);
+                    continue;
+                },
+                else => return err,
+            };
+            return;
         }
     }
 
@@ -15991,7 +16010,7 @@ pub const DB = struct {
         var stable_target = sequence;
         while (true) {
             try self.runDerivedUntilWithOptions(stable_target, options);
-            try self.runEnrichmentUntil(stable_target);
+            try self.runEnrichmentUntilForDrain(stable_target, options);
 
             const next_target = self.core.nextDerivedSequence();
             if (next_target <= stable_target) {
@@ -16209,7 +16228,7 @@ pub const DB = struct {
     }
 
     fn drainReplayStagesUntilStable(self: *DB) !void {
-        try self.drainReplayStagesUntilStableWithOptions(.{});
+        try self.drainReplayStagesUntilStableWithOptions(.{ .wait_for_enrichment_retries = true });
     }
 
     fn sleepArtifactRepairMetadataWorker(self: *DB, target_ns: u64) bool {
@@ -16279,7 +16298,10 @@ pub const DB = struct {
         // derived/replay stages: large portable restores can still leave
         // substantial posting or LSM maintenance debt, and queries remain
         // correct while that background-maintenance debt is paid down.
-        try self.drainReplayStagesUntilStableWithOptions(.{ .truncate_replay = false });
+        try self.drainReplayStagesUntilStableWithOptions(.{
+            .truncate_replay = false,
+            .wait_for_enrichment_retries = true,
+        });
         try self.flushAppliedSequencesForIdle();
     }
 
@@ -31372,6 +31394,39 @@ fn appendDerivedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.De
     return sequence;
 }
 
+fn recordEnrichmentRequestFailure(ctx_ptr: *anyopaque, failure: enrichment_runtime_mod.RequestFailure) !void {
+    const ctx: *EnrichmentAppendContext = @ptrCast(@alignCast(ctx_ptr));
+    const async_ctx = ctx.async_context orelse return;
+    const artifact_kind: types.ArtifactRepairKind = switch (failure.kind) {
+        .dense_embedding, .sparse_embedding => .embedding,
+        .asset => .asset,
+        .chunk_text => .chunk,
+    };
+    const artifact_key = switch (failure.kind) {
+        .dense_embedding, .sparse_embedding => try internal_keys.embeddingArtifactKeyForDocumentAlloc(ctx.alloc, failure.doc_key, failure.artifact_name),
+        .asset => try internal_keys.artifactNamedPrefixAlloc(ctx.alloc, failure.doc_key, "asset", failure.artifact_name),
+        .chunk_text => try internal_keys.artifactNamedPrefixAlloc(ctx.alloc, failure.doc_key, "chunk", failure.artifact_name),
+    };
+    defer ctx.alloc.free(artifact_key);
+
+    try recordArtifactRepairIssueContextDetailed(
+        async_ctx,
+        artifact_kind,
+        failure.index_name,
+        failure.doc_key,
+        "",
+        "",
+        "",
+        failure.artifact_name,
+        artifact_key,
+        null,
+        failure.sequence,
+        .enrichment_failed,
+        failure.attempts,
+        failure.error_name,
+    );
+}
+
 fn appendGeneratedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.DerivedBatch, artifact_delete_keys: []const []const u8) !u64 {
     if (artifact_delete_keys.len == 0) return appendDerivedBatchFromEnrichment(ctx_ptr, batch);
 
@@ -32599,7 +32654,7 @@ fn repairKindFromArtifactKind(kind: types.ArtifactKind) types.ArtifactRepairKind
     };
 }
 
-fn recordArtifactRepairIssueContext(
+fn recordArtifactRepairIssueContextDetailed(
     ctx: *const AsyncContext,
     artifact_kind: types.ArtifactRepairKind,
     index_name: []const u8,
@@ -32612,6 +32667,8 @@ fn recordArtifactRepairIssueContext(
     chunk_id: ?u32,
     sequence: u64,
     reason: types.ArtifactRepairReason,
+    attempts: u64,
+    last_error: []const u8,
 ) !void {
     const kind_name = @tagName(artifact_kind);
     const artifact_key_hex = try bytesToHexAlloc(ctx.alloc, artifact_key);
@@ -32643,6 +32700,7 @@ fn recordArtifactRepairIssueContext(
     issue.artifact_kind = artifact_kind;
     issue.sequence = sequence;
     issue.reason = reason;
+    issue.attempts = @max(issue.attempts, attempts);
     issue.chunk_id = chunk_id;
     issue.repairable = artifactRepairKindHasAutomatedReprocessor(artifact_kind);
     issue.last_seen_ns = now_ns;
@@ -32661,9 +32719,31 @@ fn recordArtifactRepairIssueContext(
     if (issue.unsupported_reason.len == 0 and !issue.repairable) {
         issue.unsupported_reason = try ctx.alloc.dupe(u8, artifactRepairUnsupportedReason(artifact_kind));
     }
+    if (last_error.len > 0 and !std.mem.eql(u8, issue.last_error, last_error)) {
+        const owned_last_error = try ctx.alloc.dupe(u8, last_error);
+        if (issue.last_error.len > 0) ctx.alloc.free(@constCast(issue.last_error));
+        issue.last_error = owned_last_error;
+    }
 
     try saveArtifactRepairIssueToStoreWithSummary(ctx.alloc, ctx.store, issue_key, issue, existing == null);
     if (ctx.repair_issue_counter) |counter| _ = counter.fetchAdd(1, .monotonic);
+}
+
+fn recordArtifactRepairIssueContext(
+    ctx: *const AsyncContext,
+    artifact_kind: types.ArtifactRepairKind,
+    index_name: []const u8,
+    doc_key: []const u8,
+    parent_doc_key: []const u8,
+    unit_id: []const u8,
+    source_artifact_name: []const u8,
+    artifact_name: []const u8,
+    artifact_key: []const u8,
+    chunk_id: ?u32,
+    sequence: u64,
+    reason: types.ArtifactRepairReason,
+) !void {
+    return recordArtifactRepairIssueContextDetailed(ctx, artifact_kind, index_name, doc_key, parent_doc_key, unit_id, source_artifact_name, artifact_name, artifact_key, chunk_id, sequence, reason, 0, "");
 }
 
 fn recordArtifactRepairIssueForRefContext(

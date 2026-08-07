@@ -55,7 +55,7 @@ pub const AlgebraicIndexStats = struct {
     backfill_progress: ?f64 = null,
     /// Number of documents processed during current backfill
     backfill_items_processed: ?i64 = null,
-    /// Operational readiness state such as ready, running, retrying, or failed.
+    /// Operational readiness state such as ready, running, retrying, degraded, or failed.
     backfill_state: ?[]const u8 = null,
     /// Number of documents visible to the sidecar.
     doc_count: ?i64 = null,
@@ -282,13 +282,17 @@ pub const DerivedCoverageStatus = struct {
     terminal_failed: i64,
     /// Raw terminal source outcomes counted by the configured policy. This may exceed source_total only while observation_complete is false with counter_mismatch.
     covered: i64,
-    /// Source documents without a policy-accepted terminal outcome. Null when observations are incomplete and the global value is unknown.
+    /// Source documents with any durable terminal outcome: produced, intentionally skipped, or terminally failed.
+    settled: i64,
+    /// Source documents without an outcome accepted by the configured coverage policy. Null when observations are incomplete.
+    uncovered: ?i64,
+    /// Source documents that have not reached any terminal outcome and may still be processing. Null when observations are incomplete.
     pending: ?i64,
     /// Whether observations are complete, replay has reached its target, and every observed source has an outcome accepted by the policy.
     complete: bool,
     /// Whether coverage is complete without terminal failures.
     healthy: bool,
-    /// Whether coverage is complete under best_effort but includes terminal failures.
+    /// Whether all sources are settled but one or more have terminal failures requiring operator attention.
     degraded: bool,
 };
 
@@ -639,6 +643,10 @@ pub const EnrichmentRuntimeStatus = struct {
     error_count: i64,
     retryable_error_count: i64,
     fatal_error_count: i64,
+    /// Consecutive durable worker retries for the current failed request window.
+    consecutive_retry_count: i64,
+    /// Unix epoch time in milliseconds when the current durable retry becomes eligible. Zero when not retrying.
+    next_retry_at_ms: i64,
     retrying: bool,
     worker_failed: bool,
     /// Whether the background enrichment worker is currently running.
@@ -720,7 +728,7 @@ pub const FullTextIndexStats = struct {
     backfill_progress: ?f64 = null,
     /// Number of documents indexed during current rebuild
     backfill_items_processed: ?i64 = null,
-    /// Operational readiness state such as ready, running, retrying, or failed.
+    /// Operational readiness state such as ready, running, retrying, degraded, or failed.
     backfill_state: ?[]const u8 = null,
     /// Number of documents visible to the index.
     doc_count: ?i64 = null,
@@ -828,7 +836,7 @@ pub const GraphIndexStats = struct {
     backfill_progress: ?f64 = null,
     /// Number of edges indexed during current rebuild
     backfill_items_processed: ?i64 = null,
-    /// Operational readiness state such as ready, running, retrying, or failed.
+    /// Operational readiness state such as ready, running, retrying, degraded, or failed.
     backfill_state: ?[]const u8 = null,
     /// Number of documents covered by the graph index.
     doc_count: ?i64 = null,

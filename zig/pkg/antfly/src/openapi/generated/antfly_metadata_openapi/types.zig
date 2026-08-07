@@ -481,12 +481,14 @@ pub const ArtifactRepairReason = enum {
     missing_artifact,
     corrupt_artifact,
     unreadable_artifact,
+    enrichment_failed,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .missing_artifact => "missing_artifact",
             .corrupt_artifact => "corrupt_artifact",
             .unreadable_artifact => "unreadable_artifact",
+            .enrichment_failed => "enrichment_failed",
         };
         try jw.write(s);
     }
@@ -500,6 +502,7 @@ pub const ArtifactRepairReason = enum {
             .{ "missing_artifact", .missing_artifact },
             .{ "corrupt_artifact", .corrupt_artifact },
             .{ "unreadable_artifact", .unreadable_artifact },
+            .{ "enrichment_failed", .enrichment_failed },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }

@@ -1765,6 +1765,8 @@ pub const EnrichmentStats = struct {
     error_count: u64 = 0,
     retryable_error_count: u64 = 0,
     fatal_error_count: u64 = 0,
+    consecutive_retry_count: u32 = 0,
+    next_retry_at_ms: u64 = 0,
     retrying: bool = false,
     worker_failed: bool = false,
     worker_started: bool = false,
@@ -2027,6 +2029,7 @@ pub const ArtifactRepairReason = enum {
     missing_artifact,
     corrupt_artifact,
     unreadable_artifact,
+    enrichment_failed,
 };
 
 pub const ArtifactRepairIssue = struct {
@@ -2281,7 +2284,7 @@ pub const EmbeddingArtifactRepairResult = ArtifactRepairResult;
 pub fn embeddingArtifactRepairReasonFromArtifact(reason: ArtifactRepairReason) EmbeddingArtifactRepairReason {
     return switch (reason) {
         .missing_artifact => .missing_embedding_artifact,
-        .corrupt_artifact, .unreadable_artifact => .corrupt_embedding_artifact,
+        .corrupt_artifact, .unreadable_artifact, .enrichment_failed => .corrupt_embedding_artifact,
     };
 }
 

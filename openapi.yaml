@@ -8046,6 +8046,7 @@ components:
         - missing_artifact
         - corrupt_artifact
         - unreadable_artifact
+        - enrichment_failed
     RepairTarget:
       type: string
       description: Repair subsystem to inspect or run.
@@ -17150,7 +17151,7 @@ components:
         backfill_state:
           x-go-type-skip-optional-pointer: true
           type: string
-          description: Operational readiness state such as ready, running, retrying, or failed.
+          description: Operational readiness state such as ready, running, retrying, degraded, or failed.
         doc_count:
           x-go-type-skip-optional-pointer: true
           type: integer
@@ -17329,6 +17330,8 @@ components:
         - skipped
         - terminal_failed
         - covered
+        - settled
+        - uncovered
         - pending
         - complete
         - healthy
@@ -17381,13 +17384,25 @@ components:
           format: uint64
           description: Raw terminal source outcomes counted by the configured policy. This may exceed
             source_total only while observation_complete is false with counter_mismatch.
+        settled:
+          type: integer
+          format: uint64
+          description: 'Source documents with any durable terminal outcome: produced, intentionally skipped,
+            or terminally failed.'
+        uncovered:
+          x-go-type-skip-optional-pointer: false
+          type: integer
+          format: uint64
+          nullable: true
+          description: Source documents without an outcome accepted by the configured coverage policy.
+            Null when observations are incomplete.
         pending:
           x-go-type-skip-optional-pointer: false
           type: integer
           format: uint64
           nullable: true
-          description: Source documents without a policy-accepted terminal outcome. Null when observations
-            are incomplete and the global value is unknown.
+          description: Source documents that have not reached any terminal outcome and may still be processing.
+            Null when observations are incomplete.
         complete:
           type: boolean
           description: Whether observations are complete, replay has reached its target, and every observed
@@ -17397,7 +17412,8 @@ components:
           description: Whether coverage is complete without terminal failures.
         degraded:
           type: boolean
-          description: Whether coverage is complete under best_effort but includes terminal failures.
+          description: Whether all sources are settled but one or more have terminal failures requiring
+            operator attention.
     EnrichmentRuntimeStatus:
       type: object
       additionalProperties: false
@@ -17417,6 +17433,8 @@ components:
         - error_count
         - retryable_error_count
         - fatal_error_count
+        - consecutive_retry_count
+        - next_retry_at_ms
         - retrying
         - worker_failed
         - worker_started
@@ -17480,6 +17498,15 @@ components:
         fatal_error_count:
           type: integer
           format: uint64
+        consecutive_retry_count:
+          type: integer
+          format: uint32
+          description: Consecutive durable worker retries for the current failed request window.
+        next_retry_at_ms:
+          type: integer
+          format: uint64
+          description: Unix epoch time in milliseconds when the current durable retry becomes eligible.
+            Zero when not retrying.
         retrying:
           type: boolean
         worker_failed:
@@ -17846,7 +17873,7 @@ components:
         backfill_state:
           x-go-type-skip-optional-pointer: true
           type: string
-          description: Operational readiness state such as ready, running, retrying, or failed.
+          description: Operational readiness state such as ready, running, retrying, degraded, or failed.
         doc_count:
           x-go-type-skip-optional-pointer: true
           type: integer
@@ -18066,7 +18093,7 @@ components:
         backfill_state:
           x-go-type-skip-optional-pointer: true
           type: string
-          description: Operational readiness state such as ready, running, retrying, or failed.
+          description: Operational readiness state such as ready, running, retrying, degraded, or failed.
         doc_count:
           x-go-type-skip-optional-pointer: true
           type: integer

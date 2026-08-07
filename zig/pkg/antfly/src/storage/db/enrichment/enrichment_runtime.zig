@@ -78,11 +78,22 @@ pub const Config = struct {
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     clock: platform_clock.Clock = platform_clock.Clock.real(),
     inline_retry_max_attempts: u32 = transient_embed_retry_max_attempts,
+    worker_retry_max_attempts: u32 = transient_worker_retry_max_attempts,
 };
 
 pub const RuntimeError = error{ EnrichmentWorkerFailed, EnrichmentRetryInProgress };
 
 pub const GeneratedRecordWriter = *const fn (ptr: *anyopaque, batch: derived_types.DerivedBatch, artifact_delete_keys: []const []const u8) anyerror!u64;
+pub const RequestFailure = struct {
+    kind: enrichment_types.GeneratedEnrichmentKind,
+    index_name: []const u8,
+    artifact_name: []const u8,
+    doc_key: []const u8,
+    error_name: []const u8,
+    attempts: u64,
+    sequence: u64,
+};
+pub const FailureRecorder = *const fn (ptr: *anyopaque, failure: RequestFailure) anyerror!void;
 pub const NotifyFn = *const fn (ptr: *anyopaque, sequence: u64) void;
 pub const StatusHook = struct {
     ptr: *anyopaque,
@@ -105,7 +116,9 @@ const generated_ocr_default_batch_bytes: usize = 64 * 1024 * 1024;
 const transient_embed_retry_max_attempts: u32 = 6;
 const transient_embed_retry_base_sleep_ns: u64 = 250 * std.time.ns_per_ms;
 const transient_embed_retry_max_sleep_ns: u64 = 5 * std.time.ns_per_s;
-const transient_worker_retry_sleep_ns: u64 = 100 * std.time.ns_per_ms;
+const transient_worker_retry_max_attempts: u32 = 6;
+const transient_worker_retry_base_sleep_ms: u64 = 500;
+const transient_worker_retry_max_sleep_ms: u64 = 30_000;
 const lease_denied_retry_sleep_ns: u64 = 100 * std.time.ns_per_ms;
 
 const CoverageOutcome = enum { produced, skipped, terminal_failed };
@@ -453,27 +466,73 @@ fn transientEmbedRetryDecision(runtime: *EnrichmentRuntime, attempt: u32) Transi
     return .retry_inline;
 }
 
-fn isRetryableEnrichmentError(err: anyerror) bool {
+const EnrichmentErrorDisposition = enum {
+    retryable_request,
+    terminal_request,
+    fatal_worker,
+};
+
+fn enrichmentErrorDisposition(err: anyerror) EnrichmentErrorDisposition {
     return switch (err) {
-        error.EmbedRateLimited,
-        error.EmbedTransientFailure,
-        error.ModelNotFound,
-        error.ConnectionRefused,
-        error.ConnectionResetByPeer,
-        error.ConnectionTimedOut,
-        error.Timeout,
-        error.NetworkUnreachable,
-        error.HostLacksNetworkAddresses,
-        error.TemporaryNameServerFailure,
-        error.NameServerFailure,
-        error.UnexpectedReadFailure,
-        error.SendFailed,
-        error.RecvFailed,
-        error.ResourceBudgetExceeded,
-        error.GenerateBatchTransientFailure,
-        => true,
-        else => false,
+        error.OutOfMemory,
+        error.InvalidDenseArtifactTargetCounter,
+        error.InvalidDerivedCoverageCounter,
+        error.InvalidDerivedCoverageOutcome,
+        => .fatal_worker,
+
+        error.InvalidAssetProducerConfig,
+        error.InvalidDocumentExtractionConfig,
+        error.InvalidEnrichmentConfig,
+        error.InvalidEmbeddingResponse,
+        error.UnsupportedEmbeddingProvider,
+        error.UnsupportedReaderProvider,
+        error.MissingAssetProducer,
+        error.ModelNotSpecified,
+        error.PermanentPromptFailure,
+        error.BadUnitInput,
+        error.DocumentExtractionChunkRangeMissing,
+        error.DocumentExtractionWorkingSetTooLarge,
+        error.InvalidDocumentExtractionManifest,
+        error.InvalidDocumentExtractionState,
+        error.InvalidGraphAssetState,
+        error.MissingDocxDocumentXml,
+        error.PdfExtractionUnavailable,
+        error.UnsupportedCompressionMethod,
+        error.Zip64Unsupported,
+        error.ZipBadCdOffset,
+        error.ZipBadFileOffset,
+        error.ZipCdSizeMismatch,
+        error.ZipDecompressSizeMismatch,
+        error.ZipEncryptionUnsupported,
+        error.ZipNoEndRecord,
+        error.ZipTruncated,
+        => .terminal_request,
+
+        // New provider, transport, and decoder errors must not silently drop
+        // documents. Unknown errors retry through the bounded durable worker
+        // budget and are parked for repair if that budget is exhausted.
+        else => .retryable_request,
     };
+}
+
+fn isRetryableEnrichmentError(err: anyerror) bool {
+    return enrichmentErrorDisposition(err) == .retryable_request;
+}
+
+fn shouldYieldRequestError(runtime: *const EnrichmentRuntime, err: anyerror) bool {
+    if (isEnrichmentControlError(err)) return true;
+    return switch (enrichmentErrorDisposition(err)) {
+        .fatal_worker => true,
+        .terminal_request => false,
+        .retryable_request => runtime.consecutive_retry_count < @max(runtime.config.worker_retry_max_attempts, 1),
+    };
+}
+
+fn workerRetryDelayMs(consecutive_retry_count: u32) u64 {
+    // Six doublings already exceed the cap; bounding the shift also keeps
+    // user-supplied retry budgets from overflowing before the min is applied.
+    const exponent: u6 = @intCast(@min(consecutive_retry_count -| 1, 6));
+    return @min(transient_worker_retry_base_sleep_ms << exponent, transient_worker_retry_max_sleep_ms);
 }
 
 fn isEnrichmentControlError(err: anyerror) bool {
@@ -482,6 +541,18 @@ fn isEnrichmentControlError(err: anyerror) bool {
 
 test "enrichment treats missing local model as retryable" {
     try std.testing.expect(isRetryableEnrichmentError(error.ModelNotFound));
+}
+
+test "enrichment retries unknown errors and isolates known permanent errors" {
+    try std.testing.expectEqual(EnrichmentErrorDisposition.retryable_request, enrichmentErrorDisposition(error.UnexpectedEndOfInput));
+    try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.UnsupportedEmbeddingProvider));
+    try std.testing.expectEqual(EnrichmentErrorDisposition.fatal_worker, enrichmentErrorDisposition(error.OutOfMemory));
+}
+
+test "enrichment worker retry delay is exponential and capped" {
+    try std.testing.expectEqual(@as(u64, 500), workerRetryDelayMs(1));
+    try std.testing.expectEqual(@as(u64, 1000), workerRetryDelayMs(2));
+    try std.testing.expectEqual(@as(u64, 30_000), workerRetryDelayMs(20));
 }
 
 fn noteTransientEmbedRetry(runtime: *EnrichmentRuntime, err: anyerror) void {
@@ -510,6 +581,8 @@ fn runtimeStatusSnapshot(runtime: *EnrichmentRuntime) enrichment_state.RuntimeSt
         .retryable_error_count = runtime.retryable_error_count,
         .fatal_error_count = runtime.fatal_error_count,
         .skipped_source_count = runtime.skipped_source_count,
+        .consecutive_retry_count = runtime.consecutive_retry_count,
+        .next_retry_at_ms = runtime.next_retry_at_ms,
         .retrying = runtime.retrying,
         .worker_failed = runtime.worker_failed,
     };
@@ -526,6 +599,8 @@ fn restorePersistedRuntimeStatus(runtime: anytype, persisted_status: enrichment_
     runtime.retryable_error_count = persisted_status.retryable_error_count;
     runtime.fatal_error_count = persisted_status.fatal_error_count;
     runtime.skipped_source_count = persisted_status.skipped_source_count;
+    runtime.consecutive_retry_count = persisted_status.consecutive_retry_count;
+    runtime.next_retry_at_ms = persisted_status.next_retry_at_ms;
     runtime.retrying = persisted_status.retrying and !persisted_status.worker_failed;
     runtime.worker_failed = persisted_status.worker_failed;
     runtime.target_sequence = @max(runtime.applied_sequence, persisted_status.target_sequence);
@@ -539,6 +614,8 @@ test "enrichment runtime restore preserves retry target across restart" {
         retryable_error_count: u64 = 0,
         fatal_error_count: u64 = 0,
         skipped_source_count: u64 = 0,
+        consecutive_retry_count: u32 = 0,
+        next_retry_at_ms: u64 = 0,
         retrying: bool = false,
         worker_failed: bool = false,
     }{};
@@ -567,6 +644,8 @@ test "enrichment runtime restore does not resume persisted fatal failure" {
         retryable_error_count: u64 = 0,
         fatal_error_count: u64 = 0,
         skipped_source_count: u64 = 0,
+        consecutive_retry_count: u32 = 0,
+        next_retry_at_ms: u64 = 0,
         retrying: bool = false,
         worker_failed: bool = false,
     }{};
@@ -1070,6 +1149,8 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     coverage_apply_mutex: ?*apply_rw_lock_mod.ApplyRwLock = null,
     write_ctx: *anyopaque,
     write_fn: GeneratedRecordWriter,
+    failure_ctx: ?*anyopaque = null,
+    failure_fn: ?FailureRecorder = null,
     notify_ctx: *anyopaque,
     notify_fn: NotifyFn,
     config: Config,
@@ -1079,6 +1160,8 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     error_count: u64 = 0,
     retryable_error_count: u64 = 0,
     fatal_error_count: u64 = 0,
+    consecutive_retry_count: u32 = 0,
+    next_retry_at_ms: u64 = 0,
     retrying: bool = false,
     worker_failed: bool = false,
     skip_by_hash_count: u64 = 0,
@@ -1113,6 +1196,8 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         coverage_apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
         write_ctx: *anyopaque,
         write_fn: GeneratedRecordWriter,
+        failure_ctx: ?*anyopaque,
+        failure_fn: ?FailureRecorder,
         notify_ctx: *anyopaque,
         notify_fn: NotifyFn,
         _: *background_runtime_mod.BackendRuntime,
@@ -1129,6 +1214,8 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .coverage_apply_mutex = coverage_apply_mutex,
             .write_ctx = write_ctx,
             .write_fn = write_fn,
+            .failure_ctx = failure_ctx,
+            .failure_fn = failure_fn,
             .notify_ctx = notify_ctx,
             .notify_fn = notify_fn,
             .config = .{
@@ -1142,6 +1229,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
                 .resource_manager = config.resource_manager,
                 .clock = config.clock,
                 .inline_retry_max_attempts = config.inline_retry_max_attempts,
+                .worker_retry_max_attempts = config.worker_retry_max_attempts,
             },
         };
         runtime.applied_sequence = try enrichment_state.loadAppliedSequence(alloc, store, scope_name);
@@ -1242,6 +1330,8 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             self.processed_requests += processed_request_count;
             self.retrying = false;
             self.worker_failed = false;
+            self.consecutive_retry_count = 0;
+            self.next_retry_at_ms = 0;
             clearPublishedGeneratedArtifacts(self);
             clearIsolatedFailedIndexes(self);
         }
@@ -1255,6 +1345,8 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         try saveAppliedSequenceWithRetry(self, scope_name, sequence);
         self.applied_sequence = sequence;
         self.target_sequence = @max(self.target_sequence, sequence);
+        self.consecutive_retry_count = 0;
+        self.next_retry_at_ms = 0;
         clearPublishedGeneratedArtifacts(self);
         clearIsolatedFailedIndexes(self);
     }
@@ -1280,6 +1372,8 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .error_count = self.error_count,
             .retryable_error_count = self.retryable_error_count,
             .fatal_error_count = self.fatal_error_count,
+            .consecutive_retry_count = self.consecutive_retry_count,
+            .next_retry_at_ms = self.next_retry_at_ms,
             .retrying = self.retrying,
             .worker_failed = self.worker_failed,
             .skip_by_hash_count = self.skip_by_hash_count,
@@ -1320,6 +1414,8 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     coverage_apply_mutex: ?*apply_rw_lock_mod.ApplyRwLock = null,
     write_ctx: *anyopaque,
     write_fn: GeneratedRecordWriter,
+    failure_ctx: ?*anyopaque = null,
+    failure_fn: ?FailureRecorder = null,
     notify_ctx: *anyopaque,
     notify_fn: NotifyFn,
     config: Config,
@@ -1333,6 +1429,8 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     error_count: u64 = 0,
     retryable_error_count: u64 = 0,
     fatal_error_count: u64 = 0,
+    consecutive_retry_count: u32 = 0,
+    next_retry_at_ms: u64 = 0,
     retrying: bool = false,
     worker_failed: bool = false,
     skip_by_hash_count: u64 = 0,
@@ -1370,6 +1468,8 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         coverage_apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
         write_ctx: *anyopaque,
         write_fn: GeneratedRecordWriter,
+        failure_ctx: ?*anyopaque,
+        failure_fn: ?FailureRecorder,
         notify_ctx: *anyopaque,
         notify_fn: NotifyFn,
         backend_runtime: *background_runtime_mod.BackendRuntime,
@@ -1390,6 +1490,8 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .coverage_apply_mutex = coverage_apply_mutex,
             .write_ctx = write_ctx,
             .write_fn = write_fn,
+            .failure_ctx = failure_ctx,
+            .failure_fn = failure_fn,
             .notify_ctx = notify_ctx,
             .notify_fn = notify_fn,
             .config = .{
@@ -1403,6 +1505,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
                 .resource_manager = config.resource_manager,
                 .clock = config.clock,
                 .inline_retry_max_attempts = config.inline_retry_max_attempts,
+                .worker_retry_max_attempts = config.worker_retry_max_attempts,
             },
             .ownership = try ownership_mod.State.init(alloc, store, enrichment_lease.default_lease_key, .{
                 .lease_owned = true,
@@ -1479,8 +1582,6 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     pub fn notifySequence(self: *EnrichmentRuntime, sequence: u64) void {
         const io_impl = self.io_impl orelse {
             if (sequence > self.target_sequence) self.last_error_name = null;
-            self.retrying = false;
-            self.worker_failed = false;
             if (sequence > self.target_sequence) clearIsolatedFailedIndexes(self);
             self.target_sequence = @max(self.target_sequence, sequence);
             return;
@@ -1488,8 +1589,6 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         const io = io_impl.io();
         self.mutex.lockUncancelable(io);
         if (sequence > self.target_sequence) self.last_error_name = null;
-        self.retrying = false;
-        self.worker_failed = false;
         if (sequence > self.target_sequence) clearIsolatedFailedIndexes(self);
         self.target_sequence = @max(self.target_sequence, sequence);
         self.cond.broadcast(io);
@@ -1507,6 +1606,8 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         self.last_error_name = null;
         self.retrying = false;
         self.worker_failed = false;
+        self.consecutive_retry_count = 0;
+        self.next_retry_at_ms = 0;
         clearPublishedGeneratedArtifacts(self);
         clearIsolatedFailedIndexes(self);
         self.cond.broadcast(io);
@@ -1564,6 +1665,8 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         self.last_error_name = null;
         self.retrying = false;
         self.worker_failed = false;
+        self.consecutive_retry_count = 0;
+        self.next_retry_at_ms = 0;
         clearPublishedGeneratedArtifacts(self);
         clearIsolatedFailedIndexes(self);
         status = runtimeStatusSnapshot(self);
@@ -1608,6 +1711,8 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .error_count = self.error_count,
             .retryable_error_count = self.retryable_error_count,
             .fatal_error_count = self.fatal_error_count,
+            .consecutive_retry_count = self.consecutive_retry_count,
+            .next_retry_at_ms = self.next_retry_at_ms,
             .retrying = self.retrying,
             .worker_failed = self.worker_failed,
             .worker_started = worker_started,
@@ -1674,6 +1779,8 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         self.mutex.lockUncancelable(io);
         self.error_count += 1;
         self.retryable_error_count += 1;
+        self.consecutive_retry_count +|= 1;
+        self.next_retry_at_ms = self.config.clock.nowRealtimeMs() +| workerRetryDelayMs(self.consecutive_retry_count);
         self.retrying = true;
         status = runtimeStatusSnapshot(self);
         self.cond.broadcast(io);
@@ -1711,12 +1818,26 @@ test "enrichment runtime status reports worker lifecycle diagnostics" {
 
 fn handleWorkerLoopError(runtime: *EnrichmentRuntime, io: Io, err: anyerror) void {
     if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return;
-    if (isRetryableEnrichmentError(err)) {
+    if (enrichmentErrorDisposition(err) == .retryable_request) {
         runtime.recordRetryableError(io, err);
-        io.sleep(Io.Duration.fromMilliseconds(@intCast(transient_worker_retry_sleep_ns / std.time.ns_per_ms)), .awake) catch {};
         return;
     }
     runtime.recordError(io, err);
+}
+
+fn waitForWorkerRetry(runtime: *EnrichmentRuntime, io: Io) bool {
+    while (true) {
+        runtime.mutex.lockUncancelable(io);
+        const shutdown = runtime.shutdown;
+        const retry_at_ms = runtime.next_retry_at_ms;
+        runtime.mutex.unlock(io);
+        if (shutdown) return false;
+
+        const now_ms = runtime.config.clock.nowRealtimeMs();
+        if (now_ms >= retry_at_ms) return true;
+        const remaining_ms = retry_at_ms - now_ms;
+        io.sleep(Io.Duration.fromMilliseconds(@intCast(@min(remaining_ms, 100))), .awake) catch {};
+    }
 }
 
 fn queueTerminalCoverageForRequest(runtime: *EnrichmentRuntime, window: *GeneratedReplayWindow, request: enrichment_types.GeneratedEnrichmentRequest) !void {
@@ -1766,6 +1887,22 @@ fn recordIsolatedRequestError(runtime: *EnrichmentRuntime, window: ?*GeneratedRe
             std.log.err("failed to persist terminal coverage outcome index={s} doc={s}: {s}", .{ request.index_name, request.doc_key, @errorName(coverage_err) });
         };
     }
+    if (runtime.failure_ctx) |failure_ctx| {
+        if (runtime.failure_fn) |failure_fn| failure_fn(failure_ctx, .{
+            .kind = request.kind,
+            .index_name = request.index_name,
+            .artifact_name = switch (request.kind) {
+                .dense_embedding, .sparse_embedding => requestEmbeddingName(request),
+                .asset, .chunk_text => requestArtifactName(request),
+            },
+            .doc_key = request.doc_key,
+            .error_name = @errorName(err),
+            .attempts = runtime.consecutive_retry_count,
+            .sequence = runtime.target_sequence,
+        }) catch |record_err| {
+            std.log.err("failed to park enrichment request index={s} doc={s}: {s}", .{ request.index_name, request.doc_key, @errorName(record_err) });
+        };
+    }
     if (runtime.io_impl) |io_impl| {
         const io = io_impl.io();
         runtime.mutex.lockUncancelable(io);
@@ -1785,7 +1922,17 @@ fn recordIsolatedRequestError(runtime: *EnrichmentRuntime, window: ?*GeneratedRe
     runtime.notifyStatusHook();
 }
 
+const TestFailureCapture = struct {
+    failure: ?RequestFailure = null,
+
+    fn record(ptr: *anyopaque, failure: RequestFailure) !void {
+        const self: *TestFailureCapture = @ptrCast(@alignCast(ptr));
+        self.failure = failure;
+    }
+};
+
 test "isolated enrichment request error does not mark worker failed" {
+    var failure_capture = TestFailureCapture{};
     var runtime = EnrichmentRuntime{
         .alloc = std.testing.allocator,
         .io_impl = null,
@@ -1796,6 +1943,8 @@ test "isolated enrichment request error does not mark worker failed" {
         .index_manager = undefined,
         .write_ctx = undefined,
         .write_fn = undefined,
+        .failure_ctx = &failure_capture,
+        .failure_fn = TestFailureCapture.record,
         .notify_ctx = undefined,
         .notify_fn = undefined,
         .config = .{},
@@ -1803,6 +1952,8 @@ test "isolated enrichment request error does not mark worker failed" {
     };
     runtime.retrying = true;
     runtime.worker_failed = true;
+    runtime.consecutive_retry_count = 6;
+    runtime.target_sequence = 17;
 
     recordIsolatedRequestError(&runtime, null, .{
         .kind = .dense_embedding,
@@ -1818,6 +1969,13 @@ test "isolated enrichment request error does not mark worker failed" {
     try std.testing.expect(!runtime.worker_failed);
     try std.testing.expect(runtime.indexHasIsolatedFailure("bad_visual"));
     try std.testing.expect(!runtime.indexHasIsolatedFailure("healthy_text"));
+    const failure = failure_capture.failure.?;
+    try std.testing.expectEqualStrings("bad_visual", failure.index_name);
+    try std.testing.expectEqualStrings("clipclap", failure.artifact_name);
+    try std.testing.expectEqualStrings("doc:1", failure.doc_key);
+    try std.testing.expectEqualStrings("UnsupportedEmbeddingProvider", failure.error_name);
+    try std.testing.expectEqual(@as(u64, 6), failure.attempts);
+    try std.testing.expectEqual(@as(u64, 17), failure.sequence);
     clearIsolatedFailedIndexes(&runtime);
 }
 
@@ -1835,7 +1993,10 @@ fn workerMain(runtime: *EnrichmentRuntime) void {
             return;
         }
         const target_sequence = runtime.target_sequence;
+        const retrying = runtime.retrying;
         runtime.mutex.unlock(io);
+
+        if (retrying and !waitForWorkerRetry(runtime, io)) return;
 
         runForegroundCatchUpPass(runtime, io, target_sequence) catch |err| {
             handleWorkerLoopError(runtime, io, err);
@@ -1938,6 +2099,8 @@ fn runForegroundCatchUpPass(runtime: *EnrichmentRuntime, io: Io, target_sequence
         runtime.processed_requests += processed_request_count;
         runtime.retrying = false;
         runtime.worker_failed = false;
+        runtime.consecutive_retry_count = 0;
+        runtime.next_retry_at_ms = 0;
         clearPublishedGeneratedArtifacts(runtime);
         status = runtimeStatusSnapshot(runtime);
         runtime.cond.broadcast(io);
@@ -1949,6 +2112,8 @@ fn runForegroundCatchUpPass(runtime: *EnrichmentRuntime, io: Io, target_sequence
         runtime.mutex.lockUncancelable(io);
         runtime.retrying = false;
         runtime.worker_failed = false;
+        runtime.consecutive_retry_count = 0;
+        runtime.next_retry_at_ms = 0;
         status = runtimeStatusSnapshot(runtime);
         runtime.cond.broadcast(io);
         runtime.mutex.unlock(io);
@@ -1983,22 +2148,22 @@ fn processPendingDocumentGroup(
         }
         switch (request.kind) {
             .asset => processAsset(runtime, request, deferred_assets, window) catch |err| {
-                if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
+                if (shouldYieldRequestError(runtime, err)) return err;
                 recordIsolatedRequestError(runtime, window, request, err);
                 continue;
             },
             .chunk_text => processChunkText(runtime, request, chunk_cache, window) catch |err| {
-                if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
+                if (shouldYieldRequestError(runtime, err)) return err;
                 recordIsolatedRequestError(runtime, window, request, err);
                 continue;
             },
             .dense_embedding => processDenseEmbedding(runtime, request, chunk_cache, window) catch |err| {
-                if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
+                if (shouldYieldRequestError(runtime, err)) return err;
                 recordIsolatedRequestError(runtime, window, request, err);
                 continue;
             },
             .sparse_embedding => processSparseEmbedding(runtime, request, chunk_cache, window) catch |err| {
-                if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
+                if (shouldYieldRequestError(runtime, err)) return err;
                 recordIsolatedRequestError(runtime, window, request, err);
                 continue;
             },
@@ -2171,7 +2336,7 @@ fn flushAssetProducerBatch(
 
     var produced = producer.produceBatch(runtime.alloc, requests) catch |err| {
         if (err == error.OutOfMemory) return err;
-        if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
+        if (shouldYieldRequestError(runtime, err)) return err;
         return try flushAssetProducerBatchSequential(runtime, producer, items.items, window);
     };
     if (produced.len != items.items.len) {
@@ -2194,7 +2359,7 @@ fn flushAssetProducerBatch(
             runtime.alloc.free(output);
             produced[idx] = "";
             if (err == error.OutOfMemory) return err;
-            if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
+            if (shouldYieldRequestError(runtime, err)) return err;
             recordIsolatedRequestError(runtime, window, item.request, err);
             continue;
         };
@@ -2213,14 +2378,14 @@ fn flushAssetProducerBatchSequential(
         const request = item.asRequest();
         const produced = producer.produce(runtime.alloc, request) catch |err| {
             if (err == error.OutOfMemory) return err;
-            if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
+            if (shouldYieldRequestError(runtime, err)) return err;
             recordIsolatedRequestError(runtime, window, item.request, err);
             continue;
         };
         defer runtime.alloc.free(produced);
         applyAssetProducerBatchOutput(runtime, item, produced, window) catch |err| {
             if (err == error.OutOfMemory) return err;
-            if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
+            if (shouldYieldRequestError(runtime, err)) return err;
             recordIsolatedRequestError(runtime, window, item.request, err);
         };
     }
@@ -2401,7 +2566,7 @@ fn processDocumentExtractionAsset(
     };
     defer collect_ctx.deinit(runtime.alloc);
     document_extraction_mod.extractDownloadedStreaming(runtime.alloc, downloaded_mut, source_url, config, collect_ctx.sink()) catch |err| {
-        if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
+        if (shouldYieldRequestError(runtime, err)) return err;
         try writeDocumentExtractionFailureManifest(
             runtime,
             request.doc_key,
@@ -2539,7 +2704,7 @@ fn processDocumentExtractionAsset(
         .mode = .store_artifacts,
     };
     document_extraction_mod.extractDownloadedStreaming(runtime.alloc, downloaded_mut, source_url, config, store_ctx.sink()) catch |err| {
-        if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
+        if (shouldYieldRequestError(runtime, err)) return err;
         try writeDocumentExtractionFailureManifest(
             runtime,
             request.doc_key,
@@ -2822,7 +2987,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatch(
         defer if (rendered_page) |png| runtime.alloc.free(png);
         if (kind == .ocr and std.mem.eql(u8, route_type, "pdf")) {
             rendered_page = document_extraction_mod.renderPdfPagePngAlloc(runtime.alloc, source_bytes, unit.page_number orelse 1) catch |err| {
-                if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
+                if (shouldYieldRequestError(runtime, err)) return err;
                 try markRuntimeGeneratedUnitTextFailure(runtime.alloc, &units[idx], method, kind, err);
                 continue;
             };
@@ -2894,7 +3059,7 @@ fn flushRuntimeGeneratedTextBatch(
             clearRuntimeGeneratedTextBatchParts(runtime.alloc, parts_values);
             return;
         }
-        if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
+        if (shouldYieldRequestError(runtime, err)) return err;
         return try flushRuntimeGeneratedTextBatchSequential(runtime, producer, requests, unit_indices, parts_values, units, method, kind);
     };
     if (produced.len != requests.len) {
@@ -2914,7 +3079,7 @@ fn flushRuntimeGeneratedTextBatch(
     for (produced, unit_indices, 0..) |item, unit_idx, i| {
         produced[i] = &.{};
         applyRuntimeGeneratedUnitText(runtime.alloc, &units[unit_idx], item, method, "completed", kind) catch |err| {
-            if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
+            if (shouldYieldRequestError(runtime, err)) return err;
             try markRuntimeGeneratedUnitTextFailure(runtime.alloc, &units[unit_idx], method, kind, err);
         };
     }
@@ -2938,12 +3103,12 @@ fn flushRuntimeGeneratedTextBatchSequential(
                 try markRuntimeGeneratedUnitTextFailure(runtime.alloc, &units[unit_idx], method, kind, err);
                 continue;
             }
-            if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
+            if (shouldYieldRequestError(runtime, err)) return err;
             try markRuntimeGeneratedUnitTextFailure(runtime.alloc, &units[unit_idx], method, kind, err);
             continue;
         };
         applyRuntimeGeneratedUnitText(runtime.alloc, &units[unit_idx], produced, method, "completed", kind) catch |err| {
-            if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
+            if (shouldYieldRequestError(runtime, err)) return err;
             try markRuntimeGeneratedUnitTextFailure(runtime.alloc, &units[unit_idx], method, kind, err);
         };
     }
@@ -4538,7 +4703,7 @@ fn flushChunkedDenseItems(
     const embed_started_ns = runtime.config.clock.nowRealtimeNs();
     const vectors = embedDenseBatchWithRetry(dense_embedder, runtime, embedding_artifact_name, batch_texts, expected_dims) catch |err| {
         noteEmbedBatchFinished(runtime, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
-        if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
+        if (shouldYieldRequestError(runtime, err)) return err;
         for (batch_items) |item| recordIsolatedRequestError(runtime, window, item.request, err);
         clearChunkedDenseBatch(runtime.alloc, chunk_texts, chunk_items, owns_texts);
         return false;
@@ -5160,7 +5325,7 @@ fn processPlainDenseWindow(
         }
 
         flushPlainDenseItems(runtime, dense_embedder, embedding_artifact_name, seed.expected_dims, consumer_indexes, items.items, window) catch |err| {
-            if (isEnrichmentControlError(err) or isRetryableEnrichmentError(err)) return err;
+            if (shouldYieldRequestError(runtime, err)) return err;
             for (items.items) |item| recordIsolatedRequestError(runtime, window, item.request, err);
             continue;
         };
