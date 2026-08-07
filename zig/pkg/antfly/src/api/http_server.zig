@@ -4828,6 +4828,26 @@ pub const ApiHttpServer = struct {
                         );
                         return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 409, response);
                     },
+                    error.CommitVisibilityNotSatisfied => return try textResponse(
+                        self.alloc,
+                        503,
+                        "transaction committed, but the requested visibility barrier was not reached",
+                    ),
+                    error.CommitPropagationIncomplete => return try textResponse(
+                        self.alloc,
+                        503,
+                        "transaction committed; participant recovery is pending",
+                    ),
+                    error.CommitDecisionUnknown => return try textResponse(
+                        self.alloc,
+                        503,
+                        "transaction outcome is unknown",
+                    ),
+                    error.AbortDecisionNotDurable, error.TransactionBeginFailed => return try textResponse(
+                        self.alloc,
+                        503,
+                        "transaction coordinator is temporarily unavailable",
+                    ),
                     error.UnsupportedOperation => return try textResponse(self.alloc, 405, "method not allowed"),
                     error.TableNotFound, error.UnknownGroup => return try textResponse(self.alloc, 404, "not found"),
                     else => return err,
@@ -5177,6 +5197,26 @@ pub const ApiHttpServer = struct {
                         );
                         return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 409, response);
                     },
+                    error.CommitVisibilityNotSatisfied => return try textResponse(
+                        self.alloc,
+                        503,
+                        "transaction committed, but the requested visibility barrier was not reached",
+                    ),
+                    error.CommitPropagationIncomplete => return try textResponse(
+                        self.alloc,
+                        503,
+                        "transaction committed; participant recovery is pending",
+                    ),
+                    error.CommitDecisionUnknown => return try textResponse(
+                        self.alloc,
+                        503,
+                        "transaction outcome is unknown; retry this transaction id",
+                    ),
+                    error.AbortDecisionNotDurable, error.TransactionBeginFailed => return try textResponse(
+                        self.alloc,
+                        503,
+                        "transaction coordinator is temporarily unavailable",
+                    ),
                     else => return err,
                 }) orelse return try textResponse(self.alloc, 404, "not found");
 
@@ -8677,6 +8717,12 @@ pub const ApiHttpServer = struct {
             error.TxnNotFound,
             error.InvalidTxnRecord,
             => return error.Conflict,
+            error.CommitVisibilityNotSatisfied,
+            error.CommitPropagationIncomplete,
+            error.CommitDecisionUnknown,
+            error.AbortDecisionNotDurable,
+            error.TransactionBeginFailed,
+            => return error.WriteUnavailable,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
             error.EnrichmentRetryInProgress,

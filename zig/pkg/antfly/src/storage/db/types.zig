@@ -166,6 +166,28 @@ pub const SplitTransitionMutation = struct {
     split_key: []const u8 = "",
 };
 
+/// Private data-Raft command used by the distributed transaction protocol.
+/// Every value that can affect durable state is carried in the command so
+/// replay is deterministic on followers and after restart.
+pub const TransactionMutation = union(enum) {
+    begin: struct {
+        txn_id: TxnId,
+        begin_timestamp: u64,
+        created_at_ns: u64,
+        topology_epoch: u64,
+        participants: []const []const u8,
+    },
+    prepare: struct {
+        txn_id: TxnId,
+        topology_epoch: u64,
+    },
+    resolve: struct {
+        txn_id: TxnId,
+        status: TxnStatus,
+        commit_version: u64,
+    },
+};
+
 pub const BatchRequest = struct {
     writes: []const BatchWrite = &.{},
     deletes: []const []const u8 = &.{},
@@ -181,6 +203,8 @@ pub const BatchRequest = struct {
     split_replication: ?SplitReplicationContext = null,
     /// Internal source lifecycle mutation. It must be ordered with data writes.
     split_transition: ?SplitTransitionMutation = null,
+    /// Internal 2PC phase. Public batch parsing never accepts this field.
+    transaction: ?TransactionMutation = null,
 };
 
 pub const GraphEdgeWrite = struct {

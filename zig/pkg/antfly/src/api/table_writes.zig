@@ -5581,6 +5581,54 @@ pub const ProvisionedTableWriteSource = struct {
         return self;
     }
 
+    fn transactionRecoveryConfig(self: *ProvisionedTableWriteSource) db_mod.transaction_runtime.Config {
+        if (self.backend_runtime == null or self.quiesced) return .{};
+        return .{
+            .enabled = true,
+            .lease_owned = true,
+            .owner_id = "provisioned-2pc",
+            .interval_ms = 5_000,
+            .cutoff_ns = 5 * std.time.ns_per_min,
+            .resolver_ctx = self,
+            .resolve_participant_fn = resolveRecoveryParticipant,
+        };
+    }
+
+    fn resolveRecoveryParticipant(
+        ptr: *anyopaque,
+        txn_id: db_mod.types.TxnId,
+        participant: []const u8,
+        status: db_mod.types.TxnStatus,
+        commit_version: u64,
+    ) !void {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const ref = distributed_txn.parseParticipantRef(participant) orelse return error.InvalidParticipant;
+        if (self.quiesced) return error.Canceled;
+        if (self.promotion_leadership_source) |leadership| {
+            if (!leadership.isLocalLeader(ref.group_id)) return error.NotLeader;
+        }
+        const alloc = std.heap.page_allocator;
+        if (self.raft_batcher) |batcher| {
+            try batcher.batchGroup(alloc, ref.group_id, ref.table_name, .{
+                .transaction = .{ .resolve = .{
+                    .txn_id = txn_id,
+                    .status = status,
+                    .commit_version = commit_version,
+                } },
+            });
+            return;
+        }
+        _ = (try self.source().txnResolveGroupLocal(
+            alloc,
+            ref.group_id,
+            ref.table_name,
+            txn_id,
+            status,
+            commit_version,
+            .propose,
+        )) orelse return error.UnknownGroup;
+    }
+
     pub fn withLocalWriteOwner(self: *ProvisionedTableWriteSource, owner: ?*ProvisionedTableWriteSource) *ProvisionedTableWriteSource {
         self.local_write_owner = if (owner == self) null else owner;
         return self;
@@ -7328,6 +7376,10 @@ pub const ProvisionedTableWriteSource = struct {
                             .ha_async_batch_mirror = effective_ha_mirror,
                             .ha_async_metadata_mirror = effective_ha_mirror,
                             .identity_validation = identity_validation,
+                            .transaction_recovery = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly or mode == .status_only)
+                                .{}
+                            else
+                                self.transactionRecoveryConfig(),
                         },
                     )
                 else
@@ -7355,7 +7407,10 @@ pub const ProvisionedTableWriteSource = struct {
                         .start_index_workers = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly) false else true,
                         .start_optional_runtimes = mode != .startup_catch_up and mode != .restore_repair and mode != .query_readonly,
                         .ttl_cleanup = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly) .{ .enabled = false } else .{},
-                        .transaction_recovery = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly) .{ .enabled = false } else .{},
+                        .transaction_recovery = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly or mode == .status_only)
+                            .{}
+                        else
+                            self.transactionRecoveryConfig(),
                         .text_merge = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly) .{ .enabled = false } else .{},
                     });
 
@@ -12011,6 +12066,10 @@ pub const ProvisionedTableWriteSource = struct {
                     .ha_async_effect_mirror = effective_ha_mirror,
                     .ha_async_batch_mirror = effective_ha_mirror,
                     .ha_async_metadata_mirror = effective_ha_mirror,
+                    .transaction_recovery = if (open_mode == .startup_catch_up or open_mode == .restore_repair or open_mode == .query_readonly or open_mode == .status_only)
+                        .{}
+                    else
+                        self.transactionRecoveryConfig(),
                 },
             );
             defer if (opened) |*db| db.close();
@@ -13189,7 +13248,10 @@ pub const ProvisionedTableWriteSource = struct {
             try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, apply_req.writes, apply_req.deletes, apply_req.transforms);
             runTestBeforeBatchExecutionHook();
             try validateSplitCheckpointGroup(apply_req.split_checkpoint, group_id);
-            try cached.db.batchReplicatedApply(apply_req);
+            if (apply_req.transaction != null) {
+                try cached.db.ensureTransactionRecoveryRuntime(self.transactionRecoveryConfig());
+                try applyReplicatedTransactionMutation(alloc, cached.db, table_name, group_id, apply_req);
+            } else try cached.db.batchReplicatedApply(apply_req);
             cache.publishCachedLeaseGeneration(&cached, target_generation);
             {
                 lockAtomic(&self.local_db_mutex);
@@ -13218,7 +13280,10 @@ pub const ProvisionedTableWriteSource = struct {
             try validateTableBatchAgainstCatalogSchema(alloc, self.catalog, &db, table_name, apply_req.writes, apply_req.deletes, apply_req.transforms);
             runTestBeforeBatchExecutionHook();
             try validateSplitCheckpointGroup(apply_req.split_checkpoint, group_id);
-            try db.batchReplicatedApply(apply_req);
+            if (apply_req.transaction != null) {
+                try db.ensureTransactionRecoveryRuntime(self.transactionRecoveryConfig());
+                try applyReplicatedTransactionMutation(alloc, &db, table_name, group_id, apply_req);
+            } else try db.batchReplicatedApply(apply_req);
             self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
             lockAtomic(&self.local_db_mutex);
             self.markWriteCacheDirty(table_name);
@@ -13489,21 +13554,33 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try enforceHAWriteGateOptional(self.ha_write_gate);
+        try table_catalog.validateTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
+        if (self.raft_batcher) |batcher| {
+            try batcher.batchGroupLocal(alloc, group_id, table_name, .{
+                .transaction = .{ .begin = .{
+                    .txn_id = txn_id,
+                    .begin_timestamp = begin_timestamp,
+                    .created_at_ns = platform_time.realtimeNs(),
+                    .topology_epoch = topology_epoch,
+                    .participants = participants,
+                } },
+            });
+            return {};
+        }
         self.beginGroupOperation(table_name, group_id);
         defer self.endGroupOperation(table_name, group_id);
-        try table_catalog.validateTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         if (self.write_cache) |cache| {
             var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default_async, null, null);
             defer cached.deinit(alloc);
-            try recoverProvisionedTransactionsOnce(self, alloc, cached.db, table_name, group_id);
-            _ = try cached.db.beginTransactionWithIdAndParticipantsCreatedAt(
-                txn_id,
-                begin_timestamp,
-                platform_time.realtimeNs(),
-                participants,
-            );
+            try applyReplicatedTransactionMutation(alloc, cached.db, table_name, group_id, .{ .transaction = .{ .begin = .{
+                .txn_id = txn_id,
+                .begin_timestamp = begin_timestamp,
+                .created_at_ns = platform_time.realtimeNs(),
+                .topology_epoch = topology_epoch,
+                .participants = participants,
+            } } });
             lockAtomic(&self.local_db_mutex);
             self.markWriteCacheDirty(table_name);
             self.local_db_mutex.unlock();
@@ -13511,13 +13588,13 @@ pub const ProvisionedTableWriteSource = struct {
             var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
-            try recoverProvisionedTransactionsOnce(self, alloc, &db, table_name, group_id);
-            _ = try db.beginTransactionWithIdAndParticipantsCreatedAt(
-                txn_id,
-                begin_timestamp,
-                platform_time.realtimeNs(),
-                participants,
-            );
+            try applyReplicatedTransactionMutation(alloc, &db, table_name, group_id, .{ .transaction = .{ .begin = .{
+                .txn_id = txn_id,
+                .begin_timestamp = begin_timestamp,
+                .created_at_ns = platform_time.realtimeNs(),
+                .topology_epoch = topology_epoch,
+                .participants = participants,
+            } } });
             self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
         }
     }
@@ -13533,15 +13610,24 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try enforceHAWriteGateOptional(self.ha_write_gate);
+        try table_catalog.validateTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
+        if (self.raft_batcher) |batcher| {
+            try batcher.batchGroupLocal(alloc, group_id, table_name, .{
+                .writes = transactionWritesAsBatchWrites(req.writes),
+                .deletes = req.deletes,
+                .transforms = req.transforms,
+                .predicates = req.predicates,
+                .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch } },
+            });
+            return {};
+        }
         self.beginGroupOperation(table_name, group_id);
         defer self.endGroupOperation(table_name, group_id);
-        try table_catalog.validateTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         if (self.write_cache) |cache| {
             var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default_async, null, null);
             defer cached.deinit(alloc);
-            try recoverProvisionedTransactionsOnce(self, alloc, cached.db, table_name, group_id);
             try validateTransactionAgainstCatalogSchema(alloc, self.catalog, cached.db, table_name, req.writes, req.deletes, req.transforms);
             try cached.db.writeTransaction(txn_id, req);
             lockAtomic(&self.local_db_mutex);
@@ -13551,7 +13637,6 @@ pub const ProvisionedTableWriteSource = struct {
             var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
-            try recoverProvisionedTransactionsOnce(self, alloc, &db, table_name, group_id);
             try validateTransactionAgainstCatalogSchema(alloc, self.catalog, &db, table_name, req.writes, req.deletes, req.transforms);
             try db.writeTransaction(txn_id, req);
             self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
@@ -13570,6 +13655,17 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try enforceHAWriteGateOptional(self.ha_write_gate);
+        if (self.raft_batcher) |batcher| {
+            try batcher.batchGroupLocal(alloc, group_id, table_name, .{
+                .sync_level = sync_level,
+                .transaction = .{ .resolve = .{
+                    .txn_id = txn_id,
+                    .status = status,
+                    .commit_version = commit_version,
+                } },
+            });
+            return {};
+        }
         self.beginGroupOperation(table_name, group_id);
         defer self.endGroupOperation(table_name, group_id);
         if (status == .committed) {
@@ -13589,20 +13685,20 @@ pub const ProvisionedTableWriteSource = struct {
         if (self.write_cache) |cache| {
             var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default_async, null, null);
             defer cached.deinit(alloc);
-            try cached.db.resolveTransactionIntentsWithSyncLevel(txn_id, status, commit_version, sync_level);
+            try applyReplicatedTransactionMutation(alloc, cached.db, table_name, group_id, .{
+                .sync_level = sync_level,
+                .transaction = .{ .resolve = .{ .txn_id = txn_id, .status = status, .commit_version = commit_version } },
+            });
             if (status == .committed) try drainManagedDbBeforeClose(cached.db);
-            const participant = try distributed_txn.participantIdForGroup(alloc, table_name, group_id);
-            defer alloc.free(participant);
-            try cached.db.markTransactionParticipantResolved(txn_id, participant);
         } else {
             var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
-            try db.resolveTransactionIntentsWithSyncLevel(txn_id, status, commit_version, sync_level);
+            try applyReplicatedTransactionMutation(alloc, &db, table_name, group_id, .{
+                .sync_level = sync_level,
+                .transaction = .{ .resolve = .{ .txn_id = txn_id, .status = status, .commit_version = commit_version } },
+            });
             if (status == .committed) try drainManagedDbBeforeClose(&db);
-            const participant = try distributed_txn.participantIdForGroup(alloc, table_name, group_id);
-            defer alloc.free(participant);
-            try db.markTransactionParticipantResolved(txn_id, participant);
             if (status == .committed) self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
         }
         if (status == .committed) {
@@ -13630,13 +13726,11 @@ pub const ProvisionedTableWriteSource = struct {
         if (self.write_cache) |cache| {
             var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default_async, null, null);
             defer cached.deinit(alloc);
-            try recoverProvisionedTransactionsOnce(self, alloc, cached.db, table_name, group_id);
             return try cached.db.getTransactionStatus(txn_id);
         } else {
             var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
-            try recoverProvisionedTransactionsOnce(self, alloc, &db, table_name, group_id);
             return try db.getTransactionStatus(txn_id);
         }
     }
@@ -14721,6 +14815,32 @@ pub const HostedProvisionedTableWriteSource = struct {
         return self;
     }
 
+    fn transactionRecoveryConfig(self: *HostedProvisionedTableWriteSource) db_mod.transaction_runtime.Config {
+        if (self.backend_runtime == null) return .{};
+        return .{
+            .enabled = true,
+            .lease_owned = true,
+            .owner_id = "hosted-2pc",
+            .interval_ms = 5_000,
+            .cutoff_ns = 5 * std.time.ns_per_min,
+            .resolver_ctx = self,
+            .resolve_participant_fn = resolveRecoveryParticipant,
+        };
+    }
+
+    fn resolveRecoveryParticipant(
+        ptr: *anyopaque,
+        txn_id: db_mod.types.TxnId,
+        participant: []const u8,
+        status: db_mod.types.TxnStatus,
+        commit_version: u64,
+    ) !void {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const alloc = std.heap.page_allocator;
+        var worker = distributed_txn.HostedParticipantWorker.init(self.catalog, self.router, self.source(), self.executor);
+        try distributed_txn.resolveParticipant(alloc, worker.worker(), participant, txn_id, status, commit_version);
+    }
+
     fn shouldDrainAfterBatch(self: *const HostedProvisionedTableWriteSource, sync_level: db_mod.types.SyncLevel) bool {
         return self.foreground_derived_progress or shouldDrainCachedManagedDbAfterBatch(sync_level);
     }
@@ -14880,6 +15000,10 @@ pub const HostedProvisionedTableWriteSource = struct {
                     .ha_async_effect_mirror = effective_ha_mirror,
                     .ha_async_batch_mirror = effective_ha_mirror,
                     .ha_async_metadata_mirror = effective_ha_mirror,
+                    .transaction_recovery = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly or mode == .status_only)
+                        .{}
+                    else
+                        self.transactionRecoveryConfig(),
                 },
             )
         else
@@ -14905,7 +15029,10 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .start_index_workers = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly) false else true,
                 .start_optional_runtimes = mode != .startup_catch_up and mode != .restore_repair and mode != .query_readonly,
                 .ttl_cleanup = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly) .{ .enabled = false } else .{},
-                .transaction_recovery = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly) .{ .enabled = false } else .{},
+                .transaction_recovery = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly or mode == .status_only)
+                    .{}
+                else
+                    self.transactionRecoveryConfig(),
                 .text_merge = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly) .{ .enabled = false } else .{},
             });
         defer if (opened) |*db| db.close();
@@ -15395,7 +15522,10 @@ pub const HostedProvisionedTableWriteSource = struct {
         var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default_async);
         defer cached.deinit(hosted_cache.write_cache.alloc);
         try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, req.writes, req.deletes, req.transforms);
-        try cached.db.batchReplicatedApply(req);
+        if (req.transaction != null) {
+            try cached.db.ensureTransactionRecoveryRuntime(self.transactionRecoveryConfig());
+            try applyReplicatedTransactionMutation(alloc, cached.db, table_name, group_id, req);
+        } else try cached.db.batchReplicatedApply(req);
         if (self.shouldDrainAfterBatch(req.sync_level)) try drainManagedDbBeforeClose(cached.db);
     }
 
@@ -15411,18 +15541,15 @@ pub const HostedProvisionedTableWriteSource = struct {
     ) !?void {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try table_catalog.validateTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
-        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
-        defer alloc.free(path);
-        const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
-        var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default);
-        defer cached.deinit(hosted_cache.write_cache.alloc);
-        try recoverHostedTransactionsOnce(self, alloc, cached.db, table_name, group_id);
-        _ = try cached.db.beginTransactionWithIdAndParticipantsCreatedAt(
-            txn_id,
-            begin_timestamp,
-            platform_time.realtimeNs(),
-            participants,
-        );
+        return try batchGroupLocal(ptr, alloc, group_id, table_name, .{
+            .transaction = .{ .begin = .{
+                .txn_id = txn_id,
+                .begin_timestamp = begin_timestamp,
+                .created_at_ns = platform_time.realtimeNs(),
+                .topology_epoch = topology_epoch,
+                .participants = participants,
+            } },
+        });
     }
 
     fn txnPrepareGroupLocal(
@@ -15436,14 +15563,13 @@ pub const HostedProvisionedTableWriteSource = struct {
     ) !?void {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try table_catalog.validateTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
-        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
-        defer alloc.free(path);
-        const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
-        var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default);
-        defer cached.deinit(hosted_cache.write_cache.alloc);
-        try recoverHostedTransactionsOnce(self, alloc, cached.db, table_name, group_id);
-        try validateTransactionAgainstCatalogSchema(alloc, self.catalog, cached.db, table_name, req.writes, req.deletes, req.transforms);
-        try cached.db.writeTransaction(txn_id, req);
+        return try batchGroupLocal(ptr, alloc, group_id, table_name, .{
+            .writes = transactionWritesAsBatchWrites(req.writes),
+            .deletes = req.deletes,
+            .transforms = req.transforms,
+            .predicates = req.predicates,
+            .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch } },
+        });
     }
 
     fn txnResolveGroupLocal(
@@ -15456,17 +15582,14 @@ pub const HostedProvisionedTableWriteSource = struct {
         commit_version: u64,
         sync_level: db_mod.types.SyncLevel,
     ) !?void {
-        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
-        defer alloc.free(path);
-        const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
-        var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default);
-        defer cached.deinit(hosted_cache.write_cache.alloc);
-        try cached.db.resolveTransactionIntentsWithSyncLevel(txn_id, status, commit_version, sync_level);
-        if (status == .committed) try drainManagedDbBeforeClose(cached.db);
-        const participant = try distributed_txn.participantIdForGroup(alloc, table_name, group_id);
-        defer alloc.free(participant);
-        try cached.db.markTransactionParticipantResolved(txn_id, participant);
+        return try batchGroupLocal(ptr, alloc, group_id, table_name, .{
+            .sync_level = sync_level,
+            .transaction = .{ .resolve = .{
+                .txn_id = txn_id,
+                .status = status,
+                .commit_version = commit_version,
+            } },
+        });
     }
 
     fn txnStatusGroupLocal(
@@ -15482,7 +15605,6 @@ pub const HostedProvisionedTableWriteSource = struct {
         const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
         var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default);
         defer cached.deinit(hosted_cache.write_cache.alloc);
-        try recoverHostedTransactionsOnce(self, alloc, cached.db, table_name, group_id);
         return try cached.db.getTransactionStatus(txn_id);
     }
 
@@ -16172,6 +16294,69 @@ fn applyGroupBatchUnchecked(
         .sync_level = req.sync_level,
     });
     if (shouldDrainManagedDbAfterBatch(req.sync_level)) try drainManagedDbBeforeClose(db);
+}
+
+fn applyReplicatedTransactionMutation(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    table_name: []const u8,
+    group_id: u64,
+    req: db_mod.types.BatchRequest,
+) !void {
+    const mutation = req.transaction orelse return error.InvalidBatchRequest;
+    switch (mutation) {
+        .begin => |begin| {
+            const local_participant = try distributed_txn.participantIdForGroup(alloc, table_name, group_id);
+            defer alloc.free(local_participant);
+            if (begin.participants.len == 0) return error.InvalidBatchRequest;
+            var seen = std.StringHashMapUnmanaged(void).empty;
+            defer seen.deinit(alloc);
+            var local_present = false;
+            for (begin.participants) |participant| {
+                if (distributed_txn.parseParticipantRef(participant) == null) return error.InvalidBatchRequest;
+                const entry = try seen.getOrPut(alloc, participant);
+                if (entry.found_existing) return error.InvalidBatchRequest;
+                if (std.mem.eql(u8, participant, local_participant)) local_present = true;
+            }
+            if (!local_present) return error.InvalidBatchRequest;
+            const coordinator = std.mem.eql(u8, begin.participants[0], local_participant);
+            const local_only = [_][]const u8{local_participant};
+            // Only the coordinator owns the full participant fan-out. A
+            // follower tracks itself, making successful cleanup O(N) rather
+            // than every participant retrying every other participant.
+            const durable_participants: []const []const u8 = if (coordinator) begin.participants else &local_only;
+            _ = try db.beginTransactionWithIdAndParticipantsCreatedAtAndRole(
+                begin.txn_id,
+                begin.begin_timestamp,
+                begin.created_at_ns,
+                durable_participants,
+                coordinator,
+            );
+        },
+        .prepare => |prepare| try db.writeTransaction(prepare.txn_id, .{
+            .writes = batchWritesAsTransactionWrites(req.writes),
+            .deletes = req.deletes,
+            .transforms = req.transforms,
+            .predicates = req.predicates,
+        }),
+        .resolve => |resolve| {
+            try db.resolveTransactionIntentsWithSyncLevel(
+                resolve.txn_id,
+                resolve.status,
+                resolve.commit_version,
+                req.sync_level,
+            );
+            const local_participant = try distributed_txn.participantIdForGroup(alloc, table_name, group_id);
+            defer alloc.free(local_participant);
+            try db.markTransactionParticipantResolved(resolve.txn_id, local_participant);
+        },
+    }
+}
+
+fn batchWritesAsTransactionWrites(writes: []const db_mod.types.BatchWrite) []const db_mod.types.TransactionWrite {
+    comptime std.debug.assert(@sizeOf(db_mod.types.BatchWrite) == @sizeOf(db_mod.types.TransactionWrite));
+    comptime std.debug.assert(@alignOf(db_mod.types.BatchWrite) == @alignOf(db_mod.types.TransactionWrite));
+    return @ptrCast(writes);
 }
 
 fn parseIndexKind(value: std.json.Value) !db_mod.types.IndexKind {
@@ -17837,6 +18022,7 @@ const ManagedDbOpenOptions = struct {
     ha_async_metadata_mirror: ?db_mod.HAAsyncMetadataMirror = null,
     staged_generation: ?*const db_mod.generation_lifecycle.StagedGeneration = null,
     identity_validation: StartupCatchUpMetadata.IdentityValidation = .exact,
+    transaction_recovery: db_mod.transaction_runtime.Config = .{},
 };
 
 const ManagedDbEnrichmentSet = struct {
@@ -18024,6 +18210,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                 .ha_async_effect_mirror = open_options.ha_async_effect_mirror,
                 .ha_async_batch_mirror = open_options.ha_async_batch_mirror,
                 .ha_async_metadata_mirror = open_options.ha_async_metadata_mirror,
+                .transaction_recovery = open_options.transaction_recovery,
             };
             return switch (open_mode) {
                 .default => if (enrichment_cfg != null)
@@ -18043,6 +18230,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                         .ha_async_effect_mirror = open_options.ha_async_effect_mirror,
                         .ha_async_batch_mirror = open_options.ha_async_batch_mirror,
                         .ha_async_metadata_mirror = open_options.ha_async_metadata_mirror,
+                        .transaction_recovery = open_options.transaction_recovery,
                     }),
                 .default_async, .writer_no_replay => if (enrichment_cfg != null)
                     try db_mod.DB.open(allocator, db_path, .{
@@ -18060,6 +18248,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                         .ha_async_effect_mirror = open_options.ha_async_effect_mirror,
                         .ha_async_batch_mirror = open_options.ha_async_batch_mirror,
                         .ha_async_metadata_mirror = open_options.ha_async_metadata_mirror,
+                        .transaction_recovery = open_options.transaction_recovery,
                         .open_mode = .writer_no_replay,
                         // The managed write cache opens DBs synchronously while
                         // table/index metadata can still be settling. Keep
@@ -18082,6 +18271,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                         .ha_async_effect_mirror = open_options.ha_async_effect_mirror,
                         .ha_async_batch_mirror = open_options.ha_async_batch_mirror,
                         .ha_async_metadata_mirror = open_options.ha_async_metadata_mirror,
+                        .transaction_recovery = open_options.transaction_recovery,
                         .open_mode = .writer_no_replay,
                         .index_open_parallelism = 1,
                     }),
@@ -20011,46 +20201,6 @@ fn lockAtomic(mutex: anytype) void {
     else
         mutex;
     platform_sync.lockYielding(atomic_mutex);
-}
-
-fn recoverProvisionedTransactionsOnce(
-    self: *ProvisionedTableWriteSource,
-    alloc: std.mem.Allocator,
-    db: *db_mod.DB,
-    table_name: []const u8,
-    group_id: u64,
-) !void {
-    const local_participant = try distributed_txn.participantIdForGroup(alloc, table_name, group_id);
-    defer alloc.free(local_participant);
-    var worker_impl = distributed_txn.LocalTableWriteParticipantWorker.init(self.source());
-    var resolver = distributed_txn.RecoveryResolver{
-        .alloc = alloc,
-        .worker = worker_impl.worker(),
-        .owner_id = "api-provisioned",
-        .lease_owned = true,
-        .local_participant = local_participant,
-    };
-    _ = try db.runTransactionRecoveryOnce(resolver.config());
-}
-
-fn recoverHostedTransactionsOnce(
-    self: *HostedProvisionedTableWriteSource,
-    alloc: std.mem.Allocator,
-    db: *db_mod.DB,
-    table_name: []const u8,
-    group_id: u64,
-) !void {
-    const local_participant = try distributed_txn.participantIdForGroup(alloc, table_name, group_id);
-    defer alloc.free(local_participant);
-    var worker_impl = distributed_txn.HostedParticipantWorker.init(self.catalog, self.router, self.source(), self.executor);
-    var resolver = distributed_txn.RecoveryResolver{
-        .alloc = alloc,
-        .worker = worker_impl.worker(),
-        .owner_id = "api-hosted",
-        .lease_owned = true,
-        .local_participant = local_participant,
-    };
-    _ = try db.runTransactionRecoveryOnce(resolver.config());
 }
 
 fn loadLocalTableSchemaJson(alloc: std.mem.Allocator, db: *db_mod.DB) !?[]u8 {

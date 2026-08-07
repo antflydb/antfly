@@ -1233,6 +1233,20 @@ pub const DBCore = struct {
         return txn_id;
     }
 
+    pub fn beginTransactionWithParticipantsCreatedAtAndRole(
+        self: *DBCore,
+        txn_id: transactions_mod.TxnId,
+        timestamp_ns: u64,
+        created_at_ns: u64,
+        participants: []const []const u8,
+        coordinator: bool,
+    ) !transactions_mod.TxnId {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        try manager.initTransactionWithParticipantsCreatedAtAndRole(txn_id, timestamp_ns, created_at_ns, participants, coordinator);
+        return txn_id;
+    }
+
     pub fn writeIntents(
         self: *DBCore,
         txn_id: transactions_mod.TxnId,

@@ -317,87 +317,28 @@ pub fn executeCrossGroup(
     req: db_mod.types.TransactionIntentRequest,
     trace_writer: ?tracing.AntflyTraceWriter,
 ) !ExecuteResult {
-    const topology_epoch = try table_catalog.topologyEpoch(alloc, catalog, table_name);
-    var grouped = std.ArrayListUnmanaged(GroupTxn).empty;
-    defer {
-        for (grouped.items) |*group| group.deinit(alloc);
-        grouped.deinit(alloc);
-    }
-
-    for (req.writes) |write| {
-        const group_id = (try table_catalog.resolveGroupForKeyPinned(alloc, catalog, table_name, write.key, topology_epoch)) orelse return error.UnknownGroup;
-        const group = try ensureGroupTxn(alloc, &grouped, group_id);
-        try group.writes.append(alloc, write);
-    }
-    for (req.deletes) |key| {
-        const group_id = (try table_catalog.resolveGroupForKeyPinned(alloc, catalog, table_name, key, topology_epoch)) orelse return error.UnknownGroup;
-        const group = try ensureGroupTxn(alloc, &grouped, group_id);
-        try group.deletes.append(alloc, key);
-    }
-    for (req.predicates) |predicate| {
-        const group_id = (try table_catalog.resolveGroupForKeyPinned(alloc, catalog, table_name, predicate.key, topology_epoch)) orelse return error.UnknownGroup;
-        const group = try ensureGroupTxn(alloc, &grouped, group_id);
-        try group.predicates.append(alloc, predicate);
-    }
-    for (req.transforms) |transform| {
-        const group_id = (try table_catalog.resolveGroupForKeyPinned(alloc, catalog, table_name, transform.key, topology_epoch)) orelse return error.UnknownGroup;
-        const group = try ensureGroupTxn(alloc, &grouped, group_id);
-        try group.transforms.append(alloc, transform);
-    }
-
-    var participants = try alloc.alloc([]const u8, grouped.items.len);
-    defer {
-        for (participants) |participant| alloc.free(@constCast(participant));
-        alloc.free(participants);
-    }
-    for (grouped.items, 0..) |group, i| {
-        participants[i] = try participantIdForGroup(alloc, table_name, group.group_id);
-    }
-
-    var begun = std.ArrayListUnmanaged(u64).empty;
-    defer begun.deinit(alloc);
-
-    errdefer {
-        if (trace_writer) |tw| {
-            tw.traceEvent(&.{ .name = "AbortTransaction", .txn_id = txn_id, .shard_id = "" });
-        }
-        abortBegunParticipants(alloc, worker, table_name, txn_id, commit_version, begun.items) catch {};
-    }
-
-    for (grouped.items) |group| {
-        try worker.beginGroup(alloc, group.group_id, table_name, .{
-            .txn_id = txn_id,
-            .begin_timestamp = begin_timestamp,
-            .participants = participants,
-        });
-        try begun.append(alloc, group.group_id);
-    }
-
-    for (grouped.items) |group| {
-        try worker.prepareGroup(alloc, group.group_id, table_name, .{
-            .txn_id = txn_id,
-            .req = .{
-                .writes = group.writes.items,
-                .deletes = group.deletes.items,
-                .transforms = group.transforms.items,
-                .predicates = group.predicates.items,
-            },
-        });
-    }
-
-    for (grouped.items) |group| {
-        try worker.resolveGroup(alloc, group.group_id, table_name, .{
-            .txn_id = txn_id,
-            .status = .committed,
-            .commit_version = commit_version,
-        });
-    }
-
-    if (trace_writer) |tw| {
-        tw.traceEvent(&.{ .name = "CommitTransaction", .txn_id = txn_id, .shard_id = "", .timestamp = commit_version });
-    }
-
-    return .{ .participant_count = grouped.items.len };
+    const tables = [_]TableCommitRequest{.{
+        .table_name = table_name,
+        .writes = req.writes,
+        .deletes = req.deletes,
+        .transforms = req.transforms,
+        .predicates = req.predicates,
+    }};
+    const outcome = try executeMultiTableCommit(
+        alloc,
+        catalog,
+        worker,
+        txn_id,
+        begin_timestamp,
+        commit_version,
+        &tables,
+        .propose,
+        trace_writer,
+    );
+    return switch (outcome) {
+        .committed => |committed| .{ .participant_count = committed.participant_count },
+        .conflict => error.IntentConflict,
+    };
 }
 
 pub fn executeMultiTableCommit(
@@ -492,9 +433,17 @@ fn executeMultiTableCommitOnce(
         }) catch |err| switch (err) {
             error.UnknownGroup => {
                 try abortBegunRefs(alloc, worker, txn_id, commit_version, begun.items);
+                abort_on_error = false;
                 return .{ .conflict = participantUnavailableConflict(participant, .begin) };
             },
-            else => return err,
+            else => {
+                if (begun.items.len > 0) try abortBegunRefs(alloc, worker, txn_id, commit_version, begun.items);
+                abort_on_error = false;
+                std.log.warn("transaction begin failed table={s} group_id={} err={s}", .{
+                    participant.table_name, participant.group_id, @errorName(err),
+                });
+                return error.TransactionBeginFailed;
+            },
         };
         try begun.append(alloc, .{ .table_name = participant.table_name, .group_id = participant.group_id });
     }
@@ -515,16 +464,23 @@ fn executeMultiTableCommitOnce(
                     tw.traceEvent(&.{ .name = "AbortTransaction", .txn_id = txn_id, .shard_id = "" });
                 }
                 try abortBegunRefs(alloc, worker, txn_id, commit_version, begun.items);
+                abort_on_error = false;
                 return .{ .conflict = participantConflict(participant) };
             },
             error.UnknownGroup => {
                 try abortBegunRefs(alloc, worker, txn_id, commit_version, begun.items);
+                abort_on_error = false;
                 return .{ .conflict = participantUnavailableConflict(participant, .prepare) };
             },
-            else => return err,
+            else => {
+                try abortBegunRefs(alloc, worker, txn_id, commit_version, begun.items);
+                abort_on_error = false;
+                return err;
+            },
         };
     }
 
+    var post_commit_failure: ?enum { visibility, propagation } = null;
     resolve_participants: for (participants.items, 0..) |participant, participant_index| {
         worker.resolveGroup(alloc, participant.group_id, participant.table_name, .{
             .txn_id = txn_id,
@@ -544,8 +500,11 @@ fn executeMultiTableCommitOnce(
                 }
                 if (participant_index == 0) {
                     try abortBegunRefs(alloc, worker, txn_id, commit_version, begun.items);
+                    abort_on_error = false;
+                    return .{ .conflict = participantDecisionConflict(participant, .resolve) };
                 }
-                return .{ .conflict = participantDecisionConflict(participant, .resolve) };
+                post_commit_failure = .propagation;
+                continue :resolve_participants;
             },
             error.TxnNotFound, error.InvalidTxnRecord => {
                 if (trace_writer) |tw| {
@@ -561,11 +520,20 @@ fn executeMultiTableCommitOnce(
                     // The decision participant has no durable transaction
                     // record, so no commit decision exists yet.
                     try abortBegunRefs(alloc, worker, txn_id, commit_version, begun.items);
+                    abort_on_error = false;
+                    return .{ .conflict = participantTornStateConflict(participant, .resolve) };
                 }
-                return .{ .conflict = participantTornStateConflict(participant, .resolve) };
+                post_commit_failure = .propagation;
+                continue :resolve_participants;
             },
             else => {
-                if (participant_index != 0) return err;
+                if (participant_index != 0) {
+                    std.log.warn("transaction commit propagation failed table={s} group_id={} err={s}", .{
+                        participant.table_name, participant.group_id, @errorName(err),
+                    });
+                    post_commit_failure = .propagation;
+                    continue :resolve_participants;
+                }
 
                 // A resolve can report an error after its local atomic commit
                 // (for example while mirroring or waiting for an index). Read
@@ -576,21 +544,36 @@ fn executeMultiTableCommitOnce(
                     participant.group_id,
                     participant.table_name,
                     txn_id,
-                ) catch {
+                ) catch |status_err| {
                     // The outcome is uncertain. Recovery will consult the
                     // participant record; aborting here could contradict a
                     // commit that already became durable.
                     abort_on_error = false;
-                    return err;
+                    std.log.warn("transaction commit decision probe failed table={s} group_id={} resolve_err={s} status_err={s}", .{
+                        participant.table_name, participant.group_id, @errorName(err), @errorName(status_err),
+                    });
+                    return error.CommitDecisionUnknown;
                 };
                 switch (durable_status) {
                     .committed => {
                         abort_on_error = false;
+                        // The decision is durable, but the requested sync or
+                        // visibility barrier did not complete. Preserve that
+                        // failure while finishing best-effort propagation.
+                        std.log.warn("transaction commit visibility barrier failed table={s} group_id={} err={s}", .{
+                            participant.table_name, participant.group_id, @errorName(err),
+                        });
+                        post_commit_failure = .visibility;
                         continue :resolve_participants;
                     },
-                    .pending => return err,
+                    .pending => {
+                        try abortBegunRefs(alloc, worker, txn_id, commit_version, begun.items);
+                        abort_on_error = false;
+                        return err;
+                    },
                     .aborted => {
                         try abortBegunRefs(alloc, worker, txn_id, commit_version, begun.items);
+                        abort_on_error = false;
                         return .{ .conflict = participantDecisionConflict(participant, .resolve) };
                     },
                 }
@@ -606,41 +589,13 @@ fn executeMultiTableCommitOnce(
         tw.traceEvent(&.{ .name = "CommitTransaction", .txn_id = txn_id, .shard_id = "", .timestamp = commit_version });
     }
 
+    if (post_commit_failure) |failure| switch (failure) {
+        .visibility => return error.CommitVisibilityNotSatisfied,
+        .propagation => return error.CommitPropagationIncomplete,
+    };
+
     return .{ .committed = .{ .participant_count = participants.items.len } };
 }
-
-fn abortBegunParticipants(
-    alloc: std.mem.Allocator,
-    worker: ParticipantWorker,
-    table_name: []const u8,
-    txn_id: db_mod.types.TxnId,
-    timestamp: u64,
-    groups: []const u64,
-) !void {
-    for (groups) |group_id| {
-        worker.resolveGroup(alloc, group_id, table_name, .{
-            .txn_id = txn_id,
-            .status = .aborted,
-            .commit_version = timestamp,
-        }) catch {};
-    }
-}
-
-const GroupTxn = struct {
-    group_id: u64,
-    writes: std.ArrayListUnmanaged(db_mod.types.TransactionWrite) = .empty,
-    deletes: std.ArrayListUnmanaged([]const u8) = .empty,
-    transforms: std.ArrayListUnmanaged(db_mod.types.DocumentTransform) = .empty,
-    predicates: std.ArrayListUnmanaged(db_mod.types.TransactionVersionPredicate) = .empty,
-
-    fn deinit(self: *GroupTxn, alloc: std.mem.Allocator) void {
-        self.writes.deinit(alloc);
-        self.deletes.deinit(alloc);
-        self.transforms.deinit(alloc);
-        self.predicates.deinit(alloc);
-        self.* = undefined;
-    }
-};
 
 const ParticipantTxn = struct {
     table_name: []const u8,
@@ -659,14 +614,6 @@ const ParticipantTxn = struct {
         self.* = undefined;
     }
 };
-
-fn ensureGroupTxn(alloc: std.mem.Allocator, grouped: *std.ArrayListUnmanaged(GroupTxn), group_id: u64) !*GroupTxn {
-    for (grouped.items) |*group| {
-        if (group.group_id == group_id) return group;
-    }
-    try grouped.append(alloc, .{ .group_id = group_id });
-    return &grouped.items[grouped.items.len - 1];
-}
 
 fn ensureParticipantTxn(
     alloc: std.mem.Allocator,
@@ -1251,7 +1198,29 @@ fn abortBegunRefs(
     timestamp: u64,
     refs: []const ParticipantRef,
 ) !void {
-    for (refs) |ref| {
+    if (refs.len == 0) return;
+
+    // The first participant is the coordinator. Do not report an aborted
+    // transaction until its abort decision is durable; otherwise a prepared
+    // transaction can be stranded forever while the client is told it lost.
+    const coordinator = refs[0];
+    worker.resolveGroup(alloc, coordinator.group_id, coordinator.table_name, .{
+        .txn_id = txn_id,
+        .status = .aborted,
+        .commit_version = timestamp,
+    }) catch {
+        const status = worker.statusGroup(
+            alloc,
+            coordinator.group_id,
+            coordinator.table_name,
+            txn_id,
+        ) catch return error.AbortDecisionNotDurable;
+        if (status != .aborted) return error.AbortDecisionNotDurable;
+    };
+
+    // Once the coordinator decision is durable, follower delivery is
+    // idempotent recovery work and must not contradict that decision.
+    for (refs[1..]) |ref| {
         worker.resolveGroup(alloc, ref.group_id, ref.table_name, .{
             .txn_id = txn_id,
             .status = .aborted,
@@ -1816,6 +1785,7 @@ test "distributed txn coordinator never aborts after durable commit decision" {
     const Recorder = struct {
         first_committed: bool = false,
         abort_calls: usize = 0,
+        second_conflict: bool = false,
 
         fn worker(self: *@This()) ParticipantWorker {
             return .{ .ptr = self, .vtable = &.{
@@ -1838,7 +1808,7 @@ test "distributed txn coordinator never aborts after durable commit decision" {
                 self.first_committed = true;
                 return error.InjectedPostCommitAckFailure;
             }
-            return error.InjectedResolveFailure;
+            if (self.second_conflict) return error.DecisionConflict;
         }
         fn status(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -1849,13 +1819,37 @@ test "distributed txn coordinator never aborts after durable commit decision" {
 
     var recorder = Recorder{};
     const txn_id = try parseTxnIdHex("1234567890abcdef1234567890abcdef");
-    try std.testing.expectError(error.InjectedResolveFailure, executeMultiTableCommit(
+    try std.testing.expectError(error.CommitVisibilityNotSatisfied, executeMultiTableCommit(
         std.testing.allocator,
         FakeCatalog.iface(),
         recorder.worker(),
         txn_id,
         10_000,
         10_001,
+        &.{.{
+            .table_name = "docs",
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"a\"}" },
+                .{ .key = "doc:z", .value = "{\"title\":\"z\"}" },
+            },
+        }},
+        .propose,
+        null,
+    ));
+    try std.testing.expect(recorder.first_committed);
+    try std.testing.expectEqual(@as(usize, 0), recorder.abort_calls);
+
+    // A contradictory/missing follower after the coordinator decision is a
+    // committed transaction with incomplete propagation, never an abort.
+    recorder = .{ .second_conflict = true };
+    const second_txn_id = try parseTxnIdHex("abcdef1234567890abcdef1234567890");
+    try std.testing.expectError(error.CommitPropagationIncomplete, executeMultiTableCommit(
+        std.testing.allocator,
+        FakeCatalog.iface(),
+        recorder.worker(),
+        second_txn_id,
+        20_000,
+        20_001,
         &.{.{
             .table_name = "docs",
             .writes = &.{

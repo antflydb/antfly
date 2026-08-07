@@ -4073,6 +4073,20 @@ pub const DB = struct {
         if (self.sparse_compaction_runtime) |runtime| try runtime.start();
     }
 
+    pub fn ensureTransactionRecoveryRuntime(self: *DB, cfg: transaction_runtime_mod.Config) !void {
+        if (!cfg.enabled or self.transaction_runtime != null) return;
+        lockApply(self);
+        defer self.core.unlockApply();
+        if (self.transaction_runtime != null) return;
+        try self.initOptionalTransactionRuntime(cfg);
+        if (self.optional_runtime_workers_enabled) {
+            const runtime = self.transaction_runtime.?;
+            runtime.config.local_resolution_ctx = self;
+            runtime.config.resolve_local_fn = resolveRecoveredLocalTransaction;
+            try runtime.start();
+        }
+    }
+
     fn hasConfiguredResolvers(self: *const DB) bool {
         return self.core.index_manager.resolvers.items.len > 0;
     }
@@ -13758,6 +13772,25 @@ pub const DB = struct {
         return try self.core.beginTransactionWithParticipantsCreatedAt(txn_id, timestamp_ns, created_at_ns, participants);
     }
 
+    pub fn beginTransactionWithIdAndParticipantsCreatedAtAndRole(
+        self: *DB,
+        txn_id: transactions_mod.TxnId,
+        timestamp_ns: u64,
+        created_at_ns: u64,
+        participants: []const []const u8,
+        coordinator: bool,
+    ) !transactions_mod.TxnId {
+        lockApply(self);
+        defer self.core.unlockApply();
+        return try self.core.beginTransactionWithParticipantsCreatedAtAndRole(
+            txn_id,
+            timestamp_ns,
+            created_at_ns,
+            participants,
+            coordinator,
+        );
+    }
+
     pub fn writeIntents(
         self: *DB,
         txn_id: transactions_mod.TxnId,
@@ -13778,6 +13811,13 @@ pub const DB = struct {
     }
 
     pub fn writeTransaction(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest) !void {
+        // Transform expansion is a read-modify-write operation. Hold the same
+        // apply fence used by ordinary batches from the source read through
+        // predicate validation and durable intent installation; otherwise a
+        // concurrent write can be lost between transform expansion and prepare.
+        lockApply(self);
+        defer self.core.unlockApply();
+
         var effective_ops = try coalesceKeyValueRequest(self, types.TransactionWrite, req.writes, req.deletes, req.transforms);
         defer effective_ops.deinit(self.alloc);
         // Graph projections are maintained as artifact deltas, while the
@@ -13810,7 +13850,14 @@ pub const DB = struct {
             });
         }
 
-        try self.writeIntents(txn_id, intents.items, predicates.items);
+        var identity_upsert_keys = std.ArrayListUnmanaged([]const u8).empty;
+        defer identity_upsert_keys.deinit(self.alloc);
+        for (intents.items) |intent| {
+            if (intent.value == null or isMetadataKey(intent.key)) continue;
+            try identity_upsert_keys.append(self.alloc, intent.key);
+        }
+        try self.failIfIdentityOrdinalExhaustedForNewUpserts(identity_upsert_keys.items);
+        try self.core.writeIntents(txn_id, intents.items, predicates.items);
     }
 
     // resolveTransactionTransforms, removePendingTransactionWrite, and freeTransactionWritesOwned

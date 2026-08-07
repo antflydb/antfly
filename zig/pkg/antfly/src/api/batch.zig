@@ -27,6 +27,8 @@ pub const OwnedBatchRequest = struct {
     writes: []db_mod.types.BatchWrite = &.{},
     deletes: [][]const u8 = &.{},
     transforms: []db_mod.types.DocumentTransform = &.{},
+    predicates: []db_mod.types.TransactionVersionPredicate = &.{},
+    transaction_participants: [][]const u8 = &.{},
     split_checkpoint_range_start: ?[]u8 = null,
     split_checkpoint_range_end: ?[]u8 = null,
     split_transition_key: ?[]u8 = null,
@@ -49,6 +51,10 @@ pub const OwnedBatchRequest = struct {
             if (transform.operations.len > 0) alloc.free(transform.operations);
         }
         if (self.transforms.len > 0) alloc.free(self.transforms);
+        for (self.predicates) |predicate| alloc.free(@constCast(predicate.key));
+        if (self.predicates.len > 0) alloc.free(self.predicates);
+        for (self.transaction_participants) |participant| alloc.free(participant);
+        if (self.transaction_participants.len > 0) alloc.free(self.transaction_participants);
         if (self.split_checkpoint_range_start) |value| alloc.free(value);
         if (self.split_checkpoint_range_end) |value| alloc.free(value);
         if (self.split_transition_key) |value| alloc.free(value);
@@ -126,6 +132,33 @@ fn parseBatchRequestWithOptions(
         break :transforms &.{};
     };
     errdefer freeTransforms(alloc, transforms);
+
+    const predicates: []db_mod.types.TransactionVersionPredicate = predicates: {
+        const value = root.get("_predicates") orelse break :predicates &.{};
+        if (!allow_internal or value != .array) return error.InvalidBatchRequest;
+        const items = try alloc.alloc(db_mod.types.TransactionVersionPredicate, value.array.items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (items[0..initialized]) |predicate| alloc.free(@constCast(predicate.key));
+            alloc.free(items);
+        }
+        for (value.array.items, 0..) |item, i| {
+            if (item != .object) return error.InvalidBatchRequest;
+            const key_value = item.object.get("key") orelse return error.InvalidBatchRequest;
+            const version_value = item.object.get("expected_version") orelse return error.InvalidBatchRequest;
+            if (key_value != .string) return error.InvalidBatchRequest;
+            items[i] = .{
+                .key = try alloc.dupe(u8, key_value.string),
+                .expected_version = try parseInternalU64(version_value),
+            };
+            initialized += 1;
+        }
+        break :predicates items;
+    };
+    errdefer {
+        for (predicates) |predicate| alloc.free(@constCast(predicate.key));
+        if (predicates.len > 0) alloc.free(predicates);
+    }
 
     const sync_level = sync_level: {
         if (root.get("sync_level")) |sync_level_value| {
@@ -259,12 +292,71 @@ fn parseBatchRequestWithOptions(
         };
     };
 
+    var transaction_participants: [][]const u8 = &.{};
+    var transaction_participants_initialized: usize = 0;
+    errdefer {
+        for (transaction_participants[0..transaction_participants_initialized]) |participant| alloc.free(participant);
+        if (transaction_participants.len > 0) alloc.free(transaction_participants);
+    }
+    const transaction: ?db_mod.types.TransactionMutation = transaction: {
+        const value = root.get("_transaction") orelse break :transaction null;
+        if (!allow_internal or value != .object) return error.InvalidBatchRequest;
+        const object = value.object;
+        const phase_value = object.get("phase") orelse return error.InvalidBatchRequest;
+        const txn_value = object.get("txn_id") orelse return error.InvalidBatchRequest;
+        if (phase_value != .string or txn_value != .string or txn_value.string.len != 32) return error.InvalidBatchRequest;
+        var txn_id: db_mod.types.TxnId = undefined;
+        _ = std.fmt.hexToBytes(&txn_id, txn_value.string) catch return error.InvalidBatchRequest;
+        if (std.mem.eql(u8, phase_value.string, "begin")) {
+            const participants_value = object.get("participants") orelse return error.InvalidBatchRequest;
+            if (participants_value != .array or participants_value.array.items.len == 0) return error.InvalidBatchRequest;
+            transaction_participants = try alloc.alloc([]const u8, participants_value.array.items.len);
+            for (participants_value.array.items, 0..) |participant, i| {
+                if (participant != .string or participant.string.len == 0) return error.InvalidBatchRequest;
+                transaction_participants[i] = try alloc.dupe(u8, participant.string);
+                transaction_participants_initialized += 1;
+            }
+            break :transaction .{ .begin = .{
+                .txn_id = txn_id,
+                .begin_timestamp = try parseInternalU64(object.get("begin_timestamp") orelse return error.InvalidBatchRequest),
+                .created_at_ns = try parseInternalU64(object.get("created_at_ns") orelse return error.InvalidBatchRequest),
+                .topology_epoch = try parseInternalU64(object.get("topology_epoch") orelse return error.InvalidBatchRequest),
+                .participants = transaction_participants,
+            } };
+        }
+        if (std.mem.eql(u8, phase_value.string, "prepare")) break :transaction .{ .prepare = .{
+            .txn_id = txn_id,
+            .topology_epoch = try parseInternalU64(object.get("topology_epoch") orelse return error.InvalidBatchRequest),
+        } };
+        if (std.mem.eql(u8, phase_value.string, "resolve")) {
+            const status_value = object.get("status") orelse return error.InvalidBatchRequest;
+            if (status_value != .string) return error.InvalidBatchRequest;
+            const status = std.meta.stringToEnum(db_mod.types.TxnStatus, status_value.string) orelse return error.InvalidBatchRequest;
+            if (status == .pending) return error.InvalidBatchRequest;
+            break :transaction .{ .resolve = .{
+                .txn_id = txn_id,
+                .status = status,
+                .commit_version = try parseInternalU64(object.get("commit_version") orelse return error.InvalidBatchRequest),
+            } };
+        }
+        return error.InvalidBatchRequest;
+    };
+
     if (split_transition != null and
         (writes.len != 0 or deletes.len != 0 or transforms.len != 0 or
-            split_checkpoint != null or split_replication != null))
+            predicates.len != 0 or split_checkpoint != null or split_replication != null or transaction != null))
     {
         return error.InvalidBatchRequest;
     }
+    if (transaction != null and (split_checkpoint != null or split_replication != null or split_transition != null)) {
+        return error.InvalidBatchRequest;
+    }
+    if (predicates.len != 0 and transaction == null) return error.InvalidBatchRequest;
+    if (transaction) |mutation| switch (mutation) {
+        .begin, .resolve => if (writes.len != 0 or deletes.len != 0 or transforms.len != 0 or predicates.len != 0)
+            return error.InvalidBatchRequest,
+        .prepare => {},
+    };
     if (split_checkpoint != null and split_checkpoint.?.kind == .source_ack and
         (writes.len != 0 or deletes.len != 0 or transforms.len != 0 or
             split_replication != null))
@@ -276,6 +368,8 @@ fn parseBatchRequestWithOptions(
         .writes = writes,
         .deletes = deletes,
         .transforms = transforms,
+        .predicates = predicates,
+        .transaction_participants = transaction_participants,
         .split_checkpoint_range_start = checkpoint_start,
         .split_checkpoint_range_end = checkpoint_end,
         .split_transition_key = transition_key,
@@ -283,10 +377,12 @@ fn parseBatchRequestWithOptions(
             .writes = writes,
             .deletes = deletes,
             .transforms = transforms,
+            .predicates = predicates,
             .sync_level = sync_level,
             .split_checkpoint = split_checkpoint,
             .split_replication = split_replication,
             .split_transition = split_transition,
+            .transaction = transaction,
         },
     };
 }
@@ -300,12 +396,12 @@ pub fn encodeBatchResponse(alloc: std.mem.Allocator, result: BatchResult) ![]u8 
 }
 
 pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchRequest) ![]u8 {
-    if (req.graph_writes.len > 0 or req.graph_deletes.len > 0 or req.predicates.len > 0) {
+    if (req.graph_writes.len > 0 or req.graph_deletes.len > 0 or (req.predicates.len > 0 and req.transaction == null)) {
         return error.UnsupportedBatchRequestEncoding;
     }
     if (req.split_transition != null and
         (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or
-            req.split_checkpoint != null or req.split_replication != null))
+            req.predicates.len != 0 or req.split_checkpoint != null or req.split_replication != null or req.transaction != null))
     {
         return error.InvalidBatchRequest;
     }
@@ -356,6 +452,16 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
         }
         try writer.writeAll("]");
     }
+    if (req.predicates.len > 0) {
+        try writer.writeAll(",\"_predicates\":[");
+        for (req.predicates, 0..) |predicate, i| {
+            if (i != 0) try writer.writeByte(',');
+            try writer.print("{{\"key\":{f},\"expected_version\":\"{d}\"}}", .{
+                std.json.fmt(predicate.key, .{}), predicate.expected_version,
+            });
+        }
+        try writer.writeByte(']');
+    }
     if (req.split_checkpoint) |checkpoint| {
         try writer.print(",\"_split_checkpoint\":{{\"kind\":{f},\"transition_id\":\"{d}\",\"attempt_epoch\":\"{d}\",\"source_group_id\":\"{d}\",\"destination_group_id\":\"{d}\",\"range_start\":{f},\"range_end\":{f},\"delta_sequence\":\"{d}\"}}", .{
             std.json.fmt(@tagName(checkpoint.kind), .{}),
@@ -393,6 +499,33 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
             transition.destination_group_id,
             std.json.fmt(transition.split_key, .{}),
         });
+    }
+    if (req.transaction) |mutation| {
+        try writer.writeAll(",\"_transaction\":{");
+        switch (mutation) {
+            .begin => |begin| {
+                const txn_hex = std.fmt.bytesToHex(begin.txn_id, .lower);
+                try writer.print("\"phase\":\"begin\",\"txn_id\":\"{s}\",\"begin_timestamp\":\"{d}\",\"created_at_ns\":\"{d}\",\"topology_epoch\":\"{d}\",\"participants\":[", .{
+                    &txn_hex, begin.begin_timestamp, begin.created_at_ns, begin.topology_epoch,
+                });
+                for (begin.participants, 0..) |participant, i| {
+                    if (i != 0) try writer.writeByte(',');
+                    try writer.print("{f}", .{std.json.fmt(participant, .{})});
+                }
+                try writer.writeByte(']');
+            },
+            .prepare => |prepare| {
+                const txn_hex = std.fmt.bytesToHex(prepare.txn_id, .lower);
+                try writer.print("\"phase\":\"prepare\",\"txn_id\":\"{s}\",\"topology_epoch\":\"{d}\"", .{ &txn_hex, prepare.topology_epoch });
+            },
+            .resolve => |resolve| {
+                const txn_hex = std.fmt.bytesToHex(resolve.txn_id, .lower);
+                try writer.print("\"phase\":\"resolve\",\"txn_id\":\"{s}\",\"status\":{f},\"commit_version\":\"{d}\"", .{
+                    &txn_hex, std.json.fmt(@tagName(resolve.status), .{}), resolve.commit_version,
+                });
+            },
+        }
+        try writer.writeByte('}');
     }
     try writer.print(",\"sync_level\":\"{s}\"}}", .{syncLevelName(req.sync_level)});
     return try out.toOwnedSlice();
@@ -710,6 +843,29 @@ test "internal batch parser owns and round trips split transition" {
     var reparsed = try parseInternalBatchRequest(std.testing.allocator, encoded);
     defer reparsed.deinit(std.testing.allocator);
     try std.testing.expectEqual(db_mod.types.SplitTransitionMutation.Kind.start, reparsed.req.split_transition.?.kind);
+}
+
+test "internal batch codec round trips replicated transaction phases" {
+    const alloc = std.testing.allocator;
+    const txn_id: db_mod.types.TxnId = .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+    const encoded = try encodeBatchRequest(alloc, .{
+        .writes = &.{.{ .key = "doc:a", .value = "{}" }},
+        .predicates = &.{.{ .key = "doc:a", .expected_version = 41 }},
+        .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = 7 } },
+    });
+    defer alloc.free(encoded);
+    try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, encoded));
+
+    var decoded = try parseInternalBatchRequest(alloc, encoded);
+    defer decoded.deinit(alloc);
+    const prepare = switch (decoded.req.transaction orelse return error.TestExpectedEqual) {
+        .prepare => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(txn_id, prepare.txn_id);
+    try std.testing.expectEqual(@as(u64, 7), prepare.topology_epoch);
+    try std.testing.expectEqual(@as(usize, 1), decoded.req.writes.len);
+    try std.testing.expectEqual(@as(u64, 41), decoded.req.predicates[0].expected_version);
 }
 
 test "internal batch parser rejects mixed split transition commands" {

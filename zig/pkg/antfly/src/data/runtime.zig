@@ -4097,6 +4097,9 @@ pub const DataServer = struct {
         self.write_source.setLocalChangeHook(self.localChangeHook());
         self.write_source.setLocalIndexRepairDebtHook(self.localIndexRepairDebtHook());
         _ = self.write_source.withRaftBatcher(if (self.data_raft != null) self.localRaftBatcher() else null);
+        if (self.data_raft_apply) |apply_sm| {
+            _ = apply_sm.write_source.withRaftBatcher(if (self.data_raft != null) self.localRaftBatcher() else null);
+        }
         const promotion_leadership = self.promotionLeadershipSource();
         _ = self.write_source.withPromotionLeadershipSource(promotion_leadership);
         if (self.data_raft_apply) |apply_sm| {

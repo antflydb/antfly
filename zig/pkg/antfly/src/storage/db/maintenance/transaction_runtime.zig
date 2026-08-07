@@ -262,7 +262,28 @@ fn runRecoveryWithConfig(
     defer alloc.free(txns);
 
     for (txns) |txn| {
-        if (txn.status == .pending) continue;
+        if (txn.status == .pending) {
+            const cutoff = now_ns -| config.cutoff_ns;
+            if (txn.coordinator_known and txn.coordinator and txn.created_at > 0 and txn.created_at < cutoff) {
+                const participants = try manager.getParticipants(alloc, txn.txn_id);
+                defer transactions_mod.freeParticipantList(alloc, participants);
+                if (participants.len > 0) {
+                    summary.notification_attempts += 1;
+                    config.resolve_participant_fn.?(
+                        config.resolver_ctx.?,
+                        txn.txn_id,
+                        participants[0],
+                        .aborted,
+                        now_ns,
+                    ) catch {
+                        summary.notification_failures += 1;
+                        continue;
+                    };
+                    summary.notification_successes += 1;
+                }
+            }
+            continue;
+        }
 
         if (try manager.hasIntents(txn.txn_id)) {
             if (config.resolve_local_fn) |resolve_local| {
@@ -286,7 +307,12 @@ fn runRecoveryWithConfig(
     }
 
     const cutoff = now_ns -| config.cutoff_ns;
-    summary.recovery = try manager.recoverTransactionsWithExtraBatchHooks(cutoff, now_ns, config.resolution_extra_hooks);
+    summary.recovery = try manager.recoverTransactionsWithExtraBatchHooksAndOptions(
+        cutoff,
+        now_ns,
+        config.resolution_extra_hooks,
+        .{ .presume_abort_distributed = false },
+    );
     return summary;
 }
 
@@ -427,4 +453,50 @@ test "transaction recovery runtime recoverOnce works with lsm backend store" {
     });
     try std.testing.expectEqual(@as(u64, 1), stats.auto_aborted);
     try std.testing.expectEqual(transactions_mod.TxnStatus.aborted, try manager.getTransactionStatus(txn_id));
+}
+
+test "transaction recovery delegates stale coordinator abort to replicated resolver" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var runtime_store = try backend.runtimeStore(alloc, .{ .name = "coordinator" });
+    defer runtime_store.deinit();
+
+    const txn_id: transactions_mod.TxnId = .{7} ** 16;
+    var manager = try transactions_mod.TxnManager.init(alloc, &runtime_store);
+    defer manager.deinit();
+    try manager.initTransactionWithParticipantsCreatedAtAndRole(
+        txn_id,
+        10_000,
+        1_000,
+        &.{ "table2:4:docs:group:7", "table2:4:docs:group:8" },
+        true,
+    );
+    try manager.writeIntents(txn_id, &.{.{ .key = "doc:a", .value = "{}" }}, &.{});
+
+    const Recorder = struct {
+        calls: usize = 0,
+        expected_txn_id: transactions_mod.TxnId,
+        fn resolve(ptr: *anyopaque, actual_txn_id: transactions_mod.TxnId, participant: []const u8, status: transactions_mod.TxnStatus, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqual(self.expected_txn_id, actual_txn_id);
+            try std.testing.expectEqualStrings("table2:4:docs:group:7", participant);
+            try std.testing.expectEqual(transactions_mod.TxnStatus.aborted, status);
+        }
+    };
+    var recorder = Recorder{ .expected_txn_id = txn_id };
+    var clock = platform_clock.ManualClock{};
+    clock.setRealtimeNs(5_000);
+    const stats = try recoverOnce(alloc, &runtime_store, .{
+        .enabled = true,
+        .cutoff_ns = 3_000,
+        .clock = clock.clock(),
+        .resolver_ctx = &recorder,
+        .resolve_participant_fn = Recorder.resolve,
+    });
+    try std.testing.expectEqual(@as(usize, 1), recorder.calls);
+    try std.testing.expectEqual(@as(u64, 1), stats.notification_attempts);
+    try std.testing.expectEqual(@as(u64, 0), stats.auto_aborted);
+    try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try manager.getTransactionStatus(txn_id));
 }

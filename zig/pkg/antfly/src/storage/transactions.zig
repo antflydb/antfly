@@ -84,6 +84,13 @@ pub const RecoveryStats = struct {
     deferred_unresolved: u64 = 0,
 };
 
+pub const RecoveryOptions = struct {
+    /// Distributed decisions must be replicated by their coordinator. DB-local
+    /// maintenance disables this and asks the coordinator callback to propose
+    /// the decision through data Raft instead.
+    presume_abort_distributed: bool = true,
+};
+
 pub const TxnSummary = struct {
     txn_id: TxnId,
     status: TxnStatus,
@@ -91,6 +98,8 @@ pub const TxnSummary = struct {
     commit_version: u64,
     created_at: u64,
     finalized_at: u64,
+    coordinator: bool,
+    coordinator_known: bool,
 };
 
 pub const ResolutionExtraBatch = struct {
@@ -151,6 +160,12 @@ const TxnRecord = struct {
     /// distributed records from those versions conservatively rather than
     /// risking an incorrect abort during a rolling upgrade.
     prepared_known: bool = true,
+    /// Only this participant may recover a missing terminal decision by
+    /// choosing abort. Other prepared participants must wait for that decision.
+    coordinator: bool = false,
+    /// Old records predate explicit coordinator ownership and therefore use
+    /// conservative recovery semantics during rolling upgrades.
+    coordinator_known: bool = true,
 
     fn visibleVersion(self: TxnRecord) u64 {
         if (self.commit_version > 0) return self.commit_version;
@@ -162,6 +177,7 @@ const txn_record_v0_size = 17;
 const txn_record_v1_size = 33;
 const txn_record_v2_size = 49;
 const txn_record_v3_size = 50;
+const txn_record_v4_size = 51;
 
 // ============================================================================
 // TxnManager
@@ -217,6 +233,17 @@ pub const TxnManager = struct {
         created_at: u64,
         participants: []const []const u8,
     ) !void {
+        return try self.initTransactionWithParticipantsCreatedAtAndRole(txn_id, timestamp, created_at, participants, false);
+    }
+
+    pub fn initTransactionWithParticipantsCreatedAtAndRole(
+        self: *TxnManager,
+        txn_id: TxnId,
+        timestamp: u64,
+        created_at: u64,
+        participants: []const []const u8,
+        coordinator: bool,
+    ) !void {
         const key = makeRecordKey(txn_id);
         const existing = self.loadTransactionRecord(txn_id) catch |err| switch (err) {
             TxnError.TxnNotFound => null,
@@ -224,9 +251,19 @@ pub const TxnManager = struct {
         };
         if (existing) |record| {
             if (record.status != .pending or record.begin_timestamp != timestamp) return TxnError.DecisionConflict;
+            if (record.coordinator_known and record.coordinator != coordinator) return TxnError.DecisionConflict;
             const persisted = try self.getParticipants(self.alloc, txn_id);
             defer freeParticipantList(self.alloc, persisted);
             if (!participantListsEqual(persisted, participants)) return TxnError.DecisionConflict;
+            // An idempotent begin from a new binary is the authoritative point
+            // where a legacy record can safely learn its coordinator role.
+            // Persist the upgrade before prepare can rewrite the record as v4.
+            if (!record.coordinator_known) {
+                var upgraded = record;
+                upgraded.coordinator = coordinator;
+                upgraded.coordinator_known = true;
+                try self.saveTransactionRecord(key, upgraded);
+            }
             return;
         }
         const record = TxnRecord{
@@ -235,6 +272,7 @@ pub const TxnManager = struct {
             .commit_version = 0,
             .created_at = created_at,
             .finalized_at = 0,
+            .coordinator = coordinator,
         };
         const record_value = try self.encodeRecord(record);
         defer self.alloc.free(record_value);
@@ -602,6 +640,8 @@ pub const TxnManager = struct {
                 .commit_version = record.commit_version,
                 .created_at = record.created_at,
                 .finalized_at = record.finalized_at,
+                .coordinator = record.coordinator,
+                .coordinator_known = record.coordinator_known,
             });
         }
         return try items.toOwnedSlice(alloc);
@@ -672,6 +712,21 @@ pub const TxnManager = struct {
         resolution_timestamp: u64,
         extra_hooks: RecoveryExtraBatchHooks,
     ) !RecoveryStats {
+        return try self.recoverTransactionsWithExtraBatchHooksAndOptions(
+            cutoff_timestamp,
+            resolution_timestamp,
+            extra_hooks,
+            .{},
+        );
+    }
+
+    pub fn recoverTransactionsWithExtraBatchHooksAndOptions(
+        self: *TxnManager,
+        cutoff_timestamp: u64,
+        resolution_timestamp: u64,
+        extra_hooks: RecoveryExtraBatchHooks,
+        options: RecoveryOptions,
+    ) !RecoveryStats {
         var stats: RecoveryStats = .{};
         const records = try self.scanPrefix(self.alloc, records_prefix);
         defer backend_scan.freeResults(self.alloc, records);
@@ -685,7 +740,15 @@ pub const TxnManager = struct {
 
             if (record.status == .pending) {
                 if (record.created_at > 0 and record.created_at < cutoff_timestamp) {
-                    if (record.prepared or !record.prepared_known) {
+                    if (!options.presume_abort_distributed) {
+                        const participants = try self.getParticipants(self.alloc, txn_id);
+                        defer freeParticipantList(self.alloc, participants);
+                        if (participants.len > 0) {
+                            stats.kept_recent_pending += 1;
+                            continue;
+                        }
+                    }
+                    if ((record.prepared or !record.prepared_known) and (!record.coordinator or !record.coordinator_known)) {
                         const participants = try self.getParticipants(self.alloc, txn_id);
                         defer freeParticipantList(self.alloc, participants);
                         if (participants.len > 0) {
@@ -843,7 +906,7 @@ pub const TxnManager = struct {
     }
 
     fn encodeRecord(self: *TxnManager, record: TxnRecord) ![]u8 {
-        const buf = try self.alloc.alloc(u8, txn_record_v3_size);
+        const buf = try self.alloc.alloc(u8, txn_record_v4_size);
         buf[0] = @intFromEnum(record.status);
         std.mem.writeInt(u64, buf[1..9], record.begin_timestamp, .little);
         std.mem.writeInt(u64, buf[9..17], record.commit_version, .little);
@@ -852,6 +915,7 @@ pub const TxnManager = struct {
         std.mem.writeInt(u64, buf[33..41], record.intent_revision, .little);
         std.mem.writeInt(u64, buf[41..49], record.replay_sequence, .little);
         buf[49] = @intFromBool(record.prepared);
+        buf[50] = @intFromBool(record.coordinator);
         return buf;
     }
 
@@ -1136,6 +1200,20 @@ fn resolveDecisionConflictReason(current: TxnStatus, requested: TxnStatus) []con
 }
 
 fn decodeRecord(raw: []const u8) !TxnRecord {
+    if (raw.len == txn_record_v4_size) {
+        if (raw[49] > 1 or raw[50] > 1) return TxnError.InvalidTxnRecord;
+        return .{
+            .status = @enumFromInt(raw[0]),
+            .begin_timestamp = std.mem.readInt(u64, raw[1..9], .little),
+            .commit_version = std.mem.readInt(u64, raw[9..17], .little),
+            .created_at = std.mem.readInt(u64, raw[17..25], .little),
+            .finalized_at = std.mem.readInt(u64, raw[25..33], .little),
+            .intent_revision = std.mem.readInt(u64, raw[33..41], .little),
+            .replay_sequence = std.mem.readInt(u64, raw[41..49], .little),
+            .prepared = raw[49] == 1,
+            .coordinator = raw[50] == 1,
+        };
+    }
     if (raw.len == txn_record_v3_size) {
         if (raw[49] > 1) return TxnError.InvalidTxnRecord;
         return .{
@@ -1147,6 +1225,7 @@ fn decodeRecord(raw: []const u8) !TxnRecord {
             .intent_revision = std.mem.readInt(u64, raw[33..41], .little),
             .replay_sequence = std.mem.readInt(u64, raw[41..49], .little),
             .prepared = raw[49] == 1,
+            .coordinator_known = false,
         };
     }
     if (raw.len == txn_record_v2_size) {
@@ -1159,6 +1238,7 @@ fn decodeRecord(raw: []const u8) !TxnRecord {
             .intent_revision = std.mem.readInt(u64, raw[33..41], .little),
             .replay_sequence = std.mem.readInt(u64, raw[41..49], .little),
             .prepared_known = false,
+            .coordinator_known = false,
         };
     }
     if (raw.len == txn_record_v1_size) {
@@ -1169,6 +1249,7 @@ fn decodeRecord(raw: []const u8) !TxnRecord {
             .created_at = std.mem.readInt(u64, raw[17..25], .little),
             .finalized_at = std.mem.readInt(u64, raw[25..33], .little),
             .prepared_known = false,
+            .coordinator_known = false,
         };
     }
     if (raw.len == txn_record_v0_size) {
@@ -1181,6 +1262,7 @@ fn decodeRecord(raw: []const u8) !TxnRecord {
             .created_at = std.mem.readInt(u64, raw[9..17], .little),
             .finalized_at = 0,
             .prepared_known = false,
+            .coordinator_known = false,
         };
     }
     return TxnError.InvalidTxnRecord;
@@ -1482,6 +1564,36 @@ test "transaction protocol fences begin prepare snapshot and idempotent resoluti
     try std.testing.expectEqual(@as(u64, 7), repeated.replay_sequence);
 }
 
+test "idempotent begin upgrades a legacy transaction coordinator role" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "txn-upgrade-legacy-coordinator-role");
+    defer alloc.free(path);
+    cleanupTestDir(path);
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+    defer cleanupTestDir(path);
+
+    var mgr = try TxnManager.init(alloc, &store);
+    defer mgr.deinit();
+    const txn_id: TxnId = .{6} ** 16;
+    const participants = [_][]const u8{ "table2:4:docs:group:7", "table2:4:docs:group:8" };
+    try mgr.initTransactionWithParticipantsCreatedAtAndRole(txn_id, 1_000, 900, &participants, false);
+
+    var legacy: [txn_record_v3_size]u8 = @splat(0);
+    legacy[0] = @intFromEnum(TxnStatus.pending);
+    std.mem.writeInt(u64, legacy[1..9], 1_000, .little);
+    std.mem.writeInt(u64, legacy[17..25], 900, .little);
+    const record_key = makeRecordKey(txn_id);
+    try mgr.putValue(&record_key, &legacy);
+
+    try mgr.initTransactionWithParticipantsCreatedAtAndRole(txn_id, 1_000, 900, &participants, true);
+    const txns = try mgr.listTransactions(alloc);
+    defer alloc.free(txns);
+    try std.testing.expectEqual(@as(usize, 1), txns.len);
+    try std.testing.expect(txns[0].coordinator_known);
+    try std.testing.expect(txns[0].coordinator);
+}
+
 test "transaction init + abort" {
     const alloc = std.testing.allocator;
     const path = try tempTestPath(alloc, "txn-abort");
@@ -1719,6 +1831,32 @@ test "recoverTransactions never presumes abort after a distributed prepare vote"
     const intent = try store.get(alloc, intent_key);
     defer alloc.free(intent);
     try std.testing.expectEqualStrings("prepared", intent[1..]);
+}
+
+test "coordinator recovery durably aborts a stale prepared transaction" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "txn-recover-stale-prepared-coordinator");
+    defer alloc.free(path);
+    cleanupTestDir(path);
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+    defer cleanupTestDir(path);
+
+    var mgr = try TxnManager.init(alloc, &store);
+    defer mgr.deinit();
+    const txn_id: TxnId = .{9} ** 16;
+    try mgr.initTransactionWithParticipantsCreatedAtAndRole(
+        txn_id,
+        10_000,
+        1_000,
+        &.{ "group:a", "group:b" },
+        true,
+    );
+    try mgr.writeIntents(txn_id, &.{.{ .key = "doc:prepared", .value = "prepared" }}, &.{});
+
+    const stats = try mgr.recoverTransactions(2_000, 3_000);
+    try std.testing.expectEqual(@as(u64, 1), stats.auto_aborted);
+    try std.testing.expectEqual(TxnStatus.aborted, try mgr.getTransactionStatus(txn_id));
 }
 
 test "transaction recovery age is independent from logical begin timestamp" {
