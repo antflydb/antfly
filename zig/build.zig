@@ -2273,51 +2273,68 @@ pub fn build(b: *std.Build) void {
     });
     _ = lib;
 
+    const capi_root_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/capi_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, capi_root_mod, false, link_libc);
+    const capi_usermgr_storage_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    capi_usermgr_storage_mod.addImport("antfly_root", capi_root_mod);
+    capi_usermgr_storage_mod.addImport("antfly_platform", platform_mod);
+    capi_root_mod.addImport("usermgr_storage", capi_usermgr_storage_mod);
+
     const capi_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/capi/db.zig"),
         .target = target,
         .optimize = optimize,
         .pic = true,
     });
-    capi_mod.addImport("antfly-zig", lib_mod);
+    capi_mod.addImport("antfly_storage_root", capi_root_mod);
     capi_mod.addImport("structlog", structlog_mod);
 
-    // Compile the DB/storage C ABI as a reusable PIC object. Today the
-    // shared library is its first consumer; keeping code generation separate
-    // from the final link provides the compiled boundary that the executable's
-    // storage adapters can consume incrementally without re-analyzing db.zig.
+    // Unlinked and focused CAPI builds compile the storage ABI as a standalone
+    // PIC object. Linked release builds instead include the same exports in the
+    // distributed storage-kernel archive below, so the executable and shared
+    // libraries reuse one optimized storage graph.
     const capi_object = b.addObject(.{
         .name = "antfly-storage-kernel",
         .root_module = capi_mod,
         .max_rss = 8 * 1024 * 1024 * 1024,
     });
     const capi_link_mod = b.createModule(.{
+        .root_source_file = if (linked_runtime_libraries) b.path("pkg/antfly/src/capi/link_anchor.zig") else null,
         .target = target,
         .optimize = optimize,
         .link_libc = link_libc,
         .strip = strip,
     });
-    capi_link_mod.addObject(capi_object);
+    if (!linked_runtime_libraries) capi_link_mod.addObject(capi_object);
     const capi_lib = b.addLibrary(.{
         .linkage = .dynamic,
         .name = "antfly_zig_capi",
         .root_module = capi_link_mod,
-        .max_rss = 1024 * 1024 * 1024,
+        .max_rss = 2 * 1024 * 1024 * 1024,
     });
     const install_capi_lib = b.addInstallArtifact(capi_lib, .{});
 
     const lite_capi_link_mod = b.createModule(.{
+        .root_source_file = if (linked_runtime_libraries) b.path("pkg/antfly/src/capi/link_anchor.zig") else null,
         .target = target,
         .optimize = optimize,
         .link_libc = link_libc,
         .strip = strip,
     });
-    lite_capi_link_mod.addObject(capi_object);
+    if (!linked_runtime_libraries) lite_capi_link_mod.addObject(capi_object);
     const lite_capi_lib = b.addLibrary(.{
         .linkage = .dynamic,
         .name = "antfly",
         .root_module = lite_capi_link_mod,
-        .max_rss = 1024 * 1024 * 1024,
+        .max_rss = 2 * 1024 * 1024 * 1024,
     });
     const install_lite_capi_lib = b.addInstallArtifact(lite_capi_lib, .{});
     const install_lite_capi_header = b.addInstallFileWithDir(
@@ -8532,9 +8549,11 @@ pub fn build(b: *std.Build) void {
                 .target = target,
                 .optimize = optimize,
                 .sanitize_thread = sanitize_thread,
+                .pic = if (unit == .distributed) true else null,
             });
             antfly_imports.configure(b, role_mod, false, link_libc);
             role_mod.addImport("antfly-client", antfly_client_pkg_mod);
+            if (unit == .distributed) role_mod.addImport("antfly_storage_root", role_mod);
             role_mod.addOptions("runtime_library_options", unit_options);
             const role_usermgr_storage_mod = b.createModule(.{
                 .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
@@ -8545,17 +8564,13 @@ pub fn build(b: *std.Build) void {
             role_usermgr_storage_mod.addImport("antfly_platform", platform_mod);
             role_mod.addImport("usermgr_storage", role_usermgr_storage_mod);
 
-            const role_library = b.addLibrary(.{
-                .name = b.fmt("antfly-runtime-{s}", .{@tagName(unit)}),
+            const role_artifact = b.addLibrary(.{
+                .name = if (unit == .distributed)
+                    "antfly-storage-kernel"
+                else
+                    b.fmt("antfly-runtime-{s}", .{@tagName(unit)}),
                 .root_module = role_mod,
                 .linkage = .static,
-                // Zig's build runner uses these claims to run as many LLVM
-                // codegen steps concurrently as fit in available RAM. The
-                // claims include headroom over fresh native Linux and macOS
-                // ARM64 ReleaseFast measurements. A --maxrss budget below the
-                // pod request admits API, CLI, and distributed together while
-                // retaining runner/linker/page-cache headroom; inference runs
-                // with the separately claimed PIC storage kernel.
                 .max_rss = switch (unit) {
                     .api_kernel => 5 * 1024 * 1024 * 1024,
                     .cli => 3 * 1024 * 1024 * 1024,
@@ -8563,12 +8578,21 @@ pub fn build(b: *std.Build) void {
                     .inference => 8 * 1024 * 1024 * 1024,
                 },
             });
+            // Zig's build runner uses these claims to run as many LLVM codegen
+            // steps concurrently as fit in available RAM. The distributed
+            // archive is PIC because the executable and C ABI libraries share
+            // it; all three consumers therefore reuse the same analyzed and
+            // optimized storage graph.
+            if (unit == .distributed) {
+                capi_link_mod.linkLibrary(role_artifact);
+                lite_capi_link_mod.linkLibrary(role_artifact);
+            }
+            antfly_main.root_module.linkLibrary(role_artifact);
             if (strip) {
                 var visited = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
                 defer visited.deinit();
                 setStripRecursively(role_mod, &visited);
             }
-            antfly_main.root_module.linkLibrary(role_library);
         }
     }
 

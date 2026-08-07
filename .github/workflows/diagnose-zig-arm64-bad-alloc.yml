@@ -63,9 +63,10 @@ jobs:
           # Keep 4000Mi of the ARC pod's 24000Mi request outside Zig's
           # scheduling budget. Step max_rss values are scheduling claims, not
           # a complete accounting of build-runner state and page cache. Claims
-          # admit API, CLI, and distributed as a 19GiB group; inference and the
-          # PIC storage kernel form a 16GiB group. The pod reserve covers runner
-          # state, linker work, page cache, and measurement drift.
+          # admit API, CLI, and the PIC storage kernel as a 19GiB initial
+          # group. As the small units finish, inference can overlap the kernel
+          # within the same 19GiB budget. The pod reserve covers runner state,
+          # linker work, page cache, and measurement drift.
           cd zig
           /usr/bin/time -v -o "$RUNNER_TEMP/linked-runtime.time" \
             zig build install lite-capi \
@@ -96,8 +97,14 @@ jobs:
           file "$library"
           readelf -h "$binary" | tee "$RUNNER_TEMP/linked-runtime.elf-header"
           readelf -h "$library" | tee "$RUNNER_TEMP/lite-capi.elf-header"
+          readelf -Ws "$library" | tee "$RUNNER_TEMP/lite-capi.symbols"
           grep -Eq 'Machine:.*AArch64' "$RUNNER_TEMP/linked-runtime.elf-header"
           grep -Eq 'Machine:.*AArch64' "$RUNNER_TEMP/lite-capi.elf-header"
+          grep -Eq 'GLOBAL.*antfly_db_open$' "$RUNNER_TEMP/lite-capi.symbols"
+          if grep -Eq 'GLOBAL.*antfly_(runtime_|api_kernel_|standalone_inference_|storage_kernel_link_anchor)' "$RUNNER_TEMP/lite-capi.symbols"; then
+            echo "private executable ABI leaked from libantfly.so" >&2
+            exit 1
+          fi
           stat -c 'binary_size_bytes=%s' "$binary" | tee "$RUNNER_TEMP/linked-runtime.size"
           stat -c 'lite_capi_size_bytes=%s' "$library" | tee "$RUNNER_TEMP/lite-capi.size"
 
@@ -118,5 +125,6 @@ jobs:
             ${{ runner.temp }}/linked-runtime.elf-header
             ${{ runner.temp }}/linked-runtime.size
             ${{ runner.temp }}/lite-capi.elf-header
+            ${{ runner.temp }}/lite-capi.symbols
             ${{ runner.temp }}/lite-capi.size
           if-no-files-found: error

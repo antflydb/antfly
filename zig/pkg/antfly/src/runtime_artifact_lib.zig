@@ -30,6 +30,10 @@ const api_kernel_exports = if (unit_options.unit == .api_kernel)
     @import("api/kernel_exports.zig")
 else
     struct {};
+const storage_kernel_exports = if (unit_options.unit == .distributed)
+    @import("capi/db.zig")
+else
+    struct {};
 
 const cli_runtime = if (unit_options.unit == .cli) @import("cli_runtime.zig") else struct {};
 const data_runtime = if (unit_options.unit == .distributed) @import("data/runtime.zig") else struct {};
@@ -52,10 +56,28 @@ const standalone_inference_host = if (unit_options.unit == .inference)
 else
     struct {};
 
-// The user-manager storage adapter deliberately imports these through the
-// compilation root so it shares their exact Zig type identity.
+// The embedded CAPI imports the distributed compilation root as its focused
+// storage facade so every shared file has one Zig module/type identity. The
+// user-manager adapter likewise imports its storage types through this root.
+pub const aggregation = @import("search/aggregation.zig");
+pub const backup_codec = @import("storage/backup_codec.zig");
+pub const db = @import("storage/db/mod.zig");
+pub const geo = @import("search/geo.zig");
+pub const graph = @import("graph/graph.zig");
+pub const graph_pattern = @import("graph/pattern.zig");
+pub const graph_query = @import("graph/query.zig");
+pub const hbc = @import("storage/hbc_adapter.zig");
+pub const lite = @import("storage/lite/mod.zig");
 pub const lsm_backend = @import("storage/lsm_backend/mod.zig");
+pub const paths = @import("graph/paths.zig");
+pub const platform_clock = @import("antfly_platform").clock;
+pub const platform_time = @import("antfly_platform").time;
+pub const portable_backup = @import("storage/portable_backup.zig");
+pub const public_api = @import("api/mod.zig");
+pub const raft = @import("raft/mod.zig");
 pub const storage_backend_erased = @import("storage/backend_erased.zig");
+pub const transactions = @import("storage/transactions.zig");
+pub const traversal = @import("graph/traversal.zig");
 
 fn runtimeEntry(
     context: *const bridge.Context,
@@ -132,47 +154,55 @@ fn standaloneEntry(context: *const bridge.Context) callconv(.c) c_int {
     return runtimeEntry(context, "standalone", runStandalone);
 }
 
+fn exportInternal(comptime function: anytype, comptime name: []const u8) void {
+    @export(function, .{ .name = name, .visibility = .hidden });
+}
+
 comptime {
     switch (unit_options.unit) {
         .api_kernel => {
-            @export(&api_kernel_exports.create, .{ .name = "antfly_api_kernel_create" });
-            @export(&api_kernel_exports.destroy, .{ .name = "antfly_api_kernel_destroy" });
-            @export(&api_kernel_exports.requestStats, .{ .name = "antfly_api_kernel_request_stats" });
-            @export(&api_kernel_exports.setProvider, .{ .name = "antfly_api_kernel_set_provider" });
-            @export(&api_kernel_exports.setHAExecutor, .{ .name = "antfly_api_kernel_set_ha_executor" });
-            @export(&api_kernel_exports.executor, .{ .name = "antfly_api_kernel_executor" });
-            @export(&api_kernel_exports.streamingExecutor, .{ .name = "antfly_api_kernel_streaming_executor" });
-            @export(&api_kernel_exports.attachRuntimeRestoreStore, .{ .name = "antfly_api_kernel_attach_runtime_restore_store" });
-            @export(&api_kernel_exports.attachReplicatedRestoreStore, .{ .name = "antfly_api_kernel_attach_replicated_restore_store" });
-            @export(&api_kernel_exports.resumeRestoreJobs, .{ .name = "antfly_api_kernel_resume_restore_jobs" });
-            @export(&api_kernel_exports.pollRestoreJobs, .{ .name = "antfly_api_kernel_poll_restore_jobs" });
-            @export(&api_kernel_exports.prepareRestoreLeadership, .{ .name = "antfly_api_kernel_prepare_restore_leadership" });
-            @export(&api_kernel_exports.scheduleSessionMaintenance, .{ .name = "antfly_api_kernel_schedule_session_maintenance" });
-            @export(&api_kernel_exports.storageMaintenanceActive, .{ .name = "antfly_api_kernel_storage_maintenance_active" });
-            @export(&api_kernel_exports.handle, .{ .name = "antfly_api_kernel_handle" });
-            @export(&api_kernel_exports.handleInternal, .{ .name = "antfly_api_kernel_handle_internal" });
-            @export(&api_kernel_exports.handlerCreate, .{ .name = "antfly_api_kernel_handler_create" });
-            @export(&api_kernel_exports.handlerInit, .{ .name = "antfly_api_kernel_handler_init" });
-            @export(&api_kernel_exports.handlerStats, .{ .name = "antfly_api_kernel_handler_stats" });
-            @export(&api_kernel_exports.handlerRegisterRoutes, .{ .name = "antfly_api_kernel_handler_register_routes" });
-            @export(&api_kernel_exports.handlerDestroy, .{ .name = "antfly_api_kernel_handler_destroy" });
+            exportInternal(&api_kernel_exports.create, "antfly_api_kernel_create");
+            exportInternal(&api_kernel_exports.destroy, "antfly_api_kernel_destroy");
+            exportInternal(&api_kernel_exports.requestStats, "antfly_api_kernel_request_stats");
+            exportInternal(&api_kernel_exports.setProvider, "antfly_api_kernel_set_provider");
+            exportInternal(&api_kernel_exports.setHAExecutor, "antfly_api_kernel_set_ha_executor");
+            exportInternal(&api_kernel_exports.executor, "antfly_api_kernel_executor");
+            exportInternal(&api_kernel_exports.streamingExecutor, "antfly_api_kernel_streaming_executor");
+            exportInternal(&api_kernel_exports.attachRuntimeRestoreStore, "antfly_api_kernel_attach_runtime_restore_store");
+            exportInternal(&api_kernel_exports.attachReplicatedRestoreStore, "antfly_api_kernel_attach_replicated_restore_store");
+            exportInternal(&api_kernel_exports.resumeRestoreJobs, "antfly_api_kernel_resume_restore_jobs");
+            exportInternal(&api_kernel_exports.pollRestoreJobs, "antfly_api_kernel_poll_restore_jobs");
+            exportInternal(&api_kernel_exports.prepareRestoreLeadership, "antfly_api_kernel_prepare_restore_leadership");
+            exportInternal(&api_kernel_exports.scheduleSessionMaintenance, "antfly_api_kernel_schedule_session_maintenance");
+            exportInternal(&api_kernel_exports.storageMaintenanceActive, "antfly_api_kernel_storage_maintenance_active");
+            exportInternal(&api_kernel_exports.handle, "antfly_api_kernel_handle");
+            exportInternal(&api_kernel_exports.handleInternal, "antfly_api_kernel_handle_internal");
+            exportInternal(&api_kernel_exports.handlerCreate, "antfly_api_kernel_handler_create");
+            exportInternal(&api_kernel_exports.handlerInit, "antfly_api_kernel_handler_init");
+            exportInternal(&api_kernel_exports.handlerStats, "antfly_api_kernel_handler_stats");
+            exportInternal(&api_kernel_exports.handlerRegisterRoutes, "antfly_api_kernel_handler_register_routes");
+            exportInternal(&api_kernel_exports.handlerDestroy, "antfly_api_kernel_handler_destroy");
         },
-        .cli => @export(&cliEntry, .{ .name = "antfly_runtime_cli" }),
+        .cli => exportInternal(&cliEntry, "antfly_runtime_cli"),
         .distributed => {
-            @export(&dataEntry, .{ .name = "antfly_runtime_data" });
-            @export(&metadataEntry, .{ .name = "antfly_runtime_metadata" });
-            @export(&serverlessEntry, .{ .name = "antfly_runtime_serverless" });
-            @export(&standaloneEntry, .{ .name = "antfly_runtime_standalone" });
-            @export(&restore_staging_exports.create, .{ .name = "antfly_restore_staging_create" });
-            @export(&restore_staging_exports.destroy, .{ .name = "antfly_restore_staging_destroy" });
+            // Importing the C ABI implementation makes its `pub export`
+            // declarations roots of this PIC archive. The executable and both
+            // C ABI library names link this exact compiled artifact.
+            _ = storage_kernel_exports;
+            exportInternal(&dataEntry, "antfly_runtime_data");
+            exportInternal(&metadataEntry, "antfly_runtime_metadata");
+            exportInternal(&serverlessEntry, "antfly_runtime_serverless");
+            exportInternal(&standaloneEntry, "antfly_runtime_standalone");
+            exportInternal(&restore_staging_exports.create, "antfly_restore_staging_create");
+            exportInternal(&restore_staging_exports.destroy, "antfly_restore_staging_destroy");
         },
         .inference => {
-            @export(&inferenceEntry, .{ .name = "antfly_runtime_inference" });
-            @export(&standaloneInferenceCreate, .{ .name = "antfly_standalone_inference_create" });
-            @export(&standaloneInferenceConfigure, .{ .name = "antfly_standalone_inference_configure" });
-            @export(&standaloneInferenceProvider, .{ .name = "antfly_standalone_inference_provider" });
-            @export(&standaloneInferenceRegisterRoutes, .{ .name = "antfly_standalone_inference_register_routes" });
-            @export(&standaloneInferenceDestroy, .{ .name = "antfly_standalone_inference_destroy" });
+            exportInternal(&inferenceEntry, "antfly_runtime_inference");
+            exportInternal(&standaloneInferenceCreate, "antfly_standalone_inference_create");
+            exportInternal(&standaloneInferenceConfigure, "antfly_standalone_inference_configure");
+            exportInternal(&standaloneInferenceProvider, "antfly_standalone_inference_provider");
+            exportInternal(&standaloneInferenceRegisterRoutes, "antfly_standalone_inference_register_routes");
+            exportInternal(&standaloneInferenceDestroy, "antfly_standalone_inference_destroy");
         },
     }
 }
