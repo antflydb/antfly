@@ -344,7 +344,14 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
         return try http_route_helpers.jsonResponse(ctx.alloc, struct {}{});
     }
 
-    if (routes.Routes.matchGroupBatch(path)) |batch_route| {
+    const routed_batch_route = routes.Routes.matchGroupRoutedBatch(path);
+    if (routed_batch_route orelse routes.Routes.matchGroupBatch(path)) |batch_route| {
+        const forwarding = internal_batch_forwarding.parse(req) catch {
+            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid raft batch forwarding headers");
+        };
+        if (routed_batch_route != null and forwarding == null) {
+            return try http_route_helpers.textResponse(ctx.alloc, 400, "missing raft batch forwarding headers");
+        }
         const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
         var batch_req = batch_api.parseInternalBatchRequest(ctx.alloc, req.body) catch |err| switch (err) {
             error.InvalidBatchRequest => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid batch request"),
@@ -357,14 +364,13 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
             else => return err,
         };
 
-        const forwarding = internal_batch_forwarding.parse(req) catch {
-            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid raft batch forwarding headers");
-        };
         _ = ((if (forwarding) |forwarding_context|
             if (ctx.routed_raft_batch_writer) |writer|
                 writer.run(ctx.alloc, batch_route.group_id, batch_route.table_name, batch_req.req, forwarding_context, req.cancellation)
             else
                 return try http_route_helpers.textResponse(ctx.alloc, 503, "routed raft batch unavailable")
+        else if (ctx.routed_raft_batch_writer) |writer|
+            writer.run(ctx.alloc, batch_route.group_id, batch_route.table_name, batch_req.req, internal_batch_forwarding.legacy_context, req.cancellation)
         else
             writes.batchGroupLocal(ctx.alloc, batch_route.group_id, batch_route.table_name, batch_req.req)) catch |err| switch (err) {
             error.InvalidBatchRequest => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid batch request"),
@@ -1093,17 +1099,54 @@ test "internal group write route dispatches bounded raft forwarding context" {
         .txn_validator = TestWriteSource.txnValidator(),
     }, .{
         .method = .POST,
-        .uri = "/internal/v1/groups/7/tables/docs/batch",
+        .uri = "/internal/v1/groups/7/tables/docs/batch-routed-v1",
         .headers = &headers,
         .body = "{}",
         .cancellation = &cancellation,
-    }, "/internal/v1/groups/7/tables/docs/batch")).?;
+    }, "/internal/v1/groups/7/tables/docs/batch-routed-v1")).?;
     defer resp.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u16, 201), resp.status);
     try std.testing.expectEqual(@as(u32, 425), capture.forwarding.?.remaining_ms);
     try std.testing.expectEqual(@as(u8, 1), capture.forwarding.?.forwards_remaining);
     try std.testing.expect(!capture.forwarding.?.campaign_allowed);
+
+    capture.forwarding = null;
+    var legacy_resp = (try handle(.{
+        .alloc = std.testing.allocator,
+        .shard_ops = null,
+        .writes = TestWriteSource.source(),
+        .routed_raft_batch_writer = .{ .ptr = &capture, .write = Capture.write },
+        .batch_validator = TestWriteSource.batchValidator(),
+        .txn_validator = TestWriteSource.txnValidator(),
+    }, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/batch",
+        .body = "{}",
+        .cancellation = &cancellation,
+    }, "/internal/v1/groups/7/tables/docs/batch")).?;
+    defer legacy_resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 201), legacy_resp.status);
+    try std.testing.expectEqual(internal_batch_forwarding.legacy_context, capture.forwarding.?);
+
+    capture.forwarding = null;
+    var missing_headers_resp = (try handle(.{
+        .alloc = std.testing.allocator,
+        .shard_ops = null,
+        .writes = TestWriteSource.source(),
+        .routed_raft_batch_writer = .{ .ptr = &capture, .write = Capture.write },
+        .batch_validator = TestWriteSource.batchValidator(),
+        .txn_validator = TestWriteSource.txnValidator(),
+    }, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/batch-routed-v1",
+        .body = "{}",
+    }, "/internal/v1/groups/7/tables/docs/batch-routed-v1")).?;
+    defer missing_headers_resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 400), missing_headers_resp.status);
+    try std.testing.expect(capture.forwarding == null);
 }
 
 test "internal group write routes validate transaction status requests" {

@@ -1657,7 +1657,7 @@ pub const ApiHttpClient = struct {
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
             table_name,
-            routes.Routes.batch_suffix,
+            if (forwarding != null) routes.Routes.routed_batch_suffix else routes.Routes.batch_suffix,
         });
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
@@ -1698,7 +1698,7 @@ pub const ApiHttpClient = struct {
         defer resp.deinit(self.alloc);
         if (resp.status != 201) {
             if (resp.status == 409) return remoteGroupConflictError(resp.body);
-            if (resp.status == 404) return error.UnknownGroup;
+            if (resp.status == 404) return if (forwarding != null) error.RaftBatchForwardingUnsupported else error.UnknownGroup;
             if (resp.status == 503) return error.LeaderUnavailable;
             const preview = resp.body[0..@min(resp.body.len, 256)];
             std.log.warn("internal group batch returned unexpected status={} uri={s} body={s}", .{ resp.status, uri, preview });
@@ -3000,6 +3000,7 @@ test "api http client forwards bounded raft batch routing context without alloca
         fn execute(_: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) anyerror!http_common.HttpResponse {
             try std.testing.expectEqual(@as(?u32, 500), req.timeout_ms);
             try std.testing.expect(req.cancellation != null);
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, routes.Routes.routed_batch_suffix));
             const forwarding = (try internal_batch_forwarding.parse(req)).?;
             try std.testing.expectEqual(@as(u32, 425), forwarding.remaining_ms);
             try std.testing.expectEqual(@as(u8, 1), forwarding.forwards_remaining);
@@ -3021,6 +3022,40 @@ test "api http client forwards bounded raft batch routing context without alloca
         &cancellation,
     );
     response.deinit(std.testing.allocator);
+}
+
+test "api http client rejects unsupported routed batch protocol without legacy replay" {
+    const UnsupportedExecutor = struct {
+        attempts: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.attempts += 1;
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, routes.Routes.routed_batch_suffix));
+            try std.testing.expect((try internal_batch_forwarding.parse(req)) != null);
+            return .{ .status = 404, .body = try alloc.dupe(u8, "not found") };
+        }
+    };
+
+    var executor = UnsupportedExecutor{};
+    var client = ApiHttpClient.init(std.testing.allocator, executor.executor());
+    try std.testing.expectError(error.RaftBatchForwardingUnsupported, client.fetchGroupBatchWithForwarding(
+        "http://127.0.0.1:1",
+        7,
+        "docs",
+        "{}",
+        500,
+        .{ .remaining_ms = 425, .forwards_remaining = 1, .campaign_allowed = false },
+        null,
+    ));
+    try std.testing.expectEqual(@as(usize, 1), executor.attempts);
 }
 
 test "api http client encodes merge doc identity reassignment action flag" {

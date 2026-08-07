@@ -18,6 +18,7 @@ pub const remaining_ms_header = "X-Antfly-Raft-Batch-Remaining-Ms";
 pub const forwards_remaining_header = "X-Antfly-Raft-Batch-Forwards-Remaining";
 pub const campaign_allowed_header = "X-Antfly-Raft-Batch-Campaign-Allowed";
 pub const max_forwards: u8 = 2;
+pub const max_remaining_ms: u32 = 5_000;
 
 /// Routing state carried only between trusted internal group-write endpoints.
 /// The remaining budget is relative because monotonic clocks are process-local.
@@ -26,6 +27,17 @@ pub const Context = struct {
     remaining_ms: u32,
     forwards_remaining: u8,
     campaign_allowed: bool,
+};
+
+/// A no-header request can originate from a pre-protocol node during a rolling
+/// upgrade. It may execute locally, but it must not start another request-
+/// driven campaign or forward again because neither ownership nor hop state is
+/// available from the caller. Upstream socket cancellation still bounds this
+/// conservative compatibility wait.
+pub const legacy_context = Context{
+    .remaining_ms = max_remaining_ms,
+    .forwards_remaining = 0,
+    .campaign_allowed = false,
 };
 
 pub fn parse(req: http_common.HttpRequest) !?Context {
@@ -47,7 +59,7 @@ pub fn parse(req: http_common.HttpRequest) !?Context {
         false
     else
         return error.InvalidRaftBatchForwardingHeaders;
-    if (remaining_ms == 0 or forwards_remaining > max_forwards) {
+    if (remaining_ms == 0 or remaining_ms > max_remaining_ms or forwards_remaining > max_forwards) {
         return error.InvalidRaftBatchForwardingHeaders;
     }
 
@@ -84,6 +96,16 @@ test "internal batch forwarding headers are all-or-none and strictly parsed" {
         .method = .POST,
         .uri = "/",
         .headers = &zero_budget,
+    }));
+    const excessive_budget = [_]http_common.RequestHeader{
+        .{ .name = remaining_ms_header, .value = "5001" },
+        .{ .name = forwards_remaining_header, .value = "1" },
+        .{ .name = campaign_allowed_header, .value = "true" },
+    };
+    try std.testing.expectError(error.InvalidRaftBatchForwardingHeaders, parse(.{
+        .method = .POST,
+        .uri = "/",
+        .headers = &excessive_budget,
     }));
     const excessive_hops = [_]http_common.RequestHeader{
         .{ .name = remaining_ms_header, .value = "425" },
