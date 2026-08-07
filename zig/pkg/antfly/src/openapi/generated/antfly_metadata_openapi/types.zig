@@ -2880,6 +2880,10 @@ pub const TableRepairIssue = struct {
     /// Derived replay sequence that observed the issue.
     sequence: i64,
     reason: ArtifactRepairReason,
+    /// Number of enrichment generation attempts made before this issue was parked.
+    generation_attempts: i64,
+    /// Stable source-generation error code that caused this issue to be parked.
+    generation_error: ?[]const u8 = null,
     /// Number of repair attempts made for this issue.
     attempts: i64,
     /// Monotonic timestamp when this issue was first recorded.

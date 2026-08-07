@@ -26,6 +26,7 @@ class TableRepairIssue:
             repairable (bool): Whether this artifact kind currently has an automated repair reprocessor.
             sequence (int): Derived replay sequence that observed the issue.
             reason (ArtifactRepairReason): Reason an artifact was added to the repair queue.
+            generation_attempts (int): Number of enrichment generation attempts made before this issue was parked.
             attempts (int): Number of repair attempts made for this issue.
             first_seen_ns (int): Monotonic timestamp when this issue was first recorded.
             last_seen_ns (int): Monotonic timestamp when this issue was last observed or attempted.
@@ -35,6 +36,7 @@ class TableRepairIssue:
             artifact_key (str | Unset): Hex-encoded internal artifact storage key, when known.
             chunk_id (int | None | Unset): Chunk ordinal for chunk-derived artifacts.
             unsupported_reason (str | Unset): Stable reason code when repairable is false.
+            generation_error (str | Unset): Stable source-generation error code that caused this issue to be parked.
             last_error (str | Unset): Last stable repair error code, when a repair attempt failed.
     """
 
@@ -45,6 +47,7 @@ class TableRepairIssue:
     repairable: bool
     sequence: int
     reason: ArtifactRepairReason
+    generation_attempts: int
     attempts: int
     first_seen_ns: int
     last_seen_ns: int
@@ -54,6 +57,7 @@ class TableRepairIssue:
     artifact_key: str | Unset = UNSET
     chunk_id: int | None | Unset = UNSET
     unsupported_reason: str | Unset = UNSET
+    generation_error: str | Unset = UNSET
     last_error: str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -71,6 +75,8 @@ class TableRepairIssue:
         sequence = self.sequence
 
         reason = self.reason.value
+
+        generation_attempts = self.generation_attempts
 
         attempts = self.attempts
 
@@ -94,6 +100,8 @@ class TableRepairIssue:
 
         unsupported_reason = self.unsupported_reason
 
+        generation_error = self.generation_error
+
         last_error = self.last_error
 
         field_dict: dict[str, Any] = {}
@@ -107,6 +115,7 @@ class TableRepairIssue:
                 "repairable": repairable,
                 "sequence": sequence,
                 "reason": reason,
+                "generation_attempts": generation_attempts,
                 "attempts": attempts,
                 "first_seen_ns": first_seen_ns,
                 "last_seen_ns": last_seen_ns,
@@ -124,6 +133,8 @@ class TableRepairIssue:
             field_dict["chunk_id"] = chunk_id
         if unsupported_reason is not UNSET:
             field_dict["unsupported_reason"] = unsupported_reason
+        if generation_error is not UNSET:
+            field_dict["generation_error"] = generation_error
         if last_error is not UNSET:
             field_dict["last_error"] = last_error
 
@@ -145,6 +156,8 @@ class TableRepairIssue:
         sequence = d.pop("sequence")
 
         reason = ArtifactRepairReason(d.pop("reason"))
+
+        generation_attempts = d.pop("generation_attempts")
 
         attempts = d.pop("attempts")
 
@@ -171,6 +184,8 @@ class TableRepairIssue:
 
         unsupported_reason = d.pop("unsupported_reason", UNSET)
 
+        generation_error = d.pop("generation_error", UNSET)
+
         last_error = d.pop("last_error", UNSET)
 
         table_repair_issue = cls(
@@ -181,6 +196,7 @@ class TableRepairIssue:
             repairable=repairable,
             sequence=sequence,
             reason=reason,
+            generation_attempts=generation_attempts,
             attempts=attempts,
             first_seen_ns=first_seen_ns,
             last_seen_ns=last_seen_ns,
@@ -190,6 +206,7 @@ class TableRepairIssue:
             artifact_key=artifact_key,
             chunk_id=chunk_id,
             unsupported_reason=unsupported_reason,
+            generation_error=generation_error,
             last_error=last_error,
         )
 

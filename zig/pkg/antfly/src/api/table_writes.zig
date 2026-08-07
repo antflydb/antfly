@@ -479,6 +479,7 @@ fn cloneArtifactRepairIssueAlloc(alloc: std.mem.Allocator, issue: db_mod.types.A
         .repairable = issue.repairable,
         .sequence = issue.sequence,
         .reason = issue.reason,
+        .generation_attempts = issue.generation_attempts,
         .attempts = issue.attempts,
         .first_seen_ns = issue.first_seen_ns,
         .last_seen_ns = issue.last_seen_ns,
@@ -492,6 +493,7 @@ fn cloneArtifactRepairIssueAlloc(alloc: std.mem.Allocator, issue: db_mod.types.A
     out.artifact_name = try alloc.dupe(u8, issue.artifact_name);
     out.artifact_key = try alloc.dupe(u8, issue.artifact_key);
     out.unsupported_reason = try alloc.dupe(u8, issue.unsupported_reason);
+    out.generation_error = try alloc.dupe(u8, issue.generation_error);
     out.last_error = try alloc.dupe(u8, issue.last_error);
     return out;
 }
@@ -4833,6 +4835,7 @@ pub const ProvisionedTableWriteSource = struct {
         index_repair_pending: bool = false,
         index_repair_attempted: bool = false,
         index_repair_repaired: bool = false,
+        index_repair_degraded: bool = false,
         index_repair_disk_wait: bool = false,
         index_repair_retry_at_ms: u64 = 0,
     };
@@ -19554,6 +19557,7 @@ fn catchUpManagedDb(
     var repaired_restore_runtime = false;
     var repaired_dense_artifacts: usize = 0;
     var repaired_indexes: usize = 0;
+    var degraded_indexes: usize = 0;
     var made_progress = false;
     defer if (made_progress) {
         // Only retire shared handles after this isolated owner changed durable
@@ -19666,7 +19670,8 @@ fn catchUpManagedDb(
         }
         const repair = try db.repairRecoverableStartupIndexFailures(alloc, 1, index_repair_options);
         repaired_indexes = repair.repaired;
-        made_progress = made_progress or repair.repaired != 0 or repair.discovered != 0;
+        degraded_indexes = repair.degraded;
+        made_progress = made_progress or repair.attempted != 0 or repair.repaired != 0 or repair.discovered != 0;
         repair_summary = try db.indexRepairIntentSummary(alloc);
         if (repair_summary.runnable != 0) {
             return .{
@@ -19676,8 +19681,17 @@ fn catchUpManagedDb(
                 .index_repair_pending = true,
                 .index_repair_attempted = repair.attempted != 0,
                 .index_repair_repaired = repair.repaired != 0,
+                .index_repair_degraded = repair.degraded != 0,
                 .index_repair_disk_wait = repair.disk_waits != 0,
                 .index_repair_retry_at_ms = repair.next_retry_at_ms,
+            };
+        }
+        if (degraded_indexes != 0) {
+            return .{
+                .had_debt = true,
+                .made_progress = made_progress,
+                .index_repair_attempted = repair.attempted != 0,
+                .index_repair_degraded = true,
             };
         }
     }
@@ -19754,6 +19768,7 @@ fn catchUpManagedDb(
         .made_progress = made_progress or initial_repair_debt,
         .index_repair_attempted = advance_index_repairs and repaired_indexes != 0,
         .index_repair_repaired = repaired_indexes != 0,
+        .index_repair_degraded = degraded_indexes != 0,
     };
 }
 

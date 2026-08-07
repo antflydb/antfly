@@ -1794,11 +1794,11 @@ fn coverageOutcomeTotal(produced: u64, skipped: u64, terminal_failed: u64) ?u64 
 }
 
 fn coverageCountersValid(source_total: u64, produced: u64, skipped: u64, terminal_failed: u64) bool {
-    return (coverageOutcomeTotal(produced, skipped, terminal_failed) orelse return false) <= source_total;
+    return db_mod.types.evaluateDerivedCoverageHealth(source_total, produced, skipped, terminal_failed, true, true).counters_valid;
 }
 
 fn coverageAllSourcesTerminal(source_total: u64, produced: u64, skipped: u64, terminal_failed: u64) bool {
-    return (coverageOutcomeTotal(produced, skipped, terminal_failed) orelse return false) == source_total;
+    return db_mod.types.evaluateDerivedCoverageHealth(source_total, produced, skipped, terminal_failed, true, true).all_sources_terminal;
 }
 
 fn coverageReplayCurrent(applied_sequence: u64, target_sequence: u64, catch_up_required: bool) bool {
@@ -1820,18 +1820,25 @@ fn evaluateCoverage(
         .best_effort => produced +| skipped +| terminal_failed,
         .external => produced,
     };
-    const outcome_total = coverageOutcomeTotal(produced, skipped, terminal_failed);
-    const counters_valid = if (outcome_total) |total| total <= source_total else false;
-    const all_sources_terminal = if (outcome_total) |total| total == source_total else false;
+    const health = db_mod.types.evaluateDerivedCoverageHealth(
+        source_total,
+        produced,
+        skipped,
+        terminal_failed,
+        observation_complete,
+        replay_current,
+    );
+    const counters_valid = health.counters_valid;
+    const all_sources_terminal = health.all_sources_terminal;
     const complete = observation_complete and replay_current and counters_valid and all_sources_terminal and policy_covered == source_total;
     return .{
         .covered = policy_covered,
-        .settled = outcome_total orelse 0,
+        .settled = health.settled,
         .uncovered = if (observation_complete and counters_valid) source_total -| policy_covered else null,
-        .pending = if (observation_complete and counters_valid) source_total -| (outcome_total orelse 0) else null,
+        .pending = health.pending,
         .complete = complete,
         .healthy = complete and terminal_failed == 0,
-        .degraded = observation_complete and replay_current and counters_valid and all_sources_terminal and terminal_failed > 0,
+        .degraded = health.degraded,
         .source_visible = source_total == 0 or policy_covered > 0,
         .counters_valid = counters_valid,
     };

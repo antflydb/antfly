@@ -2032,6 +2032,50 @@ pub const ArtifactRepairReason = enum {
     enrichment_failed,
 };
 
+/// Policy-independent coverage health shared by status and repair reporting.
+/// A source is settled once it has any terminal outcome; settled failures are
+/// degraded, never pending and never healthy completion.
+pub const DerivedCoverageHealth = struct {
+    settled: u64,
+    pending: ?u64,
+    counters_valid: bool,
+    all_sources_terminal: bool,
+    degraded: bool,
+};
+
+pub fn evaluateDerivedCoverageHealth(
+    source_total: u64,
+    produced: u64,
+    skipped: u64,
+    terminal_failed: u64,
+    observation_complete: bool,
+    replay_current: bool,
+) DerivedCoverageHealth {
+    const produced_and_skipped = std.math.add(u64, produced, skipped) catch return .{
+        .settled = 0,
+        .pending = null,
+        .counters_valid = false,
+        .all_sources_terminal = false,
+        .degraded = false,
+    };
+    const settled = std.math.add(u64, produced_and_skipped, terminal_failed) catch return .{
+        .settled = 0,
+        .pending = null,
+        .counters_valid = false,
+        .all_sources_terminal = false,
+        .degraded = false,
+    };
+    const counters_valid = settled <= source_total;
+    const all_sources_terminal = counters_valid and settled == source_total;
+    return .{
+        .settled = settled,
+        .pending = if (observation_complete and counters_valid) source_total - settled else null,
+        .counters_valid = counters_valid,
+        .all_sources_terminal = all_sources_terminal,
+        .degraded = observation_complete and replay_current and all_sources_terminal and terminal_failed > 0,
+    };
+}
+
 pub const ArtifactRepairIssue = struct {
     artifact_kind: ArtifactRepairKind = .embedding,
     index_name: []const u8 = "",
@@ -2046,6 +2090,10 @@ pub const ArtifactRepairIssue = struct {
     unsupported_reason: []const u8 = "",
     sequence: u64 = 0,
     reason: ArtifactRepairReason = .missing_artifact,
+    /// Number of source-generation attempts made before the request was
+    /// parked. Kept separate from repair attempts for operational clarity.
+    generation_attempts: u64 = 0,
+    generation_error: []const u8 = "",
     attempts: u64 = 0,
     first_seen_ns: u64 = 0,
     last_seen_ns: u64 = 0,
@@ -2060,6 +2108,7 @@ pub const ArtifactRepairIssue = struct {
         if (self.artifact_name.len > 0) alloc.free(@constCast(self.artifact_name));
         if (self.artifact_key.len > 0) alloc.free(@constCast(self.artifact_key));
         if (self.unsupported_reason.len > 0) alloc.free(@constCast(self.unsupported_reason));
+        if (self.generation_error.len > 0) alloc.free(@constCast(self.generation_error));
         if (self.last_error.len > 0) alloc.free(@constCast(self.last_error));
         self.* = undefined;
     }
@@ -2261,6 +2310,8 @@ pub const EmbeddingArtifactRepairIssue = struct {
     unsupported_reason: []const u8 = "",
     sequence: u64 = 0,
     reason: EmbeddingArtifactRepairReason = .missing_embedding_artifact,
+    generation_attempts: u64 = 0,
+    generation_error: []const u8 = "",
     attempts: u64 = 0,
     first_seen_ns: u64 = 0,
     last_seen_ns: u64 = 0,
@@ -2275,6 +2326,7 @@ pub const EmbeddingArtifactRepairIssue = struct {
         if (self.artifact_name.len > 0) alloc.free(@constCast(self.artifact_name));
         if (self.artifact_key.len > 0) alloc.free(@constCast(self.artifact_key));
         if (self.unsupported_reason.len > 0) alloc.free(@constCast(self.unsupported_reason));
+        if (self.generation_error.len > 0) alloc.free(@constCast(self.generation_error));
         if (self.last_error.len > 0) alloc.free(@constCast(self.last_error));
         self.* = undefined;
     }
@@ -2295,6 +2347,7 @@ pub fn embeddingArtifactRepairIssueFromArtifactAlloc(alloc: Allocator, issue: Ar
         .repairable = issue.repairable,
         .sequence = issue.sequence,
         .reason = embeddingArtifactRepairReasonFromArtifact(issue.reason),
+        .generation_attempts = issue.generation_attempts,
         .attempts = issue.attempts,
         .first_seen_ns = issue.first_seen_ns,
         .last_seen_ns = issue.last_seen_ns,
@@ -2308,6 +2361,7 @@ pub fn embeddingArtifactRepairIssueFromArtifactAlloc(alloc: Allocator, issue: Ar
     out.artifact_name = try alloc.dupe(u8, issue.artifact_name);
     out.artifact_key = try alloc.dupe(u8, issue.artifact_key);
     out.unsupported_reason = try alloc.dupe(u8, issue.unsupported_reason);
+    out.generation_error = try alloc.dupe(u8, issue.generation_error);
     out.last_error = try alloc.dupe(u8, issue.last_error);
     return out;
 }

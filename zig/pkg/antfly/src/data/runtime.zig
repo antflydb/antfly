@@ -10039,13 +10039,14 @@ pub const DataServer = struct {
                 continue;
             };
             std.log.info(
-                "provisioned index repair complete group={} table={s} duration_ms={} attempted={} repaired={} pending={} busy={} disk_wait={}",
+                "provisioned index repair pass group={} table={s} duration_ms={} attempted={} repaired={} degraded={} pending={} busy={} disk_wait={}",
                 .{
                     group_id,
                     table_name,
                     (platform_time.monotonicNs() -| attempt_started_ns) / std.time.ns_per_ms,
                     result.index_repair_attempted,
                     result.index_repair_repaired,
+                    result.index_repair_degraded,
                     result.index_repair_pending,
                     result.busy,
                     result.index_repair_disk_wait,

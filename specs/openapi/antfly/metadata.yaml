@@ -2175,6 +2175,7 @@ components:
         - repairable
         - sequence
         - reason
+        - generation_attempts
         - attempts
         - first_seen_ns
         - last_seen_ns
@@ -2219,6 +2220,13 @@ components:
           description: Derived replay sequence that observed the issue.
         reason:
           $ref: "#/components/schemas/ArtifactRepairReason"
+        generation_attempts:
+          type: integer
+          format: uint64
+          description: Number of enrichment generation attempts made before this issue was parked.
+        generation_error:
+          type: string
+          description: Stable source-generation error code that caused this issue to be parked.
         attempts:
           type: integer
           format: uint64
@@ -9776,13 +9784,13 @@ paths:
       - name: artifactName
         in: path
         required: true
-        description: Name of the derived document artifact.
+        description: Name of the derived asset enrichment.
         schema:
           type: string
     post:
-      summary: Reprocess a derived document artifact across a table range
+      summary: Reprocess a derived asset across a table range
       description: |
-        Runs a bounded operational repair pass for a derived document artifact
+        Runs a bounded operational repair pass for any asset producer type
         across source rows in key order. Use `next_key` from the response as
         the next request's `from_key` for simple single-cursor continuation.
         Distributed repair controllers should persist `shard_cursors` from the
@@ -9898,7 +9906,7 @@ paths:
       - name: artifactName
         in: path
         required: true
-        description: Name of the derived document artifact.
+        description: Name of the derived asset enrichment.
         schema:
           type: string
     post:
@@ -10148,10 +10156,12 @@ paths:
         schema:
           type: string
     post:
-      summary: Reprocess a derived document artifact
+      summary: Reprocess a derived asset
       description: |
         Invalidates the current artifact state and requests the producer to
-        rebuild the derived document hierarchy for the source document.
+        rebuild the derived asset for the source document. Copy, generator,
+        reader, transcriber, extractor, and document-extraction producers are
+        all supported.
       tags:
         - data_operations
       operationId: reprocessDocumentArtifact

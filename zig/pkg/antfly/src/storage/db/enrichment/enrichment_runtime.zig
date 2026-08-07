@@ -519,12 +519,26 @@ fn isRetryableEnrichmentError(err: anyerror) bool {
     return enrichmentErrorDisposition(err) == .retryable_request;
 }
 
-fn shouldYieldRequestError(runtime: *const EnrichmentRuntime, err: anyerror) bool {
+fn requestAttemptNumber(runtime: *EnrichmentRuntime) u64 {
+    const maybe_io = if (runtime.io_impl) |io_impl| io_impl.io() else null;
+    if (maybe_io) |io| runtime.mutex.lockUncancelable(io);
+    defer if (maybe_io) |io| runtime.mutex.unlock(io);
+    return @as(u64, runtime.consecutive_retry_count) +| 1;
+}
+
+fn retryBudgetAllowsYield(consecutive_retry_count: u32, max_attempts: u32) bool {
+    return @as(u64, consecutive_retry_count) +| 1 < @max(max_attempts, 1);
+}
+
+fn shouldYieldRequestError(runtime: *EnrichmentRuntime, err: anyerror) bool {
     if (isEnrichmentControlError(err)) return true;
     return switch (enrichmentErrorDisposition(err)) {
         .fatal_worker => true,
         .terminal_request => false,
-        .retryable_request => runtime.consecutive_retry_count < @max(runtime.config.worker_retry_max_attempts, 1),
+        // consecutive_retry_count contains failures already persisted by the
+        // supervisor. Count the current failure too, so max_attempts is a true
+        // total-attempt bound rather than an off-by-one retry count.
+        .retryable_request => requestAttemptNumber(runtime) < @max(runtime.config.worker_retry_max_attempts, 1),
     };
 }
 
@@ -547,6 +561,13 @@ test "enrichment retries unknown errors and isolates known permanent errors" {
     try std.testing.expectEqual(EnrichmentErrorDisposition.retryable_request, enrichmentErrorDisposition(error.UnexpectedEndOfInput));
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.UnsupportedEmbeddingProvider));
     try std.testing.expectEqual(EnrichmentErrorDisposition.fatal_worker, enrichmentErrorDisposition(error.OutOfMemory));
+}
+
+test "enrichment worker attempt budget includes the current request" {
+    try std.testing.expect(retryBudgetAllowsYield(0, 3));
+    try std.testing.expect(retryBudgetAllowsYield(1, 3));
+    try std.testing.expect(!retryBudgetAllowsYield(2, 3));
+    try std.testing.expect(!retryBudgetAllowsYield(0, 0));
 }
 
 test "enrichment worker retry delay is exponential and capped" {
@@ -1642,12 +1663,19 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             const applied = self.applied_sequence;
             const failed = self.last_error_name != null;
             const retrying = self.retrying;
+            const next_retry_at_ms = self.next_retry_at_ms;
             self.mutex.unlock(io);
 
             if (failed) return RuntimeError.EnrichmentWorkerFailed;
             if (applied >= sequence) return;
-            if (retrying) return RuntimeError.EnrichmentRetryInProgress;
-            try runForegroundCatchUpPass(self, io, sequence);
+            if (retrying and self.config.clock.nowRealtimeMs() < next_retry_at_ms) return RuntimeError.EnrichmentRetryInProgress;
+            runForegroundCatchUpPass(self, io, sequence) catch |err| {
+                handleWorkerLoopError(self, io, err);
+                return switch (enrichmentErrorDisposition(err)) {
+                    .fatal_worker => RuntimeError.EnrichmentWorkerFailed,
+                    .retryable_request, .terminal_request => RuntimeError.EnrichmentRetryInProgress,
+                };
+            };
         }
     }
 
@@ -1840,68 +1868,67 @@ fn waitForWorkerRetry(runtime: *EnrichmentRuntime, io: Io) bool {
     }
 }
 
-fn queueTerminalCoverageForRequest(runtime: *EnrichmentRuntime, window: *GeneratedReplayWindow, request: enrichment_types.GeneratedEnrichmentRequest) !void {
-    switch (request.kind) {
-        .dense_embedding => {
-            const indexes = try runtime.index_manager.denseIndexesForEmbedding(runtime.alloc, requestEmbeddingName(request), request.expected_dims);
-            defer {
-                for (indexes) |index_name| runtime.alloc.free(index_name);
-                runtime.alloc.free(indexes);
-            }
-            if (indexes.len > 0) return queueDerivedCoverageOutcome(runtime, window, request.doc_key, indexes, .terminal_failed);
-        },
-        .sparse_embedding => {
-            const indexes = try runtime.index_manager.sparseIndexesForEmbedding(runtime.alloc, requestEmbeddingName(request));
-            defer {
-                for (indexes) |index_name| runtime.alloc.free(index_name);
-                runtime.alloc.free(indexes);
-            }
-            if (indexes.len > 0) return queueDerivedCoverageOutcome(runtime, window, request.doc_key, indexes, .terminal_failed);
-        },
-        .chunk_text => {
-            const indexes = try runtime.index_manager.vectorIndexesForChunk(runtime.alloc, requestArtifactName(request));
-            defer {
-                for (indexes) |index_name| runtime.alloc.free(index_name);
-                runtime.alloc.free(indexes);
-            }
-            if (indexes.len > 0) return queueDerivedCoverageOutcome(runtime, window, request.doc_key, indexes, .terminal_failed);
-        },
-        .asset => {
-            const indexes = try runtime.index_manager.vectorIndexesDependingOnArtifact(runtime.alloc, requestArtifactName(request));
-            defer {
-                for (indexes) |index_name| runtime.alloc.free(index_name);
-                runtime.alloc.free(indexes);
-            }
-            if (indexes.len > 0) return queueDerivedCoverageOutcome(runtime, window, request.doc_key, indexes, .terminal_failed);
-        },
-    }
-    try queueDerivedCoverageOutcomeForIndex(runtime, window, request.index_name, request.doc_key, .terminal_failed);
+fn affectedIndexesForRequestAlloc(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest) ![][]u8 {
+    const consumers = switch (request.kind) {
+        .dense_embedding => try runtime.index_manager.denseIndexesForEmbedding(runtime.alloc, requestEmbeddingName(request), request.expected_dims),
+        .sparse_embedding => try runtime.index_manager.sparseIndexesForEmbedding(runtime.alloc, requestEmbeddingName(request)),
+        .chunk_text => try runtime.index_manager.vectorIndexesForChunk(runtime.alloc, requestArtifactName(request)),
+        .asset => try runtime.index_manager.vectorIndexesDependingOnArtifact(runtime.alloc, requestArtifactName(request)),
+    };
+    if (consumers.len > 0) return consumers;
+    runtime.alloc.free(consumers);
+
+    const fallback = try runtime.alloc.alloc([]u8, 1);
+    errdefer runtime.alloc.free(fallback);
+    fallback[0] = try runtime.alloc.dupe(u8, request.index_name);
+    return fallback;
+}
+
+fn freeAffectedIndexes(runtime: *EnrichmentRuntime, indexes: [][]u8) void {
+    for (indexes) |index_name| runtime.alloc.free(index_name);
+    runtime.alloc.free(indexes);
 }
 
 fn recordIsolatedRequestError(runtime: *EnrichmentRuntime, window: ?*GeneratedReplayWindow, request: enrichment_types.GeneratedEnrichmentRequest, err: anyerror) void {
     std.log.warn("enrichment request failed index={s} artifact={s}: {s}", .{ request.index_name, requestEmbeddingName(request), @errorName(err) });
+    const owned_indexes = if (runtime.coverage_apply_mutex != null)
+        affectedIndexesForRequestAlloc(runtime, request) catch |index_err| blk: {
+            std.log.err("failed to resolve enrichment request consumers index={s} doc={s}: {s}", .{ request.index_name, request.doc_key, @errorName(index_err) });
+            break :blk null;
+        }
+    else
+        null;
+    defer if (owned_indexes) |indexes| freeAffectedIndexes(runtime, indexes);
+    const fallback_indexes = [_][]const u8{request.index_name};
+    const indexes: []const []const u8 = if (owned_indexes) |values| values else &fallback_indexes;
+    const attempt_number = requestAttemptNumber(runtime);
+
     if (runtime.coverage_apply_mutex != null) {
-        if (window) |active_window| queueTerminalCoverageForRequest(runtime, active_window, request) catch |coverage_err| {
+        if (window) |active_window| queueDerivedCoverageOutcome(runtime, active_window, request.doc_key, indexes, .terminal_failed) catch |coverage_err| {
             std.log.err("failed to persist terminal coverage outcome index={s} doc={s}: {s}", .{ request.index_name, request.doc_key, @errorName(coverage_err) });
-        } else markDerivedCoverageTerminalFailedForIndex(runtime, request.index_name, request.doc_key) catch |coverage_err| {
-            std.log.err("failed to persist terminal coverage outcome index={s} doc={s}: {s}", .{ request.index_name, request.doc_key, @errorName(coverage_err) });
-        };
+        } else for (indexes) |index_name| {
+            markDerivedCoverageTerminalFailedForIndex(runtime, index_name, request.doc_key) catch |coverage_err| {
+                std.log.err("failed to persist terminal coverage outcome index={s} doc={s}: {s}", .{ index_name, request.doc_key, @errorName(coverage_err) });
+            };
+        }
     }
-    if (runtime.failure_ctx) |failure_ctx| {
-        if (runtime.failure_fn) |failure_fn| failure_fn(failure_ctx, .{
-            .kind = request.kind,
-            .index_name = request.index_name,
-            .artifact_name = switch (request.kind) {
-                .dense_embedding, .sparse_embedding => requestEmbeddingName(request),
-                .asset, .chunk_text => requestArtifactName(request),
-            },
-            .doc_key = request.doc_key,
-            .error_name = @errorName(err),
-            .attempts = runtime.consecutive_retry_count,
-            .sequence = runtime.target_sequence,
-        }) catch |record_err| {
-            std.log.err("failed to park enrichment request index={s} doc={s}: {s}", .{ request.index_name, request.doc_key, @errorName(record_err) });
-        };
+    for (indexes) |index_name| {
+        if (runtime.failure_ctx) |failure_ctx| {
+            if (runtime.failure_fn) |failure_fn| failure_fn(failure_ctx, .{
+                .kind = request.kind,
+                .index_name = index_name,
+                .artifact_name = switch (request.kind) {
+                    .dense_embedding, .sparse_embedding => requestEmbeddingName(request),
+                    .asset, .chunk_text => requestArtifactName(request),
+                },
+                .doc_key = request.doc_key,
+                .error_name = @errorName(err),
+                .attempts = attempt_number,
+                .sequence = request.sequence,
+            }) catch |record_err| {
+                std.log.err("failed to park enrichment request index={s} doc={s}: {s}", .{ index_name, request.doc_key, @errorName(record_err) });
+            };
+        }
     }
     if (runtime.io_impl) |io_impl| {
         const io = io_impl.io();
@@ -1910,14 +1937,14 @@ fn recordIsolatedRequestError(runtime: *EnrichmentRuntime, window: ?*GeneratedRe
         runtime.fatal_error_count += 1;
         runtime.retrying = false;
         runtime.worker_failed = false;
-        markIsolatedFailedIndex(runtime, request.index_name);
+        for (indexes) |index_name| markIsolatedFailedIndex(runtime, index_name);
         runtime.mutex.unlock(io);
     } else {
         runtime.error_count += 1;
         runtime.fatal_error_count += 1;
         runtime.retrying = false;
         runtime.worker_failed = false;
-        markIsolatedFailedIndex(runtime, request.index_name);
+        for (indexes) |index_name| markIsolatedFailedIndex(runtime, index_name);
     }
     runtime.notifyStatusHook();
 }
@@ -1961,6 +1988,7 @@ test "isolated enrichment request error does not mark worker failed" {
         .embedding_name = "clipclap",
         .doc_key = "doc:1",
         .source_field = "image_url",
+        .sequence = 11,
     }, error.UnsupportedEmbeddingProvider);
 
     try std.testing.expectEqual(@as(u64, 1), runtime.error_count);
@@ -1974,8 +2002,8 @@ test "isolated enrichment request error does not mark worker failed" {
     try std.testing.expectEqualStrings("clipclap", failure.artifact_name);
     try std.testing.expectEqualStrings("doc:1", failure.doc_key);
     try std.testing.expectEqualStrings("UnsupportedEmbeddingProvider", failure.error_name);
-    try std.testing.expectEqual(@as(u64, 6), failure.attempts);
-    try std.testing.expectEqual(@as(u64, 17), failure.sequence);
+    try std.testing.expectEqual(@as(u64, 7), failure.attempts);
+    try std.testing.expectEqual(@as(u64, 11), failure.sequence);
     clearIsolatedFailedIndexes(&runtime);
 }
 
@@ -2134,7 +2162,9 @@ fn processPendingDocumentGroup(
     processed_request_count: *u64,
 ) !void {
     const planned = try getOrCreatePlannedRequests(runtime, pending.doc_key, request_plan_cache);
-    for (planned) |request| {
+    for (planned) |planned_request| {
+        var request = planned_request;
+        request.sequence = pending.sequence;
         // Publish completed generated writes before the next external embedder call can enter retry backoff.
         if (window.hasDerivedItems()) try flushGeneratedReplayWindow(runtime, window);
         processed_request_count.* += 1;

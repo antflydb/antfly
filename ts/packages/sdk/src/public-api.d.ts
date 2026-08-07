@@ -1299,7 +1299,7 @@ export interface paths {
             path: {
                 /** @description Name of the table */
                 tableName: string;
-                /** @description Name of the derived document artifact. */
+                /** @description Name of the derived asset enrichment. */
                 artifactName: string;
             };
             cookie?: never;
@@ -1307,8 +1307,8 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Reprocess a derived document artifact across a table range
-         * @description Runs a bounded operational repair pass for a derived document artifact
+         * Reprocess a derived asset across a table range
+         * @description Runs a bounded operational repair pass for any asset producer type
          *     across source rows in key order. Use `next_key` from the response as
          *     the next request's `from_key` for simple single-cursor continuation.
          *     Distributed repair controllers should persist `shard_cursors` from the
@@ -1363,7 +1363,7 @@ export interface paths {
             path: {
                 /** @description Name of the table */
                 tableName: string;
-                /** @description Name of the derived document artifact. */
+                /** @description Name of the derived asset enrichment. */
                 artifactName: string;
             };
             cookie?: never;
@@ -1513,9 +1513,11 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Reprocess a derived document artifact
+         * Reprocess a derived asset
          * @description Invalidates the current artifact state and requests the producer to
-         *     rebuild the derived document hierarchy for the source document.
+         *     rebuild the derived asset for the source document. Copy, generator,
+         *     reader, transcriber, extractor, and document-extraction producers are
+         *     all supported.
          */
         post: operations["reprocessDocumentArtifact"];
         delete?: never;
@@ -3108,6 +3110,13 @@ export interface components {
              */
             sequence: number;
             reason: components["schemas"]["ArtifactRepairReason"];
+            /**
+             * Format: uint64
+             * @description Number of enrichment generation attempts made before this issue was parked.
+             */
+            generation_attempts: number;
+            /** @description Stable source-generation error code that caused this issue to be parked. */
+            generation_error?: string;
             /**
              * Format: uint64
              * @description Number of repair attempts made for this issue.
@@ -14589,7 +14598,7 @@ export interface operations {
             path: {
                 /** @description Name of the table */
                 tableName: string;
-                /** @description Name of the derived document artifact. */
+                /** @description Name of the derived asset enrichment. */
                 artifactName: string;
             };
             cookie?: never;
@@ -14687,7 +14696,7 @@ export interface operations {
             path: {
                 /** @description Name of the table */
                 tableName: string;
-                /** @description Name of the derived document artifact. */
+                /** @description Name of the derived asset enrichment. */
                 artifactName: string;
             };
             cookie?: never;
