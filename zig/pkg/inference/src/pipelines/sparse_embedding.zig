@@ -97,11 +97,22 @@ pub const SparseEmbeddingPipeline = struct {
         const alloc = self.allocator;
         const max_len = self.config.max_length;
         const batch = execution_batch;
+        const admitted_tokens = std.math.mul(usize, batch, max_len) catch
+            return error.ResourceLimitExceeded;
+        var run_permit = try self.session.admit(.{
+            .batch = batch,
+            .sequence = max_len,
+            .input_bytes = std.math.mul(usize, admitted_tokens, 24) catch
+                return error.ResourceLimitExceeded,
+            .host_preprocess_bytes = std.math.mul(usize, admitted_tokens, 32) catch
+                return error.ResourceLimitExceeded,
+        });
+        defer run_permit.deinit();
 
         // Tokenize
-        const all_ids = try alloc.alloc(i32, batch * max_len);
+        const all_ids = try alloc.alloc(i32, admitted_tokens);
         defer alloc.free(all_ids);
-        const all_mask = try alloc.alloc(i32, batch * max_len);
+        const all_mask = try alloc.alloc(i32, admitted_tokens);
         defer alloc.free(all_mask);
 
         for (texts, 0..) |text, i| {
@@ -128,15 +139,6 @@ pub const SparseEmbeddingPipeline = struct {
         }
         const tokens = std.math.mul(usize, batch, sequence_len) catch
             return error.ResourceLimitExceeded;
-        var run_permit = try self.session.admit(.{
-            .batch = batch,
-            .sequence = sequence_len,
-            .input_bytes = std.math.mul(usize, tokens, 24) catch
-                return error.ResourceLimitExceeded,
-            .host_preprocess_bytes = std.math.mul(usize, tokens, 32) catch
-                return error.ResourceLimitExceeded,
-        });
-        defer run_permit.deinit();
 
         // Convert to i64 for ONNX
         const ids_i64 = try alloc.alloc(i64, tokens);
@@ -347,7 +349,9 @@ fn sparseExecutionSequenceLength(
     max_len: usize,
     allow_dynamic: bool,
 ) !usize {
-    if (batch == 0 or max_len == 0 or mask.len < batch * max_len) return error.InvalidInputShape;
+    const token_count = std.math.mul(usize, batch, max_len) catch
+        return error.InvalidInputShape;
+    if (batch == 0 or max_len == 0 or mask.len < token_count) return error.InvalidInputShape;
     for (input_info) |info| {
         if (!std.mem.eql(u8, info.name, "input_ids")) continue;
         if (info.shape.len >= 2 and info.shape[1] > 0) {
@@ -766,6 +770,35 @@ test "sparse embedding batches dynamic native sessions and trims padded sequence
     try std.testing.expectEqual(@as(usize, 3), session_state.last_sequence);
     try std.testing.expectEqual(@as(usize, 3), tokenizer_state.encode_count);
     try std.testing.expectEqual(@as(usize, 3), vectors.len);
+}
+
+test "sparse embedding admission denial happens before tokenization" {
+    const alloc = std.testing.allocator;
+    const memory = @import("../runtime/tier/memory.zig");
+    var controller = memory.AdmissionController{};
+    controller.configureForcedRunDenialsForTesting(1);
+    var session_state = FakeDynamicBatchSparseSession{};
+    var session = session_state.session();
+    session.run_admission = .{
+        .controller = &controller,
+        .backend_class = .cpu,
+        .limits = .{},
+        .static_workspace_bytes = 1,
+    };
+    var tokenizer_state = FakeSparseTokenizer{};
+    var pipeline = SparseEmbeddingPipeline{
+        .allocator = alloc,
+        .session = session,
+        .tok = tokenizer_state.tokenizer(),
+        .config = .{ .max_length = 8, .top_k = 4 },
+    };
+
+    try std.testing.expectError(
+        error.ResourceTemporarilyUnavailable,
+        pipeline.embed(&.{"a"}),
+    );
+    try std.testing.expectEqual(@as(usize, 0), tokenizer_state.encode_count);
+    try std.testing.expectEqual(@as(usize, 0), session_state.run_count);
 }
 
 const FakeDynamicBatchSparseSession = struct {
