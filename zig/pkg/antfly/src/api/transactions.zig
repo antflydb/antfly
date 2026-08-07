@@ -456,6 +456,7 @@ pub const CommitResponse = struct {
 };
 
 pub const MultiBatchResponse = struct {
+    status: []const u8 = "committed",
     tables: CommitTablesResponse,
 };
 
@@ -2086,9 +2087,10 @@ pub fn buildCommitResponse(
 
 pub fn buildMultiBatchResponse(
     alloc: std.mem.Allocator,
+    status: []const u8,
     tables: []const TableCommitRequest,
 ) !MultiBatchResponse {
-    return .{ .tables = try buildCommitTablesResponse(alloc, tables) };
+    return .{ .status = status, .tables = try buildCommitTablesResponse(alloc, tables) };
 }
 
 pub fn buildSessionCommitResponse(

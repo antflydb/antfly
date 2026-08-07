@@ -3531,6 +3531,14 @@ pub const TableWriteSource = struct {
             table_name: []const u8,
             txn_id: db_mod.types.TxnId,
         ) anyerror!?db_mod.types.TxnStatus = null,
+        txn_acknowledge_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            txn_id: db_mod.types.TxnId,
+            participant: []const u8,
+        ) anyerror!?void = null,
         corrupt_embedding_artifact: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -3919,6 +3927,18 @@ pub const TableWriteSource = struct {
         return try fn_ptr(self.ptr, alloc, group_id, table_name, txn_id);
     }
 
+    pub fn txnAcknowledgeGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_mod.types.TxnId,
+        participant: []const u8,
+    ) !?void {
+        const fn_ptr = self.vtable.txn_acknowledge_group_local orelse return null;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, txn_id, participant);
+    }
+
     pub fn corruptEmbeddingArtifact(
         self: TableWriteSource,
         alloc: std.mem.Allocator,
@@ -4233,6 +4253,7 @@ pub const BoundTableWriteSource = struct {
                 .txn_prepare_group_local = txnPrepareGroupLocal,
                 .txn_resolve_group_local = txnResolveGroupLocal,
                 .txn_status_group_local = txnStatusGroupLocal,
+                .txn_acknowledge_group_local = txnAcknowledgeGroupLocal,
                 .corrupt_embedding_artifact = corruptEmbeddingArtifact,
                 .reprocess_document_artifact = reprocessDocumentArtifact,
                 .reprocess_document_artifact_range = reprocessDocumentArtifactRange,
@@ -4913,6 +4934,21 @@ pub const BoundTableWriteSource = struct {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
         return try (try self.activeDb()).getTransactionStatus(txn_id);
+    }
+
+    fn txnAcknowledgeGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_mod.types.TxnId,
+        participant: []const u8,
+    ) !?void {
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        _ = group_id;
+        _ = alloc;
+        try (try self.activeDb()).markTransactionParticipantResolved(txn_id, participant);
     }
 };
 
@@ -11952,6 +11988,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .txn_prepare_group_local = txnPrepareGroupLocal,
                 .txn_resolve_group_local = txnResolveGroupLocal,
                 .txn_status_group_local = txnStatusGroupLocal,
+                .txn_acknowledge_group_local = txnAcknowledgeGroupLocal,
                 .corrupt_embedding_artifact = corruptEmbeddingArtifact,
                 .reprocess_document_artifact = reprocessDocumentArtifact,
                 .reprocess_document_artifact_range = reprocessDocumentArtifactRange,
@@ -13685,7 +13722,7 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try enforceHAWriteGateOptional(self.ha_write_gate);
-        try table_catalog.validateTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
+        try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
         if (self.raft_batcher) |batcher| {
             try batcher.batchGroupLocal(alloc, group_id, table_name, .{
                 .transaction = .{ .begin = .{
@@ -13744,7 +13781,7 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try enforceHAWriteGateOptional(self.ha_write_gate);
-        try table_catalog.validateTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
+        try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
         if (self.raft_batcher) |batcher| {
             try batcher.batchGroupLocal(alloc, group_id, table_name, .{
                 .writes = transactionWritesAsBatchWrites(req.writes),
@@ -13866,6 +13903,43 @@ pub const ProvisionedTableWriteSource = struct {
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             return try db.getTransactionStatus(txn_id);
+        }
+    }
+
+    fn txnAcknowledgeGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_mod.types.TxnId,
+        participant: []const u8,
+    ) !?void {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try enforceHAWriteGateOptional(self.ha_write_gate);
+        if (self.raft_batcher) |batcher| {
+            try batcher.batchGroupLocal(alloc, group_id, table_name, .{
+                .sync_level = .write,
+                .transaction = .{ .acknowledge = .{ .txn_id = txn_id, .participant = participant } },
+            });
+            return {};
+        }
+        self.beginGroupOperation(table_name, group_id);
+        defer self.endGroupOperation(table_name, group_id);
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        if (self.write_cache) |cache| {
+            var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default_async, null, null);
+            defer cached.deinit(alloc);
+            try cached.db.markTransactionParticipantResolved(txn_id, participant);
+            lockAtomic(&self.local_db_mutex);
+            self.markWriteCacheDirty(table_name);
+            self.local_db_mutex.unlock();
+        } else {
+            var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
+            defer db.close();
+            try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
+            try db.markTransactionParticipantResolved(txn_id, participant);
+            self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
         }
     }
 
@@ -15288,6 +15362,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .txn_prepare_group_local = txnPrepareGroupLocal,
                 .txn_resolve_group_local = txnResolveGroupLocal,
                 .txn_status_group_local = txnStatusGroupLocal,
+                .txn_acknowledge_group_local = txnAcknowledgeGroupLocal,
                 .corrupt_embedding_artifact = corruptEmbeddingArtifact,
                 .reprocess_document_artifact = reprocessDocumentArtifact,
                 .reprocess_document_artifact_range = reprocessDocumentArtifactRange,
@@ -15639,7 +15714,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         participants: []const []const u8,
     ) !?void {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        try table_catalog.validateTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
+        try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
         return try batchGroupLocal(ptr, alloc, group_id, table_name, .{
             .transaction = .{ .begin = .{
                 .txn_id = txn_id,
@@ -15662,7 +15737,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         req: db_mod.types.TransactionIntentRequest,
     ) !?void {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        try table_catalog.validateTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
+        try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
         return try batchGroupLocal(ptr, alloc, group_id, table_name, .{
             .writes = transactionWritesAsBatchWrites(req.writes),
             .deletes = req.deletes,
@@ -15706,6 +15781,20 @@ pub const HostedProvisionedTableWriteSource = struct {
         var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default);
         defer cached.deinit(hosted_cache.write_cache.alloc);
         return try cached.db.getTransactionStatus(txn_id);
+    }
+
+    fn txnAcknowledgeGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_mod.types.TxnId,
+        participant: []const u8,
+    ) !?void {
+        return try batchGroupLocal(ptr, alloc, group_id, table_name, .{
+            .sync_level = .write,
+            .transaction = .{ .acknowledge = .{ .txn_id = txn_id, .participant = participant } },
+        });
     }
 
     fn localRuntimeStatuses(

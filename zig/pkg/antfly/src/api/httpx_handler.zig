@@ -846,7 +846,7 @@ pub const AntflyApiHandler = struct {
         };
 
         switch (outcome) {
-            .committed => {
+            .committed => |committed| {
                 var arena_impl = std.heap.ArenaAllocator.init(alloc);
                 defer arena_impl.deinit();
                 switch (response_mode) {
@@ -855,8 +855,14 @@ pub const AntflyApiHandler = struct {
                         return ctx.json(response);
                     },
                     .multi_batch => {
-                        const response = try transactions_api.buildMultiBatchResponse(arena_impl.allocator(), commit_req.tables);
-                        _ = ctx.status(201);
+                        const status: []const u8 = if (committed.propagation_pending)
+                            "committed_recovery_pending"
+                        else if (committed.visibility_pending)
+                            "committed_visibility_pending"
+                        else
+                            "committed";
+                        const response = try transactions_api.buildMultiBatchResponse(arena_impl.allocator(), status, commit_req.tables);
+                        _ = ctx.status(if (committed.propagation_pending or committed.visibility_pending) 202 else 201);
                         return ctx.json(response);
                     },
                 }
@@ -3878,6 +3884,7 @@ test "httpx multi batch route uses the batch commit hook and public response con
         transaction_calls: usize = 0,
         batch_commit_calls: usize = 0,
         fail_batch_commit: bool = false,
+        defer_batch_commit: bool = false,
 
         fn source(self: *@This()) table_writes.TableWriteSource {
             return .{
@@ -3921,6 +3928,10 @@ test "httpx multi batch route uses the batch commit hook and public response con
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.batch_commit_calls += 1;
             if (self.fail_batch_commit) return error.CommitPropagationIncomplete;
+            if (self.defer_batch_commit) return .{ .committed = .{
+                .participant_count = 2,
+                .propagation_pending = true,
+            } };
             try std.testing.expectEqual(@as(usize, 2), tables.len);
             try std.testing.expectEqualStrings("users", tables[0].table_name);
             try std.testing.expectEqualStrings("orders", tables[1].table_name);
@@ -3974,6 +3985,23 @@ test "httpx multi batch route uses the batch commit hook and public response con
     try std.testing.expectEqual(@as(usize, 0), writes.transaction_calls);
     try std.testing.expectEqual(@as(usize, 0), writes.batch_calls);
 
+    writes.defer_batch_commit = true;
+    var pending = try requestWithRetry(
+        &client,
+        client_io.io(),
+        .POST,
+        batch_url,
+        "{\"tables\":{\"users\":{\"inserts\":{\"user:2\":{\"name\":\"Bob\"}}},\"orders\":{\"deletes\":[\"order:old\"]}},\"sync_level\":\"write\"}",
+        &headers,
+        20,
+    );
+    defer pending.deinit();
+    try std.testing.expectEqual(@as(u16, 202), pending.status.code);
+    var pending_parsed = try std.json.parseFromSlice(transactions_api.MultiBatchResponse, alloc, pending.body.?, .{});
+    defer pending_parsed.deinit();
+    try std.testing.expectEqualStrings("committed_recovery_pending", pending_parsed.value.status);
+    writes.defer_batch_commit = false;
+
     var rejected = try requestWithRetry(
         &client,
         client_io.io(),
@@ -3985,7 +4013,7 @@ test "httpx multi batch route uses the batch commit hook and public response con
     );
     defer rejected.deinit();
     try std.testing.expectEqual(@as(u16, 400), rejected.status.code);
-    try std.testing.expectEqual(@as(usize, 1), writes.batch_commit_calls);
+    try std.testing.expectEqual(@as(usize, 2), writes.batch_commit_calls);
 
     writes.fail_batch_commit = true;
     var unavailable = try requestWithRetry(
@@ -4000,7 +4028,7 @@ test "httpx multi batch route uses the batch commit hook and public response con
     defer unavailable.deinit();
     try std.testing.expectEqual(@as(u16, 503), unavailable.status.code);
     try std.testing.expectEqualStrings("transaction committed; participant recovery is pending", unavailable.body.?);
-    try std.testing.expectEqual(@as(usize, 2), writes.batch_commit_calls);
+    try std.testing.expectEqual(@as(usize, 3), writes.batch_commit_calls);
 }
 
 test "httpx internal request conversion preserves protocol headers" {

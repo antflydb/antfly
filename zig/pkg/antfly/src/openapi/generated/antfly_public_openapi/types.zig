@@ -1883,6 +1883,8 @@ pub const MultiBatchRequest = struct {
 
 /// Response for a cross-table batch operation. Contains per-table results.
 pub const MultiBatchResponse = struct {
+    /// Durable commit and visibility/propagation state.
+    status: ?[]const u8 = null,
     /// Per-table batch results
     tables: ?std.json.ArrayHashMap(BatchResponse) = null,
 };

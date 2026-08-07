@@ -2409,6 +2409,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/MultiBatchResponse'
+        '202':
+          description: Commit decision is durable; visibility or participant recovery is still pending
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MultiBatchResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
         '404':
@@ -3809,6 +3815,12 @@ paths:
       responses:
         '201':
           description: Batch operation successful
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchResponse'
+        '202':
+          description: Commit decision is durable; visibility or participant recovery is still pending
           content:
             application/json:
               schema:
@@ -10441,6 +10453,9 @@ components:
       description: >
         Response for a cross-table batch operation. Contains per-table results.
       properties:
+        status:
+          type: string
+          description: Durable commit and visibility/propagation state.
         tables:
           type: object
           description: Per-table batch results

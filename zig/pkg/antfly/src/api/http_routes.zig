@@ -103,6 +103,7 @@ pub const Routes = struct {
     pub const txn_prepare_suffix = "/txn-prepare";
     pub const txn_resolve_suffix = "/txn-resolve";
     pub const txn_status_suffix = "/txn-status";
+    pub const txn_acknowledge_suffix = "/txn-acknowledge";
     pub const corrupt_embedding_artifact_suffix = "/corrupt-embedding-artifact";
     pub const group_db_median_key_suffix = "/db/median-key";
     pub const shard_ops_observe_split_suffix = "/shard-ops/observe-split";
@@ -390,6 +391,11 @@ pub const Routes = struct {
     };
 
     pub const GroupTxnStatus = struct {
+        group_id: u64,
+        table_name: []const u8,
+    };
+
+    pub const GroupTxnAcknowledge = struct {
         group_id: u64,
         table_name: []const u8,
     };
@@ -1232,6 +1238,16 @@ pub const Routes = struct {
         if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
         if (!std.mem.endsWith(u8, rest, txn_status_suffix)) return null;
         const table_name = rest[tables_prefix.len .. rest.len - txn_status_suffix.len];
+        if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
+        return .{ .group_id = group.group_id, .table_name = table_name };
+    }
+
+    pub fn matchGroupTxnAcknowledge(path: []const u8) ?GroupTxnAcknowledge {
+        const group = parseGroupPrefix(path) orelse return null;
+        const rest = group.rest;
+        if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, rest, txn_acknowledge_suffix)) return null;
+        const table_name = rest[tables_prefix.len .. rest.len - txn_acknowledge_suffix.len];
         if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
         return .{ .group_id = group.group_id, .table_name = table_name };
     }

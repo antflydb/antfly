@@ -51,6 +51,11 @@ pub const TxnStatusResponse = struct {
     status: db_mod.types.TxnStatus,
 };
 
+pub const TxnAcknowledgeRequest = struct {
+    txn_id: db_mod.types.TxnId,
+    participant: []const u8,
+};
+
 pub const TableCommitRequest = struct {
     table_name: []const u8,
     writes: []const db_mod.types.TransactionWrite = &.{},
@@ -111,6 +116,13 @@ pub const ParticipantWorker = struct {
             table_name: []const u8,
             txn_id: db_mod.types.TxnId,
         ) anyerror!db_mod.types.TxnStatus,
+        acknowledge_group: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            req: TxnAcknowledgeRequest,
+        ) anyerror!void = null,
     };
 
     pub fn beginGroup(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnBeginRequest) !void {
@@ -127,6 +139,11 @@ pub const ParticipantWorker = struct {
 
     pub fn statusGroup(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId) !db_mod.types.TxnStatus {
         return try self.vtable.status_group(self.ptr, alloc, group_id, table_name, txn_id);
+    }
+
+    pub fn acknowledgeGroup(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeRequest) !void {
+        const acknowledge = self.vtable.acknowledge_group orelse return;
+        try acknowledge(self.ptr, alloc, group_id, table_name, req);
     }
 };
 
@@ -192,6 +209,7 @@ pub const HostedParticipantWorker = struct {
                 .prepare_group = prepareGroup,
                 .resolve_group = resolveGroup,
                 .status_group = statusGroup,
+                .acknowledge_group = acknowledgeGroup,
             },
         };
     }
@@ -261,6 +279,22 @@ pub const HostedParticipantWorker = struct {
             },
         };
     }
+
+    fn acknowledgeGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeRequest) !void {
+        const self: *HostedParticipantWorker = @ptrCast(@alignCast(ptr));
+        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader)) orelse return error.UnknownGroup;
+        defer route.deinit(alloc);
+        switch (route) {
+            .local => _ = (try self.writes.txnAcknowledgeGroupLocal(alloc, group_id, table_name, req.txn_id, req.participant)) orelse return error.UnknownGroup,
+            .remote => |remote| {
+                var client = http_client_mod.ApiHttpClient.init(alloc, self.executor);
+                const body = try encodeTxnAcknowledgeRequest(alloc, req);
+                defer alloc.free(body);
+                var response = try client.fetchGroupTxnAcknowledge(remote.base_uri, group_id, table_name, body);
+                response.deinit(alloc);
+            },
+        }
+    }
 };
 
 pub const LocalTableWriteParticipantWorker = struct {
@@ -278,6 +312,7 @@ pub const LocalTableWriteParticipantWorker = struct {
                 .prepare_group = prepareGroup,
                 .resolve_group = resolveGroup,
                 .status_group = statusGroup,
+                .acknowledge_group = acknowledgeGroup,
             },
         };
     }
@@ -301,10 +336,21 @@ pub const LocalTableWriteParticipantWorker = struct {
         const self: *LocalTableWriteParticipantWorker = @ptrCast(@alignCast(ptr));
         return (try self.writes.txnStatusGroupLocal(alloc, group_id, table_name, txn_id)) orelse error.UnknownGroup;
     }
+
+    fn acknowledgeGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeRequest) !void {
+        const self: *LocalTableWriteParticipantWorker = @ptrCast(@alignCast(ptr));
+        _ = (try self.writes.txnAcknowledgeGroupLocal(alloc, group_id, table_name, req.txn_id, req.participant)) orelse return error.UnknownGroup;
+    }
 };
 
 pub const ExecuteResult = struct {
     participant_count: usize,
+    /// The commit decision is durable, but at least one participant still
+    /// needs phase-two delivery by foreground retry or recovery.
+    propagation_pending: bool = false,
+    /// Participant writes are durable, but the requested visibility barrier
+    /// was not reached before the response was produced.
+    visibility_pending: bool = false,
 };
 
 pub const ExecuteOptions = struct {
@@ -411,7 +457,7 @@ fn executeMultiTableCommitOnce(
     }
 
     for (tables) |table| {
-        const topology_epoch = try table_catalog.topologyEpoch(alloc, catalog, table.table_name);
+        const topology_epoch = try table_catalog.transactionTopologyEpoch(alloc, catalog, table.table_name);
         if (topology_epoch == 0) return error.TableNotFound;
 
         for (table.writes) |write| {
@@ -545,6 +591,27 @@ fn executeMultiTableCommitOnce(
         };
     };
 
+    // Preparing can overlap metadata publication. Recheck both transition
+    // admission and the exact range epoch before the coordinator participant
+    // records the irreversible commit decision.
+    if (!resume_committed) {
+        for (participants.items, 0..) |participant, i| {
+            var already_checked = false;
+            for (participants.items[0..i]) |prior| {
+                if (std.mem.eql(u8, prior.table_name, participant.table_name)) {
+                    already_checked = true;
+                    break;
+                }
+            }
+            if (already_checked) continue;
+            table_catalog.validateTransactionTopologyEpoch(alloc, catalog, participant.table_name, participant.topology_epoch) catch |err| {
+                try abortParticipants(alloc, worker, txn_id, commit_version, participants.items);
+                abort_on_error = false;
+                return err;
+            };
+        }
+    }
+
     var post_commit_failure: ?enum { visibility, propagation } = null;
     resolve_participants: for (participants.items, 0..) |participant, participant_index| {
         worker.resolveGroup(alloc, participant.group_id, participant.table_name, .{
@@ -644,6 +711,21 @@ fn executeMultiTableCommitOnce(
                 }
             },
         };
+        if (participant_index > 0) {
+            worker.acknowledgeGroup(alloc, participants.items[0].group_id, participants.items[0].table_name, .{
+                .txn_id = txn_id,
+                .participant = participant_ids[participant_index],
+            }) catch |err| {
+                // Phase two already succeeded. A lost cleanup acknowledgement
+                // is safe to defer; recovery will retry it without replaying
+                // the transaction's user writes.
+                std.log.warn("transaction participant acknowledgement deferred table={s} group_id={} err={s}", .{
+                    participant.table_name,
+                    participant.group_id,
+                    @errorName(err),
+                });
+            };
+        }
         // The first participant is the durable transaction decision. Once it
         // commits, all remaining retries are commit-only and must never enter
         // the abort cleanup path.
@@ -654,18 +736,23 @@ fn executeMultiTableCommitOnce(
         tw.traceEvent(&.{ .name = "CommitTransaction", .txn_id = txn_id, .shard_id = "", .timestamp = commit_version });
     }
 
+    var result: ExecuteResult = .{ .participant_count = participants.items.len };
     if (post_commit_failure) |failure| {
         if (options.report_post_commit_failure) switch (failure) {
             .visibility => return error.CommitVisibilityNotSatisfied,
             .propagation => return error.CommitPropagationIncomplete,
         };
+        switch (failure) {
+            .visibility => result.visibility_pending = true,
+            .propagation => result.propagation_pending = true,
+        }
         std.log.warn("transaction commit acknowledged with deferred {s} txn_id={x}", .{
             @tagName(failure),
             txn_id,
         });
     }
 
-    return .{ .committed = .{ .participant_count = participants.items.len } };
+    return .{ .committed = result };
 }
 
 const ParticipantTxn = struct {
@@ -903,6 +990,15 @@ pub fn encodeTxnStatusRequest(alloc: std.mem.Allocator, txn_id: db_mod.types.Txn
     return try std.fmt.allocPrint(alloc, "{{\"txn_id\":\"{s}\"}}", .{&txn_hex});
 }
 
+pub fn encodeTxnAcknowledgeRequest(alloc: std.mem.Allocator, req: TxnAcknowledgeRequest) ![]u8 {
+    const txn_hex = encodeTxnIdHex(req.txn_id);
+    return try std.fmt.allocPrint(
+        alloc,
+        "{{\"txn_id\":\"{s}\",\"participant\":{f}}}",
+        .{ &txn_hex, std.json.fmt(req.participant, .{}) },
+    );
+}
+
 pub fn encodeTxnStatusResponse(alloc: std.mem.Allocator, response: TxnStatusResponse) ![]u8 {
     const status_text = switch (response.status) {
         .pending => "pending",
@@ -1020,6 +1116,26 @@ pub fn parseTxnStatusRequest(alloc: std.mem.Allocator, body: []const u8) !db_mod
         else => return error.InvalidTxnRequest,
     };
     return try parseTxnIdHex(requireString(obj, "txn_id"));
+}
+
+pub fn parseTxnAcknowledgeRequest(alloc: std.mem.Allocator, body: []const u8) !TxnAcknowledgeRequest {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const obj = switch (parsed.value) {
+        .object => |obj| obj,
+        else => return error.InvalidTxnRequest,
+    };
+    const participant = requireString(obj, "participant");
+    if (participant.len == 0 or parseParticipantRef(participant) == null) return error.InvalidTxnRequest;
+    return .{
+        .txn_id = try parseTxnIdHex(requireString(obj, "txn_id")),
+        .participant = try alloc.dupe(u8, participant),
+    };
+}
+
+pub fn freeTxnAcknowledgeRequest(alloc: std.mem.Allocator, req: *TxnAcknowledgeRequest) void {
+    alloc.free(@constCast(req.participant));
+    req.* = undefined;
 }
 
 pub fn parseTxnStatusResponse(alloc: std.mem.Allocator, body: []const u8) !TxnStatusResponse {
@@ -1273,6 +1389,20 @@ test "txn resolve codec preserves sync level and accepts legacy requests" {
     try std.testing.expectEqual(db_mod.types.SyncLevel.propose, legacy.sync_level);
 }
 
+test "txn acknowledgement codec preserves participant identity" {
+    const alloc = std.testing.allocator;
+    const txn_id = try parseTxnIdHex("00112233445566778899aabbccddeeff");
+    const encoded = try encodeTxnAcknowledgeRequest(alloc, .{
+        .txn_id = txn_id,
+        .participant = "table2:00000004:docs:7002",
+    });
+    defer alloc.free(encoded);
+    var decoded = try parseTxnAcknowledgeRequest(alloc, encoded);
+    defer freeTxnAcknowledgeRequest(alloc, &decoded);
+    try std.testing.expectEqualSlices(u8, &txn_id, &decoded.txn_id);
+    try std.testing.expectEqualStrings("table2:00000004:docs:7002", decoded.participant);
+}
+
 fn abortParticipants(
     alloc: std.mem.Allocator,
     worker: ParticipantWorker,
@@ -1316,7 +1446,20 @@ fn abortParticipants(
                 participant.group_id,
                 @errorName(err),
             });
+            continue;
         };
+        const participant_id = try participantIdForGroup(alloc, participant.table_name, participant.group_id);
+        worker.acknowledgeGroup(alloc, coordinator.group_id, coordinator.table_name, .{
+            .txn_id = txn_id,
+            .participant = participant_id,
+        }) catch |err| {
+            std.log.warn("transaction abort acknowledgement deferred table={s} group_id={} err={s}", .{
+                participant.table_name,
+                participant.group_id,
+                @errorName(err),
+            });
+        };
+        alloc.free(participant_id);
     }
 }
 
@@ -1424,11 +1567,13 @@ test "distributed txn coordinator groups by range and commits all participants" 
         begins: std.ArrayListUnmanaged(u64) = .empty,
         prepares: std.ArrayListUnmanaged(u64) = .empty,
         resolves: std.ArrayListUnmanaged(struct { group_id: u64, status: db_mod.types.TxnStatus }) = .empty,
+        acknowledgements: std.ArrayListUnmanaged(u64) = .empty,
 
         fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             self.begins.deinit(alloc);
             self.prepares.deinit(alloc);
             self.resolves.deinit(alloc);
+            self.acknowledgements.deinit(alloc);
         }
 
         fn worker(self: *@This()) ParticipantWorker {
@@ -1439,6 +1584,7 @@ test "distributed txn coordinator groups by range and commits all participants" 
                     .prepare_group = prepare,
                     .resolve_group = resolve,
                     .status_group = status,
+                    .acknowledge_group = acknowledge,
                 },
             };
         }
@@ -1462,6 +1608,13 @@ test "distributed txn coordinator groups by range and commits all participants" 
 
         fn status(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
             return .pending;
+        }
+
+        fn acknowledge(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, _: []const u8, req: TxnAcknowledgeRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(u64, 7001), group_id);
+            try std.testing.expectEqualStrings("table2:00000004:docs:7002", req.participant);
+            try self.acknowledgements.append(std.testing.allocator, group_id);
         }
     };
 
@@ -1492,6 +1645,7 @@ test "distributed txn coordinator groups by range and commits all participants" 
     try std.testing.expectEqual(@as(usize, 2), recorder.begins.items.len);
     try std.testing.expectEqual(@as(usize, 2), recorder.prepares.items.len);
     try std.testing.expectEqual(@as(usize, 2), recorder.resolves.items.len);
+    try std.testing.expectEqual(@as(usize, 1), recorder.acknowledgements.items.len);
     for (recorder.resolves.items) |resolved| try std.testing.expectEqual(db_mod.types.TxnStatus.committed, resolved.status);
 }
 
@@ -1744,7 +1898,9 @@ test "distributed txn coordinator never restarts a transaction id on topology ch
             return .{
                 .status = .{ .metadata_group_id = 1, .metrics = .{} },
                 .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{ .table_id = 7, .name = "docs", .placement_role = "data" }})[0..]),
-                .ranges = if (self.call_count <= 2)
+                // Transaction admission now checks active transitions before
+                // pinning and resolving the range epoch.
+                .ranges = if (self.call_count <= 3)
                     @constCast((&[_]metadata_table_manager.RangeRecord{
                         .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = "doc:m" },
                         .{ .group_id = 7002, .table_id = 7, .start_key = "doc:m", .end_key = null },
@@ -2113,6 +2269,8 @@ test "distributed txn coordinator never aborts after durable commit decision" {
         .{ .report_post_commit_failure = false },
     );
     try std.testing.expect(ephemeral == .committed);
+    try std.testing.expect(ephemeral.committed.propagation_pending);
+    try std.testing.expect(!ephemeral.committed.visibility_pending);
     try std.testing.expect(recorder.first_committed);
     try std.testing.expectEqual(@as(usize, 0), recorder.abort_calls);
 }

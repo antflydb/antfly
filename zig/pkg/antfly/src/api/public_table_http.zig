@@ -65,6 +65,7 @@ pub const TableApi = struct {
         DenseRepairBackpressure,
         Unavailable,
         WriteUnavailable,
+        CommittedPending,
         DocIdentityUnavailable,
         HAReadOnlyStandby,
         HAPromotedStandbyRequiresPrimaryOpen,
@@ -614,6 +615,10 @@ pub fn handleTableBatch(
         },
         error.Unavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "maintenance routes unavailable on query-only runtime") },
         error.WriteUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "write unavailable") },
+        error.CommittedPending => return .{
+            .status = 202,
+            .body = try batch_api.encodeBatchResponse(alloc, batch_req.result()),
+        },
         error.DocIdentityUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "doc identity unavailable") },
         error.HAReadOnlyStandby => return .{ .status = 409, .body = try alloc.dupe(u8, "standby is read-only") },
         error.HAPromotedStandbyRequiresPrimaryOpen => return .{ .status = 409, .body = try alloc.dupe(u8, "promoted standby requires primary open") },
@@ -1586,12 +1591,12 @@ test "public table batch handler returns created batch response" {
         \\{"inserts":{"doc-a":{"title":"alpha"}}}
     , backend.iface());
     defer resp.deinit(std.testing.allocator);
-    var parsed = try std.json.parseFromSlice(struct { inserted: ?i64 = null }, std.testing.allocator, resp.body, .{});
+    var parsed = try std.json.parseFromSlice(batch_api.BatchResult, std.testing.allocator, resp.body, .{});
     defer parsed.deinit();
 
     try std.testing.expectEqual(@as(u16, 201), resp.status);
     try std.testing.expect(backend.called);
-    try std.testing.expectEqual(@as(i64, 1), parsed.value.inserted.?);
+    try std.testing.expectEqual(@as(u32, 1), parsed.value.inserted);
 }
 
 test "public create index exposes retryable storage descriptor exhaustion" {
@@ -1845,6 +1850,35 @@ test "public table batch handler maps write unavailable errors" {
 
     try std.testing.expectEqual(@as(u16, 503), resp.status);
     try std.testing.expectEqualStrings("write unavailable", resp.body);
+}
+
+test "public table batch handler returns accepted for durable pending commits" {
+    const Backend = struct {
+        fn iface() TableApi {
+            return .{ .ptr = undefined, .vtable = &.{
+                .execute_table_batch = executeTableBatch,
+                .execute_table_query_request = unsupportedQueryRequest,
+                .execute_table_query_view = unsupportedQueryView,
+                .execute_table_backup = unsupportedBackup,
+                .execute_table_restore = unsupportedRestore,
+                .execute_table_list_indexes = unsupportedListIndexes,
+                .execute_table_get_index = unsupportedGetIndex,
+                .execute_table_create_index = unsupportedCreateIndex,
+                .execute_table_delete_index = unsupportedDeleteIndex,
+            } };
+        }
+
+        fn executeTableBatch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) TableApi.ExecuteBatchError!void {
+            return error.CommittedPending;
+        }
+    };
+
+    var resp = try handleTableBatch(std.testing.allocator, "docs",
+        \\{"inserts":{"doc-a":{"title":"alpha"}}}
+    , Backend.iface());
+    defer resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 202), resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"inserted\":1") != null);
 }
 
 test "public table batch handler maps doc identity unavailable errors" {

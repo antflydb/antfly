@@ -650,6 +650,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
             txn_req.participants,
         ) catch |err| switch (err) {
             error.InvalidBatchRequest => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid transaction request"),
+            error.DecisionConflict => return try http_route_helpers.textResponse(ctx.alloc, 409, "decision conflict"),
             error.TopologyChanged => return try http_route_helpers.textResponse(ctx.alloc, 409, "topology changed"),
             error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
             error.UnsupportedOperation => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
@@ -724,6 +725,26 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
             else => return err,
         }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
         return try http_route_helpers.jsonResponse(ctx.alloc, distributed_txn.TxnStatusResponse{ .status = status });
+    }
+    if (routes.Routes.matchGroupTxnAcknowledge(path)) |txn_route| {
+        const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        var txn_req = distributed_txn.parseTxnAcknowledgeRequest(ctx.alloc, req.body) catch {
+            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid transaction request");
+        };
+        defer distributed_txn.freeTxnAcknowledgeRequest(ctx.alloc, &txn_req);
+        _ = (writes.txnAcknowledgeGroupLocal(
+            ctx.alloc,
+            txn_route.group_id,
+            txn_route.table_name,
+            txn_req.txn_id,
+            txn_req.participant,
+        ) catch |err| switch (err) {
+            error.InvalidParticipant, error.DecisionConflict => return try http_route_helpers.textResponse(ctx.alloc, 409, "decision conflict"),
+            error.UnsupportedOperation => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
+            error.UnknownGroup, error.TxnNotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
+            else => return err,
+        }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        return try http_route_helpers.jsonResponse(ctx.alloc, struct {}{});
     }
 
     return null;

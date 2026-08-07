@@ -8756,7 +8756,7 @@ pub const ApiHttpServer = struct {
             },
         }) orelse return error.NotFound;
         switch (outcome) {
-            .committed => {},
+            .committed => |committed| if (committed.propagation_pending or committed.visibility_pending) return error.CommittedPending,
             .conflict => return error.Conflict,
         }
     }
