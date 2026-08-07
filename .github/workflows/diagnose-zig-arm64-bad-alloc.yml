@@ -63,8 +63,8 @@ jobs:
           # Keep 4000Mi of the ARC pod's 24000Mi request outside Zig's
           # scheduling budget. Step max_rss values are scheduling claims, not
           # a complete accounting of build-runner state and page cache. The
-          # lower budget still admits the measured CLI alongside one server
-          # role, but does not admit data and metadata together.
+          # lower budget keeps the application and inference LLVM emissions
+          # serial while retaining headroom for runner state and page cache.
           cd zig
           /usr/bin/time -v -o "$RUNNER_TEMP/linked-runtime.time" \
             zig build \
