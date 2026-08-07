@@ -5063,6 +5063,8 @@ pub fn build(b: *std.Build) void {
             "api http client rejects unsupported routed batch protocol without legacy replay",
             "api http client requires explicit not-proposed marker and tracks delivery phase",
             "internal group write route dispatches bounded raft forwarding context",
+            "raft batch aggregation makes failures after an accepted group non-retryable",
+            "public table batch handler preserves partial write outcomes",
             "bound table write source backs up and restores a local table",
             "bound table write source backs up and restores a portable local table",
             "provisioned table write source backs up a portable local table",

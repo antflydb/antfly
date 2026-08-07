@@ -8674,6 +8674,7 @@ pub const ApiHttpServer = struct {
             error.DenseRepairBackpressure => return error.DenseRepairBackpressure,
             error.LeaderUnavailable => return error.WriteUnavailable,
             error.RaftBatchWriteOutcomeUnknown => return error.WriteOutcomeUnknown,
+            error.RaftBatchWritePartialOutcome => return error.WritePartialOutcome,
             error.HAReadOnlyStandby => return error.HAReadOnlyStandby,
             error.HAPromotedStandbyRequiresPrimaryOpen => return error.HAPromotedStandbyRequiresPrimaryOpen,
             error.HAFencedPrimary => return error.HAFencedPrimary,

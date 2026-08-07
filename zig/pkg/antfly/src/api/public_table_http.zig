@@ -65,6 +65,7 @@ pub const TableApi = struct {
         Unavailable,
         WriteUnavailable,
         WriteOutcomeUnknown,
+        WritePartialOutcome,
         DocIdentityUnavailable,
         HAReadOnlyStandby,
         HAPromotedStandbyRequiresPrimaryOpen,
@@ -616,6 +617,10 @@ pub fn handleTableBatch(
         // Do not use a retryable 5xx: clients must reconcile an ambiguous
         // commit result instead of blindly replaying non-idempotent transforms.
         error.WriteOutcomeUnknown => return .{ .status = 409, .body = try alloc.dupe(u8, "write outcome unknown") },
+        // At least one shard group accepted its portion before a later group
+        // failed. Replaying the whole batch can duplicate transforms in the
+        // accepted prefix, so expose an explicit non-retryable outcome.
+        error.WritePartialOutcome => return .{ .status = 409, .body = try alloc.dupe(u8, "partial write outcome") },
         error.DocIdentityUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "doc identity unavailable") },
         error.HAReadOnlyStandby => return .{ .status = 409, .body = try alloc.dupe(u8, "standby is read-only") },
         error.HAPromotedStandbyRequiresPrimaryOpen => return .{ .status = 409, .body = try alloc.dupe(u8, "promoted standby requires primary open") },
@@ -1885,6 +1890,44 @@ test "public table batch handler preserves ambiguous write outcomes" {
 
     try std.testing.expectEqual(@as(u16, 409), resp.status);
     try std.testing.expectEqualStrings("write outcome unknown", resp.body);
+}
+
+test "public table batch handler preserves partial write outcomes" {
+    const Backend = struct {
+        fn iface() TableApi {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .execute_table_batch = executeTableBatch,
+                    .execute_table_query_request = unsupportedQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableBatch(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+        ) TableApi.ExecuteBatchError!void {
+            return error.WritePartialOutcome;
+        }
+    };
+
+    var resp = try handleTableBatch(std.testing.allocator, "docs",
+        \\{"inserts":{"doc-a":{"title":"alpha"}}}
+    , Backend.iface());
+    defer resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 409), resp.status);
+    try std.testing.expectEqualStrings("partial write outcome", resp.body);
 }
 
 test "public table batch handler maps doc identity unavailable errors" {

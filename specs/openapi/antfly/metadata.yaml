@@ -9125,9 +9125,10 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           description: |
-            The server could not determine whether the write was committed
-            after a forwarding or confirmation failure. It may already be
-            committed; clients must reconcile state and must not blindly
+            The batch cannot be safely replayed as a unit. Either the server
+            could not determine whether a shard-group write committed, or one
+            or more shard groups accepted their portion before a later group
+            failed. Clients must reconcile affected keys and must not blindly
             replay non-idempotent transforms.
           content:
             text/plain:
@@ -9135,10 +9136,11 @@ paths:
                 type: string
                 enum:
                   - write outcome unknown
+                  - partial write outcome
         "429":
           $ref: "#/components/responses/DenseRepairBackpressure"
         "503":
-          description: No writable Raft leader was available before proposal.
+          description: No writable Raft leader was available before any shard group accepted the batch.
           content:
             text/plain:
               schema:
