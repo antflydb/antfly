@@ -89,6 +89,9 @@ pub const RecoveryOptions = struct {
     /// maintenance disables this and asks the coordinator callback to propose
     /// the decision through data Raft instead.
     presume_abort_distributed: bool = true,
+    /// Retained terminal decisions (transaction sessions/idempotency keys)
+    /// use this older cutoff instead of the ordinary recovery cutoff.
+    retained_cutoff_timestamp: ?u64 = null,
 };
 
 pub const TxnSummary = struct {
@@ -100,6 +103,7 @@ pub const TxnSummary = struct {
     finalized_at: u64,
     coordinator: bool,
     coordinator_known: bool,
+    retain_terminal: bool = false,
 };
 
 pub const ResolutionExtraBatch = struct {
@@ -166,6 +170,11 @@ const TxnRecord = struct {
     /// Old records predate explicit coordinator ownership and therefore use
     /// conservative recovery semantics during rolling upgrades.
     coordinator_known: bool = true,
+    /// Keep the terminal decision for the externally addressable retry window.
+    retain_terminal: bool = false,
+    /// Old records predate explicit retry retention and may learn it from an
+    /// idempotent begin during a rolling upgrade.
+    retain_terminal_known: bool = true,
 
     fn visibleVersion(self: TxnRecord) u64 {
         if (self.commit_version > 0) return self.commit_version;
@@ -178,6 +187,7 @@ const txn_record_v1_size = 33;
 const txn_record_v2_size = 49;
 const txn_record_v3_size = 50;
 const txn_record_v4_size = 51;
+const txn_record_v5_size = 52;
 
 // ============================================================================
 // TxnManager
@@ -244,6 +254,25 @@ pub const TxnManager = struct {
         participants: []const []const u8,
         coordinator: bool,
     ) !void {
+        return try self.initTransactionWithParticipantsCreatedAtRoleAndRetention(
+            txn_id,
+            timestamp,
+            created_at,
+            participants,
+            coordinator,
+            false,
+        );
+    }
+
+    pub fn initTransactionWithParticipantsCreatedAtRoleAndRetention(
+        self: *TxnManager,
+        txn_id: TxnId,
+        timestamp: u64,
+        created_at: u64,
+        participants: []const []const u8,
+        coordinator: bool,
+        retain_terminal: bool,
+    ) !void {
         const key = makeRecordKey(txn_id);
         const existing = self.loadTransactionRecord(txn_id) catch |err| switch (err) {
             TxnError.TxnNotFound => null,
@@ -252,16 +281,19 @@ pub const TxnManager = struct {
         if (existing) |record| {
             if (record.status != .pending or record.begin_timestamp != timestamp) return TxnError.DecisionConflict;
             if (record.coordinator_known and record.coordinator != coordinator) return TxnError.DecisionConflict;
+            if (record.retain_terminal_known and record.retain_terminal != retain_terminal) return TxnError.DecisionConflict;
             const persisted = try self.getParticipants(self.alloc, txn_id);
             defer freeParticipantList(self.alloc, persisted);
             if (!participantListsEqual(persisted, participants)) return TxnError.DecisionConflict;
             // An idempotent begin from a new binary is the authoritative point
             // where a legacy record can safely learn its coordinator role.
             // Persist the upgrade before prepare can rewrite the record as v4.
-            if (!record.coordinator_known) {
+            if (!record.coordinator_known or !record.retain_terminal_known) {
                 var upgraded = record;
                 upgraded.coordinator = coordinator;
                 upgraded.coordinator_known = true;
+                upgraded.retain_terminal = retain_terminal;
+                upgraded.retain_terminal_known = true;
                 try self.saveTransactionRecord(key, upgraded);
             }
             return;
@@ -273,6 +305,7 @@ pub const TxnManager = struct {
             .created_at = created_at,
             .finalized_at = 0,
             .coordinator = coordinator,
+            .retain_terminal = retain_terminal,
         };
         const record_value = try self.encodeRecord(record);
         defer self.alloc.free(record_value);
@@ -642,12 +675,29 @@ pub const TxnManager = struct {
                 .finalized_at = record.finalized_at,
                 .coordinator = record.coordinator,
                 .coordinator_known = record.coordinator_known,
+                .retain_terminal = record.retain_terminal,
             });
         }
         return try items.toOwnedSlice(alloc);
     }
 
     pub fn markParticipantResolved(self: *TxnManager, txn_id: TxnId, participant: []const u8) !void {
+        // A replicated acknowledgement can be retried after the coordinator
+        // has already cleaned the transaction. Do not recreate an orphaned
+        // resolved-participants sidecar in that case, and reject corrupt
+        // acknowledgements for participants that were never enlisted.
+        _ = try self.loadTransactionRecord(txn_id);
+        const participants = try self.getParticipants(self.alloc, txn_id);
+        defer freeParticipantList(self.alloc, participants);
+        var enlisted = false;
+        for (participants) |existing| {
+            if (std.mem.eql(u8, existing, participant)) {
+                enlisted = true;
+                break;
+            }
+        }
+        if (!enlisted) return error.InvalidParticipant;
+
         const resolved = try self.getResolvedParticipants(self.alloc, txn_id);
         defer freeParticipantList(self.alloc, resolved);
 
@@ -802,7 +852,11 @@ pub const TxnManager = struct {
             }
 
             const refreshed = try self.loadTransactionRecord(txn_id);
-            if (refreshed.status != .pending and refreshed.finalized_at < cutoff_timestamp and !try self.hasAnyIntents(txn_id)) {
+            const cleanup_cutoff = if (refreshed.retain_terminal)
+                options.retained_cutoff_timestamp orelse cutoff_timestamp
+            else
+                cutoff_timestamp;
+            if (refreshed.status != .pending and refreshed.finalized_at < cleanup_cutoff and !try self.hasAnyIntents(txn_id)) {
                 try self.deleteTransactionMetadata(txn_id);
                 stats.cleaned_records += 1;
                 if (self.trace_writer) |tw| {
@@ -906,7 +960,7 @@ pub const TxnManager = struct {
     }
 
     fn encodeRecord(self: *TxnManager, record: TxnRecord) ![]u8 {
-        const buf = try self.alloc.alloc(u8, txn_record_v4_size);
+        const buf = try self.alloc.alloc(u8, txn_record_v5_size);
         buf[0] = @intFromEnum(record.status);
         std.mem.writeInt(u64, buf[1..9], record.begin_timestamp, .little);
         std.mem.writeInt(u64, buf[9..17], record.commit_version, .little);
@@ -916,7 +970,30 @@ pub const TxnManager = struct {
         std.mem.writeInt(u64, buf[41..49], record.replay_sequence, .little);
         buf[49] = @intFromBool(record.prepared);
         buf[50] = @intFromBool(record.coordinator);
+        buf[51] = @intFromBool(record.retain_terminal);
         return buf;
+    }
+
+    /// Apply the same cleanup predicate on every replicated state-machine
+    /// copy. A missing record is already clean and is therefore idempotent.
+    pub fn cleanupTransactionMetadataIfEligible(
+        self: *TxnManager,
+        txn_id: TxnId,
+        cutoff_timestamp: u64,
+        retained_cutoff_timestamp: u64,
+    ) !bool {
+        const record = self.loadTransactionRecord(txn_id) catch |err| switch (err) {
+            TxnError.TxnNotFound => return false,
+            else => return err,
+        };
+        if (record.status == .pending or try self.hasAnyIntents(txn_id)) return false;
+        const cutoff = if (record.retain_terminal) retained_cutoff_timestamp else cutoff_timestamp;
+        if (record.finalized_at >= cutoff) return false;
+        const unresolved = try self.getUnresolvedParticipants(self.alloc, txn_id);
+        defer freeParticipantList(self.alloc, unresolved);
+        if (unresolved.len != 0) return false;
+        try self.deleteTransactionMetadata(txn_id);
+        return true;
     }
 
     fn hasAnyIntents(self: *TxnManager, txn_id: TxnId) !bool {
@@ -1200,6 +1277,21 @@ fn resolveDecisionConflictReason(current: TxnStatus, requested: TxnStatus) []con
 }
 
 fn decodeRecord(raw: []const u8) !TxnRecord {
+    if (raw.len == txn_record_v5_size) {
+        if (raw[49] > 1 or raw[50] > 1 or raw[51] > 1) return TxnError.InvalidTxnRecord;
+        return .{
+            .status = @enumFromInt(raw[0]),
+            .begin_timestamp = std.mem.readInt(u64, raw[1..9], .little),
+            .commit_version = std.mem.readInt(u64, raw[9..17], .little),
+            .created_at = std.mem.readInt(u64, raw[17..25], .little),
+            .finalized_at = std.mem.readInt(u64, raw[25..33], .little),
+            .intent_revision = std.mem.readInt(u64, raw[33..41], .little),
+            .replay_sequence = std.mem.readInt(u64, raw[41..49], .little),
+            .prepared = raw[49] == 1,
+            .coordinator = raw[50] == 1,
+            .retain_terminal = raw[51] == 1,
+        };
+    }
     if (raw.len == txn_record_v4_size) {
         if (raw[49] > 1 or raw[50] > 1) return TxnError.InvalidTxnRecord;
         return .{
@@ -1212,6 +1304,7 @@ fn decodeRecord(raw: []const u8) !TxnRecord {
             .replay_sequence = std.mem.readInt(u64, raw[41..49], .little),
             .prepared = raw[49] == 1,
             .coordinator = raw[50] == 1,
+            .retain_terminal_known = false,
         };
     }
     if (raw.len == txn_record_v3_size) {
@@ -1226,6 +1319,7 @@ fn decodeRecord(raw: []const u8) !TxnRecord {
             .replay_sequence = std.mem.readInt(u64, raw[41..49], .little),
             .prepared = raw[49] == 1,
             .coordinator_known = false,
+            .retain_terminal_known = false,
         };
     }
     if (raw.len == txn_record_v2_size) {
@@ -1239,6 +1333,7 @@ fn decodeRecord(raw: []const u8) !TxnRecord {
             .replay_sequence = std.mem.readInt(u64, raw[41..49], .little),
             .prepared_known = false,
             .coordinator_known = false,
+            .retain_terminal_known = false,
         };
     }
     if (raw.len == txn_record_v1_size) {
@@ -1250,6 +1345,7 @@ fn decodeRecord(raw: []const u8) !TxnRecord {
             .finalized_at = std.mem.readInt(u64, raw[25..33], .little),
             .prepared_known = false,
             .coordinator_known = false,
+            .retain_terminal_known = false,
         };
     }
     if (raw.len == txn_record_v0_size) {
@@ -1263,6 +1359,7 @@ fn decodeRecord(raw: []const u8) !TxnRecord {
             .finalized_at = 0,
             .prepared_known = false,
             .coordinator_known = false,
+            .retain_terminal_known = false,
         };
     }
     return TxnError.InvalidTxnRecord;
@@ -2170,4 +2267,47 @@ test "recoverTransactions cleans finalized record after all participants resolve
     const stats = try mgr.recoverTransactions(3_000, 4_000);
     try std.testing.expectEqual(@as(u64, 1), stats.cleaned_records);
     try std.testing.expectError(TxnError.TxnNotFound, mgr.getTransactionStatus(txn_id));
+}
+
+test "retained terminal transactions honor the extended retry cutoff" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var runtime_store = try backend.runtimeStore(alloc, .{ .name = "retained-terminal" });
+    defer runtime_store.deinit();
+
+    var mgr = try TxnManager.init(alloc, &runtime_store);
+    defer mgr.deinit();
+    const txn_id: TxnId = .{5} ** 16;
+    try mgr.initTransactionWithParticipantsCreatedAtRoleAndRetention(
+        txn_id,
+        1_000,
+        1_000,
+        &.{},
+        true,
+        true,
+    );
+    try mgr.resolveIntents(txn_id, .committed, 2_000);
+
+    const retained = try mgr.recoverTransactionsWithExtraBatchHooksAndOptions(
+        3_000,
+        4_000,
+        .{},
+        .{ .retained_cutoff_timestamp = 1_500 },
+    );
+    try std.testing.expectEqual(@as(u64, 0), retained.cleaned_records);
+    try std.testing.expectEqual(TxnStatus.committed, try mgr.getTransactionStatus(txn_id));
+
+    const expired = try mgr.recoverTransactionsWithExtraBatchHooksAndOptions(
+        3_000,
+        4_000,
+        .{},
+        .{ .retained_cutoff_timestamp = 3_000 },
+    );
+    try std.testing.expectEqual(@as(u64, 1), expired.cleaned_records);
+    try std.testing.expectError(TxnError.TxnNotFound, mgr.getTransactionStatus(txn_id));
+    try std.testing.expectError(TxnError.TxnNotFound, mgr.markParticipantResolved(txn_id, "late"));
+    const resolved = try mgr.getResolvedParticipants(alloc, txn_id);
+    defer freeParticipantList(alloc, resolved);
+    try std.testing.expectEqual(@as(usize, 0), resolved.len);
 }

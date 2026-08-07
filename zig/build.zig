@@ -4179,6 +4179,8 @@ pub fn build(b: *std.Build) void {
             "coordinator recovery durably aborts a stale prepared transaction",
             "idempotent begin upgrades a legacy transaction coordinator role",
             "transaction recovery delegates stale coordinator abort to replicated resolver",
+            "replicated recovery is coordinator-owned and acknowledges through hooks",
+            "retained terminal transactions honor the extended retry cutoff",
         },
     });
     const run_lib_db_txn_tests = addFilteredTestRunArtifact(b, lib_db_txn_tests);
@@ -5062,9 +5064,11 @@ pub fn build(b: *std.Build) void {
             "internal batch split identity round trips the full u64 id space",
             "internal batch codec round trips replicated transaction phases",
             "distributed txn coordinator groups by range and commits all participants",
+            "stable distributed transaction retry resumes a durable commit decision",
             "distributed txn coordinator aborts begun participants on prepare failure",
             "distributed txn coordinator never aborts after durable commit decision",
             "db transaction recovery runtime resolves table-group participants through distributed txn resolver",
+            "bound stable single-group transaction retry does not reapply transforms",
             "internal group write routes map shard doc identity mismatch to conflict",
             "api http client preserves group doc identity conflicts",
             "bound table write source backs up and restores a local table",

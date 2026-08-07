@@ -1241,9 +1241,35 @@ pub const DBCore = struct {
         participants: []const []const u8,
         coordinator: bool,
     ) !transactions_mod.TxnId {
+        return try self.beginTransactionWithParticipantsCreatedAtRoleAndRetention(
+            txn_id,
+            timestamp_ns,
+            created_at_ns,
+            participants,
+            coordinator,
+            false,
+        );
+    }
+
+    pub fn beginTransactionWithParticipantsCreatedAtRoleAndRetention(
+        self: *DBCore,
+        txn_id: transactions_mod.TxnId,
+        timestamp_ns: u64,
+        created_at_ns: u64,
+        participants: []const []const u8,
+        coordinator: bool,
+        retain_terminal: bool,
+    ) !transactions_mod.TxnId {
         var manager = try self.initTxnManager();
         defer manager.deinit();
-        try manager.initTransactionWithParticipantsCreatedAtAndRole(txn_id, timestamp_ns, created_at_ns, participants, coordinator);
+        try manager.initTransactionWithParticipantsCreatedAtRoleAndRetention(
+            txn_id,
+            timestamp_ns,
+            created_at_ns,
+            participants,
+            coordinator,
+            retain_terminal,
+        );
         return txn_id;
     }
 
@@ -1339,6 +1365,17 @@ pub const DBCore = struct {
         var manager = try self.initTxnManager();
         defer manager.deinit();
         try manager.markParticipantResolved(txn_id, participant);
+    }
+
+    pub fn cleanupTransactionMetadataIfEligible(
+        self: *DBCore,
+        txn_id: transactions_mod.TxnId,
+        cutoff_timestamp: u64,
+        retained_cutoff_timestamp: u64,
+    ) !bool {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        return try manager.cleanupTransactionMetadataIfEligible(txn_id, cutoff_timestamp, retained_cutoff_timestamp);
     }
 
     pub fn getTransactionParticipants(self: *DBCore, alloc: Allocator, txn_id: transactions_mod.TxnId) ![][]u8 {

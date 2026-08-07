@@ -3502,6 +3502,7 @@ pub const TableWriteSource = struct {
             txn_id: db_mod.types.TxnId,
             begin_timestamp: u64,
             topology_epoch: u64,
+            retain_terminal: bool,
             participants: []const []const u8,
         ) anyerror!?void = null,
         txn_prepare_group_local: ?*const fn (
@@ -3873,10 +3874,11 @@ pub const TableWriteSource = struct {
         txn_id: db_mod.types.TxnId,
         begin_timestamp: u64,
         topology_epoch: u64,
+        retain_terminal: bool,
         participants: []const []const u8,
     ) !?void {
         const fn_ptr = self.vtable.txn_begin_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, txn_id, begin_timestamp, topology_epoch, participants);
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, txn_id, begin_timestamp, topology_epoch, retain_terminal, participants);
     }
 
     pub fn txnPrepareGroupLocal(
@@ -4220,6 +4222,7 @@ pub const BoundTableWriteSource = struct {
                 .backup_table = backupTable,
                 .restore_table = restoreTable,
                 .commit_transaction = commitTransaction,
+                .commit_batch = commitBatch,
                 .commit_transaction_with_id = commitTransactionWithId,
                 .batch = batch,
                 .begin_bulk_ingest = beginBulkIngest,
@@ -4653,7 +4656,27 @@ pub const BoundTableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
     ) !?distributed_txn.CommitOutcome {
         const txn_id = nextTxnId();
-        return try commitTransactionWithId(ptr, alloc, txn_id, nextTxnTimestamp(), tables, sync_level);
+        return try commitBoundTransaction(ptr, alloc, txn_id, nextTxnTimestamp(), tables, sync_level, false);
+    }
+
+    fn commitBatch(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+    ) !?distributed_txn.CommitOutcome {
+        if (tables.len == 1 and tables[0].predicates.len == 0) {
+            const table = tables[0];
+            _ = (try batch(ptr, alloc, table.table_name, .{
+                .writes = transactionWritesAsBatchWrites(table.writes),
+                .deletes = table.deletes,
+                .transforms = table.transforms,
+                .sync_level = sync_level,
+            })) orelse return null;
+            return .{ .committed = .{ .participant_count = 1 } };
+        }
+        const txn_id = nextTxnId();
+        return try commitBoundTransaction(ptr, alloc, txn_id, nextTxnTimestamp(), tables, sync_level, false);
     }
 
     fn commitTransactionWithId(
@@ -4664,26 +4687,45 @@ pub const BoundTableWriteSource = struct {
         tables: []const distributed_txn.TableCommitRequest,
         sync_level: db_mod.types.SyncLevel,
     ) !?distributed_txn.CommitOutcome {
+        return try commitBoundTransaction(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, true);
+    }
+
+    fn commitBoundTransaction(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+        begin_timestamp: u64,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        retain_terminal: bool,
+    ) !?distributed_txn.CommitOutcome {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (tables.len != 1) return error.UnsupportedOperation;
         const table = tables[0];
         if (!std.mem.eql(u8, self.table_name, table.table_name)) return null;
 
-        if (table.predicates.len == 0) {
-            _ = (try batch(ptr, alloc, table.table_name, .{
-                .writes = transactionWritesAsBatchWrites(table.writes),
-                .deletes = table.deletes,
-                .transforms = table.transforms,
-                .sync_level = sync_level,
-            })) orelse return null;
-            return .{ .committed = .{ .participant_count = 1 } };
-        }
-
         const db = try self.activeDb();
         try validateTransactionAgainstLocalSchema(alloc, db, table.writes, table.deletes, table.transforms);
         const commit_version = begin_timestamp + 1;
 
-        _ = try db.beginTransactionWithIdAndParticipants(txn_id, begin_timestamp, &.{});
+        _ = db.beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(
+            txn_id,
+            begin_timestamp,
+            platform_time.realtimeNs(),
+            &.{},
+            true,
+            retain_terminal,
+        ) catch |err| switch (err) {
+            error.DecisionConflict => switch (try db.getTransactionStatus(txn_id)) {
+                .committed => {
+                    try db.resolveTransactionIntentsWithSyncLevel(txn_id, .committed, commit_version, sync_level);
+                    return .{ .committed = .{ .participant_count = 1 } };
+                },
+                .aborted => return .{ .conflict = boundConflict(table, error.DecisionConflict) },
+                .pending => return error.TransactionBeginFailed,
+            },
+            else => return err,
+        };
         db.writeTransaction(txn_id, .{
             .writes = table.writes,
             .deletes = table.deletes,
@@ -4795,15 +4837,18 @@ pub const BoundTableWriteSource = struct {
         txn_id: db_mod.types.TxnId,
         begin_timestamp: u64,
         _: u64,
+        retain_terminal: bool,
         participants: []const []const u8,
     ) !?void {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
-        _ = try (try self.activeDb()).beginTransactionWithIdAndParticipantsCreatedAt(
+        _ = try (try self.activeDb()).beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(
             txn_id,
             begin_timestamp,
             platform_time.realtimeNs(),
             participants,
+            true,
+            retain_terminal,
         );
     }
 
@@ -5584,15 +5629,27 @@ pub const ProvisionedTableWriteSource = struct {
     fn transactionRecoveryConfig(self: *ProvisionedTableWriteSource) db_mod.transaction_runtime.Config {
         const backend_runtime = self.backend_runtime orelse return .{};
         if (backend_runtime.io() == null or self.quiesced) return .{};
+        const replicated = self.raft_batcher != null;
         return .{
             .enabled = true,
-            .lease_owned = true,
+            .lease_owned = !replicated,
             .owner_id = "provisioned-2pc",
             .interval_ms = 5_000,
             .cutoff_ns = 5 * std.time.ns_per_min,
             .resolver_ctx = self,
             .resolve_participant_fn = resolveRecoveryParticipant,
+            .replicated_metadata = replicated,
+            .owns_recovery_fn = if (replicated) ownsRecovery else null,
+            .acknowledge_participant_fn = if (replicated) acknowledgeRecoveryParticipant else null,
+            .cleanup_transaction_fn = if (replicated) cleanupRecoveryTransaction else null,
         };
+    }
+
+    fn ownsRecovery(ptr: *anyopaque, owner_participant: []const u8) bool {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const ref = distributed_txn.parseParticipantRef(owner_participant) orelse return false;
+        const leadership = self.promotion_leadership_source orelse return true;
+        return leadership.isLocalLeader(ref.group_id);
     }
 
     fn resolveRecoveryParticipant(
@@ -5605,9 +5662,6 @@ pub const ProvisionedTableWriteSource = struct {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         const ref = distributed_txn.parseParticipantRef(participant) orelse return error.InvalidParticipant;
         if (self.quiesced) return error.Canceled;
-        if (self.promotion_leadership_source) |leadership| {
-            if (!leadership.isLocalLeader(ref.group_id)) return error.NotLeader;
-        }
         const alloc = std.heap.page_allocator;
         if (self.raft_batcher) |batcher| {
             try batcher.batchGroup(alloc, ref.group_id, ref.table_name, .{
@@ -5628,6 +5682,44 @@ pub const ProvisionedTableWriteSource = struct {
             commit_version,
             .propose,
         )) orelse return error.UnknownGroup;
+    }
+
+    fn acknowledgeRecoveryParticipant(
+        ptr: *anyopaque,
+        txn_id: db_mod.types.TxnId,
+        owner_participant: []const u8,
+        participant: []const u8,
+    ) !void {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const owner = distributed_txn.parseParticipantRef(owner_participant) orelse return error.InvalidParticipant;
+        const batcher = self.raft_batcher orelse return error.UnsupportedOperation;
+        try batcher.batchGroup(std.heap.page_allocator, owner.group_id, owner.table_name, .{
+            .sync_level = .write,
+            .transaction = .{ .acknowledge = .{
+                .txn_id = txn_id,
+                .participant = participant,
+            } },
+        });
+    }
+
+    fn cleanupRecoveryTransaction(
+        ptr: *anyopaque,
+        txn_id: db_mod.types.TxnId,
+        owner_participant: []const u8,
+        cutoff_timestamp: u64,
+        retained_cutoff_timestamp: u64,
+    ) !void {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const owner = distributed_txn.parseParticipantRef(owner_participant) orelse return error.InvalidParticipant;
+        const batcher = self.raft_batcher orelse return error.UnsupportedOperation;
+        try batcher.batchGroup(std.heap.page_allocator, owner.group_id, owner.table_name, .{
+            .sync_level = .write,
+            .transaction = .{ .cleanup = .{
+                .txn_id = txn_id,
+                .cutoff_timestamp = cutoff_timestamp,
+                .retained_cutoff_timestamp = retained_cutoff_timestamp,
+            } },
+        });
     }
 
     pub fn withLocalWriteOwner(self: *ProvisionedTableWriteSource, owner: ?*ProvisionedTableWriteSource) *ProvisionedTableWriteSource {
@@ -13038,7 +13130,7 @@ pub const ProvisionedTableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
     ) !?distributed_txn.CommitOutcome {
         const txn_id = nextTxnId();
-        return try commitTransactionWithId(ptr, alloc, txn_id, nextTxnTimestamp(), tables, sync_level);
+        return try commitProvisionedTransaction(ptr, alloc, txn_id, nextTxnTimestamp(), tables, sync_level, false);
     }
 
     fn commitTransactionWithId(
@@ -13049,12 +13141,23 @@ pub const ProvisionedTableWriteSource = struct {
         tables: []const distributed_txn.TableCommitRequest,
         sync_level: db_mod.types.SyncLevel,
     ) !?distributed_txn.CommitOutcome {
+        return try commitProvisionedTransaction(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, true);
+    }
+
+    fn commitProvisionedTransaction(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+        begin_timestamp: u64,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        retain_terminal: bool,
+    ) !?distributed_txn.CommitOutcome {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try enforceHAWriteGateOptional(self.ha_write_gate);
-        if (try self.commitSingleGroupTransaction(alloc, tables, sync_level)) |outcome| return outcome;
         var worker_impl = distributed_txn.LocalTableWriteParticipantWorker.init(self.source());
         const commit_version = begin_timestamp + 1;
-        return try distributed_txn.executeMultiTableCommit(
+        return try distributed_txn.executeMultiTableCommitWithOptions(
             alloc,
             self.catalog,
             worker_impl.worker(),
@@ -13064,6 +13167,7 @@ pub const ProvisionedTableWriteSource = struct {
             tables,
             sync_level,
             if (comptime build_options.with_tla) tracing.stderrAntflyTraceWriter() else null,
+            .{ .retain_terminal = retain_terminal },
         );
     }
 
@@ -13073,7 +13177,11 @@ pub const ProvisionedTableWriteSource = struct {
         tables: []const distributed_txn.TableCommitRequest,
         sync_level: db_mod.types.SyncLevel,
     ) !?distributed_txn.CommitOutcome {
-        return try commitTransaction(ptr, alloc, tables, sync_level);
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try enforceHAWriteGateOptional(self.ha_write_gate);
+        if (try self.commitSingleGroupTransaction(alloc, tables, sync_level)) |outcome| return outcome;
+        const txn_id = nextTxnId();
+        return try commitProvisionedTransaction(ptr, alloc, txn_id, nextTxnTimestamp(), tables, sync_level, false);
     }
 
     fn commitSingleGroupTransaction(
@@ -13551,6 +13659,7 @@ pub const ProvisionedTableWriteSource = struct {
         txn_id: db_mod.types.TxnId,
         begin_timestamp: u64,
         topology_epoch: u64,
+        retain_terminal: bool,
         participants: []const []const u8,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
@@ -13563,6 +13672,7 @@ pub const ProvisionedTableWriteSource = struct {
                     .begin_timestamp = begin_timestamp,
                     .created_at_ns = platform_time.realtimeNs(),
                     .topology_epoch = topology_epoch,
+                    .retain_terminal = retain_terminal,
                     .participants = participants,
                 } },
             });
@@ -13580,6 +13690,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .begin_timestamp = begin_timestamp,
                 .created_at_ns = platform_time.realtimeNs(),
                 .topology_epoch = topology_epoch,
+                .retain_terminal = retain_terminal,
                 .participants = participants,
             } } });
             lockAtomic(&self.local_db_mutex);
@@ -13594,6 +13705,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .begin_timestamp = begin_timestamp,
                 .created_at_ns = platform_time.realtimeNs(),
                 .topology_epoch = topology_epoch,
+                .retain_terminal = retain_terminal,
                 .participants = participants,
             } } });
             self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
@@ -15370,7 +15482,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
     ) !?distributed_txn.CommitOutcome {
         const txn_id = nextTxnId();
-        return try commitTransactionWithId(ptr, alloc, txn_id, nextTxnTimestamp(), tables, sync_level);
+        return try commitHostedTransaction(ptr, alloc, txn_id, nextTxnTimestamp(), tables, sync_level, false);
     }
 
     fn commitBatch(
@@ -15379,7 +15491,10 @@ pub const HostedProvisionedTableWriteSource = struct {
         tables: []const distributed_txn.TableCommitRequest,
         sync_level: db_mod.types.SyncLevel,
     ) !?distributed_txn.CommitOutcome {
-        return try commitTransaction(ptr, alloc, tables, sync_level);
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (try self.commitSingleGroupTransaction(alloc, tables, sync_level)) |outcome| return outcome;
+        const txn_id = nextTxnId();
+        return try commitHostedTransaction(ptr, alloc, txn_id, nextTxnTimestamp(), tables, sync_level, false);
     }
 
     fn commitTransactionWithId(
@@ -15390,11 +15505,22 @@ pub const HostedProvisionedTableWriteSource = struct {
         tables: []const distributed_txn.TableCommitRequest,
         sync_level: db_mod.types.SyncLevel,
     ) !?distributed_txn.CommitOutcome {
+        return try commitHostedTransaction(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, true);
+    }
+
+    fn commitHostedTransaction(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+        begin_timestamp: u64,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        retain_terminal: bool,
+    ) !?distributed_txn.CommitOutcome {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (try self.commitSingleGroupTransaction(alloc, tables, sync_level)) |outcome| return outcome;
         var worker_impl = distributed_txn.HostedParticipantWorker.init(self.catalog, self.router, self.source(), self.executor);
         const commit_version = begin_timestamp + 1;
-        return try distributed_txn.executeMultiTableCommit(
+        return try distributed_txn.executeMultiTableCommitWithOptions(
             alloc,
             self.catalog,
             worker_impl.worker(),
@@ -15404,6 +15530,7 @@ pub const HostedProvisionedTableWriteSource = struct {
             tables,
             sync_level,
             if (comptime build_options.with_tla) tracing.stderrAntflyTraceWriter() else null,
+            .{ .retain_terminal = retain_terminal },
         );
     }
 
@@ -15539,6 +15666,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         txn_id: db_mod.types.TxnId,
         begin_timestamp: u64,
         topology_epoch: u64,
+        retain_terminal: bool,
         participants: []const []const u8,
     ) !?void {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
@@ -15549,6 +15677,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .begin_timestamp = begin_timestamp,
                 .created_at_ns = platform_time.realtimeNs(),
                 .topology_epoch = topology_epoch,
+                .retain_terminal = retain_terminal,
                 .participants = participants,
             } },
         });
@@ -16327,12 +16456,13 @@ fn applyReplicatedTransactionMutation(
             // follower tracks itself, making successful cleanup O(N) rather
             // than every participant retrying every other participant.
             const durable_participants: []const []const u8 = if (coordinator) begin.participants else &local_only;
-            _ = try db.beginTransactionWithIdAndParticipantsCreatedAtAndRole(
+            _ = try db.beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(
                 begin.txn_id,
                 begin.begin_timestamp,
                 begin.created_at_ns,
                 durable_participants,
                 coordinator,
+                begin.retain_terminal,
             );
         },
         .prepare => |prepare| try db.writeTransaction(prepare.txn_id, .{
@@ -16352,6 +16482,18 @@ fn applyReplicatedTransactionMutation(
             defer alloc.free(local_participant);
             try db.markTransactionParticipantResolved(resolve.txn_id, local_participant);
         },
+        .acknowledge => |ack| db.markTransactionParticipantResolved(ack.txn_id, ack.participant) catch |err| switch (err) {
+            // Cleanup and acknowledgements are independently retryable Raft
+            // commands. Once cleanup wins, a late acknowledgement is a safe
+            // no-op and must not recreate coordinator sidecar metadata.
+            transactions_mod.TxnError.TxnNotFound => {},
+            else => return err,
+        },
+        .cleanup => |cleanup| _ = try db.cleanupTransactionMetadataIfEligible(
+            cleanup.txn_id,
+            cleanup.cutoff_timestamp,
+            cleanup.retained_cutoff_timestamp,
+        ),
     }
 }
 
@@ -21199,7 +21341,7 @@ test "bound table write source resolves internal group transactions into visible
     const participant = try distributed_txn.participantIdForGroup(alloc, "docs", 7);
     defer alloc.free(participant);
 
-    _ = try source.source().txnBeginGroupLocal(alloc, 7, "docs", txn_id, 10_000, 0, &.{participant});
+    _ = try source.source().txnBeginGroupLocal(alloc, 7, "docs", txn_id, 10_000, 0, false, &.{participant});
     _ = try source.source().txnPrepareGroupLocal(alloc, 7, "docs", txn_id, 0, .{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
     });
@@ -21214,6 +21356,43 @@ test "bound table write source resolves internal group transactions into visible
     var result = (try db.lookup(alloc, "doc:a", .{})).?;
     defer result.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, result.json, "\"alpha\"") != null);
+}
+
+test "bound stable single-group transaction retry does not reapply transforms" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/bound-stable-txn-retry", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:counter", .value = "{\"count\":0}" }},
+        .sync_level = .write,
+    });
+
+    var source = BoundTableWriteSource.init("docs", &db);
+    const txn_id = try distributed_txn.parseTxnIdHex("abcdef0123456789abcdef0123456789");
+    const request = [_]distributed_txn.TableCommitRequest{.{
+        .table_name = "docs",
+        .transforms = &.{.{
+            .key = "doc:counter",
+            .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }},
+        }},
+    }};
+
+    const first = (try source.source().commitTransactionWithId(alloc, txn_id, 20_000, &request, .write)) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(first == .committed);
+    const retried = (try source.source().commitTransactionWithId(alloc, txn_id, 20_000, &request, .write)) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(retried == .committed);
+
+    var result = (try db.lookup(alloc, "doc:counter", .{})) orelse return error.TestUnexpectedResult;
+    defer result.deinit(alloc);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, result.json, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("count").?.integer);
+    try std.testing.expectEqual(db_mod.types.TxnStatus.committed, try db.getTransactionStatus(txn_id));
 }
 
 test "bound table write source provisions default full text index on create" {
@@ -24474,7 +24653,7 @@ test "provisioned txn commit reuses cached writer state" {
     const txn_id = try distributed_txn.parseTxnIdHex("00112233445566778899aabbccddeeff");
     const participant = try distributed_txn.participantIdForGroup(alloc, "docs", 7001);
     defer alloc.free(participant);
-    _ = try source.source().txnBeginGroupLocal(alloc, 7001, "docs", txn_id, 10_000, 0, &.{participant});
+    _ = try source.source().txnBeginGroupLocal(alloc, 7001, "docs", txn_id, 10_000, 0, false, &.{participant});
     _ = try source.source().txnPrepareGroupLocal(alloc, 7001, "docs", txn_id, 0, .{
         .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"beta\"}" }},
     });
@@ -25661,7 +25840,7 @@ test "bound table write source rejects invalid txn prepare writes against persis
     _ = try source.source().createTable(alloc, "docs", req);
 
     const txn_id = try distributed_txn.parseTxnIdHex("11112222333344445555666677778888");
-    _ = try source.source().txnBeginGroupLocal(alloc, 7, "docs", txn_id, 10_000, 0, &.{"group:7"});
+    _ = try source.source().txnBeginGroupLocal(alloc, 7, "docs", txn_id, 10_000, 0, false, &.{"group:7"});
     try std.testing.expectError(error.InvalidBatchRequest, source.source().txnPrepareGroupLocal(alloc, 7, "docs", txn_id, 0, .{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"unexpected\"}" }},
     }));
@@ -25692,7 +25871,7 @@ test "bound table write source rejects invalid txn prepare transforms against pe
     });
 
     const txn_id = try distributed_txn.parseTxnIdHex("11112222333344445555666677779999");
-    _ = try source.source().txnBeginGroupLocal(alloc, 7, "docs", txn_id, 10_000, 0, &.{"group:7"});
+    _ = try source.source().txnBeginGroupLocal(alloc, 7, "docs", txn_id, 10_000, 0, false, &.{"group:7"});
     try std.testing.expectError(error.InvalidBatchRequest, source.source().txnPrepareGroupLocal(alloc, 7, "docs", txn_id, 0, .{
         .transforms = &.{.{
             .key = "doc:a",

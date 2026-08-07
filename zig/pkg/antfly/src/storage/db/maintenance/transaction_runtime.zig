@@ -35,9 +35,29 @@ pub const Config = struct {
     lease_ttl_ms: u64 = 30_000,
     interval_ms: u64 = 30_000,
     cutoff_ns: u64 = 5 * std.time.ns_per_min,
+    /// Stable transaction sessions may be retried for seven days. Retain the
+    /// terminal decision for an extra day so boundary retries cannot reapply.
+    retained_terminal_ns: u64 = 8 * std.time.ns_per_day,
     clock: platform_clock.Clock = platform_clock.Clock.real(),
     resolver_ctx: ?*anyopaque = null,
     resolve_participant_fn: ?resolution_mod.ResolveParticipantFn = null,
+    /// Replicated DBs route all transaction metadata changes through their
+    /// coordinator Raft group. Standalone stores keep the direct local path.
+    replicated_metadata: bool = false,
+    owns_recovery_fn: ?*const fn (ctx: *anyopaque, owner_participant: []const u8) bool = null,
+    acknowledge_participant_fn: ?*const fn (
+        ctx: *anyopaque,
+        txn_id: transactions_mod.TxnId,
+        owner_participant: []const u8,
+        participant: []const u8,
+    ) anyerror!void = null,
+    cleanup_transaction_fn: ?*const fn (
+        ctx: *anyopaque,
+        txn_id: transactions_mod.TxnId,
+        owner_participant: []const u8,
+        cutoff_timestamp: u64,
+        retained_cutoff_timestamp: u64,
+    ) anyerror!void = null,
     /// Participant represented by the DB currently being recovered. Local
     /// effects are resolved through the DB pipeline before notifications, so
     /// this participant can be acknowledged without recursively routing back
@@ -69,6 +89,11 @@ pub const Runtime = if (builtin.os.tag == .freestanding) struct {
         _ = store;
         if (config.enabled and (config.resolve_participant_fn == null or config.resolver_ctx == null)) {
             return error.MissingParticipantResolver;
+        }
+        if (config.enabled and config.replicated_metadata and
+            (config.owns_recovery_fn == null or config.acknowledge_participant_fn == null or config.cleanup_transaction_fn == null))
+        {
+            return error.MissingReplicatedRecoveryHooks;
         }
         return .{
             .config = config,
@@ -113,6 +138,11 @@ pub const Runtime = if (builtin.os.tag == .freestanding) struct {
     ) !Runtime {
         if (config.enabled and (config.resolve_participant_fn == null or config.resolver_ctx == null)) {
             return error.MissingParticipantResolver;
+        }
+        if (config.enabled and config.replicated_metadata and
+            (config.owns_recovery_fn == null or config.acknowledge_participant_fn == null or config.cleanup_transaction_fn == null))
+        {
+            return error.MissingReplicatedRecoveryHooks;
         }
         const io_impl = backend_runtime.io_impl;
         if (config.enabled and io_impl == null) return error.MissingBackendRuntimeIo;
@@ -184,6 +214,11 @@ pub const Runtime = if (builtin.os.tag == .freestanding) struct {
 pub fn recoverOnce(alloc: Allocator, store: anytype, config: Config) !types.TransactionRecoveryStats {
     if (!config.enabled) return .{};
     if (config.resolve_participant_fn == null or config.resolver_ctx == null) return error.MissingParticipantResolver;
+    if (config.replicated_metadata and
+        (config.owns_recovery_fn == null or config.acknowledge_participant_fn == null or config.cleanup_transaction_fn == null))
+    {
+        return error.MissingReplicatedRecoveryHooks;
+    }
 
     var runtime_store = try initRuntimeStore(alloc, store);
     defer runtime_store.deinit();
@@ -261,13 +296,17 @@ fn runRecoveryWithConfig(
     const txns = try manager.listTransactions(alloc);
     defer alloc.free(txns);
 
-    for (txns) |txn| {
+    transaction: for (txns) |txn| {
+        summary.recovery.scanned_records += 1;
         if (txn.status == .pending) {
             const cutoff = now_ns -| config.cutoff_ns;
             if (txn.coordinator_known and txn.coordinator and txn.created_at > 0 and txn.created_at < cutoff) {
                 const participants = try manager.getParticipants(alloc, txn.txn_id);
                 defer transactions_mod.freeParticipantList(alloc, participants);
                 if (participants.len > 0) {
+                    if (config.owns_recovery_fn) |owns| {
+                        if (!owns(config.resolver_ctx.?, participants[0])) continue;
+                    }
                     summary.notification_attempts += 1;
                     config.resolve_participant_fn.?(
                         config.resolver_ctx.?,
@@ -285,33 +324,84 @@ fn runRecoveryWithConfig(
             continue;
         }
 
+        const participants = try manager.getParticipants(alloc, txn.txn_id);
+        defer transactions_mod.freeParticipantList(alloc, participants);
+        const owner_participant = if (participants.len > 0) participants[0] else null;
+        if (config.replicated_metadata and owner_participant == null) return error.InvalidParticipant;
+        if (owner_participant) |owner| if (config.owns_recovery_fn) |owns| {
+            if (!owns(config.resolver_ctx.?, owner)) continue;
+        };
+
         if (try manager.hasIntents(txn.txn_id)) {
-            if (config.resolve_local_fn) |resolve_local| {
+            if (config.replicated_metadata) {
+                summary.notification_attempts += 1;
+                config.resolve_participant_fn.?(
+                    config.resolver_ctx.?,
+                    txn.txn_id,
+                    owner_participant.?,
+                    txn.status,
+                    txn.commit_version,
+                ) catch {
+                    summary.notification_failures += 1;
+                    continue :transaction;
+                };
+                summary.notification_successes += 1;
+            } else if (config.resolve_local_fn) |resolve_local| {
                 try resolve_local(config.local_resolution_ctx orelse return error.MissingLocalTransactionResolver, txn.txn_id, txn.status, txn.commit_version);
             }
         }
 
         const unresolved = try manager.getUnresolvedParticipants(alloc, txn.txn_id);
         defer transactions_mod.freeParticipantList(alloc, unresolved);
-        if (unresolved.len == 0) continue;
+        var all_resolved = true;
 
         for (unresolved) |participant| {
             summary.notification_attempts += 1;
             config.resolve_participant_fn.?(config.resolver_ctx.?, txn.txn_id, participant, txn.status, txn.commit_version) catch {
                 summary.notification_failures += 1;
+                all_resolved = false;
                 continue;
             };
-            try manager.markParticipantResolved(txn.txn_id, participant);
+            if (config.replicated_metadata) {
+                config.acknowledge_participant_fn.?(
+                    config.resolver_ctx.?,
+                    txn.txn_id,
+                    owner_participant.?,
+                    participant,
+                ) catch {
+                    summary.notification_failures += 1;
+                    all_resolved = false;
+                    continue;
+                };
+            } else try manager.markParticipantResolved(txn.txn_id, participant);
             summary.notification_successes += 1;
         }
+        if (config.replicated_metadata and all_resolved) {
+            const cutoff = now_ns -| config.cutoff_ns;
+            const retained_cutoff = now_ns -| config.retained_terminal_ns;
+            if (txn.finalized_at < (if (txn.retain_terminal) retained_cutoff else cutoff)) {
+                try config.cleanup_transaction_fn.?(
+                    config.resolver_ctx.?,
+                    txn.txn_id,
+                    owner_participant.?,
+                    cutoff,
+                    retained_cutoff,
+                );
+            }
+        }
     }
+
+    if (config.replicated_metadata) return summary;
 
     const cutoff = now_ns -| config.cutoff_ns;
     summary.recovery = try manager.recoverTransactionsWithExtraBatchHooksAndOptions(
         cutoff,
         now_ns,
         config.resolution_extra_hooks,
-        .{ .presume_abort_distributed = false },
+        .{
+            .presume_abort_distributed = false,
+            .retained_cutoff_timestamp = now_ns -| config.retained_terminal_ns,
+        },
     );
     return summary;
 }
@@ -499,4 +589,87 @@ test "transaction recovery delegates stale coordinator abort to replicated resol
     try std.testing.expectEqual(@as(u64, 1), stats.notification_attempts);
     try std.testing.expectEqual(@as(u64, 0), stats.auto_aborted);
     try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try manager.getTransactionStatus(txn_id));
+}
+
+test "replicated recovery is coordinator-owned and acknowledges through hooks" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var runtime_store = try backend.runtimeStore(alloc, .{ .name = "replicated-coordinator" });
+    defer runtime_store.deinit();
+
+    const txn_id: transactions_mod.TxnId = .{6} ** 16;
+    const coordinator = "table2:4:docs:group:7";
+    const remote = "table2:4:docs:group:8";
+    var manager = try transactions_mod.TxnManager.init(alloc, &runtime_store);
+    defer manager.deinit();
+    try manager.initTransactionWithParticipantsCreatedAtRoleAndRetention(
+        txn_id,
+        1_000,
+        1_000,
+        &.{ coordinator, remote },
+        true,
+        true,
+    );
+    try manager.resolveIntents(txn_id, .committed, 2_000);
+    try manager.markParticipantResolved(txn_id, coordinator);
+
+    const Recorder = struct {
+        resolve_calls: usize = 0,
+        ack_calls: usize = 0,
+        cleanup_calls: usize = 0,
+
+        fn owns(_: *anyopaque, owner: []const u8) bool {
+            std.testing.expectEqualStrings(coordinator, owner) catch return false;
+            return true;
+        }
+
+        fn resolve(ptr: *anyopaque, actual_txn_id: transactions_mod.TxnId, participant: []const u8, status: transactions_mod.TxnStatus, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.resolve_calls += 1;
+            try std.testing.expectEqual(txn_id, actual_txn_id);
+            try std.testing.expectEqualStrings(remote, participant);
+            try std.testing.expectEqual(transactions_mod.TxnStatus.committed, status);
+        }
+
+        fn acknowledge(ptr: *anyopaque, actual_txn_id: transactions_mod.TxnId, owner: []const u8, participant: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.ack_calls += 1;
+            try std.testing.expectEqual(txn_id, actual_txn_id);
+            try std.testing.expectEqualStrings(coordinator, owner);
+            try std.testing.expectEqualStrings(remote, participant);
+        }
+
+        fn cleanup(ptr: *anyopaque, _: transactions_mod.TxnId, _: []const u8, _: u64, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.cleanup_calls += 1;
+        }
+    };
+
+    var recorder = Recorder{};
+    var clock = platform_clock.ManualClock{};
+    clock.setRealtimeNs(10_000);
+    const stats = try recoverOnce(alloc, &runtime_store, .{
+        .enabled = true,
+        .clock = clock.clock(),
+        .cutoff_ns = 1_000,
+        .retained_terminal_ns = 20_000,
+        .resolver_ctx = &recorder,
+        .resolve_participant_fn = Recorder.resolve,
+        .replicated_metadata = true,
+        .owns_recovery_fn = Recorder.owns,
+        .acknowledge_participant_fn = Recorder.acknowledge,
+        .cleanup_transaction_fn = Recorder.cleanup,
+    });
+    try std.testing.expectEqual(@as(usize, 1), recorder.resolve_calls);
+    try std.testing.expectEqual(@as(usize, 1), recorder.ack_calls);
+    try std.testing.expectEqual(@as(usize, 0), recorder.cleanup_calls);
+    try std.testing.expectEqual(@as(u64, 1), stats.notification_successes);
+
+    // The worker only requested a replicated acknowledgement; it did not
+    // mutate the local coordinator metadata behind Raft's back.
+    const unresolved = try manager.getUnresolvedParticipants(alloc, txn_id);
+    defer transactions_mod.freeParticipantList(alloc, unresolved);
+    try std.testing.expectEqual(@as(usize, 1), unresolved.len);
+    try std.testing.expectEqualStrings(remote, unresolved[0]);
 }

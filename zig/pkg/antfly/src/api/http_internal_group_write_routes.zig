@@ -646,6 +646,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
             txn_req.txn_id,
             txn_req.begin_timestamp,
             txn_req.topology_epoch,
+            txn_req.retain_terminal,
             txn_req.participants,
         ) catch |err| switch (err) {
             error.InvalidBatchRequest => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid transaction request"),
@@ -1364,7 +1365,7 @@ const TestWriteSource = struct {
         return null;
     }
 
-    fn txnBeginGroupLocal(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: u64, _: []const []const u8) !?void {
+    fn txnBeginGroupLocal(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: u64, _: bool, _: []const []const u8) !?void {
         return null;
     }
 

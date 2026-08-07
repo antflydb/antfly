@@ -5118,7 +5118,11 @@ pub const ApiHttpServer = struct {
                 const distributed_tables = try commit_req.distributedTables(self.alloc);
                 defer if (distributed_tables.len > 0) self.alloc.free(distributed_tables);
                 self.validateCommitTablesAgainstSchema(distributed_tables) catch |err| switch (err) {
-                    error.InvalidBatchRequest => return try textResponse(self.alloc, 400, "invalid transaction commit request"),
+                    error.InvalidBatchRequest,
+                    error.InvalidArgument,
+                    error.InvalidGraphEdges,
+                    error.UnsupportedTransformOperation,
+                    => return try textResponse(self.alloc, 400, "invalid transaction commit request"),
                     else => return err,
                 };
                 if (try self.validateCommitReadSet(commit_req)) |conflict| {
@@ -24800,7 +24804,7 @@ test "api http server surfaces structured participant diagnostics for unavailabl
             return commitTransaction(ptr, txn_alloc, tables, sync_level);
         }
 
-        fn beginGroup(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: u64, _: []const []const u8) anyerror!?void {
+        fn beginGroup(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: u64, _: bool, _: []const []const u8) anyerror!?void {
             return error.UnsupportedOperation;
         }
 
@@ -24908,7 +24912,7 @@ test "api http server surfaces structured decision conflicts for transaction com
             return commitTransaction(ptr, txn_alloc, tables, sync_level);
         }
 
-        fn beginGroup(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: u64, _: []const []const u8) anyerror!?void {
+        fn beginGroup(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: u64, _: bool, _: []const []const u8) anyerror!?void {
             return error.UnsupportedOperation;
         }
 
@@ -25014,7 +25018,7 @@ test "api http server surfaces structured doc identity conflicts for transaction
             return commitTransaction(ptr, txn_alloc, tables, sync_level);
         }
 
-        fn beginGroup(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: u64, _: []const []const u8) anyerror!?void {
+        fn beginGroup(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: u64, _: bool, _: []const []const u8) anyerror!?void {
             return error.UnsupportedOperation;
         }
 
@@ -25122,7 +25126,7 @@ test "api http server surfaces structured torn-state conflicts when txn record i
             return commitTransaction(ptr, txn_alloc, tables, sync_level);
         }
 
-        fn beginGroup(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: u64, _: []const []const u8) anyerror!?void {
+        fn beginGroup(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: u64, _: bool, _: []const []const u8) anyerror!?void {
             return error.UnsupportedOperation;
         }
 
@@ -25227,7 +25231,7 @@ test "api http server surfaces structured torn-state conflicts when txn record i
             return commitTransaction(ptr, txn_alloc, tables, sync_level);
         }
 
-        fn beginGroup(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: u64, _: []const []const u8) anyerror!?void {
+        fn beginGroup(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: u64, _: bool, _: []const []const u8) anyerror!?void {
             return error.UnsupportedOperation;
         }
 
@@ -32822,7 +32826,7 @@ test "api http server prefers metadata-owned restore over inline write-source re
         fn unsupportedBatchGroupLocal(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
             return error.UnsupportedOperation;
         }
-        fn unsupportedTxnBeginGroupLocal(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: u64, _: []const []const u8) anyerror!?void {
+        fn unsupportedTxnBeginGroupLocal(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: u64, _: bool, _: []const []const u8) anyerror!?void {
             return error.UnsupportedOperation;
         }
         fn unsupportedTxnPrepareGroupLocal(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: db_mod.types.TransactionIntentRequest) anyerror!?void {

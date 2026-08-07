@@ -321,6 +321,10 @@ fn parseBatchRequestWithOptions(
                 .begin_timestamp = try parseInternalU64(object.get("begin_timestamp") orelse return error.InvalidBatchRequest),
                 .created_at_ns = try parseInternalU64(object.get("created_at_ns") orelse return error.InvalidBatchRequest),
                 .topology_epoch = try parseInternalU64(object.get("topology_epoch") orelse return error.InvalidBatchRequest),
+                .retain_terminal = if (object.get("retain_terminal")) |item| switch (item) {
+                    .bool => |flag| flag,
+                    else => return error.InvalidBatchRequest,
+                } else false,
                 .participants = transaction_participants,
             } };
         }
@@ -339,6 +343,22 @@ fn parseBatchRequestWithOptions(
                 .commit_version = try parseInternalU64(object.get("commit_version") orelse return error.InvalidBatchRequest),
             } };
         }
+        if (std.mem.eql(u8, phase_value.string, "acknowledge")) {
+            const participant_value = object.get("participant") orelse return error.InvalidBatchRequest;
+            if (participant_value != .string or participant_value.string.len == 0) return error.InvalidBatchRequest;
+            transaction_participants = try alloc.alloc([]const u8, 1);
+            transaction_participants[0] = try alloc.dupe(u8, participant_value.string);
+            transaction_participants_initialized = 1;
+            break :transaction .{ .acknowledge = .{
+                .txn_id = txn_id,
+                .participant = transaction_participants[0],
+            } };
+        }
+        if (std.mem.eql(u8, phase_value.string, "cleanup")) break :transaction .{ .cleanup = .{
+            .txn_id = txn_id,
+            .cutoff_timestamp = try parseInternalU64(object.get("cutoff_timestamp") orelse return error.InvalidBatchRequest),
+            .retained_cutoff_timestamp = try parseInternalU64(object.get("retained_cutoff_timestamp") orelse return error.InvalidBatchRequest),
+        } };
         return error.InvalidBatchRequest;
     };
 
@@ -353,7 +373,7 @@ fn parseBatchRequestWithOptions(
     }
     if (predicates.len != 0 and transaction == null) return error.InvalidBatchRequest;
     if (transaction) |mutation| switch (mutation) {
-        .begin, .resolve => if (writes.len != 0 or deletes.len != 0 or transforms.len != 0 or predicates.len != 0)
+        .begin, .resolve, .acknowledge, .cleanup => if (writes.len != 0 or deletes.len != 0 or transforms.len != 0 or predicates.len != 0)
             return error.InvalidBatchRequest,
         .prepare => {},
     };
@@ -505,8 +525,8 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
         switch (mutation) {
             .begin => |begin| {
                 const txn_hex = std.fmt.bytesToHex(begin.txn_id, .lower);
-                try writer.print("\"phase\":\"begin\",\"txn_id\":\"{s}\",\"begin_timestamp\":\"{d}\",\"created_at_ns\":\"{d}\",\"topology_epoch\":\"{d}\",\"participants\":[", .{
-                    &txn_hex, begin.begin_timestamp, begin.created_at_ns, begin.topology_epoch,
+                try writer.print("\"phase\":\"begin\",\"txn_id\":\"{s}\",\"begin_timestamp\":\"{d}\",\"created_at_ns\":\"{d}\",\"topology_epoch\":\"{d}\",\"retain_terminal\":{},\"participants\":[", .{
+                    &txn_hex, begin.begin_timestamp, begin.created_at_ns, begin.topology_epoch, begin.retain_terminal,
                 });
                 for (begin.participants, 0..) |participant, i| {
                     if (i != 0) try writer.writeByte(',');
@@ -522,6 +542,18 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
                 const txn_hex = std.fmt.bytesToHex(resolve.txn_id, .lower);
                 try writer.print("\"phase\":\"resolve\",\"txn_id\":\"{s}\",\"status\":{f},\"commit_version\":\"{d}\"", .{
                     &txn_hex, std.json.fmt(@tagName(resolve.status), .{}), resolve.commit_version,
+                });
+            },
+            .acknowledge => |ack| {
+                const txn_hex = std.fmt.bytesToHex(ack.txn_id, .lower);
+                try writer.print("\"phase\":\"acknowledge\",\"txn_id\":\"{s}\",\"participant\":{f}", .{
+                    &txn_hex, std.json.fmt(ack.participant, .{}),
+                });
+            },
+            .cleanup => |cleanup| {
+                const txn_hex = std.fmt.bytesToHex(cleanup.txn_id, .lower);
+                try writer.print("\"phase\":\"cleanup\",\"txn_id\":\"{s}\",\"cutoff_timestamp\":\"{d}\",\"retained_cutoff_timestamp\":\"{d}\"", .{
+                    &txn_hex, cleanup.cutoff_timestamp, cleanup.retained_cutoff_timestamp,
                 });
             },
         }
@@ -866,6 +898,58 @@ test "internal batch codec round trips replicated transaction phases" {
     try std.testing.expectEqual(@as(u64, 7), prepare.topology_epoch);
     try std.testing.expectEqual(@as(usize, 1), decoded.req.writes.len);
     try std.testing.expectEqual(@as(u64, 41), decoded.req.predicates[0].expected_version);
+
+    const begin_encoded = try encodeBatchRequest(alloc, .{
+        .transaction = .{ .begin = .{
+            .txn_id = txn_id,
+            .begin_timestamp = 42,
+            .created_at_ns = 43,
+            .topology_epoch = 7,
+            .retain_terminal = true,
+            .participants = &.{"table2:4:docs:group:7"},
+        } },
+    });
+    defer alloc.free(begin_encoded);
+    var begin_decoded = try parseInternalBatchRequest(alloc, begin_encoded);
+    defer begin_decoded.deinit(alloc);
+    const begin = switch (begin_decoded.req.transaction.?) {
+        .begin => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(begin.retain_terminal);
+    try std.testing.expectEqualStrings("table2:4:docs:group:7", begin.participants[0]);
+
+    const ack_encoded = try encodeBatchRequest(alloc, .{
+        .transaction = .{ .acknowledge = .{
+            .txn_id = txn_id,
+            .participant = "table2:4:docs:group:8",
+        } },
+    });
+    defer alloc.free(ack_encoded);
+    var ack_decoded = try parseInternalBatchRequest(alloc, ack_encoded);
+    defer ack_decoded.deinit(alloc);
+    const ack = switch (ack_decoded.req.transaction.?) {
+        .acknowledge => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqualStrings("table2:4:docs:group:8", ack.participant);
+
+    const cleanup_encoded = try encodeBatchRequest(alloc, .{
+        .transaction = .{ .cleanup = .{
+            .txn_id = txn_id,
+            .cutoff_timestamp = 100,
+            .retained_cutoff_timestamp = 50,
+        } },
+    });
+    defer alloc.free(cleanup_encoded);
+    var cleanup_decoded = try parseInternalBatchRequest(alloc, cleanup_encoded);
+    defer cleanup_decoded.deinit(alloc);
+    const cleanup = switch (cleanup_decoded.req.transaction.?) {
+        .cleanup => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(u64, 100), cleanup.cutoff_timestamp);
+    try std.testing.expectEqual(@as(u64, 50), cleanup.retained_cutoff_timestamp);
 }
 
 test "internal batch parser rejects mixed split transition commands" {

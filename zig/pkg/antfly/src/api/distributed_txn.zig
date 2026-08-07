@@ -30,6 +30,7 @@ pub const TxnBeginRequest = struct {
     txn_id: db_mod.types.TxnId,
     begin_timestamp: u64,
     topology_epoch: u64 = 0,
+    retain_terminal: bool = false,
     participants: []const []const u8,
 };
 
@@ -200,7 +201,7 @@ pub const HostedParticipantWorker = struct {
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader)) orelse return error.UnknownGroup;
         defer route.deinit(alloc);
         switch (route) {
-            .local => _ = (try self.writes.txnBeginGroupLocal(alloc, group_id, table_name, req.txn_id, req.begin_timestamp, req.topology_epoch, req.participants)) orelse return error.UnknownGroup,
+            .local => _ = (try self.writes.txnBeginGroupLocal(alloc, group_id, table_name, req.txn_id, req.begin_timestamp, req.topology_epoch, req.retain_terminal, req.participants)) orelse return error.UnknownGroup,
             .remote => |remote| {
                 var client = http_client_mod.ApiHttpClient.init(alloc, self.executor);
                 const body = try encodeTxnBeginRequest(alloc, req);
@@ -283,7 +284,7 @@ pub const LocalTableWriteParticipantWorker = struct {
 
     fn beginGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnBeginRequest) !void {
         const self: *LocalTableWriteParticipantWorker = @ptrCast(@alignCast(ptr));
-        _ = (try self.writes.txnBeginGroupLocal(alloc, group_id, table_name, req.txn_id, req.begin_timestamp, req.topology_epoch, req.participants)) orelse return error.UnknownGroup;
+        _ = (try self.writes.txnBeginGroupLocal(alloc, group_id, table_name, req.txn_id, req.begin_timestamp, req.topology_epoch, req.retain_terminal, req.participants)) orelse return error.UnknownGroup;
     }
 
     fn prepareGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnPrepareRequest) !void {
@@ -304,6 +305,12 @@ pub const LocalTableWriteParticipantWorker = struct {
 
 pub const ExecuteResult = struct {
     participant_count: usize,
+};
+
+pub const ExecuteOptions = struct {
+    /// Preserve the terminal coordinator decision for an externally supplied
+    /// transaction ID's retry window.
+    retain_terminal: bool = false,
 };
 
 pub fn executeCrossGroup(
@@ -352,11 +359,33 @@ pub fn executeMultiTableCommit(
     sync_level: db_mod.types.SyncLevel,
     trace_writer: ?tracing.AntflyTraceWriter,
 ) !CommitOutcome {
-    // A transaction id is a single protocol instance. Retrying the entire
-    // begin/prepare/resolve sequence with the same id can reset participants
-    // that already made a terminal decision, so topology failures are left to
-    // the caller to retry with a fresh transaction id.
-    return executeMultiTableCommitOnce(alloc, catalog, worker, txn_id, begin_timestamp, commit_version, tables, sync_level, trace_writer);
+    return executeMultiTableCommitWithOptions(
+        alloc,
+        catalog,
+        worker,
+        txn_id,
+        begin_timestamp,
+        commit_version,
+        tables,
+        sync_level,
+        trace_writer,
+        .{},
+    );
+}
+
+pub fn executeMultiTableCommitWithOptions(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    worker: ParticipantWorker,
+    txn_id: db_mod.types.TxnId,
+    begin_timestamp: u64,
+    commit_version: u64,
+    tables: []const TableCommitRequest,
+    sync_level: db_mod.types.SyncLevel,
+    trace_writer: ?tracing.AntflyTraceWriter,
+    options: ExecuteOptions,
+) !CommitOutcome {
+    return executeMultiTableCommitOnce(alloc, catalog, worker, txn_id, begin_timestamp, commit_version, tables, sync_level, trace_writer, options);
 }
 
 fn executeMultiTableCommitOnce(
@@ -369,6 +398,7 @@ fn executeMultiTableCommitOnce(
     tables: []const TableCommitRequest,
     sync_level: db_mod.types.SyncLevel,
     trace_writer: ?tracing.AntflyTraceWriter,
+    options: ExecuteOptions,
 ) !CommitOutcome {
     var participants = std.ArrayListUnmanaged(ParticipantTxn).empty;
     defer {
@@ -415,6 +445,7 @@ fn executeMultiTableCommitOnce(
     defer begun.deinit(alloc);
 
     var abort_on_error = true;
+    var resume_committed = false;
     errdefer {
         if (abort_on_error) {
             if (trace_writer) |tw| {
@@ -429,12 +460,42 @@ fn executeMultiTableCommitOnce(
             .txn_id = txn_id,
             .begin_timestamp = begin_timestamp,
             .topology_epoch = participant.topology_epoch,
+            .retain_terminal = options.retain_terminal,
             .participants = participant_ids,
         }) catch |err| switch (err) {
             error.UnknownGroup => {
                 try abortBegunRefs(alloc, worker, txn_id, commit_version, begun.items);
                 abort_on_error = false;
                 return .{ .conflict = participantUnavailableConflict(participant, .begin) };
+            },
+            error.DecisionConflict => {
+                // A stable transaction ID may be retried after the coordinator
+                // durably committed but before the client observed success.
+                // Resume commit-only propagation instead of treating that
+                // terminal record as a failed fresh begin.
+                if (begun.items.len == 0) {
+                    const status = worker.statusGroup(
+                        alloc,
+                        participant.group_id,
+                        participant.table_name,
+                        txn_id,
+                    ) catch return error.CommitDecisionUnknown;
+                    switch (status) {
+                        .committed => {
+                            resume_committed = true;
+                            abort_on_error = false;
+                            break;
+                        },
+                        .aborted => {
+                            abort_on_error = false;
+                            return .{ .conflict = participantDecisionConflict(participant, .begin) };
+                        },
+                        .pending => {},
+                    }
+                }
+                if (begun.items.len > 0) try abortBegunRefs(alloc, worker, txn_id, commit_version, begun.items);
+                abort_on_error = false;
+                return error.TransactionBeginFailed;
             },
             else => {
                 if (begun.items.len > 0) try abortBegunRefs(alloc, worker, txn_id, commit_version, begun.items);
@@ -448,7 +509,7 @@ fn executeMultiTableCommitOnce(
         try begun.append(alloc, .{ .table_name = participant.table_name, .group_id = participant.group_id });
     }
 
-    for (participants.items) |participant| {
+    if (!resume_committed) for (participants.items) |participant| {
         worker.prepareGroup(alloc, participant.group_id, participant.table_name, .{
             .txn_id = txn_id,
             .topology_epoch = participant.topology_epoch,
@@ -478,7 +539,7 @@ fn executeMultiTableCommitOnce(
                 return err;
             },
         };
-    }
+    };
 
     var post_commit_failure: ?enum { visibility, propagation } = null;
     resolve_participants: for (participants.items, 0..) |participant, participant_index| {
@@ -730,6 +791,8 @@ pub fn encodeTxnBeginRequest(alloc: std.mem.Allocator, req: TxnBeginRequest) ![]
     const epoch = try std.fmt.allocPrint(alloc, "{d}", .{req.topology_epoch});
     defer alloc.free(epoch);
     try out.appendSlice(alloc, epoch);
+    try out.appendSlice(alloc, ",\"retain_terminal\":");
+    try out.appendSlice(alloc, if (req.retain_terminal) "true" else "false");
     try out.appendSlice(alloc, ",\"participants\":[");
     for (req.participants, 0..) |participant, i| {
         if (i > 0) try out.append(alloc, ',');
@@ -861,7 +924,16 @@ pub fn parseTxnBeginRequest(alloc: std.mem.Allocator, body: []const u8) !TxnBegi
             else => return error.InvalidTxnRequest,
         });
     }
-    return .{ .txn_id = txn_id, .begin_timestamp = begin_timestamp, .topology_epoch = requireInteger(obj, "topology_epoch"), .participants = out };
+    return .{
+        .txn_id = txn_id,
+        .begin_timestamp = begin_timestamp,
+        .topology_epoch = requireInteger(obj, "topology_epoch"),
+        .retain_terminal = if (obj.get("retain_terminal")) |value| switch (value) {
+            .bool => |flag| flag,
+            else => return error.InvalidTxnRequest,
+        } else false,
+        .participants = out,
+    };
 }
 
 pub fn freeTxnBeginRequest(alloc: std.mem.Allocator, req: *TxnBeginRequest) void {
@@ -1402,6 +1474,115 @@ test "distributed txn coordinator groups by range and commits all participants" 
     try std.testing.expectEqual(@as(usize, 2), recorder.prepares.items.len);
     try std.testing.expectEqual(@as(usize, 2), recorder.resolves.items.len);
     for (recorder.resolves.items) |resolved| try std.testing.expectEqual(db_mod.types.TxnStatus.committed, resolved.status);
+}
+
+test "stable distributed transaction retry resumes a durable commit decision" {
+    const FakeCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !@import("../metadata/api.zig").AdminSnapshot {
+            const metadata_table_manager = @import("../metadata/table_manager.zig");
+            const raft_reconciler = @import("../raft/reconciler.zig");
+            const metadata_transition_state = @import("../metadata/transition_state.zig");
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{ .table_id = 7, .name = "docs", .placement_role = "data" }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = "doc:m" },
+                    .{ .group_id = 7002, .table_id = 7, .start_key = "doc:m", .end_key = null },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *@import("../metadata/api.zig").AdminSnapshot) void {}
+    };
+
+    const Recorder = struct {
+        begin_calls: usize = 0,
+        prepare_calls: usize = 0,
+        resolve_calls: usize = 0,
+        status_calls: usize = 0,
+
+        fn worker(self: *@This()) ParticipantWorker {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .begin_group = begin,
+                    .prepare_group = prepare,
+                    .resolve_group = resolve,
+                    .status_group = status,
+                },
+            };
+        }
+
+        fn begin(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, req: TxnBeginRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.begin_calls += 1;
+            try std.testing.expect(req.retain_terminal);
+            return error.DecisionConflict;
+        }
+
+        fn prepare(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnPrepareRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.prepare_calls += 1;
+        }
+
+        fn resolve(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, req: TxnResolveRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.resolve_calls += 1;
+            try std.testing.expectEqual(db_mod.types.TxnStatus.committed, req.status);
+        }
+
+        fn status(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.status_calls += 1;
+            return .committed;
+        }
+    };
+
+    var recorder = Recorder{};
+    const txn_id = try parseTxnIdHex("0123456789abcdeffedcba9876543210");
+    const outcome = try executeMultiTableCommitWithOptions(
+        std.testing.allocator,
+        FakeCatalog.iface(),
+        recorder.worker(),
+        txn_id,
+        10_000,
+        10_001,
+        &.{.{
+            .table_name = "docs",
+            .transforms = &.{
+                .{
+                    .key = "doc:a",
+                    .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }},
+                },
+                .{
+                    .key = "doc:z",
+                    .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }},
+                },
+            },
+        }},
+        .write,
+        null,
+        .{ .retain_terminal = true },
+    );
+    try std.testing.expect(outcome == .committed);
+    try std.testing.expectEqual(@as(usize, 1), recorder.begin_calls);
+    try std.testing.expectEqual(@as(usize, 1), recorder.status_calls);
+    try std.testing.expectEqual(@as(usize, 0), recorder.prepare_calls);
+    try std.testing.expectEqual(@as(usize, 2), recorder.resolve_calls);
 }
 
 test "distributed txn coordinator aborts begun participants on prepare failure" {

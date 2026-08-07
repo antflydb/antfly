@@ -732,7 +732,11 @@ pub const AntflyApiHandler = struct {
         const distributed_tables = try commit_req.distributedTables(alloc);
         defer if (distributed_tables.len > 0) alloc.free(distributed_tables);
         self.api_server.validateCommitTablesAgainstSchema(distributed_tables) catch |err| switch (err) {
-            error.InvalidBatchRequest => {
+            error.InvalidBatchRequest,
+            error.InvalidArgument,
+            error.InvalidGraphEdges,
+            error.UnsupportedTransformOperation,
+            => {
                 _ = ctx.status(400);
                 return ctx.text("invalid transaction commit request");
             },
@@ -755,7 +759,11 @@ pub const AntflyApiHandler = struct {
             .transaction => source.commitTransaction(alloc, distributed_tables, commit_req.sync_level),
             .multi_batch => source.commitBatch(alloc, distributed_tables, commit_req.sync_level),
         }) catch |err| switch (err) {
-            error.InvalidBatchRequest => {
+            error.InvalidBatchRequest,
+            error.InvalidArgument,
+            error.InvalidGraphEdges,
+            error.UnsupportedTransformOperation,
+            => {
                 _ = ctx.status(400);
                 return ctx.text("invalid transaction commit request");
             },
@@ -806,6 +814,22 @@ pub const AntflyApiHandler = struct {
                 );
                 _ = ctx.status(409);
                 return ctx.json(response);
+            },
+            error.CommitVisibilityNotSatisfied => {
+                _ = ctx.status(503);
+                return ctx.text("transaction committed, but the requested visibility barrier was not reached");
+            },
+            error.CommitPropagationIncomplete => {
+                _ = ctx.status(503);
+                return ctx.text("transaction committed; participant recovery is pending");
+            },
+            error.CommitDecisionUnknown => {
+                _ = ctx.status(503);
+                return ctx.text("transaction outcome is unknown");
+            },
+            error.AbortDecisionNotDurable, error.TransactionBeginFailed => {
+                _ = ctx.status(503);
+                return ctx.text("transaction coordinator is temporarily unavailable");
             },
             error.UnsupportedOperation => {
                 _ = ctx.status(405);
@@ -1328,7 +1352,11 @@ pub const AntflyApiHandler = struct {
         const distributed_tables = try commit_req.distributedTables(alloc);
         defer if (distributed_tables.len > 0) alloc.free(distributed_tables);
         self.api_server.validateCommitTablesAgainstSchema(distributed_tables) catch |err| switch (err) {
-            error.InvalidBatchRequest => {
+            error.InvalidBatchRequest,
+            error.InvalidArgument,
+            error.InvalidGraphEdges,
+            error.UnsupportedTransformOperation,
+            => {
                 _ = ctx.status(400);
                 return ctx.text("invalid transaction commit request");
             },
@@ -1350,7 +1378,14 @@ pub const AntflyApiHandler = struct {
         }
 
         const outcome = (source.commitTransactionWithId(alloc, txn_id, session.begin_timestamp, distributed_tables, session.sync_level) catch |err| switch (err) {
-            error.InvalidBatchRequest => {
+            error.InvalidBatchRequest,
+            error.InvalidArgument,
+            error.InvalidGraphEdges,
+            error.UnsupportedTransformOperation,
+            => {
+                // Participant validation terminally aborts this transaction
+                // ID, so retaining the session would only produce conflicts.
+                _ = self.api_server.txn_sessions.remove(alloc, txn_id);
                 _ = ctx.status(400);
                 return ctx.text("invalid transaction commit request");
             },
@@ -1413,6 +1448,22 @@ pub const AntflyApiHandler = struct {
                 );
                 _ = ctx.status(409);
                 return ctx.json(response);
+            },
+            error.CommitVisibilityNotSatisfied => {
+                _ = ctx.status(503);
+                return ctx.text("transaction committed, but the requested visibility barrier was not reached");
+            },
+            error.CommitPropagationIncomplete => {
+                _ = ctx.status(503);
+                return ctx.text("transaction committed; participant recovery is pending");
+            },
+            error.CommitDecisionUnknown => {
+                _ = ctx.status(503);
+                return ctx.text("transaction outcome is unknown; retry this transaction id");
+            },
+            error.AbortDecisionNotDurable, error.TransactionBeginFailed => {
+                _ = ctx.status(503);
+                return ctx.text("transaction coordinator is temporarily unavailable");
             },
             else => return err,
         }) orelse {
@@ -3802,6 +3853,7 @@ test "httpx multi batch route uses the batch commit hook and public response con
         batch_calls: usize = 0,
         transaction_calls: usize = 0,
         batch_commit_calls: usize = 0,
+        fail_batch_commit: bool = false,
 
         fn source(self: *@This()) table_writes.TableWriteSource {
             return .{
@@ -3844,6 +3896,7 @@ test "httpx multi batch route uses the batch commit hook and public response con
         ) anyerror!?distributed_txn.CommitOutcome {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.batch_commit_calls += 1;
+            if (self.fail_batch_commit) return error.CommitPropagationIncomplete;
             try std.testing.expectEqual(@as(usize, 2), tables.len);
             try std.testing.expectEqualStrings("users", tables[0].table_name);
             try std.testing.expectEqualStrings("orders", tables[1].table_name);
@@ -3909,6 +3962,21 @@ test "httpx multi batch route uses the batch commit hook and public response con
     defer rejected.deinit();
     try std.testing.expectEqual(@as(u16, 400), rejected.status.code);
     try std.testing.expectEqual(@as(usize, 1), writes.batch_commit_calls);
+
+    writes.fail_batch_commit = true;
+    var unavailable = try requestWithRetry(
+        &client,
+        client_io.io(),
+        .POST,
+        batch_url,
+        "{\"tables\":{\"users\":{\"inserts\":{\"user:2\":{\"name\":\"Bob\"}}},\"orders\":{\"deletes\":[\"order:old\"]}},\"sync_level\":\"write\"}",
+        &headers,
+        20,
+    );
+    defer unavailable.deinit();
+    try std.testing.expectEqual(@as(u16, 503), unavailable.status.code);
+    try std.testing.expectEqualStrings("transaction committed; participant recovery is pending", unavailable.body.?);
+    try std.testing.expectEqual(@as(usize, 2), writes.batch_commit_calls);
 }
 
 test "httpx internal request conversion preserves protocol headers" {

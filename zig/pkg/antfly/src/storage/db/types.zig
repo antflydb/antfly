@@ -175,6 +175,10 @@ pub const TransactionMutation = union(enum) {
         begin_timestamp: u64,
         created_at_ns: u64,
         topology_epoch: u64,
+        /// Long-lived, externally addressable transaction sessions retain a
+        /// terminal decision for their full retry window. Anonymous commits
+        /// use the shorter ordinary recovery retention.
+        retain_terminal: bool = false,
         participants: []const []const u8,
     },
     prepare: struct {
@@ -185,6 +189,20 @@ pub const TransactionMutation = union(enum) {
         txn_id: TxnId,
         status: TxnStatus,
         commit_version: u64,
+    },
+    /// Coordinator-side acknowledgement that one participant has durably
+    /// learned the terminal decision. This must be ordered by coordinator
+    /// Raft rather than written by a replica-local recovery worker.
+    acknowledge: struct {
+        txn_id: TxnId,
+        participant: []const u8,
+    },
+    /// Deterministic coordinator/participant metadata cleanup. The cutoff is
+    /// carried in the command so every replica evaluates the same predicate.
+    cleanup: struct {
+        txn_id: TxnId,
+        cutoff_timestamp: u64,
+        retained_cutoff_timestamp: u64,
     },
 };
 

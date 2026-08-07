@@ -4228,6 +4228,13 @@ pub const DB = struct {
 
     pub fn runTransactionRecoveryOnce(self: *DB, config: transaction_runtime_mod.Config) !types.TransactionRecoveryStats {
         if (!config.enabled) return .{};
+        if (config.replicated_metadata) {
+            return try transaction_runtime_mod.recoverOnce(
+                self.alloc,
+                self.core.batchExecutionResources().store,
+                config,
+            );
+        }
         const resolve_participant = config.resolve_participant_fn orelse return error.MissingParticipantResolver;
         const resolver_ctx = config.resolver_ctx orelse return error.MissingParticipantResolver;
         const now_ns = config.clock.nowRealtimeNs();
@@ -13780,14 +13787,34 @@ pub const DB = struct {
         participants: []const []const u8,
         coordinator: bool,
     ) !transactions_mod.TxnId {
-        lockApply(self);
-        defer self.core.unlockApply();
-        return try self.core.beginTransactionWithParticipantsCreatedAtAndRole(
+        return try self.beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(
             txn_id,
             timestamp_ns,
             created_at_ns,
             participants,
             coordinator,
+            false,
+        );
+    }
+
+    pub fn beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(
+        self: *DB,
+        txn_id: transactions_mod.TxnId,
+        timestamp_ns: u64,
+        created_at_ns: u64,
+        participants: []const []const u8,
+        coordinator: bool,
+        retain_terminal: bool,
+    ) !transactions_mod.TxnId {
+        lockApply(self);
+        defer self.core.unlockApply();
+        return try self.core.beginTransactionWithParticipantsCreatedAtRoleAndRetention(
+            txn_id,
+            timestamp_ns,
+            created_at_ns,
+            participants,
+            coordinator,
+            retain_terminal,
         );
     }
 
@@ -13946,6 +13973,17 @@ pub const DB = struct {
         lockApply(self);
         defer self.core.unlockApply();
         try self.core.markTransactionParticipantResolved(txn_id, participant);
+    }
+
+    pub fn cleanupTransactionMetadataIfEligible(
+        self: *DB,
+        txn_id: transactions_mod.TxnId,
+        cutoff_timestamp: u64,
+        retained_cutoff_timestamp: u64,
+    ) !bool {
+        lockApply(self);
+        defer self.core.unlockApply();
+        return try self.core.cleanupTransactionMetadataIfEligible(txn_id, cutoff_timestamp, retained_cutoff_timestamp);
     }
 
     pub fn getTransactionParticipants(self: *DB, alloc: Allocator, txn_id: transactions_mod.TxnId) ![][]u8 {
