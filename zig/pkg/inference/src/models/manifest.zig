@@ -941,12 +941,11 @@ fn applyImplicitModelTypeHints(manifest: *ModelManifest, model_dir_path: []const
         return;
     }
 
-    if (manifest.model_type != .embedder) return;
-
     if (manifest.native_arch_hint == .whisper) {
         manifest.model_type = .transcriber;
         return;
     }
+    if (manifest.model_type != .embedder) return;
     if (manifest.native_arch_hint == .florence or
         std.mem.eql(u8, manifest.config_model_arch, "vision-encoder-decoder"))
     {
@@ -2468,6 +2467,19 @@ test "rerank model name overrides sequence classifier config" {
     };
     try applyImplicitModelTypeHints(&manifest, "/tmp/models/mixedbread-ai/mxbai-rerank-base-v1");
     try std.testing.expectEqual(ModelType.reranker, manifest.model_type);
+}
+
+test "Whisper conditional generation config remains a transcriber" {
+    const allocator = std.testing.allocator;
+    var manifest = ModelManifest{ .allocator = allocator };
+    defer manifest.deinit();
+
+    try parseConfigJson(&manifest, allocator,
+        \\{"architectures":["WhisperForConditionalGeneration"],"model_type":"whisper"}
+    );
+    try std.testing.expectEqual(ModelType.generator, manifest.model_type);
+    try applyImplicitModelTypeHints(&manifest, "/tmp/models/openai/whisper-tiny");
+    try std.testing.expectEqual(ModelType.transcriber, manifest.model_type);
 }
 
 test "inferModelTypeFromPath detects extractor directory" {

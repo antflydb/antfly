@@ -1168,6 +1168,15 @@ fn modelResourceBusyResponse(ctx: *httpx.Context) !httpx.Response {
     );
 }
 
+fn modelArtifactsChangingResponse(ctx: *httpx.Context) !httpx.Response {
+    return transientCapacityFailureResponse(
+        ctx,
+        "MODEL_ARTIFACTS_CHANGING",
+        "model artifacts are being published; retry with a consistent generation",
+        "model_publication",
+    );
+}
+
 fn modelLoadFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
     return switch (err) {
         error.UnknownModelCompatibility => ctx.status(400).json(.{
@@ -1183,6 +1192,9 @@ fn modelLoadFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response 
             .message = "model resource plan exceeds the configured inference budget",
         }),
         error.ResourceTemporarilyUnavailable => modelResourceBusyResponse(ctx),
+        error.ModelArtifactsChanging,
+        error.IncompleteManagedDownload,
+        => modelArtifactsChangingResponse(ctx),
         else => ctx.status(500).json(.{
             .@"error" = "MODEL_LOAD_FAILED",
             .message = @errorName(err),
@@ -2297,7 +2309,7 @@ pub const Node = struct {
         }
 
         const results = try reader.readBatch(image_datas, .{
-            .prompt = request.prompt,
+            .prompt = normalizeReadPrompt(request.prompt),
             .max_tokens = max_tokens,
         });
         defer {
@@ -2341,15 +2353,29 @@ pub const Node = struct {
         var model_handle = try self.model_manager.acquireFromDir(model_path);
         defer model_handle.release();
         const model = model_handle.get();
-        if (session_factory.getWhisperConfig(model.session) == null) return error.UnsupportedTranscriberProvider;
+        const whisper_config = session_factory.getWhisperConfig(model.session) orelse return error.UnsupportedTranscriberProvider;
 
         const transcription = @import("../pipelines/transcription.zig");
+        const whisper_prompt = @import("../pipelines/whisper_prompt.zig");
+        const prompt_cache = if (model.whisper_prompt_cache) |*cache|
+            cache
+        else
+            return error.InvalidWhisperDecoderConfig;
+        var prompt_scratch: [3]whisper_prompt.ForcedDecoderId = undefined;
+        const forced_ids = try prompt_cache.resolve(&prompt_scratch, request.language);
         var pipeline = transcription.TranscriptionPipeline.init(
             allocator,
             model.session,
             model.session,
             model.getTokenizer(),
-            .{ .language = request.language },
+            .{
+                .max_length = @intCast(whisper_config.max_target_positions),
+                .decoder_start_token_id = whisper_config.decoder_start_token_id,
+                .eos_token_id = whisper_config.eos_token_id,
+                .language = request.language,
+                .forced_decoder_ids = forced_ids,
+                .language_tokens = prompt_cache.language_tokens,
+            },
         );
 
         var downloaded = try downloadRemoteContent(self, allocator, request.url);
@@ -6644,7 +6670,7 @@ pub const Node = struct {
         }
 
         const results = reader.readBatch(image_datas, .{
-            .prompt = body.prompt,
+            .prompt = normalizeReadPrompt(body.prompt),
             .max_tokens = max_tokens,
         }) catch |err| switch (err) {
             error.InvalidMaxTokens => return ctx.status(400).json(.{
@@ -6670,7 +6696,7 @@ pub const Node = struct {
             filled = i + 1;
         }
 
-        const prompt_tokens = if (body.prompt) |prompt| estimateTextTokens(prompt) * body.images.len else 0;
+        const prompt_tokens = if (normalizeReadPrompt(body.prompt)) |prompt| estimateTextTokens(prompt) * body.images.len else 0;
         return ctx.json(api.ReadResponse{
             .object = "list",
             .data = results_out,
@@ -6737,7 +6763,7 @@ pub const Node = struct {
         // Find encoder/decoder sessions
         const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
         const tokenizer_mod = @import("inference_tokenizer");
-        const hf_tokenizer = @import("inference_hf_tokenizer");
+        const whisper_prompt = @import("../pipelines/whisper_prompt.zig");
         var encoder_session: backends_mod.Session = undefined;
         var decoder_session: backends_mod.Session = undefined;
         var encoder_managed: ?model_manager_mod.ManagedSession = null;
@@ -6745,15 +6771,21 @@ pub const Node = struct {
         var decoder_managed: ?model_manager_mod.ManagedSession = null;
         defer if (decoder_managed) |*managed| managed.deinit();
         var tokenizer: tokenizer_mod.Tokenizer = undefined;
-        var hf_tok_owned: ?*hf_tokenizer.HfTokenizer = null;
-        defer if (hf_tok_owned) |hf_tok| hf_tok.deinitSelf();
+        var decoder_config: enc_dec_mod.DecoderConfig = undefined;
         var loaded_model_handle: ?model_manager_mod.ModelHandle = null;
         defer if (loaded_model_handle) |*handle| handle.release();
+        var whisper_assets_handle: ?model_manager_mod.WhisperAssetsHandle = null;
+        defer if (whisper_assets_handle) |*handle| handle.release();
+        var prompt_cache: ?*const whisper_prompt.PromptCache = null;
 
         if (enc_dec_mod.findEncoderDecoderPaths(ctx.allocator, model_path)) |paths| {
             defer ctx.allocator.free(paths.encoder);
             defer ctx.allocator.free(paths.decoder);
 
+            whisper_assets_handle = self.model_manager.acquireWhisperCompositeAssets(
+                model_path,
+                &.{ paths.encoder, paths.decoder },
+            ) catch |err| return modelLoadFailureResponse(ctx, err);
             var component_loader = self.model_manager.componentLoaderForPaths(
                 model_path,
                 self.session_manager.preferred_backends,
@@ -6767,42 +6799,46 @@ pub const Node = struct {
             decoder_managed = strict_loader.load(paths.decoder) catch |err|
                 return modelLoadFailureResponse(ctx, err);
             decoder_session = decoder_managed.?.session;
-
-            const tok_path = std.fmt.allocPrint(ctx.allocator, "{s}/tokenizer.json", .{model_path}) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = @errorName(err) });
-            defer ctx.allocator.free(tok_path);
-
-            const tok_bytes = c_file.readFile(ctx.allocator, tok_path) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = @errorName(err) });
-            defer ctx.allocator.free(tok_bytes);
-
-            hf_tok_owned = hf_tokenizer.HfTokenizer.loadFromBytes(ctx.allocator, tok_bytes) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = @errorName(err) });
-            if (hf_tok_owned) |hf_tok| {
-                tokenizer = hf_tok.tokenizer();
-            }
+            self.model_manager.validateWhisperAssetsCurrent(
+                &whisper_assets_handle.?,
+                model_path,
+                &.{ paths.encoder, paths.decoder },
+            ) catch |err| return modelLoadFailureResponse(ctx, err);
+            const assets = whisper_assets_handle.?.get();
+            tokenizer = assets.tokenizer();
+            decoder_config = assets.decoder_config;
+            prompt_cache = &assets.prompt_cache;
         } else |_| {
             loaded_model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
                 return modelLoadFailureResponse(ctx, err);
             const model = loaded_model_handle.?.get();
-            if (session_factory.getWhisperConfig(model.session) == null) {
+            const whisper_config = session_factory.getWhisperConfig(model.session) orelse {
                 return ctx.status(400).json(.{
                     .@"error" = "INVALID_MODEL",
                     .message = "model does not support transcription",
                 });
-            }
+            };
             encoder_session = model.session;
             decoder_session = model.session;
             tokenizer = model.getTokenizer();
+            prompt_cache = if (model.whisper_prompt_cache) |*cache| cache else null;
+            decoder_config = .{
+                .max_length = @intCast(whisper_config.max_target_positions),
+                .decoder_start_token_id = whisper_config.decoder_start_token_id,
+                .eos_token_id = whisper_config.eos_token_id,
+                .pad_token_id = whisper_config.pad_token_id,
+                .vocab_size = @intCast(whisper_config.vocab_size),
+            };
         }
 
-        // Parse decoder config for Whisper token IDs
-        const dec_config = enc_dec_mod.loadDecoderConfig(ctx.allocator, model_path) catch enc_dec_mod.DecoderConfig{};
-
-        // Parse forced_decoder_ids from generation_config.json
-        const forced_ids = loadForcedDecoderIds(ctx.allocator, model_path);
-        defer if (forced_ids) |f| ctx.allocator.free(f);
-
+        const effective_prompt_cache = prompt_cache orelse
+            return ctx.status(500).json(.{ .@"error" = "INVALID_MODEL", .message = "WhisperPromptCacheUnavailable" });
+        var prompt_scratch: [3]whisper_prompt.ForcedDecoderId = undefined;
+        const forced_ids = effective_prompt_cache.resolve(&prompt_scratch, body.language) catch
+            return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "language is not supported by this Whisper model",
+            });
         const transcription = @import("../pipelines/transcription.zig");
         var pipeline = transcription.TranscriptionPipeline.init(
             ctx.allocator,
@@ -6810,11 +6846,12 @@ pub const Node = struct {
             decoder_session,
             tokenizer,
             .{
-                .max_length = dec_config.max_length,
-                .decoder_start_token_id = dec_config.decoder_start_token_id,
-                .eos_token_id = dec_config.eos_token_id,
+                .max_length = decoder_config.max_length,
+                .decoder_start_token_id = decoder_config.decoder_start_token_id,
+                .eos_token_id = decoder_config.eos_token_id,
                 .language = body.language,
                 .forced_decoder_ids = forced_ids,
+                .language_tokens = effective_prompt_cache.language_tokens,
             },
         );
 
@@ -7351,6 +7388,18 @@ pub const Node = struct {
         const router = api.ServerRouter(Node).init(self);
         var prefixed = AiPrefixedServer(prefix, @TypeOf(server.*)){ .inner = server };
         try router.register(&prefixed);
+        // Keep the retired endpoint deterministic when inference routes share
+        // the standalone public server. Without an explicit tombstone, httpx
+        // reports 405 because nearby generated routes match the path shape,
+        // while the dedicated inference server reports 404.
+        try server.post(prefix ++ "/recognize", retiredRecognizeHandler);
+    }
+
+    fn retiredRecognizeHandler(ctx: *httpx.Context) anyerror!httpx.Response {
+        return ctx.status(404).json(.{
+            .@"error" = "NOT_FOUND",
+            .message = "resource not found",
+        });
     }
 
     fn registerRootOperationalRoutes(server: anytype) !void {
@@ -8740,6 +8789,13 @@ test "read max tokens preserves omission and rejects unsafe signed values" {
     try std.testing.expectError(error.InvalidMaxTokens, validateReadMaxTokens(std.math.maxInt(i64)));
 }
 
+test "read prompt treats empty public values as an omitted OCR prompt" {
+    try std.testing.expectEqual(@as(?[]const u8, null), normalizeReadPrompt(null));
+    try std.testing.expectEqual(@as(?[]const u8, null), normalizeReadPrompt(""));
+    try std.testing.expectEqual(@as(?[]const u8, null), normalizeReadPrompt(" \t\n"));
+    try std.testing.expectEqualStrings("<OCR>", normalizeReadPrompt("<OCR>").?);
+}
+
 test "read queue units scale with image batch and decode length" {
     try std.testing.expectEqual(@as(usize, 1), estimateReadQueueUnits(1, null));
     try std.testing.expectEqual(@as(usize, 4), estimateReadQueueUnits(4, null));
@@ -8793,6 +8849,43 @@ test "fail-fast embedding capacity response exposes retry contract" {
         @as(i64, transient_capacity_retry_after_ms),
         parsed.value.retry_after_ms,
     );
+}
+
+test "changing model publication returns an explicit retry contract" {
+    const allocator = std.testing.allocator;
+    var request = try httpx.Request.init(allocator, .POST, "/ai/v1/transcribe");
+    defer request.deinit();
+    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    defer ctx.deinit();
+
+    var response = try modelLoadFailureResponse(&ctx, error.ModelArtifactsChanging);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 503), response.status.code);
+    try std.testing.expectEqualStrings(
+        transient_capacity_retry_after_seconds,
+        response.header("Retry-After").?,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "MODEL_ARTIFACTS_CHANGING") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"retryable\":true") != null);
+}
+
+test "managed download markers return the model publication retry contract" {
+    const allocator = std.testing.allocator;
+    var request = try httpx.Request.init(allocator, .POST, "/ai/v1/transcribe");
+    defer request.deinit();
+    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    defer ctx.deinit();
+
+    var response = try modelLoadFailureResponse(&ctx, error.IncompleteManagedDownload);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 503), response.status.code);
+    try std.testing.expectEqualStrings(
+        transient_capacity_retry_after_seconds,
+        response.header("Retry-After").?,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "MODEL_ARTIFACTS_CHANGING") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"reason\":\"model_publication\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"retryable\":true") != null);
 }
 
 test "registerRoutesOn prefixes embed aliases and metrics route" {
@@ -8947,6 +9040,7 @@ test "registerAiRoutesOn excludes Traditional ML predictor routes" {
     try std.testing.expect(server.hasRoute(.post, ai_api_prefix ++ "/embeddings"));
     try std.testing.expect(server.hasRoute(.post, ai_api_prefix ++ "/generate/batch"));
     try std.testing.expect(server.hasRoute(.get, ai_api_prefix ++ "/models"));
+    try std.testing.expect(server.hasRoute(.post, ai_api_prefix ++ "/recognize"));
     try std.testing.expect(!server.hasRoute(.post, ai_api_prefix ++ "/predict"));
     try std.testing.expect(!server.hasRoute(.get, ai_api_prefix ++ "/predictors"));
 }
@@ -11167,6 +11261,11 @@ fn validateReadMaxTokens(value: ?i64) !?usize {
     return @intCast(requested);
 }
 
+fn normalizeReadPrompt(prompt: ?[]const u8) ?[]const u8 {
+    const value = prompt orelse return null;
+    return if (std.mem.trim(u8, value, " \t\r\n").len == 0) null else value;
+}
+
 fn estimateReadQueueUnits(image_count: usize, max_tokens: ?usize) usize {
     const estimated_max_tokens = max_tokens orelse default_read_queue_max_tokens;
     const token_units = 1 + ((@max(estimated_max_tokens, 1) - 1) / default_read_queue_max_tokens);
@@ -11378,84 +11477,6 @@ test "shared json schema validator: array bounds" {
     defer value_parsed.deinit();
 
     try jsonschema.validateJsonSchemaValue(allocator, schema_parsed.value, value_parsed.value);
-}
-
-/// Parse forced_decoder_ids from generation_config.json.
-/// Returns null if file not found or no forced_decoder_ids field.
-fn loadForcedDecoderIds(allocator: std.mem.Allocator, model_dir: []const u8) ?[]const [2]i32 {
-    const path = std.fmt.allocPrint(allocator, "{s}/generation_config.json", .{model_dir}) catch return null;
-    defer allocator.free(path);
-
-    const data = c_file.readFile(allocator, path) catch return null;
-    defer allocator.free(data);
-
-    // Simple JSON extraction: find "forced_decoder_ids": [[1, 50362], ...]
-    const key = "\"forced_decoder_ids\"";
-    const key_pos = std.mem.indexOf(u8, data, key) orelse return null;
-    const after_key = data[key_pos + key.len ..];
-
-    // Skip whitespace and colon
-    var pos: usize = 0;
-    while (pos < after_key.len and (after_key[pos] == ' ' or after_key[pos] == ':' or after_key[pos] == '\n' or after_key[pos] == '\r' or after_key[pos] == '\t')) pos += 1;
-
-    if (pos >= after_key.len or after_key[pos] == 'n') return null; // null value
-
-    if (after_key[pos] != '[') return null;
-    pos += 1; // skip outer [
-
-    var result = std.ArrayListUnmanaged([2]i32).empty;
-
-    while (pos < after_key.len) {
-        // Skip whitespace
-        while (pos < after_key.len and (after_key[pos] == ' ' or after_key[pos] == ',' or after_key[pos] == '\n' or after_key[pos] == '\r' or after_key[pos] == '\t')) pos += 1;
-        if (pos >= after_key.len or after_key[pos] == ']') break;
-
-        if (after_key[pos] != '[') break;
-        pos += 1; // skip inner [
-
-        // Parse first int
-        while (pos < after_key.len and after_key[pos] == ' ') pos += 1;
-        const first = parseJsonInt(after_key[pos..]) orelse break;
-        pos += first.len;
-
-        // Skip comma
-        while (pos < after_key.len and (after_key[pos] == ' ' or after_key[pos] == ',')) pos += 1;
-
-        // Parse second int
-        const second = parseJsonInt(after_key[pos..]) orelse break;
-        pos += second.len;
-
-        // Skip to closing ]
-        while (pos < after_key.len and after_key[pos] != ']') pos += 1;
-        if (pos < after_key.len) pos += 1; // skip ]
-
-        result.append(allocator, .{ @intCast(first.value), @intCast(second.value) }) catch return null;
-    }
-
-    if (result.items.len == 0) {
-        result.deinit(allocator);
-        return null;
-    }
-    return result.toOwnedSlice(allocator) catch null;
-}
-
-const ParsedInt = struct { value: i64, len: usize };
-
-fn parseJsonInt(s: []const u8) ?ParsedInt {
-    if (s.len == 0) return null;
-    var i: usize = 0;
-    var neg = false;
-    if (s[0] == '-') {
-        neg = true;
-        i = 1;
-    }
-    if (i >= s.len or s[i] < '0' or s[i] > '9') return null;
-    var val: i64 = 0;
-    while (i < s.len and s[i] >= '0' and s[i] <= '9') {
-        val = val * 10 + @as(i64, s[i] - '0');
-        i += 1;
-    }
-    return .{ .value = if (neg) -val else val, .len = i };
 }
 
 fn appendIntJson(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, value: anytype) !void {

@@ -14,7 +14,13 @@
 
 """Tests for /api/models endpoint."""
 
+import pytest
+
+from .helpers import make_text_png_uri, make_wav_b64
 from .models import DEFAULT_EXTRACTOR_MODEL
+
+
+CLIPCLAP_MODEL = "antflydb/clipclap"
 
 
 def test_models_returns_json(api):
@@ -57,3 +63,39 @@ def test_models_exposes_reader_inputs(api):
     readers = resp.get("readers", {})
     if "antflydb/florence-2-base" in readers:
         assert "image" in readers["antflydb/florence-2-base"].get("inputs", [])
+
+
+@pytest.mark.model_integration
+def test_composite_model_eviction_churn_stays_healthy(api):
+    """Audio-sidecar teardown and reader eviction must not corrupt the server."""
+
+    listing = api.models()
+    if CLIPCLAP_MODEL not in listing.get("embedders", {}):
+        pytest.skip(f"{CLIPCLAP_MODEL} is not available")
+    reader = next(
+        (name for name in listing.get("readers", {}) if "florence" in name.lower()),
+        None,
+    )
+    if reader is None:
+        pytest.skip("No Florence reader model is available")
+
+    audio = {
+        "type": "media",
+        "mime_type": "audio/wav",
+        "data": make_wav_b64(0.1, 48_000),
+    }
+    image = make_text_png_uri(["INVOICE", "TOTAL 123"], scale=6, padding=12)
+
+    # e2e-full runs with max_loaded_models=1, making each alternation evict the
+    # previous composite model. Repeating the transition catches stale sidecar
+    # handles and allocator damage at the operation that introduced it.
+    for _ in range(3):
+        embedded = api.embed(["a short silent audio clip", audio], model=CLIPCLAP_MODEL)
+        assert len(embedded["data"]) == 2
+        assert all(len(item["embedding"]) == 512 for item in embedded["data"])
+
+        read = api.read([image], model=reader)
+        assert len(read["data"]) == 1
+        assert isinstance(read["data"][0].get("text"), str)
+
+    assert api.readyz().get("status") == "ready"

@@ -498,6 +498,22 @@ pub const AdmissionRequest = struct {
     amounts: AdmissionAmounts,
 };
 
+/// The exact transient constraint that rejected an admission. Callers that can
+/// reclaim resident resources use this to choose a victim that can actually
+/// relieve the failed budget instead of evicting by coarse byte-category
+/// overlap. Permanent `ResourceLimitExceeded` failures never report pressure.
+pub const AdmissionPressure = union(enum) {
+    shared_host,
+    shared_unified,
+    domain_host: BackendClass,
+    domain_backend: BackendClass,
+    domain_combined: BackendClass,
+    domain_kv: BackendClass,
+    domain_scratch: BackendClass,
+    external_budget,
+    live_host,
+};
+
 const backend_class_count = 2;
 
 fn backendClassIndex(backend_class: BackendClass) usize {
@@ -599,13 +615,32 @@ pub const AdmissionController = struct {
         amounts: AdmissionAmounts,
         check_live_memory: bool,
     ) !AdmissionLease {
-        return self.tryAcquireRequests(
+        var ignored_pressure: ?AdmissionPressure = null;
+        return self.tryAcquireWithPressure(
+            backend_class,
+            limits,
+            amounts,
+            check_live_memory,
+            &ignored_pressure,
+        );
+    }
+
+    pub fn tryAcquireWithPressure(
+        self: *AdmissionController,
+        backend_class: BackendClass,
+        limits: Limits,
+        amounts: AdmissionAmounts,
+        check_live_memory: bool,
+        pressure: *?AdmissionPressure,
+    ) !AdmissionLease {
+        return self.tryAcquireRequestsWithPressure(
             &.{.{
                 .backend_class = backend_class,
                 .limits = limits,
                 .amounts = amounts,
             }},
             check_live_memory,
+            pressure,
         );
     }
 
@@ -618,6 +653,21 @@ pub const AdmissionController = struct {
         requests: []const AdmissionRequest,
         check_live_memory: bool,
     ) !AdmissionLease {
+        var ignored_pressure: ?AdmissionPressure = null;
+        return self.tryAcquireRequestsWithPressure(
+            requests,
+            check_live_memory,
+            &ignored_pressure,
+        );
+    }
+
+    pub fn tryAcquireRequestsWithPressure(
+        self: *AdmissionController,
+        requests: []const AdmissionRequest,
+        check_live_memory: bool,
+        pressure: *?AdmissionPressure,
+    ) !AdmissionLease {
+        pressure.* = null;
         var amounts_by_backend = emptyAdmissionAmountsByBackend();
         var limits_by_backend = [_]Limits{ .{}, .{} };
         var active_backends = [_]bool{ false, false };
@@ -662,13 +712,15 @@ pub const AdmissionController = struct {
             // CPU work and CUDA staging/cache allocations consume the same host
             // RAM. Enforce that physical domain before backend-local policies so
             // provisional cross-backend reservations cannot race past it.
-            try checkAdmissionLimit(
+            try checkAdmissionLimitWithPressure(
                 request_host,
                 next_global_host,
                 self.shared_limits.host_limit_bytes,
+                .shared_host,
+                pressure,
             );
             if (builtin.os.tag == .macos) {
-                try checkAdmissionLimit(
+                try checkAdmissionLimitWithPressure(
                     request_combined,
                     std.math.add(
                         usize,
@@ -676,6 +728,8 @@ pub const AdmissionController = struct {
                         next_global_backend,
                     ) catch return error.ResourceLimitExceeded,
                     self.shared_limits.unified_limit_bytes,
+                    .shared_unified,
+                    pressure,
                 );
             }
 
@@ -710,11 +764,42 @@ pub const AdmissionController = struct {
                 const next_scratch = domain_next.scratchTotalBytesChecked() catch
                     return error.ResourceLimitExceeded;
 
-                try checkAdmissionLimit(domain_request_host, next_host, limits.host_limit_bytes);
-                try checkAdmissionLimit(domain_request_backend, next_backend, limits.backend_limit_bytes);
-                try checkAdmissionLimit(domain_request_combined, next_combined, limits.combined_limit_bytes);
-                try checkAdmissionLimit(domain_request_kv, next_kv, limits.kv_limit_bytes);
-                try checkAdmissionLimit(domain_request_scratch, next_scratch, limits.scratch_limit_bytes);
+                const backend_class: BackendClass = @enumFromInt(index);
+                try checkAdmissionLimitWithPressure(
+                    domain_request_host,
+                    next_host,
+                    limits.host_limit_bytes,
+                    .{ .domain_host = backend_class },
+                    pressure,
+                );
+                try checkAdmissionLimitWithPressure(
+                    domain_request_backend,
+                    next_backend,
+                    limits.backend_limit_bytes,
+                    .{ .domain_backend = backend_class },
+                    pressure,
+                );
+                try checkAdmissionLimitWithPressure(
+                    domain_request_combined,
+                    next_combined,
+                    limits.combined_limit_bytes,
+                    .{ .domain_combined = backend_class },
+                    pressure,
+                );
+                try checkAdmissionLimitWithPressure(
+                    domain_request_kv,
+                    next_kv,
+                    limits.kv_limit_bytes,
+                    .{ .domain_kv = backend_class },
+                    pressure,
+                );
+                try checkAdmissionLimitWithPressure(
+                    domain_request_scratch,
+                    next_scratch,
+                    limits.scratch_limit_bytes,
+                    .{ .domain_scratch = backend_class },
+                    pressure,
+                );
                 next_by_backend[index] = domain_next;
             }
             self.admitted = next;
@@ -723,6 +808,8 @@ pub const AdmissionController = struct {
 
         if (self.resource_budget) |resource_budget| {
             resource_budget.try_reserve(resource_budget.context, amounts) catch |err| {
+                if (err == error.ResourceTemporarilyUnavailable)
+                    pressure.* = .external_budget;
                 self.releaseLocal(amounts_by_backend, amounts);
                 return err;
             };
@@ -739,6 +826,8 @@ pub const AdmissionController = struct {
                 return error.ResourceLimitExceeded;
             };
             live_reserved_bytes = self.tryReserveLiveCapacity(live_host_incremental) catch |err| {
+                if (err == error.ResourceTemporarilyUnavailable)
+                    pressure.* = .live_host;
                 self.release(amounts_by_backend, amounts);
                 return err;
             };
@@ -999,6 +1088,20 @@ fn checkAdmissionLimit(request: usize, next: usize, limit: usize) !void {
     if (limit == 0 or next <= limit) return;
     if (request > limit) return error.ResourceLimitExceeded;
     return error.ResourceTemporarilyUnavailable;
+}
+
+fn checkAdmissionLimitWithPressure(
+    request: usize,
+    next: usize,
+    limit: usize,
+    rejected_pressure: AdmissionPressure,
+    pressure: *?AdmissionPressure,
+) !void {
+    checkAdmissionLimit(request, next, limit) catch |err| {
+        if (err == error.ResourceTemporarilyUnavailable)
+            pressure.* = rejected_pressure;
+        return err;
+    };
 }
 
 fn checkLiveHostMemory(incremental_bytes: usize) !void {
@@ -1286,6 +1389,11 @@ const CgroupMemoryInfo = struct {
     available_bytes: ?usize = null,
 };
 
+const CgroupVersion = enum {
+    v1,
+    v2,
+};
+
 const CgroupHierarchyProbe = struct {
     info: CgroupMemoryInfo = .{},
     /// True when the initially addressed process directory contained at least
@@ -1444,6 +1552,39 @@ fn readLinuxUnsignedFile(path: []const u8) ?usize {
     return std.fmt.parseUnsigned(usize, raw, 10) catch null;
 }
 
+fn parseCgroupInactiveFileBytes(
+    bytes: []const u8,
+    version: CgroupVersion,
+) ?usize {
+    var inactive_file: ?usize = null;
+    var total_inactive_file: ?usize = null;
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line| {
+        var fields = std.mem.tokenizeAny(u8, line, " \t");
+        const key = fields.next() orelse continue;
+        const raw = fields.next() orelse continue;
+        const value = std.fmt.parseUnsigned(usize, raw, 10) catch continue;
+        if (std.mem.eql(u8, key, "inactive_file")) {
+            inactive_file = value;
+        } else if (std.mem.eql(u8, key, "total_inactive_file")) {
+            total_inactive_file = value;
+        }
+    }
+    return switch (version) {
+        .v1 => total_inactive_file orelse inactive_file,
+        .v2 => inactive_file,
+    };
+}
+
+fn readCgroupInactiveFileBytes(
+    path: []const u8,
+    version: CgroupVersion,
+) ?usize {
+    var buffer: [8192]u8 = undefined;
+    const bytes = readSmallLinuxFile(path, &buffer) orelse return null;
+    return parseCgroupInactiveFileBytes(bytes, version);
+}
+
 fn decodeMountInfoPath(destination: []u8, encoded: []const u8) ?usize {
     if (encoded.len == 0 or encoded[0] != '/') return null;
     var source_index: usize = 0;
@@ -1553,6 +1694,7 @@ fn probeCgroupMountInfoLine(
                 path,
                 "memory.max",
                 "memory.current",
+                .v2,
             );
             mergeAuthoritativeCgroupProbe(result, probe);
         }
@@ -1565,6 +1707,7 @@ fn probeCgroupMountInfoLine(
                 path,
                 "memory.limit_in_bytes",
                 "memory.usage_in_bytes",
+                .v1,
             );
             mergeAuthoritativeCgroupProbe(result, probe);
         }
@@ -1661,6 +1804,7 @@ fn accumulateCgroupLevel(
     result: *CgroupMemoryInfo,
     limit: ?usize,
     current: ?usize,
+    inactive_file_bytes: ?usize,
 ) void {
     const finite_limit = limit orelse return;
     // cgroup v1 uses a near-max integer as its unlimited sentinel.
@@ -1670,7 +1814,18 @@ fn accumulateCgroupLevel(
         result.current_bytes = current;
     }
     if (current) |usage| {
-        const available = finite_limit -| @min(usage, finite_limit);
+        const bounded_usage = @min(usage, finite_limit);
+        // memory.current and memory.usage_in_bytes include file-backed cache.
+        // The kernel can reclaim inactive file pages under cgroup pressure, so
+        // treating all of them as permanently resident makes a build-heavy
+        // container appear full even after the compiler exits. Use the same
+        // conservative working-set convention as container monitoring: only
+        // inactive_file is reclaimable, and never more than current usage.
+        const reclaimable = @min(
+            inactive_file_bytes orelse 0,
+            bounded_usage,
+        );
+        const available = finite_limit -| (bounded_usage - reclaimable);
         result.available_bytes = if (result.available_bytes) |existing|
             @min(existing, available)
         else
@@ -1684,6 +1839,7 @@ fn readCgroupHierarchy(
     process_path: []const u8,
     limit_filename: []const u8,
     current_filename: []const u8,
+    version: CgroupVersion,
 ) CgroupHierarchyProbe {
     const relative = cgroupPathRelativeToMount(process_path, mount_root) orelse return .{};
     var directory_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -1701,6 +1857,7 @@ fn readCgroupHierarchy(
     var result = CgroupHierarchyProbe{};
     var limit_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     var current_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var stat_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     while (directory.len >= hierarchy_root_len) {
         const limit_path = std.fmt.bufPrint(
             &limit_path_buffer,
@@ -1712,12 +1869,26 @@ fn readCgroupHierarchy(
             "{s}/{s}",
             .{ directory, current_filename },
         ) catch break;
+        const stat_path = std.fmt.bufPrint(
+            &stat_path_buffer,
+            "{s}/memory.stat",
+            .{directory},
+        ) catch break;
         const limit = readLinuxUnsignedFile(limit_path);
         const current = readLinuxUnsignedFile(current_path);
+        const inactive_file_bytes = readCgroupInactiveFileBytes(
+            stat_path,
+            version,
+        );
         if (directory.len == leaf_directory_len) {
             result.leaf_present = limit != null or current != null;
         }
-        accumulateCgroupLevel(&result.info, limit, current);
+        accumulateCgroupLevel(
+            &result.info,
+            limit,
+            current,
+            inactive_file_bytes,
+        );
         if (directory.len == hierarchy_root_len) break;
         const parent = std.fs.path.dirname(directory) orelse break;
         if (parent.len < hierarchy_root_len) break;
@@ -1746,6 +1917,7 @@ fn probeCgroupMemoryInfoLinux() CgroupMemoryInfo {
             path,
             "memory.max",
             "memory.current",
+            .v2,
         );
         if (canonicalCgroupProbeIsAuthoritative(probe)) return probe.info;
     }
@@ -1756,6 +1928,7 @@ fn probeCgroupMemoryInfoLinux() CgroupMemoryInfo {
             path,
             "memory.limit_in_bytes",
             "memory.usage_in_bytes",
+            .v1,
         );
         if (canonicalCgroupProbeIsAuthoritative(probe)) return probe.info;
     }
@@ -1952,6 +2125,28 @@ test "linux meminfo parser has a conservative legacy availability fallback" {
     try std.testing.expectEqual(@as(?usize, 1792 * 1024 * 1024), info.available_bytes);
 }
 
+test "cgroup memory stat parser uses hierarchical inactive file cache" {
+    const stat =
+        \\anon 1048576
+        \\file 8388608
+        \\inactive_file 4194304
+        \\total_inactive_file 6291456
+        \\
+    ;
+    try std.testing.expectEqual(
+        @as(?usize, 4194304),
+        parseCgroupInactiveFileBytes(stat, .v2),
+    );
+    try std.testing.expectEqual(
+        @as(?usize, 6291456),
+        parseCgroupInactiveFileBytes(stat, .v1),
+    );
+    try std.testing.expectEqual(
+        @as(?usize, 4194304),
+        parseCgroupInactiveFileBytes("inactive_file 4194304\n", .v1),
+    );
+}
+
 test "cgroup paths and limits constrain host memory" {
     const paths = parseCgroupPaths(
         \\0::/system.slice/antfly.service
@@ -2068,9 +2263,9 @@ test "cgroup mount candidates ignore ancestor-only probes" {
 test "cgroup hierarchy uses finite parent limit beneath unlimited leaf" {
     var hierarchy = CgroupMemoryInfo{};
     // A v2 "max" leaf is represented as null and must not stop the ancestor walk.
-    accumulateCgroupLevel(&hierarchy, null, gib(3));
-    accumulateCgroupLevel(&hierarchy, gib(8), gib(6));
-    accumulateCgroupLevel(&hierarchy, gib(16), gib(10));
+    accumulateCgroupLevel(&hierarchy, null, gib(3), null);
+    accumulateCgroupLevel(&hierarchy, gib(8), gib(6), null);
+    accumulateCgroupLevel(&hierarchy, gib(16), gib(10), null);
 
     try std.testing.expectEqual(@as(?usize, gib(8)), hierarchy.limit_bytes);
     try std.testing.expectEqual(@as(?usize, gib(2)), hierarchy.available_bytes);
@@ -2080,6 +2275,28 @@ test "cgroup hierarchy uses finite parent limit beneath unlimited leaf" {
     );
     try std.testing.expectEqual(gib(8), effective.total_bytes);
     try std.testing.expectEqual(@as(?usize, gib(2)), effective.available_bytes);
+}
+
+test "cgroup availability includes only reclaimable inactive file cache" {
+    var hierarchy = CgroupMemoryInfo{};
+    accumulateCgroupLevel(
+        &hierarchy,
+        gib(64),
+        gib(47),
+        gib(30),
+    );
+    try std.testing.expectEqual(@as(?usize, gib(47)), hierarchy.available_bytes);
+
+    const effective = applyCgroupMemoryInfo(
+        .{ .total_bytes = gib(128), .available_bytes = gib(80) },
+        hierarchy,
+    );
+    try std.testing.expectEqual(gib(64), effective.total_bytes);
+    try std.testing.expectEqual(@as(?usize, gib(47)), effective.available_bytes);
+
+    var saturated = CgroupMemoryInfo{};
+    accumulateCgroupLevel(&saturated, gib(8), gib(7), gib(12));
+    try std.testing.expectEqual(@as(?usize, gib(8)), saturated.available_bytes);
 }
 
 test "live memory headroom scales down for constrained containers" {
@@ -2230,6 +2447,56 @@ test "shared admission accounts for concurrent leases and releases capacity" {
     var second = try controller.tryAcquire(.cpu, limits, .{ .host_kv_bytes = 50 }, false);
     defer second.release();
     try std.testing.expectEqual(@as(usize, 50), controller.snapshot().hostTotalBytes());
+}
+
+test "admission reports the exact transient pressure domain" {
+    var controller = AdmissionController{};
+    var scratch_lease = try controller.tryAcquire(
+        .cpu,
+        .{ .scratch_limit_bytes = 100 },
+        .{ .host_scratch_bytes = 70 },
+        false,
+    );
+    defer scratch_lease.release();
+
+    var pressure: ?AdmissionPressure = null;
+    try std.testing.expectError(
+        error.ResourceTemporarilyUnavailable,
+        controller.tryAcquireWithPressure(
+            .cpu,
+            .{ .scratch_limit_bytes = 100 },
+            .{ .host_scratch_bytes = 40 },
+            false,
+            &pressure,
+        ),
+    );
+    switch (pressure orelse return error.TestExpectedAdmissionPressure) {
+        .domain_scratch => |backend_class| try std.testing.expectEqual(BackendClass.cpu, backend_class),
+        else => return error.TestUnexpectedAdmissionPressure,
+    }
+
+    scratch_lease.release();
+    var backend_lease = try controller.tryAcquire(
+        .gpu,
+        .{ .backend_limit_bytes = 100 },
+        .{ .backend_weight_bytes = 70 },
+        false,
+    );
+    defer backend_lease.release();
+    try std.testing.expectError(
+        error.ResourceTemporarilyUnavailable,
+        controller.tryAcquireWithPressure(
+            .gpu,
+            .{ .backend_limit_bytes = 100 },
+            .{ .backend_weight_bytes = 40 },
+            false,
+            &pressure,
+        ),
+    );
+    switch (pressure orelse return error.TestExpectedAdmissionPressure) {
+        .domain_backend => |backend_class| try std.testing.expectEqual(BackendClass.gpu, backend_class),
+        else => return error.TestUnexpectedAdmissionPressure,
+    }
 }
 
 test "cpu and gpu admission enforce independent policy domains" {

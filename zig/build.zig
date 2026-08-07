@@ -164,6 +164,7 @@ const inference_delegated_steps = [_][]const u8{
 
 const release_scale_test_filters = [_][]const u8{
     "db dense default dynamic 0.2 percent numeric filter exact scores bounded candidates",
+    "one percent native filter routes through integrated dense search exactly",
     "db one real delete keeps filtered full text on complement path across restart",
     "db production ingest preserves high-frequency keyword recall across clean restarts",
 };
@@ -3563,12 +3564,29 @@ pub fn build(b: *std.Build) void {
 
     const raft_transport_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        // The top-level Raft declaration walk makes the nested transport test
-        // declarations reachable; the qualified filter then keeps execution
-        // scoped to the transport package.
         .filters = &.{ "raft integration module compiles", "raft.transport." },
     });
     const run_raft_transport_tests = addFilteredTestRunArtifact(b, raft_transport_tests);
+
+    const http_low_fd_ratchet_filter = "std http listener process threads and descriptors recover after cancellation storms";
+    const http_low_fd_ratchet_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        // Compile the shared HTTP module for declaration reachability, but
+        // execute only the process-level regression below. The wider common
+        // and transport buckets contain high-cardinality socket tests that do
+        // not fit inside this target's 256-descriptor process limit.
+        .filters = &.{ "common.", http_low_fd_ratchet_filter },
+    });
+    const run_http_low_fd_ratchet_tests = addFilteredTestRunArtifactWithRuntimeFilters(
+        b,
+        http_low_fd_ratchet_tests,
+        &.{http_low_fd_ratchet_filter},
+    );
+    const http_low_fd_ratchet_test_step = b.step(
+        "http-low-fd-ratchet-test",
+        "Run the process-level low-FD HTTP worker ratchet regression",
+    );
+    http_low_fd_ratchet_test_step.dependOn(&run_http_low_fd_ratchet_tests.step);
 
     const lib_raft_sim_default_filters = [_][]const u8{
         "managed host simulation drives add and peer refresh through deterministic steps",
@@ -4784,6 +4802,7 @@ pub fn build(b: *std.Build) void {
             "cluster backup maintenance queue expires inactive repositories",
             "restore repository contention backoff is bounded and increasing",
             "restore retry deadline wakeup is interruptible without polling",
+            "owned backup runtime has a finite worker ceiling",
             "backup staging uses configured storage authority and exclusive generations",
             "owned restore verifies declared artifact identity instead of accepting staged bytes",
             "cluster restore repository errors preserve operational failure semantics",
@@ -5080,6 +5099,7 @@ pub fn build(b: *std.Build) void {
         .root_module = api_table_writes_docid_test_mod,
         .filters = selectTestFilters(b, &.{
             "auto bulk group writes release leases so idle finish can publish",
+            "provisioned table write source has a finite worker ceiling",
             "provisioned native storage metrics bypass an empty busy write cache",
             "provisioned table write source rejects stale doc identity namespace before write",
             "replicated split destination seeds inherited doc identity before range publication",
@@ -5160,6 +5180,9 @@ pub fn build(b: *std.Build) void {
         .root_module = api_table_reads_docid_test_mod,
         .filters = &.{
             "aggregation completeness requires exact total relation",
+            "api http client forwards internal query controls and maps remote timeout",
+            "remote shard query phases propagate deadline and request cancellation",
+            "provisioned table read cache has a finite worker ceiling",
             "provisioned read cache invalidates repeated ownership moves with pinned leases",
             "provisioned read cache exclusive access drains active read leases",
             "provisioned read cache group exclusive drains only the published group",
@@ -6087,6 +6110,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_raft_runtime_tests.step);
     unit_test_step.dependOn(&run_raft_restore_tests.step);
     unit_test_step.dependOn(&run_raft_ready_continuation_tests.step);
+    unit_test_step.dependOn(&run_raft_transport_tests.step);
 
     // Progress mode uses one union-filtered root artifact too. Storage and
     // metadata module paths overlap, while raft-transport is a strict subset
@@ -6478,13 +6502,14 @@ pub fn build(b: *std.Build) void {
     const release_blocker_regression_filters = [_][]const u8{
         "non-visible doc set complements visibility per generation",
         "built-in exact dense scorer filters metadata before vector reads",
+        "one percent filtered route preserves exact recall with candidate-linear IO",
         "sorted unique vector id subtraction handles sparse and dense exclusions",
     };
     const release_blocker_regression_tests = b.addTest(.{
         .root_module = db_test_mod,
         // A root DB test keeps query/search_exec and dense_exact reachable to
         // Zig's compile-time test discovery. Runtime filters below execute
-        // only the three fast primitives, never this corpus-scale anchor.
+        // only the fast primitives, never this corpus-scale anchor.
         .filters = compileFiltersWithAnchors(
             b,
             &.{"db dense default dynamic 0.2 percent numeric filter exact scores bounded candidates"},

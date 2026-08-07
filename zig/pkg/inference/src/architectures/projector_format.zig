@@ -992,3 +992,35 @@ test "detect unknown projector metadata" {
 
     try std.testing.expectEqual(Kind.unknown, try detectPath(allocator, path));
 }
+
+test "published Gemma 4 E2B decoder and projector satisfy the paired strict contract when configured" {
+    const allocator = std.testing.allocator;
+    const decoder_env = std.c.getenv("ANTFLY_TEST_GEMMA4_E2B_DECODER_GGUF") orelse
+        return error.SkipZigTest;
+    const path_env = std.c.getenv("ANTFLY_TEST_GEMMA4_E2B_PROJECTOR_GGUF") orelse
+        return error.SkipZigTest;
+    const decoder_path = std.mem.span(decoder_env);
+    const path = std.mem.span(path_env);
+    var decoder_mapped = try c_file.MmapRegion.init(allocator, decoder_path);
+    defer decoder_mapped.deinit();
+    var decoder = try gguf_format.parseStructure(allocator, decoder_mapped.data);
+    defer decoder.deinit(allocator);
+    try gguf_format.validateTensorDataRanges(&decoder, decoder_mapped.data.len);
+    var mapped = try c_file.MmapRegion.init(allocator, path);
+    defer mapped.deinit();
+    var file = try gguf_format.parseStructure(allocator, mapped.data);
+    defer file.deinit(allocator);
+    try gguf_format.validateTensorDataRanges(&file, mapped.data.len);
+
+    const contract = try inspectFileContract(&file);
+    const decoder_view = gguf_metadata.View.init(&decoder);
+    try std.testing.expectEqualStrings("gemma4", decoder_view.getString("general.architecture").?);
+    const decoder_hidden = decoder_view.getU64("gemma4.embedding_length") orelse
+        return error.InvalidProjectorContract;
+    try std.testing.expectEqual(Kind.clip_gemma4_image_audio, contract.kind);
+    try std.testing.expectEqual(@as(u32, 1536), contract.text_hidden_size);
+    try std.testing.expectEqual(decoder_hidden, @as(u64, contract.text_hidden_size));
+    try std.testing.expect(decoder.tensors.len > 0);
+    try std.testing.expect(contract.supports_image);
+    try std.testing.expect(contract.supports_audio);
+}
