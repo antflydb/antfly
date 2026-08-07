@@ -49,7 +49,8 @@ const RuntimeArtifactRole = enum {
 
 const RuntimeLibraryUnit = enum {
     api_kernel,
-    cli,
+    // CLI shares enough of the storage graph with the distributed roles that
+    // co-generation shortens the measured ReleaseFast critical path.
     distributed,
     inference,
 };
@@ -8575,7 +8576,6 @@ pub fn build(b: *std.Build) void {
                 .linkage = .static,
                 .max_rss = switch (unit) {
                     .api_kernel => 5 * 1024 * 1024 * 1024,
-                    .cli => 3 * 1024 * 1024 * 1024,
                     .distributed => 11 * 1024 * 1024 * 1024,
                     .inference => 8 * 1024 * 1024 * 1024,
                 },
