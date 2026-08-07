@@ -552,16 +552,42 @@ fn writeAllAtOffset(env: *env_mod.Environment, bytes: []const u8, offset: usize)
     return writeAllAtOffsetFd(env.fd, bytes, offset);
 }
 
+// Darwin rejects a single write larger than INT_MAX, while Linux caps one
+// transfer at MAX_RW_COUNT. Keep every syscall comfortably below both limits;
+// the extra calls are negligible for commit spans large enough to need this.
+const max_pwrite_chunk_len: usize = 1 << 30;
+
+fn pwriteChunkLen(remaining: usize) usize {
+    return @min(remaining, max_pwrite_chunk_len);
+}
+
 fn writeAllAtOffsetFd(fd: std.posix.fd_t, bytes: []const u8, offset: usize) Error!void {
     var written: usize = 0;
     while (written < bytes.len) {
-        const rc = std.posix.system.pwrite(fd, bytes.ptr + written, bytes.len - written, @intCast(offset + written));
+        const write_offset = std.math.add(usize, offset, written) catch return error.MapFull;
+        const posix_offset = std.math.cast(std.posix.off_t, write_offset) orelse return error.MapFull;
+        const rc = std.posix.system.pwrite(
+            fd,
+            bytes.ptr + written,
+            pwriteChunkLen(bytes.len - written),
+            posix_offset,
+        );
         switch (std.posix.errno(rc)) {
-            .SUCCESS => written += @intCast(rc),
+            .SUCCESS => {
+                if (rc == 0) return error.Unexpected;
+                written += @intCast(rc);
+            },
             .INTR => continue,
             else => return error.Unexpected,
         }
     }
+}
+
+test "positional writes use portable bounded chunks" {
+    try std.testing.expectEqual(@as(usize, 0), pwriteChunkLen(0));
+    try std.testing.expectEqual(@as(usize, 4096), pwriteChunkLen(4096));
+    try std.testing.expectEqual(max_pwrite_chunk_len, pwriteChunkLen(max_pwrite_chunk_len));
+    try std.testing.expectEqual(max_pwrite_chunk_len, pwriteChunkLen(max_pwrite_chunk_len + 1));
 }
 
 fn writeAllAtOffsetAsyncIo(file: std.Io.File, io: std.Io, bytes: []const u8, offset: usize) Error!void {

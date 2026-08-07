@@ -149,6 +149,7 @@ const inference_delegated_steps = [_][]const u8{
 
 const release_scale_test_filters = [_][]const u8{
     "db dense default dynamic 0.2 percent numeric filter exact scores bounded candidates",
+    "one percent native filter routes through integrated dense search exactly",
     "db one real delete keeps filtered full text on complement path across restart",
     "db production ingest preserves high-frequency keyword recall across clean restarts",
 };
@@ -6464,13 +6465,14 @@ pub fn build(b: *std.Build) void {
     const release_blocker_regression_filters = [_][]const u8{
         "non-visible doc set complements visibility per generation",
         "built-in exact dense scorer filters metadata before vector reads",
+        "one percent filtered route preserves exact recall with candidate-linear IO",
         "sorted unique vector id subtraction handles sparse and dense exclusions",
     };
     const release_blocker_regression_tests = b.addTest(.{
         .root_module = db_test_mod,
         // A root DB test keeps query/search_exec and dense_exact reachable to
         // Zig's compile-time test discovery. Runtime filters below execute
-        // only the three fast primitives, never this corpus-scale anchor.
+        // only the fast primitives, never this corpus-scale anchor.
         .filters = compileFiltersWithAnchors(
             b,
             &.{"db dense default dynamic 0.2 percent numeric filter exact scores bounded candidates"},

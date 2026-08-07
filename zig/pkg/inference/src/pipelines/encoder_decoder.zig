@@ -305,6 +305,12 @@ pub fn loadDecoderConfig(allocator: std.mem.Allocator, model_dir: []const u8) !D
     const path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{model_dir});
     defer allocator.free(path);
 
+    return loadDecoderConfigFile(allocator, path);
+}
+
+/// Parse decoder settings from an already resolved config artifact. Managed
+/// serving passes the receipt-validated canonical path through this API.
+pub fn loadDecoderConfigFile(allocator: std.mem.Allocator, path: []const u8) !DecoderConfig {
     const data = try c_file.readFile(allocator, path);
     defer allocator.free(data);
 
