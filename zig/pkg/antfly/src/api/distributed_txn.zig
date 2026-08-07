@@ -43,6 +43,7 @@ pub const TxnResolveRequest = struct {
     txn_id: db_mod.types.TxnId,
     status: db_mod.types.TxnStatus,
     commit_version: u64,
+    sync_level: db_mod.types.SyncLevel = .propose,
 };
 
 pub const TxnStatusResponse = struct {
@@ -229,7 +230,7 @@ pub const HostedParticipantWorker = struct {
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader)) orelse return error.UnknownGroup;
         defer route.deinit(alloc);
         switch (route) {
-            .local => _ = (try self.writes.txnResolveGroupLocal(alloc, group_id, table_name, req.txn_id, req.status, req.commit_version)) orelse return error.UnknownGroup,
+            .local => _ = (try self.writes.txnResolveGroupLocal(alloc, group_id, table_name, req.txn_id, req.status, req.commit_version, req.sync_level)) orelse return error.UnknownGroup,
             .remote => |remote| {
                 var client = http_client_mod.ApiHttpClient.init(alloc, self.executor);
                 const body = try encodeTxnResolveRequest(alloc, req);
@@ -290,7 +291,7 @@ pub const LocalTableWriteParticipantWorker = struct {
 
     fn resolveGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest) !void {
         const self: *LocalTableWriteParticipantWorker = @ptrCast(@alignCast(ptr));
-        _ = (try self.writes.txnResolveGroupLocal(alloc, group_id, table_name, req.txn_id, req.status, req.commit_version)) orelse return error.UnknownGroup;
+        _ = (try self.writes.txnResolveGroupLocal(alloc, group_id, table_name, req.txn_id, req.status, req.commit_version, req.sync_level)) orelse return error.UnknownGroup;
     }
 
     fn statusGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId) !db_mod.types.TxnStatus {
@@ -405,11 +406,12 @@ pub fn executeMultiTableCommit(
     begin_timestamp: u64,
     commit_version: u64,
     tables: []const TableCommitRequest,
+    sync_level: db_mod.types.SyncLevel,
     trace_writer: ?tracing.AntflyTraceWriter,
 ) !CommitOutcome {
     var attempt: usize = 0;
     while (attempt < 2) : (attempt += 1) {
-        return executeMultiTableCommitOnce(alloc, catalog, worker, txn_id, begin_timestamp, commit_version, tables, attempt > 0, trace_writer) catch |err| switch (err) {
+        return executeMultiTableCommitOnce(alloc, catalog, worker, txn_id, begin_timestamp, commit_version, tables, sync_level, attempt > 0, trace_writer) catch |err| switch (err) {
             error.TopologyChanged, error.UnknownGroup => if (attempt == 0) continue else return err,
             else => return err,
         };
@@ -425,6 +427,7 @@ fn executeMultiTableCommitOnce(
     begin_timestamp: u64,
     commit_version: u64,
     tables: []const TableCommitRequest,
+    sync_level: db_mod.types.SyncLevel,
     surface_unavailable_conflict: bool,
     trace_writer: ?tracing.AntflyTraceWriter,
 ) !CommitOutcome {
@@ -534,6 +537,7 @@ fn executeMultiTableCommitOnce(
             .txn_id = txn_id,
             .status = .committed,
             .commit_version = commit_version,
+            .sync_level = sync_level,
         }) catch |err| switch (err) {
             error.DecisionConflict => {
                 if (trace_writer) |tw| {
@@ -844,8 +848,8 @@ pub fn encodeTxnResolveRequest(alloc: std.mem.Allocator, req: TxnResolveRequest)
     };
     return try std.fmt.allocPrint(
         alloc,
-        "{{\"txn_id\":\"{s}\",\"status\":\"{s}\",\"commit_version\":{d}}}",
-        .{ &txn_hex, status_text, req.commit_version },
+        "{{\"txn_id\":\"{s}\",\"status\":\"{s}\",\"commit_version\":{d},\"sync_level\":\"{s}\"}}",
+        .{ &txn_hex, status_text, req.commit_version, @tagName(req.sync_level) },
     );
 }
 
@@ -947,6 +951,10 @@ pub fn parseTxnResolveRequest(alloc: std.mem.Allocator, body: []const u8) !TxnRe
         .txn_id = try parseTxnIdHex(requireString(obj, "txn_id")),
         .status = parseTxnStatus(requireString(obj, "status")) orelse return error.InvalidTxnRequest,
         .commit_version = requireInteger(obj, "commit_version"),
+        .sync_level = if (obj.get("sync_level")) |value| db_mod.types.parsePublicSyncLevelText(switch (value) {
+            .string => |text| text,
+            else => return error.InvalidTxnRequest,
+        }) orelse return error.InvalidTxnRequest else .propose,
     };
 }
 
@@ -1189,6 +1197,26 @@ fn parseTxnStatus(text: []const u8) ?db_mod.types.TxnStatus {
     if (std.mem.eql(u8, text, "committed")) return .committed;
     if (std.mem.eql(u8, text, "aborted")) return .aborted;
     return null;
+}
+
+test "txn resolve codec preserves sync level and accepts legacy requests" {
+    const alloc = std.testing.allocator;
+    const txn_id = try parseTxnIdHex("00112233445566778899aabbccddeeff");
+    const encoded = try encodeTxnResolveRequest(alloc, .{
+        .txn_id = txn_id,
+        .status = .committed,
+        .commit_version = 42,
+        .sync_level = .full_index,
+    });
+    defer alloc.free(encoded);
+    const decoded = try parseTxnResolveRequest(alloc, encoded);
+    try std.testing.expectEqual(db_mod.types.SyncLevel.full_index, decoded.sync_level);
+
+    const legacy = try parseTxnResolveRequest(
+        alloc,
+        "{\"txn_id\":\"00112233445566778899aabbccddeeff\",\"status\":\"committed\",\"commit_version\":42}",
+    );
+    try std.testing.expectEqual(db_mod.types.SyncLevel.propose, legacy.sync_level);
 }
 
 fn abortBegunRefs(
@@ -1519,6 +1547,7 @@ test "distributed txn coordinator retries once on topology change" {
 
     const Recorder = struct {
         prepare_calls: usize = 0,
+        resolved_sync_level: db_mod.types.SyncLevel = .propose,
 
         fn worker(self: *@This()) ParticipantWorker {
             return .{
@@ -1543,7 +1572,10 @@ test "distributed txn coordinator retries once on topology change" {
             }
         }
 
-        fn resolve(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnResolveRequest) !void {}
+        fn resolve(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, req: TxnResolveRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.resolved_sync_level = req.sync_level;
+        }
 
         fn status(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
             return .pending;
@@ -1564,10 +1596,12 @@ test "distributed txn coordinator retries once on topology change" {
             .table_name = "docs",
             .writes = &.{.{ .key = "doc:z", .value = "{\"title\":\"z\"}" }},
         }},
+        .full_index,
         null,
     );
     try std.testing.expect(outcome == .committed);
     try std.testing.expectEqual(@as(usize, 2), recorder.prepare_calls);
+    try std.testing.expectEqual(db_mod.types.SyncLevel.full_index, recorder.resolved_sync_level);
 }
 
 test "distributed txn coordinator stops after single topology retry" {
@@ -1637,6 +1671,7 @@ test "distributed txn coordinator stops after single topology retry" {
             .table_name = "docs",
             .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"a\"}" }},
         }},
+        .propose,
         null,
     ));
 }
@@ -1714,6 +1749,7 @@ test "distributed txn coordinator surfaces participant group on repeated unknown
             .table_name = "docs",
             .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"a\"}" }},
         }},
+        .propose,
         null,
     );
     try std.testing.expect(outcome == .conflict);
@@ -1810,6 +1846,7 @@ test "distributed txn coordinator surfaces resolve decision conflicts determinis
             .table_name = "docs",
             .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"a\"}" }},
         }},
+        .propose,
         null,
     );
     try std.testing.expect(outcome == .conflict);

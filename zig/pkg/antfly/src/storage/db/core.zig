@@ -1250,7 +1250,7 @@ pub const DBCore = struct {
         status: transactions_mod.TxnStatus,
         commit_version: u64,
     ) !void {
-        try self.resolveTransactionIntentsWithExtraBatch(txn_id, status, commit_version, .{});
+        _ = try self.resolveTransactionIntentsWithExtraBatch(txn_id, status, commit_version, .{});
     }
 
     pub fn resolveTransactionIntentsWithExtraBatch(
@@ -1259,10 +1259,22 @@ pub const DBCore = struct {
         status: transactions_mod.TxnStatus,
         commit_version: u64,
         extra_batch: transactions_mod.ResolutionExtraBatch,
-    ) !void {
+    ) !bool {
         var manager = try self.initTxnManager();
         defer manager.deinit();
-        try manager.resolveIntentsWithExtraBatch(txn_id, status, commit_version, extra_batch);
+        return try manager.resolveIntentsWithExtraBatch(txn_id, status, commit_version, extra_batch);
+    }
+
+    pub fn collectTransactionIntentBatch(self: *DBCore, alloc: Allocator, txn_id: transactions_mod.TxnId) !transactions_mod.IntentBatch {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        return try manager.collectIntentBatch(alloc, txn_id);
+    }
+
+    pub fn transactionHasIntents(self: *DBCore, txn_id: transactions_mod.TxnId) !bool {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        return try manager.hasIntents(txn_id);
     }
 
     pub fn collectTransactionIntentDocumentKeys(

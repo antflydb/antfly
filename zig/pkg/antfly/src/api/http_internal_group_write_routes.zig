@@ -696,6 +696,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
             txn_req.txn_id,
             txn_req.status,
             txn_req.commit_version,
+            txn_req.sync_level,
         ) catch |err| switch (err) {
             error.DecisionConflict => return try http_route_helpers.textResponse(ctx.alloc, 409, "decision conflict"),
             error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
@@ -1371,7 +1372,7 @@ const TestWriteSource = struct {
         return null;
     }
 
-    fn txnResolveGroupLocal(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: db_mod.types.TxnStatus, _: u64) !?void {
+    fn txnResolveGroupLocal(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: db_mod.types.TxnStatus, _: u64, _: db_mod.types.SyncLevel) !?void {
         return null;
     }
 

@@ -24663,7 +24663,7 @@ test "api http server surfaces structured participant diagnostics for unavailabl
             return error.UnsupportedOperation;
         }
 
-        fn resolveGroup(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: db_mod.types.TxnStatus, _: u64) anyerror!?void {
+        fn resolveGroup(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: db_mod.types.TxnStatus, _: u64, _: db_mod.types.SyncLevel) anyerror!?void {
             return error.UnsupportedOperation;
         }
 
@@ -24771,7 +24771,7 @@ test "api http server surfaces structured decision conflicts for transaction com
             return error.UnsupportedOperation;
         }
 
-        fn resolveGroup(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: db_mod.types.TxnStatus, _: u64) anyerror!?void {
+        fn resolveGroup(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: db_mod.types.TxnStatus, _: u64, _: db_mod.types.SyncLevel) anyerror!?void {
             return error.UnsupportedOperation;
         }
 
@@ -24877,7 +24877,7 @@ test "api http server surfaces structured doc identity conflicts for transaction
             return error.UnsupportedOperation;
         }
 
-        fn resolveGroup(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: db_mod.types.TxnStatus, _: u64) anyerror!?void {
+        fn resolveGroup(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: db_mod.types.TxnStatus, _: u64, _: db_mod.types.SyncLevel) anyerror!?void {
             return error.UnsupportedOperation;
         }
 
@@ -24985,7 +24985,7 @@ test "api http server surfaces structured torn-state conflicts when txn record i
             return error.UnsupportedOperation;
         }
 
-        fn resolveGroup(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: db_mod.types.TxnStatus, _: u64) anyerror!?void {
+        fn resolveGroup(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: db_mod.types.TxnStatus, _: u64, _: db_mod.types.SyncLevel) anyerror!?void {
             return error.UnsupportedOperation;
         }
 
@@ -25090,7 +25090,7 @@ test "api http server surfaces structured torn-state conflicts when txn record i
             return error.UnsupportedOperation;
         }
 
-        fn resolveGroup(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: db_mod.types.TxnStatus, _: u64) anyerror!?void {
+        fn resolveGroup(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: db_mod.types.TxnStatus, _: u64, _: db_mod.types.SyncLevel) anyerror!?void {
             return error.UnsupportedOperation;
         }
 
@@ -32683,7 +32683,7 @@ test "api http server prefers metadata-owned restore over inline write-source re
         fn unsupportedTxnPrepareGroupLocal(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: db_mod.types.TransactionIntentRequest) anyerror!?void {
             return error.UnsupportedOperation;
         }
-        fn unsupportedTxnResolveGroupLocal(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: db_mod.types.TxnStatus, _: u64) anyerror!?void {
+        fn unsupportedTxnResolveGroupLocal(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: db_mod.types.TxnStatus, _: u64, _: db_mod.types.SyncLevel) anyerror!?void {
             return error.UnsupportedOperation;
         }
     };

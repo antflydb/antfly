@@ -2148,9 +2148,19 @@ pub fn parseMultiBatchRequest(alloc: std.mem.Allocator, body: []const u8) !Owned
     var req: OwnedTransactionCommitRequest = .{};
     errdefer req.deinit(alloc);
     req.tables = try parseTables(alloc, root.get("tables") orelse return error.InvalidTransactionCommitRequest);
+    if (req.tables.len == 0) return error.InvalidTransactionCommitRequest;
     if (root.get("sync_level")) |sync_level_value| {
         req.sync_level = parseSyncLevel(sync_level_value) orelse return error.InvalidTransactionCommitRequest;
+    } else {
+        for (req.tables) |table| {
+            if (@intFromEnum(table.batch.req.sync_level) > @intFromEnum(req.sync_level)) {
+                req.sync_level = table.batch.req.sync_level;
+            }
+        }
     }
+    var operation_count: usize = 0;
+    for (req.tables) |table| operation_count += table.batch.writes.len + table.batch.deletes.len + table.batch.transforms.len;
+    if (operation_count == 0) return error.InvalidTransactionCommitRequest;
     return req;
 }
 
@@ -3495,6 +3505,26 @@ test "multi batch parser accepts the public batch envelope without a read set" {
     try std.testing.expectEqual(@as(usize, 1), req.tables[0].batch.writes.len);
     try std.testing.expectEqualStrings("audit", req.tables[1].table_name);
     try std.testing.expectEqual(@as(usize, 1), req.tables[1].batch.deletes.len);
+}
+
+test "multi batch parser derives strongest per-table sync level" {
+    var req = try parseMultiBatchRequest(std.testing.allocator,
+        \\{
+        \\  "tables":{
+        \\    "docs":{"inserts":{"doc:a":{"title":"alpha"}},"sync_level":"write"},
+        \\    "audit":{"deletes":["event:old"],"sync_level":"full_index"}
+        \\  }
+        \\}
+    );
+    defer req.deinit(std.testing.allocator);
+    try std.testing.expectEqual(db_mod.types.SyncLevel.full_index, req.sync_level);
+}
+
+test "multi batch parser rejects empty operation sets" {
+    try std.testing.expectError(
+        error.InvalidTransactionCommitRequest,
+        parseMultiBatchRequest(std.testing.allocator, "{\"tables\":{\"docs\":{}}}"),
+    );
 }
 
 test "multi batch parser rejects transaction-only read sets" {

@@ -681,9 +681,12 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("missing body");
         };
-        var commit_req = transactions_api.parseMultiBatchRequest(alloc, body_data) catch {
-            _ = ctx.status(400);
-            return ctx.text("invalid multi-batch request");
+        var commit_req = transactions_api.parseMultiBatchRequest(alloc, body_data) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {
+                _ = ctx.status(400);
+                return ctx.text("invalid multi-batch request");
+            },
         };
         defer commit_req.deinit(alloc);
         return try self.executeCommitRequest(ctx, authenticated_identity, &commit_req, .multi_batch);

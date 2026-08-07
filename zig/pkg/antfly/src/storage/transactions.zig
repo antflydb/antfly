@@ -96,6 +96,28 @@ pub const TxnSummary = struct {
 pub const ResolutionExtraBatch = struct {
     writes: []const docstore.KVPair = &.{},
     deletes: []const []const u8 = &.{},
+    replay: ?ReplayAppend = null,
+};
+
+pub const ReplayAppend = struct {
+    sequence: u64,
+    payload: []const u8,
+};
+
+pub const IntentBatch = struct {
+    writes: []docstore.KVPair = &.{},
+    deletes: [][]const u8 = &.{},
+
+    pub fn deinit(self: *IntentBatch, alloc: Allocator) void {
+        for (self.writes) |write| {
+            alloc.free(@constCast(write.key));
+            alloc.free(@constCast(write.value));
+        }
+        if (self.writes.len > 0) alloc.free(self.writes);
+        for (self.deletes) |key| alloc.free(@constCast(key));
+        if (self.deletes.len > 0) alloc.free(self.deletes);
+        self.* = undefined;
+    }
 };
 
 const TxnRecord = struct {
@@ -239,7 +261,7 @@ pub const TxnManager = struct {
             try writes.append(self.alloc, .{ .key = intent_key, .value = val });
         }
 
-        try self.applyBatch(writes.items, &.{});
+        try self.applyBatch(writes.items, &.{}, null);
 
         self.traceWriteIntentSuccess(txn_id, intents, predicates);
     }
@@ -249,7 +271,7 @@ pub const TxnManager = struct {
     /// should treat that as a protocol inconsistency / torn-state signal rather
     /// than a retryable OCC conflict.
     pub fn resolveIntents(self: *TxnManager, txn_id: TxnId, status: TxnStatus, timestamp: u64) !void {
-        try self.resolveIntentsWithExtraBatch(txn_id, status, timestamp, .{});
+        _ = try self.resolveIntentsWithExtraBatch(txn_id, status, timestamp, .{});
     }
 
     pub fn resolveIntentsWithExtraBatch(
@@ -258,9 +280,10 @@ pub const TxnManager = struct {
         status: TxnStatus,
         timestamp: u64,
         extra_batch: ResolutionExtraBatch,
-    ) !void {
+    ) !bool {
         const rec_key = makeRecordKey(txn_id);
         var record = try self.loadTransactionRecord(txn_id);
+        const was_terminal = record.status != .pending;
         applyResolveDecision(&record, status, timestamp) catch |err| {
             if (err == TxnError.DecisionConflict) {
                 if (self.trace_writer) |tw| {
@@ -285,6 +308,12 @@ pub const TxnManager = struct {
 
         const intent_entries = try self.scanPrefix(self.alloc, scan_prefix);
         defer backend_scan.freeResults(self.alloc, intent_entries);
+
+        // A resolve retry after the terminal record and all intents are already
+        // durable must not apply the caller's derived batch again. In
+        // particular, doing so could overwrite a newer user write with the
+        // transaction's old value.
+        if (was_terminal and intent_entries.len == 0) return false;
 
         var writes = std.ArrayListUnmanaged(docstore.KVPair).empty;
         defer writes.deinit(self.alloc);
@@ -340,7 +369,7 @@ pub const TxnManager = struct {
         try writes.appendSlice(self.alloc, extra_batch.writes);
         try deletes.appendSlice(self.alloc, extra_batch.deletes);
 
-        try self.applyBatch(writes.items, deletes.items);
+        try self.applyBatch(writes.items, deletes.items, extra_batch.replay);
 
         if (self.trace_writer) |tw| {
             tw.traceEvent(&.{
@@ -356,6 +385,68 @@ pub const TxnManager = struct {
                 .reason = if (status == .committed) "committed" else "aborted",
             });
         }
+        return true;
+    }
+
+    pub fn collectIntentBatch(self: *TxnManager, alloc: Allocator, txn_id: TxnId) !IntentBatch {
+        var intent_prefix_buf: [intents_prefix.len + 17]u8 = undefined;
+        @memcpy(intent_prefix_buf[0..intents_prefix.len], intents_prefix);
+        @memcpy(intent_prefix_buf[intents_prefix.len..][0..16], &txn_id);
+        intent_prefix_buf[intents_prefix.len + 16] = ':';
+        const scan_prefix = intent_prefix_buf[0 .. intents_prefix.len + 17];
+
+        const intent_entries = try self.scanPrefix(alloc, scan_prefix);
+        defer backend_scan.freeResults(alloc, intent_entries);
+
+        var write_count: usize = 0;
+        for (intent_entries) |entry| {
+            if (!(entry.value.len > 0 and entry.value[0] == 1)) write_count += 1;
+        }
+        const writes = try alloc.alloc(docstore.KVPair, write_count);
+        var writes_initialized: usize = 0;
+        errdefer {
+            for (writes[0..writes_initialized]) |write| {
+                alloc.free(@constCast(write.key));
+                alloc.free(@constCast(write.value));
+            }
+            if (writes.len > 0) alloc.free(writes);
+        }
+        const deletes = try alloc.alloc([]const u8, intent_entries.len - write_count);
+        var deletes_initialized: usize = 0;
+        errdefer {
+            for (deletes[0..deletes_initialized]) |key| alloc.free(@constCast(key));
+            if (deletes.len > 0) alloc.free(deletes);
+        }
+
+        for (intent_entries) |entry| {
+            const user_key = entry.key[intents_prefix.len + 17 ..];
+            if (entry.value.len > 0 and entry.value[0] == 1) {
+                deletes[deletes_initialized] = try alloc.dupe(u8, user_key);
+                deletes_initialized += 1;
+            } else {
+                const key = try alloc.dupe(u8, user_key);
+                errdefer alloc.free(key);
+                const value = try alloc.dupe(u8, if (entry.value.len > 1) entry.value[1..] else "");
+                writes[writes_initialized] = .{ .key = key, .value = value };
+                writes_initialized += 1;
+            }
+        }
+        return .{ .writes = writes, .deletes = deletes };
+    }
+
+    pub fn hasIntents(self: *TxnManager, txn_id: TxnId) !bool {
+        var intent_prefix_buf: [intents_prefix.len + 17]u8 = undefined;
+        @memcpy(intent_prefix_buf[0..intents_prefix.len], intents_prefix);
+        @memcpy(intent_prefix_buf[intents_prefix.len..][0..16], &txn_id);
+        intent_prefix_buf[intents_prefix.len + 16] = ':';
+        const prefix = intent_prefix_buf[0 .. intents_prefix.len + 17];
+
+        var read = try self.store.beginRead();
+        defer read.abort();
+        var cursor = try read.openCursor();
+        defer cursor.close();
+        const entry = (try cursor.seekAtOrAfter(prefix)) orelse return false;
+        return std.mem.startsWith(u8, entry.key, prefix);
     }
 
     pub fn collectIntentDocumentKeys(
@@ -524,7 +615,7 @@ pub const TxnManager = struct {
                     extra_batch = try build(extra_hooks.ctx, self, txn_id, record.status, resolve_ts);
                     extra_batch_initialized = true;
                 }
-                try self.resolveIntentsWithExtraBatch(txn_id, record.status, resolve_ts, extra_batch);
+                _ = try self.resolveIntentsWithExtraBatch(txn_id, record.status, resolve_ts, extra_batch);
                 stats.resolved_finalized += 1;
             }
 
@@ -667,7 +758,7 @@ pub const TxnManager = struct {
         const record_key = makeRecordKey(txn_id);
         const participant_key = makeSidecarKey(participants_prefix, txn_id);
         const resolved_key = makeSidecarKey(resolved_participants_prefix, txn_id);
-        try self.applyBatch(&.{}, &.{ &record_key, &participant_key, &resolved_key });
+        try self.applyBatch(&.{}, &.{ &record_key, &participant_key, &resolved_key }, null);
     }
 
     fn saveParticipantSet(self: *TxnManager, comptime prefix: []const u8, txn_id: TxnId, participants: []const []const u8) !void {
@@ -685,7 +776,7 @@ pub const TxnManager = struct {
     fn saveOwnedParticipantSet(self: *TxnManager, comptime prefix: []const u8, txn_id: TxnId, participants: []const []u8) !void {
         const key = makeSidecarKey(prefix, txn_id);
         if (participants.len == 0) {
-            try self.applyBatch(&.{}, &.{&key});
+            try self.applyBatch(&.{}, &.{&key}, null);
             return;
         }
         const encoded = try encodeParticipantList(self.alloc, participants);
@@ -717,7 +808,7 @@ pub const TxnManager = struct {
         try txn.commit();
     }
 
-    fn applyBatch(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8) !void {
+    fn applyBatch(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend) !void {
         var batch = try self.store.beginBatch();
         errdefer batch.abort();
         for (deletes) |key| {
@@ -729,6 +820,7 @@ pub const TxnManager = struct {
         for (writes) |kv| {
             try batch.put(kv.key, kv.value);
         }
+        if (replay) |entry| try batch.setReplayOpaque(entry.sequence, entry.payload);
         try batch.commit();
     }
 

@@ -3520,6 +3520,7 @@ pub const TableWriteSource = struct {
             txn_id: db_mod.types.TxnId,
             status: db_mod.types.TxnStatus,
             commit_version: u64,
+            sync_level: db_mod.types.SyncLevel,
         ) anyerror!?void = null,
         txn_status_group_local: ?*const fn (
             ptr: *anyopaque,
@@ -3898,9 +3899,10 @@ pub const TableWriteSource = struct {
         txn_id: db_mod.types.TxnId,
         status: db_mod.types.TxnStatus,
         commit_version: u64,
+        sync_level: db_mod.types.SyncLevel,
     ) !?void {
         const fn_ptr = self.vtable.txn_resolve_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, txn_id, status, commit_version);
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, txn_id, status, commit_version, sync_level);
     }
 
     pub fn txnStatusGroupLocal(
@@ -4708,7 +4710,7 @@ pub const BoundTableWriteSource = struct {
                 else => return err,
             }
         };
-        try db.resolveTransactionIntents(txn_id, .committed, commit_version);
+        try db.resolveTransactionIntentsWithSyncLevel(txn_id, .committed, commit_version, sync_level);
         return .{ .committed = .{ .participant_count = 1 } };
     }
 
@@ -4823,11 +4825,12 @@ pub const BoundTableWriteSource = struct {
         txn_id: db_mod.types.TxnId,
         status: db_mod.types.TxnStatus,
         commit_version: u64,
+        sync_level: db_mod.types.SyncLevel,
     ) !?void {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
         const db = try self.activeDb();
-        try db.resolveTransactionIntents(txn_id, status, commit_version);
+        try db.resolveTransactionIntentsWithSyncLevel(txn_id, status, commit_version, sync_level);
         const participant = try std.fmt.allocPrint(db.alloc, "group:{d}", .{group_id});
         defer db.alloc.free(participant);
         try db.markTransactionParticipantResolved(txn_id, participant);
@@ -12993,6 +12996,7 @@ pub const ProvisionedTableWriteSource = struct {
             begin_timestamp,
             commit_version,
             tables,
+            sync_level,
             if (comptime build_options.with_tla) tracing.stderrAntflyTraceWriter() else null,
         );
     }
@@ -13003,12 +13007,7 @@ pub const ProvisionedTableWriteSource = struct {
         tables: []const distributed_txn.TableCommitRequest,
         sync_level: db_mod.types.SyncLevel,
     ) !?distributed_txn.CommitOutcome {
-        const outcome = (try commitTransaction(ptr, alloc, tables, sync_level)) orelse return null;
-        if (outcome == .committed and outcome.committed.participant_count > 1) {
-            const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-            try replayCommittedTransactionBatches(self.source(), alloc, tables, sync_level);
-        }
-        return outcome;
+        return try commitTransaction(ptr, alloc, tables, sync_level);
     }
 
     fn commitSingleGroupTransaction(
@@ -13551,6 +13550,7 @@ pub const ProvisionedTableWriteSource = struct {
         txn_id: db_mod.types.TxnId,
         status: db_mod.types.TxnStatus,
         commit_version: u64,
+        sync_level: db_mod.types.SyncLevel,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try enforceHAWriteGateOptional(self.ha_write_gate);
@@ -13573,7 +13573,7 @@ pub const ProvisionedTableWriteSource = struct {
         if (self.write_cache) |cache| {
             var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default_async, null, null);
             defer cached.deinit(alloc);
-            try cached.db.resolveTransactionIntents(txn_id, status, commit_version);
+            try cached.db.resolveTransactionIntentsWithSyncLevel(txn_id, status, commit_version, sync_level);
             if (status == .committed) try drainManagedDbBeforeClose(cached.db);
             const participant = try std.fmt.allocPrint(alloc, "group:{d}", .{group_id});
             defer alloc.free(participant);
@@ -13582,7 +13582,7 @@ pub const ProvisionedTableWriteSource = struct {
             var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
-            try db.resolveTransactionIntents(txn_id, status, commit_version);
+            try db.resolveTransactionIntentsWithSyncLevel(txn_id, status, commit_version, sync_level);
             if (status == .committed) try drainManagedDbBeforeClose(&db);
             const participant = try std.fmt.allocPrint(alloc, "group:{d}", .{group_id});
             defer alloc.free(participant);
@@ -15234,12 +15234,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         tables: []const distributed_txn.TableCommitRequest,
         sync_level: db_mod.types.SyncLevel,
     ) !?distributed_txn.CommitOutcome {
-        const outcome = (try commitTransaction(ptr, alloc, tables, sync_level)) orelse return null;
-        if (outcome == .committed and outcome.committed.participant_count > 1) {
-            const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-            try replayCommittedTransactionBatches(self.source(), alloc, tables, sync_level);
-        }
-        return outcome;
+        return try commitTransaction(ptr, alloc, tables, sync_level);
     }
 
     fn commitTransactionWithId(
@@ -15262,6 +15257,7 @@ pub const HostedProvisionedTableWriteSource = struct {
             begin_timestamp,
             commit_version,
             tables,
+            sync_level,
             if (comptime build_options.with_tla) tracing.stderrAntflyTraceWriter() else null,
         );
     }
@@ -15437,6 +15433,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         txn_id: db_mod.types.TxnId,
         status: db_mod.types.TxnStatus,
         commit_version: u64,
+        sync_level: db_mod.types.SyncLevel,
     ) !?void {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
@@ -15444,7 +15441,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
         var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default);
         defer cached.deinit(hosted_cache.write_cache.alloc);
-        try cached.db.resolveTransactionIntents(txn_id, status, commit_version);
+        try cached.db.resolveTransactionIntentsWithSyncLevel(txn_id, status, commit_version, sync_level);
         if (status == .committed) try drainManagedDbBeforeClose(cached.db);
         const participant = try std.fmt.allocPrint(alloc, "group:{d}", .{group_id});
         defer alloc.free(participant);
@@ -16052,24 +16049,6 @@ pub const HostedProvisionedTableWriteSource = struct {
         return result;
     }
 };
-
-fn replayCommittedTransactionBatches(
-    source: TableWriteSource,
-    alloc: std.mem.Allocator,
-    tables: []const distributed_txn.TableCommitRequest,
-    sync_level: db_mod.types.SyncLevel,
-) !void {
-    for (tables) |table| {
-        // Transaction prepare resolves transforms to final values. Reapplying
-        // those operations would execute non-idempotent transforms twice, so
-        // this compatibility publication is limited to writes and deletes.
-        _ = (try source.batch(alloc, table.table_name, .{
-            .writes = transactionWritesAsBatchWrites(table.writes),
-            .deletes = table.deletes,
-            .sync_level = sync_level,
-        })) orelse return error.TableNotFound;
-    }
-}
 
 const GroupBatch = struct {
     group_id: u64,
@@ -21039,7 +21018,7 @@ test "bound table write source resolves internal group transactions into visible
     _ = try source.source().txnPrepareGroupLocal(alloc, 7, "docs", txn_id, 0, .{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
     });
-    _ = try source.source().txnResolveGroupLocal(alloc, 7, "docs", txn_id, .committed, 10_001);
+    _ = try source.source().txnResolveGroupLocal(alloc, 7, "docs", txn_id, .committed, 10_001, .propose);
 
     try std.testing.expectEqual(db_mod.types.TxnStatus.committed, (try source.source().txnStatusGroupLocal(alloc, 7, "docs", txn_id)).?);
 
@@ -24308,7 +24287,7 @@ test "provisioned txn commit reuses cached writer state" {
     _ = try source.source().txnPrepareGroupLocal(alloc, 7001, "docs", txn_id, 0, .{
         .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"beta\"}" }},
     });
-    _ = try source.source().txnResolveGroupLocal(alloc, 7001, "docs", txn_id, .committed, 10_001);
+    _ = try source.source().txnResolveGroupLocal(alloc, 7001, "docs", txn_id, .committed, 10_001, .propose);
 
     try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
     try std.testing.expect(source.isWriteCacheDirtyForTable("docs"));
