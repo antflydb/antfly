@@ -5757,6 +5757,10 @@ pub const ProvisionedTableWriteSource = struct {
         const alloc = std.heap.page_allocator;
         if (self.raft_batcher) |batcher| {
             try batcher.batchGroup(alloc, ref.group_id, ref.table_name, .{
+                // Recovery acknowledges immediately after this returns. Wait
+                // for Raft apply so a leader change cannot discard a merely
+                // proposed resolution after the coordinator forgets it.
+                .sync_level = .write,
                 .transaction = .{ .resolve = .{
                     .txn_id = txn_id,
                     .status = status,
@@ -5773,7 +5777,7 @@ pub const ProvisionedTableWriteSource = struct {
             status,
             commit_version,
             0,
-            .propose,
+            .write,
         )) orelse return error.UnknownGroup;
     }
 

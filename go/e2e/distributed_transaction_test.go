@@ -140,9 +140,10 @@ func TestE2E_Batch_MultiKeyUpdatePreservesBalance(t *testing.T) {
 	require.Equal(t, initialSum, finalSum, "Balance conservation violated! Sum changed from %d to %d", initialSum, finalSum)
 }
 
-// TestE2E_Batch_TimeoutHasNoPartialVisibility verifies that an indeterminate
-// client timeout leaves the batch either fully applied or fully unchanged.
-func TestE2E_Batch_TimeoutHasNoPartialVisibility(t *testing.T) {
+// TestE2E_Batch_TimeoutConvergesToOneTerminalState verifies that an
+// indeterminate client timeout eventually leaves the batch either fully
+// applied or fully unchanged.
+func TestE2E_Batch_TimeoutConvergesToOneTerminalState(t *testing.T) {
 	skipInShortMode(t)
 	ctx := testContext(t, 3*time.Minute)
 
@@ -198,39 +199,38 @@ func TestE2E_Batch_TimeoutHasNoPartialVisibility(t *testing.T) {
 		t.Log("Warning: Batch completed despite short timeout - transaction may have succeeded")
 	}
 
-	// Verify the timed-out request did not leave a partially visible update.
-	t.Log("Verifying no partial updates occurred...")
+	// Phase-two delivery is recoverable and may still be converging after the
+	// client loses its response. Accept either terminal decision, but never a
+	// permanently mixed state.
+	t.Log("Waiting for the batch to converge to one terminal state...")
+	var allUnchanged, allUpdated bool
+	require.Eventually(t, func() bool {
+		allUnchanged = true
+		allUpdated = true
+		for key, originalDoc := range originalValues {
+			currentDoc, lookupErr := cluster.Client.LookupKey(ctx, txnTestTableName, key)
+			if lookupErr != nil {
+				return false
+			}
 
-	// Give a moment for any async cleanup
-	time.Sleep(100 * time.Millisecond)
-
-	allUnchanged := true
-	for key, originalDoc := range originalValues {
-		currentDoc, lookupErr := cluster.Client.LookupKey(ctx, txnTestTableName, key)
-		require.NoError(t, lookupErr, "Failed to lookup key %s after abort", key)
-
-		originalBalance := int(originalDoc["balance"].(float64))
-		currentBalance := int(currentDoc["balance"].(float64))
-
-		if currentBalance != originalBalance {
-			t.Logf("Key %s: balance changed from %d to %d", key, originalBalance, currentBalance)
-			allUnchanged = false
-		} else {
-			t.Logf("Key %s: balance unchanged at %d", key, currentBalance)
+			updatedDoc := updatedDocs[key].(map[string]any)
+			currentName, currentNameOK := currentDoc["name"].(string)
+			currentBalance, currentBalanceOK := currentDoc["balance"].(float64)
+			if !currentNameOK || !currentBalanceOK {
+				return false
+			}
+			if currentName != originalDoc["name"].(string) || int(currentBalance) != int(originalDoc["balance"].(float64)) {
+				allUnchanged = false
+			}
+			if currentName != updatedDoc["name"].(string) || int(currentBalance) != updatedDoc["balance"].(int) {
+				allUpdated = false
+			}
 		}
-	}
+		return allUnchanged || allUpdated
+	}, 10*time.Second, 100*time.Millisecond, "timed-out batch did not converge to one terminal state")
 
-	// Note: Due to the nature of timeout-based abort testing, the transaction might
-	// have succeeded before the timeout. This test primarily verifies that if an
-	// abort occurs, no partial writes are visible.
-	if !allUnchanged && err != nil {
-		t.Fatal("Partial update detected after transaction error - atomicity violated!")
-	}
-
-	if allUnchanged {
-		t.Log("All values unchanged after the timeout")
-	} else {
-		t.Log("Transaction completed before timeout - this is acceptable behavior")
+	if err == nil {
+		require.True(t, allUpdated, "successful batch response must converge to the updated state")
 	}
 }
 

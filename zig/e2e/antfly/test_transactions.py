@@ -230,7 +230,7 @@ def test_multi_shard_transaction_recovery_health(stateful_api):
     assert visible_all == all_docs
 
 
-def test_multi_shard_batch_timeout_has_no_partial_visibility(stateful_api):
+def test_multi_shard_batch_timeout_converges_to_one_terminal_state(stateful_api):
     table_name = _create_table(stateful_api, "multi_shard_timeout")
 
     initial_docs = {
@@ -276,7 +276,7 @@ def test_multi_shard_batch_timeout_has_no_partial_visibility(stateful_api):
                 timeout_s=10.0,
                 interval_s=0.1,
             )
-            assert converged is not None, "timed-out multi-shard batch left partial visible state"
+            assert converged is not None, "timed-out multi-shard batch did not converge to one terminal state"
     else:
         assert all_updated
 
