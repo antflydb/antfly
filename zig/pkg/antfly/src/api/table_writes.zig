@@ -5582,7 +5582,8 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn transactionRecoveryConfig(self: *ProvisionedTableWriteSource) db_mod.transaction_runtime.Config {
-        if (self.backend_runtime == null or self.quiesced) return .{};
+        const backend_runtime = self.backend_runtime orelse return .{};
+        if (backend_runtime.io() == null or self.quiesced) return .{};
         return .{
             .enabled = true,
             .lease_owned = true,
@@ -14816,7 +14817,8 @@ pub const HostedProvisionedTableWriteSource = struct {
     }
 
     fn transactionRecoveryConfig(self: *HostedProvisionedTableWriteSource) db_mod.transaction_runtime.Config {
-        if (self.backend_runtime == null) return .{};
+        const backend_runtime = self.backend_runtime orelse return .{};
+        if (backend_runtime.io() == null) return .{};
         return .{
             .enabled = true,
             .lease_owned = true,
