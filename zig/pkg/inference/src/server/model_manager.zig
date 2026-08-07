@@ -18,6 +18,7 @@
 // and backend session, and returns a pipeline ready for inference.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 
@@ -2870,8 +2871,8 @@ pub const WhisperCompositeAssets = struct {
         return self.managed_tokenizer.tokenizer.tokenizer();
     }
 
-    fn reclaimableAdmission(self: *const WhisperCompositeAssets) runtime.tier.memory.AdmissionAmounts {
-        return if (self.managed_tokenizer.resource_lease) |lease| lease.amounts else .{};
+    fn reclaimableAdmission(self: *const WhisperCompositeAssets) ?runtime.tier.memory.AdmissionLease {
+        return self.managed_tokenizer.resource_lease;
     }
 
     fn deinit(self: *WhisperCompositeAssets) void {
@@ -3152,20 +3153,35 @@ pub const ModelManager = struct {
         self.allocator.destroy(evicted.assets);
     }
 
+    fn admissionAmountsPresent(amounts: runtime.tier.memory.AdmissionAmounts) bool {
+        return amounts.hostTotalBytes() > 0 or amounts.backendTotalBytes() > 0;
+    }
+
     fn admissionReclaimRelevant(
-        reclaimable: runtime.tier.memory.AdmissionAmounts,
-        requested: runtime.tier.memory.AdmissionAmounts,
+        reclaimable: runtime.tier.memory.AdmissionLease,
+        pressure: runtime.tier.memory.AdmissionPressure,
     ) bool {
-        if (requested.hostTotalBytes() > 0 and reclaimable.hostTotalBytes() > 0) return true;
-        if (requested.backendTotalBytes() > 0 and reclaimable.backendTotalBytes() > 0) return true;
-        if (requested.kvTotalBytes() > 0 and reclaimable.kvTotalBytes() > 0) return true;
-        if (requested.scratchTotalBytes() > 0 and reclaimable.scratchTotalBytes() > 0) return true;
-        return false;
+        return switch (pressure) {
+            .shared_host => reclaimable.amounts.hostTotalBytes() > 0,
+            .shared_unified => admissionAmountsPresent(reclaimable.amounts),
+            .live_host => reclaimable.amounts.hostTotalBytes() > 0 or
+                (builtin.os.tag == .macos and reclaimable.amounts.backendTotalBytes() > 0),
+            .domain_host => |backend_class| reclaimable.amounts_by_backend[@intFromEnum(backend_class)].hostTotalBytes() > 0,
+            .domain_backend => |backend_class| reclaimable.amounts_by_backend[@intFromEnum(backend_class)].backendTotalBytes() > 0,
+            .domain_combined => |backend_class| admissionAmountsPresent(
+                reclaimable.amounts_by_backend[@intFromEnum(backend_class)],
+            ),
+            .domain_kv => |backend_class| reclaimable.amounts_by_backend[@intFromEnum(backend_class)].kvTotalBytes() > 0,
+            .domain_scratch => |backend_class| reclaimable.amounts_by_backend[@intFromEnum(backend_class)].scratchTotalBytes() > 0,
+            // The process-owner budget is intentionally opaque. Any resident
+            // admission released from the aggregate can potentially satisfy it.
+            .external_budget => admissionAmountsPresent(reclaimable.amounts),
+        };
     }
 
     fn takeLruWhisperAssetsForAdmissionLocked(
         self: *ModelManager,
-        requested: runtime.tier.memory.AdmissionAmounts,
+        pressure: runtime.tier.memory.AdmissionPressure,
     ) ?EvictedWhisperAssets {
         var victim_key: ?ComponentPlanKey = null;
         var victim: ?*WhisperCompositeAssets = null;
@@ -3174,7 +3190,8 @@ pub const ModelManager = struct {
         while (it.next()) |entry| {
             const assets = entry.value_ptr.*;
             if (assets.active_handles != 0 or self.whisperAssetsIsInFlightLocked(assets)) continue;
-            if (!admissionReclaimRelevant(assets.reclaimableAdmission(), requested)) continue;
+            const reclaimable = assets.reclaimableAdmission() orelse continue;
+            if (!admissionReclaimRelevant(reclaimable, pressure)) continue;
             if (victim == null or assets.last_used_ns < oldest_ns) {
                 victim_key = entry.key_ptr.*;
                 victim = assets;
@@ -3193,11 +3210,11 @@ pub const ModelManager = struct {
     /// tokenizer residency cannot relieve the constrained resource class.
     fn evictOneIdleForAdmission(
         self: *ModelManager,
-        requested: runtime.tier.memory.AdmissionAmounts,
+        pressure: runtime.tier.memory.AdmissionPressure,
     ) bool {
         self.lockLoadedModels();
         const now_ns = platform.time.monotonicNs();
-        const assets = self.takeLruWhisperAssetsForAdmissionLocked(requested);
+        const assets = self.takeLruWhisperAssetsForAdmissionLocked(pressure);
         const model = if (assets == null) self.takeLruModelLocked(now_ns, false) else null;
         self.unlockLoadedModels();
         if (assets) |evicted| {
@@ -3217,26 +3234,31 @@ pub const ModelManager = struct {
         limits: runtime.tier.memory.Limits,
         amounts: runtime.tier.memory.AdmissionAmounts,
     ) !runtime.tier.memory.AdmissionLease {
-        return self.admission.tryAcquire(
+        var pressure: ?runtime.tier.memory.AdmissionPressure = null;
+        return self.admission.tryAcquireWithPressure(
             backend_class,
             limits,
             amounts,
             true,
+            &pressure,
         ) catch |first_err| switch (first_err) {
             error.ResourceTemporarilyUnavailable => {
                 spinLock(&self.eviction_lock);
                 defer self.eviction_lock.unlock();
                 while (true) {
-                    if (self.admission.tryAcquire(
+                    if (self.admission.tryAcquireWithPressure(
                         backend_class,
                         limits,
                         amounts,
                         true,
+                        &pressure,
                     )) |lease| return lease else |retry_err| switch (retry_err) {
                         error.ResourceTemporarilyUnavailable => {},
                         else => return retry_err,
                     }
-                    if (!self.evictOneIdleForAdmission(amounts))
+                    if (!self.evictOneIdleForAdmission(
+                        pressure orelse return error.ResourceTemporarilyUnavailable,
+                    ))
                         return error.ResourceTemporarilyUnavailable;
                 }
             },
@@ -3248,20 +3270,29 @@ pub const ModelManager = struct {
         self: *ModelManager,
         requests: []const runtime.tier.memory.AdmissionRequest,
     ) !runtime.tier.memory.AdmissionLease {
-        var requested = runtime.tier.memory.AdmissionAmounts{};
-        for (requests) |request| requested = try requested.merge(request.amounts);
-        return self.admission.tryAcquireRequests(requests, true) catch |first_err| switch (first_err) {
+        var pressure: ?runtime.tier.memory.AdmissionPressure = null;
+        return self.admission.tryAcquireRequestsWithPressure(
+            requests,
+            true,
+            &pressure,
+        ) catch |first_err| switch (first_err) {
             error.ResourceTemporarilyUnavailable => {
                 spinLock(&self.eviction_lock);
                 defer self.eviction_lock.unlock();
                 while (true) {
-                    if (self.admission.tryAcquireRequests(requests, true)) |lease|
+                    if (self.admission.tryAcquireRequestsWithPressure(
+                        requests,
+                        true,
+                        &pressure,
+                    )) |lease|
                         return lease
                     else |retry_err| switch (retry_err) {
                         error.ResourceTemporarilyUnavailable => {},
                         else => return retry_err,
                     }
-                    if (!self.evictOneIdleForAdmission(requested))
+                    if (!self.evictOneIdleForAdmission(
+                        pressure orelse return error.ResourceTemporarilyUnavailable,
+                    ))
                         return error.ResourceTemporarilyUnavailable;
                 }
             },
@@ -5219,13 +5250,36 @@ test "tokenizer admission reserves parse peak and retains live structures" {
     try std.testing.expect(plan.peak.host_weight_bytes > plan.resident.host_weight_bytes);
 }
 
-test "admission eviction only considers resources that can relieve the request" {
-    const host_tokenizer = runtime.tier.memory.AdmissionAmounts{ .host_weight_bytes = 64 };
-    const host_request = runtime.tier.memory.AdmissionAmounts{ .host_weight_bytes = 32 };
-    const backend_request = runtime.tier.memory.AdmissionAmounts{ .backend_weight_bytes = 32 };
+test "admission eviction only selects leases that relieve the rejected constraint" {
+    const cpu_host = runtime.tier.memory.AdmissionAmounts{ .host_weight_bytes = 64 };
+    const tokenizer_lease = runtime.tier.memory.AdmissionLease{
+        .controller = null,
+        .amounts = cpu_host,
+        .amounts_by_backend = .{ cpu_host, .{} },
+        .retain_backend_class = null,
+        .live_reserved_bytes = 0,
+    };
 
-    try std.testing.expect(ModelManager.admissionReclaimRelevant(host_tokenizer, host_request));
-    try std.testing.expect(!ModelManager.admissionReclaimRelevant(host_tokenizer, backend_request));
+    try std.testing.expect(ModelManager.admissionReclaimRelevant(
+        tokenizer_lease,
+        .shared_host,
+    ));
+    try std.testing.expect(ModelManager.admissionReclaimRelevant(
+        tokenizer_lease,
+        .{ .domain_host = .cpu },
+    ));
+    try std.testing.expect(!ModelManager.admissionReclaimRelevant(
+        tokenizer_lease,
+        .{ .domain_host = .gpu },
+    ));
+    try std.testing.expect(!ModelManager.admissionReclaimRelevant(
+        tokenizer_lease,
+        .{ .domain_backend = .cpu },
+    ));
+    try std.testing.expect(!ModelManager.admissionReclaimRelevant(
+        tokenizer_lease,
+        .{ .domain_scratch = .cpu },
+    ));
 }
 
 fn addArtifactBytes(total: *usize, allocator: std.mem.Allocator, maybe_path: ?[]const u8) !void {

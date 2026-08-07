@@ -1192,7 +1192,9 @@ fn modelLoadFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response 
             .message = "model resource plan exceeds the configured inference budget",
         }),
         error.ResourceTemporarilyUnavailable => modelResourceBusyResponse(ctx),
-        error.ModelArtifactsChanging => modelArtifactsChangingResponse(ctx),
+        error.ModelArtifactsChanging,
+        error.IncompleteManagedDownload,
+        => modelArtifactsChangingResponse(ctx),
         else => ctx.status(500).json(.{
             .@"error" = "MODEL_LOAD_FAILED",
             .message = @errorName(err),
@@ -8864,6 +8866,25 @@ test "changing model publication returns an explicit retry contract" {
         response.header("Retry-After").?,
     );
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "MODEL_ARTIFACTS_CHANGING") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"retryable\":true") != null);
+}
+
+test "managed download markers return the model publication retry contract" {
+    const allocator = std.testing.allocator;
+    var request = try httpx.Request.init(allocator, .POST, "/ai/v1/transcribe");
+    defer request.deinit();
+    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    defer ctx.deinit();
+
+    var response = try modelLoadFailureResponse(&ctx, error.IncompleteManagedDownload);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 503), response.status.code);
+    try std.testing.expectEqualStrings(
+        transient_capacity_retry_after_seconds,
+        response.header("Retry-After").?,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "MODEL_ARTIFACTS_CHANGING") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"reason\":\"model_publication\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"retryable\":true") != null);
 }
 
