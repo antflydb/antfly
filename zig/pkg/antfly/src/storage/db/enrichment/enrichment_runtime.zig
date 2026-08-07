@@ -524,22 +524,52 @@ fn finishFailureFingerprint(hasher: *std.hash.Wyhash) u64 {
     return if (fingerprint == 0) 1 else fingerprint;
 }
 
+fn updateFailureFingerprintBytes(hasher: *std.hash.Wyhash, value: []const u8) void {
+    var len_bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &len_bytes, value.len, .little);
+    hasher.update(&len_bytes);
+    hasher.update(value);
+}
+
 fn updateFailureFingerprintForRequest(hasher: *std.hash.Wyhash, request: enrichment_types.GeneratedEnrichmentRequest) void {
     const kind: u8 = @intFromEnum(request.kind);
     var sequence_bytes: [8]u8 = undefined;
     std.mem.writeInt(u64, &sequence_bytes, request.sequence, .little);
     hasher.update(&.{kind});
     hasher.update(&sequence_bytes);
-    hasher.update(request.doc_key);
-    hasher.update(&.{0});
-    hasher.update(requestArtifactName(request));
-    hasher.update(&.{0});
-    hasher.update(requestEmbeddingName(request));
+    updateFailureFingerprintBytes(hasher, request.doc_key);
+    updateFailureFingerprintBytes(hasher, requestArtifactName(request));
+    updateFailureFingerprintBytes(hasher, requestEmbeddingName(request));
 }
 
 fn requestFailureFingerprint(request: enrichment_types.GeneratedEnrichmentRequest) u64 {
     var hasher = std.hash.Wyhash.init(0x616e74666c795f72);
     updateFailureFingerprintForRequest(&hasher, request);
+    return finishFailureFingerprint(&hasher);
+}
+
+fn batchFailureFingerprint(items: anytype) u64 {
+    var hasher = std.hash.Wyhash.init(0x616e74666c795f62);
+    var count_bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &count_bytes, items.len, .little);
+    hasher.update(&count_bytes);
+    for (items) |item| {
+        updateFailureFingerprintForRequest(&hasher, item.request);
+        // Batch members may share the same request plan (notably one request
+        // expanded into many chunks), so include the materialized work-item
+        // identity without hashing the potentially large provider payload.
+        if (comptime @hasField(@TypeOf(item), "artifact_key"))
+            updateFailureFingerprintBytes(&hasher, item.artifact_key);
+        if (comptime @hasField(@TypeOf(item), "chunk_key"))
+            updateFailureFingerprintBytes(&hasher, item.chunk_key);
+        if (comptime @hasField(@TypeOf(item), "source_hash")) {
+            var source_hash_bytes: [8]u8 = undefined;
+            std.mem.writeInt(u64, &source_hash_bytes, item.source_hash, .little);
+            hasher.update(&source_hash_bytes);
+        }
+        if (comptime @hasField(@TypeOf(item), "state_value"))
+            updateFailureFingerprintBytes(&hasher, item.state_value);
+    }
     return finishFailureFingerprint(&hasher);
 }
 
@@ -1039,15 +1069,60 @@ const AssetProducerBatchItem = struct {
 };
 
 fn assetProducerBatchFailureFingerprint(items: []const AssetProducerBatchItem) u64 {
-    return requestFailureFingerprint(items[0].request);
+    return batchFailureFingerprint(items);
 }
 
 fn plainDenseBatchFailureFingerprint(items: []const PlainDenseBatchItem) u64 {
-    return requestFailureFingerprint(items[0].request);
+    return batchFailureFingerprint(items);
 }
 
 fn chunkedDenseBatchFailureFingerprint(items: []const ChunkedDenseWindowItem) u64 {
-    return requestFailureFingerprint(items[0].request);
+    return batchFailureFingerprint(items);
+}
+
+test "enrichment batch retry identity covers every work item" {
+    const TestItem = struct {
+        request: enrichment_types.GeneratedEnrichmentRequest,
+        chunk_key: []const u8,
+        source_hash: u64,
+    };
+    const first = TestItem{ .request = .{
+        .kind = .dense_embedding,
+        .index_name = "semantic",
+        .embedding_name = "dense_v1",
+        .doc_key = "doc:1",
+        .source_field = "body",
+        .sequence = 7,
+    }, .chunk_key = "doc:1/chunk:0", .source_hash = 10 };
+    const second = TestItem{ .request = .{
+        .kind = .dense_embedding,
+        .index_name = "semantic",
+        .embedding_name = "dense_v1",
+        .doc_key = "doc:2",
+        .source_field = "body",
+        .sequence = 8,
+    }, .chunk_key = "doc:2/chunk:0", .source_hash = 20 };
+    const replacement = TestItem{ .request = .{
+        .kind = .dense_embedding,
+        .index_name = "semantic",
+        .embedding_name = "dense_v1",
+        .doc_key = "doc:3",
+        .source_field = "body",
+        .sequence = 9,
+    }, .chunk_key = "doc:3/chunk:0", .source_hash = 30 };
+    const changed_materialization = TestItem{
+        .request = second.request,
+        .chunk_key = second.chunk_key,
+        .source_hash = 21,
+    };
+    const original = [_]TestItem{ first, second };
+    const changed = [_]TestItem{ first, replacement };
+    const changed_content = [_]TestItem{ first, changed_materialization };
+    const reordered = [_]TestItem{ second, first };
+    try std.testing.expect(batchFailureFingerprint(&original) != batchFailureFingerprint(&changed));
+    try std.testing.expect(batchFailureFingerprint(&original) != batchFailureFingerprint(&changed_content));
+    try std.testing.expect(batchFailureFingerprint(&original) != batchFailureFingerprint(&reordered));
+    try std.testing.expect(batchFailureFingerprint(&original) != batchFailureFingerprint(original[0..1]));
 }
 
 fn freePlainDenseBatchItems(alloc: Allocator, items: []PlainDenseBatchItem) void {
