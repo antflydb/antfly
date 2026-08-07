@@ -136,6 +136,7 @@ pub const RecoveryResolver = struct {
     lease_owned: bool = false,
     interval_ms: u64 = 10,
     cutoff_ns: u64 = 5 * std.time.ns_per_min,
+    local_participant: ?[]const u8 = null,
 
     pub fn config(self: *const RecoveryResolver) db_mod.transaction_runtime.Config {
         return .{
@@ -146,6 +147,7 @@ pub const RecoveryResolver = struct {
             .cutoff_ns = self.cutoff_ns,
             .resolver_ctx = @constCast(self),
             .resolve_participant_fn = resolve,
+            .local_participant = self.local_participant,
         };
     }
 

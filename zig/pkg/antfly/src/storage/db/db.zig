@@ -4213,16 +4213,70 @@ pub const DB = struct {
     }
 
     pub fn runTransactionRecoveryOnce(self: *DB, config: transaction_runtime_mod.Config) !types.TransactionRecoveryStats {
-        const resolved_finalized = try self.resolveFinalizedTransactionIntentsForRecovery(config.clock.nowRealtimeNs());
-        var effective_config = config;
-        // Finalized intents were resolved through the full DB pipeline above.
-        // Keep the apply lock while the manager aborts stale pending records.
-        effective_config.local_resolution_ctx = null;
-        effective_config.resolve_local_fn = null;
+        if (!config.enabled) return .{};
+        const resolve_participant = config.resolve_participant_fn orelse return error.MissingParticipantResolver;
+        const resolver_ctx = config.resolver_ctx orelse return error.MissingParticipantResolver;
+        const now_ns = config.clock.nowRealtimeNs();
+        const resolved_finalized = try self.resolveFinalizedTransactionIntentsForRecovery(now_ns);
+
+        var recovery_stats: types.TransactionRecoveryStats = .{
+            .enabled = true,
+            .lease_owned = config.lease_owned,
+            .runs = 1,
+            .resolved_finalized = resolved_finalized,
+            .last_run_ns = now_ns,
+        };
+
+        // Notification may perform network I/O or route back to this DB. Keep
+        // it entirely outside the apply lock and acknowledge each successful
+        // delivery with a separate short, idempotent locked update.
+        const txns = try self.core.listTransactions(self.alloc);
+        defer self.alloc.free(txns);
+        for (txns) |txn| {
+            if (txn.status == .pending) continue;
+            const unresolved = self.core.getUnresolvedTransactionParticipants(self.alloc, txn.txn_id) catch |err| switch (err) {
+                transactions_mod.TxnError.TxnNotFound => continue,
+                else => return err,
+            };
+            defer transactions_mod.freeParticipantList(self.alloc, unresolved);
+            for (unresolved) |participant| {
+                recovery_stats.notification_attempts += 1;
+                if (config.local_participant) |local| {
+                    if (std.mem.eql(u8, local, participant)) {
+                        self.markTransactionParticipantResolved(txn.txn_id, participant) catch |err| switch (err) {
+                            transactions_mod.TxnError.TxnNotFound => {},
+                            else => return err,
+                        };
+                        recovery_stats.notification_successes += 1;
+                        continue;
+                    }
+                }
+                resolve_participant(resolver_ctx, txn.txn_id, participant, txn.status, txn.commit_version) catch {
+                    recovery_stats.notification_failures += 1;
+                    continue;
+                };
+                self.markTransactionParticipantResolved(txn.txn_id, participant) catch |err| switch (err) {
+                    transactions_mod.TxnError.TxnNotFound => {},
+                    else => return err,
+                };
+                recovery_stats.notification_successes += 1;
+            }
+        }
+
+        // Serialize presumed-abort and metadata cleanup with prepare/resolve,
+        // but do not hold the lock across participant callbacks above.
         lockApply(self);
-        defer self.core.unlockApply();
-        var recovery_stats = try self.core.runTransactionRecoveryOnce(self.alloc, effective_config);
-        recovery_stats.resolved_finalized += resolved_finalized;
+        const local_stats = self.core.recoverTransactions(now_ns -| config.cutoff_ns, now_ns) catch |err| {
+            self.core.unlockApply();
+            return err;
+        };
+        self.core.unlockApply();
+        recovery_stats.scanned_records = local_stats.scanned_records;
+        recovery_stats.auto_aborted = local_stats.auto_aborted;
+        recovery_stats.resolved_finalized += local_stats.resolved_finalized;
+        recovery_stats.cleaned_records = local_stats.cleaned_records;
+        recovery_stats.kept_recent_pending = local_stats.kept_recent_pending;
+        recovery_stats.deferred_unresolved = local_stats.deferred_unresolved;
         return recovery_stats;
     }
 
@@ -13689,9 +13743,19 @@ pub const DB = struct {
     }
 
     pub fn beginTransactionWithIdAndParticipants(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64, participants: []const []const u8) !transactions_mod.TxnId {
+        return try self.beginTransactionWithIdAndParticipantsCreatedAt(txn_id, timestamp_ns, timestamp_ns, participants);
+    }
+
+    pub fn beginTransactionWithIdAndParticipantsCreatedAt(
+        self: *DB,
+        txn_id: transactions_mod.TxnId,
+        timestamp_ns: u64,
+        created_at_ns: u64,
+        participants: []const []const u8,
+    ) !transactions_mod.TxnId {
         lockApply(self);
         defer self.core.unlockApply();
-        return try self.core.beginTransactionWithParticipants(txn_id, timestamp_ns, participants);
+        return try self.core.beginTransactionWithParticipantsCreatedAt(txn_id, timestamp_ns, created_at_ns, participants);
     }
 
     pub fn writeIntents(
@@ -77350,6 +77414,49 @@ test "db participant recovery preserves finalized transaction until all particip
 
     const cleaned = try db.recoverTransactions(3_000, 4_000);
     try std.testing.expectEqual(@as(u64, 1), cleaned.cleaned_records);
+    try std.testing.expectError(transactions_mod.TxnError.TxnNotFound, db.getTransactionStatus(txn_id));
+}
+
+test "db participant recovery callbacks run outside the apply lock" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const txn_id = try db.beginTransactionWithParticipants(1_000, &.{"remote"});
+    try db.writeTransaction(txn_id, .{
+        .writes = &.{.{ .key = "doc:reentrant-recovery", .value = "{\"title\":\"value\"}" }},
+    });
+    try db.resolveTransactionIntents(txn_id, .committed, 2_000);
+
+    const ReentrantResolver = struct {
+        db: *DB,
+        calls: usize = 0,
+
+        fn resolve(ctx: *anyopaque, resolved_txn_id: transactions_mod.TxnId, participant: []const u8, _: transactions_mod.TxnStatus, _: u64) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            try std.testing.expectEqualStrings("remote", participant);
+            // This acquires the DB apply lock. It would deadlock if recovery
+            // still held that lock while invoking participant callbacks.
+            try self.db.markTransactionParticipantResolved(resolved_txn_id, participant);
+            self.calls += 1;
+        }
+    };
+    var resolver = ReentrantResolver{ .db = &db };
+    const stats = try db.runTransactionRecoveryOnce(.{
+        .enabled = true,
+        .lease_owned = true,
+        .resolver_ctx = &resolver,
+        .resolve_participant_fn = ReentrantResolver.resolve,
+        .cutoff_ns = 1,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), resolver.calls);
+    try std.testing.expectEqual(@as(u64, 1), stats.notification_successes);
     try std.testing.expectError(transactions_mod.TxnError.TxnNotFound, db.getTransactionStatus(txn_id));
 }
 

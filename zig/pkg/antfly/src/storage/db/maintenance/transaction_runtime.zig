@@ -38,6 +38,11 @@ pub const Config = struct {
     clock: platform_clock.Clock = platform_clock.Clock.real(),
     resolver_ctx: ?*anyopaque = null,
     resolve_participant_fn: ?resolution_mod.ResolveParticipantFn = null,
+    /// Participant represented by the DB currently being recovered. Local
+    /// effects are resolved through the DB pipeline before notifications, so
+    /// this participant can be acknowledged without recursively routing back
+    /// through the table-write source.
+    local_participant: ?[]const u8 = null,
     local_resolution_ctx: ?*anyopaque = null,
     resolve_local_fn: ?*const fn (
         ctx: *anyopaque,

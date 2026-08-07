@@ -141,6 +141,16 @@ const TxnRecord = struct {
     finalized_at: u64,
     intent_revision: u64 = 0,
     replay_sequence: u64 = 0,
+    /// True once this participant has durably accepted its write set.  This is
+    /// deliberately separate from `status`: the public protocol continues to
+    /// report a prepared participant as pending until a terminal decision is
+    /// learned, but recovery must never presume-abort a participant that has
+    /// already voted to commit.
+    prepared: bool = false,
+    /// Older encodings did not persist the prepare vote. Recovery treats
+    /// distributed records from those versions conservatively rather than
+    /// risking an incorrect abort during a rolling upgrade.
+    prepared_known: bool = true,
 
     fn visibleVersion(self: TxnRecord) u64 {
         if (self.commit_version > 0) return self.commit_version;
@@ -151,6 +161,7 @@ const TxnRecord = struct {
 const txn_record_v0_size = 17;
 const txn_record_v1_size = 33;
 const txn_record_v2_size = 49;
+const txn_record_v3_size = 50;
 
 // ============================================================================
 // TxnManager
@@ -196,6 +207,16 @@ pub const TxnManager = struct {
     }
 
     pub fn initTransactionWithParticipants(self: *TxnManager, txn_id: TxnId, timestamp: u64, participants: []const []const u8) !void {
+        try self.initTransactionWithParticipantsCreatedAt(txn_id, timestamp, timestamp, participants);
+    }
+
+    pub fn initTransactionWithParticipantsCreatedAt(
+        self: *TxnManager,
+        txn_id: TxnId,
+        timestamp: u64,
+        created_at: u64,
+        participants: []const []const u8,
+    ) !void {
         const key = makeRecordKey(txn_id);
         const existing = self.loadTransactionRecord(txn_id) catch |err| switch (err) {
             TxnError.TxnNotFound => null,
@@ -212,7 +233,7 @@ pub const TxnManager = struct {
             .status = .pending,
             .begin_timestamp = timestamp,
             .commit_version = 0,
-            .created_at = timestamp,
+            .created_at = created_at,
             .finalized_at = 0,
         };
         const record_value = try self.encodeRecord(record);
@@ -306,6 +327,10 @@ pub const TxnManager = struct {
         }
 
         record.intent_revision = std.math.add(u64, record.intent_revision, 1) catch return error.TransactionRevisionOverflow;
+        // Publish the prepare vote in the same backend batch as the intents.
+        // Recovery can therefore never observe intents without the durable
+        // fencing bit that prevents presumed abort.
+        record.prepared = true;
         const record_key = makeRecordKey(txn_id);
         const record_value = try self.encodeRecord(record);
         try write_vals.append(self.alloc, record_value);
@@ -660,6 +685,17 @@ pub const TxnManager = struct {
 
             if (record.status == .pending) {
                 if (record.created_at > 0 and record.created_at < cutoff_timestamp) {
+                    if (record.prepared or !record.prepared_known) {
+                        const participants = try self.getParticipants(self.alloc, txn_id);
+                        defer freeParticipantList(self.alloc, participants);
+                        if (participants.len > 0) {
+                            // A distributed participant that has voted yes is
+                            // blocked on the durable coordinator decision. It
+                            // is unsafe to infer abort from elapsed time.
+                            stats.kept_recent_pending += 1;
+                            continue;
+                        }
+                    }
                     try self.resolveIntents(txn_id, .aborted, resolution_timestamp);
                     stats.auto_aborted += 1;
                     if (self.trace_writer) |tw| {
@@ -807,7 +843,7 @@ pub const TxnManager = struct {
     }
 
     fn encodeRecord(self: *TxnManager, record: TxnRecord) ![]u8 {
-        const buf = try self.alloc.alloc(u8, txn_record_v2_size);
+        const buf = try self.alloc.alloc(u8, txn_record_v3_size);
         buf[0] = @intFromEnum(record.status);
         std.mem.writeInt(u64, buf[1..9], record.begin_timestamp, .little);
         std.mem.writeInt(u64, buf[9..17], record.commit_version, .little);
@@ -815,6 +851,7 @@ pub const TxnManager = struct {
         std.mem.writeInt(u64, buf[25..33], record.finalized_at, .little);
         std.mem.writeInt(u64, buf[33..41], record.intent_revision, .little);
         std.mem.writeInt(u64, buf[41..49], record.replay_sequence, .little);
+        buf[49] = @intFromBool(record.prepared);
         return buf;
     }
 
@@ -1099,6 +1136,19 @@ fn resolveDecisionConflictReason(current: TxnStatus, requested: TxnStatus) []con
 }
 
 fn decodeRecord(raw: []const u8) !TxnRecord {
+    if (raw.len == txn_record_v3_size) {
+        if (raw[49] > 1) return TxnError.InvalidTxnRecord;
+        return .{
+            .status = @enumFromInt(raw[0]),
+            .begin_timestamp = std.mem.readInt(u64, raw[1..9], .little),
+            .commit_version = std.mem.readInt(u64, raw[9..17], .little),
+            .created_at = std.mem.readInt(u64, raw[17..25], .little),
+            .finalized_at = std.mem.readInt(u64, raw[25..33], .little),
+            .intent_revision = std.mem.readInt(u64, raw[33..41], .little),
+            .replay_sequence = std.mem.readInt(u64, raw[41..49], .little),
+            .prepared = raw[49] == 1,
+        };
+    }
     if (raw.len == txn_record_v2_size) {
         return .{
             .status = @enumFromInt(raw[0]),
@@ -1108,6 +1158,7 @@ fn decodeRecord(raw: []const u8) !TxnRecord {
             .finalized_at = std.mem.readInt(u64, raw[25..33], .little),
             .intent_revision = std.mem.readInt(u64, raw[33..41], .little),
             .replay_sequence = std.mem.readInt(u64, raw[41..49], .little),
+            .prepared_known = false,
         };
     }
     if (raw.len == txn_record_v1_size) {
@@ -1117,6 +1168,7 @@ fn decodeRecord(raw: []const u8) !TxnRecord {
             .commit_version = std.mem.readInt(u64, raw[9..17], .little),
             .created_at = std.mem.readInt(u64, raw[17..25], .little),
             .finalized_at = std.mem.readInt(u64, raw[25..33], .little),
+            .prepared_known = false,
         };
     }
     if (raw.len == txn_record_v0_size) {
@@ -1128,6 +1180,7 @@ fn decodeRecord(raw: []const u8) !TxnRecord {
             .commit_version = if (status == .committed) ts else 0,
             .created_at = std.mem.readInt(u64, raw[9..17], .little),
             .finalized_at = 0,
+            .prepared_known = false,
         };
     }
     return TxnError.InvalidTxnRecord;
@@ -1639,6 +1692,53 @@ test "recoverTransactions auto-aborts stale pending transactions" {
         return;
     };
     return error.TestUnexpectedResult;
+}
+
+test "recoverTransactions never presumes abort after a distributed prepare vote" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "txn-recover-stale-prepared-participant");
+    defer alloc.free(path);
+    cleanupTestDir(path);
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+    defer cleanupTestDir(path);
+
+    var mgr = try TxnManager.init(alloc, &store);
+    defer mgr.deinit();
+    const txn_id: TxnId = .{ 8, 4, 8, 4, 8, 4, 8, 4, 8, 4, 8, 4, 8, 4, 8, 4 };
+    try mgr.initTransactionWithParticipantsCreatedAt(txn_id, 10_000, 1_000, &.{ "group:a", "group:b" });
+    try mgr.writeIntents(txn_id, &.{.{ .key = "doc:prepared", .value = "prepared" }}, &.{});
+
+    const stats = try mgr.recoverTransactions(2_000, 3_000);
+    try std.testing.expectEqual(@as(u64, 0), stats.auto_aborted);
+    try std.testing.expectEqual(@as(u64, 1), stats.kept_recent_pending);
+    try std.testing.expectEqual(TxnStatus.pending, try mgr.getTransactionStatus(txn_id));
+
+    const intent_key = try mgr.makeIntentKey(txn_id, "doc:prepared");
+    defer alloc.free(intent_key);
+    const intent = try store.get(alloc, intent_key);
+    defer alloc.free(intent);
+    try std.testing.expectEqualStrings("prepared", intent[1..]);
+}
+
+test "transaction recovery age is independent from logical begin timestamp" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "txn-created-at-independent");
+    defer alloc.free(path);
+    cleanupTestDir(path);
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+    defer cleanupTestDir(path);
+
+    var mgr = try TxnManager.init(alloc, &store);
+    defer mgr.deinit();
+    const txn_id: TxnId = .{ 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4 };
+    try mgr.initTransactionWithParticipantsCreatedAt(txn_id, 1_000, 10_000, &.{"group:a"});
+
+    const stats = try mgr.recoverTransactions(5_000, 12_000);
+    try std.testing.expectEqual(@as(u64, 0), stats.auto_aborted);
+    try std.testing.expectEqual(@as(u64, 1), stats.kept_recent_pending);
+    try std.testing.expectEqual(TxnStatus.pending, try mgr.getTransactionStatus(txn_id));
 }
 
 test "recoverTransactions keeps recent pending transactions" {

@@ -1217,9 +1217,19 @@ pub const DBCore = struct {
         timestamp_ns: u64,
         participants: []const []const u8,
     ) !transactions_mod.TxnId {
+        return try self.beginTransactionWithParticipantsCreatedAt(txn_id, timestamp_ns, timestamp_ns, participants);
+    }
+
+    pub fn beginTransactionWithParticipantsCreatedAt(
+        self: *DBCore,
+        txn_id: transactions_mod.TxnId,
+        timestamp_ns: u64,
+        created_at_ns: u64,
+        participants: []const []const u8,
+    ) !transactions_mod.TxnId {
         var manager = try self.initTxnManager();
         defer manager.deinit();
-        try manager.initTransactionWithParticipants(txn_id, timestamp_ns, participants);
+        try manager.initTransactionWithParticipantsCreatedAt(txn_id, timestamp_ns, created_at_ns, participants);
         return txn_id;
     }
 
