@@ -220,8 +220,9 @@ run_zig_build_steps_with_retry() {
 
 (
   cd "$repo_root/zig"
-  # The claimed PIC storage kernel overlaps the inference unit, while API, CLI,
-  # and distributed codegen occupy the first memory-budget group.
+  # API, CLI, and the shared PIC storage kernel occupy the initial 19GiB
+  # memory-budget group. As the two small units finish, inference can overlap
+  # the still-running kernel within the same 19GiB budget.
   run_zig_build_steps_with_retry archive install lite-capi
 )
 
