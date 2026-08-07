@@ -50,7 +50,7 @@ jobs:
             "$RUNNER_TEMP/zig/lib/compiler/build_runner.zig" \
             "$RUNNER_TEMP/zig-build-runner-maxrss.zig"
 
-      - name: Build linked ARM64 ReleaseFast executable
+      - name: Build linked ARM64 ReleaseFast archive artifacts
         env:
           ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/linked-runtime-cache/global
           ZIG_LOCAL_CACHE_DIR: ${{ runner.temp }}/linked-runtime-cache/compiler-local
@@ -62,12 +62,13 @@ jobs:
             "$RUNNER_TEMP/linked-runtime-cache/global"
           # Keep 4000Mi of the ARC pod's 24000Mi request outside Zig's
           # scheduling budget. Step max_rss values are scheduling claims, not
-          # a complete accounting of build-runner state and page cache. The
-          # lower budget keeps the application and inference LLVM emissions
-          # serial while retaining headroom for runner state and page cache.
+          # a complete accounting of build-runner state and page cache. Claims
+          # admit API, CLI, and distributed as a 19GiB group; inference and the
+          # PIC storage kernel form a 16GiB group. The pod reserve covers runner
+          # state, linker work, page cache, and measurement drift.
           cd zig
           /usr/bin/time -v -o "$RUNNER_TEMP/linked-runtime.time" \
-            zig build \
+            zig build install lite-capi \
             --build-runner "$RUNNER_TEMP/zig-build-runner-maxrss.zig" \
             -Dtarget=aarch64-linux-musl \
             -Doptimize=ReleaseFast \
@@ -83,33 +84,6 @@ jobs:
             --maxrss 20971520000 \
             --summary all \
             2>&1 | tee "$RUNNER_TEMP/linked-runtime.log"
-
-      - name: Build ARM64 ReleaseFast Lite C ABI
-        env:
-          ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/linked-runtime-cache/global
-          ZIG_LOCAL_CACHE_DIR: ${{ runner.temp }}/linked-runtime-cache/compiler-local
-        run: |
-          set -o pipefail
-          cd zig
-          /usr/bin/time -v -o "$RUNNER_TEMP/lite-capi.time" \
-            zig build \
-            --build-runner "$RUNNER_TEMP/zig-build-runner-maxrss.zig" \
-            lite-capi \
-            -Dtarget=aarch64-linux-musl \
-            -Doptimize=ReleaseFast \
-            -Dstrip=true \
-            -Dcpu=baseline \
-            -Dedition=full \
-            -Donnx=false \
-            -Dmetal=false \
-            -Dsystem-blas=false \
-            -Dlinked-runtime-libraries=true \
-            --prefix "$RUNNER_TEMP/linked-runtime" \
-            --cache-dir "$RUNNER_TEMP/linked-runtime-cache/local" \
-            --global-cache-dir "$RUNNER_TEMP/linked-runtime-cache/global" \
-            --maxrss 20971520000 \
-            --summary all \
-            2>&1 | tee "$RUNNER_TEMP/lite-capi.log"
 
       - name: Verify ARM64 release artifacts
         run: |
@@ -131,7 +105,6 @@ jobs:
         if: ${{ always() }}
         run: |
           cat "$RUNNER_TEMP/linked-runtime.time" || true
-          cat "$RUNNER_TEMP/lite-capi.time" || true
 
       - name: Upload result
         if: ${{ always() }}
@@ -144,8 +117,6 @@ jobs:
             ${{ runner.temp }}/linked-runtime.time
             ${{ runner.temp }}/linked-runtime.elf-header
             ${{ runner.temp }}/linked-runtime.size
-            ${{ runner.temp }}/lite-capi.log
-            ${{ runner.temp }}/lite-capi.time
             ${{ runner.temp }}/lite-capi.elf-header
             ${{ runner.temp }}/lite-capi.size
           if-no-files-found: error

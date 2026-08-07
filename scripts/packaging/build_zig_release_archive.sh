@@ -158,25 +158,39 @@ zig_install_args=(
   --global-cache-dir "$cache_root/global"
 )
 
-run_zig_build_step() {
-  local step="$1"
+zig_lib_dir="$(zig env | sed -n 's/^[[:space:]]*\.lib_dir = "\(.*\)",$/\1/p')"
+if [ -z "$zig_lib_dir" ] || [ ! -f "$zig_lib_dir/compiler/build_runner.zig" ]; then
+  echo "unable to locate Zig 0.16 build_runner.zig from 'zig env'" >&2
+  exit 1
+fi
+patched_build_runner="$work_root/zig-build-runner-maxrss.zig"
+python3 "$repo_root/zig/tools/patch_zig_0_16_build_runner_maxrss.py" \
+  "$zig_lib_dir/compiler/build_runner.zig" \
+  "$patched_build_runner"
+zig_install_args+=(
+  --build-runner "$patched_build_runner"
+  --maxrss "${ANTFLY_ZIG_MAX_RSS:-20971520000}"
+)
+
+run_zig_build_steps() {
   local -a command=(zig build)
 
   if [ -n "$jobs" ]; then
     command+=("-j$jobs")
   fi
-  command+=("${zig_build_options[@]}" "$step" "${zig_install_args[@]}")
+  command+=("${zig_build_options[@]}" "$@" "${zig_install_args[@]}")
   "${command[@]}"
 }
 
-run_zig_build_step_with_retry() {
-  local step="$1"
-  local first_attempt_log="$work_root/${step}-attempt-1.log"
-  local retry_log="$work_root/${step}-attempt-2.log"
+run_zig_build_steps_with_retry() {
+  local label="$1"
+  shift
+  local first_attempt_log="$work_root/${label}-attempt-1.log"
+  local retry_log="$work_root/${label}-attempt-2.log"
   local status
 
   set +e
-  run_zig_build_step "$step" 2>&1 | tee "$first_attempt_log"
+  run_zig_build_steps "$@" 2>&1 | tee "$first_attempt_log"
   status=${PIPESTATUS[0]}
   set -e
 
@@ -196,9 +210,9 @@ run_zig_build_step_with_retry() {
     return "$status"
   fi
 
-  echo "::warning::Zig ARM64 ReleaseSmall hit a compiler allocation failure; retrying $step once with the populated local cache"
+  echo "::warning::Zig ARM64 ReleaseSmall hit a compiler allocation failure; retrying $label once with the populated local cache"
   set +e
-  run_zig_build_step "$step" 2>&1 | tee "$retry_log"
+  run_zig_build_steps "$@" 2>&1 | tee "$retry_log"
   status=${PIPESTATUS[0]}
   set -e
   return "$status"
@@ -206,8 +220,9 @@ run_zig_build_step_with_retry() {
 
 (
   cd "$repo_root/zig"
-  run_zig_build_step_with_retry install
-  run_zig_build_step_with_retry lite-capi
+  # The claimed PIC storage kernel overlaps the inference unit, while API, CLI,
+  # and distributed codegen occupy the first memory-budget group.
+  run_zig_build_steps_with_retry archive install lite-capi
 )
 
 test -x "$prefix/bin/antfly"
