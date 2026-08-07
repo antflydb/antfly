@@ -144,6 +144,10 @@ pub fn runFromIterator(
     const command = args.next() orelse "run";
 
     if (std.mem.eql(u8, command, "run")) {
+        if (runHelpRequested(args)) {
+            printUsage();
+            return;
+        }
         return try runServer(alloc, io, args);
     } else if (std.mem.eql(u8, command, "embed")) {
         return try inference.native_embed.main(alloc, io, try collectArgs(alloc, args));
@@ -198,6 +202,14 @@ pub fn runFromIterator(
         printUsage();
         return error.InvalidArguments;
     }
+}
+
+fn runHelpRequested(args: *std.process.Args.Iterator) bool {
+    var probe = args.*;
+    while (probe.next()) |arg| {
+        if (isHelpArg(arg)) return true;
+    }
+    return false;
 }
 
 fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
@@ -650,6 +662,17 @@ test "inference runtime module compiles" {
     _ = run;
     _ = runFromIterator;
     _ = spawnServerProcess;
+}
+
+test "inference run recognizes help before server startup" {
+    var argv = [_][*:0]const u8{ "--host", "127.0.0.1", "--help" };
+    var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    try std.testing.expect(runHelpRequested(&args));
+    try std.testing.expectEqualStrings("--host", args.next().?);
+
+    var no_help_argv = [_][*:0]const u8{ "--host", "127.0.0.1" };
+    var no_help_args = std.process.Args.Iterator.init(.{ .vector = no_help_argv[0..] });
+    try std.testing.expect(!runHelpRequested(&no_help_args));
 }
 
 test "inference pull recognizes help before model resolution" {
