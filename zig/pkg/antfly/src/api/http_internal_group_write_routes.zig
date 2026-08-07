@@ -85,6 +85,18 @@ pub const Context = struct {
     txn_validator: TxnValidator,
 };
 
+fn raftBatchOutcomeResponse(
+    alloc: std.mem.Allocator,
+    status: u16,
+    body: []const u8,
+    outcome: []const u8,
+) !http_common.HttpResponse {
+    return try http_route_helpers.textResponseWithHeaders(alloc, status, body, &.{.{
+        .name = internal_batch_forwarding.outcome_header,
+        .value = outcome,
+    }});
+}
+
 const RepairJobCancelProbe = struct {
     alloc: std.mem.Allocator,
     store: *repair_jobs.Store,
@@ -346,18 +358,22 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
 
     const routed_batch_route = routes.Routes.matchGroupRoutedBatch(path);
     if (routed_batch_route orelse routes.Routes.matchGroupBatch(path)) |batch_route| {
+        if (routed_batch_route == null and ctx.routed_raft_batch_writer != null) {
+            // The legacy endpoint has no end-to-end outcome contract. Reject it
+            // solely by route, before trusting headers or parsing the request,
+            // so forwarding semantics cannot bypass protocol negotiation. The
+            // 404 is deliberate: pre-protocol nodes classify it as terminal
+            // instead of replaying a transform after an ambiguous response.
+            return try http_route_helpers.textResponse(ctx.alloc, 404, "legacy raft batch forwarding unsupported");
+        }
         const forwarding = internal_batch_forwarding.parse(req) catch {
             return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid raft batch forwarding headers");
         };
         if (routed_batch_route != null and forwarding == null) {
             return try http_route_helpers.textResponse(ctx.alloc, 400, "missing raft batch forwarding headers");
         }
-        if (routed_batch_route == null and forwarding == null and ctx.routed_raft_batch_writer != null) {
-            // Pre-protocol nodes classify a 404 as terminal UnknownGroup. Fail
-            // before proposal so an old node cannot interpret the new
-            // ambiguous-outcome response as retryable UnexpectedHttpStatus and
-            // replay a transform during a rolling upgrade.
-            return try http_route_helpers.textResponse(ctx.alloc, 404, "legacy raft batch forwarding unsupported");
+        if (routed_batch_route == null and forwarding != null) {
+            return try http_route_helpers.textResponse(ctx.alloc, 400, "raft batch forwarding headers require routed endpoint");
         }
         const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
         var batch_req = batch_api.parseInternalBatchRequest(ctx.alloc, req.body) catch |err| switch (err) {
@@ -375,7 +391,12 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
             if (ctx.routed_raft_batch_writer) |writer|
                 writer.run(ctx.alloc, batch_route.group_id, batch_route.table_name, batch_req.req, forwarding_context, req.cancellation)
             else
-                return try http_route_helpers.textResponse(ctx.alloc, 503, "routed raft batch unavailable")
+                return try raftBatchOutcomeResponse(
+                    ctx.alloc,
+                    503,
+                    "routed raft batch unavailable",
+                    internal_batch_forwarding.outcome_not_proposed_v1,
+                )
         else
             writes.batchGroupLocal(ctx.alloc, batch_route.group_id, batch_route.table_name, batch_req.req)) catch |err| switch (err) {
             error.InvalidBatchRequest => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid batch request"),
@@ -384,10 +405,20 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
                 // A generic 5xx retry policy could duplicate a transform that
                 // already committed. Conflict is deliberately non-retryable;
                 // the body preserves the machine-readable outcome class.
-                return try http_route_helpers.textResponse(ctx.alloc, 409, "write outcome unknown");
+                return try raftBatchOutcomeResponse(
+                    ctx.alloc,
+                    409,
+                    "write outcome unknown",
+                    internal_batch_forwarding.outcome_unknown_v1,
+                );
             },
             error.LeaderUnavailable, error.GroupLeaderUnavailable, error.MetadataSnapshotUnavailable => {
-                return try http_route_helpers.textResponse(ctx.alloc, 503, "group leader unavailable");
+                return try raftBatchOutcomeResponse(
+                    ctx.alloc,
+                    503,
+                    "group leader unavailable",
+                    internal_batch_forwarding.outcome_not_proposed_v1,
+                );
             },
             else => return err,
         }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
@@ -1135,6 +1166,7 @@ test "internal group write route dispatches bounded raft forwarding context" {
     }, .{
         .method = .POST,
         .uri = "/internal/v1/groups/7/tables/docs/batch",
+        .headers = &headers,
         .body = "{}",
         .cancellation = &cancellation,
     }, "/internal/v1/groups/7/tables/docs/batch")).?;
@@ -1181,6 +1213,33 @@ test "internal group write route dispatches bounded raft forwarding context" {
 
     try std.testing.expectEqual(@as(u16, 409), unknown_resp.status);
     try std.testing.expectEqualStrings("write outcome unknown", unknown_resp.body);
+    try std.testing.expectEqualStrings(
+        internal_batch_forwarding.outcome_unknown_v1,
+        unknown_resp.header(internal_batch_forwarding.outcome_header).?,
+    );
+
+    capture.failure = error.LeaderUnavailable;
+    var unavailable_resp = (try handle(.{
+        .alloc = std.testing.allocator,
+        .shard_ops = null,
+        .writes = TestWriteSource.source(),
+        .routed_raft_batch_writer = .{ .ptr = &capture, .write = Capture.write },
+        .batch_validator = TestWriteSource.batchValidator(),
+        .txn_validator = TestWriteSource.txnValidator(),
+    }, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/batch-routed-v1",
+        .headers = &headers,
+        .body = "{}",
+        .cancellation = &cancellation,
+    }, "/internal/v1/groups/7/tables/docs/batch-routed-v1")).?;
+    defer unavailable_resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 503), unavailable_resp.status);
+    try std.testing.expectEqualStrings(
+        internal_batch_forwarding.outcome_not_proposed_v1,
+        unavailable_resp.header(internal_batch_forwarding.outcome_header).?,
+    );
 
     var local_fallback_resp = (try handle(.{
         .alloc = std.testing.allocator,
@@ -1198,6 +1257,23 @@ test "internal group write route dispatches bounded raft forwarding context" {
     // The fake source reports no matching group, proving the request reached
     // batchGroupLocal instead of the absent routed writer.
     try std.testing.expectEqual(@as(u16, 404), local_fallback_resp.status);
+
+    var legacy_headers_resp = (try handle(.{
+        .alloc = std.testing.allocator,
+        .shard_ops = null,
+        .writes = TestWriteSource.source(),
+        .batch_validator = TestWriteSource.batchValidator(),
+        .txn_validator = TestWriteSource.txnValidator(),
+    }, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/batch",
+        .headers = &headers,
+        .body = "{}",
+    }, "/internal/v1/groups/7/tables/docs/batch")).?;
+    defer legacy_headers_resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 400), legacy_headers_resp.status);
+    try std.testing.expectEqualStrings("raft batch forwarding headers require routed endpoint", legacy_headers_resp.body);
 }
 
 test "internal group write routes validate transaction status requests" {

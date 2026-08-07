@@ -5061,6 +5061,7 @@ pub fn build(b: *std.Build) void {
             "api http client preserves group doc identity conflicts",
             "api http client forwards bounded raft batch routing context without allocation",
             "api http client rejects unsupported routed batch protocol without legacy replay",
+            "api http client requires explicit not-proposed marker and tracks delivery phase",
             "internal group write route dispatches bounded raft forwarding context",
             "bound table write source backs up and restores a local table",
             "bound table write source backs up and restores a portable local table",

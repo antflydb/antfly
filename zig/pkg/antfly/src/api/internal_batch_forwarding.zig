@@ -17,6 +17,9 @@ const http_common = @import("../raft/transport/http_common.zig");
 pub const remaining_ms_header = "X-Antfly-Raft-Batch-Remaining-Ms";
 pub const forwards_remaining_header = "X-Antfly-Raft-Batch-Forwards-Remaining";
 pub const campaign_allowed_header = "X-Antfly-Raft-Batch-Campaign-Allowed";
+pub const outcome_header = "X-Antfly-Raft-Batch-Outcome";
+pub const outcome_not_proposed_v1 = "not-proposed-v1";
+pub const outcome_unknown_v1 = "unknown-v1";
 pub const max_forwards: u8 = 2;
 pub const max_remaining_ms: u32 = 5_000;
 

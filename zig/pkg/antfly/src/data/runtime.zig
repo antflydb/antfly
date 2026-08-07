@@ -24704,6 +24704,9 @@ test "data raft forwarding distinguishes safe retries from ambiguous outcomes" {
     try std.testing.expectEqual(.outcome_unknown, DataServer.classifyDataRaftForwardError(error.Timeout));
     try std.testing.expectEqual(.outcome_unknown, DataServer.classifyDataRaftForwardError(error.ConnectionResetByPeer));
     try std.testing.expectEqual(.outcome_unknown, DataServer.classifyDataRaftForwardError(error.RaftBatchWriteOutcomeUnknown));
+    // The HTTP client converts an OOM observed after transmission begins into
+    // RaftBatchWriteOutcomeUnknown. A raw OOM can only reach this classifier
+    // when request setup was proven not to have sent bytes.
     try std.testing.expectEqual(.terminal, DataServer.classifyDataRaftForwardError(error.OutOfMemory));
 }
 
