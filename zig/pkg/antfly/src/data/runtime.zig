@@ -292,12 +292,9 @@ const data_raft_batch_leader_wait_ns: u64 = 5 * std.time.ns_per_s;
 const data_raft_batch_leader_retry_sleep_ns: u64 = 50 * std.time.ns_per_ms;
 const data_raft_metadata_resync_interval_ns: u64 = 500 * std.time.ns_per_ms;
 const data_raft_campaign_retry_interval_ns: u64 = 500 * std.time.ns_per_ms;
-// Give the local voter one uncontested campaign window before escaping a
-// stale leaderless view through another placement. This is long enough for a
-// healthy in-cluster pre-vote/election round while leaving most of the bounded
-// write deadline available to a remote quorum when the local voter is stale or
-// partitioned.
-const data_raft_local_campaign_grace_ns: u64 = 500 * std.time.ns_per_ms;
+const data_raft_local_campaign_max_grace_ns: u64 = 500 * std.time.ns_per_ms;
+const data_raft_forward_response_reserve_ns: u64 = 50 * std.time.ns_per_ms;
+const data_raft_batch_initial_forwards: u8 = antfly.public_api.internal_batch_forwarding.max_forwards;
 const data_raft_metadata_sync_interval_ms: u64 = 250;
 const metadata_bootstrap_retry_base_ms: u64 = 250;
 const metadata_bootstrap_retry_max_ms: u64 = 5 * std.time.ms_per_s;
@@ -307,6 +304,24 @@ const public_api_max_connection_threads: u32 = 64;
 // drain overload traffic. Health has its own listener; this bound prevents
 // expensive public queries from consuming every worker under client timeouts.
 const public_api_max_active_requests: u32 = 32;
+
+const DataRaftBatchRoute = struct {
+    allow_remote_forward: bool = true,
+    refresh_metadata: bool,
+    campaign_allowed: bool = true,
+    forwards_remaining: u8 = data_raft_batch_initial_forwards,
+    cancellation: ?*const antfly.raft.transport.http_common.RequestCancellation = null,
+};
+
+const DataRaftBatchForwardState = struct {
+    allow_remote_forward: bool,
+    refresh_metadata: bool,
+    forwards_remaining: u8,
+    local_status_missing: bool,
+    local_status_is_voter: bool,
+    local_campaign_grace_elapsed: bool,
+    leader_node_id: ?u64,
+};
 const trusted_principal_secret_key = "antfly.trusted_principal.secret";
 const trusted_principal_issuer_key = "antfly.trusted_principal.issuer";
 
@@ -4056,6 +4071,7 @@ pub const DataServer = struct {
         }
         api_server_cfg.shard_ops = self.localShardOperationAdapter();
         api_server_cfg.shard_db_adapter = self.localShardDbAdapter();
+        api_server_cfg.routed_raft_batch_writer = self.routedRaftBatchWriter();
         api_server_cfg.backend_runtime = self.backend_runtime;
         api_server_cfg.resource_manager = &self.provisioned_storage.resource_manager;
         self.configureHAPublicGateState();
@@ -5330,6 +5346,13 @@ pub const DataServer = struct {
         };
     }
 
+    fn routedRaftBatchWriter(self: *DataServer) antfly.public_api.http_internal_group_write_routes.RoutedRaftBatchWriter {
+        return .{
+            .ptr = self,
+            .write = localRaftBatchGroupForwarded,
+        };
+    }
+
     fn promotionLeadershipSource(self: *DataServer) ?antfly.public_api.table_writes.ProvisionedTableWriteCache.PromotionLeadershipSource {
         if (self.group_leadership_source == null) return null;
         return .{
@@ -5379,7 +5402,7 @@ pub const DataServer = struct {
         req: antfly.db.types.BatchRequest,
     ) !void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
-        try self.proposeRaftBatchGroup(alloc, group_id, table_name, req, true, true);
+        try self.proposeRaftBatchGroup(alloc, group_id, table_name, req, .{ .refresh_metadata = true });
     }
 
     fn localRaftBatchGroupLocal(
@@ -5390,7 +5413,35 @@ pub const DataServer = struct {
         req: antfly.db.types.BatchRequest,
     ) !void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
-        try self.proposeRaftBatchGroup(alloc, group_id, table_name, req, true, false);
+        try self.proposeRaftBatchGroup(alloc, group_id, table_name, req, .{ .refresh_metadata = false });
+    }
+
+    fn localRaftBatchGroupForwarded(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: antfly.db.types.BatchRequest,
+        forwarding: antfly.public_api.internal_batch_forwarding.Context,
+        cancellation: ?*const antfly.raft.transport.http_common.RequestCancellation,
+    ) !?void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        const leader_wait_ns = dataRaftForwardedLeaderWaitNs(forwarding);
+        if (leader_wait_ns == 0) return error.LeaderUnavailable;
+        try self.proposeRaftBatchGroupWithLeaderWait(
+            alloc,
+            group_id,
+            table_name,
+            req,
+            .{
+                .refresh_metadata = false,
+                .campaign_allowed = forwarding.campaign_allowed,
+                .forwards_remaining = forwarding.forwards_remaining,
+                .cancellation = cancellation,
+            },
+            leader_wait_ns,
+        );
+        return {};
     }
 
     fn proposeRaftBatchGroup(
@@ -5399,16 +5450,14 @@ pub const DataServer = struct {
         group_id: u64,
         table_name: []const u8,
         req: antfly.db.types.BatchRequest,
-        allow_remote_forward: bool,
-        refresh_metadata: bool,
+        route: DataRaftBatchRoute,
     ) !void {
         return try self.proposeRaftBatchGroupWithLeaderWait(
             alloc,
             group_id,
             table_name,
             req,
-            allow_remote_forward,
-            refresh_metadata,
+            route,
             data_raft_batch_leader_wait_ns,
         );
     }
@@ -5419,12 +5468,13 @@ pub const DataServer = struct {
         group_id: u64,
         table_name: []const u8,
         req: antfly.db.types.BatchRequest,
-        allow_remote_forward: bool,
-        refresh_metadata: bool,
+        route: DataRaftBatchRoute,
         leader_wait_ns: u64,
     ) !void {
         const raft = self.data_raft orelse return error.UnsupportedOperation;
-        if (refresh_metadata) {
+        const deadline_ns = platform_time.monotonicNs() +| leader_wait_ns;
+        try ensureDataRaftBatchRouteActive(route);
+        if (route.refresh_metadata) {
             try self.syncDataRaftFromRemoteMetadata();
         } else if (raft.host.http_host.host.raftStatus(group_id) == null and self.remote_metadata != null) {
             const remote_metadata = self.remote_metadata.?;
@@ -5432,11 +5482,15 @@ pub const DataServer = struct {
             defer freeAdminSnapshotOwned(self.alloc, &snapshot);
             try self.syncDataRaftFromSnapshot(&snapshot);
         }
-        const deadline_ns = platform_time.monotonicNs() + leader_wait_ns;
-        var last_metadata_sync_ns = platform_time.monotonicNs();
+        try ensureDataRaftBatchRouteActive(route);
+        const routing_start_ns = platform_time.monotonicNs();
+        if (routing_start_ns >= deadline_ns) return error.LeaderUnavailable;
+        const local_campaign_grace_ns = dataRaftLocalCampaignGraceNs(deadline_ns - routing_start_ns);
+        var last_metadata_sync_ns = routing_start_ns;
         var last_local_campaign_ns: u64 = 0;
         var local_leaderless_voter_since_ns: u64 = 0;
         while (true) {
+            try ensureDataRaftBatchRouteActive(route);
             const preflighted_local_leader = raft.host.http_host.host.isLocalLeader(group_id);
             if (preflighted_local_leader) {
                 const admission_source = if (self.data_raft_apply) |apply_sm| &apply_sm.write_source else &self.write_source;
@@ -5475,10 +5529,16 @@ pub const DataServer = struct {
                     local_status_missing = status == null;
                     local_status_is_voter = localRaftStatusIsVoter(status, local_node_id);
                     leader_node_id = if (status) |raft_status| raft_status.soft.leader_id else null;
-                    if (leader_node_id == null and local_status_is_voter and local_leaderless_voter_since_ns == 0) {
-                        local_leaderless_voter_since_ns = platform_time.monotonicNs();
+                    if (leader_node_id == null and local_status_is_voter) {
+                        if (local_leaderless_voter_since_ns == 0) {
+                            local_leaderless_voter_since_ns = platform_time.monotonicNs();
+                        }
+                    } else {
+                        // A later leadership loss starts a fresh local grace
+                        // window instead of reusing an elapsed prior term.
+                        local_leaderless_voter_since_ns = 0;
                     }
-                    if (leader_node_id == null and localRaftStatusShouldBootstrapCampaign(status, local_node_id)) {
+                    if (route.campaign_allowed and leader_node_id == null and localRaftStatusShouldBootstrapCampaign(status, local_node_id)) {
                         const now_ns = platform_time.monotonicNs();
                         if (last_local_campaign_ns == 0 or
                             now_ns -| last_local_campaign_ns >= data_raft_campaign_retry_interval_ns)
@@ -5508,21 +5568,22 @@ pub const DataServer = struct {
 
             // A hosted replica can temporarily have a stale, leaderless local
             // view even while another placement replica knows the leader. Give
-            // a local voter one uncontested election window, then let only the
-            // originating request escape that stale view. An internal group
-            // request may follow a known leader below, but must not placement-
-            // bounce and synchronize another round of campaigns.
+            // an originating request a deadline-proportional local election
+            // window, then hand routing off without granting the target another
+            // request-driven campaign. Status-missing internal calls may still
+            // reach one placement under the explicit hop budget.
             const local_campaign_grace_elapsed = local_leaderless_voter_since_ns != 0 and
-                platform_time.monotonicNs() -| local_leaderless_voter_since_ns >= data_raft_local_campaign_grace_ns;
-            if (shouldForwardRaftBatchToPlacementReplica(
-                allow_remote_forward,
-                refresh_metadata,
-                local_status_missing,
-                local_status_is_voter,
-                local_campaign_grace_elapsed,
-                leader_node_id,
-            )) {
-                const escape_leaderless_local = refresh_metadata and leader_node_id == null;
+                platform_time.monotonicNs() -| local_leaderless_voter_since_ns >= local_campaign_grace_ns;
+            if (shouldForwardRaftBatchToPlacementReplica(.{
+                .allow_remote_forward = route.allow_remote_forward,
+                .refresh_metadata = route.refresh_metadata,
+                .forwards_remaining = route.forwards_remaining,
+                .local_status_missing = local_status_missing,
+                .local_status_is_voter = local_status_is_voter,
+                .local_campaign_grace_elapsed = local_campaign_grace_elapsed,
+                .leader_node_id = leader_node_id,
+            })) {
+                const escape_leaderless_local = route.refresh_metadata and leader_node_id == null;
                 if (try self.forwardRaftBatchToPlacementReplica(
                     alloc,
                     group_id,
@@ -5530,15 +5591,16 @@ pub const DataServer = struct {
                     req,
                     local_node_id,
                     deadline_ns,
-                    refresh_metadata,
+                    route,
                     escape_leaderless_local,
+                    local_status_is_voter,
                 )) return;
             }
 
-            if (allow_remote_forward) {
+            if (route.allow_remote_forward and route.forwards_remaining > 0) {
                 if (leader_node_id) |target_node_id| {
                     if (target_node_id != local_node_id) {
-                        const leader_base_uri = try self.dataApiUriForNode(alloc, target_node_id, refresh_metadata);
+                        const leader_base_uri = try self.dataApiUriForNode(alloc, target_node_id, route.refresh_metadata);
                         if (leader_base_uri) |base_uri| {
                             defer alloc.free(base_uri);
                             var executor = antfly.raft.transport.StdHttpExecutor.init(alloc, .{});
@@ -5546,12 +5608,18 @@ pub const DataServer = struct {
                             var client = antfly.public_api.ApiHttpClient.init(alloc, executor.executor());
                             const body = try antfly.public_api.batch.encodeBatchRequest(alloc, req);
                             defer alloc.free(body);
-                            var response = client.fetchGroupBatchWithTimeout(
+                            const forwarding = nextDataRaftBatchForwarding(deadline_ns, route, local_status_is_voter) orelse {
+                                sleepDataRaftBatchLeaderRetry();
+                                continue;
+                            };
+                            var response = client.fetchGroupBatchWithForwarding(
                                 base_uri,
                                 group_id,
                                 table_name,
                                 body,
                                 dataRaftBatchHttpTimeoutMs(deadline_ns),
+                                forwarding,
+                                route.cancellation,
                             ) catch |err| {
                                 if (isRetryableDataRaftForwardError(err)) {
                                     if (platform_time.monotonicNs() >= deadline_ns) {
@@ -5577,7 +5645,7 @@ pub const DataServer = struct {
             }
 
             const now_ns = platform_time.monotonicNs();
-            if (refresh_metadata and leader_node_id == null and now_ns -| last_metadata_sync_ns >= data_raft_metadata_resync_interval_ns) {
+            if (route.refresh_metadata and leader_node_id == null and now_ns -| last_metadata_sync_ns >= data_raft_metadata_resync_interval_ns) {
                 try self.syncDataRaftFromRemoteMetadata();
                 last_metadata_sync_ns = now_ns;
             }
@@ -5655,11 +5723,12 @@ pub const DataServer = struct {
         req: antfly.db.types.BatchRequest,
         local_node_id: u64,
         deadline_ns: u64,
-        refresh_metadata: bool,
+        route: DataRaftBatchRoute,
         allow_local_placement_source: bool,
+        local_status_is_voter: bool,
     ) !bool {
         const remote_metadata = self.remote_metadata orelse return false;
-        var snapshot = if (refresh_metadata)
+        var snapshot = if (route.refresh_metadata)
             try remote_metadata.fetchSnapshot()
         else
             (try remote_metadata.cachedSnapshot()) orelse return error.MetadataSnapshotUnavailable;
@@ -5689,12 +5758,15 @@ pub const DataServer = struct {
         var client = antfly.public_api.ApiHttpClient.init(alloc, executor.executor());
         const body = try antfly.public_api.batch.encodeBatchRequest(alloc, req);
         defer alloc.free(body);
-        var response = client.fetchGroupBatchWithTimeout(
+        const forwarding = nextDataRaftBatchForwarding(deadline_ns, route, local_status_is_voter) orelse return false;
+        var response = client.fetchGroupBatchWithForwarding(
             target_store.api_url,
             group_id,
             table_name,
             body,
             dataRaftBatchHttpTimeoutMs(deadline_ns),
+            forwarding,
+            route.cancellation,
         ) catch |err| {
             if (isRetryableDataRaftForwardError(err)) {
                 if (platform_time.monotonicNs() >= deadline_ns) {
@@ -5715,22 +5787,75 @@ pub const DataServer = struct {
         return true;
     }
 
-    fn shouldForwardRaftBatchToPlacementReplica(
-        allow_remote_forward: bool,
-        refresh_metadata: bool,
-        local_status_missing: bool,
-        local_status_is_voter: bool,
-        local_campaign_grace_elapsed: bool,
-        leader_node_id: ?u64,
-    ) bool {
-        if (!allow_remote_forward or !refresh_metadata) return false;
-        if (leader_node_id != null) return false;
-        if (local_status_missing or !local_status_is_voter) return true;
+    fn shouldForwardRaftBatchToPlacementReplica(state: DataRaftBatchForwardState) bool {
+        if (!state.allow_remote_forward or state.forwards_remaining == 0) return false;
+        if (state.leader_node_id != null) return false;
+        // A status-missing caller is not a hosted replica and may use one
+        // bounded placement hop even for cached-metadata split replication.
+        if (state.local_status_missing) return true;
+        if (!state.refresh_metadata) return false;
+        if (!state.local_status_is_voter) return true;
         // Immediate forwarding makes the target internal request campaign at
         // the same instant as this voter, which can repeatedly split votes.
         // After one bounded local window, forwarding restores availability if
         // this replica is stale or partitioned from the healthy quorum.
-        return local_campaign_grace_elapsed;
+        return state.local_campaign_grace_elapsed;
+    }
+
+    fn ensureDataRaftBatchRouteActive(route: DataRaftBatchRoute) !void {
+        if (route.cancellation) |cancellation| {
+            if (cancellation.isCancelled()) return error.Cancelled;
+        }
+    }
+
+    fn dataRaftLocalCampaignGraceNs(leader_wait_ns: u64) u64 {
+        // Reserve at least three quarters of short transition deadlines for
+        // routing and remote consensus while retaining the established 500 ms
+        // cap for ordinary five-second writes.
+        return @min(data_raft_local_campaign_max_grace_ns, leader_wait_ns / 4);
+    }
+
+    fn nextDataRaftBatchForwarding(
+        deadline_ns: u64,
+        route: DataRaftBatchRoute,
+        local_status_is_voter: bool,
+    ) ?antfly.public_api.internal_batch_forwarding.Context {
+        return dataRaftBatchForwardingAt(
+            platform_time.monotonicNs(),
+            deadline_ns,
+            route,
+            local_status_is_voter,
+        );
+    }
+
+    fn dataRaftBatchForwardingAt(
+        now_ns: u64,
+        deadline_ns: u64,
+        route: DataRaftBatchRoute,
+        local_status_is_voter: bool,
+    ) ?antfly.public_api.internal_batch_forwarding.Context {
+        if (!route.allow_remote_forward or route.forwards_remaining == 0) return null;
+        if (now_ns >= deadline_ns) return null;
+        const remaining_ns = deadline_ns - now_ns;
+        if (remaining_ns <= data_raft_forward_response_reserve_ns + std.time.ns_per_ms) return null;
+        const target_budget_ns = remaining_ns - data_raft_forward_response_reserve_ns;
+        const target_budget_ms = target_budget_ns / std.time.ns_per_ms;
+        if (target_budget_ms == 0) return null;
+        return .{
+            .remaining_ms = @intCast(@min(target_budget_ms, std.math.maxInt(u32))),
+            .forwards_remaining = route.forwards_remaining - 1,
+            // Once a voter has owned the request-driven election attempt, a
+            // forwarded target may route or follow its normal randomized Raft
+            // ticker but must not start a second synchronized campaign.
+            .campaign_allowed = route.campaign_allowed and !local_status_is_voter,
+        };
+    }
+
+    fn dataRaftForwardedLeaderWaitNs(forwarding: antfly.public_api.internal_batch_forwarding.Context) u64 {
+        return @min(
+            @as(u64, forwarding.remaining_ms) * std.time.ns_per_ms,
+            data_raft_batch_leader_wait_ns,
+        );
     }
 
     fn remoteRaftBatchPlacementNode(
@@ -6905,7 +7030,7 @@ pub const DataServer = struct {
                 .destination_group_id = destination_group_id,
                 .split_key = effective_split_key,
             },
-        }, true, false);
+        }, .{ .refresh_metadata = false });
     }
 
     fn replicateSplitCatchUp(
@@ -7087,7 +7212,7 @@ pub const DataServer = struct {
                 .destination_group_id = destination_group_id,
                 .delta_sequence = delta_sequence,
             },
-        }, true, false);
+        }, .{ .refresh_metadata = false });
     }
 
     fn replicateSplitDestinationBatch(
@@ -7106,8 +7231,7 @@ pub const DataServer = struct {
             destination_group_id,
             table_name,
             replicated_req,
-            true,
-            refresh_metadata,
+            .{ .refresh_metadata = refresh_metadata },
             split_transition_batch_leader_wait_ns,
         );
     }
@@ -24321,7 +24445,7 @@ test "data raft forwarding classifies deadline and transport failures as retryab
     try std.testing.expect(!DataServer.isRetryableDataRaftForwardError(error.OutOfMemory));
 }
 
-test "data raft batch forwarding gives local election grace and chooses deterministic fallback" {
+test "data raft batch forwarding bounds routing campaigns deadlines and deterministic fallback" {
     const intents = [_]antfly.raft.PlacementIntent{
         .{ .record = .{ .group_id = 7001, .replica_id = 1, .local_node_id = 101 } },
         .{ .record = .{ .group_id = 7001, .replica_id = 3, .local_node_id = 103 } },
@@ -24352,60 +24476,95 @@ test "data raft batch forwarding gives local election grace and chooses determin
         DataServer.remoteRaftBatchPlacementNode(7003, 999, null, &intents, false),
     );
 
-    try std.testing.expect(DataServer.shouldForwardRaftBatchToPlacementReplica(
+    var state = DataRaftBatchForwardState{
+        .allow_remote_forward = true,
+        .refresh_metadata = true,
+        .forwards_remaining = 2,
+        .local_status_missing = true,
+        .local_status_is_voter = false,
+        .local_campaign_grace_elapsed = false,
+        .leader_node_id = null,
+    };
+    try std.testing.expect(DataServer.shouldForwardRaftBatchToPlacementReplica(state));
+
+    // Cached split-replication calls must retain their one bounded route from
+    // a node that does not host the destination group.
+    state.refresh_metadata = false;
+    try std.testing.expect(DataServer.shouldForwardRaftBatchToPlacementReplica(state));
+
+    state.refresh_metadata = true;
+    state.local_status_missing = false;
+    try std.testing.expect(DataServer.shouldForwardRaftBatchToPlacementReplica(state));
+    state.local_status_is_voter = true;
+    try std.testing.expect(!DataServer.shouldForwardRaftBatchToPlacementReplica(state));
+    state.local_campaign_grace_elapsed = true;
+    try std.testing.expect(DataServer.shouldForwardRaftBatchToPlacementReplica(state));
+    state.refresh_metadata = false;
+    try std.testing.expect(!DataServer.shouldForwardRaftBatchToPlacementReplica(state));
+
+    state.refresh_metadata = true;
+    state.local_status_missing = true;
+    state.local_status_is_voter = false;
+    state.allow_remote_forward = false;
+    try std.testing.expect(!DataServer.shouldForwardRaftBatchToPlacementReplica(state));
+    state.allow_remote_forward = true;
+    state.forwards_remaining = 0;
+    try std.testing.expect(!DataServer.shouldForwardRaftBatchToPlacementReplica(state));
+    state.forwards_remaining = 2;
+    state.leader_node_id = 102;
+    try std.testing.expect(!DataServer.shouldForwardRaftBatchToPlacementReplica(state));
+
+    try std.testing.expectEqual(
+        @as(u64, 125 * std.time.ns_per_ms),
+        DataServer.dataRaftLocalCampaignGraceNs(split_transition_batch_leader_wait_ns),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 500 * std.time.ns_per_ms),
+        DataServer.dataRaftLocalCampaignGraceNs(data_raft_batch_leader_wait_ns),
+    );
+
+    const now_ns = std.time.ns_per_s;
+    const deadline_ns = now_ns + 500 * std.time.ns_per_ms;
+    const voter_forwarding = DataServer.dataRaftBatchForwardingAt(
+        now_ns,
+        deadline_ns,
+        .{ .refresh_metadata = true },
         true,
-        true,
-        true,
+    ).?;
+    try std.testing.expectEqual(@as(u32, 450), voter_forwarding.remaining_ms);
+    try std.testing.expectEqual(@as(u8, 1), voter_forwarding.forwards_remaining);
+    try std.testing.expect(!voter_forwarding.campaign_allowed);
+    try std.testing.expectEqual(
+        @as(u64, 450 * std.time.ns_per_ms),
+        DataServer.dataRaftForwardedLeaderWaitNs(voter_forwarding),
+    );
+
+    const nonvoter_forwarding = DataServer.dataRaftBatchForwardingAt(
+        now_ns,
+        deadline_ns,
+        .{ .refresh_metadata = false },
         false,
+    ).?;
+    try std.testing.expect(nonvoter_forwarding.campaign_allowed);
+    try std.testing.expect(DataServer.dataRaftBatchForwardingAt(
+        now_ns,
+        deadline_ns,
+        .{ .refresh_metadata = true, .forwards_remaining = 0 },
         false,
-        null,
-    ));
-    try std.testing.expect(DataServer.shouldForwardRaftBatchToPlacementReplica(
-        true,
-        true,
+    ) == null);
+    try std.testing.expect(DataServer.dataRaftBatchForwardingAt(
+        deadline_ns,
+        deadline_ns,
+        .{ .refresh_metadata = true },
         false,
-        false,
-        false,
-        null,
-    ));
-    try std.testing.expect(!DataServer.shouldForwardRaftBatchToPlacementReplica(
-        true,
-        true,
-        false,
-        true,
-        false,
-        null,
-    ));
-    try std.testing.expect(DataServer.shouldForwardRaftBatchToPlacementReplica(
-        true,
-        true,
-        false,
-        true,
-        true,
-        null,
-    ));
-    try std.testing.expect(!DataServer.shouldForwardRaftBatchToPlacementReplica(
-        true,
-        false,
-        true,
-        false,
-        false,
-        null,
-    ));
-    try std.testing.expect(!DataServer.shouldForwardRaftBatchToPlacementReplica(
-        false,
-        true,
-        true,
-        false,
-        false,
-        null,
-    ));
-    try std.testing.expect(!DataServer.shouldForwardRaftBatchToPlacementReplica(
-        true,
-        true,
-        false,
-        false,
-        true,
-        102,
-    ));
+    ) == null);
+
+    var cancellation = antfly.raft.transport.http_common.RequestCancellation{};
+    const cancellable_route = DataRaftBatchRoute{
+        .refresh_metadata = false,
+        .cancellation = &cancellation,
+    };
+    try DataServer.ensureDataRaftBatchRouteActive(cancellable_route);
+    cancellation.cancel();
+    try std.testing.expectError(error.Cancelled, DataServer.ensureDataRaftBatchRouteActive(cancellable_route));
 }

@@ -19,6 +19,7 @@ const metadata_transition_state = @import("../metadata/transition_state.zig");
 const db_api = @import("../storage/db/db.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const http_common = @import("../raft/transport/http_common.zig");
+const internal_batch_forwarding = @import("internal_batch_forwarding.zig");
 const distributed_stats_mod = @import("../search/distributed_stats.zig");
 const routes = @import("http_routes.zig");
 const raft_routes = @import("../raft/transport/routes.zig");
@@ -1640,6 +1641,19 @@ pub const ApiHttpClient = struct {
         body: []const u8,
         timeout_ms: ?u32,
     ) !BatchResponse {
+        return self.fetchGroupBatchWithForwarding(base_uri, group_id, table_name, body, timeout_ms, null, null);
+    }
+
+    pub fn fetchGroupBatchWithForwarding(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        timeout_ms: ?u32,
+        forwarding: ?internal_batch_forwarding.Context,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) !BatchResponse {
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
             table_name,
@@ -1651,12 +1665,35 @@ pub const ApiHttpClient = struct {
         const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
         defer self.alloc.free(uri);
 
+        var remaining_buf: [10]u8 = undefined;
+        var forwards_buf: [3]u8 = undefined;
+        var forwarding_headers: [3]http_common.RequestHeader = undefined;
+        const headers: []const http_common.RequestHeader = if (forwarding) |context| headers: {
+            forwarding_headers = .{
+                .{
+                    .name = internal_batch_forwarding.remaining_ms_header,
+                    .value = try std.fmt.bufPrint(&remaining_buf, "{d}", .{context.remaining_ms}),
+                },
+                .{
+                    .name = internal_batch_forwarding.forwards_remaining_header,
+                    .value = try std.fmt.bufPrint(&forwards_buf, "{d}", .{context.forwards_remaining}),
+                },
+                .{
+                    .name = internal_batch_forwarding.campaign_allowed_header,
+                    .value = if (context.campaign_allowed) "true" else "false",
+                },
+            };
+            break :headers &forwarding_headers;
+        } else &.{};
+
         var resp = try self.executor.execute(self.alloc, .{
             .method = .POST,
             .uri = uri,
+            .headers = headers,
             .content_type = "application/json",
             .timeout_ms = timeout_ms,
             .body = body,
+            .cancellation = cancellation,
         });
         defer resp.deinit(self.alloc);
         if (resp.status != 201) {
@@ -2949,6 +2986,41 @@ test "api http client preserves group doc identity conflicts" {
     conflict_executor.status = 503;
     conflict_executor.body = "write unavailable";
     try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupBatch(base_uri, 7, "docs", "{}"));
+}
+
+test "api http client forwards bounded raft batch routing context without allocation" {
+    const ForwardingExecutor = struct {
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(_: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            try std.testing.expectEqual(@as(?u32, 500), req.timeout_ms);
+            try std.testing.expect(req.cancellation != null);
+            const forwarding = (try internal_batch_forwarding.parse(req)).?;
+            try std.testing.expectEqual(@as(u32, 425), forwarding.remaining_ms);
+            try std.testing.expectEqual(@as(u8, 1), forwarding.forwards_remaining);
+            try std.testing.expect(!forwarding.campaign_allowed);
+            return .{ .status = 201, .body = try alloc.dupe(u8, "{}") };
+        }
+    };
+
+    var executor = ForwardingExecutor{};
+    var cancellation = http_common.RequestCancellation{};
+    var client = ApiHttpClient.init(std.testing.allocator, executor.executor());
+    var response = try client.fetchGroupBatchWithForwarding(
+        "http://127.0.0.1:1",
+        7,
+        "docs",
+        "{}",
+        500,
+        .{ .remaining_ms = 425, .forwards_remaining = 1, .campaign_allowed = false },
+        &cancellation,
+    );
+    response.deinit(std.testing.allocator);
 }
 
 test "api http client encodes merge doc identity reassignment action flag" {

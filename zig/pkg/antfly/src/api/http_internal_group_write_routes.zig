@@ -19,6 +19,7 @@ const distributed_txn = @import("distributed_txn.zig");
 const http_client = @import("http_client.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const http_route_helpers = @import("http_route_helpers.zig");
+const internal_batch_forwarding = @import("internal_batch_forwarding.zig");
 const internal_keys = @import("../storage/internal_keys.zig");
 const metadata_mod = @import("../metadata/mod.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
@@ -47,11 +48,37 @@ pub const TxnValidator = struct {
     }
 };
 
+pub const RoutedRaftBatchWriter = struct {
+    ptr: *anyopaque,
+    write: *const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_mod.types.BatchRequest,
+        forwarding: internal_batch_forwarding.Context,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) anyerror!?void,
+
+    fn run(
+        self: RoutedRaftBatchWriter,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_mod.types.BatchRequest,
+        forwarding: internal_batch_forwarding.Context,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) !?void {
+        return try self.write(self.ptr, alloc, group_id, table_name, req, forwarding, cancellation);
+    }
+};
+
 pub const Context = struct {
     alloc: std.mem.Allocator,
     shard_ops: ?raft_mod.ShardOperationAdapter,
     shard_db_adapter: ?metadata_mod.ShardDbAdapter = null,
     writes: ?table_writes.TableWriteSource,
+    routed_raft_batch_writer: ?RoutedRaftBatchWriter = null,
     repair_job_store: ?*repair_jobs.Store = null,
     repair_cancel_executor: ?http_common.RequestExecutor = null,
     batch_validator: BatchValidator,
@@ -330,7 +357,16 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
             else => return err,
         };
 
-        _ = (writes.batchGroupLocal(ctx.alloc, batch_route.group_id, batch_route.table_name, batch_req.req) catch |err| switch (err) {
+        const forwarding = internal_batch_forwarding.parse(req) catch {
+            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid raft batch forwarding headers");
+        };
+        _ = ((if (forwarding) |forwarding_context|
+            if (ctx.routed_raft_batch_writer) |writer|
+                writer.run(ctx.alloc, batch_route.group_id, batch_route.table_name, batch_req.req, forwarding_context, req.cancellation)
+            else
+                return try http_route_helpers.textResponse(ctx.alloc, 503, "routed raft batch unavailable")
+        else
+            writes.batchGroupLocal(ctx.alloc, batch_route.group_id, batch_route.table_name, batch_req.req)) catch |err| switch (err) {
             error.InvalidBatchRequest => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid batch request"),
             error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
             error.LeaderUnavailable, error.GroupLeaderUnavailable, error.MetadataSnapshotUnavailable => {
@@ -1017,6 +1053,57 @@ test "internal group write routes validate batch requests" {
 
     try std.testing.expectEqual(@as(u16, 400), resp.status);
     try std.testing.expectEqualStrings("invalid batch request", resp.body);
+}
+
+test "internal group write route dispatches bounded raft forwarding context" {
+    const Capture = struct {
+        forwarding: ?internal_batch_forwarding.Context = null,
+
+        fn write(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            _: db_mod.types.BatchRequest,
+            forwarding: internal_batch_forwarding.Context,
+            cancellation: ?*const http_common.RequestCancellation,
+        ) !?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(u64, 7), group_id);
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expect(cancellation != null);
+            self.forwarding = forwarding;
+            return {};
+        }
+    };
+
+    const headers = [_]http_common.RequestHeader{
+        .{ .name = internal_batch_forwarding.remaining_ms_header, .value = "425" },
+        .{ .name = internal_batch_forwarding.forwards_remaining_header, .value = "1" },
+        .{ .name = internal_batch_forwarding.campaign_allowed_header, .value = "false" },
+    };
+    var capture = Capture{};
+    var cancellation = http_common.RequestCancellation{};
+    var resp = (try handle(.{
+        .alloc = std.testing.allocator,
+        .shard_ops = null,
+        .writes = TestWriteSource.source(),
+        .routed_raft_batch_writer = .{ .ptr = &capture, .write = Capture.write },
+        .batch_validator = TestWriteSource.batchValidator(),
+        .txn_validator = TestWriteSource.txnValidator(),
+    }, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/batch",
+        .headers = &headers,
+        .body = "{}",
+        .cancellation = &cancellation,
+    }, "/internal/v1/groups/7/tables/docs/batch")).?;
+    defer resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 201), resp.status);
+    try std.testing.expectEqual(@as(u32, 425), capture.forwarding.?.remaining_ms);
+    try std.testing.expectEqual(@as(u8, 1), capture.forwarding.?.forwards_remaining);
+    try std.testing.expect(!capture.forwarding.?.campaign_allowed);
 }
 
 test "internal group write routes validate transaction status requests" {
