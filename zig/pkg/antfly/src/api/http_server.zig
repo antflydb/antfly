@@ -8995,7 +8995,11 @@ pub const ApiHttpServer = struct {
             error.DenseRepairBackpressure => return error.DenseRepairBackpressure,
             error.LeaderUnavailable => return error.WriteUnavailable,
             error.RaftBatchWriteOutcomeUnknown => return error.WriteOutcomeUnknown,
-            error.RaftBatchWritePartialOutcome => return error.WritePartialOutcome,
+            // The public batch path is atomic: multi-group writes use 2PC and
+            // the single-group fast path is one Raft command. Preserve the
+            // conservative do-not-retry signal if a legacy adapter reports a
+            // partial outcome, without advertising a partial public commit.
+            error.RaftBatchWritePartialOutcome => return error.WriteOutcomeUnknown,
             error.HAReadOnlyStandby => return error.HAReadOnlyStandby,
             error.HAPromotedStandbyRequiresPrimaryOpen => return error.HAPromotedStandbyRequiresPrimaryOpen,
             error.HAFencedPrimary => return error.HAFencedPrimary,

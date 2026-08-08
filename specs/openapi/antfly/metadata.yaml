@@ -9254,28 +9254,18 @@ paths:
                 $ref: "#/components/schemas/BatchResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
-        "409":
-          description: Batch transaction conflicted or the serving replica is fenced
-          content:
-            text/plain:
-              schema:
-                type: string
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
           description: |
-            The batch cannot be safely replayed as a unit. Either the server
-            could not determine whether a shard-group write committed, or one
-            or more shard groups accepted their portion before a later group
-            failed. Clients must reconcile affected keys and must not blindly
-            replay non-idempotent transforms.
+            The atomic batch conflicted, the serving replica is fenced, or the
+            server could not determine whether a single-group Raft command
+            committed. An ambiguous outcome is not safe to replay blindly when
+            the request contains non-idempotent transforms.
           content:
             text/plain:
               schema:
                 type: string
-                enum:
-                  - write outcome unknown
-                  - partial write outcome
         "429":
           $ref: "#/components/responses/DenseRepairBackpressure"
         "503":

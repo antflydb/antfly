@@ -13368,6 +13368,7 @@ pub const ProvisionedTableWriteSource = struct {
             .{
                 .retain_terminal = retain_terminal,
                 .report_post_commit_failure = false,
+                .fanout_io = self.table_activity_threaded.io(),
             },
         );
     }
@@ -15802,6 +15803,10 @@ pub const HostedProvisionedTableWriteSource = struct {
             .{
                 .retain_terminal = retain_terminal,
                 .report_post_commit_failure = false,
+                .fanout_io = if (self.backend_runtime) |runtime|
+                    if (runtime.apiIoImpl()) |io_impl| io_impl.io() else null
+                else
+                    null,
             },
         );
     }
