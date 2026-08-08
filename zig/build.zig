@@ -4527,6 +4527,7 @@ pub fn build(b: *std.Build) void {
         "scan request errors map to stable client responses",
         "httpx antfly scan honors optional body and documented bad requests",
         "httpx multi batch route uses the batch commit hook and public response contract",
+        "httpx stable transaction commit durably hands off recovery before acknowledgement",
         "httpx query admission rejects saturated queries without blocking control routes",
         "httpx query admission releases a cancelled query slot",
         "httpx rejects pipelined H1 query work when disconnect ownership is ambiguous",

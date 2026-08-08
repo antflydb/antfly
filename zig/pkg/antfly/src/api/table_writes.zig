@@ -4767,21 +4767,59 @@ pub const BoundTableWriteSource = struct {
         const db = try self.activeDb();
         try validateTransactionAgainstLocalSchema(alloc, db, table.writes, table.deletes, table.transforms);
         const commit_version = begin_timestamp + 1;
+        const local_participant = try distributed_txn.participantIdForGroup(alloc, table.table_name, 0);
+        defer alloc.free(local_participant);
+        const participants = [_][]const u8{local_participant};
 
         _ = db.beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(
             txn_id,
             begin_timestamp,
             platform_time.realtimeNs(),
-            &.{},
+            &participants,
             true,
             retain_terminal,
         ) catch |err| switch (err) {
             error.DecisionConflict => switch (try db.getTransactionStatus(txn_id)) {
                 .committed => {
-                    try db.resolveTransactionIntentsWithSyncLevel(txn_id, .committed, commit_version, sync_level);
-                    return .{ .committed = .{ .participant_count = 1 } };
+                    db.resolveTransactionIntentsWithSyncLevel(txn_id, .committed, commit_version, sync_level) catch |barrier_err| {
+                        const durable_status = db.getTransactionStatus(txn_id) catch return barrier_err;
+                        if (durable_status != .committed) return barrier_err;
+                        var propagation_pending = false;
+                        if (!retain_terminal) {
+                            db.markTransactionParticipantResolved(txn_id, local_participant) catch {
+                                propagation_pending = true;
+                            };
+                        }
+                        return .{ .committed = .{
+                            .participant_count = 1,
+                            .coordinator_group_id = if (retain_terminal) 0 else null,
+                            .coordinator_table_name = if (retain_terminal) table.table_name else null,
+                            .propagation_pending = propagation_pending,
+                            .visibility_pending = true,
+                        } };
+                    };
+                    var propagation_pending = false;
+                    if (!retain_terminal) {
+                        db.markTransactionParticipantResolved(txn_id, local_participant) catch {
+                            propagation_pending = true;
+                        };
+                    }
+                    return .{ .committed = .{
+                        .participant_count = 1,
+                        .coordinator_group_id = if (retain_terminal) 0 else null,
+                        .coordinator_table_name = if (retain_terminal) table.table_name else null,
+                        .propagation_pending = propagation_pending,
+                    } };
                 },
-                .aborted => return .{ .conflict = boundConflict(table, error.DecisionConflict) },
+                .aborted => {
+                    db.markTransactionParticipantResolved(txn_id, local_participant) catch |ack_err| {
+                        std.log.warn("bound transaction abort acknowledgement retry deferred txn_id={x} err={s}", .{
+                            txn_id,
+                            @errorName(ack_err),
+                        });
+                    };
+                    return .{ .conflict = boundConflict(table, error.DecisionConflict) };
+                },
                 .pending => return error.TransactionBeginFailed,
             },
             else => return err,
@@ -4803,6 +4841,14 @@ pub const BoundTableWriteSource = struct {
                 });
                 return abort_err;
             };
+            db.markTransactionParticipantResolved(txn_id, local_participant) catch |ack_err| {
+                // The abort is already durable; recovery can finish this
+                // idempotent cleanup without changing the client result.
+                std.log.warn("bound transaction abort acknowledgement deferred txn_id={x} err={s}", .{
+                    txn_id,
+                    @errorName(ack_err),
+                });
+            };
             switch (err) {
                 error.VersionConflict, error.IntentConflict => return .{ .conflict = boundConflict(table, err) },
                 error.InvalidBatchRequest,
@@ -4820,14 +4866,34 @@ pub const BoundTableWriteSource = struct {
                     txn_id,
                     @errorName(err),
                 });
+                var propagation_pending = false;
+                if (!retain_terminal) {
+                    db.markTransactionParticipantResolved(txn_id, local_participant) catch {
+                        propagation_pending = true;
+                    };
+                }
                 return .{ .committed = .{
                     .participant_count = 1,
-                    .visibility_pending = retain_terminal,
+                    .coordinator_group_id = if (retain_terminal) 0 else null,
+                    .coordinator_table_name = if (retain_terminal) table.table_name else null,
+                    .propagation_pending = propagation_pending,
+                    .visibility_pending = true,
                 } };
             }
             return err;
         };
-        return .{ .committed = .{ .participant_count = 1 } };
+        var propagation_pending = false;
+        if (!retain_terminal) {
+            db.markTransactionParticipantResolved(txn_id, local_participant) catch {
+                propagation_pending = true;
+            };
+        }
+        return .{ .committed = .{
+            .participant_count = 1,
+            .coordinator_group_id = if (retain_terminal) 0 else null,
+            .coordinator_table_name = if (retain_terminal) table.table_name else null,
+            .propagation_pending = propagation_pending,
+        } };
     }
 
     fn createIndex(
@@ -21562,8 +21628,12 @@ test "bound stable single-group transaction retry does not reapply transforms" {
 
     const first = (try source.source().commitTransactionWithId(alloc, txn_id, 20_000, &request, .write)) orelse return error.TestUnexpectedResult;
     try std.testing.expect(first == .committed);
+    try std.testing.expectEqual(@as(?u64, 0), first.committed.coordinator_group_id);
+    try std.testing.expectEqualStrings("docs", first.committed.coordinator_table_name.?);
     const retried = (try source.source().commitTransactionWithId(alloc, txn_id, 20_000, &request, .write)) orelse return error.TestUnexpectedResult;
     try std.testing.expect(retried == .committed);
+    try std.testing.expectEqual(@as(?u64, 0), retried.committed.coordinator_group_id);
+    try std.testing.expectEqualStrings("docs", retried.committed.coordinator_table_name.?);
 
     var result = (try db.lookup(alloc, "doc:counter", .{})) orelse return error.TestUnexpectedResult;
     defer result.deinit(alloc);
@@ -21571,6 +21641,10 @@ test "bound stable single-group transaction retry does not reapply transforms" {
     defer parsed.deinit();
     try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("count").?.integer);
     try std.testing.expectEqual(db_mod.types.TxnStatus.committed, try db.getTransactionStatus(txn_id));
+    try std.testing.expect(try db.hasTopologySensitiveTransactions());
+
+    _ = (try source.source().acknowledgeTransactionCommit(alloc, txn_id, 0, "docs")) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!try db.hasTopologySensitiveTransactions());
 }
 
 test "bound single-group batch reports prepared intent conflicts" {

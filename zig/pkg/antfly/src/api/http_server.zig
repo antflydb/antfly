@@ -4945,16 +4945,28 @@ pub const ApiHttpServer = struct {
                         );
                         return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 409, response);
                     },
-                    error.CommitVisibilityNotSatisfied => return try textResponse(
-                        self.alloc,
-                        503,
-                        "transaction committed, but the requested visibility barrier was not reached",
-                    ),
-                    error.CommitPropagationIncomplete => return try textResponse(
-                        self.alloc,
-                        503,
-                        "transaction committed; participant recovery is pending",
-                    ),
+                    error.CommitVisibilityNotSatisfied => {
+                        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
+                        defer arena_impl.deinit();
+                        const response = try transactions_api.buildCommitResponse(
+                            arena_impl.allocator(),
+                            "committed_visibility_pending",
+                            null,
+                            commit_req.tables,
+                        );
+                        return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 202, response);
+                    },
+                    error.CommitPropagationIncomplete => {
+                        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
+                        defer arena_impl.deinit();
+                        const response = try transactions_api.buildCommitResponse(
+                            arena_impl.allocator(),
+                            "committed_recovery_pending",
+                            null,
+                            commit_req.tables,
+                        );
+                        return try jsonResponseWithStatusOmitNullOptionals(self.alloc, 202, response);
+                    },
                     error.CommitDecisionUnknown => return try textResponse(
                         self.alloc,
                         500,
@@ -8963,6 +8975,7 @@ pub const ApiHttpServer = struct {
             => return error.Conflict,
             error.CommitVisibilityNotSatisfied,
             error.CommitPropagationIncomplete,
+            => return error.CommittedPending,
             error.AbortDecisionNotDurable,
             error.TransactionBeginFailed,
             => return error.WriteUnavailable,
@@ -25711,7 +25724,10 @@ test "api http server serves long-lived public transaction session routes" {
         .body = "",
     });
     defer commit_again.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 404), commit_again.status);
+    try std.testing.expectEqual(@as(u16, 200), commit_again.status);
+    var parsed_commit_again = try std.json.parseFromSlice(SessionCommitResponse, std.testing.allocator, commit_again.body, .{});
+    defer parsed_commit_again.deinit();
+    try std.testing.expectEqualStrings("committed", parsed_commit_again.value.status);
 
     var abort_begin = try server.handle(.{
         .method = .POST,
