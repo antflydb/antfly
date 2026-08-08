@@ -175,6 +175,7 @@ the same host, target, cache state, and report set.
 | One-call `DB.search` probe | Distributed 415.352 s → 401.086 s, but declarations changed only 41,984 → 41,981 and storage overlap remained 98.9% | Rejected; a call boundary without storage ownership does not remove codegen |
 | Provisioned read-vtable probe | Distributed 415.352 s → 397.153 s; only 83 declarations moved | Rejected as incomplete; hosted reads retained the physical-query graph |
 | Combined provisioned + hosted read-vtable probe | Distributed 415.352 s → 367.185 s and 41,984 → 40,585 declarations | Go for a local-query island, but revert the raw prototype and redesign the ABI/ownership split |
+| Post-serverless compile-once control | Repeated cold combined distributed/storage builds: 358.589 s and 352.900 s; aggregate duplicate instances 873 → 482; executable 72.121 MB → 60.804 MB; C API unchanged at 16.382 MB | Keep the default co-generated distributed/storage archive; stop the separate opaque-kernel migration |
 
 The `/tmp` graph analysis was consolidated into
 `tools/analyze_zig_import_graph.py`. It reports lexical reachability, consumes
@@ -188,8 +189,8 @@ The linked release currently generates three large libraries concurrently:
 
 ```text
 antfly executable
-├── antfly-runtime-api_kernel
-├── antfly-storage-kernel       # currently the broader distributed unit
+├── antfly-runtime-api_kernel   # API protocol plus serverless
+├── antfly-storage-kernel       # distributed roles plus shared storage/CAPI
 └── antfly-runtime-inference
 ```
 
@@ -198,8 +199,9 @@ shared libraries link the same PIC distributed/storage archive, with function
 and data sections allowing the linker to retain only C API roots.
 
 The name `antfly-storage-kernel` currently describes the archive's reuse role,
-not yet a pure architectural boundary. It still contains data, metadata,
-serverless, standalone/Lite, CLI, and storage implementations.
+not a pure domain boundary. It contains data, metadata, standalone/Lite, CLI,
+and storage implementations. Serverless is co-generated with the API protocol
+unit; inference remains a separate safety valve.
 
 The first ABI preparation is complete:
 
@@ -217,10 +219,11 @@ The first ABI preparation is complete:
 - the graph checker rejects direct storage/table implementation imports from
   the API ABI files.
 
-This is prerequisite work for a true storage kernel. It is not the completed
-storage ownership migration.
+This remains useful source-level separation and protects the public API from
+accidental implementation barrels. The compile-once result below means it is
+no longer a prerequisite to a separate production storage kernel.
 
-## Current clean-cache profile
+## Historical pre-serverless clean-cache profile
 
 The following was a local macOS-to-ARM64-Linux-musl cross compilation from a
 fresh cache on 2026-08-07. All three units compiled concurrently and all 23
@@ -1229,51 +1232,124 @@ tests, all graph gates, and all 13 analyzer tests.
 
 Decision: **keep**. This is a material, correctly-owned critical-path win that
 meets the 380-second target without increasing runner claims or artifact size.
-It is not the end state: summed compiler work and cross-unit overlap remain too
-high, and storage/local query is not yet compiled once. Continue with the
-opaque storage ownership cut rather than merging more implementation-heavy
-roles into the API unit.
+At this checkpoint the opt-in four-unit profile still duplicated storage. The
+next required experiment was to remeasure the default compile-once topology
+before continuing the opaque storage ownership cut; the result follows.
+
+### Repeated compile-once control after serverless placement
+
+The serverless/API placement invalidated the 425.652-second baseline that had
+motivated a separately compiled storage kernel. The next experiment therefore
+disabled `-Dstorage-kernel-experiment` and let the existing PIC distributed
+archive own the C API exports again. The executable and both C API shared
+libraries link that exact archive; section GC retains only public C API roots in
+the shared libraries. No source behavior or runtime call path changes at this
+boundary.
+
+Two builds used separate fresh local and global caches, targeted ARM64 Linux
+musl `ReleaseFast`, and retained normal build concurrency:
+
+| Unit | Cold run 1 | Cold run 2 | LLVM emit (run 2) | Declarations | Repository Zig files |
+|---|---:|---:|---:|---:|---:|
+| API protocol + serverless | 205.932 s | 203.586 s | 198.835 s | 23,003 | 501 |
+| Distributed + storage + C API exports | 358.589 s | 352.900 s | 345.385 s | 40,313 | 643 |
+| Inference | 228.355 s | 224.106 s | 217.117 s | 24,945 | 523 |
+
+Both clean builds completed all 23 steps. The combined unit had an identical
+graph in both runs: 643 repository files, 40,313 declarations, 22,717 generic
+instances, and 14,731 inline calls. Its 352.9--358.6 second range is below the
+380-second gate and close to the preferred 350-second target. This is not a
+cache-assisted result.
+
+Compared with the immediately preceding four-unit serverless/API profile:
+
+| Metric | Separate storage experiment | Compile-once control | Delta |
+|---|---:|---:|---:|
+| Critical compiler unit | 361.564 s | 352.900--358.589 s | within host variance, still below 380 s |
+| Compiler units | 4 | 3 | -1 |
+| Repository-file instances | 2,060 | 1,667 | -393 |
+| Unique repository files | 1,187 | 1,185 | -2 |
+| Duplicate instances | 873 | 482 | -391 (-44.8%) |
+| Static executable | 72,121,032 bytes | 60,803,592 bytes | -11,317,440 bytes (-15.7%) |
+| `libantfly.so` | 16,382,112 bytes | 16,382,112 bytes | unchanged |
+
+The API and inference controls were 3.2% and 3.0% faster than the preceding
+profile, while the combined unit was only 0.8% faster despite gaining the C API
+roots. Some wall-time improvement is host variance, but the graph, unit-count,
+duplicate-work, and artifact-size improvements are structural. Production
+artifacts contain no `mdb_*`, `lmdb_backend`, or `backend_lmdb` implementation
+symbols. The shared library exports the public `antfly_db_*`/`antfly_lite_*`
+surface and no distributed runtime or experimental owner symbols.
+
+Validation of the unchanged production path included the two cold linked
+builds, 42/44 serverless tests with only the two opt-in cloud integrations
+skipped, 5/5 linked-main tests, 10/10 C API tests, all graph gates, and all 13
+analyzer tests. The final product remains one static executable with embedded
+standalone inference and normal concurrency.
+
+Decision: **keep the default compile-once topology and stop the separate
+opaque-storage-kernel migration**. The experiment answered its question: after
+the inference and serverless graph cuts, a dedicated storage compiler unit no
+longer improves the critical path and instead duplicates nearly the entire
+storage graph. The retained owner ABI work remains useful design evidence and
+an opt-in diagnostic, but it is not the production direction. Further work
+should reduce roots inside the three accepted units without introducing a
+fourth copy of storage or a process-wide internal RPC ABI. These local cross
+builds establish repeatability and graph shape; the overall goal remains open
+until the same cold production path is reliable within the normal Linux
+runner's memory budget.
 
 ## Holistic target architecture
 
-The preferred end state is a modular monolith with a small number of compiled
-domain islands. It is not a generic internal RPC system and not a microservice
-split.
+The measured production target is a modular source monolith with three compiled
+islands. Compiler-unit boundaries deliberately do not mirror every source
+ownership boundary: distributed orchestration and provisioned storage share so
+much optimized code that co-generation is both faster and substantially
+smaller than an internal ABI split.
 
 ```text
-thin main / standalone composition
-├── API protocol runtime
-│   └── HTTP, authentication, validation, public request translation
-├── distributed control runtime
-│   └── routing, topology, raft coordination, fanout and result merging
-├── storage + local-query kernel
-│   └── DB ownership, LSM, indexes, local physical queries,
-│       transaction participation, restore publication and maintenance
-├── inference runtime
-└── C API
-    └── calls the same compiled storage kernel
+thin linked main
+├── API protocol + serverless island
+│   └── HTTP/auth/public translation plus serverless artifact execution
+├── application/storage island (PIC, sectioned)
+│   ├── CLI, data, metadata, standalone/Lite and distributed control
+│   ├── DB ownership, LSM, indexes and provisioned local queries
+│   └── public C API exports reused by the shared libraries
+└── inference island
+    └── model lifecycle plus the linked standalone inference host
 ```
 
-Standalone should become primarily a composition mode that starts and wires
-the already compiled API, control, storage, and inference units. It should not
-own another copy of those implementations.
+The application/storage archive is compiled once. The executable retains its
+runtime and storage roots; `libantfly.so` and `libantfly_zig_capi.so` link the
+same PIC object and discard runtime-only sections. Standalone remains a product
+composition mode in that archive and calls the separately compiled inference
+host. No storage call crosses an internal ABI in the production path.
 
-### Ownership rules
+### Source ownership rules
+
+These rules guide module structure and lazy-import cleanup. They no longer
+imply a compiled ABI between distributed control and storage.
 
 | Layer | Owns | Must not own |
 |---|---|---|
-| API protocol | HTTP, auth, public validation, request translation | DBs, LSM, local indexes, raft application |
+| API protocol | HTTP, auth, public validation, request translation | Provisioned DB ownership, raft application |
+| Serverless | Published artifact lifecycle and serverless-local query execution | Provisioned table/shard ownership or cluster Raft |
 | Distributed control | Table routing, topology, leadership, fanout, distributed merge, transaction coordination | Local storage implementation details |
-| Storage/local-query kernel | Table and shard handles, local physical query execution, batches, transaction participant state, snapshots, restore publication, maintenance | HTTP, auth, cluster routing, remote topology |
+| Provisioned storage | Table and shard handles, local physical query execution, batches, transaction participant state, snapshots, restore publication, maintenance | HTTP, auth, cluster routing, remote topology |
 | Inference | Model lifecycle and inference execution | Table/storage ownership |
-| Main/standalone | Wiring, startup, shutdown and product mode selection | Domain implementations |
+| Main | Command dispatch and linked-unit invocation | Domain implementations |
+| Standalone | Product-mode wiring, startup and shutdown | Another copy of inference or storage codegen |
 | C API | Public ABI adaptation | A second storage implementation |
 
-Raft and distributed transaction coordination remain outside the kernel. A
-raft apply or transaction participant operation enters the kernel as one coarse
-local operation.
+Raft and distributed transaction coordination remain source-level control
+concerns even though LLVM emits them in the same application/storage unit as
+local execution.
 
-### ABI principles
+### Criteria for any future compiled ABI
+
+The separate storage-kernel experiment did not pay. If a future graph change
+reopens that decision, it must still follow these rules and beat the accepted
+three-unit baseline before migration resumes:
 
 - Handles such as storage, table, shard, and snapshot handles are opaque.
 - ABI declarations use C-compatible layouts and explicit-width types.
@@ -1295,11 +1371,13 @@ local operation.
 - Logical/public validation remains outside the kernel. Local physical planning
   and execution live together inside it so storage internals do not leak.
 
-## Storage-kernel experiment plan
+## Historical separate-storage-kernel experiment plan (closed)
 
-The experiment should answer one question early: can a separately compiled
-storage kernel reduce the 425.652-second critical path enough to justify the ABI
-and ownership migration?
+This experiment asked whether a separately compiled storage kernel could reduce
+the then-425.652-second critical path enough to justify the ABI and ownership
+migration. The repeated compile-once control above answered **no** after later
+graph cuts changed the baseline. The phases below are retained as the design
+and experiment record, not as the active production plan.
 
 ### Phase 0: reproducible baseline
 
@@ -1390,10 +1468,10 @@ possible critical path below the current 425.652 seconds once standalone and
 storage emission are no longer fused into that unit. This is a hypothesis, not
 a promised result.
 
-## Go/no-go criteria
+## Historical separate-kernel go/no-go criteria
 
-Proceed beyond the query slice only if it demonstrates a material improvement.
-The initial thresholds are:
+The separate-kernel migration was allowed to proceed beyond the query slice
+only if it demonstrated a material improvement. Its thresholds were:
 
 - reduce the 425.652-second distributed critical path to at most about 380
   seconds, with a preferred result below 350 seconds;
@@ -1414,6 +1492,12 @@ compiler unit close to 425 seconds, if serialization/callback overhead is
 material, or if the boundary requires exposing most DB internals. A clean
 domain boundary is desirable, but not at unlimited implementation and runtime
 cost.
+
+The migration is now stopped for the stronger reason established by the
+compile-once control: the production application/storage unit already measures
+352.9--358.6 seconds, while a separate kernel adds a fourth compiler unit, 391
+duplicate repository-file instances, 11.3 MB to the executable, and a large
+internal ABI without improving the critical path.
 
 ## Required validation
 
@@ -1448,7 +1532,7 @@ zig build \
   -Dproduction-lsm-only=true
 ```
 
-The opt-in Phase 1/2 storage-kernel scaffold adds:
+The closed, opt-in separate-storage diagnostic adds:
 
 ```sh
 zig build \
@@ -1460,8 +1544,9 @@ zig build \
   -Dstorage-kernel-experiment=true
 ```
 
-This option is intentionally off by default until the representative query
-slice meets the go/no-go criteria.
+This option remains off by default. It is retained for the historical owner-ABI
+tests and future diagnostics; production should not enable it without new cold
+measurements that beat the accepted compile-once topology.
 
 Compatibility validation keeps the linked architecture but enables LMDB:
 
@@ -1543,6 +1628,6 @@ This compilation architecture work is complete when:
   executable and C API;
 - standalone is composition rather than another implementation graph;
 - production artifacts contain no LMDB engine;
-- ABI ownership and failure behavior are covered by tests; and
+- public ABI ownership and failure behavior are covered by tests; and
 - the graph gates prevent the broad implementation dependencies from silently
   returning.
