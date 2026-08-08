@@ -15,7 +15,7 @@
 //! Versioned internal ABI for the storage kernel's live DB owner. Keep this
 //! module free of storage and distributed-runtime imports.
 
-pub const abi_version: u32 = 3;
+pub const abi_version: u32 = 4;
 
 pub const BorrowedBytes = extern struct {
     ptr: ?[*]const u8 = null,
@@ -67,6 +67,7 @@ pub const Status = enum(u32) {
     index_not_found = 14,
     identity_read_generation_changed = 15,
     timeout = 16,
+    cancelled = 17,
     internal = 255,
 };
 
@@ -90,6 +91,20 @@ pub const JsonOperationRequest = extern struct {
     _reserved0: u32 = 0,
     table_name: BorrowedBytes = .{},
     request_json: BorrowedBytes = .{},
+};
+
+/// JSON operation with synchronous local execution controls. The cancellation
+/// pointer refers to the caller's atomic boolean for the duration of the call;
+/// it is never retained by the storage owner.
+pub const ControlledJsonOperationRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved0: u32 = 0,
+    table_name: BorrowedBytes = .{},
+    request_json: BorrowedBytes = .{},
+    execution_deadline_ns: u64 = 0,
+    has_execution_deadline: u8 = 0,
+    _reserved1: [7]u8 = @splat(0),
+    cancellation_flag: ?*const anyopaque = null,
 };
 
 pub extern fn antfly_storage_owner_open(
@@ -138,6 +153,24 @@ pub extern fn antfly_storage_owner_text_stats_json(
 pub extern fn antfly_storage_owner_algebraic_partials_json(
     owner: ?*anyopaque,
     request: *const JsonOperationRequest,
+    out_response: *OwnedBytes,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_owner_graph_expand_json(
+    owner: ?*anyopaque,
+    request: *const ControlledJsonOperationRequest,
+    out_response: *OwnedBytes,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_owner_graph_hydrate_json(
+    owner: ?*anyopaque,
+    request: *const ControlledJsonOperationRequest,
+    out_response: *OwnedBytes,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_owner_graph_edges_json(
+    owner: ?*anyopaque,
+    request: *const ControlledJsonOperationRequest,
     out_response: *OwnedBytes,
 ) callconv(.c) Status;
 

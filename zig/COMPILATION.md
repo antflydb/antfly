@@ -646,6 +646,73 @@ Only after the legacy provisioned physical path becomes compile-time
 unreachable should the experiment pay the cost of the next clean ARM64 Linux
 musl `ReleaseFast` time/RSS/graph/artifact comparison.
 
+### Phase 2j graph-operation owner slice
+
+All three group-local graph operations now execute against the same resident
+opaque owner. Expand carries one frontier batch and returns all local
+expansions; hydrate carries one key batch and returns the complete hit and
+incoming-edge vectors; and edge lookup carries one validated tensor access
+path/program and returns the complete edge list. The boundary reuses the
+canonical internal graph JSON contracts, so it does not cross per frontier
+node, edge, posting, or document.
+
+Distributed control still validates the topology epoch, performs HA and Raft
+read admission, selects groups, schedules fanout, authorizes cross-table
+hydration, and combines traversal state. Before invoking the owner it clears
+the already-validated topology epoch. The kernel validates identity generation
+and resolved-filter context, performs the local graph/index and document reads,
+and encodes the local result. Expand, hydrate, and edge lookup all lease the
+same owner as the existing batch/query/read operations; none opens a competing
+DB.
+
+The internal owner ABI is now version 4. Its controlled JSON request carries an
+absolute monotonic deadline and a synchronous borrowed cancellation flag. The
+deadline is established before admission and is not reset while crossing the
+compiled boundary; the cancellation pointer is never retained. Exact
+`Cancelled` and `Timeout` outcomes therefore survive the ABI rather than being
+collapsed into a generic failure.
+
+Seeding the cross-archive graph regression exposed two pre-existing wire gaps:
+
+- the canonical internal batch encoder rejected graph mutations even though
+  the owner batch operation is intended to represent the complete local batch;
+  internal `_graph_writes` and `_graph_deletes` now round-trip owned edge
+  fields while the public batch parser rejects those internal fields; and
+- graph expansion JSON omitted null optional path fields, but the typed decoder
+  treated them as required. Those fields now default to null, matching the
+  established wire encoder and remote-worker behavior.
+
+Validation at this checkpoint:
+
+- provisioned cross-archive owner suite: 6/6 passed with zero leaks, exercising
+  graph expand, hydrate, edge lookup, graph mutation seeding, and exact live
+  cancellation and expired-deadline errors while retaining one owner;
+- opaque owner ABI suite: 2/2 passed with zero leaks, including all three new
+  invalid-ABI entry points and the stable cancelled status;
+- focused table-read and distributed-graph suite: 25/25 passed with zero
+  leaks, including cross-range graph expansion and remote deadline propagation;
+- current DB compatibility filter: 634 passed, 5 intentionally skipped, 0
+  failed, and 0 leaked, covering graph mutation, index, replay, split/merge,
+  snapshot, restore, and durable-LSM behavior;
+- current provisioned write/lifecycle regression set: 68/68 passed with zero
+  leaks, including the new internal graph-mutation wire round trip;
+- existing public C API suite: 10/10 passed with zero leaks;
+- linked native Debug with production LSM-only options succeeded with normal
+  concurrency;
+- runtime/codegen/API graph gates passed and all 13 analyzer tests passed; and
+- production-LSM native artifacts contained no LMDB globals, internal
+  owner/runtime symbols remained hidden from the shared C API, and public
+  `antfly_db_open` and `antfly_db_close` remained present.
+
+Decision: keep this slice. It removes the last graph-specific live-DB callbacks
+from the path that will attach the compiled owner, but legacy document-artifact
+reads, runtime/status inspection, and writer lifecycle operations still keep
+the old physical implementation reachable. As in the preceding migration
+checkpoints, unchanged reachability means there is no defensible cold-build or
+RSS claim yet. Move those remaining coarse families, make the old provisioned
+physical path compile-time unreachable, and then perform the next clean ARM64
+Linux musl `ReleaseFast` comparison.
+
 ## Holistic target architecture
 
 The preferred end state is a modular monolith with a small number of compiled

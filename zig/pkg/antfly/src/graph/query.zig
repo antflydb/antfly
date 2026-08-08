@@ -125,8 +125,8 @@ pub const GraphResultNode = struct {
     key: []const u8,
     depth: u32,
     distance: f64,
-    path: ?[]const []const u8,
-    path_edges: ?[]const PathEdgeInfo,
+    path: ?[]const []const u8 = null,
+    path_edges: ?[]const PathEdgeInfo = null,
     provenance: ?[]const []const u8 = null,
     /// Table the node's document lives in, when an edge reaching it declared a
     /// cross-table endpoint (`target_table` in its metadata). Null means the

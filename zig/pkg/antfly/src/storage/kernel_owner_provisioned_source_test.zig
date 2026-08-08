@@ -16,6 +16,7 @@ const std = @import("std");
 const abi = @import("kernel_owner_abi");
 const kernel_owner_source = @import("../api/kernel_owner_source.zig");
 const db_mod = @import("db/mod.zig");
+const distributed_graph = @import("../api/distributed_graph.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
@@ -62,7 +63,8 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
                     \\ "alg":{"type":"algebraic","version":1,"table":"articles","schema_version":1,
                     \\        "group_fields":[{"name":"category","path":"category","type":"keyword"}],
                     \\        "measure_fields":[{"name":"amount","path":"amount","type":"number"}],
-                    \\        "materializations":[{"name":"sum_by_category","op":"sum","group_by":["category"],"measure":"amount"}]}}
+                    \\        "materializations":[{"name":"sum_by_category","op":"sum","group_by":["category"],"measure":"amount"}]},
+                    \\ "relations_graph":{"type":"graph","edge_types":[{"name":"mentions"}]}}
                     ,
                 }})[0..]),
                 .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
@@ -124,6 +126,13 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
             .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"category\":\"news\",\"amount\":10,\"_embeddings\":{\"dense_idx\":[1,0,0]}}" },
             .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"category\":\"news\",\"amount\":20,\"_embeddings\":{\"dense_idx\":[0,1,0]}}" },
         },
+        .graph_writes = &.{.{
+            .index_name = "relations_graph",
+            .source = "doc:a",
+            .target = "doc:b",
+            .edge_type = "mentions",
+            .weight = 0.75,
+        }},
         .timestamp_ns = 4242,
         .sync_level = .full_index,
     });
@@ -266,8 +275,90 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
         read_source.source().algebraicPartialsGroupLocal(alloc, 7001, "articles", "{}"),
     );
 
+    var expand_req = distributed_graph.GraphExpandRequest{
+        .name = try alloc.dupe(u8, "mentions"),
+        .index_name = try alloc.dupe(u8, "relations_graph"),
+        .frontier = try alloc.dupe(distributed_graph.GraphFrontierItem, &.{.{
+            .id = 1,
+            .key = try alloc.dupe(u8, "doc:a"),
+        }}),
+        .exclude_nodes = @constCast((&[_]distributed_graph.GraphNodeIdentity{})[0..]),
+        .exclude_edges = @constCast((&[_][]u8{})[0..]),
+        .params = .{ .max_depth = 1, .max_results = 10 },
+    };
+    defer expand_req.deinit(alloc);
+    var expand_response = (try read_source.source().graphExpandGroupLocal(
+        alloc,
+        7001,
+        "articles",
+        expand_req,
+        .read_index,
+    )).?;
+    defer expand_response.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), expand_response.expansions.len);
+    try std.testing.expectEqualStrings("doc:a", expand_response.expansions[0].frontier_key);
+    try std.testing.expect(expand_response.expansions[0].graph_result.nodes.len > 0);
+
+    var hydrate_req = distributed_graph.GraphHydrateRequest{
+        .keys = try alloc.alloc([]u8, 2),
+        .incoming_index_name = try alloc.dupe(u8, "relations_graph"),
+        .incoming_index_name_owned = true,
+    };
+    hydrate_req.keys[0] = try alloc.dupe(u8, "doc:a");
+    hydrate_req.keys[1] = try alloc.dupe(u8, "doc:b");
+    defer hydrate_req.deinit(alloc);
+    var hydrate_response = (try read_source.source().graphHydrateGroupLocal(
+        alloc,
+        7001,
+        "articles",
+        hydrate_req,
+        .read_index,
+    )).?;
+    defer hydrate_response.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), hydrate_response.hits.len);
+    try std.testing.expectEqualSlices(bool, &.{ false, true }, hydrate_response.has_incoming);
+
+    const graph_path = db_mod.algebraic.ir.graphEdgeAccessPath("relations_graph");
+    var edges_req = distributed_graph.GraphEdgesRequest{
+        .index_name = try alloc.dupe(u8, "relations_graph"),
+        .key = try alloc.dupe(u8, "doc:a"),
+        .direction = .out,
+        .tensor_access_path = .{
+            .owner = try alloc.dupe(u8, graph_path.owner),
+            .layout = graph_path.layout,
+            .fragments = try alloc.dupe(db_mod.algebraic.ir.TensorFragment, graph_path.fragments),
+            .output_dims = try alloc.dupe(db_mod.algebraic.ir.Dimension, graph_path.output_dims),
+            .law_ids = try alloc.dupe(db_mod.algebraic.law.Id, graph_path.law_ids),
+        },
+        .tensor_program = try distributed_graph.graphEdgesTensorProgramEnvelopeAlloc(alloc, "relations_graph"),
+    };
+    defer edges_req.deinit(alloc);
+    var edges_response = (try read_source.source().graphEdgesGroupLocal(
+        alloc,
+        7001,
+        "articles",
+        edges_req,
+        .read_index,
+    )).?;
+    defer edges_response.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), edges_response.edges.len);
+    try std.testing.expectEqualStrings("doc:b", edges_response.edges[0].target);
+
+    var cancellation = std.atomic.Value(bool).init(true);
+    edges_req.cancellation = &cancellation;
+    try std.testing.expectError(
+        error.Cancelled,
+        read_source.source().graphEdgesGroupLocal(alloc, 7001, "articles", edges_req, .read_index),
+    );
+    cancellation.store(false, .release);
+    edges_req.execution_deadline_ns = 1;
+    try std.testing.expectError(
+        error.Timeout,
+        read_source.source().graphEdgesGroupLocal(alloc, 7001, "articles", edges_req, .read_index),
+    );
+
     try std.testing.expectEqual(@as(usize, 1), owner_source.ownerCountForTest());
-    try std.testing.expectEqual(@as(usize, 6), lease_capture.count);
+    try std.testing.expectEqual(@as(usize, 11), lease_capture.count);
     try std.testing.expectEqual(@as(u64, 7001), lease_capture.last_group_id);
 
     const group_path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root});

@@ -24,6 +24,7 @@ const db_types = @import("../storage/db/types.zig");
 const runtime_preflight = @import("../storage/db/runtime_preflight.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
+const distributed_graph = @import("distributed_graph.zig");
 const query_response = @import("query_response.zig");
 const read_gate = @import("../raft/read_gate.zig");
 const feature_reads = @import("../raft/feature_reads.zig");
@@ -149,6 +150,9 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .search_result_group_local = searchResultGroupLocal,
                 .text_stats_group_local = textStatsGroupLocal,
                 .algebraic_partials_group_local = algebraicPartialsGroupLocal,
+                .graph_expand_group_local = graphExpandGroupLocal,
+                .graph_hydrate_group_local = graphHydrateGroupLocal,
+                .graph_edges_group_local = graphEdgesGroupLocal,
             },
         };
     }
@@ -314,6 +318,20 @@ pub const ProvisionedKernelOwnerSource = struct {
                 return try reads.prepareScanWithConsistency(group_id, from_key, to_key, opts, .stale),
             else => return err,
         };
+    }
+
+    fn prepareGraphExpandRead(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        req: distributed_graph.GraphExpandRequest,
+        consistency: read_gate.ReadConsistency,
+    ) !void {
+        for (req.frontier) |item| {
+            const search_req = try distributed_graph.frontierItemToSearchRequest(alloc, req, item);
+            defer distributed_graph.freeExpandSearchRequest(alloc, search_req);
+            try self.prepareQueryRead(group_id, search_req, consistency);
+        }
     }
 
     fn executeQuery(
@@ -488,6 +506,90 @@ pub const ProvisionedKernelOwnerSource = struct {
         var response = try lease.owner().algebraicPartialsJson(table_name, body);
         defer response.deinit();
         return .{ .json = try alloc.dupe(u8, response.bytes()) };
+    }
+
+    fn graphExpandGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: distributed_graph.GraphExpandRequest,
+        consistency: read_gate.ReadConsistency,
+    ) !?distributed_graph.GraphExpandResponse {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        try table_catalog.validateTopologyEpoch(alloc, self.catalog, table_name, req.topology_epoch);
+        var controlled = req;
+        controlled.topology_epoch = 0;
+        controlled.execution_deadline_ns = req.execution_deadline_ns orelse distributed_graph.executionDeadlineFromTimeoutMs(req.timeout_ms);
+        try self.prepareGraphExpandRead(alloc, group_id, controlled, consistency);
+        const request_json = try distributed_graph.encodeGraphExpandRequest(alloc, controlled);
+        defer alloc.free(request_json);
+        var lease = try self.acquire(group_id, table_name);
+        defer lease.deinit();
+        var response = try lease.owner().graphExpandJson(
+            table_name,
+            request_json,
+            controlled.execution_deadline_ns,
+            if (req.cancellation) |flag| @ptrCast(flag) else null,
+        );
+        defer response.deinit();
+        return try distributed_graph.parseGraphExpandResponse(alloc, response.bytes());
+    }
+
+    fn graphHydrateGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: distributed_graph.GraphHydrateRequest,
+        consistency: read_gate.ReadConsistency,
+    ) !?distributed_graph.GraphHydrateResponse {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        try table_catalog.validateTopologyEpoch(alloc, self.catalog, table_name, req.topology_epoch);
+        var controlled = req;
+        controlled.topology_epoch = 0;
+        controlled.execution_deadline_ns = req.execution_deadline_ns orelse distributed_graph.executionDeadlineFromTimeoutMs(req.timeout_ms);
+        try self.prepareQueryRead(group_id, table_reads.graphHydrateSearchRequest(controlled), consistency);
+        const request_json = try distributed_graph.encodeGraphHydrateRequest(alloc, controlled);
+        defer alloc.free(request_json);
+        var lease = try self.acquire(group_id, table_name);
+        defer lease.deinit();
+        var response = try lease.owner().graphHydrateJson(
+            table_name,
+            request_json,
+            controlled.execution_deadline_ns,
+            if (req.cancellation) |flag| @ptrCast(flag) else null,
+        );
+        defer response.deinit();
+        return try distributed_graph.parseGraphHydrateResponse(alloc, response.bytes());
+    }
+
+    fn graphEdgesGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: distributed_graph.GraphEdgesRequest,
+        consistency: read_gate.ReadConsistency,
+    ) !?distributed_graph.GraphEdgesResponse {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        try table_catalog.validateTopologyEpoch(alloc, self.catalog, table_name, req.topology_epoch);
+        var controlled = req;
+        controlled.topology_epoch = 0;
+        controlled.execution_deadline_ns = req.execution_deadline_ns orelse distributed_graph.executionDeadlineFromTimeoutMs(req.timeout_ms);
+        try self.prepareLookupRead(group_id, req.key, .{}, consistency);
+        const request_json = try distributed_graph.encodeGraphEdgesRequest(alloc, controlled);
+        defer alloc.free(request_json);
+        var lease = try self.acquire(group_id, table_name);
+        defer lease.deinit();
+        var response = try lease.owner().graphEdgesJson(
+            table_name,
+            request_json,
+            controlled.execution_deadline_ns,
+            if (req.cancellation) |flag| @ptrCast(flag) else null,
+        );
+        defer response.deinit();
+        return try distributed_graph.parseGraphEdgesResponse(alloc, response.bytes());
     }
 
     fn queryGroupLocal(

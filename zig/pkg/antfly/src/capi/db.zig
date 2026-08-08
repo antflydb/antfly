@@ -37,6 +37,7 @@ const portable_backup = antfly.portable_backup;
 const batch_api = antfly.public_api.batch;
 const query_api = antfly.public_api.query;
 const table_reads_api = antfly.public_api.table_reads;
+const distributed_graph = antfly.public_api.distributed_graph;
 const Allocator = std.mem.Allocator;
 
 const lite_abi_version: u32 = 1;
@@ -1666,7 +1667,11 @@ fn storageOwnerOperationTableName(
     handle: *const Handle,
     request: *const kernel_owner_abi.JsonOperationRequest,
 ) ?[]const u8 {
-    const requested = request.table_name.slice();
+    return storageOwnerTableName(handle, request.table_name);
+}
+
+fn storageOwnerTableName(handle: *const Handle, table_name: kernel_owner_abi.BorrowedBytes) ?[]const u8 {
+    const requested = table_name.slice();
     const owned = handle.storage_owner_table_name orelse return null;
     if (!std.mem.eql(u8, requested, owned)) return null;
     return requested;
@@ -1880,6 +1885,75 @@ pub fn storageOwnerAlgebraicPartialsJson(
     return .ok;
 }
 
+fn applyStorageOwnerGraphControls(
+    request: *const kernel_owner_abi.ControlledJsonOperationRequest,
+    graph_request: anytype,
+) void {
+    graph_request.execution_deadline_ns = if (request.has_execution_deadline != 0) request.execution_deadline_ns else null;
+    graph_request.timeout_ms = null;
+    graph_request.cancellation = if (request.cancellation_flag) |flag|
+        @ptrCast(@alignCast(flag))
+    else
+        null;
+}
+
+pub fn storageOwnerGraphExpandJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.ControlledJsonOperationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    const table_name = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    var parsed = distributed_graph.parseGraphExpandRequest(handle.alloc, request.request_json.slice()) catch return .invalid_query;
+    defer parsed.deinit(handle.alloc);
+    applyStorageOwnerGraphControls(request, &parsed);
+    var result = table_reads_api.executeStorageKernelGraphExpand(handle.alloc, &handle.db, table_name, parsed) catch |err| return storageOwnerStatusFromError(err);
+    defer result.deinit(handle.alloc);
+    const response = distributed_graph.encodeGraphExpandResponse(handle.alloc, result) catch |err| return storageOwnerStatusFromError(err);
+    out_response.* = .{ .ptr = response.ptr, .len = @intCast(response.len) };
+    return .ok;
+}
+
+pub fn storageOwnerGraphHydrateJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.ControlledJsonOperationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    var parsed = distributed_graph.parseGraphHydrateRequest(handle.alloc, request.request_json.slice()) catch return .invalid_query;
+    defer parsed.deinit(handle.alloc);
+    applyStorageOwnerGraphControls(request, &parsed);
+    var result = table_reads_api.executeStorageKernelGraphHydrate(handle.alloc, &handle.db, parsed) catch |err| return storageOwnerStatusFromError(err);
+    defer result.deinit(handle.alloc);
+    const response = distributed_graph.encodeGraphHydrateResponse(handle.alloc, result) catch |err| return storageOwnerStatusFromError(err);
+    out_response.* = .{ .ptr = response.ptr, .len = @intCast(response.len) };
+    return .ok;
+}
+
+pub fn storageOwnerGraphEdgesJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.ControlledJsonOperationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    var parsed = distributed_graph.parseGraphEdgesRequest(handle.alloc, request.request_json.slice()) catch return .invalid_query;
+    defer parsed.deinit(handle.alloc);
+    applyStorageOwnerGraphControls(request, &parsed);
+    var result = table_reads_api.executeStorageKernelGraphEdges(handle.alloc, &handle.db, parsed) catch |err| return storageOwnerStatusFromError(err);
+    defer result.deinit(handle.alloc);
+    const response = distributed_graph.encodeGraphEdgesResponse(handle.alloc, result) catch |err| return storageOwnerStatusFromError(err);
+    out_response.* = .{ .ptr = response.ptr, .len = @intCast(response.len) };
+    return .ok;
+}
+
 pub fn storageOwnerBufferDestroy(buffer: *kernel_owner_abi.OwnedBytes) callconv(.c) void {
     antfly_db_buffer_free(buffer.ptr, @intCast(buffer.len));
     buffer.* = .{};
@@ -1915,6 +1989,7 @@ fn storageOwnerStatusFromError(err: anyerror) kernel_owner_abi.Status {
         error.IndexNotFound => .index_not_found,
         error.IdentityReadGenerationChanged => .identity_read_generation_changed,
         error.Timeout => .timeout,
+        error.Cancelled => .cancelled,
         else => .internal,
     };
 }

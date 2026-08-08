@@ -27,6 +27,8 @@ pub const OwnedBatchRequest = struct {
     writes: []db_mod.types.BatchWrite = &.{},
     deletes: [][]const u8 = &.{},
     transforms: []db_mod.types.DocumentTransform = &.{},
+    graph_writes: []db_mod.types.GraphEdgeWrite = &.{},
+    graph_deletes: []db_mod.types.GraphEdgeDelete = &.{},
     split_checkpoint_range_start: ?[]u8 = null,
     split_checkpoint_range_end: ?[]u8 = null,
     split_transition_key: ?[]u8 = null,
@@ -49,6 +51,8 @@ pub const OwnedBatchRequest = struct {
             if (transform.operations.len > 0) alloc.free(transform.operations);
         }
         if (self.transforms.len > 0) alloc.free(self.transforms);
+        freeGraphWrites(alloc, self.graph_writes);
+        freeGraphDeletes(alloc, self.graph_deletes);
         if (self.split_checkpoint_range_start) |value| alloc.free(value);
         if (self.split_checkpoint_range_end) |value| alloc.free(value);
         if (self.split_transition_key) |value| alloc.free(value);
@@ -126,6 +130,26 @@ fn parseBatchRequestWithOptions(
         break :transforms &.{};
     };
     errdefer freeTransforms(alloc, transforms);
+
+    const graph_writes: []db_mod.types.GraphEdgeWrite = graph_writes: {
+        const value = root.get("_graph_writes") orelse break :graph_writes &.{};
+        if (!allow_internal) return error.InvalidBatchRequest;
+        if (value == .null) break :graph_writes &.{};
+        const parsed_graph_writes = try parseGraphWrites(alloc, value);
+        errdefer freeGraphWrites(alloc, parsed_graph_writes);
+        break :graph_writes parsed_graph_writes;
+    };
+    errdefer freeGraphWrites(alloc, graph_writes);
+
+    const graph_deletes: []db_mod.types.GraphEdgeDelete = graph_deletes: {
+        const value = root.get("_graph_deletes") orelse break :graph_deletes &.{};
+        if (!allow_internal) return error.InvalidBatchRequest;
+        if (value == .null) break :graph_deletes &.{};
+        const parsed_graph_deletes = try parseGraphDeletes(alloc, value);
+        errdefer freeGraphDeletes(alloc, parsed_graph_deletes);
+        break :graph_deletes parsed_graph_deletes;
+    };
+    errdefer freeGraphDeletes(alloc, graph_deletes);
 
     const sync_level = sync_level: {
         if (root.get("sync_level")) |sync_level_value| {
@@ -267,12 +291,14 @@ fn parseBatchRequestWithOptions(
 
     if (split_transition != null and
         (writes.len != 0 or deletes.len != 0 or transforms.len != 0 or
+            graph_writes.len != 0 or graph_deletes.len != 0 or
             split_checkpoint != null or split_replication != null))
     {
         return error.InvalidBatchRequest;
     }
     if (split_checkpoint != null and split_checkpoint.?.kind == .source_ack and
         (writes.len != 0 or deletes.len != 0 or transforms.len != 0 or
+            graph_writes.len != 0 or graph_deletes.len != 0 or
             split_replication != null))
     {
         return error.InvalidBatchRequest;
@@ -282,6 +308,8 @@ fn parseBatchRequestWithOptions(
         .writes = writes,
         .deletes = deletes,
         .transforms = transforms,
+        .graph_writes = graph_writes,
+        .graph_deletes = graph_deletes,
         .split_checkpoint_range_start = checkpoint_start,
         .split_checkpoint_range_end = checkpoint_end,
         .split_transition_key = transition_key,
@@ -289,6 +317,8 @@ fn parseBatchRequestWithOptions(
             .writes = writes,
             .deletes = deletes,
             .transforms = transforms,
+            .graph_writes = graph_writes,
+            .graph_deletes = graph_deletes,
             .timestamp_ns = timestamp_ns,
             .sync_level = sync_level,
             .split_checkpoint = split_checkpoint,
@@ -307,11 +337,12 @@ pub fn encodeBatchResponse(alloc: std.mem.Allocator, result: BatchResult) ![]u8 
 }
 
 pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchRequest) ![]u8 {
-    if (req.graph_writes.len > 0 or req.graph_deletes.len > 0 or req.predicates.len > 0) {
+    if (req.predicates.len > 0) {
         return error.UnsupportedBatchRequestEncoding;
     }
     if (req.split_transition != null and
         (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or
+            req.graph_writes.len != 0 or req.graph_deletes.len != 0 or
             req.split_checkpoint != null or req.split_replication != null))
     {
         return error.InvalidBatchRequest;
@@ -362,6 +393,36 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
             try writer.writeByte('}');
         }
         try writer.writeAll("]");
+    }
+    if (req.graph_writes.len > 0) {
+        try writer.writeAll(",\"_graph_writes\":[");
+        for (req.graph_writes, 0..) |write, i| {
+            if (i != 0) try writer.writeByte(',');
+            try writer.print("{{\"index_name\":{f},\"source\":{f},\"target\":{f},\"edge_type\":{f},\"weight\":{d},\"created_at\":\"{d}\",\"updated_at\":\"{d}\",\"metadata_json\":{f}}}", .{
+                std.json.fmt(write.index_name, .{}),
+                std.json.fmt(write.source, .{}),
+                std.json.fmt(write.target, .{}),
+                std.json.fmt(write.edge_type, .{}),
+                write.weight,
+                write.created_at,
+                write.updated_at,
+                std.json.fmt(write.metadata_json, .{}),
+            });
+        }
+        try writer.writeByte(']');
+    }
+    if (req.graph_deletes.len > 0) {
+        try writer.writeAll(",\"_graph_deletes\":[");
+        for (req.graph_deletes, 0..) |delete, i| {
+            if (i != 0) try writer.writeByte(',');
+            try writer.print("{{\"index_name\":{f},\"source\":{f},\"target\":{f},\"edge_type\":{f}}}", .{
+                std.json.fmt(delete.index_name, .{}),
+                std.json.fmt(delete.source, .{}),
+                std.json.fmt(delete.target, .{}),
+                std.json.fmt(delete.edge_type, .{}),
+            });
+        }
+        try writer.writeByte(']');
     }
     if (req.split_checkpoint) |checkpoint| {
         try writer.print(",\"_split_checkpoint\":{{\"kind\":{f},\"transition_id\":\"{d}\",\"attempt_epoch\":\"{d}\",\"source_group_id\":\"{d}\",\"destination_group_id\":\"{d}\",\"range_start\":{f},\"range_end\":{f},\"delta_sequence\":\"{d}\"}}", .{
@@ -466,6 +527,95 @@ fn parseDeletes(alloc: std.mem.Allocator, value: std.json.Value) ![][]const u8 {
     for (values) |item| {
         if (item != .string) return error.InvalidBatchRequest;
         deletes[initialized] = try alloc.dupe(u8, item.string);
+        initialized += 1;
+    }
+    return deletes;
+}
+
+fn requiredObjectString(object: std.json.ObjectMap, name: []const u8) ![]const u8 {
+    const value = object.get(name) orelse return error.InvalidBatchRequest;
+    if (value != .string) return error.InvalidBatchRequest;
+    return value.string;
+}
+
+fn optionalObjectU64(object: std.json.ObjectMap, name: []const u8) !u64 {
+    const value = object.get(name) orelse return 0;
+    return try parseInternalU64(value);
+}
+
+fn optionalObjectF64(object: std.json.ObjectMap, name: []const u8, default: f64) !f64 {
+    const value = object.get(name) orelse return default;
+    return switch (value) {
+        .integer => |number| @floatFromInt(number),
+        .float => |number| number,
+        .number_string, .string => |text| std.fmt.parseFloat(f64, text) catch error.InvalidBatchRequest,
+        else => error.InvalidBatchRequest,
+    };
+}
+
+fn parseGraphWrites(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod.types.GraphEdgeWrite {
+    if (value != .array) return error.InvalidBatchRequest;
+    const writes = try alloc.alloc(db_mod.types.GraphEdgeWrite, value.array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        freeGraphWriteElements(alloc, writes[0..initialized]);
+        alloc.free(writes);
+    }
+    for (value.array.items, 0..) |item, i| {
+        if (item != .object) return error.InvalidBatchRequest;
+        const metadata_json = if (item.object.get("metadata_json")) |metadata| blk: {
+            if (metadata != .string) return error.InvalidBatchRequest;
+            break :blk metadata.string;
+        } else "";
+        const index_name = try alloc.dupe(u8, try requiredObjectString(item.object, "index_name"));
+        errdefer alloc.free(index_name);
+        const source = try alloc.dupe(u8, try requiredObjectString(item.object, "source"));
+        errdefer alloc.free(source);
+        const target = try alloc.dupe(u8, try requiredObjectString(item.object, "target"));
+        errdefer alloc.free(target);
+        const edge_type = try alloc.dupe(u8, try requiredObjectString(item.object, "edge_type"));
+        errdefer alloc.free(edge_type);
+        const owned_metadata_json = try alloc.dupe(u8, metadata_json);
+        errdefer alloc.free(owned_metadata_json);
+        writes[i] = .{
+            .index_name = index_name,
+            .source = source,
+            .target = target,
+            .edge_type = edge_type,
+            .weight = try optionalObjectF64(item.object, "weight", 1.0),
+            .created_at = try optionalObjectU64(item.object, "created_at"),
+            .updated_at = try optionalObjectU64(item.object, "updated_at"),
+            .metadata_json = owned_metadata_json,
+        };
+        initialized += 1;
+    }
+    return writes;
+}
+
+fn parseGraphDeletes(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod.types.GraphEdgeDelete {
+    if (value != .array) return error.InvalidBatchRequest;
+    const deletes = try alloc.alloc(db_mod.types.GraphEdgeDelete, value.array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        freeGraphDeleteElements(alloc, deletes[0..initialized]);
+        alloc.free(deletes);
+    }
+    for (value.array.items, 0..) |item, i| {
+        if (item != .object) return error.InvalidBatchRequest;
+        const index_name = try alloc.dupe(u8, try requiredObjectString(item.object, "index_name"));
+        errdefer alloc.free(index_name);
+        const source = try alloc.dupe(u8, try requiredObjectString(item.object, "source"));
+        errdefer alloc.free(source);
+        const target = try alloc.dupe(u8, try requiredObjectString(item.object, "target"));
+        errdefer alloc.free(target);
+        const edge_type = try alloc.dupe(u8, try requiredObjectString(item.object, "edge_type"));
+        errdefer alloc.free(edge_type);
+        deletes[i] = .{
+            .index_name = index_name,
+            .source = source,
+            .target = target,
+            .edge_type = edge_type,
+        };
         initialized += 1;
     }
     return deletes;
@@ -584,6 +734,35 @@ fn freeTransforms(alloc: std.mem.Allocator, transforms: []db_mod.types.DocumentT
     }
 }
 
+fn freeGraphWrites(alloc: std.mem.Allocator, writes: []db_mod.types.GraphEdgeWrite) void {
+    freeGraphWriteElements(alloc, writes);
+    if (writes.len > 0) alloc.free(writes);
+}
+
+fn freeGraphWriteElements(alloc: std.mem.Allocator, writes: []db_mod.types.GraphEdgeWrite) void {
+    for (writes) |write| {
+        alloc.free(@constCast(write.index_name));
+        alloc.free(@constCast(write.source));
+        alloc.free(@constCast(write.target));
+        alloc.free(@constCast(write.edge_type));
+        alloc.free(@constCast(write.metadata_json));
+    }
+}
+
+fn freeGraphDeletes(alloc: std.mem.Allocator, deletes: []db_mod.types.GraphEdgeDelete) void {
+    freeGraphDeleteElements(alloc, deletes);
+    if (deletes.len > 0) alloc.free(deletes);
+}
+
+fn freeGraphDeleteElements(alloc: std.mem.Allocator, deletes: []db_mod.types.GraphEdgeDelete) void {
+    for (deletes) |delete| {
+        alloc.free(@constCast(delete.index_name));
+        alloc.free(@constCast(delete.source));
+        alloc.free(@constCast(delete.target));
+        alloc.free(@constCast(delete.edge_type));
+    }
+}
+
 fn freeTransformOps(alloc: std.mem.Allocator, ops: []const db_mod.types.TransformOp) void {
     freeTransformOpElements(alloc, ops);
     if (ops.len > 0) alloc.free(@constCast(ops));
@@ -634,6 +813,42 @@ test "internal batch parser owns and round trips split checkpoint" {
     var reparsed = try parseInternalBatchRequest(std.testing.allocator, encoded);
     defer reparsed.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u64, 7), reparsed.req.split_checkpoint.?.delta_sequence);
+}
+
+test "internal batch parser owns and round trips graph mutations" {
+    const alloc = std.testing.allocator;
+    const request: db_mod.types.BatchRequest = .{
+        .graph_writes = &.{.{
+            .index_name = "relations_graph",
+            .source = "doc:a",
+            .target = "doc:b",
+            .edge_type = "mentions",
+            .weight = 0.75,
+            .created_at = 11,
+            .updated_at = 12,
+            .metadata_json = "{\"target_table\":\"entities\"}",
+        }},
+        .graph_deletes = &.{.{
+            .index_name = "relations_graph",
+            .source = "doc:c",
+            .target = "doc:d",
+            .edge_type = "mentions",
+        }},
+    };
+    const encoded = try encodeBatchRequest(alloc, request);
+    defer alloc.free(encoded);
+    try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, encoded));
+
+    var parsed = try parseInternalBatchRequest(alloc, encoded);
+    defer parsed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), parsed.req.graph_writes.len);
+    try std.testing.expectEqualStrings("relations_graph", parsed.req.graph_writes[0].index_name);
+    try std.testing.expectEqualStrings("doc:b", parsed.req.graph_writes[0].target);
+    try std.testing.expectEqual(@as(f64, 0.75), parsed.req.graph_writes[0].weight);
+    try std.testing.expectEqual(@as(u64, 11), parsed.req.graph_writes[0].created_at);
+    try std.testing.expectEqualStrings("{\"target_table\":\"entities\"}", parsed.req.graph_writes[0].metadata_json);
+    try std.testing.expectEqual(@as(usize, 1), parsed.req.graph_deletes.len);
+    try std.testing.expectEqualStrings("doc:d", parsed.req.graph_deletes[0].target);
 }
 
 test "internal batch parser requires source acknowledgements to be metadata-only" {

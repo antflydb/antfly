@@ -5309,7 +5309,7 @@ fn validateGraphHydrateResolvedDocFilterForDb(req: distributed_graph.GraphHydrat
     if (generation != ctx.identity_read_generation) return error.IdentityReadGenerationChanged;
 }
 
-fn graphHydrateSearchRequest(req: distributed_graph.GraphHydrateRequest) db_mod.types.SearchRequest {
+pub fn graphHydrateSearchRequest(req: distributed_graph.GraphHydrateRequest) db_mod.types.SearchRequest {
     return .{
         .query = .{ .match_all = {} },
         .filter_query_json = req.filter_query_json,
@@ -5318,9 +5318,99 @@ fn graphHydrateSearchRequest(req: distributed_graph.GraphHydrateRequest) db_mod.
         .resolved_doc_filter = req.resolved_doc_filter,
         .resolved_doc_filter_wire_context = req.resolved_doc_filter_wire_context,
         .identity_read_generation = req.identity_read_generation,
-        .execution_deadline_ns = distributed_graph.executionDeadlineFromTimeoutMs(req.timeout_ms),
+        .execution_deadline_ns = req.execution_deadline_ns orelse distributed_graph.executionDeadlineFromTimeoutMs(req.timeout_ms),
         .cancellation = req.cancellation,
     };
+}
+
+pub fn executeStorageKernelGraphExpand(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    table_name: []const u8,
+    req: distributed_graph.GraphExpandRequest,
+) !distributed_graph.GraphExpandResponse {
+    if (req.topology_epoch != 0) return error.InvalidArgument;
+    const expansions = try alloc.alloc(distributed_graph.GraphExpansion, req.frontier.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (expansions[0..initialized]) |*expansion| expansion.deinit(alloc);
+        alloc.free(expansions);
+    }
+    for (req.frontier, 0..) |item, i| {
+        const frontier_key = try alloc.dupe(u8, item.key);
+        errdefer alloc.free(frontier_key);
+        const search_req = try distributed_graph.frontierItemToSearchRequest(alloc, req, item);
+        defer distributed_graph.freeExpandSearchRequest(alloc, search_req);
+        var result = try db.search(alloc, search_req);
+        defer result.deinit();
+        var graph_result = if (result.graph_results.len > 0)
+            try distributed_graph.filterGraphSearchResult(alloc, table_name, result.graph_results[0], req.exclude_nodes, req.exclude_edges)
+        else
+            try distributed_graph.emptyGraphSearchResult(alloc, req.name);
+        errdefer graph_result.deinit(alloc);
+        for (graph_result.hits) |*hit| hit.deinit(alloc);
+        if (graph_result.hits.len > 0) alloc.free(graph_result.hits);
+        graph_result.hits = @constCast((&[_]db_mod.types.SearchHit{})[0..]);
+        try checkQueryDeadline(search_req);
+        expansions[i] = .{
+            .frontier_id = item.id,
+            .frontier_key = frontier_key,
+            .graph_result = graph_result,
+        };
+        initialized += 1;
+    }
+    return .{ .expansions = expansions };
+}
+
+pub fn executeStorageKernelGraphHydrate(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    req: distributed_graph.GraphHydrateRequest,
+) !distributed_graph.GraphHydrateResponse {
+    if (req.topology_epoch != 0) return error.InvalidArgument;
+    try validateGraphHydrateResolvedDocFilterForDb(req, db);
+    const search_req = graphHydrateSearchRequest(req);
+    try checkQueryDeadline(search_req);
+    const hits = if (req.include_hits)
+        try db.graphHydrateKeysForInternalRead(alloc, search_req, req.keys)
+    else
+        @constCast((&[_]db_mod.types.SearchHit{})[0..]);
+    errdefer {
+        for (hits) |*hit| hit.deinit(alloc);
+        if (hits.len > 0) alloc.free(hits);
+    }
+    try checkQueryDeadline(search_req);
+    const has_incoming = if (req.incoming_index_name.len > 0)
+        try db.graphHasIncomingEdgesForInternalRead(alloc, req.incoming_index_name, req.keys)
+    else
+        @constCast((&[_]bool{})[0..]);
+    errdefer if (has_incoming.len > 0) alloc.free(has_incoming);
+    try checkQueryDeadline(search_req);
+    return .{ .hits = hits, .has_incoming = has_incoming };
+}
+
+pub fn executeStorageKernelGraphEdges(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    req: distributed_graph.GraphEdgesRequest,
+) !distributed_graph.GraphEdgesResponse {
+    if (req.topology_epoch != 0) return error.InvalidArgument;
+    const control_req = db_mod.types.SearchRequest{
+        .identity_read_generation = req.identity_read_generation,
+        .execution_deadline_ns = req.execution_deadline_ns orelse distributed_graph.executionDeadlineFromTimeoutMs(req.timeout_ms),
+        .cancellation = req.cancellation,
+    };
+    try checkQueryDeadline(control_req);
+    try distributed_graph.validateGraphEdgesTensorAccessPath(alloc, req);
+    _ = try currentIdentityReadGenerationForDb(req.identity_read_generation, db);
+    const graph_entry = db.core.graphIndex(req.index_name) orelse return error.IndexNotFound;
+    const edges = try graph_entry.index.getEdges(alloc, req.key, "", req.direction);
+    errdefer {
+        for (edges) |edge| graph_mod.GraphIndex.freeEdge(alloc, edge);
+        if (edges.len > 0) alloc.free(edges);
+    }
+    try checkQueryDeadline(control_req);
+    return .{ .edges = edges };
 }
 
 fn graphHydrateOnOpenDb(
