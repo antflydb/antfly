@@ -12392,11 +12392,13 @@ test "metal runtime source narrowly gates the small-row split GQA route" {
     defer std.testing.allocator.free(host_source);
 
     // Stage 1 maps query rows x KV heads x context splits and shares each KV
-    // tile across the four query heads in the group.
+    // tile across the four E4B or eight E2B query heads in the group.
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "kernel void termite_paged_attention_kv_decode_gqa_split_stage("));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "kernel void termite_paged_attention_kv_decode_gqa_split_reduce("));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "const uint qi = tg.x; const uint kv_h = tg.y; const uint split = tg.z;"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "const uint query_pos = p.query_position_offset + qi;"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "(p.num_kv_heads != 1u && p.num_kv_heads != 2u)"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "const uint heads_per_group = p.num_heads / p.num_kv_heads;"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "for (uint kc = split * schedule.key_chunk; kc < p.kv_tokens; kc += split_count * schedule.key_chunk)"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "sS[j] = sS[j] * corr + row_sum"));
 
@@ -12449,9 +12451,9 @@ test "metal runtime source narrowly gates the small-row split GQA route" {
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "options:MTLResourceStorageModePrivate"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "scratch_runtime->submitted_frame_cb != nil"));
 
-    // Gemma4 E4B's measured route is exact 8Q/2KV f16 KV, q_len 1-2,
-    // HD256 SWA-512 or HD512 global attention.
-    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "num_heads != 8u || num_kv_heads != 2u"));
+    // Gemma4 E2B/E4B's measured routes are exact 8Q with 1KV or 2KV f16 KV,
+    // q_len 1-2, and HD256 SWA-512 or HD512 global attention.
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "num_heads != 8u || (num_kv_heads != 1u && num_kv_heads != 2u)"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "q_len > 2u"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "output_offset % (4u * sizeof(float)) != 0u"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "head_dim == 256u && sliding_window == 512u"));
@@ -12762,7 +12764,9 @@ test "quant kernel compiler production Metal source includes only runtime-wired 
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, contents, "TERMITE_METAL_DISABLE_ANTFLY_Q8_1_SMALL_BATCH"));
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, contents, "TERMITE_METAL_ENABLE_ANTFLY_Q8_K_SMALL_BATCH"));
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, contents, "TERMITE_METAL_DISABLE_ANTFLY_Q8_K_SMALL_BATCH"));
-    try std.testing.expectEqual(@as(usize, 8), std.mem.count(u8, contents, "TERMITE_METAL_ENABLE_ANTFLY_Q4_K_SMALL_BATCH"));
+    // Eight generated wrapper/gate references plus the two fail-closed eager
+    // provider checks that decide whether Q4_K may use the thin default path.
+    try std.testing.expectEqual(@as(usize, 10), std.mem.count(u8, contents, "TERMITE_METAL_ENABLE_ANTFLY_Q4_K_SMALL_BATCH"));
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, contents, "TERMITE_METAL_DISABLE_ANTFLY_Q4_K_SMALL_BATCH"));
     try std.testing.expectEqual(@as(usize, 8), std.mem.count(u8, contents, "TERMITE_METAL_ENABLE_ANTFLY_Q5_K_SMALL_BATCH"));
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, contents, "TERMITE_METAL_DISABLE_ANTFLY_Q5_K_SMALL_BATCH"));

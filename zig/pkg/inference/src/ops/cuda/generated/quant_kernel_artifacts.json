@@ -3585,7 +3585,7 @@
       "op_kind": "attention",
       "kernel_id": "antfly_paged_attention_1x_generated_msl_v1",
       "source_path": "src/ops/metal/generated/attention_decode_1x.metal",
-      "generated_source_fingerprint": 17384568532120412404,
+      "generated_source_fingerprint": 9375339451727833046,
       "check_command": "xcrun --toolchain Metal metal -c src/ops/metal/generated/attention_decode_1x.metal -o /tmp/antfly_paged_attention_1x_generated_msl_v1.air",
       "production_enabled": false,
       "runtime_default_enabled": false,

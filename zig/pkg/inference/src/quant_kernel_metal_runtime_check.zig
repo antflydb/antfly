@@ -1321,12 +1321,14 @@ const split_gqa_policy_kv_boundaries = [_]usize{ 511, 512, 513, 1023, 1024, 2003
 // tighter than the former ad-hoc 5e-2 bound.
 const split_gqa_tensor_tolerance: f32 = 1e-2;
 
-// Production Gemma4 E4B decode geometries. 513 tokens leaves one valid row in
+// Production Gemma4 E2B/E4B decode geometries. 513 tokens leaves one valid row in
 // the final 8-row V tile; reversed pages plus a leading physical-page gap make
 // every masked lane observable when the unused private storage is NaN-poisoned.
 // The 2,003-token global case forces every split-cap candidate to execute
 // repeated 32-token chunks instead of validating only compact-stride plumbing.
 const split_gqa_checks = [_]SplitGqaCheckCase{
+    .{ .name = "decode_gqa_split_e2b_q1_hd256_swa512", .shape = .{ .q_len = 1, .kv_tokens = 513, .num_heads = 8, .num_kv_heads = 1, .head_dim = 256, .query_position_offset = 512, .sliding_window = 512, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } },
+    .{ .name = "decode_gqa_split_e2b_q1_kv2003_hd512_global", .shape = .{ .q_len = 1, .kv_tokens = 2003, .num_heads = 8, .num_kv_heads = 1, .head_dim = 512, .query_position_offset = 2002, .sliding_window = 0, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } },
     .{ .name = "decode_gqa_split_q1_hd256_swa512", .shape = .{ .q_len = 1, .kv_tokens = 513, .num_heads = 8, .num_kv_heads = 2, .head_dim = 256, .query_position_offset = 512, .sliding_window = 512, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } },
     .{ .name = "decode_gqa_split_q2_hd256_swa512", .shape = .{ .q_len = 2, .kv_tokens = 513, .num_heads = 8, .num_kv_heads = 2, .head_dim = 256, .query_position_offset = 511, .sliding_window = 512, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } },
     .{ .name = "decode_gqa_split_q1_hd512_global", .shape = .{ .q_len = 1, .kv_tokens = 513, .num_heads = 8, .num_kv_heads = 2, .head_dim = 512, .query_position_offset = 512, .sliding_window = 0, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } },
@@ -1349,6 +1351,8 @@ const SplitGqaSelectionCheck = struct {
 // Production defaults use split GQA at and above the validated 512-token
 // crossover; the explicit disable flag remains the rollback path.
 const split_gqa_production_selection_checks = [_]SplitGqaSelectionCheck{
+    .{ .check = .{ .name = "decode_gqa_default_e2b_local_kv512", .shape = .{ .q_len = 1, .kv_tokens = 512, .num_heads = 8, .num_kv_heads = 1, .head_dim = 256, .query_position_offset = 511, .sliding_window = 512, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } }, .expect_route = true },
+    .{ .check = .{ .name = "decode_gqa_default_e2b_global_kv2003", .shape = .{ .q_len = 1, .kv_tokens = 2003, .num_heads = 8, .num_kv_heads = 1, .head_dim = 512, .query_position_offset = 2002, .sliding_window = 0, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } }, .expect_route = true },
     .{ .check = .{ .name = "decode_gqa_default_global_kv511", .shape = .{ .q_len = 1, .kv_tokens = 511, .num_heads = 8, .num_kv_heads = 2, .head_dim = 512, .query_position_offset = 510, .sliding_window = 0, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } }, .expect_route = false },
     .{ .check = .{ .name = "decode_gqa_default_global_kv512", .shape = .{ .q_len = 1, .kv_tokens = 512, .num_heads = 8, .num_kv_heads = 2, .head_dim = 512, .query_position_offset = 511, .sliding_window = 0, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } }, .expect_route = true },
     .{ .check = .{ .name = "decode_gqa_default_global_kv513", .shape = .{ .q_len = 2, .kv_tokens = 513, .num_heads = 8, .num_kv_heads = 2, .head_dim = 512, .query_position_offset = 511, .sliding_window = 0, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } }, .expect_route = true },
@@ -1657,47 +1661,49 @@ fn runSplitGqaPolicyProbeChecks() !void {
     for (split_gqa_policy_variants) |requested| {
         for (shapes) |shape| {
             for ([_]usize{ 1, 2 }) |q_len| {
-                for (split_gqa_policy_kv_boundaries) |kv_tokens| {
-                    var resolved: u32 = 99;
-                    var split_count: u32 = 99;
-                    var scratch_bytes: usize = 99;
-                    const rc = termite_metal_decode_gqa_split_policy_probe(
-                        @intFromEnum(requested),
-                        q_len,
-                        kv_tokens,
-                        8,
-                        2,
-                        shape.head_dim,
-                        shape.sliding_window,
-                        &resolved,
-                        &split_count,
-                        &scratch_bytes,
-                    );
-                    if (kv_tokens < 512) {
-                        if (rc != 0 or resolved != @intFromEnum(SplitGqaVariant.auto) or
-                            split_count != 0 or scratch_bytes != 0)
-                        {
-                            std.debug.print(
-                                "split GQA policy unsupported mismatch variant={s} q={d} kv={d} hd={d} rc={d} resolved={d} splits={d} scratch={d}\n",
-                                .{ @tagName(requested), q_len, kv_tokens, shape.head_dim, rc, resolved, split_count, scratch_bytes },
-                            );
-                            return error.GeneratedMetalKernelMismatch;
+                for ([_]usize{ 1, 2 }) |num_kv_heads| {
+                    for (split_gqa_policy_kv_boundaries) |kv_tokens| {
+                        var resolved: u32 = 99;
+                        var split_count: u32 = 99;
+                        var scratch_bytes: usize = 99;
+                        const rc = termite_metal_decode_gqa_split_policy_probe(
+                            @intFromEnum(requested),
+                            q_len,
+                            kv_tokens,
+                            8,
+                            num_kv_heads,
+                            shape.head_dim,
+                            shape.sliding_window,
+                            &resolved,
+                            &split_count,
+                            &scratch_bytes,
+                        );
+                        if (kv_tokens < 512) {
+                            if (rc != 0 or resolved != @intFromEnum(SplitGqaVariant.auto) or
+                                split_count != 0 or scratch_bytes != 0)
+                            {
+                                std.debug.print(
+                                    "split GQA policy unsupported mismatch variant={s} q={d} kv={d} hd={d} rc={d} resolved={d} splits={d} scratch={d}\n",
+                                    .{ @tagName(requested), q_len, kv_tokens, shape.head_dim, rc, resolved, split_count, scratch_bytes },
+                                );
+                                return error.GeneratedMetalKernelMismatch;
+                            }
+                        } else {
+                            const expected_variant = splitGqaResolvedVariant(requested);
+                            const expected_splits: usize = @min(splitGqaVariantCap(requested), (kv_tokens + 31) / 32);
+                            const expected_scratch = q_len * 8 * expected_splits * (shape.head_dim + 2) * @sizeOf(f32);
+                            if (rc != 1 or resolved != @intFromEnum(expected_variant) or
+                                split_count != @as(u32, @intCast(expected_splits)) or scratch_bytes != expected_scratch)
+                            {
+                                std.debug.print(
+                                    "split GQA policy mismatch variant={s} q={d} kv={d} hd={d} rc={d} resolved={d}/{d} splits={d}/{d} scratch={d}/{d}\n",
+                                    .{ @tagName(requested), q_len, kv_tokens, shape.head_dim, rc, resolved, @intFromEnum(expected_variant), split_count, expected_splits, scratch_bytes, expected_scratch },
+                                );
+                                return error.GeneratedMetalKernelMismatch;
+                            }
                         }
-                    } else {
-                        const expected_variant = splitGqaResolvedVariant(requested);
-                        const expected_splits: usize = @min(splitGqaVariantCap(requested), (kv_tokens + 31) / 32);
-                        const expected_scratch = q_len * 8 * expected_splits * (shape.head_dim + 2) * @sizeOf(f32);
-                        if (rc != 1 or resolved != @intFromEnum(expected_variant) or
-                            split_count != @as(u32, @intCast(expected_splits)) or scratch_bytes != expected_scratch)
-                        {
-                            std.debug.print(
-                                "split GQA policy mismatch variant={s} q={d} kv={d} hd={d} rc={d} resolved={d}/{d} splits={d}/{d} scratch={d}/{d}\n",
-                                .{ @tagName(requested), q_len, kv_tokens, shape.head_dim, rc, resolved, @intFromEnum(expected_variant), split_count, expected_splits, scratch_bytes, expected_scratch },
-                            );
-                            return error.GeneratedMetalKernelMismatch;
-                        }
+                        checked += 1;
                     }
-                    checked += 1;
                 }
             }
         }
@@ -1713,7 +1719,7 @@ fn runSplitGqaPolicyProbeChecks() !void {
         .{ .q_len = 0, .num_heads = 8, .num_kv_heads = 2, .head_dim = 512, .sliding_window = 0 },
         .{ .q_len = 3, .num_heads = 8, .num_kv_heads = 2, .head_dim = 512, .sliding_window = 0 },
         .{ .q_len = 1, .num_heads = 16, .num_kv_heads = 2, .head_dim = 512, .sliding_window = 0 },
-        .{ .q_len = 1, .num_heads = 8, .num_kv_heads = 1, .head_dim = 512, .sliding_window = 0 },
+        .{ .q_len = 1, .num_heads = 8, .num_kv_heads = 4, .head_dim = 512, .sliding_window = 0 },
         .{ .q_len = 1, .num_heads = 8, .num_kv_heads = 2, .head_dim = 256, .sliding_window = 0 },
         .{ .q_len = 1, .num_heads = 8, .num_kv_heads = 2, .head_dim = 512, .sliding_window = 512 },
         .{ .q_len = 1, .num_heads = 8, .num_kv_heads = 2, .head_dim = 384, .sliding_window = 0 },
@@ -2382,14 +2388,15 @@ test "quant kernel metal runtime flash prefill checks cover the generated flash 
 }
 
 test "quant kernel metal runtime split GQA checks cover production shapes and poisoned ragged pages" {
-    try std.testing.expectEqual(@as(usize, 5), split_gqa_checks.len);
+    try std.testing.expectEqual(@as(usize, 7), split_gqa_checks.len);
     try std.testing.expectEqual(@as(usize, 4), split_gqa_concrete_variants.len);
     try std.testing.expectEqual(@as(usize, 5), split_gqa_policy_variants.len);
     try std.testing.expectEqual(@as(usize, 9), split_gqa_policy_kv_boundaries.len);
-    try std.testing.expectEqual(@as(usize, 20), split_gqa_concrete_variants.len * split_gqa_checks.len);
-    try std.testing.expectEqual(@as(usize, 180), split_gqa_policy_variants.len * 2 * 2 * split_gqa_policy_kv_boundaries.len);
+    try std.testing.expectEqual(@as(usize, 28), split_gqa_concrete_variants.len * split_gqa_checks.len);
+    try std.testing.expectEqual(@as(usize, 360), split_gqa_policy_variants.len * 2 * 2 * 2 * split_gqa_policy_kv_boundaries.len);
     try std.testing.expect(split_gqa_tensor_tolerance < 5e-2);
     try std.testing.expectEqual(@as(f32, 1e-2), split_gqa_tensor_tolerance);
+    var e2b_count: usize = 0;
     var q1_count: usize = 0;
     var q2_count: usize = 0;
     var hd256_count: usize = 0;
@@ -2406,7 +2413,12 @@ test "quant kernel metal runtime split GQA checks cover production shapes and po
             try std.testing.expectEqual(@as(usize, 513), shape.kv_tokens);
         }
         try std.testing.expectEqual(@as(usize, 8), shape.num_heads);
-        try std.testing.expectEqual(@as(usize, 2), shape.num_kv_heads);
+        if (shape.num_kv_heads == 1) {
+            e2b_count += 1;
+            try std.testing.expectEqual(@as(usize, 1), shape.q_len);
+        } else {
+            try std.testing.expectEqual(@as(usize, 2), shape.num_kv_heads);
+        }
         try std.testing.expectEqual(@as(usize, 16), shape.page_size);
         try std.testing.expect(shape.permuted_pages);
         try std.testing.expectEqual(@as(usize, 1), shape.physical_page_bias);
@@ -2421,15 +2433,27 @@ test "quant kernel metal runtime split GQA checks cover production shapes and po
         } else return error.TestUnexpectedResult;
         try std.testing.expectEqual(shape.kv_tokens - shape.q_len, shape.query_position_offset);
     }
-    try std.testing.expectEqual(@as(usize, 3), q1_count);
+    try std.testing.expectEqual(@as(usize, 2), e2b_count);
+    try std.testing.expectEqual(@as(usize, 5), q1_count);
     try std.testing.expectEqual(@as(usize, 2), q2_count);
-    try std.testing.expectEqual(@as(usize, 2), hd256_count);
-    try std.testing.expectEqual(@as(usize, 3), hd512_count);
-    try std.testing.expectEqual(@as(usize, 1), long_global_count);
+    try std.testing.expectEqual(@as(usize, 3), hd256_count);
+    try std.testing.expectEqual(@as(usize, 4), hd512_count);
+    try std.testing.expectEqual(@as(usize, 2), long_global_count);
 }
 
 test "quant kernel metal runtime split GQA production policy starts at 512 tokens" {
-    try std.testing.expectEqual(@as(usize, 8), split_gqa_production_selection_checks.len);
+    try std.testing.expectEqual(@as(usize, 10), split_gqa_production_selection_checks.len);
+    const e2b_local = split_gqa_production_selection_checks[0];
+    try std.testing.expectEqual(@as(usize, 1), e2b_local.check.shape.num_kv_heads);
+    try std.testing.expectEqual(@as(usize, 256), e2b_local.check.shape.head_dim);
+    try std.testing.expectEqual(@as(usize, 512), e2b_local.check.shape.sliding_window);
+    try std.testing.expect(e2b_local.expect_route);
+    const e2b_global = split_gqa_production_selection_checks[1];
+    try std.testing.expectEqual(@as(usize, 1), e2b_global.check.shape.num_kv_heads);
+    try std.testing.expectEqual(@as(usize, 2003), e2b_global.check.shape.kv_tokens);
+    try std.testing.expectEqual(@as(usize, 512), e2b_global.check.shape.head_dim);
+    try std.testing.expectEqual(@as(usize, 0), e2b_global.check.shape.sliding_window);
+    try std.testing.expect(e2b_global.expect_route);
     const expected_kv = [_]usize{ 511, 512, 513, 4095, 4096, 4097 };
     for (expected_kv) |kv_tokens| {
         var found = false;

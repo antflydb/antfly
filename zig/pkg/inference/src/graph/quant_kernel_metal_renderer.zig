@@ -567,7 +567,7 @@ fn renderPagedAttention1xBody(
     try appendFmt(allocator, out, "    threadgroup_barrier(mem_flags::mem_threadgroup); float local_best = -3.402823466e+38f; for (uint ki = uint(tid); ki < p.kv_tokens; ki += NT) {{ float score = scores[ki]; local_best = score > local_best ? score : local_best; }} partials[tid] = local_best; threadgroup_barrier(mem_flags::mem_threadgroup); for (uint stride = NT >> 1u; stride > 0u; stride >>= 1u) {{ if (uint(tid) < stride) {{ float rhs = partials[tid + stride]; partials[tid] = rhs > partials[tid] ? rhs : partials[tid]; }} threadgroup_barrier(mem_flags::mem_threadgroup); }} float best = partials[0];\n", .{});
     try appendFmt(allocator, out, "    float local_sum = 0.0f; for (uint ki = uint(tid); ki < p.kv_tokens; ki += NT) {{ float score = scores[ki]; float e = (best > -3.0e+38f && score > -3.0e+38f) ? exp(score - best) : 0.0f; e = isfinite(e) ? e : 0.0f; scores[ki] = e; local_sum += e; }} partials[tid] = local_sum; threadgroup_barrier(mem_flags::mem_threadgroup); for (uint stride = NT >> 1u; stride > 0u; stride >>= 1u) {{ if (uint(tid) < stride) partials[tid] += partials[tid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); }} const float inv_sum = partials[0] > 0.0f ? 1.0f / partials[0] : 0.0f;\n", .{});
     try appendFmt(allocator, out, "    for (uint ki = uint(tid); ki < p.kv_tokens; ki += NT) scores[ki] *= inv_sum; threadgroup_barrier(mem_flags::mem_threadgroup);\n", .{});
-    try appendFmt(allocator, out, "    for (uint d = uint(tid); d < p.head_dim; d += NT) {{ const device half *v_col = v_half + kv_head_base + d; float value = 0.0f; for (uint ki = 0u; ki < p.kv_tokens; ++ki) {{ float weight = scores[ki]; if (weight != 0.0f) value += weight * float(v_col[as_type<uint>(phys_tokens[ki]) * p.v_row_stride]); }} output[out_base + d] = value; }}\n", .{});
+    try appendFmt(allocator, out, "    for (uint d = uint(tid); d < p.head_dim; d += NT) {{ const device half *v_col = v_half + kv_head_base + d; float value = 0.0f; for (uint ki = 0u; ki < p.kv_tokens; ++ki) {{ float weight = scores[ki]; value += weight * select(float(v_col[as_type<uint>(phys_tokens[ki]) * p.v_row_stride]), 0.0f, weight == 0.0f); }} output[out_base + d] = value; }}\n", .{});
     try out.appendSlice(allocator, "}\n");
 }
 
@@ -1479,7 +1479,7 @@ test "metal renderer renders the decode-1x paged attention kernel self-contained
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "if (qi >= p.q_len || h >= p.num_heads || p.format != 3u"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "simd_sum(acc) * scale"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "float e = (best > -3.0e+38f && score > -3.0e+38f) ? exp(score - best) : 0.0f"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "if (weight != 0.0f) value += weight * float(v_col[as_type<uint>(phys_tokens[ki]) * p.v_row_stride])"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "value += weight * select(float(v_col[as_type<uint>(phys_tokens[ki]) * p.v_row_stride]), 0.0f, weight == 0.0f)"));
     // NT/NSG parametrized to the schedule (256 threads -> 8 simdgroups).
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "const uint NT = 256u; const uint NW = 32u; const uint NSG = 8u;"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "phys_tokens = shmem + p.kv_tokens + 256u"));

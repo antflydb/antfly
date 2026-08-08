@@ -9748,6 +9748,32 @@ test "metal prepared frame fast path is qualified, diagnosable, and shares lifec
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "snapshot->prepared_frame_fallback_calls = runtime->prepared_frame_fallback_calls"));
 }
 
+test "metal DeBERTa flash4 eligibility dispatches the flash4 pipeline" {
+    const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    defer std.testing.allocator.free(source);
+
+    const function_start = std.mem.indexOf(u8, source, "int termite_metal_decode_runtime_disentangled_relative_attention_f32_device(").?;
+    const function_end = std.mem.indexOfPos(u8, source, function_start, "int termite_metal_decode_runtime_disentangled_relative_attention_backward_f32_device(").?;
+    const function_source = source[function_start..function_end];
+
+    const eligibility = std.mem.indexOf(u8, function_source, "if (flash4_attention_requested &&").?;
+    const dispatch = std.mem.indexOf(u8, function_source, "setComputePipelineState:runtime->disentangled_relative_attention_f32_flash4_pipeline").?;
+    const fallback = std.mem.indexOf(u8, function_source, "if (gemm_attention_requested &&").?;
+    try std.testing.expect(eligibility < dispatch);
+    try std.testing.expect(dispatch < fallback);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, function_source, "runtime->deberta_attention_flash_calls += 1"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, function_source, "dispatchThreadgroups:MTLSizeMake((seq_len + flash_query_block - 1u) / flash_query_block, num_heads, batch)"));
+}
+
+test "metal paged attention masks value rows without divergent branching" {
+    const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    defer std.testing.allocator.free(source);
+
+    const masked_accumulation = "value += weight * select(float(v_col[as_type<uint>(phys_tokens[ki]) * p.v_row_stride]), 0.0f, weight == 0.0f)";
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, source, masked_accumulation));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, source, "if (weight != 0.0f) value += weight"));
+}
+
 test "Metal stage timing preserves the prepared frame topology" {
     const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
     defer std.testing.allocator.free(source);
@@ -9841,37 +9867,39 @@ test "decode GQA split policy keeps AUTO stable and bounds compact schedules" {
     };
     const kv_boundaries = [_]usize{ 511, 512, 513, 1023, 1024, 2003, 4095, 4096, 8191 };
     for (variants) |case| {
-        for (kv_boundaries) |kv_tokens| {
-            var resolved: c_uint = 99;
-            var split_count: c_uint = 99;
-            var scratch_bytes: usize = 99;
-            const rc = termite_metal_decode_gqa_split_policy_probe(
-                @intFromEnum(case.variant),
-                1,
-                kv_tokens,
-                8,
-                2,
-                512,
-                0,
-                &resolved,
-                &split_count,
-                &scratch_bytes,
-            );
-            if (kv_tokens < 512) {
-                try std.testing.expectEqual(@as(c_int, 0), rc);
-                try std.testing.expectEqual(@as(c_uint, @intFromEnum(DecodeGqaSplitVariant.auto)), resolved);
-                try std.testing.expectEqual(@as(c_uint, 0), split_count);
-                try std.testing.expectEqual(@as(usize, 0), scratch_bytes);
-                continue;
+        for ([_]usize{ 1, 2 }) |num_kv_heads| {
+            for (kv_boundaries) |kv_tokens| {
+                var resolved: c_uint = 99;
+                var split_count: c_uint = 99;
+                var scratch_bytes: usize = 99;
+                const rc = termite_metal_decode_gqa_split_policy_probe(
+                    @intFromEnum(case.variant),
+                    1,
+                    kv_tokens,
+                    8,
+                    num_kv_heads,
+                    512,
+                    0,
+                    &resolved,
+                    &split_count,
+                    &scratch_bytes,
+                );
+                if (kv_tokens < 512) {
+                    try std.testing.expectEqual(@as(c_int, 0), rc);
+                    try std.testing.expectEqual(@as(c_uint, @intFromEnum(DecodeGqaSplitVariant.auto)), resolved);
+                    try std.testing.expectEqual(@as(c_uint, 0), split_count);
+                    try std.testing.expectEqual(@as(usize, 0), scratch_bytes);
+                    continue;
+                }
+                const expected_splits = @min(case.cap, (kv_tokens + 31) / 32);
+                try std.testing.expectEqual(@as(c_int, 1), rc);
+                try std.testing.expectEqual(@as(c_uint, @intFromEnum(case.variant)), resolved);
+                try std.testing.expectEqual(@as(c_uint, @intCast(expected_splits)), split_count);
+                try std.testing.expectEqual(
+                    @as(usize, 8 * expected_splits * (512 + 2) * @sizeOf(f32)),
+                    scratch_bytes,
+                );
             }
-            const expected_splits = @min(case.cap, (kv_tokens + 31) / 32);
-            try std.testing.expectEqual(@as(c_int, 1), rc);
-            try std.testing.expectEqual(@as(c_uint, @intFromEnum(case.variant)), resolved);
-            try std.testing.expectEqual(@as(c_uint, @intCast(expected_splits)), split_count);
-            try std.testing.expectEqual(
-                @as(usize, 8 * expected_splits * (512 + 2) * @sizeOf(f32)),
-                scratch_bytes,
-            );
         }
     }
 
@@ -10574,6 +10602,13 @@ pub extern fn termite_metal_jit_route_gate_probe(
     qualified_in_dim: usize,
     query_out_dim: usize,
     query_in_dim: usize,
+) c_int;
+pub extern fn termite_metal_q4_k_generic_provider_dispatch_policy_probe(
+    workload_profile_active: c_int,
+    exact_pipeline_count: usize,
+    generated_candidate_enabled: c_int,
+    generated_pipeline_available: c_int,
+    rows: usize,
 ) c_int;
 pub extern fn termite_metal_generated_pipeline_install(
     provider: ?*RawMetalProvider,
@@ -14911,6 +14946,24 @@ test "metal runtime JIT installed route bypasses legacy opt-in but not global di
         256,
         512,
     ));
+}
+
+test "metal Q4_K provider keeps the default eager route thin" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+
+    // Ordinary JIT-off eager inference launches the bundled kernel directly.
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_q4_k_generic_provider_dispatch_policy_probe(0, 0, 0, 1, 46));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_q4_k_generic_provider_dispatch_policy_probe(0, 0, 0, 1, 197));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_q4_k_generic_provider_dispatch_policy_probe(0, 0, 1, 0, 46));
+
+    // Profiling and promoted routes still require the generic dispatcher.
+    try std.testing.expectEqual(@as(c_int, 1), termite_metal_q4_k_generic_provider_dispatch_policy_probe(1, 0, 0, 0, 46));
+    try std.testing.expectEqual(@as(c_int, 1), termite_metal_q4_k_generic_provider_dispatch_policy_probe(0, 1, 0, 0, 46));
+    try std.testing.expectEqual(@as(c_int, 1), termite_metal_q4_k_generic_provider_dispatch_policy_probe(0, 0, 1, 1, 46));
+
+    // Bundled generated candidates are currently scoped to rows 2...64.
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_q4_k_generic_provider_dispatch_policy_probe(0, 0, 1, 1, 1));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_q4_k_generic_provider_dispatch_policy_probe(0, 0, 1, 1, 65));
 }
 
 test "metal runtime JIT C ABI layouts match the Objective-C bridge" {

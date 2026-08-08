@@ -205,13 +205,10 @@ pub const GlinerPipeline = struct {
         const relation_threshold = if (self.config.relation_threshold > 0) self.config.relation_threshold else self.config.threshold;
         const active_texts = try alloc.alloc([]const u8, rows_with_entities);
         defer alloc.free(active_texts);
-        const active_indices = try alloc.alloc(usize, rows_with_entities);
-        defer alloc.free(active_indices);
         var active_len: usize = 0;
         for (all_entities, 0..) |entities, i| {
             if (entities.len < 2) continue;
             active_texts[active_len] = texts[i];
-            active_indices[active_len] = i;
             active_len += 1;
         }
 
@@ -224,14 +221,23 @@ pub const GlinerPipeline = struct {
             alloc.free(relation_heads);
         }
 
-        for (all_entities, 0..) |entities, i| {
-            if (entities.len >= 2) continue;
-            all_relations[i] = try alloc.alloc(Relation, 0);
+        var active_index: usize = 0;
+        for (all_entities, 0..) |entities, row_index| {
+            if (entities.len < 2) {
+                all_relations[row_index] = try alloc.alloc(Relation, 0);
+                initialized_relations += 1;
+                continue;
+            }
+
+            all_relations[row_index] = try self.matchRelations(entities, relation_heads[active_index]);
+            active_index += 1;
             initialized_relations += 1;
-        }
-        for (active_indices[0..active_len], 0..) |row_index, active_index| {
-            all_relations[row_index] = try self.matchRelations(all_entities[row_index], relation_heads[active_index]);
-            initialized_relations += 1;
+            all_entities[row_index] = try includeRelationEndpoints(
+                alloc,
+                all_entities[row_index],
+                all_relations[row_index],
+                use_entity_labels,
+            );
         }
 
         return .{
@@ -1119,9 +1125,14 @@ pub const GlinerPipeline = struct {
             alloc.free(relation_heads);
         }
 
+        const relations = try self.matchRelations(entities, relation_heads);
+        errdefer {
+            for (relations) |*relation| relation.deinit(alloc);
+            alloc.free(relations);
+        }
         return .{
-            .entities = entities,
-            .relations = try self.matchRelations(entities, relation_heads),
+            .entities = try includeRelationEndpoints(alloc, entities, relations, entity_labels),
+            .relations = relations,
         };
     }
 
@@ -1564,6 +1575,65 @@ fn duplicateEntity(alloc: std.mem.Allocator, entity: Entity) !Entity {
         .end = entity.end,
         .score = entity.score,
     };
+}
+
+fn includeRelationEndpoints(
+    alloc: std.mem.Allocator,
+    entities: []Entity,
+    relations: []const Relation,
+    stable_labels: []const []const u8,
+) ![]Entity {
+    if (relations.len == 0) return entities;
+
+    var out = std.ArrayListUnmanaged(Entity).empty;
+    var borrowed_count: usize = 0;
+    errdefer {
+        for (out.items[borrowed_count..]) |entity| alloc.free(entity.text);
+        out.deinit(alloc);
+    }
+    try out.appendSlice(alloc, entities);
+    borrowed_count = entities.len;
+
+    for (relations) |relation| {
+        const endpoints = [_]Entity{ relation.head, relation.tail };
+        for (endpoints) |endpoint| {
+            if (containsEntity(out.items, endpoint)) continue;
+
+            const stable_label = findStableLabel(stable_labels, endpoint.label) orelse
+                return error.InvalidRelationEndpointLabel;
+            const text = try alloc.dupe(u8, endpoint.text);
+            out.append(alloc, .{
+                .text = text,
+                .label = stable_label,
+                .start = endpoint.start,
+                .end = endpoint.end,
+                .score = endpoint.score,
+            }) catch |err| {
+                alloc.free(text);
+                return err;
+            };
+        }
+    }
+
+    const reconciled = try out.toOwnedSlice(alloc);
+    alloc.free(entities);
+    return reconciled;
+}
+
+fn containsEntity(entities: []const Entity, needle: Entity) bool {
+    for (entities) |entity| {
+        if (entity.start == needle.start and entity.end == needle.end and
+            std.mem.eql(u8, entity.label, needle.label) and
+            std.mem.eql(u8, entity.text, needle.text)) return true;
+    }
+    return false;
+}
+
+fn findStableLabel(labels: []const []const u8, wanted: []const u8) ?[]const u8 {
+    for (labels) |label| {
+        if (std.mem.eql(u8, label, wanted)) return label;
+    }
+    return null;
 }
 
 fn charDistance(start1: usize, end1: usize, start2: usize, end2: usize) usize {
@@ -2015,6 +2085,65 @@ test "gliner relation matching preserves synthetic head label for unmatched head
     try std.testing.expectEqualStrings("person", relations[0].owned_head_label.?);
     try std.testing.expectEqualStrings("Acme", relations[0].tail.text);
     try std.testing.expectEqualStrings("works_for", relations[0].label);
+}
+
+test "gliner relation results include synthetic endpoint entities" {
+    const allocator = std.testing.allocator;
+    const labels = [_][]const u8{ "person", "organization" };
+
+    const entities = try allocator.alloc(Entity, 2);
+    var initialized_entities: usize = 0;
+    errdefer {
+        for (entities[0..initialized_entities]) |entity| allocator.free(entity.text);
+        allocator.free(entities);
+    }
+    entities[0] = .{
+        .text = try allocator.dupe(u8, "John"),
+        .label = labels[0],
+        .start = 0,
+        .end = 4,
+        .score = 0.91,
+    };
+    initialized_entities += 1;
+    entities[1] = .{
+        .text = try allocator.dupe(u8, "Acme"),
+        .label = labels[1],
+        .start = 15,
+        .end = 19,
+        .score = 0.88,
+    };
+    initialized_entities += 1;
+
+    const relations = [_]Relation{.{
+        .head = .{
+            .text = "employee",
+            .label = "person",
+            .start = 6,
+            .end = 14,
+            .score = 0.71,
+        },
+        .tail = .{
+            .text = "Acme",
+            .label = "organization",
+            .start = 15,
+            .end = 19,
+            .score = 0.88,
+        },
+        .label = "works_for",
+        .score = 0.71,
+    }};
+
+    const reconciled = try includeRelationEndpoints(allocator, entities, &relations, &labels);
+    defer {
+        for (reconciled) |entity| allocator.free(entity.text);
+        allocator.free(reconciled);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), reconciled.len);
+    try std.testing.expect(containsEntity(reconciled, relations[0].head));
+    try std.testing.expect(containsEntity(reconciled, relations[0].tail));
+    try std.testing.expectEqualStrings("employee", reconciled[2].text);
+    try std.testing.expectEqualStrings("person", reconciled[2].label);
 }
 
 test "gliner relation matching skips exact head span with mismatched entity label" {
