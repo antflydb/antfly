@@ -1700,6 +1700,28 @@ pub fn storageOwnerBatchJson(
     return .ok;
 }
 
+pub fn storageOwnerReplicatedBatchJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.JsonOperationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerOperationTableName(handle, request) orelse return .invalid_argument;
+    var response: capi.Buffer = .{};
+    const status = storageOwnerStatusFromCapi(replicatedBatchStorageKernelJson(handle, .{
+        .ptr = request.request_json.ptr,
+        .len = @intCast(request.request_json.len),
+    }, &response));
+    if (status != .ok) return status;
+    out_response.* = .{
+        .ptr = response.ptr,
+        .len = @intCast(response.len),
+    };
+    return .ok;
+}
+
 fn batchStorageKernelJson(
     handle: *Handle,
     request_json: capi.Slice,
@@ -1712,6 +1734,23 @@ fn batchStorageKernelJson(
     defer owned.deinit(handle.alloc);
 
     handle.db.batch(owned.req) catch |err| return capi.mapError(err);
+    const response = batch_api.encodeBatchResponse(std.heap.c_allocator, owned.result()) catch |err| return capi.mapError(err);
+    out_buf.* = .{
+        .ptr = response.ptr,
+        .len = response.len,
+    };
+    return .ok;
+}
+
+fn replicatedBatchStorageKernelJson(
+    handle: *Handle,
+    request_json: capi.Slice,
+    out_buf: *capi.Buffer,
+) capi.ErrorCode {
+    var owned = batch_api.parseInternalBatchRequest(handle.alloc, request_json.bytes()) catch |err| return capi.mapError(err);
+    defer owned.deinit(handle.alloc);
+
+    handle.db.batchReplicatedApply(owned.req) catch |err| return capi.mapError(err);
     const response = batch_api.encodeBatchResponse(std.heap.c_allocator, owned.result()) catch |err| return capi.mapError(err);
     out_buf.* = .{
         .ptr = response.ptr,

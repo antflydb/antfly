@@ -21,6 +21,7 @@ const platform_sync = @import("antfly_platform").sync;
 const platform_time = @import("antfly_platform").time;
 const abi = @import("kernel_owner_abi");
 const client = @import("../storage/kernel_owner_client.zig");
+const descriptor_contract = @import("../storage/kernel_owner_descriptor.zig");
 const db_types = @import("../storage/db/types.zig");
 const runtime_preflight = @import("../storage/db/runtime_preflight.zig");
 const metadata_api = @import("../metadata/api.zig");
@@ -45,26 +46,25 @@ pub const ProvisionedKernelOwnerSource = struct {
     mutex: std.atomic.Mutex = .unlocked,
     entries: std.ArrayListUnmanaged(*Entry) = .empty,
 
-    const Identity = struct {
-        table_id: u64,
-        shard_id: u64,
-        range_id: u64,
+    const Identity = descriptor_contract.Identity;
 
-        fn eql(left: Identity, right: Identity) bool {
-            return left.table_id == right.table_id and
-                left.shard_id == right.shard_id and
-                left.range_id == right.range_id;
-        }
-    };
-
-    const Descriptor = struct {
+    pub const LoadedDescriptor = struct {
         path: []u8,
         schema_json: []u8,
         indexes_json: []u8,
         generation: u64,
-        identity: Identity,
+        identity: descriptor_contract.Identity,
 
-        fn deinit(self: *Descriptor, alloc: std.mem.Allocator) void {
+        pub fn view(self: *const LoadedDescriptor) descriptor_contract.Descriptor {
+            return .{
+                .lsm_root_generation = self.generation,
+                .identity = self.identity,
+                .schema_json = self.schema_json,
+                .indexes_json = self.indexes_json,
+            };
+        }
+
+        pub fn deinit(self: *LoadedDescriptor, alloc: std.mem.Allocator) void {
             alloc.free(self.path);
             alloc.free(self.schema_json);
             alloc.free(self.indexes_json);
@@ -117,6 +117,14 @@ pub const ProvisionedKernelOwnerSource = struct {
         source: ?table_reads.GroupVisibleRootGenerationSource,
     ) *ProvisionedKernelOwnerSource {
         self.group_visible_root_generation = source;
+        return self;
+    }
+
+    pub fn withRequester(
+        self: *ProvisionedKernelOwnerSource,
+        requester: read_gate.ReadableLeaseRequester,
+    ) *ProvisionedKernelOwnerSource {
+        self.requester = requester;
         return self;
     }
 
@@ -189,6 +197,30 @@ pub const ProvisionedKernelOwnerSource = struct {
         return retired_count;
     }
 
+    /// Apply one already-committed local Raft batch without consulting the
+    /// catalog from the apply thread. The descriptor is part of the replicated
+    /// envelope, so every replica opens the same generation and identity.
+    pub fn applyPreparedReplicatedBatchGroupLocal(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        descriptor: descriptor_contract.Descriptor,
+        req: db_types.BatchRequest,
+    ) !void {
+        const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{
+            self.replica_root_dir,
+            group_id,
+        });
+        defer alloc.free(path);
+        const request_json = try table_writes.encodeStorageKernelBatchRequest(alloc, req);
+        defer alloc.free(request_json);
+        var lease = try self.acquireDescriptor(group_id, table_name, path, descriptor);
+        defer lease.deinit();
+        var response = try lease.owner().replicatedBatchJson(table_name, request_json);
+        defer response.deinit();
+    }
+
     pub fn ownerCountForTest(self: *ProvisionedKernelOwnerSource) usize {
         lock(&self.mutex);
         defer self.mutex.unlock();
@@ -228,12 +260,12 @@ pub const ProvisionedKernelOwnerSource = struct {
         unreachable;
     }
 
-    fn loadDescriptor(
+    pub fn loadDescriptor(
         self: *ProvisionedKernelOwnerSource,
         alloc: std.mem.Allocator,
         group_id: u64,
         table_name: []const u8,
-    ) !Descriptor {
+    ) !LoadedDescriptor {
         var snapshot = try self.catalog.adminSnapshot();
         defer self.catalog.freeAdminSnapshot(&snapshot);
 
@@ -273,12 +305,22 @@ pub const ProvisionedKernelOwnerSource = struct {
         var descriptor = try self.loadDescriptor(self.alloc, group_id, table_name);
         defer descriptor.deinit(self.alloc);
 
+        return try self.acquireDescriptor(group_id, table_name, descriptor.path, descriptor.view());
+    }
+
+    fn acquireDescriptor(
+        self: *ProvisionedKernelOwnerSource,
+        group_id: u64,
+        table_name: []const u8,
+        path: []const u8,
+        descriptor: descriptor_contract.Descriptor,
+    ) !Lease {
         lock(&self.mutex);
         defer self.mutex.unlock();
         var stale_index: ?usize = null;
         for (self.entries.items, 0..) |entry, index| {
             if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name)) continue;
-            if (entry.retired or entry.generation != descriptor.generation or !entry.identity.eql(descriptor.identity)) {
+            if (entry.retired or entry.generation != descriptor.lsm_root_generation or !entry.identity.eql(descriptor.identity)) {
                 entry.retired = true;
                 if (entry.active_users == 0) {
                     stale_index = index;
@@ -297,9 +339,9 @@ pub const ProvisionedKernelOwnerSource = struct {
         const entry = try self.alloc.create(Entry);
         errdefer self.alloc.destroy(entry);
         var owner = try client.Owner.open(.{
-            .path = abi.BorrowedBytes.fromSlice(descriptor.path),
+            .path = abi.BorrowedBytes.fromSlice(path),
             .table_name = abi.BorrowedBytes.fromSlice(table_name),
-            .lsm_root_generation = descriptor.generation,
+            .lsm_root_generation = descriptor.lsm_root_generation,
             .has_identity_namespace = 1,
             .identity_table_id = descriptor.identity.table_id,
             .identity_shard_id = descriptor.identity.shard_id,
@@ -311,7 +353,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         entry.* = .{
             .group_id = group_id,
             .table_name = owned_table_name,
-            .generation = descriptor.generation,
+            .generation = descriptor.lsm_root_generation,
             .identity = descriptor.identity,
             .owner = owner,
             .active_users = 1,

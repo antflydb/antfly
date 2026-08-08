@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
+const build_options = @import("build_options");
 const antfly = @import("runtime_root.zig");
 const indexes_api = @import("../api/indexes.zig");
 const json_helpers = @import("../api/json_helpers.zig");
@@ -60,6 +61,11 @@ const process_memory_mod = @import("antfly_platform").process_memory;
 const platform_time = @import("antfly_platform").time;
 const platform = @import("antfly_platform");
 const raft_engine = @import("raft_engine");
+
+const storage_kernel_experiment = if (@hasDecl(build_options, "storage_kernel_experiment"))
+    @field(build_options, "storage_kernel_experiment")
+else
+    false;
 
 const health_metrics = antfly.common.health_server;
 const setup_io_thread_stack_size = 1 * 1024 * 1024;
@@ -850,6 +856,7 @@ test "data descriptor factory bootstraps pristine group from complete intent pee
 const RaftTableApplyStateMachine = struct {
     alloc: std.mem.Allocator,
     write_source: antfly.public_api.ProvisionedTableWriteSource,
+    kernel_owner_source: ?antfly.public_api.ProvisionedKernelOwnerSource = null,
     applied_mutex: std.atomic.Mutex = .unlocked,
     applied_indexes: std.AutoHashMapUnmanaged(u64, u64) = .empty,
 
@@ -864,10 +871,23 @@ const RaftTableApplyStateMachine = struct {
         return .{
             .alloc = alloc,
             .write_source = write_source,
+            .kernel_owner_source = if (storage_kernel_experiment)
+                antfly.public_api.ProvisionedKernelOwnerSource.init(
+                    alloc,
+                    replica_root_dir,
+                    catalog,
+                    antfly.raft.read_gate.noopReadableLeaseRequester(),
+                )
+            else
+                null,
         };
     }
 
     fn deinit(self: *RaftTableApplyStateMachine) void {
+        self.write_source.quiesce();
+        if (comptime storage_kernel_experiment) {
+            if (self.kernel_owner_source) |*owner_source| owner_source.deinit();
+        }
         self.write_source.deinit();
         self.applied_indexes.deinit(self.alloc);
         self.* = undefined;
@@ -897,6 +917,12 @@ const RaftTableApplyStateMachine = struct {
         );
         self.write_source.runtime_status_cache = &storage.runtime_status_cache;
         _ = self.write_source.withGroupVisibleRootGeneration(storage.groupVisibleRootGenerationSource());
+        if (comptime storage_kernel_experiment) {
+            if (self.kernel_owner_source) |*owner_source| {
+                _ = owner_source.withGroupVisibleRootGeneration(storage.groupVisibleRootGenerationSource());
+                _ = self.write_source.withLocalWriteSource(owner_source.writeSource());
+            }
+        }
         if (storage.backend_runtime) |runtime| self.write_source.backend_runtime = runtime;
     }
 
@@ -946,7 +972,31 @@ const RaftTableApplyStateMachine = struct {
             // lifecycle mutation is already durable, leaving Raft replaying a
             // partially applied command.
             if (!batchRequiresDocumentDbApply(decoded.batch.req)) continue;
-            _ = self.write_source.applyPreparedReplicatedBatchGroupLocal(
+            if (comptime storage_kernel_experiment) {
+                const owner_source = if (self.kernel_owner_source) |*source|
+                    source
+                else
+                    return error.StorageKernelOwnerUnavailable;
+                const descriptor = if (decoded.storage_owner_descriptor) |*value|
+                    value.view()
+                else
+                    return error.MissingStorageKernelOwnerDescriptor;
+                owner_source.applyPreparedReplicatedBatchGroupLocal(
+                    self.alloc,
+                    group_id,
+                    decoded.table_name,
+                    descriptor,
+                    decoded.batch.req,
+                ) catch |err| {
+                    std.log.err("data raft storage-owner apply failed group_id={} index={} table={s} err={}", .{
+                        group_id,
+                        entry.index,
+                        decoded.table_name,
+                        err,
+                    });
+                    return err;
+                };
+            } else _ = self.write_source.applyPreparedReplicatedBatchGroupLocal(
                 self.alloc,
                 group_id,
                 decoded.table_name,
@@ -5431,9 +5481,19 @@ pub const DataServer = struct {
         var last_local_campaign_ns: u64 = 0;
         while (true) {
             const preflighted_local_leader = raft.host.http_host.host.isLocalLeader(group_id);
+            var storage_owner_descriptor: ?antfly.public_api.ProvisionedKernelOwnerSource.LoadedDescriptor = null;
+            defer if (storage_owner_descriptor) |*descriptor| descriptor.deinit(alloc);
             if (preflighted_local_leader) {
                 const admission_source = if (self.data_raft_apply) |apply_sm| &apply_sm.write_source else &self.write_source;
                 try admission_source.preflightDenseRepairWriteAdmission(group_id, table_name);
+                if (comptime storage_kernel_experiment) {
+                    const apply_sm = self.data_raft_apply orelse return error.StorageKernelOwnerUnavailable;
+                    const owner_source = if (apply_sm.kernel_owner_source) |*source|
+                        source
+                    else
+                        return error.StorageKernelOwnerUnavailable;
+                    storage_owner_descriptor = try owner_source.loadDescriptor(alloc, group_id, table_name);
+                }
             }
 
             var target_index: ?u64 = null;
@@ -5454,7 +5514,15 @@ pub const DataServer = struct {
                         // proposing a batch that skipped pressure admission.
                         retry_for_leader_preflight = true;
                     } else {
-                        const encoded = try data_raft_batch.encode(alloc, table_name, req);
+                        const encoded = if (comptime storage_kernel_experiment)
+                            try data_raft_batch.encodeWithStorageOwnerDescriptor(
+                                alloc,
+                                table_name,
+                                req,
+                                storage_owner_descriptor.?.view(),
+                            )
+                        else
+                            try data_raft_batch.encode(alloc, table_name, req);
                         defer alloc.free(encoded);
                         try raft.host.http_host.propose(group_id, encoded);
                         target_index = if (raft.host.http_host.host.raftStatus(group_id)) |status|

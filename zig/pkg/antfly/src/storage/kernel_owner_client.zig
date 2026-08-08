@@ -74,6 +74,19 @@ pub const Owner = struct {
         return response;
     }
 
+    pub fn replicatedBatchJson(self: *Owner, table_name: []const u8, request_json: []const u8) !Response {
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_replicated_batch_json(
+            self.handle,
+            &.{
+                .table_name = .fromSlice(table_name),
+                .request_json = .fromSlice(request_json),
+            },
+            &response.buffer,
+        ));
+        return response;
+    }
+
     pub fn queryJson(self: *Owner, table_name: []const u8, request_json: []const u8) !Response {
         var response: Response = .{};
         try statusToError(abi.antfly_storage_owner_query_json(

@@ -137,6 +137,20 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
         .sync_level = .full_index,
     });
 
+    var replicated_descriptor = try owner_source.loadDescriptor(alloc, 7001, "articles");
+    defer replicated_descriptor.deinit(alloc);
+    try owner_source.applyPreparedReplicatedBatchGroupLocal(
+        alloc,
+        7001,
+        "articles",
+        replicated_descriptor.view(),
+        .{
+            .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"beta\",\"category\":\"news\",\"amount\":20,\"_embeddings\":{\"dense_idx\":[0,1,0]}}" }},
+            .timestamp_ns = 4243,
+            .sync_level = .full_index,
+        },
+    );
+
     var lookup = (try read_source.source().lookup(alloc, "articles", "doc:a", .{
         .fields = &.{"title"},
         .include_all_fields = false,

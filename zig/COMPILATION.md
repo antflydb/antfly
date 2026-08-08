@@ -802,6 +802,59 @@ composition. Structural notifications can retire that owner only after the
 outer generation/catalog transition has published. The legacy physical source
 remains reachable, so this checkpoint still makes no cold-build or RSS claim.
 
+### Phase 2m deterministic prepared Raft-apply owner slice
+
+Committed document batches can now enter the compiled storage owner without a
+catalog read from the Raft apply thread. The leader captures a deterministic
+open descriptor after local-leader admission and before taking the Raft mutex.
+That descriptor carries the physical root generation, table/shard/range
+identity, schema, and index contract in the replicated envelope. Every replica
+therefore opens the same owner incarnation while replaying the same command;
+apply does not depend on remote metadata availability or on mutable catalog
+state observed after commitment.
+
+The descriptor contract lives in a small module with no DB, catalog, or runtime
+imports. The internal owner ABI is now version 7 and exposes one coarse
+replicated-batch operation. It deliberately calls `DB.batchReplicatedApply`,
+not the ordinary client batch entry point, so replicated apply retains its
+forced write durability, split-replication semantics, and absence of leader-side
+HA/range admission. The Raft apply state machine owns the experimental owner
+source and supplies the provisioned generation source when composition is
+available. The legacy architecture remains byte-compatible: envelopes without
+the descriptor still decode, and experiment-disabled data artifacts compile
+without referencing any hidden owner symbol.
+
+Validation at this checkpoint:
+
+- deterministic descriptor envelope test: 1/1 passed with zero leaks;
+- focused leaderless forwarding and default WAL-backed data-Raft tests: 2/2
+  passed with zero leaks, including the experiment-disabled link boundary;
+- provisioned cross-archive owner suite: 6/6 passed with zero leaks, including
+  a replicated update through the descriptor-driven owner;
+- opaque owner ABI suite: 2/2 passed with zero leaks, including the new
+  invalid-ABI entry point;
+- current provisioned write/lifecycle regression set: 68/68 passed with zero
+  leaks;
+- existing public C API suite: 10/10 passed with zero leaks;
+- linked native Debug executable built with the experiment, production LSM-only
+  options, and normal concurrency; and
+- runtime/codegen/API graph gates and all 13 analyzer tests passed.
+
+Decision: keep the prepared-apply slice, but do not attach the owner as the
+universal production source yet. Three physical mutation paths can still open a
+competing legacy writer: post-apply sync, Raft snapshot installation, and HA
+record apply. Migrate those as coarse owner/lifecycle operations before making
+the old source compile-time unreachable. Transaction-participant callbacks are
+the subsequent write-family boundary.
+
+The full schema and index JSON currently travels in every experimental Raft
+batch. That is the simplest replay-independent proof of deterministic opening,
+not the intended permanent wire format. Before enabling this architecture by
+default, measure representative envelope/log amplification and replace repeated
+contracts with a versioned descriptor reference only after provisioning and
+Raft snapshots durably carry the referenced contract. Do not trade deterministic
+replay for a leader-local or catalog-dependent cache.
+
 ## Holistic target architecture
 
 The preferred end state is a modular monolith with a small number of compiled

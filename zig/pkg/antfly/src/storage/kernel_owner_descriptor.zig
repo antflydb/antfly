@@ -12,18 +12,24 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const runtime = @import("data/runtime.zig");
-const raft_batch = @import("data/raft_batch.zig");
-const runtime_status = @import("api/runtime_status.zig");
-const indexes = @import("api/indexes.zig");
-const table_writes = @import("api/table_writes.zig");
-const enrichment_runtime = @import("storage/db/enrichment/enrichment_runtime.zig");
+//! Deterministic storage-owner open contract carried by replicated apply.
+//! This module intentionally contains no DB, catalog, or runtime imports.
 
-test {
-    _ = runtime;
-    _ = raft_batch;
-    _ = runtime_status;
-    _ = indexes;
-    _ = table_writes;
-    _ = enrichment_runtime;
-}
+pub const Identity = struct {
+    table_id: u64,
+    shard_id: u64,
+    range_id: u64,
+
+    pub fn eql(left: Identity, right: Identity) bool {
+        return left.table_id == right.table_id and
+            left.shard_id == right.shard_id and
+            left.range_id == right.range_id;
+    }
+};
+
+pub const Descriptor = struct {
+    lsm_root_generation: u64,
+    identity: Identity,
+    schema_json: []const u8 = "",
+    indexes_json: []const u8 = "",
+};
