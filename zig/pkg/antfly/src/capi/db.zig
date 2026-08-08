@@ -1815,6 +1815,28 @@ pub fn storageOwnerScanNdjson(
     return .ok;
 }
 
+pub fn storageOwnerPreflightJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.JsonOperationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    const table_name = storageOwnerOperationTableName(handle, request) orelse return .invalid_argument;
+    const response = table_reads_api.executeStorageKernelPreflight(
+        handle.alloc,
+        &handle.db,
+        table_name,
+        request.request_json.slice(),
+    ) catch |err| return storageOwnerStatusFromError(err);
+    out_response.* = .{
+        .ptr = response.ptr,
+        .len = @intCast(response.len),
+    };
+    return .ok;
+}
+
 pub fn storageOwnerBufferDestroy(buffer: *kernel_owner_abi.OwnedBytes) callconv(.c) void {
     antfly_db_buffer_free(buffer.ptr, @intCast(buffer.len));
     buffer.* = .{};

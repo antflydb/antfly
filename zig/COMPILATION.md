@@ -541,6 +541,57 @@ losing behavior or opening a competing DB. Continue migrating those coarse
 families, then make the legacy physical path compile-time unreachable and
 measure the clean ARM64 ReleaseFast application unit.
 
+### Phase 2h provisioned preflight owner slice
+
+Provisioned group-local query preflight now executes against the same opaque
+owner as batch, lookup, scan, and query. Distributed control retains table and
+range routing, fanout scheduling, Raft read admission, cross-shard summary
+merging, and vector-worker policy. One coarse owner call performs live index
+binding validation and local planning-stat collection, then returns the full
+`RuntimePreflightSummary` as one kernel-owned response buffer.
+
+The cross-archive test preflights the same named dense query later used for
+execution. It verifies the installed dense index estimate, dense planning-cost
+count, and the existing composed-query worker classification while retaining a
+single owner for all six read/write leases. This also exercises the production
+query-normalization shape: a named embedding query carries an unbound
+`full_text match_all` sentinel even when the table has no text index.
+
+That shape exposed an existing inconsistency between live binding validation
+and planning-stat collection. Both previously treated every non-null
+`full_text` query as requiring a primary text index. The shared requirement is
+now explicit: scoring text and structured filters require an index; an
+explicitly named sentinel still requires its named index; and an unbound
+`match_all` or `match_none` sentinel uses a default text index when one exists
+but remains valid when none exists. Binding validation and index-estimate
+collection now use the same rule. The existing live-binding regression proves
+that explicitly missing indexes still fail closed.
+
+Validation at this checkpoint:
+
+- provisioned cross-archive owner suite: 6/6 passed with zero leaks;
+- opaque owner ABI suite: 2/2 passed with zero leaks;
+- current provisioned write/lifecycle regression set: 67/67 passed with zero
+  leaks;
+- existing public C API suite: 10/10 passed with zero leaks;
+- DB compatibility suite: 650 passed, 5 intentionally skipped, zero failures
+  and zero leaks, including the live preflight binding regression;
+- linked native Debug with production LSM-only options succeeded with normal
+  concurrency;
+- runtime/codegen/API graph gates passed and all 13 analyzer tests passed; and
+- the internal owner/runtime symbols remained hidden from the shared C API
+  global symbol table while the public `antfly_db_open` and
+  `antfly_db_close` exports remained present.
+
+Decision: keep this slice. It removes another live-DB user from the eventual
+distributed physical graph, but the legacy implementation remains reachable
+through text-stat, algebraic-partial, graph, document-artifact, runtime-status,
+and writer lifecycle callbacks. Do not infer a clean-build improvement from a
+warm Debug validation or enable the owner globally yet. Migrate the remaining
+coarse auxiliary read families through this owner, close the minimum writer
+lifecycle surface, then make the old callbacks compile-time unreachable before
+the next cold ARM64 Linux musl `ReleaseFast` go/no-go measurement.
+
 ## Holistic target architecture
 
 The preferred end state is a modular monolith with a small number of compiled

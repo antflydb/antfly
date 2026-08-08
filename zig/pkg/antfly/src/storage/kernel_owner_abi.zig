@@ -118,6 +118,12 @@ pub extern fn antfly_storage_owner_scan_ndjson(
     out_response: *OwnedBytes,
 ) callconv(.c) Status;
 
+pub extern fn antfly_storage_owner_preflight_json(
+    owner: ?*anyopaque,
+    request: *const JsonOperationRequest,
+    out_response: *OwnedBytes,
+) callconv(.c) Status;
+
 pub extern fn antfly_storage_owner_buffer_destroy(
     buffer: *OwnedBytes,
 ) callconv(.c) void;

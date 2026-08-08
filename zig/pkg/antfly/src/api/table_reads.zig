@@ -1785,7 +1785,7 @@ fn algebraicVectorWorkerFilterJsonSupported(alloc: std.mem.Allocator, filter_que
     return true;
 }
 
-fn annotateVectorWorkerPreflight(
+pub fn annotateVectorWorkerPreflight(
     alloc: std.mem.Allocator,
     summary: *db_mod.RuntimePreflightSummary,
     req: db_mod.types.SearchRequest,
@@ -13728,6 +13728,53 @@ pub fn encodeStorageKernelScanNdjson(
         try appendScanLine(alloc, &out, entry.id, json);
     }
     return try out.toOwnedSlice(alloc);
+}
+
+pub const StorageKernelPreflightWireRequest = struct {
+    query_json: []const u8,
+    max_work: u32 = 0,
+};
+
+pub fn encodeStorageKernelPreflightRequest(
+    alloc: std.mem.Allocator,
+    req: db_mod.types.SearchRequest,
+    max_work: u32,
+) ![]u8 {
+    const query_json = try encodeQueryRequest(alloc, req);
+    defer alloc.free(query_json);
+    return try std.json.Stringify.valueAlloc(alloc, StorageKernelPreflightWireRequest{
+        .query_json = query_json,
+        .max_work = max_work,
+    }, .{});
+}
+
+pub fn executeStorageKernelPreflight(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    table_name: []const u8,
+    request_json: []const u8,
+) ![]u8 {
+    var wire = try std.json.parseFromSlice(StorageKernelPreflightWireRequest, alloc, request_json, .{});
+    defer wire.deinit();
+    var owned = try query_api.parseQueryRequest(alloc, null, table_name, wire.value.query_json);
+    defer owned.deinit(alloc);
+    var summary = try db.preflightSearchRequest(alloc, owned.req, wire.value.max_work);
+    defer summary.deinit(alloc);
+    return try std.json.Stringify.valueAlloc(alloc, summary, .{});
+}
+
+pub fn parseStorageKernelPreflightSummary(
+    alloc: std.mem.Allocator,
+    response_json: []const u8,
+) !db_mod.RuntimePreflightSummary {
+    var parsed = try std.json.parseFromSlice(
+        db_mod.RuntimePreflightSummary,
+        alloc,
+        response_json,
+        .{ .allocate = .alloc_always },
+    );
+    defer parsed.deinit();
+    return try cloneRuntimePreflightSummary(alloc, parsed.value);
 }
 
 fn appendDocFilterBindingsField(

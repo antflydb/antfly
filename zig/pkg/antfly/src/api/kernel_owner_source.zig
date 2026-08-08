@@ -21,6 +21,7 @@ const platform_sync = @import("antfly_platform").sync;
 const abi = @import("kernel_owner_abi");
 const client = @import("../storage/kernel_owner_client.zig");
 const db_types = @import("../storage/db/types.zig");
+const runtime_preflight = @import("../storage/db/runtime_preflight.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const query_response = @import("query_response.zig");
@@ -141,6 +142,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .lookup = unsupportedTopLevelLookup,
                 .scan = unsupportedTopLevelScan,
                 .query = unsupportedTopLevelQuery,
+                .preflight_query_group_local = preflightQueryGroupLocal,
                 .lookup_group_local = lookupGroupLocal,
                 .scan_group_local = scanGroupLocal,
                 .query_group_local = queryGroupLocal,
@@ -415,6 +417,28 @@ pub const ProvisionedKernelOwnerSource = struct {
         var response = try lease.owner().scanNdjson(table_name, request_json);
         defer response.deinit();
         return .{ .ndjson = try alloc.dupe(u8, response.bytes()) };
+    }
+
+    fn preflightQueryGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_types.SearchRequest,
+        consistency: read_gate.ReadConsistency,
+        max_work: u32,
+    ) !?runtime_preflight.RuntimePreflightSummary {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        try self.prepareQueryRead(group_id, req, consistency);
+        const request_json = try table_reads.encodeStorageKernelPreflightRequest(alloc, req, max_work);
+        defer alloc.free(request_json);
+        var lease = try self.acquire(group_id, table_name);
+        defer lease.deinit();
+        var response = try lease.owner().preflightJson(table_name, request_json);
+        defer response.deinit();
+        var summary = try table_reads.parseStorageKernelPreflightSummary(alloc, response.bytes());
+        table_reads.annotateVectorWorkerPreflight(alloc, &summary, req);
+        return summary;
     }
 
     fn batchGroupLocal(

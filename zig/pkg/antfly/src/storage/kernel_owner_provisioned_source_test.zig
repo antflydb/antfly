@@ -173,6 +173,21 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
         "{\"embeddings\":{\"dense_idx\":[1.0,0.0,0.0]},\"indexes\":[\"dense_idx\"],\"limit\":2}",
     );
     defer dense_query.deinit(alloc);
+    var preflight = (try read_source.source().preflightQuery(
+        alloc,
+        "articles",
+        dense_query.req,
+        .read_index,
+        1000,
+    )).?;
+    defer preflight.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), preflight.dense_query_count);
+    try std.testing.expectEqual(@as(usize, 1), preflight.embedding_indexes.len);
+    try std.testing.expectEqualStrings("dense_idx", preflight.embedding_indexes[0].name);
+    // Named composed embeddings are not the single-vector worker fast path.
+    try std.testing.expectEqual(@as(u32, 0), preflight.vector_worker_candidate_count);
+    try std.testing.expectEqual(@as(u32, 0), preflight.vector_worker_fallback_count);
+
     var dense_response = (try read_source.source().query(alloc, "articles", dense_query.req, .read_index)).?;
     defer dense_response.deinit(alloc);
     const first_doc_a = std.mem.indexOf(u8, dense_response.json, "doc:a") orelse return error.MissingDenseHit;
@@ -180,7 +195,7 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
     try std.testing.expect(first_doc_a < second_doc_b);
 
     try std.testing.expectEqual(@as(usize, 1), owner_source.ownerCountForTest());
-    try std.testing.expectEqual(@as(usize, 5), lease_capture.count);
+    try std.testing.expectEqual(@as(usize, 6), lease_capture.count);
     try std.testing.expectEqual(@as(u64, 7001), lease_capture.last_group_id);
 
     const group_path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root});
