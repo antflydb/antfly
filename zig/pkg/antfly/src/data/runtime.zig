@@ -4196,6 +4196,17 @@ pub const DataServer = struct {
         var snapshot = try self.write_source.catalog.adminSnapshot();
         defer self.write_source.catalog.freeAdminSnapshot(&snapshot);
         const route = try resolveHAReplicationRecordRoute(&snapshot, record);
+        if (comptime storage_kernel_experiment) {
+            if (self.data_raft_apply) |apply_sm| {
+                if (apply_sm.kernel_owner_source) |*owner_source| {
+                    return try owner_source.applyHAReplicationRecordGroupLocal(
+                        route.group_id,
+                        route.table_name,
+                        record,
+                    );
+                }
+            }
+        }
         try self.write_source.applyHAReplicationRecordGroupLocal(
             self.alloc,
             route.group_id,
@@ -5557,8 +5568,17 @@ pub const DataServer = struct {
                 if (req.sync_level != .propose) {
                     try self.waitForLocalRaftBatchApply(group_id, index, deadline_ns);
                 }
-                const sync_source = if (self.data_raft_apply) |apply_sm| &apply_sm.write_source else &self.write_source;
-                try sync_source.syncReplicatedBatchGroupLocal(alloc, group_id, table_name, req.sync_level);
+                if (comptime storage_kernel_experiment) {
+                    const apply_sm = self.data_raft_apply orelse return error.StorageKernelOwnerUnavailable;
+                    const owner_source = if (apply_sm.kernel_owner_source) |*source|
+                        source
+                    else
+                        return error.StorageKernelOwnerUnavailable;
+                    try owner_source.waitForCurrentSyncGroupLocal(group_id, table_name, req.sync_level);
+                } else {
+                    const sync_source = if (self.data_raft_apply) |apply_sm| &apply_sm.write_source else &self.write_source;
+                    try sync_source.syncReplicatedBatchGroupLocal(alloc, group_id, table_name, req.sync_level);
+                }
                 return;
             }
 

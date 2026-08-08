@@ -66,6 +66,18 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     );
     defer replicated_response.deinit();
     try std.testing.expect(std.mem.indexOf(u8, replicated_response.bytes(), "\"inserted\":1") != null);
+    try owner.waitForSync("docs", .full_index);
+    try owner.applyHAReplicationRecord("docs", .{
+        .record_kind = 0x0012,
+        .payload_codec = 0,
+        .cluster_id = 1,
+        .shard_id = 7001,
+        .table_id = 7,
+        .timeline_id = 1,
+        .epoch = 1,
+        .lsn = 1,
+        .previous_lsn = 0,
+    });
 
     const query_json =
         \\{"query":{"match_all":{}},"limit":10}
@@ -97,6 +109,18 @@ test "opaque storage owner validates ABI and destruction is idempotent" {
         abi.antfly_storage_owner_batch_json(null, &invalid_operation, &response),
     );
     try std.testing.expectEqual(@as(u64, 0), response.len);
+    var invalid_sync: abi.SyncRequest = .{};
+    invalid_sync.version = abi.abi_version + 1;
+    try std.testing.expectEqual(
+        abi.Status.invalid_abi,
+        abi.antfly_storage_owner_wait_for_sync(null, &invalid_sync),
+    );
+    var invalid_ha: abi.HAReplicationRecordRequest = .{};
+    invalid_ha.version = abi.abi_version + 1;
+    try std.testing.expectEqual(
+        abi.Status.invalid_abi,
+        abi.antfly_storage_owner_apply_ha_replication_record(null, &invalid_ha),
+    );
     try std.testing.expectEqual(
         abi.Status.invalid_abi,
         abi.antfly_storage_owner_replicated_batch_json(null, &invalid_operation, &response),

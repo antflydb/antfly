@@ -23,6 +23,7 @@ const abi = @import("kernel_owner_abi");
 const client = @import("../storage/kernel_owner_client.zig");
 const descriptor_contract = @import("../storage/kernel_owner_descriptor.zig");
 const db_types = @import("../storage/db/types.zig");
+const ha_replication_record = @import("../storage/ha/replication_record.zig");
 const runtime_preflight = @import("../storage/db/runtime_preflight.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
@@ -219,6 +220,52 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer lease.deinit();
         var response = try lease.owner().replicatedBatchJson(table_name, request_json);
         defer response.deinit();
+    }
+
+    pub fn waitForCurrentSyncGroupLocal(
+        self: *ProvisionedKernelOwnerSource,
+        group_id: u64,
+        table_name: []const u8,
+        sync_level: db_types.SyncLevel,
+    ) !void {
+        switch (sync_level) {
+            .propose, .write => return,
+            .full_text, .enrichments, .full_index => {},
+        }
+        const owner_sync_level: abi.SyncLevel = switch (sync_level) {
+            .propose => .propose,
+            .write => .write,
+            .full_text => .full_text,
+            .enrichments => .enrichments,
+            .full_index => .full_index,
+        };
+        var lease = try self.acquire(group_id, table_name);
+        defer lease.deinit();
+        try lease.owner().waitForSync(table_name, owner_sync_level);
+    }
+
+    pub fn applyHAReplicationRecordGroupLocal(
+        self: *ProvisionedKernelOwnerSource,
+        group_id: u64,
+        table_name: []const u8,
+        record: ha_replication_record.RecordView,
+    ) !void {
+        var lease = try self.acquire(group_id, table_name);
+        defer lease.deinit();
+        try lease.owner().applyHAReplicationRecord(table_name, .{
+            .record_kind = @intFromEnum(record.kind),
+            .payload_codec = @intFromEnum(record.payload_codec),
+            .flags = record.flags,
+            .cluster_id = record.cluster_id,
+            .shard_id = record.shard_id,
+            .table_id = record.table_id,
+            .timeline_id = record.timeline_id,
+            .epoch = record.epoch,
+            .lsn = record.lsn,
+            .previous_lsn = record.previous_lsn,
+            .commit_timestamp_ns = record.commit_timestamp_ns,
+            .payload = record.payload,
+        });
     }
 
     pub fn ownerCountForTest(self: *ProvisionedKernelOwnerSource) usize {

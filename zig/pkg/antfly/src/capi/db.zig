@@ -1722,6 +1722,53 @@ pub fn storageOwnerReplicatedBatchJson(
     return .ok;
 }
 
+pub fn storageOwnerWaitForSync(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.SyncRequest,
+) callconv(.c) kernel_owner_abi.Status {
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    const sync_level: db_mod.types.SyncLevel = switch (request.sync_level) {
+        @intFromEnum(kernel_owner_abi.SyncLevel.propose) => .propose,
+        @intFromEnum(kernel_owner_abi.SyncLevel.write) => .write,
+        @intFromEnum(kernel_owner_abi.SyncLevel.full_text) => .full_text,
+        @intFromEnum(kernel_owner_abi.SyncLevel.enrichments) => .enrichments,
+        @intFromEnum(kernel_owner_abi.SyncLevel.full_index) => .full_index,
+        else => return .invalid_argument,
+    };
+    switch (sync_level) {
+        .propose, .write => return .ok,
+        .full_text, .enrichments, .full_index => {},
+    }
+    handle.db.waitForCurrentSyncLevel(sync_level) catch |err| return storageOwnerStatusFromError(err);
+    return .ok;
+}
+
+pub fn storageOwnerApplyHAReplicationRecord(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.HAReplicationRecordRequest,
+) callconv(.c) kernel_owner_abi.Status {
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    handle.db.applyHAReplicationRecord(.{
+        .kind = @enumFromInt(request.record_kind),
+        .payload_codec = @enumFromInt(request.payload_codec),
+        .flags = request.flags,
+        .cluster_id = request.cluster_id,
+        .shard_id = request.shard_id,
+        .table_id = request.table_id,
+        .timeline_id = request.timeline_id,
+        .epoch = request.epoch,
+        .lsn = request.lsn,
+        .previous_lsn = request.previous_lsn,
+        .commit_timestamp_ns = request.commit_timestamp_ns,
+        .payload = request.payload.slice(),
+    }) catch |err| return storageOwnerStatusFromError(err);
+    return .ok;
+}
+
 fn batchStorageKernelJson(
     handle: *Handle,
     request_json: capi.Slice,

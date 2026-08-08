@@ -855,6 +855,47 @@ contracts with a versioned descriptor reference only after provisioning and
 Raft snapshots durably carry the referenced contract. Do not trade deterministic
 replay for a leader-local or catalog-dependent cache.
 
+### Phase 2n replicated sync and HA-apply owner slice
+
+Post-commit durability waiting and standby HA replay now reuse the resident
+compiled storage owner. A Raft proposer that requested `full_text`,
+`enrichments`, or `full_index` waits on the DB that applied the committed batch
+instead of reopening the same physical root through the legacy writer cache.
+`propose` and `write` preserve their existing no-wait behavior. When the data
+Raft apply composition owns the experimental source, routed HA records enter
+that owner as well; minimal compositions without a data-Raft apply state retain
+the legacy fallback until owner composition becomes unconditional.
+
+The internal owner ABI is now version 8. Sync uses a fixed scalar enum and HA
+uses a borrowed record envelope containing the stable kind/codec values,
+identity, timeline, LSN fields, and payload. No per-document callback or JSON
+translation was introduced. The kernel reconstructs the storage-owned record
+view and calls `DB.applyHAReplicationRecord`, preserving idempotent applied-LSN
+handling and the existing mutation/metadata/derived-effect semantics.
+
+Validation at this checkpoint:
+
+- provisioned cross-archive owner suite: 6/6 passed with zero leaks, exercising
+  replicated apply, full-index sync, and an HA checkpoint through one resident
+  owner and retaining exactly one owner entry;
+- opaque owner ABI suite: 2/2 passed with zero leaks, including both new
+  invalid-ABI entry points;
+- current provisioned write/lifecycle regression set: 68/68 passed with zero
+  leaks;
+- existing public C API suite: 10/10 passed with zero leaks;
+- experiment-disabled WAL-backed data-Raft link/runtime test: 1/1 passed with
+  zero leaks;
+- linked native Debug executable built with the experiment, production LSM-only
+  options, and normal concurrency; and
+- runtime/codegen/API graph gates and all 13 analyzer tests passed.
+
+Decision: keep this slice. Prepared Raft apply, its requested derived-visibility
+wait, and routed standby replay can now share one writer. Raft snapshot
+installation is the remaining competing physical writer in the immediate
+replication pipeline and must move behind an owner lifecycle operation before
+query/read composition becomes unconditional. The legacy implementation graph
+is still reachable, so this checkpoint makes no cold-build or RSS claim.
+
 ## Holistic target architecture
 
 The preferred end state is a modular monolith with a small number of compiled

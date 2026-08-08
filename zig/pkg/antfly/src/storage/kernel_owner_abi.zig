@@ -15,7 +15,7 @@
 //! Versioned internal ABI for the storage kernel's live DB owner. Keep this
 //! module free of storage and distributed-runtime imports.
 
-pub const abi_version: u32 = 7;
+pub const abi_version: u32 = 8;
 
 pub const BorrowedBytes = extern struct {
     ptr: ?[*]const u8 = null,
@@ -93,6 +93,41 @@ pub const JsonOperationRequest = extern struct {
     request_json: BorrowedBytes = .{},
 };
 
+pub const SyncLevel = enum(u32) {
+    propose = 0,
+    write = 1,
+    full_text = 2,
+    enrichments = 3,
+    full_index = 4,
+};
+
+pub const SyncRequest = extern struct {
+    version: u32 = abi_version,
+    sync_level: u32 = @intFromEnum(SyncLevel.write),
+    table_name: BorrowedBytes = .{},
+};
+
+/// Borrowed logical HA record. The scalar values intentionally mirror the
+/// versioned HA envelope without exposing a storage-owned Zig enum or layout
+/// across the compiled boundary.
+pub const HAReplicationRecordRequest = extern struct {
+    version: u32 = abi_version,
+    flags: u32 = 0,
+    table_name: BorrowedBytes = .{},
+    record_kind: u16 = 0,
+    payload_codec: u16 = 0,
+    _reserved0: u32 = 0,
+    cluster_id: u64 = 0,
+    shard_id: u64 = 0,
+    table_id: u64 = 0,
+    timeline_id: u64 = 0,
+    epoch: u64 = 0,
+    lsn: u64 = 0,
+    previous_lsn: u64 = 0,
+    commit_timestamp_ns: i64 = 0,
+    payload: BorrowedBytes = .{},
+};
+
 /// JSON operation with synchronous local execution controls. The cancellation
 /// pointer refers to the caller's atomic boolean for the duration of the call;
 /// it is never retained by the storage owner.
@@ -124,6 +159,16 @@ pub extern fn antfly_storage_owner_replicated_batch_json(
     owner: ?*anyopaque,
     request: *const JsonOperationRequest,
     out_response: *OwnedBytes,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_owner_wait_for_sync(
+    owner: ?*anyopaque,
+    request: *const SyncRequest,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_owner_apply_ha_replication_record(
+    owner: ?*anyopaque,
+    request: *const HAReplicationRecordRequest,
 ) callconv(.c) Status;
 
 pub extern fn antfly_storage_owner_query_json(

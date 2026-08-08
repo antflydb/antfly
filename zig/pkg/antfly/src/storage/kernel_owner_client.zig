@@ -87,6 +87,41 @@ pub const Owner = struct {
         return response;
     }
 
+    pub fn waitForSync(self: *Owner, table_name: []const u8, sync_level: abi.SyncLevel) !void {
+        try statusToError(abi.antfly_storage_owner_wait_for_sync(
+            self.handle,
+            &.{
+                .sync_level = @intFromEnum(sync_level),
+                .table_name = .fromSlice(table_name),
+            },
+        ));
+    }
+
+    pub fn applyHAReplicationRecord(
+        self: *Owner,
+        table_name: []const u8,
+        record: HAReplicationRecord,
+    ) !void {
+        try statusToError(abi.antfly_storage_owner_apply_ha_replication_record(
+            self.handle,
+            &.{
+                .flags = record.flags,
+                .table_name = .fromSlice(table_name),
+                .record_kind = record.record_kind,
+                .payload_codec = record.payload_codec,
+                .cluster_id = record.cluster_id,
+                .shard_id = record.shard_id,
+                .table_id = record.table_id,
+                .timeline_id = record.timeline_id,
+                .epoch = record.epoch,
+                .lsn = record.lsn,
+                .previous_lsn = record.previous_lsn,
+                .commit_timestamp_ns = record.commit_timestamp_ns,
+                .payload = .fromSlice(record.payload),
+            },
+        ));
+    }
+
     pub fn queryJson(self: *Owner, table_name: []const u8, request_json: []const u8) !Response {
         var response: Response = .{};
         try statusToError(abi.antfly_storage_owner_query_json(
@@ -256,6 +291,21 @@ pub const Owner = struct {
         ));
         return response;
     }
+};
+
+pub const HAReplicationRecord = struct {
+    record_kind: u16,
+    payload_codec: u16,
+    flags: u32 = 0,
+    cluster_id: u64,
+    shard_id: u64 = 0,
+    table_id: u64 = 0,
+    timeline_id: u64,
+    epoch: u64,
+    lsn: u64,
+    previous_lsn: u64,
+    commit_timestamp_ns: i64 = 0,
+    payload: []const u8 = &.{},
 };
 
 fn operationRequest(

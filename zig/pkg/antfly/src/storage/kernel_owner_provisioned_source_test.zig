@@ -145,11 +145,22 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
         "articles",
         replicated_descriptor.view(),
         .{
-            .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"beta\",\"category\":\"news\",\"amount\":20,\"_embeddings\":{\"dense_idx\":[0,1,0]}}" }},
+            .deletes = &.{"doc:missing"},
             .timestamp_ns = 4243,
             .sync_level = .full_index,
         },
     );
+    try owner_source.waitForCurrentSyncGroupLocal(7001, "articles", .full_index);
+    try owner_source.applyHAReplicationRecordGroupLocal(7001, "articles", .{
+        .kind = .checkpoint,
+        .cluster_id = 1,
+        .shard_id = 7001,
+        .table_id = 7,
+        .timeline_id = 1,
+        .epoch = 1,
+        .lsn = 0,
+        .previous_lsn = 0,
+    });
 
     var lookup = (try read_source.source().lookup(alloc, "articles", "doc:a", .{
         .fields = &.{"title"},
