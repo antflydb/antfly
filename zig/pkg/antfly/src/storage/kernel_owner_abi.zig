@@ -15,7 +15,7 @@
 //! Versioned internal ABI for the storage kernel's live DB owner. Keep this
 //! module free of storage and distributed-runtime imports.
 
-pub const abi_version: u32 = 2;
+pub const abi_version: u32 = 3;
 
 pub const BorrowedBytes = extern struct {
     ptr: ?[*]const u8 = null,
@@ -62,6 +62,11 @@ pub const Status = enum(u32) {
     out_of_memory = 9,
     corrupted = 10,
     identity_namespace_mismatch = 11,
+    invalid_query = 12,
+    unsupported_query = 13,
+    index_not_found = 14,
+    identity_read_generation_changed = 15,
+    timeout = 16,
     internal = 255,
 };
 
@@ -119,6 +124,18 @@ pub extern fn antfly_storage_owner_scan_ndjson(
 ) callconv(.c) Status;
 
 pub extern fn antfly_storage_owner_preflight_json(
+    owner: ?*anyopaque,
+    request: *const JsonOperationRequest,
+    out_response: *OwnedBytes,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_owner_text_stats_json(
+    owner: ?*anyopaque,
+    request: *const JsonOperationRequest,
+    out_response: *OwnedBytes,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_owner_algebraic_partials_json(
     owner: ?*anyopaque,
     request: *const JsonOperationRequest,
     out_response: *OwnedBytes,

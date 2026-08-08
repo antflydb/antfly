@@ -15,6 +15,7 @@
 const std = @import("std");
 const abi = @import("kernel_owner_abi");
 const kernel_owner_source = @import("../api/kernel_owner_source.zig");
+const db_mod = @import("db/mod.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
@@ -55,7 +56,14 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
                     .table_id = 7,
                     .name = "articles",
                     .placement_role = "data",
-                    .indexes_json = "{\"dense_idx\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":3}}",
+                    .indexes_json =
+                    \\{"dense_idx":{"type":"embeddings","external":true,"dimension":3},
+                    \\ "full_text_index_v0":{"type":"full_text"},
+                    \\ "alg":{"type":"algebraic","version":1,"table":"articles","schema_version":1,
+                    \\        "group_fields":[{"name":"category","path":"category","type":"keyword"}],
+                    \\        "measure_fields":[{"name":"amount","path":"amount","type":"number"}],
+                    \\        "materializations":[{"name":"sum_by_category","op":"sum","group_by":["category"],"measure":"amount"}]}}
+                    ,
                 }})[0..]),
                 .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
                     .group_id = 7001,
@@ -113,8 +121,8 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
 
     _ = try write_source.source().batch(alloc, "articles", .{
         .writes = &.{
-            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0,0]}}" },
-            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_embeddings\":{\"dense_idx\":[0,1,0]}}" },
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"category\":\"news\",\"amount\":10,\"_embeddings\":{\"dense_idx\":[1,0,0]}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"category\":\"news\",\"amount\":20,\"_embeddings\":{\"dense_idx\":[0,1,0]}}" },
         },
         .timestamp_ns = 4242,
         .sync_level = .full_index,
@@ -193,6 +201,70 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
     const first_doc_a = std.mem.indexOf(u8, dense_response.json, "doc:a") orelse return error.MissingDenseHit;
     const second_doc_b = std.mem.indexOf(u8, dense_response.json, "doc:b") orelse return error.MissingDenseHit;
     try std.testing.expect(first_doc_a < second_doc_b);
+
+    const text_stats_body =
+        \\{"fields":[{"index_name":"full_text_index_v0","field":"_all","terms":["alpha"]}]}
+    ;
+    var text_stats_response = (try read_source.source().textStatsGroupLocal(
+        alloc,
+        7001,
+        "articles",
+        text_stats_body,
+    )).?;
+    defer text_stats_response.deinit(alloc);
+    var text_stats = try table_reads.parseTextStatsHttpResponse(alloc, text_stats_body, text_stats_response.json);
+    defer text_stats.deinit(alloc);
+    switch (text_stats) {
+        .fields => |fields| {
+            try std.testing.expectEqual(@as(usize, 1), fields.fields.len);
+            try std.testing.expectEqual(@as(u32, 2), fields.fields[0].global_doc_count);
+            try std.testing.expectEqual(@as(u32, 1), fields.fields[0].term_doc_freqs[0].doc_freq);
+        },
+        .background_fields => return error.UnexpectedBackgroundTextStats,
+    }
+    try std.testing.expectError(
+        error.IdentityReadGenerationChanged,
+        read_source.source().textStatsGroupLocal(
+            alloc,
+            7001,
+            "articles",
+            "{\"_identity_read_generation\":999999,\"fields\":[{\"index_name\":\"full_text_index_v0\",\"field\":\"_all\",\"terms\":[\"alpha\"]}]}",
+        ),
+    );
+
+    const algebraic_ir = db_mod.algebraic.ir;
+    const sum_expr = algebraic_ir.TensorExpr{
+        .fragment = .reduce,
+        .input_dims = &.{ .doc, .scalar },
+        .output_dims = &.{.bucket},
+        .semantic_id = "sum_by_category",
+        .layout = .materialized_expr,
+        .law_id = .sum,
+    };
+    var sum_plan = (try algebraic_ir.planMaterializedExpressionAlloc(alloc, sum_expr)).?;
+    defer sum_plan.deinit(alloc);
+    const algebraic_body = try table_reads.encodeAlgebraicPartialsRequestWithProgramAtGeneration(
+        alloc,
+        "alg",
+        null,
+        &.{sum_plan.access_path},
+        &.{sum_expr},
+        null,
+    );
+    defer alloc.free(algebraic_body);
+    var algebraic_response = (try read_source.source().algebraicPartialsGroupLocal(
+        alloc,
+        7001,
+        "articles",
+        algebraic_body,
+    )).?;
+    defer algebraic_response.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, algebraic_response.json, "\"partials\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, algebraic_response.json, "sum_by_category") != null);
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        read_source.source().algebraicPartialsGroupLocal(alloc, 7001, "articles", "{}"),
+    );
 
     try std.testing.expectEqual(@as(usize, 1), owner_source.ownerCountForTest());
     try std.testing.expectEqual(@as(usize, 6), lease_capture.count);

@@ -147,6 +147,8 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .scan_group_local = scanGroupLocal,
                 .query_group_local = queryGroupLocal,
                 .search_result_group_local = searchResultGroupLocal,
+                .text_stats_group_local = textStatsGroupLocal,
+                .algebraic_partials_group_local = algebraicPartialsGroupLocal,
             },
         };
     }
@@ -456,6 +458,36 @@ pub const ProvisionedKernelOwnerSource = struct {
         var response = try lease.owner().batchJson(table_name, request_json);
         defer response.deinit();
         return {};
+    }
+
+    fn textStatsGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+    ) !?query_response.QueryResponse {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        var lease = try self.acquire(group_id, table_name);
+        defer lease.deinit();
+        var response = try lease.owner().textStatsJson(table_name, body);
+        defer response.deinit();
+        return .{ .json = try alloc.dupe(u8, response.bytes()) };
+    }
+
+    fn algebraicPartialsGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+    ) !?query_response.QueryResponse {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        var lease = try self.acquire(group_id, table_name);
+        defer lease.deinit();
+        var response = try lease.owner().algebraicPartialsJson(table_name, body);
+        defer response.deinit();
+        return .{ .json = try alloc.dupe(u8, response.bytes()) };
     }
 
     fn queryGroupLocal(

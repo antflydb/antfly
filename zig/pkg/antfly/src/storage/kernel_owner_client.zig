@@ -125,6 +125,32 @@ pub const Owner = struct {
         ));
         return response;
     }
+
+    pub fn textStatsJson(self: *Owner, table_name: []const u8, request_json: []const u8) !Response {
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_text_stats_json(
+            self.handle,
+            &.{
+                .table_name = .fromSlice(table_name),
+                .request_json = .fromSlice(request_json),
+            },
+            &response.buffer,
+        ));
+        return response;
+    }
+
+    pub fn algebraicPartialsJson(self: *Owner, table_name: []const u8, request_json: []const u8) !Response {
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_algebraic_partials_json(
+            self.handle,
+            &.{
+                .table_name = .fromSlice(table_name),
+                .request_json = .fromSlice(request_json),
+            },
+            &response.buffer,
+        ));
+        return response;
+    }
 };
 
 pub fn statusToError(status: abi.Status) !void {
@@ -141,6 +167,11 @@ pub fn statusToError(status: abi.Status) !void {
         .out_of_memory => error.OutOfMemory,
         .corrupted => error.Corrupted,
         .identity_namespace_mismatch => error.DocIdentityNamespaceMismatch,
+        .invalid_query => error.InvalidQueryRequest,
+        .unsupported_query => error.UnsupportedQueryRequest,
+        .index_not_found => error.IndexNotFound,
+        .identity_read_generation_changed => error.IdentityReadGenerationChanged,
+        .timeout => error.Timeout,
         .internal => error.StorageKernelFailure,
     };
 }

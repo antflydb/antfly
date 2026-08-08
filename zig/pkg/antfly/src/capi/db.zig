@@ -1837,6 +1837,49 @@ pub fn storageOwnerPreflightJson(
     return .ok;
 }
 
+pub fn storageOwnerTextStatsJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.JsonOperationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    const table_name = storageOwnerOperationTableName(handle, request) orelse return .invalid_argument;
+    const response = table_reads_api.executeStorageKernelTextStats(
+        handle.alloc,
+        &handle.db,
+        table_name,
+        request.request_json.slice(),
+    ) catch |err| return storageOwnerStatusFromError(err);
+    out_response.* = .{
+        .ptr = response.ptr,
+        .len = @intCast(response.len),
+    };
+    return .ok;
+}
+
+pub fn storageOwnerAlgebraicPartialsJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.JsonOperationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerOperationTableName(handle, request) orelse return .invalid_argument;
+    const response = table_reads_api.executeStorageKernelAlgebraicPartials(
+        handle.alloc,
+        &handle.db,
+        request.request_json.slice(),
+    ) catch |err| return storageOwnerStatusFromError(err);
+    out_response.* = .{
+        .ptr = response.ptr,
+        .len = @intCast(response.len),
+    };
+    return .ok;
+}
+
 pub fn storageOwnerBufferDestroy(buffer: *kernel_owner_abi.OwnedBytes) callconv(.c) void {
     antfly_db_buffer_free(buffer.ptr, @intCast(buffer.len));
     buffer.* = .{};
@@ -1867,6 +1910,11 @@ fn storageOwnerStatusFromError(err: anyerror) kernel_owner_abi.Status {
         error.OutOfMemory => .out_of_memory,
         error.Corrupted => .corrupted,
         error.DocIdentityNamespaceMismatch => .identity_namespace_mismatch,
+        error.InvalidQueryRequest => .invalid_query,
+        error.UnsupportedQueryRequest => .unsupported_query,
+        error.IndexNotFound => .index_not_found,
+        error.IdentityReadGenerationChanged => .identity_read_generation_changed,
+        error.Timeout => .timeout,
         else => .internal,
     };
 }

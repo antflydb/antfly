@@ -592,6 +592,60 @@ coarse auxiliary read families through this owner, close the minimum writer
 lifecycle surface, then make the old callbacks compile-time unreachable before
 the next cold ARM64 Linux musl `ReleaseFast` go/no-go measurement.
 
+### Phase 2i text-stat and algebraic-partial owner slice
+
+The two auxiliary planning/execution scans now use the same resident opaque
+owner. A text-stat call carries one complete existing JSON request, performs
+the explicit-query or background-field statistic scan inside the kernel, and
+returns one complete response. An algebraic-partial call carries the complete
+planned tensor/access-path request, performs the local materialized-expression
+scan inside the kernel, and returns all local partials together. There is no
+per-term, per-posting, per-row, or per-LSM-call ABI crossing.
+
+Distributed control still owns group selection, read admission, fanout,
+cross-group statistic/partial merging, algebraic proof and program planning,
+and final response construction. The kernel owns parsing the already-natural
+local wire payload, validating its live generation and index bindings, reading
+the resident DB and indexes, and encoding the local result. Both callbacks
+acquire the owner already used by batch, lookup, scan, query, and preflight;
+they do not open another DB or introduce another storage handle.
+
+The internal owner ABI is now version 3. It gives query failures stable status
+values for invalid and unsupported requests, missing indexes, changed identity
+read generations, and timeouts instead of collapsing them to a generic kernel
+failure. The consumer maps those statuses back to the existing exact errors.
+The cross-archive regression installs full-text and algebraic indexes beside
+the existing dense index, verifies corpus and term frequencies, verifies a
+materialized `sum_by_category` partial, and checks exact stale-generation and
+invalid-request failures while retaining one live owner.
+
+Validation at this checkpoint:
+
+- provisioned cross-archive owner suite: 6/6 passed with zero leaks;
+- opaque owner ABI suite: 2/2 passed with zero leaks, including every new
+  stable status and both invalid-ABI entry points;
+- current provisioned write/lifecycle regression set: 67/67 passed with zero
+  leaks;
+- existing public C API suite: 10/10 passed with zero leaks;
+- linked native Debug with production LSM-only options succeeded with normal
+  concurrency;
+- runtime/codegen/API graph gates passed and all 13 analyzer tests passed;
+- the linked native executable and shared C API contained no LMDB or
+  `backend_lmdb` global symbols; and
+- internal owner/runtime symbols remained hidden from the shared C API global
+  symbol table while public `antfly_db_open` and `antfly_db_close` remained
+  present.
+
+Decision: keep this slice. The authoritative lexical graph remains unchanged
+at this intermediate point because the legacy physical callbacks are still
+reachable, so a warm native Debug build is not evidence of a compiler-time or
+RSS improvement and no such claim is made. The next useful slices are the
+remaining graph and document-artifact read families, followed by runtime
+status and the minimum writer lifecycle needed to attach this owner globally.
+Only after the legacy provisioned physical path becomes compile-time
+unreachable should the experiment pay the cost of the next clean ARM64 Linux
+musl `ReleaseFast` time/RSS/graph/artifact comparison.
+
 ## Holistic target architecture
 
 The preferred end state is a modular monolith with a small number of compiled

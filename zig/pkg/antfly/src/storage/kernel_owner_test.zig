@@ -91,6 +91,22 @@ test "opaque storage owner validates ABI and destruction is idempotent" {
         abi.antfly_storage_owner_preflight_json(null, &invalid_operation, &response),
     );
     try std.testing.expectEqual(@as(u64, 0), response.len);
+    try std.testing.expectEqual(
+        abi.Status.invalid_abi,
+        abi.antfly_storage_owner_text_stats_json(null, &invalid_operation, &response),
+    );
+    try std.testing.expectEqual(@as(u64, 0), response.len);
+    try std.testing.expectEqual(
+        abi.Status.invalid_abi,
+        abi.antfly_storage_owner_algebraic_partials_json(null, &invalid_operation, &response),
+    );
+    try std.testing.expectEqual(@as(u64, 0), response.len);
+
+    try std.testing.expectError(error.InvalidQueryRequest, client.statusToError(.invalid_query));
+    try std.testing.expectError(error.UnsupportedQueryRequest, client.statusToError(.unsupported_query));
+    try std.testing.expectError(error.IndexNotFound, client.statusToError(.index_not_found));
+    try std.testing.expectError(error.IdentityReadGenerationChanged, client.statusToError(.identity_read_generation_changed));
+    try std.testing.expectError(error.Timeout, client.statusToError(.timeout));
 
     var empty: abi.OwnedBytes = .{};
     abi.antfly_storage_owner_buffer_destroy(&empty);

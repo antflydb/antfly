@@ -11407,7 +11407,7 @@ fn encodeAlgebraicPartialsRequestWithProgram(
     return try encodeAlgebraicPartialsRequestWithProgramAtGeneration(alloc, index_name, null, access_paths, tensor_exprs, tensor_program);
 }
 
-fn encodeAlgebraicPartialsRequestWithProgramAtGeneration(
+pub fn encodeAlgebraicPartialsRequestWithProgramAtGeneration(
     alloc: std.mem.Allocator,
     index_name: ?[]const u8,
     identity_read_generation: ?u64,
@@ -12569,18 +12569,27 @@ fn collectBoundLocalTextStats(
     body: []const u8,
 ) !?query_api.QueryResponse {
     if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+    return .{ .json = try executeStorageKernelTextStats(alloc, self.db, table_name, body) };
+}
+
+pub fn executeStorageKernelTextStats(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    table_name: []const u8,
+    body: []const u8,
+) ![]u8 {
     var parsed = try parseTextStatsRequest(alloc, table_name, body);
     defer parsed.deinit(alloc);
     return switch (parsed) {
         .background_fields => blk: {
-            const stats = try collectBackgroundTextStatsFromDbForRequest(alloc, self.db, parsed);
+            const stats = try collectBackgroundTextStatsFromDbForRequest(alloc, db, parsed);
             defer db_mod.aggregations.deinitDistributedBackgroundTextStats(alloc, stats);
-            break :blk .{ .json = try encodeBackgroundTextStatsResponse(alloc, stats) };
+            break :blk try encodeBackgroundTextStatsResponse(alloc, stats);
         },
         else => blk: {
-            const stats = try collectTextStatsFromDbForRequest(alloc, self.db, parsed);
+            const stats = try collectTextStatsFromDbForRequest(alloc, db, parsed);
             defer distributed_stats_mod.deinitTextFieldStats(alloc, stats);
-            break :blk .{ .json = try encodeTextStatsResponse(alloc, stats) };
+            break :blk try encodeTextStatsResponse(alloc, stats);
         },
     };
 }
@@ -12592,11 +12601,19 @@ fn collectBoundLocalAlgebraicPartials(
     body: []const u8,
 ) !?query_api.QueryResponse {
     if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+    return .{ .json = try executeStorageKernelAlgebraicPartials(alloc, self.db, body) };
+}
+
+pub fn executeStorageKernelAlgebraicPartials(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    body: []const u8,
+) ![]u8 {
     var parsed = try parseAlgebraicPartialsRequest(alloc, body);
     defer parsed.deinit(alloc);
-    const partials = try collectAlgebraicPartialsFromDbForRequest(alloc, self.db, parsed);
+    const partials = try collectAlgebraicPartialsFromDbForRequest(alloc, db, parsed);
     defer db_mod.algebraic.distributed.freePartials(alloc, partials);
-    return .{ .json = try encodeAlgebraicPartialsResponse(alloc, partials) };
+    return try encodeAlgebraicPartialsResponse(alloc, partials);
 }
 
 fn collectProvisionedHostedLocalTextStats(
