@@ -165,6 +165,7 @@ pub const RetrievalAgentResponse = struct {
 
 pub const BatchResponse = struct {
     owner_allocator: ?std.mem.Allocator = null,
+    status: u16,
     body: []u8,
 
     pub fn deinit(self: *BatchResponse, alloc: std.mem.Allocator) void {
@@ -1312,11 +1313,12 @@ pub const ApiHttpClient = struct {
             .body = body,
         });
         defer resp.deinit(self.alloc);
-        if (resp.status != 201) {
+        if (resp.status != 201 and resp.status != 202) {
             std.debug.print("fetchBatch unexpected status={d} uri={s} body={s}\n", .{ resp.status, uri, resp.body });
             return error.UnexpectedHttpStatus;
         }
         return .{
+            .status = resp.status,
             .body = try self.alloc.dupe(u8, resp.body),
         };
     }
@@ -1734,6 +1736,7 @@ pub const ApiHttpClient = struct {
         }
         const response = BatchResponse{
             .owner_allocator = resp.owner_allocator orelse self.alloc,
+            .status = resp.status,
             .body = resp.body,
         };
         resp.body = &.{};
@@ -2114,7 +2117,12 @@ pub const ApiHttpClient = struct {
             200 => return .{},
             404 => return error.UnknownGroup,
             409 => return remoteGroupConflictError(resp.body),
-            else => return error.UnexpectedHttpStatus,
+            503 => return error.GroupLeaderUnavailable,
+            else => {
+                const preview = resp.body[0..@min(resp.body.len, 256)];
+                std.log.warn("internal transaction begin returned unexpected status={} uri={s} body={s}", .{ resp.status, uri, preview });
+                return error.UnexpectedHttpStatus;
+            },
         }
     }
 
@@ -2147,6 +2155,7 @@ pub const ApiHttpClient = struct {
             200 => return .{},
             404 => return error.UnknownGroup,
             409 => return remoteGroupTxnPrepareConflictError(resp.body),
+            503 => return error.GroupLeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
     }
@@ -2199,6 +2208,7 @@ pub const ApiHttpClient = struct {
         switch (resp.status) {
             200 => {},
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.GroupLeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -2296,6 +2306,7 @@ pub const ApiHttpClient = struct {
             404 => return error.UnknownGroup,
             405 => return error.UnsupportedOperation,
             409 => return remoteGroupTxnResolveConflictError(resp.body),
+            503 => return error.GroupLeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
     }
@@ -2815,6 +2826,54 @@ fn remoteGroupConflictError(body: []const u8) anyerror {
 test "api http client preserves remote transaction decision conflicts" {
     try std.testing.expectEqual(error.DecisionConflict, remoteGroupConflictError("decision conflict"));
     try std.testing.expectEqual(error.DecisionConflict, remoteGroupConflictError("DecisionConflict"));
+}
+
+test "api http client accepts durable pending batch responses" {
+    const PendingExecutor = struct {
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(_: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, "/tables/docs/batch"));
+            return .{
+                .status = 202,
+                .body = try alloc.dupe(u8, "{\"status\":\"committed_pending\",\"inserted\":1,\"deleted\":0,\"transformed\":0}"),
+            };
+        }
+    };
+
+    var executor = PendingExecutor{};
+    var client = ApiHttpClient.init(std.testing.allocator, executor.executor());
+    var response = try client.fetchBatch("http://127.0.0.1:1", "docs", "{}");
+    defer response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 202), response.status);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "\"status\":\"committed_pending\"") != null);
+}
+
+test "api http client preserves retryable group transaction unavailability" {
+    const UnavailableExecutor = struct {
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(_: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            return .{
+                .status = 503,
+                .body = try alloc.dupe(u8, "group leader unavailable"),
+            };
+        }
+    };
+
+    var executor = UnavailableExecutor{};
+    var client = ApiHttpClient.init(std.testing.allocator, executor.executor());
+    const base_uri = "http://127.0.0.1:1";
+    try std.testing.expectError(error.GroupLeaderUnavailable, client.fetchGroupTxnBegin(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.GroupLeaderUnavailable, client.fetchGroupTxnPrepare(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.GroupLeaderUnavailable, client.fetchGroupTxnResolve(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.GroupLeaderUnavailable, client.fetchGroupTxnAcknowledge(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.GroupLeaderUnavailable, client.fetchGroupTxnStatus(base_uri, 7, "docs", "{}"));
 }
 
 fn isRetryableMetadataLeaderResponse(resp: http_common.HttpResponse) bool {
