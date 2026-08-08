@@ -139,6 +139,8 @@ the same host, target, cache state, and report set.
 | Production LSM-only feature set | No `mdb_*` or LMDB backend symbols in the storage archive | Kept; LMDB remains in test/legacy profiles |
 | Opt-in build-only storage kernel | Distributed 425.652 s → 415.352 s, but added a 230.093 s unit and raised duplicate instances from 393 to 756 | Keep only as Phase 2 scaffolding; do not enable in production yet |
 | One-call `DB.search` probe | Distributed 415.352 s → 401.086 s, but declarations changed only 41,984 → 41,981 and storage overlap remained 98.9% | Rejected; a call boundary without storage ownership does not remove codegen |
+| Provisioned read-vtable probe | Distributed 415.352 s → 397.153 s; only 83 declarations moved | Rejected as incomplete; hosted reads retained the physical-query graph |
+| Combined provisioned + hosted read-vtable probe | Distributed 415.352 s → 367.185 s and 41,984 → 40,585 declarations | Go for a local-query island, but revert the raw prototype and redesign the ABI/ownership split |
 
 The `/tmp` graph analysis was consolidated into
 `tools/analyze_zig_import_graph.py`. It reports lexical reachability, consumes
@@ -301,6 +303,68 @@ Do not spend time designing a stable result wire ABI around this shape. The
 next storage experiment must transfer ownership of a complete local table/shard
 runtime behind an opaque kernel handle, so distributed code cannot directly
 instantiate or call the storage implementation.
+
+### Phase 2b/2c complete read-vtable probes
+
+The next measurement routed the complete `ProvisionedTableReadSource` callback
+vtable through the storage archive. Unlike the one-call probe, this covered
+lookup, scan, query, preflight, text/algebraic planning, graph operations,
+runtime status, and artifact reads. The source context remained layout-coupled
+and results/errors remained raw Zig types solely to measure codegen before
+designing the production ABI.
+
+| Unit | Provisioned-only time | LLVM emit | Declarations | Repository Zig files |
+|---|---:|---:|---:|---:|
+| API kernel | 138.431 s | 134.315 s | 17,232 | 325 |
+| Distributed | 397.153 s | 388.728 s | 41,901 | 723 |
+| Experimental storage kernel | 240.743 s | 235.091 s | 27,301 | 415 |
+| Inference | 235.827 s | 228.249 s | 24,945 | 523 |
+
+This moved 1,939 declarations into storage but removed only 83 declarations
+from distributed. The reason was a second production owner:
+`HostedProvisionedTableReadSource` still rooted the same physical-query
+implementation for metadata/standalone composition.
+
+A follow-up routed both provisioned and hosted read vtables through the same
+storage artifact:
+
+| Unit | Combined-vtable time | LLVM emit | Declarations | Repository Zig files |
+|---|---:|---:|---:|---:|
+| API kernel | 135.831 s | 131.757 s | 17,232 | 325 |
+| Distributed | 367.185 s | 358.941 s | 40,585 | 716 |
+| Experimental storage kernel | 240.425 s | 234.618 s | 27,575 | 424 |
+| Inference | 232.352 s | 224.778 s | 24,945 | 523 |
+
+All 30 clean-cache build steps succeeded with normal concurrency. The result
+reduced the Phase 1 distributed unit by 48.167 seconds (11.6%) and 1,399
+declarations, crossing the 380-second go/no-go threshold. Adding the hosted
+surface cost the storage unit only 274 declarations and no measurable time.
+This is strong evidence that a compiled local-query island can pay off.
+
+The raw prototype itself was fully reverted because it violated three required
+properties:
+
+- the hosted vtable also carried routing, remote HTTP fanout, and result merge
+  into the storage archive instead of leaving distributed control outside;
+- arbitrary Zig error-set numbers differed between compilation units (the
+  expected `HAReadRequiresPrimary` arrived as an unrelated error), proving that
+  explicit stable status translation is mandatory; and
+- the executable grew from 57,638,496 to 71,458,096 bytes (24.0%) while both
+  direct storage ownership and linked read paths remained reachable.
+
+The focused suite passed 14 of 15 tests; the sole failure was the deliberate
+error-identity check above, not a success-path or memory-layout failure. The
+combined reports contained 806 duplicate repository-file instances, so the
+probe improved the critical path without yet satisfying the compile-once goal.
+
+Decision: proceed, but first separate distributed orchestration from local
+execution in the source model. Top-level lookup/scan/query, routing, fanout,
+remote calls, graph coordination, aggregation merge, and postprocessing stay
+in distributed. A dedicated local-operation source crosses a versioned ABI and
+owns one complete group operation at a time. Its opaque owner contains the DB,
+read/write caches, resource manager, and storage runtime. Statuses use an
+explicit enum, request/result envelopes have C-compatible versioned layouts or
+owned wire buffers, and every returned allocation is destroyed by the kernel.
 
 ## Holistic target architecture
 
