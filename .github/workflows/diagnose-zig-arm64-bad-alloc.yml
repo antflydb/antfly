@@ -28,7 +28,7 @@ jobs:
 
       - name: Verify runtime import boundaries
         run: |
-          python3 zig/tools/analyze_zig_import_graph.py --check-runtime-boundary --check-codegen-boundary --json
+          python3 zig/tools/analyze_zig_import_graph.py --check-runtime-boundary --check-codegen-boundary --check-api-kernel-boundary --json
           python3 -m unittest zig/tools/test_analyze_zig_import_graph.py
           python3 -m unittest zig/tools/test_patch_zig_0_16_build_runner_maxrss.py
 

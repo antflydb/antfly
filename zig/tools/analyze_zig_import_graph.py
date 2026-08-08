@@ -59,6 +59,25 @@ CODEGEN_BOUNDARIES = (
     ("standalone/inference_host.zig", "metadata/runtime.zig"),
 )
 
+# These files form the source-level ABI between the separately code-generated
+# API and distributed runtime units. Keep their direct imports data-only. The
+# lexical graph intentionally sees lazy/test imports, so transitive enforcement
+# is performed against an API compiler time report when one is supplied.
+API_KERNEL_CONTRACTS = (
+    "api/kernel_exports.zig",
+    "api/table_read_source.zig",
+    "api/table_write_source.zig",
+)
+API_KERNEL_IMPLEMENTATIONS = (
+    "api/table_reads.zig",
+    "api/table_writes.zig",
+    "storage/db/mod.zig",
+    "storage/db/db.zig",
+    "storage/docstore.zig",
+    "storage/lmdb.zig",
+    "storage/lmdb_backend.zig",
+)
+
 
 @dataclass(frozen=True)
 class GraphStats:
@@ -227,6 +246,13 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         "--check-codegen-boundary",
         action="store_true",
         help="fail if focused codegen/domain units can reach excluded runtime or simulation roots",
+    )
+    parser.add_argument(
+        "--check-api-kernel-boundary",
+        action="store_true",
+        help=(
+            "fail on direct storage/table implementation imports from API ABI files"
+        ),
     )
     parser.add_argument("--largest", type=int, default=0, metavar="N", help="show the N largest files per graph")
     parser.add_argument("--json", action="store_true", help="emit the summary as JSON")
@@ -582,6 +608,33 @@ def check_codegen_boundary(graph: ImportGraph) -> bool:
     return clean
 
 
+def check_api_kernel_boundary(graph: ImportGraph) -> bool:
+    """Enforce the compiled API/distributed ownership boundary.
+
+    Direct imports are safe to check lexically. Transitive lexical reachability
+    and compiler ``all_files`` lists are deliberately not gates because both
+    include lazy/test-only imports which do not contribute emitted code.
+    """
+
+    clean = True
+    implementations = {
+        graph.resolve_source(name): name for name in API_KERNEL_IMPLEMENTATIONS
+    }
+    for source_name in API_KERNEL_CONTRACTS:
+        source = graph.resolve_source(source_name)
+        for target in graph.relative_edges(source):
+            target_name = implementations.get(target)
+            if target_name is None:
+                continue
+            clean = False
+            print(
+                f"API kernel boundary violation: {source_name} directly imports {target_name}",
+                file=sys.stderr,
+            )
+
+    return clean
+
+
 def main(argv: list[str] | None = None) -> int:
     args = arguments(argv)
     try:
@@ -620,6 +673,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.check_runtime_boundary and not check_runtime_boundary(graph):
             return 1
         if args.check_codegen_boundary and not check_codegen_boundary(graph):
+            return 1
+        if args.check_api_kernel_boundary and not check_api_kernel_boundary(graph):
             return 1
         return 0
     except ValueError as error:
