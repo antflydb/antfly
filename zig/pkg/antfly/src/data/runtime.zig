@@ -100,12 +100,18 @@ const TransitionActionLanes = struct {
     }
 };
 
-/// Deadline handling is a fail-fast path: observing Raft state is useful, but
-/// waiting for its mutex after the operation's budget has elapsed is not. Keep
-/// the non-blocking policy in one helper so timeout probes and diagnostics
-/// cannot accidentally regress to an unbounded lock acquisition.
-fn tryLockRaftAfterDeadline(mutex: *std.atomic.Mutex) bool {
-    return mutex.tryLock();
+/// Capture a value from Raft state without waiting after an operation's budget
+/// has elapsed. The mutex is always released before this returns, which keeps
+/// formatting and synchronous log I/O outside the consensus critical section.
+fn tryCaptureRaftAfterDeadline(
+    comptime Result: type,
+    mutex: *std.atomic.Mutex,
+    context: anytype,
+    comptime captureFn: fn (@TypeOf(context)) Result,
+) ?Result {
+    if (!mutex.tryLock()) return null;
+    defer mutex.unlock();
+    return captureFn(context);
 }
 
 const runtime_status_refresh_max_db_opens_per_run: usize = 16;
@@ -3576,6 +3582,71 @@ const TransitionDbLeaseContext = struct {
     }
 };
 
+const RaftBatchLeaderStatusDiagnostics = struct {
+    node_id: u64,
+    role: raft_engine.core.types.StateRole,
+    leader_id: ?u64,
+    voter_count: usize,
+    term: u64,
+    election_elapsed: u32,
+    election_timeout: u32,
+    votes_granted: usize,
+    votes_rejected: usize,
+    votes_unknown: usize,
+    commit_index: u64,
+    last_index: u64,
+    applied_index: u64,
+};
+
+const RaftBatchLeaderTimeoutDiagnostics = struct {
+    status: ?RaftBatchLeaderStatusDiagnostics,
+    served_group_count: usize,
+    peer_route_count: usize,
+    sent_frames: usize,
+    send_failures: usize,
+    retries_scheduled: usize,
+    retries_exhausted: usize,
+    pending_retry_count: usize,
+};
+
+const RaftBatchLeaderTimeoutCaptureContext = struct {
+    raft: *antfly.raft.ManagedHttpHostService,
+    group_id: u64,
+};
+
+fn captureRaftBatchLeaderTimeoutDiagnostics(context: RaftBatchLeaderTimeoutCaptureContext) RaftBatchLeaderTimeoutDiagnostics {
+    const transport_host = &context.raft.host.http_host.transport_stack.transport_host;
+    const transport_metrics = transport_host.metricsSnapshot();
+    const status = if (context.raft.host.http_host.host.raftStatus(context.group_id)) |raft_status|
+        RaftBatchLeaderStatusDiagnostics{
+            .node_id = raft_status.id,
+            .role = raft_status.soft.role,
+            .leader_id = raft_status.soft.leader_id,
+            .voter_count = raft_status.conf_state.voters.len,
+            .term = raft_status.hard.current_term,
+            .election_elapsed = raft_status.election_elapsed,
+            .election_timeout = raft_status.randomized_election_timeout,
+            .votes_granted = raft_status.votes_granted,
+            .votes_rejected = raft_status.votes_rejected,
+            .votes_unknown = raft_status.votes_unknown,
+            .commit_index = raft_status.hard.commit_index,
+            .last_index = raft_status.last_index,
+            .applied_index = raft_status.applied_index,
+        }
+    else
+        null;
+    return .{
+        .status = status,
+        .served_group_count = transport_host.served_groups.count(),
+        .peer_route_count = transport_host.peer_routes.count(),
+        .sent_frames = transport_metrics.sent_frames,
+        .send_failures = transport_metrics.send_failures,
+        .retries_scheduled = transport_metrics.retries_scheduled,
+        .retries_exhausted = transport_metrics.retries_exhausted,
+        .pending_retry_count = transport_host.pendingRetryCount(),
+    };
+}
+
 pub const DataServer = struct {
     const SplitProjectionReconcileResult = union(enum) {
         advanced,
@@ -5771,52 +5842,55 @@ pub const DataServer = struct {
 
     fn logRaftBatchLeaderTimeout(self: *DataServer, group_id: u64) void {
         const raft = self.data_raft orelse return;
-        // This runs only after the caller's deadline has expired. Diagnostics
-        // must never turn that bounded failure into an unbounded wait behind a
-        // ticker or transport operation that currently owns the Raft mutex.
-        // The compact record still preserves the group id; a later attempt can
-        // emit the full snapshot once the mutex is available again.
-        if (!tryLockRaftAfterDeadline(&self.data_raft_mutex)) {
+        const diagnostics = tryCaptureRaftAfterDeadline(
+            RaftBatchLeaderTimeoutDiagnostics,
+            &self.data_raft_mutex,
+            RaftBatchLeaderTimeoutCaptureContext{ .raft = raft, .group_id = group_id },
+            captureRaftBatchLeaderTimeoutDiagnostics,
+        ) orelse {
+            // The compact record still preserves the group id; a later attempt
+            // can emit the full snapshot once the mutex is available again.
             std.log.warn("data raft leader wait timed out group_id={} diagnostics=raft_mutex_contended", .{group_id});
             return;
-        }
-        defer self.data_raft_mutex.unlock();
-        const transport_host = &raft.host.http_host.transport_stack.transport_host;
-        const transport_metrics = transport_host.metricsSnapshot();
-        if (raft.host.http_host.host.raftStatus(group_id)) |status| {
+        };
+
+        // Logging is synchronous and takes the process-wide stderr mutex. The
+        // snapshot helper has already released data_raft_mutex, so a blocked
+        // log sink cannot stop Raft progress or participate in a lock cycle.
+        if (diagnostics.status) |status| {
             std.log.warn("data raft leader wait timed out group_id={} node_id={} role={} leader={?} voters={} term={} election_elapsed={} election_timeout={} votes_granted={} votes_rejected={} votes_unknown={} commit={} last={} applied={} served_groups={} peer_routes={} sent_frames={} send_failures={} retries_scheduled={} retries_exhausted={} pending_retries={}", .{
                 group_id,
-                status.id,
-                status.soft.role,
-                status.soft.leader_id,
-                status.conf_state.voters.len,
-                status.hard.current_term,
+                status.node_id,
+                status.role,
+                status.leader_id,
+                status.voter_count,
+                status.term,
                 status.election_elapsed,
-                status.randomized_election_timeout,
+                status.election_timeout,
                 status.votes_granted,
                 status.votes_rejected,
                 status.votes_unknown,
-                status.hard.commit_index,
+                status.commit_index,
                 status.last_index,
                 status.applied_index,
-                transport_host.served_groups.count(),
-                transport_host.peer_routes.count(),
-                transport_metrics.sent_frames,
-                transport_metrics.send_failures,
-                transport_metrics.retries_scheduled,
-                transport_metrics.retries_exhausted,
-                transport_host.pendingRetryCount(),
+                diagnostics.served_group_count,
+                diagnostics.peer_route_count,
+                diagnostics.sent_frames,
+                diagnostics.send_failures,
+                diagnostics.retries_scheduled,
+                diagnostics.retries_exhausted,
+                diagnostics.pending_retry_count,
             });
         } else {
             std.log.warn("data raft leader wait timed out group_id={} status=missing served_groups={} peer_routes={} sent_frames={} send_failures={} retries_scheduled={} retries_exhausted={} pending_retries={}", .{
                 group_id,
-                transport_host.served_groups.count(),
-                transport_host.peer_routes.count(),
-                transport_metrics.sent_frames,
-                transport_metrics.send_failures,
-                transport_metrics.retries_scheduled,
-                transport_metrics.retries_exhausted,
-                transport_host.pendingRetryCount(),
+                diagnostics.served_group_count,
+                diagnostics.peer_route_count,
+                diagnostics.sent_frames,
+                diagnostics.send_failures,
+                diagnostics.retries_scheduled,
+                diagnostics.retries_exhausted,
+                diagnostics.pending_retry_count,
             });
         }
     }
@@ -6107,7 +6181,7 @@ pub const DataServer = struct {
         // This probe is used at an expired request deadline. Treat contention
         // as not-ready so the caller returns on time instead of waiting on the
         // same Raft critical section whose progress it is diagnosing.
-        if (!tryLockRaftAfterDeadline(&self.data_raft_mutex)) return false;
+        if (!self.data_raft_mutex.tryLock()) return false;
         defer self.data_raft_mutex.unlock();
         return raft.host.http_host.host.isLocalLeader(group_id);
     }
@@ -24730,15 +24804,32 @@ test "data raft forwarding distinguishes safe retries from ambiguous outcomes" {
     try std.testing.expectEqual(.terminal, DataServer.classifyDataRaftForwardError(error.OutOfMemory));
 }
 
-test "expired data raft deadline never waits for a contended raft mutex" {
-    var mutex: std.atomic.Mutex = .unlocked;
-    lockAtomic(&mutex);
-    defer mutex.unlock();
+test "expired data raft deadline snapshots never wait and release before returning" {
+    const Capture = struct {
+        fn run(call_count: *usize) usize {
+            call_count.* += 1;
+            return 42;
+        }
+    };
 
-    // The timeout path executes on the same thread in production, so a
-    // blocking acquisition here would deadlock instead of returning the
-    // caller's bounded outcome-unknown error.
-    try std.testing.expect(!tryLockRaftAfterDeadline(&mutex));
+    var mutex: std.atomic.Mutex = .unlocked;
+    var capture_calls: usize = 0;
+    lockAtomic(&mutex);
+    const contended = tryCaptureRaftAfterDeadline(usize, &mutex, &capture_calls, Capture.run);
+    mutex.unlock();
+
+    // A contended timeout path neither waits nor touches Raft state.
+    try std.testing.expectEqual(@as(?usize, null), contended);
+    try std.testing.expectEqual(@as(usize, 0), capture_calls);
+
+    const captured = tryCaptureRaftAfterDeadline(usize, &mutex, &capture_calls, Capture.run);
+    try std.testing.expectEqual(@as(?usize, 42), captured);
+    try std.testing.expectEqual(@as(usize, 1), capture_calls);
+
+    // Successful capture releases the critical section before the caller can
+    // perform synchronous logging.
+    try std.testing.expect(mutex.tryLock());
+    mutex.unlock();
 }
 
 test "data raft batch forwarding bounds routing campaigns deadlines and deterministic fallback" {
