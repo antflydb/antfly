@@ -22,6 +22,7 @@ const common_secrets = @import("../common/secrets.zig");
 const fs_paths = @import("../common/fs_paths.zig");
 const threaded_io_limits = @import("../common/threaded_io_limits.zig");
 const backups_api = @import("backups.zig");
+const batch_api = @import("batch.zig");
 const metadata_admin = @import("../metadata/admin.zig");
 const metadata_mod = @import("../metadata/domain.zig");
 const metadata_api = @import("../metadata/api.zig");
@@ -4314,6 +4315,10 @@ pub const ProvisionedTableWriteSource = struct {
     local_index_repair_debt_hook: ?LocalIndexRepairDebtHook = null,
     raft_batcher: ?RaftBatcher = null,
     local_write_owner: ?*ProvisionedTableWriteSource = null,
+    /// Optional local physical-operation provider. Top-level routing,
+    /// coalescing, admission, and lifecycle remain on this source; a compiled
+    /// storage owner supplies only group-local operations.
+    local_write_source: ?TableWriteSource = null,
     seed_create_table_writers: bool = true,
     group_visible_root_generation: ?table_reads.GroupVisibleRootGenerationSource = null,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
@@ -4814,6 +4819,14 @@ pub const ProvisionedTableWriteSource = struct {
         return self;
     }
 
+    pub fn withLocalWriteSource(
+        self: *ProvisionedTableWriteSource,
+        source_override: ?TableWriteSource,
+    ) *ProvisionedTableWriteSource {
+        self.local_write_source = source_override;
+        return self;
+    }
+
     pub fn withCreateTableWriterSeeding(self: *ProvisionedTableWriteSource, enabled: bool) *ProvisionedTableWriteSource {
         self.seed_create_table_writers = enabled;
         return self;
@@ -4822,6 +4835,10 @@ pub const ProvisionedTableWriteSource = struct {
     fn localWriteOwnerSource(self: *ProvisionedTableWriteSource) ?TableWriteSource {
         const owner = self.local_write_owner orelse return null;
         return owner.source();
+    }
+
+    fn groupLocalWriteSource(self: *ProvisionedTableWriteSource) ?TableWriteSource {
+        return self.local_write_source orelse self.localWriteOwnerSource();
     }
 
     /// Stop every source-owned worker before an attached storage owner begins
@@ -11733,6 +11750,12 @@ pub const ProvisionedTableWriteSource = struct {
         group: GroupBatch,
         req: db_mod.types.BatchRequest,
     ) !void {
+        if (self.local_write_source) |source_override| {
+            if ((try source_override.batchGroupLocal(alloc, group.group_id, table_name, req)) == null) {
+                return error.TableNotFound;
+            }
+            return;
+        }
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group.group_id);
         defer alloc.free(path);
         if (self.write_cache) |cache| {
@@ -12309,7 +12332,7 @@ pub const ProvisionedTableWriteSource = struct {
             try batcher.batchGroupLocal(alloc, group_id, table_name, req);
             return {};
         }
-        if (self.localWriteOwnerSource()) |owner| return try owner.batchGroupLocal(alloc, group_id, table_name, req);
+        if (self.groupLocalWriteSource()) |owner| return try owner.batchGroupLocal(alloc, group_id, table_name, req);
         try enforceHAWriteGateOptional(self.ha_write_gate);
         return try self.applyReplicatedBatchGroupLocal(alloc, group_id, table_name, req);
     }
@@ -19432,6 +19455,23 @@ fn applyLocalTableSchemaJson(
     if (marker_changed) try db.core.store.put(local_schema_json_key, schema_json);
 }
 
+/// Applies the catalog-owned physical table contract when an opaque compiled
+/// storage owner first opens a live group DB. This deliberately performs the
+/// same schema and index reconciliation as the in-module managed writer path.
+pub fn configureStorageKernelOwnerDb(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    schema_json: []const u8,
+    indexes_json: []const u8,
+) !void {
+    if (schema_json.len > 0) try applyLocalTableSchemaJson(alloc, db, schema_json);
+    if (indexes_json.len > 0) {
+        _ = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, db, indexes_json, .{
+            .drain_resolver_backfill = false,
+        });
+    }
+}
+
 fn loadTableIndexesJson(
     alloc: std.mem.Allocator,
     catalog: table_catalog.CatalogSource,
@@ -19853,6 +19893,12 @@ fn encodeRemoteBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReq
     }
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
+}
+
+/// Encodes the canonical internal batch wire contract for the compiled storage
+/// owner, including sync level and split-replication metadata.
+pub fn encodeStorageKernelBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchRequest) ![]u8 {
+    return try batch_api.encodeBatchRequest(alloc, req);
 }
 
 fn encodeRemoteDocumentArtifactChildRangeApplyBatch(
@@ -26867,6 +26913,100 @@ test "provisioned transition identity reassignment opens only the same table" {
         error.DocIdentityNamespaceMismatch,
         activity.openOwnedWriter(alloc, exact_metadata),
     );
+}
+
+test "provisioned batch keeps routing and delegates one group-local physical write" {
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const Capture = struct {
+        call_count: usize = 0,
+        group_id: u64 = 0,
+        write_count: usize = 0,
+
+        fn source(self: *@This()) TableWriteSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .batch = unexpectedTopLevelBatch,
+                    .batch_group_local = batchGroupLocal,
+                },
+            };
+        }
+
+        fn unexpectedTopLevelBatch(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+        ) !?void {
+            return error.UnexpectedTopLevelBatch;
+        }
+
+        fn batchGroupLocal(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            req: db_mod.types.BatchRequest,
+        ) !?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            self.call_count += 1;
+            self.group_id = group_id;
+            self.write_count = req.writes.len;
+            return {};
+        }
+    };
+
+    var capture = Capture{};
+    var source = ProvisionedTableWriteSource.init("/tmp/unused-antfly-local-write-source", Catalog.iface());
+    defer source.deinit();
+    _ = source.withLocalWriteSource(capture.source());
+
+    _ = try source.source().batch(std.testing.allocator, "docs", .{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), capture.call_count);
+    try std.testing.expectEqual(@as(u64, 7001), capture.group_id);
+    try std.testing.expectEqual(@as(usize, 2), capture.write_count);
 }
 
 test "provisioned create index updates cached writer in place" {

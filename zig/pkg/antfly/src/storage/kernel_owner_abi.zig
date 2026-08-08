@@ -70,6 +70,15 @@ pub const OpenRequest = extern struct {
     identity_table_id: u64 = 0,
     identity_shard_id: u64 = 0,
     identity_range_id: u64 = 0,
+    schema_json: BorrowedBytes = .{},
+    indexes_json: BorrowedBytes = .{},
+};
+
+pub const JsonOperationRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved0: u32 = 0,
+    table_name: BorrowedBytes = .{},
+    request_json: BorrowedBytes = .{},
 };
 
 pub extern fn antfly_storage_owner_open(
@@ -81,13 +90,13 @@ pub extern fn antfly_storage_owner_close(owner: ?*anyopaque) callconv(.c) void;
 
 pub extern fn antfly_storage_owner_batch_json(
     owner: ?*anyopaque,
-    request_json: BorrowedBytes,
+    request: *const JsonOperationRequest,
     out_response: *OwnedBytes,
 ) callconv(.c) Status;
 
 pub extern fn antfly_storage_owner_query_json(
     owner: ?*anyopaque,
-    request_json: BorrowedBytes,
+    request: *const JsonOperationRequest,
     out_response: *OwnedBytes,
 ) callconv(.c) Status;
 

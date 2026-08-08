@@ -1636,6 +1636,12 @@ pub fn storageOwnerOpen(
         .prefer_existing_identity_namespace = identity_namespace != null,
     }) catch |err| return storageOwnerStatusFromError(err);
     errdefer db.close();
+    antfly.public_api.table_writes.configureStorageKernelOwnerDb(
+        alloc,
+        &db,
+        request.schema_json.slice(),
+        request.indexes_json.slice(),
+    ) catch |err| return storageOwnerStatusFromError(err);
     const handle = alloc.create(Handle) catch return .out_of_memory;
     handle.* = .{
         .alloc = alloc,
@@ -1651,14 +1657,17 @@ pub fn storageOwnerClose(owner: ?*anyopaque) callconv(.c) void {
 
 pub fn storageOwnerBatchJson(
     owner: ?*anyopaque,
-    request_json: kernel_owner_abi.BorrowedBytes,
+    request: *const kernel_owner_abi.JsonOperationRequest,
     out_response: *kernel_owner_abi.OwnedBytes,
 ) callconv(.c) kernel_owner_abi.Status {
     out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request.table_name.len == 0) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
     var response: capi.Buffer = .{};
-    const status = storageOwnerStatusFromCapi(antfly_db_batch_json(owner, .{
-        .ptr = request_json.ptr,
-        .len = @intCast(request_json.len),
+    const status = storageOwnerStatusFromCapi(batchStorageKernelJson(handle, .{
+        .ptr = request.request_json.ptr,
+        .len = @intCast(request.request_json.len),
     }, &response));
     if (status != .ok) return status;
     out_response.* = .{
@@ -1668,17 +1677,47 @@ pub fn storageOwnerBatchJson(
     return .ok;
 }
 
+fn batchStorageKernelJson(
+    handle: *Handle,
+    request_json: capi.Slice,
+    out_buf: *capi.Buffer,
+) capi.ErrorCode {
+    // The group-local owner accepts the internal batch dialect so split
+    // replication state and the caller's requested sync level survive the
+    // compiled boundary. Public CAPI parsing remains intentionally narrower.
+    var owned = batch_api.parseInternalBatchRequest(handle.alloc, request_json.bytes()) catch |err| return capi.mapError(err);
+    defer owned.deinit(handle.alloc);
+
+    handle.db.batch(owned.req) catch |err| return capi.mapError(err);
+    const response = batch_api.encodeBatchResponse(std.heap.c_allocator, owned.result()) catch |err| return capi.mapError(err);
+    out_buf.* = .{
+        .ptr = response.ptr,
+        .len = response.len,
+    };
+    return .ok;
+}
+
 pub fn storageOwnerQueryJson(
     owner: ?*anyopaque,
-    request_json: kernel_owner_abi.BorrowedBytes,
+    request: *const kernel_owner_abi.JsonOperationRequest,
     out_response: *kernel_owner_abi.OwnedBytes,
 ) callconv(.c) kernel_owner_abi.Status {
     out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    const table_name = request.table_name.slice();
+    if (table_name.len == 0) return .invalid_argument;
     var response: capi.Buffer = .{};
-    const status = storageOwnerStatusFromCapi(antfly_db_search_json(owner, .{
-        .ptr = request_json.ptr,
-        .len = @intCast(request_json.len),
-    }, &response));
+    const request_slice: capi.Slice = .{
+        .ptr = request.request_json.ptr,
+        .len = @intCast(request.request_json.len),
+    };
+    const status = storageOwnerStatusFromCapi(searchStorageKernelQueryJson(
+        handle,
+        table_name,
+        request_slice,
+        &response,
+    ));
     if (status != .ok) return status;
     out_response.* = .{
         .ptr = response.ptr,
@@ -4035,11 +4074,19 @@ fn requestLooksLikePublicQueryJson(bytes: []const u8) bool {
         std.mem.indexOf(u8, bytes, "\"query\"") != null;
 }
 
-fn searchPublicQueryJson(handle: *Handle, request_json: capi.Slice, out_buf: *capi.Buffer) capi.ErrorCode {
-    var owned = query_api.parsePublicQueryRequest(
+fn searchStorageKernelQueryJson(
+    handle: *Handle,
+    table_name: []const u8,
+    request_json: capi.Slice,
+    out_buf: *capi.Buffer,
+) capi.ErrorCode {
+    // The distributed adapter sends the same resolved/internal query dialect
+    // used by remote group routes. It must not be reparsed as a public request:
+    // fields such as `_filter_query_json` are deliberately internal.
+    var owned = query_api.parseQueryRequest(
         handle.alloc,
         null,
-        "docs",
+        table_name,
         request_json.bytes(),
     ) catch |err| return capi.mapError(err);
     defer owned.deinit(handle.alloc);
@@ -4052,7 +4099,40 @@ fn searchPublicQueryJson(handle: *Handle, request_json: capi.Slice, out_buf: *ca
 
     var response = query_api.encodeQueryResponses(
         handle.alloc,
-        "docs",
+        table_name,
+        owned.req,
+        .{},
+        result,
+    ) catch |err| return capi.mapError(err);
+    defer response.deinit(handle.alloc);
+
+    out_buf.* = dupBytes(response.json) catch return .internal;
+    return .ok;
+}
+
+fn searchPublicQueryJson(
+    handle: *Handle,
+    table_name: []const u8,
+    request_json: capi.Slice,
+    out_buf: *capi.Buffer,
+) capi.ErrorCode {
+    var owned = query_api.parsePublicQueryRequest(
+        handle.alloc,
+        null,
+        table_name,
+        request_json.bytes(),
+    ) catch |err| return capi.mapError(err);
+    defer owned.deinit(handle.alloc);
+
+    stampSearchRequestIdentityGeneration(handle, &owned.req) catch |err| return capi.mapError(err);
+    handle.prepareSearchRequest(owned.req) catch |err| return capi.mapError(err);
+
+    var result = handle.db.search(handle.alloc, owned.req) catch |err| return capi.mapError(err);
+    defer result.deinit();
+
+    var response = query_api.encodeQueryResponses(
+        handle.alloc,
+        table_name,
         owned.req,
         .{},
         result,
@@ -4070,7 +4150,7 @@ pub export fn antfly_db_search_json(
 ) capi.ErrorCode {
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
     if (requestLooksLikePublicQueryJson(request_json.bytes())) {
-        return searchPublicQueryJson(handle, request_json, out_buf);
+        return searchPublicQueryJson(handle, "docs", request_json, out_buf);
     }
     const Request = struct {
         mode: []const u8,

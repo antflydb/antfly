@@ -44,21 +44,27 @@ pub const Owner = struct {
         self.* = undefined;
     }
 
-    pub fn batchJson(self: *Owner, request_json: []const u8) !Response {
+    pub fn batchJson(self: *Owner, table_name: []const u8, request_json: []const u8) !Response {
         var response: Response = .{};
         try statusToError(abi.antfly_storage_owner_batch_json(
             self.handle,
-            .fromSlice(request_json),
+            &.{
+                .table_name = .fromSlice(table_name),
+                .request_json = .fromSlice(request_json),
+            },
             &response.buffer,
         ));
         return response;
     }
 
-    pub fn queryJson(self: *Owner, request_json: []const u8) !Response {
+    pub fn queryJson(self: *Owner, table_name: []const u8, request_json: []const u8) !Response {
         var response: Response = .{};
         try statusToError(abi.antfly_storage_owner_query_json(
             self.handle,
-            .fromSlice(request_json),
+            &.{
+                .table_name = .fromSlice(table_name),
+                .request_json = .fromSlice(request_json),
+            },
             &response.buffer,
         ));
         return response;

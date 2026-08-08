@@ -50,15 +50,16 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     const batch_json =
         \\{"inserts":{"doc:a":{"title":"alpha"},"doc:b":{"title":"beta"}},"sync_level":"full_index"}
     ;
-    var batch_response = try owner.batchJson(batch_json);
+    var batch_response = try owner.batchJson("docs", batch_json);
     defer batch_response.deinit();
     try std.testing.expect(std.mem.indexOf(u8, batch_response.bytes(), "\"inserted\":2") != null);
 
     const query_json =
         \\{"query":{"match_all":{}},"limit":10}
     ;
-    var query_response = try owner.queryJson(query_json);
+    var query_response = try owner.queryJson("articles", query_json);
     defer query_response.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, query_response.bytes(), "articles") != null);
     try std.testing.expect(std.mem.indexOf(u8, query_response.bytes(), "doc:a") != null);
     try std.testing.expect(std.mem.indexOf(u8, query_response.bytes(), "doc:b") != null);
 }
@@ -69,6 +70,18 @@ test "opaque storage owner validates ABI and destruction is idempotent" {
     invalid.version = abi.abi_version + 1;
     try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_open(&invalid, &owner));
     try std.testing.expect(owner == null);
+
+    var response: abi.OwnedBytes = .{};
+    var invalid_operation: abi.JsonOperationRequest = .{
+        .table_name = .fromSlice("docs"),
+        .request_json = .fromSlice("{}"),
+    };
+    invalid_operation.version = abi.abi_version + 1;
+    try std.testing.expectEqual(
+        abi.Status.invalid_abi,
+        abi.antfly_storage_owner_batch_json(null, &invalid_operation, &response),
+    );
+    try std.testing.expectEqual(@as(u64, 0), response.len);
 
     var empty: abi.OwnedBytes = .{};
     abi.antfly_storage_owner_buffer_destroy(&empty);

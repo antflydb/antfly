@@ -431,6 +431,71 @@ group, neither operation may fall back to a distributed-owned `DB`; lifecycle
 and destruction tests must prove the owner is closed only after both read and
 write users drain.
 
+### Phase 2f provisioned batch/query owner slice
+
+The first production-source consumer now exists behind the opt-in storage
+kernel architecture. `ProvisionedTableWriteSource` retains top-level catalog
+routing, grouping, write coalescing, admission, table activity, HA gating, and
+change publication, then delegates one complete group batch through a new
+group-local physical-write seam. The existing provisioned read source retains
+query routing, consistency policy, fanout, merge, and postprocessing. Its
+group-local query callback crosses the same owner ABI.
+
+`ProvisionedKernelOwnerSource` is the shared consumer-side lifecycle object. It
+caches one opaque owner per table/group/generation/identity descriptor, leases
+that owner independently to reads and writes, and rejects an in-place catalog
+identity or visible-generation change until an explicit transition closes the
+old owner. First-open creation is serialized with a yielding lock; steady-state
+operations hold the lock only while incrementing or decrementing the active
+lease count. Destruction asserts that all users have drained before closing the
+kernel DB.
+
+The internal operation envelope now carries its ABI version and table name
+explicitly. The open descriptor also carries owned catalog schema and index
+JSON. The storage archive applies that contract to the writer DB before
+publishing the handle. Batches use the canonical internal batch wire dialect,
+which preserves sync level and split-replication metadata while rejecting
+unsupported graph or predicate fields instead of silently dropping them.
+Queries use the existing resolved internal group-query wire dialect rather
+than reparsing it as a public request, and non-stale reads still pass through
+the existing Raft readable-lease gate before crossing the ABI. Returned JSON
+remains kernel-owned until the consumer duplicates or parses it and calls the
+explicit destroy operation.
+
+A cross-static-archive test exercises the normal top-level provisioned source
+APIs rather than calling the ABI directly. It routes a two-document indexed
+batch, a match-all query, and a dense query through one owner; verifies both
+`read_index` gates; confirms the real table name survives the ABI; confirms a
+second writer open remains `busy`; and proves the DB can reopen only after the
+provisioned write source and shared owner have drained. The dense result order
+also proves that catalog index installation and indexed execution occur in the
+storage archive.
+
+Validation at this checkpoint:
+
+- provisioned cross-archive owner suite: 6/6 passed with zero leaks;
+- opaque owner ABI suite: 2/2 passed with zero leaks;
+- provisioned table-write regression suite: 73/73 passed with zero leaks,
+  including the focused routing/write seam;
+- existing public C API suite: 10/10 passed with zero leaks;
+- linked native Debug with production LSM-only options succeeded with normal
+  concurrency;
+- runtime/codegen/API graph gates passed and all 13 analyzer tests passed; and
+- the internal owner/runtime symbols remained hidden from the shared C API
+  global symbol table.
+
+Decision: keep this behaviorally valid representative slice, but do not attach
+it to every data-runtime path or claim a ReleaseFast reduction yet. Once this
+owner is resident, an unmigrated lookup, scan, runtime-status, transaction,
+restore, or maintenance path must not open a second distributed-owned DB for
+the same group. Global enablement would therefore be premature and a cold
+application measurement would still contain both physical implementations.
+The next slice must broaden the same owner—not add another handle—to the
+remaining coarse group-local read operations and the minimum writer lifecycle
+needed for safe runtime attachment. Only then should compile-time selection
+make the distributed query/write implementations unreachable and trigger the
+next ARM64 ReleaseFast go/no-go measurement.
+
 ## Holistic target architecture
 
 The preferred end state is a modular monolith with a small number of compiled

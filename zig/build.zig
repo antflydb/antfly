@@ -575,6 +575,7 @@ const AntflyRootImports = struct {
     platform_target: std.Build.ResolvedTarget,
     filesystem_capacity_source_file: std.Build.LazyPath,
     standalone_runtime_options: *std.Build.Step.Options,
+    kernel_owner_abi: *std.Build.Module,
 
     const import_table = [_]struct { name: []const u8, field: []const u8 }{
         .{ .name = "lmdb_engine", .field = "lmdb_engine" },
@@ -640,6 +641,7 @@ const AntflyRootImports = struct {
         .{ .name = "inference_server", .field = "inference_server" },
         .{ .name = "prometheus", .field = "prometheus" },
         .{ .name = "structlog", .field = "structlog" },
+        .{ .name = "kernel_owner_abi", .field = "kernel_owner_abi" },
     };
 
     fn configure(self: @This(), b: *std.Build, mod: *std.Build.Module, include_lmdb_c: bool, link_libc: bool) void {
@@ -1845,6 +1847,7 @@ pub fn build(b: *std.Build) void {
         .platform_target = target,
         .filesystem_capacity_source_file = b.path("lib/platform/src/filesystem_capacity.c"),
         .standalone_runtime_options = standalone_runtime_options,
+        .kernel_owner_abi = kernel_owner_abi_mod,
     };
 
     // Library module
@@ -5150,6 +5153,7 @@ pub fn build(b: *std.Build) void {
         .filters = selectTestFilters(b, &.{
             "auto bulk group writes release leases so idle finish can publish",
             "provisioned table write source has a finite worker ceiling",
+            "provisioned batch keeps routing and delegates one group-local physical write",
             "provisioned native storage metrics bypass an empty busy write cache",
             "provisioned table write source rejects stale doc identity namespace before write",
             "replicated split destination seeds inherited doc identity before range publication",
@@ -8581,7 +8585,6 @@ pub fn build(b: *std.Build) void {
                 .pic = if (owns_storage_kernel) true else null,
             });
             antfly_imports.configure(b, role_mod, false, link_libc);
-            role_mod.addImport("kernel_owner_abi", kernel_owner_abi_mod);
             role_mod.addImport("antfly-client", antfly_client_pkg_mod);
             if (owns_storage_kernel) role_mod.addImport("antfly_storage_root", role_mod);
             role_mod.addOptions("runtime_library_options", unit_options);
@@ -8637,6 +8640,29 @@ pub fn build(b: *std.Build) void {
                     "Run opaque storage owner ABI tests across static archives",
                 );
                 owner_test_step.dependOn(&run_owner_tests.step);
+
+                const provisioned_owner_test_mod = b.createModule(.{
+                    .root_source_file = b.path("pkg/antfly/src/storage_kernel_provisioned_source_test_root.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .link_libc = true,
+                });
+                antfly_imports.configure(b, provisioned_owner_test_mod, true, true);
+                const provisioned_owner_tests = b.addTest(.{
+                    .root_module = provisioned_owner_test_mod,
+                    .filters = &.{"provisioned batch and query share one opaque live storage owner"},
+                    .test_runner = .{
+                        .path = b.path("pkg/antfly/src/test_runner.zig"),
+                        .mode = .simple,
+                    },
+                });
+                provisioned_owner_tests.root_module.linkLibrary(role_artifact);
+                const run_provisioned_owner_tests = b.addRunArtifact(provisioned_owner_tests);
+                const provisioned_owner_test_step = b.step(
+                    "storage-kernel-provisioned-source-test",
+                    "Run provisioned group-local storage owner tests across static archives",
+                );
+                provisioned_owner_test_step.dependOn(&run_provisioned_owner_tests.step);
             }
             if (owns_storage_kernel) {
                 // The executable and C ABI libraries share this one optimized

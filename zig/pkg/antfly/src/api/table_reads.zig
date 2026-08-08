@@ -13660,6 +13660,13 @@ fn encodeQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest)
     return try out.toOwnedSlice(alloc);
 }
 
+/// Encodes the existing public query wire contract for the compiled storage
+/// owner. The storage boundary deliberately shares the same representation as
+/// remote group execution during the representative migration.
+pub fn encodeStorageKernelQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest) ![]u8 {
+    return try encodeQueryRequest(alloc, req);
+}
+
 fn appendDocFilterBindingsField(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -14586,6 +14593,10 @@ fn parseRemoteSearchResult(alloc: std.mem.Allocator, body: []const u8) !db_mod.t
         .total_hits_relation = try query_contract.parseTotalHitsRelation(total_obj.relation),
         .graph_results = graph_results,
     };
+}
+
+pub fn parseStorageKernelSearchResult(alloc: std.mem.Allocator, body: []const u8) !db_mod.types.SearchResult {
+    return try parseRemoteSearchResult(alloc, body);
 }
 
 fn parseRemoteIndexScoresAlloc(
