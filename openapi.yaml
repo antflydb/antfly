@@ -3858,11 +3858,23 @@ paths:
         '400':
           $ref: '#/components/responses/BadRequest'
         '409':
-          description: Batch transaction conflicted or the serving replica is fenced
+          description: >
+            The batch cannot be safely replayed as a unit. Either the server
+
+            could not determine whether a shard-group write committed, or one
+
+            or more shard groups accepted their portion before a later group
+
+            failed. Clients must reconcile affected keys and must not blindly
+
+            replay non-idempotent transforms.
           content:
             text/plain:
               schema:
                 type: string
+                enum:
+                  - write outcome unknown
+                  - partial write outcome
         '404':
           $ref: '#/components/responses/NotFound'
         '429':

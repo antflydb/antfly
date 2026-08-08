@@ -9262,6 +9262,20 @@ paths:
                 type: string
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          description: |
+            The batch cannot be safely replayed as a unit. Either the server
+            could not determine whether a shard-group write committed, or one
+            or more shard groups accepted their portion before a later group
+            failed. Clients must reconcile affected keys and must not blindly
+            replay non-idempotent transforms.
+          content:
+            text/plain:
+              schema:
+                type: string
+                enum:
+                  - write outcome unknown
+                  - partial write outcome
         "429":
           $ref: "#/components/responses/DenseRepairBackpressure"
         "503":

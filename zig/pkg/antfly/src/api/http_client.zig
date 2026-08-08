@@ -19,6 +19,8 @@ const metadata_transition_state = @import("../metadata/transition_state.zig");
 const db_api = @import("../storage/db/db.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const http_common = @import("../raft/transport/http_common.zig");
+const http_route_helpers = @import("http_route_helpers.zig");
+const internal_batch_forwarding = @import("internal_batch_forwarding.zig");
 const distributed_stats_mod = @import("../search/distributed_stats.zig");
 const routes = @import("http_routes.zig");
 const raft_routes = @import("../raft/transport/routes.zig");
@@ -162,10 +164,11 @@ pub const RetrievalAgentResponse = struct {
 };
 
 pub const BatchResponse = struct {
+    owner_allocator: ?std.mem.Allocator = null,
     body: []u8,
 
     pub fn deinit(self: *BatchResponse, alloc: std.mem.Allocator) void {
-        alloc.free(self.body);
+        if (self.body.len > 0) (self.owner_allocator orelse alloc).free(self.body);
         self.* = undefined;
     }
 };
@@ -1640,10 +1643,23 @@ pub const ApiHttpClient = struct {
         body: []const u8,
         timeout_ms: ?u32,
     ) !BatchResponse {
+        return self.fetchGroupBatchWithForwarding(base_uri, group_id, table_name, body, timeout_ms, null, null);
+    }
+
+    pub fn fetchGroupBatchWithForwarding(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        timeout_ms: ?u32,
+        forwarding: ?internal_batch_forwarding.Context,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) !BatchResponse {
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
             table_name,
-            routes.Routes.batch_suffix,
+            if (forwarding != null) routes.Routes.routed_batch_suffix else routes.Routes.batch_suffix,
         });
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
@@ -1651,23 +1667,77 @@ pub const ApiHttpClient = struct {
         const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var remaining_buf: [10]u8 = undefined;
+        var forwards_buf: [3]u8 = undefined;
+        var forwarding_headers: [3]http_common.RequestHeader = undefined;
+        const headers: []const http_common.RequestHeader = if (forwarding) |context| headers: {
+            forwarding_headers = .{
+                .{
+                    .name = internal_batch_forwarding.remaining_ms_header,
+                    .value = try std.fmt.bufPrint(&remaining_buf, "{d}", .{context.remaining_ms}),
+                },
+                .{
+                    .name = internal_batch_forwarding.forwards_remaining_header,
+                    .value = try std.fmt.bufPrint(&forwards_buf, "{d}", .{context.forwards_remaining}),
+                },
+                .{
+                    .name = internal_batch_forwarding.campaign_allowed_header,
+                    .value = if (context.campaign_allowed) "true" else "false",
+                },
+            };
+            break :headers &forwarding_headers;
+        } else &.{};
+
+        var delivery_tracker: http_common.RequestDeliveryTracker = .{};
+        var resp = self.executor.execute(self.alloc, .{
             .method = .POST,
             .uri = uri,
+            .headers = headers,
             .content_type = "application/json",
             .timeout_ms = timeout_ms,
             .body = body,
-        });
+            .cancellation = cancellation,
+            .delivery_tracker = if (forwarding != null) &delivery_tracker else null,
+        }) catch |err| {
+            const delivery = delivery_tracker.load();
+            if (forwarding != null and delivery != .not_sent and
+                !(delivery == .unknown and err == error.ConnectionRefused))
+            {
+                // An executor that cannot identify its send boundary remains
+                // unknown, except for a refused connection that never existed.
+                // An explicit post-send phase always wins over the error name.
+                return error.RaftBatchWriteOutcomeUnknown;
+            }
+            return err;
+        };
         defer resp.deinit(self.alloc);
         if (resp.status != 201) {
+            const outcome = resp.header(internal_batch_forwarding.outcome_header);
+            if ((outcome != null and std.mem.eql(u8, outcome.?, internal_batch_forwarding.outcome_unknown_v1)) or
+                std.mem.eql(u8, std.mem.trim(u8, resp.body, " \t\r\n"), "write outcome unknown"))
+            {
+                return error.RaftBatchWriteOutcomeUnknown;
+            }
             if (resp.status == 409) return remoteGroupConflictError(resp.body);
-            if (resp.status == 404) return error.UnknownGroup;
-            if (resp.status == 503) return error.LeaderUnavailable;
+            if (resp.status == 404) return if (forwarding != null) error.RaftBatchForwardingUnsupported else error.UnknownGroup;
+            if (resp.status == 503) {
+                if (forwarding == null or (outcome != null and
+                    std.mem.eql(u8, outcome.?, internal_batch_forwarding.outcome_not_proposed_v1)))
+                {
+                    return error.LeaderUnavailable;
+                }
+                return error.RaftBatchWriteOutcomeUnknown;
+            }
             const preview = resp.body[0..@min(resp.body.len, 256)];
             std.log.warn("internal group batch returned unexpected status={} uri={s} body={s}", .{ resp.status, uri, preview });
             return error.UnexpectedHttpStatus;
         }
-        return .{ .body = try self.alloc.dupe(u8, resp.body) };
+        const response = BatchResponse{
+            .owner_allocator = resp.owner_allocator orelse self.alloc,
+            .body = resp.body,
+        };
+        resp.body = &.{};
+        return response;
     }
 
     pub fn fetchGroupDocumentArtifactManifest(
@@ -2966,6 +3036,170 @@ test "api http client preserves group doc identity conflicts" {
     conflict_executor.status = 503;
     conflict_executor.body = "write unavailable";
     try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupBatch(base_uri, 7, "docs", "{}"));
+
+    conflict_executor.status = 409;
+    conflict_executor.body = "write outcome unknown";
+    try std.testing.expectError(error.RaftBatchWriteOutcomeUnknown, client.fetchGroupBatch(base_uri, 7, "docs", "{}"));
+}
+
+test "api http client forwards bounded raft batch routing context without allocation" {
+    const ForwardingExecutor = struct {
+        response_body_address: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(?u32, 500), req.timeout_ms);
+            try std.testing.expect(req.cancellation != null);
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, routes.Routes.routed_batch_suffix));
+            const forwarding = (try internal_batch_forwarding.parse(req)).?;
+            try std.testing.expectEqual(@as(u32, 425), forwarding.remaining_ms);
+            try std.testing.expectEqual(@as(u8, 1), forwarding.forwards_remaining);
+            try std.testing.expect(!forwarding.campaign_allowed);
+            const response_body = try alloc.dupe(u8, "{}");
+            self.response_body_address = @intFromPtr(response_body.ptr);
+            return .{ .status = 201, .body = response_body };
+        }
+    };
+
+    var executor = ForwardingExecutor{};
+    var cancellation = http_common.RequestCancellation{};
+    var client = ApiHttpClient.init(std.testing.allocator, executor.executor());
+    var response = try client.fetchGroupBatchWithForwarding(
+        "http://127.0.0.1:1",
+        7,
+        "docs",
+        "{}",
+        500,
+        .{ .remaining_ms = 425, .forwards_remaining = 1, .campaign_allowed = false },
+        &cancellation,
+    );
+    try std.testing.expectEqual(executor.response_body_address, @intFromPtr(response.body.ptr));
+    response.deinit(std.testing.allocator);
+}
+
+test "api http client rejects unsupported routed batch protocol without legacy replay" {
+    const UnsupportedExecutor = struct {
+        attempts: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.attempts += 1;
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, routes.Routes.routed_batch_suffix));
+            try std.testing.expect((try internal_batch_forwarding.parse(req)) != null);
+            return .{ .status = 404, .body = try alloc.dupe(u8, "not found") };
+        }
+    };
+
+    var executor = UnsupportedExecutor{};
+    var client = ApiHttpClient.init(std.testing.allocator, executor.executor());
+    try std.testing.expectError(error.RaftBatchForwardingUnsupported, client.fetchGroupBatchWithForwarding(
+        "http://127.0.0.1:1",
+        7,
+        "docs",
+        "{}",
+        500,
+        .{ .remaining_ms = 425, .forwards_remaining = 1, .campaign_allowed = false },
+        null,
+    ));
+    try std.testing.expectEqual(@as(usize, 1), executor.attempts);
+}
+
+test "api http client requires explicit not-proposed marker and tracks delivery phase" {
+    const OutcomeExecutor = struct {
+        const Mode = enum {
+            unmarked_unavailable,
+            marked_not_proposed,
+            failure_before_send,
+            failure_after_send,
+            refused_after_send,
+            failure_unknown,
+        };
+
+        mode: Mode,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, routes.Routes.routed_batch_suffix));
+            const tracker = req.delivery_tracker orelse return error.TestExpectedDeliveryTracker;
+            return switch (self.mode) {
+                .unmarked_unavailable => try http_route_helpers.textResponse(alloc, 503, "proxy unavailable"),
+                .marked_not_proposed => try http_route_helpers.textResponseWithHeaders(
+                    alloc,
+                    503,
+                    "group leader unavailable",
+                    &.{.{
+                        .name = internal_batch_forwarding.outcome_header,
+                        .value = internal_batch_forwarding.outcome_not_proposed_v1,
+                    }},
+                ),
+                .failure_before_send => {
+                    tracker.markNotSent();
+                    return error.OutOfMemory;
+                },
+                .failure_after_send => {
+                    tracker.markMayHaveBeenSent();
+                    return error.OutOfMemory;
+                },
+                .refused_after_send => {
+                    tracker.markMayHaveBeenSent();
+                    return error.ConnectionRefused;
+                },
+                .failure_unknown => return error.OutOfMemory,
+            };
+        }
+
+        fn fetch(client: *ApiHttpClient) !BatchResponse {
+            return client.fetchGroupBatchWithForwarding(
+                "http://127.0.0.1:1",
+                7,
+                "docs",
+                "{}",
+                500,
+                .{ .remaining_ms = 425, .forwards_remaining = 1, .campaign_allowed = false },
+                null,
+            );
+        }
+    };
+
+    var executor = OutcomeExecutor{ .mode = .unmarked_unavailable };
+    var client = ApiHttpClient.init(std.testing.allocator, executor.executor());
+    try std.testing.expectError(error.RaftBatchWriteOutcomeUnknown, OutcomeExecutor.fetch(&client));
+
+    executor.mode = .marked_not_proposed;
+    try std.testing.expectError(error.LeaderUnavailable, OutcomeExecutor.fetch(&client));
+
+    executor.mode = .failure_before_send;
+    try std.testing.expectError(error.OutOfMemory, OutcomeExecutor.fetch(&client));
+
+    executor.mode = .failure_after_send;
+    try std.testing.expectError(error.RaftBatchWriteOutcomeUnknown, OutcomeExecutor.fetch(&client));
+
+    executor.mode = .refused_after_send;
+    try std.testing.expectError(error.RaftBatchWriteOutcomeUnknown, OutcomeExecutor.fetch(&client));
+
+    executor.mode = .failure_unknown;
+    try std.testing.expectError(error.RaftBatchWriteOutcomeUnknown, OutcomeExecutor.fetch(&client));
 }
 
 test "api http client encodes merge doc identity reassignment action flag" {

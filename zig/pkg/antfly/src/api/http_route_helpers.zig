@@ -41,6 +41,39 @@ pub fn textResponse(alloc: std.mem.Allocator, status: u16, body: []const u8) !ht
     };
 }
 
+pub fn textResponseWithHeaders(
+    alloc: std.mem.Allocator,
+    status: u16,
+    body: []const u8,
+    headers_in: []const struct { name: []const u8, value: []const u8 },
+) !http_common.HttpResponse {
+    const headers = try alloc.alloc(http_common.Header, headers_in.len);
+    var header_index: usize = 0;
+    errdefer {
+        for (headers[0..header_index]) |*header| header.deinit(alloc);
+        alloc.free(headers);
+    }
+    for (headers_in, 0..) |header, i| {
+        const name = try alloc.dupe(u8, header.name);
+        errdefer alloc.free(name);
+        headers[i] = .{
+            .name = name,
+            .value = try alloc.dupe(u8, header.value),
+        };
+        header_index += 1;
+    }
+    const content_type = try alloc.dupe(u8, "text/plain");
+    errdefer alloc.free(content_type);
+    const owned_body = try alloc.dupe(u8, body);
+    errdefer alloc.free(owned_body);
+    return .{
+        .status = status,
+        .content_type = content_type,
+        .headers = headers,
+        .body = owned_body,
+    };
+}
+
 pub fn jsonWithHeadersResponse(
     alloc: std.mem.Allocator,
     status: u16,

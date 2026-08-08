@@ -397,6 +397,18 @@ pub const Raft = struct {
     }
 
     pub fn propose(self: *Raft, data: []const u8) !void {
+        var accepted_index: ?types.Index = null;
+        return try self.proposeWithReceipt(data, &accepted_index);
+    }
+
+    /// Proposes an entry and publishes the assigned log index as soon as the
+    /// leader appends it locally. The receipt remains null for every failure
+    /// before acceptance, but stays populated if later replication-message
+    /// construction fails. Callers can therefore distinguish a rejected
+    /// request from an accepted request whose final outcome is not yet known.
+    /// A proposal forwarded by a follower has no local acceptance receipt.
+    pub fn proposeWithReceipt(self: *Raft, data: []const u8, accepted_index: *?types.Index) !void {
+        accepted_index.* = null;
         if (self.soft_state.role != .leader) {
             if (self.cfg.disable_proposal_forwarding) return error.ProposalDropped;
             const leader = self.soft_state.leader_id orelse return error.NotLeader;
@@ -411,7 +423,7 @@ pub const Raft = struct {
             return;
         }
         if (self.lead_transferee != null) return error.LeaderTransferInProgress;
-        _ = try self.appendLocalEntryOfType(.normal, data);
+        accepted_index.* = try self.appendLocalEntryOfType(.normal, data);
         self.trace(.replicate, null);
         _ = self.maybeCommit();
         try self.bcastAppend();
