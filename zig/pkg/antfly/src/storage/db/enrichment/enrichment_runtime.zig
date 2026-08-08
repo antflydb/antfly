@@ -92,37 +92,58 @@ const ForegroundCatchUpDecision = enum {
 
 fn foregroundCatchUpDecision(
     applied_sequence: u64,
-    target_sequence: u64,
+    requested_sequence: u64,
+    runtime_target_sequence: u64,
     worker_failed: bool,
     retrying: bool,
     retry_due: bool,
 ) ForegroundCatchUpDecision {
     if (worker_failed) return .worker_failed;
-    if (retrying) return if (retry_due) .run_pass else .retry_in_progress;
-    if (applied_sequence >= target_sequence) return .complete;
+    const requested_sequence_applied = applied_sequence >= requested_sequence;
+    // Retry state is global to the runtime. Once this caller's prefix is
+    // applied, a target beyond the applied watermark proves that the retry
+    // belongs to later work and must not hold the completed caller hostage.
+    // When the whole runtime target is applied, retrying instead represents a
+    // failed status-clear write and needs the empty reconciliation pass.
+    const retry_blocks_request = retrying and
+        (!requested_sequence_applied or applied_sequence >= runtime_target_sequence);
+    if (retry_blocks_request) return if (retry_due) .run_pass else .retry_in_progress;
+    if (requested_sequence_applied) return .complete;
     return .run_pass;
 }
 
 test "enrichment foreground catch up reconciles retry state after checkpoint apply" {
     try std.testing.expectEqual(
         ForegroundCatchUpDecision.retry_in_progress,
-        foregroundCatchUpDecision(9, 9, false, true, false),
+        foregroundCatchUpDecision(9, 9, 9, false, true, false),
     );
     try std.testing.expectEqual(
         ForegroundCatchUpDecision.run_pass,
-        foregroundCatchUpDecision(9, 9, false, true, true),
+        foregroundCatchUpDecision(9, 9, 9, false, true, true),
     );
     try std.testing.expectEqual(
         ForegroundCatchUpDecision.complete,
-        foregroundCatchUpDecision(9, 9, false, false, false),
+        foregroundCatchUpDecision(9, 9, 10, false, true, false),
+    );
+    try std.testing.expectEqual(
+        ForegroundCatchUpDecision.complete,
+        foregroundCatchUpDecision(9, 9, 10, false, true, true),
+    );
+    try std.testing.expectEqual(
+        ForegroundCatchUpDecision.complete,
+        foregroundCatchUpDecision(9, 9, 9, false, false, false),
     );
     try std.testing.expectEqual(
         ForegroundCatchUpDecision.run_pass,
-        foregroundCatchUpDecision(8, 9, false, false, false),
+        foregroundCatchUpDecision(8, 9, 9, false, false, false),
+    );
+    try std.testing.expectEqual(
+        ForegroundCatchUpDecision.retry_in_progress,
+        foregroundCatchUpDecision(8, 9, 10, false, true, false),
     );
     try std.testing.expectEqual(
         ForegroundCatchUpDecision.worker_failed,
-        foregroundCatchUpDecision(9, 9, true, true, true),
+        foregroundCatchUpDecision(9, 9, 10, true, true, true),
     );
 }
 
@@ -1943,13 +1964,14 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         while (true) {
             self.mutex.lockUncancelable(io);
             const applied = self.applied_sequence;
+            const runtime_target = self.target_sequence;
             const failed = self.last_error_name != null;
             const retrying = self.retrying;
             const next_retry_at_ms = self.next_retry_at_ms;
             self.mutex.unlock(io);
 
             const retry_due = retrying and self.config.clock.nowRealtimeMs() >= next_retry_at_ms;
-            switch (foregroundCatchUpDecision(applied, sequence, failed, retrying, retry_due)) {
+            switch (foregroundCatchUpDecision(applied, sequence, runtime_target, failed, retrying, retry_due)) {
                 .complete => return,
                 .worker_failed => return RuntimeError.EnrichmentWorkerFailed,
                 .retry_in_progress => return RuntimeError.EnrichmentRetryInProgress,
