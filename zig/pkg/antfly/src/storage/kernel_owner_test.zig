@@ -108,6 +108,10 @@ test "opaque storage owner validates ABI and destruction is idempotent" {
     try std.testing.expectEqual(@as(u64, 0), response.len);
     try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_graph_edges_json(null, &invalid_controlled, &response));
     try std.testing.expectEqual(@as(u64, 0), response.len);
+    try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_document_artifact_manifest_json(null, &invalid_operation, &response));
+    try std.testing.expectEqual(@as(u64, 0), response.len);
+    try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_document_artifact_manifests_json(null, &invalid_operation, &response));
+    try std.testing.expectEqual(@as(u64, 0), response.len);
 
     try std.testing.expectError(error.InvalidQueryRequest, client.statusToError(.invalid_query));
     try std.testing.expectError(error.UnsupportedQueryRequest, client.statusToError(.unsupported_query));

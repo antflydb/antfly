@@ -59,7 +59,7 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
                     .placement_role = "data",
                     .indexes_json =
                     \\{"dense_idx":{"type":"embeddings","external":true,"dimension":3},
-                    \\ "full_text_index_v0":{"type":"full_text"},
+                    \\ "full_text_index_v0":{"type":"full_text","enrichments":[{"name":"document_units_v1","kind":"asset","field":"url","content_type":"application/json","producer_json":"{\"type\":\"document_extraction\",\"config\":{}}"}]},
                     \\ "alg":{"type":"algebraic","version":1,"table":"articles","schema_version":1,
                     \\        "group_fields":[{"name":"category","path":"category","type":"keyword"}],
                     \\        "measure_fields":[{"name":"amount","path":"amount","type":"number"}],
@@ -123,7 +123,7 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
 
     _ = try write_source.source().batch(alloc, "articles", .{
         .writes = &.{
-            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"category\":\"news\",\"amount\":10,\"_embeddings\":{\"dense_idx\":[1,0,0]}}" },
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"category\":\"news\",\"amount\":10,\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YQ==\",\"_embeddings\":{\"dense_idx\":[1,0,0]}}" },
             .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"category\":\"news\",\"amount\":20,\"_embeddings\":{\"dense_idx\":[0,1,0]}}" },
         },
         .graph_writes = &.{.{
@@ -344,6 +344,43 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
     try std.testing.expectEqual(@as(usize, 1), edges_response.edges.len);
     try std.testing.expectEqualStrings("doc:b", edges_response.edges[0].target);
 
+    var manifest = (try read_source.source().documentArtifactManifest(
+        alloc,
+        "articles",
+        "doc:a",
+        "document_units_v1",
+        .read_index,
+    )) orelse return error.MissingDocumentArtifactManifest;
+    defer manifest.deinit(alloc);
+    try std.testing.expectEqualStrings("doc:a", manifest.document_id);
+    try std.testing.expectEqualStrings("document_units_v1", manifest.artifact_name);
+    try std.testing.expectEqualStrings("text", manifest.route_type);
+    try std.testing.expectEqual(@as(usize, 1), manifest.unit_count);
+    try std.testing.expect(manifest.child_ranges.len > 0);
+    try std.testing.expectEqualStrings("unit", manifest.child_ranges[0].range_kind);
+    try std.testing.expect(std.mem.indexOf(u8, manifest.manifest_json, "\"range_policy\"") != null);
+    try std.testing.expect(manifest.state_json != null);
+
+    var manifests = (try read_source.source().documentArtifactManifests(
+        alloc,
+        "articles",
+        "doc:a",
+        .read_index,
+    )) orelse return error.MissingDocumentArtifactManifestList;
+    defer manifests.deinit(alloc);
+    try std.testing.expectEqualStrings("doc:a", manifests.document_id);
+    try std.testing.expectEqual(@as(usize, 1), manifests.artifacts.len);
+    try std.testing.expectEqualStrings("document_units_v1", manifests.artifacts[0].artifact_name);
+    try std.testing.expect(manifests.artifacts[0].child_ranges.len > 0);
+    try std.testing.expect(manifests.artifacts[0].state_json != null);
+    try std.testing.expect((try read_source.source().documentArtifactManifest(
+        alloc,
+        "articles",
+        "doc:missing",
+        "document_units_v1",
+        .read_index,
+    )) == null);
+
     var cancellation = std.atomic.Value(bool).init(true);
     edges_req.cancellation = &cancellation;
     try std.testing.expectError(
@@ -358,7 +395,7 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
     );
 
     try std.testing.expectEqual(@as(usize, 1), owner_source.ownerCountForTest());
-    try std.testing.expectEqual(@as(usize, 11), lease_capture.count);
+    try std.testing.expectEqual(@as(usize, 14), lease_capture.count);
     try std.testing.expectEqual(@as(u64, 7001), lease_capture.last_group_id);
 
     const group_path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root});

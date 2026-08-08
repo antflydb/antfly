@@ -13298,14 +13298,14 @@ fn remoteDocumentArtifactManifestAlloc(alloc: std.mem.Allocator, remote: RemoteD
     };
 }
 
-fn parseRemoteDocumentArtifactManifest(alloc: std.mem.Allocator, body: []const u8) !db_mod.types.DocumentArtifactManifest {
+pub fn parseStorageKernelDocumentArtifactManifestResponse(alloc: std.mem.Allocator, body: []const u8) !db_mod.types.DocumentArtifactManifest {
     var parsed = try std.json.parseFromSlice(RemoteDocumentArtifactManifest, alloc, body, .{});
     defer parsed.deinit();
 
     return try remoteDocumentArtifactManifestAlloc(alloc, parsed.value);
 }
 
-fn parseRemoteDocumentArtifactManifests(alloc: std.mem.Allocator, body: []const u8) !db_mod.types.DocumentArtifactManifestList {
+pub fn parseStorageKernelDocumentArtifactManifestsResponse(alloc: std.mem.Allocator, body: []const u8) !db_mod.types.DocumentArtifactManifestList {
     var parsed = try std.json.parseFromSlice(RemoteDocumentArtifactManifests, alloc, body, .{});
     defer parsed.deinit();
 
@@ -13338,7 +13338,7 @@ fn documentArtifactManifestRemote(
     var client = http_client.ApiHttpClient.init(alloc, executor);
     var result = try client.fetchGroupDocumentArtifactManifest(base_uri, group_id, table_name, doc_key, artifact_name);
     defer result.deinit(alloc);
-    return try parseRemoteDocumentArtifactManifest(alloc, result.body);
+    return try parseStorageKernelDocumentArtifactManifestResponse(alloc, result.body);
 }
 
 fn documentArtifactManifestsRemote(
@@ -13352,7 +13352,7 @@ fn documentArtifactManifestsRemote(
     var client = http_client.ApiHttpClient.init(alloc, executor);
     var result = try client.fetchGroupDocumentArtifactManifests(base_uri, group_id, table_name, doc_key);
     defer result.deinit(alloc);
-    return try parseRemoteDocumentArtifactManifests(alloc, result.body);
+    return try parseStorageKernelDocumentArtifactManifestsResponse(alloc, result.body);
 }
 
 fn scanRemote(
@@ -13790,6 +13790,49 @@ pub fn encodeStorageKernelLookupRequest(
         .fields = opts.fields,
         .include_all_fields = opts.include_all_fields,
     }, .{});
+}
+
+pub const StorageKernelDocumentArtifactManifestWireRequest = struct {
+    doc_key: []const u8,
+    artifact_name: []const u8,
+};
+
+pub const StorageKernelDocumentArtifactManifestsWireRequest = struct {
+    doc_key: []const u8,
+};
+
+pub fn encodeStorageKernelDocumentArtifactManifestRequest(
+    alloc: std.mem.Allocator,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, StorageKernelDocumentArtifactManifestWireRequest{
+        .doc_key = doc_key,
+        .artifact_name = artifact_name,
+    }, .{});
+}
+
+pub fn encodeStorageKernelDocumentArtifactManifestsRequest(
+    alloc: std.mem.Allocator,
+    doc_key: []const u8,
+) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, StorageKernelDocumentArtifactManifestsWireRequest{
+        .doc_key = doc_key,
+    }, .{});
+}
+
+pub fn encodeStorageKernelDocumentArtifactManifestResponse(
+    alloc: std.mem.Allocator,
+    manifest: db_mod.types.DocumentArtifactManifest,
+) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, manifest, .{});
+}
+
+pub fn encodeStorageKernelDocumentArtifactManifestsResponse(
+    alloc: std.mem.Allocator,
+    manifests: db_mod.types.DocumentArtifactManifestList,
+) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, manifests, .{});
 }
 
 pub const StorageKernelScanWireRequest = struct {

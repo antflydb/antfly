@@ -202,7 +202,47 @@ pub const Owner = struct {
         ));
         return response;
     }
+
+    pub fn documentArtifactManifestJson(
+        self: *Owner,
+        table_name: []const u8,
+        request_json: []const u8,
+    ) !Response {
+        var response: Response = .{};
+        const request = operationRequest(table_name, request_json);
+        try statusToError(abi.antfly_storage_owner_document_artifact_manifest_json(
+            self.handle,
+            &request,
+            &response.buffer,
+        ));
+        return response;
+    }
+
+    pub fn documentArtifactManifestsJson(
+        self: *Owner,
+        table_name: []const u8,
+        request_json: []const u8,
+    ) !Response {
+        var response: Response = .{};
+        const request = operationRequest(table_name, request_json);
+        try statusToError(abi.antfly_storage_owner_document_artifact_manifests_json(
+            self.handle,
+            &request,
+            &response.buffer,
+        ));
+        return response;
+    }
 };
+
+fn operationRequest(
+    table_name: []const u8,
+    request_json: []const u8,
+) abi.JsonOperationRequest {
+    return .{
+        .table_name = .fromSlice(table_name),
+        .request_json = .fromSlice(request_json),
+    };
+}
 
 fn controlledRequest(
     table_name: []const u8,

@@ -713,6 +713,55 @@ RSS claim yet. Move those remaining coarse families, make the old provisioned
 physical path compile-time unreachable, and then perform the next clean ARM64
 Linux musl `ReleaseFast` comparison.
 
+### Phase 2k document-artifact manifest owner slice
+
+The single-manifest and manifest-list group-local reads now execute against the
+resident opaque owner. Each call carries one document key, plus the artifact
+name for the single lookup, and returns one complete owned manifest or list.
+Nested child-range descriptors, the raw manifest, and optional state travel in
+the same response, so the ABI does not cross once per artifact or child range.
+
+Distributed control still resolves the document key to a group, enforces the HA
+gate, and acquires the Raft-readable lease before entering the kernel. The
+kernel performs the named lookup or artifact-prefix scan against the already
+open DB. A missing named manifest remains an optional miss rather than a
+generic kernel failure; listing a document with no manifests remains a valid
+empty list.
+
+The internal owner ABI is now version 5. The new operations reuse the ordinary
+synchronous JSON request envelope and the established internal HTTP manifest
+response shape. The response parser is shared with remote group reads, while
+the kernel encoder serializes the storage-owned manifest types directly. This
+keeps one ownership/deallocation path for every nested allocation and avoids a
+second compiled protocol model.
+
+Validation at this checkpoint:
+
+- provisioned cross-archive owner suite: 6/6 passed with zero leaks, generating
+  a real document-extraction manifest and round-tripping its summary, nested
+  child ranges, raw manifest, state, list form, and missing-manifest result
+  while retaining one live owner;
+- opaque owner ABI suite: 2/2 passed with zero leaks, including both new
+  invalid-ABI entry points;
+- focused table-read and distributed-graph suite: 25/25 passed with zero leaks;
+- current provisioned write/lifecycle regression set: 68/68 passed with zero
+  leaks;
+- existing public C API suite: 10/10 passed with zero leaks;
+- linked native Debug and both C API libraries built with production LSM-only
+  options and normal concurrency;
+- runtime/codegen/API graph gates passed and all 13 analyzer tests passed; and
+- production-LSM native artifacts contained no LMDB globals, internal
+  owner/runtime symbols remained hidden from the shared C API, and public
+  `antfly_db_open` and `antfly_db_close` remained present.
+
+Decision: keep this slice. It removes the final document-artifact read callbacks
+from the future owner-attached local path. Runtime/status inspection and the
+minimum writer lifecycle needed to publish, retire, and replace resident owners
+remain before the legacy physical source can become compile-time unreachable.
+Migrate those ownership families next; do not claim a cold-build or RSS change
+until the old source is actually unreachable and the ARM64 Linux musl
+`ReleaseFast` comparison is rerun.
+
 ## Holistic target architecture
 
 The preferred end state is a modular monolith with a small number of compiled

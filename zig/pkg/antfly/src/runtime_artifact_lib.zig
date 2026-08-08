@@ -216,6 +216,8 @@ comptime {
             exportInternal(&storage_kernel_exports.storageOwnerGraphExpandJson, "antfly_storage_owner_graph_expand_json");
             exportInternal(&storage_kernel_exports.storageOwnerGraphHydrateJson, "antfly_storage_owner_graph_hydrate_json");
             exportInternal(&storage_kernel_exports.storageOwnerGraphEdgesJson, "antfly_storage_owner_graph_edges_json");
+            exportInternal(&storage_kernel_exports.storageOwnerDocumentArtifactManifestJson, "antfly_storage_owner_document_artifact_manifest_json");
+            exportInternal(&storage_kernel_exports.storageOwnerDocumentArtifactManifestsJson, "antfly_storage_owner_document_artifact_manifests_json");
             exportInternal(&storage_kernel_exports.storageOwnerBufferDestroy, "antfly_storage_owner_buffer_destroy");
         },
         .inference => {

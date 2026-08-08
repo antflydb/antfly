@@ -1954,6 +1954,65 @@ pub fn storageOwnerGraphEdgesJson(
     return .ok;
 }
 
+pub fn storageOwnerDocumentArtifactManifestJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.JsonOperationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerOperationTableName(handle, request) orelse return .invalid_argument;
+    var parsed = std.json.parseFromSlice(
+        table_reads_api.StorageKernelDocumentArtifactManifestWireRequest,
+        handle.alloc,
+        request.request_json.slice(),
+        .{},
+    ) catch return .invalid_argument;
+    defer parsed.deinit();
+    var manifest = (handle.db.getDocumentArtifactManifest(
+        handle.alloc,
+        parsed.value.doc_key,
+        parsed.value.artifact_name,
+    ) catch |err| return storageOwnerStatusFromError(err)) orelse return .not_found;
+    defer manifest.deinit(handle.alloc);
+    const response = table_reads_api.encodeStorageKernelDocumentArtifactManifestResponse(
+        handle.alloc,
+        manifest,
+    ) catch |err| return storageOwnerStatusFromError(err);
+    out_response.* = .{ .ptr = response.ptr, .len = @intCast(response.len) };
+    return .ok;
+}
+
+pub fn storageOwnerDocumentArtifactManifestsJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.JsonOperationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerOperationTableName(handle, request) orelse return .invalid_argument;
+    var parsed = std.json.parseFromSlice(
+        table_reads_api.StorageKernelDocumentArtifactManifestsWireRequest,
+        handle.alloc,
+        request.request_json.slice(),
+        .{},
+    ) catch return .invalid_argument;
+    defer parsed.deinit();
+    var manifests = handle.db.listDocumentArtifactManifests(
+        handle.alloc,
+        parsed.value.doc_key,
+    ) catch |err| return storageOwnerStatusFromError(err);
+    defer manifests.deinit(handle.alloc);
+    const response = table_reads_api.encodeStorageKernelDocumentArtifactManifestsResponse(
+        handle.alloc,
+        manifests,
+    ) catch |err| return storageOwnerStatusFromError(err);
+    out_response.* = .{ .ptr = response.ptr, .len = @intCast(response.len) };
+    return .ok;
+}
+
 pub fn storageOwnerBufferDestroy(buffer: *kernel_owner_abi.OwnedBytes) callconv(.c) void {
     antfly_db_buffer_free(buffer.ptr, @intCast(buffer.len));
     buffer.* = .{};

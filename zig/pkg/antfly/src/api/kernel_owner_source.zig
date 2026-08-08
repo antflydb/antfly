@@ -153,6 +153,8 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .graph_expand_group_local = graphExpandGroupLocal,
                 .graph_hydrate_group_local = graphHydrateGroupLocal,
                 .graph_edges_group_local = graphEdgesGroupLocal,
+                .document_artifact_manifest_group_local = documentArtifactManifestGroupLocal,
+                .document_artifact_manifests_group_local = documentArtifactManifestsGroupLocal,
             },
         };
     }
@@ -437,6 +439,67 @@ pub const ProvisionedKernelOwnerSource = struct {
         var response = try lease.owner().scanNdjson(table_name, request_json);
         defer response.deinit();
         return .{ .ndjson = try alloc.dupe(u8, response.bytes()) };
+    }
+
+    fn documentArtifactManifestGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        consistency: read_gate.ReadConsistency,
+    ) !?db_types.DocumentArtifactManifest {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        try self.prepareLookupRead(group_id, doc_key, .{}, consistency);
+        const request_json = try table_reads.encodeStorageKernelDocumentArtifactManifestRequest(
+            alloc,
+            doc_key,
+            artifact_name,
+        );
+        defer alloc.free(request_json);
+        var lease = try self.acquire(group_id, table_name);
+        defer lease.deinit();
+        var response = lease.owner().documentArtifactManifestJson(
+            table_name,
+            request_json,
+        ) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        defer response.deinit();
+        return try table_reads.parseStorageKernelDocumentArtifactManifestResponse(
+            alloc,
+            response.bytes(),
+        );
+    }
+
+    fn documentArtifactManifestsGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        consistency: read_gate.ReadConsistency,
+    ) !?db_types.DocumentArtifactManifestList {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        try self.prepareLookupRead(group_id, doc_key, .{}, consistency);
+        const request_json = try table_reads.encodeStorageKernelDocumentArtifactManifestsRequest(
+            alloc,
+            doc_key,
+        );
+        defer alloc.free(request_json);
+        var lease = try self.acquire(group_id, table_name);
+        defer lease.deinit();
+        var response = try lease.owner().documentArtifactManifestsJson(
+            table_name,
+            request_json,
+        );
+        defer response.deinit();
+        return try table_reads.parseStorageKernelDocumentArtifactManifestsResponse(
+            alloc,
+            response.bytes(),
+        );
     }
 
     fn preflightQueryGroupLocal(
