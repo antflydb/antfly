@@ -29,8 +29,9 @@ const algebraic_mod = @import("../storage/db/algebraic/mod.zig");
 const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 const full_text_indexes = @import("full_text_indexes.zig");
 const json_helpers = @import("json_helpers.zig");
-const table_reads = @import("table_reads.zig");
+const table_reads = @import("table_read_source.zig");
 const coverage_policy_mod = @import("coverage_policy.zig");
+const table_create_contract = @import("table_create_contract.zig");
 
 pub const default_full_text_index_name = full_text_indexes.default_full_text_index_name;
 pub const default_indexes_json = "{\"full_text_index_v0\":{\"name\":\"full_text_index_v0\",\"type\":\"full_text\"}}";
@@ -666,21 +667,7 @@ pub fn buildSingleTableIndexWithRuntimeSchemaDebugValue(
     return value;
 }
 
-pub const CreateTableRequest = struct {
-    num_shards: ?u32 = null,
-    description: ?[]u8 = null,
-    indexes_json: ?[]u8 = null,
-    schema_json: ?[]u8 = null,
-    replication_sources_json: ?[]u8 = null,
-
-    pub fn deinit(self: *CreateTableRequest, alloc: std.mem.Allocator) void {
-        if (self.description) |value| alloc.free(value);
-        if (self.indexes_json) |value| alloc.free(value);
-        if (self.schema_json) |value| alloc.free(value);
-        if (self.replication_sources_json) |value| alloc.free(value);
-        self.* = undefined;
-    }
-};
+pub const CreateTableRequest = table_create_contract.CreateTableRequest;
 
 pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !CreateTableRequest {
     return parseCreateTableRequestWithOptions(alloc, body, false);

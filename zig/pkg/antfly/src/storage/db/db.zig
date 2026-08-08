@@ -45,6 +45,7 @@ const resolver_lib = @import("antfly_resolver");
 const backfill_state_mod = @import("backfill_state.zig");
 const range_state_mod = @import("range_state.zig");
 const types = @import("types.zig");
+const document_artifact_child_range = @import("document_artifact_child_range.zig");
 const aggregations_mod = @import("aggregations.zig");
 const algebraic_mod = @import("algebraic/mod.zig");
 const artifact_ids = @import("artifact_ids.zig");
@@ -576,15 +577,7 @@ pub const ReplayProgress = struct {
     active: bool = false,
 };
 
-pub const DocumentArtifactChildRangeApplyBatch = struct {
-    artifact_writes: []const types.BatchWrite = &.{},
-    artifact_delete_keys: []const []const u8 = &.{},
-    documents: []const derived_types.DerivedDocument = &.{},
-    dense_embeddings: []const derived_types.DerivedDenseEmbeddingWrite = &.{},
-    sparse_embeddings: []const derived_types.DerivedSparseEmbeddingWrite = &.{},
-    generated_enrichment_refs: []const enrichment_types.GeneratedEnrichmentRef = &.{},
-    sync_level: types.SyncLevel = .full_index,
-};
+pub const DocumentArtifactChildRangeApplyBatch = document_artifact_child_range.ApplyBatch;
 
 pub const DocumentArtifactChildRangeDispatch = struct {
     owner_group_id: u64,

@@ -28,6 +28,7 @@ const bedrock = @import("../inference/bedrock.zig");
 const httpx = @import("httpx");
 const extension_domain = @import("../extensions/mod.zig");
 const google_auth = @import("antfly_google").auth;
+const backup_contract = @import("backup_contract.zig");
 
 pub const BackupRequest = metadata_openapi.BackupRequest;
 pub const RestoreRequest = metadata_openapi.RestoreRequest;
@@ -46,7 +47,7 @@ pub const ClusterRestoreRequest = struct {
     restore_mode: ?[]const u8 = null,
 };
 
-pub const format_version: u32 = 2;
+pub const format_version = backup_contract.format_version;
 pub const cluster_format_version: u32 = 2;
 pub const table_backup_id = "table";
 pub const antfly_version = "zig-dev";
@@ -171,58 +172,10 @@ pub const BackupListPage = struct {
     }
 };
 
-pub const BackupFormat = enum {
-    native,
-    portable,
-};
-
-pub const ArtifactIntegrityMode = enum {
-    declared,
-    derive_after_materialization,
-};
-
-pub const TableBackupManifest = struct {
-    format_version: u32 = format_version,
-    format: BackupFormat,
-    artifact_integrity_mode: ArtifactIntegrityMode = .declared,
-    backup_id: []const u8,
-    table_name: []const u8,
-    description: []const u8,
-    schema_json: []const u8,
-    read_schema_json: []const u8,
-    indexes_json: []const u8,
-    replication_sources_json: []const u8,
-    shards: []const ShardSnapshot,
-
-    pub fn deinit(self: *TableBackupManifest, alloc: std.mem.Allocator) void {
-        alloc.free(@constCast(self.backup_id));
-        alloc.free(@constCast(self.table_name));
-        alloc.free(@constCast(self.description));
-        alloc.free(@constCast(self.schema_json));
-        alloc.free(@constCast(self.read_schema_json));
-        alloc.free(@constCast(self.indexes_json));
-        alloc.free(@constCast(self.replication_sources_json));
-        for (self.shards) |shard| shard.deinit(alloc);
-        alloc.free(@constCast(self.shards));
-        self.* = undefined;
-    }
-};
-
-pub const ShardSnapshot = struct {
-    group_id: u64,
-    start_key: []const u8,
-    end_key: ?[]const u8 = null,
-    snapshot_path: []const u8,
-    artifact_size_bytes: u64 = 0,
-    artifact_sha256: []const u8 = "",
-
-    pub fn deinit(self: ShardSnapshot, alloc: std.mem.Allocator) void {
-        alloc.free(@constCast(self.start_key));
-        if (self.end_key) |value| alloc.free(@constCast(value));
-        alloc.free(@constCast(self.snapshot_path));
-        if (self.artifact_sha256.len > 0) alloc.free(@constCast(self.artifact_sha256));
-    }
-};
+pub const BackupFormat = backup_contract.BackupFormat;
+pub const ArtifactIntegrityMode = backup_contract.ArtifactIntegrityMode;
+pub const TableBackupManifest = backup_contract.TableBackupManifest;
+pub const ShardSnapshot = backup_contract.ShardSnapshot;
 
 pub const ArtifactIntegrity = struct {
     size_bytes: u64,
@@ -234,30 +187,8 @@ pub const ArtifactIntegrity = struct {
     }
 };
 
-pub const TableBackupPlan = struct {
-    backup_root: []const u8,
-    backup_id: []const u8,
-    format: BackupFormat = .native,
-    io: ?std.Io = null,
-};
-
-pub const TableRestorePlan = struct {
-    backup_root: []const u8,
-    manifest: *const TableBackupManifest,
-    /// Immutable storage identity of this table artifact. This can differ
-    /// from the logical backup ID for a table inside a cluster backup.
-    artifact_backup_id: []const u8,
-    /// Stable location of the admitted backup source. The storage boundary
-    /// canonicalizes this into the durable restore idempotency identity after
-    /// a remote artifact is copied into a private local staging root.
-    source_location: []const u8,
-    reconcile_only: bool = false,
-    replace_existing: bool = false,
-    publication_hook: ?RestorePublicationHook = null,
-    /// Borrowed server/backend runtime for positional archive I/O. Embedded
-    /// callers may omit this and use the bounded threaded fallback.
-    io: ?std.Io = null,
-};
+pub const TableBackupPlan = backup_contract.TableBackupPlan;
+pub const TableRestorePlan = backup_contract.TableRestorePlan;
 
 pub const max_restore_source_identity_bytes: usize = 4096;
 
@@ -321,19 +252,7 @@ pub fn validateCanonicalRestoreSourceIdentity(
     if (!std.mem.eql(u8, identity, canonical)) return error.InvalidBackupRequest;
 }
 
-pub const RestorePublicationHook = struct {
-    ptr: *anyopaque,
-    publish_definition: *const fn (ptr: *anyopaque) anyerror!void,
-    rollback_definition: *const fn (ptr: *anyopaque) anyerror!void,
-
-    pub fn publish(self: @This()) !void {
-        try self.publish_definition(self.ptr);
-    }
-
-    pub fn rollback(self: @This()) !void {
-        try self.rollback_definition(self.ptr);
-    }
-};
+pub const RestorePublicationHook = backup_contract.RestorePublicationHook;
 
 pub fn validateRestorableManifestLayout(manifest: *const TableBackupManifest) !void {
     if (manifest.shards.len == 0) return error.UnsupportedBackupFormat;

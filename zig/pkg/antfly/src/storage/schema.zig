@@ -27,7 +27,6 @@ const backend_scan = @import("backend_scan.zig");
 const docstore = @import("docstore.zig");
 const DocStore = docstore.DocStore;
 const lsm_backend = @import("lsm_backend.zig");
-const lmdb = @import("lmdb.zig");
 const mem_backend = @import("mem_backend.zig");
 const platform_time = @import("antfly_platform").time;
 

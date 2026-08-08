@@ -29,7 +29,7 @@
 const std = @import("std");
 const db_mod = @import("../storage/db/mod.zig");
 const raft_mod = @import("../raft/mod.zig");
-const table_reads = @import("table_reads.zig");
+const table_reads = @import("table_read_source.zig");
 
 const CandidateSource = db_mod.CandidateSource;
 

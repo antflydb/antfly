@@ -25,6 +25,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
 const fs_paths = @import("../common/fs_paths.zig");
 const backend_adapter = @import("backend_adapter.zig");
@@ -32,14 +33,55 @@ const backend_erased = @import("backend_erased.zig");
 const backend_types = @import("backend_types.zig");
 const lsm_backend = @import("lsm_backend/mod.zig");
 const lsm_storage = @import("lsm_backend/storage_io.zig");
-const lmdb_backend = @import("lmdb_backend.zig");
+const supports_lmdb = builtin.os.tag != .freestanding and build_options.lmdb_enabled;
+const lmdb = if (supports_lmdb) @import("lmdb.zig") else struct {
+    pub const CommitStats = struct {};
+    pub const CommitBackend = enum {
+        sync,
+        worker_thread,
+        async_io,
+        adaptive,
+    };
+    pub const CommitPublishPhase = enum {
+        before_publish,
+        after_data_sync,
+        after_meta_write,
+        after_meta_sync,
+    };
+    pub const Environment = struct {};
+};
+const lmdb_backend = if (supports_lmdb) @import("lmdb_backend.zig") else struct {
+    pub const Backend = struct {
+        env: lmdb.Environment = .{},
+
+        pub fn open(_: Allocator, _: [*:0]const u8, _: anytype) !@This() {
+            return error.UnsupportedPlatform;
+        }
+
+        pub fn close(_: *@This()) void {}
+
+        pub fn sync(_: *@This(), _: bool) !void {
+            return error.UnsupportedPlatform;
+        }
+
+        pub fn commitStatsSnapshot(_: *@This()) ?lmdb.CommitStats {
+            return null;
+        }
+
+        pub fn runtimeNamespaceStore(_: *@This(), _: Allocator) !backend_erased.NamespaceStore {
+            return error.UnsupportedPlatform;
+        }
+    };
+};
 const platform = @import("antfly_platform");
 const platform_time = @import("antfly_platform").time;
-const lmdb = @import("lmdb.zig");
 const storage_sim = @import("sim_runtime.zig");
 const sim_fixture = @import("sim_fixture.zig");
 const wal_sim_fixture = @import("wal_sim_fixture.zig");
-const zig_lmdb = @import("lmdb_engine");
+const zig_lmdb = if (supports_lmdb or builtin.is_test) @import("lmdb_engine") else struct {
+    pub const storage_sim_soak = false;
+    pub const is_zig_backend = false;
+};
 const large_entry_threshold = 4096;
 const storage_sim_soak = zig_lmdb.storage_sim_soak;
 var wal_tmp_nonce: u64 = 0;
@@ -1002,6 +1044,7 @@ pub const WAL = struct {
 fn openStoreOwner(alloc: Allocator, path: [*:0]const u8, opts: WalOptions) !StoreOwner {
     return switch (opts.resolvedBackend()) {
         .lmdb => blk: {
+            if (!supports_lmdb) return error.UnsupportedPlatform;
             if (!opts.read_only) {
                 var io_impl = std.Io.Threaded.init(alloc, .{});
                 defer io_impl.deinit();

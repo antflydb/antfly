@@ -29,6 +29,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const Allocator = std.mem.Allocator;
 const AtomicU64 = platform.atomic.Value(u64);
@@ -37,7 +38,7 @@ const backend_types = @import("backend_types.zig");
 const hbc_backend = @import("hbc_backend.zig");
 const resource_manager_mod = @import("resource_manager.zig");
 const apply_rw_lock_mod = @import("db/apply_rw_lock.zig");
-const supports_lmdb = builtin.os.tag != .freestanding;
+const supports_lmdb = builtin.os.tag != .freestanding and build_options.lmdb_enabled;
 const lmdb = if (supports_lmdb) @import("lmdb.zig") else struct {
     pub const Error = error{NotFound};
 };

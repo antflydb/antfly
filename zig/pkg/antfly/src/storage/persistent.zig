@@ -38,11 +38,12 @@
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
 const backend_adapter = @import("backend_adapter.zig");
 const backend_erased = @import("backend_erased.zig");
 const backend_types = @import("backend_types.zig");
-const supports_main_lmdb = builtin.os.tag != .freestanding;
+const supports_main_lmdb = builtin.os.tag != .freestanding and build_options.lmdb_enabled;
 const lmdb = if (supports_main_lmdb) @import("lmdb.zig") else struct {
     pub const CommitBackend = enum {
         sync,

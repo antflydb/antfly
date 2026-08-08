@@ -44,7 +44,18 @@ const http_common = @import("../raft/transport/http_common.zig");
 const raft_host = @import("../raft/host.zig");
 const raft_mod = @import("../raft/mod.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = struct {
+    pub const types = @import("../storage/db/types.zig");
+    pub const RuntimePreflightSummary = @import("../storage/db/runtime_preflight.zig").RuntimePreflightSummary;
+    pub const background_runtime = @import("../storage/background_runtime.zig");
+    pub const aggregations = @import("../storage/db/aggregations.zig");
+    pub const SortRejectionDiagnostic = db_query_search.SortRejectionDiagnostic;
+
+    pub const resetLastSortRejectionDiagnostic = db_query_search.resetLastSortRejectionDiagnostic;
+    pub const recordSortRejectionDiagnostic = db_query_search.recordSortRejectionDiagnostic;
+    pub const peekLastSortRejectionDiagnostic = db_query_search.peekLastSortRejectionDiagnostic;
+    pub const takeLastSortRejectionDiagnostic = db_query_search.takeLastSortRejectionDiagnostic;
+};
 const graph_mod = @import("../graph/graph.zig");
 const backend_erased = @import("../storage/backend_erased.zig");
 const db_query_search = @import("../storage/db/query/search_exec.zig");
@@ -52,9 +63,10 @@ const storage_schema = @import("../storage/schema.zig");
 const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 const table_catalog = @import("table_catalog.zig");
 const tables_api = @import("tables.zig");
-const table_reads = @import("table_reads.zig");
+const table_reads = if (builtin.is_test) @import("table_reads.zig") else @import("table_read_source.zig");
 const table_router = @import("table_router.zig");
-const table_writes = @import("table_writes.zig");
+const table_writes = if (builtin.is_test) @import("table_writes.zig") else @import("table_write_source.zig");
+const table_index_config = @import("table_index_config.zig");
 const query_api = @import("query.zig");
 const query_contract = @import("query_contract.zig");
 const public_search_request = @import("public_search_request.zig");
@@ -72,7 +84,7 @@ const http_internal_routes = @import("http_internal_routes.zig");
 const http_internal_group_read_routes = @import("http_internal_group_read_routes.zig");
 const http_route_helpers = @import("http_route_helpers.zig");
 const transactions_api = @import("transactions.zig");
-const docstore_mod = @import("../storage/docstore.zig");
+const docstore_mod = if (builtin.is_test) @import("../storage/docstore.zig") else struct {};
 const routes = @import("http_routes.zig");
 const runtime_status = @import("runtime_status.zig");
 const test_contract_helpers = @import("test_contract_helpers.zig");
@@ -5852,7 +5864,7 @@ pub const ApiHttpServer = struct {
                     return try textResponse(self.alloc, 400, table_contract.createTableRequestErrorMessage(err, req.body));
                 };
                 defer create_req.deinit(self.alloc);
-                const normalized_indexes_json = table_writes.normalizeManagedEmbeddingIndexDimensionsJsonWithOptions(
+                const normalized_indexes_json = table_index_config.normalizeManagedEmbeddingIndexDimensionsJsonWithOptions(
                     self.alloc,
                     create_req.indexes_json orelse tables_api.default_indexes_json,
                     .{
@@ -9768,7 +9780,7 @@ pub const ApiHttpServer = struct {
             else => return error.InternalFailure,
         };
         defer alloc.free(expanded_index_json);
-        const normalized_index_json = table_writes.normalizeManagedEmbeddingIndexDimensionJsonWithOptions(
+        const normalized_index_json = table_index_config.normalizeManagedEmbeddingIndexDimensionJsonWithOptions(
             alloc,
             index_name,
             expanded_index_json,
@@ -9788,7 +9800,7 @@ pub const ApiHttpServer = struct {
         };
         defer alloc.free(normalized_index_json);
 
-        table_writes.validateIndexConfigWithOptions(alloc, index_name, normalized_index_json, .{
+        table_index_config.validateIndexConfigWithOptions(alloc, index_name, normalized_index_json, .{
             .antfly_provider = self.antfly_provider,
             .io = self.inferenceIo(),
             .secret_store = self.cfg.secret_store,

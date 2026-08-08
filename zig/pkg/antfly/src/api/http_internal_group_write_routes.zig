@@ -26,7 +26,7 @@ const metadata_openapi = @import("antfly_metadata_openapi");
 const raft_mod = @import("../raft/mod.zig");
 const repair_jobs = @import("repair_jobs.zig");
 const routes = @import("http_routes.zig");
-const table_writes = @import("table_writes.zig");
+const table_writes = @import("table_write_source.zig");
 const platform_time = @import("antfly_platform").time;
 
 pub const BatchValidator = struct {

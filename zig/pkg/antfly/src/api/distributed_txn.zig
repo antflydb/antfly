@@ -21,6 +21,7 @@ const http_client_mod = @import("http_client.zig");
 const table_catalog = @import("table_catalog.zig");
 const table_router = @import("table_router.zig");
 const table_writes = @import("table_writes.zig");
+const contract = @import("distributed_txn_contract.zig");
 
 pub const table_participant_prefix = "table:";
 const table_participant_v2_prefix = "table2:";
@@ -49,32 +50,10 @@ pub const TxnStatusResponse = struct {
     status: db_mod.types.TxnStatus,
 };
 
-pub const TableCommitRequest = struct {
-    table_name: []const u8,
-    writes: []const db_mod.types.TransactionWrite = &.{},
-    deletes: []const []const u8 = &.{},
-    transforms: []const db_mod.types.DocumentTransform = &.{},
-    predicates: []const db_mod.types.TransactionVersionPredicate = &.{},
-};
-
-pub const CommitConflict = struct {
-    table_name: []const u8,
-    key: []const u8,
-    message: []const u8,
-    group_id: ?u64 = null,
-    phase: ?ParticipantPhase = null,
-};
-
-pub const ParticipantPhase = enum {
-    begin,
-    prepare,
-    resolve,
-};
-
-pub const CommitOutcome = union(enum) {
-    committed: ExecuteResult,
-    conflict: CommitConflict,
-};
+pub const TableCommitRequest = contract.TableCommitRequest;
+pub const CommitConflict = contract.CommitConflict;
+pub const ParticipantPhase = contract.ParticipantPhase;
+pub const CommitOutcome = contract.CommitOutcome;
 
 pub const ParticipantWorker = struct {
     ptr: *anyopaque,
@@ -299,9 +278,7 @@ pub const LocalTableWriteParticipantWorker = struct {
     }
 };
 
-pub const ExecuteResult = struct {
-    participant_count: usize,
-};
+pub const ExecuteResult = contract.ExecuteResult;
 
 pub fn executeCrossGroup(
     alloc: std.mem.Allocator,
