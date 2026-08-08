@@ -784,6 +784,33 @@ test "max_uncommitted_entries_size drops new proposals until committed entries a
     try std.testing.expectEqual(@as(usize, 1), fixture.raft.uncommitted_size);
 }
 
+test "proposal receipt survives replication dispatch allocation failure" {
+    var fixture = try initLeaderFromSnapshot();
+    defer fixture.raft.deinit();
+    defer fixture.storage.deinit();
+
+    // The first Raft allocation owns the candidate entry. RaftLog uses its
+    // stable allocator to append it; the second Raft allocation clones entries
+    // for the peer message and fails after local acceptance.
+    fixture.raft.messages.clearAndFree(std.testing.allocator);
+    fixture.raft.progress[1].probe_sent = false;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    fixture.raft.alloc = failing.allocator();
+    defer fixture.raft.alloc = std.testing.allocator;
+    var accepted_index: ?types.Index = null;
+    const expected_index = fixture.raft.status().last_index + 1;
+    try std.testing.expectError(error.OutOfMemory, fixture.raft.proposeWithReceipt("accepted-before-dispatch", &accepted_index));
+    fixture.raft.alloc = std.testing.allocator;
+
+    try std.testing.expectEqual(@as(?types.Index, expected_index), accepted_index);
+    try std.testing.expectEqual(expected_index, fixture.raft.status().last_index);
+
+    // A pre-append rejection always clears a reused receipt.
+    fixture.raft.lead_transferee = 2;
+    try std.testing.expectError(error.LeaderTransferInProgress, fixture.raft.proposeWithReceipt("rejected", &accepted_index));
+    try std.testing.expect(accepted_index == null);
+}
+
 test "max_committed_size_per_ready paginates committed entries without gaps" {
     var storage = storage_mod.MemoryStorage.init(std.testing.allocator);
     defer storage.deinit();

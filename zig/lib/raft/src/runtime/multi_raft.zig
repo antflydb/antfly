@@ -720,9 +720,20 @@ pub const MultiRaft = struct {
     }
 
     pub fn propose(self: *MultiRaft, group_id: core.types.GroupId, data: []const u8) !void {
+        var accepted_index: ?core.types.Index = null;
+        return try self.proposeWithReceipt(group_id, data, &accepted_index);
+    }
+
+    pub fn proposeWithReceipt(
+        self: *MultiRaft,
+        group_id: core.types.GroupId,
+        data: []const u8,
+        accepted_index: *?core.types.Index,
+    ) !void {
+        accepted_index.* = null;
         try self.resumeOnActivity(group_id);
         const grp = self.group(group_id) orelse return error.UnknownGroup;
-        try grp.propose(data);
+        try grp.proposeWithReceipt(data, accepted_index);
     }
 
     pub fn readIndex(self: *MultiRaft, group_id: core.types.GroupId, request_ctx: []const u8) !void {

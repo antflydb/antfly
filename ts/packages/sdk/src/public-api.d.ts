@@ -14108,8 +14108,32 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
+            /**
+             * @description The batch cannot be safely replayed as a unit. Either the server
+             *     could not determine whether a shard-group write committed, or one
+             *     or more shard groups accepted their portion before a later group
+             *     failed. Clients must reconcile affected keys and must not blindly
+             *     replay non-idempotent transforms.
+             */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": "write outcome unknown" | "partial write outcome";
+                };
+            };
             429: components["responses"]["DenseRepairBackpressure"];
             500: components["responses"]["InternalServerError"];
+            /** @description No writable Raft leader was available before any shard group accepted the batch. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": "write unavailable";
+                };
+            };
         };
     };
     linearMerge: {

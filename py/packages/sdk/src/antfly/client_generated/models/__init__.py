@@ -54,6 +54,8 @@ from .batch_request import BatchRequest
 from .batch_request_inserts import BatchRequestInserts
 from .batch_request_inserts_additional_property import BatchRequestInsertsAdditionalProperty
 from .batch_response import BatchResponse
+from .batch_write_response_409 import BatchWriteResponse409
+from .batch_write_response_503 import BatchWriteResponse503
 from .bedrock_embedder_config import BedrockEmbedderConfig
 from .bedrock_generator_config import BedrockGeneratorConfig
 from .bool_field_query import BoolFieldQuery
@@ -735,6 +737,8 @@ __all__ = (
     "BatchRequestInserts",
     "BatchRequestInsertsAdditionalProperty",
     "BatchResponse",
+    "BatchWriteResponse409",
+    "BatchWriteResponse503",
     "BedrockEmbedderConfig",
     "BedrockGeneratorConfig",
     "BooleanQuery",
