@@ -4591,6 +4591,11 @@ export interface components {
             sync_level?: components["schemas"]["SyncLevel"];
         };
         BatchResponse: {
+            /**
+             * @description Durable commit and visibility/participant recovery state.
+             * @enum {string}
+             */
+            status?: "committed" | "committed_pending";
             /** @description Number of documents successfully inserted */
             inserted?: number;
             /** @description Number of documents successfully deleted */
@@ -4651,6 +4656,11 @@ export interface components {
         };
         /** @description Response for a cross-table batch operation. Contains per-table results. */
         MultiBatchResponse: {
+            /**
+             * @description Durable commit and visibility/propagation state.
+             * @enum {string}
+             */
+            status?: "committed" | "committed_visibility_pending" | "committed_recovery_pending";
             /** @description Per-table batch results */
             tables?: {
                 [key: string]: components["schemas"]["BatchResponse"];
@@ -4694,23 +4704,68 @@ export interface components {
             };
             sync_level?: components["schemas"]["SyncLevel"];
         };
+        /** @description Participant location and 2PC phase where the conflict occurred. */
+        TransactionConflictParticipant: {
+            /**
+             * Format: uint64
+             * @description Raft group that reported the conflict.
+             */
+            group_id?: number;
+            /**
+             * @description 2PC participant phase that reported the conflict.
+             * @enum {string}
+             */
+            phase?: "begin" | "prepare" | "resolve";
+        };
+        /** @description Structured details for an aborted transaction attempt. */
+        TransactionConflict: {
+            /** @description Table where the conflict was detected. */
+            table: string;
+            /** @description Document key associated with the conflict, when applicable. */
+            key: string;
+            /** @description Human-readable conflict description. */
+            message: string;
+            /**
+             * @description Stable machine-readable conflict classification.
+             * @enum {string}
+             */
+            kind: "version_conflict" | "intent_conflict" | "topology_changed" | "participant_unavailable" | "doc_identity_unavailable" | "session_lease_lost" | "transaction_conflict" | "torn_state";
+            /** @description Whether retrying the transaction may succeed without changing its writes. */
+            retryable: boolean;
+            /**
+             * Format: uint32
+             * @description Minimum suggested delay before retrying a retryable conflict.
+             */
+            retry_after_ms?: number;
+            /**
+             * @description Component whose state should be refreshed before retrying.
+             * @enum {string}
+             */
+            retry_scope?: "topology" | "participant" | "doc_identity" | "session";
+            /**
+             * Format: uint64
+             * @description Version required by the transaction predicate.
+             */
+            expected_version?: number;
+            /**
+             * Format: uint64
+             * @description Version observed while validating the transaction predicate.
+             */
+            current_version?: number;
+            participant?: components["schemas"]["TransactionConflictParticipant"];
+        };
         /** @description Result of an OCC transaction commit attempt. */
         TransactionCommitResponse: {
             /**
-             * @description Whether the transaction was committed or aborted due to a conflict
+             * @description Durable transaction outcome. Pending committed states mean the
+             *     commit decision is durable while its requested visibility barrier
+             *     or participant recovery is still completing.
              * @enum {string}
              */
-            status: "committed" | "aborted";
+            status: "committed" | "committed_visibility_pending" | "committed_recovery_pending" | "aborted";
             /** @description Details about the conflict that caused an abort (only present when status is "aborted") */
-            conflict?: {
-                /** @description Table where the conflict was detected */
-                table?: string;
-                /** @description Key that had a version mismatch */
-                key?: string;
-                /** @description Human-readable conflict description */
-                message?: string;
-            };
-            /** @description Per-table batch results (only present when status is "committed") */
+            conflict?: components["schemas"]["TransactionConflict"];
+            /** @description Per-table batch results (present for every committed status) */
             tables?: {
                 [key: string]: components["schemas"]["BatchResponse"];
             };
@@ -12791,6 +12846,21 @@ export interface components {
                 "application/json": components["schemas"]["Error"];
             };
         };
+        /**
+         * @description Internal transaction failure. If the response says that the outcome is
+         *     unknown, the request may already have committed and the stateless
+         *     request MUST NOT be retried. Use a transaction session when a commit
+         *     must be safely retryable by transaction ID.
+         */
+        StatelessTransactionFailure: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+                "text/plain": string;
+            };
+        };
         /** @description Writes are temporarily limited while a dense-index rebuild catches up. */
         DenseRepairBackpressure: {
             headers: {
@@ -13174,9 +13244,36 @@ export interface operations {
                     "application/json": components["schemas"]["MultiBatchResponse"];
                 };
             };
+            /** @description Commit decision is durable; visibility or participant recovery is still pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MultiBatchResponse"];
+                };
+            };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
-            500: components["responses"]["InternalServerError"];
+            /** @description Transaction aborted because a predicate, topology fence, or participant state conflicted */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TransactionCommitResponse"];
+                };
+            };
+            500: components["responses"]["StatelessTransactionFailure"];
+            /** @description The coordinator was unavailable before a commit decision; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
+                };
+            };
         };
     };
     commitTransaction: {
@@ -13201,6 +13298,15 @@ export interface operations {
                     "application/json": components["schemas"]["TransactionCommitResponse"];
                 };
             };
+            /** @description Transaction committed durably with visibility or participant recovery pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TransactionCommitResponse"];
+                };
+            };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
             /** @description Transaction aborted due to version conflict */
@@ -13212,7 +13318,16 @@ export interface operations {
                     "application/json": components["schemas"]["TransactionCommitResponse"];
                 };
             };
-            500: components["responses"]["InternalServerError"];
+            500: components["responses"]["StatelessTransactionFailure"];
+            /** @description The coordinator was unavailable before a commit decision; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
+                };
+            };
         };
     };
     listTransactionSessions: {
@@ -13510,6 +13625,15 @@ export interface operations {
         responses: {
             /** @description Session committed */
             200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TransactionSessionCommitResponse"];
+                };
+            };
+            /** @description Session committed durably with visibility or participant recovery pending */
+            202: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -14072,10 +14196,42 @@ export interface operations {
                     "application/json": components["schemas"]["BatchResponse"];
                 };
             };
+            /** @description Commit decision is durable; visibility or participant recovery is still pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchResponse"];
+                };
+            };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
+            /**
+             * @description The atomic batch conflicted, the serving replica is fenced, or the
+             *     server could not determine whether a single-group Raft command
+             *     committed. An ambiguous outcome is not safe to replay blindly when
+             *     the request contains non-idempotent transforms.
+             */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
+                };
+            };
             429: components["responses"]["DenseRepairBackpressure"];
-            500: components["responses"]["InternalServerError"];
+            500: components["responses"]["StatelessTransactionFailure"];
+            /** @description Write routing, document identity, or the coordinator is temporarily unavailable before a commit decision */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
+                };
+            };
         };
     };
     linearMerge: {

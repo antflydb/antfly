@@ -1,8 +1,7 @@
 from enum import Enum
 
 
-class TransactionCommitResponseStatus(str, Enum):
-    ABORTED = "aborted"
+class MultiBatchResponseStatus(str, Enum):
     COMMITTED = "committed"
     COMMITTED_RECOVERY_PENDING = "committed_recovery_pending"
     COMMITTED_VISIBILITY_PENDING = "committed_visibility_pending"
