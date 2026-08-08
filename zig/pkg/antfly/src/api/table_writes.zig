@@ -12562,13 +12562,27 @@ pub const ProvisionedTableWriteSource = struct {
         }
 
         if (self.raft_batcher) |batcher| {
+            var accepted_groups: usize = 0;
             for (grouped.items) |group| {
-                try batcher.batchGroup(alloc, group.group_id, table_name, .{
+                batcher.batchGroup(alloc, group.group_id, table_name, .{
                     .writes = group.writes.items,
                     .deletes = group.deletes.items,
                     .transforms = group.transforms.items,
                     .sync_level = req.sync_level,
-                });
+                }) catch |err| {
+                    if (accepted_groups == 0) return err;
+                    // The per-group error may be safe to retry in isolation,
+                    // but replaying the complete public batch could apply
+                    // non-idempotent transforms to an earlier accepted group
+                    // twice. Preserve the root cause in logs and expose one
+                    // non-retryable aggregate outcome to the caller.
+                    std.log.warn(
+                        "raft batch has partial write outcome table={s} accepted_groups={} failed_group_id={} err={s}",
+                        .{ table_name, accepted_groups, group.group_id, @errorName(err) },
+                    );
+                    return error.RaftBatchWritePartialOutcome;
+                };
+                accepted_groups += 1;
             }
             return {};
         }
@@ -27940,6 +27954,108 @@ test "provisioned create index updates cached writer in place" {
     try std.testing.expectEqual(@as(u64, 7001), raft_capture.last_group_id);
     try std.testing.expectEqual(@as(usize, 1), raft_capture.last_write_count);
     try std.testing.expectEqual(@as(usize, 0), outer_cache.entries.items.len);
+}
+
+test "raft batch aggregation makes failures after an accepted group non-retryable" {
+    const Catalog = struct {
+        var tables = [_]metadata_table_manager.TableRecord{.{
+            .table_id = 7,
+            .name = "docs",
+            .placement_role = "data",
+        }};
+        var ranges = [_]metadata_table_manager.RangeRecord{
+            .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = "m" },
+            .{ .group_id = 7002, .table_id = 7, .start_key = "m", .end_key = null },
+        };
+
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = tables[0..],
+                .ranges = ranges[0..],
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const Capture = struct {
+        failed_group_id: u64,
+        failure: anyerror,
+        attempts: usize = 0,
+        accepted: usize = 0,
+
+        fn batchGroup(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            group_id: u64,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+        ) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.attempts += 1;
+            if (group_id == self.failed_group_id) return self.failure;
+            self.accepted += 1;
+        }
+
+        fn batchGroupLocal(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: u64,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+        ) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    var source = ProvisionedTableWriteSource.init("unused", Catalog.iface());
+    defer source.deinit();
+    var capture = Capture{
+        .failed_group_id = 7002,
+        .failure = error.LeaderUnavailable,
+    };
+    _ = source.withRaftBatcher(.{
+        .ptr = &capture,
+        .vtable = &.{
+            .batch_group = Capture.batchGroup,
+            .batch_group_local = Capture.batchGroupLocal,
+        },
+    });
+    const transforms = [_]db_mod.types.DocumentTransform{
+        .{ .key = "a", .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }} },
+        .{ .key = "z", .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }} },
+    };
+
+    try std.testing.expectError(error.RaftBatchWritePartialOutcome, source.source().batch(std.testing.allocator, "docs", .{
+        .transforms = &transforms,
+        .sync_level = .write,
+    }));
+    try std.testing.expectEqual(@as(usize, 2), capture.attempts);
+    try std.testing.expectEqual(@as(usize, 1), capture.accepted);
+
+    // A failure before any group is accepted retains its precise classification.
+    capture = .{ .failed_group_id = 7001, .failure = error.LeaderUnavailable };
+    try std.testing.expectError(error.LeaderUnavailable, source.source().batch(std.testing.allocator, "docs", .{
+        .transforms = &transforms,
+        .sync_level = .write,
+    }));
+    try std.testing.expectEqual(@as(usize, 1), capture.attempts);
+    try std.testing.expectEqual(@as(usize, 0), capture.accepted);
 }
 
 test "provisioned table write source runtime status prefers shared snapshot cache" {
