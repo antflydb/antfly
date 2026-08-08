@@ -538,6 +538,51 @@ const TextBatchMutationStats = struct {
     }
 };
 
+const TextSegmentMutationBatch = struct {
+    segments: std.ArrayListUnmanaged(persistent_mod.PreparedMergeSegment) = .empty,
+
+    fn deinit(self: *@This(), alloc: Allocator, persistent: *persistent_mod.PersistentIndex) void {
+        persistent.discardPreparedTextSegments(self.segments.items);
+        self.segments.deinit(alloc);
+        self.* = .{};
+    }
+
+    fn append(
+        self: *@This(),
+        alloc: Allocator,
+        persistent: *persistent_mod.PersistentIndex,
+        segment: persistent_mod.PreparedMergeSegment,
+    ) !void {
+        self.segments.append(alloc, segment) catch |err| {
+            var discarded = [_]persistent_mod.PreparedMergeSegment{segment};
+            persistent.discardPreparedTextSegments(&discarded);
+            return err;
+        };
+    }
+
+    fn apply(
+        self: *@This(),
+        entry: *IndexManager.TextIndex,
+        delete_doc_ids: []const []const u8,
+    ) !persistent_mod.TextMutationBatchStats {
+        const Observer = struct {
+            fn committed(ctx: *anyopaque, delete_infos: []const index_mod.IndexWriter.DeleteInfo) void {
+                const text_entry: *IndexManager.TextIndex = @ptrCast(@alignCast(ctx));
+                text_entry.recordCommittedDeletes(delete_infos);
+            }
+        };
+        const stats = entry.persistent.applyPreparedTextMutationBatchObserved(delete_doc_ids, self.segments.items, .{
+            .ctx = entry,
+            .callback = Observer.committed,
+        }) catch |err| {
+            self.segments.items.len = 0;
+            return err;
+        };
+        self.segments.items.len = 0;
+        return stats;
+    }
+};
+
 pub const TextPublicationEstimate = struct {
     segment_count: u64 = 0,
     byte_count: u64 = 0,
@@ -1422,6 +1467,47 @@ pub const IndexManager = struct {
         complete: bool = false,
         failure_reason: ?[]const u8 = null,
         stale_generation: bool = false,
+    };
+
+    pub const AlgebraicBaseRowComponentPageResult = struct {
+        generation: u64,
+        component: schema_mod.RelationalIndexGenerationComponent,
+        scanned_keys: usize = 0,
+        indexed_rows: usize = 0,
+        next_cursor: ?[]u8 = null,
+        complete: bool = false,
+
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
+            if (self.next_cursor) |cursor| alloc.free(cursor);
+            self.* = undefined;
+        }
+    };
+
+    pub const AlgebraicCatchUpPageResult = struct {
+        generation: u64,
+        from_sequence: u64,
+        through_sequence: u64,
+        target_sequence: u64,
+        replay_records: usize = 0,
+        upserts: usize = 0,
+        deletes: usize = 0,
+        complete: bool = false,
+        promoted: bool = false,
+    };
+
+    pub const RelationalIndexDropPageResult = struct {
+        generation: u64,
+        component: ?schema_mod.RelationalIndexGenerationComponent = null,
+        scanned_artifacts: usize = 0,
+        deleted_artifacts: usize = 0,
+        next_cursor: ?[]u8 = null,
+        component_complete: bool = false,
+        complete: bool = false,
+
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
+            if (self.next_cursor) |cursor| alloc.free(cursor);
+            self.* = undefined;
+        }
     };
 
     pub const TextMergeSourceSegment = struct {
@@ -2464,6 +2550,225 @@ pub const IndexManager = struct {
         entry.config.config_json = owned;
     }
 
+    fn textDropCursor(segment_id: u64) [8]u8 {
+        return std.mem.toBytes(std.mem.nativeToBig(u64, segment_id));
+    }
+
+    fn validateTextDropCursor(cursor: ?[]const u8) !void {
+        const encoded = cursor orelse return;
+        if (encoded.len != @sizeOf(u64)) return error.InvalidRelationalIndexDropCursor;
+    }
+
+    pub fn beginRelationalIndexArtifactDrop(
+        self: *IndexManager,
+        store: *docstore_mod.DocStore,
+        access_method: schema_mod.RelationalIndexAccessMethod,
+        index_name: []const u8,
+        expected_generation: u64,
+    ) !schema_mod.RelationalIndexDropTransitionResult {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+
+        const apply_mutex = switch (access_method) {
+            .text_search => if (self.textIndexEntry(index_name)) |entry| entry.apply_mutex else null,
+            .algebraic_filter => if (self.algebraicIndex(index_name)) |entry| entry.apply_mutex else null,
+            else => null,
+        };
+        if (apply_mutex) |mutex| lockIndexApplyMutex(mutex);
+        defer if (apply_mutex) |mutex| mutex.unlock();
+
+        const result = try schema_mod.beginRelationalIndexDrop(store, self.alloc, .{
+            .access_method = access_method,
+            .index_name = index_name,
+            .expected_generation = expected_generation,
+        });
+        if (result != .started and result != .already_started) return result;
+
+        // The durable transition blocks new derived writes. Fence work that
+        // was admitted before it so no worker can repopulate deleted artifacts.
+        switch (access_method) {
+            .text_search => if (self.textIndexEntry(index_name)) |entry| {
+                self.text_merge_scheduler.removeIndex(self.alloc, index_name);
+                entry.detachAllMergeDeletionStates();
+            },
+            .algebraic_filter => if (self.algebraicIndex(index_name)) |entry| {
+                entry.index.prepareForArtifactDrop();
+            },
+            else => {},
+        }
+        return result;
+    }
+
+    pub fn finalizeRelationalIndexArtifactDrop(
+        self: *IndexManager,
+        store: *docstore_mod.DocStore,
+        access_method: schema_mod.RelationalIndexAccessMethod,
+        index_name: []const u8,
+        expected_generation: u64,
+    ) !schema_mod.RelationalIndexDropTransitionResult {
+        const transition = schema_mod.RelationalIndexDropTransition{
+            .access_method = access_method,
+            .index_name = index_name,
+            .expected_generation = expected_generation,
+        };
+        const active_schema = (try schema_mod.loadSchema(store, self.alloc)) orelse return .schema_missing;
+        defer schema_mod.freeSchema(self.alloc, active_schema);
+        var found = false;
+        for (active_schema.relational_indexes) |index| {
+            if (!std.mem.eql(u8, index.name, index_name)) continue;
+            found = true;
+            if (index.access_method != access_method) return .wrong_access_method;
+            if (index.generation != expected_generation) return .generation_mismatch;
+            switch (schema_mod.relationalIndexDropPhaseDecision(index)) {
+                .complete => {},
+                .work => return .incomplete,
+                .blocked, .malformed => return .malformed_record,
+            }
+            break;
+        }
+        if (!found) return .already_absent;
+
+        // Detach the runtime/config first. A crash here leaves the durable
+        // schema in fail-closed `dropping` state and finalization is retryable.
+        _ = try self.remove(store, index_name);
+        return try schema_mod.finalizeRelationalIndexDrop(store, self.alloc, transition);
+    }
+
+    pub fn dropRelationalTextSearchArtifactPage(
+        self: *IndexManager,
+        store: *docstore_mod.DocStore,
+        index_name: []const u8,
+        expected_generation: u64,
+        max_segments: usize,
+    ) !RelationalIndexDropPageResult {
+        if (max_segments == 0) return error.InvalidDropPageSize;
+        var guard = try self.lockManagedIndexApply(.{ .kind = .full_text, .name = index_name });
+        defer guard.unlock();
+        const entry = self.textIndexEntry(index_name) orelse unreachable;
+
+        const active_schema = (try schema_mod.loadSchema(store, self.alloc)) orelse return error.RelationalSchemaMissing;
+        defer schema_mod.freeSchema(self.alloc, active_schema);
+        if (active_schema.storage_mode != .relational) return error.RelationalSchemaRequired;
+        const schema_index = blk: {
+            for (active_schema.relational_indexes) |index| {
+                if (!std.mem.eql(u8, index.name, index_name)) continue;
+                if (index.access_method != .text_search) return error.WrongRelationalIndexAccessMethod;
+                break :blk index;
+            }
+            return error.RelationalIndexGenerationMissing;
+        };
+        if (schema_index.generation != expected_generation) return error.RelationalIndexGenerationChanged;
+        const phase = switch (schema_mod.relationalIndexDropPhaseDecision(schema_index)) {
+            .work => |work| work,
+            .complete => return error.RelationalIndexDropAlreadyComplete,
+            .blocked => return error.RelationalIndexGenerationBlocked,
+            .malformed => return error.RelationalIndexGenerationMalformed,
+        };
+        if (phase.component != null) return error.RelationalIndexGenerationMalformed;
+        try validateTextDropCursor(phase.cursor);
+        self.text_merge_scheduler.removeIndex(self.alloc, index_name);
+        entry.detachAllMergeDeletionStates();
+
+        const ids = try entry.persistent.activeSegmentIdsAlloc(self.alloc);
+        defer self.alloc.free(ids);
+        const removed_count = @min(ids.len, max_segments);
+        if (removed_count > 0) try entry.persistent.removeSegments(ids[0..removed_count]);
+        const complete = removed_count == ids.len;
+        var cursor_bytes: [8]u8 = undefined;
+        const next_cursor: ?[]const u8 = if (!complete) blk: {
+            cursor_bytes = textDropCursor(ids[removed_count - 1]);
+            break :blk cursor_bytes[0..];
+        } else null;
+
+        const progress_result = try schema_mod.updateRelationalIndexDropProgress(store, self.alloc, .{
+            .access_method = .text_search,
+            .index_name = index_name,
+            .expected_generation = expected_generation,
+            .expected_cursor = phase.cursor,
+            .next_cursor = next_cursor,
+            .complete = complete,
+        });
+        switch (progress_result) {
+            .advanced, .completed => {},
+            .already_completed, .generation_mismatch, .stale_record, .wrong_phase, .cursor_mismatch => return error.RelationalIndexGenerationChanged,
+            .schema_missing, .non_relational_schema, .index_not_found, .wrong_access_method, .malformed_record, .invalid_update => return error.RelationalIndexGenerationMalformed,
+        }
+        return .{
+            .generation = expected_generation,
+            .scanned_artifacts = removed_count,
+            .deleted_artifacts = removed_count,
+            .next_cursor = if (next_cursor) |cursor| try self.alloc.dupe(u8, cursor) else null,
+            .component_complete = complete,
+            .complete = complete,
+        };
+    }
+
+    pub fn dropRelationalAlgebraicArtifactPage(
+        self: *IndexManager,
+        store: *docstore_mod.DocStore,
+        index_name: []const u8,
+        expected_generation: u64,
+        max_rows: usize,
+    ) !RelationalIndexDropPageResult {
+        if (max_rows == 0) return error.InvalidDropPageSize;
+        var guard = try self.lockManagedIndexApply(.{ .kind = .algebraic, .name = index_name });
+        defer guard.unlock();
+        const entry = self.algebraicIndex(index_name) orelse unreachable;
+
+        const active_schema = (try schema_mod.loadSchema(store, self.alloc)) orelse return error.RelationalSchemaMissing;
+        defer schema_mod.freeSchema(self.alloc, active_schema);
+        if (active_schema.storage_mode != .relational) return error.RelationalSchemaRequired;
+        const schema_index = blk: {
+            for (active_schema.relational_indexes) |index| {
+                if (!std.mem.eql(u8, index.name, index_name)) continue;
+                if (index.access_method != .algebraic_filter) return error.WrongRelationalIndexAccessMethod;
+                break :blk index;
+            }
+            return error.RelationalIndexGenerationMissing;
+        };
+        if (schema_index.generation != expected_generation) return error.RelationalIndexGenerationChanged;
+        const phase = switch (schema_mod.relationalIndexDropPhaseDecision(schema_index)) {
+            .work => |work| work,
+            .complete => return error.RelationalIndexDropAlreadyComplete,
+            .blocked => return error.RelationalIndexGenerationBlocked,
+            .malformed => return error.RelationalIndexGenerationMalformed,
+        };
+        const component = phase.component orelse return error.RelationalIndexGenerationMalformed;
+        entry.index.prepareForArtifactDrop();
+        const drop_component: algebraic_mod.index.Index.ArtifactDropComponent = switch (component) {
+            .dictionary => .dictionary,
+            .fact => .fact,
+            .path => .path,
+            .postings => .postings,
+        };
+        var page = try entry.index.dropArtifactComponentPage(store, drop_component, phase.cursor, max_rows);
+        defer page.deinit(self.alloc);
+
+        const progress_result = try schema_mod.updateRelationalIndexDropProgress(store, self.alloc, .{
+            .access_method = .algebraic_filter,
+            .index_name = index_name,
+            .expected_generation = expected_generation,
+            .component = component,
+            .expected_cursor = phase.cursor,
+            .next_cursor = page.next_cursor,
+            .complete = page.complete,
+        });
+        switch (progress_result) {
+            .advanced, .completed => {},
+            .already_completed, .generation_mismatch, .stale_record, .wrong_phase, .cursor_mismatch => return error.RelationalIndexGenerationChanged,
+            .schema_missing, .non_relational_schema, .index_not_found, .wrong_access_method, .malformed_record, .invalid_update => return error.RelationalIndexGenerationMalformed,
+        }
+        return .{
+            .generation = expected_generation,
+            .component = component,
+            .scanned_artifacts = page.scanned_rows,
+            .deleted_artifacts = page.deleted_rows,
+            .next_cursor = if (page.next_cursor) |cursor| try self.alloc.dupe(u8, cursor) else null,
+            .component_complete = page.complete,
+            .complete = page.complete and component == .postings,
+        };
+    }
+
     pub fn repairRelationalTextSearchFromRows(
         self: *IndexManager,
         store: *docstore_mod.DocStore,
@@ -2493,6 +2798,443 @@ pub const IndexManager = struct {
         };
     }
 
+    /// Execute one bounded fact/path rebuild page for the durable algebraic
+    /// generation selected by the schema record. The artifact write precedes
+    /// the component-cursor compare-and-set; component upserts are idempotent,
+    /// so a crash between those commits can replay the page without duplication.
+    pub fn rebuildRelationalAlgebraicBaseRowComponentPage(
+        self: *IndexManager,
+        store: *docstore_mod.DocStore,
+        index_name: []const u8,
+        max_rows: usize,
+    ) !AlgebraicBaseRowComponentPageResult {
+        if (max_rows == 0) return error.InvalidRebuildPageSize;
+        const entry = self.algebraicIndex(index_name) orelse return error.IndexNotFound;
+        lockIndexApplyMutex(entry.apply_mutex);
+        defer entry.apply_mutex.*.unlock();
+
+        const active_schema = (try schema_mod.loadSchema(store, self.alloc)) orelse return error.RelationalSchemaMissing;
+        defer schema_mod.freeSchema(self.alloc, active_schema);
+        if (active_schema.storage_mode != .relational) return error.RelationalSchemaRequired;
+
+        const schema_index = blk: {
+            for (active_schema.relational_indexes) |index| {
+                if (!std.mem.eql(u8, index.name, index_name)) continue;
+                if (index.access_method != .algebraic_filter) return error.WrongRelationalIndexAccessMethod;
+                break :blk index;
+            }
+            return error.RelationalIndexGenerationMissing;
+        };
+        const generation_record = schema_index.generation_record orelse return error.RelationalIndexGenerationMissing;
+        if (schema_index.generation == 0 or generation_record.generation != schema_index.generation or
+            generation_record.lifecycle != schema_index.lifecycle)
+        {
+            return error.RelationalIndexGenerationMalformed;
+        }
+        const phase = switch (schema_mod.relationalIndexGenerationPhaseDecision(generation_record)) {
+            .work => |work| work,
+            .complete => return error.RelationalIndexGenerationAlreadyComplete,
+            .blocked => return error.RelationalIndexGenerationBlocked,
+            .malformed => return error.RelationalIndexGenerationMalformed,
+        };
+        const base_component: algebraic_mod.index.BaseRowComponent = switch (phase.component) {
+            .fact => .fact,
+            .path => .path,
+            .dictionary, .postings => return error.AlgebraicBaseRowPhaseComplete,
+        };
+
+        if (phase.cursor == null) _ = try entry.index.clearBaseRowComponentRows(store, base_component);
+
+        const lower = try internal_keys.documentRangeLowerAlloc(self.alloc, self.byte_range.start);
+        defer self.alloc.free(lower);
+        const upper = try internal_keys.documentRangeUpperAlloc(self.alloc, if (self.byte_range.end.len > 0) self.byte_range.end else "");
+        defer if (upper) |buf| self.alloc.free(buf);
+        const scan_budget = if (max_rows > std.math.maxInt(usize) / 4) max_rows else max_rows * 4;
+
+        var docs = std.ArrayListUnmanaged(derived_types.DerivedDocument).empty;
+        defer docs.deinit(self.alloc);
+        var owned_doc_ids = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (owned_doc_ids.items) |doc_id| self.alloc.free(doc_id);
+            owned_doc_ids.deinit(self.alloc);
+        }
+        var owned_values = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (owned_values.items) |value| self.alloc.free(value);
+            owned_values.deinit(self.alloc);
+        }
+        var last_seen_key: ?[]u8 = null;
+        defer if (last_seen_key) |key| self.alloc.free(key);
+        var scanned_keys: usize = 0;
+        var exhausted = true;
+
+        {
+            var txn = try store.beginReadTxn();
+            defer txn.abort();
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            cursor.setUpperBound(if (upper) |buf| buf else null);
+
+            const start = phase.cursor orelse lower;
+            var row_opt = try cursor.seekAtOrAfter(start);
+            while (row_opt) |row| : (row_opt = try cursor.next()) {
+                if (upper) |buf| {
+                    if (std.mem.order(u8, row.key, buf) != .lt) break;
+                }
+                if (phase.cursor) |resume_key| {
+                    if (std.mem.order(u8, row.key, resume_key) != .gt) continue;
+                }
+                scanned_keys += 1;
+                if (last_seen_key) |old| self.alloc.free(old);
+                last_seen_key = try self.alloc.dupe(u8, row.key);
+
+                if (!isMetadataKey(row.key) and self.visibleBaseDocumentRowKey(row.key)) {
+                    const doc_id = (try internal_keys.decodeStoredDocumentRowKeyAlloc(self.alloc, row.key)) orelse return error.MalformedStoredDocumentRowKey;
+                    var doc_id_owned = true;
+                    errdefer if (doc_id_owned) self.alloc.free(doc_id);
+                    if (self.keyInRange(doc_id)) {
+                        const doc_value = if (self.relational_base_rows)
+                            try mapper.materializeRelationalRowValueAlloc(self.alloc, row.value)
+                        else
+                            try self.alloc.dupe(u8, row.value);
+                        var doc_value_owned = true;
+                        errdefer if (doc_value_owned) self.alloc.free(doc_value);
+                        try owned_values.append(self.alloc, doc_value);
+                        doc_value_owned = false;
+                        try owned_doc_ids.append(self.alloc, doc_id);
+                        doc_id_owned = false;
+                        try docs.append(self.alloc, .{ .key = doc_id, .action = .upsert, .cleaned_value = doc_value });
+                    } else {
+                        self.alloc.free(doc_id);
+                        doc_id_owned = false;
+                    }
+                }
+
+                if (docs.items.len >= max_rows or scanned_keys >= scan_budget) {
+                    exhausted = false;
+                    break;
+                }
+            }
+        }
+
+        if (docs.items.len > 0) {
+            try entry.index.applyBaseRowComponentBatchWithOptions(
+                store,
+                base_component,
+                docs.items,
+                .{ .batch_options = .{ .mode = .bulk_ingest } },
+            );
+        }
+        const complete = exhausted or last_seen_key == null;
+        const progress_result = try schema_mod.updateRelationalIndexComponentProgress(store, self.alloc, .{
+            .index_name = index_name,
+            .expected_generation = schema_index.generation,
+            .component = phase.component,
+            .expected_cursor = phase.cursor,
+            .next_cursor = if (complete) null else last_seen_key.?,
+            .complete = complete,
+        });
+        switch (progress_result) {
+            .advanced, .completed => {},
+            .already_completed, .generation_mismatch, .stale_record, .wrong_phase, .cursor_mismatch => return error.RelationalIndexGenerationChanged,
+            .schema_missing, .non_relational_schema, .index_not_found, .wrong_access_method, .malformed_record, .invalid_update => return error.RelationalIndexGenerationMalformed,
+        }
+
+        return .{
+            .generation = schema_index.generation,
+            .component = phase.component,
+            .scanned_keys = scanned_keys,
+            .indexed_rows = docs.items.len,
+            .next_cursor = if (complete) null else try self.alloc.dupe(u8, last_seen_key.?),
+            .complete = complete,
+        };
+    }
+
+    pub fn rebuildRelationalAlgebraicDerivedRowComponentPage(
+        self: *IndexManager,
+        store: *docstore_mod.DocStore,
+        index_name: []const u8,
+        max_rows: usize,
+    ) !AlgebraicBaseRowComponentPageResult {
+        if (max_rows == 0) return error.InvalidRebuildPageSize;
+        const entry = self.algebraicIndex(index_name) orelse return error.IndexNotFound;
+        lockIndexApplyMutex(entry.apply_mutex);
+        defer entry.apply_mutex.*.unlock();
+
+        const active_schema = (try schema_mod.loadSchema(store, self.alloc)) orelse return error.RelationalSchemaMissing;
+        defer schema_mod.freeSchema(self.alloc, active_schema);
+        if (active_schema.storage_mode != .relational) return error.RelationalSchemaRequired;
+        const schema_index = blk: {
+            for (active_schema.relational_indexes) |index| {
+                if (!std.mem.eql(u8, index.name, index_name)) continue;
+                if (index.access_method != .algebraic_filter) return error.WrongRelationalIndexAccessMethod;
+                break :blk index;
+            }
+            return error.RelationalIndexGenerationMissing;
+        };
+        const record = schema_index.generation_record orelse return error.RelationalIndexGenerationMissing;
+        if (schema_index.generation == 0 or record.generation != schema_index.generation or record.lifecycle != schema_index.lifecycle) {
+            return error.RelationalIndexGenerationMalformed;
+        }
+        const phase = switch (schema_mod.relationalIndexGenerationPhaseDecision(record)) {
+            .work => |work| work,
+            .complete => return error.RelationalIndexGenerationAlreadyComplete,
+            .blocked => return error.RelationalIndexGenerationBlocked,
+            .malformed => return error.RelationalIndexGenerationMalformed,
+        };
+        const derived_component: algebraic_mod.index.DerivedRowComponent = switch (phase.component) {
+            .dictionary => .dictionary,
+            .postings => .postings,
+            .fact, .path => return error.AlgebraicDerivedRowPhaseNotReady,
+        };
+        if (phase.cursor == null) _ = try entry.index.clearDerivedRowComponentRows(store, derived_component);
+        var page = try entry.index.rebuildDerivedRowComponentPage(store, derived_component, phase.cursor, max_rows);
+        defer page.deinit(self.alloc);
+        const progress_result = try schema_mod.updateRelationalIndexComponentProgress(store, self.alloc, .{
+            .index_name = index_name,
+            .expected_generation = schema_index.generation,
+            .component = phase.component,
+            .expected_cursor = phase.cursor,
+            .next_cursor = page.next_cursor,
+            .complete = page.complete,
+        });
+        switch (progress_result) {
+            .advanced, .completed => {},
+            .already_completed, .generation_mismatch, .stale_record, .wrong_phase, .cursor_mismatch => return error.RelationalIndexGenerationChanged,
+            .schema_missing, .non_relational_schema, .index_not_found, .wrong_access_method, .malformed_record, .invalid_update => return error.RelationalIndexGenerationMalformed,
+        }
+        return .{
+            .generation = schema_index.generation,
+            .component = phase.component,
+            .scanned_keys = page.scanned_rows,
+            .indexed_rows = page.scanned_rows,
+            .next_cursor = if (page.next_cursor) |cursor| try self.alloc.dupe(u8, cursor) else null,
+            .complete = page.complete,
+        };
+    }
+
+    pub fn rebuildRelationalAlgebraicComponentPage(
+        self: *IndexManager,
+        store: *docstore_mod.DocStore,
+        index_name: []const u8,
+        expected_generation: u64,
+        max_rows: usize,
+    ) !AlgebraicBaseRowComponentPageResult {
+        const active_schema = (try schema_mod.loadSchema(store, self.alloc)) orelse return error.RelationalSchemaMissing;
+        defer schema_mod.freeSchema(self.alloc, active_schema);
+        if (active_schema.storage_mode != .relational) return error.RelationalSchemaRequired;
+        for (active_schema.relational_indexes) |index| {
+            if (!std.mem.eql(u8, index.name, index_name)) continue;
+            if (index.access_method != .algebraic_filter) return error.WrongRelationalIndexAccessMethod;
+            if (index.generation != expected_generation) return error.RelationalIndexGenerationChanged;
+            const record = index.generation_record orelse return error.RelationalIndexGenerationMissing;
+            if (record.generation != expected_generation or record.lifecycle != index.lifecycle) return error.RelationalIndexGenerationMalformed;
+            const phase = switch (schema_mod.relationalIndexGenerationPhaseDecision(record)) {
+                .work => |work| work.component,
+                .complete => return error.RelationalIndexGenerationAlreadyComplete,
+                .blocked => return error.RelationalIndexGenerationBlocked,
+                .malformed => return error.RelationalIndexGenerationMalformed,
+            };
+            return switch (phase) {
+                .fact, .path => try self.rebuildRelationalAlgebraicBaseRowComponentPage(store, index_name, max_rows),
+                .dictionary, .postings => try self.rebuildRelationalAlgebraicDerivedRowComponentPage(store, index_name, max_rows),
+            };
+        }
+        return error.RelationalIndexGenerationMissing;
+    }
+
+    /// Apply one bounded algebraic replay page to a completed relational index
+    /// generation. The authoritative current row determines whether each
+    /// coalesced key is an upsert or delete, so repeated and interrupted pages
+    /// converge without retaining stale intermediate journal values.
+    pub fn catchUpRelationalAlgebraicGenerationPage(
+        self: *IndexManager,
+        store: *docstore_mod.DocStore,
+        index_name: []const u8,
+        expected_generation: u64,
+        max_records: usize,
+    ) !AlgebraicCatchUpPageResult {
+        if (max_records == 0) return error.InvalidCatchUpPageSize;
+        const entry = self.algebraicIndex(index_name) orelse return error.IndexNotFound;
+        lockIndexApplyMutex(entry.apply_mutex);
+        defer entry.apply_mutex.*.unlock();
+
+        const active_schema = (try schema_mod.loadSchema(store, self.alloc)) orelse return error.RelationalSchemaMissing;
+        defer schema_mod.freeSchema(self.alloc, active_schema);
+        if (active_schema.storage_mode != .relational) return error.RelationalSchemaRequired;
+        const schema_index = blk: {
+            for (active_schema.relational_indexes) |index| {
+                if (!std.mem.eql(u8, index.name, index_name)) continue;
+                if (index.access_method != .algebraic_filter) return error.WrongRelationalIndexAccessMethod;
+                break :blk index;
+            }
+            return error.RelationalIndexGenerationMissing;
+        };
+        if (schema_index.generation != expected_generation) return error.RelationalIndexGenerationChanged;
+        const record = schema_index.generation_record orelse return error.RelationalIndexGenerationMissing;
+        if (record.generation != expected_generation or record.lifecycle != schema_index.lifecycle) return error.RelationalIndexGenerationMalformed;
+        if (!record.components.allReady()) return error.RelationalIndexGenerationComponentsIncomplete;
+        switch (schema_mod.relationalIndexGenerationPhaseDecision(record)) {
+            .complete => {},
+            .work => return error.RelationalIndexGenerationComponentsIncomplete,
+            .blocked => return error.RelationalIndexGenerationBlocked,
+            .malformed => return error.RelationalIndexGenerationMalformed,
+        }
+        switch (record.lifecycle) {
+            .building, .catching_up, .failed => {},
+            .ready => return error.RelationalIndexGenerationAlreadyComplete,
+            .invalid, .dropping, .stale, .rebuild_required => return error.RelationalIndexGenerationBlocked,
+        }
+
+        const from_sequence = record.ready_watermark;
+        var target_sequence = try store.latestReplaySequenceForHint(.algebraic, from_sequence);
+        var through_sequence = from_sequence;
+        var replay_records: usize = 0;
+        var changed_keys = std.StringHashMapUnmanaged(void).empty;
+        defer {
+            var it = changed_keys.keyIterator();
+            while (it.next()) |key| self.alloc.free(@constCast(key.*));
+            changed_keys.deinit(self.alloc);
+        }
+
+        if (target_sequence > from_sequence) {
+            const ReplayContext = struct {
+                alloc: Allocator,
+                manager: *IndexManager,
+                keys: *std.StringHashMapUnmanaged(void),
+                through_sequence: *u64,
+                target_sequence: *u64,
+                replay_records: *usize,
+
+                fn appendKey(ctx: *@This(), key: []const u8) !void {
+                    if (!ctx.manager.keyInRange(key)) return;
+                    if (ctx.keys.contains(key)) return;
+                    const owned = try ctx.alloc.dupe(u8, key);
+                    errdefer ctx.alloc.free(owned);
+                    const gop = try ctx.keys.getOrPut(ctx.alloc, owned);
+                    if (gop.found_existing) {
+                        ctx.alloc.free(owned);
+                        return;
+                    }
+                    gop.key_ptr.* = owned;
+                }
+
+                fn visit(ctx: *@This(), sequence: u64, payload: []const u8) !void {
+                    var decoded = change_journal_mod.decodeRecord(ctx.alloc, payload) catch return error.MalformedAlgebraicReplayRecord;
+                    defer decoded.deinit();
+                    if (decoded.record.sequence != sequence) return error.MalformedAlgebraicReplayRecord;
+                    for (decoded.record.changed_doc_keys) |key| try ctx.appendKey(key);
+                    for (decoded.record.overwritten_doc_keys) |key| try ctx.appendKey(key);
+                    for (decoded.record.deleted_doc_keys) |key| try ctx.appendKey(key);
+                    ctx.through_sequence.* = sequence;
+                    ctx.target_sequence.* = @max(ctx.target_sequence.*, sequence);
+                    ctx.replay_records.* += 1;
+                }
+            };
+            var replay_context = ReplayContext{
+                .alloc = self.alloc,
+                .manager = self,
+                .keys = &changed_keys,
+                .through_sequence = &through_sequence,
+                .target_sequence = &target_sequence,
+                .replay_records = &replay_records,
+            };
+            const stats = store.forEachReplayLaneFrom(
+                @intCast(@intFromEnum(change_journal_mod.TargetHint.algebraic)),
+                from_sequence + 1,
+                max_records,
+                &replay_context,
+                ReplayContext.visit,
+            ) catch |err| switch (err) {
+                error.ReplayIndexUnavailable => return error.RelationalIndexReplayUnavailable,
+                else => return err,
+            };
+            if (stats.matched_entries == 0 or through_sequence == from_sequence) return error.RelationalIndexReplayGap;
+        }
+
+        var documents = std.ArrayListUnmanaged(derived_types.DerivedDocument).empty;
+        defer documents.deinit(self.alloc);
+        var deleted_keys = std.ArrayListUnmanaged([]const u8).empty;
+        defer deleted_keys.deinit(self.alloc);
+        var owned_values = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (owned_values.items) |value| self.alloc.free(value);
+            owned_values.deinit(self.alloc);
+        }
+        var key_it = changed_keys.keyIterator();
+        while (key_it.next()) |key_ptr| {
+            const doc_key = key_ptr.*;
+            const stored_key = try relational_store_mod.rowKeyAlloc(self.alloc, doc_key);
+            defer self.alloc.free(stored_key);
+            const raw = store.get(self.alloc, stored_key) catch |err| switch (err) {
+                error.NotFound => {
+                    try deleted_keys.append(self.alloc, doc_key);
+                    continue;
+                },
+                else => return err,
+            };
+            defer self.alloc.free(raw);
+            const value = try mapper.materializeRelationalRowValueAlloc(self.alloc, raw);
+            var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, value, .{}) catch return error.MalformedRelationalCatchUpRow;
+            defer parsed.deinit();
+            if (parsed.value != .object) return error.MalformedRelationalCatchUpRow;
+            try owned_values.append(self.alloc, value);
+            try documents.append(self.alloc, .{ .key = doc_key, .action = .upsert, .cleaned_value = value });
+        }
+
+        if (documents.items.len > 0 or deleted_keys.items.len > 0) {
+            try entry.index.applyBatchWithOptions(store, .{
+                .sequence = through_sequence,
+                .documents = documents.items,
+                .deleted_keys = deleted_keys.items,
+            }, .{});
+        }
+
+        const progress_result = try schema_mod.updateRelationalIndexCatchUpProgress(store, self.alloc, .{
+            .index_name = index_name,
+            .expected_generation = expected_generation,
+            .expected_ready_watermark = from_sequence,
+            .next_ready_watermark = through_sequence,
+            .target_watermark = target_sequence,
+        });
+        const complete = switch (progress_result) {
+            .advanced => false,
+            .caught_up => true,
+            .generation_mismatch, .watermark_mismatch, .stale_record => return error.RelationalIndexGenerationChanged,
+            .components_incomplete => return error.RelationalIndexGenerationComponentsIncomplete,
+            .schema_missing, .non_relational_schema, .index_not_found, .wrong_access_method, .malformed_record, .invalid_update => return error.RelationalIndexGenerationMalformed,
+        };
+
+        var promoted = false;
+        if (complete) {
+            const promotion_result = try schema_mod.promoteRelationalIndexComponentsReady(store, self.alloc, .{
+                .index_name = index_name,
+                .expected_generation = expected_generation,
+                .owner_ranges = schema_index.owner_ranges,
+                .ready_watermark = through_sequence,
+                .components = .{},
+                .expected_lifecycle = .catching_up,
+            });
+            promoted = switch (promotion_result) {
+                .promoted, .already_ready => true,
+                .generation_mismatch, .stale_record => return error.RelationalIndexGenerationChanged,
+                .schema_missing, .non_relational_schema, .index_not_found, .wrong_access_method, .malformed_record, .owner_ranges_mismatch => return error.RelationalIndexGenerationMalformed,
+            };
+        }
+
+        return .{
+            .generation = expected_generation,
+            .from_sequence = from_sequence,
+            .through_sequence = through_sequence,
+            .target_sequence = target_sequence,
+            .replay_records = replay_records,
+            .upserts = documents.items.len,
+            .deletes = deleted_keys.items.len,
+            .complete = complete,
+            .promoted = promoted,
+        };
+    }
+
     pub fn repairRelationalAlgebraicFromRows(
         self: *IndexManager,
         store: *docstore_mod.DocStore,
@@ -2507,9 +3249,6 @@ pub const IndexManager = struct {
         const entry = self.algebraicIndex(index_name) orelse return error.IndexNotFound;
         lockIndexApplyMutex(entry.apply_mutex);
         defer entry.apply_mutex.*.unlock();
-
-        const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
-        try rebuild_state.clear();
 
         const rebuilt = try self.rebuildAlgebraicIndexFromBaseRows(store, entry);
         try self.saveBackfilledAppliedSequence(store, entry.config);
@@ -2540,13 +3279,8 @@ pub const IndexManager = struct {
         const upper = try internal_keys.documentRangeUpperAlloc(self.alloc, if (self.byte_range.end.len > 0) self.byte_range.end else "");
         defer if (upper) |buf| self.alloc.free(buf);
 
-        const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
-        const resume_from = try rebuild_state.check(self.alloc);
-        defer if (resume_from) |buf| self.alloc.free(buf);
-        if (resume_from == null) {
-            _ = try entry.index.clearPersistedRows(store);
-            try rebuild_state.update("");
-        }
+        const resume_from: ?[]u8 = null;
+        _ = try entry.index.clearPersistedRows(store);
 
         const ready_watermark = try self.backfilledAppliedSequenceForConfig(store, entry.config);
         const total_visible_docs = try self.countAlgebraicBackfillVisibleDocs(store, lower, upper, resume_from);
@@ -2556,7 +3290,6 @@ pub const IndexManager = struct {
             .ready_watermark = ready_watermark,
             .rebuild_cursor = resume_from,
             .components = schema_mod.relational_index_generation_components_none,
-            .component_cursors = algebraicGenerationComponentCursors(resume_from),
         });
         var last_progress_cursor: ?[]const u8 = resume_from;
         var last_progress_lag = total_visible_docs;
@@ -2568,7 +3301,6 @@ pub const IndexManager = struct {
                 .rebuild_cursor = last_progress_cursor,
                 .failure_reason = @errorName(err),
                 .components = schema_mod.relational_index_generation_components_none,
-                .component_cursors = algebraicGenerationComponentCursors(last_progress_cursor),
             }) catch {};
         }
 
@@ -2665,7 +3397,6 @@ pub const IndexManager = struct {
                 flushed_batches += 1;
             }
             if (last_seen_key) |key| {
-                try rebuild_state.update(key);
                 self.alloc.free(scan_after);
                 scan_after = try self.alloc.dupe(u8, key);
                 last_progress_cursor = scan_after;
@@ -2676,7 +3407,6 @@ pub const IndexManager = struct {
                     .ready_watermark = ready_watermark,
                     .rebuild_cursor = scan_after,
                     .components = schema_mod.relational_index_generation_components_none,
-                    .component_cursors = algebraicGenerationComponentCursors(scan_after),
                 });
             }
             if (docs.items.len > 0 and @import("builtin").is_test) {
@@ -2697,19 +3427,9 @@ pub const IndexManager = struct {
         try entry.index.finishBulkIngestSessionWithOptions(store, .{});
         bulk_session_open = false;
         if (completed) {
-            try rebuild_state.clear();
             try self.promoteAlgebraicGenerationRecordReady(store, entry, ready_watermark);
         }
         return rebuilt;
-    }
-
-    fn algebraicGenerationComponentCursors(cursor: ?[]const u8) schema_mod.RelationalIndexGenerationComponentCursors {
-        return .{
-            .dictionary = cursor,
-            .fact = cursor,
-            .path = cursor,
-            .postings = cursor,
-        };
     }
 
     fn countAlgebraicBackfillVisibleDocs(
@@ -10003,14 +10723,15 @@ pub const IndexManager = struct {
         if (delete_keys.len == 0 and writes.len == 0) return;
         for (self.text_indexes.items) |*entry| {
             if (std.mem.eql(u8, entry.config.name, index_name)) {
+                var mutations = TextSegmentMutationBatch{};
+                defer mutations.deinit(self.alloc, &entry.persistent);
                 var stats = TextBatchMutationStats{};
-                if (delete_keys.len > 0) {
-                    stats.noteDelete((try self.deleteTextBatchEntry(entry, delete_keys)).deleted_any);
-                }
                 if (writes.len > 0) {
-                    const index_stats = try self.indexTextBatchForConfig(store, entry, writes);
+                    const index_stats = try self.stageTextBatchForConfig(store, entry, writes, &mutations);
                     stats.noteIndex(index_stats.indexed_any);
                 }
+                const mutation_stats = try mutations.apply(entry, delete_keys);
+                stats.noteDelete(mutation_stats.deletion_bitmaps != 0);
                 try self.finalizeTextBatchMutations(entry, opts, stats);
                 return;
             }
@@ -10264,6 +10985,20 @@ pub const IndexManager = struct {
             internal_keys.isPrimaryDocumentKey(key);
     }
 
+    fn relationalTextBackfillAllowed(
+        self: *IndexManager,
+        store: *docstore_mod.DocStore,
+        index_name: []const u8,
+    ) !bool {
+        const active_schema = try schema_mod.loadSchema(store, self.alloc);
+        defer if (active_schema) |schema| schema_mod.freeSchema(self.alloc, schema);
+        return schema_mod.relationalAccessMethodWriteMaintenanceAllowed(
+            active_schema,
+            .text_search,
+            index_name,
+        );
+    }
+
     /// Reconstruct relational typed-row values in a freshly scanned set of
     /// document rows into canonical JSON, in place. Relational mode is strict:
     /// only relational row keys are materialized, and the value under that
@@ -10298,6 +11033,9 @@ pub const IndexManager = struct {
     }
 
     fn backfillTextIndex(self: *IndexManager, store: *docstore_mod.DocStore, entry: *TextIndex, resume_from: ?[]const u8) !void {
+        if (!try self.relationalTextBackfillAllowed(store, entry.config.name)) {
+            return error.RelationalIndexGenerationBlocked;
+        }
         if (builtin.is_test) test_text_backfill_invocations += 1;
         self.beginTextBackfill();
         defer self.endTextBackfill();
@@ -11486,7 +12224,9 @@ pub const IndexManager = struct {
                     rebuild_from_scratch_after_interruption = true;
                 }
 
-                if (allow_full_text_backfill and (rebuild_from_scratch_after_interruption or resume_from != null or (entry.persistent.snapshot().liveDocCount() == 0 and persisted_ranges.len == 0))) {
+                const backfill_allowed = allow_full_text_backfill and
+                    try self.relationalTextBackfillAllowed(store, cfg.name);
+                if (backfill_allowed and (rebuild_from_scratch_after_interruption or resume_from != null or (entry.persistent.snapshot().liveDocCount() == 0 and persisted_ranges.len == 0))) {
                     const backfill_started_ns = nowNs();
                     try rebuild_state.updateWithIo(self.checkpointIo(), if (resume_from) |buf| buf else "");
                     try self.backfillTextIndex(store, &entry, resume_from);
@@ -13701,6 +14441,20 @@ pub const IndexManager = struct {
     }
 
     fn indexTextBatchForConfig(self: *IndexManager, store: *docstore_mod.DocStore, entry: *TextIndex, writes: []const types.BatchWrite) !TextBatchMutationStats {
+        var mutations = TextSegmentMutationBatch{};
+        defer mutations.deinit(self.alloc, &entry.persistent);
+        const stats = try self.stageTextBatchForConfig(store, entry, writes, &mutations);
+        _ = try mutations.apply(entry, &.{});
+        return stats;
+    }
+
+    fn stageTextBatchForConfig(
+        self: *IndexManager,
+        store: *docstore_mod.DocStore,
+        entry: *TextIndex,
+        writes: []const types.BatchWrite,
+        mutations: *TextSegmentMutationBatch,
+    ) !TextBatchMutationStats {
         if (writes.len == 0) return .{};
 
         var filtered = std.ArrayListUnmanaged(types.BatchWrite).empty;
@@ -13732,7 +14486,7 @@ pub const IndexManager = struct {
                 .doc_ordinal = ordinals[i],
             };
         }
-        return try self.indexTextProjectionDocsMaybeChunked(store, entry, docs);
+        return try self.stageTextProjectionDocsMaybeChunked(store, entry, docs, mutations);
     }
 
     fn indexTextProjectionDocs(
@@ -13740,6 +14494,20 @@ pub const IndexManager = struct {
         store: *docstore_mod.DocStore,
         entry: *TextIndex,
         docs: []const mapper.MapperDoc,
+    ) !TextBatchMutationStats {
+        var mutations = TextSegmentMutationBatch{};
+        defer mutations.deinit(self.alloc, &entry.persistent);
+        const stats = try self.stageTextProjectionDocs(store, entry, docs, &mutations);
+        _ = try mutations.apply(entry, &.{});
+        return stats;
+    }
+
+    fn stageTextProjectionDocs(
+        self: *IndexManager,
+        store: *docstore_mod.DocStore,
+        entry: *TextIndex,
+        docs: []const mapper.MapperDoc,
+        mutations: *TextSegmentMutationBatch,
     ) !TextBatchMutationStats {
         var arena_state = std.heap.ArenaAllocator.init(self.alloc);
         defer arena_state.deinit();
@@ -13749,7 +14517,7 @@ pub const IndexManager = struct {
             docs,
             try self.textProjectionOptionsForSchema(arena, entry.runtime_schema == null),
         );
-        return try self.indexPreparedTextProjectionSourceDocsWithArena(arena, store, entry, source_batch.docs);
+        return try self.stagePreparedTextProjectionSourceDocsWithArena(arena, store, entry, source_batch.docs, mutations);
     }
 
     fn indexTextProjectionDocsMaybeChunked(
@@ -13758,16 +14526,30 @@ pub const IndexManager = struct {
         entry: *TextIndex,
         docs: []const mapper.MapperDoc,
     ) !TextBatchMutationStats {
+        var mutations = TextSegmentMutationBatch{};
+        defer mutations.deinit(self.alloc, &entry.persistent);
+        const stats = try self.stageTextProjectionDocsMaybeChunked(store, entry, docs, &mutations);
+        _ = try mutations.apply(entry, &.{});
+        return stats;
+    }
+
+    fn stageTextProjectionDocsMaybeChunked(
+        self: *IndexManager,
+        store: *docstore_mod.DocStore,
+        entry: *TextIndex,
+        docs: []const mapper.MapperDoc,
+        mutations: *TextSegmentMutationBatch,
+    ) !TextBatchMutationStats {
         const source_target_bytes = textProjectionSourceBuildTargetBytes();
         if (docs.len <= max_text_projection_docs_per_segment_build and estimatedMapperDocsBytes(docs) <= source_target_bytes) {
-            return try self.indexTextProjectionDocs(store, entry, docs);
+            return try self.stageTextProjectionDocs(store, entry, docs, mutations);
         }
 
         var stats = TextBatchMutationStats{};
         var start: usize = 0;
         while (start < docs.len) {
             const end = splitMapperDocsEnd(docs, start, source_target_bytes);
-            const chunk_stats = try self.indexTextProjectionDocs(store, entry, docs[start..end]);
+            const chunk_stats = try self.stageTextProjectionDocs(store, entry, docs[start..end], mutations);
             stats.noteIndex(chunk_stats.indexed_any);
             stats.noteDelete(chunk_stats.deleted_any);
             start = end;
@@ -13786,17 +14568,21 @@ pub const IndexManager = struct {
         var arena_state = std.heap.ArenaAllocator.init(self.alloc);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
-        const stats = try self.indexFilteredTextProjectionSourceDocsWithArena(arena, store, entry, source_docs, skip);
+        var mutations = TextSegmentMutationBatch{};
+        defer mutations.deinit(self.alloc, &entry.persistent);
+        const stats = try self.stageFilteredTextProjectionSourceDocsWithArena(arena, store, entry, source_docs, skip, &mutations);
+        _ = try mutations.apply(entry, &.{});
         try self.finalizeTextBatchMutations(entry, opts, stats);
     }
 
-    fn indexFilteredTextProjectionSourceDocsWithArena(
+    fn stageFilteredTextProjectionSourceDocsWithArena(
         self: *IndexManager,
         arena: std.mem.Allocator,
         store: *docstore_mod.DocStore,
         entry: *TextIndex,
         source_docs: []const mapper.TextProjectionSourceDoc,
         skip: ?*const TextSplitHandoff,
+        mutations: *TextSegmentMutationBatch,
     ) !TextBatchMutationStats {
         var filtered = std.ArrayListUnmanaged(mapper.TextProjectionSourceDoc).empty;
         defer filtered.deinit(arena);
@@ -13810,19 +14596,20 @@ pub const IndexManager = struct {
         }
         if (filtered.items.len == 0) return .{};
 
-        return try self.indexPreparedTextProjectionSourceDocsMaybeChunked(arena, store, entry, filtered.items);
+        return try self.stagePreparedTextProjectionSourceDocsMaybeChunked(arena, store, entry, filtered.items, mutations);
     }
 
-    fn indexPreparedTextProjectionSourceDocsMaybeChunked(
+    fn stagePreparedTextProjectionSourceDocsMaybeChunked(
         self: *IndexManager,
         arena: std.mem.Allocator,
         store: *docstore_mod.DocStore,
         entry: *TextIndex,
         source_docs: []const mapper.TextProjectionSourceDoc,
+        mutations: *TextSegmentMutationBatch,
     ) !TextBatchMutationStats {
         const source_target_bytes = textProjectionSourceBuildTargetBytes();
         if (source_docs.len <= max_text_projection_docs_per_segment_build and estimatedTextProjectionSourceDocsBytes(source_docs) <= source_target_bytes) {
-            return try self.indexPreparedTextProjectionSourceDocsWithArena(arena, store, entry, source_docs);
+            return try self.stagePreparedTextProjectionSourceDocsWithArena(arena, store, entry, source_docs, mutations);
         }
 
         var stats = TextBatchMutationStats{};
@@ -13831,11 +14618,12 @@ pub const IndexManager = struct {
             const end = splitTextProjectionSourceDocsEnd(source_docs, start, source_target_bytes);
             var chunk_arena_state = std.heap.ArenaAllocator.init(self.alloc);
             defer chunk_arena_state.deinit();
-            const chunk_stats = try self.indexPreparedTextProjectionSourceDocsWithArena(
+            const chunk_stats = try self.stagePreparedTextProjectionSourceDocsWithArena(
                 chunk_arena_state.allocator(),
                 store,
                 entry,
                 source_docs[start..end],
+                mutations,
             );
             stats.noteIndex(chunk_stats.indexed_any);
             stats.noteDelete(chunk_stats.deleted_any);
@@ -13914,12 +14702,13 @@ pub const IndexManager = struct {
         return @max(start + 1, end);
     }
 
-    fn indexPreparedTextProjectionSourceDocsWithArena(
+    fn stagePreparedTextProjectionSourceDocsWithArena(
         self: *IndexManager,
         arena: std.mem.Allocator,
         store: *docstore_mod.DocStore,
         entry: *TextIndex,
         source_docs: []const mapper.TextProjectionSourceDoc,
+        mutations: *TextSegmentMutationBatch,
     ) !TextBatchMutationStats {
         if (source_docs.len == 0) return .{};
 
@@ -14067,8 +14856,9 @@ pub const IndexManager = struct {
                         .text_analysis = entry.text_analysis,
                         .build_options = build_options,
                     };
-                    const built_len = try entry.persistent.indexSegmentFromSinkBuilder(&build_ctx, buildTextSegmentIntoSink);
-                    segment_bytes += built_len;
+                    const prepared = try entry.persistent.prepareTextSegmentFromSinkBuilder(self.alloc, &build_ctx, buildTextSegmentIntoSink);
+                    segment_bytes += prepared.data.bytes().len;
+                    try mutations.append(self.alloc, &entry.persistent, prepared);
                     segment_count += 1;
                     indexed_any = true;
                     start = end;
@@ -14364,11 +15154,11 @@ pub const IndexManager = struct {
         return index.snapshot().segments.len >= threshold;
     }
 
-    fn deleteTextBatchEntry(_: *IndexManager, entry: *TextIndex, keys: []const []const u8) !TextBatchMutationStats {
-        const delete_infos = try entry.persistent.deleteByIdsTracked(keys);
-        defer entry.persistent.freeDeleteInfos(delete_infos);
-        entry.recordCommittedDeletes(delete_infos);
-        return .{ .deleted_any = delete_infos.len != 0 };
+    fn deleteTextBatchEntry(self: *IndexManager, entry: *TextIndex, keys: []const []const u8) !TextBatchMutationStats {
+        var mutations = TextSegmentMutationBatch{};
+        defer mutations.deinit(self.alloc, &entry.persistent);
+        const stats = try mutations.apply(entry, keys);
+        return .{ .deleted_any = stats.deletion_bitmaps != 0 };
     }
 
     fn finalizeTextBatchMutations(
@@ -19954,7 +20744,697 @@ test "index manager algebraic schema reload marks changed json subdocument domai
     try std.testing.expect(std.mem.indexOf(u8, manager.algebraic_indexes.items[0].config.config_json, "\"capability_lifecycle_status\":\"rebuild_required\"") == null);
 }
 
-test "index manager embedded json schema rebuild resumes after failure and reopen" {
+test "index manager text artifact drop worker handles durable lifecycle cases" {
+    const alloc = std.testing.allocator;
+    const Scenario = enum { empty, paged_retry, interrupted_after_artifact_commit, stale_generation, non_dropping };
+    const Case = struct {
+        name: []const u8,
+        scenario: Scenario,
+        segment_count: usize,
+        expected_generation: u64 = 7,
+        lifecycle: schema_mod.RelationalIndexLifecycle = .dropping,
+        begin_drop: bool = false,
+        expected_error: ?anyerror = null,
+    };
+    const cases = [_]Case{
+        .{ .name = "empty drop begins from ready", .scenario = .empty, .segment_count = 0, .lifecycle = .ready, .begin_drop = true },
+        .{ .name = "paged retry begins from ready", .scenario = .paged_retry, .segment_count = 3, .lifecycle = .ready, .begin_drop = true },
+        .{ .name = "retry after artifact commit before cursor", .scenario = .interrupted_after_artifact_commit, .segment_count = 3 },
+        .{ .name = "stale generation", .scenario = .stale_generation, .segment_count = 2, .expected_generation = 8, .expected_error = error.RelationalIndexGenerationChanged },
+        .{ .name = "non-dropping lifecycle", .scenario = .non_dropping, .segment_count = 2, .lifecycle = .ready, .expected_error = error.RelationalIndexGenerationBlocked },
+    };
+
+    for (cases) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+        const path_z = try alloc.dupeZ(u8, path);
+        defer alloc.free(path_z);
+        var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+        defer store.close();
+        var manager = try IndexManager.init(alloc, path);
+        defer manager.deinit();
+
+        _ = try schema_mod.saveSchema(&store, alloc, .{
+            .version = 1,
+            .storage_mode = .relational,
+            .relational_indexes = &.{.{
+                .name = "text_drop",
+                .owner_kind = .table,
+                .owner_name = schema_mod.relational_table_index_owner_name,
+                .access_method = .text_search,
+                .lifecycle = case.lifecycle,
+                .generation = 7,
+                .generation_record = .{
+                    .generation = 7,
+                    .lifecycle = case.lifecycle,
+                    .components = if (case.lifecycle == .dropping) schema_mod.relational_index_generation_components_none else .{},
+                },
+            }},
+        });
+        try manager.addAllNoBackfill(&store, &.{.{ .name = "text_drop", .kind = .full_text, .config_json = "{}" }});
+        const entry = manager.textIndexEntry("text_drop") orelse return error.TestUnexpectedResult;
+        for (0..case.segment_count) |i| {
+            try entry.persistent.putActiveSegmentArtifactForTest(@intCast(i + 1), "corrupt-but-removable", "row:a", "row:z");
+        }
+        if (case.begin_drop) {
+            try std.testing.expectEqual(
+                schema_mod.RelationalIndexDropTransitionResult.started,
+                try manager.beginRelationalIndexArtifactDrop(&store, .text_search, "text_drop", case.expected_generation),
+            );
+        }
+        if (case.scenario == .interrupted_after_artifact_commit) {
+            const first = [_]u64{1};
+            try entry.persistent.removeSegments(first[0..]);
+        }
+
+        if (case.expected_error) |expected_error| {
+            try std.testing.expectError(expected_error, manager.dropRelationalTextSearchArtifactPage(&store, "text_drop", case.expected_generation, 1));
+            const remaining = try entry.persistent.activeSegmentIdsAlloc(alloc);
+            defer alloc.free(remaining);
+            try std.testing.expectEqual(case.segment_count, remaining.len);
+            continue;
+        }
+
+        var page_count: usize = 0;
+        while (true) {
+            var page = try manager.dropRelationalTextSearchArtifactPage(&store, "text_drop", case.expected_generation, 1);
+            defer page.deinit(alloc);
+            try std.testing.expect(page.scanned_artifacts <= 1);
+            page_count += 1;
+            if (page.complete) break;
+            try std.testing.expect(page.next_cursor != null);
+            const durable = (try schema_mod.loadSchema(&store, alloc)).?;
+            defer schema_mod.freeSchema(alloc, durable);
+            try std.testing.expect(durable.relational_indexes[0].generation_record.?.rebuild_cursor != null);
+            if (page_count > case.segment_count + 2) return error.TestUnexpectedResult;
+        }
+        const remaining = try entry.persistent.activeSegmentIdsAlloc(alloc);
+        defer alloc.free(remaining);
+        try std.testing.expectEqual(@as(usize, 0), remaining.len);
+        const completed = (try schema_mod.loadSchema(&store, alloc)).?;
+        try std.testing.expect(completed.relational_indexes[0].generation_record.?.components.allReady());
+        schema_mod.freeSchema(alloc, completed);
+        try std.testing.expectEqual(
+            schema_mod.RelationalIndexDropTransitionResult.finalized,
+            try manager.finalizeRelationalIndexArtifactDrop(&store, .text_search, "text_drop", case.expected_generation),
+        );
+        try std.testing.expect(manager.get("text_drop") == null);
+        const finalized = (try schema_mod.loadSchema(&store, alloc)).?;
+        defer schema_mod.freeSchema(alloc, finalized);
+        try std.testing.expectEqual(@as(usize, 0), finalized.relational_indexes.len);
+    }
+}
+
+test "index manager algebraic artifact drop worker handles durable lifecycle cases" {
+    const alloc = std.testing.allocator;
+    const Scenario = enum { paged_reopen, interrupted_after_artifact_commit, stale_generation, non_dropping };
+    const Case = struct {
+        name: []const u8,
+        scenario: Scenario,
+        expected_generation: u64 = 7,
+        lifecycle: schema_mod.RelationalIndexLifecycle = .dropping,
+        begin_drop: bool = false,
+        expected_error: ?anyerror = null,
+    };
+    const cases = [_]Case{
+        .{ .name = "paged drop begins ready and reopens from durable cursor", .scenario = .paged_reopen, .lifecycle = .ready, .begin_drop = true },
+        .{ .name = "retry after artifact commit before cursor", .scenario = .interrupted_after_artifact_commit },
+        .{ .name = "stale generation", .scenario = .stale_generation, .expected_generation = 8, .expected_error = error.RelationalIndexGenerationChanged },
+        .{ .name = "non-dropping lifecycle", .scenario = .non_dropping, .lifecycle = .ready, .expected_error = error.RelationalIndexGenerationBlocked },
+    };
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "rows"
+        \\}
+    ;
+
+    for (cases, 0..) |case, case_i| {
+        var suffix_buf: [96]u8 = undefined;
+        const suffix = try std.fmt.bufPrint(&suffix_buf, "algebraic-drop-worker-{d}", .{case_i});
+        var path_buf: [256]u8 = undefined;
+        const path_z = indexManagerTmpPathWithSuffix(&path_buf, suffix);
+        defer cleanupIndexManagerDir(path_z);
+        var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+        defer store.close();
+        var runtime = try background_runtime_mod.BackendRuntime.init(alloc, .{ .backend = .manual });
+        defer runtime.deinit();
+        var manager = try IndexManager.init(alloc, std.mem.span(path_z));
+        defer manager.deinit();
+        manager.attachHllMaintenance(runtime.durable_jobs, try runtime.allocOwnerId());
+
+        _ = try schema_mod.saveSchema(&store, alloc, .{
+            .version = 1,
+            .storage_mode = .relational,
+            .relational_indexes = &.{.{
+                .name = "alg_drop",
+                .owner_kind = .table,
+                .owner_name = schema_mod.relational_table_index_owner_name,
+                .access_method = .algebraic_filter,
+                .lifecycle = case.lifecycle,
+                .generation = 7,
+                .generation_record = .{
+                    .generation = 7,
+                    .lifecycle = case.lifecycle,
+                    .components = if (case.lifecycle == .dropping) schema_mod.relational_index_generation_components_none else .{},
+                },
+            }},
+        });
+        try manager.add(&store, .{ .name = "alg_drop", .kind = .algebraic, .config_json = cfg });
+        const entry = manager.algebraicIndex("alg_drop") orelse return error.TestUnexpectedResult;
+        try entry.index.putArtifactRowForTest(&store, .raw, "docfact", "a", "1");
+        try entry.index.putArtifactRowForTest(&store, .raw, "docfact", "b", "2");
+        try entry.index.putArtifactRowForTest(&store, .raw, "pathfact", "a", "3");
+        try entry.index.putArtifactRowForTest(&store, .raw, "lexicon", "a", "4");
+        try entry.index.putArtifactRowForTest(&store, .raw, "postings", "a", "5");
+        try entry.index.putArtifactRowForTest(&store, .canonical, "future", "a", "6");
+        if (case.begin_drop) {
+            try std.testing.expectEqual(
+                schema_mod.RelationalIndexDropTransitionResult.started,
+                try manager.beginRelationalIndexArtifactDrop(&store, .algebraic_filter, "alg_drop", case.expected_generation),
+            );
+            try std.testing.expect(entry.index.hll_maintenance_lane == null);
+        }
+        if (case.scenario == .interrupted_after_artifact_commit) {
+            var interrupted = try entry.index.dropArtifactComponentPage(&store, .fact, null, 1);
+            defer interrupted.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 1), interrupted.deleted_rows);
+        }
+
+        if (case.expected_error) |expected_error| {
+            try std.testing.expectError(expected_error, manager.dropRelationalAlgebraicArtifactPage(&store, "alg_drop", case.expected_generation, 1));
+            try std.testing.expect(entry.index.hll_maintenance_lane != null);
+            try std.testing.expectEqual(@as(usize, 2), try countAlgebraicKeysContaining(alloc, &store, "docfact", ""));
+            continue;
+        }
+
+        var page_count: usize = 0;
+        var last_component: ?schema_mod.RelationalIndexGenerationComponent = null;
+        var reopened = false;
+        while (true) {
+            var page = try manager.dropRelationalAlgebraicArtifactPage(&store, "alg_drop", case.expected_generation, 1);
+            defer page.deinit(alloc);
+            try std.testing.expect((manager.algebraicIndex("alg_drop") orelse return error.TestUnexpectedResult).index.hll_maintenance_lane == null);
+            try std.testing.expect(page.scanned_artifacts <= 1);
+            const component = page.component orelse return error.TestUnexpectedResult;
+            if (last_component) |previous| try std.testing.expect(@intFromEnum(component) >= @intFromEnum(previous) or (previous == .path and component == .dictionary));
+            last_component = component;
+            page_count += 1;
+            if (page.complete) break;
+            if (!page.component_complete) try std.testing.expect(page.next_cursor != null);
+            if (case.scenario == .paged_reopen and !reopened) {
+                manager.deinit();
+                manager = try IndexManager.init(alloc, std.mem.span(path_z));
+                try manager.load(&store);
+                manager.attachHllMaintenance(runtime.durable_jobs, try runtime.allocOwnerId());
+                try std.testing.expect((manager.algebraicIndex("alg_drop") orelse return error.TestUnexpectedResult).index.hll_maintenance_lane != null);
+                reopened = true;
+            }
+            if (page_count > 32) return error.TestUnexpectedResult;
+        }
+        try std.testing.expect(reopened or case.scenario != .paged_reopen);
+        try std.testing.expectEqual(@as(usize, 0), try countAlgebraicKeysContaining(alloc, &store, "__algebraic__", ""));
+        const completed = (try schema_mod.loadSchema(&store, alloc)).?;
+        try std.testing.expect(completed.relational_indexes[0].generation_record.?.components.allReady());
+        schema_mod.freeSchema(alloc, completed);
+        try std.testing.expectEqual(
+            schema_mod.RelationalIndexDropTransitionResult.finalized,
+            try manager.finalizeRelationalIndexArtifactDrop(&store, .algebraic_filter, "alg_drop", case.expected_generation),
+        );
+        try std.testing.expect(manager.get("alg_drop") == null);
+        const finalized = (try schema_mod.loadSchema(&store, alloc)).?;
+        defer schema_mod.freeSchema(alloc, finalized);
+        try std.testing.expectEqual(@as(usize, 0), finalized.relational_indexes.len);
+    }
+}
+
+test "index manager algebraic fact and path workers page packed row shapes independently" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path_z = indexManagerTmpPathWithSuffix(&path_buf, "algebraic-component-pages");
+    defer cleanupIndexManagerDir(path_z);
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"payload":{"type":"json"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"alg","owner_kind":"table","owner_name":"__antfly_table__","access_method":"algebraic_filter","method_config":{"type":"algebraic","derive_from_schema":true},"lifecycle":"building","generation":7,"schema_fingerprint":"secondary-index-v1:alg","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"building","lag":5,"ready_watermark":0,"components":{"dictionary":false,"fact":false,"path":false,"postings":false}}}]}
+    ;
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var manager = try IndexManager.init(alloc, std.mem.span(path_z));
+    defer manager.deinit();
+    manager.setRelationalBaseRows(true);
+    try saveRuntimeSchemaJsonForIndexManagerTest(alloc, &store, schema_json);
+
+    const config_json = try algebraic_mod.schema_capability.configJsonFromSchemaJsonAlloc(alloc, "rows", schema_json);
+    defer alloc.free(config_json);
+    try manager.add(&store, .{ .name = "alg", .kind = .algebraic, .config_json = config_json });
+
+    var parsed_schema = try schema_api_mod.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try schema_api_mod.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    const ShapeCase = struct {
+        name: []const u8,
+        key: []const u8,
+        value: []const u8,
+        path_probe: ?[]const u8,
+    };
+    const shape_cases = [_]ShapeCase{
+        .{ .name = "scalar", .key = "row:1", .value = "{\"id\":\"1\",\"payload\":7}", .path_probe = "7" },
+        .{ .name = "null", .key = "row:2", .value = "{\"id\":\"2\",\"payload\":null}", .path_probe = "payload" },
+        .{ .name = "array", .key = "row:3", .value = "{\"id\":\"3\",\"payload\":[\"new\",\"sale\"]}", .path_probe = "sale" },
+        .{ .name = "nested object", .key = "row:4", .value = "{\"id\":\"4\",\"payload\":{\"nested\":{\"value\":\"gold\"}}}", .path_probe = "gold" },
+        .{ .name = "missing field", .key = "row:5", .value = "{\"id\":\"5\"}", .path_probe = null },
+    };
+    for (shape_cases) |case| {
+        const stored_key = try relational_store_mod.rowKeyAlloc(alloc, case.key);
+        defer alloc.free(stored_key);
+        const packed_row = try mapper.buildRelationalRowValueAlloc(alloc, case.value, runtime_schema.relational_columns);
+        defer alloc.free(packed_row);
+        try store.put(stored_key, packed_row);
+    }
+
+    var fact_page_one = try manager.rebuildRelationalAlgebraicBaseRowComponentPage(&store, "alg", 3);
+    defer fact_page_one.deinit(alloc);
+    try std.testing.expectEqual(schema_mod.RelationalIndexGenerationComponent.fact, fact_page_one.component);
+    try std.testing.expectEqual(@as(usize, 3), fact_page_one.indexed_rows);
+    try std.testing.expect(!fact_page_one.complete);
+    try std.testing.expect(fact_page_one.next_cursor != null);
+    try std.testing.expect((try countAlgebraicKeysContaining(alloc, &store, "docfact", "")) > 0);
+    try std.testing.expectEqual(@as(usize, 0), try countAlgebraicKeysContaining(alloc, &store, "pathfact", ""));
+    {
+        const schema = (try schema_mod.loadSchema(&store, alloc)).?;
+        defer schema_mod.freeSchema(alloc, schema);
+        const record = schema.relational_indexes[0].generation_record.?;
+        try std.testing.expectEqualStrings(fact_page_one.next_cursor.?, record.component_cursors.fact.?);
+        try std.testing.expect(!record.components.fact);
+        try std.testing.expect(record.component_cursors.path == null);
+    }
+
+    var fact_page_two = try manager.rebuildRelationalAlgebraicBaseRowComponentPage(&store, "alg", 3);
+    defer fact_page_two.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), fact_page_two.indexed_rows);
+    try std.testing.expect(fact_page_two.complete);
+    const fact_rows_before_path = try countAlgebraicKeysContaining(alloc, &store, "docfact", "");
+    {
+        const schema = (try schema_mod.loadSchema(&store, alloc)).?;
+        defer schema_mod.freeSchema(alloc, schema);
+        const record = schema.relational_indexes[0].generation_record.?;
+        try std.testing.expect(record.components.fact);
+        try std.testing.expect(record.component_cursors.fact == null);
+        try std.testing.expect(!record.components.path);
+    }
+
+    var path_page_one = try manager.rebuildRelationalAlgebraicBaseRowComponentPage(&store, "alg", 2);
+    defer path_page_one.deinit(alloc);
+    try std.testing.expectEqual(schema_mod.RelationalIndexGenerationComponent.path, path_page_one.component);
+    try std.testing.expectEqual(@as(usize, 2), path_page_one.indexed_rows);
+    try std.testing.expect(!path_page_one.complete);
+    try std.testing.expectEqual(fact_rows_before_path, try countAlgebraicKeysContaining(alloc, &store, "docfact", ""));
+
+    var path_page_two = try manager.rebuildRelationalAlgebraicBaseRowComponentPage(&store, "alg", 8);
+    defer path_page_two.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 3), path_page_two.indexed_rows);
+    try std.testing.expect(path_page_two.complete);
+    try std.testing.expectEqual(@as(usize, shape_cases.len), try countAlgebraicKeysContaining(alloc, &store, "pathfact", ""));
+    for (shape_cases) |case| {
+        if (case.path_probe) |probe| {
+            try std.testing.expect((try countAlgebraicKeysContaining(alloc, &store, "pathfact", probe)) > 0);
+        }
+    }
+    {
+        const schema = (try schema_mod.loadSchema(&store, alloc)).?;
+        defer schema_mod.freeSchema(alloc, schema);
+        const record = schema.relational_indexes[0].generation_record.?;
+        try std.testing.expect(record.components.fact);
+        try std.testing.expect(record.components.path);
+        try std.testing.expect(!record.components.dictionary);
+        try std.testing.expect(record.component_cursors.path == null);
+    }
+    try std.testing.expectError(error.AlgebraicBaseRowPhaseComplete, manager.rebuildRelationalAlgebraicBaseRowComponentPage(&store, "alg", 1));
+
+    const shared_identity = algebraic_mod.lexical.DictionaryIdentity.canonicalScalar("alg", "/payload", .number, "json-scalar-v1", "kind-qualified");
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try std.testing.expectEqual(
+            algebraic_mod.lexical.RegistryClaim.claimed,
+            try algebraic_mod.lexical.claimRegistryOwnerTxn(alloc, &txn, shared_identity, "shared-owner", .lexicon_postings_rows, "ready"),
+        );
+        try txn.commit();
+    }
+    const path_rows_before_derived = try countAlgebraicKeysContaining(alloc, &store, "pathfact", "");
+    var dictionary_page_one = try manager.rebuildRelationalAlgebraicDerivedRowComponentPage(&store, "alg", 2);
+    defer dictionary_page_one.deinit(alloc);
+    try std.testing.expectEqual(schema_mod.RelationalIndexGenerationComponent.dictionary, dictionary_page_one.component);
+    try std.testing.expectEqual(@as(usize, 2), dictionary_page_one.indexed_rows);
+    try std.testing.expect(!dictionary_page_one.complete);
+    try std.testing.expect((try countAlgebraicKeysContaining(alloc, &store, "lexicon", "")) > 0);
+    try std.testing.expectEqual(@as(usize, 0), try countAlgebraicKeysContaining(alloc, &store, "postings", ""));
+    try std.testing.expectEqual(path_rows_before_derived, try countAlgebraicKeysContaining(alloc, &store, "pathfact", ""));
+    {
+        const schema = (try schema_mod.loadSchema(&store, alloc)).?;
+        defer schema_mod.freeSchema(alloc, schema);
+        const record = schema.relational_indexes[0].generation_record.?;
+        try std.testing.expectEqualStrings(dictionary_page_one.next_cursor.?, record.component_cursors.dictionary.?);
+        try std.testing.expect(!record.components.dictionary);
+    }
+
+    var dictionary_page_two = try manager.rebuildRelationalAlgebraicDerivedRowComponentPage(&store, "alg", 8);
+    defer dictionary_page_two.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 3), dictionary_page_two.indexed_rows);
+    try std.testing.expect(dictionary_page_two.complete);
+    try std.testing.expect((try countAlgebraicKeysContaining(alloc, &store, "lexicon_fst", "")) > 0);
+    const dictionary_rows_before_postings = try countAlgebraicKeysContaining(alloc, &store, "lexicon", "");
+    {
+        const registry_key = try shared_identity.registryKeyAlloc(alloc);
+        defer alloc.free(registry_key);
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        var owner = try algebraic_mod.lexical.RegistryEntry.decodeAlloc(alloc, try txn.get(registry_key));
+        defer owner.deinit(alloc);
+        try std.testing.expectEqualStrings("shared-owner", owner.owner);
+        try std.testing.expectEqualStrings("ready", owner.state);
+    }
+
+    var postings_page_one = try manager.rebuildRelationalAlgebraicDerivedRowComponentPage(&store, "alg", 2);
+    defer postings_page_one.deinit(alloc);
+    try std.testing.expectEqual(schema_mod.RelationalIndexGenerationComponent.postings, postings_page_one.component);
+    try std.testing.expectEqual(@as(usize, 2), postings_page_one.indexed_rows);
+    try std.testing.expect(!postings_page_one.complete);
+    try std.testing.expect((try countAlgebraicKeysContaining(alloc, &store, "postings", "")) > 0);
+    try std.testing.expectEqual(dictionary_rows_before_postings, try countAlgebraicKeysContaining(alloc, &store, "lexicon", ""));
+    try std.testing.expectEqual(path_rows_before_derived, try countAlgebraicKeysContaining(alloc, &store, "pathfact", ""));
+
+    var postings_page_two = try manager.rebuildRelationalAlgebraicDerivedRowComponentPage(&store, "alg", 8);
+    defer postings_page_two.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 3), postings_page_two.indexed_rows);
+    try std.testing.expect(postings_page_two.complete);
+    {
+        const schema = (try schema_mod.loadSchema(&store, alloc)).?;
+        defer schema_mod.freeSchema(alloc, schema);
+        const record = schema.relational_indexes[0].generation_record.?;
+        try std.testing.expect(record.components.fact);
+        try std.testing.expect(record.components.path);
+        try std.testing.expect(record.components.dictionary);
+        try std.testing.expect(record.components.postings);
+        try std.testing.expect(record.component_cursors.postings == null);
+    }
+}
+
+test "index manager algebraic base row worker rejects malformed packed rows by case" {
+    const alloc = std.testing.allocator;
+    const InvalidCase = struct {
+        name: []const u8,
+        raw: []const u8,
+        expected: anyerror,
+    };
+    const invalid_cases = [_]InvalidCase{
+        .{ .name = "bad magic", .raw = "not-a-packed-row", .expected = error.InvalidRelationalRow },
+        .{ .name = "truncated header", .raw = "AROW", .expected = error.InvalidRelationalRow },
+        .{ .name = "unsupported version", .raw = "AROW\x02\x00\x00\x00\x00\x00\x00\x00", .expected = error.UnsupportedRelationalRowVersion },
+    };
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"alg","owner_kind":"table","owner_name":"__antfly_table__","access_method":"algebraic_filter","method_config":{"type":"algebraic","derive_from_schema":true},"lifecycle":"building","generation":7,"schema_fingerprint":"secondary-index-v1:alg","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"building","lag":1,"ready_watermark":0,"components":{"dictionary":false,"fact":false,"path":false,"postings":false}}}]}
+    ;
+
+    for (invalid_cases, 0..) |case, i| {
+        var suffix_buf: [96]u8 = undefined;
+        const suffix = try std.fmt.bufPrint(&suffix_buf, "algebraic-malformed-page-{d}", .{i});
+        var path_buf: [256]u8 = undefined;
+        const path_z = indexManagerTmpPathWithSuffix(&path_buf, suffix);
+        defer cleanupIndexManagerDir(path_z);
+        var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+        defer store.close();
+        var manager = try IndexManager.init(alloc, std.mem.span(path_z));
+        defer manager.deinit();
+        manager.setRelationalBaseRows(true);
+        try saveRuntimeSchemaJsonForIndexManagerTest(alloc, &store, schema_json);
+        const config_json = try algebraic_mod.schema_capability.configJsonFromSchemaJsonAlloc(alloc, "rows", schema_json);
+        defer alloc.free(config_json);
+        try manager.add(&store, .{ .name = "alg", .kind = .algebraic, .config_json = config_json });
+        const stored_key = try relational_store_mod.rowKeyAlloc(alloc, "row:bad");
+        defer alloc.free(stored_key);
+        try store.put(stored_key, case.raw);
+
+        try std.testing.expectError(case.expected, manager.rebuildRelationalAlgebraicBaseRowComponentPage(&store, "alg", 4));
+        try std.testing.expectEqual(@as(usize, 0), try countAlgebraicKeysContaining(alloc, &store, "docfact", ""));
+        const schema = (try schema_mod.loadSchema(&store, alloc)).?;
+        defer schema_mod.freeSchema(alloc, schema);
+        const record = schema.relational_indexes[0].generation_record.?;
+        try std.testing.expect(!record.components.fact);
+        try std.testing.expect(record.component_cursors.fact == null);
+    }
+}
+
+test "index manager algebraic component coordinator reopens between ordered phases" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path_z = indexManagerTmpPathWithSuffix(&path_buf, "algebraic-component-coordinator");
+    defer cleanupIndexManagerDir(path_z);
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"payload":{"type":"json"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"alg","owner_kind":"table","owner_name":"__antfly_table__","access_method":"algebraic_filter","method_config":{"type":"algebraic","derive_from_schema":true},"lifecycle":"building","generation":7,"schema_fingerprint":"secondary-index-v1:alg","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"building","lag":1,"ready_watermark":0,"components":{"dictionary":false,"fact":false,"path":false,"postings":false}}}]}
+    ;
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    try saveRuntimeSchemaJsonForIndexManagerTest(alloc, &store, schema_json);
+    var parsed_schema = try schema_api_mod.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try schema_api_mod.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    const stored_key = try relational_store_mod.rowKeyAlloc(alloc, "row:1");
+    defer alloc.free(stored_key);
+    const packed_row = try mapper.buildRelationalRowValueAlloc(alloc, "{\"id\":\"1\",\"payload\":{\"tier\":\"gold\"}}", runtime_schema.relational_columns);
+    defer alloc.free(packed_row);
+    try store.put(stored_key, packed_row);
+
+    var manager = try IndexManager.init(alloc, std.mem.span(path_z));
+    var manager_open = true;
+    defer if (manager_open) manager.deinit();
+    manager.setRelationalBaseRows(true);
+    const config_json = try algebraic_mod.schema_capability.configJsonFromSchemaJsonAlloc(alloc, "rows", schema_json);
+    defer alloc.free(config_json);
+    try manager.add(&store, .{ .name = "alg", .kind = .algebraic, .config_json = config_json });
+    try std.testing.expectError(error.RelationalIndexGenerationChanged, manager.rebuildRelationalAlgebraicComponentPage(&store, "alg", 6, 8));
+
+    const expected_phases = [_]schema_mod.RelationalIndexGenerationComponent{ .fact, .path, .dictionary, .postings };
+    for (expected_phases, 0..) |expected_phase, i| {
+        var page = try manager.rebuildRelationalAlgebraicComponentPage(&store, "alg", 7, 8);
+        defer page.deinit(alloc);
+        try std.testing.expectEqual(expected_phase, page.component);
+        try std.testing.expect(page.complete);
+        if (i + 1 < expected_phases.len) {
+            manager.deinit();
+            manager_open = false;
+            manager = try IndexManager.init(alloc, std.mem.span(path_z));
+            manager_open = true;
+            manager.setRelationalBaseRows(true);
+            try manager.load(&store);
+        }
+    }
+    try std.testing.expectError(error.RelationalIndexGenerationAlreadyComplete, manager.rebuildRelationalAlgebraicComponentPage(&store, "alg", 7, 8));
+}
+
+fn putRelationalAlgebraicReplayMutationForTest(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    columns: []const schema_mod.RelationalColumn,
+    sequence: u64,
+    doc_key: []const u8,
+    value: ?[]const u8,
+    overwritten: bool,
+) !void {
+    const stored_key = try relational_store_mod.rowKeyAlloc(alloc, doc_key);
+    defer alloc.free(stored_key);
+    const packed_row = if (value) |json| try mapper.buildRelationalRowValueAlloc(alloc, json, columns) else null;
+    defer if (packed_row) |row| alloc.free(row);
+
+    const changed_keys: []const []const u8 = if (value != null) &.{doc_key} else &.{};
+    const deleted_keys: []const []const u8 = if (value == null) &.{doc_key} else &.{};
+    const overwritten_keys: []const []const u8 = if (overwritten) &.{doc_key} else &.{};
+    var hints = [_]change_journal_mod.TargetHint{.algebraic};
+    const payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = sequence,
+        .changed_doc_keys = changed_keys,
+        .deleted_doc_keys = deleted_keys,
+        .overwritten_doc_keys = overwritten_keys,
+        .target_hints = hints[0..],
+    });
+    defer alloc.free(payload);
+
+    if (packed_row) |row| {
+        const writes = [_]docstore_mod.KVPair{.{ .key = stored_key, .value = row }};
+        try store.putBatchWithReplay(null, writes[0..], &.{}, .{ .sequence = sequence, .payload = payload });
+    } else {
+        const deletes = [_][]const u8{stored_key};
+        try store.putBatchWithReplay(null, &.{}, deletes[0..], .{ .sequence = sequence, .payload = payload });
+    }
+}
+
+test "index manager catches completed algebraic generations up by lifecycle case" {
+    const alloc = std.testing.allocator;
+    const Mutation = enum { none, append, overwrite, delete, interrupted };
+    const CatchUpCase = struct {
+        name: []const u8,
+        mutation: Mutation,
+        expected_generation: u64 = 7,
+        max_records: usize = 8,
+        expected_pages: usize = 1,
+        expected_watermark: u64 = 0,
+        expected_error: ?anyerror = null,
+        present_probe: ?[]const u8 = null,
+        absent_probe: ?[]const u8 = null,
+    };
+    const cases = [_]CatchUpCase{
+        .{ .name = "no-op completed components promote", .mutation = .none },
+        .{ .name = "append", .mutation = .append, .expected_watermark = 1, .present_probe = "append-value" },
+        .{ .name = "overwrite", .mutation = .overwrite, .expected_watermark = 1, .present_probe = "new-value", .absent_probe = "old-value" },
+        .{ .name = "delete", .mutation = .delete, .expected_watermark = 1, .absent_probe = "old-value" },
+        .{ .name = "interrupted two-page catch-up", .mutation = .interrupted, .max_records = 1, .expected_pages = 2, .expected_watermark = 2, .present_probe = "page-b" },
+        .{ .name = "generation mismatch", .mutation = .append, .expected_generation = 8, .expected_watermark = 1, .expected_error = error.RelationalIndexGenerationChanged },
+    };
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"payload":{"type":"json"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"alg","owner_kind":"table","owner_name":"__antfly_table__","access_method":"algebraic_filter","method_config":{"type":"algebraic","derive_from_schema":true},"lifecycle":"building","generation":7,"schema_fingerprint":"secondary-index-v1:alg","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"building","lag":1,"ready_watermark":0,"components":{"dictionary":false,"fact":false,"path":false,"postings":false}}}]}
+    ;
+
+    for (cases, 0..) |case, case_i| {
+        var suffix_buf: [128]u8 = undefined;
+        const suffix = try std.fmt.bufPrint(&suffix_buf, "algebraic-catch-up-{d}", .{case_i});
+        var path_buf: [256]u8 = undefined;
+        const path_z = indexManagerTmpPathWithSuffix(&path_buf, suffix);
+        defer cleanupIndexManagerDir(path_z);
+        var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+        defer store.close();
+        try saveRuntimeSchemaJsonForIndexManagerTest(alloc, &store, schema_json);
+        var parsed_schema = try schema_api_mod.parseValidatedTableSchema(alloc, schema_json);
+        defer parsed_schema.deinit(alloc);
+        const runtime_schema = try schema_api_mod.deriveRuntimeTableSchema(alloc, parsed_schema);
+        defer schema_mod.freeSchema(alloc, runtime_schema);
+
+        const needs_initial = case.mutation == .overwrite or case.mutation == .delete;
+        if (needs_initial) {
+            const stored_key = try relational_store_mod.rowKeyAlloc(alloc, "row:1");
+            defer alloc.free(stored_key);
+            const packed_row = try mapper.buildRelationalRowValueAlloc(alloc, "{\"id\":\"1\",\"payload\":\"old-value\"}", runtime_schema.relational_columns);
+            defer alloc.free(packed_row);
+            try store.put(stored_key, packed_row);
+        }
+
+        var manager = try IndexManager.init(alloc, std.mem.span(path_z));
+        defer manager.deinit();
+        manager.setRelationalBaseRows(true);
+        const config_json = try algebraic_mod.schema_capability.configJsonFromSchemaJsonAlloc(alloc, "rows", schema_json);
+        defer alloc.free(config_json);
+        try manager.add(&store, .{ .name = "alg", .kind = .algebraic, .config_json = config_json });
+        for (schema_mod.relational_index_generation_component_order) |_| {
+            var page = try manager.rebuildRelationalAlgebraicComponentPage(&store, "alg", 7, 8);
+            defer page.deinit(alloc);
+            try std.testing.expect(page.complete);
+        }
+        try std.testing.expectEqual(@as(usize, 1), try countAlgebraicKeysContaining(alloc, &store, "dictionary_state", "ready"));
+
+        switch (case.mutation) {
+            .none => {},
+            .append => try putRelationalAlgebraicReplayMutationForTest(
+                alloc,
+                &store,
+                runtime_schema.relational_columns,
+                1,
+                "row:append",
+                "{\"id\":\"append\",\"payload\":\"append-value\"}",
+                false,
+            ),
+            .overwrite => try putRelationalAlgebraicReplayMutationForTest(
+                alloc,
+                &store,
+                runtime_schema.relational_columns,
+                1,
+                "row:1",
+                "{\"id\":\"1\",\"payload\":\"new-value\"}",
+                true,
+            ),
+            .delete => try putRelationalAlgebraicReplayMutationForTest(
+                alloc,
+                &store,
+                runtime_schema.relational_columns,
+                1,
+                "row:1",
+                null,
+                false,
+            ),
+            .interrupted => {
+                try putRelationalAlgebraicReplayMutationForTest(
+                    alloc,
+                    &store,
+                    runtime_schema.relational_columns,
+                    1,
+                    "row:a",
+                    "{\"id\":\"a\",\"payload\":\"page-a\"}",
+                    false,
+                );
+                try putRelationalAlgebraicReplayMutationForTest(
+                    alloc,
+                    &store,
+                    runtime_schema.relational_columns,
+                    2,
+                    "row:b",
+                    "{\"id\":\"b\",\"payload\":\"page-b\"}",
+                    false,
+                );
+            },
+        }
+
+        if (case.expected_error) |expected| {
+            try std.testing.expectError(expected, manager.catchUpRelationalAlgebraicGenerationPage(
+                &store,
+                "alg",
+                case.expected_generation,
+                case.max_records,
+            ));
+            continue;
+        }
+
+        var page_i: usize = 0;
+        while (page_i < case.expected_pages) : (page_i += 1) {
+            const result = try manager.catchUpRelationalAlgebraicGenerationPage(&store, "alg", case.expected_generation, case.max_records);
+            try std.testing.expectEqual(page_i + 1 == case.expected_pages, result.complete);
+            try std.testing.expectEqual(result.complete, result.promoted);
+            if (!result.complete) try std.testing.expect(result.through_sequence < result.target_sequence);
+            if (case.mutation != .none and result.upserts + result.deletes == 0) {
+                std.debug.print("catch-up case {s}: replay page hydrated no keys\n", .{case.name});
+                return error.TestUnexpectedResult;
+            }
+            if (case.mutation != .none and case.mutation != .delete and result.upserts == 0) {
+                std.debug.print("catch-up case {s}: expected upsert hydration, got deletes={d}\n", .{ case.name, result.deletes });
+                return error.TestUnexpectedResult;
+            }
+        }
+        const ready_schema = (try schema_mod.loadSchema(&store, alloc)).?;
+        defer schema_mod.freeSchema(alloc, ready_schema);
+        const ready_index = ready_schema.relational_indexes[0];
+        const ready_record = ready_index.generation_record.?;
+        try std.testing.expectEqual(schema_mod.RelationalIndexLifecycle.ready, ready_index.lifecycle);
+        try std.testing.expect(ready_record.components.allReady());
+        try std.testing.expectEqual(@as(u64, 0), ready_record.lag);
+        try std.testing.expectEqual(case.expected_watermark, ready_record.ready_watermark);
+        if (case.present_probe) |probe| {
+            const posting_count = try countAlgebraicKeysContaining(alloc, &store, "postings", probe);
+            if (posting_count == 0) {
+                const path_count = try countAlgebraicKeysContaining(alloc, &store, "pathfact", probe);
+                const all_path_count = try countAlgebraicKeysContaining(alloc, &store, "pathfact", "");
+                std.debug.print("catch-up case {s}: missing posting probe {s}; matching path rows={d}, all path rows={d}\n", .{ case.name, probe, path_count, all_path_count });
+                return error.TestUnexpectedResult;
+            }
+        }
+        if (case.absent_probe) |probe| {
+            try std.testing.expectEqual(@as(usize, 0), try countAlgebraicKeysContaining(alloc, &store, "postings", probe));
+            try std.testing.expectEqual(@as(usize, 0), try countAlgebraicKeysContaining(alloc, &store, "pathfact", probe));
+        }
+    }
+}
+
+test "index manager embedded json monolithic rebuild restarts after failure and reopen" {
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
     const path_z = indexManagerTmpPathWithSuffix(&path_buf, "json-domain-rebuild-resume");
@@ -20034,16 +21514,11 @@ test "index manager embedded json schema rebuild resumes after failure and reope
         try std.testing.expect(!interrupted_record.components.fact);
         try std.testing.expect(!interrupted_record.components.path);
         try std.testing.expect(!interrupted_record.components.postings);
-        const interrupted_cursor = interrupted_record.rebuild_cursor.?;
-        try std.testing.expectEqualStrings(interrupted_cursor, interrupted_record.component_cursors.dictionary.?);
-        try std.testing.expectEqualStrings(interrupted_cursor, interrupted_record.component_cursors.fact.?);
-        try std.testing.expectEqualStrings(interrupted_cursor, interrupted_record.component_cursors.path.?);
-        try std.testing.expectEqualStrings(interrupted_cursor, interrupted_record.component_cursors.postings.?);
+        try std.testing.expect(interrupted_record.component_cursors.dictionary == null);
+        try std.testing.expect(interrupted_record.component_cursors.fact == null);
+        try std.testing.expect(interrupted_record.component_cursors.path == null);
+        try std.testing.expect(interrupted_record.component_cursors.postings == null);
 
-        const rebuild_state = backfill_state_mod.RebuildState.init(manager.algebraic_indexes.items[0].rebuild_root_path);
-        const resume_key = try rebuild_state.check(alloc);
-        defer if (resume_key) |key| alloc.free(key);
-        try std.testing.expect(resume_key != null);
         try std.testing.expectEqual(@as(usize, 1), try countDocFactScalarKeysContaining(alloc, &store, "new_field"));
         try std.testing.expectEqual(@as(usize, 1), try countAlgebraicKeysContaining(alloc, &store, "pathfact", "new_field"));
     }
@@ -20065,10 +21540,6 @@ test "index manager embedded json schema rebuild resumes after failure and reope
         try std.testing.expectEqual(@as(usize, 2), try countAlgebraicKeysContaining(alloc, &store, "pathfact", "old_field"));
         try std.testing.expectEqual(@as(usize, 2), try countAlgebraicKeysContaining(alloc, &store, "pathfact", "new_field"));
 
-        const rebuild_state = backfill_state_mod.RebuildState.init(reopened.algebraic_indexes.items[0].rebuild_root_path);
-        const cleared_resume_key = try rebuild_state.check(alloc);
-        defer if (cleared_resume_key) |key| alloc.free(key);
-        try std.testing.expect(cleared_resume_key == null);
         const completed_schema = (try schema_mod.loadSchema(&store, alloc)) orelse return error.TestUnexpectedResult;
         defer schema_mod.freeSchema(alloc, completed_schema);
         const completed_record = completed_schema.relational_indexes[0].generation_record orelse return error.TestExpectedEqual;
@@ -20189,7 +21660,6 @@ test "index manager algebraic repair clears artifact matrix before replaying bas
         name: []const u8,
         namespace: algebraic_mod.index.Index.ArtifactNamespaceForTest,
         family: []const u8,
-        interrupted: bool = false,
         foreground_write: bool = false,
     };
     const cases = [_]ArtifactCase{
@@ -20198,7 +21668,6 @@ test "index manager algebraic repair clears artifact matrix before replaying bas
         .{ .name = "path", .namespace = .raw, .family = "pathfact" },
         .{ .name = "postings", .namespace = .raw, .family = "postings" },
         .{ .name = "canonical", .namespace = .canonical, .family = "tensor" },
-        .{ .name = "interrupted", .namespace = .raw, .family = "docfact", .interrupted = true },
         .{ .name = "foreground", .namespace = .raw, .family = "path_lookup", .foreground_write = true },
     };
 
@@ -20245,14 +21714,6 @@ test "index manager algebraic repair clears artifact matrix before replaying bas
         );
         try std.testing.expectEqual(@as(usize, 1), try countAlgebraicKeysContaining(alloc, &store, case.family, marker));
 
-        if (case.interrupted) {
-            const rebuild_state = backfill_state_mod.RebuildState.init(manager.algebraic_indexes.items[0].rebuild_root_path);
-            try rebuild_state.update(row_a_key);
-            const cursor = try rebuild_state.check(alloc);
-            defer if (cursor) |value| alloc.free(value);
-            try std.testing.expect(cursor != null);
-        }
-
         const repaired = try manager.repairRelationalAlgebraicFromRows(&store, "alg", 1);
         try std.testing.expect(repaired.complete);
         try std.testing.expect(repaired.units_completed > 0);
@@ -20261,15 +21722,10 @@ test "index manager algebraic repair clears artifact matrix before replaying bas
         if (case.foreground_write) {
             try std.testing.expect(try storeHasDocFactScalarKeyContaining(alloc, &store, "foreground"));
         }
-
-        const rebuild_state = backfill_state_mod.RebuildState.init(manager.algebraic_indexes.items[0].rebuild_root_path);
-        const cursor = try rebuild_state.check(alloc);
-        defer if (cursor) |value| alloc.free(value);
-        try std.testing.expect(cursor == null);
     }
 }
 
-test "index manager algebraic schema reload resumes interrupted bounded rebuild" {
+test "index manager document algebraic schema reload restarts interrupted bounded rebuild" {
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
     const path_z = indexManagerTmpPathWithSuffix(&path_buf, "schema-reload-resume-bounded");
@@ -20324,10 +21780,6 @@ test "index manager algebraic schema reload resumes interrupted bounded rebuild"
     test_abort_algebraic_backfill_after_batches = 1;
     try std.testing.expectError(error.TestInjectedBackfillFailure, manager.reloadAlgebraicSchemaConfigs(&store, schema_v2));
 
-    const rebuild_state = backfill_state_mod.RebuildState.init(manager.algebraic_indexes.items[0].rebuild_root_path);
-    const resume_key = try rebuild_state.check(alloc);
-    defer if (resume_key) |key| alloc.free(key);
-    try std.testing.expect(resume_key != null);
     try std.testing.expectEqual(@as(usize, 1), try countDocFactScalarKeysContaining(alloc, &store, "new_field"));
 
     test_abort_algebraic_backfill_after_batches = null;
@@ -20335,9 +21787,6 @@ test "index manager algebraic schema reload resumes interrupted bounded rebuild"
 
     try std.testing.expectEqual(@as(usize, 0), try countDocFactScalarKeysContaining(alloc, &store, "old_field"));
     try std.testing.expectEqual(@as(usize, 2), try countDocFactScalarKeysContaining(alloc, &store, "new_field"));
-    const cleared_resume_key = try rebuild_state.check(alloc);
-    defer if (cleared_resume_key) |key| alloc.free(key);
-    try std.testing.expect(cleared_resume_key == null);
 }
 
 test "index manager writable open resumes pending algebraic schema rebuild" {

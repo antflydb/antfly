@@ -82,6 +82,8 @@ pub const ForeignKeyIntegrityReport = relational_store_mod.ForeignKeyIntegrityRe
 pub const ForeignKeyIntegrityViolation = relational_store_mod.ForeignKeyIntegrityViolation;
 pub const ForeignKeyDeletePlan = relational_store_mod.ForeignKeyDeletePlan;
 pub const UniqueConstraintIntegrityReport = relational_store_mod.UniqueConstraintIntegrityReport;
+pub const RelationalIndexDropScheduleResult = relational_integrity.RelationalIndexDropScheduleResult;
+pub const RelationalIndexDropDiscoveryStats = relational_integrity.RelationalIndexDropDiscoveryStats;
 pub const local_schema_json_key = schema_runtime.local_schema_json_key;
 pub const local_lite_sql_table_record_json_key = schema_runtime.local_lite_sql_table_record_json_key;
 pub const HAAsyncEffectMirror = ha_types.AsyncEffectMirror;
@@ -1517,6 +1519,7 @@ pub const DB = struct {
         try ha_replication_impl.enforceDurableMutationGate(self);
         try ha_replication_impl.preflightDBMetadataSyncCommit(self);
         try schema_runtime_impl.setSchemaAfterGate(self, table_schema);
+        _ = try relational_integrity_impl.discoverRelationalIndexDropJobsForStoredTable(self, table_schema.default_type);
     }
 
     pub const ApplyTableSchemaOptions = schema_runtime.ApplyTableSchemaOptions;
@@ -3426,6 +3429,8 @@ pub const DB = struct {
     pub fn recordRelationalIndexDropJobPassAt(
         self: *DB,
         job_id: []const u8,
+        worker_id: []const u8,
+        lease_epoch: u64,
         status: []const u8,
         complete: bool,
         cursor: []const u8,
@@ -3438,7 +3443,72 @@ pub const DB = struct {
         now_ns: u64,
     ) !RelationalIndexDropJobRecord {
         try ha_replication_impl.enforceDurableMutationGate(self);
-        return try relational_integrity_impl.recordRelationalIndexDropJobPassAt(self, job_id, status, complete, cursor, units_queued, units_running, units_throttled, units_completed, failure_reason, stale_generation, now_ns);
+        return try relational_integrity_impl.recordRelationalIndexDropJobPassAt(self, job_id, worker_id, lease_epoch, status, complete, cursor, units_queued, units_running, units_throttled, units_completed, failure_reason, stale_generation, now_ns);
+    }
+
+    pub fn runRelationalIndexDropJobPageAt(
+        self: *DB,
+        job_id: []const u8,
+        database_name: []const u8,
+        namespace_name: []const u8,
+        table_name: []const u8,
+        access_method: []const u8,
+        index_name: []const u8,
+        generation: u64,
+        worker_id: []const u8,
+        lease_ms: u64,
+        max_work_units: usize,
+        now_ns: u64,
+    ) !RelationalIndexDropJobRecord {
+        try ha_replication_impl.enforceDurableMutationGate(self);
+        return try relational_integrity_impl.runRelationalIndexDropJobPageAt(
+            self,
+            job_id,
+            database_name,
+            namespace_name,
+            table_name,
+            access_method,
+            index_name,
+            generation,
+            worker_id,
+            lease_ms,
+            max_work_units,
+            now_ns,
+        );
+    }
+
+    pub fn scheduleRelationalIndexDropJob(
+        self: *DB,
+        job_id: []const u8,
+        database_name: []const u8,
+        namespace_name: []const u8,
+        table_name: []const u8,
+        access_method: []const u8,
+        index_name: []const u8,
+        generation: u64,
+        worker_id: []const u8,
+        lease_ms: u64,
+        max_work_units: usize,
+    ) !RelationalIndexDropScheduleResult {
+        try ha_replication_impl.enforceDurableMutationGate(self);
+        return try relational_integrity_impl.scheduleRelationalIndexDropJob(
+            self,
+            job_id,
+            database_name,
+            namespace_name,
+            table_name,
+            access_method,
+            index_name,
+            generation,
+            worker_id,
+            lease_ms,
+            max_work_units,
+        );
+    }
+
+    pub fn discoverRelationalIndexDropJobs(self: *DB, fallback_table_name: []const u8) !RelationalIndexDropDiscoveryStats {
+        try ha_replication_impl.enforceDurableMutationGate(self);
+        return try relational_integrity_impl.discoverRelationalIndexDropJobsForStoredTable(self, fallback_table_name);
     }
 
     pub fn claimAndRunForeignKeyActionJobPage(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, page_limit: usize, lease_ms: u64) !ForeignKeyActionJobRecord {

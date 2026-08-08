@@ -411,6 +411,20 @@ pub const ActiveMemTable = struct {
         self.logical_bytes +|= logicalEntryBytes(self.entries.items[idx]);
     }
 
+    pub fn applyMutations(
+        self: *ActiveMemTable,
+        allocator: Allocator,
+        namespace: backend_types.Namespace,
+        mutations: []const backend_types.KeyMutation,
+    ) !void {
+        try self.entries.ensureUnusedCapacity(allocator, mutations.len);
+        try self.index.primary.ensureUnusedCapacity(allocator, @intCast(mutations.len));
+        for (mutations) |mutation| switch (mutation) {
+            .put => |put_mutation| try self.upsert(allocator, namespace, put_mutation.key, put_mutation.value, false),
+            .delete => |delete_mutation| try self.upsert(allocator, namespace, delete_mutation.key, "", true),
+        };
+    }
+
     pub fn upsertMove(self: *ActiveMemTable, allocator: Allocator, entry: OwnedEntry) !void {
         const namespace = namespaceOf(entry);
         const key_hash = hashEntryKey(namespace, entry.key);
@@ -993,4 +1007,62 @@ test "EntryIndex stores unique hashes inline and preserves collision lookup" {
     try std.testing.expectEqual(@as(?usize, 0), index.find(entries.items, forced_hash, .{}, "alpha"));
     try std.testing.expectEqual(@as(?usize, 1), index.find(entries.items, forced_hash, .{}, "beta"));
     try std.testing.expectEqual(@as(?usize, null), index.find(entries.items, forced_hash, .{}, "missing"));
+}
+
+test "active memtable applies ordered key mutation batches by operation shape" {
+    const alloc = std.testing.allocator;
+    const Case = struct {
+        name: []const u8,
+        mutations: []const backend_types.KeyMutation,
+        expected_a: ?[]const u8,
+        expected_b: ?[]const u8,
+    };
+    const cases = [_]Case{
+        .{
+            .name = "multi-key insert",
+            .mutations = &.{
+                .{ .put = .{ .key = "a", .value = "1" } },
+                .{ .put = .{ .key = "b", .value = "2" } },
+            },
+            .expected_a = "1",
+            .expected_b = "2",
+        },
+        .{
+            .name = "ordered overwrite",
+            .mutations = &.{
+                .{ .put = .{ .key = "a", .value = "old" } },
+                .{ .put = .{ .key = "a", .value = "new" } },
+            },
+            .expected_a = "new",
+            .expected_b = null,
+        },
+        .{
+            .name = "put then delete",
+            .mutations = &.{
+                .{ .put = .{ .key = "a", .value = "1" } },
+                .{ .delete = .{ .key = "a", .ignore_missing = true } },
+            },
+            .expected_a = null,
+            .expected_b = null,
+        },
+    };
+
+    for (cases) |case| {
+        var table = ActiveMemTable{};
+        defer table.deinit(alloc);
+        try table.applyMutations(alloc, .{}, case.mutations);
+        for ([_]struct { key: []const u8, expected: ?[]const u8 }{
+            .{ .key = "a", .expected = case.expected_a },
+            .{ .key = "b", .expected = case.expected_b },
+        }) |expectation| {
+            if (expectation.expected) |expected| {
+                std.testing.expectEqualStrings(expected, try table.get(.{}, expectation.key)) catch |err| {
+                    std.debug.print("failed active memtable mutation case: {s}\n", .{case.name});
+                    return err;
+                };
+            } else {
+                try std.testing.expectError(error.NotFound, table.get(.{}, expectation.key));
+            }
+        }
+    }
 }

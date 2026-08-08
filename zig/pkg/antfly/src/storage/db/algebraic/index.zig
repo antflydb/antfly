@@ -2017,6 +2017,30 @@ pub const Status = struct {
     join_facts_matched: u64 = 0,
     join_facts_pruned: u64 = 0,
     accumulator_flush_count: u64 = 0,
+    tensor_mutation_batch_count: u64 = 0,
+    tensor_mutation_put_count: u64 = 0,
+    tensor_mutation_delete_count: u64 = 0,
+    tensor_expression_mutation_count: u64 = 0,
+    tensor_support_mutation_count: u64 = 0,
+    tensor_cache_mutation_count: u64 = 0,
+    tensor_mutation_staged_bytes: u64 = 0,
+    ready_dictionary_mutation_batch_count: u64 = 0,
+    ready_dictionary_mutation_put_count: u64 = 0,
+    ready_dictionary_mutation_delete_count: u64 = 0,
+    ready_dictionary_registry_mutation_count: u64 = 0,
+    ready_dictionary_lexicon_mutation_count: u64 = 0,
+    ready_dictionary_posting_mutation_count: u64 = 0,
+    ready_dictionary_ordinal_posting_mutation_count: u64 = 0,
+    ready_dictionary_fst_invalidation_count: u64 = 0,
+    ready_dictionary_mutation_staged_bytes: u64 = 0,
+    adaptive_mutation_batch_count: u64 = 0,
+    adaptive_mutation_put_count: u64 = 0,
+    adaptive_mutation_delete_count: u64 = 0,
+    adaptive_promotion_mutation_count: u64 = 0,
+    adaptive_path_profile_mutation_count: u64 = 0,
+    adaptive_observation_mutation_count: u64 = 0,
+    adaptive_lifecycle_mutation_count: u64 = 0,
+    adaptive_mutation_staged_bytes: u64 = 0,
     symbol_cache_hits: u64 = 0,
     symbol_cache_misses: u64 = 0,
     minmax_cache_hits: u64 = 0,
@@ -2060,6 +2084,27 @@ pub const Status = struct {
 
 pub const ApplyOptions = struct {
     batch_options: backend_types.BatchOptions = .{},
+};
+
+pub const BaseRowComponent = enum {
+    fact,
+    path,
+};
+
+pub const DerivedRowComponent = enum {
+    dictionary,
+    postings,
+};
+
+pub const DerivedRowComponentPage = struct {
+    scanned_rows: usize = 0,
+    next_cursor: ?[]u8 = null,
+    complete: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        if (self.next_cursor) |cursor| alloc.free(cursor);
+        self.* = undefined;
+    }
 };
 
 const MeasureValue = struct {
@@ -2273,11 +2318,105 @@ const ReadyAdaptiveSpecCache = struct {
     }
 };
 
+const AdaptiveMutationKind = enum {
+    promotion,
+    path_profile,
+    observation,
+    lifecycle,
+};
+
+const PendingAdaptiveMutation = struct {
+    key: []u8,
+    value: ?[]u8,
+    kind: AdaptiveMutationKind,
+
+    fn deinit(self: *PendingAdaptiveMutation, alloc: Allocator) void {
+        alloc.free(self.key);
+        if (self.value) |value| alloc.free(value);
+        self.* = undefined;
+    }
+};
+
+const AdaptiveMutationBatch = struct {
+    rows: std.StringHashMapUnmanaged(PendingAdaptiveMutation) = .empty,
+
+    fn deinit(self: *AdaptiveMutationBatch, alloc: Allocator) void {
+        var it = self.rows.iterator();
+        while (it.next()) |entry| entry.value_ptr.deinit(alloc);
+        self.rows.deinit(alloc);
+        self.* = .{};
+    }
+
+    fn entryCount(self: *const AdaptiveMutationBatch) usize {
+        return self.rows.count();
+    }
+
+    fn stage(
+        self: *AdaptiveMutationBatch,
+        alloc: Allocator,
+        key: []const u8,
+        value: ?[]const u8,
+        kind: AdaptiveMutationKind,
+    ) !void {
+        const gop = try self.rows.getOrPut(alloc, key);
+        if (gop.found_existing) {
+            const owned_value = if (value) |bytes| try alloc.dupe(u8, bytes) else null;
+            if (gop.value_ptr.value) |old| alloc.free(old);
+            gop.value_ptr.value = owned_value;
+            gop.value_ptr.kind = kind;
+            return;
+        }
+        errdefer _ = self.rows.remove(key);
+        const owned_key = try alloc.dupe(u8, key);
+        errdefer alloc.free(owned_key);
+        const owned_value = if (value) |bytes| try alloc.dupe(u8, bytes) else null;
+        errdefer if (owned_value) |bytes| alloc.free(bytes);
+        gop.key_ptr.* = owned_key;
+        gop.value_ptr.* = .{ .key = owned_key, .value = owned_value, .kind = kind };
+    }
+
+    fn stagePut(self: *AdaptiveMutationBatch, alloc: Allocator, key: []const u8, value: []const u8, kind: AdaptiveMutationKind) !void {
+        try self.stage(alloc, key, value, kind);
+    }
+
+    fn stageDelete(self: *AdaptiveMutationBatch, alloc: Allocator, key: []const u8, kind: AdaptiveMutationKind) !void {
+        try self.stage(alloc, key, null, kind);
+    }
+
+    fn getWithOverlay(self: *const AdaptiveMutationBatch, txn: anytype, key: []const u8) !?[]const u8 {
+        if (self.rows.get(key)) |pending| return pending.value;
+        return txn.get(key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+    }
+
+    fn prefixHasAnyWithOverlay(self: *const AdaptiveMutationBatch, txn: anytype, prefix: []const u8) !bool {
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var entry_opt = try cursor.seekAtOrAfter(prefix);
+        while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            if (self.rows.get(entry.key)) |pending| {
+                if (pending.value != null) return true;
+                continue;
+            }
+            return true;
+        }
+        var it = self.rows.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.value != null and std.mem.startsWith(u8, entry.value_ptr.key, prefix)) return true;
+        }
+        return false;
+    }
+};
+
 const BatchMaintenanceContext = struct {
     ready_specs: []AdaptiveMaterializationSpec = &.{},
     disabled_recommendations: std.StringHashMapUnmanaged(void) = .empty,
     dirty_path_promotion_dictionaries: std.StringHashMapUnmanaged(void) = .empty,
     tensor_accumulator: AppendOnlyAccumulator = .{},
+    mutations: AdaptiveMutationBatch = .{},
     coalesce_tensor_deltas: bool = false,
 
     fn deinit(self: *BatchMaintenanceContext, alloc: Allocator) void {
@@ -2290,6 +2429,7 @@ const BatchMaintenanceContext = struct {
         while (dirty_it.next()) |key| alloc.free(key.*);
         self.dirty_path_promotion_dictionaries.deinit(alloc);
         self.tensor_accumulator.deinit(alloc);
+        self.mutations.deinit(alloc);
         self.* = .{};
     }
 
@@ -2313,6 +2453,102 @@ const BatchMaintenanceContext = struct {
 
     fn pathPromotionDictionaryDirty(self: *const BatchMaintenanceContext, materialization_id: []const u8) bool {
         return self.dirty_path_promotion_dictionaries.contains(materialization_id);
+    }
+};
+
+const ReadyDictionaryMutationKind = enum {
+    registry,
+    lexicon,
+    posting,
+    ordinal_posting,
+    fst_invalidation,
+};
+
+const ReadyDictionaryMutationBatch = struct {
+    mutations: std.ArrayListUnmanaged(backend_types.KeyMutation) = .empty,
+    kinds: std.ArrayListUnmanaged(ReadyDictionaryMutationKind) = .empty,
+    mutation_by_key: std.StringHashMapUnmanaged(usize) = .empty,
+
+    fn deinit(self: *ReadyDictionaryMutationBatch, alloc: Allocator) void {
+        self.mutations.deinit(alloc);
+        self.kinds.deinit(alloc);
+        self.mutation_by_key.deinit(alloc);
+        self.* = .{};
+    }
+
+    fn mutationKey(mutation: backend_types.KeyMutation) []const u8 {
+        return switch (mutation) {
+            .put => |put_mutation| put_mutation.key,
+            .delete => |delete_mutation| delete_mutation.key,
+        };
+    }
+
+    fn stage(
+        self: *ReadyDictionaryMutationBatch,
+        alloc: Allocator,
+        mutation: backend_types.KeyMutation,
+        kind: ReadyDictionaryMutationKind,
+    ) !void {
+        const key = mutationKey(mutation);
+        if (self.mutation_by_key.get(key)) |index| {
+            self.mutations.items[index] = mutation;
+            self.kinds.items[index] = kind;
+            return;
+        }
+        const index = self.mutations.items.len;
+        try self.mutations.append(alloc, mutation);
+        errdefer _ = self.mutations.pop();
+        try self.kinds.append(alloc, kind);
+        errdefer _ = self.kinds.pop();
+        try self.mutation_by_key.put(alloc, key, index);
+    }
+
+    fn stagePut(
+        self: *ReadyDictionaryMutationBatch,
+        alloc: Allocator,
+        key: []const u8,
+        value: []const u8,
+        kind: ReadyDictionaryMutationKind,
+    ) !void {
+        try self.stage(alloc, .{ .put = .{ .key = key, .value = value } }, kind);
+    }
+
+    fn stageDelete(
+        self: *ReadyDictionaryMutationBatch,
+        alloc: Allocator,
+        key: []const u8,
+        kind: ReadyDictionaryMutationKind,
+    ) !void {
+        try self.stage(alloc, .{ .delete = .{ .key = key, .ignore_missing = true } }, kind);
+    }
+
+    fn getWithOverlay(self: *const ReadyDictionaryMutationBatch, txn: anytype, key: []const u8) !?[]const u8 {
+        if (self.mutation_by_key.get(key)) |index| return switch (self.mutations.items[index]) {
+            .put => |put_mutation| put_mutation.value,
+            .delete => null,
+        };
+        return txn.get(key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+    }
+
+    fn prefixHasAnyWithOverlay(self: *const ReadyDictionaryMutationBatch, txn: anytype, prefix: []const u8) !bool {
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var entry_opt = try cursor.seekAtOrAfter(prefix);
+        while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            if (self.mutation_by_key.get(entry.key)) |index| switch (self.mutations.items[index]) {
+                .put => return true,
+                .delete => continue,
+            } else return true;
+        }
+        for (self.mutations.items) |mutation| switch (mutation) {
+            .put => |put_mutation| if (std.mem.startsWith(u8, put_mutation.key, prefix)) return true,
+            .delete => {},
+        };
+        return false;
     }
 };
 
@@ -2766,31 +3002,46 @@ const PendingRow = struct {
 
 const PendingSupport = struct {
     key: []u8,
-    row: ?[]u8 = null,
+    delta_count: i64 = 0,
 
     fn deinit(self: *PendingSupport, alloc: Allocator) void {
         alloc.free(self.key);
-        if (self.row) |bytes| alloc.free(bytes);
         self.* = undefined;
     }
 
-    fn applyDelta(self: *PendingSupport, alloc: Allocator, delta: i64) !void {
-        var mutation = try tensor_mod.applyCountSupportDeltaAlloc(alloc, self.row, delta);
-        defer mutation.deinit(alloc);
-        if (self.row) |old| alloc.free(old);
-        self.row = if (mutation.encoded) |bytes| blk: {
-            const owned = try alloc.dupe(u8, bytes);
-            break :blk owned;
-        } else null;
+    fn applyDelta(self: *PendingSupport, delta: i64) void {
+        self.delta_count = std.math.add(i64, self.delta_count, delta) catch if (delta < 0)
+            std.math.minInt(i64)
+        else
+            std.math.maxInt(i64);
+    }
+};
+
+const PendingTensorMutationKind = enum {
+    expression,
+    support,
+    cache,
+};
+
+const PendingTensorMutation = struct {
+    key: []u8,
+    value: ?[]u8,
+    kind: PendingTensorMutationKind,
+
+    fn deinit(self: *PendingTensorMutation, alloc: Allocator) void {
+        alloc.free(self.key);
+        if (self.value) |value| alloc.free(value);
+        self.* = undefined;
     }
 };
 
 const AppendOnlyAccumulator = struct {
     expression_rows: std.StringHashMapUnmanaged(PendingRow) = .empty,
     support_counts: std.StringHashMapUnmanaged(PendingSupport) = .empty,
+    final_mutations: std.StringHashMapUnmanaged(PendingTensorMutation) = .empty,
 
     fn entryCount(self: *const AppendOnlyAccumulator) usize {
-        return self.expression_rows.count() + self.support_counts.count();
+        return self.expression_rows.count() + self.support_counts.count() + self.final_mutations.count();
     }
 
     fn estimatedBytes(self: *const AppendOnlyAccumulator) u64 {
@@ -2808,7 +3059,13 @@ const AppendOnlyAccumulator = struct {
         while (support_it.next()) |entry| {
             const pending = entry.value_ptr;
             total +|= @as(u64, @intCast(pending.key.len));
-            if (pending.row) |bytes| total +|= @as(u64, @intCast(bytes.len));
+            total +|= 64;
+        }
+        var mutation_it = self.final_mutations.iterator();
+        while (mutation_it.next()) |entry| {
+            const pending = entry.value_ptr;
+            total +|= @as(u64, @intCast(pending.key.len));
+            if (pending.value) |value| total +|= @as(u64, @intCast(value.len));
             total +|= 64;
         }
         return total;
@@ -2822,6 +3079,10 @@ const AppendOnlyAccumulator = struct {
         var support_it = self.support_counts.iterator();
         while (support_it.next()) |entry| entry.value_ptr.deinit(alloc);
         self.support_counts.deinit(alloc);
+
+        var mutation_it = self.final_mutations.iterator();
+        while (mutation_it.next()) |entry| entry.value_ptr.deinit(alloc);
+        self.final_mutations.deinit(alloc);
         self.* = .{};
     }
 
@@ -2853,7 +3114,7 @@ const AppendOnlyAccumulator = struct {
         const gop = try self.support_counts.getOrPut(alloc, owned_key);
         if (gop.found_existing) {
             alloc.free(owned_key);
-            try gop.value_ptr.applyDelta(alloc, delta);
+            gop.value_ptr.applyDelta(delta);
             return;
         }
         var key_owned = true;
@@ -2865,7 +3126,39 @@ const AppendOnlyAccumulator = struct {
         };
         key_owned = false;
         errdefer gop.value_ptr.deinit(alloc);
-        try gop.value_ptr.applyDelta(alloc, delta);
+        gop.value_ptr.applyDelta(delta);
+    }
+
+    fn stageMutation(
+        self: *AppendOnlyAccumulator,
+        alloc: Allocator,
+        key: []const u8,
+        value: ?[]const u8,
+        kind: PendingTensorMutationKind,
+    ) !void {
+        const gop = try self.final_mutations.getOrPut(alloc, key);
+        if (gop.found_existing) {
+            const owned_value = if (value) |bytes| try alloc.dupe(u8, bytes) else null;
+            if (gop.value_ptr.value) |old| alloc.free(old);
+            gop.value_ptr.value = owned_value;
+            gop.value_ptr.kind = kind;
+            return;
+        }
+        errdefer _ = self.final_mutations.remove(key);
+        const owned_key = try alloc.dupe(u8, key);
+        errdefer alloc.free(owned_key);
+        const owned_value = if (value) |bytes| try alloc.dupe(u8, bytes) else null;
+        errdefer if (owned_value) |bytes| alloc.free(bytes);
+        gop.key_ptr.* = owned_key;
+        gop.value_ptr.* = .{ .key = owned_key, .value = owned_value, .kind = kind };
+    }
+
+    fn getWithOverlay(self: *const AppendOnlyAccumulator, txn: anytype, key: []const u8) !?[]const u8 {
+        if (self.final_mutations.get(key)) |pending| return pending.value;
+        return txn.get(key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
     }
 };
 
@@ -2925,6 +3218,30 @@ pub const Index = struct {
     join_facts_matched: u64 = 0,
     join_facts_pruned: u64 = 0,
     accumulator_flush_count: u64 = 0,
+    tensor_mutation_batch_count: u64 = 0,
+    tensor_mutation_put_count: u64 = 0,
+    tensor_mutation_delete_count: u64 = 0,
+    tensor_expression_mutation_count: u64 = 0,
+    tensor_support_mutation_count: u64 = 0,
+    tensor_cache_mutation_count: u64 = 0,
+    tensor_mutation_staged_bytes: u64 = 0,
+    ready_dictionary_mutation_batch_count: u64 = 0,
+    ready_dictionary_mutation_put_count: u64 = 0,
+    ready_dictionary_mutation_delete_count: u64 = 0,
+    ready_dictionary_registry_mutation_count: u64 = 0,
+    ready_dictionary_lexicon_mutation_count: u64 = 0,
+    ready_dictionary_posting_mutation_count: u64 = 0,
+    ready_dictionary_ordinal_posting_mutation_count: u64 = 0,
+    ready_dictionary_fst_invalidation_count: u64 = 0,
+    ready_dictionary_mutation_staged_bytes: u64 = 0,
+    adaptive_mutation_batch_count: u64 = 0,
+    adaptive_mutation_put_count: u64 = 0,
+    adaptive_mutation_delete_count: u64 = 0,
+    adaptive_promotion_mutation_count: u64 = 0,
+    adaptive_path_profile_mutation_count: u64 = 0,
+    adaptive_observation_mutation_count: u64 = 0,
+    adaptive_lifecycle_mutation_count: u64 = 0,
+    adaptive_mutation_staged_bytes: u64 = 0,
     symbol_cache_hits: u64 = 0,
     symbol_cache_misses: u64 = 0,
     minmax_cache_hits: u64 = 0,
@@ -3143,6 +3460,26 @@ pub const Index = struct {
         return deleted;
     }
 
+    /// Delete only the persisted families owned by one base-row rebuild phase.
+    /// Component workers call this before their first page; retries with a
+    /// durable cursor must not clear already committed pages.
+    pub fn clearBaseRowComponentRows(self: *Index, store: *docstore_mod.DocStore, component: BaseRowComponent) !usize {
+        self.lockWrites();
+        defer self.unlockWrites();
+
+        const families: []const []const u8 = switch (component) {
+            .fact => &.{ "docfact", "docfact_scalar", "docfact_scalar_ord", "docfact_field", "docfact_field_ord" },
+            .path => &.{ "pathfact", "pathfact_ord", "path_lookup", "path_lookup_ord", "path_profile" },
+        };
+        var deleted: usize = 0;
+        for (families) |family| {
+            const prefix = try self.keyAlloc(&.{family});
+            defer self.alloc.free(prefix);
+            deleted += try self.deleteRowsWithPrefix(store, prefix);
+        }
+        return deleted;
+    }
+
     pub const ArtifactNamespaceForTest = enum {
         raw,
         canonical,
@@ -3188,6 +3525,14 @@ pub const Index = struct {
     pub fn attachHllMaintenanceLane(self: *Index, lane: background_runtime.DurableJobLane, owner_id: u64) void {
         self.hll_maintenance_lane = lane;
         self.hll_maintenance_owner_id = owner_id;
+    }
+
+    /// Prevent queued cardinality rebuilds from recreating artifacts after a
+    /// durable generation has entered the dropping lifecycle.
+    pub fn prepareForArtifactDrop(self: *Index) void {
+        if (self.hll_maintenance_lane) |lane| lane.drainOwner(self.hll_maintenance_owner_id);
+        self.hll_maintenance_lane = null;
+        self.hll_maintenance_owner_id = 0;
     }
 
     // Held only around a write transaction, so contention is brief.
@@ -3282,6 +3627,434 @@ pub const Index = struct {
         self.scheduleHllMaintenanceIfDirty(store);
     }
 
+    /// Rebuild one base-row component without touching another component or
+    /// higher-level dictionaries, postings, tensors, joins, or HLL sketches.
+    /// Each row is an idempotent upsert so replay after a cursor-commit failure
+    /// is safe.
+    pub fn applyBaseRowComponentBatchWithOptions(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        component: BaseRowComponent,
+        documents: []const derived_types.DerivedDocument,
+        options: ApplyOptions,
+    ) !void {
+        if (documents.len == 0) return;
+        self.lockWrites();
+        defer self.unlockWrites();
+
+        var write_batch = try store.beginWriteBatchWithOptions(options.batch_options);
+        errdefer write_batch.abort();
+        const txn = write_batch.asTxn();
+        for (documents) |doc| {
+            if (doc.action != .upsert) continue;
+            const value = doc.cleaned_value orelse return error.MissingAlgebraicBaseRowValue;
+            var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, value, .{}) catch return error.InvalidAlgebraicBaseRow;
+            defer parsed.deinit();
+            if (parsed.value != .object) return error.InvalidAlgebraicBaseRow;
+            switch (component) {
+                .fact => try self.upsertBaseDocFactRowsTxn(txn, doc.key, parsed.value),
+                .path => try self.upsertBasePathFactRowsTxn(txn, doc.key, parsed.value),
+            }
+        }
+        try write_batch.commit();
+    }
+
+    pub fn clearDerivedRowComponentRows(self: *Index, store: *docstore_mod.DocStore, component: DerivedRowComponent) !usize {
+        self.lockWrites();
+        defer self.unlockWrites();
+
+        const families: []const []const u8 = switch (component) {
+            .dictionary => &.{ "lexicon", "lexicon_fst", "dictionary_state" },
+            .postings => &.{ "postings", "postings_ord", "dictionary_state" },
+        };
+        var deleted: usize = 0;
+        for (families) |family| {
+            const prefix = try self.keyAlloc(&.{family});
+            defer self.alloc.free(prefix);
+            deleted += try self.deleteRowsWithPrefix(store, prefix);
+        }
+        if (component == .dictionary) deleted += try self.clearOwnedDictionaryRegistryRows(store);
+        return deleted;
+    }
+
+    pub const ArtifactDropComponent = enum {
+        dictionary,
+        fact,
+        path,
+        postings,
+    };
+
+    pub const ArtifactDropPage = struct {
+        scanned_rows: usize = 0,
+        deleted_rows: usize = 0,
+        next_cursor: ?[]u8 = null,
+        complete: bool = false,
+
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
+            if (self.next_cursor) |cursor| alloc.free(cursor);
+            self.* = undefined;
+        }
+    };
+
+    const ArtifactDropPrefixFilter = enum {
+        all,
+        owned_dictionary_registry,
+    };
+
+    const ArtifactDropPrefix = struct {
+        key: []u8,
+        filter: ArtifactDropPrefixFilter = .all,
+    };
+
+    const DecodedArtifactDropCursor = struct {
+        prefix_index: usize = 0,
+        key: ?[]const u8 = null,
+    };
+
+    fn encodeArtifactDropCursor(alloc: Allocator, prefix_index: usize, key: []const u8) ![]u8 {
+        if (prefix_index > std.math.maxInt(u16)) return error.TooManyArtifactDropPrefixes;
+        const out = try alloc.alloc(u8, 3 + key.len);
+        out[0] = 1;
+        out[1] = @intCast(prefix_index >> 8);
+        out[2] = @intCast(prefix_index & 0xff);
+        @memcpy(out[3..], key);
+        return out;
+    }
+
+    fn decodeArtifactDropCursor(cursor: ?[]const u8, prefixes: []const ArtifactDropPrefix) !DecodedArtifactDropCursor {
+        const encoded = cursor orelse return .{};
+        if (encoded.len <= 3 or encoded[0] != 1) return error.InvalidArtifactDropCursor;
+        const prefix_index = (@as(usize, encoded[1]) << 8) | encoded[2];
+        if (prefix_index >= prefixes.len) return error.InvalidArtifactDropCursor;
+        const key = encoded[3..];
+        if (!std.mem.startsWith(u8, key, prefixes[prefix_index].key)) return error.InvalidArtifactDropCursor;
+        return .{ .prefix_index = prefix_index, .key = key };
+    }
+
+    /// Delete one bounded page from a logical algebraic artifact component.
+    /// The opaque cursor includes the active prefix ordinal and last scanned
+    /// key, so retrying after a physical commit but before catalog progress is
+    /// safe and work remains bounded even across shared registry rows.
+    pub fn dropArtifactComponentPage(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        component: ArtifactDropComponent,
+        resume_after: ?[]const u8,
+        max_rows: usize,
+    ) !ArtifactDropPage {
+        if (max_rows == 0) return error.InvalidDropPageSize;
+        self.lockWrites();
+        defer self.unlockWrites();
+
+        var prefixes = std.ArrayListUnmanaged(ArtifactDropPrefix).empty;
+        defer {
+            for (prefixes.items) |prefix| self.alloc.free(prefix.key);
+            prefixes.deinit(self.alloc);
+        }
+        switch (component) {
+            .fact => for ([_][]const u8{ "docfact", "docfact_scalar", "docfact_scalar_ord", "docfact_field", "docfact_field_ord" }) |family| {
+                try prefixes.append(self.alloc, .{ .key = try self.keyAlloc(&.{family}) });
+            },
+            .path => for ([_][]const u8{ "pathfact", "pathfact_ord", "path_lookup", "path_lookup_ord", "path_profile", "promoted_path_lookup" }) |family| {
+                try prefixes.append(self.alloc, .{ .key = try self.keyAlloc(&.{family}) });
+            },
+            .dictionary => {
+                for ([_][]const u8{ "lexicon", "lexicon_fst", "dictionary_state" }) |family| {
+                    try prefixes.append(self.alloc, .{ .key = try self.keyAlloc(&.{family}) });
+                }
+                try prefixes.append(self.alloc, .{
+                    .key = try lexical_mod.registryPrefixAlloc(self.alloc),
+                    .filter = .owned_dictionary_registry,
+                });
+            },
+            .postings => {
+                for ([_][]const u8{ "postings", "postings_ord" }) |family| {
+                    try prefixes.append(self.alloc, .{ .key = try self.keyAlloc(&.{family}) });
+                }
+                // The final phase sweeps both complete owned namespaces. This
+                // covers tensors, adaptive state, HLL rows, and future families
+                // that are not part of the four planner-facing components.
+                try prefixes.append(self.alloc, .{ .key = try self.keyAlloc(&.{}) });
+                try prefixes.append(self.alloc, .{
+                    .key = try token.canonicalTupleAlloc(self.alloc, &.{ "\x00\x00__algebraic__", self.name }),
+                });
+            },
+        }
+
+        const decoded = try decodeArtifactDropCursor(resume_after, prefixes.items);
+        var scanned_rows: usize = 0;
+        var deletes = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (deletes.items) |key| self.alloc.free(key);
+            deletes.deinit(self.alloc);
+        }
+        var next_cursor: ?[]u8 = null;
+        errdefer if (next_cursor) |cursor| self.alloc.free(cursor);
+
+        {
+            var txn = try store.beginReadTxn();
+            defer txn.abort();
+            var prefix_index = decoded.prefix_index;
+            while (prefix_index < prefixes.items.len and scanned_rows < max_rows) : (prefix_index += 1) {
+                const prefix = prefixes.items[prefix_index];
+                const resume_key = if (prefix_index == decoded.prefix_index) decoded.key else null;
+                {
+                    var cursor = try txn.openCursor();
+                    defer cursor.close();
+                    var row_opt = try cursor.seekAtOrAfter(resume_key orelse prefix.key);
+                    while (row_opt) |row| : (row_opt = try cursor.next()) {
+                        if (!std.mem.startsWith(u8, row.key, prefix.key)) break;
+                        if (resume_key) |key| {
+                            if (std.mem.order(u8, row.key, key) != .gt) continue;
+                        }
+                        scanned_rows += 1;
+                        const delete_row = switch (prefix.filter) {
+                            .all => true,
+                            .owned_dictionary_registry => blk: {
+                                var identity = try lexical_mod.registryIdentityAlloc(self.alloc, row.key);
+                                defer identity.deinit(self.alloc);
+                                var entry = try lexical_mod.RegistryEntry.decodeAlloc(self.alloc, row.value);
+                                defer entry.deinit(self.alloc);
+                                break :blk std.mem.eql(u8, identity.scope, self.name) and std.mem.eql(u8, entry.owner, self.name);
+                            },
+                        };
+                        if (delete_row) try deletes.append(self.alloc, try self.alloc.dupe(u8, row.key));
+                        if (scanned_rows == max_rows) {
+                            next_cursor = try encodeArtifactDropCursor(self.alloc, prefix_index, row.key);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (deletes.items.len > 0) try store.putBatch(&.{}, deletes.items);
+        return .{
+            .scanned_rows = scanned_rows,
+            .deleted_rows = deletes.items.len,
+            .next_cursor = next_cursor,
+            .complete = next_cursor == null,
+        };
+    }
+
+    /// Build one dictionary or postings page from immutable completed pathfact
+    /// rows. The returned cursor is the last consumed source key, not an
+    /// artifact key, and is safe to persist after this artifact transaction.
+    pub fn rebuildDerivedRowComponentPage(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        component: DerivedRowComponent,
+        resume_after: ?[]const u8,
+        max_rows: usize,
+    ) !DerivedRowComponentPage {
+        if (max_rows == 0) return error.InvalidRebuildPageSize;
+        const SourceRow = struct {
+            key: []u8,
+            doc_key: []u8,
+            payload: []u8,
+
+            fn deinit(row: *@This(), alloc: Allocator) void {
+                alloc.free(row.key);
+                alloc.free(row.doc_key);
+                alloc.free(row.payload);
+                row.* = undefined;
+            }
+        };
+        var rows = std.ArrayListUnmanaged(SourceRow).empty;
+        defer {
+            for (rows.items) |*row| row.deinit(self.alloc);
+            rows.deinit(self.alloc);
+        }
+        const prefix = try self.keyAlloc(&.{"pathfact"});
+        defer self.alloc.free(prefix);
+        var complete = true;
+        {
+            var txn = try store.beginReadTxn();
+            defer txn.abort();
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            const start = resume_after orelse prefix;
+            var entry_opt = try cursor.seekAtOrAfter(start);
+            while (entry_opt) |entry| {
+                if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+                if (resume_after) |resume_key| {
+                    if (std.mem.order(u8, entry.key, resume_key) != .gt) {
+                        entry_opt = try cursor.next();
+                        continue;
+                    }
+                }
+                if (rows.items.len >= max_rows) {
+                    complete = false;
+                    break;
+                }
+                const doc_component = token.componentAt(entry.key, prefix.len) catch return error.MalformedAlgebraicPathRowKey;
+                if (doc_component.next != entry.key.len) return error.MalformedAlgebraicPathRowKey;
+                try rows.append(self.alloc, .{
+                    .key = try self.alloc.dupe(u8, entry.key),
+                    .doc_key = try self.alloc.dupe(u8, doc_component.payload),
+                    .payload = try self.alloc.dupe(u8, entry.value),
+                });
+                entry_opt = try cursor.next();
+            }
+        }
+
+        self.lockWrites();
+        defer self.unlockWrites();
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        for (rows.items) |row| {
+            var projection = pathfact_mod.decodeProjectionAlloc(self.alloc, row.payload) catch return error.MalformedAlgebraicPathRow;
+            defer projection.deinit(self.alloc);
+            switch (component) {
+                .dictionary => try self.writeDictionaryRowsFromPathFactsTxn(&txn, projection.facts),
+                .postings => try self.writePostingRowsFromPathFactsTxn(&txn, row.doc_key, projection.facts),
+            }
+        }
+        if (complete) switch (component) {
+            .dictionary => try self.rebuildAllOwnedDictionaryFstsTxn(&txn),
+            .postings => try self.markOwnedDictionaryRegistriesReadyTxn(&txn),
+        };
+        try txn.commit();
+
+        return .{
+            .scanned_rows = rows.items.len,
+            .next_cursor = if (!complete and rows.items.len > 0) try self.alloc.dupe(u8, rows.items[rows.items.len - 1].key) else null,
+            .complete = complete,
+        };
+    }
+
+    fn writeDictionaryRowsFromPathFactsTxn(self: *Index, txn: anytype, facts: []const pathfact_mod.Fact) !void {
+        for (facts) |fact| {
+            if (!pathLookupKindIsScalarValue(fact.kind.tag())) continue;
+            const identity = lexical_mod.DictionaryIdentity.canonicalScalar(self.name, fact.path, fact.kind, "json-scalar-v1", "kind-qualified");
+            const claim = try lexical_mod.claimRegistryOwnerTxn(self.alloc, txn, identity, self.name, .lexicon_postings_rows, "building");
+            if (claim == .owned_by_other) continue;
+            const key = try self.pathDictionaryLexiconKeyAlloc(identity, fact.value);
+            defer self.alloc.free(key);
+            try txn.put(key, "");
+        }
+    }
+
+    fn writePostingRowsFromPathFactsTxn(self: *Index, txn: anytype, doc_key: []const u8, facts: []const pathfact_mod.Fact) !void {
+        for (facts) |fact| {
+            if (!pathLookupKindIsScalarValue(fact.kind.tag())) continue;
+            const identity = lexical_mod.DictionaryIdentity.canonicalScalar(self.name, fact.path, fact.kind, "json-scalar-v1", "kind-qualified");
+            if (!(try self.dictionaryRegistryOwnedBySelfTxn(txn, identity))) continue;
+            const key = try self.pathDictionaryPostingsKeyAlloc(identity, fact.value, doc_key);
+            defer self.alloc.free(key);
+            try txn.put(key, "");
+            try self.writePathDictionaryOrdinalPostingIfAvailableTxn(txn, identity, fact.value, doc_key);
+        }
+    }
+
+    fn dictionaryRegistryOwnedBySelfTxn(self: *Index, txn: anytype, identity: lexical_mod.DictionaryIdentity) !bool {
+        const key = try identity.registryKeyAlloc(self.alloc);
+        defer self.alloc.free(key);
+        const payload = txn.get(key) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+        var entry = lexical_mod.RegistryEntry.decodeAlloc(self.alloc, payload) catch return error.InvalidDictionaryRegistryEntry;
+        defer entry.deinit(self.alloc);
+        return entry.layout == .lexicon_postings_rows and std.mem.eql(u8, entry.owner, self.name);
+    }
+
+    fn clearOwnedDictionaryRegistryRows(self: *Index, store: *docstore_mod.DocStore) !usize {
+        const prefix = try lexical_mod.registryPrefixAlloc(self.alloc);
+        defer self.alloc.free(prefix);
+        const rows = try store.scanPrefix(self.alloc, prefix);
+        defer docstore_mod.DocStore.freeResults(self.alloc, rows);
+        var deletes = std.ArrayListUnmanaged([]const u8).empty;
+        defer deletes.deinit(self.alloc);
+        for (rows) |row| {
+            var identity = try lexical_mod.registryIdentityAlloc(self.alloc, row.key);
+            defer identity.deinit(self.alloc);
+            var entry = try lexical_mod.RegistryEntry.decodeAlloc(self.alloc, row.value);
+            defer entry.deinit(self.alloc);
+            if (std.mem.eql(u8, identity.scope, self.name) and std.mem.eql(u8, entry.owner, self.name)) {
+                try deletes.append(self.alloc, row.key);
+            }
+        }
+        if (deletes.items.len > 0) try store.putBatch(&.{}, deletes.items);
+        return deletes.items.len;
+    }
+
+    fn rebuildAllOwnedDictionaryFstsTxn(self: *Index, txn: anytype) !void {
+        const Group = struct {
+            identity_key: []u8,
+            labels: std.ArrayListUnmanaged([]u8) = .empty,
+
+            fn deinit(group: *@This(), alloc: Allocator) void {
+                alloc.free(group.identity_key);
+                for (group.labels.items) |label| alloc.free(label);
+                group.labels.deinit(alloc);
+                group.* = undefined;
+            }
+        };
+        var groups = std.ArrayListUnmanaged(Group).empty;
+        defer {
+            for (groups.items) |*group| group.deinit(self.alloc);
+            groups.deinit(self.alloc);
+        }
+        const prefix = try self.keyAlloc(&.{"lexicon"});
+        defer self.alloc.free(prefix);
+        {
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            var entry_opt = try cursor.seekAtOrAfter(prefix);
+            while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
+                if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+                const identity_component = token.componentAt(entry.key, prefix.len) catch return error.MalformedAlgebraicDictionaryRow;
+                const label_component = token.componentAt(entry.key, identity_component.next) catch return error.MalformedAlgebraicDictionaryRow;
+                if (label_component.next != entry.key.len) return error.MalformedAlgebraicDictionaryRow;
+                if (groups.items.len == 0 or !std.mem.eql(u8, groups.items[groups.items.len - 1].identity_key, identity_component.payload)) {
+                    try groups.append(self.alloc, .{ .identity_key = try self.alloc.dupe(u8, identity_component.payload) });
+                }
+                try groups.items[groups.items.len - 1].labels.append(self.alloc, try self.alloc.dupe(u8, label_component.payload));
+            }
+        }
+        for (groups.items) |group| {
+            const fst = try lexical_mod.buildFstAlloc(self.alloc, group.labels.items);
+            defer self.alloc.free(fst);
+            const key = try self.keyAlloc(&.{ "lexicon_fst", group.identity_key });
+            defer self.alloc.free(key);
+            try txn.put(key, fst);
+        }
+    }
+
+    fn markOwnedDictionaryRegistriesReadyTxn(self: *Index, txn: anytype) !void {
+        const prefix = try lexical_mod.registryPrefixAlloc(self.alloc);
+        defer self.alloc.free(prefix);
+        var keys = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (keys.items) |key| self.alloc.free(key);
+            keys.deinit(self.alloc);
+        }
+        {
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            var row_opt = try cursor.seekAtOrAfter(prefix);
+            while (row_opt) |row| : (row_opt = try cursor.next()) {
+                if (!std.mem.startsWith(u8, row.key, prefix)) break;
+                var identity = try lexical_mod.registryIdentityAlloc(self.alloc, row.key);
+                defer identity.deinit(self.alloc);
+                var entry = try lexical_mod.RegistryEntry.decodeAlloc(self.alloc, row.value);
+                defer entry.deinit(self.alloc);
+                if (entry.layout == .lexicon_postings_rows and std.mem.eql(u8, identity.scope, self.name) and std.mem.eql(u8, entry.owner, self.name)) {
+                    try keys.append(self.alloc, try self.alloc.dupe(u8, row.key));
+                }
+            }
+        }
+        for (keys.items) |key| {
+            const payload = try (lexical_mod.RegistryEntry{ .owner = self.name, .layout = .lexicon_postings_rows, .state = "ready" }).encodeAlloc(self.alloc);
+            defer self.alloc.free(payload);
+            try txn.put(key, payload);
+        }
+        const ready_key = try self.keyAlloc(&.{ "dictionary_state", "ready" });
+        defer self.alloc.free(ready_key);
+        try txn.put(ready_key, "1");
+    }
+
     fn applyBatchWritesLocked(
         self: *Index,
         store: *docstore_mod.DocStore,
@@ -3322,10 +4095,14 @@ pub const Index = struct {
             ctx.deinit(self.alloc);
         };
 
-        for (batch.deleted_keys) |key| try self.removeDoc(txn, key, if (maintenance_context) |*ctx| ctx else null);
+        for (batch.deleted_keys) |key| {
+            try self.removeDoc(txn, key, if (maintenance_context) |*ctx| ctx else null);
+            if (maintenance_context) |*ctx| try self.flushAdaptiveMutationsTxn(txn, &ctx.mutations);
+        }
         for (batch.overwritten_doc_keys) |key| {
             if (batchContainsUpsertDocument(batch, key)) continue;
             try self.removeDoc(txn, key, if (maintenance_context) |*ctx| ctx else null);
+            if (maintenance_context) |*ctx| try self.flushAdaptiveMutationsTxn(txn, &ctx.mutations);
         }
         for (batch.documents) |doc| {
             if (doc.action != .upsert) continue;
@@ -3349,10 +4126,12 @@ pub const Index = struct {
                 break :blk owned;
             };
             try self.addDoc(txn, doc.key, value, if (maintenance_context) |*ctx| ctx else null);
+            if (maintenance_context) |*ctx| try self.flushAdaptiveMutationsTxn(txn, &ctx.mutations);
         }
         if (maintenance_context) |*ctx| {
             self.observeAccumulatorResourceUsage(&self.maintenance_accumulator_resource_bytes, &ctx.tensor_accumulator);
             try self.flushBatchMaintenanceTensorDeltasTxn(txn, ctx);
+            try self.flushAdaptiveMutationsTxn(txn, &ctx.mutations);
             try self.flushBatchMaintenanceContextTxn(txn, ctx);
         }
     }
@@ -3360,6 +4139,54 @@ pub const Index = struct {
     fn flushBatchMaintenanceTensorDeltasTxn(self: *Index, txn: anytype, ctx: *BatchMaintenanceContext) !void {
         if (!ctx.coalesce_tensor_deltas) return;
         try self.flushAccumulator(txn, &ctx.tensor_accumulator, true);
+    }
+
+    fn flushAdaptiveMutationsTxn(self: *Index, txn: anytype, batch: *AdaptiveMutationBatch) !void {
+        if (batch.entryCount() == 0) return;
+        var scratch = std.heap.stackFallback(32 * 1024, self.alloc);
+        var arena = std.heap.ArenaAllocator.init(scratch.get());
+        defer arena.deinit();
+        const scratch_alloc = arena.allocator();
+        var mutations = std.ArrayListUnmanaged(backend_types.KeyMutation).empty;
+        defer mutations.deinit(scratch_alloc);
+        try mutations.ensureTotalCapacity(scratch_alloc, batch.entryCount());
+        var puts: u64 = 0;
+        var deletes: u64 = 0;
+        var promotion: u64 = 0;
+        var path_profile: u64 = 0;
+        var observation: u64 = 0;
+        var lifecycle: u64 = 0;
+        var staged_bytes: u64 = 0;
+        var it = batch.rows.iterator();
+        while (it.next()) |entry| {
+            const pending = entry.value_ptr;
+            staged_bytes +|= @as(u64, @intCast(pending.key.len));
+            if (pending.value) |value| {
+                try mutations.append(scratch_alloc, .{ .put = .{ .key = pending.key, .value = value } });
+                puts += 1;
+                staged_bytes +|= @as(u64, @intCast(value.len));
+            } else {
+                try mutations.append(scratch_alloc, .{ .delete = .{ .key = pending.key, .ignore_missing = true } });
+                deletes += 1;
+            }
+            switch (pending.kind) {
+                .promotion => promotion += 1,
+                .path_profile => path_profile += 1,
+                .observation => observation += 1,
+                .lifecycle => lifecycle += 1,
+            }
+        }
+        try txn.applyMutations(mutations.items);
+        self.adaptive_mutation_batch_count += 1;
+        self.adaptive_mutation_put_count +|= puts;
+        self.adaptive_mutation_delete_count +|= deletes;
+        self.adaptive_promotion_mutation_count +|= promotion;
+        self.adaptive_path_profile_mutation_count +|= path_profile;
+        self.adaptive_observation_mutation_count +|= observation;
+        self.adaptive_lifecycle_mutation_count +|= lifecycle;
+        self.adaptive_mutation_staged_bytes +|= staged_bytes;
+        batch.deinit(self.alloc);
+        batch.* = .{};
     }
 
     fn flushBatchMaintenanceContextTxn(self: *Index, txn: anytype, ctx: *BatchMaintenanceContext) !void {
@@ -3508,6 +4335,7 @@ pub const Index = struct {
             try self.writeDocFacts(txn, doc.key, value, if (maintenance_context) |*ctx| ctx else null);
             try self.applyWrittenAdaptiveDocFactDeltaAppendOnly(txn, &accumulator, doc.key, if (maintenance_context) |*ctx| ctx else null);
             try self.applyDocDeltaAppendOnlyPreaggregated(txn, &accumulator, doc.key, value, if (maintenance_context) |*ctx| ctx else null);
+            if (maintenance_context) |*ctx| try self.flushAdaptiveMutationsTxn(txn, &ctx.mutations);
             self.observeAccumulatorResourceUsage(&self.append_only_accumulator_resource_bytes, &accumulator);
             if (accumulator.entryCount() >= self.maxBatchAccumulatorEntries()) {
                 try self.flushAppendOnlyAccumulator(txn, &accumulator);
@@ -3522,6 +4350,8 @@ pub const Index = struct {
         self.accumulator_flush_count += 1;
         if (maintenance_context) |*ctx| {
             self.observeAccumulatorResourceUsage(&self.maintenance_accumulator_resource_bytes, &ctx.tensor_accumulator);
+            try self.flushBatchMaintenanceTensorDeltasTxn(txn, ctx);
+            try self.flushAdaptiveMutationsTxn(txn, &ctx.mutations);
             try self.flushBatchMaintenanceContextTxn(txn, ctx);
         }
 
@@ -7888,12 +8718,13 @@ pub const Index = struct {
     }
 
     fn buildBatchMaintenanceContext(self: *Index, txn: anytype, options: ApplyOptions) !?BatchMaintenanceContext {
-        if (options.batch_options.mode != .bulk_ingest) return null;
-        if (!self.shouldMaintainReadyAdaptiveMaterializations()) return null;
+        _ = options;
+        if (!self.shouldMaintainReadyAdaptiveMaterializations() and !self.shouldMaintainPathProfiles()) return null;
 
         var context = BatchMaintenanceContext{};
         errdefer context.deinit(self.alloc);
-        context.coalesce_tensor_deltas = true;
+        context.coalesce_tensor_deltas = self.shouldMaintainReadyAdaptiveMaterializations();
+        if (!self.shouldMaintainReadyAdaptiveMaterializations()) return context;
 
         if (self.adaptive_ready_spec_cache) |cache| {
             context.ready_specs = try self.cloneReadySpecsAlloc(cache.specs);
@@ -11785,6 +12616,7 @@ pub const Index = struct {
     fn expressionRawValueForMaterializationTxn(
         self: *Index,
         txn: anytype,
+        accumulator: ?*AppendOnlyAccumulator,
         materialization: []const u8,
         axes_canonical: []const u8,
         bucket: ?[]const u8,
@@ -11802,10 +12634,13 @@ pub const Index = struct {
             .bucket = bucket,
         });
         defer self.alloc.free(key);
-        const raw_row = txn.get(key) catch |err| switch (err) {
-            error.NotFound => return null,
-            else => return err,
-        };
+        const raw_row = if (accumulator) |pending|
+            (try pending.getWithOverlay(txn, key)) orelse return null
+        else
+            txn.get(key) catch |err| switch (err) {
+                error.NotFound => return null,
+                else => return err,
+            };
         var row = try tensor_mod.rowFromBytesOrLayoutAlloc(self.alloc, raw_row, &.{law_id});
         defer row.deinit(self.alloc);
         if (row.slots.len == 0) return null;
@@ -11898,7 +12733,7 @@ pub const Index = struct {
             }
             var any_value = values[0] != null;
             for (materializations[1..], 1..) |name, i| {
-                values[i] = try self.expressionRawValueForMaterializationTxn(txn, name, canonical_group, bucket_start);
+                values[i] = try self.expressionRawValueForMaterializationTxn(txn, null, name, canonical_group, bucket_start);
                 if (values[i] != null) any_value = true;
             }
             if (!any_value) {
@@ -12138,6 +12973,30 @@ pub const Index = struct {
             .join_facts_matched = self.join_facts_matched,
             .join_facts_pruned = self.join_facts_pruned,
             .accumulator_flush_count = self.accumulator_flush_count,
+            .tensor_mutation_batch_count = self.tensor_mutation_batch_count,
+            .tensor_mutation_put_count = self.tensor_mutation_put_count,
+            .tensor_mutation_delete_count = self.tensor_mutation_delete_count,
+            .tensor_expression_mutation_count = self.tensor_expression_mutation_count,
+            .tensor_support_mutation_count = self.tensor_support_mutation_count,
+            .tensor_cache_mutation_count = self.tensor_cache_mutation_count,
+            .tensor_mutation_staged_bytes = self.tensor_mutation_staged_bytes,
+            .ready_dictionary_mutation_batch_count = self.ready_dictionary_mutation_batch_count,
+            .ready_dictionary_mutation_put_count = self.ready_dictionary_mutation_put_count,
+            .ready_dictionary_mutation_delete_count = self.ready_dictionary_mutation_delete_count,
+            .ready_dictionary_registry_mutation_count = self.ready_dictionary_registry_mutation_count,
+            .ready_dictionary_lexicon_mutation_count = self.ready_dictionary_lexicon_mutation_count,
+            .ready_dictionary_posting_mutation_count = self.ready_dictionary_posting_mutation_count,
+            .ready_dictionary_ordinal_posting_mutation_count = self.ready_dictionary_ordinal_posting_mutation_count,
+            .ready_dictionary_fst_invalidation_count = self.ready_dictionary_fst_invalidation_count,
+            .ready_dictionary_mutation_staged_bytes = self.ready_dictionary_mutation_staged_bytes,
+            .adaptive_mutation_batch_count = self.adaptive_mutation_batch_count,
+            .adaptive_mutation_put_count = self.adaptive_mutation_put_count,
+            .adaptive_mutation_delete_count = self.adaptive_mutation_delete_count,
+            .adaptive_promotion_mutation_count = self.adaptive_promotion_mutation_count,
+            .adaptive_path_profile_mutation_count = self.adaptive_path_profile_mutation_count,
+            .adaptive_observation_mutation_count = self.adaptive_observation_mutation_count,
+            .adaptive_lifecycle_mutation_count = self.adaptive_lifecycle_mutation_count,
+            .adaptive_mutation_staged_bytes = self.adaptive_mutation_staged_bytes,
             .symbol_cache_hits = self.symbol_cache_hits,
             .symbol_cache_misses = self.symbol_cache_misses,
             .minmax_cache_hits = self.minmax_cache_hits,
@@ -12675,7 +13534,9 @@ pub const Index = struct {
         errdefer txn.abort();
         const state = try self.encodePersistedMaterializationStateAlloc(recommendation, lifecycle, existing_state.observation_count);
         defer self.alloc.free(state);
-        try txn.put(state_key, state);
+        var mutations = AdaptiveMutationBatch{};
+        defer mutations.deinit(self.alloc);
+        try mutations.stagePut(self.alloc, state_key, state, .lifecycle);
         for (updates.items) |update| {
             const observation_recommendation = update.observation.recommendation orelse continue;
             const encoded = try self.encodePersistedObservationAlloc(
@@ -12686,8 +13547,9 @@ pub const Index = struct {
                 lifecycle,
             );
             defer self.alloc.free(encoded);
-            try txn.put(update.key, encoded);
+            try mutations.stagePut(self.alloc, update.key, encoded, .observation);
         }
+        try self.flushAdaptiveMutationsTxn(&txn, &mutations);
         try txn.commit();
         self.invalidateAdaptiveReadySpecCache();
     }
@@ -12742,14 +13604,17 @@ pub const Index = struct {
         const lifecycle = adaptive_mod.nextLifecycle(self.config().adaptive.policy(), next_count, prior.lifecycle);
         const encoded = try self.encodePersistedObservationAlloc(shape, next_count, reason, recommendation, lifecycle);
         defer self.alloc.free(encoded);
-        try txn.put(key, encoded);
+        var mutations = AdaptiveMutationBatch{};
+        defer mutations.deinit(self.alloc);
+        try mutations.stagePut(self.alloc, key, encoded, .observation);
         if (lifecycle == .recommended or lifecycle == .backfilling or lifecycle == .ready) {
             const state_key = try adaptive_mod.materializationStateKeyAlloc(self.alloc, self.name, recommendation);
             defer self.alloc.free(state_key);
             const state = try self.encodePersistedMaterializationStateAlloc(recommendation, lifecycle, next_count);
             defer self.alloc.free(state);
-            try txn.put(state_key, state);
+            try mutations.stagePut(self.alloc, state_key, state, .observation);
         }
+        try self.flushAdaptiveMutationsTxn(&txn, &mutations);
         try txn.commit();
         self.invalidateAdaptiveReadySpecCache();
     }
@@ -12771,19 +13636,22 @@ pub const Index = struct {
         defer self.alloc.free(state_key);
         var txn = try store.beginWriteTxn();
         errdefer txn.abort();
-        try txn.put(key, encoded);
+        var mutations = AdaptiveMutationBatch{};
+        defer mutations.deinit(self.alloc);
+        try mutations.stagePut(self.alloc, key, encoded, .observation);
         if (txn.get(state_key)) |existing| {
             var state = self.decodePersistedMaterializationState(existing) catch null;
             if (state) |*value| {
                 defer value.deinit(self.alloc);
                 const state_encoded = try self.encodePersistedMaterializationStateAlloc(recommendation, value.lifecycle, count);
                 defer self.alloc.free(state_encoded);
-                try txn.put(state_key, state_encoded);
+                try mutations.stagePut(self.alloc, state_key, state_encoded, .observation);
             }
         } else |err| switch (err) {
             error.NotFound => {},
             else => return err,
         }
+        try self.flushAdaptiveMutationsTxn(&txn, &mutations);
         try txn.commit();
     }
 
@@ -12966,8 +13834,11 @@ pub const Index = struct {
         defer self.alloc.free(history_key);
         const history_payload = try self.encodePersistedAdaptiveDecisionAlloc(recommendation, materialization_id, lifecycle, previous_decision, decision, observation_count, estimated_scan_rows_saved, estimated_write_cost, score, score - previous_score, idle_miss_count, generation);
         defer self.alloc.free(history_payload);
-        try txn.put(key, payload);
-        try txn.put(history_key, history_payload);
+        var mutations = AdaptiveMutationBatch{};
+        defer mutations.deinit(self.alloc);
+        try mutations.stagePut(self.alloc, key, payload, .observation);
+        try mutations.stagePut(self.alloc, history_key, history_payload, .observation);
+        try self.flushAdaptiveMutationsTxn(&txn, &mutations);
         try txn.commit();
     }
 
@@ -12989,7 +13860,10 @@ pub const Index = struct {
         defer self.alloc.free(payload);
         var txn = try store.beginWriteTxn();
         errdefer txn.abort();
-        try txn.put(key, payload);
+        var mutations = AdaptiveMutationBatch{};
+        defer mutations.deinit(self.alloc);
+        try mutations.stagePut(self.alloc, key, payload, .lifecycle);
+        try self.flushAdaptiveMutationsTxn(&txn, &mutations);
         try txn.commit();
         self.invalidateAdaptiveReadySpecCache();
     }
@@ -13019,7 +13893,11 @@ pub const Index = struct {
         txn: anytype,
         recommendation: []const u8,
         materialization_id: []const u8,
+        maintenance_context: ?*BatchMaintenanceContext,
     ) !void {
+        var local_batch = AdaptiveMutationBatch{};
+        defer local_batch.deinit(self.alloc);
+        const mutations = if (maintenance_context) |ctx| &ctx.mutations else &local_batch;
         const state_key = try adaptive_mod.materializationStateKeyAlloc(self.alloc, self.name, recommendation);
         defer self.alloc.free(state_key);
         const existing_state = txn.get(state_key) catch |err| switch (err) {
@@ -13033,7 +13911,7 @@ pub const Index = struct {
         } else 0;
         const state_payload = try self.encodePersistedMaterializationStateAlloc(recommendation, .stale, observation_count);
         defer self.alloc.free(state_payload);
-        try txn.put(state_key, state_payload);
+        try mutations.stagePut(self.alloc, state_key, state_payload, .lifecycle);
 
         const progress_key = try adaptive_mod.progressKeyAlloc(self.alloc, self.name, recommendation);
         defer self.alloc.free(progress_key);
@@ -13044,8 +13922,7 @@ pub const Index = struct {
         if (existing_progress) |payload| {
             var progress = self.decodePersistedAdaptiveProgress(payload) catch return;
             defer progress.deinit(self.alloc);
-            try self.putAdaptiveProgressTxn(
-                txn,
+            const progress_payload = try self.encodePersistedAdaptiveProgressAlloc(
                 recommendation,
                 materialization_id,
                 .stale,
@@ -13055,7 +13932,10 @@ pub const Index = struct {
                 progress.target_rows,
                 progress.cursor_key,
             );
+            defer self.alloc.free(progress_payload);
+            try mutations.stagePut(self.alloc, progress_key, progress_payload, .lifecycle);
         }
+        if (maintenance_context == null) try self.flushAdaptiveMutationsTxn(txn, &local_batch);
         self.invalidateAdaptiveReadySpecCache();
     }
 
@@ -13884,19 +14764,13 @@ pub const Index = struct {
 
         var txn = try store.beginWriteTxn();
         errdefer txn.abort();
-        for (keys.items) |key| txn.delete(key) catch |err| switch (err) {
-            error.NotFound => {},
-            else => return err,
-        };
-        txn.delete(progress_key) catch |err| switch (err) {
-            error.NotFound => {},
-            else => return err,
-        };
-        txn.delete(candidate_key) catch |err| switch (err) {
-            error.NotFound => {},
-            else => return err,
-        };
-        try self.deleteAdaptiveDictionaryIfOwnedTxn(&txn, recommendation, materialization_id);
+        var mutations = AdaptiveMutationBatch{};
+        defer mutations.deinit(self.alloc);
+        for (keys.items) |key| try mutations.stageDelete(self.alloc, key, .lifecycle);
+        try mutations.stageDelete(self.alloc, progress_key, .lifecycle);
+        try mutations.stageDelete(self.alloc, candidate_key, .lifecycle);
+        try self.deleteAdaptiveDictionaryIfOwnedTxn(&txn, recommendation, materialization_id, &mutations);
+        try self.flushAdaptiveMutationsTxn(&txn, &mutations);
         try txn.commit();
     }
 
@@ -13905,6 +14779,7 @@ pub const Index = struct {
         txn: anytype,
         recommendation: []const u8,
         materialization_id: []const u8,
+        mutations: *AdaptiveMutationBatch,
     ) !void {
         var spec = self.adaptiveSpecFromRecommendationAlloc(materialization_id, recommendation) catch return;
         defer spec.deinit(self.alloc);
@@ -13954,14 +14829,8 @@ pub const Index = struct {
         defer self.alloc.free(fst_key);
         try keys.append(self.alloc, try self.alloc.dupe(u8, fst_key));
 
-        for (keys.items) |key| txn.delete(key) catch |err| switch (err) {
-            error.NotFound => {},
-            else => return err,
-        };
-        txn.delete(registry_key) catch |err| switch (err) {
-            error.NotFound => {},
-            else => return err,
-        };
+        for (keys.items) |key| try mutations.stageDelete(self.alloc, key, .lifecycle);
+        try mutations.stageDelete(self.alloc, registry_key, .lifecycle);
     }
 
     fn updateAdaptiveTensorFromFacts(
@@ -14669,13 +15538,17 @@ pub const Index = struct {
     }
 
     fn keyAlloc(self: *Index, parts: []const []const u8) ![]u8 {
+        return try self.keyAllocWithAllocator(self.alloc, parts);
+    }
+
+    fn keyAllocWithAllocator(self: *Index, alloc: Allocator, parts: []const []const u8) ![]u8 {
         var out = std.ArrayListUnmanaged(u8).empty;
-        errdefer out.deinit(self.alloc);
-        try out.appendSlice(self.alloc, namespace_prefix);
-        try token.appendComponent(&out, self.alloc, self.name);
-        try token.appendComponent(&out, self.alloc, "v4");
-        for (parts) |part| try token.appendComponent(&out, self.alloc, part);
-        return try out.toOwnedSlice(self.alloc);
+        errdefer out.deinit(alloc);
+        try out.appendSlice(alloc, namespace_prefix);
+        try token.appendComponent(&out, alloc, self.name);
+        try token.appendComponent(&out, alloc, "v4");
+        for (parts) |part| try token.appendComponent(&out, alloc, part);
+        return try out.toOwnedSlice(alloc);
     }
 
     fn docFactKey(self: *Index, doc_key: []const u8) ![]u8 {
@@ -14795,9 +15668,13 @@ pub const Index = struct {
     }
 
     fn pathDictionaryLexiconKeyAlloc(self: *Index, identity: lexical_mod.DictionaryIdentity, label: []const u8) ![]u8 {
-        const identity_key = try identity.keyAlloc(self.alloc);
-        defer self.alloc.free(identity_key);
-        return try self.keyAlloc(&.{ "lexicon", identity_key, label });
+        return try self.pathDictionaryLexiconKeyAllocWithAllocator(self.alloc, identity, label);
+    }
+
+    fn pathDictionaryLexiconKeyAllocWithAllocator(self: *Index, alloc: Allocator, identity: lexical_mod.DictionaryIdentity, label: []const u8) ![]u8 {
+        const identity_key = try identity.keyAlloc(alloc);
+        defer alloc.free(identity_key);
+        return try self.keyAllocWithAllocator(alloc, &.{ "lexicon", identity_key, label });
     }
 
     fn pathDictionaryLexiconPrefixAlloc(self: *Index, identity: lexical_mod.DictionaryIdentity) ![]u8 {
@@ -14807,15 +15684,23 @@ pub const Index = struct {
     }
 
     fn pathDictionaryPostingsKeyAlloc(self: *Index, identity: lexical_mod.DictionaryIdentity, label: []const u8, doc_key: []const u8) ![]u8 {
-        const identity_key = try identity.keyAlloc(self.alloc);
-        defer self.alloc.free(identity_key);
-        return try self.keyAlloc(&.{ "postings", identity_key, label, doc_key });
+        return try self.pathDictionaryPostingsKeyAllocWithAllocator(self.alloc, identity, label, doc_key);
+    }
+
+    fn pathDictionaryPostingsKeyAllocWithAllocator(self: *Index, alloc: Allocator, identity: lexical_mod.DictionaryIdentity, label: []const u8, doc_key: []const u8) ![]u8 {
+        const identity_key = try identity.keyAlloc(alloc);
+        defer alloc.free(identity_key);
+        return try self.keyAllocWithAllocator(alloc, &.{ "postings", identity_key, label, doc_key });
     }
 
     fn pathDictionaryPostingsPrefixAlloc(self: *Index, identity: lexical_mod.DictionaryIdentity, label: []const u8) ![]u8 {
-        const identity_key = try identity.keyAlloc(self.alloc);
-        defer self.alloc.free(identity_key);
-        return try self.keyAlloc(&.{ "postings", identity_key, label });
+        return try self.pathDictionaryPostingsPrefixAllocWithAllocator(self.alloc, identity, label);
+    }
+
+    fn pathDictionaryPostingsPrefixAllocWithAllocator(self: *Index, alloc: Allocator, identity: lexical_mod.DictionaryIdentity, label: []const u8) ![]u8 {
+        const identity_key = try identity.keyAlloc(alloc);
+        defer alloc.free(identity_key);
+        return try self.keyAllocWithAllocator(alloc, &.{ "postings", identity_key, label });
     }
 
     fn pathDictionaryPostingsDictionaryPrefixAlloc(self: *Index, identity: lexical_mod.DictionaryIdentity) ![]u8 {
@@ -14825,10 +15710,14 @@ pub const Index = struct {
     }
 
     fn pathDictionaryOrdinalPostingsKeyAlloc(self: *Index, identity: lexical_mod.DictionaryIdentity, label: []const u8, ordinal: doc_set.DocOrdinal) ![]u8 {
-        const identity_key = try identity.keyAlloc(self.alloc);
-        defer self.alloc.free(identity_key);
+        return try self.pathDictionaryOrdinalPostingsKeyAllocWithAllocator(self.alloc, identity, label, ordinal);
+    }
+
+    fn pathDictionaryOrdinalPostingsKeyAllocWithAllocator(self: *Index, alloc: Allocator, identity: lexical_mod.DictionaryIdentity, label: []const u8, ordinal: doc_set.DocOrdinal) ![]u8 {
+        const identity_key = try identity.keyAlloc(alloc);
+        defer alloc.free(identity_key);
         const ordinal_component = ordinalComponent(ordinal);
-        return try self.keyAlloc(&.{ "postings_ord", identity_key, label, ordinal_component[0..] });
+        return try self.keyAllocWithAllocator(alloc, &.{ "postings_ord", identity_key, label, ordinal_component[0..] });
     }
 
     fn pathDictionaryOrdinalPostingsPrefixAlloc(self: *Index, identity: lexical_mod.DictionaryIdentity, label: []const u8) ![]u8 {
@@ -14844,9 +15733,13 @@ pub const Index = struct {
     }
 
     fn pathDictionaryFstKeyAlloc(self: *Index, identity: lexical_mod.DictionaryIdentity) ![]u8 {
-        const identity_key = try identity.keyAlloc(self.alloc);
-        defer self.alloc.free(identity_key);
-        return try self.keyAlloc(&.{ "lexicon_fst", identity_key });
+        return try self.pathDictionaryFstKeyAllocWithAllocator(self.alloc, identity);
+    }
+
+    fn pathDictionaryFstKeyAllocWithAllocator(self: *Index, alloc: Allocator, identity: lexical_mod.DictionaryIdentity) ![]u8 {
+        const identity_key = try identity.keyAlloc(alloc);
+        defer alloc.free(identity_key);
+        return try self.keyAllocWithAllocator(alloc, &.{ "lexicon_fst", identity_key });
     }
 
     fn pathProfileKeyAlloc(self: *Index, path: []const u8) ![]u8 {
@@ -15135,6 +16028,7 @@ pub const Index = struct {
     fn applyConfiguredExpressionMutationTxn(
         self: *Index,
         txn: anytype,
+        accumulator: ?*AppendOnlyAccumulator,
         mat: MaterializationConfig,
         op: algebra.Op,
         group_key: []const u8,
@@ -15148,6 +16042,16 @@ pub const Index = struct {
         switch (op) {
             .count, .sum, .sumsquares, .avg => {
                 if (op != .count and measure_value == null) return;
+                if (accumulator) |pending| return try self.accumulateConfiguredExpressionDeltaTxn(
+                    txn,
+                    pending,
+                    mat,
+                    op,
+                    group_key,
+                    measure_value,
+                    sign,
+                    bucket_start,
+                );
                 const delta = try self.materializationDeltaAlloc(op, measure_value, @as(i64, @intCast(sign)));
                 defer self.alloc.free(delta);
                 try self.applyConfiguredExpressionDeltaTxn(txn, mat, law_id, group_key, bucket_start, delta, true);
@@ -15156,7 +16060,7 @@ pub const Index = struct {
             .min, .max => {},
         }
 
-        const old_current = try self.expressionRawValueForMaterializationTxn(txn, mat.name, group_key, bucket_start);
+        const old_current = try self.expressionRawValueForMaterializationTxn(txn, accumulator, mat.name, group_key, bucket_start);
         defer if (old_current) |value| self.alloc.free(value);
 
         const measure = measure_value orelse return;
@@ -15164,9 +16068,9 @@ pub const Index = struct {
         defer self.alloc.free(expr_id);
         const support_group_key = try self.supportGroupKeyAlloc(kind, group_key, bucket_start);
         defer self.alloc.free(support_group_key);
-        const next_owned = try self.updateMinMaxExpressionCurrent(txn, expr_id, support_group_key, op, old_current, measure, sign);
+        const next_owned = try self.updateMinMaxExpressionCurrent(txn, accumulator, expr_id, support_group_key, op, old_current, measure, sign);
         defer if (next_owned) |bytes| self.alloc.free(bytes);
-        try self.replaceConfiguredExpressionValueTxn(txn, mat, law_id, group_key, bucket_start, next_owned);
+        try self.replaceConfiguredExpressionValueTxn(txn, accumulator, mat, law_id, group_key, bucket_start, next_owned);
     }
 
     fn applyConfiguredExpressionDeltaTxn(
@@ -15208,6 +16112,7 @@ pub const Index = struct {
     fn replaceConfiguredExpressionValueTxn(
         self: *Index,
         txn: anytype,
+        accumulator: ?*AppendOnlyAccumulator,
         mat: MaterializationConfig,
         law_id: law_mod.Id,
         group_key: []const u8,
@@ -15225,12 +16130,19 @@ pub const Index = struct {
             .bucket = bucket_start,
         });
         defer self.alloc.free(expr_key);
-        const existing = txn.get(expr_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const existing = if (accumulator) |pending|
+            try pending.getWithOverlay(txn, expr_key)
+        else
+            txn.get(expr_key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
         const next_owned = if (next) |value| try self.alloc.dupe(u8, value) else null;
         const encoded = (try tensor_mod.replaceRowSlotToBytesAlloc(self.alloc, existing, &.{law_id}, 0, law_id, next_owned, true)) orelse {
+            if (accumulator) |pending| {
+                try pending.stageMutation(self.alloc, expr_key, null, .expression);
+                return;
+            }
             txn.delete(expr_key) catch |err| switch (err) {
                 error.NotFound => {},
                 else => return err,
@@ -15238,6 +16150,7 @@ pub const Index = struct {
             return;
         };
         defer self.alloc.free(encoded);
+        if (accumulator) |pending| return try pending.stageMutation(self.alloc, expr_key, encoded, .expression);
         try txn.put(expr_key, encoded);
     }
 
@@ -15252,6 +16165,20 @@ pub const Index = struct {
         kind: RowKind,
         bucket_start: ?[]const u8,
     ) !void {
+        switch (op) {
+            .count, .sum, .sumsquares, .avg => return try self.accumulateConfiguredExpressionDeltaTxn(
+                txn,
+                accumulator,
+                mat,
+                op,
+                group_key,
+                measure_value,
+                1,
+                bucket_start,
+            ),
+            .min, .max => {},
+        }
+
         const group_id = try self.ensureSymbolAppendOnly(txn, group_key);
         defer self.alloc.free(group_id);
         const law_id = self.materializationLawId(mat, op);
@@ -15265,38 +16192,47 @@ pub const Index = struct {
         });
         const expression_row = try accumulator.expressionRow(self.alloc, expr_key, &.{law_id});
 
-        switch (op) {
-            .count => {
-                const delta = try self.materializationDeltaAlloc(op, measure_value, 1);
-                defer self.alloc.free(delta);
-                try expression_row.applyDelta(self.alloc, 0, law_id, delta);
-            },
-            .sum, .sumsquares => {
-                if (measure_value == null) return;
-                const delta = try self.materializationDeltaAlloc(op, measure_value, 1);
-                defer self.alloc.free(delta);
-                try expression_row.applyDelta(self.alloc, 0, law_id, delta);
-            },
-            .avg => {
-                if (measure_value == null) return;
-                const delta = try self.materializationDeltaAlloc(op, measure_value, 1);
-                defer self.alloc.free(delta);
-                try expression_row.applyDelta(self.alloc, 0, law_id, delta);
-            },
-            .min, .max => {
-                const measure = measure_value orelse return;
-                try expression_row.applyDelta(self.alloc, 0, law_id, measure.raw);
+        const measure = measure_value orelse return;
+        try expression_row.applyDelta(self.alloc, 0, law_id, measure.raw);
 
-                const support_group_key = try self.supportGroupKeyAlloc(kind, group_key, bucket_start);
-                defer self.alloc.free(support_group_key);
-                const support_group_id = try self.ensureSymbolAppendOnly(txn, support_group_key);
-                defer self.alloc.free(support_group_id);
-                const measure_id = try self.ensureSymbolAppendOnly(txn, measure.support_token);
-                defer self.alloc.free(measure_id);
-                const support_key = try self.keyAlloc(&.{ "minmax", expr_id, support_group_id, measure_id });
-                try accumulator.addSupport(self.alloc, support_key, 1);
-            },
-        }
+        const support_group_key = try self.supportGroupKeyAlloc(kind, group_key, bucket_start);
+        defer self.alloc.free(support_group_key);
+        const support_group_id = try self.ensureSymbolAppendOnly(txn, support_group_key);
+        defer self.alloc.free(support_group_id);
+        const measure_id = try self.ensureSymbolAppendOnly(txn, measure.support_token);
+        defer self.alloc.free(measure_id);
+        const support_key = try self.keyAlloc(&.{ "minmax", expr_id, support_group_id, measure_id });
+        try accumulator.addSupport(self.alloc, support_key, 1);
+    }
+
+    fn accumulateConfiguredExpressionDeltaTxn(
+        self: *Index,
+        txn: anytype,
+        accumulator: *AppendOnlyAccumulator,
+        mat: MaterializationConfig,
+        op: algebra.Op,
+        group_key: []const u8,
+        measure_value: ?MeasureValue,
+        sign: i8,
+        bucket_start: ?[]const u8,
+    ) !void {
+        if (op != .count and measure_value == null) return;
+        const law_id = self.materializationLawId(mat, op);
+        if (!law_mod.descriptor(law_id).invertible) return error.AlgebraicLawNotInvertible;
+        const group_id = try self.ensureSymbol(txn, group_key);
+        defer self.alloc.free(group_id);
+        const expr = materializationExpression(mat, law_id);
+        const expr_id = try self.materializedExpressionIdForLawAlloc(expr, law_id);
+        defer self.alloc.free(expr_id);
+        const expr_key = try tensor_mod.expressionKeyAlloc(self.alloc, self.name, .{
+            .expr_id = expr_id,
+            .axes_canonical = group_key,
+            .bucket = bucket_start,
+        });
+        const expression_row = try accumulator.expressionRow(self.alloc, expr_key, &.{law_id});
+        const delta = try self.materializationDeltaAlloc(op, measure_value, @as(i64, @intCast(sign)));
+        defer self.alloc.free(delta);
+        try expression_row.applyDelta(self.alloc, 0, law_id, delta);
     }
 
     fn flushAppendOnlyAccumulator(self: *Index, txn: anytype, accumulator: *AppendOnlyAccumulator) !void {
@@ -15304,26 +16240,46 @@ pub const Index = struct {
     }
 
     fn flushAccumulator(self: *Index, txn: anytype, accumulator: *AppendOnlyAccumulator, omit_empty_rows: bool) !void {
+        var scratch = std.heap.stackFallback(32 * 1024, self.alloc);
+        var arena = std.heap.ArenaAllocator.init(scratch.get());
+        defer arena.deinit();
+        const scratch_alloc = arena.allocator();
+        var mutations = std.ArrayListUnmanaged(backend_types.KeyMutation).empty;
+        defer mutations.deinit(scratch_alloc);
+        try mutations.ensureTotalCapacity(scratch_alloc, accumulator.entryCount());
+        var support_mutations: u64 = 0;
+        var expression_mutations: u64 = 0;
+        var cache_mutations: u64 = 0;
+        var put_mutations: u64 = 0;
+        var delete_mutations: u64 = 0;
+        var staged_bytes: u64 = 0;
+
         var support_it = accumulator.support_counts.iterator();
         while (support_it.next()) |entry| {
             const pending = entry.value_ptr;
-            const delta_count = try tensor_mod.countSupportValueAlloc(self.alloc, pending.row);
+            const delta_count = pending.delta_count;
             if (delta_count == 0) continue;
-            const delta = try algebra.encodeI64Alloc(self.alloc, delta_count);
-            defer self.alloc.free(delta);
+            const delta = try algebra.encodeI64Alloc(scratch_alloc, delta_count);
             const old_support = txn.get(pending.key) catch |err| switch (err) {
                 error.NotFound => null,
                 else => return err,
             };
-            var support_mutation = try tensor_mod.applyCountSupportDeltaBytesAlloc(self.alloc, old_support, delta);
-            defer support_mutation.deinit(self.alloc);
+            const support_mutation = try tensor_mod.applyCountSupportDeltaBytesAlloc(scratch_alloc, old_support, delta);
+            support_mutations += 1;
+            staged_bytes +|= @as(u64, @intCast(pending.key.len));
             if (support_mutation.encoded) |encoded_support| {
-                try txn.put(pending.key, encoded_support);
+                try mutations.append(scratch_alloc, .{ .put = .{
+                    .key = pending.key,
+                    .value = encoded_support,
+                } });
+                put_mutations += 1;
+                staged_bytes +|= @as(u64, @intCast(encoded_support.len));
             } else {
-                txn.delete(pending.key) catch |err| switch (err) {
-                    error.NotFound => {},
-                    else => return err,
-                };
+                try mutations.append(scratch_alloc, .{ .delete = .{
+                    .key = pending.key,
+                    .ignore_missing = true,
+                } });
+                delete_mutations += 1;
             }
         }
 
@@ -15335,14 +16291,14 @@ pub const Index = struct {
                 else => return err,
             };
             var deltas = std.ArrayListUnmanaged(tensor_mod.SlotDelta).empty;
-            defer deltas.deinit(self.alloc);
-            const pending_slots = try pending.slotDeltasAlloc(self.alloc);
+            defer deltas.deinit(scratch_alloc);
+            const pending_slots = try pending.slotDeltasAlloc(scratch_alloc);
             defer {
-                for (pending_slots) |*slot| slot.deinit(self.alloc);
-                if (pending_slots.len > 0) self.alloc.free(pending_slots);
+                for (pending_slots) |*slot| slot.deinit(scratch_alloc);
+                if (pending_slots.len > 0) scratch_alloc.free(pending_slots);
             }
             for (pending_slots) |pending_slot| {
-                try deltas.append(self.alloc, .{
+                try deltas.append(scratch_alloc, .{
                     .slot_idx = pending_slot.slot_idx,
                     .law_id = pending_slot.law_id,
                     .delta = pending_slot.delta,
@@ -15350,28 +16306,71 @@ pub const Index = struct {
             }
             if (deltas.items.len == 0) continue;
 
-            const encoded = try tensor_mod.applyRowSlotsToBytesAlloc(self.alloc, old_row, pending.law_ids, deltas.items, omit_empty_rows);
+            const encoded = try tensor_mod.applyRowSlotsToBytesAlloc(scratch_alloc, old_row, pending.law_ids, deltas.items, omit_empty_rows);
+            expression_mutations += 1;
+            staged_bytes +|= @as(u64, @intCast(pending.key.len));
             if (encoded) |bytes| {
-                defer self.alloc.free(bytes);
-                try txn.put(pending.key, bytes);
+                try mutations.append(scratch_alloc, .{ .put = .{
+                    .key = pending.key,
+                    .value = bytes,
+                } });
+                put_mutations += 1;
+                staged_bytes +|= @as(u64, @intCast(bytes.len));
             } else {
-                txn.delete(pending.key) catch |err| switch (err) {
-                    error.NotFound => {},
-                    else => return err,
-                };
+                try mutations.append(scratch_alloc, .{ .delete = .{
+                    .key = pending.key,
+                    .ignore_missing = true,
+                } });
+                delete_mutations += 1;
             }
         }
+        var final_it = accumulator.final_mutations.iterator();
+        while (final_it.next()) |entry| {
+            const pending = entry.value_ptr;
+            switch (pending.kind) {
+                .expression => expression_mutations += 1,
+                .support => support_mutations += 1,
+                .cache => cache_mutations += 1,
+            }
+            staged_bytes +|= @as(u64, @intCast(pending.key.len));
+            if (pending.value) |value| {
+                try mutations.append(scratch_alloc, .{ .put = .{
+                    .key = pending.key,
+                    .value = value,
+                } });
+                put_mutations += 1;
+                staged_bytes +|= @as(u64, @intCast(value.len));
+            } else {
+                try mutations.append(scratch_alloc, .{ .delete = .{
+                    .key = pending.key,
+                    .ignore_missing = true,
+                } });
+                delete_mutations += 1;
+            }
+        }
+        if (mutations.items.len == 0) return;
+        try txn.applyMutations(mutations.items);
+        self.tensor_mutation_batch_count += 1;
+        self.tensor_mutation_put_count +|= put_mutations;
+        self.tensor_mutation_delete_count +|= delete_mutations;
+        self.tensor_expression_mutation_count +|= expression_mutations;
+        self.tensor_support_mutation_count +|= support_mutations;
+        self.tensor_cache_mutation_count +|= cache_mutations;
+        self.tensor_mutation_staged_bytes +|= staged_bytes;
     }
 
     fn minMaxCacheKeyAlloc(self: *Index, expr_id: []const u8, support_group_id: []const u8) ![]u8 {
         return try self.keyAlloc(&.{ "minmax_cache", expr_id, support_group_id });
     }
 
-    fn readMinMaxCandidatesAlloc(self: *Index, txn: anytype, cache_key: []const u8) ![]MinMaxCandidate {
-        const raw = txn.get(cache_key) catch |err| switch (err) {
-            error.NotFound => return try self.alloc.alloc(MinMaxCandidate, 0),
-            else => return err,
-        };
+    fn readMinMaxCandidatesAlloc(self: *Index, txn: anytype, accumulator: ?*AppendOnlyAccumulator, cache_key: []const u8) ![]MinMaxCandidate {
+        const raw = if (accumulator) |pending|
+            (try pending.getWithOverlay(txn, cache_key)) orelse return try self.alloc.alloc(MinMaxCandidate, 0)
+        else
+            txn.get(cache_key) catch |err| switch (err) {
+                error.NotFound => return try self.alloc.alloc(MinMaxCandidate, 0),
+                else => return err,
+            };
         const decoded = try token.decodeTupleAlloc(self.alloc, raw);
         defer if (decoded.len > 0) self.alloc.free(decoded);
         var out = std.ArrayListUnmanaged(MinMaxCandidate).empty;
@@ -15403,7 +16402,7 @@ pub const Index = struct {
         if (candidates.len > 0) self.alloc.free(candidates);
     }
 
-    fn writeMinMaxCandidates(self: *Index, txn: anytype, cache_key: []const u8, candidates: []const MinMaxCandidate, limit: usize) !void {
+    fn writeMinMaxCandidates(self: *Index, txn: anytype, accumulator: ?*AppendOnlyAccumulator, cache_key: []const u8, candidates: []const MinMaxCandidate, limit: usize) !void {
         if (limit == 0 or candidates.len == 0) return;
         const kept = @min(limit, candidates.len);
         const parts = try self.alloc.alloc([]const u8, kept);
@@ -15411,6 +16410,7 @@ pub const Index = struct {
         for (parts, 0..) |*part, i| part.* = candidates[i].support_token;
         const encoded = try token.canonicalTupleAlloc(self.alloc, parts);
         defer self.alloc.free(encoded);
+        if (accumulator) |pending| return try pending.stageMutation(self.alloc, cache_key, encoded, .cache);
         try txn.put(cache_key, encoded);
     }
 
@@ -15426,6 +16426,7 @@ pub const Index = struct {
     fn updateMinMaxCandidateCache(
         self: *Index,
         txn: anytype,
+        accumulator: ?*AppendOnlyAccumulator,
         expr_id: []const u8,
         support_group_id: []const u8,
         op: algebra.Op,
@@ -15435,7 +16436,7 @@ pub const Index = struct {
         if (limit == 0) return;
         const cache_key = try self.minMaxCacheKeyAlloc(expr_id, support_group_id);
         defer self.alloc.free(cache_key);
-        var candidates = try self.readMinMaxCandidatesAlloc(txn, cache_key);
+        var candidates = try self.readMinMaxCandidatesAlloc(txn, accumulator, cache_key);
         defer self.freeMinMaxCandidates(candidates);
 
         var exists = false;
@@ -15455,12 +16456,13 @@ pub const Index = struct {
             };
         }
         self.sortMinMaxCandidates(candidates, op);
-        try self.writeMinMaxCandidates(txn, cache_key, candidates, limit);
+        try self.writeMinMaxCandidates(txn, accumulator, cache_key, candidates, limit);
     }
 
     fn cachedMinMaxCandidateAlloc(
         self: *Index,
         txn: anytype,
+        accumulator: ?*AppendOnlyAccumulator,
         expr_id: []const u8,
         support_group_id: []const u8,
         op: algebra.Op,
@@ -15472,7 +16474,7 @@ pub const Index = struct {
         }
         const cache_key = try self.minMaxCacheKeyAlloc(expr_id, support_group_id);
         defer self.alloc.free(cache_key);
-        const candidates = try self.readMinMaxCandidatesAlloc(txn, cache_key);
+        const candidates = try self.readMinMaxCandidatesAlloc(txn, accumulator, cache_key);
         defer self.freeMinMaxCandidates(candidates);
         self.sortMinMaxCandidates(candidates, op);
         for (candidates) |candidate| {
@@ -15480,10 +16482,13 @@ pub const Index = struct {
             defer self.alloc.free(measure_id);
             const support_key = try self.keyAlloc(&.{ "minmax", expr_id, support_group_id, measure_id });
             defer self.alloc.free(support_key);
-            const support = txn.get(support_key) catch |err| switch (err) {
-                error.NotFound => continue,
-                else => return err,
-            };
+            const support = if (accumulator) |pending|
+                (try pending.getWithOverlay(txn, support_key)) orelse continue
+            else
+                txn.get(support_key) catch |err| switch (err) {
+                    error.NotFound => continue,
+                    else => return err,
+                };
             if ((try tensor_mod.countSupportValueAlloc(self.alloc, support)) <= 0) continue;
             self.minmax_cache_hits += 1;
             return try self.alloc.dupe(u8, candidate.raw);
@@ -15495,6 +16500,7 @@ pub const Index = struct {
     fn updateMinMaxExpressionCurrent(
         self: *Index,
         txn: anytype,
+        accumulator: ?*AppendOnlyAccumulator,
         expr_id: []const u8,
         support_group_key: []const u8,
         op: algebra.Op,
@@ -15508,21 +16514,30 @@ pub const Index = struct {
         defer self.alloc.free(measure_id);
         const support_key = try self.keyAlloc(&.{ "minmax", expr_id, support_group_id, measure_id });
         defer self.alloc.free(support_key);
-        const old_support = txn.get(support_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
+        const old_support = if (accumulator) |pending|
+            try pending.getWithOverlay(txn, support_key)
+        else
+            txn.get(support_key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
         var support_mutation = try tensor_mod.applyCountSupportDeltaAlloc(self.alloc, old_support, sign);
         defer support_mutation.deinit(self.alloc);
         if (support_mutation.encoded) |encoded_support| {
-            try txn.put(support_key, encoded_support);
+            if (accumulator) |pending|
+                try pending.stageMutation(self.alloc, support_key, encoded_support, .support)
+            else
+                try txn.put(support_key, encoded_support);
         } else {
-            txn.delete(support_key) catch |err| switch (err) {
-                error.NotFound => {},
-                else => return err,
-            };
+            if (accumulator) |pending|
+                try pending.stageMutation(self.alloc, support_key, null, .support)
+            else
+                txn.delete(support_key) catch |err| switch (err) {
+                    error.NotFound => {},
+                    else => return err,
+                };
         }
-        if (sign > 0) try self.updateMinMaxCandidateCache(txn, expr_id, support_group_id, op, measure);
+        if (sign > 0) try self.updateMinMaxCandidateCache(txn, accumulator, expr_id, support_group_id, op, measure);
 
         const measure_f = try algebra.parseF64(measure.raw);
         if (sign > 0) {
@@ -15537,13 +16552,14 @@ pub const Index = struct {
         const old_current = if (old_current_raw) |old_raw| try algebra.parseF64(old_raw) else return null;
         if (old_current != measure_f) return try self.alloc.dupe(u8, old_current_raw.?);
         if (support_mutation.next_count > 0) return try self.alloc.dupe(u8, old_current_raw.?);
-        if (try self.cachedMinMaxCandidateAlloc(txn, expr_id, support_group_id, op)) |cached| return cached;
-        return try self.scanMinMaxSupport(txn, expr_id, support_group_id, op);
+        if (try self.cachedMinMaxCandidateAlloc(txn, accumulator, expr_id, support_group_id, op)) |cached| return cached;
+        return try self.scanMinMaxSupport(txn, accumulator, expr_id, support_group_id, op);
     }
 
     fn scanMinMaxSupport(
         self: *Index,
         txn: anytype,
+        accumulator: ?*AppendOnlyAccumulator,
         expr_id: []const u8,
         support_group_id: []const u8,
         op: algebra.Op,
@@ -15565,7 +16581,11 @@ pub const Index = struct {
         var entry_opt = try cursor.seekAtOrAfter(prefix);
         while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
             if (!std.mem.startsWith(u8, entry.key, prefix)) break;
-            if ((try tensor_mod.countSupportValueAlloc(self.alloc, entry.value)) <= 0) continue;
+            const support = if (accumulator) |pending|
+                (try pending.getWithOverlay(txn, entry.key)) orelse continue
+            else
+                entry.value;
+            if ((try tensor_mod.countSupportValueAlloc(self.alloc, support)) <= 0) continue;
             const component = token.componentAt(entry.key, prefix.len) catch continue;
             if (component.next != entry.key.len) continue;
             const measure_token = (try symbols.resolve(self, txn, component.payload)) orelse continue;
@@ -15593,7 +16613,7 @@ pub const Index = struct {
             self.sortMinMaxCandidates(candidates.items, op);
             const cache_key = try self.minMaxCacheKeyAlloc(expr_id, support_group_id);
             defer self.alloc.free(cache_key);
-            try self.writeMinMaxCandidates(txn, cache_key, candidates.items, self.minMaxCandidateCacheSize());
+            try self.writeMinMaxCandidates(txn, accumulator, cache_key, candidates.items, self.minMaxCandidateCacheSize());
         }
         return best_raw;
     }
@@ -15682,7 +16702,7 @@ pub const Index = struct {
         try self.updatePathFactRowsCoalesced(txn, path_key, old_path_payload, old_projection.facts, new_path_payload, new_projection.facts, doc_key);
 
         if (self.shouldMaintainPathProfiles() and path_profiles_changed) {
-            try self.applyPathProfileDelta(txn, old_projection.profiles, -1);
+            try self.applyPathProfileDelta(txn, old_projection.profiles, -1, maintenance_context);
         }
         if (doc_facts_changed) {
             try self.applyDocFactDelta(txn, doc_key, old_facts.facts, -1);
@@ -15698,7 +16718,7 @@ pub const Index = struct {
         }
 
         if (self.shouldMaintainPathProfiles() and path_profiles_changed) {
-            try self.applyPathProfileDelta(txn, new_projection.profiles, 1);
+            try self.applyPathProfileDelta(txn, new_projection.profiles, 1, maintenance_context);
         }
         if (path_facts_changed) {
             try self.applyReadyPathPromotionAddedDelta(txn, doc_key, old_projection.facts, new_projection.facts, maintenance_context);
@@ -15753,6 +16773,64 @@ pub const Index = struct {
         return facts;
     }
 
+    fn upsertBaseDocFactRowsTxn(self: *Index, txn: anytype, doc_key: []const u8, root: std.json.Value) !void {
+        var facts = try self.projectAllDocFactsAlloc(root);
+        defer facts.deinit(self.alloc);
+        const encoded = try fact_mod.encodeListAlloc(self.alloc, facts.facts);
+        defer self.alloc.free(encoded);
+        const fact_key = try self.docFactKey(doc_key);
+        defer self.alloc.free(fact_key);
+
+        const old_payload = txn.get(fact_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (old_payload) |payload| {
+            var old_facts = fact_mod.decodeListAlloc(self.alloc, payload) catch return error.MalformedAlgebraicFactRow;
+            defer old_facts.deinit(self.alloc);
+            try self.updateDocFactRowsCoalesced(txn, fact_key, payload, old_facts.facts, encoded, facts.facts, doc_key);
+            return;
+        }
+        try txn.put(fact_key, encoded);
+        try self.writeDocFactLookupRows(txn, doc_key, facts.facts);
+    }
+
+    fn upsertBasePathFactRowsTxn(self: *Index, txn: anytype, doc_key: []const u8, root: std.json.Value) !void {
+        var projection = try pathfact_mod.projectJsonValueAlloc(self.alloc, root);
+        defer projection.deinit(self.alloc);
+        const encoded = try pathfact_mod.encodeProjectionAlloc(self.alloc, projection);
+        defer self.alloc.free(encoded);
+        const path_key = try self.pathFactKey(doc_key);
+        defer self.alloc.free(path_key);
+
+        const old_payload = txn.get(path_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (old_payload) |payload| {
+            var old_projection = pathfact_mod.decodeProjectionAlloc(self.alloc, payload) catch return error.MalformedAlgebraicPathRow;
+            defer old_projection.deinit(self.alloc);
+            const facts_changed = !pathFactListsEqual(old_projection.facts, projection.facts);
+            const profiles_changed = !pathProfileListsEqual(old_projection.profiles, projection.profiles);
+            if (facts_changed) {
+                try self.updatePathFactRowsCoalesced(txn, path_key, payload, old_projection.facts, encoded, projection.facts, doc_key);
+            } else if (!std.mem.eql(u8, payload, encoded)) {
+                try txn.put(path_key, encoded);
+                try self.writePathFactOrdinalIfAvailableTxn(txn, doc_key, encoded);
+            }
+            if (self.shouldMaintainPathProfiles() and profiles_changed) {
+                try self.applyPathProfileDelta(txn, old_projection.profiles, -1, null);
+                try self.applyPathProfileDelta(txn, projection.profiles, 1, null);
+            }
+            return;
+        }
+
+        try txn.put(path_key, encoded);
+        try self.writePathFactOrdinalIfAvailableTxn(txn, doc_key, encoded);
+        try self.writePathFactLookupRows(txn, doc_key, projection.facts);
+        if (self.shouldMaintainPathProfiles()) try self.applyPathProfileDelta(txn, projection.profiles, 1, null);
+    }
+
     fn writeDocFacts(self: *Index, txn: anytype, doc_key: []const u8, value: []const u8, maintenance_context: ?*BatchMaintenanceContext) !void {
         var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, value, .{}) catch return;
         defer parsed.deinit();
@@ -15776,17 +16854,36 @@ pub const Index = struct {
     }
 
     fn writeDocFactLookupRows(self: *Index, txn: anytype, doc_key: []const u8, facts: []const fact_mod.Fact) !void {
+        var scratch = std.heap.stackFallback(32 * 1024, self.alloc);
+        var arena = std.heap.ArenaAllocator.init(scratch.get());
+        defer arena.deinit();
+        const scratch_alloc = arena.allocator();
+        var mutations = std.ArrayListUnmanaged(backend_types.KeyMutation).empty;
+        defer mutations.deinit(scratch_alloc);
+        try mutations.ensureTotalCapacity(scratch_alloc, facts.len * 4);
+        const ordinal = try doc_identity.lookupOrdinalTxn(scratch_alloc, txn, doc_key);
         for (facts) |fact| {
-            const scalar_key = try self.docFactScalarKeyAlloc(fact.role, fact.field, fact.scalar, doc_key);
-            defer self.alloc.free(scalar_key);
-            try txn.put(scalar_key, "");
-            try self.writeDocFactScalarOrdinalIfAvailableTxn(txn, fact.role, fact.field, fact.scalar, doc_key);
-
-            const field_key = try self.docFactFieldKeyAlloc(fact.role, fact.field, doc_key);
-            defer self.alloc.free(field_key);
-            try txn.put(field_key, "");
-            try self.writeDocFactFieldOrdinalIfAvailableTxn(txn, fact.role, fact.field, doc_key);
+            try mutations.append(scratch_alloc, .{ .put = .{
+                .key = try self.keyAllocWithAllocator(scratch_alloc, &.{ "docfact_scalar", @tagName(fact.role), fact.field, fact.scalar, doc_key }),
+                .value = "",
+            } });
+            try mutations.append(scratch_alloc, .{ .put = .{
+                .key = try self.keyAllocWithAllocator(scratch_alloc, &.{ "docfact_field", @tagName(fact.role), fact.field, doc_key }),
+                .value = "",
+            } });
+            if (ordinal) |doc_ordinal| {
+                const ordinal_component = ordinalComponent(doc_ordinal);
+                try mutations.append(scratch_alloc, .{ .put = .{
+                    .key = try self.keyAllocWithAllocator(scratch_alloc, &.{ "docfact_scalar_ord", @tagName(fact.role), fact.field, fact.scalar, ordinal_component[0..] }),
+                    .value = "",
+                } });
+                try mutations.append(scratch_alloc, .{ .put = .{
+                    .key = try self.keyAllocWithAllocator(scratch_alloc, &.{ "docfact_field_ord", @tagName(fact.role), fact.field, ordinal_component[0..] }),
+                    .value = "",
+                } });
+            }
         }
+        if (mutations.items.len > 0) try txn.applyMutations(mutations.items);
     }
 
     fn updateDocFactRowsCoalesced(
@@ -15812,60 +16909,104 @@ pub const Index = struct {
         old_facts: []const fact_mod.Fact,
         new_facts: []const fact_mod.Fact,
     ) !void {
+        var scratch = std.heap.stackFallback(32 * 1024, self.alloc);
+        var arena = std.heap.ArenaAllocator.init(scratch.get());
+        defer arena.deinit();
+        const scratch_alloc = arena.allocator();
+        var mutations = std.ArrayListUnmanaged(backend_types.KeyMutation).empty;
+        defer mutations.deinit(scratch_alloc);
+        try mutations.ensureTotalCapacity(scratch_alloc, (old_facts.len + new_facts.len) * 4);
+        const ordinal = try doc_identity.lookupOrdinalTxn(scratch_alloc, txn, doc_key);
         for (old_facts) |old_fact| {
             if (!docFactListContainsExact(new_facts, old_fact)) {
-                const scalar_key = try self.docFactScalarKeyAlloc(old_fact.role, old_fact.field, old_fact.scalar, doc_key);
-                defer self.alloc.free(scalar_key);
-                txn.delete(scalar_key) catch |err| switch (err) {
-                    error.NotFound => {},
-                    else => return err,
-                };
-                try self.deleteDocFactScalarOrdinalIfAvailableTxn(txn, old_fact.role, old_fact.field, old_fact.scalar, doc_key);
+                try mutations.append(scratch_alloc, .{ .delete = .{
+                    .key = try self.keyAllocWithAllocator(scratch_alloc, &.{ "docfact_scalar", @tagName(old_fact.role), old_fact.field, old_fact.scalar, doc_key }),
+                    .ignore_missing = true,
+                } });
+                if (ordinal) |doc_ordinal| {
+                    const ordinal_component = ordinalComponent(doc_ordinal);
+                    try mutations.append(scratch_alloc, .{ .delete = .{
+                        .key = try self.keyAllocWithAllocator(scratch_alloc, &.{ "docfact_scalar_ord", @tagName(old_fact.role), old_fact.field, old_fact.scalar, ordinal_component[0..] }),
+                        .ignore_missing = true,
+                    } });
+                }
             }
             if (!docFactListContainsField(new_facts, old_fact.role, old_fact.field)) {
-                const field_key = try self.docFactFieldKeyAlloc(old_fact.role, old_fact.field, doc_key);
-                defer self.alloc.free(field_key);
-                txn.delete(field_key) catch |err| switch (err) {
-                    error.NotFound => {},
-                    else => return err,
-                };
-                try self.deleteDocFactFieldOrdinalIfAvailableTxn(txn, old_fact.role, old_fact.field, doc_key);
+                try mutations.append(scratch_alloc, .{ .delete = .{
+                    .key = try self.keyAllocWithAllocator(scratch_alloc, &.{ "docfact_field", @tagName(old_fact.role), old_fact.field, doc_key }),
+                    .ignore_missing = true,
+                } });
+                if (ordinal) |doc_ordinal| {
+                    const ordinal_component = ordinalComponent(doc_ordinal);
+                    try mutations.append(scratch_alloc, .{ .delete = .{
+                        .key = try self.keyAllocWithAllocator(scratch_alloc, &.{ "docfact_field_ord", @tagName(old_fact.role), old_fact.field, ordinal_component[0..] }),
+                        .ignore_missing = true,
+                    } });
+                }
             }
         }
         for (new_facts) |new_fact| {
             if (!docFactListContainsExact(old_facts, new_fact)) {
-                const scalar_key = try self.docFactScalarKeyAlloc(new_fact.role, new_fact.field, new_fact.scalar, doc_key);
-                defer self.alloc.free(scalar_key);
-                try txn.put(scalar_key, "");
-                try self.writeDocFactScalarOrdinalIfAvailableTxn(txn, new_fact.role, new_fact.field, new_fact.scalar, doc_key);
+                try mutations.append(scratch_alloc, .{ .put = .{
+                    .key = try self.keyAllocWithAllocator(scratch_alloc, &.{ "docfact_scalar", @tagName(new_fact.role), new_fact.field, new_fact.scalar, doc_key }),
+                    .value = "",
+                } });
+                if (ordinal) |doc_ordinal| {
+                    const ordinal_component = ordinalComponent(doc_ordinal);
+                    try mutations.append(scratch_alloc, .{ .put = .{
+                        .key = try self.keyAllocWithAllocator(scratch_alloc, &.{ "docfact_scalar_ord", @tagName(new_fact.role), new_fact.field, new_fact.scalar, ordinal_component[0..] }),
+                        .value = "",
+                    } });
+                }
             }
             if (!docFactListContainsField(old_facts, new_fact.role, new_fact.field)) {
-                const field_key = try self.docFactFieldKeyAlloc(new_fact.role, new_fact.field, doc_key);
-                defer self.alloc.free(field_key);
-                try txn.put(field_key, "");
-                try self.writeDocFactFieldOrdinalIfAvailableTxn(txn, new_fact.role, new_fact.field, doc_key);
+                try mutations.append(scratch_alloc, .{ .put = .{
+                    .key = try self.keyAllocWithAllocator(scratch_alloc, &.{ "docfact_field", @tagName(new_fact.role), new_fact.field, doc_key }),
+                    .value = "",
+                } });
+                if (ordinal) |doc_ordinal| {
+                    const ordinal_component = ordinalComponent(doc_ordinal);
+                    try mutations.append(scratch_alloc, .{ .put = .{
+                        .key = try self.keyAllocWithAllocator(scratch_alloc, &.{ "docfact_field_ord", @tagName(new_fact.role), new_fact.field, ordinal_component[0..] }),
+                        .value = "",
+                    } });
+                }
             }
         }
+        if (mutations.items.len > 0) try txn.applyMutations(mutations.items);
     }
 
     fn deleteDocFactLookupRows(self: *Index, txn: anytype, doc_key: []const u8, facts: []const fact_mod.Fact) !void {
+        var scratch = std.heap.stackFallback(32 * 1024, self.alloc);
+        var arena = std.heap.ArenaAllocator.init(scratch.get());
+        defer arena.deinit();
+        const scratch_alloc = arena.allocator();
+        var mutations = std.ArrayListUnmanaged(backend_types.KeyMutation).empty;
+        defer mutations.deinit(scratch_alloc);
+        try mutations.ensureTotalCapacity(scratch_alloc, facts.len * 4);
+        const ordinal = try doc_identity.lookupOrdinalTxn(scratch_alloc, txn, doc_key);
         for (facts) |fact| {
-            const scalar_key = try self.docFactScalarKeyAlloc(fact.role, fact.field, fact.scalar, doc_key);
-            defer self.alloc.free(scalar_key);
-            txn.delete(scalar_key) catch |err| switch (err) {
-                error.NotFound => {},
-                else => return err,
-            };
-            try self.deleteDocFactScalarOrdinalIfAvailableTxn(txn, fact.role, fact.field, fact.scalar, doc_key);
-
-            const field_key = try self.docFactFieldKeyAlloc(fact.role, fact.field, doc_key);
-            defer self.alloc.free(field_key);
-            txn.delete(field_key) catch |err| switch (err) {
-                error.NotFound => {},
-                else => return err,
-            };
-            try self.deleteDocFactFieldOrdinalIfAvailableTxn(txn, fact.role, fact.field, doc_key);
+            try mutations.append(scratch_alloc, .{ .delete = .{
+                .key = try self.keyAllocWithAllocator(scratch_alloc, &.{ "docfact_scalar", @tagName(fact.role), fact.field, fact.scalar, doc_key }),
+                .ignore_missing = true,
+            } });
+            try mutations.append(scratch_alloc, .{ .delete = .{
+                .key = try self.keyAllocWithAllocator(scratch_alloc, &.{ "docfact_field", @tagName(fact.role), fact.field, doc_key }),
+                .ignore_missing = true,
+            } });
+            if (ordinal) |doc_ordinal| {
+                const ordinal_component = ordinalComponent(doc_ordinal);
+                try mutations.append(scratch_alloc, .{ .delete = .{
+                    .key = try self.keyAllocWithAllocator(scratch_alloc, &.{ "docfact_scalar_ord", @tagName(fact.role), fact.field, fact.scalar, ordinal_component[0..] }),
+                    .ignore_missing = true,
+                } });
+                try mutations.append(scratch_alloc, .{ .delete = .{
+                    .key = try self.keyAllocWithAllocator(scratch_alloc, &.{ "docfact_field_ord", @tagName(fact.role), fact.field, ordinal_component[0..] }),
+                    .ignore_missing = true,
+                } });
+            }
         }
+        if (mutations.items.len > 0) try txn.applyMutations(mutations.items);
     }
 
     fn writeDocFactScalarOrdinalIfAvailableTxn(
@@ -15939,9 +17080,10 @@ pub const Index = struct {
         try self.writePathFactOrdinalIfAvailableTxn(txn, doc_key, encoded);
         try self.writePathFactLookupRows(txn, doc_key, projection.facts);
         if (self.shouldMaintainPathProfiles()) {
-            try self.applyPathProfileDelta(txn, projection.profiles, 1);
+            try self.applyPathProfileDelta(txn, projection.profiles, 1, maintenance_context);
         }
         try self.applyReadyPathPromotionDelta(txn, doc_key, projection.facts, 1, maintenance_context);
+        try self.applyReadyGenerationDictionaryDeltaTxn(txn, doc_key, projection.facts, 1);
     }
 
     fn writePathFactOrdinalIfAvailableTxn(self: *Index, txn: anytype, doc_key: []const u8, payload: []const u8) !void {
@@ -15962,17 +17104,28 @@ pub const Index = struct {
     }
 
     fn writePathFactLookupRows(self: *Index, txn: anytype, doc_key: []const u8, facts: []const pathfact_mod.Fact) !void {
-        const ordinal = try doc_identity.lookupOrdinalTxn(self.alloc, txn, doc_key);
+        var scratch = std.heap.stackFallback(32 * 1024, self.alloc);
+        var arena = std.heap.ArenaAllocator.init(scratch.get());
+        defer arena.deinit();
+        const scratch_alloc = arena.allocator();
+        var mutations = std.ArrayListUnmanaged(backend_types.KeyMutation).empty;
+        defer mutations.deinit(scratch_alloc);
+        try mutations.ensureTotalCapacity(scratch_alloc, facts.len * 2);
+        const ordinal = try doc_identity.lookupOrdinalTxn(scratch_alloc, txn, doc_key);
         for (facts) |fact| {
-            const lookup_key = try self.pathLookupKeyAlloc(fact.path, fact.kind, fact.value, doc_key);
-            defer self.alloc.free(lookup_key);
-            try txn.put(lookup_key, "");
+            try mutations.append(scratch_alloc, .{ .put = .{
+                .key = try self.keyAllocWithAllocator(scratch_alloc, &.{ "path_lookup", fact.path, fact.kind.tag(), fact.value, doc_key }),
+                .value = "",
+            } });
             if (ordinal) |doc_ordinal| {
-                const ordinal_key = try self.pathLookupOrdinalKeyAlloc(fact.path, fact.kind, fact.value, doc_ordinal);
-                defer self.alloc.free(ordinal_key);
-                try txn.put(ordinal_key, "");
+                const ordinal_component = ordinalComponent(doc_ordinal);
+                try mutations.append(scratch_alloc, .{ .put = .{
+                    .key = try self.keyAllocWithAllocator(scratch_alloc, &.{ "path_lookup_ord", fact.path, fact.kind.tag(), fact.value, ordinal_component[0..] }),
+                    .value = "",
+                } });
             }
         }
+        if (mutations.items.len > 0) try txn.applyMutations(mutations.items);
     }
 
     fn updatePathFactRowsCoalesced(
@@ -15999,35 +17152,43 @@ pub const Index = struct {
         old_facts: []const pathfact_mod.Fact,
         new_facts: []const pathfact_mod.Fact,
     ) !void {
-        const ordinal = try doc_identity.lookupOrdinalTxn(self.alloc, txn, doc_key);
+        var scratch = std.heap.stackFallback(32 * 1024, self.alloc);
+        var arena = std.heap.ArenaAllocator.init(scratch.get());
+        defer arena.deinit();
+        const scratch_alloc = arena.allocator();
+        var mutations = std.ArrayListUnmanaged(backend_types.KeyMutation).empty;
+        defer mutations.deinit(scratch_alloc);
+        try mutations.ensureTotalCapacity(scratch_alloc, (old_facts.len + new_facts.len) * 2);
+        const ordinal = try doc_identity.lookupOrdinalTxn(scratch_alloc, txn, doc_key);
         for (old_facts) |old_fact| {
             if (pathFactListContainsExact(new_facts, old_fact)) continue;
-            const lookup_key = try self.pathLookupKeyAlloc(old_fact.path, old_fact.kind, old_fact.value, doc_key);
-            defer self.alloc.free(lookup_key);
-            txn.delete(lookup_key) catch |err| switch (err) {
-                error.NotFound => {},
-                else => return err,
-            };
+            try mutations.append(scratch_alloc, .{ .delete = .{
+                .key = try self.keyAllocWithAllocator(scratch_alloc, &.{ "path_lookup", old_fact.path, old_fact.kind.tag(), old_fact.value, doc_key }),
+                .ignore_missing = true,
+            } });
             if (ordinal) |doc_ordinal| {
-                const ordinal_key = try self.pathLookupOrdinalKeyAlloc(old_fact.path, old_fact.kind, old_fact.value, doc_ordinal);
-                defer self.alloc.free(ordinal_key);
-                txn.delete(ordinal_key) catch |err| switch (err) {
-                    error.NotFound => {},
-                    else => return err,
-                };
+                const ordinal_component = ordinalComponent(doc_ordinal);
+                try mutations.append(scratch_alloc, .{ .delete = .{
+                    .key = try self.keyAllocWithAllocator(scratch_alloc, &.{ "path_lookup_ord", old_fact.path, old_fact.kind.tag(), old_fact.value, ordinal_component[0..] }),
+                    .ignore_missing = true,
+                } });
             }
         }
         for (new_facts) |new_fact| {
             if (pathFactListContainsExact(old_facts, new_fact)) continue;
-            const lookup_key = try self.pathLookupKeyAlloc(new_fact.path, new_fact.kind, new_fact.value, doc_key);
-            defer self.alloc.free(lookup_key);
-            try txn.put(lookup_key, "");
+            try mutations.append(scratch_alloc, .{ .put = .{
+                .key = try self.keyAllocWithAllocator(scratch_alloc, &.{ "path_lookup", new_fact.path, new_fact.kind.tag(), new_fact.value, doc_key }),
+                .value = "",
+            } });
             if (ordinal) |doc_ordinal| {
-                const ordinal_key = try self.pathLookupOrdinalKeyAlloc(new_fact.path, new_fact.kind, new_fact.value, doc_ordinal);
-                defer self.alloc.free(ordinal_key);
-                try txn.put(ordinal_key, "");
+                const ordinal_component = ordinalComponent(doc_ordinal);
+                try mutations.append(scratch_alloc, .{ .put = .{
+                    .key = try self.keyAllocWithAllocator(scratch_alloc, &.{ "path_lookup_ord", new_fact.path, new_fact.kind.tag(), new_fact.value, ordinal_component[0..] }),
+                    .value = "",
+                } });
             }
         }
+        if (mutations.items.len > 0) try txn.applyMutations(mutations.items);
     }
 
     fn deletePathFacts(self: *Index, txn: anytype, doc_key: []const u8, maintenance_context: ?*BatchMaintenanceContext) !void {
@@ -16046,10 +17207,11 @@ pub const Index = struct {
             return;
         };
         defer projection.deinit(self.alloc);
+        try self.applyReadyGenerationDictionaryDeltaTxn(txn, doc_key, projection.facts, -1);
         try self.applyReadyPathPromotionDelta(txn, doc_key, projection.facts, -1, maintenance_context);
         try self.deletePathFactLookupRows(txn, doc_key, projection.facts);
         if (self.shouldMaintainPathProfiles()) {
-            try self.applyPathProfileDelta(txn, projection.profiles, -1);
+            try self.applyPathProfileDelta(txn, projection.profiles, -1, maintenance_context);
         }
         txn.delete(path_key) catch |err| switch (err) {
             error.NotFound => {},
@@ -16059,23 +17221,28 @@ pub const Index = struct {
     }
 
     fn deletePathFactLookupRows(self: *Index, txn: anytype, doc_key: []const u8, facts: []const pathfact_mod.Fact) !void {
-        const ordinal = try doc_identity.lookupOrdinalTxn(self.alloc, txn, doc_key);
+        var scratch = std.heap.stackFallback(32 * 1024, self.alloc);
+        var arena = std.heap.ArenaAllocator.init(scratch.get());
+        defer arena.deinit();
+        const scratch_alloc = arena.allocator();
+        var mutations = std.ArrayListUnmanaged(backend_types.KeyMutation).empty;
+        defer mutations.deinit(scratch_alloc);
+        try mutations.ensureTotalCapacity(scratch_alloc, facts.len * 2);
+        const ordinal = try doc_identity.lookupOrdinalTxn(scratch_alloc, txn, doc_key);
         for (facts) |fact| {
-            const lookup_key = try self.pathLookupKeyAlloc(fact.path, fact.kind, fact.value, doc_key);
-            defer self.alloc.free(lookup_key);
-            txn.delete(lookup_key) catch |err| switch (err) {
-                error.NotFound => {},
-                else => return err,
-            };
+            try mutations.append(scratch_alloc, .{ .delete = .{
+                .key = try self.keyAllocWithAllocator(scratch_alloc, &.{ "path_lookup", fact.path, fact.kind.tag(), fact.value, doc_key }),
+                .ignore_missing = true,
+            } });
             if (ordinal) |doc_ordinal| {
-                const ordinal_key = try self.pathLookupOrdinalKeyAlloc(fact.path, fact.kind, fact.value, doc_ordinal);
-                defer self.alloc.free(ordinal_key);
-                txn.delete(ordinal_key) catch |err| switch (err) {
-                    error.NotFound => {},
-                    else => return err,
-                };
+                const ordinal_component = ordinalComponent(doc_ordinal);
+                try mutations.append(scratch_alloc, .{ .delete = .{
+                    .key = try self.keyAllocWithAllocator(scratch_alloc, &.{ "path_lookup_ord", fact.path, fact.kind.tag(), fact.value, ordinal_component[0..] }),
+                    .ignore_missing = true,
+                } });
             }
         }
+        if (mutations.items.len > 0) try txn.applyMutations(mutations.items);
     }
 
     fn applyReadyPathPromotionDelta(
@@ -16118,6 +17285,7 @@ pub const Index = struct {
         defer if (changed.len > 0) self.alloc.free(changed);
         if (changed.len == 0) return;
         try self.applyReadyPathPromotionDelta(txn, doc_key, changed, -1, maintenance_context);
+        try self.applyReadyGenerationDictionaryDeltaTxn(txn, doc_key, changed, -1);
     }
 
     fn applyReadyPathPromotionAddedDelta(
@@ -16132,6 +17300,120 @@ pub const Index = struct {
         defer if (changed.len > 0) self.alloc.free(changed);
         if (changed.len == 0) return;
         try self.applyReadyPathPromotionDelta(txn, doc_key, changed, 1, maintenance_context);
+        try self.applyReadyGenerationDictionaryDeltaTxn(txn, doc_key, changed, 1);
+    }
+
+    fn applyReadyGenerationDictionaryDeltaTxn(
+        self: *Index,
+        txn: anytype,
+        doc_key: []const u8,
+        facts: []const pathfact_mod.Fact,
+        sign: i8,
+    ) !void {
+        var scratch = std.heap.stackFallback(32 * 1024, self.alloc);
+        var arena = std.heap.ArenaAllocator.init(scratch.get());
+        defer arena.deinit();
+        const scratch_alloc = arena.allocator();
+
+        const ready_key = try self.keyAllocWithAllocator(scratch_alloc, &.{ "dictionary_state", "ready" });
+        _ = txn.get(ready_key) catch |err| switch (err) {
+            error.NotFound => return,
+            else => return err,
+        };
+
+        var batch = ReadyDictionaryMutationBatch{};
+        defer batch.deinit(scratch_alloc);
+        try batch.mutations.ensureTotalCapacity(scratch_alloc, facts.len * 4);
+        try batch.kinds.ensureTotalCapacity(scratch_alloc, facts.len * 4);
+        const ordinal = try doc_identity.lookupOrdinalTxn(scratch_alloc, txn, doc_key);
+
+        for (facts) |fact| {
+            if (!pathLookupKindIsScalarValue(fact.kind.tag())) continue;
+            const identity = lexical_mod.DictionaryIdentity.canonicalScalar(self.name, fact.path, fact.kind, "json-scalar-v1", "kind-qualified");
+            const registry_key = try identity.registryKeyAlloc(scratch_alloc);
+            const registry_payload = try batch.getWithOverlay(txn, registry_key);
+            if (registry_payload) |payload| {
+                var registry = lexical_mod.RegistryEntry.decodeAlloc(scratch_alloc, payload) catch return error.InvalidDictionaryRegistryEntry;
+                defer registry.deinit(scratch_alloc);
+                if (registry.layout != .lexicon_postings_rows or
+                    !std.mem.eql(u8, registry.owner, self.name) or
+                    !std.mem.eql(u8, registry.state, "ready")) continue;
+            } else {
+                if (sign < 0) continue;
+                const payload = try (lexical_mod.RegistryEntry{
+                    .owner = self.name,
+                    .layout = .lexicon_postings_rows,
+                    .state = "ready",
+                }).encodeAlloc(scratch_alloc);
+                try batch.stagePut(scratch_alloc, registry_key, payload, .registry);
+            }
+
+            const posting_key = try self.pathDictionaryPostingsKeyAllocWithAllocator(scratch_alloc, identity, fact.value, doc_key);
+            if (sign > 0) {
+                const lexicon_key = try self.pathDictionaryLexiconKeyAllocWithAllocator(scratch_alloc, identity, fact.value);
+                try batch.stagePut(scratch_alloc, lexicon_key, "", .lexicon);
+                try batch.stagePut(scratch_alloc, posting_key, "", .posting);
+                if (ordinal) |doc_ordinal| {
+                    const ordinal_key = try self.pathDictionaryOrdinalPostingsKeyAllocWithAllocator(scratch_alloc, identity, fact.value, doc_ordinal);
+                    try batch.stagePut(scratch_alloc, ordinal_key, "", .ordinal_posting);
+                }
+            } else {
+                try batch.stageDelete(scratch_alloc, posting_key, .posting);
+                if (ordinal) |doc_ordinal| {
+                    const ordinal_key = try self.pathDictionaryOrdinalPostingsKeyAllocWithAllocator(scratch_alloc, identity, fact.value, doc_ordinal);
+                    try batch.stageDelete(scratch_alloc, ordinal_key, .ordinal_posting);
+                }
+                const postings_prefix = try self.pathDictionaryPostingsPrefixAllocWithAllocator(scratch_alloc, identity, fact.value);
+                if (!(try batch.prefixHasAnyWithOverlay(txn, postings_prefix))) {
+                    const lexicon_key = try self.pathDictionaryLexiconKeyAllocWithAllocator(scratch_alloc, identity, fact.value);
+                    try batch.stageDelete(scratch_alloc, lexicon_key, .lexicon);
+                }
+            }
+            const fst_key = try self.pathDictionaryFstKeyAllocWithAllocator(scratch_alloc, identity);
+            try batch.stageDelete(scratch_alloc, fst_key, .fst_invalidation);
+        }
+        try self.flushReadyDictionaryMutationBatchTxn(txn, &batch);
+    }
+
+    fn flushReadyDictionaryMutationBatchTxn(self: *Index, txn: anytype, batch: *const ReadyDictionaryMutationBatch) !void {
+        if (batch.mutations.items.len == 0) return;
+        var puts: u64 = 0;
+        var deletes: u64 = 0;
+        var registry: u64 = 0;
+        var lexicon: u64 = 0;
+        var postings: u64 = 0;
+        var ordinal_postings: u64 = 0;
+        var fst_invalidations: u64 = 0;
+        var staged_bytes: u64 = 0;
+        for (batch.mutations.items, batch.kinds.items) |mutation, kind| {
+            switch (mutation) {
+                .put => |put_mutation| {
+                    puts += 1;
+                    staged_bytes +|= @as(u64, @intCast(put_mutation.key.len + put_mutation.value.len));
+                },
+                .delete => |delete_mutation| {
+                    deletes += 1;
+                    staged_bytes +|= @as(u64, @intCast(delete_mutation.key.len));
+                },
+            }
+            switch (kind) {
+                .registry => registry += 1,
+                .lexicon => lexicon += 1,
+                .posting => postings += 1,
+                .ordinal_posting => ordinal_postings += 1,
+                .fst_invalidation => fst_invalidations += 1,
+            }
+        }
+        try txn.applyMutations(batch.mutations.items);
+        self.ready_dictionary_mutation_batch_count += 1;
+        self.ready_dictionary_mutation_put_count +|= puts;
+        self.ready_dictionary_mutation_delete_count +|= deletes;
+        self.ready_dictionary_registry_mutation_count +|= registry;
+        self.ready_dictionary_lexicon_mutation_count +|= lexicon;
+        self.ready_dictionary_posting_mutation_count +|= postings;
+        self.ready_dictionary_ordinal_posting_mutation_count +|= ordinal_postings;
+        self.ready_dictionary_fst_invalidation_count +|= fst_invalidations;
+        self.ready_dictionary_mutation_staged_bytes +|= staged_bytes;
     }
 
     fn changedPathFactsAlloc(self: *Index, source: []const pathfact_mod.Fact, comparison: []const pathfact_mod.Fact) ![]pathfact_mod.Fact {
@@ -16269,6 +17551,25 @@ pub const Index = struct {
     ) !void {
         const promoted_key = try self.promotedPathLookupKeyAlloc(spec.name, fact.path, fact.kind, fact.value, doc_key);
         defer self.alloc.free(promoted_key);
+        if (maintenance_context) |ctx| {
+            try ctx.mutations.stagePut(self.alloc, promoted_key, "", .promotion);
+            if (owns_dictionary) {
+                const identity = lexical_mod.DictionaryIdentity.canonicalScalar(self.name, fact.path, fact.kind, "json-scalar-v1", "kind-qualified");
+                const lexicon_key = try self.pathDictionaryLexiconKeyAlloc(identity, fact.value);
+                defer self.alloc.free(lexicon_key);
+                try ctx.mutations.stagePut(self.alloc, lexicon_key, "", .promotion);
+                const posting_key = try self.pathDictionaryPostingsKeyAlloc(identity, fact.value, doc_key);
+                defer self.alloc.free(posting_key);
+                try ctx.mutations.stagePut(self.alloc, posting_key, "", .promotion);
+                if (try doc_identity.lookupOrdinalTxn(self.alloc, txn, doc_key)) |ordinal| {
+                    const ordinal_key = try self.pathDictionaryOrdinalPostingsKeyAlloc(identity, fact.value, ordinal);
+                    defer self.alloc.free(ordinal_key);
+                    try ctx.mutations.stagePut(self.alloc, ordinal_key, "", .promotion);
+                }
+                try ctx.markPathPromotionDictionaryDirty(self.alloc, spec.name);
+            }
+            return;
+        }
         try txn.put(promoted_key, "");
         if (owns_dictionary) {
             const identity = lexical_mod.DictionaryIdentity.canonicalScalar(self.name, fact.path, fact.kind, "json-scalar-v1", "kind-qualified");
@@ -16294,6 +17595,29 @@ pub const Index = struct {
     ) !void {
         const promoted_key = try self.promotedPathLookupKeyAlloc(spec.name, fact.path, fact.kind, fact.value, doc_key);
         defer self.alloc.free(promoted_key);
+        if (maintenance_context) |ctx| {
+            try ctx.mutations.stageDelete(self.alloc, promoted_key, .promotion);
+            if (owns_dictionary) {
+                const identity = lexical_mod.DictionaryIdentity.canonicalScalar(self.name, fact.path, fact.kind, "json-scalar-v1", "kind-qualified");
+                const posting_key = try self.pathDictionaryPostingsKeyAlloc(identity, fact.value, doc_key);
+                defer self.alloc.free(posting_key);
+                try ctx.mutations.stageDelete(self.alloc, posting_key, .promotion);
+                if (try doc_identity.lookupOrdinalTxn(self.alloc, txn, doc_key)) |ordinal| {
+                    const ordinal_key = try self.pathDictionaryOrdinalPostingsKeyAlloc(identity, fact.value, ordinal);
+                    defer self.alloc.free(ordinal_key);
+                    try ctx.mutations.stageDelete(self.alloc, ordinal_key, .promotion);
+                }
+                const postings_prefix = try self.pathDictionaryPostingsPrefixAlloc(identity, fact.value);
+                defer self.alloc.free(postings_prefix);
+                if (!(try ctx.mutations.prefixHasAnyWithOverlay(txn, postings_prefix))) {
+                    const lexicon_key = try self.pathDictionaryLexiconKeyAlloc(identity, fact.value);
+                    defer self.alloc.free(lexicon_key);
+                    try ctx.mutations.stageDelete(self.alloc, lexicon_key, .promotion);
+                }
+                try ctx.markPathPromotionDictionaryDirty(self.alloc, spec.name);
+            }
+            return;
+        }
         txn.delete(promoted_key) catch |err| switch (err) {
             error.NotFound => {},
             else => return err,
@@ -16432,17 +17756,24 @@ pub const Index = struct {
         return if (entry) |found| std.mem.startsWith(u8, found.key, prefix) else false;
     }
 
-    fn applyPathProfileDelta(self: *Index, txn: anytype, profiles: []const pathfact_mod.PathProfile, direction: i8) !void {
+    fn applyPathProfileDelta(
+        self: *Index,
+        txn: anytype,
+        profiles: []const pathfact_mod.PathProfile,
+        direction: i8,
+        maintenance_context: ?*BatchMaintenanceContext,
+    ) !void {
+        var local_batch = AdaptiveMutationBatch{};
+        defer local_batch.deinit(self.alloc);
+        const mutations = if (maintenance_context) |ctx| &ctx.mutations else &local_batch;
         for (profiles) |delta| {
             const key = try self.pathProfileKeyAlloc(delta.path);
             defer self.alloc.free(key);
 
-            var current: pathfact_mod.PathProfile = if (txn.get(key)) |payload|
+            var current: pathfact_mod.PathProfile = if (try mutations.getWithOverlay(txn, key)) |payload|
                 try pathfact_mod.decodeProfileAlloc(self.alloc, delta.path, payload)
-            else |err| switch (err) {
-                error.NotFound => .{ .path = try self.alloc.dupe(u8, delta.path) },
-                else => return err,
-            };
+            else
+                .{ .path = try self.alloc.dupe(u8, delta.path) };
             defer current.deinit(self.alloc);
 
             if (direction > 0) {
@@ -16479,16 +17810,14 @@ pub const Index = struct {
             }
 
             if (current.empty()) {
-                txn.delete(key) catch |err| switch (err) {
-                    error.NotFound => {},
-                    else => return err,
-                };
+                try mutations.stageDelete(self.alloc, key, .path_profile);
             } else {
                 const encoded = try pathfact_mod.encodeProfileAlloc(self.alloc, current);
                 defer self.alloc.free(encoded);
-                try txn.put(key, encoded);
+                try mutations.stagePut(self.alloc, key, encoded, .path_profile);
             }
         }
+        if (maintenance_context == null) try self.flushAdaptiveMutationsTxn(txn, &local_batch);
     }
 
     fn recomputePathProfileMaxStringTokenCountTxn(self: *Index, txn: anytype, path: []const u8) !u32 {
@@ -16550,9 +17879,11 @@ pub const Index = struct {
             return;
         }
 
+        var tensor_accumulator = AppendOnlyAccumulator{};
+        defer tensor_accumulator.deinit(self.alloc);
         for (self.config().materializations) |mat| {
             if (mat.join == null) {
-                self.applyDirectMaterialization(txn, parsed.value, mat, sign) catch |err| switch (err) {
+                self.applyDirectMaterialization(txn, &tensor_accumulator, parsed.value, mat, sign) catch |err| switch (err) {
                     error.AlgebraicSymbolCollision => {
                         try self.recordError(doc_key, "symbol_collision");
                         return err;
@@ -16561,6 +17892,7 @@ pub const Index = struct {
                 };
             }
         }
+        try self.flushAccumulator(txn, &tensor_accumulator, true);
         // HLL cardinality sketches are maintained from the written facts in
         // writeDocFacts (add) / updateDocFactRowsCoalesced (update), not here, so
         // the incremental and rebuild tokenizations stay identical.
@@ -16595,9 +17927,11 @@ pub const Index = struct {
     }
 
     fn applyDocFactDelta(self: *Index, txn: anytype, doc_key: []const u8, facts: []const fact_mod.Fact, sign: i8) !void {
+        var tensor_accumulator = AppendOnlyAccumulator{};
+        defer tensor_accumulator.deinit(self.alloc);
         for (self.config().materializations) |mat| {
             if (mat.join != null) continue;
-            self.applyDirectMaterializationFromFacts(txn, facts, mat, sign) catch |err| switch (err) {
+            self.applyDirectMaterializationFromFacts(txn, &tensor_accumulator, facts, mat, sign) catch |err| switch (err) {
                 error.AlgebraicSymbolCollision => {
                     try self.recordError(doc_key, "symbol_collision");
                     return err;
@@ -16605,6 +17939,7 @@ pub const Index = struct {
                 else => return err,
             };
         }
+        try self.flushAccumulator(txn, &tensor_accumulator, true);
     }
 
     fn applyWrittenAdaptiveDocFactDelta(self: *Index, txn: anytype, doc_key: []const u8, sign: i8, maintenance_context: ?*BatchMaintenanceContext) !void {
@@ -16656,7 +17991,7 @@ pub const Index = struct {
                     self.updateAdaptiveTensorFromFacts(txn, spec, facts, sign);
                 update_result catch |err| switch (err) {
                     error.AlgebraicLawNotInvertible => {
-                        try self.markAdaptiveMaterializationStaleTxn(txn, spec.recommendation, spec.name);
+                        try self.markAdaptiveMaterializationStaleTxn(txn, spec.recommendation, spec.name, ctx);
                         try ctx.disable(self.alloc, spec.recommendation);
                         self.adaptive_maintenance_disabled_count += 1;
                         continue;
@@ -16682,7 +18017,7 @@ pub const Index = struct {
             if (spec.join != null) continue;
             self.updateAdaptiveTensorFromFacts(txn, spec, facts, sign) catch |err| switch (err) {
                 error.AlgebraicLawNotInvertible => {
-                    try self.markAdaptiveMaterializationStaleTxn(txn, progress.recommendation, progress.materialization_id);
+                    try self.markAdaptiveMaterializationStaleTxn(txn, progress.recommendation, progress.materialization_id, null);
                     continue;
                 },
                 error.MissingField => continue,
@@ -16704,7 +18039,7 @@ pub const Index = struct {
             if (spec.join != null) continue;
             self.updateAdaptiveTensorFromFactsAppendOnly(txn, accumulator, spec, facts) catch |err| switch (err) {
                 error.AlgebraicLawNotInvertible => {
-                    try self.markAdaptiveMaterializationStaleTxn(txn, spec.recommendation, spec.name);
+                    try self.markAdaptiveMaterializationStaleTxn(txn, spec.recommendation, spec.name, maintenance_context);
                     try maintenance_context.disable(self.alloc, spec.recommendation);
                     self.adaptive_maintenance_disabled_count += 1;
                     continue;
@@ -16926,7 +18261,14 @@ pub const Index = struct {
         }
     }
 
-    fn applyDirectMaterialization(self: *Index, txn: anytype, root: std.json.Value, mat: MaterializationConfig, sign: i8) !void {
+    fn applyDirectMaterialization(
+        self: *Index,
+        txn: anytype,
+        accumulator: *AppendOnlyAccumulator,
+        root: std.json.Value,
+        mat: MaterializationConfig,
+        sign: i8,
+    ) !void {
         const op = algebra.Op.parse(mat.op) orelse return;
         const group_key = self.groupKeyAlloc(root, mat.group_by) catch |err| switch (err) {
             error.MissingField => return,
@@ -16940,7 +18282,12 @@ pub const Index = struct {
             null;
         defer if (measure_value) |value| value.deinit(self.alloc);
 
-        if (mat.time == null) try self.applyConfiguredExpressionMutationTxn(txn, mat, op, group_key, measure_value, sign, .direct, null);
+        if (mat.time == null) {
+            if (law_mod.descriptor(self.materializationLawId(mat, op)).invertible)
+                try self.accumulateConfiguredExpressionDeltaTxn(txn, accumulator, mat, op, group_key, measure_value, sign, null)
+            else
+                try self.applyConfiguredExpressionMutationTxn(txn, accumulator, mat, op, group_key, measure_value, sign, .direct, null);
+        }
 
         if (mat.time) |time_name| {
             if (mat.bucket) |bucket_name| {
@@ -16949,7 +18296,10 @@ pub const Index = struct {
                 defer self.alloc.free(time_value);
                 const bucket_start = try cylinder.bucketStartAlloc(self.alloc, bucket, time_value);
                 defer self.alloc.free(bucket_start);
-                try self.applyConfiguredExpressionMutationTxn(txn, mat, op, group_key, measure_value, sign, .cylinder, bucket_start);
+                if (law_mod.descriptor(self.materializationLawId(mat, op)).invertible)
+                    try self.accumulateConfiguredExpressionDeltaTxn(txn, accumulator, mat, op, group_key, measure_value, sign, bucket_start)
+                else
+                    try self.applyConfiguredExpressionMutationTxn(txn, accumulator, mat, op, group_key, measure_value, sign, .cylinder, bucket_start);
             }
         }
     }
@@ -16957,6 +18307,7 @@ pub const Index = struct {
     fn applyDirectMaterializationFromFacts(
         self: *Index,
         txn: anytype,
+        accumulator: *AppendOnlyAccumulator,
         facts: []const fact_mod.Fact,
         mat: MaterializationConfig,
         sign: i8,
@@ -16974,7 +18325,12 @@ pub const Index = struct {
             null;
         defer if (measure_value) |value| value.deinit(self.alloc);
 
-        if (mat.time == null) try self.applyConfiguredExpressionMutationTxn(txn, mat, op, group_key, measure_value, sign, .direct, null);
+        if (mat.time == null) {
+            if (law_mod.descriptor(self.materializationLawId(mat, op)).invertible)
+                try self.accumulateConfiguredExpressionDeltaTxn(txn, accumulator, mat, op, group_key, measure_value, sign, null)
+            else
+                try self.applyConfiguredExpressionMutationTxn(txn, accumulator, mat, op, group_key, measure_value, sign, .direct, null);
+        }
 
         if (mat.time) |time_name| {
             if (mat.bucket) |bucket_name| {
@@ -16983,7 +18339,10 @@ pub const Index = struct {
                 defer self.alloc.free(time_value);
                 const bucket_start = try cylinder.bucketStartAlloc(self.alloc, bucket, time_value);
                 defer self.alloc.free(bucket_start);
-                try self.applyConfiguredExpressionMutationTxn(txn, mat, op, group_key, measure_value, sign, .cylinder, bucket_start);
+                if (law_mod.descriptor(self.materializationLawId(mat, op)).invertible)
+                    try self.accumulateConfiguredExpressionDeltaTxn(txn, accumulator, mat, op, group_key, measure_value, sign, bucket_start)
+                else
+                    try self.applyConfiguredExpressionMutationTxn(txn, accumulator, mat, op, group_key, measure_value, sign, .cylinder, bucket_start);
             }
         }
     }
@@ -18188,6 +19547,8 @@ pub const Index = struct {
                 };
             }
         }
+        var configured_accumulator = AppendOnlyAccumulator{};
+        defer configured_accumulator.deinit(self.alloc);
         for (opposite_facts.items) |opposite_fact| {
             const left_fact = if (changed_side == .left) changed_fact else opposite_fact;
             const right_fact = if (changed_side == .left) opposite_fact else changed_fact;
@@ -18207,7 +19568,7 @@ pub const Index = struct {
                 else
                     null;
                 defer if (measure_value) |value| value.deinit(self.alloc);
-                try self.applyConfiguredExpressionMutationTxn(txn, mat, op, group_key, measure_value, sign, .direct, null);
+                try self.applyConfiguredExpressionMutationTxn(txn, &configured_accumulator, mat, op, group_key, measure_value, sign, .direct, null);
             }
             const specs = if (maintenance_context) |ctx| ctx.ready_specs else adaptive_specs;
             for (specs) |spec| {
@@ -18224,7 +19585,7 @@ pub const Index = struct {
                     self.updateAdaptiveTensorFromJoinPair(txn, spec, left_fact, right_fact, sign);
                 update_result catch |err| switch (err) {
                     error.AlgebraicLawNotInvertible => {
-                        try self.markAdaptiveMaterializationStaleTxn(txn, spec.recommendation, spec.name);
+                        try self.markAdaptiveMaterializationStaleTxn(txn, spec.recommendation, spec.name, maintenance_context);
                         if (maintenance_context) |ctx| {
                             try ctx.disable(self.alloc, spec.recommendation);
                             self.adaptive_maintenance_disabled_count += 1;
@@ -18234,6 +19595,7 @@ pub const Index = struct {
                 };
             }
         }
+        try self.flushAccumulator(txn, &configured_accumulator, true);
     }
 
     fn applyJoinFoldsForChangedFactAppendOnly(
@@ -18311,7 +19673,7 @@ pub const Index = struct {
                 } else continue;
                 self.updateAdaptiveTensorFromJoinPairAppendOnly(txn, accumulator, spec, left_fact, right_fact) catch |err| switch (err) {
                     error.AlgebraicLawNotInvertible => {
-                        try self.markAdaptiveMaterializationStaleTxn(txn, spec.recommendation, spec.name);
+                        try self.markAdaptiveMaterializationStaleTxn(txn, spec.recommendation, spec.name, maintenance_context);
                         if (maintenance_context) |ctx| {
                             try ctx.disable(self.alloc, spec.recommendation);
                             self.adaptive_maintenance_disabled_count += 1;
@@ -21148,6 +22510,67 @@ test "algebraic scans compact materialization rows from expression cache" {
     try std.testing.expectEqual(@as(usize, 1), try idx.countMaterializedExpressionRowsUpTo(&store, "count_by_customer", 10));
 }
 
+test "algebraic artifact drop pages are bounded and component isolated by case" {
+    const alloc = std.testing.allocator;
+    const Case = struct {
+        name: []const u8,
+        component: Index.ArtifactDropComponent,
+        target_family: []const u8,
+        other_family: []const u8,
+        final_sweep: bool = false,
+    };
+    const cases = [_]Case{
+        .{ .name = "dictionary", .component = .dictionary, .target_family = "lexicon", .other_family = "docfact" },
+        .{ .name = "fact", .component = .fact, .target_family = "docfact", .other_family = "pathfact" },
+        .{ .name = "path", .component = .path, .target_family = "pathfact", .other_family = "postings" },
+        .{ .name = "postings and final namespace sweep", .component = .postings, .target_family = "postings", .other_family = "future_family", .final_sweep = true },
+    };
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "rows"
+        \\}
+    ;
+
+    for (cases) |case| {
+        var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
+        defer backend.close();
+        const runtime_store = try backend.runtimeStore(alloc, .{});
+        var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+        defer store.close();
+        var idx = try Index.open(alloc, "alg_drop", cfg);
+        defer idx.close();
+
+        try idx.putArtifactRowForTest(&store, .raw, case.target_family, "a", "1");
+        try idx.putArtifactRowForTest(&store, .raw, case.target_family, "b", "2");
+        try idx.putArtifactRowForTest(&store, .raw, case.other_family, "keep", "3");
+        if (case.final_sweep) try idx.putArtifactRowForTest(&store, .canonical, "future_canonical", "sweep", "4");
+
+        var resume_after: ?[]u8 = null;
+        defer if (resume_after) |cursor| alloc.free(cursor);
+        var pages: usize = 0;
+        while (true) {
+            var page = try idx.dropArtifactComponentPage(&store, case.component, resume_after, 1);
+            defer page.deinit(alloc);
+            try std.testing.expect(page.scanned_rows <= 1);
+            if (!page.complete) try std.testing.expect(page.next_cursor != null);
+            pages += 1;
+            if (resume_after) |cursor| alloc.free(cursor);
+            resume_after = if (page.next_cursor) |cursor| try alloc.dupe(u8, cursor) else null;
+            if (page.complete) break;
+            if (pages > 32) return error.TestUnexpectedResult;
+        }
+        try std.testing.expect(pages >= 2);
+        try std.testing.expectEqual(@as(u64, 0), try idx.countRowsWithPrefix(&store, try idx.keyAlloc(&.{case.target_family})));
+        const other_count = try idx.countRowsWithPrefix(&store, try idx.keyAlloc(&.{case.other_family}));
+        try std.testing.expectEqual(@as(u64, if (case.final_sweep) 0 else 1), other_count);
+        if (case.final_sweep) {
+            const canonical_prefix = try token.canonicalTupleAlloc(alloc, &.{ "\x00\x00__algebraic__", "alg_drop" });
+            try std.testing.expectEqual(@as(u64, 0), try idx.countRowsWithPrefix(&store, canonical_prefix));
+        }
+    }
+}
+
 fn expectProjectionFact(projection: pathfact_mod.StoredProjection, path: []const u8, kind: pathfact_mod.Kind, value: []const u8) !void {
     for (projection.facts) |fact| {
         if (std.mem.eql(u8, fact.path, path) and fact.kind == kind and std.mem.eql(u8, fact.value, value)) {
@@ -21155,6 +22578,835 @@ fn expectProjectionFact(projection: pathfact_mod.StoredProjection, path: []const
         }
     }
     return error.MissingProjectionFact;
+}
+
+test "algebraic base row component writers are isolated and replay idempotent" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "orders",
+        \\  "adaptive": {"observe": true},
+        \\  "group_fields": [{"name":"customer","path":"customer","type":"string"}],
+        \\  "measure_fields": [{"name":"amount","path":"amount","type":"number"}],
+        \\  "materializations": [{"name":"count_by_customer","op":"count","group_by":["customer"]}]
+        \\}
+    ;
+    var idx = try Index.open(alloc, "alg_component_rebuild", cfg);
+    defer idx.close();
+
+    const ShapeCase = struct {
+        name: []const u8,
+        key: []const u8,
+        value: []const u8,
+        path_fact_count: usize,
+    };
+    const shape_cases = [_]ShapeCase{
+        .{ .name = "scalar", .key = "o1", .value = "{\"customer\":\"alice\",\"amount\":7}", .path_fact_count = 2 },
+        .{ .name = "null", .key = "o2", .value = "{\"customer\":null}", .path_fact_count = 1 },
+        .{ .name = "array", .key = "o3", .value = "{\"tags\":[\"new\",\"sale\"]}", .path_fact_count = 5 },
+        .{ .name = "nested object", .key = "o4", .value = "{\"meta\":{\"tier\":\"gold\"}}", .path_fact_count = 2 },
+        .{ .name = "missing configured field", .key = "o5", .value = "{}", .path_fact_count = 0 },
+    };
+
+    var docs: [shape_cases.len]derived_types.DerivedDocument = undefined;
+    for (shape_cases, 0..) |case, i| {
+        docs[i] = .{ .key = case.key, .action = .upsert, .cleaned_value = case.value };
+        try idx.applyBaseRowComponentBatchWithOptions(&store, .fact, docs[i .. i + 1], .{});
+        try std.testing.expectEqual(@as(u64, i + 1), try idx.countRowsWithPrefix(&store, try idx.docFactPrefixAlloc()));
+        try std.testing.expectEqual(@as(u64, 0), try idx.countRowsWithPrefix(&store, try idx.keyAlloc(&.{"pathfact"})));
+    }
+
+    // Replaying a completed page must not duplicate fact lookup rows.
+    const fact_family_counts = [_]u64{
+        try idx.countRowsWithPrefix(&store, try idx.keyAlloc(&.{"docfact"})),
+        try idx.countRowsWithPrefix(&store, try idx.keyAlloc(&.{"docfact_scalar"})),
+        try idx.countRowsWithPrefix(&store, try idx.keyAlloc(&.{"docfact_field"})),
+    };
+    try idx.applyBaseRowComponentBatchWithOptions(&store, .fact, docs[0..], .{});
+    try std.testing.expectEqual(fact_family_counts[0], try idx.countRowsWithPrefix(&store, try idx.keyAlloc(&.{"docfact"})));
+    try std.testing.expectEqual(fact_family_counts[1], try idx.countRowsWithPrefix(&store, try idx.keyAlloc(&.{"docfact_scalar"})));
+    try std.testing.expectEqual(fact_family_counts[2], try idx.countRowsWithPrefix(&store, try idx.keyAlloc(&.{"docfact_field"})));
+
+    for (shape_cases, 0..) |case, i| {
+        try idx.applyBaseRowComponentBatchWithOptions(&store, .path, docs[i .. i + 1], .{});
+        const path_key = try idx.pathFactKey(case.key);
+        defer alloc.free(path_key);
+        var txn = try store.beginReadTxn();
+        const payload = try alloc.dupe(u8, try txn.get(path_key));
+        txn.abort();
+        defer alloc.free(payload);
+        var projection = try pathfact_mod.decodeProjectionAlloc(alloc, payload);
+        defer projection.deinit(alloc);
+        try std.testing.expectEqual(case.path_fact_count, projection.facts.len);
+        try std.testing.expectEqual(@as(u64, shape_cases.len), try idx.countRowsWithPrefix(&store, try idx.docFactPrefixAlloc()));
+    }
+
+    var customer_before = (try idx.pathProfileStatsAlloc(&store, "/customer")).?;
+    defer customer_before.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), customer_before.profile.string_count);
+    try std.testing.expectEqual(@as(u32, 1), customer_before.profile.null_count);
+    const path_family_counts = [_]u64{
+        try idx.countRowsWithPrefix(&store, try idx.keyAlloc(&.{"pathfact"})),
+        try idx.countRowsWithPrefix(&store, try idx.keyAlloc(&.{"path_lookup"})),
+        try idx.countRowsWithPrefix(&store, try idx.keyAlloc(&.{"path_profile"})),
+    };
+    try idx.applyBaseRowComponentBatchWithOptions(&store, .path, docs[0..], .{});
+    try std.testing.expectEqual(path_family_counts[0], try idx.countRowsWithPrefix(&store, try idx.keyAlloc(&.{"pathfact"})));
+    try std.testing.expectEqual(path_family_counts[1], try idx.countRowsWithPrefix(&store, try idx.keyAlloc(&.{"path_lookup"})));
+    try std.testing.expectEqual(path_family_counts[2], try idx.countRowsWithPrefix(&store, try idx.keyAlloc(&.{"path_profile"})));
+    var customer_after = (try idx.pathProfileStatsAlloc(&store, "/customer")).?;
+    defer customer_after.deinit(alloc);
+    try std.testing.expectEqual(customer_before.profile.string_count, customer_after.profile.string_count);
+    try std.testing.expectEqual(customer_before.profile.null_count, customer_after.profile.null_count);
+
+    const InvalidCase = struct {
+        name: []const u8,
+        document: derived_types.DerivedDocument,
+        expected: anyerror,
+    };
+    const invalid_cases = [_]InvalidCase{
+        .{ .name = "malformed json", .document = .{ .key = "bad-json", .action = .upsert, .cleaned_value = "{" }, .expected = error.InvalidAlgebraicBaseRow },
+        .{ .name = "top-level array", .document = .{ .key = "bad-shape", .action = .upsert, .cleaned_value = "[]" }, .expected = error.InvalidAlgebraicBaseRow },
+        .{ .name = "missing cleaned value", .document = .{ .key = "missing", .action = .upsert }, .expected = error.MissingAlgebraicBaseRowValue },
+    };
+    const components = [_]BaseRowComponent{ .fact, .path };
+    for (components) |component| {
+        for (invalid_cases) |case| {
+            try std.testing.expectError(case.expected, idx.applyBaseRowComponentBatchWithOptions(&store, component, &.{case.document}, .{}));
+            try std.testing.expectEqual(fact_family_counts[0], try idx.countRowsWithPrefix(&store, try idx.keyAlloc(&.{"docfact"})));
+            try std.testing.expectEqual(path_family_counts[0], try idx.countRowsWithPrefix(&store, try idx.keyAlloc(&.{"pathfact"})));
+        }
+    }
+
+    _ = try idx.clearBaseRowComponentRows(&store, .fact);
+    try std.testing.expectEqual(@as(u64, 0), try idx.countRowsWithPrefix(&store, try idx.keyAlloc(&.{"docfact"})));
+    try std.testing.expectEqual(path_family_counts[0], try idx.countRowsWithPrefix(&store, try idx.keyAlloc(&.{"pathfact"})));
+    try idx.applyBaseRowComponentBatchWithOptions(&store, .fact, docs[0..], .{});
+    _ = try idx.clearBaseRowComponentRows(&store, .path);
+    try std.testing.expectEqual(fact_family_counts[0], try idx.countRowsWithPrefix(&store, try idx.keyAlloc(&.{"docfact"})));
+    try std.testing.expectEqual(@as(u64, 0), try idx.countRowsWithPrefix(&store, try idx.keyAlloc(&.{"pathfact"})));
+    try std.testing.expect((try idx.pathProfileStatsAlloc(&store, "/customer")) == null);
+}
+
+test "algebraic derived component pages replay and reject malformed path rows by case" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+    var idx = try Index.open(alloc, "alg_derived_pages", "{\"version\":1,\"table\":\"rows\"}");
+    defer idx.close();
+
+    const docs = [_]derived_types.DerivedDocument{
+        .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"payload\":[\"same\",\"same\"]}" },
+        .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"payload\":\"same\"}" },
+        .{ .key = "o3", .action = .upsert, .cleaned_value = "{}" },
+    };
+    try idx.applyBaseRowComponentBatchWithOptions(&store, .path, docs[0..], .{});
+
+    _ = try idx.clearDerivedRowComponentRows(&store, .dictionary);
+    var dictionary_first = try idx.rebuildDerivedRowComponentPage(&store, .dictionary, null, 1);
+    defer dictionary_first.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), dictionary_first.scanned_rows);
+    try std.testing.expect(!dictionary_first.complete);
+    const dictionary_first_count = try idx.countRowsWithPrefix(&store, try idx.keyAlloc(&.{"lexicon"}));
+
+    // Simulate artifact commit followed by cursor-commit failure. A cursor-less
+    // retry clears only dictionary artifacts and deterministically rebuilds the
+    // same page.
+    _ = try idx.clearDerivedRowComponentRows(&store, .dictionary);
+    var dictionary_retry = try idx.rebuildDerivedRowComponentPage(&store, .dictionary, null, 1);
+    defer dictionary_retry.deinit(alloc);
+    try std.testing.expectEqual(dictionary_first_count, try idx.countRowsWithPrefix(&store, try idx.keyAlloc(&.{"lexicon"})));
+    try std.testing.expectEqualStrings(dictionary_first.next_cursor.?, dictionary_retry.next_cursor.?);
+
+    var dictionary_final = try idx.rebuildDerivedRowComponentPage(&store, .dictionary, dictionary_retry.next_cursor, 8);
+    defer dictionary_final.deinit(alloc);
+    try std.testing.expect(dictionary_final.complete);
+    const dictionary_final_count = try idx.countRowsWithPrefix(&store, try idx.keyAlloc(&.{"lexicon"}));
+    const fst_count = try idx.countRowsWithPrefix(&store, try idx.keyAlloc(&.{"lexicon_fst"}));
+    try std.testing.expect(fst_count > 0);
+    var dictionary_final_retry = try idx.rebuildDerivedRowComponentPage(&store, .dictionary, dictionary_retry.next_cursor, 8);
+    defer dictionary_final_retry.deinit(alloc);
+    try std.testing.expect(dictionary_final_retry.complete);
+    try std.testing.expectEqual(dictionary_final_count, try idx.countRowsWithPrefix(&store, try idx.keyAlloc(&.{"lexicon"})));
+    try std.testing.expectEqual(fst_count, try idx.countRowsWithPrefix(&store, try idx.keyAlloc(&.{"lexicon_fst"})));
+
+    _ = try idx.clearDerivedRowComponentRows(&store, .postings);
+    var postings_first = try idx.rebuildDerivedRowComponentPage(&store, .postings, null, 1);
+    defer postings_first.deinit(alloc);
+    try std.testing.expect(!postings_first.complete);
+    const postings_first_count = try idx.countRowsWithPrefix(&store, try idx.keyAlloc(&.{"postings"}));
+    var postings_first_retry = try idx.rebuildDerivedRowComponentPage(&store, .postings, null, 1);
+    defer postings_first_retry.deinit(alloc);
+    try std.testing.expectEqual(postings_first_count, try idx.countRowsWithPrefix(&store, try idx.keyAlloc(&.{"postings"})));
+    var postings_final = try idx.rebuildDerivedRowComponentPage(&store, .postings, postings_first.next_cursor, 8);
+    defer postings_final.deinit(alloc);
+    try std.testing.expect(postings_final.complete);
+    const postings_final_count = try idx.countRowsWithPrefix(&store, try idx.keyAlloc(&.{"postings"}));
+    var postings_final_retry = try idx.rebuildDerivedRowComponentPage(&store, .postings, postings_first.next_cursor, 8);
+    defer postings_final_retry.deinit(alloc);
+    try std.testing.expect(postings_final_retry.complete);
+    try std.testing.expectEqual(postings_final_count, try idx.countRowsWithPrefix(&store, try idx.keyAlloc(&.{"postings"})));
+
+    const invalid_payloads = [_][]const u8{ "", "not-a-path-projection" };
+    const components = [_]DerivedRowComponent{ .dictionary, .postings };
+    for (invalid_payloads, 0..) |payload, payload_i| {
+        const marker = try std.fmt.allocPrint(alloc, "zz-corrupt-{d}", .{payload_i});
+        defer alloc.free(marker);
+        try idx.putArtifactRowForTest(&store, .raw, "pathfact", marker, payload);
+        for (components) |component| {
+            _ = try idx.clearDerivedRowComponentRows(&store, component);
+            try std.testing.expectError(error.MalformedAlgebraicPathRow, idx.rebuildDerivedRowComponentPage(&store, component, null, 64));
+            const family = if (component == .dictionary) "lexicon" else "postings";
+            try std.testing.expectEqual(@as(u64, 0), try idx.countRowsWithPrefix(&store, try idx.keyAlloc(&.{family})));
+        }
+    }
+}
+
+const DictionaryPostingExpectation = struct {
+    path: []const u8,
+    kind: pathfact_mod.Kind,
+    value: []const u8,
+    count: u64,
+};
+
+fn buildReadyDerivedComponentsForTest(idx: *Index, store: *docstore_mod.DocStore) !void {
+    _ = try idx.clearDerivedRowComponentRows(store, .dictionary);
+    var dictionary = try idx.rebuildDerivedRowComponentPage(store, .dictionary, null, 1_024);
+    defer dictionary.deinit(idx.alloc);
+    try std.testing.expect(dictionary.complete);
+
+    _ = try idx.clearDerivedRowComponentRows(store, .postings);
+    var postings = try idx.rebuildDerivedRowComponentPage(store, .postings, null, 1_024);
+    defer postings.deinit(idx.alloc);
+    try std.testing.expect(postings.complete);
+}
+
+fn expectDictionaryPostingCounts(
+    idx: *Index,
+    store: *docstore_mod.DocStore,
+    expectations: []const DictionaryPostingExpectation,
+) !void {
+    for (expectations) |expectation| {
+        const identity = lexical_mod.DictionaryIdentity.canonicalScalar(
+            idx.name,
+            expectation.path,
+            expectation.kind,
+            "json-scalar-v1",
+            "kind-qualified",
+        );
+        try std.testing.expectEqual(
+            expectation.count,
+            try idx.countRowsWithPrefix(store, try idx.pathDictionaryPostingsPrefixAlloc(identity, expectation.value)),
+        );
+        try std.testing.expectEqual(
+            @as(u64, @intFromBool(expectation.count > 0)),
+            try idx.countRowsWithPrefix(store, try idx.pathDictionaryLexiconKeyAlloc(identity, expectation.value)),
+        );
+    }
+}
+
+test "algebraic tensor accumulator batches mutation shapes by law" {
+    const alloc = std.testing.allocator;
+    var idx = try Index.open(alloc, "tensor_batch_shapes", "{\"version\":1,\"table\":\"rows\"}");
+    defer idx.close();
+
+    const RecordingTxn = struct {
+        alloc: Allocator,
+        rows: std.StringHashMapUnmanaged([]u8) = .empty,
+        batch_calls: usize = 0,
+        puts: usize = 0,
+        deletes: usize = 0,
+
+        fn deinit(self: *@This()) void {
+            var it = self.rows.iterator();
+            while (it.next()) |entry| {
+                self.alloc.free(entry.key_ptr.*);
+                self.alloc.free(entry.value_ptr.*);
+            }
+            self.rows.deinit(self.alloc);
+        }
+
+        fn set(self: *@This(), key: []const u8, value: []const u8) !void {
+            const gop = try self.rows.getOrPut(self.alloc, key);
+            if (gop.found_existing) {
+                self.alloc.free(gop.value_ptr.*);
+            } else {
+                gop.key_ptr.* = try self.alloc.dupe(u8, key);
+            }
+            gop.value_ptr.* = try self.alloc.dupe(u8, value);
+        }
+
+        fn remove(self: *@This(), key: []const u8) void {
+            const removed = self.rows.fetchRemove(key) orelse return;
+            self.alloc.free(removed.key);
+            self.alloc.free(removed.value);
+        }
+
+        pub fn get(self: *@This(), key: []const u8) anyerror![]const u8 {
+            return self.rows.get(key) orelse error.NotFound;
+        }
+
+        pub fn applyMutations(self: *@This(), mutations: []const backend_types.KeyMutation) !void {
+            self.batch_calls += 1;
+            for (mutations) |mutation| switch (mutation) {
+                .put => |put_mutation| {
+                    self.puts += 1;
+                    try self.set(put_mutation.key, put_mutation.value);
+                },
+                .delete => |delete_mutation| {
+                    self.deletes += 1;
+                    self.remove(delete_mutation.key);
+                },
+            };
+        }
+    };
+    const Case = struct {
+        name: []const u8,
+        law_id: law_mod.Id,
+        initial: ?[]const u8 = null,
+        deltas: []const []const u8,
+        initial_support: i64 = 0,
+        support_deltas: []const i64 = &.{},
+        expected: ?[]const u8,
+        expected_support: i64 = 0,
+        expected_puts: usize,
+        expected_deletes: usize,
+    };
+    const cases = [_]Case{
+        .{ .name = "count add", .law_id = .count, .deltas = &.{"1"}, .expected = "1", .expected_puts = 1, .expected_deletes = 0 },
+        .{ .name = "sum replace", .law_id = .sum, .initial = "10", .deltas = &.{ "-10", "20" }, .expected = "20", .expected_puts = 1, .expected_deletes = 0 },
+        .{ .name = "sumsquares add", .law_id = .sumsquares, .deltas = &.{ "9", "16" }, .expected = "25", .expected_puts = 1, .expected_deletes = 0 },
+        .{ .name = "min duplicate support", .law_id = .min, .deltas = &.{ "20", "10" }, .support_deltas = &.{ 1, 1 }, .expected = "10", .expected_support = 2, .expected_puts = 2, .expected_deletes = 0 },
+        .{ .name = "max add", .law_id = .max, .deltas = &.{ "10", "20" }, .support_deltas = &.{1}, .expected = "20", .expected_support = 1, .expected_puts = 2, .expected_deletes = 0 },
+        .{ .name = "count delete", .law_id = .count, .initial = "1", .deltas = &.{"-1"}, .expected = null, .expected_puts = 0, .expected_deletes = 1 },
+        .{ .name = "support delete", .law_id = .min, .deltas = &.{}, .initial_support = 1, .support_deltas = &.{-1}, .expected = null, .expected_support = 0, .expected_puts = 0, .expected_deletes = 1 },
+    };
+
+    for (cases) |case| {
+        errdefer std.debug.print("tensor mutation case failed: {s}\n", .{case.name});
+        var txn = RecordingTxn{ .alloc = alloc };
+        defer txn.deinit();
+        if (case.initial) |initial| {
+            const encoded = (try tensor_mod.applyRowSlotToBytesAlloc(alloc, null, &.{case.law_id}, 0, case.law_id, initial, false)).?;
+            defer alloc.free(encoded);
+            try txn.set("expr", encoded);
+        }
+        if (case.initial_support != 0) {
+            var support = try tensor_mod.applyCountSupportDeltaAlloc(alloc, null, case.initial_support);
+            defer support.deinit(alloc);
+            try txn.set("support", support.encoded.?);
+        }
+
+        var accumulator = AppendOnlyAccumulator{};
+        defer accumulator.deinit(alloc);
+        if (case.deltas.len > 0) {
+            const row = try accumulator.expressionRow(alloc, try alloc.dupe(u8, "expr"), &.{case.law_id});
+            for (case.deltas) |delta| try row.applyDelta(alloc, 0, case.law_id, delta);
+        }
+        for (case.support_deltas) |delta| try accumulator.addSupport(alloc, try alloc.dupe(u8, "support"), delta);
+
+        const status_before = idx.status();
+        try idx.flushAccumulator(&txn, &accumulator, true);
+        const status_after = idx.status();
+        try std.testing.expectEqual(@as(usize, 1), txn.batch_calls);
+        try std.testing.expectEqual(case.expected_puts, txn.puts);
+        try std.testing.expectEqual(case.expected_deletes, txn.deletes);
+        try std.testing.expectEqual(status_before.tensor_mutation_batch_count + 1, status_after.tensor_mutation_batch_count);
+        try std.testing.expect(status_after.tensor_mutation_staged_bytes > status_before.tensor_mutation_staged_bytes);
+
+        const expression = txn.get("expr") catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (case.expected) |expected| {
+            var row = try tensor_mod.decodeRowAlloc(alloc, expression.?);
+            defer row.deinit(alloc);
+            try std.testing.expectEqualStrings(expected, row.slots[0].value.?);
+        } else {
+            try std.testing.expect(expression == null);
+        }
+
+        const support = txn.get("support") catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        try std.testing.expectEqual(case.expected_support, try tensor_mod.countSupportValueAlloc(alloc, support));
+    }
+}
+
+test "configured invertible tensor writes batch by row operation and materialization kind" {
+    const alloc = std.testing.allocator;
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "orders",
+        \\  "group_fields": [{"name":"region","path":"region","type":"string"}],
+        \\  "measure_fields": [{"name":"amount","path":"amount","type":"number"}],
+        \\  "time_fields": [{"name":"created","path":"created","type":"timestamp"}],
+        \\  "materializations": [
+        \\    {"name":"count_by_region","op":"count","group_by":["region"]},
+        \\    {"name":"sum_by_region","op":"sum","group_by":["region"],"measure":"amount"},
+        \\    {"name":"sumsquares_by_region","op":"sumsquares","group_by":["region"],"measure":"amount"},
+        \\    {"name":"avg_by_region","op":"avg","group_by":["region"],"measure":"amount"},
+        \\    {"name":"min_by_region","op":"min","group_by":["region"],"measure":"amount"},
+        \\    {"name":"max_by_region","op":"max","group_by":["region"],"measure":"amount"},
+        \\    {"name":"count_by_day","op":"count","group_by":["region"],"time":"created","bucket":"day"},
+        \\    {"name":"min_by_day","op":"min","group_by":["region"],"measure":"amount","time":"created","bucket":"day"},
+        \\    {"name":"max_by_day","op":"max","group_by":["region"],"measure":"amount","time":"created","bucket":"day"}
+        \\  ]
+        \\}
+    ;
+    const Operation = enum { insert, replace, unchanged, duplicate_support, delete };
+    const Case = struct {
+        name: []const u8,
+        operation: Operation,
+        expected_batches: u64,
+        expected_puts: u64,
+        expected_deletes: u64,
+        expected_expressions: u64,
+        expected_supports: u64,
+        expected_caches: u64,
+    };
+    const cases = [_]Case{
+        .{ .name = "insert", .operation = .insert, .expected_batches = 1, .expected_puts = 17, .expected_deletes = 0, .expected_expressions = 9, .expected_supports = 4, .expected_caches = 4 },
+        .{ .name = "changed overwrite", .operation = .replace, .expected_batches = 2, .expected_puts = 17, .expected_deletes = 13, .expected_expressions = 18, .expected_supports = 8, .expected_caches = 4 },
+        .{ .name = "unchanged overwrite", .operation = .unchanged, .expected_batches = 0, .expected_puts = 0, .expected_deletes = 0, .expected_expressions = 0, .expected_supports = 0, .expected_caches = 0 },
+        .{ .name = "duplicate support", .operation = .duplicate_support, .expected_batches = 2, .expected_puts = 34, .expected_deletes = 0, .expected_expressions = 18, .expected_supports = 8, .expected_caches = 8 },
+        .{ .name = "delete", .operation = .delete, .expected_batches = 1, .expected_puts = 0, .expected_deletes = 13, .expected_expressions = 9, .expected_supports = 4, .expected_caches = 0 },
+    };
+    const initial = [_]derived_types.DerivedDocument{.{
+        .key = "o1",
+        .action = .upsert,
+        .cleaned_value = "{\"region\":\"west\",\"amount\":10,\"created\":\"2026-08-07T00:00:00Z\"}",
+    }};
+    const replacement = [_]derived_types.DerivedDocument{.{
+        .key = "o1",
+        .action = .upsert,
+        .cleaned_value = "{\"region\":\"west\",\"amount\":20,\"created\":\"2026-08-07T00:00:00Z\"}",
+    }};
+    const duplicates = [_]derived_types.DerivedDocument{
+        .{ .key = "o1", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"amount\":10,\"created\":\"2026-08-07T00:00:00Z\"}" },
+        .{ .key = "o2", .action = .upsert, .cleaned_value = "{\"region\":\"west\",\"amount\":10,\"created\":\"2026-08-07T00:00:00Z\"}" },
+    };
+    const deleted = [_][]const u8{"o1"};
+
+    for (cases) |case| {
+        errdefer std.debug.print("configured tensor write case failed: {s}\n", .{case.name});
+        var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
+        defer backend.close();
+        const runtime_store = try backend.runtimeStore(alloc, .{});
+        var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+        defer store.close();
+        var idx = try Index.open(alloc, "configured_tensor_batch_shapes", cfg);
+        defer idx.close();
+
+        if (case.operation == .replace or case.operation == .unchanged or case.operation == .delete)
+            try idx.applyBatch(&store, .{ .documents = &initial });
+        const before = idx.status();
+        switch (case.operation) {
+            .insert => try idx.applyBatch(&store, .{ .documents = &initial }),
+            .replace => try idx.applyBatch(&store, .{ .documents = &replacement }),
+            .unchanged => try idx.applyBatch(&store, .{ .documents = &initial }),
+            .duplicate_support => try idx.applyBatchWithOptions(&store, .{ .documents = &duplicates }, .{ .batch_options = .{ .mode = .bulk_ingest } }),
+            .delete => try idx.applyBatch(&store, .{ .deleted_keys = &deleted }),
+        }
+        const after = idx.status();
+        try std.testing.expectEqual(case.expected_batches, after.tensor_mutation_batch_count - before.tensor_mutation_batch_count);
+        try std.testing.expectEqual(case.expected_puts, after.tensor_mutation_put_count - before.tensor_mutation_put_count);
+        try std.testing.expectEqual(case.expected_deletes, after.tensor_mutation_delete_count - before.tensor_mutation_delete_count);
+        try std.testing.expectEqual(case.expected_expressions, after.tensor_expression_mutation_count - before.tensor_expression_mutation_count);
+        try std.testing.expectEqual(case.expected_supports, after.tensor_support_mutation_count - before.tensor_support_mutation_count);
+        try std.testing.expectEqual(case.expected_caches, after.tensor_cache_mutation_count - before.tensor_cache_mutation_count);
+    }
+}
+
+test "algebraic lookup deltas submit one row-local mutation batch by shape" {
+    const alloc = std.testing.allocator;
+    var idx = try Index.open(alloc, "lookup_batch_shapes", "{\"version\":1,\"table\":\"rows\"}");
+    defer idx.close();
+
+    const RecordingTxn = struct {
+        batch_calls: usize = 0,
+        puts: usize = 0,
+        deletes: usize = 0,
+        delete_ignores_missing: usize = 0,
+
+        pub fn get(_: *@This(), _: []const u8) anyerror![]const u8 {
+            return error.NotFound;
+        }
+
+        pub fn applyMutations(self: *@This(), mutations: []const backend_types.KeyMutation) !void {
+            self.batch_calls += 1;
+            for (mutations) |mutation| switch (mutation) {
+                .put => self.puts += 1,
+                .delete => |delete_mutation| {
+                    self.deletes += 1;
+                    if (delete_mutation.ignore_missing) self.delete_ignores_missing += 1;
+                },
+            };
+        }
+    };
+    const LookupKind = enum { doc, path };
+    const Operation = enum { insert, update, delete };
+    const Case = struct {
+        name: []const u8,
+        lookup_kind: LookupKind,
+        operation: Operation,
+        old_doc_facts: []const fact_mod.Fact = &.{},
+        new_doc_facts: []const fact_mod.Fact = &.{},
+        old_path_facts: []const pathfact_mod.Fact = &.{},
+        new_path_facts: []const pathfact_mod.Fact = &.{},
+        expected_batch_calls: usize,
+        expected_puts: usize,
+        expected_deletes: usize,
+    };
+
+    const doc_open = [_]fact_mod.Fact{.{ .role = .group, .field = @constCast("status"[0..]), .scalar = @constCast("open"[0..]) }};
+    const doc_closed = [_]fact_mod.Fact{.{ .role = .group, .field = @constCast("status"[0..]), .scalar = @constCast("closed"[0..]) }};
+    const path_tags_ab = [_]pathfact_mod.Fact{
+        .{ .path = @constCast("/tags"[0..]), .kind = .string, .value = @constCast("a"[0..]) },
+        .{ .path = @constCast("/tags"[0..]), .kind = .string, .value = @constCast("b"[0..]) },
+    };
+    const path_tags_bc = [_]pathfact_mod.Fact{
+        .{ .path = @constCast("/tags"[0..]), .kind = .string, .value = @constCast("b"[0..]) },
+        .{ .path = @constCast("/tags"[0..]), .kind = .string, .value = @constCast("c"[0..]) },
+    };
+    const path_nested_gold = [_]pathfact_mod.Fact{.{ .path = @constCast("/meta/tier"[0..]), .kind = .string, .value = @constCast("gold"[0..]) }};
+    const path_nested_silver = [_]pathfact_mod.Fact{.{ .path = @constCast("/meta/tier"[0..]), .kind = .string, .value = @constCast("silver"[0..]) }};
+
+    const cases = [_]Case{
+        .{ .name = "declared scalar insert", .lookup_kind = .doc, .operation = .insert, .new_doc_facts = &doc_open, .expected_batch_calls = 1, .expected_puts = 2, .expected_deletes = 0 },
+        .{ .name = "declared scalar replacement", .lookup_kind = .doc, .operation = .update, .old_doc_facts = &doc_open, .new_doc_facts = &doc_closed, .expected_batch_calls = 1, .expected_puts = 1, .expected_deletes = 1 },
+        .{ .name = "declared scalar unchanged", .lookup_kind = .doc, .operation = .update, .old_doc_facts = &doc_open, .new_doc_facts = &doc_open, .expected_batch_calls = 0, .expected_puts = 0, .expected_deletes = 0 },
+        .{ .name = "declared scalar delete", .lookup_kind = .doc, .operation = .delete, .old_doc_facts = &doc_open, .expected_batch_calls = 1, .expected_puts = 0, .expected_deletes = 2 },
+        .{ .name = "array insert", .lookup_kind = .path, .operation = .insert, .new_path_facts = &path_tags_ab, .expected_batch_calls = 1, .expected_puts = 2, .expected_deletes = 0 },
+        .{ .name = "array membership replacement", .lookup_kind = .path, .operation = .update, .old_path_facts = &path_tags_ab, .new_path_facts = &path_tags_bc, .expected_batch_calls = 1, .expected_puts = 1, .expected_deletes = 1 },
+        .{ .name = "nested scalar replacement", .lookup_kind = .path, .operation = .update, .old_path_facts = &path_nested_gold, .new_path_facts = &path_nested_silver, .expected_batch_calls = 1, .expected_puts = 1, .expected_deletes = 1 },
+        .{ .name = "array delete", .lookup_kind = .path, .operation = .delete, .old_path_facts = &path_tags_ab, .expected_batch_calls = 1, .expected_puts = 0, .expected_deletes = 2 },
+    };
+
+    for (cases) |case| {
+        var txn = RecordingTxn{};
+        switch (case.lookup_kind) {
+            .doc => switch (case.operation) {
+                .insert => try idx.writeDocFactLookupRows(&txn, "row-1", case.new_doc_facts),
+                .update => try idx.updateDocFactLookupRowsCoalesced(&txn, "row-1", case.old_doc_facts, case.new_doc_facts),
+                .delete => try idx.deleteDocFactLookupRows(&txn, "row-1", case.old_doc_facts),
+            },
+            .path => switch (case.operation) {
+                .insert => try idx.writePathFactLookupRows(&txn, "row-1", case.new_path_facts),
+                .update => try idx.updatePathFactLookupRowsCoalesced(&txn, "row-1", case.old_path_facts, case.new_path_facts),
+                .delete => try idx.deletePathFactLookupRows(&txn, "row-1", case.old_path_facts),
+            },
+        }
+        std.testing.expectEqual(case.expected_batch_calls, txn.batch_calls) catch |err| {
+            std.debug.print("failed algebraic lookup mutation case: {s}\n", .{case.name});
+            return err;
+        };
+        try std.testing.expectEqual(case.expected_puts, txn.puts);
+        try std.testing.expectEqual(case.expected_deletes, txn.deletes);
+        try std.testing.expectEqual(case.expected_deletes, txn.delete_ignores_missing);
+    }
+
+    const large_value = try alloc.alloc(u8, 40 * 1024);
+    defer alloc.free(large_value);
+    @memset(large_value, 'x');
+    var large_path_fact = [_]pathfact_mod.Fact{.{
+        .path = @constCast("/large"[0..]),
+        .kind = .string,
+        .value = large_value,
+    }};
+    var overflow_txn = RecordingTxn{};
+    try idx.writePathFactLookupRows(&overflow_txn, "row-1", &large_path_fact);
+    try std.testing.expectEqual(@as(usize, 1), overflow_txn.batch_calls);
+    try std.testing.expectEqual(@as(usize, 1), overflow_txn.puts);
+}
+
+test "algebraic ready dictionary foreground upserts maintain old and new deltas by row shape" {
+    const alloc = std.testing.allocator;
+    const DeltaCase = struct {
+        name: []const u8,
+        old_value: []const u8,
+        new_value: []const u8,
+        expectations: []const DictionaryPostingExpectation,
+        fst_survives: bool,
+        expected_mutation_batches: u64,
+        expected_fst_invalidations: u64,
+    };
+    const cases = [_]DeltaCase{
+        .{
+            .name = "unchanged scalar",
+            .old_value = "{\"value\":\"alpha\"}",
+            .new_value = "{\"value\":\"alpha\"}",
+            .expectations = &.{.{ .path = "/value", .kind = .string, .value = "alpha", .count = 1 }},
+            .fst_survives = true,
+            .expected_mutation_batches = 0,
+            .expected_fst_invalidations = 0,
+        },
+        .{
+            .name = "changed scalar",
+            .old_value = "{\"value\":\"alpha\"}",
+            .new_value = "{\"value\":\"beta\"}",
+            .expectations = &.{
+                .{ .path = "/value", .kind = .string, .value = "alpha", .count = 0 },
+                .{ .path = "/value", .kind = .string, .value = "beta", .count = 1 },
+            },
+            .fst_survives = false,
+            .expected_mutation_batches = 2,
+            .expected_fst_invalidations = 2,
+        },
+        .{
+            .name = "null to scalar",
+            .old_value = "{\"value\":null}",
+            .new_value = "{\"value\":\"beta\"}",
+            .expectations = &.{
+                .{ .path = "/value", .kind = .null, .value = "", .count = 0 },
+                .{ .path = "/value", .kind = .string, .value = "beta", .count = 1 },
+            },
+            .fst_survives = false,
+            .expected_mutation_batches = 2,
+            .expected_fst_invalidations = 2,
+        },
+        .{
+            .name = "array membership change",
+            .old_value = "{\"tags\":[\"a\",\"b\"]}",
+            .new_value = "{\"tags\":[\"b\",\"c\"]}",
+            .expectations = &.{
+                .{ .path = "/tags", .kind = .string, .value = "a", .count = 0 },
+                .{ .path = "/tags", .kind = .string, .value = "b", .count = 1 },
+                .{ .path = "/tags", .kind = .string, .value = "c", .count = 1 },
+            },
+            .fst_survives = false,
+            .expected_mutation_batches = 2,
+            .expected_fst_invalidations = 6,
+        },
+        .{
+            .name = "nested path change",
+            .old_value = "{\"meta\":{\"tier\":\"gold\"}}",
+            .new_value = "{\"meta\":{\"tier\":\"silver\"}}",
+            .expectations = &.{
+                .{ .path = "/meta/tier", .kind = .string, .value = "gold", .count = 0 },
+                .{ .path = "/meta/tier", .kind = .string, .value = "silver", .count = 1 },
+            },
+            .fst_survives = false,
+            .expected_mutation_batches = 2,
+            .expected_fst_invalidations = 2,
+        },
+    };
+
+    for (cases) |case| {
+        var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
+        defer backend.close();
+        const runtime_store = try backend.runtimeStore(alloc, .{});
+        var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+        defer store.close();
+        var idx = try Index.open(alloc, case.name, "{\"version\":1,\"table\":\"rows\"}");
+        defer idx.close();
+
+        const initial = &.{derived_types.DerivedDocument{
+            .key = "row-1",
+            .action = .upsert,
+            .cleaned_value = case.old_value,
+        }};
+        try idx.applyBaseRowComponentBatchWithOptions(&store, .fact, initial, .{});
+        try idx.applyBaseRowComponentBatchWithOptions(&store, .path, initial, .{});
+        try buildReadyDerivedComponentsForTest(&idx, &store);
+        const before = idx.status();
+        try idx.applyBatch(&store, .{ .documents = &.{.{
+            .key = "row-1",
+            .action = .upsert,
+            .cleaned_value = case.new_value,
+        }} });
+        const after = idx.status();
+
+        try expectDictionaryPostingCounts(&idx, &store, case.expectations);
+        try std.testing.expectEqual(case.expected_mutation_batches, after.ready_dictionary_mutation_batch_count - before.ready_dictionary_mutation_batch_count);
+        try std.testing.expectEqual(case.expected_fst_invalidations, after.ready_dictionary_fst_invalidation_count - before.ready_dictionary_fst_invalidation_count);
+        const first = case.expectations[case.expectations.len - 1];
+        const identity = lexical_mod.DictionaryIdentity.canonicalScalar(idx.name, first.path, first.kind, "json-scalar-v1", "kind-qualified");
+        try std.testing.expectEqual(
+            @as(u64, @intFromBool(case.fst_survives)),
+            try idx.countRowsWithPrefix(&store, try idx.pathDictionaryFstKeyAlloc(identity)),
+        );
+    }
+}
+
+test "algebraic ready dictionary foreground deletes remove stale postings by batch shape" {
+    const alloc = std.testing.allocator;
+    const DeleteCase = struct {
+        name: []const u8,
+        documents: []const derived_types.DerivedDocument,
+        deleted_keys: []const []const u8,
+        expectations: []const DictionaryPostingExpectation,
+    };
+    const cases = [_]DeleteCase{
+        .{
+            .name = "single row",
+            .documents = &.{.{ .key = "d1", .action = .upsert, .cleaned_value = "{\"value\":\"alpha\"}" }},
+            .deleted_keys = &.{"d1"},
+            .expectations = &.{.{ .path = "/value", .kind = .string, .value = "alpha", .count = 0 }},
+        },
+        .{
+            .name = "multi row",
+            .documents = &.{
+                .{ .key = "d1", .action = .upsert, .cleaned_value = "{\"value\":\"alpha\"}" },
+                .{ .key = "d2", .action = .upsert, .cleaned_value = "{\"value\":\"beta\"}" },
+            },
+            .deleted_keys = &.{ "d1", "d2" },
+            .expectations = &.{
+                .{ .path = "/value", .kind = .string, .value = "alpha", .count = 0 },
+                .{ .path = "/value", .kind = .string, .value = "beta", .count = 0 },
+            },
+        },
+        .{
+            .name = "sparse routed batch",
+            .documents = &.{
+                .{ .key = "route-a/d1", .action = .upsert, .cleaned_value = "{\"value\":\"alpha\"}" },
+                .{ .key = "route-b/d2", .action = .upsert, .cleaned_value = "{\"value\":\"alpha\"}" },
+                .{ .key = "route-c/d3", .action = .upsert, .cleaned_value = "{\"value\":\"beta\"}" },
+            },
+            .deleted_keys = &.{ "route-a/d1", "route-c/d3" },
+            .expectations = &.{
+                .{ .path = "/value", .kind = .string, .value = "alpha", .count = 1 },
+                .{ .path = "/value", .kind = .string, .value = "beta", .count = 0 },
+            },
+        },
+    };
+
+    for (cases) |case| {
+        var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
+        defer backend.close();
+        const runtime_store = try backend.runtimeStore(alloc, .{});
+        var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+        defer store.close();
+        var idx = try Index.open(alloc, case.name, "{\"version\":1,\"table\":\"rows\"}");
+        defer idx.close();
+
+        try idx.applyBaseRowComponentBatchWithOptions(&store, .fact, case.documents, .{});
+        try idx.applyBaseRowComponentBatchWithOptions(&store, .path, case.documents, .{});
+        try buildReadyDerivedComponentsForTest(&idx, &store);
+        const before = idx.status();
+        try idx.applyBatch(&store, .{ .deleted_keys = case.deleted_keys });
+        const after = idx.status();
+        try expectDictionaryPostingCounts(&idx, &store, case.expectations);
+        try std.testing.expectEqual(@as(u64, @intCast(case.deleted_keys.len)), after.ready_dictionary_mutation_batch_count - before.ready_dictionary_mutation_batch_count);
+        try std.testing.expectEqual(@as(u64, @intCast(case.deleted_keys.len)), after.ready_dictionary_fst_invalidation_count - before.ready_dictionary_fst_invalidation_count);
+        try std.testing.expectEqual(@as(u64, 0), try idx.countRowsWithPrefix(&store, try idx.keyAlloc(&.{"lexicon_fst"})));
+    }
+}
+
+test "algebraic ready dictionary batching honors registry lifecycle" {
+    const alloc = std.testing.allocator;
+    const RegistrySetup = enum { absent, self_building, self_ready, foreign_ready };
+    const Case = struct {
+        name: []const u8,
+        global_ready: bool,
+        registry: RegistrySetup,
+        sign: i8,
+        seed_artifacts: bool = false,
+        has_ordinal: bool = false,
+        expected_batches: u64,
+        expected_puts: u64,
+        expected_deletes: u64,
+        expected_registry: u64,
+        expected_lexicon: u64,
+        expected_postings: u64,
+        expected_fst_invalidations: u64,
+    };
+    const cases = [_]Case{
+        .{ .name = "global state missing", .global_ready = false, .registry = .absent, .sign = 1, .expected_batches = 0, .expected_puts = 0, .expected_deletes = 0, .expected_registry = 0, .expected_lexicon = 0, .expected_postings = 0, .expected_fst_invalidations = 0 },
+        .{ .name = "claim absent registry", .global_ready = true, .registry = .absent, .sign = 1, .expected_batches = 1, .expected_puts = 3, .expected_deletes = 1, .expected_registry = 1, .expected_lexicon = 1, .expected_postings = 1, .expected_fst_invalidations = 1 },
+        .{ .name = "building registry blocks foreground maintenance", .global_ready = true, .registry = .self_building, .sign = 1, .expected_batches = 0, .expected_puts = 0, .expected_deletes = 0, .expected_registry = 0, .expected_lexicon = 0, .expected_postings = 0, .expected_fst_invalidations = 0 },
+        .{ .name = "ready registry admits insert", .global_ready = true, .registry = .self_ready, .sign = 1, .has_ordinal = true, .expected_batches = 1, .expected_puts = 3, .expected_deletes = 1, .expected_registry = 0, .expected_lexicon = 1, .expected_postings = 1, .expected_fst_invalidations = 1 },
+        .{ .name = "foreign registry blocks foreground maintenance", .global_ready = true, .registry = .foreign_ready, .sign = 1, .expected_batches = 0, .expected_puts = 0, .expected_deletes = 0, .expected_registry = 0, .expected_lexicon = 0, .expected_postings = 0, .expected_fst_invalidations = 0 },
+        .{ .name = "ready registry admits delete", .global_ready = true, .registry = .self_ready, .sign = -1, .seed_artifacts = true, .has_ordinal = true, .expected_batches = 1, .expected_puts = 0, .expected_deletes = 4, .expected_registry = 0, .expected_lexicon = 1, .expected_postings = 1, .expected_fst_invalidations = 1 },
+        .{ .name = "absent registry ignores delete", .global_ready = true, .registry = .absent, .sign = -1, .expected_batches = 0, .expected_puts = 0, .expected_deletes = 0, .expected_registry = 0, .expected_lexicon = 0, .expected_postings = 0, .expected_fst_invalidations = 0 },
+    };
+
+    for (cases) |case| {
+        errdefer std.debug.print("ready dictionary lifecycle case failed: {s}\n", .{case.name});
+        var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
+        defer backend.close();
+        const runtime_store = try backend.runtimeStore(alloc, .{});
+        var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+        defer store.close();
+        var idx = try Index.open(alloc, case.name, "{\"version\":1,\"table\":\"rows\"}");
+        defer idx.close();
+
+        const identity = lexical_mod.DictionaryIdentity.canonicalScalar(idx.name, "/value", .string, "json-scalar-v1", "kind-qualified");
+        {
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            if (case.global_ready) {
+                const ready_key = try idx.keyAlloc(&.{ "dictionary_state", "ready" });
+                defer alloc.free(ready_key);
+                try txn.put(ready_key, "1");
+            }
+            if (case.registry != .absent) {
+                const registry_key = try identity.registryKeyAlloc(alloc);
+                defer alloc.free(registry_key);
+                const registry_payload = try (lexical_mod.RegistryEntry{
+                    .owner = if (case.registry == .foreign_ready) "other-owner" else idx.name,
+                    .layout = .lexicon_postings_rows,
+                    .state = if (case.registry == .self_building) "building" else "ready",
+                }).encodeAlloc(alloc);
+                defer alloc.free(registry_payload);
+                try txn.put(registry_key, registry_payload);
+            }
+            const ordinal: ?doc_set.DocOrdinal = if (case.has_ordinal)
+                (try doc_identity.ensureOrdinalTxn(alloc, &txn, 0, 0, 1, "row-1")).ordinal
+            else
+                null;
+            if (case.seed_artifacts) {
+                const lexicon_key = try idx.pathDictionaryLexiconKeyAlloc(identity, "alpha");
+                defer alloc.free(lexicon_key);
+                const posting_key = try idx.pathDictionaryPostingsKeyAlloc(identity, "alpha", "row-1");
+                defer alloc.free(posting_key);
+                const fst_key = try idx.pathDictionaryFstKeyAlloc(identity);
+                defer alloc.free(fst_key);
+                try txn.put(lexicon_key, "");
+                try txn.put(posting_key, "");
+                try txn.put(fst_key, "fst");
+                if (ordinal) |doc_ordinal| {
+                    const ordinal_key = try idx.pathDictionaryOrdinalPostingsKeyAlloc(identity, "alpha", doc_ordinal);
+                    defer alloc.free(ordinal_key);
+                    try txn.put(ordinal_key, "");
+                }
+            }
+            try txn.commit();
+        }
+
+        var facts = [_]pathfact_mod.Fact{.{
+            .path = @constCast("/value"),
+            .kind = .string,
+            .value = @constCast("alpha"),
+        }};
+        const before = idx.status();
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try idx.applyReadyGenerationDictionaryDeltaTxn(&txn, "row-1", &facts, case.sign);
+        try txn.commit();
+        const after = idx.status();
+
+        try std.testing.expectEqual(case.expected_batches, after.ready_dictionary_mutation_batch_count - before.ready_dictionary_mutation_batch_count);
+        try std.testing.expectEqual(case.expected_puts, after.ready_dictionary_mutation_put_count - before.ready_dictionary_mutation_put_count);
+        try std.testing.expectEqual(case.expected_deletes, after.ready_dictionary_mutation_delete_count - before.ready_dictionary_mutation_delete_count);
+        try std.testing.expectEqual(case.expected_registry, after.ready_dictionary_registry_mutation_count - before.ready_dictionary_registry_mutation_count);
+        try std.testing.expectEqual(case.expected_lexicon, after.ready_dictionary_lexicon_mutation_count - before.ready_dictionary_lexicon_mutation_count);
+        try std.testing.expectEqual(case.expected_postings, after.ready_dictionary_posting_mutation_count - before.ready_dictionary_posting_mutation_count);
+        try std.testing.expectEqual(@as(u64, @intFromBool(case.has_ordinal and case.expected_batches > 0)), after.ready_dictionary_ordinal_posting_mutation_count - before.ready_dictionary_ordinal_posting_mutation_count);
+        try std.testing.expectEqual(case.expected_fst_invalidations, after.ready_dictionary_fst_invalidation_count - before.ready_dictionary_fst_invalidation_count);
+    }
 }
 
 test "algebraic index stores schemaless path facts and lookup rows" {
@@ -22374,6 +24626,173 @@ test "algebraic resolved doc filters honor identity generation for explicit ids"
     try std.testing.expectEqual(@as(?usize, 0), hidden_at_delete.include.estimatedCardinality());
 }
 
+test "algebraic adaptive maintenance context admits only current ready lifecycle" {
+    const alloc = std.testing.allocator;
+    const Case = struct {
+        name: []const u8,
+        enabled: bool = true,
+        progress_lifecycle: ?adaptive_mod.Lifecycle = null,
+        state_lifecycle: ?adaptive_mod.Lifecycle = null,
+        schema_drift: bool = false,
+        expected_context: bool,
+        expected_ready_specs: usize,
+    };
+    const cases = [_]Case{
+        .{ .name = "disabled", .enabled = false, .expected_context = false, .expected_ready_specs = 0 },
+        .{ .name = "building", .progress_lifecycle = .backfilling, .state_lifecycle = .backfilling, .expected_context = true, .expected_ready_specs = 0 },
+        .{ .name = "ready promotion", .progress_lifecycle = .ready, .state_lifecycle = .ready, .expected_context = true, .expected_ready_specs = 1 },
+        .{ .name = "stale generation", .progress_lifecycle = .ready, .state_lifecycle = .ready, .schema_drift = true, .expected_context = true, .expected_ready_specs = 0 },
+        .{ .name = "stale", .progress_lifecycle = .ready, .state_lifecycle = .stale, .expected_context = true, .expected_ready_specs = 0 },
+        .{ .name = "dematerialization", .progress_lifecycle = .ready, .state_lifecycle = .dematerialize_recommended, .expected_context = true, .expected_ready_specs = 0 },
+    };
+    const enabled_v1 =
+        \\{"version":2,"table":"rows","schema_version":1,"capability_fingerprint":"schema-a","adaptive":{"observe":true,"lazy_materialization":true}}
+    ;
+    const enabled_v2 =
+        \\{"version":2,"table":"rows","schema_version":2,"capability_fingerprint":"schema-b","adaptive":{"observe":true,"lazy_materialization":true}}
+    ;
+    const disabled =
+        \\{"version":2,"table":"rows","schema_version":1,"capability_fingerprint":"schema-a","adaptive":{"observe":false,"lazy_materialization":false}}
+    ;
+    const Expect = struct {
+        fn context(idx: *Index, store: *docstore_mod.DocStore, case: Case) !void {
+            var txn = try store.beginWriteTxn();
+            defer txn.abort();
+            var maintenance = try idx.buildBatchMaintenanceContext(&txn, .{});
+            defer if (maintenance) |*ctx| ctx.deinit(idx.alloc);
+            try std.testing.expectEqual(case.expected_context, maintenance != null);
+            if (maintenance) |*ctx| {
+                try std.testing.expectEqual(case.expected_ready_specs, ctx.ready_specs.len);
+                try std.testing.expectEqual(case.enabled, ctx.coalesce_tensor_deltas);
+            }
+        }
+    };
+
+    for (cases) |case| {
+        errdefer std.debug.print("adaptive lifecycle case failed: {s}\n", .{case.name});
+        var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
+        defer backend.close();
+        const runtime_store = try backend.runtimeStore(alloc, .{});
+        var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+        defer store.close();
+        var writer = try Index.open(alloc, case.name, if (case.enabled) enabled_v1 else disabled);
+        defer writer.close();
+
+        if (case.progress_lifecycle) |progress_lifecycle| {
+            const state_lifecycle = case.state_lifecycle orelse return error.TestUnexpectedResult;
+            const recommendation = try adaptive_mod.pathPromotionRecommendationAlloc(alloc, "/value", "string", "stable_numeric_string_path");
+            defer alloc.free(recommendation);
+            const materialization_id = try adaptive_mod.materializationIdAlloc(alloc, recommendation);
+            defer alloc.free(materialization_id);
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            const state_key = try adaptive_mod.materializationStateKeyAlloc(alloc, writer.name, recommendation);
+            defer alloc.free(state_key);
+            const state = try writer.encodePersistedMaterializationStateAlloc(recommendation, state_lifecycle, 1);
+            defer alloc.free(state);
+            try txn.put(state_key, state);
+            try writer.putAdaptiveProgressTxn(&txn, recommendation, materialization_id, progress_lifecycle, 1, 1, 1, 1, "");
+            try txn.commit();
+        }
+
+        if (case.schema_drift) {
+            var reader = try Index.open(alloc, case.name, enabled_v2);
+            defer reader.close();
+            try Expect.context(&reader, &store, case);
+        } else {
+            try Expect.context(&writer, &store, case);
+        }
+    }
+}
+
+test "algebraic adaptive promotion and profiles batch once per row operation" {
+    const alloc = std.testing.allocator;
+    const Operation = enum { insert, replace, unchanged, delete };
+    const Case = struct {
+        name: []const u8,
+        operation: Operation,
+        expected_batches: u64,
+        expected_promotion_mutations: u64,
+        expected_profile_mutations: bool,
+        expected_old_postings: u64,
+        expected_new_postings: u64,
+    };
+    const cases = [_]Case{
+        .{ .name = "insert", .operation = .insert, .expected_batches = 1, .expected_promotion_mutations = 3, .expected_profile_mutations = true, .expected_old_postings = 1, .expected_new_postings = 1 },
+        .{ .name = "replace", .operation = .replace, .expected_batches = 1, .expected_promotion_mutations = 6, .expected_profile_mutations = false, .expected_old_postings = 0, .expected_new_postings = 1 },
+        .{ .name = "unchanged", .operation = .unchanged, .expected_batches = 0, .expected_promotion_mutations = 0, .expected_profile_mutations = false, .expected_old_postings = 1, .expected_new_postings = 0 },
+        .{ .name = "delete", .operation = .delete, .expected_batches = 1, .expected_promotion_mutations = 3, .expected_profile_mutations = true, .expected_old_postings = 0, .expected_new_postings = 0 },
+    };
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "orders",
+        \\  "adaptive": {"observe": true, "lazy_materialization": true, "min_observations": 1, "max_backfill_rows_per_tick": 10, "min_estimated_scan_rows_saved": 1},
+        \\  "materializations": []
+        \\}
+    ;
+
+    for (cases) |case| {
+        errdefer std.debug.print("adaptive row operation case failed: {s}\n", .{case.name});
+        var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
+        defer backend.close();
+        const runtime_store = try backend.runtimeStore(alloc, .{});
+        var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+        defer store.close();
+        var idx = try Index.open(alloc, case.name, cfg);
+        defer idx.close();
+
+        const setup_key = if (case.operation == .insert) "seed-1" else "row-1";
+        const setup = [_]derived_types.DerivedDocument{
+            .{ .key = setup_key, .action = .upsert, .cleaned_value = "{\"meta\":{\"score_text\":\"10.5\"}}" },
+            .{ .key = "seed-2", .action = .upsert, .cleaned_value = "{\"meta\":{\"score_text\":\"12.5\"}}" },
+            .{ .key = "seed-3", .action = .upsert, .cleaned_value = "{\"meta\":{\"score_text\":\"15.5\"}}" },
+        };
+        try idx.applyBatch(&store, .{ .documents = &setup });
+        try std.testing.expect(try idx.persistSchemalessPathPromotionRecommendations(&store) > 0);
+        while (try idx.runAdaptiveWork(&store, 0) != 0) {}
+
+        const recommendation = try adaptive_mod.pathPromotionRecommendationAlloc(alloc, "/meta/score_text", "string", "stable_numeric_string_path");
+        defer alloc.free(recommendation);
+        const materialization_id = (try idx.readyAdaptiveMaterializationIdAlloc(&store, recommendation)).?;
+        defer alloc.free(materialization_id);
+        const before = idx.status();
+        switch (case.operation) {
+            .insert => try idx.applyBatch(&store, .{ .documents = &.{.{
+                .key = "row-1",
+                .action = .upsert,
+                .cleaned_value = "{\"meta\":{\"score_text\":\"17.5\"}}",
+            }} }),
+            .replace => try idx.applyBatch(&store, .{ .documents = &.{.{
+                .key = "row-1",
+                .action = .upsert,
+                .cleaned_value = "{\"meta\":{\"score_text\":\"17.5\"}}",
+            }} }),
+            .unchanged => try idx.applyBatch(&store, .{ .documents = &setup }),
+            .delete => try idx.applyBatch(&store, .{ .deleted_keys = &.{"row-1"} }),
+        }
+        const after = idx.status();
+
+        try std.testing.expectEqual(case.expected_batches, after.adaptive_mutation_batch_count - before.adaptive_mutation_batch_count);
+        try std.testing.expectEqual(case.expected_promotion_mutations, after.adaptive_promotion_mutation_count - before.adaptive_promotion_mutation_count);
+        try std.testing.expectEqual(case.expected_batches, after.tensor_mutation_batch_count - before.tensor_mutation_batch_count);
+        try std.testing.expectEqual(case.expected_batches, after.path_dictionary_fst_rebuild_count - before.path_dictionary_fst_rebuild_count);
+        if (case.expected_profile_mutations) {
+            try std.testing.expect(after.adaptive_path_profile_mutation_count > before.adaptive_path_profile_mutation_count);
+        } else {
+            try std.testing.expectEqual(before.adaptive_path_profile_mutation_count, after.adaptive_path_profile_mutation_count);
+        }
+        try std.testing.expectEqual(
+            case.expected_old_postings,
+            try idx.countRowsWithPrefix(&store, try idx.promotedPathLookupPrefixAlloc(materialization_id, "/meta/score_text", .string, "10.5")),
+        );
+        try std.testing.expectEqual(
+            case.expected_new_postings,
+            try idx.countRowsWithPrefix(&store, try idx.promotedPathLookupPrefixAlloc(materialization_id, "/meta/score_text", .string, "17.5")),
+        );
+    }
+}
+
 test "algebraic adaptive path promotion defers fst rebuild until backfill completion" {
     const alloc = std.testing.allocator;
     var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
@@ -23294,7 +25713,7 @@ test "algebraic bulk ingest maintains ready adaptive aggregate tensors" {
     var expr_after = (try idx.adaptiveMaterializedExpressionRawValueForRecommendationAlloc(&store, recommendation, axes, null)).?;
     defer expr_after.deinit(idx.alloc);
     try std.testing.expectEqual(@as(f64, 35), try algebra.parseF64(expr_after.raw.?));
-    try std.testing.expectEqual(@as(u64, 1), idx.adaptive_maintenance_plan_build_count);
+    try std.testing.expectEqual(@as(u64, 2), idx.adaptive_maintenance_plan_build_count);
     try std.testing.expectEqual(@as(u64, 1), idx.adaptive_maintenance_cached_spec_count);
     var resource_stats = resource_manager.snapshot();
     var algebraic_accumulator_stats = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.algebraic_tensor_accumulators)];
@@ -23317,7 +25736,7 @@ test "algebraic bulk ingest maintains ready adaptive aggregate tensors" {
     const raw_after_overwrite = (try idx.adaptiveTensorRawValueAlloc(&store, materialization_id, axes, null)).?;
     defer alloc.free(raw_after_overwrite);
     try std.testing.expectEqual(@as(f64, 37), try algebra.parseF64(raw_after_overwrite));
-    try std.testing.expectEqual(@as(u64, 1), idx.adaptive_maintenance_plan_build_count);
+    try std.testing.expectEqual(@as(u64, 2), idx.adaptive_maintenance_plan_build_count);
     try std.testing.expectEqual(@as(u64, 2), idx.adaptive_maintenance_cached_spec_count);
     resource_stats = resource_manager.snapshot();
     algebraic_accumulator_stats = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.algebraic_tensor_accumulators)];
@@ -27275,6 +29694,55 @@ test "algebraic index records query shape recommendations" {
     try std.testing.expect(stringSliceContains(recommendation_parts, "recommendation:v1"));
     try std.testing.expect(stringSliceContains(recommendation_parts, "group"));
     try std.testing.expect(stringSliceContains(recommendation_parts, "customer"));
+}
+
+test "algebraic adaptive observations batch by lifecycle transition" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+    var idx = try Index.open(
+        alloc,
+        "adaptive_observation_batch",
+        "{\"version\":1,\"table\":\"orders\",\"group_fields\":[{\"name\":\"customer\",\"path\":\"customer\",\"type\":\"string\"}],\"adaptive\":{\"observe\":true,\"lazy_materialization\":true,\"min_observations\":3}}",
+    );
+    defer idx.close();
+    const query = ir.Query{
+        .kind = .terms,
+        .aggregation_name = "count_by_customer",
+        .bucket_field = "customer",
+        .metric = .{ .name = "count", .op = .count },
+    };
+    const Case = struct {
+        name: []const u8,
+        expected_count: u64,
+        expected_lifecycle: adaptive_mod.Lifecycle,
+        expected_observation_mutations: u64,
+    };
+    const cases = [_]Case{
+        .{ .name = "first observation", .expected_count = 1, .expected_lifecycle = .observing, .expected_observation_mutations = 1 },
+        .{ .name = "second observation", .expected_count = 2, .expected_lifecycle = .observing, .expected_observation_mutations = 1 },
+        .{ .name = "recommendation threshold", .expected_count = 3, .expected_lifecycle = .recommended, .expected_observation_mutations = 2 },
+    };
+
+    for (cases) |case| {
+        errdefer std.debug.print("adaptive observation case failed: {s}\n", .{case.name});
+        const before = idx.status();
+        idx.recordObservedQueryShapeWithStore(&store, query, case.name);
+        const after = idx.status();
+        try std.testing.expectEqual(@as(u64, 1), after.adaptive_mutation_batch_count - before.adaptive_mutation_batch_count);
+        try std.testing.expectEqual(case.expected_observation_mutations, after.adaptive_observation_mutation_count - before.adaptive_observation_mutation_count);
+        const observations = try idx.scanPersistedQueryObservations(&store);
+        defer {
+            for (observations) |*observation| observation.deinit(alloc);
+            if (observations.len > 0) alloc.free(observations);
+        }
+        try std.testing.expectEqual(@as(usize, 1), observations.len);
+        try std.testing.expectEqual(case.expected_count, observations[0].count);
+        try std.testing.expectEqual(case.expected_lifecycle, observations[0].lifecycle);
+    }
 }
 
 test "algebraic index persists query shape observations and recommendations" {

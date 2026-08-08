@@ -1165,6 +1165,73 @@ metadata apply path enforces the same owner-range readiness gate for direct
 promotion commands, so stale or incomplete rebuild evidence cannot bypass the
 worker's promotion checks.
 
+Artifact deletion is a generation-checked lifecycle operation rather than an
+unbounded tail of `DROP INDEX`. A drop first compare-and-sets the matching
+generation to `dropping`, clears prior rebuild progress, and immediately removes
+the index from query and derived-write admission. Valid dropping text-search and
+algebraic indexes do not block foreground base-row writes; those writes simply
+stop maintaining the retired generation. The transition and every resumed page
+also fence pre-transition maintenance: queued text merges are superseded and
+their deletion state is detached, while algebraic HLL work is drained and its
+lane is detached. This fence is reapplied after reopen, so cleanup correctness
+does not depend on the begin call and page execution sharing one process.
+Text-search cleanup removes a bounded
+batch of active segments and stores an opaque segment cursor in the generation
+record. Algebraic cleanup walks fact, path, dictionary, and postings phases in
+durable order, storing one opaque prefix/key cursor per component; its final
+postings phase sweeps both complete index-owned namespaces so adaptive,
+materialized, HLL, and future artifact families cannot survive the drop.
+Physical deletion commits before cursor compare-and-set, and both deletion forms
+are idempotent, so interruption at either commit boundary is retry-safe. A stale
+worker cannot advance progress for another generation. Catalog/runtime removal
+is permitted only after the durable phase reports complete; runtime detachment
+precedes final catalog removal so a crash leaves a fail-closed `dropping` record
+that can be finalized again. A persisted relational-index drop job executes one
+bounded page for either access method, records a printable phase/opaque-cursor
+summary and work counters for operators, and treats the generation record as
+the sole correctness cursor. It retries terminal finalization before deleting
+more artifacts, so a crash after the final cleanup commit is completed without
+replaying an invalid page; an already absent matching target is idempotent
+completion, while a generation mismatch is persisted as stale worker evidence.
+Drop-job records use a versioned identity lease over database, namespace, table,
+access method, index name, and generation. Every claim or renewal advances a
+monotonic lease epoch and records an absolute expiry. A different owner may take
+over only after expiry, and every progress write compare-and-sets the owner and
+epoch while the lease is still live. An older or expired worker may have
+completed an idempotent physical page, but it cannot publish job progress after
+takeover; the next owner resumes from the authoritative generation cursor.
+Completed job records are immutable and repeat claims return the terminal
+record without advancing attempts or lease state.
+Incomplete jobs run on the durable cleanup lane under a process-local job-id
+single-flight registry and the persisted lease epoch. Each callback processes a
+fixed page budget, retries transient failures with capped exponential backoff,
+and persists retry exhaustion for operator visibility. A callback transfers
+single-flight ownership only after its tail callback is accepted by the lane;
+failed handoff releases admission so later discovery can resume it. Shutdown is
+checked before work, during retry waits, and before handoff. Closing the DB
+closes and drains the relational cleanup owner before destroying its registry.
+Manual runtimes execute one bounded callback without recursive tail submission;
+normal threaded runtimes keep handing off bounded callbacks until the durable
+generation reaches terminal completion. Physical cleanup remains safe across a
+worker crash before job-progress publication because the next claim reads the
+generation record's authoritative component cursor.
+Schema application and writable DB reopen discover every durable
+`dropping` text-search or algebraic generation and submit its cleanup job.
+Discovery runs after the schema transaction and apply lock have completed, and
+reopen runs it after index runtimes are loaded, so scheduling can safely fence
+or detach the matching runtime. Job IDs are deterministic over the
+database/namespace/table, access method, index name, and generation; a missing
+record is created, an incomplete record is resumed, and duplicate discovery
+joins the process-local single-flight chain. If a canonical job is already
+complete while the schema still says `dropping`, discovery uses one
+deterministic reconciliation job and fails closed if that job also contradicts
+the schema. This closes the crash window between committing `dropping` and
+creating the first job record. Read-only and HA-standby opens never schedule
+cleanup. Startup full-text backfill also consults the authoritative relational
+write-maintenance lifecycle before rebuilding, so loading an empty runtime
+cannot resurrect a `dropping`, stale, invalid, failed, or rebuild-required
+generation before discovery runs.
+
 The durable runtime schema carries this through `TableSchema.relational_indexes`.
 Each entry records stable index identity, owner kind (`relational_column`,
 `unique_constraint`, or `table`), owner name, access method, uniqueness,
@@ -1209,6 +1276,106 @@ embedded property index metadata and owner-local unique physical index fields
 for relational schemas. Low-level storage helpers that do not receive a
 relational schema use an empty catalog policy and do not maintain scalar side
 rows.
+
+Secondary write staging uses row-local ownership slabs. Unconditional scalar
+indexes measure all changed forward keys, reverse-membership keys, and packed
+single-cell values before allocating, then encode the complete secondary delta
+into one owned slab. An unchanged overwrite stages no secondary mutation; a
+scalar value change deletes and replaces only the forward entry because the
+reverse doc/column membership is stable. Ordered-tuple construction uses
+bounded stack-backed scratch storage for tuple and covering-payload assembly,
+then packs the encoded tuple, forward key, reverse key, and payload into one
+owned entry allocation. Payload-only updates replace only the forward entry;
+tuple changes replace both directions. The owner slab remains live through
+batch application or participant abort, so staged key and value slices never
+borrow transient scratch memory. Conditional indexes and structured JSON/array
+artifacts retain the generic fail-closed path until their own batched planners
+can preserve the same ownership invariant.
+
+Algebraic base fact and schemaless path lookup maintenance also stages one
+ordered mutation batch per row-local delta. It resolves document ordinal
+identity once, builds scalar/field/path and ordinal lookup keys in a bounded
+stack-backed arena, and releases arena overflow storage after the transaction
+has copied the batch. Empty deltas do not call the backend. The LSM transaction
+reserves mutable-table capacity for the batch and invalidates its cursor snapshot
+once, while LMDB and backends without a native batch hook preserve the same
+ordered put/delete semantics through the transaction adapter. Tensor,
+dictionary, and adaptive-materialization maintenance remains a separate derived
+write layer and must not borrow the base lookup arena after the batch returns.
+
+Configured algebraic tensors coalesce all mutations for one direct/cylinder
+document or changed join fact before storage. Count, sum, sumsquares, and
+average materializations accumulate law deltas. Min/max maintenance stages
+support, bounded candidate-cache, and expression writes in a pending-value
+overlay; support lookups and scans consult the overlay so a pending tombstone
+cannot be selected as the next extremum, and repeated join folds see earlier
+pending expression values. Append-only and adaptive tensor accumulators use the
+same flush path. Support accumulation retains a signed numeric delta rather
+than an encoded standalone support row, so compensation against an existing
+persisted count is not lost and duplicate support changes collapse to one final
+mutation. Flush computes every final expression/support value against the
+transaction snapshot, stages values in bounded stack-backed arena storage, and
+calls the backend only after all folds succeed.
+
+Public status counters report tensor batches, puts, deletes,
+expression/support/cache mutations, and staged key/value bytes; the algebraic
+benchmark emits them in its stable JSONL status event. Its
+`tensor-write-matrix` mode isolates allocation events, allocated bytes, peak
+live bytes, latency, and mutation counts for count, sum, sumsquares, average,
+min, and max across direct/cylinder add, replace, duplicate-support, and delete
+cases. Checked-in benchmark evidence uses schema-versioned JSONL so later
+write-path changes can compare the same matrix.
+
+Ready-generation canonical-scalar dictionary maintenance uses one
+final-key-deduplicated backend mutation batch for each non-empty added or
+removed path-fact delta. Registry claims, lexicon rows, document and ordinal
+postings, and FST invalidations share a 32 KiB stack-backed arena. Deletion
+checks consult the staged mutation overlay as well as the transaction cursor,
+so the last posting removes its lexicon row even though its posting tombstone
+has not yet reached the backend. Missing global-ready state, self-owned
+`building` registries, and foreign owners fail closed; an absent registry may
+be claimed only by an added delta after global readiness. Public status exposes
+batch, put, delete, artifact-family, invalidation, and staged-byte counters.
+The schema-versioned `ready-dictionary-write-matrix` benchmark records latency,
+allocation pressure, and those counters for scalar, array, and nested insert,
+replace, unchanged, and delete cases.
+
+Adaptive foreground maintenance uses the same lifecycle-filtered maintenance
+context for normal and bulk writes. Only progress rows that are `ready`, match
+the current schema version and capability fingerprint, and have a matching
+ready materialization state enter the cached ready-spec plan; disabled,
+backfilling, stale-generation, stale, and dematerializing artifacts remain
+write-ineligible. Each changed row stages promoted lookup, owned dictionary,
+and path-profile final mutations in one overlay-aware batch. Adaptive tensor
+deltas coalesce across the enclosing write batch, and each dirty path
+dictionary rebuilds its FST once after those row mutations are visible. This
+also fixes append-only bulk writes so their path-promotion tensor accumulator is
+always flushed. Query-observation/state transitions, candidate/history pairs,
+and dematerialization cleanup use final mutation batches rather than per-key
+writes. Public status exposes adaptive batch, put, delete, promotion, profile,
+observation, lifecycle, and staged-byte counters. The schema-versioned
+`adaptive-write-matrix` benchmark records those counters with latency and
+allocation pressure for promoted insert, replace, unchanged, and delete cases.
+
+Text-search foreground maintenance stages immutable replacement segments before
+touching the live index. Insert, overwrite, and delete then cross one persistent
+mutation boundary: old-document deletion bitmaps, replacement segment bytes or
+file references, active-segment metadata, ranges, the next-segment high-water
+mark, and the committed WAL watermark are written in one metadata transaction.
+After that durable commit, inserts and overwrites publish one prepared in-memory
+snapshot; delete-only batches update the shared deletion masks without an
+unnecessary snapshot swap. A post-commit observer gives concurrent merge tasks
+the exact newly deleted local document ids, preserving tombstones that arrive
+while a merge is building. Inline-segment WAL records are versioned mutation
+batches containing both delete identities and every replacement segment, so
+recovery cannot replay only the insert half of an overwrite. Empty/unchanged
+operations emit no transaction or publication. Public persistent-index stats
+report mutation batches, segments, deletion bitmaps, durable commits, and
+snapshot publications. The schema-versioned `text_mutation_write_matrix` mode
+of `text-segment-write-bench` records those counters and latency for insert,
+overwrite, unchanged, and delete; checked-in evidence lives at
+`bench/full_text/results/text-mutation-write-matrix-100.jsonl`.
+
 Runtime schema format v52 removes relational column and unique-constraint
 embedded-index payload slots from the durable shape and rejects older schema
 blobs instead of byte-skipping legacy embedded relational index layouts.
@@ -1246,6 +1413,22 @@ The query planner chooses indexes by capability:
    row when a derived method is involved or when partial-predicate proof is not
    complete.
 
+Ordered-tuple execution uses a measured candidate policy rather than an
+unbounded materialization threshold. An index that exactly satisfies the
+requested order remains a streaming plan because it avoids the authoritative
+row scan and in-memory sort. Unordered `bounded` and `none` total modes also
+remain streaming plans and stop after the requested page is full. For an
+unordered `exact` query, the executor admits a covering stream only while a
+single-pass probe stays within the larger of 5% of the estimated base rows and
+four requested page widths, capped at 4,096 buffered candidates. Crossing the
+gate stops the tuple scan and falls back to the authoritative base scan without
+retaining the rejected candidate set. Exact count-only requests use the base
+scan until the ordered-tuple implementation has a direct count path; probing a
+nonempty tuple range is bounded to one entry before that fallback. The 5%
+default is the measured 10k-row crossover for the current packed-row and
+covering-payload implementations and must be recalibrated from the benchmark
+matrix before it changes.
+
 An ordered tuple may satisfy `ORDER BY` only when the requested direction,
 null ordering, collation, predicate domain, and tie-breaker semantics are
 exact. If requested order keys are matched but the index has trailing key parts,
@@ -1258,9 +1441,35 @@ Row-query profiles name the selected access method and record planned
 candidate-set counts by scalar, array, JSON, mixed, and ordered-tuple sources,
 the selected candidate estimate, measured candidate rows, hydrated rows,
 residual rechecks, covering-payload rechecks, ordered-tuple generation/bounds,
-and the deterministic fallback reason. Algebraic and text-search candidates
-should plug into the same measured doc-set path instead of adding separate
-planner side channels.
+candidate-gate limit/observation, peak buffered candidate rows/bytes, and the
+deterministic fallback reason. Every ordered-tuple, text-search, and
+algebraic rejection also maps to one stable fallback class: `unavailable`,
+`stale`, `malformed`, `too-expensive`, or `unsupported-shape`. Profile JSON
+retains the method-specific reason and unsupported-reason mapping, while the
+plan summary names the rejected access method and shared class. This keeps
+operator diagnostics precise without making clients understand each physical
+index implementation.
+
+Fallback is permitted only when it preserves the complete query semantics.
+Optional ordered-tuple and algebraic candidates may fall back to an
+authoritative packed-row scan and report the rejection in the profile. An
+explicit text-search query cannot reproduce analyzed matching, scores, or text
+projections from a base-row scan, and a request that requires algebraic filter
+resolution has made the same fail-closed choice. Those plans return a typed
+`relational_index_plan_rejected` response carrying the shared fallback class
+and retryability. Unavailable and stale artifacts are retryable service
+failures; malformed metadata is a non-retryable server failure; a resource
+budget rejection is retryable backpressure; and an unsupported shape is a
+non-retryable request rejection. Query, aggregate, window, join, and lateral
+HTTP entry points preserve this contract when nested row subplans reject an
+index.
+
+Algebraic and text-search candidates plug into the same measured doc-set path
+instead of adding separate planner side channels. Lifecycle and generation
+admission distinguish a missing runtime, an artifact still catching up, a
+stale generation, and malformed generation metadata before query execution.
+Derived candidates still hydrate and recheck the authoritative packed row
+unless a separately proven covering path can avoid that work safely.
 
 This keeps the relational schema stable while leaving the physical backend open
 to benchmark-driven replacement. The first production compound index should be
@@ -6844,6 +7053,99 @@ and column keys:
 - **Invariant:** relational typed storage is the single physical base store for
   point reads, transforms, predicate scans, recovery, split/merge, and
   derived-index backfill.
+
+Schema-backed writes whose only synchronous artifact is the packed base row use
+a dedicated participant fast path. Admission fails closed when the schema has a
+maintained scalar or ordered index, primary key, unique constraint, foreign key,
+period, externalized parent check, or constraint-timing override. The admitted
+path stages the relational row directly and does not fetch or decode the
+authoritative previous row. Stored generated columns remain eligible because
+the SQL/rows mutation layer materializes their final values before packing the
+row and entering the storage participant; an indexed generated column is still
+excluded by its maintained index.
+
+`BatchProfile` publishes `relational_base_row_fast_path_upserts`,
+`relational_generic_upserts`, `relational_authoritative_row_lookups`, and
+`relational_row_decodes` alongside relational staged-write counts and bytes.
+`zig build relational-write-fast-path-bench` emits a schema-versioned,
+data-driven JSONL matrix for no-derived and generated-only schemas, insert and
+overwrite operations, and generic-baseline versus admitted paths. The checked-in
+10k-row evidence lives at
+`bench/storage/results/relational-write-fast-path-10k.jsonl`; both paths stage
+one write per row, while the admitted path performs no authoritative-row
+lookups.
+
+`relational-read-bench` keeps the primary backend explicit in schema-versioned
+JSONL (`primary=mem|lsm_memory`). The default `mem` primary isolates relational
+planner, index, hydration, projection, and total-mode costs; `lsm_memory` is an
+opt-in backend-cost dimension and must not be mixed into planner comparisons.
+The matrix is data-driven across document/no-index/scalar/ordered-tuple modes,
+low/high selectivity, filter/ordered pages, and exact/bounded/none/count-only
+totals. Checked-in 10k and 100k evidence lives in
+`bench/storage/results/relational-read-matrix-mem-10k.jsonl` and
+`bench/storage/results/relational-read-matrix-mem-100k.jsonl`; the gated 1M run
+is archived as `bench/storage/results/relational-read-matrix-mem-1m.jsonl`.
+Candidate buffering remains flat from 100k through 1M at 4,096 rows (about 955
+KB). At 1M rows, measured load times range from 124 seconds for document tables
+to 436 seconds for ordered tuples, so load/write amplification remains a
+separate concern even though query-side candidate memory is bounded.
+`algebraic_filter` is a fifth admitted mode: the benchmark creates the runtime
+algebraic index from the table schema, loads with `full_index`, and verifies the
+selected access method in result rows. Its complete 10k and 100k matrices are
+archived as `relational-read-matrix-mem-algebraic-10k.jsonl` and
+`relational-read-matrix-mem-algebraic-100k.jsonl`; all 28 result rows use
+`algebraic_doc_set` without fallback.
+
+Schema-v4 candidate-structure evidence is archived in
+`bench/storage/results/relational-index-structures-mem-10k.jsonl` and
+`bench/storage/results/relational-index-structures-mem-100k.jsonl`. The
+data-driven matrix covers document/base scans, scalar KV, ordered KV equality
+and range, and algebraic dictionary/FST equality and prefix. At 100k rows with
+100-row no-total pages, ordered KV equality and range complete in roughly
+0.09-0.14 ms/query and scan exactly the page width; covering equality avoids
+all authoritative row hydration. Ordered KV does not claim prefix filtering.
+The current algebraic implementation admits equality and prefix but scans the
+full matching doc set: measured equality ranges from about 9 ms at 10%
+selectivity to 63 ms at 90%, while prefix ranges from about 108 ms to 6.98 s.
+Range is rejected and falls back to the packed-row scan. These results support
+keeping ordered tuples and algebraic dictionary/FST indexes as separate access
+methods; replacing ordered KV with the current FST path would regress equality,
+range, ordering, and bounded-page behavior.
+
+Nullable and multi-index maintenance evidence is archived in
+`bench/storage/results/relational-index-maintenance-10k.jsonl` under schema v1.
+Its table-driven matrix covers three index shapes and nine old/new row
+operations, verifies the resulting scalar and ordered artifact counts after
+every operation, and records 81 mutation rows plus nine rebuild rows with no
+cleanup failures. Unchanged overwrites stage only the base-row mutation.
+Changed scalar values stage three mutations, changed ordered nullable values
+stage five, and mixed status-only changes stage three. The 10k-row rebuild
+samples write 20k entries for scalar or ordered shapes and 40k for the mixed
+shape, at approximately 1.79, 2.01, and 4.21 microseconds per row respectively.
+
+Public row-query evidence is archived in
+`bench/storage/results/relational-public-query-10k.jsonl` under schema v1. The
+data-driven 18-case matrix compares direct DB execution with the real loopback
+HTTP endpoint across base scans, ordered tuples, and algebraic filters at 10%
+and 90% selectivity for no-total pages, exact pages, and exact count-only
+requests. Each surface uses an independently loaded database so planner
+observation state cannot leak between measurements. Algebraic path observation
+remains enabled, while lazy materialization is disabled to keep adaptive
+backfill outside this surface-cost benchmark. Every result has matching rows,
+totals, exactness, access method, fallback reason, and direct/public planner
+counters.
+
+At 10k rows, a 100-row ordered-tuple no-total page takes about 0.05 ms directly
+and 0.31 ms through HTTP, scans exactly 100 tuple entries, and hydrates no base
+rows. Comparable base scans take about 1.62-2.10 ms directly and 2.04-2.45 ms
+through HTTP. Exact and count-only ordered predicates cross the measured
+candidate gate at this scale and correctly fall back to the base scan at about
+6.58-6.90 ms directly and 7.23-7.46 ms through HTTP. With lazy materialization
+disabled, algebraic equality remains candidate-scan dominated: no-total pages
+take about 52.60 ms at 10% selectivity and 433.46 ms at 90%, while exact work
+ranges from about 87.27 ms to 781.30 ms. Direct and HTTP algebraic timings stay
+within about 2%, confirming that this cost is in index resolution/observation
+rather than the public transport layer.
 
 The value-level magic check is intentional because `DB.get` is generic and also
 serves non-document internal keys. Document-mode JSON blobs and internal store

@@ -1934,7 +1934,9 @@ pub fn applyTableDdlPlanToTableRecordWithSessionAlloc(
         },
         .drop_index => |drop_index| {
             if (try tableIndexesJsonContainsIndex(alloc, table.indexes_json, drop_index.index_name)) {
-                return try applyRelationalDerivedIndexDropToTableRecordAlloc(alloc, table, drop_index.index_name);
+                if (!(try relationalSchemaIndexUsesNonblockingDropAlloc(alloc, table.schema_json, drop_index.index_name))) {
+                    return try applyRelationalDerivedIndexDropToTableRecordAlloc(alloc, table, drop_index.index_name);
+                }
             }
             try validateDerivedIndexHasNoDependentsAlloc(alloc, table.indexes_json, drop_index.index_name);
         },
@@ -1963,6 +1965,23 @@ pub fn applyTableDdlPlanToTableRecordWithSessionAlloc(
         .rewrite_required = applied.rewrite_required,
         .work_items = work_items,
     };
+}
+
+fn relationalSchemaIndexUsesNonblockingDropAlloc(
+    alloc: std.mem.Allocator,
+    schema_json: []const u8,
+    index_name: []const u8,
+) !bool {
+    if (schema_json.len == 0) return false;
+    var parsed = try parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const runtime_schema = try deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema_mod.freeSchema(alloc, runtime_schema);
+    for (runtime_schema.relational_indexes) |index| {
+        if (!std.mem.eql(u8, index.name, index_name)) continue;
+        return index.access_method == .text_search or index.access_method == .algebraic_filter;
+    }
+    return false;
 }
 
 fn applyRelationalAlgebraicIndexCreateToTableRecordAlloc(
@@ -8576,6 +8595,35 @@ test "metadata.schema update sql ddl applies Antfly derived indexes to table met
     try std.testing.expect(docs_algebraic_filter.method_config_json != null);
     try std.testing.expect(std.mem.indexOf(u8, docs_algebraic_filter.method_config_json.?, "\"type\":\"algebraic\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, docs_algebraic_filter.method_config_json.?, "\"derive_from_schema\":true") != null);
+
+    var text_drop = try applyRelationalSqlDdlToTableRecordAlloc(
+        std.testing.allocator,
+        &full_text.table,
+        "DROP INDEX docs_body_fts;",
+    );
+    defer text_drop.deinit(std.testing.allocator);
+    var text_drop_schema = try parseValidatedTableSchema(std.testing.allocator, text_drop.table.schema_json);
+    defer text_drop_schema.deinit(std.testing.allocator);
+    const text_drop_runtime = try deriveRuntimeTableSchema(std.testing.allocator, text_drop_schema);
+    defer runtime_schema_mod.freeSchema(std.testing.allocator, text_drop_runtime);
+    const dropping_text = secondaryIndexCatalogByName(text_drop_runtime.relational_indexes, "docs_body_fts") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(runtime_schema_mod.RelationalIndexLifecycle.dropping, dropping_text.lifecycle);
+    try std.testing.expect(!dropping_text.generation_record.?.components.allReady());
+
+    var algebraic_drop = try applyRelationalSqlDdlToTableRecordAlloc(
+        std.testing.allocator,
+        &algebraic.table,
+        "DROP INDEX docs_algebraic_filter;",
+    );
+    defer algebraic_drop.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, algebraic_drop.table.indexes_json, "\"docs_algebraic_filter\"") != null);
+    var algebraic_drop_schema = try parseValidatedTableSchema(std.testing.allocator, algebraic_drop.table.schema_json);
+    defer algebraic_drop_schema.deinit(std.testing.allocator);
+    const algebraic_drop_runtime = try deriveRuntimeTableSchema(std.testing.allocator, algebraic_drop_schema);
+    defer runtime_schema_mod.freeSchema(std.testing.allocator, algebraic_drop_runtime);
+    const dropping_algebraic = secondaryIndexCatalogByName(algebraic_drop_runtime.relational_indexes, "docs_algebraic_filter") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(runtime_schema_mod.RelationalIndexLifecycle.dropping, dropping_algebraic.lifecycle);
+    try std.testing.expect(!dropping_algebraic.generation_record.?.components.allReady());
 
     var semantic = try applyRelationalSqlDdlToTableRecordAlloc(
         std.testing.allocator,

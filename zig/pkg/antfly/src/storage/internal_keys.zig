@@ -181,6 +181,31 @@ pub fn appendEncodedComponent(list: *std.ArrayListUnmanaged(u8), alloc: Allocato
     _ = encodeComponent(list.items[start..], bytes);
 }
 
+fn namespacedComponentsKeyLen(components: []const []const u8) !usize {
+    var len: usize = 1;
+    for (components) |component| {
+        len = std.math.add(usize, len, encodedComponentLen(component)) catch return error.OutOfMemory;
+    }
+    return len;
+}
+
+fn writeNamespacedComponentsKey(out: []u8, namespace: u8, components: []const []const u8) ![]u8 {
+    const len = try namespacedComponentsKeyLen(components);
+    if (out.len < len) return error.NoSpaceLeft;
+    const key = out[0..len];
+    key[0] = namespace;
+    var pos: usize = 1;
+    for (components) |component| pos += encodeComponent(key[pos..], component);
+    std.debug.assert(pos == key.len);
+    return key;
+}
+
+fn namespacedComponentsKeyAlloc(alloc: Allocator, namespace: u8, components: []const []const u8) ![]u8 {
+    const key = try alloc.alloc(u8, try namespacedComponentsKeyLen(components));
+    errdefer alloc.free(key);
+    return try writeNamespacedComponentsKey(key, namespace, components);
+}
+
 pub fn findComponentTerminator(key: []const u8, start: usize) ?usize {
     var i = start;
     while (i + 1 < key.len) : (i += 1) {
@@ -302,11 +327,13 @@ pub fn relationalAggregateDistinctSpillKeyAlloc(alloc: Allocator, spill_id: []co
 }
 
 pub fn relationalRowKeyAlloc(alloc: Allocator, doc_key: []const u8) ![]u8 {
-    var list = std.ArrayListUnmanaged(u8).empty;
-    defer list.deinit(alloc);
-    try appendDocumentPrefix(&list, alloc, doc_key);
-    try list.append(alloc, relational_row_kind);
-    return try list.toOwnedSlice(alloc);
+    const len = std.math.add(usize, 2, encodedComponentLen(doc_key)) catch return error.OutOfMemory;
+    const key = try alloc.alloc(u8, len);
+    key[0] = user_namespace;
+    const pos = 1 + encodeComponent(key[1..], doc_key);
+    key[pos] = relational_row_kind;
+    std.debug.assert(pos + 1 == key.len);
+    return key;
 }
 
 pub fn relationalColumnKeyAlloc(alloc: Allocator, doc_key: []const u8, column_path: []const u8) ![]u8 {
@@ -319,12 +346,15 @@ pub fn relationalColumnKeyAlloc(alloc: Allocator, doc_key: []const u8, column_pa
 }
 
 pub fn relationalColumnIndexKeyAlloc(alloc: Allocator, column_path: []const u8, doc_key: []const u8) ![]u8 {
-    var list = std.ArrayListUnmanaged(u8).empty;
-    defer list.deinit(alloc);
-    try list.append(alloc, relational_column_index_namespace);
-    try appendEncodedComponent(&list, alloc, column_path);
-    try appendEncodedComponent(&list, alloc, doc_key);
-    return try list.toOwnedSlice(alloc);
+    return try namespacedComponentsKeyAlloc(alloc, relational_column_index_namespace, &.{ column_path, doc_key });
+}
+
+pub fn relationalColumnIndexKeyLen(column_path: []const u8, doc_key: []const u8) !usize {
+    return try namespacedComponentsKeyLen(&.{ column_path, doc_key });
+}
+
+pub fn writeRelationalColumnIndexKey(out: []u8, column_path: []const u8, doc_key: []const u8) ![]u8 {
+    return try writeNamespacedComponentsKey(out, relational_column_index_namespace, &.{ column_path, doc_key });
 }
 
 pub fn relationalColumnIndexPrefixAlloc(alloc: Allocator, column_path: []const u8) ![]u8 {
@@ -446,12 +476,15 @@ pub fn relationalJsonPathIndexColumnPrefixAlloc(alloc: Allocator, column_path: [
 }
 
 pub fn relationalColumnIndexByDocKeyAlloc(alloc: Allocator, doc_key: []const u8, column_path: []const u8) ![]u8 {
-    var list = std.ArrayListUnmanaged(u8).empty;
-    defer list.deinit(alloc);
-    try list.append(alloc, relational_column_index_by_doc_namespace);
-    try appendEncodedComponent(&list, alloc, doc_key);
-    try appendEncodedComponent(&list, alloc, column_path);
-    return try list.toOwnedSlice(alloc);
+    return try namespacedComponentsKeyAlloc(alloc, relational_column_index_by_doc_namespace, &.{ doc_key, column_path });
+}
+
+pub fn relationalColumnIndexByDocKeyLen(doc_key: []const u8, column_path: []const u8) !usize {
+    return try namespacedComponentsKeyLen(&.{ doc_key, column_path });
+}
+
+pub fn writeRelationalColumnIndexByDocKey(out: []u8, doc_key: []const u8, column_path: []const u8) ![]u8 {
+    return try writeNamespacedComponentsKey(out, relational_column_index_by_doc_namespace, &.{ doc_key, column_path });
 }
 
 pub fn relationalColumnIndexByDocRangeLowerAlloc(alloc: Allocator, doc_key: []const u8) ![]u8 {
@@ -481,13 +514,15 @@ pub fn relationalOrderedTupleIndexKeyAlloc(
     encoded_tuple: []const u8,
     doc_key: []const u8,
 ) ![]u8 {
-    var list = std.ArrayListUnmanaged(u8).empty;
-    defer list.deinit(alloc);
-    try list.append(alloc, relational_ordered_tuple_index_namespace);
-    try appendEncodedComponent(&list, alloc, index_id);
-    try appendEncodedComponent(&list, alloc, encoded_tuple);
-    try appendEncodedComponent(&list, alloc, doc_key);
-    return try list.toOwnedSlice(alloc);
+    return try namespacedComponentsKeyAlloc(alloc, relational_ordered_tuple_index_namespace, &.{ index_id, encoded_tuple, doc_key });
+}
+
+pub fn relationalOrderedTupleIndexKeyLen(index_id: []const u8, encoded_tuple: []const u8, doc_key: []const u8) !usize {
+    return try namespacedComponentsKeyLen(&.{ index_id, encoded_tuple, doc_key });
+}
+
+pub fn writeRelationalOrderedTupleIndexKey(out: []u8, index_id: []const u8, encoded_tuple: []const u8, doc_key: []const u8) ![]u8 {
+    return try writeNamespacedComponentsKey(out, relational_ordered_tuple_index_namespace, &.{ index_id, encoded_tuple, doc_key });
 }
 
 pub fn relationalOrderedTupleIndexPrefixAlloc(alloc: Allocator, index_id: []const u8) ![]u8 {
@@ -563,13 +598,15 @@ pub fn relationalOrderedTupleIndexByDocKeyAlloc(
     index_id: []const u8,
     encoded_tuple: []const u8,
 ) ![]u8 {
-    var list = std.ArrayListUnmanaged(u8).empty;
-    defer list.deinit(alloc);
-    try list.append(alloc, relational_ordered_tuple_index_by_doc_namespace);
-    try appendEncodedComponent(&list, alloc, doc_key);
-    try appendEncodedComponent(&list, alloc, index_id);
-    try appendEncodedComponent(&list, alloc, encoded_tuple);
-    return try list.toOwnedSlice(alloc);
+    return try namespacedComponentsKeyAlloc(alloc, relational_ordered_tuple_index_by_doc_namespace, &.{ doc_key, index_id, encoded_tuple });
+}
+
+pub fn relationalOrderedTupleIndexByDocKeyLen(doc_key: []const u8, index_id: []const u8, encoded_tuple: []const u8) !usize {
+    return try namespacedComponentsKeyLen(&.{ doc_key, index_id, encoded_tuple });
+}
+
+pub fn writeRelationalOrderedTupleIndexByDocKey(out: []u8, doc_key: []const u8, index_id: []const u8, encoded_tuple: []const u8) ![]u8 {
+    return try writeNamespacedComponentsKey(out, relational_ordered_tuple_index_by_doc_namespace, &.{ doc_key, index_id, encoded_tuple });
 }
 
 pub fn relationalOrderedTupleUniqueConflictKeyAlloc(

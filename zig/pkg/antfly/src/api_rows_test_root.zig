@@ -49,6 +49,170 @@ const distributed_txn = @import("api/distributed_txn.zig");
 const http_common = @import("raft/transport/http_common.zig");
 const query_api = @import("api/query.zig");
 
+const PublicRowsLifecycleAccessMode = enum {
+    base_scan,
+    ordered_tuple,
+    algebraic_filter,
+
+    fn schemaJson(self: @This()) []const u8 {
+        return switch (self) {
+            .base_scan =>
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id","status","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+            ,
+            .ordered_tuple =>
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id","status","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_amount_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"},{"column":"amount"}],"include_columns":["id","amount"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:status_amount_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
+            ,
+            .algebraic_filter =>
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id","status","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"alg_v1","owner_kind":"table","owner_name":"__antfly_table__","access_method":"algebraic_filter","method_config":{"type":"algebraic","derive_from_schema":true},"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:alg_v1","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0,"components":{"dictionary":true,"fact":true,"path":true,"postings":true}},"planner_capabilities":{"equality":true,"prefix":true,"algebraic_dictionary":true,"algebraic_fact":true,"algebraic_path":true}}]}
+            ,
+        };
+    }
+};
+
+const PublicRowsLifecycleStatusSource = struct {
+    tables: [1]metadata_table_manager.TableRecord,
+
+    fn init(schema_json: []const u8) @This() {
+        return .{ .tables = .{.{
+            .table_id = 1,
+            .name = "rows",
+            .schema_json = schema_json,
+            .desired_replica_count = 1,
+        }} };
+    }
+
+    fn iface(self: *@This()) http_server.StatusSource {
+        return .{ .ptr = self, .vtable = &.{
+            .status = status,
+            .admin_snapshot = adminSnapshot,
+            .free_admin_snapshot = freeAdminSnapshot,
+        } };
+    }
+
+    fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+        return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+    }
+
+    fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return .{
+            .status = try status(ptr),
+            .tables = self.tables[0..],
+            .ranges = &.{},
+            .stores = &.{},
+            .placement_intents = &.{},
+            .split_transitions = &.{},
+            .merge_transitions = &.{},
+        };
+    }
+
+    fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+};
+
+fn runPublicRowsQueryLifecycleCase(
+    alloc: std.mem.Allocator,
+    tmp_sub_path: []const u8,
+    access_mode: PublicRowsLifecycleAccessMode,
+) !void {
+    const schema_json = access_mode.schemaJson();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/public-rows-{s}", .{ tmp_sub_path, @tagName(access_mode) });
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{ .start_index_workers = false });
+    defer db.close();
+    try db.applyTableSchemaJson(alloc, schema_json, .{});
+    if (access_mode == .algebraic_filter) {
+        const config_json = try db_mod.algebraic.schema_capability.configJsonFromSchemaJsonAlloc(alloc, "rows", schema_json);
+        defer alloc.free(config_json);
+        try db.addIndex(.{ .name = "alg_v1", .kind = .algebraic, .config_json = config_json });
+    }
+
+    const writes = try alloc.alloc(db_mod.types.BatchWrite, 100);
+    defer {
+        for (writes) |write| {
+            alloc.free(write.key);
+            alloc.free(write.value);
+        }
+        alloc.free(writes);
+    }
+    for (writes, 0..) |*write, row_index| {
+        const status = if (row_index < 10) "low" else "high";
+        write.* = .{
+            .key = try std.fmt.allocPrint(alloc, "row:{d:0>3}", .{row_index}),
+            .value = try std.fmt.allocPrint(alloc, "{{\"id\":\"{d:0>3}\",\"status\":\"{s}\",\"amount\":{d}}}", .{ row_index, status, row_index }),
+        };
+    }
+    try db.batch(.{
+        .writes = writes,
+        .sync_level = if (access_mode == .algebraic_filter) .full_index else .write,
+    });
+
+    var reads = table_reads.BoundTableReadSource.init("rows", 1, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var status_source = PublicRowsLifecycleStatusSource.init(schema_json);
+    var server = http_server.ApiHttpServer.init(alloc, .{}, status_source.iface(), reads.source(), null);
+    defer server.deinit();
+
+    const query_cases = [_]struct {
+        name: []const u8,
+        body: []const u8,
+        expected_rows: usize,
+        expected_total: i64,
+        expected_total_exact: bool,
+        expected_access: [3][]const u8,
+    }{
+        .{
+            .name = "no total page",
+            .body = "{\"query\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"low\"},\"select\":[\"id\",\"amount\"],\"limit\":5,\"total_mode\":\"none\",\"profile\":true}}",
+            .expected_rows = 5,
+            .expected_total = 5,
+            .expected_total_exact = false,
+            .expected_access = .{ "base_scan", "ordered_tuple_stream", "algebraic_doc_set" },
+        },
+        .{
+            .name = "exact total page",
+            .body = "{\"query\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"low\"},\"select\":[\"id\",\"amount\"],\"limit\":5,\"total_mode\":\"exact\",\"profile\":true}}",
+            .expected_rows = 5,
+            .expected_total = 10,
+            .expected_total_exact = true,
+            .expected_access = .{ "base_scan", "ordered_tuple_stream", "algebraic_doc_set" },
+        },
+        .{
+            .name = "exact count only",
+            .body = "{\"query\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"low\"},\"select\":[\"id\",\"amount\"],\"limit\":0,\"total_mode\":\"exact\",\"profile\":true}}",
+            .expected_rows = 0,
+            .expected_total = 10,
+            .expected_total_exact = true,
+            .expected_access = .{ "base_scan", "base_scan", "algebraic_doc_set" },
+        },
+    };
+    const access_index: usize = @intFromEnum(access_mode);
+    for (0..8) |_| {
+        for (query_cases) |query_case| {
+            var response = try server.handle(.{
+                .method = .POST,
+                .uri = "/tables/rows/rows/query",
+                .content_type = "application/json",
+                .body = query_case.body,
+            });
+            defer response.deinit(alloc);
+            errdefer std.debug.print("public rows lifecycle failed mode={s} case={s} status={d} body={s}\n", .{ @tagName(access_mode), query_case.name, response.status, response.body });
+            try std.testing.expectEqual(@as(u16, 200), response.status);
+
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.body, .{ .allocate = .alloc_always });
+            defer parsed.deinit();
+            const object = parsed.value.object;
+            try std.testing.expectEqual(query_case.expected_total, object.get("total").?.integer);
+            const total_exact = if (object.get("total_exact")) |value| value.bool else true;
+            try std.testing.expectEqual(query_case.expected_total_exact, total_exact);
+            try std.testing.expectEqual(query_case.expected_rows, object.get("rows").?.array.items.len);
+            try std.testing.expectEqualStrings(
+                query_case.expected_access[access_index],
+                object.get("profile").?.object.get("access_method").?.string,
+            );
+        }
+    }
+}
+
 test {
     _ = http_server;
     _ = public_sql_endpoint_parity;
@@ -73,6 +237,17 @@ test {
     _ = table_writes_integrity;
     _ = table_writes_schema_jobs;
     _ = table_writes_sources;
+}
+
+test "api rows repeated public query lifecycle is stable by access and total mode" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const access_modes = [_]PublicRowsLifecycleAccessMode{ .base_scan, .ordered_tuple, .algebraic_filter };
+    for (access_modes) |access_mode| {
+        try runPublicRowsQueryLifecycleCase(alloc, &tmp.sub_path, access_mode);
+    }
 }
 
 test "api rows insert-source upsert aborts before commit when unique owner topology moves" {

@@ -964,6 +964,8 @@ pub fn AsyncContext(comptime DB: type) type {
         index_repair_state_corrupt: std.atomic.Value(bool) = .init(false),
         index_artifact_cleanup_mutex: std.atomic.Mutex = .unlocked,
         index_artifact_finalization_mutex: std.atomic.Mutex = .unlocked,
+        relational_index_drop_jobs_mutex: std.atomic.Mutex = .unlocked,
+        relational_index_drop_jobs: std.StringHashMapUnmanaged(void) = .empty,
         background_closing: std.atomic.Value(bool) = .init(false),
         enrichment_lifecycle_mutex: std.atomic.Mutex = .unlocked,
         enrichment_runtime: ?*enrichment_runtime_mod.EnrichmentRuntime = null,
@@ -993,6 +995,9 @@ pub fn AsyncContext(comptime DB: type) type {
             var target_repair_it = self.target_advance_repair_last_ns.iterator();
             while (target_repair_it.next()) |entry| alloc.free(@constCast(entry.key_ptr.*));
             self.target_advance_repair_last_ns.deinit(alloc);
+            var drop_job_it = self.relational_index_drop_jobs.keyIterator();
+            while (drop_job_it.next()) |key| alloc.free(@constCast(key.*));
+            self.relational_index_drop_jobs.deinit(alloc);
         }
     };
 }

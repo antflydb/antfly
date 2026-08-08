@@ -1012,6 +1012,9 @@ pub fn Impl(comptime DB: type) type {
                 if (!openModeRequiresReadOnlyBackends(opts.open_mode)) {
                     _ = try db.runArtifactRepairMetadataMaintenancePass();
                     try db.persistIndexLoadFailuresFromManager(alloc);
+                    if (!ha_standby_role) {
+                        _ = try db.discoverRelationalIndexDropJobs("");
+                    }
                 }
                 Self.recordStartupOpenStats(&db, profile);
                 if (openModeAllowsReplay(opts.open_mode)) {
@@ -5947,7 +5950,9 @@ test "db lifecycle open query_readonly lsm primary opens physical backend read-o
     try std.testing.expectError(error.ReadOnly, readonly.runRelationalIndexRepairJobPageAt("repair-target", "default", "public", "docs", "text_search", "idx", 1, "worker-a", 1000, 10, 1));
     try std.testing.expectError(error.ReadOnly, readonly.scheduleRelationalIndexRepairJobPageAt("repair-target", "default", "public", "docs", "text_search", "idx", 1, "worker-a", 1000, 10, 1));
     try std.testing.expectError(error.ReadOnly, readonly.upsertRelationalIndexDropJobRecordAt("drop-target", "default", "public", "docs", "text_search", "idx", 1, "worker-a", "", 1000, 10, "running", 1));
-    try std.testing.expectError(error.ReadOnly, readonly.recordRelationalIndexDropJobPassAt("drop-target", "complete", true, "", 1, 1, 0, 1, null, false, 1));
+    try std.testing.expectError(error.ReadOnly, readonly.recordRelationalIndexDropJobPassAt("drop-target", "worker-a", 1, "complete", true, "", 1, 1, 0, 1, null, false, 1));
+    try std.testing.expectError(error.ReadOnly, readonly.scheduleRelationalIndexDropJob("drop-target", "default", "public", "docs", "text_search", "idx", 1, "worker-a", 1000, 10));
+    try std.testing.expectError(error.ReadOnly, readonly.discoverRelationalIndexDropJobs("docs"));
     try std.testing.expectError(error.ReadOnly, readonly.completeForeignKeyIntegrityJobRecord("job-a", "complete", true, .{}));
     try std.testing.expectError(error.ReadOnly, readonly.completeForeignKeyIntegrityJobRecordWithDiagnostics("job-a", "complete", true, .{}, "[]", 0, false));
     try std.testing.expectError(error.ReadOnly, readonly.completeForeignKeyIntegrityJobRecordAt("job-at", "complete", true, .{}, 1));

@@ -409,23 +409,26 @@ pub fn Impl(comptime DB: type) type {
             const runtime_schema = try schema_api_mod.deriveRuntimeTableSchema(alloc, parsed_schema);
             defer schema_mod.freeSchema(alloc, runtime_schema);
 
-            self.core.lockApply();
-            defer self.core.unlockApply();
+            {
+                self.core.lockApply();
+                defer self.core.unlockApply();
 
-            try Self.validateTableSchemaCompatibilityLocked(self, alloc, runtime_schema);
-            if (options.reload_algebraic_schema_configs) {
-                try Self.stageAlgebraicSchemaConfigsPending(self, schema_json);
+                try Self.validateTableSchemaCompatibilityLocked(self, alloc, runtime_schema);
+                if (options.reload_algebraic_schema_configs) {
+                    try Self.stageAlgebraicSchemaConfigsPending(self, schema_json);
+                }
+                try Self.migrateRelationalRowsForSchemaTransitionLocked(self, alloc, runtime_schema);
+                try Self.migrateRelationalConstraintsForSchemaTransitionLocked(self, alloc, runtime_schema);
+                if (options.persist_local_schema_json) {
+                    try Self.setSchemaWithLocalSchemaJsonAfterGate(self, runtime_schema, schema_json);
+                } else {
+                    try Self.setSchemaAfterGate(self, runtime_schema);
+                }
+                if (options.reload_algebraic_schema_configs) {
+                    try Self.completePendingAlgebraicSchemaRebuilds(self);
+                }
             }
-            try Self.migrateRelationalRowsForSchemaTransitionLocked(self, alloc, runtime_schema);
-            try Self.migrateRelationalConstraintsForSchemaTransitionLocked(self, alloc, runtime_schema);
-            if (options.persist_local_schema_json) {
-                try Self.setSchemaWithLocalSchemaJsonAfterGate(self, runtime_schema, schema_json);
-            } else {
-                try Self.setSchemaAfterGate(self, runtime_schema);
-            }
-            if (options.reload_algebraic_schema_configs) {
-                try Self.completePendingAlgebraicSchemaRebuilds(self);
-            }
+            _ = try self.discoverRelationalIndexDropJobs(runtime_schema.default_type);
         }
 
         /// Refresh schema-derived algebraic index configs for callers that have
@@ -532,15 +535,18 @@ pub fn Impl(comptime DB: type) type {
             const runtime_schema = try schema_api_mod.deriveRuntimeTableSchema(alloc, parsed_schema);
             defer schema_mod.freeSchema(alloc, runtime_schema);
 
-            self.core.lockApply();
-            defer self.core.unlockApply();
+            {
+                self.core.lockApply();
+                defer self.core.unlockApply();
 
-            try Self.validateTableSchemaCompatibilityLocked(self, alloc, runtime_schema);
-            try Self.stageAlgebraicSchemaConfigsPending(self, table.schema_json);
-            try Self.migrateRelationalRowsForSchemaTransitionLocked(self, alloc, runtime_schema);
-            try Self.migrateRelationalConstraintsForSchemaTransitionLocked(self, alloc, runtime_schema);
-            try Self.setSchemaWithLocalLiteSqlTableRecordJsonAfterGate(self, runtime_schema, table.schema_json, table_record_json);
-            try Self.completePendingAlgebraicSchemaRebuilds(self);
+                try Self.validateTableSchemaCompatibilityLocked(self, alloc, runtime_schema);
+                try Self.stageAlgebraicSchemaConfigsPending(self, table.schema_json);
+                try Self.migrateRelationalRowsForSchemaTransitionLocked(self, alloc, runtime_schema);
+                try Self.migrateRelationalConstraintsForSchemaTransitionLocked(self, alloc, runtime_schema);
+                try Self.setSchemaWithLocalLiteSqlTableRecordJsonAfterGate(self, runtime_schema, table.schema_json, table_record_json);
+                try Self.completePendingAlgebraicSchemaRebuilds(self);
+            }
+            _ = try self.discoverRelationalIndexDropJobs(table.name);
         }
 
         pub fn getLiteSqlTableRecordAlloc(self: *DB, alloc: Allocator) !?metadata_table_manager.TableRecord {

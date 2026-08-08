@@ -202,7 +202,78 @@ pub const DictionaryIdentity = struct {
         defer alloc.free(identity_key);
         return try token.canonicalTupleAlloc(alloc, &.{ "dictionary_registry:v1", identity_key });
     }
+
+    pub fn decodeAlloc(alloc: std.mem.Allocator, encoded: []const u8) !OwnedDictionaryIdentity {
+        const parts = token.decodeTupleAlloc(alloc, encoded) catch return error.InvalidDictionaryIdentity;
+        defer {
+            for (parts) |part| alloc.free(part);
+            if (parts.len > 0) alloc.free(parts);
+        }
+        if (parts.len != 7 or !std.mem.eql(u8, parts[0], "dictionary:v1")) return error.InvalidDictionaryIdentity;
+        const label_kind = std.meta.stringToEnum(LabelKind, parts[3]) orelse return error.InvalidDictionaryIdentity;
+        const scope = try alloc.dupe(u8, parts[1]);
+        errdefer alloc.free(scope);
+        const field_or_path = try alloc.dupe(u8, parts[2]);
+        errdefer alloc.free(field_or_path);
+        const analyzer_or_canonicalization = try alloc.dupe(u8, parts[4]);
+        errdefer alloc.free(analyzer_or_canonicalization);
+        const value_kind = try alloc.dupe(u8, parts[5]);
+        errdefer alloc.free(value_kind);
+        const coercion_policy = try alloc.dupe(u8, parts[6]);
+        errdefer alloc.free(coercion_policy);
+        return .{
+            .scope = scope,
+            .field_or_path = field_or_path,
+            .label_kind = label_kind,
+            .analyzer_or_canonicalization = analyzer_or_canonicalization,
+            .value_kind = value_kind,
+            .coercion_policy = coercion_policy,
+        };
+    }
 };
+
+pub const OwnedDictionaryIdentity = struct {
+    scope: []u8,
+    field_or_path: []u8,
+    label_kind: LabelKind,
+    analyzer_or_canonicalization: []u8,
+    value_kind: []u8,
+    coercion_policy: []u8,
+
+    pub fn view(self: OwnedDictionaryIdentity) DictionaryIdentity {
+        return .{
+            .scope = self.scope,
+            .field_or_path = self.field_or_path,
+            .label_kind = self.label_kind,
+            .analyzer_or_canonicalization = self.analyzer_or_canonicalization,
+            .value_kind = self.value_kind,
+            .coercion_policy = self.coercion_policy,
+        };
+    }
+
+    pub fn deinit(self: *OwnedDictionaryIdentity, alloc: std.mem.Allocator) void {
+        alloc.free(self.scope);
+        alloc.free(self.field_or_path);
+        alloc.free(self.analyzer_or_canonicalization);
+        alloc.free(self.value_kind);
+        alloc.free(self.coercion_policy);
+        self.* = undefined;
+    }
+};
+
+pub fn registryPrefixAlloc(alloc: std.mem.Allocator) ![]u8 {
+    return try token.canonicalTupleAlloc(alloc, &.{"dictionary_registry:v1"});
+}
+
+pub fn registryIdentityAlloc(alloc: std.mem.Allocator, registry_key: []const u8) !OwnedDictionaryIdentity {
+    const parts = token.decodeTupleAlloc(alloc, registry_key) catch return error.InvalidDictionaryRegistryEntry;
+    defer {
+        for (parts) |part| alloc.free(part);
+        if (parts.len > 0) alloc.free(parts);
+    }
+    if (parts.len != 2 or !std.mem.eql(u8, parts[0], "dictionary_registry:v1")) return error.InvalidDictionaryRegistryEntry;
+    return DictionaryIdentity.decodeAlloc(alloc, parts[1]) catch return error.InvalidDictionaryRegistryEntry;
+}
 
 pub const AccessPath = struct {
     dictionary: DictionaryIdentity,
@@ -409,6 +480,31 @@ test "dictionary identity prevents duplicate FST ownership for identical semanti
         AccessPathProof{ .rejected = .scope_mismatch },
         sharedDictionaryProof(full_text, different_scope),
     );
+}
+
+test "dictionary identity and registry key decode by label-space case" {
+    const alloc = std.testing.allocator;
+    const cases = [_]DictionaryIdentity{
+        DictionaryIdentity.analyzedText("docs", "body", "standard"),
+        DictionaryIdentity.canonicalScalar("alg", "/payload", .number, "json-scalar-v1", "kind-qualified"),
+        DictionaryIdentity.sparseToken("docs", "body", "splade-v1", "token"),
+        DictionaryIdentity.graphLabel("graph", "/edge_type", "graph-label-v1", "string"),
+    };
+    for (cases) |identity| {
+        const encoded = try identity.keyAlloc(alloc);
+        defer alloc.free(encoded);
+        var decoded = try DictionaryIdentity.decodeAlloc(alloc, encoded);
+        defer decoded.deinit(alloc);
+        try std.testing.expect(DictionaryIdentity.eql(identity, decoded.view()));
+
+        const registry_key = try identity.registryKeyAlloc(alloc);
+        defer alloc.free(registry_key);
+        var registry_identity = try registryIdentityAlloc(alloc, registry_key);
+        defer registry_identity.deinit(alloc);
+        try std.testing.expect(DictionaryIdentity.eql(identity, registry_identity.view()));
+    }
+    try std.testing.expectError(error.InvalidDictionaryIdentity, DictionaryIdentity.decodeAlloc(alloc, "not-an-identity"));
+    try std.testing.expectError(error.InvalidDictionaryRegistryEntry, registryIdentityAlloc(alloc, "not-a-registry-key"));
 }
 
 test "dictionary registry entry records one physical owner per identity" {

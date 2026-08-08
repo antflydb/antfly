@@ -26067,6 +26067,12 @@ pub const ApiHttpServer = struct {
 
         var result = (source.rowsQueryPlan(self.alloc, table_name, schema, plan, .read_index) catch |err| switch (err) {
             error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.RelationalRowsCteMaterializationRejected => return try textResponse(self.alloc, 400, "invalid rows query request"),
+            error.RelationalIndexUnavailable,
+            error.RelationalIndexStale,
+            error.RelationalIndexMalformed,
+            error.RelationalIndexPlanTooExpensive,
+            error.RelationalIndexUnsupportedShape,
+            => return try relationalRowsPlannerFallbackErrorResponse(self.alloc, err),
             error.RelationalRowsCteSpillRequired => return try textResponse(self.alloc, 429, "rows query backpressured"),
             error.UnsupportedOperation, error.UnsupportedRowsQuery, error.EmptyExternalSourceSnapshot => return try textResponse(self.alloc, 501, "rows query plan unavailable"),
             error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
@@ -26130,6 +26136,12 @@ pub const ApiHttpServer = struct {
 
         var result = (source.rowsAggregatePlan(self.alloc, table_name, schema, plan, .read_index) catch |err| switch (err) {
             error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.ResourceBudgetExceeded, error.RelationalRowsCteMaterializationRejected => return try textResponse(self.alloc, 400, "invalid rows aggregate request"),
+            error.RelationalIndexUnavailable,
+            error.RelationalIndexStale,
+            error.RelationalIndexMalformed,
+            error.RelationalIndexPlanTooExpensive,
+            error.RelationalIndexUnsupportedShape,
+            => return try relationalRowsPlannerFallbackErrorResponse(self.alloc, err),
             error.RelationalRowsCteSpillRequired => return try textResponse(self.alloc, 429, "rows aggregate backpressured"),
             error.UnsupportedOperation, error.UnsupportedRowsQuery, error.EmptyExternalSourceSnapshot => return try textResponse(self.alloc, 501, "rows aggregate plan unavailable"),
             error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
@@ -26172,6 +26184,12 @@ pub const ApiHttpServer = struct {
 
         var result = (source.rowsWindowPlan(self.alloc, table_name, schema, plan, .read_index) catch |err| switch (err) {
             error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.RelationalRowsCteMaterializationRejected => return try textResponse(self.alloc, 400, "invalid rows window request"),
+            error.RelationalIndexUnavailable,
+            error.RelationalIndexStale,
+            error.RelationalIndexMalformed,
+            error.RelationalIndexPlanTooExpensive,
+            error.RelationalIndexUnsupportedShape,
+            => return try relationalRowsPlannerFallbackErrorResponse(self.alloc, err),
             error.RelationalRowsCteSpillRequired => return try textResponse(self.alloc, 429, "rows window backpressured"),
             error.UnsupportedOperation => return try textResponse(self.alloc, 501, "rows window plan unavailable"),
             error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
@@ -26235,6 +26253,12 @@ pub const ApiHttpServer = struct {
         else
             table_reads.rowsJoinPlanFromRoutedScansWithSchemasAlloc(self.alloc, source, table_name, left_table_name, right_table_name, cte_schema, left_schema, right_schema, plan, .read_index)) catch |err| switch (err) {
             error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.RelationalRowsCteMaterializationRejected => return try textResponse(self.alloc, 400, "invalid rows join request"),
+            error.RelationalIndexUnavailable,
+            error.RelationalIndexStale,
+            error.RelationalIndexMalformed,
+            error.RelationalIndexPlanTooExpensive,
+            error.RelationalIndexUnsupportedShape,
+            => return try relationalRowsPlannerFallbackErrorResponse(self.alloc, err),
             error.RelationalRowsCteSpillRequired => return try textResponse(self.alloc, 429, "rows join backpressured"),
             error.UnsupportedOperation => return try textResponse(self.alloc, 501, "rows join plan unavailable"),
             error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
@@ -26298,6 +26322,12 @@ pub const ApiHttpServer = struct {
         else
             table_reads.rowsLateralPlanFromRoutedScansWithSchemasAlloc(self.alloc, source, table_name, left_table_name, right_table_name, cte_schema, left_schema, right_schema, plan, .read_index)) catch |err| switch (err) {
             error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.RelationalRowsCteMaterializationRejected => return try textResponse(self.alloc, 400, "invalid rows lateral request"),
+            error.RelationalIndexUnavailable,
+            error.RelationalIndexStale,
+            error.RelationalIndexMalformed,
+            error.RelationalIndexPlanTooExpensive,
+            error.RelationalIndexUnsupportedShape,
+            => return try relationalRowsPlannerFallbackErrorResponse(self.alloc, err),
             error.RelationalRowsCteSpillRequired => return try textResponse(self.alloc, 429, "rows lateral backpressured"),
             error.UnsupportedOperation => return try textResponse(self.alloc, 501, "rows lateral plan unavailable"),
             error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
@@ -32725,6 +32755,68 @@ fn jsonBodyResponseWithStatus(
         .content_type = try alloc.dupe(u8, "application/json"),
         .body = try alloc.dupe(u8, body),
     };
+}
+
+fn relationalRowsPlannerFallbackErrorResponse(
+    alloc: std.mem.Allocator,
+    err: anyerror,
+) !http_common.HttpResponse {
+    return switch (err) {
+        error.RelationalIndexUnavailable => jsonBodyResponseWithStatus(
+            alloc,
+            503,
+            "{\"error\":\"relational_index_plan_rejected\",\"fallback_class\":\"unavailable\",\"retryable\":true}",
+        ),
+        error.RelationalIndexStale => jsonBodyResponseWithStatus(
+            alloc,
+            503,
+            "{\"error\":\"relational_index_plan_rejected\",\"fallback_class\":\"stale\",\"retryable\":true}",
+        ),
+        error.RelationalIndexMalformed => jsonBodyResponseWithStatus(
+            alloc,
+            500,
+            "{\"error\":\"relational_index_plan_rejected\",\"fallback_class\":\"malformed\",\"retryable\":false}",
+        ),
+        error.RelationalIndexPlanTooExpensive => jsonBodyResponseWithStatus(
+            alloc,
+            429,
+            "{\"error\":\"relational_index_plan_rejected\",\"fallback_class\":\"too-expensive\",\"retryable\":true}",
+        ),
+        error.RelationalIndexUnsupportedShape => jsonBodyResponseWithStatus(
+            alloc,
+            422,
+            "{\"error\":\"relational_index_plan_rejected\",\"fallback_class\":\"unsupported-shape\",\"retryable\":false}",
+        ),
+        else => error.InvalidArgument,
+    };
+}
+
+test "http relational rows planner fallback error payload matrix" {
+    const Case = struct {
+        err: anyerror,
+        status: u16,
+        fallback_class: []const u8,
+        retryable: bool,
+    };
+    const cases = [_]Case{
+        .{ .err = error.RelationalIndexUnavailable, .status = 503, .fallback_class = "unavailable", .retryable = true },
+        .{ .err = error.RelationalIndexStale, .status = 503, .fallback_class = "stale", .retryable = true },
+        .{ .err = error.RelationalIndexMalformed, .status = 500, .fallback_class = "malformed", .retryable = false },
+        .{ .err = error.RelationalIndexPlanTooExpensive, .status = 429, .fallback_class = "too-expensive", .retryable = true },
+        .{ .err = error.RelationalIndexUnsupportedShape, .status = 422, .fallback_class = "unsupported-shape", .retryable = false },
+    };
+
+    for (cases) |case| {
+        var response = try relationalRowsPlannerFallbackErrorResponse(std.testing.allocator, case.err);
+        defer response.deinit(std.testing.allocator);
+        try std.testing.expectEqual(case.status, response.status);
+        try std.testing.expectEqualStrings("application/json", response.content_type.?);
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, response.body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("relational_index_plan_rejected", parsed.value.object.get("error").?.string);
+        try std.testing.expectEqualStrings(case.fallback_class, parsed.value.object.get("fallback_class").?.string);
+        try std.testing.expectEqual(case.retryable, parsed.value.object.get("retryable").?.bool);
+    }
 }
 
 fn jsonResponseWithStatusOmitNullOptionals(

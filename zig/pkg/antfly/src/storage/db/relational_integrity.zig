@@ -16,9 +16,11 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const docstore_mod = @import("../docstore.zig");
+const background_runtime_mod = @import("../background_runtime.zig");
 const internal_keys = @import("../internal_keys.zig");
 const schema_mod = @import("../schema.zig");
 const schema_api_mod = @import("../../schema/mod.zig");
+const metadata_table_manager = @import("../../metadata/table_manager.zig");
 const transactions_mod = @import("../transactions.zig");
 const mapper = @import("document_mapper.zig");
 const db_internal = @import("internal.zig");
@@ -42,6 +44,71 @@ const foreign_key_action_job_key_prefix = "\x00\x00__metadata__:foreign_key_acti
 const foreign_key_action_schedule_key_prefix = "\x00\x00__metadata__:foreign_key_action_schedule";
 const unique_constraint_integrity_progress_key_prefix = "\x00\x00__metadata__:unique_constraint_integrity_progress";
 const foreign_key_action_default_cascade_max_depth: u32 = 64;
+
+pub const RelationalIndexDropScheduleResult = enum {
+    scheduled,
+    already_scheduled,
+    shutting_down,
+};
+
+pub const RelationalIndexDropDiscoveryStats = struct {
+    dropping_generations: u64 = 0,
+    scheduled_jobs: u64 = 0,
+    already_scheduled_jobs: u64 = 0,
+    reconciliation_jobs: u64 = 0,
+};
+
+const relational_index_drop_pages_per_callback: usize = 8;
+const relational_index_drop_max_retries_per_callback: usize = 4;
+const relational_index_drop_retry_base_ms: u64 = 25;
+const relational_index_drop_retry_max_ms: u64 = 1_000;
+const relational_index_drop_discovery_lease_ms: u64 = 30_000;
+const relational_index_drop_discovery_page_size: usize = 128;
+
+const relational_index_drop_test = struct {
+    var transient_failures_remaining: std.atomic.Value(u32) = .init(0);
+    var crash_after_page_remaining: std.atomic.Value(u32) = .init(0);
+    var block_callbacks: std.atomic.Value(bool) = .init(false);
+    var release_callbacks: std.atomic.Value(bool) = .init(false);
+    var callbacks_entered: std.atomic.Value(u32) = .init(0);
+    var active_callbacks: std.atomic.Value(u32) = .init(0);
+    var peak_active_callbacks: std.atomic.Value(u32) = .init(0);
+    var tail_submissions: std.atomic.Value(u32) = .init(0);
+
+    fn reset() void {
+        transient_failures_remaining.store(0, .release);
+        crash_after_page_remaining.store(0, .release);
+        block_callbacks.store(false, .release);
+        release_callbacks.store(false, .release);
+        callbacks_entered.store(0, .release);
+        active_callbacks.store(0, .release);
+        peak_active_callbacks.store(0, .release);
+        tail_submissions.store(0, .release);
+    }
+};
+
+fn consumeRelationalIndexDropTestFailure(counter: *std.atomic.Value(u32)) bool {
+    if (!builtin.is_test) return false;
+    var remaining = counter.load(.acquire);
+    while (remaining > 0) {
+        if (counter.cmpxchgWeak(remaining, remaining - 1, .acq_rel, .acquire)) |actual| {
+            remaining = actual;
+            continue;
+        }
+        return true;
+    }
+    return false;
+}
+
+fn lockRelationalIndexDropScheduler(mutex: *std.atomic.Mutex) void {
+    while (!mutex.tryLock()) {
+        if (builtin.os.tag == .freestanding or builtin.single_threaded) {
+            std.atomic.spinLoopHint();
+        } else {
+            std.Thread.yield() catch {};
+        }
+    }
+}
 
 fn currentTimeNs() u64 {
     return platform_clock.Clock.real().nowRealtimeNs();
@@ -273,7 +340,7 @@ pub const RelationalIndexRepairJobRecord = struct {
 };
 
 pub const RelationalIndexDropJobRecord = struct {
-    version: u32 = 1,
+    version: u32 = 2,
     job_id: []const u8,
     database_name: []const u8 = "default",
     namespace_name: []const u8 = "public",
@@ -288,6 +355,9 @@ pub const RelationalIndexDropJobRecord = struct {
     status: []const u8,
     created_at_ns: u64,
     updated_at_ns: u64,
+    claimed_at_ns: u64,
+    lease_until_ns: u64,
+    lease_epoch: u64,
     attempts: u32 = 0,
     completed: bool = false,
     failure_reason: ?[]const u8 = null,
@@ -3488,6 +3558,7 @@ pub fn Impl(comptime DB: type) type {
 
             var created_at_ns = now_ns;
             var attempts: u32 = 1;
+            var lease_epoch: u64 = 1;
             var preserved_cursor: ?[]u8 = null;
             defer if (preserved_cursor) |value| self.alloc.free(value);
             var previous_cursor: []const u8 = cursor;
@@ -3503,10 +3574,23 @@ pub fn Impl(comptime DB: type) type {
             if (self.core.store.get(self.alloc, key)) |raw| {
                 defer self.alloc.free(raw);
                 const existing = try cloneRelationalIndexDropJobRecordFromJson(self, raw);
+                if (!std.mem.eql(u8, existing.database_name, database_name) or
+                    !std.mem.eql(u8, existing.namespace_name, namespace_name) or
+                    !std.mem.eql(u8, existing.table_name, table_name) or
+                    !std.mem.eql(u8, existing.access_method, access_method) or
+                    !std.mem.eql(u8, existing.index_name, index_name) or
+                    existing.generation != generation)
+                {
+                    self.freeRelationalIndexDropJobRecord(existing);
+                    return error.RelationalIndexDropJobIdentityMismatch;
+                }
+                if (existing.completed) return existing;
                 defer self.freeRelationalIndexDropJobRecord(existing);
-                if (existing.generation != generation) return error.StaleRelationalIndexDropJobGeneration;
+                if (!std.mem.eql(u8, existing.worker_id, worker_id) and now_ns <= existing.lease_until_ns)
+                    return error.RelationalIndexDropJobLeaseHeld;
                 created_at_ns = existing.created_at_ns;
                 attempts = existing.attempts +| 1;
+                lease_epoch = std.math.add(u64, existing.lease_epoch, 1) catch return error.RelationalIndexDropJobLeaseEpochExhausted;
                 if (cursor.len == 0) {
                     preserved_cursor = try self.alloc.dupe(u8, existing.cursor);
                     previous_cursor = preserved_cursor.?;
@@ -3541,6 +3625,13 @@ pub fn Impl(comptime DB: type) type {
                 .status = status,
                 .created_at_ns = created_at_ns,
                 .updated_at_ns = now_ns,
+                .claimed_at_ns = now_ns,
+                .lease_until_ns = std.math.add(
+                    u64,
+                    now_ns,
+                    std.math.mul(u64, lease_ms, std.time.ns_per_ms) catch std.math.maxInt(u64),
+                ) catch std.math.maxInt(u64),
+                .lease_epoch = lease_epoch,
                 .attempts = attempts,
                 .failure_reason = failure_reason,
                 .stale_generation = stale_generation,
@@ -3559,6 +3650,8 @@ pub fn Impl(comptime DB: type) type {
         pub fn recordRelationalIndexDropJobPassAt(
             self: *DB,
             job_id: []const u8,
+            worker_id: []const u8,
+            lease_epoch: u64,
             status: []const u8,
             complete: bool,
             cursor: []const u8,
@@ -3570,7 +3663,7 @@ pub fn Impl(comptime DB: type) type {
             stale_generation: bool,
             now_ns: u64,
         ) !RelationalIndexDropJobRecord {
-            if (job_id.len == 0 or status.len == 0) return error.InvalidRelationalIndexDropJob;
+            if (job_id.len == 0 or worker_id.len == 0 or lease_epoch == 0 or status.len == 0) return error.InvalidRelationalIndexDropJob;
             self.core.lockApply();
             defer self.core.unlockApply();
 
@@ -3583,6 +3676,13 @@ pub fn Impl(comptime DB: type) type {
             defer self.alloc.free(raw);
             const existing = try cloneRelationalIndexDropJobRecordFromJson(self, raw);
             defer self.freeRelationalIndexDropJobRecord(existing);
+            if (existing.completed) return error.RelationalIndexDropJobCompleted;
+            if (!std.mem.eql(u8, existing.worker_id, worker_id) or
+                existing.lease_epoch != lease_epoch or
+                now_ns > existing.lease_until_ns)
+            {
+                return error.StaleRelationalIndexDropJobLease;
+            }
 
             const record = RelationalIndexDropJobRecord{
                 .job_id = existing.job_id,
@@ -3599,6 +3699,9 @@ pub fn Impl(comptime DB: type) type {
                 .status = status,
                 .created_at_ns = existing.created_at_ns,
                 .updated_at_ns = now_ns,
+                .claimed_at_ns = existing.claimed_at_ns,
+                .lease_until_ns = if (complete) now_ns else existing.lease_until_ns,
+                .lease_epoch = existing.lease_epoch,
                 .attempts = existing.attempts,
                 .completed = complete,
                 .failure_reason = failure_reason,
@@ -3617,6 +3720,722 @@ pub fn Impl(comptime DB: type) type {
             defer self.alloc.free(payload);
             try self.core.store.put(key, payload);
             return try cloneRelationalIndexDropJobRecordFromJson(self, payload);
+        }
+
+        fn recordRelationalIndexDropJobFailureAt(
+            self: *DB,
+            job_id: []const u8,
+            worker_id: []const u8,
+            lease_epoch: u64,
+            cursor: []const u8,
+            err: anyerror,
+            stale_generation: bool,
+            now_ns: u64,
+        ) !RelationalIndexDropJobRecord {
+            return try self.recordRelationalIndexDropJobPassAt(
+                job_id,
+                worker_id,
+                lease_epoch,
+                "failed",
+                false,
+                cursor,
+                1,
+                0,
+                0,
+                0,
+                @errorName(err),
+                stale_generation,
+                now_ns,
+            );
+        }
+
+        fn relationalIndexDropPageCursorAlloc(
+            self: *DB,
+            access_method: schema_mod.RelationalIndexAccessMethod,
+            component: ?schema_mod.RelationalIndexGenerationComponent,
+            cursor: ?[]const u8,
+        ) ![]u8 {
+            const phase = if (component) |value| @tagName(value) else access_method.name();
+            const cursor_bytes = cursor orelse return try self.alloc.dupe(u8, phase);
+            const hex = "0123456789abcdef";
+            const encoded = try self.alloc.alloc(u8, phase.len + 1 + cursor_bytes.len * 2);
+            @memcpy(encoded[0..phase.len], phase);
+            encoded[phase.len] = ':';
+            for (cursor_bytes, 0..) |byte, i| {
+                encoded[phase.len + 1 + i * 2] = hex[byte >> 4];
+                encoded[phase.len + 2 + i * 2] = hex[byte & 0x0f];
+            }
+            return encoded;
+        }
+
+        pub fn runRelationalIndexDropJobPageAt(
+            self: *DB,
+            job_id: []const u8,
+            database_name: []const u8,
+            namespace_name: []const u8,
+            table_name: []const u8,
+            access_method_text: []const u8,
+            index_name: []const u8,
+            generation: u64,
+            worker_id: []const u8,
+            lease_ms: u64,
+            max_work_units: usize,
+            now_ns: u64,
+        ) !RelationalIndexDropJobRecord {
+            const started = try self.upsertRelationalIndexDropJobRecordAt(
+                job_id,
+                database_name,
+                namespace_name,
+                table_name,
+                access_method_text,
+                index_name,
+                generation,
+                worker_id,
+                "",
+                lease_ms,
+                max_work_units,
+                "running",
+                now_ns,
+            );
+            if (started.completed) return started;
+            defer self.freeRelationalIndexDropJobRecord(started);
+
+            const access_method = schema_mod.RelationalIndexAccessMethod.fromString(access_method_text) orelse
+                return try recordRelationalIndexDropJobFailureAt(
+                    self,
+                    job_id,
+                    started.worker_id,
+                    started.lease_epoch,
+                    started.cursor,
+                    error.UnsupportedRelationalIndexDropAccessMethod,
+                    false,
+                    now_ns,
+                );
+            if (access_method != .text_search and access_method != .algebraic_filter) {
+                return try recordRelationalIndexDropJobFailureAt(
+                    self,
+                    job_id,
+                    started.worker_id,
+                    started.lease_epoch,
+                    started.cursor,
+                    error.UnsupportedRelationalIndexDropAccessMethod,
+                    false,
+                    now_ns,
+                );
+            }
+
+            const begin = self.core.index_manager.beginRelationalIndexArtifactDrop(
+                self.core.store,
+                access_method,
+                index_name,
+                generation,
+            ) catch |err| {
+                return try recordRelationalIndexDropJobFailureAt(self, job_id, started.worker_id, started.lease_epoch, started.cursor, err, false, now_ns);
+            };
+            switch (begin) {
+                .started, .already_started => {},
+                .index_not_found, .already_absent => {
+                    return try self.recordRelationalIndexDropJobPassAt(job_id, started.worker_id, started.lease_epoch, "complete", true, "", 1, 0, 0, 0, null, false, now_ns);
+                },
+                .generation_mismatch => {
+                    return try recordRelationalIndexDropJobFailureAt(self, job_id, started.worker_id, started.lease_epoch, started.cursor, error.RelationalIndexGenerationChanged, true, now_ns);
+                },
+                .schema_missing, .non_relational_schema, .wrong_access_method, .malformed_record, .incomplete, .finalized => {
+                    return try recordRelationalIndexDropJobFailureAt(self, job_id, started.worker_id, started.lease_epoch, started.cursor, error.RelationalIndexGenerationMalformed, false, now_ns);
+                },
+            }
+
+            const finalize = self.core.index_manager.finalizeRelationalIndexArtifactDrop(
+                self.core.store,
+                access_method,
+                index_name,
+                generation,
+            ) catch |err| {
+                return try recordRelationalIndexDropJobFailureAt(self, job_id, started.worker_id, started.lease_epoch, started.cursor, err, false, now_ns);
+            };
+            switch (finalize) {
+                .finalized, .already_absent => {
+                    return try self.recordRelationalIndexDropJobPassAt(job_id, started.worker_id, started.lease_epoch, "complete", true, "", 1, 0, 0, 0, null, false, now_ns);
+                },
+                .incomplete => {},
+                .generation_mismatch => {
+                    return try recordRelationalIndexDropJobFailureAt(self, job_id, started.worker_id, started.lease_epoch, started.cursor, error.RelationalIndexGenerationChanged, true, now_ns);
+                },
+                .started, .already_started, .schema_missing, .non_relational_schema, .index_not_found, .wrong_access_method, .malformed_record => {
+                    return try recordRelationalIndexDropJobFailureAt(self, job_id, started.worker_id, started.lease_epoch, started.cursor, error.RelationalIndexGenerationMalformed, false, now_ns);
+                },
+            }
+
+            var page = switch (access_method) {
+                .text_search => self.core.index_manager.dropRelationalTextSearchArtifactPage(
+                    self.core.store,
+                    index_name,
+                    generation,
+                    max_work_units,
+                ),
+                .algebraic_filter => self.core.index_manager.dropRelationalAlgebraicArtifactPage(
+                    self.core.store,
+                    index_name,
+                    generation,
+                    max_work_units,
+                ),
+                else => unreachable,
+            } catch |err| {
+                const stale = err == error.RelationalIndexGenerationChanged;
+                return try recordRelationalIndexDropJobFailureAt(self, job_id, started.worker_id, started.lease_epoch, started.cursor, err, stale, now_ns);
+            };
+            defer page.deinit(self.alloc);
+
+            if (consumeRelationalIndexDropTestFailure(&relational_index_drop_test.crash_after_page_remaining)) {
+                return error.RelationalIndexDropInjectedWorkerCrash;
+            }
+
+            const cursor = try relationalIndexDropPageCursorAlloc(self, access_method, page.component, page.next_cursor);
+            defer self.alloc.free(cursor);
+            if (page.complete) {
+                const completed = self.core.index_manager.finalizeRelationalIndexArtifactDrop(
+                    self.core.store,
+                    access_method,
+                    index_name,
+                    generation,
+                ) catch |err| {
+                    return try recordRelationalIndexDropJobFailureAt(self, job_id, started.worker_id, started.lease_epoch, cursor, err, false, now_ns);
+                };
+                if (completed != .finalized and completed != .already_absent) {
+                    const stale = completed == .generation_mismatch;
+                    return try recordRelationalIndexDropJobFailureAt(
+                        self,
+                        job_id,
+                        started.worker_id,
+                        started.lease_epoch,
+                        cursor,
+                        if (stale) error.RelationalIndexGenerationChanged else error.RelationalIndexGenerationMalformed,
+                        stale,
+                        now_ns,
+                    );
+                }
+            }
+
+            return try self.recordRelationalIndexDropJobPassAt(
+                job_id,
+                started.worker_id,
+                started.lease_epoch,
+                if (page.complete) "complete" else "running",
+                page.complete,
+                if (page.complete) "" else cursor,
+                1,
+                1,
+                0,
+                page.deleted_artifacts,
+                null,
+                false,
+                now_ns,
+            );
+        }
+
+        fn acquireRelationalIndexDropSchedule(self: *DB, job_id: []const u8) !RelationalIndexDropScheduleResult {
+            if (self.async_context.background_closing.load(.acquire)) return .shutting_down;
+            lockRelationalIndexDropScheduler(&self.async_context.relational_index_drop_jobs_mutex);
+            defer self.async_context.relational_index_drop_jobs_mutex.unlock();
+            if (self.async_context.background_closing.load(.acquire)) return .shutting_down;
+            if (self.async_context.relational_index_drop_jobs.contains(job_id)) return .already_scheduled;
+            const owned_job_id = try self.runtime_alloc.dupe(u8, job_id);
+            errdefer self.runtime_alloc.free(owned_job_id);
+            try self.async_context.relational_index_drop_jobs.putNoClobber(self.runtime_alloc, owned_job_id, {});
+            return .scheduled;
+        }
+
+        fn releaseRelationalIndexDropSchedule(self: *DB, job_id: []const u8) void {
+            lockRelationalIndexDropScheduler(&self.async_context.relational_index_drop_jobs_mutex);
+            defer self.async_context.relational_index_drop_jobs_mutex.unlock();
+            if (self.async_context.relational_index_drop_jobs.fetchRemove(job_id)) |removed| {
+                self.runtime_alloc.free(removed.key);
+            }
+        }
+
+        fn relationalIndexDropFailureIsTerminal(record: RelationalIndexDropJobRecord) bool {
+            if (record.stale_generation) return true;
+            const reason = record.failure_reason orelse return false;
+            const terminal_reasons = [_][]const u8{
+                "UnsupportedRelationalIndexDropAccessMethod",
+                "RelationalIndexGenerationChanged",
+                "RelationalIndexGenerationMalformed",
+                "RelationalIndexDropJobIdentityMismatch",
+            };
+            for (terminal_reasons) |terminal| {
+                if (std.mem.eql(u8, reason, terminal)) return true;
+            }
+            return false;
+        }
+
+        fn waitForRelationalIndexDropRetry(self: *DB, delay_ms: u64) bool {
+            var remaining_ms = delay_ms;
+            while (remaining_ms > 0) {
+                if (self.async_context.background_closing.load(.acquire)) return false;
+                const chunk_ms = @min(remaining_ms, relational_index_drop_retry_base_ms);
+                if (self.backend_runtime.io()) |io| {
+                    io.sleep(std.Io.Duration.fromMilliseconds(chunk_ms), .awake) catch return false;
+                } else {
+                    // Manual lanes are deterministic and execute inline. Retrying
+                    // without wall-clock delay keeps those runtimes non-blocking.
+                    std.atomic.spinLoopHint();
+                }
+                remaining_ms -= chunk_ms;
+            }
+            return !self.async_context.background_closing.load(.acquire);
+        }
+
+        fn persistRelationalIndexDropRetryExhaustion(
+            self: *DB,
+            job_id: []const u8,
+            database_name: []const u8,
+            namespace_name: []const u8,
+            table_name: []const u8,
+            access_method: []const u8,
+            index_name: []const u8,
+            generation: u64,
+            worker_id: []const u8,
+            lease_ms: u64,
+            max_work_units: usize,
+        ) void {
+            const now_ns = currentTimeNs();
+            const started = self.upsertRelationalIndexDropJobRecordAt(
+                job_id,
+                database_name,
+                namespace_name,
+                table_name,
+                access_method,
+                index_name,
+                generation,
+                worker_id,
+                "",
+                lease_ms,
+                max_work_units,
+                "running",
+                now_ns,
+            ) catch return;
+            defer self.freeRelationalIndexDropJobRecord(started);
+            if (started.completed) return;
+            const failed = self.recordRelationalIndexDropJobPassAt(
+                job_id,
+                started.worker_id,
+                started.lease_epoch,
+                "failed",
+                false,
+                started.cursor,
+                0,
+                0,
+                0,
+                0,
+                "RelationalIndexDropRetriesExhausted",
+                false,
+                now_ns,
+            ) catch return;
+            self.freeRelationalIndexDropJobRecord(failed);
+        }
+
+        fn relationalIndexDropDiscoveryJobIdAlloc(
+            self: *DB,
+            database_name: []const u8,
+            namespace_name: []const u8,
+            table_name: []const u8,
+            access_method: []const u8,
+            index_name: []const u8,
+            generation: u64,
+            reconciliation: bool,
+        ) ![]u8 {
+            return try std.fmt.allocPrint(
+                self.alloc,
+                "job:relational-index-drop:{d}:{s}:{d}:{s}:{d}:{s}:{d}:{s}:{d}:{s}:{d}{s}",
+                .{
+                    database_name.len,
+                    database_name,
+                    namespace_name.len,
+                    namespace_name,
+                    table_name.len,
+                    table_name,
+                    access_method.len,
+                    access_method,
+                    index_name.len,
+                    index_name,
+                    generation,
+                    if (reconciliation) ":reconcile" else "",
+                },
+            );
+        }
+
+        pub fn discoverRelationalIndexDropJobs(
+            self: *DB,
+            database_name: []const u8,
+            namespace_name: []const u8,
+            table_name: []const u8,
+        ) !RelationalIndexDropDiscoveryStats {
+            if (database_name.len == 0 or namespace_name.len == 0 or table_name.len == 0) return error.InvalidRelationalIndexDropDiscoveryIdentity;
+            const schema = (try schema_mod.loadSchema(self.core.store, self.alloc)) orelse return .{};
+            defer schema_mod.freeSchema(self.alloc, schema);
+            if (schema.storage_mode != .relational) return .{};
+
+            var stats = RelationalIndexDropDiscoveryStats{};
+            for (schema.relational_indexes) |index| {
+                if (index.lifecycle != .dropping) continue;
+                if (index.access_method != .text_search and index.access_method != .algebraic_filter) continue;
+                stats.dropping_generations += 1;
+
+                var job_id = try relationalIndexDropDiscoveryJobIdAlloc(
+                    self,
+                    database_name,
+                    namespace_name,
+                    table_name,
+                    index.access_method.name(),
+                    index.name,
+                    index.generation,
+                    false,
+                );
+                defer self.alloc.free(job_id);
+                if (try self.loadRelationalIndexDropJobRecord(job_id)) |existing| {
+                    defer self.freeRelationalIndexDropJobRecord(existing);
+                    if (existing.completed) {
+                        self.alloc.free(job_id);
+                        stats.reconciliation_jobs += 1;
+                        job_id = try relationalIndexDropDiscoveryJobIdAlloc(
+                            self,
+                            database_name,
+                            namespace_name,
+                            table_name,
+                            index.access_method.name(),
+                            index.name,
+                            index.generation,
+                            true,
+                        );
+                        if (try self.loadRelationalIndexDropJobRecord(job_id)) |recovery| {
+                            defer self.freeRelationalIndexDropJobRecord(recovery);
+                            if (recovery.completed) return error.RelationalIndexDropCompletionContradictsSchema;
+                        }
+                    }
+                }
+
+                const worker_id = try std.fmt.allocPrint(self.alloc, "worker:{s}", .{job_id});
+                defer self.alloc.free(worker_id);
+                const result = try self.scheduleRelationalIndexDropJob(
+                    job_id,
+                    database_name,
+                    namespace_name,
+                    table_name,
+                    index.access_method.name(),
+                    index.name,
+                    index.generation,
+                    worker_id,
+                    relational_index_drop_discovery_lease_ms,
+                    relational_index_drop_discovery_page_size,
+                );
+                switch (result) {
+                    .scheduled => stats.scheduled_jobs += 1,
+                    .already_scheduled => stats.already_scheduled_jobs += 1,
+                    .shutting_down => return error.RelationalIndexDropDiscoveryShuttingDown,
+                }
+            }
+            return stats;
+        }
+
+        pub fn discoverRelationalIndexDropJobsForStoredTable(
+            self: *DB,
+            fallback_table_name: []const u8,
+        ) !RelationalIndexDropDiscoveryStats {
+            const table_record = try self.getLiteSqlTableRecordAlloc(self.alloc);
+            defer if (table_record) |record| metadata_table_manager.freeTable(self.alloc, record);
+            if (table_record) |record| {
+                return try discoverRelationalIndexDropJobs(
+                    self,
+                    record.database_name,
+                    record.namespace_name,
+                    record.name,
+                );
+            }
+            const schema = if (fallback_table_name.len == 0) try schema_mod.loadSchema(self.core.store, self.alloc) else null;
+            defer if (schema) |value| schema_mod.freeSchema(self.alloc, value);
+            const table_name = if (fallback_table_name.len > 0)
+                fallback_table_name
+            else if (schema) |value|
+                value.default_type
+            else
+                return .{};
+            return try discoverRelationalIndexDropJobs(
+                self,
+                metadata_table_manager.default_database_name,
+                metadata_table_manager.default_namespace_name,
+                table_name,
+            );
+        }
+
+        pub fn scheduleRelationalIndexDropJob(
+            self: *DB,
+            job_id: []const u8,
+            database_name: []const u8,
+            namespace_name: []const u8,
+            table_name: []const u8,
+            access_method: []const u8,
+            index_name: []const u8,
+            generation: u64,
+            worker_id: []const u8,
+            lease_ms: u64,
+            max_work_units: usize,
+        ) !RelationalIndexDropScheduleResult {
+            if (job_id.len == 0 or database_name.len == 0 or namespace_name.len == 0 or table_name.len == 0 or access_method.len == 0 or index_name.len == 0 or generation == 0 or worker_id.len == 0 or lease_ms == 0 or max_work_units == 0) return error.InvalidRelationalIndexDropJob;
+
+            const admission = try acquireRelationalIndexDropSchedule(self, job_id);
+            if (admission != .scheduled) return admission;
+            errdefer releaseRelationalIndexDropSchedule(self, job_id);
+
+            const DropChainJob = struct {
+                alloc: Allocator,
+                db: *DB,
+                job_id: []u8,
+                database_name: []u8,
+                namespace_name: []u8,
+                table_name: []u8,
+                access_method: []u8,
+                index_name: []u8,
+                generation: u64,
+                worker_id: []u8,
+                lease_ms: u64,
+                max_work_units: usize,
+
+                fn init(
+                    alloc: Allocator,
+                    db: *DB,
+                    job_id_arg: []const u8,
+                    database_name_arg: []const u8,
+                    namespace_name_arg: []const u8,
+                    table_name_arg: []const u8,
+                    access_method_arg: []const u8,
+                    index_name_arg: []const u8,
+                    generation_arg: u64,
+                    worker_id_arg: []const u8,
+                    lease_ms_arg: u64,
+                    max_work_units_arg: usize,
+                ) !*@This() {
+                    const job = try alloc.create(@This());
+                    errdefer alloc.destroy(job);
+                    job.* = .{
+                        .alloc = alloc,
+                        .db = db,
+                        .job_id = try alloc.dupe(u8, job_id_arg),
+                        .database_name = &.{},
+                        .namespace_name = &.{},
+                        .table_name = &.{},
+                        .access_method = &.{},
+                        .index_name = &.{},
+                        .generation = generation_arg,
+                        .worker_id = &.{},
+                        .lease_ms = lease_ms_arg,
+                        .max_work_units = max_work_units_arg,
+                    };
+                    errdefer alloc.free(job.job_id);
+                    job.database_name = try alloc.dupe(u8, database_name_arg);
+                    errdefer alloc.free(job.database_name);
+                    job.namespace_name = try alloc.dupe(u8, namespace_name_arg);
+                    errdefer alloc.free(job.namespace_name);
+                    job.table_name = try alloc.dupe(u8, table_name_arg);
+                    errdefer alloc.free(job.table_name);
+                    job.access_method = try alloc.dupe(u8, access_method_arg);
+                    errdefer alloc.free(job.access_method);
+                    job.index_name = try alloc.dupe(u8, index_name_arg);
+                    errdefer alloc.free(job.index_name);
+                    job.worker_id = try alloc.dupe(u8, worker_id_arg);
+                    return job;
+                }
+
+                fn updatePeakActiveCallbacks(active: u32) void {
+                    if (!builtin.is_test) return;
+                    var peak = relational_index_drop_test.peak_active_callbacks.load(.acquire);
+                    while (active > peak) {
+                        if (relational_index_drop_test.peak_active_callbacks.cmpxchgWeak(peak, active, .acq_rel, .acquire)) |actual| {
+                            peak = actual;
+                            continue;
+                        }
+                        break;
+                    }
+                }
+
+                fn submitTail(job: *@This()) !void {
+                    const tail = try init(
+                        job.alloc,
+                        job.db,
+                        job.job_id,
+                        job.database_name,
+                        job.namespace_name,
+                        job.table_name,
+                        job.access_method,
+                        job.index_name,
+                        job.generation,
+                        job.worker_id,
+                        job.lease_ms,
+                        job.max_work_units,
+                    );
+                    errdefer deinit(tail);
+                    try job.db.backend_runtime.durable_jobs.submit(.{
+                        .owner_id = job.db.relational_index_worker_owner_id,
+                        .class = .cleanup,
+                        .ptr = tail,
+                        .run = run,
+                        .deinit = deinit,
+                    });
+                    if (builtin.is_test) _ = relational_index_drop_test.tail_submissions.fetchAdd(1, .acq_rel);
+                }
+
+                fn run(ptr: *anyopaque) anyerror!void {
+                    const job: *@This() = @ptrCast(@alignCast(ptr));
+                    var release_admission = true;
+                    defer if (release_admission) Self.releaseRelationalIndexDropSchedule(job.db, job.job_id);
+
+                    if (builtin.is_test) {
+                        const active = relational_index_drop_test.active_callbacks.fetchAdd(1, .acq_rel) + 1;
+                        defer _ = relational_index_drop_test.active_callbacks.fetchSub(1, .acq_rel);
+                        updatePeakActiveCallbacks(active);
+                        _ = relational_index_drop_test.callbacks_entered.fetchAdd(1, .acq_rel);
+                        while (relational_index_drop_test.block_callbacks.load(.acquire) and
+                            !relational_index_drop_test.release_callbacks.load(.acquire) and
+                            !job.db.async_context.background_closing.load(.acquire))
+                        {
+                            std.Thread.yield() catch {};
+                        }
+                    }
+
+                    var pages: usize = 0;
+                    var retries: usize = 0;
+                    while (pages < relational_index_drop_pages_per_callback) {
+                        if (job.db.async_context.background_closing.load(.acquire)) return;
+                        const now_ns = currentTimeNs();
+                        const page = if (consumeRelationalIndexDropTestFailure(&relational_index_drop_test.transient_failures_remaining))
+                            error.RelationalIndexDropInjectedTransientFailure
+                        else
+                            job.db.runRelationalIndexDropJobPageAt(
+                                job.job_id,
+                                job.database_name,
+                                job.namespace_name,
+                                job.table_name,
+                                job.access_method,
+                                job.index_name,
+                                job.generation,
+                                job.worker_id,
+                                job.lease_ms,
+                                job.max_work_units,
+                                now_ns,
+                            );
+                        const record = page catch |err| {
+                            switch (err) {
+                                error.RelationalIndexDropJobLeaseHeld,
+                                error.RelationalIndexDropJobIdentityMismatch,
+                                error.StaleRelationalIndexDropJobLease,
+                                error.RelationalIndexDropJobCompleted,
+                                => return,
+                                else => {},
+                            }
+                            if (retries == relational_index_drop_max_retries_per_callback) {
+                                Self.persistRelationalIndexDropRetryExhaustion(
+                                    job.db,
+                                    job.job_id,
+                                    job.database_name,
+                                    job.namespace_name,
+                                    job.table_name,
+                                    job.access_method,
+                                    job.index_name,
+                                    job.generation,
+                                    job.worker_id,
+                                    job.lease_ms,
+                                    job.max_work_units,
+                                );
+                                return;
+                            }
+                            const shift: u6 = @intCast(@min(retries, 5));
+                            const delay_ms = @min(relational_index_drop_retry_base_ms << shift, relational_index_drop_retry_max_ms);
+                            retries += 1;
+                            if (!Self.waitForRelationalIndexDropRetry(job.db, delay_ms)) return;
+                            continue;
+                        };
+                        defer job.db.freeRelationalIndexDropJobRecord(record);
+                        if (record.completed or Self.relationalIndexDropFailureIsTerminal(record)) return;
+                        if (std.mem.eql(u8, record.status, "failed")) {
+                            if (retries == relational_index_drop_max_retries_per_callback) {
+                                Self.persistRelationalIndexDropRetryExhaustion(
+                                    job.db,
+                                    job.job_id,
+                                    job.database_name,
+                                    job.namespace_name,
+                                    job.table_name,
+                                    job.access_method,
+                                    job.index_name,
+                                    job.generation,
+                                    job.worker_id,
+                                    job.lease_ms,
+                                    job.max_work_units,
+                                );
+                                return;
+                            }
+                            const shift: u6 = @intCast(@min(retries, 5));
+                            const delay_ms = @min(relational_index_drop_retry_base_ms << shift, relational_index_drop_retry_max_ms);
+                            retries += 1;
+                            if (!Self.waitForRelationalIndexDropRetry(job.db, delay_ms)) return;
+                            continue;
+                        }
+                        retries = 0;
+                        pages += 1;
+                    }
+
+                    if (job.db.async_context.background_closing.load(.acquire)) return;
+                    // Manual lanes execute submit inline; releasing admission here avoids
+                    // recursive, unbounded callbacks in deterministic test runtimes.
+                    if (job.db.backend_runtime.io() == null) return;
+                    try submitTail(job);
+                    release_admission = false;
+                }
+
+                fn deinit(ptr: *anyopaque) void {
+                    const job: *@This() = @ptrCast(@alignCast(ptr));
+                    job.alloc.free(job.job_id);
+                    job.alloc.free(job.database_name);
+                    job.alloc.free(job.namespace_name);
+                    job.alloc.free(job.table_name);
+                    job.alloc.free(job.access_method);
+                    job.alloc.free(job.index_name);
+                    job.alloc.free(job.worker_id);
+                    const alloc = job.alloc;
+                    alloc.destroy(job);
+                }
+            };
+
+            const job = try DropChainJob.init(
+                self.runtime_alloc,
+                self,
+                job_id,
+                database_name,
+                namespace_name,
+                table_name,
+                access_method,
+                index_name,
+                generation,
+                worker_id,
+                lease_ms,
+                max_work_units,
+            );
+            errdefer DropChainJob.deinit(job);
+            self.backend_runtime.durable_jobs.submit(.{
+                .owner_id = self.relational_index_worker_owner_id,
+                .class = .cleanup,
+                .ptr = job,
+                .run = DropChainJob.run,
+                .deinit = DropChainJob.deinit,
+            }) catch |err| {
+                switch (err) {
+                    error.BackgroundOwnerClosing, error.BackgroundOwnerClosed => {
+                        DropChainJob.deinit(job);
+                        releaseRelationalIndexDropSchedule(self, job_id);
+                        return .shutting_down;
+                    },
+                    else => return err,
+                }
+            };
+            return .scheduled;
         }
 
         pub fn completeForeignKeyIntegrityJobRecord(
@@ -5420,6 +6239,9 @@ pub fn Impl(comptime DB: type) type {
                 .status = &.{},
                 .created_at_ns = parsed.value.created_at_ns,
                 .updated_at_ns = parsed.value.updated_at_ns,
+                .claimed_at_ns = parsed.value.claimed_at_ns,
+                .lease_until_ns = parsed.value.lease_until_ns,
+                .lease_epoch = parsed.value.lease_epoch,
                 .attempts = parsed.value.attempts,
                 .completed = parsed.value.completed,
                 .failure_reason = null,
@@ -6641,6 +7463,8 @@ test "db relational index drop job records persist generation counters and stale
 
         const partial = try db.recordRelationalIndexDropJobPassAt(
             "job:index-drop:docs:alg_docs:11",
+            created.worker_id,
+            created.lease_epoch,
             "running",
             false,
             "artifact:postings:m",
@@ -6657,6 +7481,26 @@ test "db relational index drop job records persist generation counters and stale
         try std.testing.expectEqual(@as(u64, 1), partial.pass_count);
         try std.testing.expectEqual(@as(u64, 2), partial.total_units_completed);
 
+        try std.testing.expectError(
+            error.RelationalIndexDropJobLeaseHeld,
+            db.upsertRelationalIndexDropJobRecordAt(
+                "job:index-drop:docs:alg_docs:11",
+                "tenant_ops",
+                "analytics",
+                "docs",
+                "algebraic_filter",
+                "alg_docs",
+                11,
+                "worker:drop-b",
+                "",
+                60_000,
+                2,
+                "running",
+                30_000,
+            ),
+        );
+
+        const takeover_ns = created.lease_until_ns + 1;
         const resumed = try db.upsertRelationalIndexDropJobRecordAt(
             "job:index-drop:docs:alg_docs:11",
             "tenant_ops",
@@ -6670,14 +7514,15 @@ test "db relational index drop job records persist generation counters and stale
             60_000,
             2,
             "running",
-            30_000,
+            takeover_ns,
         );
         defer db.freeRelationalIndexDropJobRecord(resumed);
         try std.testing.expectEqual(@as(u32, 2), resumed.attempts);
+        try std.testing.expectEqual(@as(u64, 2), resumed.lease_epoch);
         try std.testing.expectEqualStrings("artifact:postings:m", resumed.cursor);
 
         try std.testing.expectError(
-            error.StaleRelationalIndexDropJobGeneration,
+            error.RelationalIndexDropJobIdentityMismatch,
             db.upsertRelationalIndexDropJobRecordAt(
                 "job:index-drop:docs:alg_docs:11",
                 "tenant_ops",
@@ -6697,6 +7542,8 @@ test "db relational index drop job records persist generation counters and stale
 
         const complete = try db.recordRelationalIndexDropJobPassAt(
             "job:index-drop:docs:alg_docs:11",
+            resumed.worker_id,
+            resumed.lease_epoch,
             "complete",
             true,
             "",
@@ -6706,7 +7553,7 @@ test "db relational index drop job records persist generation counters and stale
             3,
             null,
             false,
-            40_000,
+            takeover_ns + 1,
         );
         defer db.freeRelationalIndexDropJobRecord(complete);
         try std.testing.expect(complete.completed);
@@ -6728,6 +7575,636 @@ test "db relational index drop job records persist generation counters and stale
     try std.testing.expectEqual(@as(u64, 2), persisted.pass_count);
     try std.testing.expectEqual(@as(u64, 5), persisted.total_units_completed);
     try std.testing.expect(persisted.completed);
+    try std.testing.expectEqual(@as(u64, 2), persisted.lease_epoch);
+}
+
+test "db relational index drop job claims enforce identity lease and epoch matrix" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+    const Scenario = enum {
+        same_owner_renewal,
+        live_owner_contention,
+        expired_owner_takeover,
+        identity_mismatch,
+        completed_job,
+        stale_claim_epoch,
+    };
+    const Case = struct {
+        name: []const u8,
+        scenario: Scenario,
+    };
+    const cases = [_]Case{
+        .{ .name = "same owner renews with a new epoch", .scenario = .same_owner_renewal },
+        .{ .name = "different owner cannot steal a live lease", .scenario = .live_owner_contention },
+        .{ .name = "different owner takes over an expired lease", .scenario = .expired_owner_takeover },
+        .{ .name = "job id cannot be rebound to another target", .scenario = .identity_mismatch },
+        .{ .name = "completed job remains immutable", .scenario = .completed_job },
+        .{ .name = "older claim epoch cannot publish progress", .scenario = .stale_claim_epoch },
+    };
+
+    for (cases, 0..) |case, case_i| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+        var db = try DB.open(alloc, path, .{});
+        defer db.close();
+
+        var job_id_buf: [96]u8 = undefined;
+        const job_id = try std.fmt.bufPrint(&job_id_buf, "job:drop-claim-matrix:{d}", .{case_i});
+        const initial = try db.upsertRelationalIndexDropJobRecordAt(
+            job_id,
+            "default",
+            "public",
+            "rows",
+            "text_search",
+            "drop_idx",
+            7,
+            "worker-a",
+            "",
+            1_000,
+            1,
+            "running",
+            10_000,
+        );
+        defer db.freeRelationalIndexDropJobRecord(initial);
+        try std.testing.expectEqual(@as(u64, 1), initial.lease_epoch);
+        try std.testing.expect(initial.lease_until_ns > initial.claimed_at_ns);
+
+        switch (case.scenario) {
+            .same_owner_renewal => {
+                const renewed = try db.upsertRelationalIndexDropJobRecordAt(job_id, "default", "public", "rows", "text_search", "drop_idx", 7, "worker-a", "", 1_000, 1, "running", 20_000);
+                defer db.freeRelationalIndexDropJobRecord(renewed);
+                try std.testing.expectEqual(@as(u64, 2), renewed.lease_epoch);
+                try std.testing.expectEqualStrings("worker-a", renewed.worker_id);
+                try std.testing.expectEqual(@as(u32, 2), renewed.attempts);
+            },
+            .live_owner_contention => {
+                try std.testing.expectError(
+                    error.RelationalIndexDropJobLeaseHeld,
+                    db.upsertRelationalIndexDropJobRecordAt(job_id, "default", "public", "rows", "text_search", "drop_idx", 7, "worker-b", "", 1_000, 1, "running", 20_000),
+                );
+            },
+            .expired_owner_takeover => {
+                const takeover = try db.upsertRelationalIndexDropJobRecordAt(job_id, "default", "public", "rows", "text_search", "drop_idx", 7, "worker-b", "", 1_000, 1, "running", initial.lease_until_ns + 1);
+                defer db.freeRelationalIndexDropJobRecord(takeover);
+                try std.testing.expectEqual(@as(u64, 2), takeover.lease_epoch);
+                try std.testing.expectEqualStrings("worker-b", takeover.worker_id);
+            },
+            .identity_mismatch => {
+                try std.testing.expectError(
+                    error.RelationalIndexDropJobIdentityMismatch,
+                    db.upsertRelationalIndexDropJobRecordAt(job_id, "default", "public", "rows", "text_search", "other_idx", 7, "worker-a", "", 1_000, 1, "running", 20_000),
+                );
+            },
+            .completed_job => {
+                const completed = try db.recordRelationalIndexDropJobPassAt(job_id, initial.worker_id, initial.lease_epoch, "complete", true, "", 1, 1, 0, 1, null, false, 20_000);
+                defer db.freeRelationalIndexDropJobRecord(completed);
+                const repeated = try db.upsertRelationalIndexDropJobRecordAt(job_id, "default", "public", "rows", "text_search", "drop_idx", 7, "worker-b", "", 1_000, 1, "running", initial.lease_until_ns + 1);
+                defer db.freeRelationalIndexDropJobRecord(repeated);
+                try std.testing.expect(repeated.completed);
+                try std.testing.expectEqual(@as(u64, 1), repeated.lease_epoch);
+                try std.testing.expectEqualStrings("worker-a", repeated.worker_id);
+                try std.testing.expectEqualStrings("complete", repeated.status);
+            },
+            .stale_claim_epoch => {
+                const renewed = try db.upsertRelationalIndexDropJobRecordAt(job_id, "default", "public", "rows", "text_search", "drop_idx", 7, "worker-a", "", 1_000, 1, "running", 20_000);
+                defer db.freeRelationalIndexDropJobRecord(renewed);
+                try std.testing.expectError(
+                    error.StaleRelationalIndexDropJobLease,
+                    db.recordRelationalIndexDropJobPassAt(job_id, initial.worker_id, initial.lease_epoch, "running", false, "cursor", 1, 1, 0, 1, null, false, 30_000),
+                );
+            },
+        }
+    }
+}
+
+test "db relational index drop job page executes access method and lifecycle matrix" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+    const Scenario = enum { progress, complete, stale_generation, malformed_generation, idempotent_completion };
+    const Case = struct {
+        name: []const u8,
+        access_method: schema_mod.RelationalIndexAccessMethod,
+        scenario: Scenario,
+        artifact_count: usize,
+        expected_status: []const u8,
+        expected_complete: bool,
+        expected_stale: bool = false,
+    };
+    const cases = [_]Case{
+        .{ .name = "text progress", .access_method = .text_search, .scenario = .progress, .artifact_count = 2, .expected_status = "running", .expected_complete = false },
+        .{ .name = "text complete", .access_method = .text_search, .scenario = .complete, .artifact_count = 1, .expected_status = "complete", .expected_complete = true },
+        .{ .name = "algebraic progress", .access_method = .algebraic_filter, .scenario = .progress, .artifact_count = 2, .expected_status = "running", .expected_complete = false },
+        .{ .name = "stale generation", .access_method = .algebraic_filter, .scenario = .stale_generation, .artifact_count = 1, .expected_status = "failed", .expected_complete = false, .expected_stale = true },
+        .{ .name = "malformed generation", .access_method = .algebraic_filter, .scenario = .malformed_generation, .artifact_count = 1, .expected_status = "failed", .expected_complete = false },
+        .{ .name = "idempotent completion", .access_method = .text_search, .scenario = .idempotent_completion, .artifact_count = 0, .expected_status = "complete", .expected_complete = true },
+    };
+    const algebraic_config =
+        \\{
+        \\  "version": 1,
+        \\  "table": "rows"
+        \\}
+    ;
+
+    for (cases, 0..) |case, case_i| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+        var db = try DB.open(alloc, path, .{});
+        defer db.close();
+
+        const lifecycle: schema_mod.RelationalIndexLifecycle = if (case.scenario == .malformed_generation) .dropping else .ready;
+        _ = try schema_mod.saveSchema(db.core.store, alloc, .{
+            .version = 1,
+            .storage_mode = .relational,
+            .relational_indexes = &.{.{
+                .name = "drop_idx",
+                .owner_kind = .table,
+                .owner_name = schema_mod.relational_table_index_owner_name,
+                .access_method = case.access_method,
+                .lifecycle = lifecycle,
+                .generation = 7,
+                .generation_record = .{
+                    .generation = 7,
+                    .lifecycle = lifecycle,
+                    .components = if (case.scenario == .malformed_generation) schema_mod.relational_index_generation_components_none else .{},
+                    .component_cursors = if (case.scenario == .malformed_generation) .{ .dictionary = "out-of-order" } else .{},
+                },
+            }},
+        });
+        try db.addIndex(.{
+            .name = "drop_idx",
+            .kind = if (case.access_method == .text_search) .full_text else .algebraic,
+            .config_json = if (case.access_method == .text_search) "{}" else algebraic_config,
+        });
+
+        if (case.access_method == .text_search) {
+            const entry = db.core.index_manager.textIndexEntry("drop_idx") orelse return error.TestUnexpectedResult;
+            for (0..case.artifact_count) |i| {
+                try entry.persistent.putActiveSegmentArtifactForTest(@intCast(i + 1), "drop-test", "row:a", "row:z");
+            }
+        } else {
+            const entry = db.core.index_manager.algebraicIndex("drop_idx") orelse return error.TestUnexpectedResult;
+            for (0..case.artifact_count) |i| {
+                var suffix_buf: [32]u8 = undefined;
+                const suffix = try std.fmt.bufPrint(&suffix_buf, "{d}", .{i});
+                try entry.index.putArtifactRowForTest(db.core.store, .raw, "docfact", suffix, "value");
+            }
+        }
+
+        var job_id_buf: [96]u8 = undefined;
+        const job_id = try std.fmt.bufPrint(&job_id_buf, "job:drop-matrix:{d}", .{case_i});
+        const generation: u64 = if (case.scenario == .stale_generation) 8 else 7;
+        const record = try db.runRelationalIndexDropJobPageAt(
+            job_id,
+            "default",
+            "public",
+            "rows",
+            case.access_method.name(),
+            "drop_idx",
+            generation,
+            "worker-a",
+            60_000,
+            1,
+            10_000,
+        );
+        defer db.freeRelationalIndexDropJobRecord(record);
+        try std.testing.expectEqualStrings(case.expected_status, record.status);
+        try std.testing.expectEqual(case.expected_complete, record.completed);
+        try std.testing.expectEqual(case.expected_stale, record.stale_generation);
+        if (case.expected_complete) {
+            try std.testing.expect(db.core.index_manager.get("drop_idx") == null);
+        } else if (case.scenario == .progress) {
+            try std.testing.expect(record.cursor.len > 0);
+            try std.testing.expectEqual(@as(u64, 1), record.last_units_running);
+        } else {
+            try std.testing.expect(record.failure_reason != null);
+        }
+
+        if (case.scenario == .idempotent_completion) {
+            const repeated = try db.runRelationalIndexDropJobPageAt(
+                job_id,
+                "default",
+                "public",
+                "rows",
+                case.access_method.name(),
+                "drop_idx",
+                generation,
+                "worker-a",
+                60_000,
+                1,
+                20_000,
+            );
+            defer db.freeRelationalIndexDropJobRecord(repeated);
+            try std.testing.expectEqualStrings("complete", repeated.status);
+            try std.testing.expect(repeated.completed);
+            try std.testing.expectEqual(@as(u64, 1), repeated.pass_count);
+            try std.testing.expectEqual(@as(u64, 1), repeated.lease_epoch);
+        }
+    }
+}
+
+test "db relational index drop scheduler handles durable lane outcome matrix" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+    const Scenario = enum {
+        duplicate_singleflight,
+        worker_crash_resume,
+        retry_exhaustion,
+        shutdown_cancellation,
+        tail_rescheduling,
+    };
+    const Case = struct {
+        name: []const u8,
+        scenario: Scenario,
+        backend: background_runtime_mod.Backend,
+        artifact_count: usize,
+    };
+    const cases = [_]Case{
+        .{ .name = "duplicate admission keeps exactly one active callback", .scenario = .duplicate_singleflight, .backend = .io_threaded, .artifact_count = 0 },
+        .{ .name = "worker crash resumes from durable generation cursor", .scenario = .worker_crash_resume, .backend = .manual, .artifact_count = 2 },
+        .{ .name = "transient retry exhaustion persists failure", .scenario = .retry_exhaustion, .backend = .manual, .artifact_count = 1 },
+        .{ .name = "shutdown cancels active callback", .scenario = .shutdown_cancellation, .backend = .io_threaded, .artifact_count = 1 },
+        .{ .name = "page budget hands off to tail callback", .scenario = .tail_rescheduling, .backend = .io_threaded, .artifact_count = relational_index_drop_pages_per_callback + 2 },
+    };
+
+    const Wait = struct {
+        fn counterAtLeast(counter: *const std.atomic.Value(u32), expected: u32) !void {
+            for (0..100_000) |_| {
+                if (counter.load(.acquire) >= expected) return;
+                std.Thread.yield() catch {};
+            }
+            return error.TestTimedOut;
+        }
+    };
+    const Schedule = struct {
+        fn call(db: *DB, job_id: []const u8) !RelationalIndexDropScheduleResult {
+            return try db.scheduleRelationalIndexDropJob(
+                job_id,
+                "default",
+                "public",
+                "rows",
+                "text_search",
+                "drop_idx",
+                7,
+                "worker-a",
+                60_000,
+                1,
+            );
+        }
+    };
+
+    for (cases, 0..) |case, case_i| {
+        relational_index_drop_test.reset();
+        defer relational_index_drop_test.reset();
+
+        var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = case.backend });
+        defer runtime.deinit();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+        var db = try DB.open(alloc, path, .{
+            .backend_runtime = runtime.ptr(),
+            .executor = .{ .backend = case.backend },
+        });
+        defer db.close();
+
+        _ = try schema_mod.saveSchema(db.core.store, alloc, .{
+            .version = 1,
+            .storage_mode = .relational,
+            .relational_indexes = &.{.{
+                .name = "drop_idx",
+                .owner_kind = .table,
+                .owner_name = schema_mod.relational_table_index_owner_name,
+                .access_method = .text_search,
+                .lifecycle = .ready,
+                .generation = 7,
+                .generation_record = .{
+                    .generation = 7,
+                    .lifecycle = .ready,
+                },
+            }},
+        });
+        try db.addIndex(.{
+            .name = "drop_idx",
+            .kind = .full_text,
+            .config_json = "{}",
+        });
+        const entry = db.core.index_manager.textIndexEntry("drop_idx") orelse return error.TestUnexpectedResult;
+        for (0..case.artifact_count) |artifact_i| {
+            try entry.persistent.putActiveSegmentArtifactForTest(@intCast(artifact_i + 1), "drop-scheduler-test", "row:a", "row:z");
+        }
+
+        var job_id_buf: [96]u8 = undefined;
+        const job_id = try std.fmt.bufPrint(&job_id_buf, "job:drop-scheduler-matrix:{d}", .{case_i});
+
+        switch (case.scenario) {
+            .duplicate_singleflight => {
+                relational_index_drop_test.block_callbacks.store(true, .release);
+                try std.testing.expectEqual(RelationalIndexDropScheduleResult.scheduled, try Schedule.call(&db, job_id));
+                try Wait.counterAtLeast(&relational_index_drop_test.callbacks_entered, 1);
+                try std.testing.expectEqual(RelationalIndexDropScheduleResult.already_scheduled, try Schedule.call(&db, job_id));
+                relational_index_drop_test.release_callbacks.store(true, .release);
+                db.backend_runtime.durable_jobs.drainOwner(db.relational_index_worker_owner_id);
+                try std.testing.expectEqual(@as(u32, 1), relational_index_drop_test.peak_active_callbacks.load(.acquire));
+                const record = (try db.loadRelationalIndexDropJobRecord(job_id)) orelse return error.TestUnexpectedResult;
+                defer db.freeRelationalIndexDropJobRecord(record);
+                try std.testing.expect(record.completed);
+            },
+            .worker_crash_resume => {
+                relational_index_drop_test.crash_after_page_remaining.store(1, .release);
+                try std.testing.expectEqual(RelationalIndexDropScheduleResult.scheduled, try Schedule.call(&db, job_id));
+                const record = (try db.loadRelationalIndexDropJobRecord(job_id)) orelse return error.TestUnexpectedResult;
+                defer db.freeRelationalIndexDropJobRecord(record);
+                try std.testing.expect(record.completed);
+                try std.testing.expectEqual(@as(u32, 2), record.attempts);
+                try std.testing.expectEqual(@as(u64, 1), record.pass_count);
+            },
+            .retry_exhaustion => {
+                relational_index_drop_test.transient_failures_remaining.store(@intCast(relational_index_drop_max_retries_per_callback + 1), .release);
+                try std.testing.expectEqual(RelationalIndexDropScheduleResult.scheduled, try Schedule.call(&db, job_id));
+                const record = (try db.loadRelationalIndexDropJobRecord(job_id)) orelse return error.TestUnexpectedResult;
+                defer db.freeRelationalIndexDropJobRecord(record);
+                try std.testing.expectEqualStrings("failed", record.status);
+                try std.testing.expectEqualStrings("RelationalIndexDropRetriesExhausted", record.failure_reason.?);
+                try std.testing.expect(!record.completed);
+            },
+            .shutdown_cancellation => {
+                relational_index_drop_test.block_callbacks.store(true, .release);
+                try std.testing.expectEqual(RelationalIndexDropScheduleResult.scheduled, try Schedule.call(&db, job_id));
+                try Wait.counterAtLeast(&relational_index_drop_test.callbacks_entered, 1);
+                db.async_context.background_closing.store(true, .release);
+                db.backend_runtime.durable_jobs.drainOwner(db.relational_index_worker_owner_id);
+                lockRelationalIndexDropScheduler(&db.async_context.relational_index_drop_jobs_mutex);
+                const active_jobs = db.async_context.relational_index_drop_jobs.count();
+                db.async_context.relational_index_drop_jobs_mutex.unlock();
+                try std.testing.expectEqual(@as(usize, 0), active_jobs);
+                try std.testing.expectEqual(RelationalIndexDropScheduleResult.shutting_down, try Schedule.call(&db, job_id));
+                db.async_context.background_closing.store(false, .release);
+            },
+            .tail_rescheduling => {
+                try std.testing.expectEqual(RelationalIndexDropScheduleResult.scheduled, try Schedule.call(&db, job_id));
+                db.backend_runtime.durable_jobs.drainOwner(db.relational_index_worker_owner_id);
+                const record = (try db.loadRelationalIndexDropJobRecord(job_id)) orelse return error.TestUnexpectedResult;
+                defer db.freeRelationalIndexDropJobRecord(record);
+                try std.testing.expect(record.completed);
+                try std.testing.expect(relational_index_drop_test.tail_submissions.load(.acquire) >= 1);
+                try std.testing.expectEqual(@as(u32, 1), relational_index_drop_test.peak_active_callbacks.load(.acquire));
+            },
+        }
+    }
+}
+
+test "db relational index drop discovery handles schema apply and reopen matrix" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+    const Scenario = enum {
+        schema_apply_missing_job,
+        sql_schema_json_apply_missing_job,
+        existing_job,
+        completed_job,
+        runtime_detached,
+        duplicate_discovery,
+        reopen,
+    };
+    const Case = struct {
+        name: []const u8,
+        access_method: schema_mod.RelationalIndexAccessMethod,
+        scenario: Scenario,
+        backend: background_runtime_mod.Backend = .manual,
+    };
+    const cases = [_]Case{
+        .{ .name = "text schema apply creates missing job", .access_method = .text_search, .scenario = .schema_apply_missing_job },
+        .{ .name = "algebraic schema apply creates missing job", .access_method = .algebraic_filter, .scenario = .schema_apply_missing_job },
+        .{ .name = "SQL schema JSON apply creates missing job", .access_method = .text_search, .scenario = .sql_schema_json_apply_missing_job },
+        .{ .name = "existing incomplete job resumes", .access_method = .text_search, .scenario = .existing_job },
+        .{ .name = "completed canonical job gets reconciliation job", .access_method = .algebraic_filter, .scenario = .completed_job },
+        .{ .name = "completed generation finalizes with runtime detached", .access_method = .text_search, .scenario = .runtime_detached },
+        .{ .name = "duplicate discovery preserves one chain", .access_method = .algebraic_filter, .scenario = .duplicate_discovery, .backend = .io_threaded },
+        .{ .name = "text reopen discovers crash before job creation", .access_method = .text_search, .scenario = .reopen },
+        .{ .name = "algebraic reopen discovers crash before job creation", .access_method = .algebraic_filter, .scenario = .reopen },
+    };
+    const Harness = struct {
+        const algebraic_config =
+            \\{
+            \\  "version": 1,
+            \\  "table": "rows"
+            \\}
+        ;
+        const ready_text_schema_json =
+            \\{"version":1,"storage_mode":"relational","default_type":"rows","enforce_types":true,"document_schemas":{"rows":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"title":{"type":"text"}},"required":["id","title"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"drop_idx","owner_kind":"relational_column","owner_name":"title","access_method":"text_search","method_config":{"type":"full_text","field":"title","analyzer":"standard"},"columns":["title"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:drop_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
+        ;
+        const dropping_text_schema_json =
+            \\{"version":2,"storage_mode":"relational","default_type":"rows","enforce_types":true,"document_schemas":{"rows":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"title":{"type":"text"}},"required":["id","title"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"drop_idx","owner_kind":"relational_column","owner_name":"title","access_method":"text_search","method_config":{"type":"full_text","field":"title","analyzer":"standard"},"columns":["title"],"lifecycle":"dropping","generation":7,"schema_fingerprint":"secondary-index-v1:drop_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"dropping","lag":0,"ready_watermark":0,"components":{"dictionary":false,"fact":false,"path":false,"postings":false}}}]}
+        ;
+
+        fn setSchema(db: *DB, access_method: schema_mod.RelationalIndexAccessMethod, lifecycle: schema_mod.RelationalIndexLifecycle, complete: bool, public_apply: bool) !void {
+            const indexes = [_]schema_mod.RelationalIndex{.{
+                .name = "drop_idx",
+                .owner_kind = .table,
+                .owner_name = schema_mod.relational_table_index_owner_name,
+                .access_method = access_method,
+                .lifecycle = lifecycle,
+                .generation = 7,
+                .generation_record = .{
+                    .generation = 7,
+                    .lifecycle = lifecycle,
+                    .components = if (complete) .{
+                        .dictionary = true,
+                        .fact = true,
+                        .path = true,
+                        .postings = true,
+                    } else schema_mod.relational_index_generation_components_none,
+                },
+            }};
+            const schema = schema_mod.TableSchema{
+                .version = if (lifecycle == .ready) 1 else 2,
+                .default_type = "rows",
+                .storage_mode = .relational,
+                .relational_indexes = &indexes,
+            };
+            if (public_apply) {
+                try db.setSchema(schema);
+            } else {
+                _ = try schema_mod.saveSchema(db.core.store, alloc, schema);
+            }
+        }
+
+        fn addRuntime(db: *DB, access_method: schema_mod.RelationalIndexAccessMethod) !void {
+            if (db.core.index_manager.get("drop_idx") != null) return;
+            try db.addIndex(.{
+                .name = "drop_idx",
+                .kind = if (access_method == .text_search) .full_text else .algebraic,
+                .config_json = if (access_method == .text_search) "{}" else algebraic_config,
+            });
+        }
+
+        fn canonicalJobIdAlloc(access_method: schema_mod.RelationalIndexAccessMethod) ![]u8 {
+            return try std.fmt.allocPrint(
+                alloc,
+                "job:relational-index-drop:{d}:{s}:{d}:{s}:{d}:{s}:{d}:{s}:{d}:{s}:{d}",
+                .{
+                    "default".len,
+                    "default",
+                    "public".len,
+                    "public",
+                    "rows".len,
+                    "rows",
+                    access_method.name().len,
+                    access_method.name(),
+                    "drop_idx".len,
+                    "drop_idx",
+                    @as(u64, 7),
+                },
+            );
+        }
+
+        fn expectDropped(db: *DB) !void {
+            const schema = (try schema_mod.loadSchema(db.core.store, alloc)) orelse return error.TestUnexpectedResult;
+            defer schema_mod.freeSchema(alloc, schema);
+            for (schema.relational_indexes) |index| {
+                if (std.mem.eql(u8, index.name, "drop_idx")) return error.TestUnexpectedResult;
+            }
+            try std.testing.expect(db.core.index_manager.get("drop_idx") == null);
+        }
+    };
+
+    for (cases) |case| {
+        relational_index_drop_test.reset();
+        defer relational_index_drop_test.reset();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = try std.fmt.bufPrintZ(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+
+        if (case.scenario == .reopen) {
+            var first_runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+            {
+                var first = try DB.open(alloc, path, .{
+                    .backend_runtime = first_runtime.ptr(),
+                    .executor = .{ .backend = .manual },
+                    .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+                });
+                try Harness.addRuntime(&first, case.access_method);
+                first.async_context.background_closing.store(true, .release);
+                try std.testing.expectError(
+                    error.RelationalIndexDropDiscoveryShuttingDown,
+                    Harness.setSchema(&first, case.access_method, .dropping, false, true),
+                );
+                {
+                    const committed_schema = (try schema_mod.loadSchema(first.core.store, alloc)) orelse return error.TestUnexpectedResult;
+                    defer schema_mod.freeSchema(alloc, committed_schema);
+                    try std.testing.expectEqual(schema_mod.RelationalIndexLifecycle.dropping, committed_schema.relational_indexes[0].lifecycle);
+                }
+                first.async_context.background_closing.store(false, .release);
+                first.close();
+            }
+            first_runtime.deinit();
+
+            var reopened_runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+            defer reopened_runtime.deinit();
+            var reopened = try DB.open(alloc, path, .{
+                .backend_runtime = reopened_runtime.ptr(),
+                .executor = .{ .backend = .manual },
+                .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+            });
+            defer reopened.close();
+            try Harness.expectDropped(&reopened);
+            continue;
+        }
+
+        var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = case.backend });
+        defer runtime.deinit();
+        var db = try DB.open(alloc, path, .{
+            .backend_runtime = runtime.ptr(),
+            .executor = .{ .backend = case.backend },
+        });
+        defer db.close();
+
+        if (case.scenario == .schema_apply_missing_job) {
+            try Harness.setSchema(&db, case.access_method, .ready, case.access_method == .algebraic_filter, true);
+            try Harness.addRuntime(&db, case.access_method);
+            try Harness.setSchema(&db, case.access_method, .dropping, false, true);
+            try Harness.expectDropped(&db);
+            continue;
+        }
+
+        if (case.scenario == .sql_schema_json_apply_missing_job) {
+            try db.applyTableSchemaJson(alloc, Harness.ready_text_schema_json, .{});
+            try Harness.addRuntime(&db, case.access_method);
+            try db.applyTableSchemaJson(alloc, Harness.dropping_text_schema_json, .{});
+            try Harness.expectDropped(&db);
+            continue;
+        }
+
+        if (case.scenario != .runtime_detached) try Harness.addRuntime(&db, case.access_method);
+        try Harness.setSchema(&db, case.access_method, .dropping, case.scenario == .runtime_detached, false);
+
+        const canonical_job_id = try Harness.canonicalJobIdAlloc(case.access_method);
+        defer alloc.free(canonical_job_id);
+        const worker_id = try std.fmt.allocPrint(alloc, "worker:{s}", .{canonical_job_id});
+        defer alloc.free(worker_id);
+        if (case.scenario == .existing_job or case.scenario == .completed_job) {
+            const existing = try db.upsertRelationalIndexDropJobRecordAt(
+                canonical_job_id,
+                "default",
+                "public",
+                "rows",
+                case.access_method.name(),
+                "drop_idx",
+                7,
+                worker_id,
+                "",
+                30_000,
+                128,
+                "running",
+                currentTimeNs(),
+            );
+            defer db.freeRelationalIndexDropJobRecord(existing);
+            if (case.scenario == .completed_job) {
+                const completed = try db.recordRelationalIndexDropJobPassAt(
+                    canonical_job_id,
+                    existing.worker_id,
+                    existing.lease_epoch,
+                    "complete",
+                    true,
+                    "",
+                    0,
+                    0,
+                    0,
+                    0,
+                    null,
+                    false,
+                    currentTimeNs(),
+                );
+                defer db.freeRelationalIndexDropJobRecord(completed);
+            }
+        }
+
+        if (case.scenario == .duplicate_discovery) {
+            relational_index_drop_test.block_callbacks.store(true, .release);
+            const first = try db.discoverRelationalIndexDropJobs("rows");
+            try std.testing.expectEqual(@as(u64, 1), first.scheduled_jobs);
+            for (0..100_000) |_| {
+                if (relational_index_drop_test.callbacks_entered.load(.acquire) > 0) break;
+                std.Thread.yield() catch {};
+            }
+            const duplicate = try db.discoverRelationalIndexDropJobs("rows");
+            try std.testing.expectEqual(@as(u64, 1), duplicate.already_scheduled_jobs);
+            relational_index_drop_test.release_callbacks.store(true, .release);
+            db.backend_runtime.durable_jobs.drainOwner(db.relational_index_worker_owner_id);
+            try std.testing.expectEqual(@as(u32, 1), relational_index_drop_test.peak_active_callbacks.load(.acquire));
+        } else {
+            const stats = try db.discoverRelationalIndexDropJobs("rows");
+            try std.testing.expectEqual(@as(u64, 1), stats.dropping_generations);
+            try std.testing.expectEqual(@as(u64, 1), stats.scheduled_jobs);
+            try std.testing.expectEqual(@as(u64, if (case.scenario == .completed_job) 1 else 0), stats.reconciliation_jobs);
+        }
+        try Harness.expectDropped(&db);
+    }
 }
 
 test "db foreign key action jobs canonicalize SQL action aliases" {

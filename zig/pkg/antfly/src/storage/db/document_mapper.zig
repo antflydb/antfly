@@ -1711,11 +1711,17 @@ pub fn buildRelationalRowValueFromValueAlloc(
         if (column.field_type == .array) {
             try validateRelationalArrayColumnValue(column, found);
         }
-        const value = try coerceRelationalStorageValue(alloc, value_type, found) orelse {
+        const stores_canonical_json = column.field_type == .json or column.field_type == .array;
+        const value = if (stores_canonical_json) blk: {
+            const encoded = try std.json.Stringify.valueAlloc(alloc, found, .{});
+            errdefer alloc.free(encoded);
+            try owned.append(alloc, encoded);
+            break :blk typed_dv.TypedValue{ .bytes_val = encoded };
+        } else try coerceRelationalStorageValue(alloc, value_type, found) orelse {
             if (column.nullable) continue;
             return error.InvalidBatchRequest;
         };
-        if (value_type == .bytes_val and found != .string) {
+        if (!stores_canonical_json and value_type == .bytes_val and found != .string) {
             // coerceRelationalStorageValue allocated canonical JSON for a
             // structured value; track it for cleanup.
             try owned.append(alloc, @constCast(value.bytes_val));
@@ -1723,7 +1729,7 @@ pub fn buildRelationalRowValueFromValueAlloc(
         try cells.append(alloc, .{
             .path = column.path,
             .value_type = value_type,
-            .is_json = column.field_type == .json or column.field_type == .array,
+            .is_json = stores_canonical_json,
             .value = value,
         });
     }
@@ -5044,6 +5050,38 @@ test "relational KV row value round-trips a document through project + reconstru
         error.InvalidBatchRequest,
         buildRelationalRowValueAlloc(alloc, "{\"id\":\"abc\",\"amount\":12.5,\"tags\":[\"hot\",1]}", &columns),
     );
+}
+
+test "relational JSON columns preserve canonical scalar and structured shapes by case" {
+    const alloc = std.testing.allocator;
+    const columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
+        .{ .name = "payload", .path = "payload", .field_type = .json, .nullable = false },
+    };
+    const ShapeCase = struct {
+        name: []const u8,
+        payload: []const u8,
+    };
+    const cases = [_]ShapeCase{
+        .{ .name = "string", .payload = "\"text\"" },
+        .{ .name = "number", .payload = "12.5" },
+        .{ .name = "boolean", .payload = "true" },
+        .{ .name = "object", .payload = "{\"nested\":1}" },
+        .{ .name = "array", .payload = "[\"a\",2]" },
+    };
+
+    for (cases) |case| {
+        const input = try std.fmt.allocPrint(alloc, "{{\"id\":\"row\",\"payload\":{s}}}", .{case.payload});
+        defer alloc.free(input);
+        const row = try buildRelationalRowValueAlloc(alloc, input, &columns);
+        defer alloc.free(row);
+        const rebuilt = try materializeRelationalRowValueAlloc(alloc, row);
+        defer alloc.free(rebuilt);
+        if (!std.mem.eql(u8, input, rebuilt)) {
+            std.debug.print("relational JSON shape {s}: expected {s}, got {s}\n", .{ case.name, input, rebuilt });
+            return error.TestExpectedEqual;
+        }
+    }
 }
 
 test "relational KV row value rejects missing required columns" {

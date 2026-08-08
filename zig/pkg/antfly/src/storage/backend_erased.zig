@@ -352,6 +352,7 @@ pub const WriteTxn = struct {
         get_many_sorted: ?*const fn (*anyopaque, []const []const u8, []?[]const u8) anyerror!void = null,
         put: *const fn (*anyopaque, []const u8, []const u8) anyerror!void,
         delete: *const fn (*anyopaque, []const u8) anyerror!void,
+        apply_mutations: ?*const fn (*anyopaque, []const backend_types.KeyMutation) anyerror!void = null,
         open_cursor: *const fn (Allocator, *anyopaque) anyerror!Cursor,
     };
 
@@ -389,6 +390,16 @@ pub const WriteTxn = struct {
 
     pub fn delete(self: *WriteTxn, key: []const u8) !void {
         try self.vtable.delete(self.ptr, key);
+    }
+
+    pub fn applyMutations(self: *WriteTxn, mutations: []const backend_types.KeyMutation) !void {
+        if (self.vtable.apply_mutations) |apply_mutations| return try apply_mutations(self.ptr, mutations);
+        for (mutations) |mutation| switch (mutation) {
+            .put => |put_mutation| try self.put(put_mutation.key, put_mutation.value),
+            .delete => |delete_mutation| self.delete(delete_mutation.key) catch |err| {
+                if (!delete_mutation.ignore_missing or err != error.NotFound) return err;
+            },
+        };
     }
 
     pub fn openCursor(self: *WriteTxn) !Cursor {
@@ -457,6 +468,7 @@ pub const Batch = struct {
         put: *const fn (*anyopaque, []const u8, []const u8) anyerror!void,
         append_put: ?*const fn (*anyopaque, []const u8, []const u8) anyerror!void = null,
         delete: *const fn (*anyopaque, []const u8) anyerror!void,
+        apply_mutations: ?*const fn (*anyopaque, []const backend_types.KeyMutation) anyerror!void = null,
         open_cursor: ?*const fn (Allocator, *anyopaque) anyerror!Cursor = null,
         set_replay_opaque: ?*const fn (*anyopaque, u64, []const u8) anyerror!void = null,
     };
@@ -500,6 +512,16 @@ pub const Batch = struct {
 
     pub fn delete(self: *Batch, key: []const u8) !void {
         try self.vtable.delete(self.ptr, key);
+    }
+
+    pub fn applyMutations(self: *Batch, mutations: []const backend_types.KeyMutation) !void {
+        if (self.vtable.apply_mutations) |apply_mutations| return try apply_mutations(self.ptr, mutations);
+        for (mutations) |mutation| switch (mutation) {
+            .put => |put_mutation| try self.put(put_mutation.key, put_mutation.value),
+            .delete => |delete_mutation| self.delete(delete_mutation.key) catch |err| {
+                if (!delete_mutation.ignore_missing or err != error.NotFound) return err;
+            },
+        };
     }
 
     pub fn openCursor(self: *Batch) !Cursor {
@@ -1149,6 +1171,10 @@ pub fn writeTxnFrom(allocator: Allocator, handle: anytype) !WriteTxn {
             try unbox(ptr).handle.delete(key);
         }
 
+        fn applyMutations(ptr: *anyopaque, mutations: []const backend_types.KeyMutation) anyerror!void {
+            try unbox(ptr).handle.applyMutations(mutations);
+        }
+
         fn openCursor(alloc: Allocator, ptr: *anyopaque) anyerror!Cursor {
             const parent = unbox(ptr);
             try parent.retainChild();
@@ -1169,6 +1195,7 @@ pub fn writeTxnFrom(allocator: Allocator, handle: anytype) !WriteTxn {
             .get_many_sorted = vt.getManySorted,
             .put = vt.put,
             .delete = vt.delete,
+            .apply_mutations = if (@hasDecl(Handle, "applyMutations")) vt.applyMutations else null,
             .open_cursor = vt.openCursor,
         },
     };
@@ -1284,6 +1311,10 @@ pub fn batchFrom(allocator: Allocator, handle: anytype) !Batch {
             try unbox(ptr).handle.delete(key);
         }
 
+        fn applyMutations(ptr: *anyopaque, mutations: []const backend_types.KeyMutation) anyerror!void {
+            try unbox(ptr).handle.applyMutations(mutations);
+        }
+
         fn openCursor(alloc: Allocator, ptr: *anyopaque) anyerror!Cursor {
             const parent = unbox(ptr);
             try parent.retainChild();
@@ -1312,6 +1343,7 @@ pub fn batchFrom(allocator: Allocator, handle: anytype) !Batch {
             .put = vt.put,
             .append_put = if (@hasDecl(Handle, "appendPut")) vt.appendPut else null,
             .delete = vt.delete,
+            .apply_mutations = if (@hasDecl(Handle, "applyMutations")) vt.applyMutations else null,
             .open_cursor = if (@hasDecl(Handle, "openCursor")) vt.openCursor else null,
             .set_replay_opaque = if (@hasDecl(Handle, "setReplayOpaque")) vt.setReplayOpaque else null,
         },

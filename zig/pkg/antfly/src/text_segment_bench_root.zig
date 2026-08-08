@@ -16,4 +16,5 @@ pub const bloom = @import("bloom");
 pub const inverted = @import("section/inverted.zig");
 pub const lsm_backend = @import("storage/lsm_backend/mod.zig");
 pub const platform_time = @import("antfly_platform").time;
+pub const persistent = @import("storage/persistent.zig");
 pub const segment = @import("segment.zig");

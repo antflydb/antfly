@@ -557,6 +557,38 @@ pub const RelationalIndexGenerationComponents = struct {
             .postings = self.postings or other.postings,
         };
     }
+
+    pub fn contains(self: RelationalIndexGenerationComponents, component: RelationalIndexGenerationComponent) bool {
+        return switch (component) {
+            .dictionary => self.dictionary,
+            .fact => self.fact,
+            .path => self.path,
+            .postings => self.postings,
+        };
+    }
+
+    pub fn markReady(self: *RelationalIndexGenerationComponents, component: RelationalIndexGenerationComponent) void {
+        switch (component) {
+            .dictionary => self.dictionary = true,
+            .fact => self.fact = true,
+            .path => self.path = true,
+            .postings => self.postings = true,
+        }
+    }
+};
+
+pub const RelationalIndexGenerationComponent = enum(u8) {
+    dictionary = 0,
+    fact = 1,
+    path = 2,
+    postings = 3,
+};
+
+pub const relational_index_generation_component_order = [_]RelationalIndexGenerationComponent{
+    .fact,
+    .path,
+    .dictionary,
+    .postings,
 };
 
 pub const relational_index_generation_components_none = RelationalIndexGenerationComponents{
@@ -571,6 +603,15 @@ pub const RelationalIndexGenerationComponentCursors = struct {
     fact: ?[]const u8 = null,
     path: ?[]const u8 = null,
     postings: ?[]const u8 = null,
+
+    pub fn get(self: RelationalIndexGenerationComponentCursors, component: RelationalIndexGenerationComponent) ?[]const u8 {
+        return switch (component) {
+            .dictionary => self.dictionary,
+            .fact => self.fact,
+            .path => self.path,
+            .postings => self.postings,
+        };
+    }
 };
 
 pub const RelationalIndexRebuildLease = struct {
@@ -608,6 +649,109 @@ pub const RelationalIndexGenerationRecord = struct {
     component_cursors: RelationalIndexGenerationComponentCursors = .{},
     rebuild_leases: []const RelationalIndexRebuildLease = &.{},
 };
+
+pub const RelationalIndexGenerationPhaseWork = struct {
+    component: RelationalIndexGenerationComponent,
+    cursor: ?[]const u8,
+};
+
+pub const RelationalIndexGenerationPhaseDecision = union(enum) {
+    work: RelationalIndexGenerationPhaseWork,
+    complete,
+    blocked,
+    malformed,
+};
+
+pub const RelationalIndexDropPhaseWork = struct {
+    component: ?RelationalIndexGenerationComponent = null,
+    cursor: ?[]const u8 = null,
+};
+
+pub const RelationalIndexDropPhaseDecision = union(enum) {
+    work: RelationalIndexDropPhaseWork,
+    complete,
+    blocked,
+    malformed,
+};
+
+/// Select the first incomplete algebraic rebuild phase. A cursor is valid only
+/// on that phase: later-phase cursors would violate the durable phase order and
+/// are rejected rather than silently replayed out of order. The caller still
+/// owns lifecycle transitions from stale/rebuild-required into building.
+pub fn relationalIndexGenerationPhaseDecision(record: RelationalIndexGenerationRecord) RelationalIndexGenerationPhaseDecision {
+    for (relational_index_generation_component_order) |component| {
+        if (record.components.contains(component) and record.component_cursors.get(component) != null) return .malformed;
+    }
+
+    switch (record.lifecycle) {
+        .ready => return if (record.components.allReady()) .complete else .malformed,
+        .building, .catching_up, .failed => {},
+        .invalid, .dropping, .stale, .rebuild_required => return .blocked,
+    }
+
+    if (record.components.allReady()) return .complete;
+
+    var active_component: ?RelationalIndexGenerationComponent = null;
+    for (relational_index_generation_component_order) |component| {
+        if (record.components.contains(component)) continue;
+        if (active_component == null) {
+            active_component = component;
+        } else if (record.component_cursors.get(component) != null) {
+            return .malformed;
+        }
+    }
+    const component = active_component orelse unreachable;
+    return .{ .work = .{ .component = component, .cursor = record.component_cursors.get(component) } };
+}
+
+/// Interpret generation progress as durable artifact-deletion progress. Drop
+/// uses the same cursor storage as rebuild because the lifecycle makes their
+/// meaning disjoint: text search has one segment phase in `rebuild_cursor`,
+/// while algebraic cleanup follows the normal component order.
+pub fn relationalIndexDropPhaseDecision(index: RelationalIndex) RelationalIndexDropPhaseDecision {
+    const record = index.generation_record orelse return .malformed;
+    if (index.generation == 0 or record.generation != index.generation) return .malformed;
+    if (index.lifecycle != .dropping or record.lifecycle != .dropping) return .blocked;
+    if (index.owner_ranges.len != 0 and !relationalIndexOwnerRangeSlicesEqual(index.owner_ranges, record.owner_ranges)) return .malformed;
+
+    switch (index.access_method) {
+        .text_search => {
+            if (record.component_cursors.dictionary != null or
+                record.component_cursors.fact != null or
+                record.component_cursors.path != null or
+                record.component_cursors.postings != null)
+            {
+                return .malformed;
+            }
+            if (record.components.allReady()) {
+                return if (record.rebuild_cursor == null) .complete else .malformed;
+            }
+            if (record.components.dictionary or record.components.fact or record.components.path or record.components.postings) return .malformed;
+            return .{ .work = .{ .cursor = record.rebuild_cursor } };
+        },
+        .algebraic_filter => {
+            if (record.rebuild_cursor != null) return .malformed;
+            for (relational_index_generation_component_order) |component| {
+                if (record.components.contains(component)) {
+                    if (record.component_cursors.get(component) != null) return .malformed;
+                    continue;
+                }
+                var later = false;
+                for (relational_index_generation_component_order) |candidate| {
+                    if (candidate == component) {
+                        later = true;
+                        continue;
+                    }
+                    if (!later) continue;
+                    if (record.components.contains(candidate) or record.component_cursors.get(candidate) != null) return .malformed;
+                }
+                return .{ .work = .{ .component = component, .cursor = record.component_cursors.get(component) } };
+            }
+            return .complete;
+        },
+        .scalar_column, .ordered_tuple => return .blocked,
+    }
+}
 
 pub const RelationalIndexPlannerCapabilities = struct {
     equality: bool = false,
@@ -742,9 +886,18 @@ pub fn relationalTableForegroundWriteBlockReason(schema: ?TableSchema, operation
     const active_schema = schema orelse return null;
     if (active_schema.storage_mode != .relational) return null;
     for (active_schema.relational_indexes) |index| {
+        if (relationalIndexNonblockingDrop(index)) continue;
         if (relationalIndexWriteMaintenanceBlockReason(index)) |reason| return reason;
     }
     return null;
+}
+
+fn relationalIndexNonblockingDrop(index: RelationalIndex) bool {
+    if (index.access_method != .text_search and index.access_method != .algebraic_filter) return false;
+    return switch (relationalIndexDropPhaseDecision(index)) {
+        .work, .complete => true,
+        .blocked, .malformed => false,
+    };
 }
 
 pub fn relationalIndexWriteMaintenanceBlockReason(index: RelationalIndex) ?[]const u8 {
@@ -2451,6 +2604,22 @@ fn clearRelationalIndexGenerationComponentCursorsForComponents(
     }
 }
 
+fn replaceRelationalIndexGenerationComponentCursor(
+    alloc: Allocator,
+    cursors: *RelationalIndexGenerationComponentCursors,
+    component: RelationalIndexGenerationComponent,
+    next_cursor: ?[]const u8,
+) void {
+    const cursor = switch (component) {
+        .dictionary => &cursors.dictionary,
+        .fact => &cursors.fact,
+        .path => &cursors.path,
+        .postings => &cursors.postings,
+    };
+    if (cursor.*) |old_cursor| alloc.free(old_cursor);
+    cursor.* = next_cursor;
+}
+
 fn freeRelationalIndexOwnerRangeSlice(alloc: Allocator, ranges: []const RelationalIndexOwnerRange) void {
     for (ranges) |range| freeRelationalIndexOwnerRange(alloc, range);
     if (ranges.len > 0) alloc.free(ranges);
@@ -2721,6 +2890,102 @@ pub const RelationalIndexComponentPromotion = struct {
     expected_lifecycle: ?RelationalIndexLifecycle = null,
 };
 
+pub const RelationalIndexComponentProgressUpdate = struct {
+    access_method: RelationalIndexAccessMethod = .algebraic_filter,
+    index_name: []const u8,
+    expected_generation: u64,
+    component: RelationalIndexGenerationComponent,
+    expected_cursor: ?[]const u8 = null,
+    next_cursor: ?[]const u8 = null,
+    complete: bool = false,
+};
+
+pub const RelationalIndexComponentProgressResult = enum {
+    advanced,
+    completed,
+    already_completed,
+    schema_missing,
+    non_relational_schema,
+    index_not_found,
+    wrong_access_method,
+    generation_mismatch,
+    malformed_record,
+    stale_record,
+    wrong_phase,
+    cursor_mismatch,
+    invalid_update,
+};
+
+pub const RelationalIndexDropProgressUpdate = struct {
+    access_method: RelationalIndexAccessMethod,
+    index_name: []const u8,
+    expected_generation: u64,
+    component: ?RelationalIndexGenerationComponent = null,
+    expected_cursor: ?[]const u8 = null,
+    next_cursor: ?[]const u8 = null,
+    complete: bool = false,
+};
+
+pub const RelationalIndexDropProgressResult = enum {
+    advanced,
+    completed,
+    already_completed,
+    schema_missing,
+    non_relational_schema,
+    index_not_found,
+    wrong_access_method,
+    generation_mismatch,
+    malformed_record,
+    stale_record,
+    wrong_phase,
+    cursor_mismatch,
+    invalid_update,
+};
+
+pub const RelationalIndexDropTransition = struct {
+    access_method: RelationalIndexAccessMethod,
+    index_name: []const u8,
+    expected_generation: u64,
+};
+
+pub const RelationalIndexDropTransitionResult = enum {
+    started,
+    already_started,
+    finalized,
+    already_absent,
+    schema_missing,
+    non_relational_schema,
+    index_not_found,
+    wrong_access_method,
+    generation_mismatch,
+    malformed_record,
+    incomplete,
+};
+
+pub const RelationalIndexCatchUpProgressUpdate = struct {
+    access_method: RelationalIndexAccessMethod = .algebraic_filter,
+    index_name: []const u8,
+    expected_generation: u64,
+    expected_ready_watermark: u64,
+    next_ready_watermark: u64,
+    target_watermark: u64,
+};
+
+pub const RelationalIndexCatchUpProgressResult = enum {
+    advanced,
+    caught_up,
+    schema_missing,
+    non_relational_schema,
+    index_not_found,
+    wrong_access_method,
+    generation_mismatch,
+    malformed_record,
+    stale_record,
+    components_incomplete,
+    watermark_mismatch,
+    invalid_update,
+};
+
 pub const RelationalIndexRangePromotionResult = enum {
     promoted,
     already_ready,
@@ -2822,6 +3087,278 @@ pub fn updateRelationalIndexGenerationRecord(
     return false;
 }
 
+pub fn beginRelationalIndexDrop(
+    store: anytype,
+    alloc: Allocator,
+    transition: RelationalIndexDropTransition,
+) !RelationalIndexDropTransitionResult {
+    if (transition.access_method != .text_search and transition.access_method != .algebraic_filter) return .wrong_access_method;
+    const maybe_schema = try loadSchema(store, alloc);
+    var schema = maybe_schema orelse return .schema_missing;
+    defer freeSchema(alloc, schema);
+    if (schema.storage_mode != .relational) return .non_relational_schema;
+
+    const result = try beginRelationalIndexDropInSchemaAlloc(alloc, &schema, transition);
+    if (result == .started) _ = try saveSchema(store, alloc, schema);
+    return result;
+}
+
+pub fn beginRelationalIndexDropInSchemaAlloc(
+    alloc: Allocator,
+    schema: *TableSchema,
+    transition: RelationalIndexDropTransition,
+) !RelationalIndexDropTransitionResult {
+    if (transition.access_method != .text_search and transition.access_method != .algebraic_filter) return .wrong_access_method;
+    if (schema.storage_mode != .relational) return .non_relational_schema;
+
+    var saw_name = false;
+    for (@constCast(schema.relational_indexes)) |*index| {
+        if (!std.mem.eql(u8, index.name, transition.index_name)) continue;
+        saw_name = true;
+        if (index.access_method != transition.access_method) continue;
+        if (index.generation != transition.expected_generation) return .generation_mismatch;
+        const old_record = index.generation_record orelse return .malformed_record;
+        if (old_record.generation != transition.expected_generation or old_record.lifecycle != index.lifecycle) return .malformed_record;
+        if (index.owner_ranges.len != 0 and !relationalIndexOwnerRangeSlicesEqual(index.owner_ranges, old_record.owner_ranges)) return .malformed_record;
+        if (index.lifecycle == .dropping) {
+            return switch (relationalIndexDropPhaseDecision(index.*)) {
+                .work, .complete => .already_started,
+                .blocked, .malformed => .malformed_record,
+            };
+        }
+
+        const record = try relationalIndexGenerationRecordFromProgressAlloc(alloc, index.*, .{
+            .lifecycle = .dropping,
+            .lag = 0,
+            .ready_watermark = old_record.ready_watermark,
+            .components = relational_index_generation_components_none,
+        });
+        errdefer freeRelationalIndexGenerationRecord(alloc, record);
+        freeRelationalIndexGenerationRecord(alloc, old_record);
+        index.lifecycle = .dropping;
+        index.generation_record = record;
+        return .started;
+    }
+    return if (saw_name) .wrong_access_method else .index_not_found;
+}
+
+pub fn finalizeRelationalIndexDrop(
+    store: anytype,
+    alloc: Allocator,
+    transition: RelationalIndexDropTransition,
+) !RelationalIndexDropTransitionResult {
+    const maybe_schema = try loadSchema(store, alloc);
+    var schema = maybe_schema orelse return .schema_missing;
+    defer freeSchema(alloc, schema);
+    if (schema.storage_mode != .relational) return .non_relational_schema;
+
+    var target_index: ?usize = null;
+    for (schema.relational_indexes, 0..) |index, i| {
+        if (!std.mem.eql(u8, index.name, transition.index_name)) continue;
+        if (index.access_method != transition.access_method) return .wrong_access_method;
+        if (index.generation != transition.expected_generation) return .generation_mismatch;
+        switch (relationalIndexDropPhaseDecision(index)) {
+            .complete => target_index = i,
+            .work => return .incomplete,
+            .blocked, .malformed => return .malformed_record,
+        }
+        break;
+    }
+    const remove_index = target_index orelse return .already_absent;
+    const old_indexes = schema.relational_indexes;
+    const new_indexes: []RelationalIndex = if (old_indexes.len > 1) try alloc.alloc(RelationalIndex, old_indexes.len - 1) else &.{};
+    var out: usize = 0;
+    for (old_indexes, 0..) |index, i| {
+        if (i == remove_index) {
+            freeRelationalIndex(alloc, index);
+            continue;
+        }
+        new_indexes[out] = index;
+        out += 1;
+    }
+    if (old_indexes.len > 0) alloc.free(old_indexes);
+    schema.relational_indexes = new_indexes;
+    _ = try saveSchema(store, alloc, schema);
+    return .finalized;
+}
+
+/// Compare and set one algebraic component cursor. Artifact pages are written
+/// before this call; if a process fails between those commits, replaying the
+/// same page is safe and this expected-cursor check prevents stale workers from
+/// advancing over newer durable progress.
+pub fn updateRelationalIndexComponentProgress(
+    store: anytype,
+    alloc: Allocator,
+    update: RelationalIndexComponentProgressUpdate,
+) !RelationalIndexComponentProgressResult {
+    if (update.complete) {
+        if (update.next_cursor != null) return .invalid_update;
+    } else {
+        const next_cursor = update.next_cursor orelse return .invalid_update;
+        if (next_cursor.len == 0) return .invalid_update;
+    }
+
+    const maybe_schema = try loadSchema(store, alloc);
+    const schema = maybe_schema orelse return .schema_missing;
+    defer freeSchema(alloc, schema);
+    if (schema.storage_mode != .relational) return .non_relational_schema;
+
+    var saw_name = false;
+    const mutable_indexes = @constCast(schema.relational_indexes);
+    for (mutable_indexes) |*index| {
+        if (!std.mem.eql(u8, index.name, update.index_name)) continue;
+        saw_name = true;
+        if (index.access_method != update.access_method) continue;
+        if (index.generation != update.expected_generation) return .generation_mismatch;
+
+        var record = index.generation_record orelse return .malformed_record;
+        if (record.generation != update.expected_generation) return .generation_mismatch;
+        if (record.lifecycle != index.lifecycle) return .malformed_record;
+        if (index.owner_ranges.len != 0 and !relationalIndexOwnerRangeSlicesEqual(index.owner_ranges, record.owner_ranges)) return .malformed_record;
+        if (record.components.contains(update.component)) {
+            if (record.component_cursors.get(update.component) != null) return .malformed_record;
+            return .already_completed;
+        }
+
+        const work = switch (relationalIndexGenerationPhaseDecision(record)) {
+            .work => |work| work,
+            .blocked => return .stale_record,
+            .complete, .malformed => return .malformed_record,
+        };
+        if (work.component != update.component) return .wrong_phase;
+        if (!optionalStringsEqual(work.cursor, update.expected_cursor)) return .cursor_mismatch;
+
+        const owned_next_cursor = if (update.next_cursor) |cursor| try alloc.dupe(u8, cursor) else null;
+        replaceRelationalIndexGenerationComponentCursor(alloc, &record.component_cursors, update.component, owned_next_cursor);
+        if (update.complete) record.components.markReady(update.component);
+        if (record.lifecycle == .failed) {
+            record.lifecycle = .building;
+            index.lifecycle = .building;
+            if (record.failure_reason) |reason| alloc.free(reason);
+            record.failure_reason = null;
+        }
+        index.generation_record = record;
+        _ = try saveSchema(store, alloc, schema);
+        return if (update.complete) .completed else .advanced;
+    }
+    return if (saw_name) .wrong_access_method else .index_not_found;
+}
+
+/// Compare and set one durable artifact-drop page after its physical deletion
+/// commits. Replaying a page before this CAS is harmless: text segment removal
+/// and algebraic row deletion are both idempotent.
+pub fn updateRelationalIndexDropProgress(
+    store: anytype,
+    alloc: Allocator,
+    update: RelationalIndexDropProgressUpdate,
+) !RelationalIndexDropProgressResult {
+    if (update.access_method != .text_search and update.access_method != .algebraic_filter) return .wrong_access_method;
+    if (update.complete) {
+        if (update.next_cursor != null) return .invalid_update;
+    } else {
+        const next_cursor = update.next_cursor orelse return .invalid_update;
+        if (next_cursor.len == 0) return .invalid_update;
+    }
+    if ((update.access_method == .text_search) != (update.component == null)) return .invalid_update;
+
+    const maybe_schema = try loadSchema(store, alloc);
+    const schema = maybe_schema orelse return .schema_missing;
+    defer freeSchema(alloc, schema);
+    if (schema.storage_mode != .relational) return .non_relational_schema;
+
+    var saw_name = false;
+    const mutable_indexes = @constCast(schema.relational_indexes);
+    for (mutable_indexes) |*index| {
+        if (!std.mem.eql(u8, index.name, update.index_name)) continue;
+        saw_name = true;
+        if (index.access_method != update.access_method) continue;
+        if (index.generation != update.expected_generation) return .generation_mismatch;
+
+        var record = index.generation_record orelse return .malformed_record;
+        if (record.generation != update.expected_generation) return .generation_mismatch;
+        const phase = switch (relationalIndexDropPhaseDecision(index.*)) {
+            .work => |work| work,
+            .complete => return .already_completed,
+            .blocked => return .stale_record,
+            .malformed => return .malformed_record,
+        };
+        if (phase.component != update.component) return .wrong_phase;
+        if (!optionalStringsEqual(phase.cursor, update.expected_cursor)) return .cursor_mismatch;
+
+        const owned_next_cursor = if (update.next_cursor) |cursor| try alloc.dupe(u8, cursor) else null;
+        if (update.access_method == .text_search) {
+            if (record.rebuild_cursor) |cursor| alloc.free(cursor);
+            record.rebuild_cursor = owned_next_cursor;
+            if (update.complete) record.components = .{};
+        } else {
+            replaceRelationalIndexGenerationComponentCursor(alloc, &record.component_cursors, update.component.?, owned_next_cursor);
+            if (update.complete) record.components.markReady(update.component.?);
+        }
+        index.generation_record = record;
+        _ = try saveSchema(store, alloc, schema);
+        return if (update.complete) .completed else .advanced;
+    }
+    return if (saw_name) .wrong_access_method else .index_not_found;
+}
+
+/// Compare and set the durable replay watermark after one catch-up artifact
+/// page commits. This cannot advance a partially built generation and never
+/// replaces component, cursor, lease, or owner-range state.
+pub fn updateRelationalIndexCatchUpProgress(
+    store: anytype,
+    alloc: Allocator,
+    update: RelationalIndexCatchUpProgressUpdate,
+) !RelationalIndexCatchUpProgressResult {
+    if (update.next_ready_watermark < update.expected_ready_watermark or
+        update.next_ready_watermark > update.target_watermark)
+    {
+        return .invalid_update;
+    }
+
+    const maybe_schema = try loadSchema(store, alloc);
+    const schema = maybe_schema orelse return .schema_missing;
+    defer freeSchema(alloc, schema);
+    if (schema.storage_mode != .relational) return .non_relational_schema;
+
+    var saw_name = false;
+    const mutable_indexes = @constCast(schema.relational_indexes);
+    for (mutable_indexes) |*index| {
+        if (!std.mem.eql(u8, index.name, update.index_name)) continue;
+        saw_name = true;
+        if (index.access_method != update.access_method) continue;
+        if (index.generation != update.expected_generation) return .generation_mismatch;
+
+        var record = index.generation_record orelse return .malformed_record;
+        if (record.generation != update.expected_generation) return .generation_mismatch;
+        if (record.lifecycle != index.lifecycle) return .malformed_record;
+        if (index.owner_ranges.len != 0 and !relationalIndexOwnerRangeSlicesEqual(index.owner_ranges, record.owner_ranges)) return .malformed_record;
+        if (!record.components.allReady()) return .components_incomplete;
+        switch (relationalIndexGenerationPhaseDecision(record)) {
+            .complete => {},
+            .work => return .components_incomplete,
+            .blocked => return .stale_record,
+            .malformed => return .malformed_record,
+        }
+        switch (record.lifecycle) {
+            .building, .catching_up, .failed => {},
+            .ready => return .stale_record,
+            .invalid, .dropping, .stale, .rebuild_required => return .stale_record,
+        }
+        if (record.ready_watermark != update.expected_ready_watermark) return .watermark_mismatch;
+
+        record.ready_watermark = update.next_ready_watermark;
+        record.lag = update.target_watermark - update.next_ready_watermark;
+        record.lifecycle = .catching_up;
+        if (record.failure_reason) |reason| alloc.free(reason);
+        record.failure_reason = null;
+        index.lifecycle = .catching_up;
+        index.generation_record = record;
+        _ = try saveSchema(store, alloc, schema);
+        return if (record.lag == 0) .caught_up else .advanced;
+    }
+    return if (saw_name) .wrong_access_method else .index_not_found;
+}
+
 pub fn promoteRelationalIndexRangesReady(
     store: anytype,
     alloc: Allocator,
@@ -2909,6 +3446,10 @@ pub fn promoteRelationalIndexComponentsReady(
         if (record.generation != promotion.expected_generation) return .generation_mismatch;
         if (record.lifecycle != index.lifecycle) return .malformed_record;
         if (index.owner_ranges.len != 0 and !relationalIndexOwnerRangeSlicesEqual(index.owner_ranges, record.owner_ranges)) return .malformed_record;
+        switch (relationalIndexGenerationPhaseDecision(record)) {
+            .malformed => return .malformed_record,
+            .work, .complete, .blocked => {},
+        }
 
         const target_ranges = promotion.owner_ranges;
         if (record.lifecycle == .ready and record.lag == 0 and record.components.allReady()) {
@@ -5400,22 +5941,20 @@ test "schema promotes algebraic component readiness by generation case" {
     }};
     const cases = [_]Case{
         .{
-            .name = "dictionary only",
-            .existing_record = .{ .generation = 7, .owner_ranges = &ranges, .lifecycle = .catching_up, .lag = 5, .ready_watermark = 2, .rebuild_cursor = "row:m", .components = relational_index_generation_components_none, .component_cursors = .{ .dictionary = "row:d", .fact = "row:f", .path = "row:p", .postings = "row:o" } },
-            .promotion_components = .{ .dictionary = true, .fact = false, .path = false, .postings = false },
-            .expected_components = .{ .dictionary = true, .fact = false, .path = false, .postings = false },
-            .expected_component_cursors = .{ .fact = "row:f", .path = "row:p", .postings = "row:o" },
+            .name = "fact only",
+            .existing_record = .{ .generation = 7, .owner_ranges = &ranges, .lifecycle = .catching_up, .lag = 5, .ready_watermark = 2, .rebuild_cursor = "row:m", .components = relational_index_generation_components_none, .component_cursors = .{ .fact = "row:f" } },
+            .promotion_components = .{ .dictionary = false, .fact = true, .path = false, .postings = false },
+            .expected_components = .{ .dictionary = false, .fact = true, .path = false, .postings = false },
             .expected_lifecycle = .catching_up,
             .expected_lag = 5,
             .expected_cursor = "row:m",
             .expected_result = .promoted,
         },
         .{
-            .name = "postings only",
-            .existing_record = .{ .generation = 7, .owner_ranges = &ranges, .lifecycle = .catching_up, .lag = 5, .ready_watermark = 2, .rebuild_cursor = "row:m", .components = relational_index_generation_components_none, .component_cursors = .{ .dictionary = "row:d", .fact = "row:f", .path = "row:p", .postings = "row:o" } },
-            .promotion_components = .{ .dictionary = false, .fact = false, .path = false, .postings = true },
-            .expected_components = .{ .dictionary = false, .fact = false, .path = false, .postings = true },
-            .expected_component_cursors = .{ .dictionary = "row:d", .fact = "row:f", .path = "row:p" },
+            .name = "path only",
+            .existing_record = .{ .generation = 7, .owner_ranges = &ranges, .lifecycle = .catching_up, .lag = 5, .ready_watermark = 2, .rebuild_cursor = "row:m", .components = .{ .dictionary = false, .fact = true, .path = false, .postings = false }, .component_cursors = .{ .path = "row:p" } },
+            .promotion_components = .{ .dictionary = false, .fact = false, .path = true, .postings = false },
+            .expected_components = .{ .dictionary = false, .fact = true, .path = true, .postings = false },
             .expected_lifecycle = .catching_up,
             .expected_lag = 5,
             .expected_cursor = "row:m",
@@ -5536,6 +6075,380 @@ test "schema promotes algebraic component readiness by generation case" {
         try expectOptionalStringEqual(case.expected_component_cursors.fact, record.component_cursors.fact);
         try expectOptionalStringEqual(case.expected_component_cursors.path, record.component_cursors.path);
         try expectOptionalStringEqual(case.expected_component_cursors.postings, record.component_cursors.postings);
+    }
+}
+
+test "schema advances one algebraic component cursor by durable compare and set case" {
+    const alloc = std.testing.allocator;
+    const Case = struct {
+        name: []const u8,
+        index_generation: u64 = 7,
+        stored_access_method: RelationalIndexAccessMethod = .algebraic_filter,
+        record: RelationalIndexGenerationRecord,
+        update: RelationalIndexComponentProgressUpdate,
+        expected: RelationalIndexComponentProgressResult,
+        expected_lifecycle: ?RelationalIndexLifecycle = null,
+        expected_cursor: ?[]const u8 = null,
+        expected_ready: ?bool = null,
+        expect_failure_reason: bool = false,
+    };
+    const cases = [_]Case{
+        .{
+            .name = "first fact page",
+            .record = .{ .generation = 7, .lifecycle = .building, .components = relational_index_generation_components_none },
+            .update = .{ .index_name = "alg", .expected_generation = 7, .component = .fact, .next_cursor = "row:a" },
+            .expected = .advanced,
+            .expected_lifecycle = .building,
+            .expected_cursor = "row:a",
+            .expected_ready = false,
+        },
+        .{
+            .name = "fact completion",
+            .record = .{ .generation = 7, .lifecycle = .building, .components = relational_index_generation_components_none, .component_cursors = .{ .fact = "row:a" } },
+            .update = .{ .index_name = "alg", .expected_generation = 7, .component = .fact, .expected_cursor = "row:a", .complete = true },
+            .expected = .completed,
+            .expected_lifecycle = .building,
+            .expected_ready = true,
+        },
+        .{
+            .name = "stale worker cursor",
+            .record = .{ .generation = 7, .lifecycle = .building, .components = relational_index_generation_components_none, .component_cursors = .{ .fact = "row:b" } },
+            .update = .{ .index_name = "alg", .expected_generation = 7, .component = .fact, .expected_cursor = "row:a", .next_cursor = "row:c" },
+            .expected = .cursor_mismatch,
+        },
+        .{
+            .name = "wrong ordered phase",
+            .record = .{ .generation = 7, .lifecycle = .building, .components = .{ .dictionary = false, .fact = true, .path = false, .postings = false } },
+            .update = .{ .index_name = "alg", .expected_generation = 7, .component = .dictionary, .next_cursor = "row:a" },
+            .expected = .wrong_phase,
+        },
+        .{
+            .name = "later cursor makes record malformed",
+            .record = .{ .generation = 7, .lifecycle = .building, .components = relational_index_generation_components_none, .component_cursors = .{ .path = "row:a" } },
+            .update = .{ .index_name = "alg", .expected_generation = 7, .component = .fact, .next_cursor = "row:b" },
+            .expected = .malformed_record,
+        },
+        .{
+            .name = "generation changed",
+            .index_generation = 8,
+            .record = .{ .generation = 8, .lifecycle = .building, .components = relational_index_generation_components_none },
+            .update = .{ .index_name = "alg", .expected_generation = 7, .component = .fact, .next_cursor = "row:a" },
+            .expected = .generation_mismatch,
+        },
+        .{
+            .name = "failed phase resumes and clears failure",
+            .record = .{ .generation = 7, .lifecycle = .failed, .failure_reason = "transient", .components = relational_index_generation_components_none, .component_cursors = .{ .fact = "row:a" } },
+            .update = .{ .index_name = "alg", .expected_generation = 7, .component = .fact, .expected_cursor = "row:a", .next_cursor = "row:b" },
+            .expected = .advanced,
+            .expected_lifecycle = .building,
+            .expected_cursor = "row:b",
+            .expected_ready = false,
+        },
+        .{
+            .name = "completed phase is idempotent",
+            .record = .{ .generation = 7, .lifecycle = .building, .components = .{ .dictionary = false, .fact = true, .path = false, .postings = false } },
+            .update = .{ .index_name = "alg", .expected_generation = 7, .component = .fact, .complete = true },
+            .expected = .already_completed,
+        },
+        .{
+            .name = "incomplete update requires next cursor",
+            .record = .{ .generation = 7, .lifecycle = .building, .components = relational_index_generation_components_none },
+            .update = .{ .index_name = "alg", .expected_generation = 7, .component = .fact },
+            .expected = .invalid_update,
+        },
+        .{
+            .name = "access method changed",
+            .stored_access_method = .ordered_tuple,
+            .record = .{ .generation = 7, .lifecycle = .building, .components = relational_index_generation_components_none },
+            .update = .{ .index_name = "alg", .expected_generation = 7, .component = .fact, .next_cursor = "row:a" },
+            .expected = .wrong_access_method,
+        },
+    };
+
+    for (cases, 0..) |case, i| {
+        const path_name = try std.fmt.allocPrint(alloc, "schema-component-progress-{d}", .{i});
+        defer alloc.free(path_name);
+        const path = try tempTestPath(alloc, path_name);
+        defer alloc.free(path);
+        cleanupTestDir(path);
+        var store = try DocStore.open(alloc, path, .{});
+        defer store.close();
+        defer cleanupTestDir(path);
+
+        _ = try saveSchema(&store, alloc, .{
+            .version = 1,
+            .storage_mode = .relational,
+            .relational_indexes = &.{.{
+                .name = "alg",
+                .owner_kind = .table,
+                .owner_name = relational_table_index_owner_name,
+                .access_method = case.stored_access_method,
+                .lifecycle = case.record.lifecycle,
+                .generation = case.index_generation,
+                .generation_record = case.record,
+            }},
+        });
+
+        try std.testing.expectEqual(case.expected, try updateRelationalIndexComponentProgress(&store, alloc, case.update));
+        if (case.expected_lifecycle) |expected_lifecycle| {
+            const loaded = (try loadSchema(&store, alloc)).?;
+            defer freeSchema(alloc, loaded);
+            const loaded_index = loaded.relational_indexes[0];
+            const record = loaded_index.generation_record.?;
+            try std.testing.expectEqual(expected_lifecycle, loaded_index.lifecycle);
+            try std.testing.expectEqual(expected_lifecycle, record.lifecycle);
+            try expectOptionalStringEqual(case.expected_cursor, record.component_cursors.get(case.update.component));
+            try std.testing.expectEqual(case.expected_ready.?, record.components.contains(case.update.component));
+            try std.testing.expectEqual(case.expect_failure_reason, record.failure_reason != null);
+        }
+    }
+}
+
+test "schema advances durable relational index drop progress by lifecycle case" {
+    const alloc = std.testing.allocator;
+    const ExpectedPhase = enum { unchanged, work, complete };
+    const Case = struct {
+        name: []const u8,
+        stored_access_method: RelationalIndexAccessMethod,
+        index_generation: u64 = 7,
+        index_lifecycle: RelationalIndexLifecycle = .dropping,
+        record: RelationalIndexGenerationRecord,
+        update: RelationalIndexDropProgressUpdate,
+        expected: RelationalIndexDropProgressResult,
+        expected_phase: ExpectedPhase = .unchanged,
+        expected_component: ?RelationalIndexGenerationComponent = null,
+        expected_cursor: ?[]const u8 = null,
+    };
+    const cases = [_]Case{
+        .{
+            .name = "text first segment page",
+            .stored_access_method = .text_search,
+            .record = .{ .generation = 7, .lifecycle = .dropping, .components = relational_index_generation_components_none },
+            .update = .{ .access_method = .text_search, .index_name = "idx", .expected_generation = 7, .next_cursor = "segment:a" },
+            .expected = .advanced,
+            .expected_phase = .work,
+            .expected_cursor = "segment:a",
+        },
+        .{
+            .name = "text completion",
+            .stored_access_method = .text_search,
+            .record = .{ .generation = 7, .lifecycle = .dropping, .rebuild_cursor = "segment:a", .components = relational_index_generation_components_none },
+            .update = .{ .access_method = .text_search, .index_name = "idx", .expected_generation = 7, .expected_cursor = "segment:a", .complete = true },
+            .expected = .completed,
+            .expected_phase = .complete,
+        },
+        .{
+            .name = "algebraic fact page",
+            .stored_access_method = .algebraic_filter,
+            .record = .{ .generation = 7, .lifecycle = .dropping, .components = relational_index_generation_components_none },
+            .update = .{ .access_method = .algebraic_filter, .index_name = "idx", .expected_generation = 7, .component = .fact, .next_cursor = "drop:fact:a" },
+            .expected = .advanced,
+            .expected_phase = .work,
+            .expected_component = .fact,
+            .expected_cursor = "drop:fact:a",
+        },
+        .{
+            .name = "algebraic fact completion advances phase",
+            .stored_access_method = .algebraic_filter,
+            .record = .{ .generation = 7, .lifecycle = .dropping, .components = relational_index_generation_components_none, .component_cursors = .{ .fact = "drop:fact:a" } },
+            .update = .{ .access_method = .algebraic_filter, .index_name = "idx", .expected_generation = 7, .component = .fact, .expected_cursor = "drop:fact:a", .complete = true },
+            .expected = .completed,
+            .expected_phase = .work,
+            .expected_component = .path,
+        },
+        .{
+            .name = "algebraic final postings completion",
+            .stored_access_method = .algebraic_filter,
+            .record = .{ .generation = 7, .lifecycle = .dropping, .components = .{ .dictionary = true, .fact = true, .path = true, .postings = false } },
+            .update = .{ .access_method = .algebraic_filter, .index_name = "idx", .expected_generation = 7, .component = .postings, .complete = true },
+            .expected = .completed,
+            .expected_phase = .complete,
+        },
+        .{
+            .name = "stale text cursor",
+            .stored_access_method = .text_search,
+            .record = .{ .generation = 7, .lifecycle = .dropping, .rebuild_cursor = "segment:b", .components = relational_index_generation_components_none },
+            .update = .{ .access_method = .text_search, .index_name = "idx", .expected_generation = 7, .expected_cursor = "segment:a", .next_cursor = "segment:c" },
+            .expected = .cursor_mismatch,
+        },
+        .{
+            .name = "wrong algebraic phase",
+            .stored_access_method = .algebraic_filter,
+            .record = .{ .generation = 7, .lifecycle = .dropping, .components = relational_index_generation_components_none },
+            .update = .{ .access_method = .algebraic_filter, .index_name = "idx", .expected_generation = 7, .component = .dictionary, .next_cursor = "drop:dictionary" },
+            .expected = .wrong_phase,
+        },
+        .{
+            .name = "later algebraic progress is malformed",
+            .stored_access_method = .algebraic_filter,
+            .record = .{ .generation = 7, .lifecycle = .dropping, .components = relational_index_generation_components_none, .component_cursors = .{ .path = "drop:path" } },
+            .update = .{ .access_method = .algebraic_filter, .index_name = "idx", .expected_generation = 7, .component = .fact, .next_cursor = "drop:fact" },
+            .expected = .malformed_record,
+        },
+        .{
+            .name = "generation changed",
+            .stored_access_method = .text_search,
+            .index_generation = 8,
+            .record = .{ .generation = 8, .lifecycle = .dropping, .components = relational_index_generation_components_none },
+            .update = .{ .access_method = .text_search, .index_name = "idx", .expected_generation = 7, .next_cursor = "segment:a" },
+            .expected = .generation_mismatch,
+        },
+        .{
+            .name = "non-dropping generation is stale work",
+            .stored_access_method = .text_search,
+            .index_lifecycle = .ready,
+            .record = .{ .generation = 7, .lifecycle = .ready },
+            .update = .{ .access_method = .text_search, .index_name = "idx", .expected_generation = 7, .next_cursor = "segment:a" },
+            .expected = .stale_record,
+        },
+        .{
+            .name = "completed text drop is idempotent",
+            .stored_access_method = .text_search,
+            .record = .{ .generation = 7, .lifecycle = .dropping },
+            .update = .{ .access_method = .text_search, .index_name = "idx", .expected_generation = 7, .complete = true },
+            .expected = .already_completed,
+        },
+        .{
+            .name = "incomplete page requires cursor",
+            .stored_access_method = .text_search,
+            .record = .{ .generation = 7, .lifecycle = .dropping, .components = relational_index_generation_components_none },
+            .update = .{ .access_method = .text_search, .index_name = "idx", .expected_generation = 7 },
+            .expected = .invalid_update,
+        },
+        .{
+            .name = "access method changed",
+            .stored_access_method = .ordered_tuple,
+            .record = .{ .generation = 7, .lifecycle = .dropping, .components = relational_index_generation_components_none },
+            .update = .{ .access_method = .text_search, .index_name = "idx", .expected_generation = 7, .next_cursor = "segment:a" },
+            .expected = .wrong_access_method,
+        },
+    };
+
+    for (cases, 0..) |case, i| {
+        const path_name = try std.fmt.allocPrint(alloc, "schema-drop-progress-{d}", .{i});
+        defer alloc.free(path_name);
+        const path = try tempTestPath(alloc, path_name);
+        defer alloc.free(path);
+        cleanupTestDir(path);
+        var store = try DocStore.open(alloc, path, .{});
+        defer store.close();
+        defer cleanupTestDir(path);
+
+        _ = try saveSchema(&store, alloc, .{
+            .version = 1,
+            .storage_mode = .relational,
+            .relational_indexes = &.{.{
+                .name = "idx",
+                .owner_kind = .table,
+                .owner_name = relational_table_index_owner_name,
+                .access_method = case.stored_access_method,
+                .lifecycle = case.index_lifecycle,
+                .generation = case.index_generation,
+                .generation_record = case.record,
+            }},
+        });
+
+        try std.testing.expectEqual(case.expected, try updateRelationalIndexDropProgress(&store, alloc, case.update));
+        if (case.expected_phase == .unchanged) continue;
+        const loaded = (try loadSchema(&store, alloc)).?;
+        defer freeSchema(alloc, loaded);
+        switch (relationalIndexDropPhaseDecision(loaded.relational_indexes[0])) {
+            .work => |work| {
+                try std.testing.expectEqual(ExpectedPhase.work, case.expected_phase);
+                try std.testing.expectEqual(case.expected_component, work.component);
+                try expectOptionalStringEqual(case.expected_cursor, work.cursor);
+            },
+            .complete => try std.testing.expectEqual(ExpectedPhase.complete, case.expected_phase),
+            .blocked, .malformed => return error.TestUnexpectedResult,
+        }
+    }
+}
+
+test "schema selects algebraic rebuild phase by durable generation case" {
+    const Expected = enum { work, complete, blocked, malformed };
+    const Case = struct {
+        name: []const u8,
+        record: RelationalIndexGenerationRecord,
+        expected: Expected,
+        expected_component: ?RelationalIndexGenerationComponent = null,
+        expected_cursor: ?[]const u8 = null,
+    };
+    const cases = [_]Case{
+        .{
+            .name = "fresh rebuild starts with facts",
+            .record = .{ .generation = 7, .lifecycle = .building, .components = relational_index_generation_components_none },
+            .expected = .work,
+            .expected_component = .fact,
+        },
+        .{
+            .name = "fact only",
+            .record = .{ .generation = 7, .lifecycle = .catching_up, .components = .{ .dictionary = true, .fact = false, .path = true, .postings = true } },
+            .expected = .work,
+            .expected_component = .fact,
+        },
+        .{
+            .name = "path only",
+            .record = .{ .generation = 7, .lifecycle = .building, .components = .{ .dictionary = true, .fact = true, .path = false, .postings = true } },
+            .expected = .work,
+            .expected_component = .path,
+        },
+        .{
+            .name = "postings only",
+            .record = .{ .generation = 7, .lifecycle = .catching_up, .components = .{ .dictionary = true, .fact = true, .path = true, .postings = false } },
+            .expected = .work,
+            .expected_component = .postings,
+        },
+        .{
+            .name = "later phase cursor before facts is malformed",
+            .record = .{ .generation = 7, .lifecycle = .building, .components = relational_index_generation_components_none, .component_cursors = .{ .path = "row:m" } },
+            .expected = .malformed,
+        },
+        .{
+            .name = "failed phase resumes",
+            .record = .{ .generation = 7, .lifecycle = .failed, .components = .{ .dictionary = true, .fact = false, .path = false, .postings = false }, .component_cursors = .{ .fact = "row:f" } },
+            .expected = .work,
+            .expected_component = .fact,
+            .expected_cursor = "row:f",
+        },
+        .{
+            .name = "completed phase cannot retain cursor",
+            .record = .{ .generation = 7, .lifecycle = .catching_up, .components = .{ .dictionary = true, .fact = false, .path = false, .postings = false }, .component_cursors = .{ .dictionary = "row:d" } },
+            .expected = .malformed,
+        },
+        .{
+            .name = "ready record requires all phases",
+            .record = .{ .generation = 7, .lifecycle = .ready, .components = .{ .dictionary = true, .fact = true, .path = true, .postings = false } },
+            .expected = .malformed,
+        },
+        .{
+            .name = "completed record",
+            .record = .{ .generation = 7, .lifecycle = .ready },
+            .expected = .complete,
+        },
+        .{
+            .name = "component build complete before catchup",
+            .record = .{ .generation = 7, .lifecycle = .building },
+            .expected = .complete,
+        },
+        .{
+            .name = "rebuild required needs lifecycle transition",
+            .record = .{ .generation = 7, .lifecycle = .rebuild_required, .components = relational_index_generation_components_none },
+            .expected = .blocked,
+        },
+    };
+
+    for (cases) |case| {
+        const decision = relationalIndexGenerationPhaseDecision(case.record);
+        switch (decision) {
+            .work => |work| {
+                try std.testing.expectEqual(Expected.work, case.expected);
+                try std.testing.expectEqual(case.expected_component.?, work.component);
+                try expectOptionalStringEqual(case.expected_cursor, work.cursor);
+            },
+            .complete => try std.testing.expectEqual(Expected.complete, case.expected),
+            .blocked => try std.testing.expectEqual(Expected.blocked, case.expected),
+            .malformed => try std.testing.expectEqual(Expected.malformed, case.expected),
+        }
     }
 }
 
@@ -5751,6 +6664,7 @@ test "schema gates relational foreground writes by operation and generation case
         record: ?RelationalIndexGenerationRecord = null,
         scalar_generation_record_malformed: bool = false,
         expected: ?[]const u8 = null,
+        expected_index_maintenance: ?bool = null,
     };
     const cases = [_]Case{
         .{
@@ -5772,6 +6686,31 @@ test "schema gates relational foreground writes by operation and generation case
             .access_method = .algebraic_filter,
             .lifecycle = .building,
             .record = .{ .generation = 7, .lifecycle = .building, .lag = 0, .ready_watermark = 0, .components = .{ .dictionary = true, .fact = false, .path = false, .postings = false } },
+        },
+        .{
+            .name = "write text search dropping remains available",
+            .operation = .write,
+            .access_method = .text_search,
+            .lifecycle = .dropping,
+            .record = .{ .generation = 7, .lifecycle = .dropping, .components = relational_index_generation_components_none },
+            .expected_index_maintenance = false,
+        },
+        .{
+            .name = "delete algebraic dropping remains available",
+            .operation = .delete,
+            .access_method = .algebraic_filter,
+            .lifecycle = .dropping,
+            .record = .{ .generation = 7, .lifecycle = .dropping, .components = .{ .dictionary = false, .fact = true, .path = false, .postings = false }, .component_cursors = .{ .path = "drop:path" } },
+            .expected_index_maintenance = false,
+        },
+        .{
+            .name = "batch malformed dropping still fails closed",
+            .operation = .batch,
+            .access_method = .algebraic_filter,
+            .lifecycle = .dropping,
+            .record = .{ .generation = 7, .lifecycle = .dropping, .components = relational_index_generation_components_none, .component_cursors = .{ .dictionary = "out-of-order" } },
+            .expected = "relational_generation_dropping",
+            .expected_index_maintenance = false,
         },
         .{
             .name = "routed prepare missing record",
@@ -5866,6 +6805,9 @@ test "schema gates relational foreground writes by operation and generation case
             try std.testing.expectEqualStrings(expected, reason.?);
         } else {
             try std.testing.expect(reason == null);
+        }
+        if (case.expected_index_maintenance) |expected| {
+            try std.testing.expectEqual(expected, relationalAccessMethodWriteMaintenanceAllowed(schema, case.access_method, "idx"));
         }
     }
 }

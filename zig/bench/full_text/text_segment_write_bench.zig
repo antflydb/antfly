@@ -32,6 +32,7 @@ const Config = struct {
     terms_per_doc: usize = 12,
     merge_width: usize = 8,
     storage_mode: StorageSelection = .host,
+    mutation_matrix: bool = false,
 };
 
 const StorageSelection = enum {
@@ -312,6 +313,16 @@ pub fn main(init: std.process.Init) !void {
     var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
     const out = &stdout_writer.interface;
 
+    if (cfg.mutation_matrix) {
+        try out.print(
+            "{{\"schema_version\":1,\"event\":\"text_mutation_write_matrix_config\",\"samples\":{d},\"docs\":{d},\"terms_per_doc\":{d}}}\n",
+            .{ cfg.samples, cfg.docs, cfg.terms_per_doc },
+        );
+        try runMutationMatrix(out, &stdout_writer, alloc, cfg);
+        try stdout_writer.flush();
+        return;
+    }
+
     try out.print(
         "text segment write bench samples={d} docs={d} batch_size={d} terms_per_doc={d} merge_width={d} storage={s}\n",
         .{ cfg.samples, cfg.docs, cfg.batch_size, cfg.terms_per_doc, cfg.merge_width, @tagName(cfg.storage_mode) },
@@ -336,6 +347,89 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     try stdout_writer.flush();
+}
+
+fn runMutationMatrix(writer: anytype, stdout_writer: anytype, alloc: Allocator, cfg: Config) !void {
+    const Operation = enum { insert, overwrite, unchanged, delete };
+    const cases = [_]Operation{ .insert, .overwrite, .unchanged, .delete };
+    const CopyBuilder = struct {
+        bytes: []const u8,
+
+        fn build(ptr: *anyopaque, sink: *antfly.segment.SegmentSink) !void {
+            const ctx: *@This() = @ptrCast(@alignCast(ptr));
+            try sink.appendSlice(ctx.bytes);
+        }
+    };
+
+    for (0..cfg.samples) |sample| {
+        for (cases) |operation| {
+            var storage = antfly.lsm_backend.MemoryStorage.init(alloc);
+            defer storage.deinit();
+            const path = try std.fmt.allocPrintSentinel(alloc, "/text-mutation-{d}-{s}", .{ sample, @tagName(operation) }, 0);
+            defer alloc.free(path);
+            var persistent = try antfly.persistent.PersistentIndex.open(alloc, .{
+                .path = path.ptr,
+                .main_backend = .lsm,
+                .main_lsm_storage = storage.storage(),
+                .wal_storage = storage.storage(),
+            });
+            defer persistent.close();
+
+            const delete_ids = try alloc.alloc([]const u8, cfg.docs);
+            defer {
+                for (delete_ids) |doc_id| alloc.free(@constCast(doc_id));
+                alloc.free(delete_ids);
+            }
+            for (delete_ids, 0..) |*doc_id, i| doc_id.* = try std.fmt.allocPrint(alloc, "doc:{d}", .{i});
+
+            if (operation != .insert) {
+                const setup_bytes = try buildSegment(alloc, 0, cfg.docs, cfg.terms_per_doc);
+                defer alloc.free(setup_bytes);
+                var setup_ctx = CopyBuilder{ .bytes = setup_bytes };
+                var setup_prepared = [_]antfly.persistent.PreparedMergeSegment{
+                    try persistent.prepareTextSegmentFromSinkBuilder(alloc, &setup_ctx, CopyBuilder.build),
+                };
+                _ = try persistent.applyPreparedTextMutationBatch(&.{}, &setup_prepared);
+            }
+
+            const before = persistent.statsSnapshot();
+            var prepare_ns: u64 = 0;
+            var apply_ns: u64 = 0;
+            var prepared_storage: [1]antfly.persistent.PreparedMergeSegment = undefined;
+            var prepared: []antfly.persistent.PreparedMergeSegment = prepared_storage[0..0];
+            var segment_bytes: ?[]u8 = null;
+            defer if (segment_bytes) |bytes| alloc.free(bytes);
+            if (operation == .insert or operation == .overwrite) {
+                segment_bytes = try buildSegment(alloc, 0, cfg.docs, cfg.terms_per_doc);
+                var ctx = CopyBuilder{ .bytes = segment_bytes.? };
+                const prepare_start = nanotime();
+                prepared_storage[0] = try persistent.prepareTextSegmentFromSinkBuilder(alloc, &ctx, CopyBuilder.build);
+                prepare_ns = nanotime() - prepare_start;
+                prepared = prepared_storage[0..1];
+            }
+            const deletes: []const []const u8 = switch (operation) {
+                .overwrite, .delete => delete_ids,
+                .insert, .unchanged => &.{},
+            };
+            const apply_start = nanotime();
+            _ = try persistent.applyPreparedTextMutationBatch(deletes, prepared);
+            apply_ns = nanotime() - apply_start;
+            const after = persistent.statsSnapshot();
+            const mutation = antfly.persistent.TextMutationBatchStats{
+                .batches = after.text_mutation.batches - before.text_mutation.batches,
+                .segments = after.text_mutation.segments - before.text_mutation.segments,
+                .deletion_bitmaps = after.text_mutation.deletion_bitmaps - before.text_mutation.deletion_bitmaps,
+                .durable_commits = after.text_mutation.durable_commits - before.text_mutation.durable_commits,
+                .snapshot_publications = after.text_mutation.snapshot_publications - before.text_mutation.snapshot_publications,
+            };
+            const total_ns = prepare_ns + apply_ns;
+            try writer.print(
+                "{{\"schema_version\":1,\"event\":\"text_mutation_write_matrix\",\"sample\":{d},\"operation\":\"{s}\",\"docs\":{d},\"ns\":{d},\"ns_per_doc\":{d:.2},\"prepare_ns\":{d},\"apply_ns\":{d},\"batches\":{d},\"segments\":{d},\"deletion_bitmaps\":{d},\"durable_commits\":{d},\"snapshot_publications\":{d}}}\n",
+                .{ sample, @tagName(operation), cfg.docs, total_ns, @as(f64, @floatFromInt(total_ns)) / @as(f64, @floatFromInt(@max(cfg.docs, 1))), prepare_ns, apply_ns, mutation.batches, mutation.segments, mutation.deletion_bitmaps, mutation.durable_commits, mutation.snapshot_publications },
+            );
+            try stdout_writer.flush();
+        }
+    }
 }
 
 fn runBuildSegments(writer: anytype, stdout_writer: anytype, scenario: *Scenario) !void {
@@ -560,6 +654,8 @@ fn parseArgs(alloc: Allocator, proc_args: std.process.Args) !Config {
         } else if (std.mem.eql(u8, arg, "--storage")) {
             const value = args.next() orelse return error.InvalidArgument;
             cfg.storage_mode = std.meta.stringToEnum(StorageSelection, value) orelse return error.InvalidArgument;
+        } else if (std.mem.eql(u8, arg, "--mutation-matrix")) {
+            cfg.mutation_matrix = true;
         } else {
             return error.InvalidArgument;
         }

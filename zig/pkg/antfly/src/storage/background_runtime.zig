@@ -569,20 +569,22 @@ const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
     }
 
     fn drainAll(self: *ThreadedDurableJobLane) void {
-        lockAtomic(&self.reap_mutex);
-        defer self.reap_mutex.unlock();
         while (true) {
-            const entry = self.popAny() orelse return;
-            self.awaitAndDestroy(entry);
+            lockAtomic(&self.reap_mutex);
+            const entry = self.popAny();
+            self.reap_mutex.unlock();
+            const detached = entry orelse return;
+            self.awaitAndDestroy(detached);
         }
     }
 
     fn drainMatching(self: *ThreadedDurableJobLane, owner_id: u64) void {
-        lockAtomic(&self.reap_mutex);
-        defer self.reap_mutex.unlock();
         while (true) {
-            const entry = self.popOwner(owner_id) orelse return;
-            self.awaitAndDestroy(entry);
+            lockAtomic(&self.reap_mutex);
+            const entry = self.popOwner(owner_id);
+            self.reap_mutex.unlock();
+            const detached = entry orelse return;
+            self.awaitAndDestroy(detached);
         }
     }
 
@@ -852,6 +854,83 @@ test "backend runtime durable lane drains threaded jobs by owner" {
     handle.ptr().durable_jobs.drainOwner(second_owner_id);
     try std.testing.expectEqual(@as(u32, 1), second.value.load(.monotonic));
     try std.testing.expectEqual(@as(u32, 1), second.deinits.load(.monotonic));
+}
+
+test "backend runtime threaded owner drain permits nested owner drain" {
+    if (builtin.os.tag == .freestanding) return;
+
+    const NestedCtx = struct {
+        lane: DurableJobLane,
+        io: Io,
+        nested_owner_id: u64,
+        entered: std.atomic.Value(bool) = .init(false),
+        ran: std.atomic.Value(u32) = .init(0),
+        deinits: std.atomic.Value(u32) = .init(0),
+    };
+    const LeafCtx = struct {
+        ran: std.atomic.Value(u32) = .init(0),
+        deinits: std.atomic.Value(u32) = .init(0),
+    };
+    const LeafFns = struct {
+        fn run(ptr: *anyopaque) !void {
+            const ctx: *LeafCtx = @ptrCast(@alignCast(ptr));
+            _ = ctx.ran.fetchAdd(1, .release);
+        }
+
+        fn deinit(ptr: *anyopaque) void {
+            const ctx: *LeafCtx = @ptrCast(@alignCast(ptr));
+            _ = ctx.deinits.fetchAdd(1, .release);
+        }
+    };
+    const NestedFns = struct {
+        fn run(ptr: *anyopaque) !void {
+            const ctx: *NestedCtx = @ptrCast(@alignCast(ptr));
+            ctx.entered.store(true, .release);
+            // Give the outer drain time to detach this job and await it. The
+            // nested drain must not contend on a reaper lock held by that wait.
+            ctx.io.sleep(Io.Duration.fromMilliseconds(10), .awake) catch {};
+            ctx.lane.drainOwner(ctx.nested_owner_id);
+            _ = ctx.ran.fetchAdd(1, .release);
+        }
+
+        fn deinit(ptr: *anyopaque) void {
+            const ctx: *NestedCtx = @ptrCast(@alignCast(ptr));
+            _ = ctx.deinits.fetchAdd(1, .release);
+        }
+    };
+
+    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
+    defer handle.deinit();
+
+    const outer_owner_id = try handle.ptr().allocOwnerId();
+    const nested_owner_id = try handle.ptr().allocOwnerId();
+    var leaf = LeafCtx{};
+    var nested = NestedCtx{
+        .lane = handle.ptr().durable_jobs,
+        .io = handle.ptr().io().?,
+        .nested_owner_id = nested_owner_id,
+    };
+    try handle.ptr().durable_jobs.submit(.{
+        .owner_id = nested_owner_id,
+        .class = .cleanup,
+        .ptr = &leaf,
+        .run = LeafFns.run,
+        .deinit = LeafFns.deinit,
+    });
+    try handle.ptr().durable_jobs.submit(.{
+        .owner_id = outer_owner_id,
+        .class = .maintenance,
+        .ptr = &nested,
+        .run = NestedFns.run,
+        .deinit = NestedFns.deinit,
+    });
+    while (!nested.entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    handle.ptr().durable_jobs.drainOwner(outer_owner_id);
+    try std.testing.expectEqual(@as(u32, 1), nested.ran.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 1), nested.deinits.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 1), leaf.ran.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 1), leaf.deinits.load(.acquire));
 }
 
 test "backend runtime threaded durable lane rejects jobs after owner close" {

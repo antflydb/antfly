@@ -3656,6 +3656,13 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             self.invalidateCursorSnapshot();
         }
 
+        pub fn applyMutations(self: *@This(), mutations: []const backend_types.KeyMutation) !void {
+            if (mutations.len == 0) return;
+            try self.drainBulkAppendsToMutable();
+            try self.mutable.applyMutations(self.allocator, self.namespace, mutations);
+            self.invalidateCursorSnapshot();
+        }
+
         pub fn openCursor(self: *@This()) !LocalCursor {
             try self.ensureCursorSnapshot();
             const cursor_alloc = runtimeScratchAllocator(self.allocator);

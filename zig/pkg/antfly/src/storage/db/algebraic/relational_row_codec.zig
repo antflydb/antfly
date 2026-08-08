@@ -92,34 +92,86 @@ pub fn looksLikeRow(value: []const u8) bool {
 
 /// Serialize a document's cells. Caller owns the result.
 pub fn serialize(alloc: Allocator, cells: []const Cell) ![]u8 {
-    var buf = std.ArrayListUnmanaged(u8).empty;
-    errdefer buf.deinit(alloc);
+    const encoded_len = try serializedLen(cells);
+    const buf = try alloc.alloc(u8, encoded_len);
+    errdefer alloc.free(buf);
+    _ = try serializeInto(buf, cells);
+    return buf;
+}
 
-    try buf.appendSlice(alloc, &magic);
-    try appendU32(alloc, &buf, version);
-    try appendU32(alloc, &buf, @intCast(cells.len));
+/// Return the exact number of bytes required by `serializeInto`.
+pub fn serializedLen(cells: []const Cell) !usize {
+    const count = std.math.cast(u32, cells.len) orelse return error.InvalidRelationalRow;
+    _ = count;
+    var encoded_len: usize = magic.len + 2 * @sizeOf(u32);
+    for (cells) |cell| {
+        _ = std.math.cast(u32, cell.path.len) orelse return error.InvalidRelationalRow;
+        encoded_len = try serializedLenAdd(encoded_len, @sizeOf(u32) + cell.path.len + 2);
+        encoded_len = try serializedLenAdd(encoded_len, switch (cell.value) {
+            .u64_val, .i64_val, .f64_val => @sizeOf(u64),
+            .bool_val => 1,
+            .geo_point => 2 * @sizeOf(u64),
+            .bytes_val => |bytes| blk: {
+                _ = std.math.cast(u32, bytes.len) orelse return error.InvalidRelationalRow;
+                break :blk @sizeOf(u32) + bytes.len;
+            },
+        });
+    }
+    return encoded_len;
+}
 
-    for (cells) |c| {
-        try appendStr(alloc, &buf, c.path);
-        try buf.append(alloc, if (c.is_json) flag_is_json else 0);
-        try buf.append(alloc, @intFromEnum(c.value_type));
-        switch (c.value) {
-            .u64_val => |v| try appendU64(alloc, &buf, v),
-            .i64_val => |v| try appendU64(alloc, &buf, @bitCast(v)),
-            .f64_val => |v| try appendU64(alloc, &buf, @bitCast(v)),
-            .bool_val => |v| try buf.append(alloc, if (v) 1 else 0),
-            .geo_point => |gp| {
-                try appendU64(alloc, &buf, @bitCast(gp.lat));
-                try appendU64(alloc, &buf, @bitCast(gp.lon));
+/// Serialize into caller-owned storage and return the initialized prefix.
+pub fn serializeInto(buf: []u8, cells: []const Cell) ![]u8 {
+    const encoded_len = try serializedLen(cells);
+    if (buf.len < encoded_len) return error.NoSpaceLeft;
+    const out = buf[0..encoded_len];
+    var pos: usize = 0;
+    @memcpy(out[pos..][0..magic.len], &magic);
+    pos += magic.len;
+    writeU32(out, &pos, version);
+    writeU32(out, &pos, @intCast(cells.len));
+    for (cells) |cell| {
+        writeU32(out, &pos, @intCast(cell.path.len));
+        @memcpy(out[pos..][0..cell.path.len], cell.path);
+        pos += cell.path.len;
+        out[pos] = if (cell.is_json) flag_is_json else 0;
+        out[pos + 1] = @intFromEnum(cell.value_type);
+        pos += 2;
+        switch (cell.value) {
+            .u64_val => |value| writeU64(out, &pos, value),
+            .i64_val => |value| writeU64(out, &pos, @bitCast(value)),
+            .f64_val => |value| writeU64(out, &pos, @bitCast(value)),
+            .bool_val => |value| {
+                out[pos] = if (value) 1 else 0;
+                pos += 1;
+            },
+            .geo_point => |value| {
+                writeU64(out, &pos, @bitCast(value.lat));
+                writeU64(out, &pos, @bitCast(value.lon));
             },
             .bytes_val => |bytes| {
-                try appendU32(alloc, &buf, @intCast(bytes.len));
-                try buf.appendSlice(alloc, bytes);
+                writeU32(out, &pos, @intCast(bytes.len));
+                @memcpy(out[pos..][0..bytes.len], bytes);
+                pos += bytes.len;
             },
         }
     }
+    std.debug.assert(pos == out.len);
+    return out;
+}
 
-    return try buf.toOwnedSlice(alloc);
+fn serializedLenAdd(current: usize, additional: usize) !usize {
+    return std.math.add(usize, current, additional) catch error.OutOfMemory;
+}
+
+fn writeU32(buf: []u8, pos: *usize, value: u32) void {
+    std.mem.writeInt(u32, buf[pos.*..][0..@sizeOf(u32)], value, .little);
+    pos.* += @sizeOf(u32);
+}
+
+fn writeU64(buf: []u8, pos: *usize, value: u64) void {
+    std.mem.writeInt(u64, buf[pos.*..][0..@sizeOf(u64)], value, .little);
+    pos.* += @sizeOf(u64);
 }
 
 /// A decoded row. `cells` and the `path`/`bytes_val` slices they reference
@@ -376,23 +428,6 @@ fn hexDigit(value: u8) u8 {
 fn valueTypeFromByte(tag: u8) ?typed_dv.ValueType {
     if (tag >= std.meta.fields(typed_dv.ValueType).len) return null;
     return @enumFromInt(tag);
-}
-
-fn appendU32(alloc: Allocator, buf: *std.ArrayListUnmanaged(u8), val: u32) !void {
-    var tmp: [4]u8 = undefined;
-    std.mem.writeInt(u32, &tmp, val, .little);
-    try buf.appendSlice(alloc, &tmp);
-}
-
-fn appendU64(alloc: Allocator, buf: *std.ArrayListUnmanaged(u8), val: u64) !void {
-    var tmp: [8]u8 = undefined;
-    std.mem.writeInt(u64, &tmp, val, .little);
-    try buf.appendSlice(alloc, &tmp);
-}
-
-fn appendStr(alloc: Allocator, buf: *std.ArrayListUnmanaged(u8), s: []const u8) !void {
-    try appendU32(alloc, buf, @intCast(s.len));
-    try buf.appendSlice(alloc, s);
 }
 
 fn readU32(data: []const u8, pos: *usize) u32 {

@@ -1169,10 +1169,6 @@ pub const ColumnIndexPolicy = struct {
         return .{};
     }
 
-    fn maintainsLegacyScalarIndexes(self: ColumnIndexPolicy) bool {
-        return self.columns.len == 0 and self.indexes.len == 0 and self.target_index_name == null;
-    }
-
     pub fn fromSchemaParts(columns: []const schema_mod.RelationalColumn, indexes: []const schema_mod.RelationalIndex) ColumnIndexPolicy {
         return .{
             .columns = columns,
@@ -1218,37 +1214,40 @@ pub const ColumnIndexPolicy = struct {
     }
 
     pub fn mayIndexAnyRow(self: ColumnIndexPolicy) bool {
-        if (self.maintainsLegacyScalarIndexes()) return true;
-        for (self.columns) |column| {
-            if (!self.shouldMaintainIndexColumn(column)) continue;
-            if (self.catalogIndexForMaintainedColumn(column)) |_| return true;
-        }
-        return false;
-    }
-
-    pub fn hasConditionalIndexes(self: ColumnIndexPolicy) bool {
-        for (self.columns) |column| {
-            if (self.catalogIndexForMaintainedColumn(column)) |index| {
-                if (index.where.len != 0 or index.where_expressions.len != 0) return true;
+        for (self.indexes) |index| {
+            if (index.owner_kind != .relational_column) continue;
+            if (!self.shouldMaintainCatalogIndex(index)) continue;
+            if (self.columnByName(index.owner_name) == null) continue;
+            switch (index.access_method) {
+                .scalar_column, .ordered_tuple => if (relationalIndexMaintained(index)) return true,
+                .algebraic_filter, .text_search => {},
             }
         }
         return false;
     }
 
+    pub fn hasConditionalIndexes(self: ColumnIndexPolicy) bool {
+        for (self.indexes) |index| {
+            if (!self.maintainsRelationalColumnIndex(index)) continue;
+            if (index.where.len != 0 or index.where_expressions.len != 0) return true;
+        }
+        return false;
+    }
+
     pub fn canSkipUnchangedRowDerivedMaintenance(self: ColumnIndexPolicy) bool {
-        for (self.columns) |column| {
-            if (self.catalogIndexForMaintainedColumn(column)) |index| {
-                switch (index.access_method) {
-                    .scalar_column, .ordered_tuple => if (!relationalIndexReady(index)) return false,
-                    .algebraic_filter, .text_search => return false,
-                }
+        for (self.indexes) |index| {
+            if (index.owner_kind != .relational_column) continue;
+            if (!self.shouldMaintainCatalogIndex(index)) continue;
+            if (self.columnByName(index.owner_name) == null) continue;
+            switch (index.access_method) {
+                .scalar_column, .ordered_tuple => if (relationalIndexMaintained(index) and !relationalIndexReady(index)) return false,
+                .algebraic_filter, .text_search => {},
             }
         }
         return true;
     }
 
     pub fn shouldIndex(self: ColumnIndexPolicy, path: []const u8) bool {
-        if (self.maintainsLegacyScalarIndexes()) return true;
         for (self.columns) |column| {
             if (std.mem.eql(u8, column.path, path) or std.mem.eql(u8, column.name, path)) {
                 return self.catalogIndexForColumn(column, null) != null;
@@ -1258,22 +1257,18 @@ pub const ColumnIndexPolicy = struct {
     }
 
     pub fn shouldMaintainScalarIndexRow(self: ColumnIndexPolicy, alloc: Allocator, path: []const u8, row_value: []const u8) !bool {
-        if (self.maintainsLegacyScalarIndexes()) return true;
         for (self.columns) |column| {
             if (!std.mem.eql(u8, column.path, path) and !std.mem.eql(u8, column.name, path)) continue;
-            if (!self.shouldMaintainIndexColumn(column)) return false;
-            if (!self.columnHasScalarIndex(column)) return false;
-            return try self.shouldIndexRow(alloc, path, row_value);
+            const index = self.maintainedScalarIndexForColumn(column) orelse return false;
+            return try self.shouldIndexCatalogRow(alloc, index, row_value);
         }
         return false;
     }
 
     pub fn shouldIndexRow(self: ColumnIndexPolicy, alloc: Allocator, path: []const u8, row_value: []const u8) !bool {
-        if (self.maintainsLegacyScalarIndexes()) return true;
         for (self.columns) |column| {
             if (!std.mem.eql(u8, column.path, path) and !std.mem.eql(u8, column.name, path)) continue;
-            if (!self.shouldMaintainIndexColumn(column)) return false;
-            const index = self.catalogIndexForColumn(column, null);
+            const index = self.maintainedScalarIndexForColumn(column);
             if (index == null) return false;
             const predicates = index.?.where;
             const expression_predicates = index.?.where_expressions;
@@ -1294,7 +1289,6 @@ pub const ColumnIndexPolicy = struct {
     }
 
     pub fn readyForQuery(self: ColumnIndexPolicy, path: []const u8) bool {
-        if (self.maintainsLegacyScalarIndexes()) return true;
         for (self.columns) |column| {
             if (!std.mem.eql(u8, column.path, path) and !std.mem.eql(u8, column.name, path)) continue;
             if (self.catalogIndexForColumn(column, .scalar_column)) |index| {
@@ -1317,20 +1311,38 @@ pub const ColumnIndexPolicy = struct {
     }
 
     fn columnHasScalarIndex(self: ColumnIndexPolicy, column: schema_mod.RelationalColumn) bool {
-        if (self.catalogIndexForColumn(column, .scalar_column)) |_| return true;
-        return false;
+        return self.maintainedScalarIndexForColumn(column) != null;
+    }
+
+    fn maintainedScalarIndexForColumn(self: ColumnIndexPolicy, column: schema_mod.RelationalColumn) ?schema_mod.RelationalIndex {
+        const index = self.catalogIndexForColumn(column, .scalar_column) orelse return null;
+        if (!self.shouldMaintainIndexColumn(column) or !self.shouldMaintainCatalogIndex(index)) return null;
+        return if (relationalIndexMaintained(index)) index else null;
+    }
+
+    fn maintainsRelationalColumnIndex(self: ColumnIndexPolicy, index: schema_mod.RelationalIndex) bool {
+        if (index.owner_kind != .relational_column) return false;
+        if (!self.shouldMaintainCatalogIndex(index)) return false;
+        if (self.columnByName(index.owner_name) == null) return false;
+        return switch (index.access_method) {
+            .scalar_column, .ordered_tuple => relationalIndexMaintained(index),
+            .algebraic_filter, .text_search => false,
+        };
+    }
+
+    fn canBatchUnconditionalScalarMutations(self: ColumnIndexPolicy) bool {
+        var has_scalar = false;
+        for (self.indexes) |index| {
+            if (!self.maintainsRelationalColumnIndex(index)) continue;
+            if (index.access_method != .scalar_column) return false;
+            if (index.where.len != 0 or index.where_expressions.len != 0) return false;
+            has_scalar = true;
+        }
+        return has_scalar;
     }
 
     fn uniqueConstraintIndex(self: ColumnIndexPolicy, constraint: schema_mod.UniqueConstraint, access_method: ?schema_mod.RelationalIndexAccessMethod) ?schema_mod.RelationalIndex {
         return relationalIndexForUniqueConstraint(self.indexes, constraint, access_method);
-    }
-
-    fn catalogIndexForMaintainedColumn(self: ColumnIndexPolicy, column: schema_mod.RelationalColumn) ?schema_mod.RelationalIndex {
-        const index = self.catalogIndexForColumn(column, null) orelse return null;
-        return switch (index.access_method) {
-            .scalar_column, .ordered_tuple => if (relationalIndexMaintained(index)) index else null,
-            .algebraic_filter, .text_search => null,
-        };
     }
 
     fn catalogIndexForColumn(self: ColumnIndexPolicy, column: schema_mod.RelationalColumn, access_method: ?schema_mod.RelationalIndexAccessMethod) ?schema_mod.RelationalIndex {
@@ -1415,16 +1427,14 @@ pub fn bytesTupleValueAlloc(alloc: Allocator, values: []const []const u8) ![]u8 
 }
 
 pub const OrderedTupleIndexEntryKeys = struct {
+    storage: []u8,
     encoded_tuple: []u8,
     forward_key: []u8,
     reverse_key: []u8,
     forward_value: []u8,
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
-        if (self.encoded_tuple.len != 0) alloc.free(self.encoded_tuple);
-        if (self.forward_key.len != 0) alloc.free(self.forward_key);
-        if (self.reverse_key.len != 0) alloc.free(self.reverse_key);
-        if (self.forward_value.len != 0) alloc.free(self.forward_value);
+        if (self.storage.len != 0) alloc.free(self.storage);
         self.* = undefined;
     }
 };
@@ -1466,19 +1476,13 @@ fn orderedTupleIndexEntryKeysForCellsWithMetadataAlloc(
     index_generation: u64,
     schema_fingerprint: ?[]const u8,
 ) !OrderedTupleIndexEntryKeys {
-    const encoded_tuple = try orderedTupleValueForIndexKeyCellsAlloc(alloc, cells, index_keys, columns);
-    errdefer alloc.free(encoded_tuple);
-    const forward_key = try internal_keys.relationalOrderedTupleIndexKeyAlloc(alloc, index_id, encoded_tuple, doc_key);
-    errdefer alloc.free(forward_key);
-    const reverse_key = try internal_keys.relationalOrderedTupleIndexByDocKeyAlloc(alloc, doc_key, index_id, encoded_tuple);
-    errdefer alloc.free(reverse_key);
-    const forward_value = try orderedTupleIncludePayloadForCellsAlloc(alloc, cells, include_columns, columns, row_generation, index_generation, schema_fingerprint);
-    return .{
-        .encoded_tuple = encoded_tuple,
-        .forward_key = forward_key,
-        .reverse_key = reverse_key,
-        .forward_value = forward_value,
-    };
+    var scratch = std.heap.stackFallback(4096, alloc);
+    const scratch_alloc = scratch.get();
+    const encoded_tuple = try orderedTupleValueForIndexKeyCellsAlloc(scratch_alloc, cells, index_keys, columns);
+    defer scratch_alloc.free(encoded_tuple);
+    const forward_value = try orderedTupleIncludePayloadForCellsAlloc(scratch_alloc, cells, include_columns, columns, row_generation, index_generation, schema_fingerprint);
+    defer scratch_alloc.free(forward_value);
+    return try packOrderedTupleIndexEntryAlloc(alloc, index_id, doc_key, encoded_tuple, forward_value);
 }
 
 fn orderedTupleIndexEntryKeysForEncodedTupleAlloc(
@@ -1491,16 +1495,48 @@ fn orderedTupleIndexEntryKeysForEncodedTupleAlloc(
     columns: []const schema_mod.RelationalColumn,
 ) !OrderedTupleIndexEntryKeys {
     errdefer alloc.free(encoded_tuple);
-    const forward_key = try internal_keys.relationalOrderedTupleIndexKeyAlloc(alloc, index_id, encoded_tuple, doc_key);
-    errdefer alloc.free(forward_key);
-    const reverse_key = try internal_keys.relationalOrderedTupleIndexByDocKeyAlloc(alloc, doc_key, index_id, encoded_tuple);
-    errdefer alloc.free(reverse_key);
-    const forward_value = try orderedTupleIncludePayloadForCellsAlloc(alloc, cells, include_columns, columns, 0, 0, null);
+    var scratch = std.heap.stackFallback(4096, alloc);
+    const scratch_alloc = scratch.get();
+    const forward_value = try orderedTupleIncludePayloadForCellsAlloc(scratch_alloc, cells, include_columns, columns, 0, 0, null);
+    defer scratch_alloc.free(forward_value);
+    const entry = try packOrderedTupleIndexEntryAlloc(alloc, index_id, doc_key, encoded_tuple, forward_value);
+    alloc.free(encoded_tuple);
+    return entry;
+}
+
+fn packOrderedTupleIndexEntryAlloc(
+    alloc: Allocator,
+    index_id: []const u8,
+    doc_key: []const u8,
+    encoded_tuple: []const u8,
+    forward_value: []const u8,
+) !OrderedTupleIndexEntryKeys {
+    const forward_key_len = try internal_keys.relationalOrderedTupleIndexKeyLen(index_id, encoded_tuple, doc_key);
+    const reverse_key_len = try internal_keys.relationalOrderedTupleIndexByDocKeyLen(doc_key, index_id, encoded_tuple);
+    var storage_len = std.math.add(usize, encoded_tuple.len, forward_key_len) catch return error.OutOfMemory;
+    storage_len = std.math.add(usize, storage_len, reverse_key_len) catch return error.OutOfMemory;
+    storage_len = std.math.add(usize, storage_len, forward_value.len) catch return error.OutOfMemory;
+    const storage = try alloc.alloc(u8, storage_len);
+    errdefer alloc.free(storage);
+
+    var pos: usize = 0;
+    @memcpy(storage[pos..][0..encoded_tuple.len], encoded_tuple);
+    const packed_tuple = storage[pos..][0..encoded_tuple.len];
+    pos += encoded_tuple.len;
+    const forward_key = try internal_keys.writeRelationalOrderedTupleIndexKey(storage[pos..], index_id, packed_tuple, doc_key);
+    pos += forward_key.len;
+    const reverse_key = try internal_keys.writeRelationalOrderedTupleIndexByDocKey(storage[pos..], doc_key, index_id, packed_tuple);
+    pos += reverse_key.len;
+    @memcpy(storage[pos..][0..forward_value.len], forward_value);
+    const packed_forward_value = storage[pos..][0..forward_value.len];
+    pos += forward_value.len;
+    std.debug.assert(pos == storage.len);
     return .{
-        .encoded_tuple = encoded_tuple,
+        .storage = storage,
+        .encoded_tuple = packed_tuple,
         .forward_key = forward_key,
         .reverse_key = reverse_key,
-        .forward_value = forward_value,
+        .forward_value = packed_forward_value,
     };
 }
 
@@ -1923,6 +1959,13 @@ fn sortableF64Bits(value: f64) u64 {
     return if ((bits & (@as(u64, 1) << 63)) != 0) ~bits else bits ^ (@as(u64, 1) << 63);
 }
 
+pub const WriteParticipantStats = struct {
+    base_row_fast_path_upserts: u64 = 0,
+    generic_upserts: u64 = 0,
+    authoritative_row_lookups: u64 = 0,
+    row_decodes: u64 = 0,
+};
+
 pub const WriteParticipant = struct {
     const PendingForeignKeyParentCheck = struct {
         foreign_key: schema_mod.ForeignKey,
@@ -1963,6 +2006,8 @@ pub const WriteParticipant = struct {
     cascade_depth: usize = 0,
     cascade_delete_count: usize = 0,
     next_row_generation: u64 = 0,
+    base_row_fast_path_enabled: bool = true,
+    stats: WriteParticipantStats = .{},
     prepared: bool = false,
     closed: bool = false,
 
@@ -2048,6 +2093,25 @@ pub const WriteParticipant = struct {
         self.next_row_generation = row_generation;
     }
 
+    pub fn configureBaseRowFastPathEnabled(self: *WriteParticipant, enabled: bool) void {
+        self.base_row_fast_path_enabled = enabled;
+    }
+
+    pub fn statsSnapshot(self: *const WriteParticipant) WriteParticipantStats {
+        return self.stats;
+    }
+
+    fn canUseBaseRowFastPath(self: *const WriteParticipant) bool {
+        return self.base_row_fast_path_enabled and
+            !self.column_index_policy.mayIndexAnyRow() and
+            self.primary_key == null and
+            self.unique_constraints.len == 0 and
+            self.foreign_keys.len == 0 and
+            self.periods.len == 0 and
+            self.externalized_parent_checks.len == 0 and
+            self.constraint_timing_overrides.len == 0;
+    }
+
     fn uniqueConstraintTupleValueForRowAlloc(
         self: *const WriteParticipant,
         row_value: []const u8,
@@ -2077,6 +2141,26 @@ pub const WriteParticipant = struct {
         if (self.closed) return error.ParticipantClosed;
         const row_generation = self.next_row_generation;
         self.next_row_generation = 0;
+        if (self.canUseBaseRowFastPath()) {
+            try appendUpsertInternalWithOldRowAndCells(
+                self.alloc,
+                self.writes,
+                self.deletes,
+                self.owned_keys,
+                self.owned_values,
+                doc_key,
+                null,
+                null,
+                typed_row,
+                null,
+                self.column_index_policy,
+                row_generation,
+            );
+            self.stats.base_row_fast_path_upserts += 1;
+            self.prepared = true;
+            return;
+        }
+        self.stats.authoritative_row_lookups += 1;
         const old_row = try getRawAlloc(self.alloc, self.store, doc_key);
         defer if (old_row) |row| self.alloc.free(row);
         const final_state_deleted = containsKey(self.planned_delete_keys, doc_key);
@@ -2099,6 +2183,7 @@ pub const WriteParticipant = struct {
         if (needs_old_cells) {
             old_decoded = try relational_row_codec.deserialize(self.alloc, old_row.?);
             old_decoded_ready = true;
+            self.stats.row_decodes += 1;
         }
         var new_decoded: relational_row_codec.Row = undefined;
         var new_decoded_ready = false;
@@ -2106,6 +2191,7 @@ pub const WriteParticipant = struct {
         if (needs_new_cells) {
             new_decoded = try relational_row_codec.deserialize(self.alloc, typed_row);
             new_decoded_ready = true;
+            self.stats.row_decodes += 1;
         }
         const old_cells = if (old_decoded_ready) old_decoded.cells else null;
         const new_cells = if (new_decoded_ready) new_decoded.cells else null;
@@ -2116,6 +2202,7 @@ pub const WriteParticipant = struct {
         try self.prepareForeignKeyUpsertWithCells(doc_key, old_row, old_cells, typed_row, new_cells, final_state_deleted);
         try appendUpsertWithColumnIndexPolicyAndOldRowAndCells(self.alloc, self.writes, self.deletes, self.owned_keys, self.owned_values, doc_key, old_row, old_cells, typed_row, new_cells, self.column_index_policy, row_generation);
         try self.appendOrderedTupleUniqueConstraintUpsertWithCells(doc_key, old_row, old_cells, typed_row, new_cells, final_state_deleted);
+        self.stats.generic_upserts += 1;
         self.prepared = true;
     }
 
@@ -11276,6 +11363,16 @@ fn appendUpsertInternalWithOldRowAndCells(
 
     if (old_row_value) |old_value| {
         const resolved_old_cells = old_cells orelse return error.InvalidArgument;
+        if (try appendBatchedUnconditionalScalarMutations(
+            alloc,
+            writes,
+            deletes,
+            owned_keys,
+            doc_key,
+            resolved_old_cells,
+            resolved_new_cells,
+            column_index_policy,
+        )) return;
         try appendChangedColumnIndexMutationsForRows(
             alloc,
             writes,
@@ -11304,6 +11401,16 @@ fn appendUpsertInternalWithOldRowAndCells(
             row_generation,
         );
     } else {
+        if (try appendBatchedUnconditionalScalarMutations(
+            alloc,
+            writes,
+            deletes,
+            owned_keys,
+            doc_key,
+            &.{},
+            resolved_new_cells,
+            column_index_policy,
+        )) return;
         const reserve = insertIndexReserveCounts(column_index_policy, resolved_new_cells);
         try writes.ensureUnusedCapacity(alloc, reserve.writes);
         if (owned_keys) |keys| try keys.ensureUnusedCapacity(alloc, reserve.keys);
@@ -11327,15 +11434,12 @@ fn insertIndexReserveCounts(
     column_index_policy: ColumnIndexPolicy,
     cells: []const relational_row_codec.Cell,
 ) InsertIndexReserveCounts {
-    var scalar_cells: usize = cells.len;
-    if (!column_index_policy.maintainsLegacyScalarIndexes()) {
-        scalar_cells = 0;
-        for (cells) |cell| {
-            for (column_index_policy.columns) |column| {
-                if (!std.mem.eql(u8, column.path, cell.path) and !std.mem.eql(u8, column.name, cell.path)) continue;
-                if (column_index_policy.columnHasScalarIndex(column)) scalar_cells += 1;
-                break;
-            }
+    var scalar_cells: usize = 0;
+    for (cells) |cell| {
+        for (column_index_policy.columns) |column| {
+            if (!std.mem.eql(u8, column.path, cell.path) and !std.mem.eql(u8, column.name, cell.path)) continue;
+            if (column_index_policy.columnHasScalarIndex(column)) scalar_cells += 1;
+            break;
         }
     }
 
@@ -11388,7 +11492,6 @@ fn scalarIndexCellCount(
 }
 
 fn catalogCellHasScalarIndex(column_index_policy: ColumnIndexPolicy, path: []const u8) bool {
-    if (column_index_policy.maintainsLegacyScalarIndexes()) return true;
     for (column_index_policy.columns) |column| {
         if (!std.mem.eql(u8, column.path, path) and !std.mem.eql(u8, column.name, path)) continue;
         return column_index_policy.columnHasScalarIndex(column);
@@ -11415,29 +11518,41 @@ fn appendChangedOrderedTupleIndexMutationsForRows(
         if (!column_index_policy.shouldMaintainCatalogIndex(index)) continue;
         if (column_index_policy.orderedTupleIndexOwnerColumn(index) == null) continue;
         if (!(try orderedTupleIndexMaintainedChecked(index))) continue;
-        const old_indexed = try column_index_policy.shouldIndexCatalogRow(alloc, index, old_row_value);
-        const new_indexed = try column_index_policy.shouldIndexCatalogRow(alloc, index, new_row_value);
+        var scratch = std.heap.stackFallback(16 * 1024, alloc);
+        const scratch_alloc = scratch.get();
+        const old_indexed = try column_index_policy.shouldIndexCatalogRow(scratch_alloc, index, old_row_value);
+        const new_indexed = try column_index_policy.shouldIndexCatalogRow(scratch_alloc, index, new_row_value);
         if (old_indexed) {
-            var old_keys = try orderedTupleIndexEntryKeysForCellsAlloc(alloc, index.name, doc_key, old_cells, index.keys, index.include_columns, column_index_policy.columns);
-            defer old_keys.deinit(alloc);
+            var old_keys = try orderedTupleIndexEntryKeysForCellsAlloc(scratch_alloc, index.name, doc_key, old_cells, index.keys, index.include_columns, column_index_policy.columns);
+            defer old_keys.deinit(scratch_alloc);
             if (!new_indexed) {
-                try appendOrderedTupleIndexDeleteKeys(alloc, deletes, owned_keys, &old_keys);
+                var staged_old = try packOrderedTupleIndexEntryAlloc(alloc, index.name, doc_key, old_keys.encoded_tuple, old_keys.forward_value);
+                defer staged_old.deinit(alloc);
+                try appendOrderedTupleIndexDeleteKeys(alloc, deletes, owned_keys, &staged_old);
                 continue;
             }
-            var new_keys = try orderedTupleIndexEntryKeysForCellsWithMetadataAlloc(alloc, index.name, doc_key, new_cells, index.keys, index.include_columns, column_index_policy.columns, row_generation, index.generation, index.schema_fingerprint);
-            defer new_keys.deinit(alloc);
+            var new_keys = try orderedTupleIndexEntryKeysForCellsWithMetadataAlloc(scratch_alloc, index.name, doc_key, new_cells, index.keys, index.include_columns, column_index_policy.columns, row_generation, index.generation, index.schema_fingerprint);
+            defer new_keys.deinit(scratch_alloc);
             if (std.mem.eql(u8, old_keys.encoded_tuple, new_keys.encoded_tuple)) {
                 if (!std.mem.eql(u8, old_keys.forward_value, new_keys.forward_value)) {
-                    try appendOrderedTupleForwardIndexWriteKey(alloc, writes, owned_keys, owned_values, &new_keys);
+                    var staged_new = try packOrderedTupleIndexEntryAlloc(alloc, index.name, doc_key, new_keys.encoded_tuple, new_keys.forward_value);
+                    defer staged_new.deinit(alloc);
+                    try appendOrderedTupleForwardIndexWriteKey(alloc, writes, owned_keys, owned_values, &staged_new);
                 }
                 continue;
             }
-            try appendOrderedTupleIndexDeleteKeys(alloc, deletes, owned_keys, &old_keys);
-            try appendOrderedTupleIndexWriteKeys(alloc, writes, owned_keys, owned_values, &new_keys);
+            var staged_old = try packOrderedTupleIndexEntryAlloc(alloc, index.name, doc_key, old_keys.encoded_tuple, old_keys.forward_value);
+            defer staged_old.deinit(alloc);
+            var staged_new = try packOrderedTupleIndexEntryAlloc(alloc, index.name, doc_key, new_keys.encoded_tuple, new_keys.forward_value);
+            defer staged_new.deinit(alloc);
+            try appendOrderedTupleIndexDeleteKeys(alloc, deletes, owned_keys, &staged_old);
+            try appendOrderedTupleIndexWriteKeys(alloc, writes, owned_keys, owned_values, &staged_new);
         } else if (new_indexed) {
-            var new_keys = try orderedTupleIndexEntryKeysForCellsWithMetadataAlloc(alloc, index.name, doc_key, new_cells, index.keys, index.include_columns, column_index_policy.columns, row_generation, index.generation, index.schema_fingerprint);
-            defer new_keys.deinit(alloc);
-            try appendOrderedTupleIndexWriteKeys(alloc, writes, owned_keys, owned_values, &new_keys);
+            var new_keys = try orderedTupleIndexEntryKeysForCellsWithMetadataAlloc(scratch_alloc, index.name, doc_key, new_cells, index.keys, index.include_columns, column_index_policy.columns, row_generation, index.generation, index.schema_fingerprint);
+            defer new_keys.deinit(scratch_alloc);
+            var staged_new = try packOrderedTupleIndexEntryAlloc(alloc, index.name, doc_key, new_keys.encoded_tuple, new_keys.forward_value);
+            defer staged_new.deinit(alloc);
+            try appendOrderedTupleIndexWriteKeys(alloc, writes, owned_keys, owned_values, &staged_new);
         }
     }
 }
@@ -11470,7 +11585,11 @@ fn appendChangedColumnIndexMutationsForRows(
             false;
         if (!old_indexed) continue;
         if (!new_indexed or !relationalCellsEqual(old_cell, new_cell.?)) {
-            try appendColumnIndexDeleteForCell(alloc, deletes, owned_keys, doc_key, old_cell);
+            if (new_indexed and scalarCellHasNoStructuredSideIndexes(old_cell) and scalarCellHasNoStructuredSideIndexes(new_cell.?)) {
+                try appendScalarColumnIndexEntryDeleteForCell(alloc, deletes, owned_keys, doc_key, old_cell);
+            } else {
+                try appendColumnIndexDeleteForCell(alloc, deletes, owned_keys, doc_key, old_cell);
+            }
         }
     }
 
@@ -11483,9 +11602,173 @@ fn appendChangedColumnIndexMutationsForRows(
         else
             false;
         if (!old_indexed or !relationalCellsEqual(old_cell.?, new_cell)) {
-            try appendColumnIndexWriteForCell(alloc, writes, owned_keys, owned_values, doc_key, new_cell);
+            if (old_indexed and scalarCellHasNoStructuredSideIndexes(old_cell.?) and scalarCellHasNoStructuredSideIndexes(new_cell)) {
+                try appendScalarColumnIndexEntryWriteForCell(alloc, writes, owned_keys, owned_values, doc_key, new_cell);
+            } else {
+                try appendColumnIndexWriteForCell(alloc, writes, owned_keys, owned_values, doc_key, new_cell);
+            }
         }
     }
+}
+
+fn scalarCellHasNoStructuredSideIndexes(cell: relational_row_codec.Cell) bool {
+    return cell.value_type != .bytes_val or !cell.is_json;
+}
+
+const ScalarMutationBatchPlan = struct {
+    bytes: usize = 0,
+    writes: usize = 0,
+    deletes: usize = 0,
+
+    fn addBytes(self: *@This(), len: usize) !void {
+        self.bytes = std.math.add(usize, self.bytes, len) catch return error.OutOfMemory;
+    }
+
+    fn addForwardWrite(self: *@This(), doc_key: []const u8, cell: relational_row_codec.Cell) !void {
+        try self.addBytes(try internal_keys.relationalColumnIndexKeyLen(cell.path, doc_key));
+        try self.addBytes(try relational_row_codec.serializedLen(&.{cell}));
+        self.writes += 1;
+    }
+
+    fn addReverseWrite(self: *@This(), doc_key: []const u8, cell: relational_row_codec.Cell) !void {
+        try self.addBytes(try internal_keys.relationalColumnIndexByDocKeyLen(doc_key, cell.path));
+        self.writes += 1;
+    }
+
+    fn addForwardDelete(self: *@This(), doc_key: []const u8, cell: relational_row_codec.Cell) !void {
+        try self.addBytes(try internal_keys.relationalColumnIndexKeyLen(cell.path, doc_key));
+        self.deletes += 1;
+    }
+
+    fn addReverseDelete(self: *@This(), doc_key: []const u8, cell: relational_row_codec.Cell) !void {
+        try self.addBytes(try internal_keys.relationalColumnIndexByDocKeyLen(doc_key, cell.path));
+        self.deletes += 1;
+    }
+};
+
+const ScalarMutationSlabWriter = struct {
+    bytes: []u8,
+    pos: usize = 0,
+
+    fn take(self: *@This(), len: usize) []u8 {
+        std.debug.assert(len <= self.bytes.len - self.pos);
+        const out = self.bytes[self.pos..][0..len];
+        self.pos += len;
+        return out;
+    }
+
+    fn forwardKey(self: *@This(), doc_key: []const u8, cell: relational_row_codec.Cell) ![]u8 {
+        const out = self.take(try internal_keys.relationalColumnIndexKeyLen(cell.path, doc_key));
+        return try internal_keys.writeRelationalColumnIndexKey(out, cell.path, doc_key);
+    }
+
+    fn reverseKey(self: *@This(), doc_key: []const u8, cell: relational_row_codec.Cell) ![]u8 {
+        const out = self.take(try internal_keys.relationalColumnIndexByDocKeyLen(doc_key, cell.path));
+        return try internal_keys.writeRelationalColumnIndexByDocKey(out, doc_key, cell.path);
+    }
+
+    fn value(self: *@This(), cell: relational_row_codec.Cell) ![]u8 {
+        const out = self.take(try relational_row_codec.serializedLen(&.{cell}));
+        return try relational_row_codec.serializeInto(out, &.{cell});
+    }
+};
+
+fn planBatchedUnconditionalScalarMutations(
+    doc_key: []const u8,
+    old_cells: []const relational_row_codec.Cell,
+    new_cells: []const relational_row_codec.Cell,
+    column_index_policy: ColumnIndexPolicy,
+) !?ScalarMutationBatchPlan {
+    if (!column_index_policy.canBatchUnconditionalScalarMutations()) return null;
+    for (old_cells) |cell| {
+        if (catalogCellHasScalarIndex(column_index_policy, cell.path) and !scalarCellHasNoStructuredSideIndexes(cell)) return null;
+    }
+    for (new_cells) |cell| {
+        if (catalogCellHasScalarIndex(column_index_policy, cell.path) and !scalarCellHasNoStructuredSideIndexes(cell)) return null;
+    }
+
+    var plan = ScalarMutationBatchPlan{};
+    for (old_cells) |old_cell| {
+        if (!catalogCellHasScalarIndex(column_index_policy, old_cell.path)) continue;
+        const new_cell = findCellInCells(new_cells, old_cell.path);
+        const new_indexed = if (new_cell) |cell| catalogCellHasScalarIndex(column_index_policy, cell.path) else false;
+        if (!new_indexed) {
+            try plan.addForwardDelete(doc_key, old_cell);
+            try plan.addReverseDelete(doc_key, old_cell);
+        } else if (!relationalCellsEqual(old_cell, new_cell.?)) {
+            try plan.addForwardDelete(doc_key, old_cell);
+        }
+    }
+    for (new_cells) |new_cell| {
+        if (!catalogCellHasScalarIndex(column_index_policy, new_cell.path)) continue;
+        const old_cell = findCellInCells(old_cells, new_cell.path);
+        const old_indexed = if (old_cell) |cell| catalogCellHasScalarIndex(column_index_policy, cell.path) else false;
+        if (!old_indexed) {
+            try plan.addForwardWrite(doc_key, new_cell);
+            try plan.addReverseWrite(doc_key, new_cell);
+        } else if (!relationalCellsEqual(old_cell.?, new_cell)) {
+            try plan.addForwardWrite(doc_key, new_cell);
+        }
+    }
+    return plan;
+}
+
+fn appendBatchedUnconditionalScalarMutations(
+    alloc: Allocator,
+    writes: ?*std.ArrayListUnmanaged(docstore_mod.KVPair),
+    deletes: *std.ArrayListUnmanaged([]const u8),
+    owned_keys: ?*std.ArrayListUnmanaged([]u8),
+    doc_key: []const u8,
+    old_cells: []const relational_row_codec.Cell,
+    new_cells: []const relational_row_codec.Cell,
+    column_index_policy: ColumnIndexPolicy,
+) !bool {
+    const keys = owned_keys orelse return false;
+    const plan = (try planBatchedUnconditionalScalarMutations(doc_key, old_cells, new_cells, column_index_policy)) orelse return false;
+    if (plan.writes != 0 and writes == null) return error.InvalidArgument;
+    if (plan.bytes == 0) return true;
+
+    if (writes) |items| try items.ensureUnusedCapacity(alloc, plan.writes);
+    try deletes.ensureUnusedCapacity(alloc, plan.deletes);
+    try keys.ensureUnusedCapacity(alloc, 1);
+    const slab = try alloc.alloc(u8, plan.bytes);
+    var slab_staged = false;
+    errdefer {
+        if (slab_staged) _ = keys.pop();
+        alloc.free(slab);
+    }
+    keys.appendAssumeCapacity(slab);
+    slab_staged = true;
+
+    var writer = ScalarMutationSlabWriter{ .bytes = slab };
+    for (old_cells) |old_cell| {
+        if (!catalogCellHasScalarIndex(column_index_policy, old_cell.path)) continue;
+        const new_cell = findCellInCells(new_cells, old_cell.path);
+        const new_indexed = if (new_cell) |cell| catalogCellHasScalarIndex(column_index_policy, cell.path) else false;
+        if (!new_indexed) {
+            deletes.appendAssumeCapacity(try writer.forwardKey(doc_key, old_cell));
+            deletes.appendAssumeCapacity(try writer.reverseKey(doc_key, old_cell));
+        } else if (!relationalCellsEqual(old_cell, new_cell.?)) {
+            deletes.appendAssumeCapacity(try writer.forwardKey(doc_key, old_cell));
+        }
+    }
+    for (new_cells) |new_cell| {
+        if (!catalogCellHasScalarIndex(column_index_policy, new_cell.path)) continue;
+        const old_cell = findCellInCells(old_cells, new_cell.path);
+        const old_indexed = if (old_cell) |cell| catalogCellHasScalarIndex(column_index_policy, cell.path) else false;
+        if (!old_indexed) {
+            const forward_key = try writer.forwardKey(doc_key, new_cell);
+            const value = try writer.value(new_cell);
+            writes.?.appendAssumeCapacity(.{ .key = forward_key, .value = value });
+            writes.?.appendAssumeCapacity(.{ .key = try writer.reverseKey(doc_key, new_cell), .value = "" });
+        } else if (!relationalCellsEqual(old_cell.?, new_cell)) {
+            const forward_key = try writer.forwardKey(doc_key, new_cell);
+            const value = try writer.value(new_cell);
+            writes.?.appendAssumeCapacity(.{ .key = forward_key, .value = value });
+        }
+    }
+    std.debug.assert(writer.pos == slab.len);
+    return true;
 }
 
 fn appendOrderedTupleIndexWritesForRowWithColumnIndexPolicy(
@@ -11504,10 +11787,14 @@ fn appendOrderedTupleIndexWritesForRowWithColumnIndexPolicy(
         if (!column_index_policy.shouldMaintainCatalogIndex(index)) continue;
         if (column_index_policy.orderedTupleIndexOwnerColumn(index) == null) continue;
         if (!(try orderedTupleIndexMaintainedChecked(index))) continue;
-        if (!(try column_index_policy.shouldIndexCatalogRow(alloc, index, row_value))) continue;
-        var keys = try orderedTupleIndexEntryKeysForCellsWithMetadataAlloc(alloc, index.name, doc_key, cells, index.keys, index.include_columns, column_index_policy.columns, row_generation, index.generation, index.schema_fingerprint);
-        defer keys.deinit(alloc);
-        try appendOrderedTupleIndexWriteKeys(alloc, writes, owned_keys, owned_values, &keys);
+        var scratch = std.heap.stackFallback(16 * 1024, alloc);
+        const scratch_alloc = scratch.get();
+        if (!(try column_index_policy.shouldIndexCatalogRow(scratch_alloc, index, row_value))) continue;
+        var scratch_keys = try orderedTupleIndexEntryKeysForCellsWithMetadataAlloc(scratch_alloc, index.name, doc_key, cells, index.keys, index.include_columns, column_index_policy.columns, row_generation, index.generation, index.schema_fingerprint);
+        defer scratch_keys.deinit(scratch_alloc);
+        var staged_keys = try packOrderedTupleIndexEntryAlloc(alloc, index.name, doc_key, scratch_keys.encoded_tuple, scratch_keys.forward_value);
+        defer staged_keys.deinit(alloc);
+        try appendOrderedTupleIndexWriteKeys(alloc, writes, owned_keys, owned_values, &staged_keys);
     }
 }
 
@@ -11525,10 +11812,14 @@ fn appendOrderedTupleIndexDeletesForRowWithColumnIndexPolicy(
         if (!column_index_policy.shouldMaintainCatalogIndex(index)) continue;
         if (column_index_policy.orderedTupleIndexOwnerColumn(index) == null) continue;
         if (!(try orderedTupleIndexMaintainedChecked(index))) continue;
-        if (!(try column_index_policy.shouldIndexCatalogRow(alloc, index, row_value))) continue;
-        var keys = try orderedTupleIndexEntryKeysForCellsAlloc(alloc, index.name, doc_key, cells, index.keys, index.include_columns, column_index_policy.columns);
-        defer keys.deinit(alloc);
-        try appendOrderedTupleIndexDeleteKeys(alloc, deletes, owned_keys, &keys);
+        var scratch = std.heap.stackFallback(16 * 1024, alloc);
+        const scratch_alloc = scratch.get();
+        if (!(try column_index_policy.shouldIndexCatalogRow(scratch_alloc, index, row_value))) continue;
+        var scratch_keys = try orderedTupleIndexEntryKeysForCellsAlloc(scratch_alloc, index.name, doc_key, cells, index.keys, index.include_columns, column_index_policy.columns);
+        defer scratch_keys.deinit(scratch_alloc);
+        var staged_keys = try packOrderedTupleIndexEntryAlloc(alloc, index.name, doc_key, scratch_keys.encoded_tuple, scratch_keys.forward_value);
+        defer staged_keys.deinit(alloc);
+        try appendOrderedTupleIndexDeleteKeys(alloc, deletes, owned_keys, &staged_keys);
     }
 }
 
@@ -11664,17 +11955,31 @@ fn appendOrderedTupleIndexWriteKeys(
     owned_values: ?*std.ArrayListUnmanaged([]u8),
     keys: *OrderedTupleIndexEntryKeys,
 ) !void {
-    try appendOrderedTupleForwardIndexWriteKey(alloc, writes, owned_keys, owned_values, keys);
+    if (owned_keys) |items| {
+        try writes.ensureUnusedCapacity(alloc, 2);
+        try items.ensureUnusedCapacity(alloc, 1);
+        items.appendAssumeCapacity(keys.storage);
+        keys.storage = keys.storage[0..0];
+        writes.appendAssumeCapacity(.{ .key = keys.forward_key, .value = keys.forward_value });
+        writes.appendAssumeCapacity(.{ .key = keys.reverse_key, .value = "" });
+        return;
+    }
 
-    const reverse_key = try stageOrderedTupleBuffer(alloc, &keys.reverse_key, owned_keys);
-    var reverse_owned = owned_keys == null;
-    errdefer if (reverse_owned) alloc.free(reverse_key);
-    const reverse_value: []const u8 = if (owned_values == null) try alloc.dupe(u8, "") else "";
-    var reverse_value_owned = owned_values == null;
-    errdefer if (reverse_value_owned) alloc.free(@constCast(reverse_value));
-    try writes.append(alloc, .{ .key = reverse_key, .value = reverse_value });
-    reverse_owned = false;
-    reverse_value_owned = false;
+    try writes.ensureUnusedCapacity(alloc, 2);
+    const forward_key = try alloc.dupe(u8, keys.forward_key);
+    errdefer alloc.free(forward_key);
+    const reverse_key = try alloc.dupe(u8, keys.reverse_key);
+    errdefer alloc.free(reverse_key);
+    const forward_value = try alloc.dupe(u8, keys.forward_value);
+    var forward_value_owned = true;
+    errdefer if (forward_value_owned) alloc.free(forward_value);
+    if (owned_values) |values| {
+        try values.append(alloc, forward_value);
+        forward_value_owned = false;
+    }
+    writes.appendAssumeCapacity(.{ .key = forward_key, .value = forward_value });
+    writes.appendAssumeCapacity(.{ .key = reverse_key, .value = "" });
+    forward_value_owned = false;
 }
 
 fn appendOrderedTupleForwardIndexWriteKey(
@@ -11684,15 +11989,27 @@ fn appendOrderedTupleForwardIndexWriteKey(
     owned_values: ?*std.ArrayListUnmanaged([]u8),
     keys: *OrderedTupleIndexEntryKeys,
 ) !void {
-    const forward_key = try stageOrderedTupleBuffer(alloc, &keys.forward_key, owned_keys);
-    var forward_owned = owned_keys == null;
-    errdefer if (forward_owned) alloc.free(forward_key);
-    const forward_value = try stageOrderedTupleBuffer(alloc, &keys.forward_value, owned_values);
-    var value_owned = owned_values == null;
-    errdefer if (value_owned) alloc.free(forward_value);
-    try writes.append(alloc, .{ .key = forward_key, .value = forward_value });
-    forward_owned = false;
-    value_owned = false;
+    if (owned_keys) |items| {
+        try writes.ensureUnusedCapacity(alloc, 1);
+        try items.ensureUnusedCapacity(alloc, 1);
+        items.appendAssumeCapacity(keys.storage);
+        keys.storage = keys.storage[0..0];
+        writes.appendAssumeCapacity(.{ .key = keys.forward_key, .value = keys.forward_value });
+        return;
+    }
+
+    try writes.ensureUnusedCapacity(alloc, 1);
+    const forward_key = try alloc.dupe(u8, keys.forward_key);
+    errdefer alloc.free(forward_key);
+    const forward_value = try alloc.dupe(u8, keys.forward_value);
+    var forward_value_owned = true;
+    errdefer if (forward_value_owned) alloc.free(forward_value);
+    if (owned_values) |values| {
+        try values.append(alloc, forward_value);
+        forward_value_owned = false;
+    }
+    writes.appendAssumeCapacity(.{ .key = forward_key, .value = forward_value });
+    forward_value_owned = false;
 }
 
 fn appendOrderedTupleIndexDeleteKeys(
@@ -11701,31 +12018,23 @@ fn appendOrderedTupleIndexDeleteKeys(
     owned_keys: ?*std.ArrayListUnmanaged([]u8),
     keys: *OrderedTupleIndexEntryKeys,
 ) !void {
-    const forward_key = try stageOrderedTupleBuffer(alloc, &keys.forward_key, owned_keys);
-    var forward_owned = owned_keys == null;
-    errdefer if (forward_owned) alloc.free(forward_key);
-    try deletes.append(alloc, forward_key);
-    forward_owned = false;
-
-    const reverse_key = try stageOrderedTupleBuffer(alloc, &keys.reverse_key, owned_keys);
-    var reverse_owned = owned_keys == null;
-    errdefer if (reverse_owned) alloc.free(reverse_key);
-    try deletes.append(alloc, reverse_key);
-    reverse_owned = false;
-}
-
-fn stageOrderedTupleBuffer(
-    alloc: Allocator,
-    source: *[]u8,
-    owned: ?*std.ArrayListUnmanaged([]u8),
-) ![]u8 {
-    if (owned) |items| {
-        const staged = source.*;
-        try items.append(alloc, staged);
-        source.* = source.*[0..0];
-        return staged;
+    if (owned_keys) |items| {
+        try deletes.ensureUnusedCapacity(alloc, 2);
+        try items.ensureUnusedCapacity(alloc, 1);
+        items.appendAssumeCapacity(keys.storage);
+        keys.storage = keys.storage[0..0];
+        deletes.appendAssumeCapacity(keys.forward_key);
+        deletes.appendAssumeCapacity(keys.reverse_key);
+        return;
     }
-    return try alloc.dupe(u8, source.*);
+
+    try deletes.ensureUnusedCapacity(alloc, 2);
+    const forward_key = try alloc.dupe(u8, keys.forward_key);
+    errdefer alloc.free(forward_key);
+    const reverse_key = try alloc.dupe(u8, keys.reverse_key);
+    errdefer alloc.free(reverse_key);
+    deletes.appendAssumeCapacity(forward_key);
+    deletes.appendAssumeCapacity(reverse_key);
 }
 
 fn findCellInCells(cells: []const relational_row_codec.Cell, path: []const u8) ?relational_row_codec.Cell {
@@ -11756,6 +12065,22 @@ fn appendColumnIndexWriteForCell(
     doc_key: []const u8,
     cell: relational_row_codec.Cell,
 ) !void {
+    try appendScalarColumnIndexEntryWriteForCell(alloc, writes, owned_keys, owned_values, doc_key, cell);
+    try appendColumnIndexByDocWriteForCell(alloc, writes, owned_keys, doc_key, cell);
+    try appendArrayElementIndexWritesForCell(alloc, writes, owned_keys, doc_key, cell);
+    try appendArrayValueIndexWriteForCell(alloc, writes, owned_keys, doc_key, cell);
+    try appendJsonValueIndexWritesForCell(alloc, writes, owned_keys, doc_key, cell);
+    try appendJsonPathIndexWritesForCell(alloc, writes, owned_keys, doc_key, cell);
+}
+
+fn appendScalarColumnIndexEntryWriteForCell(
+    alloc: Allocator,
+    writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+    owned_keys: ?*std.ArrayListUnmanaged([]u8),
+    owned_values: ?*std.ArrayListUnmanaged([]u8),
+    doc_key: []const u8,
+    cell: relational_row_codec.Cell,
+) !void {
     const index_key = try internal_keys.relationalColumnIndexKeyAlloc(alloc, cell.path, doc_key);
     var index_key_owned = true;
     errdefer if (index_key_owned) alloc.free(index_key);
@@ -11778,7 +12103,15 @@ fn appendColumnIndexWriteForCell(
     });
     index_key_owned = false;
     index_value_owned = false;
+}
 
+fn appendColumnIndexByDocWriteForCell(
+    alloc: Allocator,
+    writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+    owned_keys: ?*std.ArrayListUnmanaged([]u8),
+    doc_key: []const u8,
+    cell: relational_row_codec.Cell,
+) !void {
     const by_doc_key = try internal_keys.relationalColumnIndexByDocKeyAlloc(alloc, doc_key, cell.path);
     var by_doc_key_owned = true;
     errdefer if (by_doc_key_owned) alloc.free(by_doc_key);
@@ -11792,14 +12125,24 @@ fn appendColumnIndexWriteForCell(
         .value = "",
     });
     by_doc_key_owned = false;
-
-    try appendArrayElementIndexWritesForCell(alloc, writes, owned_keys, doc_key, cell);
-    try appendArrayValueIndexWriteForCell(alloc, writes, owned_keys, doc_key, cell);
-    try appendJsonValueIndexWritesForCell(alloc, writes, owned_keys, doc_key, cell);
-    try appendJsonPathIndexWritesForCell(alloc, writes, owned_keys, doc_key, cell);
 }
 
 fn appendColumnIndexDeleteForCell(
+    alloc: Allocator,
+    deletes: *std.ArrayListUnmanaged([]const u8),
+    owned_keys: ?*std.ArrayListUnmanaged([]u8),
+    doc_key: []const u8,
+    cell: relational_row_codec.Cell,
+) !void {
+    try appendScalarColumnIndexEntryDeleteForCell(alloc, deletes, owned_keys, doc_key, cell);
+    try appendColumnIndexByDocDeleteForCell(alloc, deletes, owned_keys, doc_key, cell);
+    try appendArrayElementIndexDeletesForCell(alloc, deletes, owned_keys, doc_key, cell);
+    try appendArrayValueIndexDeleteForCell(alloc, deletes, owned_keys, doc_key, cell);
+    try appendJsonValueIndexDeletesForCell(alloc, deletes, owned_keys, doc_key, cell);
+    try appendJsonPathIndexDeletesForCell(alloc, deletes, owned_keys, doc_key, cell);
+}
+
+fn appendScalarColumnIndexEntryDeleteForCell(
     alloc: Allocator,
     deletes: *std.ArrayListUnmanaged([]const u8),
     owned_keys: ?*std.ArrayListUnmanaged([]u8),
@@ -11815,7 +12158,15 @@ fn appendColumnIndexDeleteForCell(
     }
     try deletes.append(alloc, index_key);
     index_key_owned = false;
+}
 
+fn appendColumnIndexByDocDeleteForCell(
+    alloc: Allocator,
+    deletes: *std.ArrayListUnmanaged([]const u8),
+    owned_keys: ?*std.ArrayListUnmanaged([]u8),
+    doc_key: []const u8,
+    cell: relational_row_codec.Cell,
+) !void {
     const by_doc_key = try internal_keys.relationalColumnIndexByDocKeyAlloc(alloc, doc_key, cell.path);
     var by_doc_key_owned = true;
     errdefer if (by_doc_key_owned) alloc.free(by_doc_key);
@@ -11825,11 +12176,6 @@ fn appendColumnIndexDeleteForCell(
     }
     try deletes.append(alloc, by_doc_key);
     by_doc_key_owned = false;
-
-    try appendArrayElementIndexDeletesForCell(alloc, deletes, owned_keys, doc_key, cell);
-    try appendArrayValueIndexDeleteForCell(alloc, deletes, owned_keys, doc_key, cell);
-    try appendJsonValueIndexDeletesForCell(alloc, deletes, owned_keys, doc_key, cell);
-    try appendJsonPathIndexDeletesForCell(alloc, deletes, owned_keys, doc_key, cell);
 }
 
 fn appendArrayElementIndexWritesForCell(
@@ -12213,7 +12559,19 @@ fn appendDeleteInternalWithOldRowAndCells(
 
     if (old_row_value) |row| {
         if (column_index_policy.mayIndexAnyRow()) {
-            try appendExistingColumnDeletesForRow(alloc, deletes, owned_keys, doc_key, row, old_cells orelse return error.InvalidArgument, column_index_policy);
+            const resolved_old_cells = old_cells orelse return error.InvalidArgument;
+            if (!(try appendBatchedUnconditionalScalarMutations(
+                alloc,
+                null,
+                deletes,
+                owned_keys,
+                doc_key,
+                resolved_old_cells,
+                &.{},
+                column_index_policy,
+            ))) {
+                try appendExistingColumnDeletesForRow(alloc, deletes, owned_keys, doc_key, row, resolved_old_cells, column_index_policy);
+            }
         }
     }
 
@@ -12276,6 +12634,7 @@ fn cloneTypedValue(alloc: Allocator, value_type: typed_dv.ValueType, value: type
 
 const RelationalStoreCountingAllocator = struct {
     backing: Allocator,
+    allocation_count: usize = 0,
     allocated_total: usize = 0,
     live_bytes: usize = 0,
 
@@ -12284,6 +12643,7 @@ const RelationalStoreCountingAllocator = struct {
     }
 
     fn reset(self: *@This()) void {
+        self.allocation_count = 0;
         self.allocated_total = 0;
         self.live_bytes = 0;
     }
@@ -12293,6 +12653,12 @@ const RelationalStoreCountingAllocator = struct {
     }
 
     fn recordAlloc(self: *@This(), len: usize) void {
+        self.allocation_count += 1;
+        self.allocated_total += len;
+        self.live_bytes += len;
+    }
+
+    fn recordGrowth(self: *@This(), len: usize) void {
         self.allocated_total += len;
         self.live_bytes += len;
     }
@@ -12312,7 +12678,7 @@ const RelationalStoreCountingAllocator = struct {
         const self: *@This() = @ptrCast(@alignCast(ctx));
         if (!self.backing.rawResize(memory, alignment, new_len, ret_addr)) return false;
         if (new_len > memory.len) {
-            self.recordAlloc(new_len - memory.len);
+            self.recordGrowth(new_len - memory.len);
         } else {
             self.recordFree(memory.len - new_len);
         }
@@ -12343,6 +12709,373 @@ const RelationalStoreCountingAllocator = struct {
         .free = free,
     };
 };
+
+test "relational empty catalog stages only authoritative row mutations by operation" {
+    const Operation = enum { insert, unchanged_overwrite, changed_overwrite, delete };
+    const Case = struct {
+        name: []const u8,
+        operation: Operation,
+        old_row: ?[]const u8,
+        new_row: ?[]const u8,
+        expected_writes: usize,
+        expected_deletes: usize,
+    };
+    const cases = [_]Case{
+        .{ .name = "insert", .operation = .insert, .old_row = null, .new_row = "not-a-packed-row:a", .expected_writes = 1, .expected_deletes = 0 },
+        .{ .name = "unchanged overwrite", .operation = .unchanged_overwrite, .old_row = "not-a-packed-row:a", .new_row = "not-a-packed-row:a", .expected_writes = 1, .expected_deletes = 0 },
+        .{ .name = "changed overwrite", .operation = .changed_overwrite, .old_row = "not-a-packed-row:a", .new_row = "not-a-packed-row:b", .expected_writes = 1, .expected_deletes = 0 },
+        .{ .name = "delete", .operation = .delete, .old_row = "not-a-packed-row:a", .new_row = null, .expected_writes = 0, .expected_deletes = 1 },
+    };
+
+    for (cases) |case| {
+        var counting = RelationalStoreCountingAllocator.init(std.testing.allocator);
+        const alloc = counting.allocator();
+        var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+        defer writes.deinit(alloc);
+        var deletes = std.ArrayListUnmanaged([]const u8).empty;
+        defer deletes.deinit(alloc);
+        var owned_keys = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (owned_keys.items) |key| alloc.free(key);
+            owned_keys.deinit(alloc);
+        }
+        var owned_values = std.ArrayListUnmanaged([]u8).empty;
+        defer owned_values.deinit(alloc);
+
+        try writes.ensureUnusedCapacity(alloc, 1);
+        try deletes.ensureUnusedCapacity(alloc, 1);
+        try owned_keys.ensureUnusedCapacity(alloc, 1);
+        counting.reset();
+
+        switch (case.operation) {
+            .insert, .unchanged_overwrite, .changed_overwrite => try appendUpsertInternalWithOldRowAndCells(
+                alloc,
+                &writes,
+                &deletes,
+                &owned_keys,
+                &owned_values,
+                "doc:a",
+                case.old_row,
+                null,
+                case.new_row.?,
+                null,
+                ColumnIndexPolicy.empty(),
+                0,
+            ),
+            .delete => try appendDeleteInternalWithOldRowAndCells(
+                alloc,
+                &deletes,
+                &owned_keys,
+                "doc:a",
+                case.old_row,
+                null,
+                ColumnIndexPolicy.empty(),
+            ),
+        }
+
+        if (writes.items.len != case.expected_writes or deletes.items.len != case.expected_deletes) {
+            std.debug.print("empty catalog operation failed: {s}\n", .{case.name});
+        }
+        try std.testing.expectEqual(case.expected_writes, writes.items.len);
+        try std.testing.expectEqual(case.expected_deletes, deletes.items.len);
+        try std.testing.expectEqual(@as(usize, 1), owned_keys.items.len);
+        try std.testing.expect(internal_keys.isRelationalRowKey(owned_keys.items[0]));
+        try std.testing.expectEqual(@as(usize, 1), counting.allocation_count);
+        try std.testing.expectEqual(owned_keys.items[0].len, counting.live_bytes);
+    }
+}
+
+test "relational scalar index stages selective mutations with bounded allocations by operation" {
+    const Operation = enum { insert, unchanged_overwrite, changed_overwrite, delete };
+    const Case = struct {
+        name: []const u8,
+        operation: Operation,
+        expected_writes: usize,
+        expected_deletes: usize,
+        expected_owned_keys: usize,
+        expected_owned_values: usize,
+        expected_allocations: usize,
+        expected_by_doc_mutations: usize,
+    };
+    const cases = [_]Case{
+        .{ .name = "insert", .operation = .insert, .expected_writes = 3, .expected_deletes = 0, .expected_owned_keys = 2, .expected_owned_values = 0, .expected_allocations = 2, .expected_by_doc_mutations = 1 },
+        .{ .name = "unchanged overwrite", .operation = .unchanged_overwrite, .expected_writes = 1, .expected_deletes = 0, .expected_owned_keys = 1, .expected_owned_values = 0, .expected_allocations = 1, .expected_by_doc_mutations = 0 },
+        .{ .name = "changed overwrite", .operation = .changed_overwrite, .expected_writes = 2, .expected_deletes = 1, .expected_owned_keys = 2, .expected_owned_values = 0, .expected_allocations = 2, .expected_by_doc_mutations = 0 },
+        .{ .name = "delete", .operation = .delete, .expected_writes = 0, .expected_deletes = 3, .expected_owned_keys = 2, .expected_owned_values = 0, .expected_allocations = 2, .expected_by_doc_mutations = 1 },
+    };
+    const columns = [_]schema_mod.RelationalColumn{.{
+        .name = "amount",
+        .path = "amount",
+        .field_type = .numeric,
+    }};
+    const indexes = [_]schema_mod.RelationalIndex{.{
+        .name = "orders_amount_idx",
+        .owner_kind = .relational_column,
+        .owner_name = "amount",
+        .access_method = .scalar_column,
+        .columns = &.{"amount"},
+        .lifecycle = .ready,
+        .generation = 7,
+        .schema_fingerprint = "secondary-index-v1:orders_amount_idx",
+    }};
+    const policy = ColumnIndexPolicy.fromSchemaParts(columns[0..], indexes[0..]);
+    const old_cells = [_]relational_row_codec.Cell{.{ .path = "amount", .value_type = .f64_val, .value = .{ .f64_val = 10 } }};
+    const new_cells = [_]relational_row_codec.Cell{.{ .path = "amount", .value_type = .f64_val, .value = .{ .f64_val = 20 } }};
+    const old_row = try relational_row_codec.serialize(std.testing.allocator, old_cells[0..]);
+    defer std.testing.allocator.free(old_row);
+    const new_row = try relational_row_codec.serialize(std.testing.allocator, new_cells[0..]);
+    defer std.testing.allocator.free(new_row);
+
+    for (cases) |case| {
+        var counting = RelationalStoreCountingAllocator.init(std.testing.allocator);
+        const alloc = counting.allocator();
+        var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+        defer writes.deinit(alloc);
+        var deletes = std.ArrayListUnmanaged([]const u8).empty;
+        defer deletes.deinit(alloc);
+        var owned_keys = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (owned_keys.items) |key| alloc.free(key);
+            owned_keys.deinit(alloc);
+        }
+        var owned_values = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (owned_values.items) |value| alloc.free(value);
+            owned_values.deinit(alloc);
+        }
+        try writes.ensureUnusedCapacity(alloc, 8);
+        try deletes.ensureUnusedCapacity(alloc, 8);
+        try owned_keys.ensureUnusedCapacity(alloc, 8);
+        try owned_values.ensureUnusedCapacity(alloc, 2);
+        counting.reset();
+
+        switch (case.operation) {
+            .insert => try appendUpsertInternalWithOldRowAndCells(alloc, &writes, &deletes, &owned_keys, &owned_values, "doc:a", null, null, old_row, old_cells[0..], policy, 0),
+            .unchanged_overwrite => try appendUpsertInternalWithOldRowAndCells(alloc, &writes, &deletes, &owned_keys, &owned_values, "doc:a", old_row, old_cells[0..], old_row, old_cells[0..], policy, 0),
+            .changed_overwrite => try appendUpsertInternalWithOldRowAndCells(alloc, &writes, &deletes, &owned_keys, &owned_values, "doc:a", old_row, old_cells[0..], new_row, new_cells[0..], policy, 0),
+            .delete => try appendDeleteInternalWithOldRowAndCells(alloc, &deletes, &owned_keys, "doc:a", old_row, old_cells[0..], policy),
+        }
+
+        var by_doc_mutations: usize = 0;
+        for (writes.items) |write| by_doc_mutations += @intFromBool(internal_keys.isRelationalColumnIndexByDocKey(write.key));
+        for (deletes.items) |key| by_doc_mutations += @intFromBool(internal_keys.isRelationalColumnIndexByDocKey(key));
+        if (writes.items.len != case.expected_writes or deletes.items.len != case.expected_deletes) {
+            std.debug.print("scalar mutation operation failed: {s}\n", .{case.name});
+        }
+        try std.testing.expectEqual(case.expected_writes, writes.items.len);
+        try std.testing.expectEqual(case.expected_deletes, deletes.items.len);
+        try std.testing.expectEqual(case.expected_owned_keys, owned_keys.items.len);
+        try std.testing.expectEqual(case.expected_owned_values, owned_values.items.len);
+        try std.testing.expectEqual(case.expected_allocations, counting.allocation_count);
+        try std.testing.expectEqual(case.expected_by_doc_mutations, by_doc_mutations);
+    }
+}
+
+test "relational scalar fast path handles nullable and multi-index row deltas by shape" {
+    const Operation = enum { upsert, delete };
+    const Case = struct {
+        name: []const u8,
+        operation: Operation,
+        old_cells: ?[]const relational_row_codec.Cell,
+        new_cells: ?[]const relational_row_codec.Cell,
+        expected_writes: usize,
+        expected_deletes: usize,
+        expected_allocations: usize,
+        expected_by_doc_mutations: usize,
+    };
+    const status_open = [_]relational_row_codec.Cell{
+        .{ .path = "status", .value_type = .bytes_val, .value = .{ .bytes_val = "open" } },
+    };
+    const status_open_amount_10 = [_]relational_row_codec.Cell{
+        .{ .path = "status", .value_type = .bytes_val, .value = .{ .bytes_val = "open" } },
+        .{ .path = "amount", .value_type = .f64_val, .value = .{ .f64_val = 10 } },
+    };
+    const status_open_amount_20 = [_]relational_row_codec.Cell{
+        .{ .path = "status", .value_type = .bytes_val, .value = .{ .bytes_val = "open" } },
+        .{ .path = "amount", .value_type = .f64_val, .value = .{ .f64_val = 20 } },
+    };
+    const status_closed_amount_30 = [_]relational_row_codec.Cell{
+        .{ .path = "status", .value_type = .bytes_val, .value = .{ .bytes_val = "closed" } },
+        .{ .path = "amount", .value_type = .f64_val, .value = .{ .f64_val = 30 } },
+    };
+    const cases = [_]Case{
+        .{ .name = "nullable indexed cell omitted on insert", .operation = .upsert, .old_cells = null, .new_cells = status_open[0..], .expected_writes = 3, .expected_deletes = 0, .expected_allocations = 2, .expected_by_doc_mutations = 1 },
+        .{ .name = "nullable indexed cell added", .operation = .upsert, .old_cells = status_open[0..], .new_cells = status_open_amount_10[0..], .expected_writes = 3, .expected_deletes = 0, .expected_allocations = 2, .expected_by_doc_mutations = 1 },
+        .{ .name = "nullable indexed cell removed", .operation = .upsert, .old_cells = status_open_amount_10[0..], .new_cells = status_open[0..], .expected_writes = 1, .expected_deletes = 2, .expected_allocations = 2, .expected_by_doc_mutations = 1 },
+        .{ .name = "multi-index insert", .operation = .upsert, .old_cells = null, .new_cells = status_open_amount_10[0..], .expected_writes = 5, .expected_deletes = 0, .expected_allocations = 2, .expected_by_doc_mutations = 2 },
+        .{ .name = "multi-index unchanged overwrite", .operation = .upsert, .old_cells = status_open_amount_10[0..], .new_cells = status_open_amount_10[0..], .expected_writes = 1, .expected_deletes = 0, .expected_allocations = 1, .expected_by_doc_mutations = 0 },
+        .{ .name = "one of two indexed cells changed", .operation = .upsert, .old_cells = status_open_amount_10[0..], .new_cells = status_open_amount_20[0..], .expected_writes = 2, .expected_deletes = 1, .expected_allocations = 2, .expected_by_doc_mutations = 0 },
+        .{ .name = "both indexed cells changed", .operation = .upsert, .old_cells = status_open_amount_10[0..], .new_cells = status_closed_amount_30[0..], .expected_writes = 3, .expected_deletes = 2, .expected_allocations = 2, .expected_by_doc_mutations = 0 },
+        .{ .name = "multi-index delete", .operation = .delete, .old_cells = status_open_amount_10[0..], .new_cells = null, .expected_writes = 0, .expected_deletes = 5, .expected_allocations = 2, .expected_by_doc_mutations = 2 },
+    };
+    const columns = [_]schema_mod.RelationalColumn{
+        .{ .name = "status", .path = "status", .field_type = .keyword },
+        .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = true },
+    };
+    const indexes = [_]schema_mod.RelationalIndex{
+        .{ .name = "status", .owner_kind = .relational_column, .owner_name = "status", .access_method = .scalar_column, .columns = &.{"status"}, .lifecycle = .ready },
+        .{ .name = "amount", .owner_kind = .relational_column, .owner_name = "amount", .access_method = .scalar_column, .columns = &.{"amount"}, .lifecycle = .ready },
+    };
+    const policy = ColumnIndexPolicy.fromSchemaParts(columns[0..], indexes[0..]);
+
+    for (cases) |case| {
+        const old_row = if (case.old_cells) |cells| try relational_row_codec.serialize(std.testing.allocator, cells) else null;
+        defer if (old_row) |row| std.testing.allocator.free(row);
+        const new_row = if (case.new_cells) |cells| try relational_row_codec.serialize(std.testing.allocator, cells) else null;
+        defer if (new_row) |row| std.testing.allocator.free(row);
+
+        var counting = RelationalStoreCountingAllocator.init(std.testing.allocator);
+        const alloc = counting.allocator();
+        var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+        defer writes.deinit(alloc);
+        var deletes = std.ArrayListUnmanaged([]const u8).empty;
+        defer deletes.deinit(alloc);
+        var owned_keys = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (owned_keys.items) |key| alloc.free(key);
+            owned_keys.deinit(alloc);
+        }
+        var owned_values = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (owned_values.items) |value| alloc.free(value);
+            owned_values.deinit(alloc);
+        }
+        try writes.ensureUnusedCapacity(alloc, 8);
+        try deletes.ensureUnusedCapacity(alloc, 8);
+        try owned_keys.ensureUnusedCapacity(alloc, 4);
+        try owned_values.ensureUnusedCapacity(alloc, 2);
+        counting.reset();
+
+        switch (case.operation) {
+            .upsert => try appendUpsertInternalWithOldRowAndCells(alloc, &writes, &deletes, &owned_keys, &owned_values, "doc:a", old_row, case.old_cells, new_row.?, case.new_cells, policy, 0),
+            .delete => try appendDeleteInternalWithOldRowAndCells(alloc, &deletes, &owned_keys, "doc:a", old_row, case.old_cells, policy),
+        }
+
+        var by_doc_mutations: usize = 0;
+        for (writes.items) |write| by_doc_mutations += @intFromBool(internal_keys.isRelationalColumnIndexByDocKey(write.key));
+        for (deletes.items) |key| by_doc_mutations += @intFromBool(internal_keys.isRelationalColumnIndexByDocKey(key));
+        if (writes.items.len != case.expected_writes or deletes.items.len != case.expected_deletes) {
+            std.debug.print("scalar schema-shape operation failed: {s}\n", .{case.name});
+        }
+        try std.testing.expectEqual(case.expected_writes, writes.items.len);
+        try std.testing.expectEqual(case.expected_deletes, deletes.items.len);
+        try std.testing.expectEqual(case.expected_allocations, counting.allocation_count);
+        try std.testing.expectEqual(case.expected_by_doc_mutations, by_doc_mutations);
+        try std.testing.expectEqual(@as(usize, 0), owned_values.items.len);
+    }
+}
+
+test "relational ordered tuple stages packed mutations with bounded allocations by operation" {
+    const Operation = enum { insert, unchanged_overwrite, tuple_overwrite, payload_overwrite, delete };
+    const Case = struct {
+        name: []const u8,
+        operation: Operation,
+        expected_writes: usize,
+        expected_deletes: usize,
+        expected_owned_keys: usize,
+        expected_allocations: usize,
+        expected_ordered_writes: usize,
+        expected_ordered_deletes: usize,
+    };
+    const cases = [_]Case{
+        .{ .name = "insert", .operation = .insert, .expected_writes = 3, .expected_deletes = 0, .expected_owned_keys = 2, .expected_allocations = 2, .expected_ordered_writes = 2, .expected_ordered_deletes = 0 },
+        .{ .name = "unchanged overwrite", .operation = .unchanged_overwrite, .expected_writes = 1, .expected_deletes = 0, .expected_owned_keys = 1, .expected_allocations = 1, .expected_ordered_writes = 0, .expected_ordered_deletes = 0 },
+        .{ .name = "tuple overwrite", .operation = .tuple_overwrite, .expected_writes = 3, .expected_deletes = 2, .expected_owned_keys = 3, .expected_allocations = 3, .expected_ordered_writes = 2, .expected_ordered_deletes = 2 },
+        .{ .name = "payload overwrite", .operation = .payload_overwrite, .expected_writes = 2, .expected_deletes = 0, .expected_owned_keys = 2, .expected_allocations = 2, .expected_ordered_writes = 1, .expected_ordered_deletes = 0 },
+        .{ .name = "delete", .operation = .delete, .expected_writes = 0, .expected_deletes = 3, .expected_owned_keys = 2, .expected_allocations = 2, .expected_ordered_writes = 0, .expected_ordered_deletes = 2 },
+    };
+    const columns = [_]schema_mod.RelationalColumn{
+        .{ .name = "status", .path = "status", .field_type = .keyword },
+        .{ .name = "amount", .path = "amount", .field_type = .numeric },
+        .{ .name = "note", .path = "note", .field_type = .keyword },
+    };
+    const index_keys = [_]schema_mod.RelationalIndexKey{
+        .{ .column = "status" },
+        .{ .column = "amount" },
+    };
+    const indexes = [_]schema_mod.RelationalIndex{.{
+        .name = "orders_status_amount_idx",
+        .owner_kind = .relational_column,
+        .owner_name = "status",
+        .access_method = .ordered_tuple,
+        .columns = &.{ "status", "amount" },
+        .keys = index_keys[0..],
+        .include_columns = &.{"note"},
+        .lifecycle = .ready,
+        .generation = 7,
+        .schema_fingerprint = "secondary-index-v1:orders_status_amount_idx",
+        .generation_record = .{ .generation = 7, .lifecycle = .ready },
+    }};
+    const policy = ColumnIndexPolicy.fromSchemaParts(columns[0..], indexes[0..]);
+    const old_cells = [_]relational_row_codec.Cell{
+        .{ .path = "status", .value_type = .bytes_val, .value = .{ .bytes_val = "active" } },
+        .{ .path = "amount", .value_type = .f64_val, .value = .{ .f64_val = 10 } },
+        .{ .path = "note", .value_type = .bytes_val, .value = .{ .bytes_val = "alpha" } },
+    };
+    const tuple_changed_cells = [_]relational_row_codec.Cell{
+        .{ .path = "status", .value_type = .bytes_val, .value = .{ .bytes_val = "active" } },
+        .{ .path = "amount", .value_type = .f64_val, .value = .{ .f64_val = 20 } },
+        .{ .path = "note", .value_type = .bytes_val, .value = .{ .bytes_val = "alpha" } },
+    };
+    const payload_changed_cells = [_]relational_row_codec.Cell{
+        .{ .path = "status", .value_type = .bytes_val, .value = .{ .bytes_val = "active" } },
+        .{ .path = "amount", .value_type = .f64_val, .value = .{ .f64_val = 10 } },
+        .{ .path = "note", .value_type = .bytes_val, .value = .{ .bytes_val = "beta" } },
+    };
+    const old_row = try relational_row_codec.serialize(std.testing.allocator, old_cells[0..]);
+    defer std.testing.allocator.free(old_row);
+    const tuple_changed_row = try relational_row_codec.serialize(std.testing.allocator, tuple_changed_cells[0..]);
+    defer std.testing.allocator.free(tuple_changed_row);
+    const payload_changed_row = try relational_row_codec.serialize(std.testing.allocator, payload_changed_cells[0..]);
+    defer std.testing.allocator.free(payload_changed_row);
+
+    for (cases) |case| {
+        var counting = RelationalStoreCountingAllocator.init(std.testing.allocator);
+        const alloc = counting.allocator();
+        var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+        defer writes.deinit(alloc);
+        var deletes = std.ArrayListUnmanaged([]const u8).empty;
+        defer deletes.deinit(alloc);
+        var owned_keys = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (owned_keys.items) |key| alloc.free(key);
+            owned_keys.deinit(alloc);
+        }
+        var owned_values = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (owned_values.items) |value| alloc.free(value);
+            owned_values.deinit(alloc);
+        }
+        try writes.ensureUnusedCapacity(alloc, 4);
+        try deletes.ensureUnusedCapacity(alloc, 4);
+        try owned_keys.ensureUnusedCapacity(alloc, 4);
+        try owned_values.ensureUnusedCapacity(alloc, 2);
+        counting.reset();
+
+        switch (case.operation) {
+            .insert => try appendUpsertInternalWithOldRowAndCells(alloc, &writes, &deletes, &owned_keys, &owned_values, "doc:a", null, null, old_row, old_cells[0..], policy, 11),
+            .unchanged_overwrite => try appendUpsertInternalWithOldRowAndCells(alloc, &writes, &deletes, &owned_keys, &owned_values, "doc:a", old_row, old_cells[0..], old_row, old_cells[0..], policy, 12),
+            .tuple_overwrite => try appendUpsertInternalWithOldRowAndCells(alloc, &writes, &deletes, &owned_keys, &owned_values, "doc:a", old_row, old_cells[0..], tuple_changed_row, tuple_changed_cells[0..], policy, 12),
+            .payload_overwrite => try appendUpsertInternalWithOldRowAndCells(alloc, &writes, &deletes, &owned_keys, &owned_values, "doc:a", old_row, old_cells[0..], payload_changed_row, payload_changed_cells[0..], policy, 12),
+            .delete => try appendDeleteInternalWithOldRowAndCells(alloc, &deletes, &owned_keys, "doc:a", old_row, old_cells[0..], policy),
+        }
+
+        var ordered_writes: usize = 0;
+        for (writes.items) |write| ordered_writes += @intFromBool(internal_keys.isRelationalOrderedTupleIndexKey(write.key) or internal_keys.isRelationalOrderedTupleIndexByDocKey(write.key));
+        var ordered_deletes: usize = 0;
+        for (deletes.items) |key| ordered_deletes += @intFromBool(internal_keys.isRelationalOrderedTupleIndexKey(key) or internal_keys.isRelationalOrderedTupleIndexByDocKey(key));
+        if (writes.items.len != case.expected_writes or deletes.items.len != case.expected_deletes) {
+            std.debug.print("ordered tuple mutation operation failed: {s}\n", .{case.name});
+        }
+        try std.testing.expectEqual(case.expected_writes, writes.items.len);
+        try std.testing.expectEqual(case.expected_deletes, deletes.items.len);
+        try std.testing.expectEqual(case.expected_owned_keys, owned_keys.items.len);
+        try std.testing.expectEqual(@as(usize, 0), owned_values.items.len);
+        try std.testing.expectEqual(case.expected_allocations, counting.allocation_count);
+        try std.testing.expectEqual(case.expected_ordered_writes, ordered_writes);
+        try std.testing.expectEqual(case.expected_ordered_deletes, ordered_deletes);
+    }
+}
 
 test "relational base store writes materialize and delete by document key" {
     const alloc = std.testing.allocator;
@@ -12515,11 +13248,11 @@ test "relational ordered tuple staging transfers owned buffers without allocatio
 
     try std.testing.expectEqual(@as(usize, 0), counting.allocated_total);
     try std.testing.expectEqual(@as(usize, 2), writes.items.len);
-    try std.testing.expectEqual(@as(usize, 2), owned_keys.items.len);
-    try std.testing.expectEqual(@as(usize, 1), owned_values.items.len);
-    try std.testing.expectEqual(@as(usize, 0), keys.forward_key.len);
-    try std.testing.expectEqual(@as(usize, 0), keys.reverse_key.len);
-    try std.testing.expectEqual(@as(usize, 0), keys.forward_value.len);
+    try std.testing.expectEqual(@as(usize, 1), owned_keys.items.len);
+    try std.testing.expectEqual(@as(usize, 0), owned_values.items.len);
+    try std.testing.expectEqual(@as(usize, 0), keys.storage.len);
+    try std.testing.expect(keys.forward_key.len > 0);
+    try std.testing.expect(keys.reverse_key.len > 0);
     try std.testing.expect(keys.encoded_tuple.len > 0);
 }
 
@@ -13679,8 +14412,8 @@ test "relational scalar column index maintenance skips unchanged and tracks pred
     writes.clearRetainingCapacity();
     deletes.clearRetainingCapacity();
     try appendUpsertWithColumnIndexPolicy(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:a", active_amount_changed_row, policy);
-    try std.testing.expectEqual(@as(usize, 2), countScalarWrites(writes.items));
-    try std.testing.expectEqual(@as(usize, 2), countScalarDeletes(deletes.items));
+    try std.testing.expectEqual(@as(usize, 1), countScalarWrites(writes.items));
+    try std.testing.expectEqual(@as(usize, 1), countScalarDeletes(deletes.items));
     try store.putBatch(writes.items, deletes.items);
     const changed_values = try scanColumnAlloc(alloc, &store, "amount", "", "");
     defer freeColumnValues(alloc, changed_values);
@@ -16546,6 +17279,24 @@ test "relational foreign key repair rebuilds missing refs and prunes stale refs"
     try std.testing.expectEqual(@as(u64, 0), final_report.scanned_ref_rows);
 }
 
+const test_amount_scalar_columns = [_]schema_mod.RelationalColumn{.{
+    .name = "amount",
+    .path = "amount",
+    .field_type = .numeric,
+}};
+const test_amount_scalar_indexes = [_]schema_mod.RelationalIndex{.{
+    .name = "amount",
+    .owner_kind = .relational_column,
+    .owner_name = "amount",
+    .access_method = .scalar_column,
+    .columns = &.{"amount"},
+    .lifecycle = .ready,
+}};
+
+fn testAmountScalarIndexPolicy() ColumnIndexPolicy {
+    return ColumnIndexPolicy.fromSchemaParts(test_amount_scalar_columns[0..], test_amount_scalar_indexes[0..]);
+}
+
 test "relational base store scans rows and columns by document range" {
     const alloc = std.testing.allocator;
     var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
@@ -16606,9 +17357,10 @@ test "relational base store scans rows and columns by document range" {
         owned_values.deinit(alloc);
     }
 
-    try appendUpsert(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:a", row_a);
-    try appendUpsert(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:b", row_b);
-    try appendUpsert(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:c", row_c);
+    const policy = testAmountScalarIndexPolicy();
+    try appendUpsertWithColumnIndexPolicy(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:a", row_a, policy);
+    try appendUpsertWithColumnIndexPolicy(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:b", row_b, policy);
+    try appendUpsertWithColumnIndexPolicy(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:c", row_c, policy);
     try writes.append(alloc, .{ .key = primary_key, .value = "{\"ignored\":true}" });
     try store.putBatch(writes.items, deletes.items);
 
@@ -16641,7 +17393,7 @@ test "relational base store scans rows and columns by document range" {
     defer alloc.free(row_b_without_amount);
     writes.clearRetainingCapacity();
     deletes.clearRetainingCapacity();
-    try appendUpsert(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:b", row_b_without_amount);
+    try appendUpsertWithColumnIndexPolicy(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:b", row_b_without_amount, policy);
     try store.putBatch(writes.items, deletes.items);
     try std.testing.expectError(error.NotFound, store.get(alloc, doc_b_amount_index_key));
 
@@ -16654,7 +17406,7 @@ test "relational base store scans rows and columns by document range" {
     defer alloc.free(doc_a_amount_index_key);
     writes.clearRetainingCapacity();
     deletes.clearRetainingCapacity();
-    try appendDelete(alloc, &store, &deletes, &owned_keys, "doc:a");
+    try appendDeleteWithColumnIndexPolicy(alloc, &store, &deletes, &owned_keys, "doc:a", policy);
     try store.putBatch(writes.items, deletes.items);
     try std.testing.expectError(error.NotFound, store.get(alloc, doc_a_amount_index_key));
 }
@@ -16728,8 +17480,8 @@ test "relational upsert skips unchanged secondary index churn" {
     writes.clearRetainingCapacity();
     deletes.clearRetainingCapacity();
     try appendUpsertWithColumnIndexPolicy(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:a", changed_row, policy);
-    try std.testing.expectEqual(@as(usize, 3), writes.items.len);
-    try std.testing.expectEqual(@as(usize, 2), deletes.items.len);
+    try std.testing.expectEqual(@as(usize, 2), writes.items.len);
+    try std.testing.expectEqual(@as(usize, 1), deletes.items.len);
 }
 
 test "relational array element indexes support targeted containment scans" {
@@ -16784,8 +17536,18 @@ test "relational array element indexes support targeted containment scans" {
         owned_values.deinit(alloc);
     }
 
-    try appendUpsert(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:a", row_a);
-    try appendUpsert(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:b", row_b);
+    const columns = [_]schema_mod.RelationalColumn{.{ .name = "tags", .path = "tags", .field_type = .array }};
+    const indexes = [_]schema_mod.RelationalIndex{.{
+        .name = "tags",
+        .owner_kind = .relational_column,
+        .owner_name = "tags",
+        .access_method = .scalar_column,
+        .columns = &.{"tags"},
+        .lifecycle = .ready,
+    }};
+    const policy = ColumnIndexPolicy.fromSchemaParts(columns[0..], indexes[0..]);
+    try appendUpsertWithColumnIndexPolicy(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:a", row_a, policy);
+    try appendUpsertWithColumnIndexPolicy(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:b", row_b, policy);
     try store.putBatch(writes.items, deletes.items);
 
     var parsed_hot = try std.json.parseFromSlice(std.json.Value, alloc, "\"hot\"", .{});
@@ -16818,7 +17580,7 @@ test "relational array element indexes support targeted containment scans" {
     defer alloc.free(row_a_cold);
     writes.clearRetainingCapacity();
     deletes.clearRetainingCapacity();
-    try appendUpsert(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:a", row_a_cold);
+    try appendUpsertWithColumnIndexPolicy(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:a", row_a_cold, policy);
     try store.putBatch(writes.items, deletes.items);
 
     try std.testing.expectError(error.NotFound, store.get(alloc, hot_index_key));
@@ -16875,8 +17637,18 @@ test "relational json value indexes support targeted containment scans" {
         owned_values.deinit(alloc);
     }
 
-    try appendUpsert(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:a", row_a);
-    try appendUpsert(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:b", row_b);
+    const columns = [_]schema_mod.RelationalColumn{.{ .name = "attrs", .path = "attrs", .field_type = .json }};
+    const indexes = [_]schema_mod.RelationalIndex{.{
+        .name = "attrs",
+        .owner_kind = .relational_column,
+        .owner_name = "attrs",
+        .access_method = .scalar_column,
+        .columns = &.{"attrs"},
+        .lifecycle = .ready,
+    }};
+    const policy = ColumnIndexPolicy.fromSchemaParts(columns[0..], indexes[0..]);
+    try appendUpsertWithColumnIndexPolicy(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:a", row_a, policy);
+    try appendUpsertWithColumnIndexPolicy(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:b", row_b, policy);
     try store.putBatch(writes.items, deletes.items);
 
     var parsed_pro = try std.json.parseFromSlice(std.json.Value, alloc, "\"pro\"", .{});
@@ -16904,7 +17676,7 @@ test "relational json value indexes support targeted containment scans" {
     defer alloc.free(row_a_updated);
     writes.clearRetainingCapacity();
     deletes.clearRetainingCapacity();
-    try appendUpsert(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:a", row_a_updated);
+    try appendUpsertWithColumnIndexPolicy(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:a", row_a_updated, policy);
     try store.putBatch(writes.items, deletes.items);
 
     try std.testing.expectError(error.NotFound, store.get(alloc, pro_index_key));
@@ -16961,7 +17733,7 @@ test "relational column scans hydrate values from current base rows" {
         owned_values.deinit(alloc);
     }
 
-    try appendUpsert(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:a", old_row);
+    try appendUpsertWithColumnIndexPolicy(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:a", old_row, testAmountScalarIndexPolicy());
     try store.putBatch(writes.items, deletes.items);
 
     const row_key = try rowKeyAlloc(alloc, "doc:a");
@@ -17194,8 +17966,9 @@ test "relational column scan indexes rebuild and delete from packed rows" {
         owned_values.deinit(alloc);
     }
 
-    try appendUpsert(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:a", row_a);
-    try appendUpsert(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:b", row_b);
+    const policy = testAmountScalarIndexPolicy();
+    try appendUpsertWithColumnIndexPolicy(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:a", row_a, policy);
+    try appendUpsertWithColumnIndexPolicy(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:b", row_b, policy);
     try store.putBatch(writes.items, deletes.items);
 
     const doc_a_index = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "amount", "doc:a");
@@ -17207,7 +17980,7 @@ test "relational column scan indexes rebuild and delete from packed rows" {
     try std.testing.expectError(error.NotFound, store.get(alloc, doc_a_index));
     try std.testing.expectError(error.NotFound, store.get(alloc, doc_b_index));
 
-    try rebuildAllColumnIndexesFromRowsInRange(alloc, &store, "doc:a", "doc:c");
+    try rebuildAllColumnIndexesFromRowsInRangeWithColumnIndexPolicy(alloc, &store, "doc:a", "doc:c", policy);
     const rebuilt_a = try store.get(alloc, doc_a_index);
     defer alloc.free(rebuilt_a);
     const rebuilt_b = try store.get(alloc, doc_b_index);
@@ -17267,7 +18040,16 @@ test "relational row rewrite renames and drops packed cells with fresh side inde
         owned_values.deinit(alloc);
     }
 
-    try appendUpsert(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:a", row);
+    const columns = [_]schema_mod.RelationalColumn{
+        .{ .name = "status", .path = "status", .field_type = .keyword },
+        .{ .name = "state", .path = "state", .field_type = .keyword },
+    };
+    const indexes = [_]schema_mod.RelationalIndex{
+        .{ .name = "status", .owner_kind = .relational_column, .owner_name = "status", .access_method = .scalar_column, .columns = &.{"status"}, .lifecycle = .ready },
+        .{ .name = "state", .owner_kind = .relational_column, .owner_name = "state", .access_method = .scalar_column, .columns = &.{"state"}, .lifecycle = .ready },
+    };
+    const policy = ColumnIndexPolicy.fromSchemaParts(columns[0..], indexes[0..]);
+    try appendUpsertWithColumnIndexPolicy(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:a", row, policy);
     try store.putBatch(writes.items, deletes.items);
 
     const old_status_index = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "status", "doc:a");
@@ -17278,7 +18060,7 @@ test "relational row rewrite renames and drops packed cells with fresh side inde
     const old_status_index_value = try store.get(alloc, old_status_index);
     defer alloc.free(old_status_index_value);
 
-    const report = try rewriteRowsInRange(
+    const report = try rewriteRowsInRangeWithColumnIndexPolicy(
         alloc,
         &store,
         .{
@@ -17294,6 +18076,7 @@ test "relational row rewrite renames and drops packed cells with fresh side inde
         },
         "doc:a",
         "doc:z",
+        policy,
     );
     try std.testing.expectEqual(@as(u64, 1), report.scanned_rows);
     try std.testing.expectEqual(@as(u64, 1), report.rewritten_rows);
@@ -17971,8 +18754,9 @@ test "relational column scan prune removes only entries whose base row is missin
         owned_values.deinit(alloc);
     }
 
-    try appendUpsert(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:a", row_a);
-    try appendUpsert(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:b", row_b);
+    const policy = testAmountScalarIndexPolicy();
+    try appendUpsertWithColumnIndexPolicy(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:a", row_a, policy);
+    try appendUpsertWithColumnIndexPolicy(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:b", row_b, policy);
     try store.putBatch(writes.items, deletes.items);
 
     const doc_a_index = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "amount", "doc:a");
@@ -18030,8 +18814,9 @@ test "relational column scan delete by document range uses reverse index entries
         owned_values.deinit(alloc);
     }
 
-    try appendUpsert(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:a", row_a);
-    try appendUpsert(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:b", row_b);
+    const policy = testAmountScalarIndexPolicy();
+    try appendUpsertWithColumnIndexPolicy(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:a", row_a, policy);
+    try appendUpsertWithColumnIndexPolicy(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:b", row_b, policy);
     try store.putBatch(writes.items, deletes.items);
 
     const doc_a_index = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "amount", "doc:a");
@@ -18281,4 +19066,109 @@ test "relational column backed repair rebuilds ordered tuple entries from packed
     try std.testing.expectError(error.NotFound, store.get(alloc, stale_doc_a_forward));
     try std.testing.expectError(error.NotFound, store.get(alloc, stale_doc_z_forward));
     try std.testing.expectError(error.NotFound, store.get(alloc, stale_doc_z_reverse));
+}
+
+test "relational write participant admits base-row fast path by schema shape" {
+    const alloc = std.testing.allocator;
+    const Shape = enum {
+        no_index_with_primary_key,
+        generated_only,
+        foreign_key_only,
+        no_derived_artifact,
+    };
+    const cases = [_]struct {
+        name: []const u8,
+        shape: Shape,
+        expect_fast_path: bool,
+    }{
+        .{ .name = "no-index-with-primary-key", .shape = .no_index_with_primary_key, .expect_fast_path = false },
+        .{ .name = "generated-only", .shape = .generated_only, .expect_fast_path = true },
+        .{ .name = "foreign-key-only", .shape = .foreign_key_only, .expect_fast_path = false },
+        .{ .name = "no-derived-artifact", .shape = .no_derived_artifact, .expect_fast_path = true },
+    };
+    const base_columns = [_]schema_mod.RelationalColumn{
+        .{ .name = "id", .path = "id", .field_type = .keyword, .indexed = false },
+        .{ .name = "title", .path = "title", .field_type = .keyword, .indexed = false },
+    };
+    const generated_columns = [_]schema_mod.RelationalColumn{
+        .{ .name = "id", .path = "id", .field_type = .keyword, .indexed = false },
+        .{ .name = "title", .path = "title", .field_type = .keyword, .indexed = false },
+        .{
+            .name = "title_lc",
+            .path = "title_lc",
+            .field_type = .keyword,
+            .indexed = false,
+            .generated = .{ .op = .lower, .field = "title" },
+        },
+    };
+    const primary_key = schema_mod.PrimaryKey{ .columns = &.{"id"} };
+    const foreign_keys = [_]schema_mod.ForeignKey{.{
+        .name = "row_parent_fk",
+        .child_columns = &.{"parent_id"},
+        .parent_table = "row",
+        .parent_columns = &.{"id"},
+    }};
+    const row = try relational_row_codec.serialize(alloc, &.{
+        .{ .path = "id", .value_type = .bytes_val, .value = .{ .bytes_val = "row-1" } },
+        .{ .path = "title", .value_type = .bytes_val, .value = .{ .bytes_val = "Hello" } },
+        .{ .path = "title_lc", .value_type = .bytes_val, .value = .{ .bytes_val = "hello" } },
+    });
+    defer alloc.free(row);
+
+    for (cases, 0..) |case, case_index| {
+        errdefer std.log.err("schema-backed write shape failed: {s}", .{case.name});
+        var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
+        defer backend.close();
+        const runtime_store = try backend.runtimeStore(alloc, .{});
+        var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+        defer store.close();
+
+        var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+        defer writes.deinit(alloc);
+        var deletes = std.ArrayListUnmanaged([]const u8).empty;
+        defer deletes.deinit(alloc);
+        var owned_keys = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (owned_keys.items) |key| alloc.free(key);
+            owned_keys.deinit(alloc);
+        }
+        var owned_values = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (owned_values.items) |value| alloc.free(value);
+            owned_values.deinit(alloc);
+        }
+
+        var participant = WriteParticipant.initWithColumnIndexPolicy(
+            alloc,
+            &store,
+            &writes,
+            &deletes,
+            &owned_keys,
+            &owned_values,
+            ColumnIndexPolicy.empty(),
+        );
+        const columns = if (case.shape == .generated_only) generated_columns[0..] else base_columns[0..];
+        participant.configurePeriods(&.{}, columns);
+        switch (case.shape) {
+            .no_index_with_primary_key => participant.configurePrimaryKey(primary_key),
+            .foreign_key_only => participant.configureForeignKeys("row", foreign_keys[0..], &.{}),
+            .generated_only, .no_derived_artifact => {},
+        }
+
+        const doc_key = try std.fmt.allocPrint(alloc, "shape:{d}", .{case_index});
+        defer alloc.free(doc_key);
+        try participant.prepareUpsert("row", doc_key, row, null);
+        try participant.closePreparedIntents();
+        const stats = participant.statsSnapshot();
+        try std.testing.expectEqual(@intFromBool(case.expect_fast_path), stats.base_row_fast_path_upserts);
+        try std.testing.expectEqual(@intFromBool(!case.expect_fast_path), stats.generic_upserts);
+        try std.testing.expectEqual(@intFromBool(!case.expect_fast_path), stats.authoritative_row_lookups);
+        try std.testing.expectEqual(@intFromBool(!case.expect_fast_path), stats.row_decodes);
+        try std.testing.expect(writes.items.len >= 1);
+        try std.testing.expectEqual(@as(usize, 0), deletes.items.len);
+        try store.putBatch(writes.items, deletes.items);
+        const stored = (try getRawAlloc(alloc, &store, doc_key)) orelse return error.TestUnexpectedResult;
+        defer alloc.free(stored);
+        try std.testing.expectEqualSlices(u8, row, stored);
+    }
 }

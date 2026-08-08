@@ -148,6 +148,10 @@ pub const BatchProfile = struct {
     relational_store_deletes: u64 = 0,
     relational_store_write_bytes: u64 = 0,
     relational_store_delete_key_bytes: u64 = 0,
+    relational_base_row_fast_path_upserts: u64 = 0,
+    relational_generic_upserts: u64 = 0,
+    relational_authoritative_row_lookups: u64 = 0,
+    relational_row_decodes: u64 = 0,
     extract_timestamp_ns: u64 = 0,
     overwrite_probe_ns: u64 = 0,
     delete_artifacts_ns: u64 = 0,
@@ -388,7 +392,7 @@ pub fn logBatchProfile(req: types.BatchRequest, profile: BatchProfile) void {
         },
     );
     std.log.info(
-        "antfly_bench_batch_relational writes={d} row_value_ms={d} prepare_upsert_ms={d} prepare_delete_ms={d} prepare_identity_rewrite_ms={d} row_upserts={d} row_deletes={d} identity_rewrites={d} relational_store_writes={d} relational_store_deletes={d} relational_store_write_bytes={d} relational_store_delete_key_bytes={d}",
+        "antfly_bench_batch_relational writes={d} row_value_ms={d} prepare_upsert_ms={d} prepare_delete_ms={d} prepare_identity_rewrite_ms={d} row_upserts={d} row_deletes={d} identity_rewrites={d} relational_store_writes={d} relational_store_deletes={d} relational_store_write_bytes={d} relational_store_delete_key_bytes={d} base_row_fast_path_upserts={d} generic_upserts={d} authoritative_row_lookups={d} row_decodes={d}",
         .{
             req.writes.len,
             nsToMs(profile.relational_row_value_ns),
@@ -402,6 +406,10 @@ pub fn logBatchProfile(req: types.BatchRequest, profile: BatchProfile) void {
             profile.relational_store_deletes,
             profile.relational_store_write_bytes,
             profile.relational_store_delete_key_bytes,
+            profile.relational_base_row_fast_path_upserts,
+            profile.relational_generic_upserts,
+            profile.relational_authoritative_row_lookups,
+            profile.relational_row_decodes,
         },
     );
     std.log.info(
@@ -593,6 +601,17 @@ fn recordRelationalStagedBytes(
 ) void {
     profile.relational_store_write_bytes +|= stagedWriteBytes(writes[writes_start..]);
     profile.relational_store_delete_key_bytes +|= stagedDeleteKeyBytes(deletes[deletes_start..]);
+}
+
+fn recordRelationalParticipantStatsDelta(
+    profile: *BatchProfile,
+    before: relational_store_mod.WriteParticipantStats,
+    after: relational_store_mod.WriteParticipantStats,
+) void {
+    profile.relational_base_row_fast_path_upserts += after.base_row_fast_path_upserts - before.base_row_fast_path_upserts;
+    profile.relational_generic_upserts += after.generic_upserts - before.generic_upserts;
+    profile.relational_authoritative_row_lookups += after.authoritative_row_lookups - before.authoritative_row_lookups;
+    profile.relational_row_decodes += after.row_decodes - before.row_decodes;
 }
 
 fn nsToMs(ns: u64) u64 {
@@ -11019,6 +11038,7 @@ pub fn Impl(comptime DB: type) type {
                         const row_write_index = store_writes.items.len;
                         const row_delete_index = delete_keys.items.len;
                         const prepare_upsert_start_ns = DB.WritePathCallbacks.monotonic_time_ns();
+                        const participant_stats_before = relational_participant.statsSnapshot();
                         relational_participant.configureNextRowGeneration(write_timestamp_ns);
                         relational_participant.prepareUpsert("", write.key, store_value, null) catch |err| {
                             if (err == error.ForeignKeyViolation) DB.WritePathCallbacks.record_foreign_key_child_write_reject(self);
@@ -11030,6 +11050,7 @@ pub fn Impl(comptime DB: type) type {
                             active_profile.relational_store_writes += @intCast(store_writes.items.len - row_write_index);
                             active_profile.relational_store_deletes += @intCast(delete_keys.items.len - row_delete_index);
                             recordRelationalStagedBytes(active_profile, store_writes.items, delete_keys.items, row_write_index, row_delete_index);
+                            recordRelationalParticipantStatsDelta(active_profile, participant_stats_before, relational_participant.statsSnapshot());
                         }
                         relational_participant_prepared = true;
                         const primary_key = try internal_keys.documentKeyAlloc(self.alloc, write.key);

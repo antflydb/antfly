@@ -29,11 +29,11 @@
 //!   └── WAL backend (<path>/wal/) — pending batches for crash recovery
 //!
 //! Write flow:
-//!   1. WAL.append(serialized_batch) → returns LSN (durable)
+//!   1. WAL.append(versioned segments + delete identities) → durable LSN
 //!   2. Publish immutable segment file atomically
-//!   3. Metadata txn: update active segments/ranges + committed_lsn = LSN
-//!   4. IndexWriter.addSegmentWithId(segment) → new in-memory snapshot
-//!   4. WAL.truncate(LSN)
+//!   3. One metadata txn commits deletions, segments/ranges, and the LSN
+//!   4. IndexWriter publishes one prepared in-memory snapshot
+//!   5. WAL.truncate(LSN)
 
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
@@ -239,6 +239,20 @@ pub const MainBackend = enum {
 pub const PersistentIndexStats = struct {
     wal: wal_mod.WalStats,
     main_commit: ?lmdb.CommitStats,
+    text_mutation: TextMutationBatchStats,
+};
+
+pub const TextMutationBatchStats = struct {
+    batches: u64 = 0,
+    segments: u64 = 0,
+    deletion_bitmaps: u64 = 0,
+    durable_commits: u64 = 0,
+    snapshot_publications: u64 = 0,
+};
+
+pub const TextDeleteCommitObserver = struct {
+    ctx: *anyopaque,
+    callback: *const fn (*anyopaque, []const index_mod.IndexWriter.DeleteInfo) void,
 };
 
 pub const PersistentIndexMemoryStats = struct {
@@ -888,6 +902,17 @@ pub const PreparedMergeSegment = struct {
     }
 };
 
+const DecodedTextMutationWal = struct {
+    delete_doc_ids: []const []const u8,
+    segment_bytes: []const []const u8,
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.delete_doc_ids);
+        alloc.free(self.segment_bytes);
+        self.* = undefined;
+    }
+};
+
 /// Meta keys in the LMDB metadata database.
 const meta_committed_lsn = "committed_lsn";
 const meta_next_seg_id = "next_seg_id";
@@ -895,6 +920,110 @@ const meta_active_segments = "active_segments";
 const meta_active_segment_prefix = "active_segment:";
 const meta_retired_segment_prefix = "retired_segment:";
 const meta_segment_range_prefix = "segment_range:";
+const text_mutation_wal_magic = "AFTM";
+const text_mutation_wal_version: u8 = 1;
+
+fn encodeTextMutationWalAlloc(
+    alloc: Allocator,
+    delete_doc_ids: []const []const u8,
+    segment_bytes: []const []const u8,
+) ![]u8 {
+    if (delete_doc_ids.len > std.math.maxInt(u32) or segment_bytes.len > std.math.maxInt(u32)) return error.InvalidData;
+    var len: usize = text_mutation_wal_magic.len + 1 + 4 + 4;
+    for (delete_doc_ids) |doc_id| {
+        if (doc_id.len > std.math.maxInt(u32)) return error.InvalidData;
+        len = std.math.add(usize, len, 4 + doc_id.len) catch return error.InvalidData;
+    }
+    for (segment_bytes) |segment| {
+        len = std.math.add(usize, len, 8 + segment.len) catch return error.InvalidData;
+    }
+    const out = try alloc.alloc(u8, len);
+    var cursor: usize = 0;
+    @memcpy(out[cursor..][0..text_mutation_wal_magic.len], text_mutation_wal_magic);
+    cursor += text_mutation_wal_magic.len;
+    out[cursor] = text_mutation_wal_version;
+    cursor += 1;
+    std.mem.writeInt(u32, out[cursor..][0..4], @intCast(delete_doc_ids.len), .little);
+    cursor += 4;
+    for (delete_doc_ids) |doc_id| {
+        std.mem.writeInt(u32, out[cursor..][0..4], @intCast(doc_id.len), .little);
+        cursor += 4;
+        @memcpy(out[cursor..][0..doc_id.len], doc_id);
+        cursor += doc_id.len;
+    }
+    std.mem.writeInt(u32, out[cursor..][0..4], @intCast(segment_bytes.len), .little);
+    cursor += 4;
+    for (segment_bytes) |segment| {
+        std.mem.writeInt(u64, out[cursor..][0..8], segment.len, .little);
+        cursor += 8;
+        @memcpy(out[cursor..][0..segment.len], segment);
+        cursor += segment.len;
+    }
+    std.debug.assert(cursor == out.len);
+    return out;
+}
+
+fn decodeTextMutationWalAlloc(alloc: Allocator, bytes: []const u8) !DecodedTextMutationWal {
+    const header_len = text_mutation_wal_magic.len + 1 + 4;
+    if (bytes.len < header_len or !std.mem.eql(u8, bytes[0..text_mutation_wal_magic.len], text_mutation_wal_magic)) return error.InvalidData;
+    var cursor: usize = text_mutation_wal_magic.len;
+    if (bytes[cursor] != text_mutation_wal_version) return error.InvalidData;
+    cursor += 1;
+    const delete_count = std.mem.readInt(u32, bytes[cursor..][0..4], .little);
+    cursor += 4;
+    const delete_doc_ids = try alloc.alloc([]const u8, delete_count);
+    errdefer alloc.free(delete_doc_ids);
+    for (delete_doc_ids) |*doc_id| {
+        if (cursor + 4 > bytes.len) return error.InvalidData;
+        const doc_id_len = std.mem.readInt(u32, bytes[cursor..][0..4], .little);
+        cursor += 4;
+        if (doc_id_len > bytes.len - cursor) return error.InvalidData;
+        doc_id.* = bytes[cursor..][0..doc_id_len];
+        cursor += doc_id_len;
+    }
+    if (cursor + 4 > bytes.len) return error.InvalidData;
+    const segment_count = std.mem.readInt(u32, bytes[cursor..][0..4], .little);
+    cursor += 4;
+    const segment_bytes = try alloc.alloc([]const u8, segment_count);
+    errdefer alloc.free(segment_bytes);
+    for (segment_bytes) |*segment| {
+        if (cursor + 8 > bytes.len) return error.InvalidData;
+        const segment_len = std.mem.readInt(u64, bytes[cursor..][0..8], .little);
+        cursor += 8;
+        if (segment_len > bytes.len - cursor) return error.InvalidData;
+        segment.* = bytes[cursor..][0..@intCast(segment_len)];
+        cursor += @intCast(segment_len);
+    }
+    if (cursor != bytes.len) return error.InvalidData;
+    return .{ .delete_doc_ids = delete_doc_ids, .segment_bytes = segment_bytes };
+}
+
+test "text mutation WAL codec round trips operation shapes" {
+    const Case = struct {
+        name: []const u8,
+        deletes: []const []const u8,
+        segments: []const []const u8,
+    };
+    const cases = [_]Case{
+        .{ .name = "insert", .deletes = &.{}, .segments = &.{"segment-a"} },
+        .{ .name = "overwrite", .deletes = &.{ "doc:a", "doc:b" }, .segments = &.{ "segment-b", "segment-c" } },
+        .{ .name = "delete", .deletes = &.{"doc:a"}, .segments = &.{} },
+        .{ .name = "unchanged", .deletes = &.{}, .segments = &.{} },
+    };
+    for (cases) |case| {
+        const encoded = try encodeTextMutationWalAlloc(std.testing.allocator, case.deletes, case.segments);
+        defer std.testing.allocator.free(encoded);
+        var decoded = decodeTextMutationWalAlloc(std.testing.allocator, encoded) catch |err| {
+            std.log.err("text mutation WAL case {s} failed to decode", .{case.name});
+            return err;
+        };
+        defer decoded.deinit(std.testing.allocator);
+        try std.testing.expectEqual(case.deletes.len, decoded.delete_doc_ids.len);
+        try std.testing.expectEqual(case.segments.len, decoded.segment_bytes.len);
+        for (case.deletes, decoded.delete_doc_ids) |expected, actual| try std.testing.expectEqualStrings(expected, actual);
+        for (case.segments, decoded.segment_bytes) |expected, actual| try std.testing.expectEqualStrings(expected, actual);
+    }
+}
 pub const text_projection_provenance_meta_key = "text_projection_provenance";
 const segments_db_name = "segments";
 const meta_db_name = "meta";
@@ -1058,6 +1187,11 @@ pub const PersistentIndex = struct {
     main_map_size: usize,
     wal_map_size: usize,
     read_only: bool = false,
+    text_mutation_batches: std.atomic.Value(u64) = .init(0),
+    text_mutation_segments: std.atomic.Value(u64) = .init(0),
+    text_mutation_deletion_bitmaps: std.atomic.Value(u64) = .init(0),
+    text_mutation_durable_commits: std.atomic.Value(u64) = .init(0),
+    text_mutation_snapshot_publications: std.atomic.Value(u64) = .init(0),
 
     pub const BackendStore = backend_adapter.Store(PersistentIndex, MainTxn, MainTxn, MainTxn, .{
         .capabilities = backendCapabilities,
@@ -1860,7 +1994,9 @@ pub const PersistentIndex = struct {
         // recover from metadata alone and orphan pre-commit files are harmless.
         const lsn = if (uses_segment_wal) blk: {
             const wal_append_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
-            const appended_lsn = try self.wal.append(owned.?);
+            const wal_record = try encodeTextMutationWalAlloc(self.alloc, &.{}, &.{owned.?});
+            defer self.alloc.free(wal_record);
+            const appended_lsn = try self.wal.append(wal_record);
             if (profile_enabled) wal_append_ns = platform_time.monotonicNs() - wal_append_start_ns;
             break :blk appended_lsn;
         } else self.committed_lsn;
@@ -2097,6 +2233,180 @@ pub const PersistentIndex = struct {
         return segment_len;
     }
 
+    /// Build one immutable text segment without publishing it. The returned
+    /// segment can be committed with document tombstones and sibling segments
+    /// through `applyPreparedTextMutationBatch`.
+    pub fn prepareTextSegmentFromSinkBuilder(
+        self: *PersistentIndex,
+        staging_alloc: Allocator,
+        ctx: *anyopaque,
+        build_fn: SegmentSinkBuildFn,
+    ) !PreparedMergeSegment {
+        const seg_id = self.reserveSegmentId();
+        var data: ?index_mod.SegmentData = null;
+        var delete_file_on_error = false;
+        errdefer {
+            if (data) |*segment_data| segment_data.deinit(self.alloc);
+            if (delete_file_on_error) self.deleteSegmentFile(seg_id);
+        }
+
+        if (self.segment_files != null and self.segment_files.?.storage_owner != null) {
+            const store = &self.segment_files.?;
+            const storage_owner = store.storage_owner.?;
+            var publication_admission = try NativeSegmentPublicationAdmission.init(storage_owner);
+            defer publication_admission.deinit();
+            const path = try store.pathAlloc(seg_id);
+            defer store.allocator.free(path);
+
+            var writer = try publication_admission.beginAtomicWrite(self.alloc, path);
+            var writer_active = true;
+            errdefer if (writer_active) writer.abort();
+            var sink_adapter = AtomicSegmentSink.init(self.alloc, &writer);
+            defer sink_adapter.deinit();
+            var sink = sink_adapter.sink();
+            try build_fn(ctx, &sink);
+            try sink_adapter.flush();
+            writer_active = false;
+            try writer.finish();
+            delete_file_on_error = true;
+            data = .fromMapped(try publication_admission.mapFile(path));
+            data.?.madviseAccessPattern();
+        } else {
+            var sink_impl = segment_mod.MemorySegmentSink.init(self.alloc);
+            errdefer sink_impl.deinit();
+            var sink = sink_impl.sink();
+            try build_fn(ctx, &sink);
+            data = .fromOwnedHeap(try sink_impl.finishOwned());
+        }
+
+        var key_range = try extractSegmentKeyRange(staging_alloc, data.?.bytes());
+        errdefer key_range.deinit(staging_alloc);
+        key_range.seg_id = seg_id;
+        const prepared = PreparedMergeSegment{
+            .id = seg_id,
+            .data = data.?,
+            .key_range = key_range,
+            .staging_alloc = staging_alloc,
+        };
+        data = null;
+        delete_file_on_error = false;
+        return prepared;
+    }
+
+    pub fn discardPreparedTextSegments(self: *PersistentIndex, prepared_segments: []PreparedMergeSegment) void {
+        for (prepared_segments) |*segment| {
+            const id = segment.id;
+            segment.deinit(self.alloc);
+            self.deleteSegmentFile(id);
+        }
+    }
+
+    /// Atomically commits old-document tombstones and every replacement text
+    /// segment, then publishes one volatile snapshot. Prepared segments are
+    /// consumed on both success and failure.
+    pub fn applyPreparedTextMutationBatch(
+        self: *PersistentIndex,
+        delete_doc_ids: []const []const u8,
+        prepared_segments: []PreparedMergeSegment,
+    ) !TextMutationBatchStats {
+        return try self.applyPreparedTextMutationBatchInternal(delete_doc_ids, prepared_segments, null, null);
+    }
+
+    pub fn applyPreparedTextMutationBatchObserved(
+        self: *PersistentIndex,
+        delete_doc_ids: []const []const u8,
+        prepared_segments: []PreparedMergeSegment,
+        observer: TextDeleteCommitObserver,
+    ) !TextMutationBatchStats {
+        return try self.applyPreparedTextMutationBatchInternal(delete_doc_ids, prepared_segments, null, observer);
+    }
+
+    fn applyPreparedTextMutationBatchInternal(
+        self: *PersistentIndex,
+        delete_doc_ids: []const []const u8,
+        prepared_segments: []PreparedMergeSegment,
+        replay_lsn: ?u64,
+        observer: ?TextDeleteCommitObserver,
+    ) !TextMutationBatchStats {
+        if (delete_doc_ids.len == 0 and prepared_segments.len == 0) return .{};
+        const caller_holds_storage_lock = replay_lsn != null;
+        if (!caller_holds_storage_lock) self.lockStorage();
+        defer if (!caller_holds_storage_lock) self.unlockStorage();
+
+        var segments_consumed = false;
+        defer if (!segments_consumed) self.discardPreparedTextSegments(prepared_segments);
+
+        const delete_infos = try self.writer.deleteAllByIdsTracked(self.alloc, delete_doc_ids);
+        defer index_mod.IndexWriter.freeDeleteInfos(self.alloc, delete_infos);
+        var deletes_committed = false;
+        errdefer if (!deletes_committed) self.writer.rollbackDeleteInfos(delete_infos);
+        if (delete_infos.len == 0 and prepared_segments.len == 0) {
+            deletes_committed = true;
+            return .{};
+        }
+
+        const replacements = try self.alloc.alloc(index_mod.ReplacementSegmentData, prepared_segments.len);
+        defer self.alloc.free(replacements);
+        for (prepared_segments, 0..) |*segment, i| {
+            replacements[i] = .{ .id = segment.id, .data = segment.data };
+        }
+        var writer_publication: ?index_mod.IndexWriter.PreparedSegmentReplacement = null;
+        defer if (writer_publication) |*publication| publication.abort();
+        if (replacements.len > 0) writer_publication = try self.writer.prepareSegmentsManyData(&.{}, replacements);
+
+        var wal_lsn = replay_lsn orelse self.committed_lsn;
+        const uses_segment_wal = replay_lsn == null and self.segment_files == null and prepared_segments.len > 0;
+        if (uses_segment_wal) {
+            const segment_bytes = try self.alloc.alloc([]const u8, prepared_segments.len);
+            defer self.alloc.free(segment_bytes);
+            for (prepared_segments, 0..) |segment, i| segment_bytes[i] = segment.data.bytes();
+            const wal_record = try encodeTextMutationWalAlloc(self.alloc, delete_doc_ids, segment_bytes);
+            defer self.alloc.free(wal_record);
+            wal_lsn = try self.wal.append(wal_record);
+        }
+
+        var txn = try self.beginWriteMainTxn();
+        errdefer txn.abort();
+        for (delete_infos) |delete_info| {
+            const seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, delete_info.seg_id));
+            try txn.put(.deletions, &seg_key, delete_info.bitmap_bytes);
+        }
+        for (prepared_segments) |*segment| {
+            const seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, segment.id));
+            if (self.segment_files == null) try txn.put(.segments, &seg_key, segment.data.bytes());
+            try self.saveSegmentRange(&txn, segment.id, segment.key_range);
+            try self.updateActiveSegments(&txn, segment.id, .add);
+        }
+        try saveNextSegmentId(&txn, self.writer.next_segment_id);
+        if (uses_segment_wal or replay_lsn != null) {
+            const lsn_bytes = std.mem.toBytes(std.mem.nativeToLittle(u64, wal_lsn));
+            try txn.put(.meta, meta_committed_lsn, &lsn_bytes);
+        }
+        try txn.commit();
+        deletes_committed = true;
+        if (uses_segment_wal or replay_lsn != null) self.committed_lsn = wal_lsn;
+        if (observer) |commit_observer| commit_observer.callback(commit_observer.ctx, delete_infos);
+
+        if (writer_publication) |*publication| publication.publish();
+        for (prepared_segments) |*segment| segment.key_range.deinit(segment.staging_alloc);
+        segments_consumed = true;
+        if (uses_segment_wal or replay_lsn != null) try self.wal.truncate(wal_lsn);
+
+        const stats = TextMutationBatchStats{
+            .batches = 1,
+            .segments = @intCast(prepared_segments.len),
+            .deletion_bitmaps = @intCast(delete_infos.len),
+            .durable_commits = 1,
+            .snapshot_publications = if (prepared_segments.len > 0) 1 else 0,
+        };
+        _ = self.text_mutation_batches.fetchAdd(stats.batches, .monotonic);
+        _ = self.text_mutation_segments.fetchAdd(stats.segments, .monotonic);
+        _ = self.text_mutation_deletion_bitmaps.fetchAdd(stats.deletion_bitmaps, .monotonic);
+        _ = self.text_mutation_durable_commits.fetchAdd(stats.durable_commits, .monotonic);
+        _ = self.text_mutation_snapshot_publications.fetchAdd(stats.snapshot_publications, .monotonic);
+        return stats;
+    }
+
     /// Get current snapshot (lock-free, delegates to IndexWriter).
     pub fn snapshot(self: *PersistentIndex) *index_mod.IndexSnapshot {
         return self.writer.snapshot();
@@ -2118,6 +2428,13 @@ pub const PersistentIndex = struct {
         return .{
             .wal = self.wal.statsSnapshot(),
             .main_commit = self.main_store_owner.commitStatsSnapshot(),
+            .text_mutation = .{
+                .batches = self.text_mutation_batches.load(.monotonic),
+                .segments = self.text_mutation_segments.load(.monotonic),
+                .deletion_bitmaps = self.text_mutation_deletion_bitmaps.load(.monotonic),
+                .durable_commits = self.text_mutation_durable_commits.load(.monotonic),
+                .snapshot_publications = self.text_mutation_snapshot_publications.load(.monotonic),
+            },
         };
     }
 
@@ -3278,27 +3595,32 @@ pub const PersistentIndex = struct {
         try txn.put(.meta, meta_next_seg_id, &next_segment_id_bytes);
     }
 
-    fn replayWalEntry(self: *PersistentIndex, lsn: u64, segment_bytes: []const u8) !void {
-        const seg_id = self.writer.next_segment_id;
-        var segment_data: ?index_mod.SegmentData = try self.materializeSegmentData(seg_id, segment_bytes);
-        var rollback_segment = true;
-        errdefer {
-            if (rollback_segment) {
-                if (segment_data) |*data| data.deinit(self.alloc);
-                self.deleteSegmentFile(seg_id);
+    fn replayWalEntry(self: *PersistentIndex, lsn: u64, wal_record: []const u8) !void {
+        var decoded = try decodeTextMutationWalAlloc(self.alloc, wal_record);
+        defer decoded.deinit(self.alloc);
+
+        const prepared = try self.alloc.alloc(PreparedMergeSegment, decoded.segment_bytes.len);
+        defer self.alloc.free(prepared);
+        var initialized: usize = 0;
+        errdefer self.discardPreparedTextSegments(prepared[0..initialized]);
+        const CopyBuilder = struct {
+            bytes: []const u8,
+
+            fn build(ptr: *anyopaque, sink: *segment_mod.SegmentSink) !void {
+                const ctx: *@This() = @ptrCast(@alignCast(ptr));
+                try sink.appendSlice(ctx.bytes);
             }
+        };
+        for (decoded.segment_bytes) |segment_bytes| {
+            var ctx = CopyBuilder{ .bytes = segment_bytes };
+            prepared[initialized] = try self.prepareTextSegmentFromSinkBuilder(self.alloc, &ctx, CopyBuilder.build);
+            initialized += 1;
         }
-        var replacement = [_]index_mod.ReplacementSegmentData{.{
-            .id = seg_id,
-            .data = segment_data.?,
-        }};
-        var writer_publication = try self.writer.prepareSegmentsManyData(&.{}, &replacement);
-        defer writer_publication.abort();
-        try self.persistSegment(seg_id, segment_bytes, lsn);
-        writer_publication.publish();
-        segment_data = null;
-        rollback_segment = false;
-        try self.wal.truncate(lsn);
+        _ = self.applyPreparedTextMutationBatchInternal(decoded.delete_doc_ids, prepared, lsn, null) catch |err| {
+            initialized = 0;
+            return err;
+        };
+        initialized = 0;
     }
 
     fn saveSegmentRange(
@@ -4037,6 +4359,92 @@ test "native sink publication admits writer and mmap before invoking builder" {
     try std.testing.expectEqual(segment.len, try pi.indexSegmentFromSinkBuilder(&builder, CopyBuilder.build));
     try std.testing.expectEqual(@as(usize, 1), calls);
     try std.testing.expectEqual(@as(u32, 1), pi.snapshot().liveDocCount());
+}
+
+test "persistent text mutation batches publish once by operation shape" {
+    if (builtin.os.tag == .freestanding or builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPathWithSuffix(&path_buf, "text-mutation-matrix");
+    defer cleanupPersistDir(path);
+
+    const Operation = enum { insert, overwrite, unchanged, delete, delete_missing };
+    const Case = struct {
+        name: []const u8,
+        operation: Operation,
+        term: ?[]const u8,
+        expected_alpha: usize,
+        expected_beta: usize,
+        expected_live_docs: u32,
+        expected_batches: u64,
+        expected_segments: u64,
+        expected_deletion_bitmaps: u64,
+        expected_snapshot_publications: u64,
+    };
+    const cases = [_]Case{
+        .{ .name = "insert", .operation = .insert, .term = "alpha", .expected_alpha = 1, .expected_beta = 0, .expected_live_docs = 1, .expected_batches = 1, .expected_segments = 1, .expected_deletion_bitmaps = 0, .expected_snapshot_publications = 1 },
+        .{ .name = "overwrite", .operation = .overwrite, .term = "beta", .expected_alpha = 0, .expected_beta = 1, .expected_live_docs = 1, .expected_batches = 1, .expected_segments = 1, .expected_deletion_bitmaps = 1, .expected_snapshot_publications = 1 },
+        .{ .name = "unchanged", .operation = .unchanged, .term = null, .expected_alpha = 0, .expected_beta = 1, .expected_live_docs = 1, .expected_batches = 0, .expected_segments = 0, .expected_deletion_bitmaps = 0, .expected_snapshot_publications = 0 },
+        .{ .name = "delete", .operation = .delete, .term = null, .expected_alpha = 0, .expected_beta = 0, .expected_live_docs = 0, .expected_batches = 1, .expected_segments = 0, .expected_deletion_bitmaps = 1, .expected_snapshot_publications = 0 },
+        .{ .name = "delete missing", .operation = .delete_missing, .term = null, .expected_alpha = 0, .expected_beta = 0, .expected_live_docs = 0, .expected_batches = 0, .expected_segments = 0, .expected_deletion_bitmaps = 0, .expected_snapshot_publications = 0 },
+    };
+
+    var pi = try PersistentIndex.open(alloc, .{ .path = path });
+    var pi_open = true;
+    defer if (pi_open) pi.close();
+
+    const CopyBuilder = struct {
+        bytes: []const u8,
+
+        fn build(ptr: *anyopaque, sink: *segment_mod.SegmentSink) !void {
+            const ctx: *@This() = @ptrCast(@alignCast(ptr));
+            try sink.appendSlice(ctx.bytes);
+        }
+    };
+
+    for (cases) |case| {
+        const before = pi.statsSnapshot().text_mutation;
+        var prepared_storage: [1]PreparedMergeSegment = undefined;
+        var prepared: []PreparedMergeSegment = prepared_storage[0..0];
+        if (case.term) |term| {
+            const segment = try buildSimpleSegment(alloc, "doc:a", term);
+            defer alloc.free(segment);
+            var ctx = CopyBuilder{ .bytes = segment };
+            prepared_storage[0] = try pi.prepareTextSegmentFromSinkBuilder(alloc, &ctx, CopyBuilder.build);
+            prepared = prepared_storage[0..1];
+        }
+        const delete_ids: []const []const u8 = switch (case.operation) {
+            .overwrite, .delete => &.{"doc:a"},
+            .delete_missing => &.{"doc:missing"},
+            .insert, .unchanged => &.{},
+        };
+        const result = try pi.applyPreparedTextMutationBatch(delete_ids, prepared);
+        const after = pi.statsSnapshot().text_mutation;
+        try std.testing.expectEqual(case.expected_batches, result.batches);
+        try std.testing.expectEqual(case.expected_segments, result.segments);
+        try std.testing.expectEqual(case.expected_deletion_bitmaps, result.deletion_bitmaps);
+        try std.testing.expectEqual(case.expected_batches, after.batches - before.batches);
+        try std.testing.expectEqual(case.expected_batches, after.durable_commits - before.durable_commits);
+        try std.testing.expectEqual(case.expected_snapshot_publications, after.snapshot_publications - before.snapshot_publications);
+
+        const snap = pi.snapshot();
+        try std.testing.expectEqual(case.expected_live_docs, snap.liveDocCount());
+        try std.testing.expectEqual(case.expected_alpha, try persistentSearchHitCount(alloc, snap, "alpha"));
+        try std.testing.expectEqual(case.expected_beta, try persistentSearchHitCount(alloc, snap, "beta"));
+
+        pi.close();
+        pi_open = false;
+        pi = try PersistentIndex.open(alloc, .{ .path = path });
+        pi_open = true;
+        const reopened = pi.snapshot();
+        std.testing.expectEqual(case.expected_live_docs, reopened.liveDocCount()) catch |err| {
+            std.log.err("text mutation case {s} lost live-doc durability", .{case.name});
+            return err;
+        };
+        try std.testing.expectEqual(case.expected_alpha, try persistentSearchHitCount(alloc, reopened, "alpha"));
+        try std.testing.expectEqual(case.expected_beta, try persistentSearchHitCount(alloc, reopened, "beta"));
+    }
 }
 
 test "retired segment cleanup outlives persistent index close" {
@@ -5162,7 +5570,9 @@ pub fn indexSegmentPublishPhaseForTest(
     segment_bytes: []const u8,
     phase: lmdb.CommitPublishPhase,
 ) !void {
-    const lsn = try self.wal.append(segment_bytes);
+    const wal_record = try encodeTextMutationWalAlloc(self.alloc, &.{}, &.{segment_bytes});
+    defer self.alloc.free(wal_record);
+    const lsn = try self.wal.append(wal_record);
 
     self.writer.lockMutex();
     const seg_id = self.writer.next_segment_id;

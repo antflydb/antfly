@@ -36,6 +36,7 @@ const text_index_name = "full_text_index_v1";
 const algebraic_index_name = "algebraic_idx";
 const graph_index_name = "graph_idx";
 const native_endian = builtin.target.cpu.arch.endian();
+const relational_rows_schema_version: u32 = 1;
 
 const benchmark_schema_json =
     \\{"version":1,"default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true,"properties":{"title":{"type":"text"},"body":{"type":"text"},"category":{"type":"string","x-antfly-field":{"type":"keyword","sortable":true}},"status":{"type":"string","x-antfly-field":{"type":"keyword","sortable":true}},"tenant":{"type":"string","x-antfly-field":{"type":"keyword","sortable":true}},"score":{"type":"number","x-antfly-field":{"type":"number","sortable":true}},"created_at":{"type":"string","format":"date-time","x-antfly-field":{"type":"date","sortable":true}},"active":{"type":"boolean","x-antfly-field":{"type":"boolean","sortable":true}}}}}}}
@@ -237,6 +238,8 @@ const Config = struct {
     load_progress_interval: usize = 25_000,
     standalone_binary: []const u8 = "./zig-out/bin/antfly",
     bind_host: []const u8 = "127.0.0.1",
+    relational_rows_matrix: bool = false,
+    warmup: usize = 2,
 };
 
 const InputDoc = struct {
@@ -1069,11 +1072,536 @@ const DirectHandlerWorkerContext = struct {
     }
 };
 
+const RelationalRowsIndexMode = enum {
+    base_scan,
+    ordered_tuple,
+    algebraic_filter,
+
+    fn schemaJson(self: @This()) []const u8 {
+        return switch (self) {
+            .base_scan =>
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id","status","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+            ,
+            .ordered_tuple =>
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id","status","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_amount_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"},{"column":"amount"}],"include_columns":["id","amount"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:status_amount_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
+            ,
+            .algebraic_filter =>
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id","status","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"alg_v1","owner_kind":"table","owner_name":"__antfly_table__","access_method":"algebraic_filter","method_config":{"type":"algebraic","derive_from_schema":true},"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:alg_v1","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0,"components":{"dictionary":true,"fact":true,"path":true,"postings":true}},"planner_capabilities":{"equality":true,"prefix":true,"algebraic_dictionary":true,"algebraic_fact":true,"algebraic_path":true}}]}
+            ,
+        };
+    }
+};
+
+const RelationalRowsSelectivity = enum {
+    low,
+    high,
+
+    fn status(self: @This()) []const u8 {
+        return @tagName(self);
+    }
+};
+
+const RelationalRowsTotalCase = enum {
+    none,
+    exact,
+    count_only,
+
+    fn totalMode(self: @This()) db_mod.types.RelationalRowsQueryRequest.TotalMode {
+        return if (self == .none) .none else .exact;
+    }
+
+    fn limit(self: @This(), cfg: Config) u32 {
+        return if (self == .count_only) 0 else @intCast(cfg.k);
+    }
+};
+
+const RelationalRowsQueryCase = struct {
+    const OrderedExpectation = enum {
+        stream,
+        stream_or_candidate_gate,
+
+        fn matches(
+            self: @This(),
+            access: db_mod.types.RelationalRowsQueryResult.AccessMethod,
+            fallback: db_mod.types.RelationalRowsQueryResult.FallbackReason,
+        ) bool {
+            return switch (self) {
+                .stream => access == .ordered_tuple_stream and fallback == .none,
+                .stream_or_candidate_gate => (access == .ordered_tuple_stream and fallback == .none) or
+                    (access == .base_scan and fallback == .ordered_tuple_candidate_gate),
+            };
+        }
+    };
+
+    name: []const u8,
+    selectivity: RelationalRowsSelectivity,
+    total_case: RelationalRowsTotalCase,
+    ordered_expectation: OrderedExpectation,
+};
+
+const relational_rows_query_cases = [_]RelationalRowsQueryCase{
+    .{ .name = "low no total", .selectivity = .low, .total_case = .none, .ordered_expectation = .stream },
+    .{ .name = "low exact page", .selectivity = .low, .total_case = .exact, .ordered_expectation = .stream_or_candidate_gate },
+    .{ .name = "low exact count", .selectivity = .low, .total_case = .count_only, .ordered_expectation = .stream_or_candidate_gate },
+    .{ .name = "high no total", .selectivity = .high, .total_case = .none, .ordered_expectation = .stream },
+    .{ .name = "high exact page", .selectivity = .high, .total_case = .exact, .ordered_expectation = .stream_or_candidate_gate },
+    .{ .name = "high exact count", .selectivity = .high, .total_case = .count_only, .ordered_expectation = .stream_or_candidate_gate },
+};
+
+const RelationalRowsStatusSource = struct {
+    tables: [1]metadata_table_manager.TableRecord,
+
+    fn init(schema_json: []const u8) @This() {
+        return .{ .tables = .{.{
+            .table_id = 1,
+            .name = table_name,
+            .description = "relational rows public query guardrail",
+            .schema_json = schema_json,
+            .desired_replica_count = 1,
+        }} };
+    }
+
+    fn iface(self: *@This()) api.http_server.StatusSource {
+        return .{ .ptr = self, .vtable = &.{
+            .status = status,
+            .admin_snapshot = adminSnapshot,
+            .free_admin_snapshot = freeAdminSnapshot,
+        } };
+    }
+
+    fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+        return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+    }
+
+    fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return .{
+            .status = try status(ptr),
+            .tables = self.tables[0..],
+            .ranges = &.{},
+            .stores = &.{},
+            .placement_intents = &.{},
+            .split_transitions = &.{},
+            .merge_transitions = &.{},
+        };
+    }
+
+    fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+};
+
+const RelationalRowsProfileWire = struct {
+    access_method: db_mod.types.RelationalRowsQueryResult.AccessMethod = .unknown,
+    fallback_reason: db_mod.types.RelationalRowsQueryResult.FallbackReason = .none,
+    index_entries_scanned: u64 = 0,
+    candidate_rows: u64 = 0,
+    hydrated_rows: u64 = 0,
+    projected_rows: u64 = 0,
+};
+
+const RelationalRowsResponseWire = struct {
+    total: u64,
+    total_exact: bool = true,
+    rows: []const std.json.Value,
+    profile: ?RelationalRowsProfileWire = null,
+};
+
+const RelationalRowsSurfaceStats = struct {
+    elapsed_ns: u64 = 0,
+    min_elapsed_ns: u64 = std.math.maxInt(u64),
+    max_elapsed_ns: u64 = 0,
+    rows: u64 = 0,
+    total: u64 = 0,
+    total_exact: bool = false,
+    access_method: db_mod.types.RelationalRowsQueryResult.AccessMethod = .unknown,
+    fallback_reason: db_mod.types.RelationalRowsQueryResult.FallbackReason = .none,
+    index_entries_scanned: u64 = 0,
+    candidate_rows: u64 = 0,
+    hydrated_rows: u64 = 0,
+    projected_rows: u64 = 0,
+
+    fn observeElapsed(self: *@This(), elapsed_ns: u64) void {
+        self.elapsed_ns += elapsed_ns;
+        self.min_elapsed_ns = @min(self.min_elapsed_ns, elapsed_ns);
+        self.max_elapsed_ns = @max(self.max_elapsed_ns, elapsed_ns);
+    }
+};
+
+fn relationalRowsAlgebraicConfigAlloc(alloc: std.mem.Allocator, schema_json: []const u8) ![]u8 {
+    const generated = try db_mod.algebraic.schema_capability.configJsonFromSchemaJsonAlloc(alloc, table_name, schema_json);
+    defer alloc.free(generated);
+    var parsed = try std.json.parseFromSlice(db_mod.algebraic.index.Config, alloc, generated, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+    parsed.value.adaptive.lazy_materialization = false;
+    return try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+}
+
+fn runRelationalRowsMatrix(alloc: std.mem.Allocator, cfg: Config) !void {
+    if (cfg.docs < 2 or cfg.k > std.math.maxInt(u32)) return error.InvalidArgument;
+    const modes = [_]RelationalRowsIndexMode{ .base_scan, .ordered_tuple, .algebraic_filter };
+    std.debug.print(
+        "{{\"event\":\"relational_rows_public_query_config\",\"schema_version\":{d},\"docs\":{d},\"limit\":{d},\"repeats\":{d},\"warmup\":{d},\"index_modes\":[\"base_scan\",\"ordered_tuple\",\"algebraic_filter\"],\"selectivities\":[\"low\",\"high\"],\"total_modes\":[\"none\",\"exact\",\"count_only\"],\"surfaces\":[\"direct_db\",\"public_http\"],\"algebraic_observation\":true,\"algebraic_lazy_materialization\":false}}\n",
+        .{ relational_rows_schema_version, cfg.docs, cfg.k, cfg.repeats, cfg.warmup },
+    );
+    for (modes) |mode| {
+        try runRelationalRowsMode(alloc, cfg, mode, &relational_rows_query_cases);
+    }
+}
+
+fn runRelationalRowsMode(
+    alloc: std.mem.Allocator,
+    cfg: Config,
+    mode: RelationalRowsIndexMode,
+    query_cases: []const RelationalRowsQueryCase,
+) !void {
+    const path_nonce = platform_time.monotonicNs();
+    var direct_path_buf: [256]u8 = undefined;
+    const direct_path = std.fmt.bufPrintZ(&direct_path_buf, "/tmp/antfly-public-query-{d}-direct", .{path_nonce}) catch unreachable;
+    defer cleanupTempDir(direct_path);
+    var public_path_buf: [256]u8 = undefined;
+    const public_path = std.fmt.bufPrintZ(&public_path_buf, "/tmp/antfly-public-query-{d}-public", .{path_nonce}) catch unreachable;
+    defer cleanupTempDir(public_path);
+    const schema_json = mode.schemaJson();
+
+    var direct_db = try db_mod.DB.open(alloc, direct_path[0..direct_path.len], .{ .start_index_workers = false });
+    defer direct_db.close();
+    var public_db = try db_mod.DB.open(alloc, public_path[0..public_path.len], .{ .start_index_workers = false });
+    defer public_db.close();
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try direct_db.setSchema(runtime_schema);
+    try public_db.setSchema(runtime_schema);
+    if (mode == .algebraic_filter) {
+        const config_json = try relationalRowsAlgebraicConfigAlloc(alloc, schema_json);
+        defer alloc.free(config_json);
+        try direct_db.addIndex(.{ .name = "alg_v1", .kind = .algebraic, .config_json = config_json });
+        try public_db.addIndex(.{ .name = "alg_v1", .kind = .algebraic, .config_json = config_json });
+    }
+
+    const direct_load_started = nowNs();
+    try loadRelationalRows(alloc, &direct_db, cfg, mode);
+    const direct_load_ns = elapsedSince(direct_load_started);
+    const public_load_started = nowNs();
+    try loadRelationalRows(alloc, &public_db, cfg, mode);
+    const public_load_ns = elapsedSince(public_load_started);
+    std.debug.print(
+        "{{\"event\":\"relational_rows_public_query_load\",\"schema_version\":{d},\"index_mode\":\"{s}\",\"docs\":{d},\"direct_load_ns\":{d},\"public_load_ns\":{d}}}\n",
+        .{ relational_rows_schema_version, @tagName(mode), cfg.docs, direct_load_ns, public_load_ns },
+    );
+
+    var read_source = api.BoundTableReadSource.init(table_name, 1, &public_db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var status_source = RelationalRowsStatusSource.init(schema_json);
+    var server = api.ApiHttpServer.init(alloc, .{}, status_source.iface(), read_source.source(), null);
+    defer server.deinit();
+    var listener = std_http_listener.StdHttpListener.init(alloc, .{
+        .bind_host = "127.0.0.1",
+        .bind_port = 0,
+        .serve_in_connection_threads = true,
+    }, server.executor());
+    defer listener.deinit();
+    try listener.start();
+    const base_uri = try listener.baseUri(alloc);
+    defer alloc.free(base_uri);
+    const query_uri = try std.fmt.allocPrint(alloc, "{s}/tables/{s}/rows/query", .{ base_uri, table_name });
+    defer alloc.free(query_uri);
+    var executor = std_http_executor.StdHttpExecutor.init(alloc, .{});
+    defer executor.deinit();
+
+    for (query_cases) |query_case| {
+        const body = try relationalRowsQueryBodyAlloc(alloc, cfg, query_case.selectivity, query_case.total_case);
+        defer alloc.free(body);
+        for (0..cfg.warmup) |_| {
+            var direct = try queryRelationalRowsOnce(alloc, &direct_db, runtime_schema, cfg, query_case.selectivity, query_case.total_case);
+            direct.deinit(alloc);
+            var response = try executor.executor().execute(alloc, .{
+                .method = .POST,
+                .uri = query_uri,
+                .content_type = "application/json",
+                .body = body,
+            });
+            if (response.status != 200) {
+                std.debug.print("relational rows public warmup case={s} status={d} body={s}\n", .{ query_case.name, response.status, response.body });
+                response.deinit(alloc);
+                return error.UnexpectedHttpStatus;
+            }
+            response.deinit(alloc);
+        }
+
+        const direct = try benchRelationalRowsDirect(alloc, &direct_db, runtime_schema, cfg, query_case.selectivity, query_case.total_case);
+        const public = try benchRelationalRowsHttp(alloc, executor.executor(), query_uri, body, cfg);
+        try validateRelationalRowsBench(cfg, mode, query_case, direct, public);
+        printRelationalRowsBenchResult(cfg, mode, query_case.selectivity, query_case.total_case, direct, public);
+    }
+}
+
+fn loadRelationalRows(alloc: std.mem.Allocator, db: *db_mod.DB, cfg: Config, mode: RelationalRowsIndexMode) !void {
+    const low_rows = @max(@as(usize, 1), cfg.docs / 10);
+    var start: usize = 0;
+    while (start < cfg.docs) : (start += cfg.batch_size) {
+        const end = @min(start + cfg.batch_size, cfg.docs);
+        const writes = try alloc.alloc(db_mod.types.BatchWrite, end - start);
+        var initialized: usize = 0;
+        defer {
+            for (writes[0..initialized]) |write| {
+                alloc.free(write.key);
+                alloc.free(write.value);
+            }
+            alloc.free(writes);
+        }
+        for (writes, start..) |*write, row_index| {
+            const rank = (row_index *% 2_654_435_761) % cfg.docs;
+            const status = if (rank < low_rows) "low" else "high";
+            const key = try std.fmt.allocPrint(alloc, "row:{d:0>9}", .{row_index});
+            const value = std.fmt.allocPrint(
+                alloc,
+                "{{\"id\":\"{d:0>9}\",\"status\":\"{s}\",\"amount\":{d}}}",
+                .{ row_index, status, row_index },
+            ) catch |err| {
+                alloc.free(key);
+                return err;
+            };
+            write.* = .{
+                .key = key,
+                .value = value,
+            };
+            initialized += 1;
+        }
+        try db.batch(.{
+            .writes = writes,
+            .sync_level = if (mode == .algebraic_filter) .full_index else cfg.sync_level,
+        });
+    }
+}
+
+fn relationalRowsQueryBodyAlloc(
+    alloc: std.mem.Allocator,
+    cfg: Config,
+    selectivity: RelationalRowsSelectivity,
+    total_case: RelationalRowsTotalCase,
+) ![]u8 {
+    return try std.fmt.allocPrint(
+        alloc,
+        "{{\"query\":{{\"where\":{{\"field\":\"status\",\"op\":\"eq\",\"value\":\"{s}\"}},\"select\":[\"id\",\"amount\"],\"limit\":{d},\"total_mode\":\"{s}\",\"profile\":true}}}}",
+        .{ selectivity.status(), total_case.limit(cfg), @tagName(total_case.totalMode()) },
+    );
+}
+
+fn queryRelationalRowsOnce(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    runtime_schema: schema_mod.TableSchema,
+    cfg: Config,
+    selectivity: RelationalRowsSelectivity,
+    total_case: RelationalRowsTotalCase,
+) !db_mod.types.RelationalRowsQueryResult {
+    const predicates = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "status",
+        .op = .eq,
+        .value_json = if (selectivity == .low) "\"low\"" else "\"high\"",
+    }};
+    const select = [_][]const u8{ "id", "amount" };
+    return try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = predicates[0..],
+        .select = select[0..],
+        .select_all = false,
+        .limit = total_case.limit(cfg),
+        .total_mode = total_case.totalMode(),
+        .profile = true,
+    });
+}
+
+fn benchRelationalRowsDirect(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    runtime_schema: schema_mod.TableSchema,
+    cfg: Config,
+    selectivity: RelationalRowsSelectivity,
+    total_case: RelationalRowsTotalCase,
+) !RelationalRowsSurfaceStats {
+    var stats = RelationalRowsSurfaceStats{};
+    for (0..cfg.repeats) |_| {
+        const started = nowNs();
+        var result = try queryRelationalRowsOnce(alloc, db, runtime_schema, cfg, selectivity, total_case);
+        stats.observeElapsed(elapsedSince(started));
+        stats.rows += result.rows.len;
+        stats.total += result.total;
+        stats.total_exact = result.total_exact;
+        stats.access_method = result.profile.access_method;
+        stats.fallback_reason = result.profile.fallback_reason;
+        stats.index_entries_scanned += result.profile.index_entries_scanned;
+        stats.candidate_rows += result.profile.candidate_rows;
+        stats.hydrated_rows += result.profile.hydrated_rows;
+        stats.projected_rows += result.profile.projected_rows;
+        result.deinit(alloc);
+    }
+    return stats;
+}
+
+fn benchRelationalRowsHttp(
+    alloc: std.mem.Allocator,
+    executor: http_common.RequestExecutor,
+    query_uri: []const u8,
+    body: []const u8,
+    cfg: Config,
+) !RelationalRowsSurfaceStats {
+    var stats = RelationalRowsSurfaceStats{};
+    for (0..cfg.repeats) |_| {
+        const started = nowNs();
+        var response = try executor.execute(alloc, .{
+            .method = .POST,
+            .uri = query_uri,
+            .content_type = "application/json",
+            .body = body,
+        });
+        stats.observeElapsed(elapsedSince(started));
+        defer response.deinit(alloc);
+        if (response.status != 200) {
+            std.debug.print("relational rows public query status={d} body={s}\n", .{ response.status, response.body });
+            return error.UnexpectedHttpStatus;
+        }
+        var parsed = try std.json.parseFromSlice(RelationalRowsResponseWire, alloc, response.body, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        stats.rows += parsed.value.rows.len;
+        stats.total += parsed.value.total;
+        stats.total_exact = parsed.value.total_exact;
+        const profile = parsed.value.profile orelse return error.InvalidQueryResponse;
+        stats.access_method = profile.access_method;
+        stats.fallback_reason = profile.fallback_reason;
+        stats.index_entries_scanned += profile.index_entries_scanned;
+        stats.candidate_rows += profile.candidate_rows;
+        stats.hydrated_rows += profile.hydrated_rows;
+        stats.projected_rows += profile.projected_rows;
+    }
+    return stats;
+}
+
+fn validateRelationalRowsBench(
+    cfg: Config,
+    mode: RelationalRowsIndexMode,
+    query_case: RelationalRowsQueryCase,
+    direct: RelationalRowsSurfaceStats,
+    public: RelationalRowsSurfaceStats,
+) !void {
+    const selectivity = query_case.selectivity;
+    const total_case = query_case.total_case;
+    const repeats: u64 = @intCast(cfg.repeats);
+    const low_rows = @max(@as(usize, 1), cfg.docs / 10);
+    const matches: u64 = @intCast(if (selectivity == .low) low_rows else cfg.docs - low_rows);
+    const limit: u64 = total_case.limit(cfg);
+    const expected_rows = if (total_case == .count_only) 0 else @min(matches, limit);
+    const expected_total = if (total_case == .none) expected_rows else matches;
+    const expected_exact = total_case != .none or matches < limit;
+    const planner_contract = switch (mode) {
+        .base_scan => direct.access_method == .base_scan and direct.fallback_reason == .none,
+        .ordered_tuple => query_case.ordered_expectation.matches(direct.access_method, direct.fallback_reason),
+        .algebraic_filter => direct.access_method == .algebraic_doc_set and direct.fallback_reason == .none,
+    };
+    const valid = planner_contract and
+        direct.rows == expected_rows * repeats and
+        public.rows == direct.rows and
+        direct.total == expected_total * repeats and
+        public.total == direct.total and
+        direct.total_exact == expected_exact and
+        public.total_exact == expected_exact and
+        public.access_method == direct.access_method and
+        public.fallback_reason == direct.fallback_reason and
+        public.index_entries_scanned == direct.index_entries_scanned and
+        public.candidate_rows == direct.candidate_rows and
+        public.hydrated_rows == direct.hydrated_rows and
+        public.projected_rows == direct.projected_rows;
+    if (valid) return;
+    std.debug.print(
+        "relational rows guardrail contract failed mode={s} case={s} selectivity={s} total={s} direct_rows={d} public_rows={d} direct_total={d} public_total={d} direct_exact={} public_exact={} direct_access={s} public_access={s} direct_fallback={s} public_fallback={s} direct_counters={d}/{d}/{d}/{d} public_counters={d}/{d}/{d}/{d} ordered_expectation={s}\n",
+        .{
+            @tagName(mode),
+            query_case.name,
+            @tagName(selectivity),
+            @tagName(total_case),
+            direct.rows,
+            public.rows,
+            direct.total,
+            public.total,
+            direct.total_exact,
+            public.total_exact,
+            @tagName(direct.access_method),
+            @tagName(public.access_method),
+            @tagName(direct.fallback_reason),
+            @tagName(public.fallback_reason),
+            direct.index_entries_scanned,
+            direct.candidate_rows,
+            direct.hydrated_rows,
+            direct.projected_rows,
+            public.index_entries_scanned,
+            public.candidate_rows,
+            public.hydrated_rows,
+            public.projected_rows,
+            @tagName(query_case.ordered_expectation),
+        },
+    );
+    return error.BenchmarkContractViolation;
+}
+
+fn printRelationalRowsBenchResult(
+    cfg: Config,
+    mode: RelationalRowsIndexMode,
+    selectivity: RelationalRowsSelectivity,
+    total_case: RelationalRowsTotalCase,
+    direct: RelationalRowsSurfaceStats,
+    public: RelationalRowsSurfaceStats,
+) void {
+    const repeats_f64: f64 = @floatFromInt(cfg.repeats);
+    const repeats_u64: u64 = @intCast(cfg.repeats);
+    const direct_ns = @as(f64, @floatFromInt(direct.elapsed_ns)) / repeats_f64;
+    const public_ns = @as(f64, @floatFromInt(public.elapsed_ns)) / repeats_f64;
+    std.debug.print(
+        "{{\"event\":\"relational_rows_public_query\",\"schema_version\":{d},\"index_mode\":\"{s}\",\"selectivity\":\"{s}\",\"total_mode\":\"{s}\",\"count_only\":{},\"docs\":{d},\"limit\":{d},\"repeats\":{d},\"direct_db_ns_per_query\":{d:.3},\"direct_db_min_ns\":{d},\"direct_db_max_ns\":{d},\"public_http_ns_per_query\":{d:.3},\"public_http_min_ns\":{d},\"public_http_max_ns\":{d},\"public_http_overhead_ns_per_query\":{d:.3},\"public_http_to_direct_ratio\":{d:.6},\"rows_per_query\":{d},\"total_per_query\":{d},\"total_exact\":{},\"access_method\":\"{s}\",\"fallback_reason\":\"{s}\",\"direct_index_entries_scanned_per_query\":{d},\"direct_candidate_rows_per_query\":{d},\"direct_hydrated_rows_per_query\":{d},\"direct_projected_rows_per_query\":{d},\"public_index_entries_scanned_per_query\":{d},\"public_candidate_rows_per_query\":{d},\"public_hydrated_rows_per_query\":{d},\"public_projected_rows_per_query\":{d},\"contract_verified\":true}}\n",
+        .{
+            relational_rows_schema_version,
+            @tagName(mode),
+            @tagName(selectivity),
+            @tagName(total_case.totalMode()),
+            total_case == .count_only,
+            cfg.docs,
+            cfg.k,
+            cfg.repeats,
+            direct_ns,
+            direct.min_elapsed_ns,
+            direct.max_elapsed_ns,
+            public_ns,
+            public.min_elapsed_ns,
+            public.max_elapsed_ns,
+            public_ns - direct_ns,
+            public_ns / @max(direct_ns, 1),
+            direct.rows / repeats_u64,
+            direct.total / repeats_u64,
+            direct.total_exact,
+            @tagName(direct.access_method),
+            @tagName(direct.fallback_reason),
+            direct.index_entries_scanned / repeats_u64,
+            direct.candidate_rows / repeats_u64,
+            direct.hydrated_rows / repeats_u64,
+            direct.projected_rows / repeats_u64,
+            public.index_entries_scanned / repeats_u64,
+            public.candidate_rows / repeats_u64,
+            public.hydrated_rows / repeats_u64,
+            public.projected_rows / repeats_u64,
+        },
+    );
+}
+
 pub fn main(init: std.process.Init) !void {
     const alloc = std.heap.c_allocator;
     const cfg = try parseArgs(init.minimal.args);
     if (cfg.docs == 0 or cfg.dims == 0 or cfg.queries == 0 or cfg.repeats == 0 or cfg.k == 0 or cfg.batch_size == 0 or cfg.search_threads == 0) {
         return error.InvalidArgument;
+    }
+
+    if (cfg.relational_rows_matrix) {
+        if (cfg.mode != .local) return error.InvalidArgument;
+        try runRelationalRowsMatrix(alloc, cfg);
+        return;
     }
 
     const dataset = try makeDataset(alloc, cfg);
@@ -1603,6 +2131,10 @@ fn parseArg(cfg: *Config, arg: []const u8, args: *std.process.Args.Iterator) !vo
         cfg.with_sparse = true;
     } else if (std.mem.eql(u8, arg, "--with-graph")) {
         cfg.with_graph = true;
+    } else if (std.mem.eql(u8, arg, "--relational-rows-matrix")) {
+        cfg.relational_rows_matrix = true;
+    } else if (std.mem.eql(u8, arg, "--warmup")) {
+        cfg.warmup = try parseNextUsize(args, "--warmup");
     } else if (std.mem.eql(u8, arg, "--require-symbolic-profile")) {
         cfg.require_symbolic_profile = true;
     } else if (std.mem.eql(u8, arg, "--docs")) {

@@ -104,6 +104,83 @@ const QueryStats = struct {
     checksum: u64 = 0,
 };
 
+const AllocationStats = struct {
+    allocation_events: u64 = 0,
+    allocated_bytes: u64 = 0,
+    live_bytes: u64 = 0,
+    peak_live_bytes: u64 = 0,
+};
+
+const CountingAllocator = struct {
+    backing: std.mem.Allocator,
+    stats: AllocationStats = .{},
+
+    fn init(backing: std.mem.Allocator) CountingAllocator {
+        return .{ .backing = backing };
+    }
+
+    fn reset(self: *CountingAllocator) void {
+        self.stats = .{};
+    }
+
+    fn allocator(self: *CountingAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        const ptr = self.backing.rawAlloc(len, alignment, ret_addr) orelse return null;
+        self.stats.allocation_events +|= 1;
+        self.stats.allocated_bytes +|= len;
+        self.stats.live_bytes +|= len;
+        self.stats.peak_live_bytes = @max(self.stats.peak_live_bytes, self.stats.live_bytes);
+        return ptr;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        if (!self.backing.rawResize(memory, alignment, new_len, ret_addr)) return false;
+        if (new_len > memory.len) {
+            const added = new_len - memory.len;
+            self.stats.allocation_events +|= 1;
+            self.stats.allocated_bytes +|= added;
+            self.stats.live_bytes +|= added;
+            self.stats.peak_live_bytes = @max(self.stats.peak_live_bytes, self.stats.live_bytes);
+        } else {
+            self.stats.live_bytes -|= memory.len - new_len;
+        }
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        const ptr = self.backing.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
+        if (new_len > memory.len) {
+            const added = new_len - memory.len;
+            self.stats.allocation_events +|= 1;
+            self.stats.allocated_bytes +|= added;
+            self.stats.live_bytes +|= added;
+            self.stats.peak_live_bytes = @max(self.stats.peak_live_bytes, self.stats.live_bytes);
+        } else {
+            self.stats.live_bytes -|= memory.len - new_len;
+        }
+        return ptr;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        self.stats.live_bytes -|= memory.len;
+        self.backing.rawFree(memory, alignment, ret_addr);
+    }
+
+    const vtable = std.mem.Allocator.VTable{
+        .alloc = alloc,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    };
+};
+
 const AdaptiveWarmupCounts = struct {
     candidate_count: u64 = 0,
     progress_count: u64 = 0,
@@ -588,6 +665,12 @@ fn runSelectedMode(io: std.Io, alloc: std.mem.Allocator, cfg: Config) anyerror!v
         try runBenchmarkCase(io, alloc, cfg, "wide_composite_keys", .{ .standard_queries = false, .wide_queries = true });
     } else if (std.mem.eql(u8, cfg.mode, "write-amp")) {
         try runWriteAmplificationCases(io, alloc, cfg);
+    } else if (std.mem.eql(u8, cfg.mode, "tensor-write-matrix")) {
+        try runTensorWriteMatrix(cfg);
+    } else if (std.mem.eql(u8, cfg.mode, "ready-dictionary-write-matrix")) {
+        try runReadyDictionaryWriteMatrix(cfg);
+    } else if (std.mem.eql(u8, cfg.mode, "adaptive-write-matrix")) {
+        try runAdaptiveWriteMatrix(cfg);
     } else if (std.mem.eql(u8, cfg.mode, "churn")) {
         try runBenchmarkCase(io, alloc, cfg, "update_delete_churn", .{ .standard_queries = false, .churn = true });
     } else if (std.mem.eql(u8, cfg.mode, "cold")) {
@@ -690,7 +773,12 @@ fn runHllCardinalityCase(io: std.Io, alloc: std.mem.Allocator, cfg: Config) !voi
         .config_json = algebraic_hll_config,
     });
     const alg_index = try algebraic_mod.index.Index.open(alloc, "alg", algebraic_hll_config);
-    try manager.algebraic_indexes.append(alloc, .{ .apply_mutex = mutex, .config = config, .index = alg_index });
+    try manager.algebraic_indexes.append(alloc, .{
+        .apply_mutex = mutex,
+        .config = config,
+        .rebuild_root_path = try alloc.dupe(u8, "."),
+        .index = alg_index,
+    });
     const index = &manager.algebraic_indexes.items[0].index;
 
     const build_start = nowNs();
@@ -998,6 +1086,7 @@ fn runBenchmarkCase(
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
+        .rebuild_root_path = try alloc.dupe(u8, "."),
         .index = alg_index,
     });
 
@@ -1486,6 +1575,341 @@ fn runWriteAmplificationCases(io: std.Io, alloc: std.mem.Allocator, cfg: Config)
             .standard_queries = false,
             .config_json = config_json,
         });
+    }
+}
+
+const TensorMaterializationKind = enum { direct, cylinder };
+const TensorWriteOperation = enum { add, replace, duplicate_support, delete };
+
+fn tensorWriteConfigAlloc(
+    alloc: std.mem.Allocator,
+    law_name: []const u8,
+    kind: TensorMaterializationKind,
+) ![]u8 {
+    const measure = if (std.mem.eql(u8, law_name, "count")) "" else ",\"measure\":\"amount\"";
+    const time = if (kind == .cylinder) ",\"time\":\"created\",\"bucket\":\"day\"" else "";
+    return try std.fmt.allocPrint(
+        alloc,
+        "{{\"version\":1,\"table\":\"orders\",\"group_fields\":[{{\"name\":\"region\",\"path\":\"region\",\"type\":\"string\"}}],\"measure_fields\":[{{\"name\":\"amount\",\"path\":\"amount\",\"type\":\"number\"}}],\"time_fields\":[{{\"name\":\"created\",\"path\":\"created\",\"type\":\"timestamp\"}}],\"adaptive\":{{\"observe\":false}},\"materializations\":[{{\"name\":\"metric\",\"op\":\"{s}\",\"group_by\":[\"region\"]{s}{s}}}]}}",
+        .{ law_name, measure, time },
+    );
+}
+
+fn runTensorWriteMatrix(cfg: Config) !void {
+    const fixture_alloc = std.heap.c_allocator;
+    const docs_count = @max(cfg.docs, @as(usize, 2));
+    const keys = try fixture_alloc.alloc([]const u8, docs_count);
+    defer {
+        for (keys) |key| fixture_alloc.free(key);
+        fixture_alloc.free(keys);
+    }
+    const initial = try fixture_alloc.alloc(db_mod.derived_types.DerivedDocument, docs_count);
+    defer fixture_alloc.free(initial);
+    const replacement = try fixture_alloc.alloc(db_mod.derived_types.DerivedDocument, docs_count);
+    defer fixture_alloc.free(replacement);
+    const duplicates = try fixture_alloc.alloc(db_mod.derived_types.DerivedDocument, docs_count);
+    defer fixture_alloc.free(duplicates);
+    var initial_values = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (initial_values.items) |value| fixture_alloc.free(value);
+        initial_values.deinit(fixture_alloc);
+    }
+    var replacement_values = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (replacement_values.items) |value| fixture_alloc.free(value);
+        replacement_values.deinit(fixture_alloc);
+    }
+    const duplicate_value = "{\"region\":\"west\",\"amount\":10,\"created\":\"2026-08-07T00:00:00Z\"}";
+    for (0..docs_count) |i| {
+        keys[i] = try std.fmt.allocPrint(fixture_alloc, "row:{d:0>8}", .{i});
+        const initial_value = try std.fmt.allocPrint(
+            fixture_alloc,
+            "{{\"region\":\"west\",\"amount\":{d},\"created\":\"2026-08-07T00:00:00Z\"}}",
+            .{1 + i % 97},
+        );
+        try initial_values.append(fixture_alloc, initial_value);
+        const replacement_value = try std.fmt.allocPrint(
+            fixture_alloc,
+            "{{\"region\":\"west\",\"amount\":{d},\"created\":\"2026-08-07T00:00:00Z\"}}",
+            .{101 + i % 97},
+        );
+        try replacement_values.append(fixture_alloc, replacement_value);
+        initial[i] = .{ .key = keys[i], .action = .upsert, .cleaned_value = initial_value };
+        replacement[i] = .{ .key = keys[i], .action = .upsert, .cleaned_value = replacement_value };
+        duplicates[i] = .{ .key = keys[i], .action = .upsert, .cleaned_value = duplicate_value };
+    }
+
+    const laws = [_][]const u8{ "count", "sum", "sumsquares", "avg", "min", "max" };
+    const kinds = [_]TensorMaterializationKind{ .direct, .cylinder };
+    const operations = [_]TensorWriteOperation{ .add, .replace, .duplicate_support, .delete };
+    std.debug.print(
+        "{{\"event\":\"tensor_write_matrix_config\",\"schema_version\":1,\"docs\":{d},\"laws\":[\"count\",\"sum\",\"sumsquares\",\"avg\",\"min\",\"max\"],\"materialization_kinds\":[\"direct\",\"cylinder\"],\"operations\":[\"add\",\"replace\",\"duplicate_support\",\"delete\"]}}\n",
+        .{docs_count},
+    );
+    for (laws) |law_name| {
+        for (kinds) |kind| {
+            const config_json = try tensorWriteConfigAlloc(fixture_alloc, law_name, kind);
+            defer fixture_alloc.free(config_json);
+            for (operations) |operation| {
+                var counting = CountingAllocator.init(std.heap.c_allocator);
+                const alloc = counting.allocator();
+                var backend = antfly.mem_backend.Backend.init(alloc, .{});
+                defer backend.close();
+                const runtime_store = try backend.runtimeStore(alloc, .{});
+                var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+                defer store.close();
+                var index = try algebraic_mod.index.Index.open(alloc, "tensor_write_matrix", config_json);
+                defer index.close();
+
+                if (operation == .replace or operation == .delete)
+                    try index.applyBatch(&store, .{ .documents = initial });
+                const status_before = index.status();
+                counting.reset();
+                const start_ns = nowNs();
+                switch (operation) {
+                    .add => try index.applyBatch(&store, .{ .documents = initial }),
+                    .replace => try index.applyBatch(&store, .{ .documents = replacement }),
+                    .duplicate_support => try index.applyBatch(&store, .{ .documents = duplicates }),
+                    .delete => try index.applyBatch(&store, .{ .deleted_keys = keys }),
+                }
+                const elapsed_ns = elapsedSince(start_ns);
+                const allocations = counting.stats;
+                const status_after = index.status();
+                std.debug.print(
+                    "{{\"event\":\"tensor_write_matrix\",\"schema_version\":1,\"law\":\"{s}\",\"materialization_kind\":\"{s}\",\"operation\":\"{s}\",\"docs\":{d},\"elapsed_ns\":{d},\"ns_per_doc\":{d:.2},\"allocation_events\":{d},\"allocated_bytes\":{d},\"peak_live_bytes\":{d},\"tensor_mutation_batches\":{d},\"tensor_mutation_puts\":{d},\"tensor_mutation_deletes\":{d},\"tensor_expression_mutations\":{d},\"tensor_support_mutations\":{d},\"tensor_cache_mutations\":{d},\"tensor_staged_bytes\":{d}}}\n",
+                    .{
+                        law_name,
+                        @tagName(kind),
+                        @tagName(operation),
+                        docs_count,
+                        elapsed_ns,
+                        @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(docs_count)),
+                        allocations.allocation_events,
+                        allocations.allocated_bytes,
+                        allocations.peak_live_bytes,
+                        status_after.tensor_mutation_batch_count - status_before.tensor_mutation_batch_count,
+                        status_after.tensor_mutation_put_count - status_before.tensor_mutation_put_count,
+                        status_after.tensor_mutation_delete_count - status_before.tensor_mutation_delete_count,
+                        status_after.tensor_expression_mutation_count - status_before.tensor_expression_mutation_count,
+                        status_after.tensor_support_mutation_count - status_before.tensor_support_mutation_count,
+                        status_after.tensor_cache_mutation_count - status_before.tensor_cache_mutation_count,
+                        status_after.tensor_mutation_staged_bytes - status_before.tensor_mutation_staged_bytes,
+                    },
+                );
+            }
+        }
+    }
+}
+
+const ReadyDictionaryRowShape = enum { scalar, array, nested };
+const ReadyDictionaryWriteOperation = enum { insert, replace, unchanged, delete };
+
+fn readyDictionaryValues(shape: ReadyDictionaryRowShape) struct { initial: []const u8, replacement: []const u8 } {
+    return switch (shape) {
+        .scalar => .{ .initial = "{\"value\":\"alpha\"}", .replacement = "{\"value\":\"beta\"}" },
+        .array => .{ .initial = "{\"tags\":[\"a\",\"b\"]}", .replacement = "{\"tags\":[\"b\",\"c\"]}" },
+        .nested => .{ .initial = "{\"meta\":{\"tier\":\"gold\"}}", .replacement = "{\"meta\":{\"tier\":\"silver\"}}" },
+    };
+}
+
+fn buildReadyDictionaryForBench(
+    index: *algebraic_mod.index.Index,
+    store: *docstore_mod.DocStore,
+    documents: []const db_mod.derived_types.DerivedDocument,
+) !void {
+    try index.applyBaseRowComponentBatchWithOptions(store, .fact, documents, .{});
+    try index.applyBaseRowComponentBatchWithOptions(store, .path, documents, .{});
+    var dictionary = try index.rebuildDerivedRowComponentPage(store, .dictionary, null, documents.len + 1);
+    defer dictionary.deinit(index.alloc);
+    if (!dictionary.complete) return error.DictionaryBenchmarkRebuildIncomplete;
+    var postings = try index.rebuildDerivedRowComponentPage(store, .postings, null, documents.len + 1);
+    defer postings.deinit(index.alloc);
+    if (!postings.complete) return error.DictionaryBenchmarkRebuildIncomplete;
+}
+
+fn runReadyDictionaryWriteMatrix(cfg: Config) !void {
+    const fixture_alloc = std.heap.c_allocator;
+    const docs_count = @max(cfg.docs, @as(usize, 1));
+    const keys = try fixture_alloc.alloc([]const u8, docs_count);
+    defer {
+        for (keys) |key| fixture_alloc.free(key);
+        fixture_alloc.free(keys);
+    }
+    const initial = try fixture_alloc.alloc(db_mod.derived_types.DerivedDocument, docs_count);
+    defer fixture_alloc.free(initial);
+    const replacement = try fixture_alloc.alloc(db_mod.derived_types.DerivedDocument, docs_count);
+    defer fixture_alloc.free(replacement);
+    const shapes = [_]ReadyDictionaryRowShape{ .scalar, .array, .nested };
+    const operations = [_]ReadyDictionaryWriteOperation{ .insert, .replace, .unchanged, .delete };
+
+    for (0..docs_count) |i| keys[i] = try std.fmt.allocPrint(fixture_alloc, "row:{d:0>8}", .{i});
+    std.debug.print(
+        "{{\"event\":\"ready_dictionary_write_matrix_config\",\"schema_version\":1,\"docs\":{d},\"row_shapes\":[\"scalar\",\"array\",\"nested\"],\"operations\":[\"insert\",\"replace\",\"unchanged\",\"delete\"]}}\n",
+        .{docs_count},
+    );
+
+    for (shapes) |shape| {
+        const values = readyDictionaryValues(shape);
+        for (0..docs_count) |i| {
+            initial[i] = .{ .key = keys[i], .action = .upsert, .cleaned_value = values.initial };
+            replacement[i] = .{ .key = keys[i], .action = .upsert, .cleaned_value = values.replacement };
+        }
+        for (operations) |operation| {
+            var counting = CountingAllocator.init(std.heap.c_allocator);
+            const alloc = counting.allocator();
+            var backend = antfly.mem_backend.Backend.init(alloc, .{});
+            defer backend.close();
+            const runtime_store = try backend.runtimeStore(alloc, .{});
+            var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+            defer store.close();
+            var index = try algebraic_mod.index.Index.open(alloc, "ready_dictionary_write_matrix", "{\"version\":1,\"table\":\"rows\",\"adaptive\":{\"observe\":false}}");
+            defer index.close();
+
+            if (operation == .insert) {
+                const seed = [_]db_mod.derived_types.DerivedDocument{.{
+                    .key = "seed",
+                    .action = .upsert,
+                    .cleaned_value = values.initial,
+                }};
+                try buildReadyDictionaryForBench(&index, &store, &seed);
+            } else {
+                try buildReadyDictionaryForBench(&index, &store, initial);
+            }
+
+            const status_before = index.status();
+            counting.reset();
+            const start_ns = nowNs();
+            switch (operation) {
+                .insert => try index.applyBatch(&store, .{ .documents = initial }),
+                .replace => try index.applyBatch(&store, .{ .documents = replacement }),
+                .unchanged => try index.applyBatch(&store, .{ .documents = initial }),
+                .delete => try index.applyBatch(&store, .{ .deleted_keys = keys }),
+            }
+            const elapsed_ns = elapsedSince(start_ns);
+            const allocations = counting.stats;
+            const status_after = index.status();
+            std.debug.print(
+                "{{\"event\":\"ready_dictionary_write_matrix\",\"schema_version\":1,\"row_shape\":\"{s}\",\"operation\":\"{s}\",\"docs\":{d},\"elapsed_ns\":{d},\"ns_per_doc\":{d:.2},\"allocation_events\":{d},\"allocated_bytes\":{d},\"peak_live_bytes\":{d},\"mutation_batches\":{d},\"mutation_puts\":{d},\"mutation_deletes\":{d},\"registry_mutations\":{d},\"lexicon_mutations\":{d},\"posting_mutations\":{d},\"ordinal_posting_mutations\":{d},\"fst_invalidations\":{d},\"staged_bytes\":{d}}}\n",
+                .{
+                    @tagName(shape),
+                    @tagName(operation),
+                    docs_count,
+                    elapsed_ns,
+                    @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(docs_count)),
+                    allocations.allocation_events,
+                    allocations.allocated_bytes,
+                    allocations.peak_live_bytes,
+                    status_after.ready_dictionary_mutation_batch_count - status_before.ready_dictionary_mutation_batch_count,
+                    status_after.ready_dictionary_mutation_put_count - status_before.ready_dictionary_mutation_put_count,
+                    status_after.ready_dictionary_mutation_delete_count - status_before.ready_dictionary_mutation_delete_count,
+                    status_after.ready_dictionary_registry_mutation_count - status_before.ready_dictionary_registry_mutation_count,
+                    status_after.ready_dictionary_lexicon_mutation_count - status_before.ready_dictionary_lexicon_mutation_count,
+                    status_after.ready_dictionary_posting_mutation_count - status_before.ready_dictionary_posting_mutation_count,
+                    status_after.ready_dictionary_ordinal_posting_mutation_count - status_before.ready_dictionary_ordinal_posting_mutation_count,
+                    status_after.ready_dictionary_fst_invalidation_count - status_before.ready_dictionary_fst_invalidation_count,
+                    status_after.ready_dictionary_mutation_staged_bytes - status_before.ready_dictionary_mutation_staged_bytes,
+                },
+            );
+        }
+    }
+}
+
+fn promoteAdaptivePathForBench(index: *algebraic_mod.index.Index, store: *docstore_mod.DocStore) !void {
+    if (try index.persistSchemalessPathPromotionRecommendations(store) == 0)
+        return error.AdaptiveBenchmarkRecommendationMissing;
+    while (try index.runAdaptiveWork(store, 0) != 0) {}
+}
+
+fn runAdaptiveWriteMatrix(cfg: Config) !void {
+    const fixture_alloc = std.heap.c_allocator;
+    const docs_count = @max(cfg.docs, @as(usize, 3));
+    const keys = try fixture_alloc.alloc([]const u8, docs_count);
+    defer {
+        for (keys) |key| fixture_alloc.free(key);
+        fixture_alloc.free(keys);
+    }
+    const initial = try fixture_alloc.alloc(db_mod.derived_types.DerivedDocument, docs_count);
+    defer fixture_alloc.free(initial);
+    const replacement = try fixture_alloc.alloc(db_mod.derived_types.DerivedDocument, docs_count);
+    defer fixture_alloc.free(replacement);
+    const values = [_][]const u8{
+        "{\"meta\":{\"score_text\":\"10.5\"}}",
+        "{\"meta\":{\"score_text\":\"12.5\"}}",
+        "{\"meta\":{\"score_text\":\"15.5\"}}",
+    };
+    const replacement_value = "{\"meta\":{\"score_text\":\"17.5\"}}";
+    for (0..docs_count) |i| {
+        keys[i] = try std.fmt.allocPrint(fixture_alloc, "row:{d:0>8}", .{i});
+        initial[i] = .{ .key = keys[i], .action = .upsert, .cleaned_value = values[i % values.len] };
+        replacement[i] = .{ .key = keys[i], .action = .upsert, .cleaned_value = replacement_value };
+    }
+    const operations = [_]ReadyDictionaryWriteOperation{ .insert, .replace, .unchanged, .delete };
+    std.debug.print(
+        "{{\"event\":\"adaptive_write_matrix_config\",\"schema_version\":1,\"docs\":{d},\"operations\":[\"insert\",\"replace\",\"unchanged\",\"delete\"]}}\n",
+        .{docs_count},
+    );
+
+    for (operations) |operation| {
+        var counting = CountingAllocator.init(std.heap.c_allocator);
+        const alloc = counting.allocator();
+        var backend = antfly.mem_backend.Backend.init(alloc, .{});
+        defer backend.close();
+        const runtime_store = try backend.runtimeStore(alloc, .{});
+        var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+        defer store.close();
+        var index = try algebraic_mod.index.Index.open(
+            alloc,
+            "adaptive_write_matrix",
+            "{\"version\":1,\"table\":\"rows\",\"adaptive\":{\"observe\":true,\"lazy_materialization\":true,\"min_observations\":1,\"max_backfill_rows_per_tick\":1000000,\"min_estimated_scan_rows_saved\":1},\"materializations\":[]}",
+        );
+        defer index.close();
+
+        if (operation == .insert) {
+            const seeds = [_]db_mod.derived_types.DerivedDocument{
+                .{ .key = "seed-1", .action = .upsert, .cleaned_value = values[0] },
+                .{ .key = "seed-2", .action = .upsert, .cleaned_value = values[1] },
+                .{ .key = "seed-3", .action = .upsert, .cleaned_value = values[2] },
+            };
+            try index.applyBatch(&store, .{ .documents = &seeds });
+        } else {
+            try index.applyBatch(&store, .{ .documents = initial });
+        }
+        try promoteAdaptivePathForBench(&index, &store);
+
+        const status_before = index.status();
+        counting.reset();
+        const start_ns = nowNs();
+        switch (operation) {
+            .insert => try index.applyBatch(&store, .{ .documents = replacement }),
+            .replace => try index.applyBatch(&store, .{ .documents = replacement }),
+            .unchanged => try index.applyBatch(&store, .{ .documents = initial }),
+            .delete => try index.applyBatch(&store, .{ .deleted_keys = keys }),
+        }
+        const elapsed_ns = elapsedSince(start_ns);
+        const allocations = counting.stats;
+        const status_after = index.status();
+        std.debug.print(
+            "{{\"event\":\"adaptive_write_matrix\",\"schema_version\":1,\"operation\":\"{s}\",\"docs\":{d},\"elapsed_ns\":{d},\"ns_per_doc\":{d:.2},\"allocation_events\":{d},\"allocated_bytes\":{d},\"peak_live_bytes\":{d},\"adaptive_mutation_batches\":{d},\"adaptive_mutation_puts\":{d},\"adaptive_mutation_deletes\":{d},\"promotion_mutations\":{d},\"path_profile_mutations\":{d},\"observation_mutations\":{d},\"lifecycle_mutations\":{d},\"adaptive_staged_bytes\":{d},\"tensor_mutation_batches\":{d},\"fst_rebuilds\":{d}}}\n",
+            .{
+                @tagName(operation),
+                docs_count,
+                elapsed_ns,
+                @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(docs_count)),
+                allocations.allocation_events,
+                allocations.allocated_bytes,
+                allocations.peak_live_bytes,
+                status_after.adaptive_mutation_batch_count - status_before.adaptive_mutation_batch_count,
+                status_after.adaptive_mutation_put_count - status_before.adaptive_mutation_put_count,
+                status_after.adaptive_mutation_delete_count - status_before.adaptive_mutation_delete_count,
+                status_after.adaptive_promotion_mutation_count - status_before.adaptive_promotion_mutation_count,
+                status_after.adaptive_path_profile_mutation_count - status_before.adaptive_path_profile_mutation_count,
+                status_after.adaptive_observation_mutation_count - status_before.adaptive_observation_mutation_count,
+                status_after.adaptive_lifecycle_mutation_count - status_before.adaptive_lifecycle_mutation_count,
+                status_after.adaptive_mutation_staged_bytes - status_before.adaptive_mutation_staged_bytes,
+                status_after.tensor_mutation_batch_count - status_before.tensor_mutation_batch_count,
+                status_after.path_dictionary_fst_rebuild_count - status_before.path_dictionary_fst_rebuild_count,
+            },
+        );
     }
 }
 
@@ -2302,6 +2726,7 @@ fn openAlgebraicManager(alloc: std.mem.Allocator, config_json: []const u8) !db_m
     try manager.algebraic_indexes.append(alloc, .{
         .apply_mutex = mutex,
         .config = config,
+        .rebuild_root_path = try alloc.dupe(u8, "."),
         .index = alg_index,
     });
     return manager;
@@ -2603,12 +3028,41 @@ fn printDatasetAlgebraicStatus(
         },
     );
     std.debug.print(
-        ",\"algebraic_join_facts_scanned\":{d},\"algebraic_join_facts_matched\":{d},\"algebraic_join_facts_pruned\":{d},\"algebraic_accumulator_flush_count\":{d},\"algebraic_symbol_cache_hits\":{d},\"algebraic_symbol_cache_misses\":{d},\"algebraic_minmax_cache_hits\":{d},\"algebraic_minmax_cache_misses\":{d},\"algebraic_minmax_support_scans\":{d}",
+        ",\"algebraic_join_facts_scanned\":{d},\"algebraic_join_facts_matched\":{d},\"algebraic_join_facts_pruned\":{d},\"algebraic_accumulator_flush_count\":{d},\"algebraic_tensor_mutation_batch_count\":{d},\"algebraic_tensor_mutation_put_count\":{d},\"algebraic_tensor_mutation_delete_count\":{d},\"algebraic_tensor_expression_mutation_count\":{d},\"algebraic_tensor_support_mutation_count\":{d},\"algebraic_tensor_cache_mutation_count\":{d},\"algebraic_tensor_mutation_staged_bytes\":{d},\"algebraic_ready_dictionary_mutation_batch_count\":{d},\"algebraic_ready_dictionary_mutation_put_count\":{d},\"algebraic_ready_dictionary_mutation_delete_count\":{d},\"algebraic_ready_dictionary_registry_mutation_count\":{d},\"algebraic_ready_dictionary_lexicon_mutation_count\":{d},\"algebraic_ready_dictionary_posting_mutation_count\":{d},\"algebraic_ready_dictionary_ordinal_posting_mutation_count\":{d},\"algebraic_ready_dictionary_fst_invalidation_count\":{d},\"algebraic_ready_dictionary_mutation_staged_bytes\":{d}",
         .{
             status.join_facts_scanned,
             status.join_facts_matched,
             status.join_facts_pruned,
             status.accumulator_flush_count,
+            status.tensor_mutation_batch_count,
+            status.tensor_mutation_put_count,
+            status.tensor_mutation_delete_count,
+            status.tensor_expression_mutation_count,
+            status.tensor_support_mutation_count,
+            status.tensor_cache_mutation_count,
+            status.tensor_mutation_staged_bytes,
+            status.ready_dictionary_mutation_batch_count,
+            status.ready_dictionary_mutation_put_count,
+            status.ready_dictionary_mutation_delete_count,
+            status.ready_dictionary_registry_mutation_count,
+            status.ready_dictionary_lexicon_mutation_count,
+            status.ready_dictionary_posting_mutation_count,
+            status.ready_dictionary_ordinal_posting_mutation_count,
+            status.ready_dictionary_fst_invalidation_count,
+            status.ready_dictionary_mutation_staged_bytes,
+        },
+    );
+    std.debug.print(
+        ",\"algebraic_adaptive_mutation_batch_count\":{d},\"algebraic_adaptive_mutation_put_count\":{d},\"algebraic_adaptive_mutation_delete_count\":{d},\"algebraic_adaptive_promotion_mutation_count\":{d},\"algebraic_adaptive_path_profile_mutation_count\":{d},\"algebraic_adaptive_observation_mutation_count\":{d},\"algebraic_adaptive_lifecycle_mutation_count\":{d},\"algebraic_adaptive_mutation_staged_bytes\":{d},\"algebraic_symbol_cache_hits\":{d},\"algebraic_symbol_cache_misses\":{d},\"algebraic_minmax_cache_hits\":{d},\"algebraic_minmax_cache_misses\":{d},\"algebraic_minmax_support_scans\":{d}",
+        .{
+            status.adaptive_mutation_batch_count,
+            status.adaptive_mutation_put_count,
+            status.adaptive_mutation_delete_count,
+            status.adaptive_promotion_mutation_count,
+            status.adaptive_path_profile_mutation_count,
+            status.adaptive_observation_mutation_count,
+            status.adaptive_lifecycle_mutation_count,
+            status.adaptive_mutation_staged_bytes,
             status.symbol_cache_hits,
             status.symbol_cache_misses,
             status.minmax_cache_hits,

@@ -99,6 +99,23 @@ pub const BatchOptions = struct {
     defer_commit_flush: bool = false,
 };
 
+/// Ordered mutations applied inside an already-open write transaction.
+/// Implementations must preserve slice order and read-your-writes visibility.
+pub const KeyMutation = union(enum) {
+    put: Put,
+    delete: Delete,
+
+    pub const Put = struct {
+        key: []const u8,
+        value: []const u8,
+    };
+
+    pub const Delete = struct {
+        key: []const u8,
+        ignore_missing: bool = false,
+    };
+};
+
 pub const BulkIngestFinishOptions = struct {
     pub const ProgressPhase = enum(u8) {
         begin,

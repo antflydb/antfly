@@ -1156,6 +1156,7 @@ pub const APITestFilters = struct {
         "postgres sql adapter validates app parity fixture metadata with applied schema context",
         "sql adapter ddl plan lowers create table ddl into typed schema plan",
         "sql adapter ddl plan lowers application-time temporal table constraints",
+        "SQL DROP INDEX selects nonblocking lifecycle by access method",
         "catalog apply creates clones and replaces public schema json",
         "catalog apply applies create table ddl plan to owned runtime schema",
         "catalog apply applies additive alter table ddl plan to runtime schema",
@@ -1807,6 +1808,7 @@ pub const APITestFilters = struct {
     };
 
     pub const rows = [_][]const u8{
+        "api rows repeated public query lifecycle is stable by access and total mode",
         "relational rows unique selector",
         "relational rows conflict target upsert",
         "relational rows batch returning",

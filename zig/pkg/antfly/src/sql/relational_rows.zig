@@ -8385,16 +8385,17 @@ fn appendRowsQueryProfileJson(
     profile: db_mod.types.RelationalRowsQueryResult.Profile,
 ) !void {
     try writer.print(
-        ",\"profile\":{{\"access_method\":\"{s}\",\"fallback_reason\":\"{s}\",\"unsupported_reason\":\"{s}\"",
+        ",\"profile\":{{\"access_method\":\"{s}\",\"fallback_reason\":\"{s}\",\"fallback_class\":\"{s}\",\"unsupported_reason\":\"{s}\"",
         .{
             rowsQueryAccessMethodName(profile.access_method),
             rowsQueryFallbackReasonName(profile.fallback_reason),
+            profile.fallbackClass().name(),
             rowsQueryUnsupportedReasonName(profile.unsupportedReason()),
         },
     );
     try appendRowsQueryPlanSummaryJson(writer, profile);
     try writer.print(
-        ",\"total_mode\":\"{s}\",\"count_only\":{any},\"index_entries_scanned\":{d},\"candidate_rows\":{d},\"candidate_stream_emitted\":{d},\"retained_candidate_rows\":{d},\"candidate_stream_stop_reason\":\"{s}\",\"estimated_candidate_rows\":{d},\"selected_candidate_estimated_rows\":{d},\"candidate_gate_limit\":{d},\"candidate_gate_observed\":{d},\"candidate_gate_exceeded\":{any},\"iterator_seeks\":{d},\"hydrated_rows\":{d},\"residual_rechecks\":{d},\"covering_payload_rows\":{d},\"covering_payload_rechecked_rows\":{d},\"covering_payload_hydration_avoided_rows\":{d},\"covering_payload_fallbacks\":{{\"metadata_missing\":{d},\"row_generation_mismatch\":{d},\"index_generation_mismatch\":{d},\"schema_fingerprint_mismatch\":{d},\"residual_predicates\":{d},\"projection_shape\":{d}}},\"projected_rows\":{d}",
+        ",\"total_mode\":\"{s}\",\"count_only\":{any},\"index_entries_scanned\":{d},\"candidate_rows\":{d},\"candidate_stream_emitted\":{d},\"retained_candidate_rows\":{d},\"candidate_stream_stop_reason\":\"{s}\",\"estimated_candidate_rows\":{d},\"selected_candidate_estimated_rows\":{d},\"candidate_gate_limit\":{d},\"candidate_gate_observed\":{d},\"candidate_gate_exceeded\":{any},\"candidate_buffer_peak_rows\":{d},\"candidate_buffer_peak_bytes\":{d},\"iterator_seeks\":{d},\"hydrated_rows\":{d},\"residual_rechecks\":{d},\"covering_payload_rows\":{d},\"covering_payload_rechecked_rows\":{d},\"covering_payload_hydration_avoided_rows\":{d},\"covering_payload_generation_batches\":{d},\"covering_payload_fallbacks\":{{\"metadata_missing\":{d},\"row_generation_mismatch\":{d},\"index_generation_mismatch\":{d},\"schema_fingerprint_mismatch\":{d},\"residual_predicates\":{d},\"projection_shape\":{d}}},\"projected_rows\":{d}",
         .{
             rowsQueryTotalModeName(profile.total_mode),
             profile.count_only,
@@ -8408,12 +8409,15 @@ fn appendRowsQueryProfileJson(
             profile.candidate_gate_limit,
             profile.candidate_gate_observed,
             profile.candidate_gate_exceeded,
+            profile.candidate_buffer_peak_rows,
+            profile.candidate_buffer_peak_bytes,
             profile.iterator_seeks,
             profile.hydrated_rows,
             profile.residual_rechecks,
             profile.covering_payload_rows,
             profile.covering_payload_rechecked_rows,
             profile.covering_payload_hydration_avoided_rows,
+            profile.covering_payload_generation_batches,
             profile.covering_payload_fallback_metadata_missing_rows,
             profile.covering_payload_fallback_row_generation_mismatch_rows,
             profile.covering_payload_fallback_index_generation_mismatch_rows,
@@ -8424,7 +8428,7 @@ fn appendRowsQueryProfileJson(
         },
     );
     try writer.print(
-        ",\"routed_materialization\":{{\"fallbacks\":{d},\"rows\":{d},\"bytes\":{d},\"spills\":{d},\"spilled_rows\":{d},\"spilled_bytes\":{d}}},\"candidate_sets\":{{\"planned\":{d},\"scalar\":{d},\"array\":{d},\"json\":{d},\"mixed\":{d},\"ordered_tuple\":{d}}}",
+        ",\"routed_materialization\":{{\"fallbacks\":{d},\"rows\":{d},\"bytes\":{d},\"spills\":{d},\"spilled_rows\":{d},\"spilled_bytes\":{d}}},\"candidate_sets\":{{\"planned\":{d},\"scalar\":{d},\"array\":{d},\"json\":{d},\"text_search\":{d},\"algebraic\":{d},\"mixed\":{d},\"ordered_tuple\":{d}}},\"algebraic_plans\":{{\"considered\":{d},\"admitted\":{d},\"rejected\":{d},\"selected\":{d}}}",
         .{
             profile.routed_materialization_fallbacks,
             profile.routed_materialized_rows,
@@ -8436,8 +8440,14 @@ fn appendRowsQueryProfileJson(
             profile.scalar_candidate_sets,
             profile.array_candidate_sets,
             profile.json_candidate_sets,
+            profile.text_search_candidate_sets,
+            profile.algebraic_candidate_sets,
             profile.mixed_candidate_sets,
             profile.ordered_tuple_candidate_sets,
+            profile.algebraic_plans_considered,
+            profile.algebraic_plans_admitted,
+            profile.algebraic_plans_rejected,
+            profile.algebraic_selected_candidate_sets,
         },
     );
     if (profile.ordered_tuple_plan_selected) {
@@ -8509,11 +8519,12 @@ fn appendRowsQueryPlanSummaryJson(
                 if (profile.ordered_tuple_prefix_scan) "true" else "false",
             },
         );
-    } else if (profile.fallback_reason != .none) {
-        try writer.writeAll(";ordered_tuple=rejected");
+    } else if (rowsQueryRejectedAccessMethodName(profile.fallback_reason)) |method| {
+        try writer.print(";{s}=rejected", .{method});
     }
+    try writer.print(";fallback_class={s}", .{profile.fallbackClass().name()});
     try writer.print(
-        ";total_mode={s};count_only={s};candidate_sets=planned:{d},scalar:{d},array:{d},json:{d},mixed:{d},ordered_tuple:{d},selected_estimate:{d};estimated_candidates={d};candidate_gate={d}/{d}/{s};index_entries={d};candidate_rows={d};candidate_stream={d}/{s};retained_candidates={d};hydrated_rows={d};residual_rechecks={d};covering_payload_rechecks={d};covering_payload_hydration_avoided={d};covering_payload_fallbacks=metadata_missing:{d},row_generation_mismatch:{d},index_generation_mismatch:{d},schema_fingerprint_mismatch:{d},residual_predicates:{d},projection_shape:{d};projected_rows={d}",
+        ";total_mode={s};count_only={s};candidate_sets=planned:{d},scalar:{d},array:{d},json:{d},text_search:{d},algebraic:{d},mixed:{d},ordered_tuple:{d},selected_estimate:{d};algebraic_plans=considered:{d},admitted:{d},rejected:{d},selected:{d}",
         .{
             rowsQueryTotalModeName(profile.total_mode),
             if (profile.count_only) "true" else "false",
@@ -8521,13 +8532,26 @@ fn appendRowsQueryPlanSummaryJson(
             profile.scalar_candidate_sets,
             profile.array_candidate_sets,
             profile.json_candidate_sets,
+            profile.text_search_candidate_sets,
+            profile.algebraic_candidate_sets,
             profile.mixed_candidate_sets,
             profile.ordered_tuple_candidate_sets,
             profile.selected_candidate_estimated_rows,
+            profile.algebraic_plans_considered,
+            profile.algebraic_plans_admitted,
+            profile.algebraic_plans_rejected,
+            profile.algebraic_selected_candidate_sets,
+        },
+    );
+    try writer.print(
+        ";estimated_candidates={d};candidate_gate={d}/{d}/{s};candidate_buffer_peak={d}/{d};index_entries={d};candidate_rows={d};candidate_stream={d}/{s};retained_candidates={d};hydrated_rows={d};residual_rechecks={d};covering_payload_rechecks={d};covering_payload_hydration_avoided={d};covering_payload_generation_batches={d};covering_payload_fallbacks=metadata_missing:{d},row_generation_mismatch:{d},index_generation_mismatch:{d},schema_fingerprint_mismatch:{d},residual_predicates:{d},projection_shape:{d};projected_rows={d}",
+        .{
             profile.estimated_candidate_rows,
             profile.candidate_gate_observed,
             profile.candidate_gate_limit,
             if (profile.candidate_gate_exceeded) "exceeded" else "measured",
+            profile.candidate_buffer_peak_rows,
+            profile.candidate_buffer_peak_bytes,
             profile.index_entries_scanned,
             profile.candidate_rows,
             profile.candidate_stream_emitted,
@@ -8537,6 +8561,7 @@ fn appendRowsQueryPlanSummaryJson(
             profile.residual_rechecks,
             profile.covering_payload_rechecked_rows,
             profile.covering_payload_hydration_avoided_rows,
+            profile.covering_payload_generation_batches,
             profile.covering_payload_fallback_metadata_missing_rows,
             profile.covering_payload_fallback_row_generation_mismatch_rows,
             profile.covering_payload_fallback_index_generation_mismatch_rows,
@@ -8559,6 +8584,46 @@ fn appendRowsQueryPlanSummaryJson(
     );
 }
 
+fn rowsQueryRejectedAccessMethodName(
+    reason: db_mod.types.RelationalRowsQueryResult.FallbackReason,
+) ?[]const u8 {
+    return switch (reason) {
+        .none => null,
+        .ordered_tuple_skipped_for_exact_paged_total,
+        .ordered_tuple_candidate_gate,
+        .ordered_tuple_materialization_cap,
+        .ordered_tuple_ordering_not_covered,
+        .ordered_tuple_index_unavailable,
+        .ordered_tuple_index_not_ready,
+        .ordered_tuple_stale_generation,
+        .ordered_tuple_malformed_generation,
+        .ordered_tuple_access_method_mismatch,
+        .ordered_tuple_predicate_not_proven,
+        .ordered_tuple_no_usable_bounds,
+        .ordered_tuple_order_field_not_covered,
+        .ordered_tuple_order_direction_not_covered,
+        .ordered_tuple_order_nulls_not_covered,
+        .ordered_tuple_order_collation_not_covered,
+        .ordered_tuple_order_tiebreaker_not_covered,
+        .ordered_tuple_collation_not_supported,
+        => "ordered_tuple",
+        .text_search_index_unavailable,
+        .text_search_index_not_ready,
+        .text_search_stale_generation,
+        .text_search_malformed_generation,
+        .text_search_unsupported_shape,
+        .text_search_resolution_too_expensive,
+        => "text_search",
+        .algebraic_index_unavailable,
+        .algebraic_index_not_ready,
+        .algebraic_stale_generation,
+        .algebraic_malformed_generation,
+        .algebraic_unsupported_shape,
+        .algebraic_resolution_too_expensive,
+        => "algebraic",
+    };
+}
+
 fn rowsQueryAccessMethodName(method: db_mod.types.RelationalRowsQueryResult.AccessMethod) []const u8 {
     return switch (method) {
         .unknown => "unknown",
@@ -8568,6 +8633,7 @@ fn rowsQueryAccessMethodName(method: db_mod.types.RelationalRowsQueryResult.Acce
         .array_doc_set => "array_doc_set",
         .json_doc_set => "json_doc_set",
         .text_search_doc_set => "text_search_doc_set",
+        .algebraic_doc_set => "algebraic_doc_set",
         .mixed_doc_set => "mixed_doc_set",
         .ordered_tuple_doc_set => "ordered_tuple_doc_set",
         .ordered_tuple_stream => "ordered_tuple_stream",
@@ -8589,8 +8655,10 @@ fn rowsQueryFallbackReasonName(reason: db_mod.types.RelationalRowsQueryResult.Fa
         .ordered_tuple_candidate_gate => "ordered_tuple_candidate_gate",
         .ordered_tuple_materialization_cap => "ordered_tuple_materialization_cap",
         .ordered_tuple_ordering_not_covered => "ordered_tuple_ordering_not_covered",
+        .ordered_tuple_index_unavailable => "ordered_tuple_index_unavailable",
         .ordered_tuple_index_not_ready => "ordered_tuple_index_not_ready",
         .ordered_tuple_stale_generation => "ordered_tuple_stale_generation",
+        .ordered_tuple_malformed_generation => "ordered_tuple_malformed_generation",
         .ordered_tuple_access_method_mismatch => "ordered_tuple_access_method_mismatch",
         .ordered_tuple_predicate_not_proven => "ordered_tuple_predicate_not_proven",
         .ordered_tuple_no_usable_bounds => "ordered_tuple_no_usable_bounds",
@@ -8600,6 +8668,18 @@ fn rowsQueryFallbackReasonName(reason: db_mod.types.RelationalRowsQueryResult.Fa
         .ordered_tuple_order_collation_not_covered => "ordered_tuple_order_collation_not_covered",
         .ordered_tuple_order_tiebreaker_not_covered => "ordered_tuple_order_tiebreaker_not_covered",
         .ordered_tuple_collation_not_supported => "ordered_tuple_collation_not_supported",
+        .text_search_index_unavailable => "text_search_index_unavailable",
+        .text_search_index_not_ready => "text_search_index_not_ready",
+        .text_search_stale_generation => "text_search_stale_generation",
+        .text_search_malformed_generation => "text_search_malformed_generation",
+        .text_search_unsupported_shape => "text_search_unsupported_shape",
+        .text_search_resolution_too_expensive => "text_search_resolution_too_expensive",
+        .algebraic_index_unavailable => "algebraic_index_unavailable",
+        .algebraic_index_not_ready => "algebraic_index_not_ready",
+        .algebraic_stale_generation => "algebraic_stale_generation",
+        .algebraic_malformed_generation => "algebraic_malformed_generation",
+        .algebraic_unsupported_shape => "algebraic_unsupported_shape",
+        .algebraic_resolution_too_expensive => "algebraic_resolution_too_expensive",
     };
 }
 
@@ -27633,54 +27713,48 @@ test "relational rows query contract filters orders paginates and projects rows"
     try std.testing.expect(std.mem.indexOf(u8, fallback_profile_response, "\"fallback_reason\":\"ordered_tuple_predicate_not_proven\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, fallback_profile_response, "\"unsupported_reason\":\"predicate-not-proven\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, fallback_profile_response, "\"plan_summary\":\"method=base_scan;fallback=ordered_tuple_predicate_not_proven;ordered_tuple=rejected") != null);
-    const fallback_reasons = [_]db_mod.types.RelationalRowsQueryResult.FallbackReason{
-        .ordered_tuple_index_not_ready,
-        .ordered_tuple_stale_generation,
-        .ordered_tuple_access_method_mismatch,
-        .ordered_tuple_no_usable_bounds,
-        .ordered_tuple_order_field_not_covered,
-        .ordered_tuple_order_direction_not_covered,
-        .ordered_tuple_order_nulls_not_covered,
-        .ordered_tuple_order_collation_not_covered,
-        .ordered_tuple_order_tiebreaker_not_covered,
-        .ordered_tuple_collation_not_supported,
+    const FallbackCase = struct {
+        name: []const u8,
+        reason: db_mod.types.RelationalRowsQueryResult.FallbackReason,
+        reason_name: []const u8,
+        class_name: []const u8,
+        unsupported_name: []const u8,
+        rejected_method: []const u8,
     };
-    const fallback_reason_names = [_][]const u8{
-        "\"fallback_reason\":\"ordered_tuple_index_not_ready\"",
-        "\"fallback_reason\":\"ordered_tuple_stale_generation\"",
-        "\"fallback_reason\":\"ordered_tuple_access_method_mismatch\"",
-        "\"fallback_reason\":\"ordered_tuple_no_usable_bounds\"",
-        "\"fallback_reason\":\"ordered_tuple_order_field_not_covered\"",
-        "\"fallback_reason\":\"ordered_tuple_order_direction_not_covered\"",
-        "\"fallback_reason\":\"ordered_tuple_order_nulls_not_covered\"",
-        "\"fallback_reason\":\"ordered_tuple_order_collation_not_covered\"",
-        "\"fallback_reason\":\"ordered_tuple_order_tiebreaker_not_covered\"",
-        "\"fallback_reason\":\"ordered_tuple_collation_not_supported\"",
+    const fallback_cases = [_]FallbackCase{
+        .{ .name = "unavailable text index", .reason = .text_search_index_unavailable, .reason_name = "text_search_index_unavailable", .class_name = "unavailable", .unsupported_name = "index-unavailable", .rejected_method = "text_search=rejected" },
+        .{ .name = "stale ordered tuple", .reason = .ordered_tuple_stale_generation, .reason_name = "ordered_tuple_stale_generation", .class_name = "stale", .unsupported_name = "stale-generation", .rejected_method = "ordered_tuple=rejected" },
+        .{ .name = "malformed algebraic index", .reason = .algebraic_malformed_generation, .reason_name = "algebraic_malformed_generation", .class_name = "malformed", .unsupported_name = "malformed-generation", .rejected_method = "algebraic=rejected" },
+        .{ .name = "ordered tuple cost gate", .reason = .ordered_tuple_candidate_gate, .reason_name = "ordered_tuple_candidate_gate", .class_name = "too-expensive", .unsupported_name = "resolution-too-expensive", .rejected_method = "ordered_tuple=rejected" },
+        .{ .name = "unsupported text shape", .reason = .text_search_unsupported_shape, .reason_name = "text_search_unsupported_shape", .class_name = "unsupported-shape", .unsupported_name = "unsupported-shape", .rejected_method = "text_search=rejected" },
+        .{ .name = "ordered tuple access mismatch", .reason = .ordered_tuple_access_method_mismatch, .reason_name = "ordered_tuple_access_method_mismatch", .class_name = "unsupported-shape", .unsupported_name = "unsupported-access-method", .rejected_method = "ordered_tuple=rejected" },
+        .{ .name = "ordered tuple order mismatch", .reason = .ordered_tuple_order_field_not_covered, .reason_name = "ordered_tuple_order_field_not_covered", .class_name = "unsupported-shape", .unsupported_name = "ordering-not-covered", .rejected_method = "ordered_tuple=rejected" },
+        .{ .name = "ordered tuple bounds mismatch", .reason = .ordered_tuple_no_usable_bounds, .reason_name = "ordered_tuple_no_usable_bounds", .class_name = "unsupported-shape", .unsupported_name = "access-method-capability-mismatch", .rejected_method = "ordered_tuple=rejected" },
     };
-    const unsupported_reason_names = [_][]const u8{
-        "\"unsupported_reason\":\"index-not-ready\"",
-        "\"unsupported_reason\":\"stale-generation\"",
-        "\"unsupported_reason\":\"unsupported-access-method\"",
-        "\"unsupported_reason\":\"access-method-capability-mismatch\"",
-        "\"unsupported_reason\":\"ordering-not-covered\"",
-        "\"unsupported_reason\":\"ordering-not-covered\"",
-        "\"unsupported_reason\":\"ordering-not-covered\"",
-        "\"unsupported_reason\":\"ordering-not-covered\"",
-        "\"unsupported_reason\":\"ordering-not-covered\"",
-        "\"unsupported_reason\":\"access-method-capability-mismatch\"",
-    };
-    for (fallback_reasons, fallback_reason_names, unsupported_reason_names) |reason, expected_name, expected_unsupported| {
+    for (fallback_cases) |case| {
         const encoded = try encodeRowsQueryResponseAlloc(std.testing.allocator, .{
             .total = 0,
             .include_profile = true,
             .profile = .{
                 .access_method = .base_scan,
-                .fallback_reason = reason,
+                .fallback_reason = case.reason,
             },
         });
         defer std.testing.allocator.free(encoded);
-        try std.testing.expect(std.mem.indexOf(u8, encoded, expected_name) != null);
-        try std.testing.expect(std.mem.indexOf(u8, encoded, expected_unsupported) != null);
+        var parsed_response = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, encoded, .{});
+        defer parsed_response.deinit();
+        const profile = parsed_response.value.object.get("profile").?.object;
+        if (!std.mem.eql(u8, case.reason_name, profile.get("fallback_reason").?.string)) {
+            std.debug.print("rows fallback profile case failed: {s}\n", .{case.name});
+        }
+        try std.testing.expectEqualStrings(case.reason_name, profile.get("fallback_reason").?.string);
+        try std.testing.expectEqualStrings(case.class_name, profile.get("fallback_class").?.string);
+        try std.testing.expectEqualStrings(case.unsupported_name, profile.get("unsupported_reason").?.string);
+        const summary = profile.get("plan_summary").?.string;
+        try std.testing.expect(std.mem.indexOf(u8, summary, case.rejected_method) != null);
+        const expected_class = try std.fmt.allocPrint(std.testing.allocator, "fallback_class={s}", .{case.class_name});
+        defer std.testing.allocator.free(expected_class);
+        try std.testing.expect(std.mem.indexOf(u8, summary, expected_class) != null);
     }
 
     const ordered_tuple_profile_response = try encodeRowsQueryResponseAlloc(std.testing.allocator, .{
@@ -27718,6 +27792,7 @@ test "relational rows query contract filters orders paginates and projects rows"
             .covering_payload_rows = 2,
             .covering_payload_rechecked_rows = 3,
             .covering_payload_hydration_avoided_rows = 2,
+            .covering_payload_generation_batches = 1,
             .covering_payload_fallback_metadata_missing_rows = 1,
             .covering_payload_fallback_row_generation_mismatch_rows = 2,
             .covering_payload_fallback_index_generation_mismatch_rows = 3,
@@ -27736,12 +27811,16 @@ test "relational rows query contract filters orders paginates and projects rows"
     try std.testing.expect(std.mem.indexOf(u8, ordered_tuple_profile_response, "\"candidate_stream_stop_reason\":\"page-full\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, ordered_tuple_profile_response, "\"total_mode\":\"exact\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, ordered_tuple_profile_response, "\"count_only\":false") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ordered_tuple_profile_response, "\"candidate_sets\":{\"planned\":3,\"scalar\":1,\"array\":1,\"json\":0,\"mixed\":0,\"ordered_tuple\":0}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ordered_tuple_profile_response, "\"candidate_sets\":{\"planned\":3,\"scalar\":1,\"array\":1,\"json\":0,\"text_search\":0,\"algebraic\":0,\"mixed\":0,\"ordered_tuple\":0}") != null);
     try std.testing.expect(std.mem.indexOf(u8, ordered_tuple_profile_response, "\"candidate_gate_exceeded\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, ordered_tuple_profile_response, "\"covering_payload_rechecked_rows\":3") != null);
     try std.testing.expect(std.mem.indexOf(u8, ordered_tuple_profile_response, "\"covering_payload_hydration_avoided_rows\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ordered_tuple_profile_response, "\"covering_payload_generation_batches\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, ordered_tuple_profile_response, "\"covering_payload_fallbacks\":{\"metadata_missing\":1,\"row_generation_mismatch\":2,\"index_generation_mismatch\":3,\"schema_fingerprint_mismatch\":4,\"residual_predicates\":5,\"projection_shape\":6}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ordered_tuple_profile_response, "\"plan_summary\":\"method=ordered_tuple_stream;fallback=none;ordered_tuple=selected;generation=7;catalog_ordinal=1;keys=2;equality_prefix=1;range_key=1;predicates=filter:3,proven:2,residual:1,recheck:true;bounds=lower:12,upper:18,prefix:false;total_mode=exact;count_only=false;candidate_sets=planned:3,scalar:1,array:1,json:0,mixed:0,ordered_tuple:0,selected_estimate:4;estimated_candidates=12;candidate_gate=12/20/exceeded;index_entries=10;candidate_rows=10;candidate_stream=8/page-full;retained_candidates=6;hydrated_rows=0;residual_rechecks=0;covering_payload_rechecks=3;covering_payload_hydration_avoided=2;covering_payload_fallbacks=metadata_missing:1,row_generation_mismatch:2,index_generation_mismatch:3,schema_fingerprint_mismatch:4,residual_predicates:5,projection_shape:6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ordered_tuple_profile_response, "\"plan_summary\":\"method=ordered_tuple_stream;fallback=none;ordered_tuple=selected;generation=7;catalog_ordinal=1;keys=2;equality_prefix=1;range_key=1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ordered_tuple_profile_response, ";fallback_class=none;total_mode=exact;count_only=false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ordered_tuple_profile_response, ";candidate_stream=8/page-full;retained_candidates=6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ordered_tuple_profile_response, ";covering_payload_rechecks=3;covering_payload_hydration_avoided=2;covering_payload_generation_batches=1") != null);
     try std.testing.expect(std.mem.indexOf(u8, ordered_tuple_profile_response, "\"ordered_tuple\":{\"catalog_ordinal\":1,\"index_generation\":7,\"key_count\":2,\"equality_prefix_len\":1,\"filter_predicates\":3,\"proven_predicates\":2,\"residual_predicates\":1,\"residual_recheck_required\":true,\"range_key_index\":1") != null);
 
     var distinct_result = try executeRowsQueryOnJsonRowsAlloc(std.testing.allocator, schema, distinct_request, rows[0..]);

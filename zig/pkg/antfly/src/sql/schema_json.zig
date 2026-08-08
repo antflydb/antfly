@@ -693,6 +693,7 @@ pub fn applyDropIndexPlanToSchemaJsonValue(
     root: *std.json.ObjectMap,
     plan: ddl_plan.DropIndexPlan,
 ) !void {
+    if (try markNamedRelationalIndexDropping(alloc, root.getPtr("relational_indexes"), plan.index_name)) return;
     if (try removeNamedConstraintFromJsonArray(root.getPtr("unique_constraints"), plan.index_name)) {
         _ = try removeNamedRelationalIndexFromJsonArray(root.getPtr("relational_indexes"), plan.index_name);
         removeCommentMapEntry(root, "indexes", plan.index_name);
@@ -716,6 +717,48 @@ pub fn applyDropIndexPlanToSchemaJsonValue(
         }
     }
     removeCommentMapEntry(root, "indexes", plan.index_name);
+}
+
+fn markNamedRelationalIndexDropping(
+    alloc: std.mem.Allocator,
+    value: ?*std.json.Value,
+    index_name: []const u8,
+) !bool {
+    const array_value = value orelse return false;
+    if (array_value.* != .array) return error.InvalidSqlCatalog;
+    for (array_value.array.items) |*item| {
+        if (item.* != .object) return error.InvalidSqlCatalog;
+        const name = item.object.get("name") orelse return error.InvalidSqlCatalog;
+        if (name != .string) return error.InvalidSqlCatalog;
+        if (!std.mem.eql(u8, name.string, index_name)) continue;
+        const access_method = item.object.get("access_method") orelse return error.InvalidSqlCatalog;
+        if (access_method != .string) return error.InvalidSqlCatalog;
+        if (!std.mem.eql(u8, access_method.string, "text_search") and
+            !std.mem.eql(u8, access_method.string, "algebraic_filter")) return false;
+
+        const generation = item.object.get("generation") orelse return error.InvalidSqlCatalog;
+        if (generation != .integer or generation.integer <= 0) return error.InvalidSqlCatalog;
+        const generation_record_value = item.object.getPtr("generation_record") orelse return error.InvalidSqlCatalog;
+        if (generation_record_value.* != .object) return error.InvalidSqlCatalog;
+        const record_generation = generation_record_value.object.get("generation") orelse return error.InvalidSqlCatalog;
+        if (record_generation != .integer or record_generation.integer != generation.integer) return error.InvalidSqlCatalog;
+
+        try item.object.put(alloc, "lifecycle", .{ .string = "dropping" });
+        try generation_record_value.object.put(alloc, "lifecycle", .{ .string = "dropping" });
+        try generation_record_value.object.put(alloc, "lag", .{ .integer = 0 });
+        var components = std.json.ObjectMap.empty;
+        try components.put(alloc, "dictionary", .{ .bool = false });
+        try components.put(alloc, "fact", .{ .bool = false });
+        try components.put(alloc, "path", .{ .bool = false });
+        try components.put(alloc, "postings", .{ .bool = false });
+        try generation_record_value.object.put(alloc, "components", .{ .object = components });
+        _ = generation_record_value.object.orderedRemove("failure_reason");
+        _ = generation_record_value.object.orderedRemove("rebuild_cursor");
+        _ = generation_record_value.object.orderedRemove("component_cursors");
+        _ = generation_record_value.object.orderedRemove("rebuild_leases");
+        return true;
+    }
+    return false;
 }
 
 pub fn applyCreateUpdatePolicyPlanToSchemaJsonValue(

@@ -38732,6 +38732,53 @@ test "sql adapter ddl plan lowers computed check constraints into native express
     }
 }
 
+test "SQL DROP INDEX selects nonblocking lifecycle by access method" {
+    const alloc = std.testing.allocator;
+    const Case = struct {
+        name: []const u8,
+        access_method: runtime_schema.RelationalIndexAccessMethod,
+        generation: u64,
+        record: ?runtime_schema.RelationalIndexGenerationRecord,
+        retained_for_cleanup: bool,
+    };
+    const cases = [_]Case{
+        .{ .name = "text search", .access_method = .text_search, .generation = 7, .record = .{ .generation = 7, .lifecycle = .ready }, .retained_for_cleanup = true },
+        .{ .name = "algebraic", .access_method = .algebraic_filter, .generation = 7, .record = .{ .generation = 7, .lifecycle = .ready }, .retained_for_cleanup = true },
+        .{ .name = "ordered tuple", .access_method = .ordered_tuple, .generation = 7, .record = .{ .generation = 7, .lifecycle = .ready }, .retained_for_cleanup = false },
+        .{ .name = "scalar", .access_method = .scalar_column, .generation = 0, .record = null, .retained_for_cleanup = false },
+    };
+    for (cases) |case| {
+        const source = runtime_schema.TableSchema{
+            .storage_mode = .relational,
+            .relational_indexes = &.{.{
+                .name = "idx",
+                .owner_kind = .table,
+                .owner_name = runtime_schema.relational_table_index_owner_name,
+                .access_method = case.access_method,
+                .lifecycle = .ready,
+                .generation = case.generation,
+                .generation_record = case.record,
+            }},
+        };
+        var schema = try cloneRelationalRuntimeSchemaAlloc(alloc, source);
+        defer runtime_schema.freeSchema(alloc, schema);
+        try dropIndexFromRuntimeSchemaAlloc(alloc, &schema, .{ .index_name = "idx" });
+        if (!case.retained_for_cleanup) {
+            try std.testing.expectEqual(@as(usize, 0), schema.relational_indexes.len);
+            continue;
+        }
+        try std.testing.expectEqual(@as(usize, 1), schema.relational_indexes.len);
+        const index = schema.relational_indexes[0];
+        try std.testing.expectEqual(runtime_schema.RelationalIndexLifecycle.dropping, index.lifecycle);
+        const record = index.generation_record orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(runtime_schema.RelationalIndexLifecycle.dropping, record.lifecycle);
+        try std.testing.expect(!record.components.dictionary);
+        try std.testing.expect(!record.components.fact);
+        try std.testing.expect(!record.components.path);
+        try std.testing.expect(!record.components.postings);
+    }
+}
+
 test "SQL adapter DDL helper conversions map names to runtime enums" {
     try std.testing.expectEqual(runtime_schema.AntflyType.datetime, ddlRangeBoundTypeForName("tstzrange").?);
     try std.testing.expectEqual(runtime_schema.AntflyType.numeric, ddlRangeBoundTypeForName("numrange").?);
@@ -39628,6 +39675,20 @@ pub fn dropIndexFromRuntimeSchemaAlloc(
     schema: *runtime_schema.TableSchema,
     plan: DropIndexPlan,
 ) !void {
+    for (schema.relational_indexes) |index| {
+        if (!std.mem.eql(u8, index.name, plan.index_name)) continue;
+        if (index.access_method != .text_search and index.access_method != .algebraic_filter) break;
+        const result = try runtime_schema.beginRelationalIndexDropInSchemaAlloc(alloc, schema, .{
+            .access_method = index.access_method,
+            .index_name = plan.index_name,
+            .expected_generation = index.generation,
+        });
+        return switch (result) {
+            .started, .already_started => {},
+            .wrong_access_method, .generation_mismatch, .malformed_record => error.InvalidSqlCatalog,
+            .schema_missing, .non_relational_schema, .index_not_found, .finalized, .already_absent, .incomplete => error.InvalidSqlCatalog,
+        };
+    }
     if (try dropUniqueConstraintByNameAlloc(alloc, schema, plan.index_name)) {
         _ = try dropRelationalIndexByNameAlloc(alloc, schema, plan.index_name);
         return;

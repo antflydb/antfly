@@ -189,6 +189,7 @@ const QueryStats = struct {
     base_scan_queries: u64 = 0,
     resolved_doc_set_queries: u64 = 0,
     scalar_doc_set_queries: u64 = 0,
+    algebraic_doc_set_queries: u64 = 0,
     array_doc_set_queries: u64 = 0,
     json_doc_set_queries: u64 = 0,
     text_search_doc_set_queries: u64 = 0,
@@ -199,10 +200,24 @@ const QueryStats = struct {
     ordered_tuple_materialization_cap_fallbacks: u64 = 0,
     ordered_tuple_exact_paged_total_fallbacks: u64 = 0,
     ordered_tuple_ordering_not_covered_fallbacks: u64 = 0,
+    ordered_tuple_index_unavailable_fallbacks: u64 = 0,
     ordered_tuple_index_not_ready_fallbacks: u64 = 0,
     ordered_tuple_stale_generation_fallbacks: u64 = 0,
+    ordered_tuple_malformed_generation_fallbacks: u64 = 0,
     ordered_tuple_predicate_not_proven_fallbacks: u64 = 0,
     ordered_tuple_no_usable_bounds_fallbacks: u64 = 0,
+    text_search_index_unavailable_fallbacks: u64 = 0,
+    text_search_index_not_ready_fallbacks: u64 = 0,
+    text_search_stale_generation_fallbacks: u64 = 0,
+    text_search_malformed_generation_fallbacks: u64 = 0,
+    text_search_unsupported_shape_fallbacks: u64 = 0,
+    text_search_resolution_too_expensive_fallbacks: u64 = 0,
+    algebraic_index_unavailable_fallbacks: u64 = 0,
+    algebraic_index_not_ready_fallbacks: u64 = 0,
+    algebraic_stale_generation_fallbacks: u64 = 0,
+    algebraic_malformed_generation_fallbacks: u64 = 0,
+    algebraic_unsupported_shape_fallbacks: u64 = 0,
+    algebraic_resolution_too_expensive_fallbacks: u64 = 0,
     allocations: AllocationStats = .{},
 };
 
@@ -259,6 +274,7 @@ const MatrixComparison = struct {
     ordered_tuple_base_scan_queries: u64,
     ordered_tuple_resolved_doc_set_queries: u64,
     ordered_tuple_scalar_doc_set_queries: u64,
+    ordered_tuple_algebraic_doc_set_queries: u64,
     ordered_tuple_array_doc_set_queries: u64,
     ordered_tuple_json_doc_set_queries: u64,
     ordered_tuple_text_search_doc_set_queries: u64,
@@ -270,6 +286,8 @@ const MatrixComparison = struct {
     ordered_tuple_covering_payload_hydration_avoided_rows: u64,
     ordered_tuple_covering_payload_fallback_rows: u64,
     ordered_tuple_candidate_gate_exceeded_count: u64,
+    ordered_tuple_index_unavailable_fallbacks: u64,
+    ordered_tuple_malformed_generation_fallbacks: u64,
     ordered_tuple_access_missing_flag: bool,
     ordered_tuple_fallback_flag: bool,
 };
@@ -1464,6 +1482,7 @@ fn runQueryProbes(alloc: std.mem.Allocator, db: *db_mod.DB, cfg: Config) !QueryS
                     .base_scan => stats.base_scan_queries += 1,
                     .resolved_doc_set => stats.resolved_doc_set_queries += 1,
                     .scalar_doc_set => stats.scalar_doc_set_queries += 1,
+                    .algebraic_doc_set => stats.algebraic_doc_set_queries += 1,
                     .array_doc_set => stats.array_doc_set_queries += 1,
                     .json_doc_set => stats.json_doc_set_queries += 1,
                     .text_search_doc_set => stats.text_search_doc_set_queries += 1,
@@ -1484,11 +1503,25 @@ fn runQueryProbes(alloc: std.mem.Allocator, db: *db_mod.DB, cfg: Config) !QueryS
                     .ordered_tuple_order_tiebreaker_not_covered,
                     .ordered_tuple_collation_not_supported,
                     => stats.ordered_tuple_ordering_not_covered_fallbacks += 1,
+                    .ordered_tuple_index_unavailable => stats.ordered_tuple_index_unavailable_fallbacks += 1,
                     .ordered_tuple_index_not_ready => stats.ordered_tuple_index_not_ready_fallbacks += 1,
                     .ordered_tuple_stale_generation => stats.ordered_tuple_stale_generation_fallbacks += 1,
+                    .ordered_tuple_malformed_generation => stats.ordered_tuple_malformed_generation_fallbacks += 1,
                     .ordered_tuple_access_method_mismatch => stats.ordered_tuple_stale_generation_fallbacks += 1,
                     .ordered_tuple_predicate_not_proven => stats.ordered_tuple_predicate_not_proven_fallbacks += 1,
                     .ordered_tuple_no_usable_bounds => stats.ordered_tuple_no_usable_bounds_fallbacks += 1,
+                    .text_search_index_unavailable => stats.text_search_index_unavailable_fallbacks += 1,
+                    .text_search_index_not_ready => stats.text_search_index_not_ready_fallbacks += 1,
+                    .text_search_stale_generation => stats.text_search_stale_generation_fallbacks += 1,
+                    .text_search_malformed_generation => stats.text_search_malformed_generation_fallbacks += 1,
+                    .text_search_unsupported_shape => stats.text_search_unsupported_shape_fallbacks += 1,
+                    .text_search_resolution_too_expensive => stats.text_search_resolution_too_expensive_fallbacks += 1,
+                    .algebraic_index_unavailable => stats.algebraic_index_unavailable_fallbacks += 1,
+                    .algebraic_index_not_ready => stats.algebraic_index_not_ready_fallbacks += 1,
+                    .algebraic_stale_generation => stats.algebraic_stale_generation_fallbacks += 1,
+                    .algebraic_malformed_generation => stats.algebraic_malformed_generation_fallbacks += 1,
+                    .algebraic_unsupported_shape => stats.algebraic_unsupported_shape_fallbacks += 1,
+                    .algebraic_resolution_too_expensive => stats.algebraic_resolution_too_expensive_fallbacks += 1,
                 }
                 result.deinit(alloc);
             },
@@ -1697,6 +1730,10 @@ fn addBatchProfile(total: *db_mod.BatchProfile, delta: db_mod.BatchProfile) void
     total.relational_store_deletes += delta.relational_store_deletes;
     total.relational_store_write_bytes += delta.relational_store_write_bytes;
     total.relational_store_delete_key_bytes += delta.relational_store_delete_key_bytes;
+    total.relational_base_row_fast_path_upserts += delta.relational_base_row_fast_path_upserts;
+    total.relational_generic_upserts += delta.relational_generic_upserts;
+    total.relational_authoritative_row_lookups += delta.relational_authoritative_row_lookups;
+    total.relational_row_decodes += delta.relational_row_decodes;
     total.identity_upsert_keys += delta.identity_upsert_keys;
     total.identity_delete_keys += delta.identity_delete_keys;
     total.store_write_ns += delta.store_write_ns;
@@ -1798,7 +1835,7 @@ fn printSummary(cfg: Config, summary: Summary) void {
     );
     if (cfg.workload == .relational_rows) {
         std.debug.print(
-            "batch_bench_relational row_value_ms={d:.3} prepare_upsert_ms={d:.3} prepare_delete_ms={d:.3} prepare_identity_rewrite_ms={d:.3} row_upserts={d} row_deletes={d} identity_rewrites={d} relational_store_writes={d} relational_store_deletes={d} relational_store_mutations={d} relational_store_write_bytes={d} relational_store_delete_key_bytes={d}\n",
+            "batch_bench_relational row_value_ms={d:.3} prepare_upsert_ms={d:.3} prepare_delete_ms={d:.3} prepare_identity_rewrite_ms={d:.3} row_upserts={d} row_deletes={d} identity_rewrites={d} relational_store_writes={d} relational_store_deletes={d} relational_store_mutations={d} relational_store_write_bytes={d} relational_store_delete_key_bytes={d} base_row_fast_path_upserts={d} generic_upserts={d} authoritative_row_lookups={d} row_decodes={d}\n",
             .{
                 nsToMsFloat(summary.profile.relational_row_value_ns),
                 nsToMsFloat(summary.profile.relational_prepare_upsert_ns),
@@ -1812,6 +1849,10 @@ fn printSummary(cfg: Config, summary: Summary) void {
                 relationalStoreMutationEntries(summary.profile),
                 summary.profile.relational_store_write_bytes,
                 summary.profile.relational_store_delete_key_bytes,
+                summary.profile.relational_base_row_fast_path_upserts,
+                summary.profile.relational_generic_upserts,
+                summary.profile.relational_authoritative_row_lookups,
+                summary.profile.relational_row_decodes,
             },
         );
     }
@@ -1862,12 +1903,13 @@ fn printSummary(cfg: Config, summary: Summary) void {
             },
         );
         std.debug.print(
-            "batch_bench_query_access unknown_access_queries={d} base_scan_queries={d} resolved_doc_set_queries={d} scalar_doc_set_queries={d} array_doc_set_queries={d} json_doc_set_queries={d} text_search_doc_set_queries={d} mixed_doc_set_queries={d} ordered_tuple_doc_set_queries={d} ordered_tuple_stream_queries={d}\n",
+            "batch_bench_query_access unknown_access_queries={d} base_scan_queries={d} resolved_doc_set_queries={d} scalar_doc_set_queries={d} algebraic_doc_set_queries={d} array_doc_set_queries={d} json_doc_set_queries={d} text_search_doc_set_queries={d} mixed_doc_set_queries={d} ordered_tuple_doc_set_queries={d} ordered_tuple_stream_queries={d}\n",
             .{
                 summary.query.unknown_access_queries,
                 summary.query.base_scan_queries,
                 summary.query.resolved_doc_set_queries,
                 summary.query.scalar_doc_set_queries,
+                summary.query.algebraic_doc_set_queries,
                 summary.query.array_doc_set_queries,
                 summary.query.json_doc_set_queries,
                 summary.query.text_search_doc_set_queries,
@@ -1885,16 +1927,40 @@ fn printSummary(cfg: Config, summary: Summary) void {
             },
         );
         std.debug.print(
-            "batch_bench_query_fallbacks ordered_tuple_candidate_gate_fallbacks={d} ordered_tuple_materialization_cap_fallbacks={d} ordered_tuple_exact_paged_total_fallbacks={d} ordered_tuple_ordering_not_covered_fallbacks={d} ordered_tuple_index_not_ready_fallbacks={d} ordered_tuple_stale_generation_fallbacks={d} ordered_tuple_predicate_not_proven_fallbacks={d} ordered_tuple_no_usable_bounds_fallbacks={d}\n",
+            "batch_bench_query_fallbacks ordered_tuple_candidate_gate_fallbacks={d} ordered_tuple_materialization_cap_fallbacks={d} ordered_tuple_exact_paged_total_fallbacks={d} ordered_tuple_ordering_not_covered_fallbacks={d} ordered_tuple_index_unavailable_fallbacks={d} ordered_tuple_index_not_ready_fallbacks={d} ordered_tuple_stale_generation_fallbacks={d} ordered_tuple_malformed_generation_fallbacks={d} ordered_tuple_predicate_not_proven_fallbacks={d} ordered_tuple_no_usable_bounds_fallbacks={d}\n",
             .{
                 summary.query.ordered_tuple_candidate_gate_fallbacks,
                 summary.query.ordered_tuple_materialization_cap_fallbacks,
                 summary.query.ordered_tuple_exact_paged_total_fallbacks,
                 summary.query.ordered_tuple_ordering_not_covered_fallbacks,
+                summary.query.ordered_tuple_index_unavailable_fallbacks,
                 summary.query.ordered_tuple_index_not_ready_fallbacks,
                 summary.query.ordered_tuple_stale_generation_fallbacks,
+                summary.query.ordered_tuple_malformed_generation_fallbacks,
                 summary.query.ordered_tuple_predicate_not_proven_fallbacks,
                 summary.query.ordered_tuple_no_usable_bounds_fallbacks,
+            },
+        );
+        std.debug.print(
+            "batch_bench_query_text_search_fallbacks index_unavailable={d} index_not_ready={d} stale_generation={d} malformed_generation={d} unsupported_shape={d} resolution_too_expensive={d}\n",
+            .{
+                summary.query.text_search_index_unavailable_fallbacks,
+                summary.query.text_search_index_not_ready_fallbacks,
+                summary.query.text_search_stale_generation_fallbacks,
+                summary.query.text_search_malformed_generation_fallbacks,
+                summary.query.text_search_unsupported_shape_fallbacks,
+                summary.query.text_search_resolution_too_expensive_fallbacks,
+            },
+        );
+        std.debug.print(
+            "batch_bench_query_algebraic_fallbacks index_unavailable={d} index_not_ready={d} stale_generation={d} malformed_generation={d} unsupported_shape={d} resolution_too_expensive={d}\n",
+            .{
+                summary.query.algebraic_index_unavailable_fallbacks,
+                summary.query.algebraic_index_not_ready_fallbacks,
+                summary.query.algebraic_stale_generation_fallbacks,
+                summary.query.algebraic_malformed_generation_fallbacks,
+                summary.query.algebraic_unsupported_shape_fallbacks,
+                summary.query.algebraic_resolution_too_expensive_fallbacks,
             },
         );
         std.debug.print(
@@ -1966,6 +2032,15 @@ fn printMatrixResult(cfg: Config, selectivity: []const u8, summary: Summary) voi
         },
     );
     std.debug.print(
+        " base_row_fast_path_upserts={d} generic_upserts={d} authoritative_row_lookups={d} row_decodes={d}",
+        .{
+            summary.profile.relational_base_row_fast_path_upserts,
+            summary.profile.relational_generic_upserts,
+            summary.profile.relational_authoritative_row_lookups,
+            summary.profile.relational_row_decodes,
+        },
+    );
+    std.debug.print(
         " predicate_ms={d:.3} predicate_hits={d} exact_totals={d} query_alloc_events={d} query_alloc_bytes={d} query_peak_live_bytes={d} index_entries_scanned={d} candidate_rows={d} candidate_stream_emitted={d} retained_candidate_rows={d} candidate_stream_early_stops={d} base_scan_rows={d} max_selected_candidate_selectivity_ppm={d} max_ordered_tuple_probe_selectivity_ppm={d} candidate_gate_limit={d} candidate_gate_observed={d} iterator_seeks={d} hydrated_rows={d} residual_rechecks={d} covering_payload_rows={d} covering_payload_rechecked_rows={d} covering_payload_hydration_avoided_rows={d} covering_payload_fallback_metadata_missing_rows={d} covering_payload_fallback_row_generation_mismatch_rows={d} covering_payload_fallback_index_generation_mismatch_rows={d} covering_payload_fallback_schema_fingerprint_mismatch_rows={d} covering_payload_fallback_residual_predicate_rows={d} covering_payload_fallback_projection_shape_rows={d} projected_rows={d}",
         .{
             nsToMsFloat(summary.query.predicate_ns),
@@ -2000,12 +2075,13 @@ fn printMatrixResult(cfg: Config, selectivity: []const u8, summary: Summary) voi
         },
     );
     std.debug.print(
-        " unknown_access_queries={d} base_scan_queries={d} resolved_doc_set_queries={d} scalar_doc_set_queries={d} array_doc_set_queries={d} json_doc_set_queries={d} text_search_doc_set_queries={d} mixed_doc_set_queries={d} ordered_tuple_doc_set_queries={d} ordered_tuple_stream_queries={d} candidate_gate_fallbacks={d} materialization_cap_fallbacks={d} exact_paged_total_fallbacks={d} ordering_not_covered_fallbacks={d} index_not_ready_fallbacks={d} stale_generation_fallbacks={d} predicate_not_proven_fallbacks={d} no_usable_bounds_fallbacks={d}",
+        " unknown_access_queries={d} base_scan_queries={d} resolved_doc_set_queries={d} scalar_doc_set_queries={d} algebraic_doc_set_queries={d} array_doc_set_queries={d} json_doc_set_queries={d} text_search_doc_set_queries={d} mixed_doc_set_queries={d} ordered_tuple_doc_set_queries={d} ordered_tuple_stream_queries={d} candidate_gate_fallbacks={d} materialization_cap_fallbacks={d} exact_paged_total_fallbacks={d} ordering_not_covered_fallbacks={d} index_unavailable_fallbacks={d} index_not_ready_fallbacks={d} stale_generation_fallbacks={d} malformed_generation_fallbacks={d} predicate_not_proven_fallbacks={d} no_usable_bounds_fallbacks={d}",
         .{
             summary.query.unknown_access_queries,
             summary.query.base_scan_queries,
             summary.query.resolved_doc_set_queries,
             summary.query.scalar_doc_set_queries,
+            summary.query.algebraic_doc_set_queries,
             summary.query.array_doc_set_queries,
             summary.query.json_doc_set_queries,
             summary.query.text_search_doc_set_queries,
@@ -2016,15 +2092,31 @@ fn printMatrixResult(cfg: Config, selectivity: []const u8, summary: Summary) voi
             summary.query.ordered_tuple_materialization_cap_fallbacks,
             summary.query.ordered_tuple_exact_paged_total_fallbacks,
             summary.query.ordered_tuple_ordering_not_covered_fallbacks,
+            summary.query.ordered_tuple_index_unavailable_fallbacks,
             summary.query.ordered_tuple_index_not_ready_fallbacks,
             summary.query.ordered_tuple_stale_generation_fallbacks,
+            summary.query.ordered_tuple_malformed_generation_fallbacks,
             summary.query.ordered_tuple_predicate_not_proven_fallbacks,
             summary.query.ordered_tuple_no_usable_bounds_fallbacks,
         },
     );
     std.debug.print(
-        " candidate_gate_exceeded_count={d}\n",
-        .{summary.query.candidate_gate_exceeded_count},
+        " text_search_index_unavailable_fallbacks={d} text_search_index_not_ready_fallbacks={d} text_search_stale_generation_fallbacks={d} text_search_malformed_generation_fallbacks={d} text_search_unsupported_shape_fallbacks={d} text_search_resolution_too_expensive_fallbacks={d} algebraic_index_unavailable_fallbacks={d} algebraic_index_not_ready_fallbacks={d} algebraic_stale_generation_fallbacks={d} algebraic_malformed_generation_fallbacks={d} algebraic_unsupported_shape_fallbacks={d} algebraic_resolution_too_expensive_fallbacks={d} candidate_gate_exceeded_count={d}\n",
+        .{
+            summary.query.text_search_index_unavailable_fallbacks,
+            summary.query.text_search_index_not_ready_fallbacks,
+            summary.query.text_search_stale_generation_fallbacks,
+            summary.query.text_search_malformed_generation_fallbacks,
+            summary.query.text_search_unsupported_shape_fallbacks,
+            summary.query.text_search_resolution_too_expensive_fallbacks,
+            summary.query.algebraic_index_unavailable_fallbacks,
+            summary.query.algebraic_index_not_ready_fallbacks,
+            summary.query.algebraic_stale_generation_fallbacks,
+            summary.query.algebraic_malformed_generation_fallbacks,
+            summary.query.algebraic_unsupported_shape_fallbacks,
+            summary.query.algebraic_resolution_too_expensive_fallbacks,
+            summary.query.candidate_gate_exceeded_count,
+        },
     );
     std.debug.print(
         "batch_bench_matrix_plan workload={s} write_scenario={s} constraint_probe={s} query_shape={s} relational_index_mode={s} docs={d} selectivity={s} total_mode={s} ordered_tuple_plan_queries={d} ordered_tuple_max_key_count={d} ordered_tuple_max_equality_prefix_len={d} ordered_tuple_max_filter_predicates={d} ordered_tuple_max_proven_predicates={d} ordered_tuple_max_residual_predicates={d} ordered_tuple_range_plan_queries={d} ordered_tuple_prefix_scan_queries={d}\n",
@@ -2091,8 +2183,10 @@ fn matrixRelationalComparison(
         ordered_tuple.query.ordered_tuple_materialization_cap_fallbacks != 0 or
         ordered_tuple.query.ordered_tuple_exact_paged_total_fallbacks != 0 or
         ordered_tuple.query.ordered_tuple_ordering_not_covered_fallbacks != 0 or
+        ordered_tuple.query.ordered_tuple_index_unavailable_fallbacks != 0 or
         ordered_tuple.query.ordered_tuple_index_not_ready_fallbacks != 0 or
         ordered_tuple.query.ordered_tuple_stale_generation_fallbacks != 0 or
+        ordered_tuple.query.ordered_tuple_malformed_generation_fallbacks != 0 or
         ordered_tuple.query.ordered_tuple_predicate_not_proven_fallbacks != 0 or
         ordered_tuple.query.ordered_tuple_no_usable_bounds_fallbacks != 0;
     const ordered_tuple_access_missing = ordered_tuple.query.predicate_repeats != 0 and
@@ -2135,6 +2229,7 @@ fn matrixRelationalComparison(
         .ordered_tuple_base_scan_queries = ordered_tuple.query.base_scan_queries,
         .ordered_tuple_resolved_doc_set_queries = ordered_tuple.query.resolved_doc_set_queries,
         .ordered_tuple_scalar_doc_set_queries = ordered_tuple.query.scalar_doc_set_queries,
+        .ordered_tuple_algebraic_doc_set_queries = ordered_tuple.query.algebraic_doc_set_queries,
         .ordered_tuple_array_doc_set_queries = ordered_tuple.query.array_doc_set_queries,
         .ordered_tuple_json_doc_set_queries = ordered_tuple.query.json_doc_set_queries,
         .ordered_tuple_text_search_doc_set_queries = ordered_tuple.query.text_search_doc_set_queries,
@@ -2151,6 +2246,8 @@ fn matrixRelationalComparison(
             ordered_tuple.query.covering_payload_fallback_residual_predicate_rows +
             ordered_tuple.query.covering_payload_fallback_projection_shape_rows,
         .ordered_tuple_candidate_gate_exceeded_count = ordered_tuple.query.candidate_gate_exceeded_count,
+        .ordered_tuple_index_unavailable_fallbacks = ordered_tuple.query.ordered_tuple_index_unavailable_fallbacks,
+        .ordered_tuple_malformed_generation_fallbacks = ordered_tuple.query.ordered_tuple_malformed_generation_fallbacks,
         .ordered_tuple_access_missing_flag = ordered_tuple_access_missing,
         .ordered_tuple_fallback_flag = ordered_tuple_flagged,
     };
@@ -2201,11 +2298,12 @@ fn printMatrixRelationalComparison(comparison: MatrixComparison) void {
         },
     );
     std.debug.print(
-        " ordered_tuple_base_scan_queries={d} ordered_tuple_resolved_doc_set_queries={d} ordered_tuple_scalar_doc_set_queries={d} ordered_tuple_array_doc_set_queries={d} ordered_tuple_json_doc_set_queries={d} ordered_tuple_text_search_doc_set_queries={d} ordered_tuple_mixed_doc_set_queries={d} ordered_tuple_doc_set_queries={d} ordered_tuple_stream_queries={d} ordered_tuple_covering_payload_rows={d} ordered_tuple_covering_payload_rechecked_rows={d} ordered_tuple_covering_payload_hydration_avoided_rows={d} ordered_tuple_covering_payload_fallback_rows={d} ordered_tuple_candidate_gate_exceeded_count={d} ordered_tuple_access_missing_flag={any} ordered_tuple_fallback_flag={any}\n",
+        " ordered_tuple_base_scan_queries={d} ordered_tuple_resolved_doc_set_queries={d} ordered_tuple_scalar_doc_set_queries={d} ordered_tuple_algebraic_doc_set_queries={d} ordered_tuple_array_doc_set_queries={d} ordered_tuple_json_doc_set_queries={d} ordered_tuple_text_search_doc_set_queries={d} ordered_tuple_mixed_doc_set_queries={d} ordered_tuple_doc_set_queries={d} ordered_tuple_stream_queries={d} ordered_tuple_covering_payload_rows={d} ordered_tuple_covering_payload_rechecked_rows={d} ordered_tuple_covering_payload_hydration_avoided_rows={d} ordered_tuple_covering_payload_fallback_rows={d} ordered_tuple_candidate_gate_exceeded_count={d} ordered_tuple_index_unavailable_fallbacks={d} ordered_tuple_malformed_generation_fallbacks={d} ordered_tuple_access_missing_flag={any} ordered_tuple_fallback_flag={any}\n",
         .{
             comparison.ordered_tuple_base_scan_queries,
             comparison.ordered_tuple_resolved_doc_set_queries,
             comparison.ordered_tuple_scalar_doc_set_queries,
+            comparison.ordered_tuple_algebraic_doc_set_queries,
             comparison.ordered_tuple_array_doc_set_queries,
             comparison.ordered_tuple_json_doc_set_queries,
             comparison.ordered_tuple_text_search_doc_set_queries,
@@ -2217,6 +2315,8 @@ fn printMatrixRelationalComparison(comparison: MatrixComparison) void {
             comparison.ordered_tuple_covering_payload_hydration_avoided_rows,
             comparison.ordered_tuple_covering_payload_fallback_rows,
             comparison.ordered_tuple_candidate_gate_exceeded_count,
+            comparison.ordered_tuple_index_unavailable_fallbacks,
+            comparison.ordered_tuple_malformed_generation_fallbacks,
             comparison.ordered_tuple_access_missing_flag,
             comparison.ordered_tuple_fallback_flag,
         },

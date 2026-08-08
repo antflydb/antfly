@@ -399,6 +399,7 @@ pub fn addBenchSteps(ctx: anytype) BenchSteps {
             "--repeats",    "3",
             "--batch-size", "1000",
             "--limit",      "100",
+            "--primary",    "mem",
         });
     }
     const relational_read_bench_step = b.step("relational-read-bench", "Benchmark relational read selectivity, total-mode, and index-policy matrix");
@@ -504,6 +505,7 @@ pub fn addBenchSteps(ctx: anytype) BenchSteps {
     text_segment_bench_root_mod.addImport("bloom", bloom_mod);
     text_segment_bench_root_mod.addImport("antfly_vellum", vellum_mod);
     text_segment_bench_root_mod.addImport("antfly_platform", platform_mod);
+    text_segment_bench_root_mod.addImport("lmdb_engine", lmdb_engine_mod);
     text_segment_write_bench_mod.addImport("antfly_text_bench", text_segment_bench_root_mod);
     const text_segment_write_bench = b.addExecutable(.{
         .name = "text_segment_write_bench",
@@ -1352,6 +1354,42 @@ pub fn addBenchSteps(ctx: anytype) BenchSteps {
     const batch_bench_step = b.step("batch-bench", "Benchmark overwrite-heavy batch writes and bulk-session coalescing");
     batch_bench_step.dependOn(&run_batch_bench.step);
 
+    const relational_write_fast_path_bench_mod = b.createModule(.{
+        .root_source_file = b.path("bench/storage/relational_write_fast_path_bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    relational_write_fast_path_bench_mod.addImport("antfly-zig", replay_bench_root_mod);
+    const relational_write_fast_path_bench = b.addExecutable(.{
+        .name = "relational_write_fast_path_bench",
+        .root_module = relational_write_fast_path_bench_mod,
+    });
+    const run_relational_write_fast_path_bench = b.addRunArtifact(relational_write_fast_path_bench);
+    if (b.args) |args| run_relational_write_fast_path_bench.addArgs(args);
+    const relational_write_fast_path_bench_step = b.step(
+        "relational-write-fast-path-bench",
+        "Compare former and schema-backed base-row write paths",
+    );
+    relational_write_fast_path_bench_step.dependOn(&run_relational_write_fast_path_bench.step);
+
+    const relational_index_maintenance_bench_mod = b.createModule(.{
+        .root_source_file = b.path("bench/storage/relational_index_maintenance_bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    relational_index_maintenance_bench_mod.addImport("antfly-zig", replay_bench_root_mod);
+    const relational_index_maintenance_bench = b.addExecutable(.{
+        .name = "relational_index_maintenance_bench",
+        .root_module = relational_index_maintenance_bench_mod,
+    });
+    const run_relational_index_maintenance_bench = b.addRunArtifact(relational_index_maintenance_bench);
+    if (b.args) |args| run_relational_index_maintenance_bench.addArgs(args);
+    const relational_index_maintenance_bench_step = b.step(
+        "relational-index-maintenance-bench",
+        "Benchmark nullable and multi-index write churn, cleanup, memory, and rebuild cost",
+    );
+    relational_index_maintenance_bench_step.dependOn(&run_relational_index_maintenance_bench.step);
+
     const run_relational_index_bench_matrix = b.addRunArtifact(batch_bench);
     if (b.args) |args| {
         run_relational_index_bench_matrix.addArgs(args);
@@ -1426,6 +1464,8 @@ pub fn addBenchSteps(ctx: anytype) BenchSteps {
     algebraic_bench_root_mod.addImport("bloom", bloom_mod);
     algebraic_bench_root_mod.addImport("antfly_vector", vector_mod);
     algebraic_bench_root_mod.addImport("antfly_vectorindex", vectorindex_mod);
+    algebraic_bench_root_mod.addImport("antfly_matcher", matcher_mod);
+    algebraic_bench_root_mod.addImport("antfly_resolver", resolver_mod);
     algebraic_bench_root_mod.addImport("antfly_vellum", vellum_mod);
     algebraic_bench_root_mod.addImport("antfly_regex", regex_mod);
     algebraic_bench_root_mod.addImport("antfly_platform", platform_mod);

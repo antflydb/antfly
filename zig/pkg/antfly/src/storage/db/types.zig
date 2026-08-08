@@ -1544,6 +1544,7 @@ pub const RelationalRowsQueryRequest = struct {
     limit: ?u32 = null,
     offset: u32 = 0,
     total_mode: TotalMode = .exact,
+    require_algebraic_filter_resolution: bool = false,
     profile: bool = false,
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
@@ -2042,6 +2043,7 @@ pub const RelationalRowsQueryResult = struct {
         array_doc_set,
         json_doc_set,
         text_search_doc_set,
+        algebraic_doc_set,
         mixed_doc_set,
         ordered_tuple_doc_set,
         ordered_tuple_stream,
@@ -2053,8 +2055,10 @@ pub const RelationalRowsQueryResult = struct {
         ordered_tuple_candidate_gate,
         ordered_tuple_materialization_cap,
         ordered_tuple_ordering_not_covered,
+        ordered_tuple_index_unavailable,
         ordered_tuple_index_not_ready,
         ordered_tuple_stale_generation,
+        ordered_tuple_malformed_generation,
         ordered_tuple_access_method_mismatch,
         ordered_tuple_predicate_not_proven,
         ordered_tuple_no_usable_bounds,
@@ -2064,6 +2068,42 @@ pub const RelationalRowsQueryResult = struct {
         ordered_tuple_order_collation_not_covered,
         ordered_tuple_order_tiebreaker_not_covered,
         ordered_tuple_collation_not_supported,
+        text_search_index_unavailable,
+        text_search_index_not_ready,
+        text_search_stale_generation,
+        text_search_malformed_generation,
+        text_search_unsupported_shape,
+        text_search_resolution_too_expensive,
+        algebraic_index_unavailable,
+        algebraic_index_not_ready,
+        algebraic_stale_generation,
+        algebraic_malformed_generation,
+        algebraic_unsupported_shape,
+        algebraic_resolution_too_expensive,
+    };
+
+    pub const FallbackClass = enum {
+        none,
+        unavailable,
+        stale,
+        malformed,
+        too_expensive,
+        unsupported_shape,
+
+        pub fn name(self: @This()) []const u8 {
+            return switch (self) {
+                .none => "none",
+                .unavailable => "unavailable",
+                .stale => "stale",
+                .malformed => "malformed",
+                .too_expensive => "too-expensive",
+                .unsupported_shape => "unsupported-shape",
+            };
+        }
+
+        pub fn jsonStringify(self: @This(), jw: anytype) !void {
+            try jw.write(self.name());
+        }
     };
 
     pub const UnsupportedReason = enum {
@@ -2072,7 +2112,11 @@ pub const RelationalRowsQueryResult = struct {
         predicate_not_proven,
         ordering_not_covered,
         index_not_ready,
+        index_unavailable,
         stale_generation,
+        malformed_generation,
+        resolution_too_expensive,
+        unsupported_shape,
         access_method_capability_mismatch,
 
         pub fn name(self: @This()) []const u8 {
@@ -2082,7 +2126,11 @@ pub const RelationalRowsQueryResult = struct {
                 .predicate_not_proven => "predicate-not-proven",
                 .ordering_not_covered => "ordering-not-covered",
                 .index_not_ready => "index-not-ready",
+                .index_unavailable => "index-unavailable",
                 .stale_generation => "stale-generation",
+                .malformed_generation => "malformed-generation",
+                .resolution_too_expensive => "resolution-too-expensive",
+                .unsupported_shape => "unsupported-shape",
                 .access_method_capability_mismatch => "access-method-capability-mismatch",
             };
         }
@@ -2106,14 +2154,67 @@ pub const RelationalRowsQueryResult = struct {
                 .{ "ordering_not_covered", .ordering_not_covered },
                 .{ "index-not-ready", .index_not_ready },
                 .{ "index_not_ready", .index_not_ready },
+                .{ "index-unavailable", .index_unavailable },
+                .{ "index_unavailable", .index_unavailable },
                 .{ "stale-generation", .stale_generation },
                 .{ "stale_generation", .stale_generation },
+                .{ "malformed-generation", .malformed_generation },
+                .{ "malformed_generation", .malformed_generation },
+                .{ "resolution-too-expensive", .resolution_too_expensive },
+                .{ "resolution_too_expensive", .resolution_too_expensive },
+                .{ "unsupported-shape", .unsupported_shape },
+                .{ "unsupported_shape", .unsupported_shape },
                 .{ "access-method-capability-mismatch", .access_method_capability_mismatch },
                 .{ "access_method_capability_mismatch", .access_method_capability_mismatch },
             });
             return map.get(s) orelse error.UnexpectedToken;
         }
     };
+
+    pub fn fallbackClass(reason: FallbackReason) FallbackClass {
+        return switch (reason) {
+            .none => .none,
+
+            .ordered_tuple_index_unavailable,
+            .ordered_tuple_index_not_ready,
+            .text_search_index_unavailable,
+            .text_search_index_not_ready,
+            .algebraic_index_unavailable,
+            .algebraic_index_not_ready,
+            => .unavailable,
+
+            .ordered_tuple_stale_generation,
+            .text_search_stale_generation,
+            .algebraic_stale_generation,
+            => .stale,
+
+            .ordered_tuple_malformed_generation,
+            .text_search_malformed_generation,
+            .algebraic_malformed_generation,
+            => .malformed,
+
+            .ordered_tuple_skipped_for_exact_paged_total,
+            .ordered_tuple_candidate_gate,
+            .ordered_tuple_materialization_cap,
+            .text_search_resolution_too_expensive,
+            .algebraic_resolution_too_expensive,
+            => .too_expensive,
+
+            .ordered_tuple_ordering_not_covered,
+            .ordered_tuple_access_method_mismatch,
+            .ordered_tuple_predicate_not_proven,
+            .ordered_tuple_no_usable_bounds,
+            .ordered_tuple_order_field_not_covered,
+            .ordered_tuple_order_direction_not_covered,
+            .ordered_tuple_order_nulls_not_covered,
+            .ordered_tuple_order_collation_not_covered,
+            .ordered_tuple_order_tiebreaker_not_covered,
+            .ordered_tuple_collation_not_supported,
+            .text_search_unsupported_shape,
+            .algebraic_unsupported_shape,
+            => .unsupported_shape,
+        };
+    }
 
     pub const CandidateStreamStopReason = enum {
         none,
@@ -2150,13 +2251,17 @@ pub const RelationalRowsQueryResult = struct {
 
     pub fn unsupportedReasonForFallback(reason: FallbackReason) UnsupportedReason {
         return switch (reason) {
-            .none,
+            .none => .none,
+
             .ordered_tuple_skipped_for_exact_paged_total,
             .ordered_tuple_candidate_gate,
             .ordered_tuple_materialization_cap,
-            => .none,
+            .text_search_resolution_too_expensive,
+            .algebraic_resolution_too_expensive,
+            => .resolution_too_expensive,
 
-            .ordered_tuple_predicate_not_proven => .predicate_not_proven,
+            .ordered_tuple_predicate_not_proven,
+            => .predicate_not_proven,
 
             .ordered_tuple_ordering_not_covered,
             .ordered_tuple_order_field_not_covered,
@@ -2166,8 +2271,29 @@ pub const RelationalRowsQueryResult = struct {
             .ordered_tuple_order_tiebreaker_not_covered,
             => .ordering_not_covered,
 
-            .ordered_tuple_index_not_ready => .index_not_ready,
-            .ordered_tuple_stale_generation => .stale_generation,
+            .ordered_tuple_index_not_ready,
+            .text_search_index_not_ready,
+            .algebraic_index_not_ready,
+            => .index_not_ready,
+
+            .ordered_tuple_index_unavailable,
+            .text_search_index_unavailable,
+            .algebraic_index_unavailable,
+            => .index_unavailable,
+
+            .ordered_tuple_stale_generation,
+            .text_search_stale_generation,
+            .algebraic_stale_generation,
+            => .stale_generation,
+
+            .ordered_tuple_malformed_generation,
+            .text_search_malformed_generation,
+            .algebraic_malformed_generation,
+            => .malformed_generation,
+
+            .text_search_unsupported_shape,
+            .algebraic_unsupported_shape,
+            => .unsupported_shape,
 
             .ordered_tuple_access_method_mismatch => .unsupported_access_method,
 
@@ -2199,6 +2325,11 @@ pub const RelationalRowsQueryResult = struct {
         array_candidate_sets: u32 = 0,
         json_candidate_sets: u32 = 0,
         text_search_candidate_sets: u32 = 0,
+        algebraic_candidate_sets: u32 = 0,
+        algebraic_plans_considered: u32 = 0,
+        algebraic_plans_admitted: u32 = 0,
+        algebraic_plans_rejected: u32 = 0,
+        algebraic_selected_candidate_sets: u32 = 0,
         mixed_candidate_sets: u32 = 0,
         ordered_tuple_candidate_sets: u32 = 0,
         selected_candidate_estimated_rows: u64 = 0,
@@ -2216,12 +2347,15 @@ pub const RelationalRowsQueryResult = struct {
         candidate_gate_limit: u64 = 0,
         candidate_gate_observed: u64 = 0,
         candidate_gate_exceeded: bool = false,
+        candidate_buffer_peak_rows: u64 = 0,
+        candidate_buffer_peak_bytes: u64 = 0,
         iterator_seeks: u64 = 0,
         hydrated_rows: u64 = 0,
         residual_rechecks: u64 = 0,
         covering_payload_rows: u64 = 0,
         covering_payload_rechecked_rows: u64 = 0,
         covering_payload_hydration_avoided_rows: u64 = 0,
+        covering_payload_generation_batches: u64 = 0,
         covering_payload_fallback_metadata_missing_rows: u64 = 0,
         covering_payload_fallback_row_generation_mismatch_rows: u64 = 0,
         covering_payload_fallback_index_generation_mismatch_rows: u64 = 0,
@@ -2239,6 +2373,10 @@ pub const RelationalRowsQueryResult = struct {
         pub fn unsupportedReason(self: @This()) UnsupportedReason {
             if (self.unsupported_reason != .none) return self.unsupported_reason;
             return RelationalRowsQueryResult.unsupportedReasonForFallback(self.fallback_reason);
+        }
+
+        pub fn fallbackClass(self: @This()) FallbackClass {
+            return RelationalRowsQueryResult.fallbackClass(self.fallback_reason);
         }
 
         pub fn refreshUnsupportedReason(self: *@This()) void {

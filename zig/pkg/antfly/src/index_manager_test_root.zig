@@ -17,4 +17,7 @@ pub const lsm_backend = @import("storage/lsm_backend.zig");
 
 test {
     _ = @import("storage/db/catalog/index_manager.zig");
+    _ = @import("storage/db/document_mapper.zig");
+    _ = @import("storage/db/algebraic/index.zig");
+    _ = @import("storage/db/algebraic/lexical.zig");
 }

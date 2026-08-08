@@ -518,6 +518,21 @@ pub const DocStore = struct {
             try self.write.?.delete(key);
         }
 
+        pub fn applyMutations(self: *Txn, mutations: []const backend_types.KeyMutation) !void {
+            if (supports_lmdb) {
+                if (self.raw) |*raw| {
+                    for (mutations) |mutation| switch (mutation) {
+                        .put => |put_mutation| try raw.put(self.dbi, put_mutation.key, put_mutation.value, .{}),
+                        .delete => |delete_mutation| raw.delete(self.dbi, delete_mutation.key) catch |err| {
+                            if (!delete_mutation.ignore_missing or err != error.NotFound) return err;
+                        },
+                    };
+                    return;
+                }
+            }
+            try self.write.?.applyMutations(mutations);
+        }
+
         pub fn cursor(self: *Txn) !LmdbCursor {
             if (!supports_lmdb) return error.Unsupported;
             var raw = self.raw orelse return error.Unsupported;
@@ -614,6 +629,21 @@ pub const DocStore = struct {
                     }
                 }
                 try self.runtime.?.delete(key);
+            }
+
+            pub fn applyMutations(self: @This(), mutations: []const backend_types.KeyMutation) !void {
+                if (supports_lmdb) {
+                    if (self.raw) |raw| {
+                        for (mutations) |mutation| switch (mutation) {
+                            .put => |put_mutation| try raw.put(self.dbi, put_mutation.key, put_mutation.value, .{}),
+                            .delete => |delete_mutation| raw.delete(self.dbi, delete_mutation.key) catch |err| {
+                                if (!delete_mutation.ignore_missing or err != error.NotFound) return err;
+                            },
+                        };
+                        return;
+                    }
+                }
+                try self.runtime.?.applyMutations(mutations);
             }
 
             pub fn openCursor(self: @This()) !backend_erased.Cursor {

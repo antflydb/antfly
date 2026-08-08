@@ -664,6 +664,14 @@ Rebuild work records durable owner-range progress with leases, completed-row
 counts, resume row keys, and error state; SQL DDL never owns a separate backend
 cursor or hidden physical index job.
 
+`DROP INDEX` for segment-backed text search and algebraic access methods maps to
+the same native two-step lifecycle: atomically mark the expected generation
+`dropping`, then let bounded catalog workers delete physical artifacts and
+finalize removal. The dropping definition is immediately ineligible for plans
+and derived maintenance but does not make ordinary table writes unavailable.
+Cleanup cursors remain generation-owned catalog metadata rather than SQL job
+state, making retries and failover reject stale generations consistently.
+
 Lowered SQL index definitions should populate the native
 `TableSchema.relational_indexes` catalog shape: stable index name, owner kind,
 owner name, access method, uniqueness, key columns, include columns, ordered key
