@@ -36,9 +36,11 @@ const backup_codec = antfly.backup_codec;
 const portable_backup = antfly.portable_backup;
 const batch_api = antfly.public_api.batch;
 const query_api = antfly.public_api.query;
+const tables_api = antfly.public_api.tables;
 const table_reads_api = antfly.public_api.table_reads;
 const distributed_graph = antfly.public_api.distributed_graph;
 const runtime_status = antfly.public_api.runtime_status;
+const shard_state_store = antfly.data_snapshot;
 const Allocator = std.mem.Allocator;
 
 const lite_abi_version: u32 = 1;
@@ -116,6 +118,24 @@ const Handle = struct {
     ) !void {
         const hook = self.readable_lease_hook orelse return;
         try hook.featureReads().prepareScan(hook.group_id, from_key, to_key, opts);
+    }
+};
+
+const StorageSnapshot = struct {
+    alloc: Allocator,
+    preparation: db_mod.generation_lifecycle.PreparationTransition,
+    staged: db_mod.generation_lifecycle.StagedGeneration,
+    transition: ?db_mod.generation_lifecycle.ExclusiveTransition = null,
+    published: bool = false,
+    finalized: bool = false,
+
+    fn deinit(self: *StorageSnapshot) void {
+        self.staged.deinit();
+        if (self.transition) |*transition| transition.deinit();
+        self.preparation.deinit();
+        const alloc = self.alloc;
+        self.* = undefined;
+        alloc.destroy(self);
     }
 };
 
@@ -1767,6 +1787,136 @@ pub fn storageOwnerApplyHAReplicationRecord(
         .payload = request.payload.slice(),
     }) catch |err| return storageOwnerStatusFromError(err);
     return .ok;
+}
+
+fn prepareStorageSnapshot(request: *const kernel_owner_abi.SnapshotPrepareRequest) !*StorageSnapshot {
+    const alloc = std.heap.c_allocator;
+    const path = request.path.slice();
+    const table_name = request.table_name.slice();
+    if (path.len == 0 or table_name.len == 0 or request.group_id == 0) return error.InvalidArgument;
+
+    const state = try shard_state_store.GroupStateSnapshotStream.init(request.encoded_snapshot.slice());
+    try shard_state_store.validateGroupStateSnapshotStream(alloc, request.group_id, state);
+
+    var preparation = try db_mod.generation_lifecycle.beginProcessPreparationWithRuntime(path, null);
+    var preparation_owned = true;
+    errdefer if (preparation_owned) preparation.deinit();
+    var staged = try preparation.beginStaging();
+    var staged_owned = true;
+    errdefer if (staged_owned) staged.deinit();
+
+    var db = try db_mod.DB.open(alloc, staged.path(), .{
+        .lsm_root_generation = request.lsm_root_generation,
+        .staged_generation = &staged,
+        .identity_namespace = .{
+            .table_id = request.identity_table_id,
+            .shard_id = request.identity_shard_id,
+            .range_id = request.identity_range_id,
+        },
+        .prefer_existing_identity_namespace = true,
+    });
+    var db_open = true;
+    defer if (db_open) db.close();
+    try antfly.public_api.table_writes.configureStorageKernelOwnerDb(
+        alloc,
+        &db,
+        request.schema_json.slice(),
+        request.indexes_json.slice(),
+    );
+
+    var parsed_schema: ?tables_api.ParsedTableSchema = null;
+    if (request.schema_json.len > 0)
+        parsed_schema = try tables_api.parseValidatedTableSchema(alloc, request.schema_json.slice());
+    defer if (parsed_schema) |*schema| schema.deinit(alloc);
+
+    const max_chunk_entries = 512;
+    const max_chunk_payload_bytes = 4 * 1024 * 1024;
+    var writes_buffer: [max_chunk_entries]db_mod.types.BatchWrite = undefined;
+    var entries = state.entries();
+    var exhausted = false;
+    while (!exhausted) {
+        var chunk_len: usize = 0;
+        var chunk_payload_bytes: usize = 0;
+        while (chunk_len < writes_buffer.len) {
+            var candidate_entries = entries;
+            const entry = (try candidate_entries.next()) orelse {
+                exhausted = true;
+                break;
+            };
+            const entry_bytes = std.math.add(usize, entry.key.len, entry.value.len) catch return error.SnapshotTooLarge;
+            if (chunk_len > 0 and entry_bytes > max_chunk_payload_bytes -| chunk_payload_bytes) break;
+            entries = candidate_entries;
+            writes_buffer[chunk_len] = .{ .key = entry.key, .value = entry.value };
+            chunk_len += 1;
+            chunk_payload_bytes = std.math.add(usize, chunk_payload_bytes, entry_bytes) catch return error.SnapshotTooLarge;
+        }
+        if (chunk_len == 0) break;
+        const writes = writes_buffer[0..chunk_len];
+        if (parsed_schema) |schema| try tables_api.validateWritesAgainstTableSchema(alloc, schema, writes);
+        try db.appendRaftDocumentSnapshotChunk(&staged, state.byte_range, writes);
+    }
+    try db.finishRaftDocumentSnapshot(&staged, state.byte_range);
+    try db.sync(true);
+    try db.syncIndexes(true);
+    db.close();
+    db_open = false;
+    try staged.seal();
+
+    const snapshot = try alloc.create(StorageSnapshot);
+    snapshot.* = .{
+        .alloc = alloc,
+        .preparation = preparation,
+        .staged = staged,
+    };
+    preparation_owned = false;
+    staged_owned = false;
+    return snapshot;
+}
+
+pub fn storageSnapshotPrepare(
+    request: *const kernel_owner_abi.SnapshotPrepareRequest,
+    out_snapshot: *?*anyopaque,
+) callconv(.c) kernel_owner_abi.Status {
+    out_snapshot.* = null;
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const snapshot = prepareStorageSnapshot(request) catch |err| return storageOwnerStatusFromError(err);
+    out_snapshot.* = snapshot;
+    return .ok;
+}
+
+pub fn storageSnapshotPublishPrepared(
+    snapshot_handle: ?*anyopaque,
+    out_result: *kernel_owner_abi.SnapshotPublishResult,
+) callconv(.c) kernel_owner_abi.Status {
+    out_result.* = .{};
+    const snapshot: *StorageSnapshot = @ptrCast(@alignCast(snapshot_handle orelse return .invalid_argument));
+    if (snapshot.published or snapshot.finalized) return .invalid_argument;
+    snapshot.transition = snapshot.preparation.promote() catch |err| return storageOwnerStatusFromError(err);
+    const outcome = snapshot.staged.publishPrepared() catch |err| return storageOwnerStatusFromError(err);
+    snapshot.published = true;
+    out_result.durability_uncertain = @intFromBool(outcome == .durability_uncertain);
+    return .ok;
+}
+
+pub fn storageSnapshotCommit(snapshot_handle: ?*anyopaque) callconv(.c) kernel_owner_abi.Status {
+    const snapshot: *StorageSnapshot = @ptrCast(@alignCast(snapshot_handle orelse return .invalid_argument));
+    if (!snapshot.published or snapshot.finalized) return .invalid_argument;
+    snapshot.staged.commitPublication() catch |err| return storageOwnerStatusFromError(err);
+    snapshot.finalized = true;
+    return .ok;
+}
+
+pub fn storageSnapshotRollback(snapshot_handle: ?*anyopaque) callconv(.c) kernel_owner_abi.Status {
+    const snapshot: *StorageSnapshot = @ptrCast(@alignCast(snapshot_handle orelse return .invalid_argument));
+    if (!snapshot.published or snapshot.finalized) return .invalid_argument;
+    snapshot.staged.rollbackPublication() catch |err| return storageOwnerStatusFromError(err);
+    snapshot.finalized = true;
+    return .ok;
+}
+
+pub fn storageSnapshotDestroy(snapshot_handle: ?*anyopaque) callconv(.c) void {
+    const snapshot: *StorageSnapshot = @ptrCast(@alignCast(snapshot_handle orelse return));
+    snapshot.deinit();
 }
 
 fn batchStorageKernelJson(

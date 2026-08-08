@@ -26,6 +26,7 @@ const read_gate = @import("../raft/read_gate.zig");
 const table_catalog = @import("../api/table_catalog.zig");
 const table_reads = @import("../api/table_reads.zig");
 const table_writes = @import("../api/table_writes.zig");
+const shard_state_store = @import("../data/storage/shard_state_store.zig");
 
 fn cleanup(path: []const u8) void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -40,19 +41,28 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
     defer cleanup(replica_root);
 
     const Catalog = struct {
-        fn iface() table_catalog.CatalogSource {
+        const metadata_incarnation: metadata_api.MetadataClusterIncarnation = "31313131313131313131313131313131".*;
+
+        accept_publication: bool = true,
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
             return .{
-                .ptr = undefined,
+                .ptr = self,
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .validate_publication = validatePublication,
                 },
             };
         }
 
         fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
             return .{
-                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .status = .{
+                    .metadata_group_id = 1,
+                    .metadata_incarnation = metadata_incarnation,
+                    .metrics = .{},
+                },
                 .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
                     .table_id = 7,
                     .name = "articles",
@@ -70,6 +80,7 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
                 .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
                     .group_id = 7001,
                     .table_id = 7,
+                    .range_id = 7001,
                     .start_key = "",
                     .end_key = null,
                 }})[0..]),
@@ -81,6 +92,13 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
         }
 
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn validatePublication(ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!self.accept_publication) return false;
+            var snapshot = try adminSnapshot(ptr);
+            return contract.matches(&snapshot);
+        }
     };
 
     const LeaseCapture = struct {
@@ -101,25 +119,61 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
         }
     };
 
+    const GenerationTracker = struct {
+        generation: u64 = table_reads.backend_current_root_generation,
+        reservations: usize = 0,
+
+        fn iface(self: *@This()) table_reads.GroupVisibleRootGenerationSource {
+            return .{
+                .ptr = self,
+                .visible_root_generation_for_group = visible,
+                .reserve_root_generation_for_group = reserve,
+                .finish_root_generation_reservation = finish,
+            };
+        }
+
+        fn visible(ptr: *anyopaque, _: u64) u64 {
+            return (@as(*@This(), @ptrCast(@alignCast(ptr)))).generation;
+        }
+
+        fn reserve(ptr: *anyopaque, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.reservations += 1;
+        }
+
+        fn finish(ptr: *anyopaque, _: u64, advance: bool) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            std.debug.assert(self.reservations > 0);
+            if (advance) self.generation +%= 1;
+            self.reservations -= 1;
+        }
+    };
+
+    var catalog = Catalog{};
     var lease_capture = LeaseCapture{};
+    var generations = GenerationTracker{};
     var owner_source = kernel_owner_source.ProvisionedKernelOwnerSource.init(
         alloc,
         replica_root,
-        Catalog.iface(),
+        catalog.iface(),
         lease_capture.requester(),
     );
+    _ = owner_source.withGroupVisibleRootGeneration(generations.iface());
     var owner_source_active = true;
     defer if (owner_source_active) owner_source.deinit();
-    var write_source = table_writes.ProvisionedTableWriteSource.init(replica_root, Catalog.iface());
+    var write_source = table_writes.ProvisionedTableWriteSource.init(replica_root, catalog.iface());
     var write_source_active = true;
     defer if (write_source_active) write_source.deinit();
     _ = write_source.withLocalWriteSource(owner_source.writeSource());
+    _ = write_source.withStorageSnapshotSource(owner_source.snapshotSource());
+    _ = write_source.withGroupVisibleRootGeneration(generations.iface());
     var read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        Catalog.iface(),
+        catalog.iface(),
         lease_capture.requester(),
     );
     _ = read_source.withLocalReadSource(owner_source.readSource());
+    _ = read_source.withGroupVisibleRootGeneration(generations.iface());
 
     _ = try write_source.source().batch(alloc, "articles", .{
         .writes = &.{
@@ -445,6 +499,71 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
     try std.testing.expect(std.mem.indexOf(u8, reopened_lookup.json, "beta") != null);
     try std.testing.expectEqual(@as(usize, 1), owner_source.ownerCountForTest());
     try std.testing.expectEqual(@as(usize, 15), lease_capture.count);
+
+    const accepted_snapshot = try shard_state_store.encodeGroupStateSnapshot(
+        alloc,
+        .{ .start = "", .end = "" },
+        &.{.{
+            .key = "doc:snapshot",
+            .value = "{\"title\":\"published snapshot\",\"category\":\"archive\",\"amount\":30}",
+        }},
+        &.{},
+    );
+    defer alloc.free(accepted_snapshot);
+    try write_source.installRaftSnapshotGroupLocal(alloc, 7001, accepted_snapshot);
+    try std.testing.expectEqual(@as(usize, 0), owner_source.ownerCountForTest());
+    try std.testing.expectEqual(@as(u64, 1), generations.generation);
+    try std.testing.expectEqual(@as(usize, 0), generations.reservations);
+    try std.testing.expect((try read_source.source().lookup(
+        alloc,
+        "articles",
+        "doc:b",
+        .{},
+        .read_index,
+    )) == null);
+    var published_snapshot_lookup = (try read_source.source().lookup(
+        alloc,
+        "articles",
+        "doc:snapshot",
+        .{},
+        .read_index,
+    )).?;
+    defer published_snapshot_lookup.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, published_snapshot_lookup.json, "published snapshot") != null);
+    try std.testing.expectEqual(@as(usize, 1), owner_source.ownerCountForTest());
+
+    const rejected_snapshot = try shard_state_store.encodeGroupStateSnapshot(
+        alloc,
+        .{ .start = "", .end = "" },
+        &.{.{ .key = "doc:rejected", .value = "{\"title\":\"rejected snapshot\"}" }},
+        &.{},
+    );
+    defer alloc.free(rejected_snapshot);
+    catalog.accept_publication = false;
+    try std.testing.expectError(
+        error.CatalogChanged,
+        write_source.installRaftSnapshotGroupLocal(alloc, 7001, rejected_snapshot),
+    );
+    try std.testing.expectEqual(@as(usize, 0), owner_source.ownerCountForTest());
+    try std.testing.expectEqual(@as(u64, 1), generations.generation);
+    try std.testing.expectEqual(@as(usize, 0), generations.reservations);
+    try std.testing.expect((try read_source.source().lookup(
+        alloc,
+        "articles",
+        "doc:rejected",
+        .{},
+        .read_index,
+    )) == null);
+    var rolled_back_snapshot_lookup = (try read_source.source().lookup(
+        alloc,
+        "articles",
+        "doc:snapshot",
+        .{},
+        .read_index,
+    )).?;
+    defer rolled_back_snapshot_lookup.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, rolled_back_snapshot_lookup.json, "published snapshot") != null);
+    try std.testing.expectEqual(@as(usize, 1), owner_source.ownerCountForTest());
 
     const group_path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root});
     defer alloc.free(group_path);

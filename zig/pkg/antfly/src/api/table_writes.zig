@@ -49,6 +49,7 @@ const ha_public_gate_state_mod = @import("../storage/ha/public_gate_state.zig");
 const storage_schema = @import("../storage/schema.zig");
 const table_catalog = @import("table_catalog.zig");
 const table_reads = @import("table_reads.zig");
+const storage_snapshot_source = @import("storage_snapshot_source.zig");
 const table_write_source = @import("table_write_source.zig");
 const table_index_config = @import("table_index_config.zig");
 const table_router = @import("table_router.zig");
@@ -57,6 +58,11 @@ const indexes_api = @import("indexes.zig");
 const coverage_policy_mod = @import("coverage_policy.zig");
 const query_api = @import("query.zig");
 const runtime_status = @import("runtime_status.zig");
+
+const storage_kernel_experiment = if (@hasDecl(build_options, "storage_kernel_experiment"))
+    @field(build_options, "storage_kernel_experiment")
+else
+    false;
 
 fn publishRuntimeStatusGroupForTest(
     cache: *runtime_status.TableRuntimeSnapshotCache,
@@ -4319,6 +4325,7 @@ pub const ProvisionedTableWriteSource = struct {
     /// coalescing, admission, and lifecycle remain on this source; a compiled
     /// storage owner supplies only group-local operations.
     local_write_source: ?TableWriteSource = null,
+    storage_snapshot_source: ?storage_snapshot_source.Source = null,
     seed_create_table_writers: bool = true,
     group_visible_root_generation: ?table_reads.GroupVisibleRootGenerationSource = null,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
@@ -4824,6 +4831,14 @@ pub const ProvisionedTableWriteSource = struct {
         source_override: ?TableWriteSource,
     ) *ProvisionedTableWriteSource {
         self.local_write_source = source_override;
+        return self;
+    }
+
+    pub fn withStorageSnapshotSource(
+        self: *ProvisionedTableWriteSource,
+        snapshot_source: ?storage_snapshot_source.Source,
+    ) *ProvisionedTableWriteSource {
+        self.storage_snapshot_source = snapshot_source;
         return self;
     }
 
@@ -12478,6 +12493,18 @@ pub const ProvisionedTableWriteSource = struct {
         group_id: u64,
         encoded: []const u8,
     ) !void {
+        if (comptime storage_kernel_experiment) {
+            return try self.installRaftSnapshotGroupLocalKernel(alloc, group_id, encoded);
+        }
+        return try self.installRaftSnapshotGroupLocalLegacy(alloc, group_id, encoded);
+    }
+
+    fn installRaftSnapshotGroupLocalLegacy(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        encoded: []const u8,
+    ) !void {
         const state = try shard_state_store.GroupStateSnapshotStream.init(encoded);
         try shard_state_store.validateGroupStateSnapshotStream(alloc, group_id, state);
 
@@ -12616,6 +12643,108 @@ pub const ProvisionedTableWriteSource = struct {
         self.notifyLocalChange(table_name, .structural);
         self.notifyLocalChange(table_name, .data);
         if (publication_outcome == .durability_uncertain) return error.GenerationDurabilityUncertain;
+    }
+
+    fn installRaftSnapshotGroupLocalKernel(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        encoded: []const u8,
+    ) !void {
+        const snapshot_source = self.storage_snapshot_source orelse return error.StorageKernelSnapshotUnavailable;
+        const state = try shard_state_store.GroupStateSnapshotStream.init(encoded);
+        try shard_state_store.validateGroupStateSnapshotStream(alloc, group_id, state);
+
+        var discovery_snapshot = try self.catalog.adminSnapshot();
+        var discovery_snapshot_owned = true;
+        defer if (discovery_snapshot_owned) self.catalog.freeAdminSnapshot(&discovery_snapshot);
+        const discovered_range = metadata_mod.findAdminRange(&discovery_snapshot, group_id) orelse return error.UnknownGroup;
+        const discovered_table = metadata_mod.findAdminTable(&discovery_snapshot, discovered_range.table_id) orelse return error.TableNotFound;
+        const table_id = discovered_table.table_id;
+        const table_name = try alloc.dupe(u8, discovered_table.name);
+        self.catalog.freeAdminSnapshot(&discovery_snapshot);
+        discovery_snapshot_owned = false;
+        defer alloc.free(table_name);
+
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+
+        self.beginGroupGenerationPreparation(table_name, group_id);
+        var preparation_activity = true;
+        defer if (preparation_activity) self.endGroupGenerationPreparation(table_name, group_id);
+
+        var catalog_contract = try captureRaftSnapshotCatalogContract(
+            alloc,
+            self.catalog,
+            group_id,
+            table_id,
+            table_name,
+        );
+        defer catalog_contract.deinit(alloc);
+        if (!std.mem.eql(u8, state.byte_range.start, catalog_contract.range.start_key) or
+            !std.mem.eql(u8, state.byte_range.end, catalog_contract.range.end_key orelse ""))
+        {
+            return error.SnapshotRangeMismatch;
+        }
+        const identity_namespace = tableIdentityNamespaceForRangeId(
+            catalog_contract.table_id,
+            catalog_contract.range,
+        );
+
+        const generation_source = self.groupVisibleRootGenerationSource();
+        var generation_reservation = if (generation_source) |root_generation_source|
+            try root_generation_source.reserveRootGenerationForGroup(group_id)
+        else
+            null;
+        defer if (generation_reservation) |*reservation| reservation.deinit();
+
+        var prepared = try snapshot_source.prepare(.{
+            .path = path,
+            .table_name = table_name,
+            .group_id = group_id,
+            .lsm_root_generation = self.visibleRootGeneration(group_id),
+            .identity = .{
+                .table_id = identity_namespace.table_id,
+                .shard_id = identity_namespace.shard_id,
+                .range_id = identity_namespace.range_id,
+            },
+            .schema_json = catalog_contract.schema_json,
+            .indexes_json = catalog_contract.indexes_json,
+            .encoded_snapshot = encoded,
+        });
+        defer prepared.deinit();
+
+        var transition = try self.beginLocalGroupGenerationTransitionFromPreparation(table_name, group_id);
+        preparation_activity = false;
+        errdefer transition.abort();
+        defer transition.deinit();
+
+        try snapshot_source.retireGroupForPublication(group_id, table_name);
+        self.invalidateSharedPathCaches(path);
+        const durability_uncertain = try prepared.publishPrepared();
+        var publication_pending = true;
+        errdefer if (publication_pending) prepared.rollback() catch |rollback_err| {
+            std.log.err("Raft snapshot kernel catalog validation rollback failed group_id={} err={s}", .{ group_id, @errorName(rollback_err) });
+        };
+
+        const catalog_valid = self.catalog.validatePublication(catalog_contract.publicationContract()) catch |err| {
+            try prepared.rollback();
+            publication_pending = false;
+            return err;
+        };
+        if (!catalog_valid) {
+            try prepared.rollback();
+            publication_pending = false;
+            return error.CatalogChanged;
+        }
+        try prepared.commit();
+        publication_pending = false;
+        if (generation_reservation) |*reservation| reservation.advance();
+        self.invalidateSharedPathCaches(path);
+        transition.finishMutation();
+        self.notifyLocalChange(table_name, .structural);
+        self.notifyLocalChange(table_name, .data);
+        if (durability_uncertain) return error.GenerationDurabilityUncertain;
     }
 
     pub fn applyHAReplicationRecordGroupLocal(

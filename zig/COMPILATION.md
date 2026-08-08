@@ -896,6 +896,75 @@ replication pipeline and must move behind an owner lifecycle operation before
 query/read composition becomes unconditional. The legacy implementation graph
 is still reachable, so this checkpoint makes no cold-build or RSS claim.
 
+### Phase 2o two-phase Raft-snapshot publication owner slice
+
+Raft snapshot materialization and physical generation exchange now run behind
+the compiled storage owner. The boundary is deliberately two phase. Distributed
+control first captures the table/range/catalog contract, reserves the visible
+root generation, and asks the kernel to build and seal an isolated candidate.
+After group activity drains, control retires the resident owner and asks the
+kernel to atomically publish the prepared candidate. The candidate remains
+unservable while control performs the linearizable catalog publication check;
+the kernel then either commits the exchange or rolls the old generation back
+into place.
+
+This split keeps the ownership boundary honest:
+
+- the storage kernel owns staged DB creation, bounded document chunks, schema
+  validation, local schema/index installation, durable DB/index sync, sealing,
+  namespace exchange, commit, rollback, and destruction;
+- distributed control owns group admission, catalog identity and range checks,
+  generation reservation, cache invalidation, structural notifications, and
+  the linearizable publication fence; and
+- one opaque prepared-snapshot handle spans the publication decision. No DB,
+  staged-generation, or lifecycle type crosses the compiled boundary.
+
+The internal owner ABI is now version 9. Its prepare request borrows the path,
+table, deterministic identity/generation descriptor, schema/index contract,
+and complete encoded Raft snapshot for one synchronous preparation call.
+Publish returns only the durability-uncertain bit. Commit, rollback, and destroy
+operate on the opaque handle. This is one call per snapshot phase, not one call
+per document or index posting.
+
+The cross-archive regression exercises both terminal paths. An accepted
+snapshot retires the prior resident owner, publishes only the replacement
+document set, advances the outer generation reservation once, and reopens the
+new generation through the same read source. A deliberately rejected catalog
+fence publishes and then rolls back a second candidate, leaves the generation
+counter unchanged, and reopens the previously accepted snapshot with the
+rejected document absent.
+
+Validation at this checkpoint:
+
+- provisioned cross-archive owner suite: 6/6 passed with zero leaks, including
+  snapshot commit, catalog-fenced rollback, owner retirement/reopen, and outer
+  generation reservation checks;
+- opaque owner ABI suite: 2/2 passed with zero leaks, including invalid-version
+  prepare and null publish/commit/rollback/destroy cases;
+- experiment-disabled provisioned write/lifecycle suite: 68/68 passed with zero
+  leaks, retaining both legacy snapshot publication and rollback regressions;
+- existing public C API suite: 10/10 passed with zero leaks;
+- linked native Debug built with normal concurrency for both production
+  LSM-only and LMDB-compatibility configurations;
+- experiment-disabled default WAL-backed data-Raft test: 1/1 passed with zero
+  leaks;
+- runtime/codegen/API graph gates and all 13 analyzer tests passed; and
+- both native C API libraries linked against the experimental storage artifact
+  with public `antfly_db_open`/`antfly_db_close` globals, while internal owner
+  and snapshot symbols and LMDB/backend-LMDB globals remained hidden or absent.
+
+Decision: keep this slice. The immediate Raft replication pipeline can now use
+one physical writer for deterministic batch apply, derived-visibility waits,
+HA replay, and snapshot replacement. This remains experimental rather than
+default-enabled: the prepared staging DB still needs the production owner
+environment for backend runtime and optional provider/secret/remote-content
+hooks before every managed index configuration is equivalent to the legacy
+open path. Query/read composition must also attach to the same owner
+unconditionally and make the old provisioned physical path compile-time
+unreachable before the next cold ARM64 Linux musl `ReleaseFast` comparison.
+Until then, this checkpoint makes no compiler-time, RSS, or graph-reduction
+claim.
+
 ## Holistic target architecture
 
 The preferred end state is a modular monolith with a small number of compiled

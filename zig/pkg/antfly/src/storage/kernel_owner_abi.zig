@@ -15,7 +15,7 @@
 //! Versioned internal ABI for the storage kernel's live DB owner. Keep this
 //! module free of storage and distributed-runtime imports.
 
-pub const abi_version: u32 = 8;
+pub const abi_version: u32 = 9;
 
 pub const BorrowedBytes = extern struct {
     ptr: ?[*]const u8 = null,
@@ -128,6 +128,26 @@ pub const HAReplicationRecordRequest = extern struct {
     payload: BorrowedBytes = .{},
 };
 
+pub const SnapshotPrepareRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved0: u32 = 0,
+    path: BorrowedBytes = .{},
+    table_name: BorrowedBytes = .{},
+    group_id: u64 = 0,
+    lsm_root_generation: u64 = 0,
+    identity_table_id: u64 = 0,
+    identity_shard_id: u64 = 0,
+    identity_range_id: u64 = 0,
+    schema_json: BorrowedBytes = .{},
+    indexes_json: BorrowedBytes = .{},
+    encoded_snapshot: BorrowedBytes = .{},
+};
+
+pub const SnapshotPublishResult = extern struct {
+    durability_uncertain: u8 = 0,
+    _reserved0: [7]u8 = @splat(0),
+};
+
 /// JSON operation with synchronous local execution controls. The cancellation
 /// pointer refers to the caller's atomic boolean for the duration of the call;
 /// it is never retained by the storage owner.
@@ -170,6 +190,22 @@ pub extern fn antfly_storage_owner_apply_ha_replication_record(
     owner: ?*anyopaque,
     request: *const HAReplicationRecordRequest,
 ) callconv(.c) Status;
+
+pub extern fn antfly_storage_snapshot_prepare(
+    request: *const SnapshotPrepareRequest,
+    out_snapshot: *?*anyopaque,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_snapshot_publish_prepared(
+    snapshot: ?*anyopaque,
+    out_result: *SnapshotPublishResult,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_snapshot_commit(snapshot: ?*anyopaque) callconv(.c) Status;
+
+pub extern fn antfly_storage_snapshot_rollback(snapshot: ?*anyopaque) callconv(.c) Status;
+
+pub extern fn antfly_storage_snapshot_destroy(snapshot: ?*anyopaque) callconv(.c) void;
 
 pub extern fn antfly_storage_owner_query_json(
     owner: ?*anyopaque,

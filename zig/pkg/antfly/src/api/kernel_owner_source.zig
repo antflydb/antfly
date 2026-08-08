@@ -35,6 +35,7 @@ const feature_reads = @import("../raft/feature_reads.zig");
 const table_catalog = @import("table_catalog.zig");
 const table_read_source = @import("table_read_source.zig");
 const table_reads = @import("table_reads.zig");
+const storage_snapshot_source = @import("storage_snapshot_source.zig");
 const table_write_source = @import("table_write_source.zig");
 const table_writes = @import("table_writes.zig");
 
@@ -179,6 +180,20 @@ pub const ProvisionedKernelOwnerSource = struct {
         };
     }
 
+    pub fn snapshotSource(self: *ProvisionedKernelOwnerSource) storage_snapshot_source.Source {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .retire_group_for_publication = retireGroupForPublication,
+                .prepare = prepareSnapshot,
+                .publish_prepared = publishPreparedSnapshot,
+                .commit = commitSnapshot,
+                .rollback = rollbackSnapshot,
+                .destroy = destroySnapshot,
+            },
+        };
+    }
+
     /// Retire every resident generation for a table. Active calls retain their
     /// old owner until their lease drains; the next call then opens the catalog
     /// descriptor that won the outer structural transition.
@@ -196,6 +211,69 @@ pub const ProvisionedKernelOwnerSource = struct {
             if (entry.active_users == 0) self.destroyEntryAtIndexLocked(i);
         }
         return retired_count;
+    }
+
+    fn retireGroupForPublication(
+        ptr: *anyopaque,
+        group_id: u64,
+        table_name: []const u8,
+    ) !void {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        var i = self.entries.items.len;
+        while (i > 0) {
+            i -= 1;
+            const entry = self.entries.items[i];
+            if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name)) continue;
+            if (entry.active_users != 0) return error.StorageBusy;
+            entry.retired = true;
+            self.destroyEntryAtIndexLocked(i);
+        }
+    }
+
+    fn prepareSnapshot(
+        ptr: *anyopaque,
+        request: storage_snapshot_source.PrepareRequest,
+    ) !*anyopaque {
+        _ = ptr;
+        const snapshot = try client.Snapshot.prepare(.{
+            .path = .fromSlice(request.path),
+            .table_name = .fromSlice(request.table_name),
+            .group_id = request.group_id,
+            .lsm_root_generation = request.lsm_root_generation,
+            .identity_table_id = request.identity.table_id,
+            .identity_shard_id = request.identity.shard_id,
+            .identity_range_id = request.identity.range_id,
+            .schema_json = .fromSlice(request.schema_json),
+            .indexes_json = .fromSlice(request.indexes_json),
+            .encoded_snapshot = .fromSlice(request.encoded_snapshot),
+        });
+        return snapshot.handle orelse error.StorageKernelFailure;
+    }
+
+    fn publishPreparedSnapshot(ptr: *anyopaque, snapshot_handle: *anyopaque) !bool {
+        _ = ptr;
+        var snapshot = client.Snapshot{ .handle = snapshot_handle };
+        return try snapshot.publishPrepared();
+    }
+
+    fn commitSnapshot(ptr: *anyopaque, snapshot_handle: *anyopaque) !void {
+        _ = ptr;
+        var snapshot = client.Snapshot{ .handle = snapshot_handle };
+        try snapshot.commit();
+    }
+
+    fn rollbackSnapshot(ptr: *anyopaque, snapshot_handle: *anyopaque) !void {
+        _ = ptr;
+        var snapshot = client.Snapshot{ .handle = snapshot_handle };
+        try snapshot.rollback();
+    }
+
+    fn destroySnapshot(ptr: *anyopaque, snapshot_handle: *anyopaque) void {
+        _ = ptr;
+        var snapshot = client.Snapshot{ .handle = snapshot_handle };
+        snapshot.deinit();
     }
 
     /// Apply one already-committed local Raft batch without consulting the

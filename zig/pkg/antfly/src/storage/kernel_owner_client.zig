@@ -308,6 +308,35 @@ pub const HAReplicationRecord = struct {
     payload: []const u8 = &.{},
 };
 
+pub const Snapshot = struct {
+    handle: ?*anyopaque,
+
+    pub fn prepare(request: abi.SnapshotPrepareRequest) !Snapshot {
+        var handle: ?*anyopaque = null;
+        try statusToError(abi.antfly_storage_snapshot_prepare(&request, &handle));
+        return .{ .handle = handle orelse return error.StorageKernelFailure };
+    }
+
+    pub fn publishPrepared(self: *Snapshot) !bool {
+        var result: abi.SnapshotPublishResult = .{};
+        try statusToError(abi.antfly_storage_snapshot_publish_prepared(self.handle, &result));
+        return result.durability_uncertain != 0;
+    }
+
+    pub fn commit(self: *Snapshot) !void {
+        try statusToError(abi.antfly_storage_snapshot_commit(self.handle));
+    }
+
+    pub fn rollback(self: *Snapshot) !void {
+        try statusToError(abi.antfly_storage_snapshot_rollback(self.handle));
+    }
+
+    pub fn deinit(self: *Snapshot) void {
+        abi.antfly_storage_snapshot_destroy(self.handle);
+        self.* = undefined;
+    }
+};
+
 fn operationRequest(
     table_name: []const u8,
     request_json: []const u8,

@@ -121,6 +121,24 @@ test "opaque storage owner validates ABI and destruction is idempotent" {
         abi.Status.invalid_abi,
         abi.antfly_storage_owner_apply_ha_replication_record(null, &invalid_ha),
     );
+    var snapshot: ?*anyopaque = undefined;
+    var invalid_snapshot: abi.SnapshotPrepareRequest = .{};
+    invalid_snapshot.version = abi.abi_version + 1;
+    try std.testing.expectEqual(
+        abi.Status.invalid_abi,
+        abi.antfly_storage_snapshot_prepare(&invalid_snapshot, &snapshot),
+    );
+    try std.testing.expect(snapshot == null);
+    var snapshot_publish_result: abi.SnapshotPublishResult = .{ .durability_uncertain = 1 };
+    try std.testing.expectEqual(
+        abi.Status.invalid_argument,
+        abi.antfly_storage_snapshot_publish_prepared(null, &snapshot_publish_result),
+    );
+    try std.testing.expectEqual(@as(u8, 0), snapshot_publish_result.durability_uncertain);
+    try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_snapshot_commit(null));
+    try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_snapshot_rollback(null));
+    abi.antfly_storage_snapshot_destroy(null);
+    abi.antfly_storage_snapshot_destroy(null);
     try std.testing.expectEqual(
         abi.Status.invalid_abi,
         abi.antfly_storage_owner_replicated_batch_json(null, &invalid_operation, &response),

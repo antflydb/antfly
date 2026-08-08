@@ -921,6 +921,7 @@ const RaftTableApplyStateMachine = struct {
             if (self.kernel_owner_source) |*owner_source| {
                 _ = owner_source.withGroupVisibleRootGeneration(storage.groupVisibleRootGenerationSource());
                 _ = self.write_source.withLocalWriteSource(owner_source.writeSource());
+                _ = self.write_source.withStorageSnapshotSource(owner_source.snapshotSource());
             }
         }
         if (storage.backend_runtime) |runtime| self.write_source.backend_runtime = runtime;

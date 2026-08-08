@@ -63,6 +63,7 @@ else
 // user-manager adapter likewise imports its storage types through this root.
 pub const aggregation = @import("search/aggregation.zig");
 pub const backup_codec = @import("storage/backup_codec.zig");
+pub const data_snapshot = @import("data/storage/shard_state_store.zig");
 pub const db = @import("storage/db/mod.zig");
 pub const geo = @import("search/geo.zig");
 pub const graph = @import("graph/graph.zig");
@@ -210,6 +211,11 @@ comptime {
             exportInternal(&storage_kernel_exports.storageOwnerReplicatedBatchJson, "antfly_storage_owner_replicated_batch_json");
             exportInternal(&storage_kernel_exports.storageOwnerWaitForSync, "antfly_storage_owner_wait_for_sync");
             exportInternal(&storage_kernel_exports.storageOwnerApplyHAReplicationRecord, "antfly_storage_owner_apply_ha_replication_record");
+            exportInternal(&storage_kernel_exports.storageSnapshotPrepare, "antfly_storage_snapshot_prepare");
+            exportInternal(&storage_kernel_exports.storageSnapshotPublishPrepared, "antfly_storage_snapshot_publish_prepared");
+            exportInternal(&storage_kernel_exports.storageSnapshotCommit, "antfly_storage_snapshot_commit");
+            exportInternal(&storage_kernel_exports.storageSnapshotRollback, "antfly_storage_snapshot_rollback");
+            exportInternal(&storage_kernel_exports.storageSnapshotDestroy, "antfly_storage_snapshot_destroy");
             exportInternal(&storage_kernel_exports.storageOwnerQueryJson, "antfly_storage_owner_query_json");
             exportInternal(&storage_kernel_exports.storageOwnerLookupJson, "antfly_storage_owner_lookup_json");
             exportInternal(&storage_kernel_exports.storageOwnerScanNdjson, "antfly_storage_owner_scan_ndjson");

@@ -65,6 +65,7 @@ CODEGEN_BOUNDARIES = (
 # is performed against an API compiler time report when one is supplied.
 API_KERNEL_CONTRACTS = (
     "api/kernel_exports.zig",
+    "api/storage_snapshot_source.zig",
     "api/table_read_source.zig",
     "api/table_write_source.zig",
 )
