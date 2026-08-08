@@ -102,6 +102,9 @@ pub const GeneratedEnrichmentRequest = struct {
     content_type: []const u8 = "",
     producer_json: []const u8 = "",
     execution_json: []const u8 = "",
+    /// Replay sequence of the source document change. This is attached when a
+    /// cached request plan is instantiated for a pending journal group.
+    sequence: u64 = 0,
 };
 
 pub const GeneratedEnrichmentRef = struct {
@@ -168,6 +171,7 @@ pub fn cloneGeneratedRequest(alloc: Allocator, request: GeneratedEnrichmentReque
         .content_type = content_type,
         .producer_json = producer_json,
         .execution_json = execution_json,
+        .sequence = request.sequence,
     };
 }
 

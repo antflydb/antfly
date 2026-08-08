@@ -53,6 +53,7 @@ pub const artifact_repair_summary_rebuild_kind: u8 = 0x2a;
 pub const managed_index_admission_kind: u8 = 0x2b;
 pub const index_artifact_cleanup_kind: u8 = 0x2c;
 pub const range_document_count_key = [_]u8{ replay_namespace, 0xff, 0x2d };
+pub const artifact_repair_completion_kind: u8 = 0x2e;
 pub const embedding_artifact_repair_issue_kind: u8 = artifact_repair_issue_kind;
 pub const identity_doc_to_ordinal_kind: u8 = 0x01;
 pub const identity_ordinal_to_doc_kind: u8 = 0x02;
@@ -631,6 +632,23 @@ pub fn artifactRepairIssueKeyAlloc(
     defer list.deinit(alloc);
     try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, artifact_repair_issue_kind });
     try appendEncodedComponent(&list, alloc, index_name);
+    try appendEncodedComponent(&list, alloc, repair_artifact_kind);
+    try appendEncodedComponent(&list, alloc, issue_id);
+    return try list.toOwnedSlice(alloc);
+}
+
+/// Durable single-flight fence for producer repair work. Repair issues remain
+/// indexed per consumer, while this key is canonical per physical artifact so
+/// a successful regeneration is never repeated for sibling consumer records,
+/// later cursor pages, or after restart.
+pub fn artifactRepairCompletionKeyAlloc(
+    alloc: Allocator,
+    repair_artifact_kind: []const u8,
+    issue_id: []const u8,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, artifact_repair_completion_kind });
     try appendEncodedComponent(&list, alloc, repair_artifact_kind);
     try appendEncodedComponent(&list, alloc, issue_id);
     return try list.toOwnedSlice(alloc);

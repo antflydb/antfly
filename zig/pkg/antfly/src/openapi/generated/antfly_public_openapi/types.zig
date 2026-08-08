@@ -520,12 +520,14 @@ pub const ArtifactRepairReason = enum {
     missing_artifact,
     corrupt_artifact,
     unreadable_artifact,
+    enrichment_failed,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .missing_artifact => "missing_artifact",
             .corrupt_artifact => "corrupt_artifact",
             .unreadable_artifact => "unreadable_artifact",
+            .enrichment_failed => "enrichment_failed",
         };
         try jw.write(s);
     }
@@ -539,6 +541,7 @@ pub const ArtifactRepairReason = enum {
             .{ "missing_artifact", .missing_artifact },
             .{ "corrupt_artifact", .corrupt_artifact },
             .{ "unreadable_artifact", .unreadable_artifact },
+            .{ "enrichment_failed", .enrichment_failed },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -3035,6 +3038,10 @@ pub const TableRepairIssue = struct {
     /// Derived replay sequence that observed the issue.
     sequence: i64,
     reason: ArtifactRepairReason,
+    /// Number of enrichment generation attempts made before this issue was parked.
+    generation_attempts: i64,
+    /// Stable source-generation error code that caused this issue to be parked.
+    generation_error: ?[]const u8 = null,
     /// Number of repair attempts made for this issue.
     attempts: i64,
     /// Monotonic timestamp when this issue was first recorded.
@@ -3146,8 +3153,10 @@ pub const TableRepairRunResult = struct {
     in_progress: i64,
     /// Number of indexes rebuilt by this pass when target is index.
     indexes_rebuilt: i64,
-    /// Number of selected indexes that were already degraded or quarantined before repair.
-    indexes_degraded: i64,
+    /// Number of selected indexes that were degraded or quarantined when this repair pass began.
+    indexes_degraded_before: i64,
+    /// Number of selected indexes that remain degraded or quarantined when this repair pass returns.
+    indexes_degraded_after: i64,
     /// Number of existing index repairs that accepted the requested control.
     controls_applied: i64,
     /// Effective repair limit.

@@ -183,6 +183,7 @@ class InferenceServer:
         host: str,
         port: int,
         max_loaded_models: str | None = None,
+        extra_env: dict[str, str] | None = None,
     ):
         self.url = f"http://{host}:{port}"
         self.failure_reported = False
@@ -209,6 +210,7 @@ class InferenceServer:
             ],
             stdout=self.output,
             stderr=subprocess.STDOUT,
+            env={**os.environ, **extra_env} if extra_env else None,
         )
         if not wait_for_server(self.url):
             self.stop(close_output=False)

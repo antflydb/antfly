@@ -327,6 +327,7 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
     // work, and backend sessions all compose with the same executor.
     node.attachIo(io);
     try node.warmConfiguredGenerators(alloc);
+    node.configureForcedRunAdmissionDenialsFromEnvironmentForTesting();
     std.debug.print("listening on {s}:{d}\n", .{ host, port });
     try node.serve(alloc, io, host, port);
 }

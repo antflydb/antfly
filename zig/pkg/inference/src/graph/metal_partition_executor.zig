@@ -35,6 +35,7 @@ const metal_tensor_mod = if (build_options.enable_metal) @import("../backends/me
 const weight_source_mod = @import("../models/weight_source.zig");
 const quant_codec = @import("../gguf/quant_codec.zig");
 const transpose_utils = @import("transpose_utils.zig");
+const runtime_slice = @import("runtime_slice.zig");
 const metal_runtime_mod = if (build_options.enable_metal) @import("../backends/metal_runtime.zig") else struct {
     pub fn metalDeviceAvailable() bool {
         return false;
@@ -14582,11 +14583,7 @@ fn executeRuntimeSlice(
     var starts: [ml.graph.shape.max_rank]i64 = undefined;
     var limits: [ml.graph.shape.max_rank]i64 = undefined;
     var strides: [ml.graph.shape.max_rank]i64 = undefined;
-    for (0..rank) |axis| {
-        starts[axis] = attrs.starts[axis];
-        limits[axis] = attrs.limits[axis];
-        strides[axis] = attrs.strides[axis];
-    }
+    try runtime_slice.resolve(graph.allocator, cb, values, inputs, attrs, &starts, &limits, &strides);
     if (in_shape.len == 2 and rank == 2 and
         starts[0] == 0 and limits[0] == in_shape[0] and
         strides[0] == 1 and strides[1] == 1)

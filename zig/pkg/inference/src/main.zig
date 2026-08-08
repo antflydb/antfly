@@ -435,6 +435,7 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
     node.attachIo(io);
 
     try node.warmConfiguredModelsBeforeServing(allocator);
+    node.configureForcedRunAdmissionDenialsFromEnvironmentForTesting();
     print("listening on {s}:{d}\n", .{ host, port });
     try node.serve(allocator, io, host, port);
 

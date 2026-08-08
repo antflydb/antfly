@@ -689,6 +689,31 @@ pub const AdmissionController = struct {
         emptyAdmissionAmountsByBackend(),
     shared_limits: SharedAdmissionLimits = .{},
     resource_budget: ?AdmissionResourceBudget = null,
+    /// Opt-in fault injection for live server regression tests. Production
+    /// callers leave this at zero, so normal admission behavior is unchanged.
+    forced_run_denials_for_testing: std.atomic.Value(usize) = .init(0),
+
+    pub fn configureForcedRunDenialsForTesting(
+        self: *AdmissionController,
+        count: usize,
+    ) void {
+        self.forced_run_denials_for_testing.store(count, .release);
+    }
+
+    pub fn consumeForcedRunDenialForTesting(
+        self: *AdmissionController,
+    ) bool {
+        var remaining = self.forced_run_denials_for_testing.load(.acquire);
+        while (remaining > 0) {
+            remaining = self.forced_run_denials_for_testing.cmpxchgWeak(
+                remaining,
+                remaining - 1,
+                .acq_rel,
+                .acquire,
+            ) orelse return true;
+        }
+        return false;
+    }
 
     pub fn configureSharedLimits(
         self: *AdmissionController,

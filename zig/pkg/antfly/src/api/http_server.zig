@@ -10059,7 +10059,7 @@ pub const ApiHttpServer = struct {
         const source = self.table_writes orelse return error.NotFound;
         const handled = source.reprocessDocumentArtifact(alloc, table_name, doc_key, artifact_name) catch |err| switch (err) {
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
-            error.InvalidArgument => return error.NotFound,
+            error.InvalidArgument, error.NotFound => return error.NotFound,
             else => {
                 std.log.err("public document artifact reprocess failed table={s} doc={s} artifact={s} err={}", .{ table_name, doc_key, artifact_name, err });
                 return error.InternalFailure;

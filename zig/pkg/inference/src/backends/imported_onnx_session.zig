@@ -909,6 +909,7 @@ pub fn createSessionWithOptions(
     var deduped = try CsePass.eliminate(allocator, &fused.graph);
     defer deduped.deinit();
     try validateImportedGraph(&deduped.graph, "cse");
+    try validateRuntimeShapeBackend(&deduped.graph, requested_backend);
 
     const folded_to_fused = try composeNodeIdMaps(allocator, folded.id_map, fused.id_map);
     defer allocator.free(folded_to_fused);
@@ -1277,6 +1278,45 @@ fn validateImportedGraph(graph: *const Graph, stage: []const u8) !void {
             }
         }
     }
+}
+
+fn validateRuntimeShapeBackend(graph: *const Graph, backend_type: BackendType) !void {
+    // Runtime-bound Slice is currently validated end-to-end only by the native
+    // imported graph runtime. Other graph backends still plan downstream ops
+    // from declared shapes, so accepting these graphs can turn a dynamic
+    // sequence dimension into an UnsupportedShape failure during execution.
+    if (backend_type == .native or backend_type == .onnx) return;
+
+    for (graph.nodes.items, 0..) |node, node_id| {
+        const attrs = switch (node.op) {
+            .slice => |slice_attrs| slice_attrs,
+            else => continue,
+        };
+        if (!attrs.runtime_starts and !attrs.runtime_limits) continue;
+
+        std.log.info(
+            "imported onnx backend {s} does not support runtime-bound Slice at node_id={}; falling back",
+            .{ @tagName(backend_type), node_id },
+        );
+        return error.UnsupportedDynamicOnnxGraphBackend;
+    }
+}
+
+test "runtime-bound ONNX slices use the native imported graph backend" {
+    var graph = Graph.init(std.testing.allocator);
+    defer graph.deinit();
+
+    var attrs: ml.graph.node.SliceAttrs = .{};
+    attrs.runtime_limits = true;
+    _ = try graph.addNode(.{
+        .op = .{ .slice = attrs },
+        .output_shape = Shape.init(.f32, &.{ 1, -1 }),
+    });
+
+    try validateRuntimeShapeBackend(&graph, .native);
+    try validateRuntimeShapeBackend(&graph, .onnx);
+    try std.testing.expectError(error.UnsupportedDynamicOnnxGraphBackend, validateRuntimeShapeBackend(&graph, .metal));
+    try std.testing.expectError(error.UnsupportedDynamicOnnxGraphBackend, validateRuntimeShapeBackend(&graph, .wasm));
 }
 
 fn composeNodeIdMaps(

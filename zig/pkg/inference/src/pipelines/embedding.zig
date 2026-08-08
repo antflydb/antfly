@@ -2085,6 +2085,15 @@ test "embedding text plans backend and fixed-shape batches" {
         TextSessionBatchPlan{ .batch_size = 1, .pad_final_batch = false },
         textSessionBatchPlan(external_onnx, 2).?,
     );
+
+    const dynamic_info = [_]backends.TensorInfo{
+        .{ .name = "input_ids", .dtype = .i64, .shape = &.{ -1, 77 } },
+    };
+    try std.testing.expect(textSessionBatchPlanForRuntime(&dynamic_info, .native, true, 3) == null);
+    try std.testing.expectEqual(
+        TextSessionBatchPlan{ .batch_size = 1, .pad_final_batch = false },
+        textSessionBatchPlanForRuntime(&dynamic_info, .metal, true, 3).?,
+    );
 }
 
 fn sessionHasInput(session: backends.Session, name: []const u8) bool {
@@ -2102,10 +2111,25 @@ pub const TextSessionBatchPlan = struct {
 /// Return an execution plan only when the requested batch cannot be sent to
 /// the session directly. Fixed-shape models are processed at their declared
 /// batch size, padding only the final partial chunk. External ONNX sessions
-/// with dynamic shapes retain the conservative single-row execution path.
+/// and non-native imported graphs retain the conservative single-row path;
+/// imported native graphs preserve runtime batch dimensions and execute whole.
 pub fn textSessionBatchPlan(session: backends.Session, requested_batch: usize) ?TextSessionBatchPlan {
+    return textSessionBatchPlanForRuntime(
+        session.inputInfo(),
+        session.backend(),
+        backends.imported_onnx_session.sharedBackendContext(session) != null,
+        requested_batch,
+    );
+}
+
+fn textSessionBatchPlanForRuntime(
+    input_info: []const backends.TensorInfo,
+    backend: backends.BackendType,
+    imported: bool,
+    requested_batch: usize,
+) ?TextSessionBatchPlan {
     if (requested_batch == 0) return null;
-    for (session.inputInfo()) |info| {
+    for (input_info) |info| {
         if (!std.mem.eql(u8, info.name, "input_ids")) continue;
         if (info.shape.len == 0) break;
         const declared_batch = info.shape[0];
@@ -2117,9 +2141,10 @@ pub fn textSessionBatchPlan(session: backends.Session, requested_batch: usize) ?
         break;
     }
     if (requested_batch <= 1) return null;
-    if (session.backend() == .onnx or
-        backends.imported_onnx_session.sharedBackendContext(session) != null)
-    {
+    if (backend == .onnx) {
+        return .{ .batch_size = 1, .pad_final_batch = false };
+    }
+    if (imported and backend != .native) {
         return .{ .batch_size = 1, .pad_final_batch = false };
     }
     return null;

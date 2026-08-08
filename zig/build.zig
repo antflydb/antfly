@@ -2567,6 +2567,7 @@ pub fn build(b: *std.Build) void {
             "table repair job store persists monotonic next id across stale durable writes",
             "table repair job cleanup pages durable expired jobs",
             "forced index repair job dispatches force only once",
+            "index repair job keeps degradation gauges as snapshots across retries",
             "named index repair cancellation remains nonterminal until durable controls finish",
             "named index repair cancellation restarts its durable traversal after job store recovery",
             "durable cancellation retries transient failures with backoff",
@@ -5240,6 +5241,7 @@ pub fn build(b: *std.Build) void {
             "public index config encoders redact coverage incarnation",
             "identical index mutation retries preserve coverage incarnation",
             "derived coverage evaluation is policy exact and observation gated",
+            "settled terminal enrichment debt is degraded rather than rebuilding",
             "derived coverage aggregation rejects mixed config observations",
             "index status exposes compact repair state without internal diagnostics",
             "rebuild quarantine remains an explicit failed public index status",
@@ -5742,6 +5744,7 @@ pub fn build(b: *std.Build) void {
         .root_module = api_artifact_reprocess_jobs_test_mod,
         .filters = &.{
             "forced index repair job dispatches force only once",
+            "index repair job keeps degradation gauges as snapshots across retries",
             "named index repair cancellation remains nonterminal until durable controls finish",
             "named index repair cancellation restarts its durable traversal after job store recovery",
             "durable cancellation scan rotates past a backed off head window",

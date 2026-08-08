@@ -86,12 +86,7 @@ pub const RunAdmission = struct {
         output_info: []const TensorInfo,
     ) !memory.AdmissionLease {
         const request = try RunRequest.fromTensors(inputs);
-        return self.controller.tryAcquire(
-            self.backend_class,
-            self.limits,
-            try self.estimateRequest(request, output_info),
-            self.check_live_memory,
-        );
+        return self.acquireAmounts(try self.estimateRequest(request, output_info));
     }
 
     fn acquireRequest(
@@ -99,12 +94,7 @@ pub const RunAdmission = struct {
         request: RunRequest,
         output_info: []const TensorInfo,
     ) !memory.AdmissionLease {
-        return self.controller.tryAcquire(
-            self.backend_class,
-            self.limits,
-            try self.estimateRequest(request, output_info),
-            self.check_live_memory,
-        );
+        return self.acquireAmounts(try self.estimateRequest(request, output_info));
     }
 
     fn acquireResidentInputs(
@@ -112,10 +102,21 @@ pub const RunAdmission = struct {
         inputs: []const ResidentInput,
         output_info: []const TensorInfo,
     ) !memory.AdmissionLease {
+        return self.acquireAmounts(try self.estimateResidentAmounts(inputs, output_info));
+    }
+
+    fn acquireAmounts(
+        self: RunAdmission,
+        amounts: memory.AdmissionAmounts,
+    ) !memory.AdmissionLease {
+        if (self.controller.consumeForcedRunDenialForTesting()) {
+            std.log.warn("test-only forced inference run admission denial", .{});
+            return error.ResourceTemporarilyUnavailable;
+        }
         return self.controller.tryAcquire(
             self.backend_class,
             self.limits,
-            try self.estimateResidentAmounts(inputs, output_info),
+            amounts,
             self.check_live_memory,
         );
     }
@@ -617,4 +618,38 @@ test "run admission scales dynamic outputs and honors reserved backend workspace
         .host_preprocess_bytes = 16 * 512 * 32,
     }, &outputs);
     try std.testing.expect(profiled_amounts.host_scratch_bytes > 256 * 1024 * 1024);
+}
+
+test "forced run admission denials are counted and recover" {
+    var controller = memory.AdmissionController{};
+    controller.configureForcedRunDenialsForTesting(2);
+
+    var probe = AdmissionProbeSession{ .controller = &controller };
+    const session = Session{
+        .ptr = &probe,
+        .vtable = &AdmissionProbeSession.vtable,
+        .run_admission = .{
+            .controller = &controller,
+            .backend_class = .cpu,
+            .limits = .{},
+            .static_workspace_bytes = 1,
+        },
+    };
+
+    try std.testing.expectError(
+        error.ResourceTemporarilyUnavailable,
+        session.run(&.{}, std.testing.allocator),
+    );
+    try std.testing.expectError(
+        error.ResourceTemporarilyUnavailable,
+        session.run(&.{}, std.testing.allocator),
+    );
+    try std.testing.expectEqual(memory.AdmissionAmounts{}, controller.snapshot());
+    try std.testing.expect(!probe.observed_active_lease);
+
+    const outputs = try session.run(&.{}, std.testing.allocator);
+    try std.testing.expect(probe.observed_active_lease);
+    for (outputs) |*output| output.deinit();
+    std.testing.allocator.free(outputs);
+    try std.testing.expectEqual(memory.AdmissionAmounts{}, controller.snapshot());
 }

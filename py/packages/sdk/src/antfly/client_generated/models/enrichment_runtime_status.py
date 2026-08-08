@@ -28,6 +28,9 @@ class EnrichmentRuntimeStatus:
         error_count (int):
         retryable_error_count (int):
         fatal_error_count (int):
+        consecutive_retry_count (int): Consecutive durable worker retries for the current failed request window.
+        next_retry_at_ms (int): Unix epoch time in milliseconds when the current durable retry becomes eligible. Zero
+            when not retrying.
         retrying (bool):
         worker_failed (bool):
         worker_started (bool): Whether the background enrichment worker is currently running.
@@ -67,6 +70,8 @@ class EnrichmentRuntimeStatus:
     error_count: int
     retryable_error_count: int
     fatal_error_count: int
+    consecutive_retry_count: int
+    next_retry_at_ms: int
     retrying: bool
     worker_failed: bool
     worker_started: bool
@@ -117,6 +122,10 @@ class EnrichmentRuntimeStatus:
         retryable_error_count = self.retryable_error_count
 
         fatal_error_count = self.fatal_error_count
+
+        consecutive_retry_count = self.consecutive_retry_count
+
+        next_retry_at_ms = self.next_retry_at_ms
 
         retrying = self.retrying
 
@@ -178,6 +187,8 @@ class EnrichmentRuntimeStatus:
                 "error_count": error_count,
                 "retryable_error_count": retryable_error_count,
                 "fatal_error_count": fatal_error_count,
+                "consecutive_retry_count": consecutive_retry_count,
+                "next_retry_at_ms": next_retry_at_ms,
                 "retrying": retrying,
                 "worker_failed": worker_failed,
                 "worker_started": worker_started,
@@ -234,6 +245,10 @@ class EnrichmentRuntimeStatus:
         retryable_error_count = d.pop("retryable_error_count")
 
         fatal_error_count = d.pop("fatal_error_count")
+
+        consecutive_retry_count = d.pop("consecutive_retry_count")
+
+        next_retry_at_ms = d.pop("next_retry_at_ms")
 
         retrying = d.pop("retrying")
 
@@ -292,6 +307,8 @@ class EnrichmentRuntimeStatus:
             error_count=error_count,
             retryable_error_count=retryable_error_count,
             fatal_error_count=fatal_error_count,
+            consecutive_retry_count=consecutive_retry_count,
+            next_retry_at_ms=next_retry_at_ms,
             retrying=retrying,
             worker_failed=worker_failed,
             worker_started=worker_started,

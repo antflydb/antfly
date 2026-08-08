@@ -1299,7 +1299,7 @@ export interface paths {
             path: {
                 /** @description Name of the table */
                 tableName: string;
-                /** @description Name of the derived document artifact. */
+                /** @description Name of the derived asset enrichment. */
                 artifactName: string;
             };
             cookie?: never;
@@ -1307,8 +1307,8 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Reprocess a derived document artifact across a table range
-         * @description Runs a bounded operational repair pass for a derived document artifact
+         * Reprocess a derived asset across a table range
+         * @description Runs a bounded operational repair pass for any asset producer type
          *     across source rows in key order. Use `next_key` from the response as
          *     the next request's `from_key` for simple single-cursor continuation.
          *     Distributed repair controllers should persist `shard_cursors` from the
@@ -1363,7 +1363,7 @@ export interface paths {
             path: {
                 /** @description Name of the table */
                 tableName: string;
-                /** @description Name of the derived document artifact. */
+                /** @description Name of the derived asset enrichment. */
                 artifactName: string;
             };
             cookie?: never;
@@ -1513,9 +1513,11 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Reprocess a derived document artifact
+         * Reprocess a derived asset
          * @description Invalidates the current artifact state and requests the producer to
-         *     rebuild the derived document hierarchy for the source document.
+         *     rebuild the derived asset for the source document. Copy, generator,
+         *     reader, transcriber, extractor, and document-extraction producers are
+         *     all supported.
          */
         post: operations["reprocessDocumentArtifact"];
         delete?: never;
@@ -3123,7 +3125,7 @@ export interface components {
          * @description Reason an artifact was added to the repair queue.
          * @enum {string}
          */
-        ArtifactRepairReason: "missing_artifact" | "corrupt_artifact" | "unreadable_artifact";
+        ArtifactRepairReason: "missing_artifact" | "corrupt_artifact" | "unreadable_artifact" | "enrichment_failed";
         /**
          * @description Repair subsystem to inspect or run.
          * @enum {string}
@@ -3161,6 +3163,13 @@ export interface components {
              */
             sequence: number;
             reason: components["schemas"]["ArtifactRepairReason"];
+            /**
+             * Format: uint64
+             * @description Number of enrichment generation attempts made before this issue was parked.
+             */
+            generation_attempts: number;
+            /** @description Stable source-generation error code that caused this issue to be parked. */
+            generation_error?: string;
             /**
              * Format: uint64
              * @description Number of repair attempts made for this issue.
@@ -3305,9 +3314,14 @@ export interface components {
             indexes_rebuilt: number;
             /**
              * Format: uint64
-             * @description Number of selected indexes that were already degraded or quarantined before repair.
+             * @description Number of selected indexes that were degraded or quarantined when this repair pass began.
              */
-            indexes_degraded: number;
+            indexes_degraded_before: number;
+            /**
+             * Format: uint64
+             * @description Number of selected indexes that remain degraded or quarantined when this repair pass returns.
+             */
+            indexes_degraded_after: number;
             /**
              * Format: uint64
              * @description Number of existing index repairs that accepted the requested control.
@@ -8950,7 +8964,7 @@ export interface components {
              * @description Number of documents indexed during current rebuild
              */
             backfill_items_processed?: number;
-            /** @description Operational readiness state such as ready, running, retrying, or failed. */
+            /** @description Operational readiness state such as ready, running, retrying, degraded, or failed. */
             backfill_state?: string;
             /**
              * Format: uint64
@@ -9095,14 +9109,24 @@ export interface components {
             covered: number;
             /**
              * Format: uint64
-             * @description Source documents without a policy-accepted terminal outcome. Null when observations are incomplete and the global value is unknown.
+             * @description Source documents with any durable terminal outcome: produced, intentionally skipped, or terminally failed.
+             */
+            settled: number;
+            /**
+             * Format: uint64
+             * @description Source documents without an outcome accepted by the configured coverage policy. Null when observations are incomplete.
+             */
+            uncovered: number | null;
+            /**
+             * Format: uint64
+             * @description Source documents that have not reached any terminal outcome and may still be processing. Null when observations are incomplete.
              */
             pending: number | null;
             /** @description Whether observations are complete, replay has reached its target, and every observed source has an outcome accepted by the policy. */
             complete: boolean;
             /** @description Whether coverage is complete without terminal failures. */
             healthy: boolean;
-            /** @description Whether coverage is complete under best_effort but includes terminal failures. */
+            /** @description Whether all sources are settled but coverage remains unhealthy under the configured policy, including terminal failures or policy-rejected skips. */
             degraded: boolean;
         };
         /** @description Runtime state for the durable embeddings enrichment worker. */
@@ -9132,6 +9156,16 @@ export interface components {
             retryable_error_count: number;
             /** Format: uint64 */
             fatal_error_count: number;
+            /**
+             * Format: uint32
+             * @description Consecutive durable worker retries for the current failed request window.
+             */
+            consecutive_retry_count: number;
+            /**
+             * Format: uint64
+             * @description Unix epoch time in milliseconds when the current durable retry becomes eligible. Zero when not retrying.
+             */
+            next_retry_at_ms: number;
             retrying: boolean;
             worker_failed: boolean;
             /** @description Whether the background enrichment worker is currently running. */
@@ -9370,7 +9404,7 @@ export interface components {
              * @description Number of edges indexed during current rebuild
              */
             backfill_items_processed?: number;
-            /** @description Operational readiness state such as ready, running, retrying, or failed. */
+            /** @description Operational readiness state such as ready, running, retrying, degraded, or failed. */
             backfill_state?: string;
             /**
              * Format: uint64
@@ -9514,7 +9548,7 @@ export interface components {
              * @description Number of documents processed during current backfill
              */
             backfill_items_processed?: number;
-            /** @description Operational readiness state such as ready, running, retrying, or failed. */
+            /** @description Operational readiness state such as ready, running, retrying, degraded, or failed. */
             backfill_state?: string;
             /**
              * Format: uint64
@@ -14173,8 +14207,32 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
+            /**
+             * @description The batch cannot be safely replayed as a unit. Either the server
+             *     could not determine whether a shard-group write committed, or one
+             *     or more shard groups accepted their portion before a later group
+             *     failed. Clients must reconcile affected keys and must not blindly
+             *     replay non-idempotent transforms.
+             */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": "write outcome unknown" | "partial write outcome";
+                };
+            };
             429: components["responses"]["DenseRepairBackpressure"];
             500: components["responses"]["InternalServerError"];
+            /** @description No writable Raft leader was available before any shard group accepted the batch. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": "write unavailable";
+                };
+            };
         };
     };
     linearMerge: {
@@ -14668,7 +14726,7 @@ export interface operations {
             path: {
                 /** @description Name of the table */
                 tableName: string;
-                /** @description Name of the derived document artifact. */
+                /** @description Name of the derived asset enrichment. */
                 artifactName: string;
             };
             cookie?: never;
@@ -14766,7 +14824,7 @@ export interface operations {
             path: {
                 /** @description Name of the table */
                 tableName: string;
-                /** @description Name of the derived document artifact. */
+                /** @description Name of the derived asset enrichment. */
                 artifactName: string;
             };
             cookie?: never;
