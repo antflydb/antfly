@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
-const table_reads = @import("table_reads.zig");
+const table_reads = @import("table_read_source.zig");
 const query_api = @import("query.zig");
 const query_contract = @import("query_contract.zig");
 const foreign_mod = @import("../foreign/mod.zig");

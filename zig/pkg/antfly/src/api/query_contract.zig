@@ -37,14 +37,7 @@ const algebraic_lexical = db_mod.algebraic.lexical;
 const public_query_max_tree_depth: usize = 64;
 const public_query_max_tree_nodes: usize = 16 * 1024;
 
-pub const QueryResponse = struct {
-    json: []u8,
-
-    pub fn deinit(self: *QueryResponse, alloc: std.mem.Allocator) void {
-        alloc.free(self.json);
-        self.* = undefined;
-    }
-};
+pub const QueryResponse = @import("query_response.zig").QueryResponse;
 
 pub const testing = if (builtin.is_test) struct {
     pub fn bodyHasInternalShardFields(alloc: std.mem.Allocator, body: []const u8) !bool {

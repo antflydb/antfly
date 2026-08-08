@@ -14,10 +14,11 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
 const backend_erased = @import("backend_erased.zig");
 const lsm_backend = @import("lsm_backend.zig");
-const supports_native_lmdb_backend = builtin.os.tag != .freestanding;
+const supports_native_lmdb_backend = builtin.os.tag != .freestanding and build_options.lmdb_enabled;
 const lmdb_backend = if (supports_native_lmdb_backend) @import("lmdb_backend.zig") else struct {
     pub const Backend = struct {
         pub fn close(_: *@This()) void {}

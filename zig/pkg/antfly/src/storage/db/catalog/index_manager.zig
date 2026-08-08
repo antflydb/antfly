@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const storage_build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const Allocator = std.mem.Allocator;
 const fs_paths = @import("../../../common/fs_paths.zig");
@@ -25,6 +26,7 @@ const backend_erased = @import("../../backend_erased.zig");
 const backend_scan = @import("../../backend_scan.zig");
 const types = @import("../types.zig");
 const doc_identity = @import("../doc_identity.zig");
+const dynamic_field_capability = @import("../dynamic_field_capability.zig");
 const apply_state = @import("../derived/apply_state.zig");
 const change_journal_mod = @import("../derived/change_journal.zig");
 const derived_types = @import("../derived/derived_types.zig");
@@ -44,7 +46,14 @@ const docstore_mod = @import("../../docstore.zig");
 const schema_mod = @import("../../schema.zig");
 const analysis_mod = @import("../../../search/analysis.zig");
 const ttl_mod = @import("../../ttl.zig");
-const lmdb = @import("../../lmdb.zig");
+const lmdb = if (storage_build_options.lmdb_enabled or builtin.is_test) @import("../../lmdb.zig") else struct {
+    pub const CommitPublishPhase = enum {
+        before_publish,
+        after_data_sync,
+        after_meta_write,
+        after_meta_sync,
+    };
+};
 const mapper = @import("../document_mapper.zig");
 const typed_dv = @import("../../../section/typed_doc_values.zig");
 const typed_dv_coverage = @import("../typed_doc_values_coverage.zig");
@@ -1391,16 +1400,7 @@ pub const IndexManager = struct {
         }
     };
 
-    pub const ObservedDynamicFieldCapabilitySet = struct {
-        index_name: []u8,
-        field_capabilities: []schema_mod.FieldCapability,
-
-        pub fn deinit(self: *@This(), alloc: Allocator) void {
-            alloc.free(self.index_name);
-            schema_mod.freeOwnedFieldCapabilities(alloc, self.field_capabilities);
-            self.* = undefined;
-        }
-    };
+    pub const ObservedDynamicFieldCapabilitySet = dynamic_field_capability.ObservedDynamicFieldCapabilitySet;
 
     pub const AlgebraicIndex = struct {
         apply_mutex: *std.atomic.Mutex,

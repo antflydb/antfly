@@ -21,6 +21,7 @@ const http_client_mod = @import("http_client.zig");
 const table_catalog = @import("table_catalog.zig");
 const table_router = @import("table_router.zig");
 const table_writes = @import("table_writes.zig");
+const contract = @import("distributed_txn_contract.zig");
 
 pub const table_participant_prefix = "table:";
 const table_participant_v2_prefix = "table2:";

@@ -47,9 +47,10 @@ const resource_manager_mod = @import("../storage/resource_manager.zig");
 const ha_primary_mod = @import("../storage/ha/primary.zig");
 const ha_public_gate_state_mod = @import("../storage/ha/public_gate_state.zig");
 const storage_schema = @import("../storage/schema.zig");
-const lmdb = @import("../storage/lmdb.zig");
 const table_catalog = @import("table_catalog.zig");
 const table_reads = @import("table_reads.zig");
+const table_write_source = @import("table_write_source.zig");
+const table_index_config = @import("table_index_config.zig");
 const table_router = @import("table_router.zig");
 const tables_api = @import("tables.zig");
 const indexes_api = @import("indexes.zig");
@@ -15924,9 +15925,10 @@ pub const HostedProvisionedTableWriteSource = struct {
         format: backups_api.BackupFormat,
         location_uri: []const u8,
         connection: []const u8,
-        location: *backups_api.BackupLocation,
+        location_ptr: *anyopaque,
     ) !?[]backups_api.ShardSnapshot {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const location: *backups_api.BackupLocation = @ptrCast(@alignCast(location_ptr));
         const group_id = (try table_catalog.resolveSingleRangeGroup(alloc, self.catalog, table_name)) orelse return null;
         const resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader);
         var route = resolved_route orelse return null;
@@ -20838,7 +20840,7 @@ fn lockAtomic(mutex: anytype) void {
 
 fn loadLocalTableSchemaJson(alloc: std.mem.Allocator, db: *db_mod.DB) !?[]u8 {
     return db.core.store.get(alloc, local_schema_json_key) catch |err| switch (err) {
-        lmdb.Error.NotFound => null,
+        error.NotFound => null,
         else => return err,
     };
 }
