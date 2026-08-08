@@ -8266,6 +8266,15 @@ pub const DB = struct {
         var current = existing;
         defer current.deinit(alloc);
         if (!revision.matches(current)) return .stale;
+
+        // Validate the shared execution fence before interpreting this
+        // consumer's coverage marker. A sibling failure can advance the epoch
+        // without changing this issue revision; treating that stale snapshot
+        // as coverage debt would pay for provider work that cannot commit.
+        var completion = (try self.loadArtifactRepairCompletionState(alloc, completion_key)) orelse ArtifactRepairCompletionState{};
+        if (completion.epoch != expected_epoch) return .stale;
+        if (require_completed_fence and completion.completed_sequence < revision.sequence) return .stale;
+
         // Coverage transitions and repair-ledger completion share this mutex.
         // Re-read the repaired generation while holding it so either repair
         // clears debt first (and stale terminal transitions are rejected) or a
@@ -8275,9 +8284,6 @@ pub const DB = struct {
             if (!try self.repairCoverageMarkerComplete(alloc, marker_key)) return .coverage_incomplete;
         }
 
-        var completion = (try self.loadArtifactRepairCompletionState(alloc, completion_key)) orelse ArtifactRepairCompletionState{};
-        if (completion.epoch != expected_epoch) return .stale;
-        if (require_completed_fence and completion.completed_sequence < revision.sequence) return .stale;
         completion.completed_sequence = @max(completion.completed_sequence, revision.sequence);
         completion.pending_issues -|= 1;
 
@@ -50746,6 +50752,17 @@ test "db repair completion cannot clear debt behind terminal coverage" {
     const marker_key = try internal_keys.derivedCoverageOutcomeKeyAlloc(alloc, "semantic", generation, "doc:a");
     defer alloc.free(marker_key);
     try db.core.store.put(marker_key, "terminal_failed");
+    try std.testing.expectEqual(
+        DB.ArtifactRepairCompletionDisposition.stale,
+        try db.completeArtifactRepairIssueIfCurrent(
+            alloc,
+            pending[0],
+            revision,
+            completion_key,
+            completion.epoch +% 1,
+            false,
+        ),
+    );
     try std.testing.expectEqual(
         DB.ArtifactRepairCompletionDisposition.coverage_incomplete,
         try db.completeArtifactRepairIssueIfCurrent(

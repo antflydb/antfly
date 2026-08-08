@@ -2550,7 +2550,12 @@ fn beginReplayPass(runtime: *EnrichmentRuntime, io: Io, target_sequence: u64) !b
         runtime.mutex.unlock(io);
         return RuntimeError.EnrichmentWorkerFailed;
     }
-    if (runtime.applied_sequence >= target_sequence) {
+    // A pass can advance the applied checkpoint and then fail while persisting
+    // the corresponding cleared runtime status. Keep one retry pass eligible
+    // in that state: its empty-window path reconciles durable status and clears
+    // retrying. Skipping it would leave the worker immediately retrying forever
+    // once the backoff deadline elapsed.
+    if (runtime.applied_sequence >= target_sequence and !runtime.retrying) {
         runtime.mutex.unlock(io);
         return false;
     }
@@ -2623,6 +2628,13 @@ test "enrichment replay passes are single flight" {
     waiter.acquired.waitUncancelable(io);
     try std.testing.expect(waiter.err == null);
     try std.testing.expect(runtime.replay_pass_active);
+    endReplayPass(&runtime, io);
+
+    runtime.applied_sequence = 1;
+    try std.testing.expect(!try beginReplayPass(&runtime, io, 1));
+    runtime.retrying = true;
+    runtime.next_retry_at_ms = 0;
+    try std.testing.expect(try beginReplayPass(&runtime, io, 1));
     endReplayPass(&runtime, io);
 }
 
