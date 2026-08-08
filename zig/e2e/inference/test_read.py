@@ -22,7 +22,23 @@ import os
 from pathlib import Path
 
 import pytest
-from .helpers import TINY_PNG_URI, assert_openai_list_response, load_go_sample_page_fixture, make_text_png_uri
+import requests
+
+from .conftest import InferenceServer, api_path, find_free_port
+from .helpers import (
+    TINY_PNG_URI,
+    assert_openai_list_response,
+    load_go_sample_page_fixture,
+    make_text_png_uri,
+)
+from .models import (
+    ensure_model_by_name,
+    inference_command,
+    inference_download_enabled,
+    local_model_exists,
+    ml_dir,
+    models_dir,
+)
 
 pytestmark = pytest.mark.model_integration
 
@@ -249,6 +265,81 @@ def test_read_florence_model_answers_text(api):
     observed = _normalize_text(results[0]["text"])
     assert "invoice" in observed, f"Florence OCR missed INVOICE: {results[0]['text']!r}"
     assert "123" in observed, f"Florence OCR missed TOTAL 123: {results[0]['text']!r}"
+
+
+@pytest.mark.multimodal
+@pytest.mark.slow
+def test_read_recovers_after_forced_run_admission_denials():
+    """A loaded Florence reader survives repeated pre-execution denials."""
+    if os.environ.get("RUN_INFERENCE_ADMISSION_RECOVERY_TESTS") != "1":
+        pytest.skip(
+            "Set RUN_INFERENCE_ADMISSION_RECOVERY_TESTS=1 to run admission recovery coverage"
+        )
+
+    model = (
+        os.environ.get("ANTFLY_INFERENCE_FLORENCE_MODEL")
+        or "antflydb/florence-2-base"
+    )
+    if not local_model_exists(model, "readers"):
+        if not inference_download_enabled():
+            pytest.skip(f"{model} is not available")
+        if ensure_model_by_name(model, "readers") is None:
+            pytest.skip(f"{model} is not a curated reader model")
+
+    forced_denials = 3
+    server = InferenceServer(
+        inference_command(),
+        str(models_dir()),
+        str(ml_dir()),
+        "127.0.0.1",
+        find_free_port(),
+        max_loaded_models="1",
+        extra_env={
+            "ANTFLY_INFERENCE_TEST_FORCE_RUN_ADMISSION_DENIALS": str(forced_denials),
+        },
+    )
+    payload = {
+        "model": model,
+        "images": [{"url": TINY_PNG_URI}],
+        "max_tokens": 1,
+    }
+    read_url = f"{server.url}{api_path('/read')}"
+
+    def post_read():
+        try:
+            return requests.post(read_url, json=payload, timeout=300)
+        except requests.RequestException as exc:
+            raise AssertionError(server.failure_diagnostic()) from exc
+
+    try:
+        startup_marker = (
+            "enabling test-only forced inference run admission denials "
+            f"count={forced_denials}"
+        )
+        assert startup_marker in server.read_output(), server.failure_diagnostic()
+
+        for _ in range(forced_denials):
+            response = post_read()
+            assert response.status_code == 503, (
+                f"{response.text[:2000]}\n{server.failure_diagnostic()}"
+            )
+            body = response.json()
+            assert body["error"] == "MODEL_RESOURCE_BUSY"
+            assert body["retryable"] is True
+            assert response.headers["Retry-After"]
+            assert server.proc.poll() is None, server.failure_diagnostic()
+
+        response = post_read()
+        assert response.status_code == 200, response.text[:2000]
+        results = response.json()["data"]
+        assert len(results) == 1
+        _assert_read_result_shape(results[0])
+        assert server.proc.poll() is None, server.failure_diagnostic()
+
+        output = server.read_output()
+        assert output.count("test-only forced inference run admission denial") >= forced_denials
+    finally:
+        server.stop()
 
 
 @pytest.mark.multimodal

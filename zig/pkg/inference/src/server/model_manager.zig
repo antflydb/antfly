@@ -3020,6 +3020,13 @@ pub const ModelManager = struct {
         self.admission.configureResourceBudget(resource_budget);
     }
 
+    pub fn configureForcedRunAdmissionDenialsForTesting(
+        self: *ModelManager,
+        count: usize,
+    ) void {
+        self.admission.configureForcedRunDenialsForTesting(count);
+    }
+
     fn modelIsInFlightLocked(self: *ModelManager, model: *LoadedModel) bool {
         var it = self.in_flight_loads.valueIterator();
         while (it.next()) |flight_ptr| {
