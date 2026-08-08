@@ -1,6 +1,6 @@
 # Antfly Zig compilation architecture
 
-Last updated: 2026-08-07
+Last updated: 2026-08-08
 
 ## Main goal
 
@@ -40,6 +40,40 @@ do not satisfy the main goal.
   per record, posting, LMDB operation, or vector candidate.
 - Allocation ownership, cancellation, deadlines, and error translation must be
   explicit at every compiled ABI boundary.
+
+## Goal loop
+
+Repeat this loop until the main goal and exit criteria are satisfied:
+
+1. Measure the current cold ARM64 Linux musl `ReleaseFast` build, including
+   per-unit wall time, LLVM time, declarations, analyzed files, overlap, peak
+   memory when available, and final artifact/symbol shape.
+2. Select one coarse ownership boundary from the largest remaining duplicated
+   implementation family. State what control remains outside the boundary and
+   what complete local operation moves behind it.
+3. Implement the boundary behind the storage-kernel experiment. Preserve one
+   static executable, embedded standalone inference, normal build concurrency,
+   the small C API surface, and exact behavior/error/cancellation ownership.
+4. Validate the affected behavior in both experiment-enabled and legacy
+   configurations, then run graph gates, ABI tests, artifact/symbol audits, and
+   a genuinely cold ARM64 `ReleaseFast` comparison.
+5. Make an explicit decision:
+   - **keep** only when the boundary is behaviorally sound and either removes
+     material compiler work now or is a necessary, bounded prerequisite to a
+     named immediately-following cut;
+   - **revise** when the ownership direction is correct but legacy roots remain
+     reachable or the measured change is only host variance; or
+   - **revert** when the boundary duplicates work, grows the wrong artifact,
+     weakens behavior, or has no credible path to the target architecture.
+6. Record the evidence and decision here, commit and push only the accepted
+   increment, then name and begin the next largest viable slice.
+
+The loop ends only when repeated cold builds are reliable on the normal runner,
+storage/local query is compiled once and reused by the executable and C API,
+the distributed critical path is at most 380 seconds (preferably 350 seconds),
+production artifacts contain no LMDB implementation, and the experiment can
+become the production architecture without increasing runner cost. Enabling it
+by default, merging it, or increasing CI cost still requires explicit approval.
 
 ## Why source-module cleanup alone is insufficient
 
@@ -964,6 +998,162 @@ unconditionally and make the old provisioned physical path compile-time
 unreachable before the next cold ARM64 Linux musl `ReleaseFast` comparison.
 Until then, this checkpoint makes no compiler-time, RSS, or graph-reduction
 claim.
+
+### Phase 2p process-owner attachment and read fallback removal
+
+`DataServer` now owns one heap-stable `ProvisionedKernelOwnerSource` and lends
+it to API reads, direct writes, Raft apply, HA replay, snapshot publication, and
+warmup. In the experiment, provisioned and hosted group-local reads fail closed
+when that owner has not been attached; they no longer retain a physical DB
+fallback. The legacy resident DB source is disabled in the same composition.
+
+Two cold profiles showed that this was necessary ownership work but not yet a
+compiler win. The first candidate measured 392.784 seconds for distributed.
+The repeated owner-attached profile measured 404.195 seconds with 724
+repository files and 41,964 declarations. Relative to the preceding graph it
+removed only four files and 254 declarations, while the host was 6–12% slower
+across independent units. No timing claim is therefore attributable to the
+change.
+
+Decision: keep the single-owner composition as a bounded prerequisite, but
+classify the compiler result as **revise**. Local write and lifecycle functions
+remain roots through the provisioned source vtable, so attaching the owner is
+not equivalent to removing the old implementation.
+
+### Phase 3a transaction-participant owner slice
+
+The internal owner ABI is now version 10 and exposes begin, prepare, resolve,
+and status as one coarse call per transaction phase. Recovery deliberately
+calls back into distributed control using opaque participant identifiers;
+routing and coordination do not move into the storage kernel. Metadata uses a
+remote transaction source, while provisioned local participants use the
+resident owner under the experiment.
+
+Focused cross-archive owner tests passed 6/6 with zero leaks, the owner ABI
+tests passed 2/2, the default public C API passed 10/10, and the production
+write regression suite passed 68/68. The cold ARM64 profile was:
+
+| Unit | Compiler time | LLVM emit | Declarations | Repository Zig files |
+|---|---:|---:|---:|---:|
+| API kernel | 142.441 s | 138.184 s | 17,241 | 325 |
+| Distributed | 405.103 s | 396.328 s | 41,967 | 724 |
+| Storage kernel | 236.926 s | 231.085 s | 26,544 | 395 |
+| Inference | 239.373 s | 231.613 s | 24,945 | 523 |
+
+The distributed graph was exactly the same 724 files as the preceding profile
+and added only three declarations. Transaction participation is therefore a
+correct architectural prerequisite, not a standalone build-time win.
+
+Decision: keep it in the Phase 3 candidate, but **revise and continue** rather
+than enabling the experiment or claiming success.
+
+### Rejected Lite command-dispatch probe
+
+Moving the offline `antfly lite` command entry into the storage archive while
+leaving `lite serve` in distributed produced this cold comparison:
+
+| Unit | Before | Probe | Delta |
+|---|---:|---:|---:|
+| Distributed | 405.103 s | 399.933 s | -5.170 s |
+| Storage kernel | 236.926 s | 244.894 s | +7.968 s |
+
+Distributed lost only two net repository files and 405 declarations, while
+storage gained 25 files and 592 declarations. Standalone still directly owns
+the Lite backend, so moving command dispatch cannot remove that implementation
+from the distributed graph.
+
+Decision: **revert** the probe. The result does not meet the go/no-go criteria
+and confirms that the next Lite cut must move physical ownership, not CLI
+dispatch.
+
+### Phase 3b metadata remote-only write-source probe
+
+Metadata/API proxy processes never own a data-group DB. Their hosted write
+source now reflects that fact in its vtable: local schema, batch, transaction,
+artifact, and runtime-status callbacks are absent. Required top-level batch and
+artifact operations retain routing and HTTP fanout, with compile-time-specialized
+local/no-route cases returning unhandled. This is a correctness boundary as
+well as a graph experiment; an impossible metadata-local branch can no longer
+silently open storage.
+
+The linked native experiment built successfully. The focused cross-archive
+suite passed 6/6 with zero leaks, the normal production write suite passed
+68/68 with zero leaks, and all 26 cold ARM64 build steps succeeded. The exact
+cold comparison was:
+
+| Unit | Phase 3a | Remote-only | Graph/declaration result |
+|---|---:|---:|---|
+| API kernel | 142.441 s | 136.014 s | identical graph and declarations |
+| Distributed | 405.103 s | 385.637 s | identical 724-file graph; -32 declarations |
+| Storage kernel | 236.926 s | 227.861 s | identical graph and declarations |
+| Inference | 239.373 s | 230.751 s | identical graph and declarations |
+
+Every independent unit improved by roughly 4–6%, identifying host variance
+rather than a 19.466-second distributed win. Distributed retained all 724
+repository files and 1,053,172 repository source lines.
+
+Decision: **revise**. Retain this only within the uncommitted Phase 3 candidate
+because it is the correct metadata contract and a prerequisite to the next
+cut; it does not earn acceptance on performance. The next measured slice must
+move complete provisioned physical write/lifecycle operations behind the owner
+and make their legacy implementations compile-time unreachable. If the
+combined slice still leaves the graph unchanged, revert the candidate rather
+than attributing host variance to the architecture.
+
+### Rejected Phase 3 transaction and artifact-family candidate
+
+The final Phase 3 probe completed the document-artifact family behind the live
+storage owner. Reprocess-one, reprocess-range, issue listing, child-range
+placement, child-range batch application, and complete repair execution each
+crossed the archive boundary as one coarse operation. Repair retained routing,
+admission, scheduling policy, and result notifications in distributed control;
+the owner received a versioned options record plus synchronous cancellation,
+yield, activation, and capacity callbacks. No per-document or storage-engine
+call crossed the ABI.
+
+Behavioral validation was successful:
+
+- the cross-archive owner suite passed 6/6 with zero leaks, including actual
+  repair execution and cancellation propagation;
+- the owner ABI suite passed 2/2 with future-version, malformed-request, and
+  status-translation coverage;
+- the production write/lifecycle suite passed 68/68 with the experiment both
+  disabled and enabled;
+- the public C API suite passed 10/10 with zero leaks;
+- the linked native Debug executable, all graph gates, and all 13 analyzer
+  tests passed; and
+- the release artifacts remained one stripped static ARM64 executable plus
+  16.394 MB C API libraries. Internal owner symbols remained hidden and no
+  LMDB implementation symbol or path appeared in the production artifacts.
+
+The cold ARM64 Linux musl `ReleaseFast` profile used fresh local and global
+caches, production LSM-only mode, and normal concurrency:
+
+| Unit | Compiler time | LLVM emit | Declarations | Repository Zig files |
+|---|---:|---:|---:|---:|
+| API kernel | 137.084 s | 132.976 s | 17,241 | 325 |
+| Distributed | 397.836 s | 389.286 s | 41,961 | 724 |
+| Storage kernel | 233.884 s | 228.110 s | 26,779 | 395 |
+| Inference | 233.189 s | 225.572 s | 24,945 | 523 |
+
+The authoritative graph result was unchanged: 1,967 repository-file instances,
+1,187 unique files, 780 duplicate instances, and 474 duplicated files across
+the four units. Distributed remained at the same 724 files and gained 25
+declarations versus the preceding artifact profile; storage remained at 395
+files and gained 189 declarations. All independent units were 3--7% slower
+than that profile, so the wall-time change is host variance rather than an
+architectural result.
+
+Decision: **revert** the complete uncommitted Phase 3 candidate, including the
+Phase 2p owner attachment that was retained only as its prerequisite. The
+experiment proved the ABI and ownership mechanics but not the compiler result.
+Adding operation families one at a time cannot pay while the distributed unit
+still roots the complete provisioned write/lifecycle implementation through
+the same broad source and vtable composition. The next viable probe must remove
+that implementation root as one atomic cut--for example by separating control
+and legacy physical provisioned sources into different modules and making the
+entire physical module unreachable in the experimental distributed artifact--
+before adding more owner operations.
 
 ## Holistic target architecture
 
