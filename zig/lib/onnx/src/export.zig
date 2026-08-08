@@ -1923,7 +1923,12 @@ fn convertOpToNode(
     };
 
     const inputs_slice = n.getInputs();
-    const extra_inputs: usize = @intFromBool(shape_attr != null) + @intFromBool(reduce_axes_attr != null) + (if (slice_attr != null) @as(usize, 4) else @as(usize, 0));
+    const runtime_slice_bounds = if (slice_attr) |a| a.runtime_starts or a.runtime_limits else false;
+    const slice_extra_inputs: usize = if (slice_attr != null)
+        (if (runtime_slice_bounds) 2 else 4)
+    else
+        0;
+    const extra_inputs: usize = @intFromBool(shape_attr != null) + @intFromBool(reduce_axes_attr != null) + slice_extra_inputs;
     var inp_names = try alloc.alloc([]const u8, inputs_slice.len + extra_inputs);
     errdefer alloc.free(inp_names);
     for (inputs_slice, 0..) |inp_id, i| {
@@ -1995,52 +2000,56 @@ fn convertOpToNode(
     }
 
     if (slice_attr) |a| {
-        try shape_extras.ensureUnusedCapacity(alloc, 4);
+        try shape_extras.ensureUnusedCapacity(alloc, slice_extra_inputs);
 
-        const starts_name = try std.fmt.allocPrint(alloc, "slice_starts_{d}", .{node_id});
-        errdefer alloc.free(starts_name);
-        const starts_i64 = try alloc.alloc(i64, a.num_axes);
-        errdefer alloc.free(starts_i64);
-        for (0..a.num_axes) |i| starts_i64[i] = a.starts[i];
-        const starts_dims = try alloc.alloc(i64, 1);
-        errdefer alloc.free(starts_dims);
-        starts_dims[0] = @intCast(a.num_axes);
-        try initializers.append(alloc, .{
-            .name = starts_name,
-            .dims = starts_dims,
-            .data_type = .int64,
-            .raw_data = std.mem.sliceAsBytes(starts_i64),
-        });
-        shape_extras.appendAssumeCapacity(.{ .name = starts_name, .raw_data = starts_i64 });
-        inp_names[extra_input_idx] = starts_name;
-        extra_input_idx += 1;
+        if (!runtime_slice_bounds) {
+            const starts_name = try std.fmt.allocPrint(alloc, "slice_starts_{d}", .{node_id});
+            errdefer alloc.free(starts_name);
+            const starts_i64 = try alloc.alloc(i64, a.num_axes);
+            errdefer alloc.free(starts_i64);
+            for (0..a.num_axes) |i| starts_i64[i] = a.starts[i];
+            const starts_dims = try alloc.alloc(i64, 1);
+            errdefer alloc.free(starts_dims);
+            starts_dims[0] = @intCast(a.num_axes);
+            try initializers.append(alloc, .{
+                .name = starts_name,
+                .dims = starts_dims,
+                .data_type = .int64,
+                .raw_data = std.mem.sliceAsBytes(starts_i64),
+            });
+            shape_extras.appendAssumeCapacity(.{ .name = starts_name, .raw_data = starts_i64 });
+            inp_names[extra_input_idx] = starts_name;
+            extra_input_idx += 1;
 
-        const ends_name = try std.fmt.allocPrint(alloc, "slice_ends_{d}", .{node_id});
-        errdefer alloc.free(ends_name);
-        const ends_i64 = try alloc.alloc(i64, a.num_axes);
-        errdefer alloc.free(ends_i64);
-        for (0..a.num_axes) |i| ends_i64[i] = a.limits[i];
-        const ends_dims = try alloc.alloc(i64, 1);
-        errdefer alloc.free(ends_dims);
-        ends_dims[0] = @intCast(a.num_axes);
-        try initializers.append(alloc, .{
-            .name = ends_name,
-            .dims = ends_dims,
-            .data_type = .int64,
-            .raw_data = std.mem.sliceAsBytes(ends_i64),
-        });
-        shape_extras.appendAssumeCapacity(.{ .name = ends_name, .raw_data = ends_i64 });
-        inp_names[extra_input_idx] = ends_name;
-        extra_input_idx += 1;
+            const ends_name = try std.fmt.allocPrint(alloc, "slice_ends_{d}", .{node_id});
+            errdefer alloc.free(ends_name);
+            const ends_i64 = try alloc.alloc(i64, a.num_axes);
+            errdefer alloc.free(ends_i64);
+            for (0..a.num_axes) |i| ends_i64[i] = a.limits[i];
+            const ends_dims = try alloc.alloc(i64, 1);
+            errdefer alloc.free(ends_dims);
+            ends_dims[0] = @intCast(a.num_axes);
+            try initializers.append(alloc, .{
+                .name = ends_name,
+                .dims = ends_dims,
+                .data_type = .int64,
+                .raw_data = std.mem.sliceAsBytes(ends_i64),
+            });
+            shape_extras.appendAssumeCapacity(.{ .name = ends_name, .raw_data = ends_i64 });
+            inp_names[extra_input_idx] = ends_name;
+            extra_input_idx += 1;
+        }
+
+        const slice_axes_len: u8 = if (runtime_slice_bounds) a.num_bound_axes else a.num_axes;
 
         const axes_name = try std.fmt.allocPrint(alloc, "slice_axes_{d}", .{node_id});
         errdefer alloc.free(axes_name);
-        const axes_i64 = try alloc.alloc(i64, a.num_axes);
+        const axes_i64 = try alloc.alloc(i64, slice_axes_len);
         errdefer alloc.free(axes_i64);
-        for (0..a.num_axes) |i| axes_i64[i] = @intCast(i);
+        for (0..slice_axes_len) |i| axes_i64[i] = if (runtime_slice_bounds) a.bound_axes[i] else @intCast(i);
         const axes_dims = try alloc.alloc(i64, 1);
         errdefer alloc.free(axes_dims);
-        axes_dims[0] = @intCast(a.num_axes);
+        axes_dims[0] = @intCast(slice_axes_len);
         try initializers.append(alloc, .{
             .name = axes_name,
             .dims = axes_dims,
@@ -2053,12 +2062,15 @@ fn convertOpToNode(
 
         const steps_name = try std.fmt.allocPrint(alloc, "slice_steps_{d}", .{node_id});
         errdefer alloc.free(steps_name);
-        const steps_i64 = try alloc.alloc(i64, a.num_axes);
+        const steps_i64 = try alloc.alloc(i64, slice_axes_len);
         errdefer alloc.free(steps_i64);
-        for (0..a.num_axes) |i| steps_i64[i] = a.strides[i];
+        for (0..slice_axes_len) |i| {
+            const axis = if (runtime_slice_bounds) a.bound_axes[i] else @as(u8, @intCast(i));
+            steps_i64[i] = a.strides[axis];
+        }
         const steps_dims = try alloc.alloc(i64, 1);
         errdefer alloc.free(steps_dims);
-        steps_dims[0] = @intCast(a.num_axes);
+        steps_dims[0] = @intCast(slice_axes_len);
         try initializers.append(alloc, .{
             .name = steps_name,
             .dims = steps_dims,
