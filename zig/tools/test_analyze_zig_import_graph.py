@@ -42,6 +42,12 @@ class ImportGraphTest(unittest.TestCase):
             if not path.exists():
                 self.write(name, "pub const value = 1;\n")
 
+    def write_api_kernel_boundaries(self):
+        for name in set(analyzer.API_KERNEL_CONTRACTS) | set(analyzer.API_KERNEL_IMPLEMENTATIONS):
+            path = self.root / name
+            if not path.exists():
+                self.write(name, "pub const value = 1;\n")
+
     def test_follows_only_existing_relative_zig_imports_inside_root(self):
         entry = self.write(
             "entry.zig",
@@ -110,6 +116,27 @@ class ImportGraphTest(unittest.TestCase):
             self.assertFalse(analyzer.check_codegen_boundary(graph))
         self.assertIn(
             "standalone/inference_host.zig -> standalone/runtime.zig",
+            diagnostics.getvalue(),
+        )
+
+    def test_api_kernel_boundary_accepts_data_only_contract_imports(self):
+        self.write_api_kernel_boundaries()
+        self.write("api/table_write_source.zig", 'const wire = @import("backup_contract.zig");\n')
+        self.write("api/backup_contract.zig", "pub const value = 1;\n")
+        graph = analyzer.ImportGraph(self.root)
+
+        self.assertTrue(analyzer.check_api_kernel_boundary(graph))
+
+    def test_api_kernel_boundary_rejects_direct_implementation_import(self):
+        self.write_api_kernel_boundaries()
+        self.write("api/table_write_source.zig", 'const impl = @import("table_writes.zig");\n')
+        graph = analyzer.ImportGraph(self.root)
+
+        diagnostics = io.StringIO()
+        with redirect_stderr(diagnostics):
+            self.assertFalse(analyzer.check_api_kernel_boundary(graph))
+        self.assertIn(
+            "api/table_write_source.zig directly imports api/table_writes.zig",
             diagnostics.getvalue(),
         )
 
