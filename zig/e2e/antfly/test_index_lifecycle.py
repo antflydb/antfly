@@ -643,9 +643,9 @@ def test_stateful_managed_embeddings_replay_tail_converges_without_probe_write(
     converged = wait_until(converged_replay_status, timeout_s=12.0, interval_s=0.1)
     assert converged is not None, json.dumps(latest_status, indent=2, sort_keys=True)
 
-    # The default strict policy still reports the three field-less documents as
-    # uncovered, settled coverage debt. They are not pending replay work and
-    # must not imply that a worker is still active.
+    # The default strict policy reports the three field-less documents as
+    # settled but uncovered. It must not rewrite the authoritative replay
+    # ledger into fake pending work or imply that a worker is still active.
     coverage = converged["coverage"]
     assert coverage["policy"] == "strict"
     assert coverage["complete"] is False
@@ -655,6 +655,8 @@ def test_stateful_managed_embeddings_replay_tail_converges_without_probe_write(
     assert coverage["settled"] == 9
     assert coverage["uncovered"] == 3
     assert coverage["pending"] == 0
+    assert coverage["healthy"] is False
+    assert coverage["degraded"] is True
     assert converged["backfill_active"] is False
     assert converged["rebuilding"] is False
     assert converged["backfill_progress"] == pytest.approx(1.0)
