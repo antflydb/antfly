@@ -2426,14 +2426,13 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '503':
-          description: Transaction outcome or requested visibility is temporarily unavailable; retry is
-            safe
+          description: The coordinator was unavailable before a commit decision; retry is safe
           content:
             text/plain:
               schema:
                 type: string
         '500':
-          $ref: '#/components/responses/InternalServerError'
+          $ref: '#/components/responses/StatelessTransactionFailure'
       security:
         - BasicAuth: []
         - ApiKeyAuth: []
@@ -2499,8 +2498,14 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/TransactionCommitResponse'
+        '503':
+          description: The coordinator was unavailable before a commit decision; retry is safe
+          content:
+            text/plain:
+              schema:
+                type: string
         '500':
-          $ref: '#/components/responses/InternalServerError'
+          $ref: '#/components/responses/StatelessTransactionFailure'
       security:
         - BasicAuth: []
         - ApiKeyAuth: []
@@ -3863,13 +3868,14 @@ paths:
         '429':
           $ref: '#/components/responses/DenseRepairBackpressure'
         '503':
-          description: Write routing, document identity, or commit visibility is temporarily unavailable
+          description: Write routing, document identity, or the coordinator is temporarily unavailable
+            before a commit decision
           content:
             text/plain:
               schema:
                 type: string
         '500':
-          $ref: '#/components/responses/InternalServerError'
+          $ref: '#/components/responses/StatelessTransactionFailure'
       security:
         - BasicAuth: []
         - ApiKeyAuth: []
@@ -23156,6 +23162,22 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
+    StatelessTransactionFailure:
+      description: >
+        Internal transaction failure. If the response says that the outcome is
+
+        unknown, the request may already have committed and the stateless
+
+        request MUST NOT be retried. Use a transaction session when a commit
+
+        must be safely retryable by transaction ID.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+        text/plain:
+          schema:
+            type: string
     DenseRepairBackpressure:
       description: Writes are temporarily limited while a dense-index rebuild catches up.
       headers:

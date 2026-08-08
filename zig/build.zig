@@ -5079,6 +5079,8 @@ pub fn build(b: *std.Build) void {
             "txn resolve codec preserves sync level and accepts legacy requests",
             "distributed txn coordinator groups by range and commits all participants",
             "stable distributed transaction retry resumes a durable commit decision",
+            "distributed txn retries an ambiguous coordinator decision under the same id",
+            "distributed txn bounds unresolved coordinator decision retries",
             "distributed txn coordinator aborts begun participants on prepare failure",
             "distributed txn coordinator never aborts after durable commit decision",
             "distributed txn coordinator never restarts a transaction id on topology change",

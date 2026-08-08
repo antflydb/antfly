@@ -2412,7 +2412,11 @@ pub const ApiHttpServer = struct {
                         txn_id,
                         commit.begin_timestamp,
                         distributed_tables,
-                        commit.sync_level,
+                        // Proposal-only delivery is insufficient for recovery:
+                        // a new leader may discard it before apply. Upgrade
+                        // only the weakest level, preserving stronger caller
+                        // visibility contracts without extra hot-path work.
+                        if (commit.sync_level == .propose) .write else commit.sync_level,
                     ) catch |err| switch (err) {
                         error.InvalidBatchRequest,
                         error.InvalidArgument,
@@ -2456,17 +2460,23 @@ pub const ApiHttpServer = struct {
                                 std.log.warn("stable transaction terminal handoff persistence deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
                                 continue;
                             }) orelse continue;
-                            if (committed.coordinator_group_id) |group_id| {
-                                const table_name = committed.coordinator_table_name orelse continue;
-                                const acknowledged = source.acknowledgeTransactionCommit(self.alloc, txn_id, group_id, table_name) catch |err| {
-                                    std.log.warn("stable transaction recovered coordinator acknowledgement deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
-                                    continue;
-                                };
-                                if (acknowledged == null) continue;
-                                _ = (self.txn_sessions.markTerminalCoordinatorAcknowledged(self.alloc, txn_id) catch |err| {
-                                    std.log.warn("stable transaction recovered acknowledgement receipt persistence deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
-                                    continue;
-                                }) orelse continue;
+                            // Pending is a durable decision, not a completed
+                            // API/storage handoff. Retain the coordinator's
+                            // self-participant so topology stays fenced while
+                            // maintenance replays phase two under this ID.
+                            if (status == .committed) {
+                                if (committed.coordinator_group_id) |group_id| {
+                                    const table_name = committed.coordinator_table_name orelse continue;
+                                    const acknowledged = source.acknowledgeTransactionCommit(self.alloc, txn_id, group_id, table_name) catch |err| {
+                                        std.log.warn("stable transaction recovered coordinator acknowledgement deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
+                                        continue;
+                                    };
+                                    if (acknowledged == null) continue;
+                                    _ = (self.txn_sessions.markTerminalCoordinatorAcknowledged(self.alloc, txn_id) catch |err| {
+                                        std.log.warn("stable transaction recovered acknowledgement receipt persistence deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
+                                        continue;
+                                    }) orelse continue;
+                                }
                             }
                         },
                     }
@@ -4947,8 +4957,8 @@ pub const ApiHttpServer = struct {
                     ),
                     error.CommitDecisionUnknown => return try textResponse(
                         self.alloc,
-                        503,
-                        "transaction outcome is unknown",
+                        500,
+                        "transaction outcome is unknown; do not retry this stateless request because it may already have committed; use a transaction session for retryable commits",
                     ),
                     error.AbortDecisionNotDurable, error.TransactionBeginFailed => return try textResponse(
                         self.alloc,
@@ -5235,7 +5245,10 @@ pub const ApiHttpServer = struct {
                     var terminal = terminal_value;
                     defer terminal.deinit(self.alloc);
                     var status = terminal.status;
-                    if (!terminal.coordinator_acknowledged) {
+                    // A pending terminal state still requires commit replay;
+                    // acknowledging the coordinator here would release the
+                    // topology fence and strand the durable API response.
+                    if (status == .committed and !terminal.coordinator_acknowledged) {
                         if (terminal.coordinator_group_id) |coordinator_group_id| {
                             const coordinator_table_name = terminal.coordinator_table_name orelse return error.InvalidTransactionSessionRecord;
                             const acknowledged = source.acknowledgeTransactionCommit(
@@ -5423,24 +5436,26 @@ pub const ApiHttpServer = struct {
                             return try textResponse(self.alloc, 503, "transaction committed; durable response handoff is pending");
                         }) orelse return try textResponse(self.alloc, 503, "transaction committed; durable response handoff is pending");
 
-                        if (committed.coordinator_group_id) |coordinator_group_id| {
-                            const coordinator_table_name = committed.coordinator_table_name orelse return error.InvalidTransactionSessionRecord;
-                            const acknowledged = source.acknowledgeTransactionCommit(
-                                self.alloc,
-                                txn_id,
-                                coordinator_group_id,
-                                coordinator_table_name,
-                            ) catch |err| blk: {
-                                std.log.warn("stable transaction coordinator acknowledgement deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
-                                break :blk null;
-                            };
-                            if (acknowledged == null) {
-                                status = .committed_recovery_pending;
-                            } else if ((self.txn_sessions.markTerminalCoordinatorAcknowledged(self.alloc, txn_id) catch |err| blk: {
-                                std.log.warn("failed to persist stable transaction coordinator acknowledgement txn_id={x} err={s}", .{ txn_id, @errorName(err) });
-                                break :blk null;
-                            }) == null) {
-                                status = .committed_recovery_pending;
+                        if (status == .committed) {
+                            if (committed.coordinator_group_id) |coordinator_group_id| {
+                                const coordinator_table_name = committed.coordinator_table_name orelse return error.InvalidTransactionSessionRecord;
+                                const acknowledged = source.acknowledgeTransactionCommit(
+                                    self.alloc,
+                                    txn_id,
+                                    coordinator_group_id,
+                                    coordinator_table_name,
+                                ) catch |err| blk: {
+                                    std.log.warn("stable transaction coordinator acknowledgement deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
+                                    break :blk null;
+                                };
+                                if (acknowledged == null) {
+                                    status = .committed_recovery_pending;
+                                } else if ((self.txn_sessions.markTerminalCoordinatorAcknowledged(self.alloc, txn_id) catch |err| blk: {
+                                    std.log.warn("failed to persist stable transaction coordinator acknowledgement txn_id={x} err={s}", .{ txn_id, @errorName(err) });
+                                    break :blk null;
+                                }) == null) {
+                                    status = .committed_recovery_pending;
+                                }
                             }
                         }
                         var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
@@ -8948,10 +8963,10 @@ pub const ApiHttpServer = struct {
             => return error.Conflict,
             error.CommitVisibilityNotSatisfied,
             error.CommitPropagationIncomplete,
-            error.CommitDecisionUnknown,
             error.AbortDecisionNotDurable,
             error.TransactionBeginFailed,
             => return error.WriteUnavailable,
+            error.CommitDecisionUnknown => return error.OutcomeUnknown,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
             error.EnrichmentRetryInProgress,
@@ -26112,15 +26127,20 @@ test "api http server retries stable terminal commits without replaying writes" 
             _: db_mod.types.TxnId,
             _: u64,
             tables: []const distributed_txn.TableCommitRequest,
-            _: db_mod.types.SyncLevel,
+            sync_level: db_mod.types.SyncLevel,
         ) anyerror!?distributed_txn.CommitOutcome {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.commit_calls += 1;
             try std.testing.expectEqual(@as(usize, 1), tables.len);
+            try std.testing.expectEqual(
+                if (self.commit_calls == 1) db_mod.types.SyncLevel.propose else db_mod.types.SyncLevel.write,
+                sync_level,
+            );
             return .{ .committed = .{
                 .participant_count = 1,
                 .coordinator_group_id = 7001,
                 .coordinator_table_name = "docs",
+                .propagation_pending = self.commit_calls == 1,
             } };
         }
 
@@ -26175,11 +26195,20 @@ test "api http server retries stable terminal commits without replaying writes" 
     var parsed_first = try std.json.parseFromSlice(transactions_api.SessionCommitResponse, alloc, first.body, .{});
     defer parsed_first.deinit();
     try std.testing.expectEqualStrings("committed_recovery_pending", parsed_first.value.status);
+    try std.testing.expectEqual(@as(usize, 1), writes.commit_calls);
+    try std.testing.expectEqual(@as(usize, 0), writes.acknowledge_calls);
+
+    // The first maintenance pass replays the sealed request under the same
+    // transaction ID and reaches a complete commit. Its first coordinator ACK
+    // fails, so a second pass must retry only that handoff, not user writes.
+    try server.runSessionMaintenanceOnce();
+    try std.testing.expectEqual(@as(usize, 2), writes.commit_calls);
+    try std.testing.expectEqual(@as(usize, 1), writes.acknowledge_calls);
     try server.runSessionMaintenanceOnce();
     var retry = try server.handle(.{ .method = .POST, .uri = commit_uri, .content_type = "application/json", .body = body });
     defer retry.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), retry.status);
-    try std.testing.expectEqual(@as(usize, 1), writes.commit_calls);
+    try std.testing.expectEqual(@as(usize, 2), writes.commit_calls);
     try std.testing.expectEqual(@as(usize, 2), writes.acknowledge_calls);
 
     const abort_uri = try std.fmt.allocPrint(alloc, "{s}{s}{s}", .{

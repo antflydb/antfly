@@ -1766,6 +1766,23 @@ pub const SessionRegistry = struct {
         }
 
         if (candidate.terminal_commit) |terminal| {
+            // A pending terminal response is not the API/storage handoff. Keep
+            // replaying the exact sealed request under the original ID until
+            // every phase-two delivery and requested visibility barrier has
+            // completed. In particular, do this before consulting the legacy
+            // acknowledgement bit so records written by an older binary can
+            // self-heal instead of remaining pending forever.
+            if (terminal.status != .committed) {
+                if (candidate.commit_body_digest == null or !candidate.commit_execution_started)
+                    return error.InvalidTransactionSessionRecord;
+                const request = candidate.staged orelse return error.InvalidTransactionSessionRecord;
+                return .{ .commit = .{
+                    .txn_id = txn_id,
+                    .begin_timestamp = candidate.begin_timestamp,
+                    .sync_level = candidate.sync_level,
+                    .request = try request.clone(alloc),
+                } };
+            }
             if (terminal.coordinator_acknowledged) return null;
             const group_id = terminal.coordinator_group_id orelse return null;
             const table_name = terminal.coordinator_table_name orelse return error.InvalidTransactionSessionRecord;
@@ -3815,7 +3832,8 @@ fn makeSessionRecoveryKey(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) 
 
 fn sessionNeedsRecovery(session: Session) bool {
     if (session.terminal_commit) |terminal| {
-        return terminal.coordinator_group_id != null and !terminal.coordinator_acknowledged;
+        return terminal.status != .committed or
+            (terminal.coordinator_group_id != null and !terminal.coordinator_acknowledged);
     }
     return session.commit_body_digest != null and session.commit_execution_started;
 }
@@ -4490,12 +4508,31 @@ test "durable recovery index tracks only validated commit execution and terminal
     defer work.deinit(alloc);
     try std.testing.expect(work == .commit);
 
-    _ = (try registry.recordTerminalCommit(alloc, session.txn_id, .committed, 7001, "docs")) orelse return error.TestExpectedEqual;
+    _ = (try registry.recordTerminalCommit(alloc, session.txn_id, .committed_recovery_pending, 7001, "docs")) orelse return error.TestExpectedEqual;
     var terminal_registry = SessionRegistry.init(&durable);
     defer terminal_registry.deinit(alloc);
     const terminal_pending = try terminal_registry.listPendingRecoveryIds(alloc, 32);
     defer alloc.free(terminal_pending);
     try std.testing.expectEqual(@as(usize, 1), terminal_pending.len);
+
+    var pending_terminal_work = (try terminal_registry.claimPendingRecovery(
+        alloc,
+        session.txn_id,
+        9,
+        nextTxnTimestamp(),
+    )) orelse return error.TestExpectedEqual;
+    defer pending_terminal_work.deinit(alloc);
+    try std.testing.expect(pending_terminal_work == .commit);
+
+    _ = (try terminal_registry.recordTerminalCommit(alloc, session.txn_id, .committed, 7001, "docs")) orelse return error.TestExpectedEqual;
+    var acknowledgement_work = (try terminal_registry.claimPendingRecovery(
+        alloc,
+        session.txn_id,
+        9,
+        nextTxnTimestamp(),
+    )) orelse return error.TestExpectedEqual;
+    defer acknowledgement_work.deinit(alloc);
+    try std.testing.expect(acknowledgement_work == .acknowledge);
     _ = (try terminal_registry.markTerminalCoordinatorAcknowledged(alloc, session.txn_id)) orelse return error.TestExpectedEqual;
 
     var completed_registry = SessionRegistry.init(&durable);

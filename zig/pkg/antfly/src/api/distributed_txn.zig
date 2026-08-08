@@ -735,18 +735,21 @@ fn executeMultiTableCommitOnce(
                 // (for example while mirroring or waiting for an index). Read
                 // the participant record before deciding whether abort is
                 // still legal.
-                const durable_status = worker.statusGroup(
+                const durable_status = resolveCoordinatorDecisionAfterFailure(
                     alloc,
-                    participant.group_id,
-                    participant.table_name,
+                    worker,
+                    participant,
                     txn_id,
+                    commit_version,
+                    sync_level,
+                    err,
                 ) catch |status_err| {
                     // The outcome is uncertain. Recovery will consult the
                     // participant record; aborting here could contradict a
                     // commit that already became durable.
                     abort_on_error = false;
-                    std.log.warn("transaction commit decision probe failed table={s} group_id={} resolve_err={s} status_err={s}", .{
-                        participant.table_name, participant.group_id, @errorName(err), @errorName(status_err),
+                    std.log.warn("transaction commit decision remains unknown table={s} group_id={} err={s}", .{
+                        participant.table_name, participant.group_id, @errorName(status_err),
                     });
                     return error.CommitDecisionUnknown;
                 };
@@ -835,6 +838,70 @@ fn executeMultiTableCommitOnce(
     return .{ .committed = result };
 }
 
+const max_coordinator_resolution_attempts: usize = 3;
+
+/// Resolve an ambiguous coordinator submission without changing transaction
+/// identity. Status is probed after every failed submission; retries are
+/// idempotent and occur only on this failure path, keeping the normal commit
+/// path at one Raft round trip.
+fn resolveCoordinatorDecisionAfterFailure(
+    alloc: std.mem.Allocator,
+    worker: ParticipantWorker,
+    participant: ParticipantTxn,
+    txn_id: db_mod.types.TxnId,
+    commit_version: u64,
+    sync_level: db_mod.types.SyncLevel,
+    initial_resolve_error: anyerror,
+) !db_mod.types.TxnStatus {
+    var attempts: usize = 1;
+    var last_resolve_error = initial_resolve_error;
+    while (true) {
+        const status = worker.statusGroup(
+            alloc,
+            participant.group_id,
+            participant.table_name,
+            txn_id,
+        ) catch |status_err| {
+            if (attempts >= max_coordinator_resolution_attempts) {
+                std.log.warn("transaction commit decision probe exhausted table={s} group_id={} attempts={} resolve_err={s} status_err={s}", .{
+                    participant.table_name,
+                    participant.group_id,
+                    attempts,
+                    @errorName(last_resolve_error),
+                    @errorName(status_err),
+                });
+                return error.CommitDecisionUnknown;
+            }
+            attempts += 1;
+            worker.resolveGroup(alloc, participant.group_id, participant.table_name, .{
+                .txn_id = txn_id,
+                .status = .committed,
+                .commit_version = commit_version,
+                .topology_epoch = participant.topology_epoch,
+                .sync_level = sync_level,
+            }) catch |retry_err| {
+                last_resolve_error = retry_err;
+                continue;
+            };
+            return .committed;
+        };
+
+        if (status != .pending or attempts >= max_coordinator_resolution_attempts) return status;
+        attempts += 1;
+        worker.resolveGroup(alloc, participant.group_id, participant.table_name, .{
+            .txn_id = txn_id,
+            .status = .committed,
+            .commit_version = commit_version,
+            .topology_epoch = participant.topology_epoch,
+            .sync_level = sync_level,
+        }) catch |retry_err| {
+            last_resolve_error = retry_err;
+            continue;
+        };
+        return .committed;
+    }
+}
+
 const ParticipantTxn = struct {
     table_name: []const u8,
     group_id: u64,
@@ -852,6 +919,94 @@ const ParticipantTxn = struct {
         self.* = undefined;
     }
 };
+
+test "distributed txn retries an ambiguous coordinator decision under the same id" {
+    const Recorder = struct {
+        resolve_calls: usize = 0,
+        status_calls: usize = 0,
+
+        fn worker(self: *@This()) ParticipantWorker {
+            return .{ .ptr = self, .vtable = &.{
+                .begin_group = begin,
+                .prepare_group = prepare,
+                .resolve_group = resolve,
+                .status_group = status,
+            } };
+        }
+
+        fn begin(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnBeginRequest) !void {}
+        fn prepare(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnPrepareRequest) !void {}
+        fn resolve(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, req: TxnResolveRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.resolve_calls += 1;
+            try std.testing.expectEqual(db_mod.types.TxnStatus.committed, req.status);
+            try std.testing.expectEqual(@as(u64, 10_001), req.commit_version);
+        }
+        fn status(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.status_calls += 1;
+            return error.InjectedStatusFailure;
+        }
+    };
+
+    var recorder = Recorder{};
+    const txn_id = try parseTxnIdHex("00112233445566778899aabbccddeeff");
+    const status = try resolveCoordinatorDecisionAfterFailure(
+        std.testing.allocator,
+        recorder.worker(),
+        .{ .table_name = "docs", .group_id = 7001, .topology_epoch = 9 },
+        txn_id,
+        10_001,
+        .write,
+        error.InjectedResolveFailure,
+    );
+    try std.testing.expectEqual(db_mod.types.TxnStatus.committed, status);
+    try std.testing.expectEqual(@as(usize, 1), recorder.status_calls);
+    try std.testing.expectEqual(@as(usize, 1), recorder.resolve_calls);
+}
+
+test "distributed txn bounds unresolved coordinator decision retries" {
+    const Recorder = struct {
+        resolve_calls: usize = 0,
+        status_calls: usize = 0,
+
+        fn worker(self: *@This()) ParticipantWorker {
+            return .{ .ptr = self, .vtable = &.{
+                .begin_group = begin,
+                .prepare_group = prepare,
+                .resolve_group = resolve,
+                .status_group = status,
+            } };
+        }
+
+        fn begin(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnBeginRequest) !void {}
+        fn prepare(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnPrepareRequest) !void {}
+        fn resolve(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnResolveRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.resolve_calls += 1;
+            return error.InjectedResolveFailure;
+        }
+        fn status(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.status_calls += 1;
+            return error.InjectedStatusFailure;
+        }
+    };
+
+    var recorder = Recorder{};
+    const txn_id = try parseTxnIdHex("ffeeddccbbaa99887766554433221100");
+    try std.testing.expectError(error.CommitDecisionUnknown, resolveCoordinatorDecisionAfterFailure(
+        std.testing.allocator,
+        recorder.worker(),
+        .{ .table_name = "docs", .group_id = 7001, .topology_epoch = 9 },
+        txn_id,
+        10_001,
+        .write,
+        error.InjectedResolveFailure,
+    ));
+    try std.testing.expectEqual(max_coordinator_resolution_attempts, recorder.status_calls);
+    try std.testing.expectEqual(max_coordinator_resolution_attempts - 1, recorder.resolve_calls);
+}
 
 fn ensureParticipantTxn(
     alloc: std.mem.Allocator,

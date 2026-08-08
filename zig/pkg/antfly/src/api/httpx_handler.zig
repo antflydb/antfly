@@ -824,8 +824,8 @@ pub const AntflyApiHandler = struct {
                 return ctx.text("transaction committed; participant recovery is pending");
             },
             error.CommitDecisionUnknown => {
-                _ = ctx.status(503);
-                return ctx.text("transaction outcome is unknown");
+                _ = ctx.status(500);
+                return ctx.text("transaction outcome is unknown; do not retry this stateless request because it may already have committed; use a transaction session for retryable commits");
             },
             error.AbortDecisionNotDurable, error.TransactionBeginFailed => {
                 _ = ctx.status(503);
@@ -3891,6 +3891,7 @@ test "httpx multi batch route uses the batch commit hook and public response con
         transaction_calls: usize = 0,
         batch_commit_calls: usize = 0,
         fail_batch_commit: bool = false,
+        unknown_batch_commit: bool = false,
         defer_batch_commit: bool = false,
         defer_transaction_commit: bool = false,
 
@@ -3940,6 +3941,7 @@ test "httpx multi batch route uses the batch commit hook and public response con
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.batch_commit_calls += 1;
             if (self.fail_batch_commit) return error.CommitPropagationIncomplete;
+            if (self.unknown_batch_commit) return error.CommitDecisionUnknown;
             if (self.defer_batch_commit) return .{ .committed = .{
                 .participant_count = 2,
                 .propagation_pending = true,
@@ -4061,6 +4063,25 @@ test "httpx multi batch route uses the batch commit hook and public response con
     try std.testing.expectEqual(@as(u16, 503), unavailable.status.code);
     try std.testing.expectEqualStrings("transaction committed; participant recovery is pending", unavailable.body.?);
     try std.testing.expectEqual(@as(usize, 3), writes.batch_commit_calls);
+
+    writes.fail_batch_commit = false;
+    writes.unknown_batch_commit = true;
+    var unknown = try requestWithRetry(
+        &client,
+        client_io.io(),
+        .POST,
+        batch_url,
+        "{\"tables\":{\"users\":{\"inserts\":{\"user:2\":{\"name\":\"Bob\"}}},\"orders\":{\"deletes\":[\"order:old\"]}},\"sync_level\":\"write\"}",
+        &headers,
+        20,
+    );
+    defer unknown.deinit();
+    try std.testing.expectEqual(@as(u16, 500), unknown.status.code);
+    try std.testing.expectEqualStrings(
+        "transaction outcome is unknown; do not retry this stateless request because it may already have committed; use a transaction session for retryable commits",
+        unknown.body.?,
+    );
+    try std.testing.expectEqual(@as(usize, 4), writes.batch_commit_calls);
 }
 
 test "httpx internal request conversion preserves protocol headers" {
