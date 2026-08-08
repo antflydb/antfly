@@ -62,6 +62,7 @@ pub const native_embed = @import("native_embed.zig");
 pub const native_classify = @import("native_classify.zig");
 pub const native_rerank = @import("native_rerank.zig");
 pub const native_transcribe = @import("native_transcribe.zig");
+pub const whisper_prompt = @import("pipelines/whisper_prompt.zig");
 pub const native_read = @import("native_read.zig");
 pub const scraping = @import("antfly_scraping");
 pub const native_extract = @import("native_extract.zig");
@@ -123,6 +124,7 @@ test {
     _ = native_classify;
     _ = native_rerank;
     _ = native_transcribe;
+    _ = whisper_prompt;
     _ = native_read;
     _ = @import("readers/reader.zig");
     _ = native_extract;

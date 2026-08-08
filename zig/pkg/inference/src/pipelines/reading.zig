@@ -1498,7 +1498,9 @@ fn buildFlorencePromptIds(
 }
 
 fn normalizeFlorencePrompt(prompt: []const u8) []const u8 {
-    if (std.mem.eql(u8, prompt, "<OCR>")) return "What is the text in the image?";
+    // /read is an OCR endpoint, so an explicitly empty prompt follows the same
+    // OCR default as an omitted prompt (which the caller represents as <OCR>).
+    if (prompt.len == 0 or std.mem.eql(u8, prompt, "<OCR>")) return "What is the text in the image?";
     if (std.mem.eql(u8, prompt, "<OCR_WITH_REGION>")) return "What is the text in the image, with regions?";
     if (std.mem.eql(u8, prompt, "<CAPTION>")) return "What does the image describe?";
     if (std.mem.eql(u8, prompt, "<DETAILED_CAPTION>")) return "Describe in detail what is shown in the image.";
@@ -1507,6 +1509,11 @@ fn normalizeFlorencePrompt(prompt: []const u8) []const u8 {
     if (std.mem.eql(u8, prompt, "<DENSE_REGION_CAPTION>")) return "Locate the objects in the image, with their descriptions.";
     if (std.mem.eql(u8, prompt, "<REGION_PROPOSAL>")) return "Locate the region proposals in the image.";
     return prompt;
+}
+
+test "Florence defaults an empty read prompt to OCR" {
+    try std.testing.expectEqualStrings("What is the text in the image?", normalizeFlorencePrompt(""));
+    try std.testing.expectEqualStrings("What is the text in the image?", normalizeFlorencePrompt("<OCR>"));
 }
 
 fn cleanupPureText(allocator: std.mem.Allocator, text: []const u8) ![]u8 {

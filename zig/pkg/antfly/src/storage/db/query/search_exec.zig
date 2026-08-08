@@ -58,6 +58,15 @@ fn getenv(name: [*:0]const u8) ?[]const u8 {
 const default_balanced_search_effort: f32 = 0.5;
 const default_late_visibility_exact_candidate_budget: u32 = 100_000;
 const default_exact_native_filter_candidate_budget: u32 = 1024;
+// Exact filtered search performs one storage lookup and one distance evaluation
+// per candidate. Bound both sources of work: candidate count protects the
+// storage path while component count keeps high-dimensional indexes from
+// consuming disproportionate CPU. These are routing budgets, not result caps;
+// requests above them continue through filtered HBC.
+const default_selective_exact_candidate_budget: usize = 32 * 1024;
+const default_selective_exact_component_budget: usize = 16 * 1024 * 1024;
+const exact_native_filter_cancellation_stride: usize = 64;
+const exact_native_filter_metadata_batch_size: usize = 1024;
 const default_distributed_sort_shard_window_budget: u32 = 100_000;
 const default_sorted_segment_scan_budget: u64 = 100_000;
 const sorted_segment_deadline_check_interval: u64 = 1024;
@@ -12924,6 +12933,8 @@ fn searchDenseInternal(
         const route = denseSearchRoute(
             native_constraints.positive_filter,
             effective_native_filter_candidate_count,
+            index_stats.active_count,
+            entry.dims,
             paging,
             executor.exact_dense_search != null,
         );
@@ -13147,6 +13158,8 @@ const DenseSearchRoute = struct {
 fn denseSearchRoute(
     positive_filter: bool,
     effective_candidate_count: usize,
+    active_count: u64,
+    vector_dims: usize,
     paging: ComponentPaging,
     exact_executor_available: bool,
 ) DenseSearchRoute {
@@ -13160,9 +13173,10 @@ fn denseSearchRoute(
         .name = "hbc",
         .reason = "empty_native_filter",
     };
-    const paging_budget = pagingCandidateWindow(paging) *| 32;
-    const budget = @max(paging_budget, default_exact_native_filter_candidate_budget);
-    if (effective_candidate_count <= budget) return .{
+    const paging_budget: usize = pagingCandidateWindow(paging) *| 32;
+    const requested_budget = @max(paging_budget, default_exact_native_filter_candidate_budget);
+    const work_budget = selectiveExactCandidateWorkBudget(vector_dims);
+    if (effective_candidate_count <= @min(requested_budget, work_budget)) return .{
         .exact_native_filter = true,
         .name = "exact_native_filter",
         .reason = if (exact_executor_available)
@@ -13170,6 +13184,38 @@ fn denseSearchRoute(
         else
             "candidate_count_within_budget_builtin",
     };
+    // Rare positive subsets are a poor fit for graph traversal: the HBC
+    // centroids describe the whole corpus, so a traversal can spend most of
+    // its work on leaves whose members the filter rejects and still miss
+    // eligible neighbours. Exact scoring is recall-safe for these subsets, but
+    // selectivity alone is not a cost bound on a large index. Require both the
+    // relative threshold and the dimension-aware absolute work budget. Use
+    // division for the relative threshold to avoid candidate_count * 100
+    // overflow.
+    const selective_candidate_limit: usize = @intCast(@min(active_count / 100, std.math.maxInt(usize)));
+    if (selective_candidate_limit > 0 and
+        effective_candidate_count <= selective_candidate_limit and
+        effective_candidate_count <= work_budget)
+    {
+        return .{
+            .exact_native_filter = true,
+            .name = "exact_native_filter",
+            .reason = if (exact_executor_available)
+                "selectivity_within_exact_threshold"
+            else
+                "selectivity_within_exact_threshold_builtin",
+        };
+    }
+    if ((effective_candidate_count <= requested_budget or
+        (selective_candidate_limit > 0 and effective_candidate_count <= selective_candidate_limit)) and
+        effective_candidate_count > work_budget)
+    {
+        return .{
+            .exact_native_filter = false,
+            .name = "hbc",
+            .reason = "selective_exact_work_budget_exceeded",
+        };
+    }
     return .{
         .exact_native_filter = false,
         .name = "hbc",
@@ -13177,32 +13223,56 @@ fn denseSearchRoute(
     };
 }
 
+fn selectiveExactCandidateWorkBudget(vector_dims: usize) usize {
+    const dimensions = @max(vector_dims, 1);
+    const component_limited = @max(default_selective_exact_component_budget / dimensions, 1);
+    return @min(default_selective_exact_candidate_budget, component_limited);
+}
+
 test "dense search route reports exact native filter budget decisions" {
     const paging = ComponentPaging{ .offset = 0, .limit = 100 };
 
-    const no_filter = denseSearchRoute(false, 0, paging, false);
+    const no_filter = denseSearchRoute(false, 0, 1_000_000, 768, paging, false);
     try std.testing.expect(!no_filter.exact_native_filter);
     try std.testing.expectEqualStrings("hbc", no_filter.name);
     try std.testing.expectEqualStrings("no_native_filter", no_filter.reason);
 
-    const within_budget = denseSearchRoute(true, 500, paging, true);
+    const within_budget = denseSearchRoute(true, 500, 10_000, 768, paging, true);
     try std.testing.expect(within_budget.exact_native_filter);
     try std.testing.expectEqualStrings("exact_native_filter", within_budget.name);
     try std.testing.expectEqualStrings("candidate_count_within_budget", within_budget.reason);
 
-    const builtin_fallback = denseSearchRoute(true, 500, paging, false);
+    const builtin_fallback = denseSearchRoute(true, 500, 10_000, 768, paging, false);
     try std.testing.expect(builtin_fallback.exact_native_filter);
     try std.testing.expectEqualStrings("exact_native_filter", builtin_fallback.name);
     try std.testing.expectEqualStrings("candidate_count_within_budget_builtin", builtin_fallback.reason);
 
-    const over_budget = denseSearchRoute(true, 3201, paging, false);
+    const one_percent = denseSearchRoute(true, 10_000, 1_000_000, 768, paging, true);
+    try std.testing.expect(one_percent.exact_native_filter);
+    try std.testing.expectEqualStrings("exact_native_filter", one_percent.name);
+    try std.testing.expectEqualStrings("selectivity_within_exact_threshold", one_percent.reason);
+
+    const one_percent_builtin = denseSearchRoute(true, 10_000, 1_000_000, 768, paging, false);
+    try std.testing.expect(one_percent_builtin.exact_native_filter);
+    try std.testing.expectEqualStrings("selectivity_within_exact_threshold_builtin", one_percent_builtin.reason);
+
+    const over_budget = denseSearchRoute(true, 10_001, 1_000_000, 768, paging, false);
     try std.testing.expect(!over_budget.exact_native_filter);
     try std.testing.expectEqualStrings("hbc", over_budget.name);
     try std.testing.expectEqualStrings("native_filter_candidate_budget_exceeded", over_budget.reason);
 
-    const exclusion_reduced = denseSearchRoute(true, 201, paging, true);
+    const exclusion_reduced = denseSearchRoute(true, 201, 10_000, 768, paging, true);
     try std.testing.expect(exclusion_reduced.exact_native_filter);
     try std.testing.expectEqualStrings("candidate_count_within_budget", exclusion_reduced.reason);
+
+    const oversized_one_percent = denseSearchRoute(true, 1_000_000, 100_000_000, 768, paging, true);
+    try std.testing.expect(!oversized_one_percent.exact_native_filter);
+    try std.testing.expectEqualStrings("hbc", oversized_one_percent.name);
+    try std.testing.expectEqualStrings("selective_exact_work_budget_exceeded", oversized_one_percent.reason);
+
+    try std.testing.expectEqual(@as(usize, 32 * 1024), selectiveExactCandidateWorkBudget(2));
+    try std.testing.expectEqual(@as(usize, 16 * 1024), selectiveExactCandidateWorkBudget(1024));
+    try std.testing.expectEqual(@as(usize, 1), selectiveExactCandidateWorkBudget(std.math.maxInt(usize)));
 }
 
 fn pagingCandidateWindow(paging: ComponentPaging) u32 {
@@ -13258,6 +13328,7 @@ fn exactScoreNativeDenseFilter(
     entry: *index_manager_mod.IndexManager.DenseIndex,
     req: vectorindex_mod.SearchRequest,
 ) !dense_exact.SearchOutcome {
+    try checkVectorSearchCancelled(req);
     var candidates = try dense_exact.CandidateDifference.init(alloc, req.filter_ids, req.exclude_ids);
     defer candidates.deinit();
     const unique_candidate_ids = candidates.values;
@@ -13285,7 +13356,18 @@ fn exactScoreNativeDenseFilter(
     defer alloc.free(candidate_metadata);
     if (candidate_metadata.len > 0) {
         @memset(candidate_metadata, null);
-        try entry.index.getMetadataManySortedInTxn(&txn, unique_candidate_ids, candidate_metadata);
+        var metadata_start: usize = 0;
+        while (metadata_start < unique_candidate_ids.len) {
+            try checkVectorSearchCancelled(req);
+            const metadata_end = @min(metadata_start + exact_native_filter_metadata_batch_size, unique_candidate_ids.len);
+            try entry.index.getMetadataManySortedInTxn(
+                &txn,
+                unique_candidate_ids[metadata_start..metadata_end],
+                candidate_metadata[metadata_start..metadata_end],
+            );
+            metadata_start = metadata_end;
+        }
+        try checkVectorSearchCancelled(req);
     }
 
     const vector_scratch = try alloc.alloc(f32, entry.dims);
@@ -13294,6 +13376,7 @@ fn exactScoreNativeDenseFilter(
     var vectors_scored: u64 = 0;
 
     for (unique_candidate_ids, 0..) |vector_id, i| {
+        if (i % exact_native_filter_cancellation_stride == 0) try checkVectorSearchCancelled(req);
         if (req.filter_prefix.len > 0) {
             const metadata = candidate_metadata[i] orelse continue;
             if (!std.mem.startsWith(u8, metadata, req.filter_prefix)) continue;
@@ -13323,6 +13406,12 @@ fn exactScoreNativeDenseFilter(
         .results = results,
         .vectors_scored = vectors_scored,
     };
+}
+
+inline fn checkVectorSearchCancelled(req: vectorindex_mod.SearchRequest) !void {
+    if (req.cancellation) |cancellation| {
+        if (cancellation.load(.acquire)) return error.Cancelled;
+    }
 }
 
 test "built-in exact dense scorer filters metadata before vector reads" {
@@ -13389,6 +13478,229 @@ test "built-in exact dense scorer filters metadata before vector reads" {
     try std.testing.expectEqual(@as(usize, 2), hits.len);
     try std.testing.expectEqual(@as(u64, 1), hits[0].vector_id);
     try std.testing.expectEqual(@as(u64, 2), hits[1].vector_id);
+}
+
+test "one percent filtered route preserves exact recall with candidate-linear IO" {
+    const alloc = std.testing.allocator;
+    const candidate_count: usize = 1100;
+    const dims: usize = 8;
+    const result_count: usize = 10;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/selective-exact-recall", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var index = try hbc_mod.HBCIndex.open(alloc, path_z.ptr, .{
+        .dims = dims,
+        .leaf_size = 64,
+        .branching_factor = 8,
+    });
+    var index_owned = true;
+    defer if (index_owned) index.close();
+
+    const vectors = try alloc.alloc(f32, candidate_count * dims);
+    defer alloc.free(vectors);
+    @memset(vectors, 0);
+    const items = try alloc.alloc(hbc_mod.BatchInsertItem, candidate_count);
+    defer alloc.free(items);
+    const filter_ids = try alloc.alloc(u64, candidate_count);
+    defer alloc.free(filter_ids);
+    for (items, 0..) |*item, i| {
+        const vector_id: u64 = @intCast(i + 1);
+        const vector = vectors[i * dims ..][0..dims];
+        vector[0] = @floatFromInt(vector_id);
+        item.* = .{ .vector_id = vector_id, .vector = vector };
+        filter_ids[i] = vector_id;
+    }
+    try index.bulkBuildWithMetadata(items);
+
+    var apply_mutex = std.atomic.Mutex.unlocked;
+    var entry = index_manager_mod.IndexManager.DenseIndex{
+        .apply_mutex = &apply_mutex,
+        .config = .{ .name = "dense", .kind = .dense_vector, .config_json = "{}" },
+        .field_name = @constCast("embedding"),
+        .dims = dims,
+        .metric = .l2_squared,
+        .external = false,
+        .chunk_name = null,
+        .embedding_name = null,
+        .index = index,
+    };
+    index_owned = false;
+    defer entry.index.close();
+
+    const paging = ComponentPaging{ .offset = 0, .limit = result_count };
+    const route = denseSearchRoute(true, candidate_count, candidate_count * 100, dims, paging, false);
+    try std.testing.expect(route.exact_native_filter);
+    try std.testing.expectEqualStrings("selectivity_within_exact_threshold_builtin", route.reason);
+
+    const VectorLoadCounter = struct {
+        count: usize = 0,
+        cancel_after: usize = 0,
+        cancellation: ?*std.atomic.Value(bool) = null,
+
+        fn onLoad(ctx_ptr: ?*anyopaque, _: *hbc_mod.HBCIndex, _: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx_ptr.?));
+            self.count += 1;
+            if (self.cancel_after > 0 and self.count >= self.cancel_after) {
+                self.cancellation.?.store(true, .release);
+            }
+        }
+    };
+    var counter = VectorLoadCounter{};
+    hbc_mod.setTestGetVectorViewOrScratchHook(&counter, VectorLoadCounter.onLoad);
+    defer hbc_mod.setTestGetVectorViewOrScratchHook(null, null);
+
+    var query = [_]f32{0} ** dims;
+    query[0] = @floatFromInt(candidate_count);
+    var outcome = try exactScoreNativeDenseFilter(alloc, &entry, .{
+        .query = &query,
+        .k = result_count,
+        .filter_ids = filter_ids,
+    });
+    defer outcome.results.deinit();
+
+    try std.testing.expectEqual(@as(u64, candidate_count), outcome.vectors_scored);
+    try std.testing.expectEqual(candidate_count, counter.count);
+    const hits = outcome.results.getHits();
+    try std.testing.expectEqual(result_count, hits.len);
+    for (hits, 0..) |hit, rank| {
+        try std.testing.expectEqual(@as(u64, @intCast(candidate_count - rank)), hit.vector_id);
+    }
+
+    var cancellation = std.atomic.Value(bool).init(false);
+    counter = .{
+        .cancel_after = exact_native_filter_cancellation_stride,
+        .cancellation = &cancellation,
+    };
+    try std.testing.expectError(error.Cancelled, exactScoreNativeDenseFilter(alloc, &entry, .{
+        .query = &query,
+        .k = result_count,
+        .filter_ids = filter_ids,
+        .cancellation = &cancellation,
+    }));
+    try std.testing.expectEqual(exact_native_filter_cancellation_stride, counter.count);
+}
+
+test "one percent native filter routes through integrated dense search exactly" {
+    const alloc = std.testing.allocator;
+    const active_count: usize = 110_000;
+    const candidate_count: usize = active_count / 100;
+    const dims: usize = 2;
+    const result_count: usize = 10;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/integrated-selective-exact", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var index = try hbc_mod.HBCIndex.open(alloc, path_z.ptr, .{
+        .dims = dims,
+        .leaf_size = 128,
+        .branching_factor = 16,
+    });
+    var index_owned = true;
+    defer if (index_owned) index.close();
+
+    const vectors = try alloc.alloc(f32, active_count * dims);
+    defer alloc.free(vectors);
+    @memset(vectors, 0);
+    const items = try alloc.alloc(hbc_mod.BatchInsertItem, active_count);
+    defer alloc.free(items);
+    const filter_ids = try alloc.alloc(u64, candidate_count);
+    defer alloc.free(filter_ids);
+    for (items, 0..) |*item, i| {
+        const vector_id: u64 = @intCast(i + 1);
+        const vector = vectors[i * dims ..][0..dims];
+        vector[0] = @floatFromInt(vector_id);
+        item.* = .{ .vector_id = vector_id, .vector = vector, .metadata = "doc" };
+        if (i >= active_count - candidate_count) filter_ids[i - (active_count - candidate_count)] = vector_id;
+    }
+    try index.bulkBuildWithMetadata(items);
+
+    var apply_mutex = std.atomic.Mutex.unlocked;
+    var entry = index_manager_mod.IndexManager.DenseIndex{
+        .apply_mutex = &apply_mutex,
+        .config = .{ .name = "dense", .kind = .dense_vector, .config_json = "{}" },
+        .field_name = @constCast("embedding"),
+        .dims = dims,
+        .metric = .l2_squared,
+        .external = false,
+        .chunk_name = null,
+        .embedding_name = null,
+        .index = index,
+    };
+    index_owned = false;
+    defer entry.index.close();
+
+    const Harness = struct {
+        entry: *index_manager_mod.IndexManager.DenseIndex,
+
+        fn self(ctx: ?*anyopaque) *@This() {
+            return @ptrCast(@alignCast(ctx.?));
+        }
+        fn textIndex(_: ?*anyopaque, _: ?[]const u8) anyerror!?*index_manager_mod.IndexManager.TextIndex {
+            return null;
+        }
+        fn denseIndex(ctx: ?*anyopaque, _: ?[]const u8) anyerror!?*index_manager_mod.IndexManager.DenseIndex {
+            return self(ctx).entry;
+        }
+        fn unexpectedDocKey(_: ?*anyopaque, _: []const u8, _: u64) anyerror!?[]u8 {
+            return error.UnexpectedTestCall;
+        }
+        fn unexpectedVectorId(_: ?*anyopaque, _: []const u8, _: []const u8) anyerror!?u64 {
+            return error.UnexpectedTestCall;
+        }
+        fn unexpectedLoad(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, _: []const u8) anyerror![]u8 {
+            return error.UnexpectedTestCall;
+        }
+        fn unexpectedHbc(_: ?*anyopaque, _: *index_manager_mod.IndexManager.DenseIndex, _: vectorindex_mod.SearchRequest) anyerror!vectorindex_mod.SearchResults {
+            return error.UnexpectedHbcRoute;
+        }
+        fn unexpectedHbcProfiled(_: ?*anyopaque, _: *index_manager_mod.IndexManager.DenseIndex, _: vectorindex_mod.SearchRequest) anyerror!vectorindex_mod.ProfiledSearchResults {
+            return error.UnexpectedHbcRoute;
+        }
+        fn postprocess(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, raw: types.SearchResult, _: bool) anyerror!types.SearchResult {
+            return raw;
+        }
+    };
+    var harness = Harness{ .entry = &entry };
+    const executor = DenseSearchExecutor{
+        .ctx = &harness,
+        .text_index_entry = Harness.textIndex,
+        .dense_index = Harness.denseIndex,
+        .lookup_doc_key = Harness.unexpectedDocKey,
+        .lookup_vector_id = Harness.unexpectedVectorId,
+        .load_projected_document = Harness.unexpectedLoad,
+        .hbc_search = Harness.unexpectedHbc,
+        .hbc_search_profiled = Harness.unexpectedHbcProfiled,
+        .postprocess = Harness.postprocess,
+    };
+
+    var query = [_]f32{ 0, 0 };
+    query[0] = @floatFromInt(active_count);
+    var profiled = try searchDenseProfiled(alloc, .{
+        .index_name = "dense",
+        .limit = result_count,
+        .include_stored = false,
+        .profile = true,
+        .filter_ids = filter_ids,
+    }, .{
+        .vector = &query,
+        .k = result_count,
+    }, executor);
+    defer profiled.result.deinit();
+
+    try std.testing.expectEqualStrings("exact_native_filter", profiled.profile.search_route);
+    try std.testing.expectEqualStrings("selectivity_within_exact_threshold_builtin", profiled.profile.route_reason);
+    try std.testing.expectEqual(@as(u64, candidate_count), profiled.profile.hbc_exact_vectors_scored);
+    try std.testing.expectEqual(result_count, profiled.result.hits.len);
+    try std.testing.expectEqualStrings("exact", profiled.result.sort_profile.?.exactness);
 }
 
 fn countActiveDenseVectorIdsAlloc(

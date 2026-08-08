@@ -188,6 +188,7 @@ class _Api:
                     f"table={table!r} key={doc_id!r} sync_level={sync_level!r} "
                     f"last_retryable_response={last_retryable_response!r}"
                     f"\n[native stacks]\n{stacks}"
+                    f"\n[metadata snapshot]\n{self._server.metadata_snapshot_diagnostic()}"
                     f"\n[logs]\n{self._server.debug_logs()}"
                 ) from exc
             try:
@@ -200,6 +201,7 @@ class _Api:
                 raise AssertionError(
                     f"batch insert timed out/failed table={table!r} key={doc_id!r} "
                     f"sync_level={sync_level!r}: {exc!r}\n[native stacks]\n{stacks}"
+                    f"\n[metadata snapshot]\n{self._server.metadata_snapshot_diagnostic()}"
                     f"\n[logs]\n{self._server.debug_logs()}"
                 ) from exc
             if (
@@ -208,7 +210,9 @@ class _Api:
                 and response.text.strip() == "write unavailable"
                 and not deadline.expired()
             ):
-                last_retryable_response = f"{response.status_code} {response.text.strip()}"
+                last_retryable_response = (
+                    f"{response.status_code} {response.text.strip()} from {self.url}"
+                )
                 deadline.sleep()
                 continue
             return self._check(response)

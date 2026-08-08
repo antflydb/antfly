@@ -149,6 +149,7 @@ const inference_delegated_steps = [_][]const u8{
 
 const release_scale_test_filters = [_][]const u8{
     "db dense default dynamic 0.2 percent numeric filter exact scores bounded candidates",
+    "one percent native filter routes through integrated dense search exactly",
     "db one real delete keeps filtered full text on complement path across restart",
     "db production ingest preserves high-frequency keyword recall across clean restarts",
 };
@@ -3794,7 +3795,10 @@ pub fn build(b: *std.Build) void {
         "data server can register a store without enabling data raft",
         "data server registered data raft uses wal state backend by default",
         "data raft ticker advances consensus independently of control rounds",
-        "data raft batch forwarding escapes a leaderless local placement",
+        "data raft forwarding distinguishes safe retries from ambiguous outcomes",
+        "data raft batch forwarding bounds routing campaigns deadlines and deterministic fallback",
+        "internal batch forwarding headers are all-or-none and strictly parsed",
+        "metadata http client shares deadline and cancellation across retries",
         "data server wires configured HA executors into API server",
         "data server mirrors managed primary writes into HA replication log",
         "data server fail-closed sync policy rejects primary writes before local commit",
@@ -5055,6 +5059,12 @@ pub fn build(b: *std.Build) void {
             "internal batch split identity round trips the full u64 id space",
             "internal group write routes map shard doc identity mismatch to conflict",
             "api http client preserves group doc identity conflicts",
+            "api http client forwards bounded raft batch routing context without allocation",
+            "api http client rejects unsupported routed batch protocol without legacy replay",
+            "api http client requires explicit not-proposed marker and tracks delivery phase",
+            "internal group write route dispatches bounded raft forwarding context",
+            "raft batch aggregation makes failures after an accepted group non-retryable",
+            "public table batch handler preserves partial write outcomes",
             "bound table write source backs up and restores a local table",
             "bound table write source backs up and restores a portable local table",
             "provisioned table write source backs up a portable local table",
@@ -5152,6 +5162,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "public table batch handler maps doc identity unavailable errors",
             "public table batch handler maps write unavailable errors",
+            "public table batch handler preserves ambiguous write outcomes",
             "public table batch handler maps HA write gate errors",
             "public table batch handler returns concise dense repair backpressure",
             "public create index exposes retryable storage descriptor exhaustion",
@@ -6448,13 +6459,14 @@ pub fn build(b: *std.Build) void {
     const release_blocker_regression_filters = [_][]const u8{
         "non-visible doc set complements visibility per generation",
         "built-in exact dense scorer filters metadata before vector reads",
+        "one percent filtered route preserves exact recall with candidate-linear IO",
         "sorted unique vector id subtraction handles sparse and dense exclusions",
     };
     const release_blocker_regression_tests = b.addTest(.{
         .root_module = db_test_mod,
         // A root DB test keeps query/search_exec and dense_exact reachable to
         // Zig's compile-time test discovery. Runtime filters below execute
-        // only the three fast primitives, never this corpus-scale anchor.
+        // only the fast primitives, never this corpus-scale anchor.
         .filters = compileFiltersWithAnchors(
             b,
             &.{"db dense default dynamic 0.2 percent numeric filter exact scores bounded candidates"},

@@ -84,6 +84,8 @@ const resolver_catalog_key = "\x00\x00__metadata__:resolvers";
 const text_field_analyzers_prefix = "\x00\x00__metadata__:text_field_analyzers:";
 const active_index_root_pointer_file = ".antfly-active-index-root";
 const active_index_root_pointer_magic = "antfly-active-index-root-v1\n";
+const exact_dense_cancellation_stride: usize = 64;
+const exact_dense_metadata_batch_size: usize = 1024;
 
 fn optionalBytesEqual(a: ?[]const u8, b: ?[]const u8) bool {
     if (a == null or b == null) return a == null and b == null;
@@ -94,6 +96,12 @@ const index_generation_manifest = @import("../derived/index_generation_manifest.
 fn checkRepairCancelled(cancel_check: ?types.RepairCancelCheck) !void {
     if (cancel_check) |check| {
         if (check.requested()) return error.Canceled;
+    }
+}
+
+inline fn checkDenseSearchCancelled(req: hbc_mod.SearchRequest) !void {
+    if (req.cancellation) |cancellation| {
+        if (cancellation.load(.acquire)) return error.Cancelled;
     }
 }
 const repair_shadow_root_prefix = ".repair-shadow-";
@@ -7320,6 +7328,7 @@ pub const IndexManager = struct {
         entry: *DenseIndex,
         req: hbc_mod.SearchRequest,
     ) !dense_exact.SearchOutcome {
+        try checkDenseSearchCancelled(req);
         const previous_load_session = active_dense_vector_load_session;
         var vector_load_session: ?DenseVectorLoadSession = null;
         defer {
@@ -7340,6 +7349,7 @@ pub const IndexManager = struct {
         var candidates = try dense_exact.CandidateDifference.init(self.alloc, req.filter_ids, req.exclude_ids);
         defer candidates.deinit();
         const unique_candidate_ids = candidates.values;
+        try checkDenseSearchCancelled(req);
 
         var results = try hbc_mod.SearchResults.initCapacity(
             self.alloc,
@@ -7359,7 +7369,21 @@ pub const IndexManager = struct {
         const candidate_metadata = try self.alloc.alloc(?[]const u8, unique_candidate_ids.len);
         defer self.alloc.free(candidate_metadata);
         @memset(candidate_metadata, null);
-        try entry.index.getMetadataManySortedInTxn(&txn, unique_candidate_ids, candidate_metadata);
+        var metadata_start: usize = 0;
+        while (metadata_start < unique_candidate_ids.len) {
+            try checkDenseSearchCancelled(req);
+            const metadata_end = @min(
+                metadata_start + exact_dense_metadata_batch_size,
+                unique_candidate_ids.len,
+            );
+            try entry.index.getMetadataManySortedInTxn(
+                &txn,
+                unique_candidate_ids[metadata_start..metadata_end],
+                candidate_metadata[metadata_start..metadata_end],
+            );
+            metadata_start = metadata_end;
+        }
+        try checkDenseSearchCancelled(req);
 
         const fallback_doc_keys = try self.alloc.alloc(?[]u8, unique_candidate_ids.len);
         defer {
@@ -7382,7 +7406,8 @@ pub const IndexManager = struct {
                 var legacy_vector_ordinals = std.AutoHashMapUnmanaged(u64, doc_identity.DocOrdinal).empty;
                 defer legacy_vector_ordinals.deinit(self.alloc);
                 var needs_legacy_reverse = false;
-                for (unique_candidate_ids, candidate_metadata) |vector_id, maybe_metadata| {
+                for (unique_candidate_ids, candidate_metadata, 0..) |vector_id, maybe_metadata, i| {
+                    if (i % exact_dense_cancellation_stride == 0) try checkDenseSearchCancelled(req);
                     if (maybe_metadata == null and !entry.vector_ordinals.contains(vector_id)) {
                         needs_legacy_reverse = true;
                         break;
@@ -7391,7 +7416,9 @@ pub const IndexManager = struct {
                 if (needs_legacy_reverse) {
                     try legacy_vector_ordinals.ensureTotalCapacity(self.alloc, entry.ordinal_vector_ids.count());
                     var reverse_it = entry.ordinal_vector_ids.iterator();
-                    while (reverse_it.next()) |item| {
+                    var reverse_count: usize = 0;
+                    while (reverse_it.next()) |item| : (reverse_count += 1) {
+                        if (reverse_count % exact_dense_cancellation_stride == 0) try checkDenseSearchCancelled(req);
                         legacy_vector_ordinals.putAssumeCapacity(item.value_ptr.*, item.key_ptr.*);
                     }
                 }
@@ -7399,6 +7426,7 @@ pub const IndexManager = struct {
                 var identity_txn = try store.beginProbeTxn();
                 defer identity_txn.abort();
                 for (unique_candidate_ids, candidate_metadata, 0..) |vector_id, maybe_metadata, i| {
+                    if (i % exact_dense_cancellation_stride == 0) try checkDenseSearchCancelled(req);
                     if (maybe_metadata != null) continue;
                     const ordinal = entry.vector_ordinals.get(vector_id) orelse legacy_vector_ordinals.get(vector_id) orelse continue;
                     fallback_doc_keys[i] = try doc_identity.lookupDocIdTxn(self.alloc, &identity_txn, ordinal);
@@ -7416,7 +7444,8 @@ pub const IndexManager = struct {
         const vector_scratch = try self.alloc.alloc(f32, entry.dims);
         defer self.alloc.free(vector_scratch);
         var vectors_scored: u64 = 0;
-        for (unique_candidate_ids, candidate_metadata, fallback_doc_keys) |vector_id, maybe_metadata, fallback_doc_key| {
+        for (unique_candidate_ids, candidate_metadata, fallback_doc_keys, 0..) |vector_id, maybe_metadata, fallback_doc_key, i| {
+            if (i % exact_dense_cancellation_stride == 0) try checkDenseSearchCancelled(req);
             const doc_key = maybe_metadata orelse fallback_doc_key;
             if (req.filter_prefix.len > 0) {
                 const resolved_doc_key = doc_key orelse continue;
@@ -20501,6 +20530,92 @@ test "dense vector id uses deterministic key hash with legacy mapping fallback" 
     try std.testing.expect(!second.needs_mapping);
     try std.testing.expectEqual(@as(u64, 42), second.vector_id);
     second_batch.abort();
+}
+
+test "production exact dense scorer cancels during bounded vector work" {
+    const alloc = std.testing.allocator;
+    const candidate_count = exact_dense_cancellation_stride * 3;
+    const dims: usize = 2;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const cwd = try std.process.currentPathAlloc(io_impl.io(), alloc);
+    defer alloc.free(cwd);
+    const relative_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(relative_root);
+    const root = try std.fs.path.resolve(alloc, &.{ cwd, relative_root });
+    defer alloc.free(root);
+    const hbc_path = try std.fs.path.join(alloc, &.{ root, "exact-cancellation-hbc" });
+    defer alloc.free(hbc_path);
+    const hbc_path_z = try alloc.dupeZ(u8, hbc_path);
+    defer alloc.free(hbc_path_z);
+
+    var manager = try IndexManager.init(alloc, root);
+    defer manager.deinit();
+    var index = try hbc_mod.HBCIndex.open(alloc, hbc_path_z.ptr, .{
+        .dims = dims,
+        .leaf_size = 32,
+        .branching_factor = 4,
+    });
+    var index_owned = true;
+    defer if (index_owned) index.close();
+
+    const vectors = try alloc.alloc(f32, candidate_count * dims);
+    defer alloc.free(vectors);
+    @memset(vectors, 0);
+    const items = try alloc.alloc(hbc_mod.BatchInsertItem, candidate_count);
+    defer alloc.free(items);
+    const filter_ids = try alloc.alloc(u64, candidate_count);
+    defer alloc.free(filter_ids);
+    for (items, 0..) |*item, i| {
+        const vector_id: u64 = @intCast(i + 1);
+        const vector = vectors[i * dims ..][0..dims];
+        vector[0] = @floatFromInt(vector_id);
+        item.* = .{ .vector_id = vector_id, .vector = vector, .metadata = "doc" };
+        filter_ids[i] = vector_id;
+    }
+    try index.bulkBuildWithMetadata(items);
+
+    var apply_mutex = std.atomic.Mutex.unlocked;
+    var entry = IndexManager.DenseIndex{
+        .apply_mutex = &apply_mutex,
+        .config = .{ .name = "dense", .kind = .dense_vector, .config_json = "{}" },
+        .field_name = @constCast("embedding"),
+        .dims = dims,
+        .metric = .l2_squared,
+        .external = false,
+        .chunk_name = null,
+        .embedding_name = null,
+        .index = index,
+    };
+    index_owned = false;
+    defer entry.index.close();
+
+    const CancelAfterLoads = struct {
+        count: usize = 0,
+        cancellation: *std.atomic.Value(bool),
+
+        fn onLoad(ctx_ptr: ?*anyopaque, _: *hbc_mod.HBCIndex, _: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx_ptr.?));
+            self.count += 1;
+            if (self.count == exact_dense_cancellation_stride)
+                self.cancellation.store(true, .release);
+        }
+    };
+    var cancellation = std.atomic.Value(bool).init(false);
+    var counter = CancelAfterLoads{ .cancellation = &cancellation };
+    hbc_mod.setTestGetVectorViewOrScratchHook(&counter, CancelAfterLoads.onLoad);
+    defer hbc_mod.setTestGetVectorViewOrScratchHook(null, null);
+
+    try std.testing.expectError(error.Cancelled, manager.exactScoreDenseEntryWithRequest(&entry, .{
+        .query = &.{ 0, 0 },
+        .k = 10,
+        .filter_ids = filter_ids,
+        .cancellation = &cancellation,
+    }));
+    try std.testing.expectEqual(exact_dense_cancellation_stride, counter.count);
 }
 
 test "dense vector id ignores ordinal metadata for a different doc" {

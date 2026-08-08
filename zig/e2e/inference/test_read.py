@@ -176,21 +176,41 @@ def _maybe_write_surya_expectations(result: dict, regions: list[dict], labels: l
     Path(path).write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def _read_or_skip_backend_unavailable(api, *, images, model: str = "", prompt: str = "", **kwargs):
+def _read_or_skip_backend_unavailable(
+    api,
+    *,
+    images,
+    model: str = "",
+    prompt: str = "",
+    require_runtime_support: bool = False,
+    **kwargs,
+):
     image_objs = [{"url": img} if isinstance(img, str) else img for img in images]
     body = {"model": model, "images": image_objs, "prompt": prompt, **kwargs}
     resp = api.post("/read", json=body)
 
     if resp.status_code == 500 and resp.headers.get("content-type", "").startswith("application/json"):
         payload = resp.json()
-        if payload.get("error") == "MODEL_LOAD_FAILED" and payload.get("message") == "NoBackendAvailable":
+        if (
+            not require_runtime_support
+            and payload.get("error") == "MODEL_LOAD_FAILED"
+            and payload.get("message") == "NoBackendAvailable"
+        ):
             pytest.skip("Reader model is installed, but this antfly runtime was built without a compatible backend")
-        if payload.get("error") in {"MODEL_LOAD_FAILED", "INFERENCE_FAILED"} and payload.get("message") in {
-            "MissingWeight",
-            "ShapeMismatch",
-            "UnsupportedShape",
-        }:
+        if (
+            not require_runtime_support
+            and payload.get("error") in {"MODEL_LOAD_FAILED", "INFERENCE_FAILED"}
+            and payload.get("message") in {
+                "MissingWeight",
+                "ShapeMismatch",
+                "UnsupportedShape",
+            }
+        ):
             pytest.skip("Reader model is installed, but this antfly graph runtime does not support it yet")
+        if require_runtime_support:
+            pytest.fail(
+                f"required reader {model!r} failed with HTTP {resp.status_code}: {payload!r}"
+            )
 
     resp.raise_for_status()
     return resp.json()
@@ -237,11 +257,14 @@ def test_read_florence_model_answers_text(api):
         images=[test_image],
         model=model,
         max_tokens=64,
+        require_runtime_support=True,
     )
     results = resp["data"]
     assert len(results) == 1
     _assert_read_result_shape(results[0])
-    assert results[0]["text"].strip()
+    observed = _normalize_text(results[0]["text"])
+    assert "invoice" in observed, f"Florence OCR missed INVOICE: {results[0]['text']!r}"
+    assert "123" in observed, f"Florence OCR missed TOTAL 123: {results[0]['text']!r}"
 
 
 @pytest.mark.multimodal
