@@ -1217,9 +1217,59 @@ pub const DBCore = struct {
         timestamp_ns: u64,
         participants: []const []const u8,
     ) !transactions_mod.TxnId {
+        return try self.beginTransactionWithParticipantsCreatedAt(txn_id, timestamp_ns, timestamp_ns, participants);
+    }
+
+    pub fn beginTransactionWithParticipantsCreatedAt(
+        self: *DBCore,
+        txn_id: transactions_mod.TxnId,
+        timestamp_ns: u64,
+        created_at_ns: u64,
+        participants: []const []const u8,
+    ) !transactions_mod.TxnId {
         var manager = try self.initTxnManager();
         defer manager.deinit();
-        try manager.initTransactionWithParticipants(txn_id, timestamp_ns, participants);
+        try manager.initTransactionWithParticipantsCreatedAt(txn_id, timestamp_ns, created_at_ns, participants);
+        return txn_id;
+    }
+
+    pub fn beginTransactionWithParticipantsCreatedAtAndRole(
+        self: *DBCore,
+        txn_id: transactions_mod.TxnId,
+        timestamp_ns: u64,
+        created_at_ns: u64,
+        participants: []const []const u8,
+        coordinator: bool,
+    ) !transactions_mod.TxnId {
+        return try self.beginTransactionWithParticipantsCreatedAtRoleAndRetention(
+            txn_id,
+            timestamp_ns,
+            created_at_ns,
+            participants,
+            coordinator,
+            false,
+        );
+    }
+
+    pub fn beginTransactionWithParticipantsCreatedAtRoleAndRetention(
+        self: *DBCore,
+        txn_id: transactions_mod.TxnId,
+        timestamp_ns: u64,
+        created_at_ns: u64,
+        participants: []const []const u8,
+        coordinator: bool,
+        retain_terminal: bool,
+    ) !transactions_mod.TxnId {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        try manager.initTransactionWithParticipantsCreatedAtRoleAndRetention(
+            txn_id,
+            timestamp_ns,
+            created_at_ns,
+            participants,
+            coordinator,
+            retain_terminal,
+        );
         return txn_id;
     }
 
@@ -1244,13 +1294,24 @@ pub const DBCore = struct {
         try manager.checkVersionPredicates(predicates, exclude_txn_id);
     }
 
+    pub fn checkOrdinaryWriteConflicts(
+        self: *DBCore,
+        writes: []const types.BatchWrite,
+        deletes: []const []const u8,
+    ) !void {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        for (writes) |write| try manager.checkOrdinaryWriteConflict(write.key);
+        for (deletes) |key| try manager.checkOrdinaryWriteConflict(key);
+    }
+
     pub fn resolveTransactionIntents(
         self: *DBCore,
         txn_id: transactions_mod.TxnId,
         status: transactions_mod.TxnStatus,
         commit_version: u64,
     ) !void {
-        try self.resolveTransactionIntentsWithExtraBatch(txn_id, status, commit_version, .{});
+        _ = try self.resolveTransactionIntentsWithExtraBatch(txn_id, status, commit_version, .{});
     }
 
     pub fn resolveTransactionIntentsWithExtraBatch(
@@ -1259,10 +1320,58 @@ pub const DBCore = struct {
         status: transactions_mod.TxnStatus,
         commit_version: u64,
         extra_batch: transactions_mod.ResolutionExtraBatch,
+    ) !transactions_mod.ResolutionOutcome {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        return try manager.resolveIntentsWithExtraBatch(txn_id, status, commit_version, extra_batch);
+    }
+
+    pub fn collectTransactionIntentBatch(self: *DBCore, alloc: Allocator, txn_id: transactions_mod.TxnId) !transactions_mod.IntentBatch {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        return try manager.collectIntentBatch(alloc, txn_id);
+    }
+
+    pub fn transactionHasIntents(self: *DBCore, txn_id: transactions_mod.TxnId) !bool {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        return try manager.hasIntents(txn_id);
+    }
+
+    pub fn validateTransactionIntentSnapshot(
+        self: *DBCore,
+        txn_id: transactions_mod.TxnId,
+        expected_revision: u64,
+    ) !transactions_mod.IntentSnapshotValidation {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        return try manager.validateIntentSnapshot(txn_id, expected_revision);
+    }
+
+    pub fn loadTransactionHAOutbox(
+        self: *DBCore,
+        alloc: Allocator,
+        txn_id: transactions_mod.TxnId,
+    ) !transactions_mod.HAOutbox {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        return try manager.loadHAOutbox(alloc, txn_id);
+    }
+
+    pub fn transactionHasHAOutbox(self: *DBCore, txn_id: transactions_mod.TxnId) !bool {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        return try manager.hasHAOutbox(txn_id);
+    }
+
+    pub fn clearTransactionHAOutbox(
+        self: *DBCore,
+        txn_id: transactions_mod.TxnId,
+        kind: transactions_mod.HAOutboxKind,
     ) !void {
         var manager = try self.initTxnManager();
         defer manager.deinit();
-        try manager.resolveIntentsWithExtraBatch(txn_id, status, commit_version, extra_batch);
+        try manager.clearHAOutbox(txn_id, kind);
     }
 
     pub fn collectTransactionIntentDocumentKeys(
@@ -1289,16 +1398,45 @@ pub const DBCore = struct {
         return try manager.getCommitVersion(txn_id);
     }
 
+    pub fn transactionDefersCoordinatorAcknowledgement(self: *DBCore, txn_id: transactions_mod.TxnId) !bool {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        return try manager.defersCoordinatorAcknowledgement(txn_id);
+    }
+
     pub fn markTransactionParticipantResolved(self: *DBCore, txn_id: transactions_mod.TxnId, participant: []const u8) !void {
         var manager = try self.initTxnManager();
         defer manager.deinit();
         try manager.markParticipantResolved(txn_id, participant);
     }
 
+    pub fn cleanupTransactionMetadataIfEligible(
+        self: *DBCore,
+        txn_id: transactions_mod.TxnId,
+        cutoff_timestamp: u64,
+        retained_cutoff_timestamp: u64,
+    ) !bool {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        return try manager.cleanupTransactionMetadataIfEligible(txn_id, cutoff_timestamp, retained_cutoff_timestamp);
+    }
+
     pub fn getTransactionParticipants(self: *DBCore, alloc: Allocator, txn_id: transactions_mod.TxnId) ![][]u8 {
         var manager = try self.initTxnManager();
         defer manager.deinit();
         return try manager.getParticipants(alloc, txn_id);
+    }
+
+    pub fn listTransactions(self: *DBCore, alloc: Allocator) ![]transactions_mod.TxnSummary {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        return try manager.listTransactions(alloc);
+    }
+
+    pub fn hasTopologySensitiveTransactions(self: *DBCore) !bool {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        return try manager.hasTopologySensitiveTransactions();
     }
 
     pub fn getUnresolvedTransactionParticipants(self: *DBCore, alloc: Allocator, txn_id: transactions_mod.TxnId) ![][]u8 {

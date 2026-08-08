@@ -10,8 +10,8 @@ from ..models.transaction_commit_response_status import TransactionCommitRespons
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
-    from ..models.transaction_commit_response_conflict import TransactionCommitResponseConflict
     from ..models.transaction_commit_response_tables import TransactionCommitResponseTables
+    from ..models.transaction_conflict import TransactionConflict
 
 
 T = TypeVar("T", bound="TransactionCommitResponse")
@@ -22,15 +22,15 @@ class TransactionCommitResponse:
     """Result of an OCC transaction commit attempt.
 
     Attributes:
-        status (TransactionCommitResponseStatus): Whether the transaction was committed or aborted due to a conflict
-        conflict (TransactionCommitResponseConflict | Unset): Details about the conflict that caused an abort (only
-            present when status is "aborted")
-        tables (TransactionCommitResponseTables | Unset): Per-table batch results (only present when status is
-            "committed")
+        status (TransactionCommitResponseStatus): Durable transaction outcome. Pending committed states mean the
+            commit decision is durable while its requested visibility barrier
+            or participant recovery is still completing.
+        conflict (TransactionConflict | Unset): Structured details for an aborted transaction attempt.
+        tables (TransactionCommitResponseTables | Unset): Per-table batch results (present for every committed status)
     """
 
     status: TransactionCommitResponseStatus
-    conflict: TransactionCommitResponseConflict | Unset = UNSET
+    conflict: TransactionConflict | Unset = UNSET
     tables: TransactionCommitResponseTables | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -61,18 +61,18 @@ class TransactionCommitResponse:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.transaction_commit_response_conflict import TransactionCommitResponseConflict
         from ..models.transaction_commit_response_tables import TransactionCommitResponseTables
+        from ..models.transaction_conflict import TransactionConflict
 
         d = dict(src_dict)
         status = TransactionCommitResponseStatus(d.pop("status"))
 
         _conflict = d.pop("conflict", UNSET)
-        conflict: TransactionCommitResponseConflict | Unset
+        conflict: TransactionConflict | Unset
         if isinstance(_conflict, Unset):
             conflict = UNSET
         else:
-            conflict = TransactionCommitResponseConflict.from_dict(_conflict)
+            conflict = TransactionConflict.from_dict(_conflict)
 
         _tables = d.pop("tables", UNSET)
         tables: TransactionCommitResponseTables | Unset

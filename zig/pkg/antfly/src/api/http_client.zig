@@ -2161,6 +2161,16 @@ pub const ApiHttpClient = struct {
         return try fetchInternalPostEmpty(self, base_uri, group_id, table_name, routes.Routes.txn_resolve_suffix, body);
     }
 
+    pub fn fetchGroupTxnAcknowledge(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+    ) !EmptyResponse {
+        return try fetchInternalPostEmpty(self, base_uri, group_id, table_name, routes.Routes.txn_acknowledge_suffix, body);
+    }
+
     pub fn fetchGroupTxnStatus(
         self: *ApiHttpClient,
         base_uri: []const u8,
@@ -2792,6 +2802,7 @@ fn isDocIdentityNamespaceMismatchConflictMessage(body: []const u8) bool {
 }
 
 fn remoteGroupConflictError(body: []const u8) anyerror {
+    if (std.mem.eql(u8, body, "DecisionConflict") or std.mem.eql(u8, body, "decision conflict")) return error.DecisionConflict;
     if (transactions_api.isTopologyChangedConflictMessage(body)) return error.TopologyChanged;
     if (std.mem.eql(u8, body, "TopologyChanged") or std.mem.eql(u8, body, "topology changed")) return error.TopologyChanged;
     if (std.mem.eql(u8, body, "IdentityReadGenerationChanged") or
@@ -2799,6 +2810,11 @@ fn remoteGroupConflictError(body: []const u8) anyerror {
     if (isDocIdentityNamespaceMismatchConflictMessage(body)) return error.DocIdentityNamespaceMismatch;
     if (std.mem.eql(u8, body, "repair cancelled")) return error.Canceled;
     return error.UnexpectedHttpStatus;
+}
+
+test "api http client preserves remote transaction decision conflicts" {
+    try std.testing.expectEqual(error.DecisionConflict, remoteGroupConflictError("decision conflict"));
+    try std.testing.expectEqual(error.DecisionConflict, remoteGroupConflictError("DecisionConflict"));
 }
 
 fn isRetryableMetadataLeaderResponse(resp: http_common.HttpResponse) bool {
@@ -2823,6 +2839,7 @@ fn remoteGroupTxnPrepareConflictError(body: []const u8) anyerror {
 
 fn remoteGroupTxnResolveConflictError(body: []const u8) anyerror {
     if (isDocIdentityNamespaceMismatchConflictMessage(body)) return error.DocIdentityNamespaceMismatch;
+    if (std.mem.eql(u8, body, "topology changed") or std.mem.eql(u8, body, "TopologyChanged")) return error.TopologyChanged;
     if (std.mem.eql(u8, body, "decision conflict")) return error.DecisionConflict;
     return error.UnexpectedHttpStatus;
 }
@@ -3885,7 +3902,7 @@ test "api http client maps group txn resolve decision conflicts" {
             return error.UnsupportedOperation;
         }
 
-        fn beginGroup(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: u64, _: []const []const u8) anyerror!?void {
+        fn beginGroup(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: u64, _: bool, _: []const []const u8) anyerror!?void {
             return error.UnsupportedOperation;
         }
 
@@ -3893,7 +3910,7 @@ test "api http client maps group txn resolve decision conflicts" {
             return error.UnsupportedOperation;
         }
 
-        fn resolveGroup(_: *anyopaque, _: std.mem.Allocator, group_id: u64, table_name: []const u8, _: db_mod.types.TxnId, _: db_mod.types.TxnStatus, _: u64) anyerror!?void {
+        fn resolveGroup(_: *anyopaque, _: std.mem.Allocator, group_id: u64, table_name: []const u8, _: db_mod.types.TxnId, _: db_mod.types.TxnStatus, _: u64, _: db_mod.types.SyncLevel) anyerror!?void {
             try std.testing.expectEqual(@as(u64, 7001), group_id);
             try std.testing.expectEqualStrings("docs", table_name);
             return error.DecisionConflict;

@@ -205,6 +205,9 @@ func TestBatchSendsContentLengthRequestAndParsesResponse(t *testing.T) {
 	if result.Inserted != 1 {
 		t.Fatalf("Inserted = %d, want 1", result.Inserted)
 	}
+	if result.Status != "committed" {
+		t.Fatalf("Status = %q, want committed", result.Status)
+	}
 	if gotPath != "/db/v1/tables/files/batch" {
 		t.Fatalf("path = %q, want /db/v1/tables/files/batch", gotPath)
 	}
@@ -213,6 +216,136 @@ func TestBatchSendsContentLengthRequestAndParsesResponse(t *testing.T) {
 	}
 	if !strings.Contains(gotBody, `"doc-1"`) || !strings.Contains(gotBody, `"title":"hello"`) {
 		t.Fatalf("request body = %q, want encoded insert", gotBody)
+	}
+}
+
+func TestBatchReportsAcceptedPendingStatusForLegacyResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"inserted":1}`))
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+	result, err := client.Batch(context.Background(), "files", BatchRequest{
+		Inserts: map[string]any{"doc-1": map[string]any{"title": "hello"}},
+	})
+	if err != nil {
+		t.Fatalf("Batch: %v", err)
+	}
+	if result.Status != "committed_pending" {
+		t.Fatalf("Status = %q, want committed_pending", result.Status)
+	}
+}
+
+func TestMultiBatchPreservesAcceptedRecoveryStatus(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"status":"committed_recovery_pending","tables":{}}`))
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+	result, err := client.MultiBatch(context.Background(), MultiBatchRequest{
+		Tables: map[string]BatchRequest{"files": {Inserts: map[string]any{"doc-1": map[string]any{"title": "hello"}}}},
+	})
+	if err != nil {
+		t.Fatalf("MultiBatch: %v", err)
+	}
+	if result.Status != "committed_recovery_pending" {
+		t.Fatalf("Status = %q, want committed_recovery_pending", result.Status)
+	}
+}
+
+func TestMultiBatchReturnsStructuredConflict(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"status":"aborted","conflict":{"table":"files","key":"doc-1","message":"participant unavailable","kind":"participant_unavailable","retryable":true,"retry_after_ms":50,"retry_scope":"participant","expected_version":41,"current_version":42,"participant":{"group_id":7,"phase":"prepare"}}}`))
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+	result, err := client.MultiBatch(context.Background(), MultiBatchRequest{
+		Tables: map[string]BatchRequest{"files": {Inserts: map[string]any{"doc-1": map[string]any{"title": "hello"}}}},
+	})
+	if err != nil {
+		t.Fatalf("MultiBatch: %v", err)
+	}
+	if result.Status != "aborted" {
+		t.Fatalf("Status = %q, want aborted", result.Status)
+	}
+	if result.Conflict == nil {
+		t.Fatal("Conflict = nil, want structured conflict")
+	}
+	assertCompleteTransactionConflict(t, result.Conflict)
+}
+
+func assertCompleteTransactionConflict(t *testing.T, conflict *TransactionConflict) {
+	t.Helper()
+	if conflict.Table != "files" || conflict.Key != "doc-1" || conflict.Message != "participant unavailable" {
+		t.Fatalf("Conflict identity = %#v", conflict)
+	}
+	if conflict.Kind != TransactionConflictParticipantUnavailable || !conflict.Retryable {
+		t.Fatalf("Conflict classification = %#v", conflict)
+	}
+	if conflict.RetryAfterMS == nil || *conflict.RetryAfterMS != 50 || conflict.RetryScope != TransactionConflictRetryScopeParticipant {
+		t.Fatalf("Conflict retry metadata = %#v", conflict)
+	}
+	if conflict.ExpectedVersion == nil || *conflict.ExpectedVersion != 41 || conflict.CurrentVersion == nil || *conflict.CurrentVersion != 42 {
+		t.Fatalf("Conflict versions = %#v", conflict)
+	}
+	if conflict.Participant == nil || conflict.Participant.GroupID == nil || *conflict.Participant.GroupID != 7 || conflict.Participant.Phase != TransactionConflictPhasePrepare {
+		t.Fatalf("Conflict participant = %#v", conflict)
+	}
+}
+
+func TestMultiBatchRejectsMalformedConflictResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"status":"committed"}`))
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+	_, err = client.MultiBatch(context.Background(), MultiBatchRequest{Tables: map[string]BatchRequest{}})
+	if err == nil || !strings.Contains(err.Error(), `unexpected status "committed"`) {
+		t.Fatalf("MultiBatch error = %v, want unexpected conflict status", err)
+	}
+}
+
+func TestMultiBatchRejectsOversizedConflictResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"status":"aborted","conflict":{"message":"response exceeds the configured limit"}}`))
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+	_, err = client.MultiBatchWithOptions(context.Background(), MultiBatchRequest{Tables: map[string]BatchRequest{}}, WriteOptions{
+		MaxResponseBytes: 16,
+	})
+	if err == nil || !strings.Contains(err.Error(), "multi-batch response exceeded 16 bytes") {
+		t.Fatalf("MultiBatchWithOptions error = %v, want response limit error", err)
 	}
 }
 
@@ -516,4 +649,51 @@ func TestTransactionCommitUsesWriteOptions(t *testing.T) {
 	if requests != 0 {
 		t.Fatalf("requests = %d, want no request sent after local request limit failure", requests)
 	}
+}
+
+func TestTransactionCommitPreservesAcceptedRecoveryStatus(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"status":"committed_recovery_pending","tables":{}}`))
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+	result, err := client.NewTransaction().Commit(context.Background(), map[string]BatchRequest{
+		"files": {Inserts: map[string]any{"doc-1": map[string]any{"title": "hello"}}},
+	})
+	if err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if result.Status != "committed_recovery_pending" {
+		t.Fatalf("Status = %q, want committed_recovery_pending", result.Status)
+	}
+}
+
+func TestTransactionCommitPreservesStructuredConflict(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"status":"aborted","conflict":{"table":"files","key":"doc-1","message":"participant unavailable","kind":"participant_unavailable","retryable":true,"retry_after_ms":50,"retry_scope":"participant","expected_version":41,"current_version":42,"participant":{"group_id":7,"phase":"prepare"}}}`))
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+	result, err := client.NewTransaction().Commit(context.Background(), map[string]BatchRequest{
+		"files": {Inserts: map[string]any{"doc-1": map[string]any{"title": "hello"}}},
+	})
+	if err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if result.Status != "aborted" || result.Conflict == nil {
+		t.Fatalf("Commit result = %#v, want aborted conflict", result)
+	}
+	assertCompleteTransactionConflict(t, result.Conflict)
 }
