@@ -1155,6 +1155,39 @@ and legacy physical provisioned sources into different modules and making the
 entire physical module unreachable in the experimental distributed artifact--
 before adding more owner operations.
 
+### Rejected standalone plus storage-kernel codegen island
+
+A follow-up probe moved the complete standalone/Lite runtime entry point from
+the distributed unit into the experimental storage-kernel unit. This retained
+four concurrent units, one final static executable, and the same linked
+embedded-inference host. It specifically avoided the previously measured
+six-minute standalone-only unit by co-generating standalone with storage that
+the C API already required.
+
+The cold ARM64 Linux musl `ReleaseFast` result initially looked attractive:
+
+| Unit | Compiler time | Declarations | Repository Zig files |
+|---|---:|---:|---:|
+| API kernel | 135.427 s | 17,241 | 325 |
+| Distributed | 382.842 s | 41,258 | 716 |
+| Storage + standalone | 314.078 s | 36,033 | 608 |
+| Inference | 230.540 s | 24,945 | 523 |
+
+Distributed lost 8 files, 703 declarations, and approximately 15 seconds while
+storage remained off the critical path. The complete result moved in the wrong
+direction, however. Aggregate analyzed file instances rose from 1,967 to 2,172
+and duplicate instances rose from 780 to 985. The storage unit gained 213 files
+while distributed lost only 8. The stripped C API grew only 0.139 MB, but the
+final static executable grew from 72.290 MB to 79.008 MB because standalone's
+newly rooted storage/control code duplicated implementations still required by
+the data runtime.
+
+Decision: **revert**. Reducing one unit's latency by increasing total LLVM work,
+cross-unit duplication, and final executable size is not the target
+architecture. Standalone can move out of distributed only after it consumes a
+genuinely shared compiled storage/control kernel; co-location with either side
+before that ownership cut merely moves and duplicates the graph.
+
 ## Holistic target architecture
 
 The preferred end state is a modular monolith with a small number of compiled
