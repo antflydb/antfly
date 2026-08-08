@@ -1628,6 +1628,40 @@ const ParsedTextStatsRequest = union(TextStatsRequestMode) {
 };
 
 pub const TableReadSource = table_read_source.TableReadSource;
+
+fn unsupportedPhysicalTopLevelLookup(
+    _: *anyopaque,
+    _: std.mem.Allocator,
+    _: []const u8,
+    _: []const u8,
+    _: db_mod.types.LookupOptions,
+    _: raft_mod.ReadConsistency,
+) !?LookupResponse {
+    return error.UnsupportedLocalOperation;
+}
+
+fn unsupportedPhysicalTopLevelScan(
+    _: *anyopaque,
+    _: std.mem.Allocator,
+    _: []const u8,
+    _: []const u8,
+    _: []const u8,
+    _: db_mod.types.ScanOptions,
+    _: raft_mod.ReadConsistency,
+) !?ScanResponse {
+    return error.UnsupportedLocalOperation;
+}
+
+fn unsupportedPhysicalTopLevelQuery(
+    _: *anyopaque,
+    _: std.mem.Allocator,
+    _: []const u8,
+    _: db_mod.types.SearchRequest,
+    _: raft_mod.ReadConsistency,
+) !?query_api.QueryResponse {
+    return error.UnsupportedLocalOperation;
+}
+
 pub fn searchRequestFromVectorWorkerEnvelope(envelope: *const query_contract.OwnedAlgebraicVectorWorkerRequestEnvelope) db_mod.types.SearchRequest {
     var req = switch (envelope.query) {
         .dense => |dense| db_mod.types.SearchRequest{
@@ -2281,6 +2315,10 @@ pub const ProvisionedTableReadSource = struct {
     inference_api_url: ?[]const u8 = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
+    /// Optional local physical-operation provider. Distributed routing and
+    /// merge stay on this source; a compiled storage owner can supply only the
+    /// group-local callbacks without replacing the orchestration vtable.
+    local_read_source: ?TableReadSource = null,
 
     pub fn init(
         replica_root_dir: []const u8,
@@ -2349,6 +2387,41 @@ pub const ProvisionedTableReadSource = struct {
     ) *ProvisionedTableReadSource {
         self.ha_read_gate = gate;
         return self;
+    }
+
+    pub fn withLocalReadSource(
+        self: *ProvisionedTableReadSource,
+        source_override: ?TableReadSource,
+    ) *ProvisionedTableReadSource {
+        self.local_read_source = source_override;
+        return self;
+    }
+
+    fn groupLocalSource(self: *ProvisionedTableReadSource) TableReadSource {
+        return self.local_read_source orelse self.physicalSource();
+    }
+
+    fn physicalSource(self: *ProvisionedTableReadSource) TableReadSource {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .lookup = unsupportedPhysicalTopLevelLookup,
+                .scan = unsupportedPhysicalTopLevelScan,
+                .query = unsupportedPhysicalTopLevelQuery,
+                .preflight_query_group_local = preflightQueryGroupLocalPhysical,
+                .lookup_group_local = lookupGroupLocalPhysical,
+                .scan_group_local = scanGroupLocalPhysical,
+                .query_group_local = queryGroupLocalPhysical,
+                .search_result_group_local = searchResultGroupLocalPhysical,
+                .text_stats_group_local = textStatsGroupLocalPhysical,
+                .algebraic_partials_group_local = algebraicPartialsGroupLocalPhysical,
+                .graph_expand_group_local = graphExpandGroupLocalPhysical,
+                .graph_hydrate_group_local = graphHydrateGroupLocalPhysical,
+                .graph_edges_group_local = graphEdgesGroupLocalPhysical,
+                .document_artifact_manifest_group_local = documentArtifactManifestGroupLocalPhysical,
+                .document_artifact_manifests_group_local = documentArtifactManifestsGroupLocalPhysical,
+            },
+        };
     }
 
     fn ensureHAReadAllowed(self: *ProvisionedTableReadSource, consistency: raft_mod.ReadConsistency) !void {
@@ -2446,7 +2519,7 @@ pub const ProvisionedTableReadSource = struct {
         var read_activity = self.beginPreparedRead(table_name, .general);
         defer if (read_activity) |*activity| activity.deinit();
         const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, key)) orelse return null;
-        return try lookupProvisionedHostedLocal(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, key, opts, consistency);
+        return try self.groupLocalSource().lookupGroupLocal(alloc, group_id, table_name, key, opts, consistency);
     }
 
     fn documentArtifactManifest(
@@ -2462,7 +2535,7 @@ pub const ProvisionedTableReadSource = struct {
         var read_activity = self.beginPreparedRead(table_name, .general);
         defer if (read_activity) |*activity| activity.deinit();
         const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, doc_key)) orelse return null;
-        return try documentArtifactManifestProvisionedHostedLocal(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, doc_key, artifact_name, consistency);
+        return try self.groupLocalSource().documentArtifactManifestGroupLocal(alloc, group_id, table_name, doc_key, artifact_name, consistency);
     }
 
     fn documentArtifactManifests(
@@ -2477,7 +2550,7 @@ pub const ProvisionedTableReadSource = struct {
         var read_activity = self.beginPreparedRead(table_name, .general);
         defer if (read_activity) |*activity| activity.deinit();
         const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, doc_key)) orelse return null;
-        return try documentArtifactManifestsProvisionedHostedLocal(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, doc_key, consistency);
+        return try self.groupLocalSource().documentArtifactManifestsGroupLocal(alloc, group_id, table_name, doc_key, consistency);
     }
 
     fn scan(
@@ -2508,7 +2581,7 @@ pub const ProvisionedTableReadSource = struct {
                 group_opts.limit = opts.limit - emitted;
             }
 
-            var result = (try scanProvisionedHostedLocal(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, from_key, to_key, group_opts, consistency)) orelse continue;
+            var result = (try self.groupLocalSource().scanGroupLocal(alloc, group_id, table_name, from_key, to_key, group_opts, consistency)) orelse continue;
             defer result.deinit(alloc);
             try out.appendSlice(alloc, result.ndjson);
             emitted += @intCast(std.mem.count(u8, result.ndjson, "\n"));
@@ -2534,25 +2607,8 @@ pub const ProvisionedTableReadSource = struct {
         try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
         if (group_ids.len > 1) try distributed_graph.rejectUnstampedResultRefs(req);
         const start_ns = platform_time.monotonicNs();
-        if (group_ids.len == 1 and !distributed_graph.supportsCrossRange(req)) {
-            var execution = try queryHostedLocalDetailed(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_ids[0], self.visibleRootGeneration(group_ids[0]), self.managedReadRuntimeConfig(), table_name, req, consistency);
-            defer execution.releaseDb();
-            try checkQueryDeadline(execution.request);
-            var result = execution.result;
-            defer result.deinit();
-            const response_req = execution.request;
-            var meta: query_api.QueryResponseMeta = .{
-                .took_ms = @intCast(@divTrunc(platform_time.monotonicNs() - start_ns, std.time.ns_per_ms)),
-                .shard_count = 1,
-                .dense_search = execution.dense_profile,
-            };
-            defer meta.deinit(alloc);
-            try applyProvisionedQueryAggregations(self, alloc, group_ids, table_name, response_req, &result, &meta, execution.db(), consistency);
-            execution.releaseDb();
-            try checkQueryDeadline(response_req);
-            try applyQueryPostProcessing(alloc, response_req, &result, &meta, self.antfly_provider, self.secret_store);
-            return try query_api.encodeQueryResponses(alloc, table_name, response_req, meta, result);
-        }
+        if (group_ids.len == 1 and !distributed_graph.supportsCrossRange(req))
+            return try self.groupLocalSource().queryGroupLocal(alloc, group_ids[0], table_name, req, consistency);
 
         if (requiresDistributedGraphCoordinator(group_ids.len, req)) {
             var base_req = req;
@@ -2633,6 +2689,19 @@ pub const ProvisionedTableReadSource = struct {
         try self.ensureHAReadAllowed(consistency);
         var read_activity = self.beginPreparedRead(table_name, .general);
         defer if (read_activity) |*activity| activity.deinit();
+        return try self.groupLocalSource().lookupGroupLocal(alloc, group_id, table_name, key, opts, consistency);
+    }
+
+    fn lookupGroupLocalPhysical(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        key: []const u8,
+        opts: db_mod.types.LookupOptions,
+        consistency: raft_mod.ReadConsistency,
+    ) !?LookupResponse {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         return try lookupProvisionedHostedLocal(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, key, opts, consistency);
     }
 
@@ -2649,6 +2718,19 @@ pub const ProvisionedTableReadSource = struct {
         try self.ensureHAReadAllowed(consistency);
         var read_activity = self.beginPreparedRead(table_name, .general);
         defer if (read_activity) |*activity| activity.deinit();
+        return try self.groupLocalSource().documentArtifactManifestGroupLocal(alloc, group_id, table_name, doc_key, artifact_name, consistency);
+    }
+
+    fn documentArtifactManifestGroupLocalPhysical(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.DocumentArtifactManifest {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         return try documentArtifactManifestProvisionedHostedLocal(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, doc_key, artifact_name, consistency);
     }
 
@@ -2664,6 +2746,18 @@ pub const ProvisionedTableReadSource = struct {
         try self.ensureHAReadAllowed(consistency);
         var read_activity = self.beginPreparedRead(table_name, .general);
         defer if (read_activity) |*activity| activity.deinit();
+        return try self.groupLocalSource().documentArtifactManifestsGroupLocal(alloc, group_id, table_name, doc_key, consistency);
+    }
+
+    fn documentArtifactManifestsGroupLocalPhysical(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.DocumentArtifactManifestList {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         return try documentArtifactManifestsProvisionedHostedLocal(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, doc_key, consistency);
     }
 
@@ -2678,6 +2772,19 @@ pub const ProvisionedTableReadSource = struct {
     ) !?db_mod.RuntimePreflightSummary {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHAReadAllowed(consistency);
+        return try self.groupLocalSource().preflightQueryGroupLocal(alloc, group_id, table_name, req, consistency, max_work);
+    }
+
+    fn preflightQueryGroupLocalPhysical(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_mod.types.SearchRequest,
+        consistency: raft_mod.ReadConsistency,
+        max_work: u32,
+    ) !?db_mod.RuntimePreflightSummary {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         return try preflightHostedLocal(
             self.cache,
             self.replica_root_dir,
@@ -2708,6 +2815,20 @@ pub const ProvisionedTableReadSource = struct {
         try self.ensureHAReadAllowed(consistency);
         var read_activity = self.beginPreparedRead(table_name, .general);
         defer if (read_activity) |*activity| activity.deinit();
+        return try self.groupLocalSource().scanGroupLocal(alloc, group_id, table_name, from_key, to_key, opts, consistency);
+    }
+
+    fn scanGroupLocalPhysical(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        from_key: []const u8,
+        to_key: []const u8,
+        opts: db_mod.types.ScanOptions,
+        consistency: raft_mod.ReadConsistency,
+    ) !?ScanResponse {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         return try scanProvisionedHostedLocal(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, from_key, to_key, opts, consistency);
     }
 
@@ -2723,6 +2844,18 @@ pub const ProvisionedTableReadSource = struct {
         try self.ensureHAReadAllowed(consistency);
         var read_activity = self.beginPreparedRead(table_name, readPreparationKindForQuery(req));
         defer if (read_activity) |*activity| activity.deinit();
+        return try self.groupLocalSource().queryGroupLocal(alloc, group_id, table_name, req, consistency);
+    }
+
+    fn queryGroupLocalPhysical(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_mod.types.SearchRequest,
+        consistency: raft_mod.ReadConsistency,
+    ) !?query_api.QueryResponse {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         const start_ns = platform_time.monotonicNs();
         var execution = try queryHostedLocalDetailed(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.managedReadRuntimeConfig(), table_name, req, consistency);
         defer execution.releaseDb();
@@ -2753,6 +2886,18 @@ pub const ProvisionedTableReadSource = struct {
         try self.ensureHAReadAllowed(consistency);
         var read_activity = self.beginPreparedRead(table_name, readPreparationKindForQuery(req));
         defer if (read_activity) |*activity| activity.deinit();
+        return try self.groupLocalSource().searchResultGroupLocal(alloc, group_id, table_name, req, consistency);
+    }
+
+    fn searchResultGroupLocalPhysical(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_mod.types.SearchRequest,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.SearchResult {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         return try queryHostedLocal(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.managedReadRuntimeConfig(), table_name, req, consistency);
     }
 
@@ -2764,10 +2909,32 @@ pub const ProvisionedTableReadSource = struct {
         body: []const u8,
     ) !?query_api.QueryResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        return try self.groupLocalSource().textStatsGroupLocal(alloc, group_id, table_name, body);
+    }
+
+    fn textStatsGroupLocalPhysical(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+    ) !?query_api.QueryResponse {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         return try collectProvisionedHostedLocalTextStats(self.cache, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body);
     }
 
     fn algebraicPartialsGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+    ) !?query_api.QueryResponse {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        return try self.groupLocalSource().algebraicPartialsGroupLocal(alloc, group_id, table_name, body);
+    }
+
+    fn algebraicPartialsGroupLocalPhysical(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         group_id: u64,
@@ -2788,6 +2955,18 @@ pub const ProvisionedTableReadSource = struct {
     ) !?distributed_graph.GraphExpandResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHAReadAllowed(consistency);
+        return try self.groupLocalSource().graphExpandGroupLocal(alloc, group_id, table_name, req, consistency);
+    }
+
+    fn graphExpandGroupLocalPhysical(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: distributed_graph.GraphExpandRequest,
+        consistency: raft_mod.ReadConsistency,
+    ) !?distributed_graph.GraphExpandResponse {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         const expansions = try alloc.alloc(distributed_graph.GraphExpansion, req.frontier.len);
         var initialized: usize = 0;
         errdefer {
@@ -2830,8 +3009,27 @@ pub const ProvisionedTableReadSource = struct {
     ) !?distributed_graph.GraphHydrateResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHAReadAllowed(consistency);
+        return try self.groupLocalSource().graphHydrateGroupLocal(alloc, group_id, table_name, req, consistency);
+    }
+
+    fn graphHydrateGroupLocalPhysical(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: distributed_graph.GraphHydrateRequest,
+        consistency: raft_mod.ReadConsistency,
+    ) !?distributed_graph.GraphHydrateResponse {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try table_catalog.validateTopologyEpoch(alloc, self.catalog, table_name, req.topology_epoch);
-        return try executeProvisionedGraphHydrate(ptr, alloc, group_id, table_name, req, consistency);
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        var db = try openProvisionedQueryDbForTableWithRuntime(alloc, path, self.catalog, table_name, group_id, self.visibleRootGeneration(group_id), self.backend_runtime);
+        defer db.close();
+        try validateGraphHydrateResolvedDocFilterForDb(req, &db);
+
+        const reads = raft_mod.FeatureDBReads.init(group_id, self.requester);
+        return try graphHydrateOnOpenDb(alloc, reads, &db, req, consistency, true);
     }
 
     fn graphEdgesGroupLocal(
@@ -2844,6 +3042,18 @@ pub const ProvisionedTableReadSource = struct {
     ) !?distributed_graph.GraphEdgesResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHAReadAllowed(consistency);
+        return try self.groupLocalSource().graphEdgesGroupLocal(alloc, group_id, table_name, req, consistency);
+    }
+
+    fn graphEdgesGroupLocalPhysical(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: distributed_graph.GraphEdgesRequest,
+        consistency: raft_mod.ReadConsistency,
+    ) !?distributed_graph.GraphEdgesResponse {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         return try graphGetEdgesLocal(alloc, self.replica_root_dir, self.catalog, self.requester, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, req, consistency);
     }
 
@@ -3089,6 +3299,9 @@ pub const HostedProvisionedTableReadSource = struct {
     io_impl: ?*std.Io.Threaded = null,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
     group_visible_root_generation: ?GroupVisibleRootGenerationSource = null,
+    /// Optional local physical-operation provider. Hosted routing, remote
+    /// execution, fanout, and merging remain in this source.
+    local_read_source: ?TableReadSource = null,
 
     pub fn init(
         replica_root_dir: []const u8,
@@ -3119,6 +3332,41 @@ pub const HostedProvisionedTableReadSource = struct {
     pub fn withGroupVisibleRootGeneration(self: *HostedProvisionedTableReadSource, generation_source: ?GroupVisibleRootGenerationSource) *HostedProvisionedTableReadSource {
         self.group_visible_root_generation = generation_source;
         return self;
+    }
+
+    pub fn withLocalReadSource(
+        self: *HostedProvisionedTableReadSource,
+        source_override: ?TableReadSource,
+    ) *HostedProvisionedTableReadSource {
+        self.local_read_source = source_override;
+        return self;
+    }
+
+    fn groupLocalSource(self: *HostedProvisionedTableReadSource) TableReadSource {
+        return self.local_read_source orelse self.physicalSource();
+    }
+
+    fn physicalSource(self: *HostedProvisionedTableReadSource) TableReadSource {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .lookup = unsupportedPhysicalTopLevelLookup,
+                .scan = unsupportedPhysicalTopLevelScan,
+                .query = unsupportedPhysicalTopLevelQuery,
+                .preflight_query_group_local = preflightQueryGroupLocalPhysical,
+                .lookup_group_local = lookupGroupLocalPhysical,
+                .scan_group_local = scanGroupLocalPhysical,
+                .query_group_local = queryGroupLocalPhysical,
+                .search_result_group_local = searchResultGroupLocalPhysical,
+                .text_stats_group_local = textStatsGroupLocalPhysical,
+                .algebraic_partials_group_local = algebraicPartialsGroupLocalPhysical,
+                .graph_expand_group_local = graphExpandGroupLocalPhysical,
+                .graph_hydrate_group_local = graphHydrateGroupLocalPhysical,
+                .graph_edges_group_local = graphEdgesGroupLocalPhysical,
+                .document_artifact_manifest_group_local = documentArtifactManifestGroupLocalPhysical,
+                .document_artifact_manifests_group_local = documentArtifactManifestsGroupLocalPhysical,
+            },
+        };
     }
 
     fn visibleRootGeneration(self: *const HostedProvisionedTableReadSource, group_id: u64) u64 {
@@ -3215,7 +3463,7 @@ pub const HostedProvisionedTableReadSource = struct {
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return null;
         defer route.deinit(alloc);
         return switch (route) {
-            .local => try documentArtifactManifestProvisionedHostedLocal(null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, doc_key, artifact_name, consistency),
+            .local => try self.groupLocalSource().documentArtifactManifestGroupLocal(alloc, group_id, table_name, doc_key, artifact_name, consistency),
             .remote => |remote| documentArtifactManifestRemote(self.executor, alloc, remote.base_uri, group_id, table_name, doc_key, artifact_name) catch |err| switch (err) {
                 error.UnexpectedHttpStatus, error.NotFound => null,
                 else => err,
@@ -3234,7 +3482,7 @@ pub const HostedProvisionedTableReadSource = struct {
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return null;
         defer route.deinit(alloc);
         return switch (route) {
-            .local => try documentArtifactManifestsProvisionedHostedLocal(null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, doc_key, consistency),
+            .local => try self.groupLocalSource().documentArtifactManifestsGroupLocal(alloc, group_id, table_name, doc_key, consistency),
             .remote => |remote| documentArtifactManifestsRemote(self.executor, alloc, remote.base_uri, group_id, table_name, doc_key) catch |err| switch (err) {
                 error.UnexpectedHttpStatus, error.NotFound => null,
                 else => err,
@@ -3253,7 +3501,7 @@ pub const HostedProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?LookupResponse {
         return switch (route) {
-            .local => try lookupProvisionedHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, key, opts, consistency),
+            .local => try self.groupLocalSource().lookupGroupLocal(alloc, group_id, table_name, key, opts, consistency),
             .remote => |remote| lookupRemote(self.executor, alloc, remote.base_uri, group_id, table_name, key, opts) catch |err| switch (err) {
                 error.UnexpectedHttpStatus => null,
                 else => err,
@@ -3288,7 +3536,7 @@ pub const HostedProvisionedTableReadSource = struct {
             const node_id = intent.record.local_node_id;
             if (node_id == local_node_id) {
                 if (tried_local or self.router.localStatus(group_id) != .active) continue;
-                if (try lookupProvisionedHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, key, opts, consistency)) |result| return result;
+                if (try self.groupLocalSource().lookupGroupLocal(alloc, group_id, table_name, key, opts, consistency)) |result| return result;
                 continue;
             }
             if (node_id == tried_remote_node_id) continue;
@@ -3358,7 +3606,7 @@ pub const HostedProvisionedTableReadSource = struct {
             defer route.deinit(alloc);
 
             var result = switch (route) {
-                .local => try scanProvisionedHostedLocal(null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, from_key, to_key, group_opts, consistency),
+                .local => try self.groupLocalSource().scanGroupLocal(alloc, group_id, table_name, from_key, to_key, group_opts, consistency),
                 .remote => |remote| try scanRemote(self.executor, alloc, remote.base_uri, group_id, table_name, from_key, to_key, group_opts),
             } orelse return null;
             defer result.deinit(alloc);
@@ -3388,25 +3636,8 @@ pub const HostedProvisionedTableReadSource = struct {
             var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_ids[0], routePolicyForConsistency(consistency))) orelse return null;
             defer route.deinit(alloc);
 
-            if (route == .local) {
-                var execution = try queryHostedLocalDetailed(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_ids[0], self.visibleRootGeneration(group_ids[0]), .{ .backend_runtime = self.backend_runtime }, table_name, req, consistency);
-                defer execution.releaseDb();
-                try checkQueryDeadline(execution.request);
-                var result = execution.result;
-                defer result.deinit();
-                const response_req = execution.request;
-                var meta: query_api.QueryResponseMeta = .{
-                    .took_ms = @intCast(@divTrunc(platform_time.monotonicNs() - start_ns, std.time.ns_per_ms)),
-                    .shard_count = 1,
-                    .dense_search = execution.dense_profile,
-                };
-                defer meta.deinit(alloc);
-                try applyHostedProvisionedQueryAggregations(self, alloc, group_ids, table_name, response_req, &result, &meta, execution.db(), consistency);
-                execution.releaseDb();
-                try checkQueryDeadline(response_req);
-                try applyQueryPostProcessing(alloc, response_req, &result, &meta, null, null);
-                return try query_api.encodeQueryResponses(alloc, table_name, response_req, meta, result);
-            }
+            if (route == .local)
+                return try self.groupLocalSource().queryGroupLocal(alloc, group_ids[0], table_name, req, consistency);
         }
 
         if (requiresDistributedGraphCoordinator(group_ids.len, req)) {
@@ -3482,7 +3713,7 @@ pub const HostedProvisionedTableReadSource = struct {
             defer route.deinit(alloc);
             switch (route) {
                 .local => {
-                    const summary = try preflightHostedLocal(null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, req, consistency, max_work);
+                    const summary = (try self.groupLocalSource().preflightQueryGroupLocal(alloc, group_id, table_name, req, consistency, max_work)) orelse return null;
                     if (first_summary == null) {
                         first_summary = summary;
                     } else {
@@ -3513,10 +3744,36 @@ pub const HostedProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?LookupResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        return try self.groupLocalSource().lookupGroupLocal(alloc, group_id, table_name, key, opts, consistency);
+    }
+
+    fn lookupGroupLocalPhysical(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        key: []const u8,
+        opts: db_mod.types.LookupOptions,
+        consistency: raft_mod.ReadConsistency,
+    ) !?LookupResponse {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         return try lookupProvisionedHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, key, opts, consistency);
     }
 
     fn documentArtifactManifestGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.DocumentArtifactManifest {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        return try self.groupLocalSource().documentArtifactManifestGroupLocal(alloc, group_id, table_name, doc_key, artifact_name, consistency);
+    }
+
+    fn documentArtifactManifestGroupLocalPhysical(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         group_id: u64,
@@ -3538,10 +3795,35 @@ pub const HostedProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?db_mod.types.DocumentArtifactManifestList {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        return try self.groupLocalSource().documentArtifactManifestsGroupLocal(alloc, group_id, table_name, doc_key, consistency);
+    }
+
+    fn documentArtifactManifestsGroupLocalPhysical(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.DocumentArtifactManifestList {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         return try documentArtifactManifestsProvisionedHostedLocal(null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, doc_key, consistency);
     }
 
     fn preflightQueryGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_mod.types.SearchRequest,
+        consistency: raft_mod.ReadConsistency,
+        max_work: u32,
+    ) !?db_mod.RuntimePreflightSummary {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        return try self.groupLocalSource().preflightQueryGroupLocal(alloc, group_id, table_name, req, consistency, max_work);
+    }
+
+    fn preflightQueryGroupLocalPhysical(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         group_id: u64,
@@ -3565,10 +3847,36 @@ pub const HostedProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?ScanResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        return try self.groupLocalSource().scanGroupLocal(alloc, group_id, table_name, from_key, to_key, opts, consistency);
+    }
+
+    fn scanGroupLocalPhysical(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        from_key: []const u8,
+        to_key: []const u8,
+        opts: db_mod.types.ScanOptions,
+        consistency: raft_mod.ReadConsistency,
+    ) !?ScanResponse {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         return try scanProvisionedHostedLocal(null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, from_key, to_key, opts, consistency);
     }
 
     fn queryGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_mod.types.SearchRequest,
+        consistency: raft_mod.ReadConsistency,
+    ) !?query_api.QueryResponse {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        return try self.groupLocalSource().queryGroupLocal(alloc, group_id, table_name, req, consistency);
+    }
+
+    fn queryGroupLocalPhysical(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         group_id: u64,
@@ -3608,12 +3916,35 @@ pub const HostedProvisionedTableReadSource = struct {
         defer route.deinit(alloc);
 
         return switch (route) {
-            .local => try queryHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), .{ .backend_runtime = self.backend_runtime }, table_name, req, consistency),
+            .local => try self.groupLocalSource().searchResultGroupLocal(alloc, group_id, table_name, req, consistency),
             .remote => null,
         };
     }
 
+    fn searchResultGroupLocalPhysical(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_mod.types.SearchRequest,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.SearchResult {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        return try queryHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), .{ .backend_runtime = self.backend_runtime }, table_name, req, consistency);
+    }
+
     fn textStatsGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+    ) !?query_api.QueryResponse {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        return try self.groupLocalSource().textStatsGroupLocal(alloc, group_id, table_name, body);
+    }
+
+    fn textStatsGroupLocalPhysical(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         group_id: u64,
@@ -3625,6 +3956,17 @@ pub const HostedProvisionedTableReadSource = struct {
     }
 
     fn algebraicPartialsGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+    ) !?query_api.QueryResponse {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        return try self.groupLocalSource().algebraicPartialsGroupLocal(alloc, group_id, table_name, body);
+    }
+
+    fn algebraicPartialsGroupLocalPhysical(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         group_id: u64,
@@ -3760,38 +4102,7 @@ pub const HostedProvisionedTableReadSource = struct {
         defer route.deinit(alloc);
 
         return switch (route) {
-            .local => blk: {
-                try table_catalog.validateTopologyEpoch(alloc, self.catalog, table_name, req.topology_epoch);
-                const expansions = try alloc.alloc(distributed_graph.GraphExpansion, req.frontier.len);
-                var initialized: usize = 0;
-                errdefer {
-                    for (expansions[0..initialized]) |*expansion| expansion.deinit(alloc);
-                    alloc.free(expansions);
-                }
-                for (req.frontier, 0..) |item, i| {
-                    const search_req = try distributed_graph.frontierItemToSearchRequest(alloc, req, item);
-                    defer distributed_graph.freeExpandSearchRequest(alloc, search_req);
-
-                    expansions[i] = .{
-                        .frontier_id = item.id,
-                        .frontier_key = try alloc.dupe(u8, item.key),
-                        .graph_result = graph_blk: {
-                            var result = try queryHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), .{ .backend_runtime = self.backend_runtime }, table_name, search_req, consistency);
-                            defer result.deinit();
-                            var graph_result = if (result.graph_results.len > 0)
-                                try distributed_graph.filterGraphSearchResult(alloc, table_name, result.graph_results[0], req.exclude_nodes, req.exclude_edges)
-                            else
-                                try distributed_graph.emptyGraphSearchResult(alloc, req.name);
-                            for (graph_result.hits) |*hit| hit.deinit(alloc);
-                            if (graph_result.hits.len > 0) alloc.free(graph_result.hits);
-                            graph_result.hits = @constCast((&[_]db_mod.types.SearchHit{})[0..]);
-                            break :graph_blk graph_result;
-                        },
-                    };
-                    initialized += 1;
-                }
-                break :blk .{ .expansions = expansions };
-            },
+            .local => try self.groupLocalSource().graphExpandGroupLocal(alloc, group_id, table_name, req, consistency),
             .remote => |remote| blk: {
                 if (req.resolved_doc_filter != null) {
                     const ctx = req.resolved_doc_filter_wire_context orelse return error.UnsupportedQueryRequest;
@@ -3810,6 +4121,47 @@ pub const HostedProvisionedTableReadSource = struct {
         };
     }
 
+    fn graphExpandGroupLocalPhysical(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: distributed_graph.GraphExpandRequest,
+        consistency: raft_mod.ReadConsistency,
+    ) !?distributed_graph.GraphExpandResponse {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        try table_catalog.validateTopologyEpoch(alloc, self.catalog, table_name, req.topology_epoch);
+        const expansions = try alloc.alloc(distributed_graph.GraphExpansion, req.frontier.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (expansions[0..initialized]) |*expansion| expansion.deinit(alloc);
+            alloc.free(expansions);
+        }
+        for (req.frontier, 0..) |item, i| {
+            const search_req = try distributed_graph.frontierItemToSearchRequest(alloc, req, item);
+            defer distributed_graph.freeExpandSearchRequest(alloc, search_req);
+
+            expansions[i] = .{
+                .frontier_id = item.id,
+                .frontier_key = try alloc.dupe(u8, item.key),
+                .graph_result = graph_blk: {
+                    var result = try queryHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), .{ .backend_runtime = self.backend_runtime }, table_name, search_req, consistency);
+                    defer result.deinit();
+                    var graph_result = if (result.graph_results.len > 0)
+                        try distributed_graph.filterGraphSearchResult(alloc, table_name, result.graph_results[0], req.exclude_nodes, req.exclude_edges)
+                    else
+                        try distributed_graph.emptyGraphSearchResult(alloc, req.name);
+                    for (graph_result.hits) |*hit| hit.deinit(alloc);
+                    if (graph_result.hits.len > 0) alloc.free(graph_result.hits);
+                    graph_result.hits = @constCast((&[_]db_mod.types.SearchHit{})[0..]);
+                    break :graph_blk graph_result;
+                },
+            };
+            initialized += 1;
+        }
+        return .{ .expansions = expansions };
+    }
+
     fn graphHydrateGroupLocal(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -3819,8 +4171,42 @@ pub const HostedProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?distributed_graph.GraphHydrateResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return null;
+        defer route.deinit(alloc);
+
+        return switch (route) {
+            .local => try self.groupLocalSource().graphHydrateGroupLocal(alloc, group_id, table_name, req, consistency),
+            .remote => |remote| blk: {
+                try table_catalog.validateTopologyEpoch(alloc, self.catalog, table_name, req.topology_epoch);
+                break :blk try graphHydrateRemote(self.executor, alloc, remote.base_uri, group_id, table_name, req);
+            },
+        };
+    }
+
+    fn graphHydrateGroupLocalPhysical(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: distributed_graph.GraphHydrateRequest,
+        consistency: raft_mod.ReadConsistency,
+    ) !?distributed_graph.GraphHydrateResponse {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try table_catalog.validateTopologyEpoch(alloc, self.catalog, table_name, req.topology_epoch);
-        return try executeHostedGraphHydrate(ptr, alloc, group_id, table_name, req, consistency);
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        const identity_namespace = try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id);
+        var db = try db_mod.DB.open(alloc, path, .{
+            .backend_runtime = self.backend_runtime,
+            .identity_namespace = identity_namespace,
+            .prefer_existing_identity_namespace = identity_namespace != null,
+        });
+        defer db.close();
+        try validateOpenedProvisionedDbIdentityNamespace(&db, identity_namespace);
+        try validateGraphHydrateResolvedDocFilterForDb(req, &db);
+
+        const reads = raft_mod.FeatureDBReads.init(group_id, self.requester);
+        return try graphHydrateOnOpenDb(alloc, reads, &db, req, consistency, false);
     }
 
     fn graphEdgesGroupLocal(
@@ -3836,9 +4222,21 @@ pub const HostedProvisionedTableReadSource = struct {
         defer route.deinit(alloc);
 
         return switch (route) {
-            .local => try graphGetEdgesLocal(alloc, self.replica_root_dir, self.catalog, self.requester, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, req, consistency),
+            .local => try self.groupLocalSource().graphEdgesGroupLocal(alloc, group_id, table_name, req, consistency),
             .remote => |remote| try graphEdgesRemote(self.executor, alloc, remote.base_uri, group_id, table_name, req),
         };
+    }
+
+    fn graphEdgesGroupLocalPhysical(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: distributed_graph.GraphEdgesRequest,
+        consistency: raft_mod.ReadConsistency,
+    ) !?distributed_graph.GraphEdgesResponse {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        return try graphGetEdgesLocal(alloc, self.replica_root_dir, self.catalog, self.requester, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, req, consistency);
     }
 };
 
@@ -3966,14 +4364,9 @@ fn collectProvisionedSearchRequestTextStatsParallel(
             body_inner: []const u8,
         ) void {
             const arena = slot.arena.allocator();
-            var response = collectProvisionedHostedLocalTextStats(
-                source.cache,
-                source.replica_root_dir,
-                source.catalog,
+            var response = source.groupLocalSource().textStatsGroupLocal(
                 arena,
                 group_id,
-                source.visibleRootGeneration(group_id),
-                source.backend_runtime,
                 table_name_inner,
                 body_inner,
             ) catch |err| {
@@ -4067,14 +4460,9 @@ fn collectHostedSearchRequestTextStatsParallel(
         ) void {
             const arena = slot.arena.allocator();
             var response = switch (route) {
-                .local => collectProvisionedHostedLocalTextStats(
-                    null,
-                    source.replica_root_dir,
-                    source.catalog,
+                .local => source.groupLocalSource().textStatsGroupLocal(
                     arena,
                     group_id,
-                    0,
-                    source.backend_runtime,
                     table_name_inner,
                     body_inner,
                 ),
@@ -4141,21 +4529,17 @@ fn queryProvisionedAcrossGroupsParallel(
             consistency_inner: raft_mod.ReadConsistency,
         ) void {
             const arena = slot.arena.allocator();
-            slot.result = queryHostedLocal(
-                source.resident_db,
-                source.cache,
-                source.replica_root_dir,
-                source.catalog,
-                source.requester,
+            slot.result = source.groupLocalSource().searchResultGroupLocal(
                 arena,
                 group_id,
-                source.visibleRootGeneration(group_id),
-                source.managedReadRuntimeConfig(),
                 table_name_inner,
                 shard_req_inner.*,
                 consistency_inner,
             ) catch |err| {
                 slot.err = err;
+                return;
+            } orelse {
+                slot.err = error.TableNotFound;
                 return;
             };
         }
@@ -4213,20 +4597,19 @@ fn queryHostedAcrossGroupsParallel(
         ) void {
             const arena = slot.arena.allocator();
             slot.result = switch (route) {
-                .local => queryHostedLocal(
-                    null,
-                    null,
-                    source.replica_root_dir,
-                    source.catalog,
-                    source.requester,
+                .local => source.groupLocalSource().searchResultGroupLocal(
                     arena,
                     group_id,
-                    0,
-                    .{ .backend_runtime = source.backend_runtime },
                     table_name_inner,
                     shard_req_inner.*,
                     consistency_inner,
-                ),
+                ) catch |err| {
+                    slot.err = err;
+                    return;
+                } orelse {
+                    slot.err = error.TableNotFound;
+                    return;
+                },
                 .remote => |remote| queryRemote(source.executor, arena, remote.base_uri, group_id, table_name_inner, shard_req_inner.*),
             } catch |err| {
                 slot.err = err;
@@ -4633,15 +5016,9 @@ fn preflightProvisionedGroupsParallel(
             max_work_inner: u32,
         ) void {
             const arena = slot.arena.allocator();
-            slot.summary = preflightHostedLocal(
-                source.cache,
-                source.replica_root_dir,
-                source.catalog,
-                source.requester,
+            slot.summary = source.groupLocalSource().preflightQueryGroupLocal(
                 arena,
                 group_id,
-                source.visibleRootGeneration(group_id),
-                source.backend_runtime,
                 table_name_inner,
                 req_inner.*,
                 consistency_inner,
@@ -4650,6 +5027,7 @@ fn preflightProvisionedGroupsParallel(
                 slot.err = err;
                 return;
             };
+            if (slot.summary == null) slot.err = error.TableNotFound;
         }
     };
 
@@ -4716,22 +5094,19 @@ fn preflightHostedGroupsParallel(
             max_work_inner: u32,
         ) void {
             const arena = slot.arena.allocator();
-            slot.summary = switch (route) {
-                .local => preflightHostedLocal(
-                    null,
-                    source.replica_root_dir,
-                    source.catalog,
-                    source.requester,
+            switch (route) {
+                .local => slot.summary = source.groupLocalSource().preflightQueryGroupLocal(
                     arena,
                     group_id,
-                    0,
-                    source.backend_runtime,
                     table_name_inner,
                     req_inner.*,
                     consistency_inner,
                     max_work_inner,
-                ),
-                .remote => |remote| preflightRemote(
+                ) catch |err| {
+                    slot.err = err;
+                    return;
+                },
+                .remote => |remote| slot.summary = preflightRemote(
                     source.executor,
                     arena,
                     remote.base_uri,
@@ -4739,11 +5114,12 @@ fn preflightHostedGroupsParallel(
                     table_name_inner,
                     req_inner.*,
                     max_work_inner,
-                ),
-            } catch |err| {
-                slot.err = err;
-                return;
-            };
+                ) catch |err| {
+                    slot.err = err;
+                    return;
+                },
+            }
+            if (slot.summary == null) slot.err = error.TableNotFound;
         }
     };
 
@@ -5013,7 +5389,13 @@ fn queryProvisionedAcrossGroups(
     }
 
     for (group_ids, 0..) |group_id, i| {
-        shard_results[i] = try queryHostedLocal(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.managedReadRuntimeConfig(), table_name, shard_req, consistency);
+        shard_results[i] = (try self.groupLocalSource().searchResultGroupLocal(
+            alloc,
+            group_id,
+            table_name,
+            shard_req,
+            consistency,
+        )) orelse return error.TableNotFound;
         initialized += 1;
     }
     return try mergeSearchResultsWithTableRuntimeSchema(alloc, self.catalog, table_name, req, shard_results[0..initialized], req.offset, req.limit);
@@ -5052,7 +5434,13 @@ fn queryHostedAcrossGroups(
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return error.TableNotFound;
         defer route.deinit(alloc);
         shard_results[i] = switch (route) {
-            .local => try queryHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), .{ .backend_runtime = self.backend_runtime }, table_name, shard_req, consistency),
+            .local => (try self.groupLocalSource().searchResultGroupLocal(
+                alloc,
+                group_id,
+                table_name,
+                shard_req,
+                consistency,
+            )) orelse return error.TableNotFound,
             .remote => |remote| try queryRemote(self.executor, alloc, remote.base_uri, group_id, table_name, shard_req),
         };
         initialized += 1;
@@ -5119,37 +5507,7 @@ fn executeProvisionedGraphExpand(
     consistency: raft_mod.ReadConsistency,
 ) !distributed_graph.GraphExpandResponse {
     const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-    try table_catalog.validateTopologyEpoch(alloc, self.catalog, table_name, req.topology_epoch);
-    const expansions = try alloc.alloc(distributed_graph.GraphExpansion, req.frontier.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (expansions[0..initialized]) |*expansion| expansion.deinit(alloc);
-        alloc.free(expansions);
-    }
-
-    for (req.frontier, 0..) |item, i| {
-        const search_req = try distributed_graph.frontierItemToSearchRequest(alloc, req, item);
-        defer distributed_graph.freeExpandSearchRequest(alloc, search_req);
-
-        expansions[i] = .{
-            .frontier_id = item.id,
-            .frontier_key = try alloc.dupe(u8, item.key),
-            .graph_result = graph_result_blk: {
-                var result = try queryHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), .{ .backend_runtime = self.backend_runtime }, table_name, search_req, consistency);
-                defer result.deinit();
-                var graph_result = if (result.graph_results.len > 0)
-                    try distributed_graph.filterGraphSearchResult(alloc, table_name, result.graph_results[0], req.exclude_nodes, req.exclude_edges)
-                else
-                    try distributed_graph.emptyGraphSearchResult(alloc, req.name);
-                for (graph_result.hits) |*hit| hit.deinit(alloc);
-                if (graph_result.hits.len > 0) alloc.free(graph_result.hits);
-                graph_result.hits = @constCast((&[_]db_mod.types.SearchHit{})[0..]);
-                break :graph_result_blk graph_result;
-            },
-        };
-        initialized += 1;
-    }
-    return .{ .expansions = expansions };
+    return (try self.groupLocalSource().graphExpandGroupLocal(alloc, group_id, table_name, req, consistency)) orelse return error.TableNotFound;
 }
 
 fn executeProvisionedGraphHydrate(
@@ -5161,15 +5519,7 @@ fn executeProvisionedGraphHydrate(
     consistency: raft_mod.ReadConsistency,
 ) !distributed_graph.GraphHydrateResponse {
     const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-    try table_catalog.validateTopologyEpoch(alloc, self.catalog, table_name, req.topology_epoch);
-    const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
-    defer alloc.free(path);
-    var db = try openProvisionedQueryDbForTableWithRuntime(alloc, path, self.catalog, table_name, group_id, self.visibleRootGeneration(group_id), self.backend_runtime);
-    defer db.close();
-    try validateGraphHydrateResolvedDocFilterForDb(req, &db);
-
-    const reads = raft_mod.FeatureDBReads.init(group_id, self.requester);
-    return try graphHydrateOnOpenDb(alloc, reads, &db, req, consistency, true);
+    return (try self.groupLocalSource().graphHydrateGroupLocal(alloc, group_id, table_name, req, consistency)) orelse return error.TableNotFound;
 }
 
 fn executeHostedGraphExpand(
@@ -5180,7 +5530,14 @@ fn executeHostedGraphExpand(
     req: distributed_graph.GraphExpandRequest,
     consistency: raft_mod.ReadConsistency,
 ) !distributed_graph.GraphExpandResponse {
-    return (try HostedProvisionedTableReadSource.graphExpandGroupLocal(ptr, alloc, group_id, table_name, req, consistency)) orelse return error.TableNotFound;
+    const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+    var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return error.TableNotFound;
+    defer route.deinit(alloc);
+
+    return switch (route) {
+        .local => (try self.groupLocalSource().graphExpandGroupLocal(alloc, group_id, table_name, req, consistency)) orelse return error.TableNotFound,
+        .remote => |remote| try graphExpandRemote(self.executor, alloc, remote.base_uri, group_id, table_name, req),
+    };
 }
 
 fn executeHostedGraphHydrate(
@@ -5196,22 +5553,7 @@ fn executeHostedGraphHydrate(
     defer route.deinit(alloc);
 
     return switch (route) {
-        .local => blk: {
-            const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
-            defer alloc.free(path);
-            const identity_namespace = try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id);
-            var db = try db_mod.DB.open(alloc, path, .{
-                .backend_runtime = self.backend_runtime,
-                .identity_namespace = identity_namespace,
-                .prefer_existing_identity_namespace = identity_namespace != null,
-            });
-            defer db.close();
-            try validateOpenedProvisionedDbIdentityNamespace(&db, identity_namespace);
-            try validateGraphHydrateResolvedDocFilterForDb(req, &db);
-
-            const reads = raft_mod.FeatureDBReads.init(group_id, self.requester);
-            break :blk try graphHydrateOnOpenDb(alloc, reads, &db, req, consistency, false);
-        },
+        .local => (try self.groupLocalSource().graphHydrateGroupLocal(alloc, group_id, table_name, req, consistency)) orelse return error.TableNotFound,
         .remote => |remote| blk: {
             if (req.resolved_doc_filter != null) {
                 const ctx = req.resolved_doc_filter_wire_context orelse return error.UnsupportedQueryRequest;
@@ -5239,7 +5581,7 @@ fn executeProvisionedGraphGetEdges(
     consistency: raft_mod.ReadConsistency,
 ) anyerror!distributed_graph.GraphEdgesResponse {
     const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-    return graphGetEdgesLocal(alloc, self.replica_root_dir, self.catalog, self.requester, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, req, consistency);
+    return (try self.groupLocalSource().graphEdgesGroupLocal(alloc, group_id, table_name, req, consistency)) orelse return error.TableNotFound;
 }
 
 fn executeHostedGraphGetEdges(
@@ -5255,7 +5597,7 @@ fn executeHostedGraphGetEdges(
     defer route.deinit(alloc);
 
     return switch (route) {
-        .local => graphGetEdgesLocal(alloc, self.replica_root_dir, self.catalog, self.requester, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, req, consistency),
+        .local => (try self.groupLocalSource().graphEdgesGroupLocal(alloc, group_id, table_name, req, consistency)) orelse return error.TableNotFound,
         .remote => |remote| try graphEdgesRemote(self.executor, alloc, remote.base_uri, group_id, table_name, req),
     };
 }
@@ -6193,20 +6535,14 @@ fn preflightProvisionedGroups(
     var first_summary: ?db_mod.RuntimePreflightSummary = null;
     errdefer if (first_summary) |*summary| summary.deinit(alloc);
     for (group_ids) |group_id| {
-        const summary = try preflightHostedLocal(
-            self.cache,
-            self.replica_root_dir,
-            self.catalog,
-            self.requester,
+        const summary = (try self.groupLocalSource().preflightQueryGroupLocal(
             alloc,
             group_id,
-            self.visibleRootGeneration(group_id),
-            self.backend_runtime,
             table_name,
             req,
             consistency,
             max_work,
-        );
+        )) orelse return null;
         if (first_summary == null) {
             first_summary = summary;
         } else {
@@ -12369,7 +12705,7 @@ fn collectProvisionedSearchRequestTextStats(
     }
 
     for (group_ids, 0..) |group_id, i| {
-        var response = (try collectProvisionedHostedLocalTextStats(self.cache, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body)) orelse return error.TableNotFound;
+        var response = (try self.groupLocalSource().textStatsGroupLocal(alloc, group_id, table_name, body)) orelse return error.TableNotFound;
         defer response.deinit(alloc);
         shard_stats[i] = try parseTextStatsResponse(alloc, response.json);
         initialized += 1;
@@ -12409,7 +12745,7 @@ fn collectHostedSearchRequestTextStats(
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return error.TableNotFound;
         defer route.deinit(alloc);
         var response = switch (route) {
-            .local => (try collectProvisionedHostedLocalTextStats(null, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body)) orelse return error.TableNotFound,
+            .local => (try self.groupLocalSource().textStatsGroupLocal(alloc, group_id, table_name, body)) orelse return error.TableNotFound,
             .remote => |remote| (try textStatsRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body, req)) orelse return error.TableNotFound,
         };
         defer response.deinit(alloc);
@@ -12449,7 +12785,7 @@ fn collectProvisionedAggregationTextStats(
         alloc.free(shard_stats);
     }
     for (group_ids, 0..) |group_id, i| {
-        var response = (try collectProvisionedHostedLocalTextStats(self.cache, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body)) orelse return error.TableNotFound;
+        var response = (try self.groupLocalSource().textStatsGroupLocal(alloc, group_id, table_name, body)) orelse return error.TableNotFound;
         defer response.deinit(alloc);
         shard_stats[i] = try parseTextStatsResponse(alloc, response.json);
         initialized += 1;
@@ -12486,7 +12822,7 @@ fn collectProvisionedAggregationBackgroundTextStats(
         alloc.free(shard_stats);
     }
     for (group_ids, 0..) |group_id, i| {
-        var response = (try collectProvisionedHostedLocalTextStats(self.cache, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body)) orelse return error.TableNotFound;
+        var response = (try self.groupLocalSource().textStatsGroupLocal(alloc, group_id, table_name, body)) orelse return error.TableNotFound;
         defer response.deinit(alloc);
         shard_stats[i] = try parseBackgroundTextStatsResponse(alloc, response.json);
         initialized += 1;
@@ -12527,7 +12863,7 @@ fn collectHostedAggregationTextStats(
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return error.TableNotFound;
         defer route.deinit(alloc);
         var response = switch (route) {
-            .local => (try collectProvisionedHostedLocalTextStats(null, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body)) orelse return error.TableNotFound,
+            .local => (try self.groupLocalSource().textStatsGroupLocal(alloc, group_id, table_name, body)) orelse return error.TableNotFound,
             .remote => |remote| (try textStatsRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body, req)) orelse return error.TableNotFound,
         };
         defer response.deinit(alloc);
@@ -12570,7 +12906,7 @@ fn collectHostedAggregationBackgroundTextStats(
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return error.TableNotFound;
         defer route.deinit(alloc);
         var response = switch (route) {
-            .local => (try collectProvisionedHostedLocalTextStats(null, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body)) orelse return error.TableNotFound,
+            .local => (try self.groupLocalSource().textStatsGroupLocal(alloc, group_id, table_name, body)) orelse return error.TableNotFound,
             .remote => |remote| (try textStatsRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body, req)) orelse return error.TableNotFound,
         };
         defer response.deinit(alloc);
@@ -15107,9 +15443,17 @@ test "provisioned table read source routes lookup and scan across ranges" {
     const right_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7002);
     defer alloc.free(right_path);
 
-    var left_db = try db_mod.DB.open(alloc, left_path, .{});
+    var left_db = try db_mod.DB.open(alloc, left_path, .{ .identity_namespace = .{
+        .table_id = 7,
+        .shard_id = 7001,
+        .range_id = 7001,
+    } });
     defer left_db.close();
-    var right_db = try db_mod.DB.open(alloc, right_path, .{});
+    var right_db = try db_mod.DB.open(alloc, right_path, .{ .identity_namespace = .{
+        .table_id = 7,
+        .shard_id = 7002,
+        .range_id = 7002,
+    } });
     defer right_db.close();
 
     try left_db.batch(.{
@@ -15313,9 +15657,17 @@ test "provisioned table read source merges query results across ranges" {
     const right_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7002);
     defer alloc.free(right_path);
 
-    var left_db = try db_mod.DB.open(alloc, left_path, .{});
+    var left_db = try db_mod.DB.open(alloc, left_path, .{ .identity_namespace = .{
+        .table_id = 7,
+        .shard_id = 7001,
+        .range_id = 7001,
+    } });
     defer left_db.close();
-    var right_db = try db_mod.DB.open(alloc, right_path, .{});
+    var right_db = try db_mod.DB.open(alloc, right_path, .{ .identity_namespace = .{
+        .table_id = 7,
+        .shard_id = 7002,
+        .range_id = 7002,
+    } });
     defer right_db.close();
 
     try left_db.addIndex(.{ .name = "full_text_index_v0", .kind = .full_text, .config_json = "{}" });
@@ -15399,8 +15751,11 @@ test "provisioned table read source merges query results across ranges" {
     var parsed = try parseJsonTestBody(metadata_openapi.QueryResponses, alloc, response.json);
     defer parsed.deinit();
     const hits = parsed.value.responses.?[0].hits.?.hits.?;
-    try std.testing.expectEqualStrings("doc:a", hits[0]._id);
-    try std.testing.expectEqualStrings("doc:z", hits[1]._id);
+    try std.testing.expectEqual(@as(usize, 2), hits.len);
+    try std.testing.expect(
+        (std.mem.eql(u8, "doc:a", hits[0]._id) and std.mem.eql(u8, "doc:z", hits[1]._id)) or
+            (std.mem.eql(u8, "doc:z", hits[0]._id) and std.mem.eql(u8, "doc:a", hits[1]._id)),
+    );
 }
 
 test "provisioned table read source serves dense queries for explicit external embeddings" {
@@ -15712,6 +16067,129 @@ test "provisioned table read source managed runtime config carries inference url
     try std.testing.expect(runtime_cfg.remote_content == null);
 }
 
+test "provisioned query delegates single-group physical execution to local read source" {
+    const alloc = std.testing.allocator;
+
+    const FakeCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = "{}",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const LocalOwner = struct {
+        calls: usize = 0,
+        group_id: u64 = 0,
+        limit: u32 = 0,
+        consistency: raft_mod.ReadConsistency = .stale,
+
+        fn source(self: *@This()) TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = unexpectedLookup,
+                    .scan = unexpectedScan,
+                    .query = unexpectedQuery,
+                    .query_group_local = queryGroupLocal,
+                },
+            };
+        }
+
+        fn unexpectedLookup(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.LookupOptions,
+            _: raft_mod.ReadConsistency,
+        ) !?LookupResponse {
+            return error.UnexpectedTopLevelRead;
+        }
+
+        fn unexpectedScan(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.ScanOptions,
+            _: raft_mod.ReadConsistency,
+        ) !?ScanResponse {
+            return error.UnexpectedTopLevelRead;
+        }
+
+        fn unexpectedQuery(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.SearchRequest,
+            _: raft_mod.ReadConsistency,
+        ) !?query_api.QueryResponse {
+            return error.UnexpectedTopLevelRead;
+        }
+
+        fn queryGroupLocal(
+            ptr: *anyopaque,
+            response_alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            req: db_mod.types.SearchRequest,
+            consistency: raft_mod.ReadConsistency,
+        ) !?query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            self.calls += 1;
+            self.group_id = group_id;
+            self.limit = req.limit;
+            self.consistency = consistency;
+            return .{ .json = try response_alloc.dupe(u8, "{\"from\":\"local-owner\"}") };
+        }
+    };
+
+    var local_owner = LocalOwner{};
+    var source = ProvisionedTableReadSource.init(
+        "/tmp/unused-antfly-local-owner-delegation",
+        FakeCatalog.iface(),
+        raft_mod.read_gate.noopReadableLeaseRequester(),
+    );
+    _ = source.withLocalReadSource(local_owner.source());
+
+    var response = (try source.source().query(alloc, "docs", .{ .limit = 17 }, .read_index)).?;
+    defer response.deinit(alloc);
+
+    try std.testing.expectEqualStrings("{\"from\":\"local-owner\"}", response.json);
+    try std.testing.expectEqual(@as(usize, 1), local_owner.calls);
+    try std.testing.expectEqual(@as(u64, 7001), local_owner.group_id);
+    try std.testing.expectEqual(@as(u32, 17), local_owner.limit);
+    try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, local_owner.consistency);
+}
+
 test "provisioned table read source serves public dense query requests with read_index" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-api-provisioned-query-dense-public";
@@ -15723,7 +16201,11 @@ test "provisioned table read source serves public dense query requests with read
 
     const group_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
     defer alloc.free(group_path);
-    var db = try db_mod.DB.open(alloc, group_path, .{});
+    var db = try db_mod.DB.open(alloc, group_path, .{ .identity_namespace = .{
+        .table_id = 7,
+        .shard_id = 7001,
+        .range_id = 7001,
+    } });
     defer db.close();
 
     const FakeCatalog = struct {
@@ -16045,12 +16527,25 @@ test "provisioned table read source preflights every local group" {
     const right_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7002);
     defer alloc.free(right_path);
 
-    var left_db = try db_mod.DB.open(alloc, left_path, .{});
+    var left_db = try db_mod.DB.open(alloc, left_path, .{ .identity_namespace = .{
+        .table_id = 7,
+        .shard_id = 7001,
+        .range_id = 7001,
+    } });
     defer left_db.close();
-    var right_db = try db_mod.DB.open(alloc, right_path, .{});
+    var right_db = try db_mod.DB.open(alloc, right_path, .{ .identity_namespace = .{
+        .table_id = 7,
+        .shard_id = 7002,
+        .range_id = 7002,
+    } });
     defer right_db.close();
 
     try left_db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+    });
+    try right_db.addIndex(.{
         .name = "dense_idx",
         .kind = .dense_vector,
         .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
@@ -16092,10 +16587,13 @@ test "provisioned table read source preflights every local group" {
 
     var source = ProvisionedTableReadSource.init(path, FakeCatalog.iface(), raft_mod.read_gate.noopReadableLeaseRequester());
     _ = source.withIo(&io_impl);
-    try std.testing.expectError(error.InvalidArgument, source.source().preflightQuery(alloc, "docs", .{
+    var dense_summary = (try source.source().preflightQuery(alloc, "docs", .{
         .index_name = "dense_idx",
         .dense = .{ .vector = &.{ 1.0, 2.0, 3.0 }, .k = 5 },
-    }, .read_index, 0));
+    }, .read_index, 0)).?;
+    defer dense_summary.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), dense_summary.shard_count);
+    try std.testing.expectEqual(@as(u32, 2), dense_summary.dense_query_count);
     try std.testing.expectError(error.UnsupportedQueryRequest, source.source().preflightQuery(alloc, "docs", .{
         .graph_queries = &.{
             .{
@@ -19955,7 +20453,11 @@ test "hosted textStatsGroupLocal serves only the local group" {
 
     const group_path = try metadata_mod.groupDbPathFromReplicaRoot(test_alloc, path, 7);
     defer test_alloc.free(group_path);
-    var db = try db_mod.DB.open(test_alloc, group_path, .{});
+    var db = try db_mod.DB.open(test_alloc, group_path, .{ .identity_namespace = .{
+        .table_id = 7,
+        .shard_id = 7,
+        .range_id = 7,
+    } });
     defer db.close();
 
     try db.addIndex(.{ .name = "full_text_index_v0", .kind = .full_text, .config_json = "{}" });
@@ -20224,11 +20726,20 @@ test "hosted table read source preflights every local group" {
     defer test_alloc.free(left_path);
     const right_path = try metadata_mod.groupDbPathFromReplicaRoot(test_alloc, path, 8);
     defer test_alloc.free(right_path);
-    var left_db = try db_mod.DB.open(test_alloc, left_path, .{});
+    var left_db = try db_mod.DB.open(test_alloc, left_path, .{ .identity_namespace = .{
+        .table_id = 7,
+        .shard_id = 7,
+        .range_id = 7,
+    } });
     defer left_db.close();
-    var right_db = try db_mod.DB.open(test_alloc, right_path, .{});
+    var right_db = try db_mod.DB.open(test_alloc, right_path, .{ .identity_namespace = .{
+        .table_id = 7,
+        .shard_id = 8,
+        .range_id = 8,
+    } });
     defer right_db.close();
     try left_db.addIndex(.{ .name = "dv_v1", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3}" });
+    try right_db.addIndex(.{ .name = "dv_v1", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3}" });
 
     const FakeCatalog = struct {
         fn iface() table_catalog.CatalogSource {
@@ -20328,10 +20839,13 @@ test "hosted table read source preflights every local group" {
     );
     _ = hosted.withIo(&io_impl);
 
-    try std.testing.expectError(error.InvalidArgument, hosted.source().preflightQuery(test_alloc, "docs", .{
+    var dense_summary = (try hosted.source().preflightQuery(test_alloc, "docs", .{
         .index_name = "dv_v1",
         .dense = .{ .vector = &.{ 1.0, 2.0, 3.0 }, .k = 5 },
-    }, .read_index, 0));
+    }, .read_index, 0)).?;
+    defer dense_summary.deinit(test_alloc);
+    try std.testing.expectEqual(@as(u32, 2), dense_summary.shard_count);
+    try std.testing.expectEqual(@as(u32, 2), dense_summary.dense_query_count);
     try std.testing.expectError(error.UnsupportedQueryRequest, hosted.source().preflightQuery(test_alloc, "docs", .{
         .graph_queries = &.{
             .{
@@ -20524,23 +21038,34 @@ test "hosted cross-range graph query expands explicit local start keys" {
         \\{"relations_graph":{"type":"graph","edge_types":[{"name":"mentions"}]}}
     ;
 
-    var left_db = try db_mod.DB.open(alloc, left_path, .{});
-    defer left_db.close();
+    var left_db = try db_mod.DB.open(alloc, left_path, .{ .identity_namespace = .{
+        .table_id = 7,
+        .shard_id = 7001,
+        .range_id = 7001,
+    } });
     try left_db.addIndex(.{ .name = "relations_graph", .kind = .graph, .config_json = "{\"edge_types\":[{\"name\":\"mentions\"}]}" });
     try left_db.batch(.{
-        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"left\"}" }},
-        .sync_level = .write,
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"left\"}" },
+            .{ .key = "entity:ada", .value = "{\"name\":\"Ada\"}" },
+        },
+        .sync_level = .full_index,
     });
 
-    var right_db = try db_mod.DB.open(alloc, right_path, .{});
-    defer right_db.close();
+    var right_db = try db_mod.DB.open(alloc, right_path, .{ .identity_namespace = .{
+        .table_id = 7,
+        .shard_id = 7002,
+        .range_id = 7002,
+    } });
     try right_db.addIndex(.{ .name = "relations_graph", .kind = .graph, .config_json = "{\"edge_types\":[{\"name\":\"mentions\"}]}" });
     try right_db.batch(.{
         .writes = &.{.{ .key = "zdoc:a", .value = "{\"title\":\"right\"}" }},
-        .sync_level = .write,
+        .sync_level = .full_index,
     });
     const graph_entry = right_db.core.graphIndex("relations_graph") orelse return error.IndexNotFound;
     try graph_entry.index.addEdge("zdoc:a", "entity:ada", "mentions", 1.0, 0, 0, "{\"target_table\":\"entities\"}");
+    right_db.close();
+    left_db.close();
 
     const FakeCatalog = struct {
         const statuses = [_]metadata_reconciler.MergedGroupStatus{
@@ -20550,10 +21075,10 @@ test "hosted cross-range graph query expands explicit local start keys" {
                     .namespace_table_id = 7,
                     .namespace_shard_id = 7001,
                     .namespace_range_id = 7001,
-                    .next_ordinal = 2,
-                    .allocated_ordinals = 1,
-                    .state_rows = 1,
-                    .live_ordinals = 1,
+                    .next_ordinal = 3,
+                    .allocated_ordinals = 2,
+                    .state_rows = 2,
+                    .live_ordinals = 2,
                     .complete = true,
                 },
             },
