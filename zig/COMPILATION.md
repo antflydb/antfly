@@ -366,6 +366,34 @@ read/write caches, resource manager, and storage runtime. Statuses use an
 explicit enum, request/result envelopes have C-compatible versioned layouts or
 owned wire buffers, and every returned allocation is destroyed by the kernel.
 
+### Phase 2d stateless stable-query ABI probe
+
+A subsequent probe implemented the intended stable mechanics before moving
+ownership: versioned C-compatible request/result structures, explicit status
+translation, borrowed table metadata and query wire, a readable-lease callback,
+kernel-owned response/profile buffers, and explicit destruction. The
+distributed side retained routing, aggregation, and postprocessing. A focused
+test linked the consumer and provider as separate static archives and executed
+the existing dense and profiled-dense query fixtures across the boundary.
+
+Both cross-archive queries correctly failed with `GenerationTransitionActive`.
+The fixture, like a production data node, already had its writer DB open in the
+distributed compilation unit. The storage archive has a separate process-local
+DB registry and cannot open a second query DB for that live generation. The
+current in-process implementation avoids that conflict by leasing the resident
+writer DB; a stable compiled boundary cannot safely borrow that Zig `DB`
+pointer or its layout-coupled lease.
+
+Decision: reject and fully revert the stateless query ABI without spending a
+cold ReleaseFast measurement on a behaviorally invalid architecture. Do not
+work around this by closing the writer, weakening generation locking, or
+mapping the conflict to a retry. The next experiment must establish the opaque
+storage owner first: the kernel must create and retain the live table/shard DB
+used by both writes and reads. Query migration then targets that kernel-owned
+handle. This tightens Phase 2's prerequisite from “query plus a new read cache”
+to “shared read/write storage ownership,” while leaving routing, fanout, merge,
+and policy in distributed control.
+
 ## Holistic target architecture
 
 The preferred end state is a modular monolith with a small number of compiled
