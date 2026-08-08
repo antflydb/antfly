@@ -16,6 +16,7 @@ const std = @import("std");
 const antfly = @import("antfly_storage_root");
 const capi = @import("types.zig");
 const search_wire = @import("search_wire.zig");
+const kernel_owner_abi = @import("kernel_owner_abi");
 
 const db_mod = antfly.db;
 const raft_mod = antfly.raft;
@@ -1609,6 +1610,115 @@ pub export fn antfly_db_open(path: ?[*:0]const u8, out_handle: ?*?*anyopaque) ca
     const handle = openDefaultDirectoryHandle(path_slice) catch |err| return capi.mapError(err);
     out.* = handle;
     return .ok;
+}
+
+pub fn storageOwnerOpen(
+    request: *const kernel_owner_abi.OpenRequest,
+    out_owner: *?*anyopaque,
+) callconv(.c) kernel_owner_abi.Status {
+    out_owner.* = null;
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const path = request.path.slice();
+    if (path.len == 0) return .invalid_argument;
+
+    const identity_namespace: ?db_mod.DocIdentityNamespace = if (request.has_identity_namespace != 0)
+        .{
+            .table_id = request.identity_table_id,
+            .shard_id = request.identity_shard_id,
+            .range_id = request.identity_range_id,
+        }
+    else
+        null;
+    const alloc = std.heap.c_allocator;
+    var db = db_mod.DB.open(alloc, path, .{
+        .lsm_root_generation = request.lsm_root_generation,
+        .identity_namespace = identity_namespace,
+        .prefer_existing_identity_namespace = identity_namespace != null,
+    }) catch |err| return storageOwnerStatusFromError(err);
+    errdefer db.close();
+    const handle = alloc.create(Handle) catch return .out_of_memory;
+    handle.* = .{
+        .alloc = alloc,
+        .db = db,
+    };
+    out_owner.* = handle;
+    return .ok;
+}
+
+pub fn storageOwnerClose(owner: ?*anyopaque) callconv(.c) void {
+    antfly_db_close(owner);
+}
+
+pub fn storageOwnerBatchJson(
+    owner: ?*anyopaque,
+    request_json: kernel_owner_abi.BorrowedBytes,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    var response: capi.Buffer = .{};
+    const status = storageOwnerStatusFromCapi(antfly_db_batch_json(owner, .{
+        .ptr = request_json.ptr,
+        .len = @intCast(request_json.len),
+    }, &response));
+    if (status != .ok) return status;
+    out_response.* = .{
+        .ptr = response.ptr,
+        .len = @intCast(response.len),
+    };
+    return .ok;
+}
+
+pub fn storageOwnerQueryJson(
+    owner: ?*anyopaque,
+    request_json: kernel_owner_abi.BorrowedBytes,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    var response: capi.Buffer = .{};
+    const status = storageOwnerStatusFromCapi(antfly_db_search_json(owner, .{
+        .ptr = request_json.ptr,
+        .len = @intCast(request_json.len),
+    }, &response));
+    if (status != .ok) return status;
+    out_response.* = .{
+        .ptr = response.ptr,
+        .len = @intCast(response.len),
+    };
+    return .ok;
+}
+
+pub fn storageOwnerBufferDestroy(buffer: *kernel_owner_abi.OwnedBytes) callconv(.c) void {
+    antfly_db_buffer_free(buffer.ptr, @intCast(buffer.len));
+    buffer.* = .{};
+}
+
+fn storageOwnerStatusFromCapi(status: capi.ErrorCode) kernel_owner_abi.Status {
+    return switch (status) {
+        .ok => .ok,
+        .invalid_argument => .invalid_argument,
+        .not_found => .not_found,
+        .version_conflict => .version_conflict,
+        .intent_conflict => .intent_conflict,
+        .txn_not_found => .transaction_not_found,
+        .busy => .busy,
+        .internal => .internal,
+    };
+}
+
+fn storageOwnerStatusFromError(err: anyerror) kernel_owner_abi.Status {
+    return switch (err) {
+        error.InvalidArgument, error.InvalidArguments => .invalid_argument,
+        error.NotFound, error.FileNotFound => .not_found,
+        error.VersionConflict => .version_conflict,
+        error.IntentConflict, error.DecisionConflict => .intent_conflict,
+        error.TxnNotFound => .transaction_not_found,
+        error.LsmRootWriterAlreadyOpen, error.GenerationTransitionActive, error.WouldBlock => .busy,
+        error.ReadOnly => .read_only,
+        error.OutOfMemory => .out_of_memory,
+        error.Corrupted => .corrupted,
+        error.DocIdentityNamespaceMismatch => .identity_namespace_mismatch,
+        else => .internal,
+    };
 }
 
 fn openDefaultDirectoryHandle(path: []const u8) !*Handle {

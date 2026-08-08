@@ -1721,6 +1721,11 @@ pub fn build(b: *std.Build) void {
     const inference_server_mod = inference_graph.inference_mod;
     const standalone_runtime_options = b.addOptions();
     standalone_runtime_options.addOption(bool, "linked_inference", linked_runtime_libraries);
+    const kernel_owner_abi_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/storage/kernel_owner_abi.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
     const hf_tokenizer_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -2303,6 +2308,7 @@ pub fn build(b: *std.Build) void {
     });
     capi_mod.addImport("antfly_storage_root", capi_root_mod);
     capi_mod.addImport("structlog", structlog_mod);
+    capi_mod.addImport("kernel_owner_abi", kernel_owner_abi_mod);
 
     // Unlinked and focused CAPI builds compile the storage ABI as a standalone
     // PIC object. Linked release builds instead include the same exports in the
@@ -8575,6 +8581,7 @@ pub fn build(b: *std.Build) void {
                 .pic = if (owns_storage_kernel) true else null,
             });
             antfly_imports.configure(b, role_mod, false, link_libc);
+            role_mod.addImport("kernel_owner_abi", kernel_owner_abi_mod);
             role_mod.addImport("antfly-client", antfly_client_pkg_mod);
             if (owns_storage_kernel) role_mod.addImport("antfly_storage_root", role_mod);
             role_mod.addOptions("runtime_library_options", unit_options);
@@ -8608,6 +8615,29 @@ pub fn build(b: *std.Build) void {
                     .inference => 8 * 1024 * 1024 * 1024,
                 },
             });
+            if (unit == .storage_kernel and storage_kernel_experiment) {
+                const owner_test_mod = b.createModule(.{
+                    .root_source_file = b.path("pkg/antfly/src/storage/kernel_owner_test.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .link_libc = true,
+                });
+                owner_test_mod.addImport("kernel_owner_abi", kernel_owner_abi_mod);
+                const owner_tests = b.addTest(.{
+                    .root_module = owner_test_mod,
+                    .test_runner = .{
+                        .path = b.path("pkg/antfly/src/test_runner.zig"),
+                        .mode = .simple,
+                    },
+                });
+                owner_tests.root_module.linkLibrary(role_artifact);
+                const run_owner_tests = b.addRunArtifact(owner_tests);
+                const owner_test_step = b.step(
+                    "storage-kernel-owner-test",
+                    "Run opaque storage owner ABI tests across static archives",
+                );
+                owner_test_step.dependOn(&run_owner_tests.step);
+            }
             if (owns_storage_kernel) {
                 // The executable and C ABI libraries share this one optimized
                 // PIC object. Give the final links enough section granularity

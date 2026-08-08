@@ -394,6 +394,43 @@ handle. This tightens Phase 2's prerequisite from “query plus a new read cache
 to “shared read/write storage ownership,” while leaving routing, fanout, merge,
 and policy in distributed control.
 
+### Phase 2e opaque live-owner foundation
+
+The storage archive now exposes an opt-in, hidden internal owner ABI backed by
+the same `Handle` and `DB` implementation already compiled for the C API. The
+open request is versioned and carries only explicit-width path, root-generation,
+and document-identity fields. The consumer receives an opaque handle; coarse
+batch and query operations accept borrowed JSON already used by the API
+contracts; result buffers remain kernel-owned and have an explicit destroy
+operation. A typed consumer imports only the ABI module and cannot name `DB`,
+LSM, indexes, or any storage implementation type.
+
+A focused test compiles the consumer and provider as separate static archives,
+opens one writer owner, performs a two-document batch and match-all query on
+that same live DB, validates the response, and destroys both returned buffers.
+A concurrent second owner for the same root is rejected as `busy`, confirming
+that the boundary preserves writer exclusivity rather than bypassing the
+generation lock. ABI-version rejection and repeated empty-buffer destruction
+are also covered.
+
+Validation at this foundation checkpoint:
+
+- opaque owner ABI tests: 2/2 passed with zero leaks;
+- existing public C API tests: 10/10 passed with zero leaks;
+- the full linked Debug executable built successfully with normal concurrency;
+- runtime/codegen/API graph gates and all 13 analyzer tests passed; and
+- the internal `antfly_storage_owner_*` symbols remain hidden from the shared
+  C API library's global symbol table.
+
+Decision: keep the owner foundation. It intentionally has no production
+consumer yet, so a cold ReleaseFast graph measurement would only remeasure the
+existing CAPI-backed storage unit and cannot demonstrate deduplication. The
+next measured checkpoint must route a representative provisioned local batch
+and local query through the same per-group owner. Once an owner is active for a
+group, neither operation may fall back to a distributed-owned `DB`; lifecycle
+and destruction tests must prove the owner is closed only after both read and
+write users drain.
+
 ## Holistic target architecture
 
 The preferred end state is a modular monolith with a small number of compiled

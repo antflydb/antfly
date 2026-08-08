@@ -204,6 +204,11 @@ comptime {
             // storage directly until representative operations migrate across
             // this ABI in later phases.
             _ = storage_kernel_exports;
+            exportInternal(&storage_kernel_exports.storageOwnerOpen, "antfly_storage_owner_open");
+            exportInternal(&storage_kernel_exports.storageOwnerClose, "antfly_storage_owner_close");
+            exportInternal(&storage_kernel_exports.storageOwnerBatchJson, "antfly_storage_owner_batch_json");
+            exportInternal(&storage_kernel_exports.storageOwnerQueryJson, "antfly_storage_owner_query_json");
+            exportInternal(&storage_kernel_exports.storageOwnerBufferDestroy, "antfly_storage_owner_buffer_destroy");
         },
         .inference => {
             exportInternal(&inferenceEntry, "antfly_runtime_inference");
