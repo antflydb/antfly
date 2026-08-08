@@ -215,6 +215,37 @@ class _Api:
                 )
                 deadline.sleep()
                 continue
+            if (
+                deadline is not None
+                and response.status_code == 409
+                and response.text.strip() == "write outcome unknown"
+                and not deadline.expired()
+            ):
+                # Raft may have accepted the entry before losing leadership or
+                # timing out at the local apply barrier. This helper only
+                # issues idempotent upserts, so reconcile the key first and
+                # otherwise retry the same value without turning ambiguous
+                # transforms into a generally retryable API contract.
+                last_retryable_response = (
+                    f"{response.status_code} {response.text.strip()} from {self.url}"
+                )
+                try:
+                    observed = self.lookup(
+                        table,
+                        doc_id,
+                        timeout=deadline.request_timeout(
+                            POLL_REQUEST_TIMEOUT_S,
+                            minimum_timeout_s=WRITE_REQUEST_TIMEOUT_FLOOR_S,
+                        ),
+                    )
+                except requests.RequestException as exc:
+                    if not _transient_poll_error(exc):
+                        raise
+                    observed = None
+                if observed is not None:
+                    return {}
+                deadline.sleep()
+                continue
             return self._check(response)
 
     def lookup(self, table: str, key: str, *, timeout: float = 10.0) -> dict | None:

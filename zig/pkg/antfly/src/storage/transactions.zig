@@ -2493,7 +2493,15 @@ test "late committed resolve after stale auto-abort does not silently lose write
     var mgr = try TxnManager.init(alloc, &store);
     defer mgr.deinit();
     const txn_id: TxnId = .{ 2, 4, 2, 4, 2, 4, 2, 4, 2, 4, 2, 4, 2, 4, 2, 4 };
-    try mgr.initTransactionWithParticipants(txn_id, 1_000, &.{ "coordinator", "participant" });
+    // Auto-abort is a coordinator decision. A prepared non-coordinator must
+    // retain its intents until it learns the replicated decision instead.
+    try mgr.initTransactionWithParticipantsCreatedAtAndRole(
+        txn_id,
+        1_000,
+        1_000,
+        &.{ "coordinator", "participant" },
+        true,
+    );
     try mgr.writeIntents(txn_id, &.{
         .{ .key = "doc:late_commit_after_abort", .value = "committed-value" },
     }, &.{});
