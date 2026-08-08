@@ -144,3 +144,27 @@ test "raft batch round trips internal split replication identity" {
     try std.testing.expectEqual(@as(u64, 42), replication.destination_group_id);
     try std.testing.expect(replication.identity_namespace.eql(namespace));
 }
+
+test "raft batch round trips deterministic transaction begin" {
+    const txn_id: db_mod.types.TxnId = .{1} ** 16;
+    const encoded = try encode(std.testing.allocator, "docs", .{
+        .transaction = .{ .begin = .{
+            .txn_id = txn_id,
+            .begin_timestamp = 100,
+            .created_at_ns = 200,
+            .topology_epoch = 3,
+            .participants = &.{ "table2:4:docs:group:7", "table2:5:other:group:8" },
+        } },
+    });
+    defer std.testing.allocator.free(encoded);
+
+    var decoded = try decode(std.testing.allocator, encoded);
+    defer decoded.deinit(std.testing.allocator);
+    const begin = switch (decoded.batch.req.transaction orelse return error.TestExpectedEqual) {
+        .begin => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(txn_id, begin.txn_id);
+    try std.testing.expectEqual(@as(u64, 200), begin.created_at_ns);
+    try std.testing.expectEqualStrings("table2:4:docs:group:7", begin.participants[0]);
+}

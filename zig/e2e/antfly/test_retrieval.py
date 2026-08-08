@@ -398,6 +398,12 @@ def test_retrieval_agent_semantic_and_hybrid_queries(backup_api):
             "sparse": True,
         },
     ) == {}
+    backup_api.wait_index_ready(
+        table_name, "dense_idx", timeout_s=30.0, interval_s=0.5, require_query_fresh=True
+    )
+    backup_api.wait_index_ready(
+        table_name, "sparse_idx", timeout_s=30.0, interval_s=0.5, require_query_fresh=True
+    )
 
     batch = backup_api.batch_write(
         table_name,

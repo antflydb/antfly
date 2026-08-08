@@ -166,6 +166,46 @@ pub const SplitTransitionMutation = struct {
     split_key: []const u8 = "",
 };
 
+/// Private data-Raft command used by the distributed transaction protocol.
+/// Every value that can affect durable state is carried in the command so
+/// replay is deterministic on followers and after restart.
+pub const TransactionMutation = union(enum) {
+    begin: struct {
+        txn_id: TxnId,
+        begin_timestamp: u64,
+        created_at_ns: u64,
+        topology_epoch: u64,
+        /// Long-lived, externally addressable transaction sessions retain a
+        /// terminal decision for their full retry window. Anonymous commits
+        /// use the shorter ordinary recovery retention.
+        retain_terminal: bool = false,
+        participants: []const []const u8,
+    },
+    prepare: struct {
+        txn_id: TxnId,
+        topology_epoch: u64,
+    },
+    resolve: struct {
+        txn_id: TxnId,
+        status: TxnStatus,
+        commit_version: u64,
+    },
+    /// Coordinator-side acknowledgement that one participant has durably
+    /// learned the terminal decision. This must be ordered by coordinator
+    /// Raft rather than written by a replica-local recovery worker.
+    acknowledge: struct {
+        txn_id: TxnId,
+        participant: []const u8,
+    },
+    /// Deterministic coordinator/participant metadata cleanup. The cutoff is
+    /// carried in the command so every replica evaluates the same predicate.
+    cleanup: struct {
+        txn_id: TxnId,
+        cutoff_timestamp: u64,
+        retained_cutoff_timestamp: u64,
+    },
+};
+
 pub const BatchRequest = struct {
     writes: []const BatchWrite = &.{},
     deletes: []const []const u8 = &.{},
@@ -181,6 +221,8 @@ pub const BatchRequest = struct {
     split_replication: ?SplitReplicationContext = null,
     /// Internal source lifecycle mutation. It must be ordered with data writes.
     split_transition: ?SplitTransitionMutation = null,
+    /// Internal 2PC phase. Public batch parsing never accepts this field.
+    transaction: ?TransactionMutation = null,
 };
 
 pub const GraphEdgeWrite = struct {

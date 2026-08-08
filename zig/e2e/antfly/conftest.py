@@ -2063,14 +2063,11 @@ def stateful_api(request: pytest.FixtureRequest):
             return self._check(response)
 
         def multi_batch(self, tables: dict[str, dict], *, sync_level: str | None = None) -> dict:
-            payload: dict[str, object] = {
-                "read_set": [],
-                "tables": tables,
-            }
+            payload: dict[str, object] = {"tables": tables}
             if sync_level is not None:
                 payload["sync_level"] = sync_level
-            response = self._request("POST", "/transactions/commit", payload)
-            if response.status_code != 200:
+            response = self._request("POST", "/batch", payload)
+            if response.status_code != 201:
                 return self._check(response)
             return self._decode(response)
 
@@ -2646,6 +2643,39 @@ def table_api(request):
 
         def create_index(self, table_name: str, index_name: str, payload: dict) -> dict:
             return self.raw.create_index(table_name, index_name, payload)
+
+        def wait_index_ready(
+            self,
+            table_name: str,
+            index_name: str,
+            *,
+            timeout_s: float = 30.0,
+            interval_s: float = 0.5,
+            require_query_fresh: bool = False,
+        ) -> dict:
+            deadline = time.monotonic() + timeout_s
+            last_info: dict[str, Any] | None = None
+            last_error: BaseException | None = None
+            while True:
+                try:
+                    last_info = self.get_index(table_name, index_name)
+                    ready = ready_index_status(last_info, require_query_fresh=require_query_fresh)
+                    if ready is not None:
+                        return ready
+                except requests.RequestException as exc:
+                    last_error = exc
+                if time.monotonic() >= deadline:
+                    raise AssertionError(
+                        _index_ready_timeout_message(
+                            table_name,
+                            index_name,
+                            timeout_s,
+                            last_info,
+                            last_error,
+                            getattr(self.raw, "_server", None),
+                        )
+                    )
+                time.sleep(interval_s)
 
         def delete_index(self, table_name: str, index_name: str) -> dict:
             return self.raw.delete_index(table_name, index_name)
