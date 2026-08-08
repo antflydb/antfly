@@ -13667,6 +13667,69 @@ pub fn encodeStorageKernelQueryRequest(alloc: std.mem.Allocator, req: db_mod.typ
     return try encodeQueryRequest(alloc, req);
 }
 
+pub const StorageKernelLookupWireRequest = struct {
+    key: []const u8,
+    fields: []const []const u8 = &.{},
+    include_all_fields: bool = true,
+};
+
+pub fn encodeStorageKernelLookupRequest(
+    alloc: std.mem.Allocator,
+    key: []const u8,
+    opts: db_mod.types.LookupOptions,
+) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, StorageKernelLookupWireRequest{
+        .key = key,
+        .fields = opts.fields,
+        .include_all_fields = opts.include_all_fields,
+    }, .{});
+}
+
+pub const StorageKernelScanWireRequest = struct {
+    from_key: []const u8 = "",
+    to_key: []const u8 = "",
+    inclusive_from: bool = false,
+    exclusive_to: bool = false,
+    include_documents: bool = false,
+    limit: u32 = 0,
+    fields: []const []const u8 = &.{},
+    include_all_fields: bool = true,
+    filter_query_json: []const u8 = "",
+};
+
+pub fn encodeStorageKernelScanRequest(
+    alloc: std.mem.Allocator,
+    from_key: []const u8,
+    to_key: []const u8,
+    opts: db_mod.types.ScanOptions,
+) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, StorageKernelScanWireRequest{
+        .from_key = from_key,
+        .to_key = to_key,
+        .inclusive_from = opts.inclusive_from,
+        .exclusive_to = opts.exclusive_to,
+        .include_documents = opts.include_documents,
+        .limit = opts.limit,
+        .fields = opts.fields,
+        .include_all_fields = opts.include_all_fields,
+        .filter_query_json = opts.filter_query_json,
+    }, .{});
+}
+
+pub fn encodeStorageKernelScanNdjson(
+    alloc: std.mem.Allocator,
+    result: db_mod.types.ScanResult,
+    include_documents: bool,
+) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+    for (result.hashes, 0..) |entry, i| {
+        const json = if (include_documents) result.documents[i].json else null;
+        try appendScanLine(alloc, &out, entry.id, json);
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
 fn appendDocFilterBindingsField(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),

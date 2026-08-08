@@ -30,6 +30,23 @@ pub const Response = struct {
     }
 };
 
+pub const VersionedResponse = struct {
+    response: abi.VersionedOwnedBytes = .{},
+
+    pub fn bytes(self: VersionedResponse) []const u8 {
+        return self.response.buffer.slice();
+    }
+
+    pub fn version(self: VersionedResponse) u64 {
+        return self.response.version;
+    }
+
+    pub fn deinit(self: *VersionedResponse) void {
+        abi.antfly_storage_owner_buffer_destroy(&self.response.buffer);
+        self.* = undefined;
+    }
+};
+
 pub const Owner = struct {
     handle: ?*anyopaque,
 
@@ -60,6 +77,32 @@ pub const Owner = struct {
     pub fn queryJson(self: *Owner, table_name: []const u8, request_json: []const u8) !Response {
         var response: Response = .{};
         try statusToError(abi.antfly_storage_owner_query_json(
+            self.handle,
+            &.{
+                .table_name = .fromSlice(table_name),
+                .request_json = .fromSlice(request_json),
+            },
+            &response.buffer,
+        ));
+        return response;
+    }
+
+    pub fn lookupJson(self: *Owner, table_name: []const u8, request_json: []const u8) !VersionedResponse {
+        var response: VersionedResponse = .{};
+        try statusToError(abi.antfly_storage_owner_lookup_json(
+            self.handle,
+            &.{
+                .table_name = .fromSlice(table_name),
+                .request_json = .fromSlice(request_json),
+            },
+            &response.response,
+        ));
+        return response;
+    }
+
+    pub fn scanNdjson(self: *Owner, table_name: []const u8, request_json: []const u8) !Response {
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_scan_ndjson(
             self.handle,
             &.{
                 .table_name = .fromSlice(table_name),

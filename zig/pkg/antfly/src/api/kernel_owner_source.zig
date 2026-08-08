@@ -141,6 +141,8 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .lookup = unsupportedTopLevelLookup,
                 .scan = unsupportedTopLevelScan,
                 .query = unsupportedTopLevelQuery,
+                .lookup_group_local = lookupGroupLocal,
+                .scan_group_local = scanGroupLocal,
                 .query_group_local = queryGroupLocal,
                 .search_result_group_local = searchResultGroupLocal,
             },
@@ -237,6 +239,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         errdefer self.alloc.destroy(entry);
         var owner = try client.Owner.open(.{
             .path = abi.BorrowedBytes.fromSlice(descriptor.path),
+            .table_name = abi.BorrowedBytes.fromSlice(table_name),
             .lsm_root_generation = descriptor.generation,
             .has_identity_namespace = 1,
             .identity_table_id = descriptor.identity.table_id,
@@ -270,6 +273,41 @@ pub const ProvisionedKernelOwnerSource = struct {
                 return err
             else
                 return try reads.prepareSearchWithConsistency(group_id, req, .stale),
+            else => return err,
+        };
+    }
+
+    fn prepareLookupRead(
+        self: *ProvisionedKernelOwnerSource,
+        group_id: u64,
+        key: []const u8,
+        opts: db_types.LookupOptions,
+        consistency: read_gate.ReadConsistency,
+    ) !void {
+        const reads = feature_reads.FeatureReads.init(self.requester);
+        reads.prepareLookupWithConsistency(group_id, key, opts, consistency) catch |err| switch (err) {
+            error.NotLeader => if (consistency == .stale)
+                return err
+            else
+                return try reads.prepareLookupWithConsistency(group_id, key, opts, .stale),
+            else => return err,
+        };
+    }
+
+    fn prepareScanRead(
+        self: *ProvisionedKernelOwnerSource,
+        group_id: u64,
+        from_key: []const u8,
+        to_key: []const u8,
+        opts: db_types.ScanOptions,
+        consistency: read_gate.ReadConsistency,
+    ) !void {
+        const reads = feature_reads.FeatureReads.init(self.requester);
+        reads.prepareScanWithConsistency(group_id, from_key, to_key, opts, consistency) catch |err| switch (err) {
+            error.NotLeader => if (consistency == .stale)
+                return err
+            else
+                return try reads.prepareScanWithConsistency(group_id, from_key, to_key, opts, .stale),
             else => return err,
         };
     }
@@ -330,6 +368,53 @@ pub const ProvisionedKernelOwnerSource = struct {
         _: db_types.BatchRequest,
     ) !?void {
         return error.UnsupportedStorageKernelTopLevelOperation;
+    }
+
+    fn lookupGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        key: []const u8,
+        opts: db_types.LookupOptions,
+        consistency: read_gate.ReadConsistency,
+    ) !?table_read_source.LookupResponse {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        try self.prepareLookupRead(group_id, key, opts, consistency);
+        const request_json = try table_reads.encodeStorageKernelLookupRequest(alloc, key, opts);
+        defer alloc.free(request_json);
+        var lease = try self.acquire(group_id, table_name);
+        defer lease.deinit();
+        var response = lease.owner().lookupJson(table_name, request_json) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        defer response.deinit();
+        return .{
+            .json = try alloc.dupe(u8, response.bytes()),
+            .version = response.version(),
+        };
+    }
+
+    fn scanGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        from_key: []const u8,
+        to_key: []const u8,
+        opts: db_types.ScanOptions,
+        consistency: read_gate.ReadConsistency,
+    ) !?table_read_source.ScanResponse {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        try self.prepareScanRead(group_id, from_key, to_key, opts, consistency);
+        const request_json = try table_reads.encodeStorageKernelScanRequest(alloc, from_key, to_key, opts);
+        defer alloc.free(request_json);
+        var lease = try self.acquire(group_id, table_name);
+        defer lease.deinit();
+        var response = try lease.owner().scanNdjson(table_name, request_json);
+        defer response.deinit();
+        return .{ .ndjson = try alloc.dupe(u8, response.bytes()) };
     }
 
     fn batchGroupLocal(

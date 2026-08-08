@@ -36,6 +36,7 @@ const backup_codec = antfly.backup_codec;
 const portable_backup = antfly.portable_backup;
 const batch_api = antfly.public_api.batch;
 const query_api = antfly.public_api.query;
+const table_reads_api = antfly.public_api.table_reads;
 const Allocator = std.mem.Allocator;
 
 const lite_abi_version: u32 = 1;
@@ -73,6 +74,7 @@ const Handle = struct {
     owned_lite_backend: ?lite_backend.Handle = null,
     lite_profile: ?lite_backend.Profile = null,
     lite_inference_status: ?lite_backend.InferenceStatus = null,
+    storage_owner_table_name: ?[]u8 = null,
 
     fn prepareSearchRequest(self: *Handle, req: db_mod.types.SearchRequest) !void {
         const hook = self.readable_lease_hook orelse return;
@@ -124,6 +126,7 @@ fn closeHandle(handle: *Handle) void {
     if (handle.owned_lite_backend) |*backend| {
         backend.deinit();
     }
+    if (handle.storage_owner_table_name) |table_name| handle.alloc.free(table_name);
     handle.alloc.destroy(handle);
 }
 
@@ -1619,7 +1622,8 @@ pub fn storageOwnerOpen(
     out_owner.* = null;
     if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
     const path = request.path.slice();
-    if (path.len == 0) return .invalid_argument;
+    const table_name = request.table_name.slice();
+    if (path.len == 0 or table_name.len == 0) return .invalid_argument;
 
     const identity_namespace: ?db_mod.DocIdentityNamespace = if (request.has_identity_namespace != 0)
         .{
@@ -1642,10 +1646,13 @@ pub fn storageOwnerOpen(
         request.schema_json.slice(),
         request.indexes_json.slice(),
     ) catch |err| return storageOwnerStatusFromError(err);
+    const owned_table_name = alloc.dupe(u8, table_name) catch return .out_of_memory;
+    errdefer alloc.free(owned_table_name);
     const handle = alloc.create(Handle) catch return .out_of_memory;
     handle.* = .{
         .alloc = alloc,
         .db = db,
+        .storage_owner_table_name = owned_table_name,
     };
     out_owner.* = handle;
     return .ok;
@@ -1655,6 +1662,16 @@ pub fn storageOwnerClose(owner: ?*anyopaque) callconv(.c) void {
     antfly_db_close(owner);
 }
 
+fn storageOwnerOperationTableName(
+    handle: *const Handle,
+    request: *const kernel_owner_abi.JsonOperationRequest,
+) ?[]const u8 {
+    const requested = request.table_name.slice();
+    const owned = handle.storage_owner_table_name orelse return null;
+    if (!std.mem.eql(u8, requested, owned)) return null;
+    return requested;
+}
+
 pub fn storageOwnerBatchJson(
     owner: ?*anyopaque,
     request: *const kernel_owner_abi.JsonOperationRequest,
@@ -1662,8 +1679,8 @@ pub fn storageOwnerBatchJson(
 ) callconv(.c) kernel_owner_abi.Status {
     out_response.* = .{};
     if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
-    if (request.table_name.len == 0) return .invalid_argument;
     const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerOperationTableName(handle, request) orelse return .invalid_argument;
     var response: capi.Buffer = .{};
     const status = storageOwnerStatusFromCapi(batchStorageKernelJson(handle, .{
         .ptr = request.request_json.ptr,
@@ -1705,8 +1722,7 @@ pub fn storageOwnerQueryJson(
     out_response.* = .{};
     if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
     const handle = asHandle(owner) orelse return .invalid_argument;
-    const table_name = request.table_name.slice();
-    if (table_name.len == 0) return .invalid_argument;
+    const table_name = storageOwnerOperationTableName(handle, request) orelse return .invalid_argument;
     var response: capi.Buffer = .{};
     const request_slice: capi.Slice = .{
         .ptr = request.request_json.ptr,
@@ -1722,6 +1738,79 @@ pub fn storageOwnerQueryJson(
     out_response.* = .{
         .ptr = response.ptr,
         .len = @intCast(response.len),
+    };
+    return .ok;
+}
+
+pub fn storageOwnerLookupJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.JsonOperationRequest,
+    out_response: *kernel_owner_abi.VersionedOwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerOperationTableName(handle, request) orelse return .invalid_argument;
+
+    var parsed = std.json.parseFromSlice(
+        table_reads_api.StorageKernelLookupWireRequest,
+        handle.alloc,
+        request.request_json.slice(),
+        .{},
+    ) catch return .invalid_argument;
+    defer parsed.deinit();
+    const opts: db_mod.types.LookupOptions = .{
+        .fields = parsed.value.fields,
+        .include_all_fields = parsed.value.include_all_fields,
+    };
+    handle.prepareLookupRequest(parsed.value.key, opts) catch |err| return storageOwnerStatusFromError(err);
+    var result = (handle.db.getDocument(handle.alloc, parsed.value.key, opts) catch |err| return storageOwnerStatusFromError(err)) orelse return .not_found;
+    defer result.deinit(handle.alloc);
+    const version = handle.db.getTimestamp(handle.alloc, parsed.value.key) catch |err| return storageOwnerStatusFromError(err);
+    const response = dupBytes(result.json) catch return .out_of_memory;
+    out_response.* = .{
+        .buffer = .{
+            .ptr = response.ptr,
+            .len = @intCast(response.len),
+        },
+        .version = version,
+    };
+    return .ok;
+}
+
+pub fn storageOwnerScanNdjson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.JsonOperationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerOperationTableName(handle, request) orelse return .invalid_argument;
+
+    var parsed = std.json.parseFromSlice(
+        table_reads_api.StorageKernelScanWireRequest,
+        handle.alloc,
+        request.request_json.slice(),
+        .{},
+    ) catch return .invalid_argument;
+    defer parsed.deinit();
+    const opts: db_mod.types.ScanOptions = .{
+        .inclusive_from = parsed.value.inclusive_from,
+        .exclusive_to = parsed.value.exclusive_to,
+        .include_documents = parsed.value.include_documents,
+        .limit = parsed.value.limit,
+        .fields = parsed.value.fields,
+        .include_all_fields = parsed.value.include_all_fields,
+        .filter_query_json = parsed.value.filter_query_json,
+    };
+    handle.prepareScanRequest(parsed.value.from_key, parsed.value.to_key, opts) catch |err| return storageOwnerStatusFromError(err);
+    var result = handle.db.scan(handle.alloc, parsed.value.from_key, parsed.value.to_key, opts) catch |err| return storageOwnerStatusFromError(err);
+    defer result.deinit(handle.alloc);
+    const ndjson = table_reads_api.encodeStorageKernelScanNdjson(handle.alloc, result, opts.include_documents) catch |err| return storageOwnerStatusFromError(err);
+    out_response.* = .{
+        .ptr = ndjson.ptr,
+        .len = @intCast(ndjson.len),
     };
     return .ok;
 }

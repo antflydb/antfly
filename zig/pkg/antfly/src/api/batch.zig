@@ -135,6 +135,12 @@ fn parseBatchRequestWithOptions(
         break :sync_level db_mod.types.SyncLevel.propose;
     };
 
+    const timestamp_ns = timestamp: {
+        const value = root.get("_timestamp_ns") orelse break :timestamp 0;
+        if (!allow_internal) return error.InvalidBatchRequest;
+        break :timestamp try parseInternalU64(value);
+    };
+
     var checkpoint_start: ?[]u8 = null;
     errdefer if (checkpoint_start) |value| alloc.free(value);
     var checkpoint_end: ?[]u8 = null;
@@ -283,6 +289,7 @@ fn parseBatchRequestWithOptions(
             .writes = writes,
             .deletes = deletes,
             .transforms = transforms,
+            .timestamp_ns = timestamp_ns,
             .sync_level = sync_level,
             .split_checkpoint = split_checkpoint,
             .split_replication = split_replication,
@@ -393,6 +400,9 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
             transition.destination_group_id,
             std.json.fmt(transition.split_key, .{}),
         });
+    }
+    if (req.timestamp_ns != 0) {
+        try writer.print(",\"_timestamp_ns\":\"{d}\"", .{req.timestamp_ns});
     }
     try writer.print(",\"sync_level\":\"{s}\"}}", .{syncLevelName(req.sync_level)});
     return try out.toOwnedSlice();

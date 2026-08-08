@@ -31,7 +31,7 @@ fn cleanup(path: []const u8) void {
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 }
 
-test "provisioned batch and query share one opaque live storage owner" {
+test "provisioned batch lookup scan and query share one opaque live storage owner" {
     const alloc = std.testing.allocator;
     const replica_root = "/tmp/antfly-storage-kernel-provisioned-source";
     cleanup(replica_root);
@@ -116,8 +116,41 @@ test "provisioned batch and query share one opaque live storage owner" {
             .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0,0]}}" },
             .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_embeddings\":{\"dense_idx\":[0,1,0]}}" },
         },
+        .timestamp_ns = 4242,
         .sync_level = .full_index,
     });
+
+    var lookup = (try read_source.source().lookup(alloc, "articles", "doc:a", .{
+        .fields = &.{"title"},
+        .include_all_fields = false,
+    }, .read_index)).?;
+    defer lookup.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 4242), lookup.version);
+    try std.testing.expect(std.mem.indexOf(u8, lookup.json, "alpha") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lookup.json, "dense_idx") == null);
+
+    try std.testing.expect((try read_source.source().lookup(
+        alloc,
+        "articles",
+        "doc:missing",
+        .{},
+        .read_index,
+    )) == null);
+
+    var scan = (try read_source.source().scan(alloc, "articles", "doc:a", "doc:z", .{
+        .inclusive_from = true,
+        .exclusive_to = true,
+        .include_documents = true,
+        .limit = 10,
+        .fields = &.{"title"},
+        .include_all_fields = false,
+        .filter_query_json = "{\"term\":{\"path\":\"/title\",\"value\":\"alpha\"}}",
+    }, .read_index)).?;
+    defer scan.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, scan.ndjson, "doc:a") != null);
+    try std.testing.expect(std.mem.indexOf(u8, scan.ndjson, "alpha") != null);
+    try std.testing.expect(std.mem.indexOf(u8, scan.ndjson, "doc:b") == null);
+    try std.testing.expect(std.mem.indexOf(u8, scan.ndjson, "dense_idx") == null);
 
     var query = try query_api.parsePublicQueryRequest(
         alloc,
@@ -147,13 +180,14 @@ test "provisioned batch and query share one opaque live storage owner" {
     try std.testing.expect(first_doc_a < second_doc_b);
 
     try std.testing.expectEqual(@as(usize, 1), owner_source.ownerCountForTest());
-    try std.testing.expectEqual(@as(usize, 2), lease_capture.count);
+    try std.testing.expectEqual(@as(usize, 5), lease_capture.count);
     try std.testing.expectEqual(@as(u64, 7001), lease_capture.last_group_id);
 
     const group_path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root});
     defer alloc.free(group_path);
     const open_request: abi.OpenRequest = .{
         .path = .fromSlice(group_path),
+        .table_name = .fromSlice("articles"),
         .has_identity_namespace = 1,
         .identity_table_id = 7,
         .identity_shard_id = 7001,

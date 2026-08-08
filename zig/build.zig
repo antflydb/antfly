@@ -8650,7 +8650,7 @@ pub fn build(b: *std.Build) void {
                 antfly_imports.configure(b, provisioned_owner_test_mod, true, true);
                 const provisioned_owner_tests = b.addTest(.{
                     .root_module = provisioned_owner_test_mod,
-                    .filters = &.{"provisioned batch and query share one opaque live storage owner"},
+                    .filters = &.{"provisioned batch lookup scan and query share one opaque live storage owner"},
                     .test_runner = .{
                         .path = b.path("pkg/antfly/src/test_runner.zig"),
                         .mode = .simple,

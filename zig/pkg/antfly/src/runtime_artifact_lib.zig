@@ -208,6 +208,8 @@ comptime {
             exportInternal(&storage_kernel_exports.storageOwnerClose, "antfly_storage_owner_close");
             exportInternal(&storage_kernel_exports.storageOwnerBatchJson, "antfly_storage_owner_batch_json");
             exportInternal(&storage_kernel_exports.storageOwnerQueryJson, "antfly_storage_owner_query_json");
+            exportInternal(&storage_kernel_exports.storageOwnerLookupJson, "antfly_storage_owner_lookup_json");
+            exportInternal(&storage_kernel_exports.storageOwnerScanNdjson, "antfly_storage_owner_scan_ndjson");
             exportInternal(&storage_kernel_exports.storageOwnerBufferDestroy, "antfly_storage_owner_buffer_destroy");
         },
         .inference => {

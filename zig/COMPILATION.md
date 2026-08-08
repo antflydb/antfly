@@ -496,6 +496,51 @@ needed for safe runtime attachment. Only then should compile-time selection
 make the distributed query/write implementations unreachable and trigger the
 next ARM64 ReleaseFast go/no-go measurement.
 
+### Phase 2g provisioned lookup/scan owner slice
+
+The same provisioned owner now performs group-local point lookup and range
+scan. The consumer retains table/range routing, multi-range scan aggregation,
+HA admission, read preparation, and Raft consistency fallback. One complete
+lookup or scan then crosses the compiled boundary; neither operation opens a
+second DB or introduces a per-record callback.
+
+The owner ABI is now version 2 and binds the table name at open time. Every
+batch, lookup, scan, and query operation must name that same table, preventing
+a caller from relabeling a response or accidentally using a table/group owner
+for another catalog entry. Lookup requests preserve field projection and
+return both owned JSON and the stored document version. Scan requests preserve
+the complete physical contract: range endpoints, inclusive/exclusive bounds,
+document inclusion, limit, field projection, and filter-query JSON. The
+storage archive returns the existing NDJSON representation in one owned
+buffer.
+
+Validation also found that the internal batch encoder preserved sync and split
+metadata but not an explicit `timestamp_ns`. The internal-only batch dialect
+now round-trips `_timestamp_ns`; the public batch parser still rejects that
+field. This prevents document versions from changing merely because a batch
+crossed the compiled boundary.
+
+The cross-static-archive test now drives the normal provisioned APIs through a
+single owner in this order: an indexed batch at timestamp 4242, projected
+lookup, missing lookup, filtered/projected bounded scan, match-all query, and
+dense query. It verifies the exact lookup version, projection/filter behavior,
+all five readable-lease requests, indexed result order, one live owner, writer
+exclusivity, and reopen after drain. The suite remains 6/6 with zero leaks;
+the low-level owner ABI suite remains 2/2 with zero leaks. The 73-case
+provisioned write regression suite and 10-case public CAPI suite also pass with
+zero leaks. The full linked native Debug build succeeds with normal
+concurrency, graph gates and all 13 analyzer tests pass, and no internal owner
+or runtime symbol appears in the shared CAPI global symbol table.
+
+Decision: keep this slice. It closes the ordinary document-read surface but is
+still not a production-enable or cold-build checkpoint. Provisioned preflight,
+text/algebraic/graph helpers, document-artifact reads, runtime status, and
+writer transition/maintenance operations still have physical callbacks that
+must share this owner before the distributed runtime can attach it without
+losing behavior or opening a competing DB. Continue migrating those coarse
+families, then make the legacy physical path compile-time unreachable and
+measure the clean ARM64 ReleaseFast application unit.
+
 ## Holistic target architecture
 
 The preferred end state is a modular monolith with a small number of compiled

@@ -29,6 +29,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
 
     var owner = try client.Owner.open(.{
         .path = .fromSlice(path),
+        .table_name = .fromSlice("docs"),
         .lsm_root_generation = 0,
         .has_identity_namespace = 1,
         .identity_table_id = 7,
@@ -40,6 +41,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     var duplicate_owner: ?*anyopaque = null;
     try std.testing.expectEqual(abi.Status.busy, abi.antfly_storage_owner_open(&.{
         .path = .fromSlice(path),
+        .table_name = .fromSlice("docs"),
         .has_identity_namespace = 1,
         .identity_table_id = 7,
         .identity_shard_id = 7001,
@@ -57,9 +59,11 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     const query_json =
         \\{"query":{"match_all":{}},"limit":10}
     ;
-    var query_response = try owner.queryJson("articles", query_json);
+    try std.testing.expectError(error.InvalidArgument, owner.queryJson("articles", query_json));
+
+    var query_response = try owner.queryJson("docs", query_json);
     defer query_response.deinit();
-    try std.testing.expect(std.mem.indexOf(u8, query_response.bytes(), "articles") != null);
+    try std.testing.expect(std.mem.indexOf(u8, query_response.bytes(), "docs") != null);
     try std.testing.expect(std.mem.indexOf(u8, query_response.bytes(), "doc:a") != null);
     try std.testing.expect(std.mem.indexOf(u8, query_response.bytes(), "doc:b") != null);
 }
