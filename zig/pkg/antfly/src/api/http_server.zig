@@ -5887,7 +5887,8 @@ pub const ApiHttpServer = struct {
                         error.InvalidCreateTableRequest => return try textResponse(self.alloc, 400, "invalid table configuration"),
                         error.UnsupportedOperation => return try textResponse(self.alloc, 405, "method not allowed"),
                         error.UnexpectedHttpStatus => {
-                            if (platform_time.monotonicNs() -| metadata_create_start_ns >= metadata_create_timeout_ns) {
+                            const elapsed_ns = platform_time.monotonicNs() -| metadata_create_start_ns;
+                            if (!shouldRetryMetadataMutation(err, elapsed_ns, metadata_create_timeout_ns)) {
                                 std.log.err("public create table metadata create failed table={s} err={}", .{ table_name, err });
                                 return err;
                             }
@@ -5895,7 +5896,14 @@ pub const ApiHttpServer = struct {
                             continue;
                         },
                         else => {
-                            if (metadata_authority.isRetryableError(err)) return error.NotLeader;
+                            if (metadata_authority.isRetryableError(err)) {
+                                const elapsed_ns = platform_time.monotonicNs() -| metadata_create_start_ns;
+                                if (shouldRetryMetadataMutation(err, elapsed_ns, metadata_create_timeout_ns)) {
+                                    sleepNs(metadata_create_poll_ns);
+                                    continue;
+                                }
+                                return error.NotLeader;
+                            }
                             std.log.err("public create table metadata create failed table={s} err={}", .{ table_name, err });
                             return err;
                         },
@@ -16930,6 +16938,20 @@ fn restoreIdempotencyNamespaceAlloc(
 fn metadataAccessFailure(err: anyerror) error{ NotLeader, InternalFailure } {
     if (metadata_authority.isRetryableError(err)) return error.NotLeader;
     return error.InternalFailure;
+}
+
+pub fn shouldRetryMetadataMutation(err: anyerror, elapsed_ns: u64, timeout_ns: u64) bool {
+    return elapsed_ns < timeout_ns and
+        (err == error.UnexpectedHttpStatus or metadata_authority.isRetryableError(err));
+}
+
+test "public metadata mutation retries transient authority loss only within its deadline" {
+    const timeout_ns = 5 * std.time.ns_per_s;
+    try std.testing.expect(shouldRetryMetadataMutation(error.NotLeader, timeout_ns - 1, timeout_ns));
+    try std.testing.expect(shouldRetryMetadataMutation(error.ProposalDropped, 0, timeout_ns));
+    try std.testing.expect(shouldRetryMetadataMutation(error.UnexpectedHttpStatus, 0, timeout_ns));
+    try std.testing.expect(!shouldRetryMetadataMutation(error.NotLeader, timeout_ns, timeout_ns));
+    try std.testing.expect(!shouldRetryMetadataMutation(error.InvalidArguments, 0, timeout_ns));
 }
 
 pub fn buildLocalSchemaUpdateStatus(alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !struct {
