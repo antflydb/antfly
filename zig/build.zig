@@ -3797,7 +3797,6 @@ pub fn build(b: *std.Build) void {
         "data server registered data raft uses wal state backend by default",
         "data raft ticker advances consensus independently of control rounds",
         "raft batch round trips deterministic transaction begin",
-        "data raft batch forwarding escapes a leaderless local placement",
         "data raft forwarding distinguishes safe retries from ambiguous outcomes",
         "data raft batch forwarding bounds routing campaigns deadlines and deterministic fallback",
         "internal batch forwarding headers are all-or-none and strictly parsed",
