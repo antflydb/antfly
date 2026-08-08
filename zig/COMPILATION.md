@@ -1188,6 +1188,52 @@ architecture. Standalone can move out of distributed only after it consumes a
 genuinely shared compiled storage/control kernel; co-location with either side
 before that ownership cut merely moves and duplicates the graph.
 
+### Serverless API-protocol placement
+
+The complete serverless command/runtime now shares the API-kernel codegen
+island instead of distributed control. This matches ownership: serverless owns
+HTTP adaptation, request validation/translation, and local query planning; it
+does not own cluster topology, Raft coordination, or distributed fanout. The
+move adds no compiler unit and changes no runtime ABI--the final executable
+still calls the same hidden `antfly_runtime_serverless` entry point.
+
+The cold ARM64 Linux musl `ReleaseFast` build used fresh caches, production
+LSM-only mode, and normal concurrency:
+
+| Unit | Compiler time | LLVM emit | Declarations | Repository Zig files |
+|---|---:|---:|---:|---:|
+| API + serverless | 212.663 s | 207.160 s | 23,003 | 501 |
+| Distributed | 361.564 s | 353.401 s | 39,686 | 641 |
+| Storage kernel | 233.495 s | 227.935 s | 26,489 | 395 |
+| Inference | 235.522 s | 227.951 s | 24,945 | 523 |
+
+Relative to the immediately preceding four-unit baseline, distributed lost 83
+repository files and 2,275 declarations and improved from 397.836 seconds to
+361.564 seconds. Storage was effectively unchanged and inference was slightly
+slower, so the 36.272-second critical-path reduction is not host-wide variance.
+The API unit remains far off the critical path.
+
+The tradeoff is explicit: aggregate file instances increased from 1,967 to
+2,060 and duplicate instances from 780 to 873 because serverless shares some
+storage/search implementation with distributed. Unlike the rejected
+standalone/storage placement, this did not duplicate final executable code in
+a harmful way: the stripped static executable decreased from 72.290 MB to
+72.121 MB and both stripped C API libraries decreased to 16.382 MB. The C API
+exports remain limited to public symbols and production artifacts contain no
+LMDB implementation symbol or path.
+
+Validation included the linked native executable with the experiment both
+enabled and disabled, `serverless --help`, 42/44 serverless tests passing with
+the two opt-in cloud integrations skipped, 5/5 linked-main tests, 10/10 C API
+tests, all graph gates, and all 13 analyzer tests.
+
+Decision: **keep**. This is a material, correctly-owned critical-path win that
+meets the 380-second target without increasing runner claims or artifact size.
+It is not the end state: summed compiler work and cross-unit overlap remain too
+high, and storage/local query is not yet compiled once. Continue with the
+opaque storage ownership cut rather than merging more implementation-heavy
+roles into the API unit.
+
 ## Holistic target architecture
 
 The preferred end state is a modular monolith with a small number of compiled
