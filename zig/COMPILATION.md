@@ -176,6 +176,7 @@ the same host, target, cache state, and report set.
 | Provisioned read-vtable probe | Distributed 415.352 s → 397.153 s; only 83 declarations moved | Rejected as incomplete; hosted reads retained the physical-query graph |
 | Combined provisioned + hosted read-vtable probe | Distributed 415.352 s → 367.185 s and 41,984 → 40,585 declarations | Go for a local-query island, but revert the raw prototype and redesign the ABI/ownership split |
 | Post-serverless compile-once control | Repeated cold combined distributed/storage builds: 358.589 s and 352.900 s; aggregate duplicate instances 873 → 482; executable 72.121 MB → 60.804 MB; C API unchanged at 16.382 MB | Keep the default co-generated distributed/storage archive; stop the separate opaque-kernel migration |
+| Post-main normal-runner control | Clean ARM64 musl `ReleaseFast` succeeded on the normal 24 GiB publish runner; API 5 m / 6 GB, application/storage 9 m / 10 GB, inference 6 m / 6 GB; first API attempt was discarded after exceeding its stale 5 GiB claim | Reliability and artifact gates pass, but the 9-minute critical unit misses the 380-second target; raise only the API scheduling claim and continue profiling |
 
 The `/tmp` graph analysis was consolidated into
 `tools/analyze_zig_import_graph.py`. It reports lexical reachability, consumes
@@ -1298,6 +1299,46 @@ fourth copy of storage or a process-wide internal RPC ABI. These local cross
 builds establish repeatability and graph shape; the overall goal remains open
 until the same cold production path is reliable within the normal Linux
 runner's memory budget.
+
+### Post-main normal-runner control
+
+After merging current `main`, GitHub Actions run `31281549097` exercised the
+default compile-once topology on the normal `arc-antfly-publish` runner. The
+run used a clean cache, ARM64 Linux musl `ReleaseFast`, the production LSM-only
+feature set, normal build concurrency, and the existing 24 GiB pod request. It
+did not add swap, a larger runner, or serialized compilation.
+
+The archive build succeeded and all artifact gates passed:
+
+| Unit or artifact | Normal-runner result |
+|---|---:|
+| API protocol + serverless | 5 m, 6 GB reported MaxRSS |
+| Distributed + storage + C API exports | 9 m, 10 GB reported MaxRSS |
+| Inference | 6 m, 6 GB reported MaxRSS |
+| Thin final executable link | 10 s, 427 MB reported MaxRSS |
+| Complete archive build | 12:28.74 wall, 10,259,540 KiB peak process RSS, zero swap |
+| Static executable | 61,223,736 bytes |
+| `libantfly.so` | 16,669,872 bytes |
+
+This is the first authoritative proof that the accepted three-island
+architecture completes the original failing build on the normal runner after
+the `main` merge. It is not proof that the performance goal is complete: the
+application/storage unit is reported at about nine minutes, above the
+380-second gate.
+
+The run also found a measurement-infrastructure defect. The API unit peaked at
+6.32 GB while its build-step scheduling claim was still 5 GiB. Zig therefore
+reported the first 5m41s API attempt as exceeding its declared upper bound and
+discarded it before scheduling a successful retry. The claim is now 7 GiB.
+Together with the application/storage unit's 11 GiB claim, the initial group
+remains within the existing 20 GB Zig scheduling budget and the runner's 4 GiB
+reserve. This corrects scheduling metadata; it does not increase runner cost,
+add memory, serialize compilation, or weaken a product boundary.
+
+Decision: **keep the compile-once architecture and correct the API claim, but
+continue the goal loop**. The next experiment must capture post-merge compiler
+reports for the application/storage unit and identify the largest newly
+analyzed or newly emitted family before selecting another coarse cut.
 
 ## Holistic target architecture
 

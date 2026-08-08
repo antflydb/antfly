@@ -8670,7 +8670,11 @@ pub fn build(b: *std.Build) void {
                 .root_module = role_mod,
                 .linkage = .static,
                 .max_rss = switch (unit) {
-                    .api_kernel => 5 * 1024 * 1024 * 1024,
+                    // A cold ARM64 Linux ReleaseFast build measured 6.32 GB
+                    // after serverless moved into this unit. Keep the claim
+                    // above the observed peak so the build runner does not
+                    // discard completed work and retry it in a later group.
+                    .api_kernel => 7 * 1024 * 1024 * 1024,
                     .storage_kernel => 8 * 1024 * 1024 * 1024,
                     .distributed => 11 * 1024 * 1024 * 1024,
                     .inference => 8 * 1024 * 1024 * 1024,

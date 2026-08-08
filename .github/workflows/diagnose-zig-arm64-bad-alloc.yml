@@ -63,7 +63,7 @@ jobs:
           # Keep 4000Mi of the ARC pod's 24000Mi request outside Zig's
           # scheduling budget. Step max_rss values are scheduling claims, not
           # a complete accounting of build-runner state and page cache. Claims
-          # admit API and the PIC distributed/CLI storage kernel as a 16GiB
+          # admit API and the PIC distributed/CLI storage kernel as an 18GiB
           # initial group. When API finishes, inference can overlap the kernel
           # within a 19GiB group. The pod reserve covers runner state,
           # linker work, page cache, and measurement drift.
