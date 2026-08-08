@@ -3797,6 +3797,7 @@ pub fn build(b: *std.Build) void {
         "data server registered data raft uses wal state backend by default",
         "data raft ticker advances consensus independently of control rounds",
         "data raft forwarding distinguishes safe retries from ambiguous outcomes",
+        "expired data raft deadline never waits for a contended raft mutex",
         "data raft batch forwarding bounds routing campaigns deadlines and deterministic fallback",
         "internal batch forwarding headers are all-or-none and strictly parsed",
         "metadata http client shares deadline and cancellation across retries",

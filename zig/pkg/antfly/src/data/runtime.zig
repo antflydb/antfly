@@ -100,6 +100,14 @@ const TransitionActionLanes = struct {
     }
 };
 
+/// Deadline handling is a fail-fast path: observing Raft state is useful, but
+/// waiting for its mutex after the operation's budget has elapsed is not. Keep
+/// the non-blocking policy in one helper so timeout probes and diagnostics
+/// cannot accidentally regress to an unbounded lock acquisition.
+fn tryLockRaftAfterDeadline(mutex: *std.atomic.Mutex) bool {
+    return mutex.tryLock();
+}
+
 const runtime_status_refresh_max_db_opens_per_run: usize = 16;
 const runtime_status_disk_usage_refresh_interval_ns: u64 = 30 * std.time.ns_per_s;
 const auto_bulk_finish_poll_interval_ms: u64 = 250;
@@ -5763,7 +5771,15 @@ pub const DataServer = struct {
 
     fn logRaftBatchLeaderTimeout(self: *DataServer, group_id: u64) void {
         const raft = self.data_raft orelse return;
-        lockAtomic(&self.data_raft_mutex);
+        // This runs only after the caller's deadline has expired. Diagnostics
+        // must never turn that bounded failure into an unbounded wait behind a
+        // ticker or transport operation that currently owns the Raft mutex.
+        // The compact record still preserves the group id; a later attempt can
+        // emit the full snapshot once the mutex is available again.
+        if (!tryLockRaftAfterDeadline(&self.data_raft_mutex)) {
+            std.log.warn("data raft leader wait timed out group_id={} diagnostics=raft_mutex_contended", .{group_id});
+            return;
+        }
         defer self.data_raft_mutex.unlock();
         const transport_host = &raft.host.http_host.transport_stack.transport_host;
         const transport_metrics = transport_host.metricsSnapshot();
@@ -6088,7 +6104,10 @@ pub const DataServer = struct {
 
     fn localDataRaftLeaderReady(self: *DataServer, group_id: u64) bool {
         const raft = self.data_raft orelse return false;
-        lockAtomic(&self.data_raft_mutex);
+        // This probe is used at an expired request deadline. Treat contention
+        // as not-ready so the caller returns on time instead of waiting on the
+        // same Raft critical section whose progress it is diagnosing.
+        if (!tryLockRaftAfterDeadline(&self.data_raft_mutex)) return false;
         defer self.data_raft_mutex.unlock();
         return raft.host.http_host.host.isLocalLeader(group_id);
     }
@@ -24709,6 +24728,17 @@ test "data raft forwarding distinguishes safe retries from ambiguous outcomes" {
     // RaftBatchWriteOutcomeUnknown. A raw OOM can only reach this classifier
     // when request setup was proven not to have sent bytes.
     try std.testing.expectEqual(.terminal, DataServer.classifyDataRaftForwardError(error.OutOfMemory));
+}
+
+test "expired data raft deadline never waits for a contended raft mutex" {
+    var mutex: std.atomic.Mutex = .unlocked;
+    lockAtomic(&mutex);
+    defer mutex.unlock();
+
+    // The timeout path executes on the same thread in production, so a
+    // blocking acquisition here would deadlock instead of returning the
+    // caller's bounded outcome-unknown error.
+    try std.testing.expect(!tryLockRaftAfterDeadline(&mutex));
 }
 
 test "data raft batch forwarding bounds routing campaigns deadlines and deterministic fallback" {
