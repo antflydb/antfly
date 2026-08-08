@@ -698,9 +698,9 @@ const AsyncContext = struct {
     index_repair_state_corrupt: std.atomic.Value(bool) = .init(false),
     index_artifact_cleanup_mutex: std.atomic.Mutex = .unlocked,
     index_artifact_finalization_mutex: std.atomic.Mutex = .unlocked,
-    /// Serializes repair-issue revision checks with enrichment failure
-    /// publication. Provider calls never run under this lock; only bounded
-    /// DocStore metadata transitions do.
+    /// Serializes repair-issue revision checks and completion with terminal
+    /// enrichment coverage publication. Provider calls never run under this
+    /// lock; healthy produced/skipped coverage stays off this path.
     artifact_repair_issue_mutex: std.atomic.Mutex = .unlocked,
     background_closing: std.atomic.Value(bool) = .init(false),
     enrichment_lifecycle_mutex: std.atomic.Mutex = .unlocked,
@@ -3754,6 +3754,11 @@ pub const DB = struct {
             append_ctx,
             recordEnrichmentRequestFailure,
             enrichmentRequestFailurePending,
+            .{
+                .ptr = append_ctx,
+                .lock_fn = lockEnrichmentFailurePendingFence,
+                .unlock_fn = unlockEnrichmentFailurePendingFence,
+            },
             self.executor,
             notifyDerivedExecutorSequence,
             self.backend_runtime,
@@ -7735,6 +7740,29 @@ pub const DB = struct {
         return true;
     }
 
+    fn reprocessChunkArtifactIssue(
+        self: *DB,
+        alloc: Allocator,
+        issue: types.ArtifactRepairIssue,
+    ) !bool {
+        var cfg = (try self.getEnrichment(alloc, .chunk, issue.artifact_name)) orelse return false;
+        defer cfg.deinit(alloc);
+
+        const source_doc_key = if (issue.parent_doc_key.len > 0) issue.parent_doc_key else issue.doc_key;
+        const value = try self.get(alloc, source_doc_key) orelse return error.NotFound;
+        defer alloc.free(value);
+
+        const writes = [_]types.BatchWrite{.{ .key = source_doc_key, .value = value }};
+        const force_artifacts = [_][]const u8{issue.artifact_name};
+        try self.batchInternal(.{
+            .writes = &writes,
+            .sync_level = .full_index,
+        }, null, .{
+            .force_generated_artifact_names = &force_artifacts,
+        });
+        return true;
+    }
+
     fn repairIssueKeyForIssueAlloc(self: *DB, alloc: Allocator, issue: types.ArtifactRepairIssue) ![]u8 {
         _ = self;
         return try artifactRepairIssueKeyForIssueAlloc(alloc, issue);
@@ -8185,6 +8213,32 @@ pub const DB = struct {
         return true;
     }
 
+    fn enrichmentFailureCoverageMarkerKeyAlloc(
+        self: *DB,
+        alloc: Allocator,
+        issue: types.ArtifactRepairIssue,
+    ) !?[]u8 {
+        if (issue.reason != .enrichment_failed or issue.index_name.len == 0) return null;
+        if (self.core.index_manager.denseIndex(issue.index_name) == null and
+            self.core.index_manager.sparseIndex(issue.index_name) == null)
+        {
+            return null;
+        }
+        const generation = self.core.index_manager.coverageGenerationForIndex(issue.index_name) orelse return null;
+        return try internal_keys.derivedCoverageOutcomeKeyAlloc(alloc, issue.index_name, generation, issue.doc_key);
+    }
+
+    fn repairCoverageMarkerComplete(self: *DB, alloc: Allocator, marker_key: []const u8) !bool {
+        const raw_outcome = self.core.store.get(alloc, marker_key) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+        defer alloc.free(raw_outcome);
+        const outcome = std.meta.stringToEnum(DerivedCoverageOutcome, raw_outcome) orelse
+            return error.InvalidDerivedCoverageOutcome;
+        return outcome == .produced or outcome == .skipped;
+    }
+
     fn completeArtifactRepairIssueIfCurrent(
         self: *DB,
         alloc: Allocator,
@@ -8194,6 +8248,9 @@ pub const DB = struct {
         expected_epoch: u64,
         require_completed_fence: bool,
     ) !bool {
+        const coverage_marker_key = try self.enrichmentFailureCoverageMarkerKeyAlloc(alloc, issue);
+        defer if (coverage_marker_key) |key| alloc.free(key);
+
         lockAtomicWithBackoff(&self.async_context.artifact_repair_issue_mutex);
         defer self.async_context.artifact_repair_issue_mutex.unlock();
 
@@ -8203,6 +8260,14 @@ pub const DB = struct {
         var current = existing;
         defer current.deinit(alloc);
         if (!revision.matches(current)) return false;
+        // Coverage transitions and repair-ledger completion share this mutex.
+        // Re-read the repaired generation while holding it so either repair
+        // clears debt first (and stale terminal transitions are rejected) or a
+        // terminal transition lands first (and debt remains queued). There is
+        // no interleaving that can leave terminal coverage without repair debt.
+        if (coverage_marker_key) |marker_key| {
+            if (!try self.repairCoverageMarkerComplete(alloc, marker_key)) return false;
+        }
 
         var completion = (try self.loadArtifactRepairCompletionState(alloc, completion_key)) orelse ArtifactRepairCompletionState{};
         if (completion.epoch != expected_epoch) return false;
@@ -9078,7 +9143,8 @@ pub const DB = struct {
         return switch (issue.artifact_kind) {
             .embedding => try self.reprocessEmbeddingArtifactIssue(alloc, issue),
             .asset => try self.reprocessDocumentArtifact(alloc, if (issue.parent_doc_key.len > 0) issue.parent_doc_key else issue.doc_key, issue.artifact_name),
-            .chunk, .graph, .full_text, .algebraic => false,
+            .chunk => try self.reprocessChunkArtifactIssue(alloc, issue),
+            .graph, .full_text, .algebraic => false,
         };
     }
 
@@ -11498,7 +11564,11 @@ pub const DB = struct {
             if (issue.reason == .enrichment_failed and
                 completion_snapshot.completed_sequence >= issue.sequence)
             {
-                if (try self.artifactNowReadable(alloc, issue.*)) {
+                // Chunk regeneration is set-valued: a valid run may replace,
+                // remove, or produce no physical chunks. A completion fence
+                // written only after successful full_index regeneration is
+                // the authoritative proof for sibling consumer debt.
+                if (issue.artifact_kind == .chunk or try self.artifactNowReadable(alloc, issue.*)) {
                     if (try self.completeArtifactRepairIssueIfCurrent(
                         alloc,
                         issue.*,
@@ -11547,7 +11617,7 @@ pub const DB = struct {
                 continue;
             }
             result.reprocessed += 1;
-            if (try self.artifactNowReadable(alloc, issue.*)) {
+            if (issue.artifact_kind == .chunk or try self.artifactNowReadable(alloc, issue.*)) {
                 if (issue.reason == .enrichment_failed) {
                     if (try self.completeArtifactRepairIssueIfCurrent(
                         alloc,
@@ -31888,29 +31958,21 @@ fn recordEnrichmentRequestFailure(ctx_ptr: *anyopaque, failure: enrichment_runti
 
 fn enrichmentRequestFailurePending(
     ctx_ptr: *anyopaque,
-    request: enrichment_types.GeneratedEnrichmentRequest,
+    failure: enrichment_runtime_mod.FailureIdentity,
     index_name: []const u8,
 ) !bool {
     const ctx: *EnrichmentAppendContext = @ptrCast(@alignCast(ctx_ptr));
-    const artifact_kind: types.ArtifactRepairKind = switch (request.kind) {
+    const artifact_kind: types.ArtifactRepairKind = switch (failure.kind) {
         .dense_embedding, .sparse_embedding => .embedding,
         .asset => .asset,
         .chunk_text => .chunk,
     };
-    const artifact_name = switch (request.kind) {
-        .dense_embedding, .sparse_embedding => requestEmbeddingName(request),
-        .asset, .chunk_text => requestArtifactName(request),
-    };
-    const source_artifact_name = switch (request.kind) {
-        .dense_embedding, .sparse_embedding => if (requestHasChunking(request)) requestArtifactName(request) else "",
-        .asset, .chunk_text => "",
-    };
     const artifact_key = try enrichmentFailureArtifactKeyAlloc(
         ctx.alloc,
-        request.kind,
-        request.doc_key,
-        artifact_name,
-        source_artifact_name,
+        failure.kind,
+        failure.doc_key,
+        failure.artifact_name,
+        failure.source_artifact_name,
     );
     defer ctx.alloc.free(artifact_key);
     const artifact_key_hex = if (artifact_key.len > 0)
@@ -31922,16 +31984,28 @@ fn enrichmentRequestFailurePending(
     const issue_key = try artifactRepairIssueKeyForIssueAlloc(ctx.alloc, .{
         .artifact_kind = artifact_kind,
         .index_name = index_name,
-        .doc_key = request.doc_key,
-        .source_artifact_name = source_artifact_name,
-        .artifact_name = artifact_name,
+        .doc_key = failure.doc_key,
+        .source_artifact_name = failure.source_artifact_name,
+        .artifact_name = failure.artifact_name,
         .artifact_key = artifact_key_hex,
     });
     defer ctx.alloc.free(issue_key);
     const loaded = (try loadArtifactRepairIssueFromStoreByKey(ctx.alloc, ctx.store, issue_key)) orelse return false;
     var issue = loaded;
     defer issue.deinit(ctx.alloc);
-    return issue.reason == .enrichment_failed and issue.sequence >= request.sequence;
+    return issue.reason == .enrichment_failed and issue.sequence >= failure.sequence;
+}
+
+fn lockEnrichmentFailurePendingFence(ctx_ptr: *anyopaque) void {
+    const ctx: *EnrichmentAppendContext = @ptrCast(@alignCast(ctx_ptr));
+    const async_ctx = ctx.async_context orelse return;
+    lockAtomicWithBackoff(&async_ctx.artifact_repair_issue_mutex);
+}
+
+fn unlockEnrichmentFailurePendingFence(ctx_ptr: *anyopaque) void {
+    const ctx: *EnrichmentAppendContext = @ptrCast(@alignCast(ctx_ptr));
+    const async_ctx = ctx.async_context orelse return;
+    async_ctx.artifact_repair_issue_mutex.unlock();
 }
 
 fn appendGeneratedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.DerivedBatch, artifact_delete_keys: []const []const u8) !u64 {
@@ -32853,15 +32927,14 @@ fn artifactRepairIssueIdHashOptionalU64(hasher: *std.crypto.hash.sha2.Sha256, va
 
 fn artifactRepairKindHasAutomatedReprocessor(kind: types.ArtifactRepairKind) bool {
     return switch (kind) {
-        .embedding, .asset => true,
-        .chunk, .graph, .full_text, .algebraic => false,
+        .embedding, .asset, .chunk => true,
+        .graph, .full_text, .algebraic => false,
     };
 }
 
 fn artifactRepairUnsupportedReason(kind: types.ArtifactRepairKind) []const u8 {
     return switch (kind) {
-        .embedding, .asset => "",
-        .chunk => "chunk_reprocessor_unavailable",
+        .embedding, .asset, .chunk => "",
         .graph => "graph_reprocessor_unavailable",
         .full_text => "full_text_reprocessor_unavailable",
         .algebraic => "algebraic_index_rebuild_unavailable",
@@ -50563,6 +50636,123 @@ test "db generic artifact repair queue reprocesses document asset artifacts" {
     try std.testing.expect(after.manifest_json.len > 0);
 }
 
+test "db generic artifact repair queue regenerates set-valued chunk artifacts" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "body_chunks_v1",
+        .kind = .chunk,
+        .field = "body",
+        .chunk_size = 8,
+    });
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            // Empty input intentionally produces no physical chunk. Successful
+            // regeneration of this empty set must still retire durable debt.
+            .value = "{\"body\":\"\"}",
+        }},
+        .sync_level = .full_index,
+    });
+
+    const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "body_chunks_v1");
+    defer alloc.free(chunk_prefix);
+    const artifact_key_hex = try bytesToHexAlloc(alloc, chunk_prefix);
+    var issue = types.ArtifactRepairIssue{
+        .artifact_kind = .chunk,
+        .doc_key = try alloc.dupe(u8, "doc:a"),
+        .artifact_name = try alloc.dupe(u8, "body_chunks_v1"),
+        .artifact_key = artifact_key_hex,
+        .reason = .enrichment_failed,
+        .sequence = 1,
+    };
+    defer issue.deinit(alloc);
+    try db.recordArtifactRepairIssue(alloc, issue);
+
+    const repair = try db.repairArtifactIssues(alloc, .chunk, 10);
+    try std.testing.expectEqual(@as(u64, 1), repair.scanned);
+    try std.testing.expectEqual(@as(u64, 1), repair.reprocessed);
+    try std.testing.expectEqual(@as(u64, 1), repair.repaired);
+    try std.testing.expectEqual(@as(u64, 0), repair.failed);
+    try std.testing.expect(!repair.debt_remaining);
+
+    const issues_after = try db.listArtifactRepairIssues(alloc, .chunk, null, 0);
+    defer types.freeArtifactRepairIssues(alloc, issues_after);
+    try std.testing.expectEqual(@as(usize, 0), issues_after.len);
+}
+
+test "db repair completion cannot clear debt behind terminal coverage" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    try db.addIndex(.{
+        .name = "semantic",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3}",
+    });
+
+    const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "semantic");
+    defer alloc.free(artifact_key);
+    const artifact_key_hex = try bytesToHexAlloc(alloc, artifact_key);
+    var issue = types.ArtifactRepairIssue{
+        .artifact_kind = .embedding,
+        .index_name = try alloc.dupe(u8, "semantic"),
+        .doc_key = try alloc.dupe(u8, "doc:a"),
+        .artifact_name = try alloc.dupe(u8, "semantic"),
+        .artifact_key = artifact_key_hex,
+        .reason = .enrichment_failed,
+        .sequence = 7,
+    };
+    defer issue.deinit(alloc);
+    try db.recordArtifactRepairIssue(alloc, issue);
+
+    const pending = try db.listArtifactRepairIssues(alloc, .embedding, "semantic", 1);
+    defer types.freeArtifactRepairIssues(alloc, pending);
+    try std.testing.expectEqual(@as(usize, 1), pending.len);
+    const revision = DB.ArtifactRepairIssueRevision.capture(pending[0]);
+    const completion_key = try db.artifactRepairCompletionKeyForIssueAlloc(alloc, pending[0]);
+    defer alloc.free(completion_key);
+    const completion = try db.artifactRepairCompletionSnapshot(alloc, completion_key);
+
+    const generation = db.core.index_manager.coverageGenerationForIndex("semantic") orelse return error.TestUnexpectedResult;
+    const marker_key = try internal_keys.derivedCoverageOutcomeKeyAlloc(alloc, "semantic", generation, "doc:a");
+    defer alloc.free(marker_key);
+    try db.core.store.put(marker_key, "terminal_failed");
+    try std.testing.expect(!try db.completeArtifactRepairIssueIfCurrent(
+        alloc,
+        pending[0],
+        revision,
+        completion_key,
+        completion.epoch,
+        false,
+    ));
+
+    try db.core.store.put(marker_key, "produced");
+    try std.testing.expect(try db.completeArtifactRepairIssueIfCurrent(
+        alloc,
+        pending[0],
+        revision,
+        completion_key,
+        completion.epoch,
+        false,
+    ));
+    const remaining = try db.listArtifactRepairIssues(alloc, .embedding, "semantic", 1);
+    defer types.freeArtifactRepairIssues(alloc, remaining);
+    try std.testing.expectEqual(@as(usize, 0), remaining.len);
+}
+
 test "db artifact repair summary is persisted for status-only reopen" {
     const alloc = std.testing.allocator;
 
@@ -51082,8 +51272,8 @@ test "db artifact repair queue keeps distinct unit artifacts for same document a
     const issues = try db.listArtifactRepairIssues(alloc, .chunk, "body_chunks_v1", 10);
     defer types.freeArtifactRepairIssues(alloc, issues);
     try std.testing.expectEqual(@as(usize, 2), issues.len);
-    try std.testing.expect(!issues[0].repairable);
-    try std.testing.expectEqualStrings("chunk_reprocessor_unavailable", issues[0].unsupported_reason);
+    try std.testing.expect(issues[0].repairable);
+    try std.testing.expectEqualStrings("", issues[0].unsupported_reason);
     try std.testing.expectEqualStrings("page:000001", issues[0].unit_id);
     try std.testing.expectEqualStrings("page:000002", issues[1].unit_id);
 }
@@ -55920,6 +56110,83 @@ test "db shared enrichment failure parks repair debt for every consumer" {
     try std.testing.expectEqual(@as(u64, 1), replayed.indexes_degraded_after);
     try std.testing.expectEqual(@as(u64, 0), replayed.repaired);
     try std.testing.expect(replayed.debt_remaining);
+}
+
+test "db upstream asset failure dominates downstream coverage in one replay sequence" {
+    const alloc = std.testing.allocator;
+
+    const FailingProducer = struct {
+        fn producer(self: *@This()) asset_producer_mod.Producer {
+            return .{ .ptr = self, .vtable = &.{ .produce = produce } };
+        }
+
+        fn produce(_: *anyopaque, _: Allocator, _: asset_producer_mod.Request) ![]u8 {
+            return error.PermanentAssetFailure;
+        }
+    };
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var failing = FailingProducer{};
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_optional_runtime_workers = false,
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .asset_producer = failing.producer(),
+            .dense_embedder = deterministic.interface(),
+            .inline_retry_max_attempts = 1,
+            .worker_retry_max_attempts = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "summary_v1",
+        .kind = .asset,
+        .field = "body",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+    });
+    try db.addEnrichment(.{
+        .name = "summary_chunks_v1",
+        .kind = .chunk,
+        .field = "value",
+        .source_artifact_name = "summary_v1",
+        .chunk_size = 8,
+    });
+    try db.addEnrichment(.{
+        .name = "summary_dense_v1",
+        .kind = .embedding,
+        .field = "value",
+        .source_artifact_name = "summary_chunks_v1",
+        .expected_dims = 3,
+    });
+    try db.addIndex(.{
+        .name = "semantic",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"embedding_name\":\"summary_dense_v1\"}",
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }},
+        .sync_level = .write,
+    });
+    const sequence = db.core.nextEnrichmentSequence();
+    try db.runEnrichmentUntil(sequence);
+
+    const generation = db.core.index_manager.coverageGenerationForIndex("semantic") orelse return error.TestUnexpectedResult;
+    const marker_key = try internal_keys.derivedCoverageOutcomeKeyAlloc(alloc, "semantic", generation, "doc:a");
+    defer alloc.free(marker_key);
+    const outcome = try db.core.store.get(alloc, marker_key);
+    defer alloc.free(outcome);
+    try std.testing.expectEqualStrings("terminal_failed", outcome);
+
+    const issues = try db.listArtifactRepairIssues(alloc, .asset, "semantic", 0);
+    defer types.freeArtifactRepairIssues(alloc, issues);
+    try std.testing.expectEqual(@as(usize, 1), issues.len);
+    try std.testing.expectEqualStrings("summary_v1", issues[0].artifact_name);
 }
 
 test "db enrichment retry makes monotonic progress across provider batches" {

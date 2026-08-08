@@ -97,11 +97,31 @@ pub const RequestFailure = struct {
     sequence: u64,
 };
 pub const FailureRecorder = *const fn (ptr: *anyopaque, failure: RequestFailure) anyerror!void;
+pub const FailureIdentity = struct {
+    kind: enrichment_types.GeneratedEnrichmentKind,
+    artifact_name: []const u8,
+    source_artifact_name: []const u8 = "",
+    doc_key: []const u8,
+    sequence: u64,
+};
 pub const FailurePendingCheck = *const fn (
     ptr: *anyopaque,
-    request: enrichment_types.GeneratedEnrichmentRequest,
+    failure: FailureIdentity,
     index_name: []const u8,
 ) anyerror!bool;
+pub const FailurePendingFence = struct {
+    ptr: *anyopaque,
+    lock_fn: *const fn (ptr: *anyopaque) void,
+    unlock_fn: *const fn (ptr: *anyopaque) void,
+
+    fn lock(self: @This()) void {
+        self.lock_fn(self.ptr);
+    }
+
+    fn unlock(self: @This()) void {
+        self.unlock_fn(self.ptr);
+    }
+};
 pub const NotifyFn = *const fn (ptr: *anyopaque, sequence: u64) void;
 pub const StatusHook = struct {
     ptr: *anyopaque,
@@ -135,9 +155,11 @@ const coverage_outcome_count = std.meta.fields(CoverageOutcome).len;
 const CoverageOutcomeTransition = struct {
     index_name: []u8,
     generation: u64,
+    source_sequence: u64,
     outcome: CoverageOutcome,
     marker_key: []u8,
     counter_keys: [coverage_outcome_count][]u8,
+    failure_guards: std.ArrayListUnmanaged(FailureIdentity) = .empty,
 };
 
 const GeneratedReplayWindow = struct {
@@ -1359,6 +1381,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     failure_ctx: ?*anyopaque = null,
     failure_fn: ?FailureRecorder = null,
     failure_pending_fn: ?FailurePendingCheck = null,
+    failure_pending_fence: ?FailurePendingFence = null,
     notify_ctx: *anyopaque,
     notify_fn: NotifyFn,
     config: Config,
@@ -1409,6 +1432,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         failure_ctx: ?*anyopaque,
         failure_fn: ?FailureRecorder,
         failure_pending_fn: ?FailurePendingCheck,
+        failure_pending_fence: ?FailurePendingFence,
         notify_ctx: *anyopaque,
         notify_fn: NotifyFn,
         _: *background_runtime_mod.BackendRuntime,
@@ -1428,6 +1452,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .failure_ctx = failure_ctx,
             .failure_fn = failure_fn,
             .failure_pending_fn = failure_pending_fn,
+            .failure_pending_fence = failure_pending_fence,
             .notify_ctx = notify_ctx,
             .notify_fn = notify_fn,
             .config = .{
@@ -1641,6 +1666,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     failure_ctx: ?*anyopaque = null,
     failure_fn: ?FailureRecorder = null,
     failure_pending_fn: ?FailurePendingCheck = null,
+    failure_pending_fence: ?FailurePendingFence = null,
     notify_ctx: *anyopaque,
     notify_fn: NotifyFn,
     config: Config,
@@ -1698,6 +1724,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         failure_ctx: ?*anyopaque,
         failure_fn: ?FailureRecorder,
         failure_pending_fn: ?FailurePendingCheck,
+        failure_pending_fence: ?FailurePendingFence,
         notify_ctx: *anyopaque,
         notify_fn: NotifyFn,
         backend_runtime: *background_runtime_mod.BackendRuntime,
@@ -1721,6 +1748,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .failure_ctx = failure_ctx,
             .failure_fn = failure_fn,
             .failure_pending_fn = failure_pending_fn,
+            .failure_pending_fence = failure_pending_fence,
             .notify_ctx = notify_ctx,
             .notify_fn = notify_fn,
             .config = .{
@@ -2132,6 +2160,22 @@ fn runtimeRetryInProgress(runtime: *EnrichmentRuntime) bool {
     return runtime.retrying;
 }
 
+fn failureIdentityForRequest(request: enrichment_types.GeneratedEnrichmentRequest) FailureIdentity {
+    return .{
+        .kind = request.kind,
+        .artifact_name = switch (request.kind) {
+            .dense_embedding, .sparse_embedding => requestEmbeddingName(request),
+            .asset, .chunk_text => requestArtifactName(request),
+        },
+        .source_artifact_name = switch (request.kind) {
+            .dense_embedding, .sparse_embedding => if (requestHasChunking(request)) requestArtifactName(request) else "",
+            .asset, .chunk_text => "",
+        },
+        .doc_key = request.doc_key,
+        .sequence = request.sequence,
+    };
+}
+
 /// A terminal request can be followed by a different request that still needs
 /// to yield. On the next pass, consult the durable repair ledger before calling
 /// the provider again. This makes progress monotonic across batch boundaries
@@ -2147,12 +2191,13 @@ fn skipPersistedRequestFailure(
 
     const indexes = try affectedIndexesForRequestAlloc(runtime, request);
     defer freeAffectedIndexes(runtime, indexes);
+    const failure_identity = failureIdentityForRequest(request);
     for (indexes) |index_name| {
-        if (!try pending_fn(failure_ctx, request, index_name)) return false;
+        if (!try pending_fn(failure_ctx, failure_identity, index_name)) return false;
     }
 
     if (runtime.coverage_apply_mutex != null) {
-        try queueDerivedCoverageOutcome(runtime, window, request.doc_key, indexes, .terminal_failed);
+        try queueDerivedCoverageOutcome(runtime, window, request, indexes, .terminal_failed);
     }
     return true;
 }
@@ -2168,13 +2213,9 @@ fn recordIsolatedRequestError(runtime: *EnrichmentRuntime, window: ?*GeneratedRe
     const indexes: []const []const u8 = if (owned_indexes) |values| values else &fallback_indexes;
     const attempt_number = requestAttemptNumber(runtime);
 
-    if (runtime.coverage_apply_mutex != null) {
-        if (window) |active_window| {
-            try queueDerivedCoverageOutcome(runtime, active_window, request.doc_key, indexes, .terminal_failed);
-        } else for (indexes) |index_name| {
-            try markDerivedCoverageTerminalFailedForIndex(runtime, index_name, request.doc_key);
-        }
-    }
+    // Publish durable debt before terminal coverage. Coverage application
+    // revalidates this exact identity under the same ledger fence, so a repair
+    // that completes in between cannot be overwritten by a stale transition.
     for (indexes) |index_name| {
         if (runtime.failure_ctx) |failure_ctx| {
             if (runtime.failure_fn) |failure_fn| try failure_fn(failure_ctx, .{
@@ -2193,6 +2234,13 @@ fn recordIsolatedRequestError(runtime: *EnrichmentRuntime, window: ?*GeneratedRe
                 .attempts = attempt_number,
                 .sequence = request.sequence,
             });
+        }
+    }
+    if (runtime.coverage_apply_mutex != null) {
+        if (window) |active_window| {
+            try queueDerivedCoverageOutcome(runtime, active_window, request, indexes, .terminal_failed);
+        } else for (indexes) |index_name| {
+            try markDerivedCoverageTerminalFailedForIndex(runtime, index_name, request);
         }
     }
     if (runtime.io_impl) |io_impl| {
@@ -5251,7 +5299,7 @@ fn flushChunkedDenseItems(
             .source_hash = item.source_hash,
             .vector = vector,
         });
-        try queueDerivedCoverageProduced(runtime, window, item.request.doc_key, consumer_indexes);
+        try queueDerivedCoverageProduced(runtime, window, item.request, consumer_indexes);
         const artifact_key = try embeddingArtifactKey(runtime, item.chunk_key, item.artifact_name);
         var artifact_key_owned = true;
         errdefer if (artifact_key_owned) runtime.alloc.free(artifact_key);
@@ -5301,7 +5349,7 @@ fn processCachedChunkDenseItems(
     for (cached_items.items) |item| {
         if (try appendCachedChunkDenseEmbeddingToWindow(runtime, window, request, item.chunk_key, item.embedding_key, consumer_indexes)) {
             if (!queued_produced) {
-                try queueDerivedCoverageProduced(runtime, window, request.doc_key, consumer_indexes);
+                try queueDerivedCoverageProduced(runtime, window, request, consumer_indexes);
                 queued_produced = true;
             }
         }
@@ -5481,7 +5529,7 @@ fn processMaterializedChunkDenseRequest(
         try appendUniqueDupeKey(runtime.alloc, &window.artifact_delete_keys, embedding_key);
         try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
     }
-    if (desired_chunk_keys.count() == 0) try markDerivedCoverageSkipped(runtime, window, request.doc_key, consumer_indexes);
+    if (desired_chunk_keys.count() == 0) try markDerivedCoverageSkipped(runtime, window, request, consumer_indexes);
     try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
 }
 
@@ -5502,7 +5550,7 @@ fn flushMaterializedSparseChunkSources(
         if (chunk_embeddings.len > 0) runtime.alloc.free(chunk_embeddings);
     }
     if (chunk_embeddings.len == 0) return;
-    try queueDerivedCoverageProduced(runtime, window, request.doc_key, consumer_indexes);
+    try queueDerivedCoverageProduced(runtime, window, request, consumer_indexes);
 
     var expanded = try expandSparseEmbeddingsForConsumers(runtime, chunk_embeddings, consumer_indexes);
     defer {
@@ -5524,7 +5572,7 @@ fn processCachedChunkSparseItems(
     for (cached_items.items) |item| {
         if (try appendCachedSparseEmbeddingToWindow(runtime, window, item.chunk_key, item.embedding_key, consumer_indexes)) {
             if (!queued_produced) {
-                try queueDerivedCoverageProduced(runtime, window, request.doc_key, consumer_indexes);
+                try queueDerivedCoverageProduced(runtime, window, request, consumer_indexes);
                 queued_produced = true;
             }
         }
@@ -5692,7 +5740,7 @@ fn processMaterializedChunkSparseRequest(
         try appendUniqueDupeKey(runtime.alloc, &window.artifact_delete_keys, embedding_key);
         try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
     }
-    if (desired_chunk_keys.count() == 0) try markDerivedCoverageSkipped(runtime, window, request.doc_key, consumer_indexes);
+    if (desired_chunk_keys.count() == 0) try markDerivedCoverageSkipped(runtime, window, request, consumer_indexes);
     try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
 }
 
@@ -5712,7 +5760,7 @@ fn collectPlainDenseBatchItem(
     defer runtime.alloc.free(raw);
 
     const source_text = try extractSourceText(runtime.alloc, runtime.config, raw, request) orelse {
-        try markDerivedCoverageSkipped(runtime, window, request.doc_key, consumer_indexes);
+        try markDerivedCoverageSkipped(runtime, window, request, consumer_indexes);
         return null;
     };
     errdefer runtime.alloc.free(@constCast(source_text));
@@ -5722,7 +5770,7 @@ fn collectPlainDenseBatchItem(
     errdefer runtime.alloc.free(artifact_key);
     if (try shouldSkipEmbeddingArtifact(runtime, artifact_key, source_hash)) {
         if (try appendCachedDenseEmbeddingToWindow(runtime, window, request.doc_key, artifact_key, consumer_indexes)) {
-            try queueDerivedCoverageProduced(runtime, window, request.doc_key, consumer_indexes);
+            try queueDerivedCoverageProduced(runtime, window, request, consumer_indexes);
         }
         runtime.alloc.free(@constCast(source_text));
         runtime.alloc.free(artifact_key);
@@ -5783,7 +5831,7 @@ fn flushPlainDenseItems(
             .source_hash = item.source_hash,
             .vector = vector,
         });
-        try queueDerivedCoverageProduced(runtime, window, item.request.doc_key, consumer_indexes);
+        try queueDerivedCoverageProduced(runtime, window, item.request, consumer_indexes);
 
         var embeddings = try singleDenseEmbeddingForConsumers(runtime, item.request.doc_key, item.artifact_key, vector, consumer_indexes);
         defer {
@@ -5921,7 +5969,7 @@ fn processChunkedDenseWindow(
             try mergeOwnedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale_deletes);
             try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
             if (source_set.sources.len == 0) {
-                try markDerivedCoverageSkipped(runtime, window, request.doc_key, consumer_indexes);
+                try markDerivedCoverageSkipped(runtime, window, request, consumer_indexes);
                 continue;
             }
 
@@ -5931,7 +5979,7 @@ fn processChunkedDenseWindow(
                 defer runtime.alloc.free(embedding_key);
                 if (try shouldSkipEmbeddingArtifact(runtime, embedding_key, source_hash)) {
                     if (try appendCachedChunkDenseEmbeddingToWindow(runtime, window, request, source.key, embedding_key, consumer_indexes)) {
-                        try queueDerivedCoverageProduced(runtime, window, request.doc_key, consumer_indexes);
+                        try queueDerivedCoverageProduced(runtime, window, request, consumer_indexes);
                     }
                     try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
                     continue;
@@ -6370,7 +6418,7 @@ fn processDenseEmbedding(
         var stale_deletes = try deleteStaleChunkEmbeddingArtifacts(runtime, request.doc_key, chunk_artifact_name, embedding_artifact_name, source_set.desired_chunk_keys);
         errdefer stale_deletes.deinit(runtime.alloc);
         if (source_set.sources.len == 0) {
-            try markDerivedCoverageSkipped(runtime, window, request.doc_key, consumer_indexes);
+            try markDerivedCoverageSkipped(runtime, window, request, consumer_indexes);
             try mergeOwnedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale_deletes);
             return;
         }
@@ -6382,7 +6430,7 @@ fn processDenseEmbedding(
         }
 
         if (chunk_embeddings.len == 0) {
-            try markDerivedCoverageSkipped(runtime, window, request.doc_key, consumer_indexes);
+            try markDerivedCoverageSkipped(runtime, window, request, consumer_indexes);
             try mergeOwnedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale_deletes);
             return;
         }
@@ -6391,7 +6439,7 @@ fn processDenseEmbedding(
             if (embedding.vector.len > 0) try appendUniqueDupeKey(runtime.alloc, &window.deleted_keys, embedding.doc_key);
         }
         try writeChunkEmbeddingArtifacts(runtime, request.doc_key, request.source_field, embedding_artifact_name, chunk_embeddings);
-        try queueDerivedCoverageProduced(runtime, window, request.doc_key, consumer_indexes);
+        try queueDerivedCoverageProduced(runtime, window, request, consumer_indexes);
         var expanded = try expandDenseEmbeddingsForConsumers(runtime, chunk_embeddings, consumer_indexes);
         defer {
             for (expanded) |embedding| freeDerivedDenseEmbedding(runtime.alloc, embedding);
@@ -6427,7 +6475,7 @@ fn processDenseEmbedding(
                 .source_hash = null,
                 .vector = vector,
             });
-            try queueDerivedCoverageProduced(runtime, window, request.doc_key, consumer_indexes);
+            try queueDerivedCoverageProduced(runtime, window, request, consumer_indexes);
             const artifact_key = try embeddingArtifactKey(runtime, request.doc_key, embedding_artifact_name);
             defer runtime.alloc.free(artifact_key);
 
@@ -6439,12 +6487,12 @@ fn processDenseEmbedding(
             try appendOwnedDenseEmbeddingsToWindow(runtime, window, &embeddings);
             return;
         }
-        try markDerivedCoverageSkipped(runtime, window, request.doc_key, consumer_indexes);
+        try markDerivedCoverageSkipped(runtime, window, request, consumer_indexes);
         return;
     }
 
     const source_text = try extractSourceText(runtime.alloc, runtime.config, raw, request) orelse {
-        try markDerivedCoverageSkipped(runtime, window, request.doc_key, consumer_indexes);
+        try markDerivedCoverageSkipped(runtime, window, request, consumer_indexes);
         return;
     };
     defer runtime.alloc.free(source_text);
@@ -6454,7 +6502,7 @@ fn processDenseEmbedding(
     defer runtime.alloc.free(artifact_key);
     if (try shouldSkipEmbeddingArtifact(runtime, artifact_key, source_hash)) {
         if (try appendCachedDenseEmbeddingToWindow(runtime, window, request.doc_key, artifact_key, consumer_indexes)) {
-            try queueDerivedCoverageProduced(runtime, window, request.doc_key, consumer_indexes);
+            try queueDerivedCoverageProduced(runtime, window, request, consumer_indexes);
         }
         return;
     }
@@ -6471,7 +6519,7 @@ fn processDenseEmbedding(
         .source_hash = source_hash,
         .vector = vector,
     });
-    try queueDerivedCoverageProduced(runtime, window, request.doc_key, consumer_indexes);
+    try queueDerivedCoverageProduced(runtime, window, request, consumer_indexes);
 
     var embeddings = try singleDenseEmbeddingForConsumers(runtime, request.doc_key, artifact_key, vector, consumer_indexes);
     defer {
@@ -6508,7 +6556,7 @@ fn processSparseEmbedding(
         var stale_deletes = try deleteStaleChunkEmbeddingArtifacts(runtime, request.doc_key, chunk_artifact_name, embedding_artifact_name, source_set.desired_chunk_keys);
         errdefer stale_deletes.deinit(runtime.alloc);
         if (source_set.sources.len == 0) {
-            try markDerivedCoverageSkipped(runtime, window, request.doc_key, consumer_indexes);
+            try markDerivedCoverageSkipped(runtime, window, request, consumer_indexes);
             try mergeOwnedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale_deletes);
             return;
         }
@@ -6520,12 +6568,12 @@ fn processSparseEmbedding(
         }
 
         if (chunk_embeddings.len == 0) {
-            try markDerivedCoverageSkipped(runtime, window, request.doc_key, consumer_indexes);
+            try markDerivedCoverageSkipped(runtime, window, request, consumer_indexes);
             try mergeOwnedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale_deletes);
             return;
         }
 
-        try queueDerivedCoverageProduced(runtime, window, request.doc_key, consumer_indexes);
+        try queueDerivedCoverageProduced(runtime, window, request, consumer_indexes);
         var expanded = try expandSparseEmbeddingsForConsumers(runtime, chunk_embeddings, consumer_indexes);
         defer {
             for (expanded) |embedding| freeDerivedSparseEmbedding(runtime.alloc, embedding);
@@ -6545,7 +6593,7 @@ fn processSparseEmbedding(
     defer runtime.alloc.free(raw);
 
     const source_text = try extractSourceText(runtime.alloc, runtime.config, raw, request) orelse {
-        try markDerivedCoverageSkipped(runtime, window, request.doc_key, consumer_indexes);
+        try markDerivedCoverageSkipped(runtime, window, request, consumer_indexes);
         return;
     };
     defer runtime.alloc.free(source_text);
@@ -6555,7 +6603,7 @@ fn processSparseEmbedding(
     defer runtime.alloc.free(artifact_key);
     if (try shouldSkipEmbeddingArtifact(runtime, artifact_key, source_hash)) {
         if (try appendCachedSparseEmbeddingToWindow(runtime, window, request.doc_key, artifact_key, consumer_indexes)) {
-            try queueDerivedCoverageProduced(runtime, window, request.doc_key, consumer_indexes);
+            try queueDerivedCoverageProduced(runtime, window, request, consumer_indexes);
         }
         return;
     }
@@ -6563,7 +6611,7 @@ fn processSparseEmbedding(
     var sparse = try embedSparseWithRetry(sparse_embedder, runtime, embedding_artifact_name, source_text);
     defer sparse.deinit(runtime.alloc);
     try writeSparseEmbeddingArtifact(runtime, request.doc_key, embedding_artifact_name, source_hash, sparse.indices, sparse.values);
-    try queueDerivedCoverageProduced(runtime, window, request.doc_key, consumer_indexes);
+    try queueDerivedCoverageProduced(runtime, window, request, consumer_indexes);
 
     var embeddings = try singleSparseEmbeddingForConsumers(runtime, request.doc_key, artifact_key, sparse.indices, sparse.values, consumer_indexes);
     defer {
@@ -8778,10 +8826,18 @@ fn coverageOutcomeName(outcome: CoverageOutcome) []const u8 {
     return @tagName(outcome);
 }
 
-fn initCoverageOutcomeTransition(runtime: *EnrichmentRuntime, index_name: []const u8, generation: u64, doc_key: []const u8, outcome: CoverageOutcome) !CoverageOutcomeTransition {
+fn initCoverageOutcomeTransition(
+    runtime: *EnrichmentRuntime,
+    index_name: []const u8,
+    generation: u64,
+    doc_key: []const u8,
+    source_sequence: u64,
+    outcome: CoverageOutcome,
+) !CoverageOutcomeTransition {
     var transition: CoverageOutcomeTransition = .{
         .index_name = try runtime.alloc.dupe(u8, index_name),
         .generation = generation,
+        .source_sequence = source_sequence,
         .outcome = outcome,
         .marker_key = undefined,
         .counter_keys = undefined,
@@ -8802,21 +8858,74 @@ fn initCoverageOutcomeTransition(runtime: *EnrichmentRuntime, index_name: []cons
     return transition;
 }
 
+fn deinitFailureIdentity(alloc: Allocator, failure: FailureIdentity) void {
+    if (failure.artifact_name.len > 0) alloc.free(@constCast(failure.artifact_name));
+    if (failure.source_artifact_name.len > 0) alloc.free(@constCast(failure.source_artifact_name));
+    if (failure.doc_key.len > 0) alloc.free(@constCast(failure.doc_key));
+}
+
+fn clearCoverageFailureGuards(alloc: Allocator, guards: *std.ArrayListUnmanaged(FailureIdentity)) void {
+    for (guards.items) |failure| deinitFailureIdentity(alloc, failure);
+    guards.deinit(alloc);
+    guards.* = .empty;
+}
+
+fn sameFailureIdentity(lhs: FailureIdentity, rhs: FailureIdentity) bool {
+    return lhs.kind == rhs.kind and
+        lhs.sequence == rhs.sequence and
+        std.mem.eql(u8, lhs.artifact_name, rhs.artifact_name) and
+        std.mem.eql(u8, lhs.source_artifact_name, rhs.source_artifact_name) and
+        std.mem.eql(u8, lhs.doc_key, rhs.doc_key);
+}
+
+fn appendCoverageFailureGuard(
+    alloc: Allocator,
+    guards: *std.ArrayListUnmanaged(FailureIdentity),
+    failure: FailureIdentity,
+) !void {
+    for (guards.items) |existing| {
+        if (sameFailureIdentity(existing, failure)) return;
+    }
+    const artifact_name = if (failure.artifact_name.len == 0) "" else try alloc.dupe(u8, failure.artifact_name);
+    errdefer if (artifact_name.len > 0) alloc.free(@constCast(artifact_name));
+    const source_artifact_name = if (failure.source_artifact_name.len == 0) "" else try alloc.dupe(u8, failure.source_artifact_name);
+    errdefer if (source_artifact_name.len > 0) alloc.free(@constCast(source_artifact_name));
+    const doc_key = if (failure.doc_key.len == 0) "" else try alloc.dupe(u8, failure.doc_key);
+    errdefer if (doc_key.len > 0) alloc.free(@constCast(doc_key));
+    try guards.append(alloc, .{
+        .kind = failure.kind,
+        .artifact_name = artifact_name,
+        .source_artifact_name = source_artifact_name,
+        .doc_key = doc_key,
+        .sequence = failure.sequence,
+    });
+}
+
 fn deinitCoverageOutcomeTransition(alloc: Allocator, transition: CoverageOutcomeTransition) void {
     alloc.free(transition.index_name);
     alloc.free(transition.marker_key);
     for (transition.counter_keys) |key| alloc.free(key);
+    var failure_guards = transition.failure_guards;
+    clearCoverageFailureGuards(alloc, &failure_guards);
 }
 
-fn markDerivedCoverageOutcomeForIndex(runtime: *EnrichmentRuntime, index_name: []const u8, doc_key: []const u8, outcome: CoverageOutcome) !void {
+fn markDerivedCoverageOutcomeForIndex(
+    runtime: *EnrichmentRuntime,
+    index_name: []const u8,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    outcome: CoverageOutcome,
+) !void {
     const generation = runtime.index_manager.coverageGenerationForIndex(index_name) orelse return;
-    const transition = try initCoverageOutcomeTransition(runtime, index_name, generation, doc_key, outcome);
+    var transition = try initCoverageOutcomeTransition(runtime, index_name, generation, request.doc_key, request.sequence, outcome);
     defer deinitCoverageOutcomeTransition(runtime.alloc, transition);
+    if (outcome == .terminal_failed) {
+        try appendCoverageFailureGuard(runtime.alloc, &transition.failure_guards, failureIdentityForRequest(request));
+    }
     try applyCoverageOutcomeTransitions(runtime, &.{transition});
 }
 
-fn markDerivedCoverageTerminalFailedForIndex(runtime: *EnrichmentRuntime, index_name: []const u8, doc_key: []const u8) !void {
-    try markDerivedCoverageOutcomeForIndex(runtime, index_name, doc_key, .terminal_failed);
+fn markDerivedCoverageTerminalFailedForIndex(runtime: *EnrichmentRuntime, index_name: []const u8, request: enrichment_types.GeneratedEnrichmentRequest) !void {
+    try markDerivedCoverageOutcomeForIndex(runtime, index_name, request, .terminal_failed);
 }
 
 fn clearQueuedCoverageTransitions(
@@ -8867,36 +8976,97 @@ fn derivedCoverageOutcomeCounterValue(runtime: *EnrichmentRuntime, counter_key: 
         try scanDerivedCoverageOutcome(runtime, index_name, generation, outcome);
 }
 
-fn queueDerivedCoverageOutcomeForIndex(runtime: *EnrichmentRuntime, window: *GeneratedReplayWindow, index_name: []const u8, doc_key: []const u8, outcome: CoverageOutcome) !void {
+fn coverageOutcomePriority(outcome: CoverageOutcome) u8 {
+    return switch (outcome) {
+        .skipped => 0,
+        .produced => 1,
+        .terminal_failed => 2,
+    };
+}
+
+fn shouldReplaceCoverageOutcome(queued_sequence: u64, queued_outcome: CoverageOutcome, source_sequence: u64, outcome: CoverageOutcome) bool {
+    if (source_sequence != queued_sequence) return source_sequence > queued_sequence;
+    return coverageOutcomePriority(outcome) > coverageOutcomePriority(queued_outcome);
+}
+
+fn queueDerivedCoverageOutcomeForIndex(
+    runtime: *EnrichmentRuntime,
+    window: *GeneratedReplayWindow,
+    index_name: []const u8,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    outcome: CoverageOutcome,
+) !void {
     const generation = runtime.index_manager.coverageGenerationForIndex(index_name) orelse return;
-    const transition = try initCoverageOutcomeTransition(runtime, index_name, generation, doc_key, outcome);
+    var transition = try initCoverageOutcomeTransition(runtime, index_name, generation, request.doc_key, request.sequence, outcome);
     errdefer deinitCoverageOutcomeTransition(runtime.alloc, transition);
     const identity_key = transition.marker_key;
     if (window.coverage_transition_keys.getKey(identity_key)) |existing_key| {
         for (window.coverage_transitions.items) |*queued| {
             if (std.mem.eql(u8, queued.marker_key, existing_key)) {
-                queued.outcome = outcome;
+                if (shouldReplaceCoverageOutcome(queued.source_sequence, queued.outcome, request.sequence, outcome)) {
+                    var replacement_guards = std.ArrayListUnmanaged(FailureIdentity).empty;
+                    errdefer clearCoverageFailureGuards(runtime.alloc, &replacement_guards);
+                    if (outcome == .terminal_failed) {
+                        try appendCoverageFailureGuard(runtime.alloc, &replacement_guards, failureIdentityForRequest(request));
+                    }
+                    clearCoverageFailureGuards(runtime.alloc, &queued.failure_guards);
+                    queued.source_sequence = request.sequence;
+                    queued.outcome = outcome;
+                    queued.failure_guards = replacement_guards;
+                } else if (request.sequence == queued.source_sequence and outcome == .terminal_failed) {
+                    try appendCoverageFailureGuard(runtime.alloc, &queued.failure_guards, failureIdentityForRequest(request));
+                }
                 break;
             }
         }
         deinitCoverageOutcomeTransition(runtime.alloc, transition);
         return;
     }
+    if (outcome == .terminal_failed) {
+        try appendCoverageFailureGuard(runtime.alloc, &transition.failure_guards, failureIdentityForRequest(request));
+    }
     try window.coverage_transitions.append(runtime.alloc, transition);
     errdefer _ = window.coverage_transitions.pop();
     try window.coverage_transition_keys.put(runtime.alloc, identity_key, {});
 }
 
-fn queueDerivedCoverageOutcome(runtime: *EnrichmentRuntime, window: *GeneratedReplayWindow, doc_key: []const u8, consumer_indexes: []const []const u8, outcome: CoverageOutcome) !void {
-    for (consumer_indexes) |index_name| try queueDerivedCoverageOutcomeForIndex(runtime, window, index_name, doc_key, outcome);
+fn queueDerivedCoverageOutcome(
+    runtime: *EnrichmentRuntime,
+    window: *GeneratedReplayWindow,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    consumer_indexes: []const []const u8,
+    outcome: CoverageOutcome,
+) !void {
+    for (consumer_indexes) |index_name| try queueDerivedCoverageOutcomeForIndex(runtime, window, index_name, request, outcome);
 }
 
-fn markDerivedCoverageSkipped(runtime: *EnrichmentRuntime, window: *GeneratedReplayWindow, doc_key: []const u8, consumer_indexes: []const []const u8) !void {
-    try queueDerivedCoverageOutcome(runtime, window, doc_key, consumer_indexes, .skipped);
+fn markDerivedCoverageSkipped(runtime: *EnrichmentRuntime, window: *GeneratedReplayWindow, request: enrichment_types.GeneratedEnrichmentRequest, consumer_indexes: []const []const u8) !void {
+    try queueDerivedCoverageOutcome(runtime, window, request, consumer_indexes, .skipped);
 }
 
-fn queueDerivedCoverageProduced(runtime: *EnrichmentRuntime, window: *GeneratedReplayWindow, doc_key: []const u8, consumer_indexes: []const []const u8) !void {
-    try queueDerivedCoverageOutcome(runtime, window, doc_key, consumer_indexes, .produced);
+fn queueDerivedCoverageProduced(runtime: *EnrichmentRuntime, window: *GeneratedReplayWindow, request: enrichment_types.GeneratedEnrichmentRequest, consumer_indexes: []const []const u8) !void {
+    try queueDerivedCoverageOutcome(runtime, window, request, consumer_indexes, .produced);
+}
+
+fn transitionFailureStillPending(runtime: *EnrichmentRuntime, transition: CoverageOutcomeTransition) !bool {
+    if (transition.outcome != .terminal_failed or transition.failure_guards.items.len == 0) return true;
+    const pending_fn = runtime.failure_pending_fn orelse return true;
+    const failure_ctx = runtime.failure_ctx orelse return true;
+    for (transition.failure_guards.items) |failure| {
+        if (try pending_fn(failure_ctx, failure, transition.index_name)) return true;
+    }
+    return false;
+}
+
+fn lockCoverageFailureFence(runtime: *EnrichmentRuntime, transitions: []const CoverageOutcomeTransition) ?FailurePendingFence {
+    for (transitions) |transition| {
+        if (transition.outcome == .terminal_failed and transition.failure_guards.items.len != 0) {
+            const fence = runtime.failure_pending_fence orelse return null;
+            fence.lock();
+            return fence;
+        }
+    }
+    return null;
 }
 
 fn applyCoverageOutcomeTransitions(runtime: *EnrichmentRuntime, transitions: []const CoverageOutcomeTransition) !void {
@@ -8931,12 +9101,27 @@ fn applyCoverageOutcomeTransitions(runtime: *EnrichmentRuntime, transitions: []c
             ordered[group_start + retained] = transition;
             retained += 1;
         }
+        const failure_fence = lockCoverageFailureFence(runtime, ordered[group_start .. group_start + retained]);
+
+        var pending_retained: usize = 0;
+        for (ordered[group_start .. group_start + retained]) |transition| {
+            if (!(transitionFailureStillPending(runtime, transition) catch |err| {
+                if (failure_fence) |fence| fence.unlock();
+                apply_guard.unlock();
+                return err;
+            })) continue;
+            ordered[group_start + pending_retained] = transition;
+            pending_retained += 1;
+        }
+        retained = pending_retained;
         if (retained > 0) {
             applyCoverageOutcomeTransitionsForIndex(runtime, ordered[group_start .. group_start + retained]) catch |err| {
+                if (failure_fence) |fence| fence.unlock();
                 apply_guard.unlock();
                 return err;
             };
         }
+        if (failure_fence) |fence| fence.unlock();
         apply_guard.unlock();
         group_start = group_end;
     }
@@ -9036,6 +9221,88 @@ fn applyQueuedCoverageTransitionsAfterReplayAppend(runtime: *EnrichmentRuntime, 
     try applyCoverageOutcomeTransitions(runtime, transitions);
 }
 
+test "coverage transition merge is sequence aware and failure dominant" {
+    try std.testing.expect(shouldReplaceCoverageOutcome(10, .skipped, 10, .produced));
+    try std.testing.expect(shouldReplaceCoverageOutcome(10, .produced, 10, .terminal_failed));
+    try std.testing.expect(!shouldReplaceCoverageOutcome(10, .terminal_failed, 10, .produced));
+    try std.testing.expect(!shouldReplaceCoverageOutcome(10, .terminal_failed, 9, .terminal_failed));
+    try std.testing.expect(shouldReplaceCoverageOutcome(10, .terminal_failed, 11, .skipped));
+}
+
+test "terminal coverage revalidates durable debt under the failure fence" {
+    const alloc = std.testing.allocator;
+    const FailureState = struct {
+        pending: bool = false,
+        fence_held: bool = false,
+        checks: usize = 0,
+
+        fn lock(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            std.debug.assert(!self.fence_held);
+            self.fence_held = true;
+        }
+
+        fn unlock(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            std.debug.assert(self.fence_held);
+            self.fence_held = false;
+        }
+
+        fn check(ptr: *anyopaque, failure: FailureIdentity, index_name: []const u8) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!self.fence_held) return error.FailureFenceNotHeld;
+            try std.testing.expectEqualStrings("visual", index_name);
+            try std.testing.expectEqualStrings("doc:1", failure.doc_key);
+            self.checks += 1;
+            return self.pending;
+        }
+    };
+    var failure_state = FailureState{};
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .failure_ctx = &failure_state,
+        .failure_pending_fn = FailureState.check,
+        .failure_pending_fence = .{
+            .ptr = &failure_state,
+            .lock_fn = FailureState.lock,
+            .unlock_fn = FailureState.unlock,
+        },
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .ownership = undefined,
+    };
+
+    var terminal = try initCoverageOutcomeTransition(&runtime, "visual", 3, "doc:1", 7, .terminal_failed);
+    defer deinitCoverageOutcomeTransition(alloc, terminal);
+    try appendCoverageFailureGuard(alloc, &terminal.failure_guards, .{
+        .kind = .dense_embedding,
+        .artifact_name = "visual",
+        .doc_key = "doc:1",
+        .sequence = 7,
+    });
+    // Models the repair winning after skipPersistedRequestFailure's first
+    // lookup but before the replay window commits coverage.
+    failure_state.pending = false;
+    const failure_fence = lockCoverageFailureFence(&runtime, &.{terminal}) orelse return error.TestUnexpectedResult;
+    const still_pending = transitionFailureStillPending(&runtime, terminal) catch |err| {
+        failure_fence.unlock();
+        return err;
+    };
+    failure_fence.unlock();
+    try std.testing.expect(!still_pending);
+    try std.testing.expectEqual(@as(usize, 1), failure_state.checks);
+    try std.testing.expect(!failure_state.fence_held);
+}
+
 test "derived coverage outcome transitions are exclusive and idempotent" {
     const alloc = std.testing.allocator;
 
@@ -9063,7 +9330,7 @@ test "derived coverage outcome transitions are exclusive and idempotent" {
         .coverage_apply_mutex = &coverage_apply_mutex,
     };
 
-    var transition = try initCoverageOutcomeTransition(&runtime, "visual", 7, "doc:1", .skipped);
+    var transition = try initCoverageOutcomeTransition(&runtime, "visual", 7, "doc:1", 1, .skipped);
     defer deinitCoverageOutcomeTransition(alloc, transition);
 
     try applyCoverageOutcomeTransitionsForIndex(&runtime, &.{transition});
