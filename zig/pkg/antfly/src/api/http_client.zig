@@ -2118,11 +2118,7 @@ pub const ApiHttpClient = struct {
             404 => return error.UnknownGroup,
             409 => return remoteGroupConflictError(resp.body),
             503 => return error.GroupLeaderUnavailable,
-            else => {
-                const preview = resp.body[0..@min(resp.body.len, 256)];
-                std.log.warn("internal transaction begin returned unexpected status={} uri={s} body={s}", .{ resp.status, uri, preview });
-                return error.UnexpectedHttpStatus;
-            },
+            else => return error.UnexpectedHttpStatus,
         }
     }
 
