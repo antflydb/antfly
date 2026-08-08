@@ -2644,6 +2644,39 @@ def table_api(request):
         def create_index(self, table_name: str, index_name: str, payload: dict) -> dict:
             return self.raw.create_index(table_name, index_name, payload)
 
+        def wait_index_ready(
+            self,
+            table_name: str,
+            index_name: str,
+            *,
+            timeout_s: float = 30.0,
+            interval_s: float = 0.5,
+            require_query_fresh: bool = False,
+        ) -> dict:
+            deadline = time.monotonic() + timeout_s
+            last_info: dict[str, Any] | None = None
+            last_error: BaseException | None = None
+            while True:
+                try:
+                    last_info = self.get_index(table_name, index_name)
+                    ready = ready_index_status(last_info, require_query_fresh=require_query_fresh)
+                    if ready is not None:
+                        return ready
+                except requests.RequestException as exc:
+                    last_error = exc
+                if time.monotonic() >= deadline:
+                    raise AssertionError(
+                        _index_ready_timeout_message(
+                            table_name,
+                            index_name,
+                            timeout_s,
+                            last_info,
+                            last_error,
+                            getattr(self.raw, "_server", None),
+                        )
+                    )
+                time.sleep(interval_s)
+
         def delete_index(self, table_name: str, index_name: str) -> dict:
             return self.raw.delete_index(table_name, index_name)
 

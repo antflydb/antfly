@@ -14022,7 +14022,13 @@ pub const ProvisionedTableWriteSource = struct {
                 .sync_level = sync_level,
                 .transaction = .{ .resolve = .{ .txn_id = txn_id, .status = status, .commit_version = commit_version } },
             });
-            if (status == .committed) try drainManagedDbBeforeClose(cached.db);
+            // Transaction resolution already honors the requested sync level.
+            // In particular, `.write` must not become coupled to an external
+            // enrichment provider merely because the ordinary batch route now
+            // uses the transaction coordinator. The cached runtime owns the
+            // durable replay tail and its background worker will resume it.
+            if (status == .committed and shouldDrainCachedManagedDbAfterBatch(sync_level))
+                try drainManagedDbBeforeClose(cached.db);
         } else {
             var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
             defer db.close();

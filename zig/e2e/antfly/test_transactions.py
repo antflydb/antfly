@@ -78,6 +78,18 @@ class StatelessTransaction:
         )
 
 
+def assert_committed_response(status: int, result: dict) -> None:
+    """Accept both fully propagated and durably committed 2PC outcomes."""
+    assert status in (200, 202)
+    if status == 200:
+        assert result["status"] == "committed"
+    else:
+        assert result["status"] in {
+            "committed_visibility_pending",
+            "committed_recovery_pending",
+        }
+
+
 def test_multi_batch_commit(stateful_api):
     table_a, table_b = _create_tables(stateful_api, "multi_batch_commit")
 
@@ -402,8 +414,7 @@ def test_occ_basic_read_modify_write(stateful_api):
             }
         }
     )
-    assert status == 200
-    assert result["status"] == "committed"
+    assert_committed_response(status, result)
 
     updated = stateful_api.lookup_key(table_name, "account:alice")
     assert updated["balance"] == 1500
@@ -437,8 +448,7 @@ def test_occ_conflict_detection(stateful_api):
             }
         }
     )
-    assert commit_status == 200
-    assert commit_result["status"] == "committed"
+    assert_committed_response(commit_status, commit_result)
 
     abort_status, abort_result = tx2.commit(
         {
@@ -489,8 +499,7 @@ def test_occ_cross_table_read_modify_write(stateful_api):
             },
         }
     )
-    assert status == 200
-    assert result["status"] == "committed"
+    assert_committed_response(status, result)
     assert result["tables"][table_a]["inserted"] == 1
     assert result["tables"][table_b]["inserted"] == 1
 
@@ -528,8 +537,7 @@ def test_occ_transform_commit(stateful_api):
             }
         }
     )
-    assert status == 200
-    assert result["status"] == "committed"
+    assert_committed_response(status, result)
     assert result["tables"][table_name]["transformed"] == 1
 
     updated = stateful_api.lookup_key(table_name, "account:alice")
@@ -682,8 +690,7 @@ def test_session_stage_transform_commit(stateful_api):
     assert staged["transaction_id"] == txn_id
 
     status, result = stateful_api.commit_transaction_session(txn_id)
-    assert status == 200
-    assert result["status"] == "committed"
+    assert_committed_response(status, result)
     assert result["transaction_id"] == txn_id
     assert result["tables"][table_name]["transformed"] == 1
 
@@ -743,8 +750,7 @@ def test_session_transform_savepoint_rollback(stateful_api):
     assert rolled_back["savepoint_id"] == savepoint_id
 
     status, result = stateful_api.commit_transaction_session(txn_id)
-    assert status == 200
-    assert result["status"] == "committed"
+    assert_committed_response(status, result)
     assert result["tables"][table_name]["transformed"] == 1
 
     updated = stateful_api.lookup_key(table_name, "account:alice")
@@ -790,8 +796,7 @@ def test_session_explicit_read_write_commit(stateful_api):
     assert staged_write["transaction_id"] == txn_id
 
     status, result = stateful_api.commit_transaction_session(txn_id)
-    assert status == 200
-    assert result["status"] == "committed"
+    assert_committed_response(status, result)
     assert result["tables"][table_name]["inserted"] == 1
 
     inserted = stateful_api.lookup_key(table_name, "doc:2")
@@ -887,8 +892,7 @@ def test_session_stage_delete_commit(stateful_api):
     assert staged_delete["transaction_id"] == txn_id
 
     status, result = stateful_api.commit_transaction_session(txn_id)
-    assert status == 200
-    assert result["status"] == "committed"
+    assert_committed_response(status, result)
     assert result["tables"][table_name]["deleted"] == 1
 
     with pytest.raises(requests.HTTPError):
@@ -939,8 +943,7 @@ def test_session_mixed_read_write_delete_commit(stateful_api):
     assert staged_delete["status"] == "staged"
 
     status, result = stateful_api.commit_transaction_session(txn_id)
-    assert status == 200
-    assert result["status"] == "committed"
+    assert_committed_response(status, result)
     assert result["tables"][table_name]["inserted"] == 1
     assert result["tables"][table_name]["deleted"] == 1
 
