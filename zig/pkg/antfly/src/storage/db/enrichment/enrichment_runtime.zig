@@ -83,6 +83,49 @@ pub const Config = struct {
 
 pub const RuntimeError = error{ EnrichmentWorkerFailed, EnrichmentRetryInProgress };
 
+const ForegroundCatchUpDecision = enum {
+    complete,
+    worker_failed,
+    retry_in_progress,
+    run_pass,
+};
+
+fn foregroundCatchUpDecision(
+    applied_sequence: u64,
+    target_sequence: u64,
+    worker_failed: bool,
+    retrying: bool,
+    retry_due: bool,
+) ForegroundCatchUpDecision {
+    if (worker_failed) return .worker_failed;
+    if (retrying) return if (retry_due) .run_pass else .retry_in_progress;
+    if (applied_sequence >= target_sequence) return .complete;
+    return .run_pass;
+}
+
+test "enrichment foreground catch up reconciles retry state after checkpoint apply" {
+    try std.testing.expectEqual(
+        ForegroundCatchUpDecision.retry_in_progress,
+        foregroundCatchUpDecision(9, 9, false, true, false),
+    );
+    try std.testing.expectEqual(
+        ForegroundCatchUpDecision.run_pass,
+        foregroundCatchUpDecision(9, 9, false, true, true),
+    );
+    try std.testing.expectEqual(
+        ForegroundCatchUpDecision.complete,
+        foregroundCatchUpDecision(9, 9, false, false, false),
+    );
+    try std.testing.expectEqual(
+        ForegroundCatchUpDecision.run_pass,
+        foregroundCatchUpDecision(8, 9, false, false, false),
+    );
+    try std.testing.expectEqual(
+        ForegroundCatchUpDecision.worker_failed,
+        foregroundCatchUpDecision(9, 9, true, true, true),
+    );
+}
+
 pub const GeneratedRecordWriter = *const fn (ptr: *anyopaque, batch: derived_types.DerivedBatch, artifact_delete_keys: []const []const u8) anyerror!u64;
 pub const RequestFailure = struct {
     kind: enrichment_types.GeneratedEnrichmentKind,
@@ -1905,9 +1948,13 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             const next_retry_at_ms = self.next_retry_at_ms;
             self.mutex.unlock(io);
 
-            if (failed) return RuntimeError.EnrichmentWorkerFailed;
-            if (applied >= sequence) return;
-            if (retrying and self.config.clock.nowRealtimeMs() < next_retry_at_ms) return RuntimeError.EnrichmentRetryInProgress;
+            const retry_due = retrying and self.config.clock.nowRealtimeMs() >= next_retry_at_ms;
+            switch (foregroundCatchUpDecision(applied, sequence, failed, retrying, retry_due)) {
+                .complete => return,
+                .worker_failed => return RuntimeError.EnrichmentWorkerFailed,
+                .retry_in_progress => return RuntimeError.EnrichmentRetryInProgress,
+                .run_pass => {},
+            }
             runForegroundCatchUpPass(self, io, sequence) catch |err| {
                 return switch (err) {
                     RuntimeError.EnrichmentWorkerFailed => RuntimeError.EnrichmentWorkerFailed,
