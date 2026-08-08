@@ -4132,6 +4132,8 @@ pub fn build(b: *std.Build) void {
             "executeSearchGraphWithSets preserves node ordinals",
             "cloneNamedSetAsResult preserves hit ordinals",
             "fuseNamedSets preserves source hit ordinals",
+            "fuseNamedSets reports a lower bound while any source window is truncated",
+            "db search marks a truncated fused candidate union as a lower bound",
             "fuseNamedSets deduplicates aliases by ordinal when complete",
             "fuseNamedSets drops conflicting source hit ordinals",
             "applyGraphUnion deduplicates by ordinals when hit pages are complete",

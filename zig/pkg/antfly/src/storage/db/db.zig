@@ -70916,6 +70916,69 @@ test "db search fuses full_text and dense named searches before graph expansion"
     try std.testing.expectEqualStrings("doc:c", result.graph_results[0].hits[0].id);
 }
 
+test "db search marks a truncated fused candidate union as a lower bound" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\"}",
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"common alpha\",\"_embeddings\":{\"dv_v1\":[1,0,0]}}" },
+            .{ .key = "doc:b", .value = "{\"body\":\"common beta\",\"_embeddings\":{\"dv_v1\":[0,1,0]}}" },
+            .{ .key = "doc:c", .value = "{\"body\":\"common gamma\",\"_embeddings\":{\"dv_v1\":[0,0,1]}}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    const dense_queries = [_]types.NamedDenseQuery{.{
+        .name = "dv_v1",
+        .index_name = "dv_v1",
+        .query = .{ .vector = &.{ 1.0, 0.0, 0.0 }, .k = 1 },
+    }};
+    const merge_config = types.MergeConfig{
+        .strategy = .rrf,
+        .weights = &.{
+            .{ .name = "full_text", .weight = 1.0 },
+            .{ .name = "dv_v1", .weight = 1.0 },
+        },
+    };
+
+    var first_page = try db.search(alloc, .{
+        .full_text = .{ .match = .{ .field = "body", .text = "common" } },
+        .index_name = "ft_v1",
+        .dense_queries = &dense_queries,
+        .merge_config = merge_config,
+        .include_stored = false,
+        .limit = 1,
+    });
+    defer first_page.deinit();
+    try std.testing.expectEqual(@as(usize, 1), first_page.hits.len);
+    try std.testing.expectEqual(types.TotalHitsRelation.gte, first_page.total_hits_relation);
+
+    var full_window = try db.search(alloc, .{
+        .full_text = .{ .match = .{ .field = "body", .text = "common" } },
+        .index_name = "ft_v1",
+        .dense_queries = &dense_queries,
+        .merge_config = merge_config,
+        .include_stored = false,
+        .limit = 10,
+    });
+    defer full_window.deinit();
+    try std.testing.expectEqual(@as(usize, 3), full_window.hits.len);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, full_window.total_hits_relation);
+}
+
 test "db hybrid search does not hard-filter dense leg with scoring full_text" {
     const alloc = std.testing.allocator;
 
