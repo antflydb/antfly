@@ -1673,6 +1673,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     ownership: ownership_mod.State,
     mutex: Io.Mutex = .init,
     cond: Io.Condition = .init,
+    replay_pass_active: bool = false,
     shutdown: bool = false,
     target_sequence: u64 = 0,
     applied_sequence: u64 = 0,
@@ -1908,10 +1909,13 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             if (applied >= sequence) return;
             if (retrying and self.config.clock.nowRealtimeMs() < next_retry_at_ms) return RuntimeError.EnrichmentRetryInProgress;
             runForegroundCatchUpPass(self, io, sequence) catch |err| {
-                handleWorkerLoopError(self, io, err);
-                return switch (enrichmentErrorDisposition(err)) {
-                    .fatal_worker, .terminal_request => RuntimeError.EnrichmentWorkerFailed,
-                    .retryable_request => RuntimeError.EnrichmentRetryInProgress,
+                return switch (err) {
+                    RuntimeError.EnrichmentWorkerFailed => RuntimeError.EnrichmentWorkerFailed,
+                    RuntimeError.EnrichmentRetryInProgress => RuntimeError.EnrichmentRetryInProgress,
+                    else => switch (enrichmentErrorDisposition(err)) {
+                        .fatal_worker, .terminal_request => RuntimeError.EnrichmentWorkerFailed,
+                        .retryable_request => RuntimeError.EnrichmentRetryInProgress,
+                    },
                 };
             };
         }
@@ -2527,14 +2531,112 @@ fn workerMain(runtime: *EnrichmentRuntime) void {
 
         if (retrying and !waitForWorkerRetry(runtime, io)) return;
 
-        runForegroundCatchUpPass(runtime, io, target_sequence) catch |err| {
-            handleWorkerLoopError(runtime, io, err);
+        runForegroundCatchUpPass(runtime, io, target_sequence) catch {
             continue :worker_loop;
         };
     }
 }
 
+fn beginReplayPass(runtime: *EnrichmentRuntime, io: Io, target_sequence: u64) !bool {
+    runtime.mutex.lockUncancelable(io);
+    while (runtime.replay_pass_active and !runtime.shutdown) {
+        runtime.cond.waitUncancelable(io, &runtime.mutex);
+    }
+    if (runtime.shutdown) {
+        runtime.mutex.unlock(io);
+        return error.EnrichmentRetryAborted;
+    }
+    if (runtime.last_error_name != null) {
+        runtime.mutex.unlock(io);
+        return RuntimeError.EnrichmentWorkerFailed;
+    }
+    if (runtime.applied_sequence >= target_sequence) {
+        runtime.mutex.unlock(io);
+        return false;
+    }
+    if (runtime.retrying and runtime.config.clock.nowRealtimeMs() < runtime.next_retry_at_ms) {
+        runtime.mutex.unlock(io);
+        return RuntimeError.EnrichmentRetryInProgress;
+    }
+    runtime.replay_pass_active = true;
+    runtime.mutex.unlock(io);
+    return true;
+}
+
+fn endReplayPass(runtime: *EnrichmentRuntime, io: Io) void {
+    runtime.mutex.lockUncancelable(io);
+    std.debug.assert(runtime.replay_pass_active);
+    runtime.replay_pass_active = false;
+    runtime.cond.broadcast(io);
+    runtime.mutex.unlock(io);
+}
+
+test "enrichment replay passes are single flight" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    var io_impl = Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var runtime = EnrichmentRuntime{
+        .alloc = std.testing.allocator,
+        .io_impl = &io_impl,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .ownership = undefined,
+        .replay_pass_active = true,
+    };
+    const Waiter = struct {
+        runtime: *EnrichmentRuntime,
+        io: Io,
+        entered: Io.Event = .unset,
+        acquired: Io.Event = .unset,
+        err: ?anyerror = null,
+
+        fn run(waiter: *@This()) void {
+            waiter.entered.set(waiter.io);
+            const owns_pass = beginReplayPass(waiter.runtime, waiter.io, 1) catch |err| {
+                waiter.err = err;
+                waiter.acquired.set(waiter.io);
+                return;
+            };
+            if (!owns_pass) waiter.err = error.TestUnexpectedResult;
+            waiter.acquired.set(waiter.io);
+        }
+    };
+    var waiter = Waiter{ .runtime = &runtime, .io = io };
+    var future = try io.concurrent(Waiter.run, .{&waiter});
+    defer _ = future.await(io);
+
+    waiter.entered.waitUncancelable(io);
+    try io.sleep(Io.Duration.fromMilliseconds(10), .awake);
+    try std.testing.expect(!waiter.acquired.isSet());
+
+    endReplayPass(&runtime, io);
+    waiter.acquired.waitUncancelable(io);
+    try std.testing.expect(waiter.err == null);
+    try std.testing.expect(runtime.replay_pass_active);
+    endReplayPass(&runtime, io);
+}
+
 fn runForegroundCatchUpPass(runtime: *EnrichmentRuntime, io: Io, target_sequence: u64) !void {
+    if (!try beginReplayPass(runtime, io, target_sequence)) return;
+    defer endReplayPass(runtime, io);
+
+    runForegroundCatchUpPassOwned(runtime, io, target_sequence) catch |err| {
+        handleWorkerLoopError(runtime, io, err);
+        return err;
+    };
+}
+
+fn runForegroundCatchUpPassOwned(runtime: *EnrichmentRuntime, io: Io, target_sequence: u64) !void {
     setActiveFailureFingerprint(runtime, 0);
     const now_ms = runtime.config.clock.nowRealtimeMs();
     runtime.mutex.lockUncancelable(io);

@@ -1765,6 +1765,7 @@ fn aggregateHbcPostingStats(dst: *db_mod.types.HbcPostingStats, src: db_mod.type
 const EmbeddingsRuntimeView = struct {
     backfill_active: bool,
     backfill_progress: f64,
+    coverage_degraded: bool,
     replay_applied_sequence: u64,
     replay_target_sequence: u64,
     replay_catch_up_required: bool,
@@ -2240,6 +2241,7 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: E
     var view: EmbeddingsRuntimeView = .{
         .backfill_active = if (observation_current) item.backfill_active else true,
         .backfill_progress = if (observation_current) item.backfill_progress else 0.0,
+        .coverage_degraded = false,
         .replay_applied_sequence = if (observation_current) item.replay_applied_sequence else 0,
         .replay_target_sequence = if (observation_current) item.replay_target_sequence else 0,
         .replay_catch_up_required = if (observation_current) item.replay_catch_up_required else true,
@@ -2260,6 +2262,7 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: E
         !coverage_incomplete,
         replay_current,
     );
+    view.coverage_degraded = coverage.degraded;
     const require_table_coverage = embeddingsCoveragePolicyRequiresTableCoverage(coverage_policy);
     const source_coverage_visible = coverage.source_visible;
     const dense_coverage_complete = coverage.complete;
@@ -2669,9 +2672,6 @@ fn appendSingleIndexRuntimeStatus(
     const visible_edge_count = if (embeddings_materialization_current) item.edge_count else 0;
     const visible_node_count = if (embeddings_materialization_current) item.node_count else 0;
     const visible_root_node = if (embeddings_materialization_current) item.root_node else 0;
-    const enrichment_terminal_failed = embeddings_materialization_current and
-        @hasField(@TypeOf(item), "coverage_terminal_failed_count") and
-        item.coverage_terminal_failed_count > 0;
     const embeddings_view = if (index_type == .embeddings)
         embeddingsRuntimeView(item, table_doc_count, embeddings_coverage_policy, embeddings_sparse, coverage_generation, coverage_config_hash, enrichment, coverage_runtime_present)
     else
@@ -2797,7 +2797,9 @@ fn appendSingleIndexRuntimeStatus(
     } else if (repair_state != null and std.mem.eql(u8, repair_state.?, "waiting")) {
         try appendJsonString(alloc, out, "retrying");
     } else {
-        try appendJsonString(alloc, out, backfillState(index_type, backfill_active, (embeddings_materialization_current and item.enrichment_failed) or enrichment_terminal_failed, replay_applied_sequence, replay_target_sequence, visible_enrichment));
+        const enrichment_degraded = (embeddings_materialization_current and item.enrichment_failed) or
+            (if (embeddings_view) |view| view.coverage_degraded else false);
+        try appendJsonString(alloc, out, backfillState(index_type, backfill_active, enrichment_degraded, replay_applied_sequence, replay_target_sequence, visible_enrichment));
     }
     if (load_error) |err_name| {
         const msg = try std.fmt.allocPrint(alloc, "load failed: {s}", .{err_name});
@@ -5017,7 +5019,7 @@ test "managed embeddings skipped terminal sources complete backfill without fabr
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"rebuilding\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_active\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_progress\":1.000") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_state\":\"ready\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_state\":\"degraded\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_applied_sequence\":20") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_target_sequence\":20") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_catch_up_required\":false") != null);

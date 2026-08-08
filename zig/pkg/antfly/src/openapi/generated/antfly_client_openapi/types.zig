@@ -1986,7 +1986,7 @@ pub const DerivedCoverageStatus = struct {
     complete: bool,
     /// Whether coverage is complete without terminal failures.
     healthy: bool,
-    /// Whether all sources are settled but one or more have terminal failures requiring operator attention.
+    /// Whether all sources are settled but coverage remains unhealthy under the configured policy, including terminal failures or policy-rejected skips.
     degraded: bool,
 };
 

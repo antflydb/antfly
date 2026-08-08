@@ -42,8 +42,8 @@ class DerivedCoverageStatus:
         complete (bool): Whether observations are complete, replay has reached its target, and every observed source has
             an outcome accepted by the policy.
         healthy (bool): Whether coverage is complete without terminal failures.
-        degraded (bool): Whether all sources are settled but one or more have terminal failures requiring operator
-            attention.
+        degraded (bool): Whether all sources are settled but coverage remains unhealthy under the configured policy,
+            including terminal failures or policy-rejected skips.
     """
 
     policy: DerivedCoverageStatusPolicy

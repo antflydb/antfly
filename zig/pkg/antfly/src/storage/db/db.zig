@@ -7818,6 +7818,12 @@ pub const DB = struct {
         }
     };
 
+    const ArtifactRepairCompletionDisposition = enum {
+        completed,
+        stale,
+        coverage_incomplete,
+    };
+
     fn artifactRepairCompletionSnapshot(
         self: *DB,
         alloc: Allocator,
@@ -8247,7 +8253,7 @@ pub const DB = struct {
         completion_key: []const u8,
         expected_epoch: u64,
         require_completed_fence: bool,
-    ) !bool {
+    ) !ArtifactRepairCompletionDisposition {
         const coverage_marker_key = try self.enrichmentFailureCoverageMarkerKeyAlloc(alloc, issue);
         defer if (coverage_marker_key) |key| alloc.free(key);
 
@@ -8256,22 +8262,22 @@ pub const DB = struct {
 
         const key = try self.repairIssueKeyForIssueAlloc(alloc, issue);
         defer alloc.free(key);
-        const existing = (try self.loadArtifactRepairIssueByKey(alloc, key)) orelse return false;
+        const existing = (try self.loadArtifactRepairIssueByKey(alloc, key)) orelse return .stale;
         var current = existing;
         defer current.deinit(alloc);
-        if (!revision.matches(current)) return false;
+        if (!revision.matches(current)) return .stale;
         // Coverage transitions and repair-ledger completion share this mutex.
         // Re-read the repaired generation while holding it so either repair
         // clears debt first (and stale terminal transitions are rejected) or a
         // terminal transition lands first (and debt remains queued). There is
         // no interleaving that can leave terminal coverage without repair debt.
         if (coverage_marker_key) |marker_key| {
-            if (!try self.repairCoverageMarkerComplete(alloc, marker_key)) return false;
+            if (!try self.repairCoverageMarkerComplete(alloc, marker_key)) return .coverage_incomplete;
         }
 
         var completion = (try self.loadArtifactRepairCompletionState(alloc, completion_key)) orelse ArtifactRepairCompletionState{};
-        if (completion.epoch != expected_epoch) return false;
-        if (require_completed_fence and completion.completed_sequence < revision.sequence) return false;
+        if (completion.epoch != expected_epoch) return .stale;
+        if (require_completed_fence and completion.completed_sequence < revision.sequence) return .stale;
         completion.completed_sequence = @max(completion.completed_sequence, revision.sequence);
         completion.pending_issues -|= 1;
 
@@ -8293,7 +8299,7 @@ pub const DB = struct {
             completion_writes,
             completion_deletes,
         );
-        return true;
+        return .completed;
     }
 
     fn saveArtifactRepairAttemptIfCurrent(
@@ -11569,7 +11575,7 @@ pub const DB = struct {
                 // written only after successful full_index regeneration is
                 // the authoritative proof for sibling consumer debt.
                 if (issue.artifact_kind == .chunk or try self.artifactNowReadable(alloc, issue.*)) {
-                    if (try self.completeArtifactRepairIssueIfCurrent(
+                    switch (try self.completeArtifactRepairIssueIfCurrent(
                         alloc,
                         issue.*,
                         issue_revision,
@@ -11577,12 +11583,21 @@ pub const DB = struct {
                         completion_snapshot.epoch,
                         true,
                     )) {
-                        result.repaired += 1;
-                    } else {
-                        result.unresolved += 1;
-                        result.debt_remaining = true;
+                        .completed => {
+                            result.repaired += 1;
+                            continue;
+                        },
+                        .stale => {
+                            result.unresolved += 1;
+                            result.debt_remaining = true;
+                            continue;
+                        },
+                        // A sibling consumer completed the shared provider
+                        // work, but this consumer still has terminal coverage.
+                        // Reprocess it below so the durable fence cannot turn
+                        // into a permanent no-progress fast path.
+                        .coverage_incomplete => {},
                     }
-                    continue;
                 }
             }
 
@@ -11619,7 +11634,7 @@ pub const DB = struct {
             result.reprocessed += 1;
             if (issue.artifact_kind == .chunk or try self.artifactNowReadable(alloc, issue.*)) {
                 if (issue.reason == .enrichment_failed) {
-                    if (try self.completeArtifactRepairIssueIfCurrent(
+                    switch (try self.completeArtifactRepairIssueIfCurrent(
                         alloc,
                         issue.*,
                         issue_revision,
@@ -11627,10 +11642,11 @@ pub const DB = struct {
                         completion_snapshot.epoch,
                         false,
                     )) {
-                        result.repaired += 1;
-                    } else {
-                        result.unresolved += 1;
-                        result.debt_remaining = true;
+                        .completed => result.repaired += 1,
+                        .stale, .coverage_incomplete => {
+                            result.unresolved += 1;
+                            result.debt_remaining = true;
+                        },
                     }
                 } else {
                     if (try self.clearArtifactRepairIssueIfCurrent(alloc, issue.*, issue_revision)) {
@@ -50730,24 +50746,103 @@ test "db repair completion cannot clear debt behind terminal coverage" {
     const marker_key = try internal_keys.derivedCoverageOutcomeKeyAlloc(alloc, "semantic", generation, "doc:a");
     defer alloc.free(marker_key);
     try db.core.store.put(marker_key, "terminal_failed");
-    try std.testing.expect(!try db.completeArtifactRepairIssueIfCurrent(
-        alloc,
-        pending[0],
-        revision,
-        completion_key,
-        completion.epoch,
-        false,
-    ));
+    try std.testing.expectEqual(
+        DB.ArtifactRepairCompletionDisposition.coverage_incomplete,
+        try db.completeArtifactRepairIssueIfCurrent(
+            alloc,
+            pending[0],
+            revision,
+            completion_key,
+            completion.epoch,
+            false,
+        ),
+    );
 
     try db.core.store.put(marker_key, "produced");
-    try std.testing.expect(try db.completeArtifactRepairIssueIfCurrent(
-        alloc,
-        pending[0],
-        revision,
-        completion_key,
-        completion.epoch,
-        false,
-    ));
+    try std.testing.expectEqual(
+        DB.ArtifactRepairCompletionDisposition.completed,
+        try db.completeArtifactRepairIssueIfCurrent(
+            alloc,
+            pending[0],
+            revision,
+            completion_key,
+            completion.epoch,
+            false,
+        ),
+    );
+    const remaining = try db.listArtifactRepairIssues(alloc, .embedding, "semantic", 1);
+    defer types.freeArtifactRepairIssues(alloc, remaining);
+    try std.testing.expectEqual(@as(usize, 0), remaining.len);
+}
+
+test "db shared repair completion reprocesses consumer with terminal coverage" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_optional_runtime_workers = false,
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = deterministic.interface(),
+        },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "semantic",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"dense_v1\"}}",
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"repair me\"}" }},
+        .sync_level = .full_index,
+    });
+
+    const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dense_v1");
+    defer alloc.free(artifact_key);
+    var issue = types.ArtifactRepairIssue{
+        .artifact_kind = .embedding,
+        .index_name = try alloc.dupe(u8, "semantic"),
+        .doc_key = try alloc.dupe(u8, "doc:a"),
+        .artifact_name = try alloc.dupe(u8, "dense_v1"),
+        .artifact_key = try bytesToHexAlloc(alloc, artifact_key),
+        .reason = .enrichment_failed,
+        .sequence = 7,
+    };
+    defer issue.deinit(alloc);
+    try db.recordArtifactRepairIssue(alloc, issue);
+
+    const pending = try db.listArtifactRepairIssues(alloc, .embedding, "semantic", 1);
+    defer types.freeArtifactRepairIssues(alloc, pending);
+    try std.testing.expectEqual(@as(usize, 1), pending.len);
+    const completion_key = try db.artifactRepairCompletionKeyForIssueAlloc(alloc, pending[0]);
+    defer alloc.free(completion_key);
+    var completion = try db.artifactRepairCompletionSnapshot(alloc, completion_key);
+    completion.completed_sequence = pending[0].sequence;
+    var encoded_completion: [artifact_repair_completion_state_len]u8 = undefined;
+    encodeArtifactRepairCompletionState(&encoded_completion, completion);
+    try db.core.store.put(completion_key, &encoded_completion);
+
+    const generation = db.core.index_manager.coverageGenerationForIndex("semantic") orelse return error.TestUnexpectedResult;
+    const marker_key = try internal_keys.derivedCoverageOutcomeKeyAlloc(alloc, "semantic", generation, "doc:a");
+    defer alloc.free(marker_key);
+    try setDerivedCoverageOutcomes(alloc, db.core.store, db.core.index_manager, "semantic", &.{.{
+        .doc_key = "doc:a",
+        .outcome = .terminal_failed,
+    }});
+
+    var repair = try db.repairArtifactIssues(alloc, .embedding, 1);
+    defer repair.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), repair.scanned);
+    try std.testing.expectEqual(@as(u64, 1), repair.reprocessed);
+    try std.testing.expectEqual(@as(u64, 1), repair.repaired);
+    try std.testing.expectEqual(@as(u64, 0), repair.unresolved);
+    try std.testing.expect(!repair.debt_remaining);
+
+    try std.testing.expect(try db.repairCoverageMarkerComplete(alloc, marker_key));
     const remaining = try db.listArtifactRepairIssues(alloc, .embedding, "semantic", 1);
     defer types.freeArtifactRepairIssues(alloc, remaining);
     try std.testing.expectEqual(@as(usize, 0), remaining.len);
@@ -56480,14 +56575,17 @@ test "db enrichment repair never clears a newer failure revision" {
         "ProviderUnavailable",
     );
     try std.testing.expect(!try db.clearArtifactRepairIssueIfCurrent(alloc, stale_issue, stale_revision));
-    try std.testing.expect(!try db.completeArtifactRepairIssueIfCurrent(
-        alloc,
-        stale_issue,
-        stale_revision,
-        completion_key,
-        stale_completion.epoch,
-        false,
-    ));
+    try std.testing.expectEqual(
+        DB.ArtifactRepairCompletionDisposition.stale,
+        try db.completeArtifactRepairIssueIfCurrent(
+            alloc,
+            stale_issue,
+            stale_revision,
+            completion_key,
+            stale_completion.epoch,
+            false,
+        ),
+    );
 
     const current = try db.listArtifactRepairIssues(alloc, .embedding, "semantic", 1);
     defer types.freeArtifactRepairIssues(alloc, current);

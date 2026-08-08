@@ -9277,7 +9277,7 @@ export interface components {
             complete: boolean;
             /** @description Whether coverage is complete without terminal failures. */
             healthy: boolean;
-            /** @description Whether all sources are settled but one or more have terminal failures requiring operator attention. */
+            /** @description Whether all sources are settled but coverage remains unhealthy under the configured policy, including terminal failures or policy-rejected skips. */
             degraded: boolean;
         };
         /** @description Runtime state for the durable embeddings enrichment worker. */
