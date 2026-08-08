@@ -138,6 +138,7 @@ the same host, target, cache state, and report set.
 | Function/data section GC | `libantfly.so` returned to 16.55 MB | Kept |
 | Production LSM-only feature set | No `mdb_*` or LMDB backend symbols in the storage archive | Kept; LMDB remains in test/legacy profiles |
 | Opt-in build-only storage kernel | Distributed 425.652 s → 415.352 s, but added a 230.093 s unit and raised duplicate instances from 393 to 756 | Keep only as Phase 2 scaffolding; do not enable in production yet |
+| One-call `DB.search` probe | Distributed 415.352 s → 401.086 s, but declarations changed only 41,984 → 41,981 and storage overlap remained 98.9% | Rejected; a call boundary without storage ownership does not remove codegen |
 
 The `/tmp` graph analysis was consolidated into
 `tools/analyze_zig_import_graph.py`. It reports lexical reachability, consumes
@@ -259,9 +260,47 @@ surface and did not retain distributed runtime entry points.
 Decision: the skeleton validates the link topology, PIC reuse, opaque handle
 convention, and section GC, so it remains available behind
 `-Dstorage-kernel-experiment=true`. It is not enabled by default and is not a
-go decision by itself. The next measurement must move one complete local query
-through the compiled boundary. If that does not materially reduce the
-distributed unit, the experiment stops as required by the go/no-go criteria.
+go decision by itself.
+
+### Phase 2a one-call local-query probe
+
+The first query probe deliberately used a temporary, non-production raw-pointer
+bridge to answer a narrow codegen question before designing the stable wire
+ABI. It routed the final `DB.search` / profiled dense-search call through the
+experimental archive while leaving DB ownership, leases, aggregation, result
+merging, and all other storage operations in the distributed runtime.
+
+The probe was built from fresh local and global caches on the same host and
+with the same ARM64 Linux musl `ReleaseFast` flags and normal concurrency as
+Phase 1. All 27 build steps succeeded.
+
+| Unit | Compiler time | LLVM emit | Declarations | Repository Zig files |
+|---|---:|---:|---:|---:|
+| API kernel | 137.866 s | 133.586 s | 17,232 | 325 |
+| Distributed control plus direct storage ownership | 401.086 s | 392.515 s | 41,981 | 723 |
+| Experimental storage kernel | 220.105 s | 214.689 s | 25,370 | 367 |
+| Inference | 236.875 s | 229.213 s | 24,945 | 523 |
+
+The distributed time was 14.266 seconds below the Phase 1 run, but only three
+declarations left the unit. Storage still shared 363 of 367 repository files
+with distributed (98.9%), and aggregate duplicate instances remained 756.
+That combination identifies timing variance, not a material movement of LLVM
+work. The probe also grew the stripped executable from 57,638,496 to
+60,697,720 bytes (5.3%) because both ownership paths remained reachable.
+
+The focused cross-archive local-query suite passed all 15 tests and the C API
+suite passed all 11 selected tests. A broader table-read fixture failed with
+the same `DocIdentityNamespaceMismatch` both with and without the probe, and a
+standalone smoke failed during startup identically in both configurations;
+neither was used as evidence for or against the boundary.
+
+Decision: reject and fully revert the raw-pointer bridge. Moving a terminal
+method call while the consumer still owns `DB` does not satisfy Phase 2's
+complete-operation requirement and cannot remove the implementation graph.
+Do not spend time designing a stable result wire ABI around this shape. The
+next storage experiment must transfer ownership of a complete local table/shard
+runtime behind an opaque kernel handle, so distributed code cannot directly
+instantiate or call the storage implementation.
 
 ## Holistic target architecture
 
