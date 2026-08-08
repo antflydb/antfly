@@ -2244,8 +2244,8 @@ pub const AntflyApiHandler = struct {
             return ctx.text("unsupported table index configuration");
         };
         std.log.info("public create table begin table={s}", .{decoded_table_name});
-        const metadata_create_timeout_ns = 5 * std.time.ns_per_s;
-        const metadata_create_poll_ns = 50 * std.time.ns_per_ms;
+        const metadata_create_timeout_ns = http_server_mod.default_metadata_mutation_retry_timeout_ns;
+        const metadata_create_poll_ns = http_server_mod.default_metadata_mutation_retry_poll_ns;
         const metadata_create_start_ns = platform_time.monotonicNs();
         while (true) {
             self.api_server.source.createTable(alloc, decoded_table_name, create_req) catch |err| switch (err) {
