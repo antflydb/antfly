@@ -5324,6 +5324,11 @@ pub const ProvisionedTableWriteSource = struct {
         table_request_active: usize = 0,
         read_request_active: usize = 0,
         operation_active: bool = false,
+        // Reserved before an exclusive group operation waits for admitted
+        // readers to drain. Without this reservation, newly arriving reads
+        // can repeatedly overtake a committed Raft apply and starve the
+        // state-machine thread indefinitely.
+        operation_waiters: usize = 0,
         // Reserved before a transition waits so newly arriving writers cannot
         // repeatedly win the idle handoff and starve structural progress.
         transition_waiters: usize = 0,
@@ -6115,7 +6120,7 @@ pub const ProvisionedTableWriteSource = struct {
     fn pruneTableActivityLocked(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: ?u64) void {
         const index = self.findTableActivityLocked(table_name, group_id) orelse return;
         const entry = self.active_table_activities.items[index];
-        if (entry.table_request_active > 0 or entry.read_request_active > 0 or entry.operation_active or entry.transition_waiters > 0 or entry.structural_active or entry.structural_reconcile_active or entry.structural_reconcile_queued > 0 or entry.structural_reconcile_waiters > 0 or entry.restore_preparations > 0 or entry.generation_preparation_active) return;
+        if (entry.table_request_active > 0 or entry.read_request_active > 0 or entry.operation_active or entry.operation_waiters > 0 or entry.transition_waiters > 0 or entry.structural_active or entry.structural_reconcile_active or entry.structural_reconcile_queued > 0 or entry.structural_reconcile_waiters > 0 or entry.restore_preparations > 0 or entry.generation_preparation_active) return;
         const removed = self.active_table_activities.swapRemove(index);
         std.heap.page_allocator.free(removed.table_name);
         if (self.active_table_activities.items.len == 0) {
@@ -6128,7 +6133,7 @@ pub const ProvisionedTableWriteSource = struct {
         for (self.active_table_activities.items) |entry| {
             if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
             if (entry.group_id == null) continue;
-            if (entry.operation_active) return true;
+            if (entry.operation_active or entry.operation_waiters > 0) return true;
         }
         return false;
     }
@@ -6137,7 +6142,7 @@ pub const ProvisionedTableWriteSource = struct {
         for (self.active_table_activities.items) |entry| {
             if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
             if (entry.group_id == null) continue;
-            if (entry.transition_waiters > 0 or (entry.operation_active and !entry.operation_allows_reads)) return true;
+            if (entry.operation_waiters > 0 or entry.transition_waiters > 0 or (entry.operation_active and !entry.operation_allows_reads)) return true;
         }
         return false;
     }
@@ -6337,6 +6342,7 @@ pub const ProvisionedTableWriteSource = struct {
 
     fn beginGroupOperationLocked(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
         const io = self.table_activity_threaded.io();
+        self.activityEntryLocked(table_name, group_id).operation_waiters += 1;
         while (true) {
             if (self.findTableActivityLocked(table_name, null)) |index| {
                 const entry = self.active_table_activities.items[index];
@@ -6353,6 +6359,8 @@ pub const ProvisionedTableWriteSource = struct {
                 }
             }
             const entry = self.activityEntryLocked(table_name, group_id);
+            std.debug.assert(entry.operation_waiters > 0);
+            entry.operation_waiters -= 1;
             entry.operation_active = true;
             entry.operation_allows_reads = false;
             return;
@@ -6366,7 +6374,7 @@ pub const ProvisionedTableWriteSource = struct {
         }
         if (self.findTableActivityLocked(table_name, group_id)) |index| {
             const entry = self.active_table_activities.items[index];
-            if (entry.operation_active or entry.transition_waiters > 0 or entry.generation_preparation_active) return false;
+            if (entry.operation_active or entry.operation_waiters > 0 or entry.transition_waiters > 0 or entry.generation_preparation_active) return false;
         }
         const entry = self.activityEntryLocked(table_name, group_id);
         entry.operation_active = true;
@@ -6381,7 +6389,7 @@ pub const ProvisionedTableWriteSource = struct {
         }
         if (self.findTableActivityLocked(table_name, group_id)) |index| {
             const entry = self.active_table_activities.items[index];
-            if (entry.operation_active or entry.transition_waiters > 0 or entry.generation_preparation_active) return false;
+            if (entry.operation_active or entry.operation_waiters > 0 or entry.transition_waiters > 0 or entry.generation_preparation_active) return false;
         }
         const entry = self.activityEntryLocked(table_name, group_id);
         entry.operation_active = true;
@@ -6630,6 +6638,15 @@ pub const ProvisionedTableWriteSource = struct {
         defer self.table_activity_mutex.unlock(io);
         const index = self.findTableActivityLocked(table_name, group_id) orelse return 0;
         return self.active_table_activities.items[index].transition_waiters;
+    }
+
+    pub fn testingGroupOperationWaiterCount(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) usize {
+        if (!builtin.is_test) @compileError("testingGroupOperationWaiterCount is test-only");
+        const io = self.table_activity_threaded.io();
+        self.table_activity_mutex.lockUncancelable(io);
+        defer self.table_activity_mutex.unlock(io);
+        const index = self.findTableActivityLocked(table_name, group_id) orelse return 0;
+        return self.active_table_activities.items[index].operation_waiters;
     }
 
     fn tryBeginGroupOperation(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) bool {
@@ -9618,7 +9635,7 @@ pub const ProvisionedTableWriteSource = struct {
         }
         if (self.findTableActivityLocked(table_name, group_id)) |index| {
             const entry = self.active_table_activities.items[index];
-            if (entry.operation_active or entry.generation_preparation_active) return true;
+            if (entry.operation_active or entry.operation_waiters > 0 or entry.generation_preparation_active) return true;
         }
         return false;
     }
@@ -9633,7 +9650,7 @@ pub const ProvisionedTableWriteSource = struct {
         }
         if (self.findTableActivityLocked(table_name, group_id)) |index| {
             const entry = self.active_table_activities.items[index];
-            if (entry.transition_waiters > 0 or (entry.operation_active and !entry.operation_allows_reads)) return true;
+            if (entry.operation_waiters > 0 or entry.transition_waiters > 0 or (entry.operation_active and !entry.operation_allows_reads)) return true;
         }
         return false;
     }
@@ -9699,7 +9716,7 @@ pub const ProvisionedTableWriteSource = struct {
         for (self.active_table_activities.items) |activity| {
             if (!std.mem.eql(u8, activity.table_name, table_name)) continue;
             const group_id = activity.group_id orelse continue;
-            if (!activity.operation_active and !activity.generation_preparation_active) continue;
+            if (!activity.operation_active and activity.operation_waiters == 0 and !activity.generation_preparation_active) continue;
             try groups.append(alloc, group_id);
         }
 
@@ -10290,13 +10307,14 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         group_id: u64,
         lsm_root_generation: u64,
+        options: table_reads.ResidentDbSource.LeaseOptions,
     ) !?table_reads.ResidentDbLease {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         if (self.local_write_owner) |owner| {
-            return try leaseResidentDb(owner, alloc, table_name, group_id, lsm_root_generation);
+            return try leaseResidentDb(owner, alloc, table_name, group_id, lsm_root_generation, options);
         }
-        self.beginReadRequest(table_name);
-        var read_request_active = true;
+        var read_request_active = !options.read_activity_held;
+        if (read_request_active) self.beginReadRequest(table_name);
         errdefer if (read_request_active) self.endReadRequest(table_name);
 
         lockAtomic(&self.local_db_mutex);
@@ -10309,8 +10327,10 @@ pub const ProvisionedTableWriteSource = struct {
         // writer-cache owner. Once the replacement is resident, subsequent
         // queries lease it normally while the unpublished target builds.
         if (resident.cached == null and self.readCompatibleMaintenanceActiveBestEffort(table_name, group_id)) {
-            self.endReadRequest(table_name);
-            read_request_active = false;
+            if (read_request_active) {
+                self.endReadRequest(table_name);
+                read_request_active = false;
+            }
             return null;
         }
 
@@ -10327,8 +10347,10 @@ pub const ProvisionedTableWriteSource = struct {
         // cache-open barrier. Recheck under the activity lock before treating
         // a stale resident generation as an outage.
         if (resident.cached == null and self.readCompatibleMaintenanceActiveBestEffort(table_name, group_id)) {
-            self.endReadRequest(table_name);
-            read_request_active = false;
+            if (read_request_active) {
+                self.endReadRequest(table_name);
+                read_request_active = false;
+            }
             return null;
         }
 
@@ -10341,8 +10363,10 @@ pub const ProvisionedTableWriteSource = struct {
         // the explicit readonly fallback.
         if (resident.cached == null) {
             const cache = self.write_cache orelse self.startup_write_cache orelse {
-                self.endReadRequest(table_name);
-                read_request_active = false;
+                if (read_request_active) {
+                    self.endReadRequest(table_name);
+                    read_request_active = false;
+                }
                 return null;
             };
             const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
@@ -10365,21 +10389,22 @@ pub const ProvisionedTableWriteSource = struct {
         }
 
         var cached_value = resident.cached orelse {
-            self.endReadRequest(table_name);
-            read_request_active = false;
+            if (read_request_active) {
+                self.endReadRequest(table_name);
+                read_request_active = false;
+            }
             return null;
         };
-        const owned_table_name = alloc.dupe(u8, table_name) catch |err| {
-            cached_value.deinit(alloc);
-            self.endReadRequest(table_name);
-            read_request_active = false;
-            return err;
-        };
-        errdefer alloc.free(owned_table_name);
+        const owned_table_name = if (read_request_active)
+            alloc.dupe(u8, table_name) catch |err| {
+                cached_value.deinit(alloc);
+                return err;
+            }
+        else
+            null;
+        errdefer if (owned_table_name) |name| alloc.free(name);
         const lease_ctx = alloc.create(ResidentLeaseContext) catch |err| {
             cached_value.deinit(alloc);
-            self.endReadRequest(table_name);
-            read_request_active = false;
             return err;
         };
         lease_ctx.* = .{
@@ -10452,15 +10477,17 @@ pub const ProvisionedTableWriteSource = struct {
 
     const ResidentLeaseContext = struct {
         source: *ProvisionedTableWriteSource,
-        table_name: []u8,
+        table_name: ?[]u8,
         cached: ProvisionedTableWriteCache.CachedDb,
     };
 
     fn releaseResidentDb(ptr: *anyopaque, alloc: std.mem.Allocator) void {
         const lease_ctx: *ResidentLeaseContext = @ptrCast(@alignCast(ptr));
         lease_ctx.cached.deinit(alloc);
-        lease_ctx.source.endReadRequest(lease_ctx.table_name);
-        alloc.free(lease_ctx.table_name);
+        if (lease_ctx.table_name) |table_name| {
+            lease_ctx.source.endReadRequest(table_name);
+            alloc.free(table_name);
+        }
         alloc.destroy(lease_ctx);
     }
 
@@ -27731,6 +27758,7 @@ test "failed full index enrichment does not make resident reads unavailable" {
         "docs",
         7001,
         table_reads.backend_current_root_generation,
+        .{},
     )).?;
     defer affected.release(alloc);
     var affected_doc = (try affected.db.lookup(alloc, "doc:a", .{})).?;
@@ -27743,6 +27771,7 @@ test "failed full index enrichment does not make resident reads unavailable" {
         "stable",
         7002,
         table_reads.backend_current_root_generation,
+        .{},
     )).?;
     defer unrelated.release(alloc);
     var unrelated_doc = (try unrelated.db.lookup(alloc, "doc:stable", .{})).?;
@@ -30350,6 +30379,89 @@ test "provisioned table write source read request blocks group operation" {
     try std.testing.expect(source.hasReadBlockingActivityBestEffort("docs", 7001));
 }
 
+test "provisioned table group operation waiter queues ahead of later readers" {
+    const NoCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedCatalogCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+    const WriteWorker = struct {
+        source: *ProvisionedTableWriteSource,
+        entered: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            self.source.beginGroupOperation("docs", 7001);
+            defer self.source.endGroupOperation("docs", 7001);
+            self.entered.store(true, .release);
+            while (!self.release.load(.acquire)) std.atomic.spinLoopHint();
+        }
+    };
+    const ReadWorker = struct {
+        source: *ProvisionedTableWriteSource,
+        entered: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            var read = self.source.readPreparation().beginRead("docs", .general).?;
+            defer read.deinit();
+            self.entered.store(true, .release);
+        }
+    };
+
+    var source = ProvisionedTableWriteSource.init("/tmp/unused-antfly-group-writer-reader-fairness", NoCatalog.iface());
+    var initial_read = source.readPreparation().beginRead("docs", .general).?;
+    var initial_read_active = true;
+    defer if (initial_read_active) initial_read.deinit();
+
+    var write_worker = WriteWorker{ .source = &source };
+    const write_thread = try std.Thread.spawn(.{}, WriteWorker.run, .{&write_worker});
+    defer {
+        write_worker.release.store(true, .release);
+        write_thread.join();
+    }
+    while (source.testingGroupOperationWaiterCount("docs", 7001) == 0) std.atomic.spinLoopHint();
+
+    // Query-local resident leases are nested beneath the initial read
+    // admission. They must not queue behind the writer that is waiting for
+    // that same outer admission to drain.
+    try std.testing.expect((try source.residentDbSource().leaseGroup(
+        std.testing.allocator,
+        "docs",
+        7001,
+        table_reads.backend_current_root_generation,
+        .{ .read_activity_held = true },
+    )) == null);
+
+    var read_worker = ReadWorker{ .source = &source };
+    const read_thread = try std.Thread.spawn(.{}, ReadWorker.run, .{&read_worker});
+    defer read_thread.join();
+
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    io_impl.io().sleep(Io.Duration.fromMilliseconds(10), .awake) catch {};
+    try std.testing.expect(!read_worker.entered.load(.acquire));
+
+    initial_read.deinit();
+    initial_read_active = false;
+    while (!write_worker.entered.load(.acquire)) std.atomic.spinLoopHint();
+    try std.testing.expect(!read_worker.entered.load(.acquire));
+
+    write_worker.release.store(true, .release);
+    while (!read_worker.entered.load(.acquire)) std.atomic.spinLoopHint();
+}
+
 test "structural reconcile reservation defers metadata group refresh without blocking admitted work" {
     const NoCatalog = struct {
         fn iface() table_catalog.CatalogSource {
@@ -31082,7 +31194,7 @@ test "provisioned schema reconcile keeps reads and status available" {
     var activity = source.readPreparation().beginRead("docs", .general).?;
     activity.deinit();
 
-    try std.testing.expect((try source.residentDbSource().leaseGroup(std.testing.allocator, "docs", 7001, 1)) == null);
+    try std.testing.expect((try source.residentDbSource().leaseGroup(std.testing.allocator, "docs", 7001, 1, .{})) == null);
 
     source.beginStatusRequest("docs");
     source.endReadRequest("docs");
@@ -39498,7 +39610,7 @@ test "resident DB lease adopts seeded write cache across visible generation bump
     _ = source.withGroupVisibleRootGeneration(testingVisibleRootGenerationSource(&generation));
 
     const resident = source.residentDbSource();
-    var seeded = (try resident.leaseGroup(alloc, "docs", 7001, generation)).?;
+    var seeded = (try resident.leaseGroup(alloc, "docs", 7001, generation, .{})).?;
     try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
     try seeded.db.batch(.{
         .writes = &.{.{ .key = "doc:gold", .value = "{\"title\":\"gold doc\"}" }},
@@ -39507,22 +39619,22 @@ test "resident DB lease adopts seeded write cache across visible generation bump
     seeded.release(alloc);
 
     try source.prepareTableStructuralReconcile("docs", null);
-    var retained = (try resident.leaseGroup(alloc, "docs", 7001, generation)).?;
+    var retained = (try resident.leaseGroup(alloc, "docs", 7001, generation, .{})).?;
     retained.release(alloc);
     try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
 
     generation = 2;
-    try std.testing.expectError(error.ReadUnavailable, resident.leaseGroup(alloc, "docs", 7001, generation));
+    try std.testing.expectError(error.ReadUnavailable, resident.leaseGroup(alloc, "docs", 7001, generation, .{}));
 
     source.reserveStructuralReconcileActivity("docs");
-    try std.testing.expect((try resident.leaseGroup(alloc, "docs", 7001, generation)) == null);
+    try std.testing.expect((try resident.leaseGroup(alloc, "docs", 7001, generation, .{})) == null);
     source.cancelStructuralReconcileReservation("docs");
-    try std.testing.expectError(error.ReadUnavailable, resident.leaseGroup(alloc, "docs", 7001, generation));
+    try std.testing.expectError(error.ReadUnavailable, resident.leaseGroup(alloc, "docs", 7001, generation, .{}));
 
     write_cache.entries.items[0].allow_generation_adoption = true;
     const misses_before = write_cache.miss_count.load(.monotonic);
 
-    var lease = (try resident.leaseGroup(alloc, "docs", 7001, generation)).?;
+    var lease = (try resident.leaseGroup(alloc, "docs", 7001, generation, .{})).?;
     defer lease.release(alloc);
 
     try std.testing.expectEqual(@as(u64, 2), write_cache.entries.items[0].lsm_root_generation);
@@ -39571,6 +39683,7 @@ test "resident DB lease waits for an in-flight startup writer publication" {
                 "docs",
                 7001,
                 table_reads.backend_current_root_generation,
+                .{},
             ) catch {
                 self.completed.store(true, .release);
                 return;

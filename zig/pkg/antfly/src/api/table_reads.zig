@@ -1164,6 +1164,13 @@ pub const ResidentDbLease = struct {
 };
 
 pub const ResidentDbSource = struct {
+    pub const LeaseOptions = struct {
+        // Query and lookup entry points already hold a table read-admission
+        // lease. Reacquiring it here can deadlock behind an exclusive apply
+        // waiter that is waiting for the outer lease to drain.
+        read_activity_held: bool = false,
+    };
+
     ptr: *anyopaque,
     lease_group: *const fn (
         ptr: *anyopaque,
@@ -1171,6 +1178,7 @@ pub const ResidentDbSource = struct {
         table_name: []const u8,
         group_id: u64,
         lsm_root_generation: u64,
+        options: LeaseOptions,
     ) anyerror!?ResidentDbLease,
 
     pub fn leaseGroup(
@@ -1179,8 +1187,9 @@ pub const ResidentDbSource = struct {
         table_name: []const u8,
         group_id: u64,
         lsm_root_generation: u64,
+        options: LeaseOptions,
     ) !?ResidentDbLease {
-        return try self.lease_group(self.ptr, alloc, table_name, group_id, lsm_root_generation);
+        return try self.lease_group(self.ptr, alloc, table_name, group_id, lsm_root_generation, options);
     }
 };
 
@@ -5969,7 +5978,7 @@ fn lookupProvisionedLocal(
     // The source returns null when no matching writer generation is resident;
     // query-only runtimes and cold groups then use the read cache below.
     if (resident_db) |source| {
-        if (try source.leaseGroup(alloc, table_name, group_id, lsm_root_generation)) |lease_value| {
+        if (try source.leaseGroup(alloc, table_name, group_id, lsm_root_generation, .{ .read_activity_held = true })) |lease_value| {
             var lease = lease_value;
             defer lease.release(alloc);
             try validateProvisionedDbIdentityNamespace(alloc, catalog, table_name, group_id, lease.db);
@@ -6445,7 +6454,7 @@ fn queryLocalDetailed(
     // time. The lease also holds read activity for its lifetime, preventing
     // structural maintenance from retiring the DB while search is executing.
     if (resident_db) |source| {
-        if (try source.leaseGroup(alloc, table_name, group_id, lsm_root_generation)) |lease_value| {
+        if (try source.leaseGroup(alloc, table_name, group_id, lsm_root_generation, .{ .read_activity_held = true })) |lease_value| {
             validateProvisionedDbIdentityNamespace(alloc, catalog, table_name, group_id, lease_value.db) catch |err| {
                 var lease = lease_value;
                 lease.release(alloc);
@@ -16286,6 +16295,7 @@ test "provisioned local query reuses resident generation without readonly open" 
             table_name: []const u8,
             group_id: u64,
             lsm_root_generation: u64,
+            _: ResidentDbSource.LeaseOptions,
         ) !?ResidentDbLease {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
@@ -22033,6 +22043,7 @@ test "provisioned primary lookup lease fails on identity namespace mismatch" {
             _: []const u8,
             _: u64,
             _: u64,
+            _: ResidentDbSource.LeaseOptions,
         ) !?ResidentDbLease {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return .{

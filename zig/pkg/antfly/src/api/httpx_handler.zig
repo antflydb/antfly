@@ -49,6 +49,7 @@ const query_builder_agent = @import("query_builder_agent.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_api = @import("../metadata/api.zig");
+const metadata_authority = @import("../metadata/authority.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
 const test_contract_helpers = @import("test_contract_helpers.zig");
 const platform_time = @import("antfly_platform").time;
@@ -2243,8 +2244,8 @@ pub const AntflyApiHandler = struct {
             return ctx.text("unsupported table index configuration");
         };
         std.log.info("public create table begin table={s}", .{decoded_table_name});
-        const metadata_create_timeout_ns = 5 * std.time.ns_per_s;
-        const metadata_create_poll_ns = 50 * std.time.ns_per_ms;
+        const metadata_create_timeout_ns = http_server_mod.default_metadata_mutation_retry_timeout_ns;
+        const metadata_create_poll_ns = http_server_mod.default_metadata_mutation_retry_poll_ns;
         const metadata_create_start_ns = platform_time.monotonicNs();
         while (true) {
             self.api_server.source.createTable(alloc, decoded_table_name, create_req) catch |err| switch (err) {
@@ -2261,7 +2262,8 @@ pub const AntflyApiHandler = struct {
                     return ctx.text("method not allowed");
                 },
                 error.UnexpectedHttpStatus => {
-                    if (platform_time.monotonicNs() -| metadata_create_start_ns >= metadata_create_timeout_ns) {
+                    const elapsed_ns = platform_time.monotonicNs() -| metadata_create_start_ns;
+                    if (!http_server_mod.shouldRetryMetadataMutation(err, elapsed_ns, metadata_create_timeout_ns)) {
                         std.log.err("public create table metadata create failed table={s} err={}", .{ decoded_table_name, err });
                         return err;
                     }
@@ -2269,6 +2271,14 @@ pub const AntflyApiHandler = struct {
                     continue;
                 },
                 else => {
+                    if (metadata_authority.isRetryableError(err)) {
+                        const elapsed_ns = platform_time.monotonicNs() -| metadata_create_start_ns;
+                        if (http_server_mod.shouldRetryMetadataMutation(err, elapsed_ns, metadata_create_timeout_ns)) {
+                            sleepNs(metadata_create_poll_ns);
+                            continue;
+                        }
+                        return error.NotLeader;
+                    }
                     std.log.err("public create table metadata create failed table={s} err={}", .{ decoded_table_name, err });
                     return err;
                 },

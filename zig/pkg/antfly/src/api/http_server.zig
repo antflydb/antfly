@@ -1295,6 +1295,22 @@ fn persistRestoreTableIntent(
     _ = try workflow.createTableWithRanges(service, spec.table, spec.ranges);
 }
 
+pub const default_metadata_mutation_retry_timeout_ns: u64 = 5 * std.time.ns_per_s;
+pub const default_metadata_mutation_retry_poll_ns: u64 = 50 * std.time.ns_per_ms;
+
+const MetadataMutationRetryPolicy = struct {
+    timeout_ns: u64 = default_metadata_mutation_retry_timeout_ns,
+    poll_ns: u64 = default_metadata_mutation_retry_poll_ns,
+    max_attempts: ?usize = null,
+
+    fn shouldRetry(self: @This(), err: anyerror, elapsed_ns: u64, attempt_count: usize) bool {
+        if (self.max_attempts) |max_attempts| {
+            if (attempt_count >= max_attempts) return false;
+        }
+        return shouldRetryMetadataMutation(err, elapsed_ns, self.timeout_ns);
+    }
+};
+
 pub const ApiHttpServer = struct {
     const SupportedJoinRequest = distributed_join.SupportedJoinRequest;
     const SupportedJoinFilters = distributed_join.SupportedJoinFilters;
@@ -1641,6 +1657,7 @@ pub const ApiHttpServer = struct {
     owner_alloc: std.mem.Allocator,
     cfg: ApiHttpServerConfig,
     source: StatusSource,
+    metadata_mutation_retry_policy: MetadataMutationRetryPolicy = .{},
     table_reads: ?table_reads.TableReadSource = null,
     table_writes: ?table_writes.TableWriteSource = null,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
@@ -6174,24 +6191,32 @@ pub const ApiHttpServer = struct {
                     return try textResponse(self.alloc, 400, "unsupported table index configuration");
                 };
                 std.log.info("public create table begin table={s}", .{table_name});
-                const metadata_create_timeout_ns = 5 * std.time.ns_per_s;
-                const metadata_create_poll_ns = 50 * std.time.ns_per_ms;
                 const metadata_create_start_ns = platform_time.monotonicNs();
+                var metadata_create_attempts: usize = 0;
                 while (true) {
+                    metadata_create_attempts += 1;
                     self.source.createTable(self.alloc, table_name, create_req) catch |err| switch (err) {
                         error.TableAlreadyExists => return try textResponse(self.alloc, 409, "table already exists"),
                         error.InvalidCreateTableRequest => return try textResponse(self.alloc, 400, "invalid table configuration"),
                         error.UnsupportedOperation => return try textResponse(self.alloc, 405, "method not allowed"),
                         error.UnexpectedHttpStatus => {
-                            if (platform_time.monotonicNs() -| metadata_create_start_ns >= metadata_create_timeout_ns) {
+                            const elapsed_ns = platform_time.monotonicNs() -| metadata_create_start_ns;
+                            if (!self.metadata_mutation_retry_policy.shouldRetry(err, elapsed_ns, metadata_create_attempts)) {
                                 std.log.err("public create table metadata create failed table={s} err={}", .{ table_name, err });
                                 return err;
                             }
-                            sleepNs(metadata_create_poll_ns);
+                            sleepNs(self.metadata_mutation_retry_policy.poll_ns);
                             continue;
                         },
                         else => {
-                            if (metadata_authority.isRetryableError(err)) return error.NotLeader;
+                            if (metadata_authority.isRetryableError(err)) {
+                                const elapsed_ns = platform_time.monotonicNs() -| metadata_create_start_ns;
+                                if (self.metadata_mutation_retry_policy.shouldRetry(err, elapsed_ns, metadata_create_attempts)) {
+                                    sleepNs(self.metadata_mutation_retry_policy.poll_ns);
+                                    continue;
+                                }
+                                return error.NotLeader;
+                            }
                             std.log.err("public create table metadata create failed table={s} err={}", .{ table_name, err });
                             return err;
                         },
@@ -17259,6 +17284,24 @@ fn restoreIdempotencyNamespaceAlloc(
 fn metadataAccessFailure(err: anyerror) error{ NotLeader, InternalFailure } {
     if (metadata_authority.isRetryableError(err)) return error.NotLeader;
     return error.InternalFailure;
+}
+
+pub fn shouldRetryMetadataMutation(err: anyerror, elapsed_ns: u64, timeout_ns: u64) bool {
+    return elapsed_ns < timeout_ns and
+        (err == error.UnexpectedHttpStatus or metadata_authority.isRetryableError(err));
+}
+
+test "public metadata mutation retries transient authority loss only within its deadline" {
+    const timeout_ns = default_metadata_mutation_retry_timeout_ns;
+    try std.testing.expect(shouldRetryMetadataMutation(error.NotLeader, timeout_ns - 1, timeout_ns));
+    try std.testing.expect(shouldRetryMetadataMutation(error.ProposalDropped, 0, timeout_ns));
+    try std.testing.expect(shouldRetryMetadataMutation(error.UnexpectedHttpStatus, 0, timeout_ns));
+    try std.testing.expect(!shouldRetryMetadataMutation(error.NotLeader, timeout_ns, timeout_ns));
+    try std.testing.expect(!shouldRetryMetadataMutation(error.InvalidArguments, 0, timeout_ns));
+
+    const bounded_attempts = MetadataMutationRetryPolicy{ .max_attempts = 3 };
+    try std.testing.expect(bounded_attempts.shouldRetry(error.NotLeader, 0, 2));
+    try std.testing.expect(!bounded_attempts.shouldRetry(error.NotLeader, 0, 3));
 }
 
 pub fn buildLocalSchemaUpdateStatus(alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !struct {
@@ -31392,6 +31435,7 @@ test "api http server returns retryable not leader when local reconcile lease is
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    server.metadata_mutation_retry_policy = .{ .poll_ns = 0, .max_attempts = 3 };
     const create_body = try test_contract_helpers.encodeCreateTableRequest(alloc, "docs table");
     defer alloc.free(create_body);
 
@@ -31404,7 +31448,7 @@ test "api http server returns retryable not leader when local reconcile lease is
     defer resp.deinit(alloc);
 
     try expectPublicMetadataNotLeaderResponse(resp);
-    try std.testing.expectEqual(@as(usize, 1), source.create_calls);
+    try std.testing.expectEqual(@as(usize, 3), source.create_calls);
 }
 
 test "api http server returns retryable not leader when metadata proposal is dropped" {
@@ -31436,6 +31480,7 @@ test "api http server returns retryable not leader when metadata proposal is dro
 
     var source = FakeSource{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    server.metadata_mutation_retry_policy = .{ .poll_ns = 0, .max_attempts = 3 };
     const create_body = try test_contract_helpers.encodeCreateTableRequest(alloc, "docs table");
     defer alloc.free(create_body);
 
@@ -31448,7 +31493,7 @@ test "api http server returns retryable not leader when metadata proposal is dro
     defer resp.deinit(alloc);
 
     try expectPublicMetadataNotLeaderResponse(resp);
-    try std.testing.expectEqual(@as(usize, 1), source.create_calls);
+    try std.testing.expectEqual(@as(usize, 3), source.create_calls);
 }
 
 test "api http server returns retryable not leader through public table adapter mutation" {

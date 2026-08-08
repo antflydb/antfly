@@ -100,6 +100,20 @@ const TransitionActionLanes = struct {
     }
 };
 
+/// Capture a value from Raft state without waiting after an operation's budget
+/// has elapsed. The mutex is always released before this returns, which keeps
+/// formatting and synchronous log I/O outside the consensus critical section.
+fn tryCaptureRaftAfterDeadline(
+    comptime Result: type,
+    mutex: *std.atomic.Mutex,
+    context: anytype,
+    comptime captureFn: fn (@TypeOf(context)) Result,
+) ?Result {
+    if (!mutex.tryLock()) return null;
+    defer mutex.unlock();
+    return captureFn(context);
+}
+
 const runtime_status_refresh_max_db_opens_per_run: usize = 16;
 const runtime_status_disk_usage_refresh_interval_ns: u64 = 30 * std.time.ns_per_s;
 const auto_bulk_finish_poll_interval_ms: u64 = 250;
@@ -3568,6 +3582,71 @@ const TransitionDbLeaseContext = struct {
     }
 };
 
+const RaftBatchLeaderStatusDiagnostics = struct {
+    node_id: u64,
+    role: raft_engine.core.types.StateRole,
+    leader_id: ?u64,
+    voter_count: usize,
+    term: u64,
+    election_elapsed: u32,
+    election_timeout: u32,
+    votes_granted: usize,
+    votes_rejected: usize,
+    votes_unknown: usize,
+    commit_index: u64,
+    last_index: u64,
+    applied_index: u64,
+};
+
+const RaftBatchLeaderTimeoutDiagnostics = struct {
+    status: ?RaftBatchLeaderStatusDiagnostics,
+    served_group_count: usize,
+    peer_route_count: usize,
+    sent_frames: usize,
+    send_failures: usize,
+    retries_scheduled: usize,
+    retries_exhausted: usize,
+    pending_retry_count: usize,
+};
+
+const RaftBatchLeaderTimeoutCaptureContext = struct {
+    raft: *antfly.raft.ManagedHttpHostService,
+    group_id: u64,
+};
+
+fn captureRaftBatchLeaderTimeoutDiagnostics(context: RaftBatchLeaderTimeoutCaptureContext) RaftBatchLeaderTimeoutDiagnostics {
+    const transport_host = &context.raft.host.http_host.transport_stack.transport_host;
+    const transport_metrics = transport_host.metricsSnapshot();
+    const status = if (context.raft.host.http_host.host.raftStatus(context.group_id)) |raft_status|
+        RaftBatchLeaderStatusDiagnostics{
+            .node_id = raft_status.id,
+            .role = raft_status.soft.role,
+            .leader_id = raft_status.soft.leader_id,
+            .voter_count = raft_status.conf_state.voters.len,
+            .term = raft_status.hard.current_term,
+            .election_elapsed = raft_status.election_elapsed,
+            .election_timeout = raft_status.randomized_election_timeout,
+            .votes_granted = raft_status.votes_granted,
+            .votes_rejected = raft_status.votes_rejected,
+            .votes_unknown = raft_status.votes_unknown,
+            .commit_index = raft_status.hard.commit_index,
+            .last_index = raft_status.last_index,
+            .applied_index = raft_status.applied_index,
+        }
+    else
+        null;
+    return .{
+        .status = status,
+        .served_group_count = transport_host.served_groups.count(),
+        .peer_route_count = transport_host.peer_routes.count(),
+        .sent_frames = transport_metrics.sent_frames,
+        .send_failures = transport_metrics.send_failures,
+        .retries_scheduled = transport_metrics.retries_scheduled,
+        .retries_exhausted = transport_metrics.retries_exhausted,
+        .pending_retry_count = transport_host.pendingRetryCount(),
+    };
+}
+
 pub const DataServer = struct {
     const SplitProjectionReconcileResult = union(enum) {
         advanced,
@@ -5400,16 +5479,17 @@ pub const DataServer = struct {
         table_name: []const u8,
         group_id: u64,
         lsm_root_generation: u64,
+        options: antfly.public_api.table_reads.ResidentDbSource.LeaseOptions,
     ) !?antfly.public_api.table_reads.ResidentDbLease {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         if (self.data_raft_apply) |apply_sm| {
             const apply_source = apply_sm.write_source.residentDbSource();
-            if (try apply_source.leaseGroup(alloc, table_name, group_id, lsm_root_generation)) |lease| {
+            if (try apply_source.leaseGroup(alloc, table_name, group_id, lsm_root_generation, options)) |lease| {
                 return lease;
             }
         }
         const write_source = self.write_source.residentDbSource();
-        return try write_source.leaseGroup(alloc, table_name, group_id, lsm_root_generation);
+        return try write_source.leaseGroup(alloc, table_name, group_id, lsm_root_generation, options);
     }
 
     fn localRaftBatchGroup(
@@ -5766,44 +5846,55 @@ pub const DataServer = struct {
 
     fn logRaftBatchLeaderTimeout(self: *DataServer, group_id: u64) void {
         const raft = self.data_raft orelse return;
-        lockAtomic(&self.data_raft_mutex);
-        defer self.data_raft_mutex.unlock();
-        const transport_host = &raft.host.http_host.transport_stack.transport_host;
-        const transport_metrics = transport_host.metricsSnapshot();
-        if (raft.host.http_host.host.raftStatus(group_id)) |status| {
+        const diagnostics = tryCaptureRaftAfterDeadline(
+            RaftBatchLeaderTimeoutDiagnostics,
+            &self.data_raft_mutex,
+            RaftBatchLeaderTimeoutCaptureContext{ .raft = raft, .group_id = group_id },
+            captureRaftBatchLeaderTimeoutDiagnostics,
+        ) orelse {
+            // The compact record still preserves the group id; a later attempt
+            // can emit the full snapshot once the mutex is available again.
+            std.log.warn("data raft leader wait timed out group_id={} diagnostics=raft_mutex_contended", .{group_id});
+            return;
+        };
+
+        // Logging is synchronous and takes the process-wide stderr mutex. The
+        // snapshot helper has already released data_raft_mutex, so a blocked
+        // log sink cannot stop Raft progress or participate in a lock cycle.
+        if (diagnostics.status) |status| {
             std.log.warn("data raft leader wait timed out group_id={} node_id={} role={} leader={?} voters={} term={} election_elapsed={} election_timeout={} votes_granted={} votes_rejected={} votes_unknown={} commit={} last={} applied={} served_groups={} peer_routes={} sent_frames={} send_failures={} retries_scheduled={} retries_exhausted={} pending_retries={}", .{
                 group_id,
-                status.id,
-                status.soft.role,
-                status.soft.leader_id,
-                status.conf_state.voters.len,
-                status.hard.current_term,
+                status.node_id,
+                status.role,
+                status.leader_id,
+                status.voter_count,
+                status.term,
                 status.election_elapsed,
-                status.randomized_election_timeout,
+                status.election_timeout,
                 status.votes_granted,
                 status.votes_rejected,
                 status.votes_unknown,
-                status.hard.commit_index,
+                status.commit_index,
                 status.last_index,
                 status.applied_index,
-                transport_host.served_groups.count(),
-                transport_host.peer_routes.count(),
-                transport_metrics.sent_frames,
-                transport_metrics.send_failures,
-                transport_metrics.retries_scheduled,
-                transport_metrics.retries_exhausted,
-                transport_host.pendingRetryCount(),
+                diagnostics.served_group_count,
+                diagnostics.peer_route_count,
+                diagnostics.sent_frames,
+                diagnostics.send_failures,
+                diagnostics.retries_scheduled,
+                diagnostics.retries_exhausted,
+                diagnostics.pending_retry_count,
             });
         } else {
             std.log.warn("data raft leader wait timed out group_id={} status=missing served_groups={} peer_routes={} sent_frames={} send_failures={} retries_scheduled={} retries_exhausted={} pending_retries={}", .{
                 group_id,
-                transport_host.served_groups.count(),
-                transport_host.peer_routes.count(),
-                transport_metrics.sent_frames,
-                transport_metrics.send_failures,
-                transport_metrics.retries_scheduled,
-                transport_metrics.retries_exhausted,
-                transport_host.pendingRetryCount(),
+                diagnostics.served_group_count,
+                diagnostics.peer_route_count,
+                diagnostics.sent_frames,
+                diagnostics.send_failures,
+                diagnostics.retries_scheduled,
+                diagnostics.retries_exhausted,
+                diagnostics.pending_retry_count,
             });
         }
     }
@@ -6091,7 +6182,10 @@ pub const DataServer = struct {
 
     fn localDataRaftLeaderReady(self: *DataServer, group_id: u64) bool {
         const raft = self.data_raft orelse return false;
-        lockAtomic(&self.data_raft_mutex);
+        // This probe is used at an expired request deadline. Treat contention
+        // as not-ready so the caller returns on time instead of waiting on the
+        // same Raft critical section whose progress it is diagnosing.
+        if (!self.data_raft_mutex.tryLock()) return false;
         defer self.data_raft_mutex.unlock();
         return raft.host.http_host.host.isLocalLeader(group_id);
     }
@@ -12262,7 +12356,11 @@ const RemoteMetadataSource = struct {
 
     alloc: std.mem.Allocator,
     base_uris: [][]u8,
-    preferred_base_uri_index: usize = 0,
+    // Mutations discover the current leader by trying every configured
+    // endpoint. Keep that authority affinity separate from ordinary reads:
+    // a successful read from a reachable-but-lagging follower must not steer
+    // the next mutation or post-mutation catalog refresh away from the leader.
+    preferred_authority_uri_index: usize = 0,
     cache_mutex: std.atomic.Mutex = .unlocked,
     cached_head: ?antfly.metadata_api.MetadataHead = null,
     metadata_incarnation: ?antfly.metadata_api.MetadataClusterIncarnation = null,
@@ -12335,15 +12433,33 @@ const RemoteMetadataSource = struct {
 
     fn metadataApiIndexForAttempt(self: *RemoteMetadataSource, attempt: usize) usize {
         lockAtomic(&self.cache_mutex);
-        const start = self.preferred_base_uri_index % self.base_uris.len;
+        const start = self.preferred_authority_uri_index % self.base_uris.len;
         self.cache_mutex.unlock();
         return (start + attempt) % self.base_uris.len;
     }
 
-    fn noteMetadataApiSuccess(self: *RemoteMetadataSource, index: usize) void {
+    fn noteMetadataAuthoritySuccess(self: *RemoteMetadataSource, index: usize) void {
         lockAtomic(&self.cache_mutex);
-        self.preferred_base_uri_index = index;
+        self.preferred_authority_uri_index = index;
         self.cache_mutex.unlock();
+    }
+
+    fn sameMetadataIncarnation(left: antfly.metadata_api.MetadataHead, right: antfly.metadata_api.MetadataHead) bool {
+        return left.metadata_group_id == right.metadata_group_id and
+            std.meta.eql(left.metadata_incarnation, right.metadata_incarnation);
+    }
+
+    fn monotonicMetadataHead(cached: antfly.metadata_api.MetadataHead, candidate: antfly.metadata_api.MetadataHead) antfly.metadata_api.MetadataHead {
+        if (sameMetadataIncarnation(cached, candidate) and cached.metadata_epoch > candidate.metadata_epoch) return cached;
+        return candidate;
+    }
+
+    fn snapshotHead(snapshot: *const antfly.metadata_api.AdminSnapshot) antfly.metadata_api.MetadataHead {
+        return .{
+            .metadata_group_id = snapshot.status.metadata_group_id,
+            .metadata_incarnation = snapshot.status.metadata_incarnation,
+            .metadata_epoch = snapshot.status.metadata_epoch,
+        };
     }
 
     fn acceptMetadataIncarnation(
@@ -12389,6 +12505,10 @@ const RemoteMetadataSource = struct {
         const head = try self.fetchRemoteHead(budget);
         lockAtomic(&self.cache_mutex);
         defer self.cache_mutex.unlock();
+        if (self.cached_head) |cached| {
+            const selected = monotonicMetadataHead(cached, head);
+            if (selected.metadata_epoch != head.metadata_epoch) return selected;
+        }
         self.cached_head = head;
         self.cached_head_at_ms = now_ms;
         return head;
@@ -12454,39 +12574,40 @@ const RemoteMetadataSource = struct {
         try ensureBudgetActive(budget);
         const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
         lockAtomic(&self.cache_mutex);
-        if (self.cached_head) |cached_head| {
-            if (self.cached_snapshot) |snapshot| {
-                if (cached_head.metadata_group_id == head.metadata_group_id and
-                    std.meta.eql(cached_head.metadata_incarnation, head.metadata_incarnation) and
-                    cached_head.metadata_epoch == head.metadata_epoch and
-                    now_ms -| self.cached_snapshot_at_ms <= metadata_snapshot_cache_ttl_ms)
-                {
-                    defer self.cache_mutex.unlock();
-                    return try cloneAdminSnapshotOwned(self.alloc, snapshot);
-                }
+        if (self.cached_snapshot) |snapshot| {
+            const cached_snapshot_head = snapshotHead(&snapshot);
+            if (sameMetadataIncarnation(cached_snapshot_head, head) and
+                cached_snapshot_head.metadata_epoch >= head.metadata_epoch and
+                now_ms -| self.cached_snapshot_at_ms <= metadata_snapshot_cache_ttl_ms)
+            {
+                defer self.cache_mutex.unlock();
+                return try cloneAdminSnapshotOwned(self.alloc, snapshot);
             }
         }
         self.cache_mutex.unlock();
 
         var fresh = try self.fetchSnapshotRemoteWithBudget(head, budget);
         errdefer freeAdminSnapshotOwned(self.alloc, &fresh);
+        const fresh_head = snapshotHead(&fresh);
 
         lockAtomic(&self.cache_mutex);
         defer self.cache_mutex.unlock();
-        if (self.cached_head) |cached_head| {
-            if (self.cached_snapshot) |snapshot| {
-                if (cached_head.metadata_group_id == head.metadata_group_id and
-                    std.meta.eql(cached_head.metadata_incarnation, head.metadata_incarnation) and
-                    cached_head.metadata_epoch == head.metadata_epoch and
-                    now_ms -| self.cached_snapshot_at_ms <= metadata_snapshot_cache_ttl_ms)
-                {
-                    return try cloneAdminSnapshotOwned(self.alloc, snapshot);
-                }
+        if (self.cached_snapshot) |snapshot| {
+            const cached_snapshot_head = snapshotHead(&snapshot);
+            // Concurrent follower reads may complete after a leader read.
+            // Never let that race regress the process-wide catalog view.
+            if (sameMetadataIncarnation(cached_snapshot_head, fresh_head) and
+                cached_snapshot_head.metadata_epoch > fresh_head.metadata_epoch)
+            {
+                return try cloneAdminSnapshotOwned(self.alloc, snapshot);
             }
         }
         if (self.cached_snapshot) |*snapshot| freeAdminSnapshotOwned(self.alloc, snapshot);
         self.cached_snapshot = fresh;
-        self.cached_head = head;
+        self.cached_head = if (self.cached_head) |cached_head|
+            monotonicMetadataHead(cached_head, fresh_head)
+        else
+            fresh_head;
         self.cached_head_at_ms = now_ms;
         self.cached_snapshot_at_ms = now_ms;
         return try cloneAdminSnapshotOwned(self.alloc, self.cached_snapshot.?);
@@ -12560,7 +12681,7 @@ const RemoteMetadataSource = struct {
                 last_err = err;
                 continue;
             };
-            self.noteMetadataApiSuccess(index);
+            self.noteMetadataAuthoritySuccess(index);
             return result;
         }
         return last_err;
@@ -12591,7 +12712,6 @@ const RemoteMetadataSource = struct {
                 last_err = err;
                 continue;
             };
-            self.noteMetadataApiSuccess(index);
             return head;
         }
         return last_err;
@@ -12614,7 +12734,6 @@ const RemoteMetadataSource = struct {
                 last_err = err;
                 continue;
             };
-            self.noteMetadataApiSuccess(index);
             return status;
         }
         return last_err;
@@ -12657,7 +12776,6 @@ const RemoteMetadataSource = struct {
                 last_err = error.MetadataSnapshotHeadMismatch;
                 continue;
             }
-            self.noteMetadataApiSuccess(index);
             return try cloneAdminSnapshotOwned(self.alloc, parsed.value);
         }
         return last_err;
@@ -12694,7 +12812,6 @@ const RemoteMetadataSource = struct {
                 last_err = err;
                 continue;
             };
-            self.noteMetadataApiSuccess(index);
             return valid;
         }
         return last_err;
@@ -12716,7 +12833,6 @@ const RemoteMetadataSource = struct {
                 last_err = err;
                 continue;
             };
-            self.noteMetadataApiSuccess(index);
             return valid;
         }
         return last_err;
@@ -24717,6 +24833,48 @@ test "remote metadata source pins one cluster incarnation across cache invalidat
     );
 }
 
+test "remote metadata source retains mutation authority across cache invalidation" {
+    var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{});
+    defer backend_runtime.deinit();
+    var source = try RemoteMetadataSource.init(
+        std.testing.allocator,
+        &.{ "http://metadata-1.invalid", "http://metadata-2.invalid", "http://metadata-3.invalid" },
+        backend_runtime.ptr().apiIoImpl().?,
+    );
+    defer source.deinit();
+
+    source.noteMetadataAuthoritySuccess(2);
+    try std.testing.expectEqual(@as(usize, 2), source.metadataApiIndexForAttempt(0));
+    try std.testing.expectEqual(@as(usize, 0), source.metadataApiIndexForAttempt(1));
+    try std.testing.expectEqual(@as(usize, 1), source.metadataApiIndexForAttempt(2));
+
+    source.cached_head = .{ .metadata_group_id = 9, .metadata_epoch = 17 };
+    source.invalidateCache();
+    try std.testing.expectEqual(@as(usize, 2), source.metadataApiIndexForAttempt(0));
+}
+
+test "remote metadata cache orders heads monotonically within an incarnation" {
+    const incarnation: antfly.metadata_api.MetadataClusterIncarnation = "11111111111111111111111111111111".*;
+    const older = antfly.metadata_api.MetadataHead{
+        .metadata_group_id = 9,
+        .metadata_incarnation = incarnation,
+        .metadata_epoch = 16,
+    };
+    const newer = antfly.metadata_api.MetadataHead{
+        .metadata_group_id = 9,
+        .metadata_incarnation = incarnation,
+        .metadata_epoch = 17,
+    };
+    try std.testing.expect(RemoteMetadataSource.sameMetadataIncarnation(older, newer));
+    try std.testing.expectEqual(newer, RemoteMetadataSource.monotonicMetadataHead(newer, older));
+    try std.testing.expectEqual(newer, RemoteMetadataSource.monotonicMetadataHead(older, newer));
+
+    var foreign = newer;
+    foreign.metadata_group_id = 10;
+    try std.testing.expect(!RemoteMetadataSource.sameMetadataIncarnation(newer, foreign));
+    try std.testing.expectEqual(foreign, RemoteMetadataSource.monotonicMetadataHead(newer, foreign));
+}
+
 test "remote metadata source shares backend runtime io across a bounded executor pool" {
     var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{});
     defer backend_runtime.deinit();
@@ -24751,6 +24909,34 @@ test "data raft forwarding distinguishes safe retries from ambiguous outcomes" {
     // RaftBatchWriteOutcomeUnknown. A raw OOM can only reach this classifier
     // when request setup was proven not to have sent bytes.
     try std.testing.expectEqual(.terminal, DataServer.classifyDataRaftForwardError(error.OutOfMemory));
+}
+
+test "expired data raft deadline snapshots never wait and release before returning" {
+    const Capture = struct {
+        fn run(call_count: *usize) usize {
+            call_count.* += 1;
+            return 42;
+        }
+    };
+
+    var mutex: std.atomic.Mutex = .unlocked;
+    var capture_calls: usize = 0;
+    lockAtomic(&mutex);
+    const contended = tryCaptureRaftAfterDeadline(usize, &mutex, &capture_calls, Capture.run);
+    mutex.unlock();
+
+    // A contended timeout path neither waits nor touches Raft state.
+    try std.testing.expectEqual(@as(?usize, null), contended);
+    try std.testing.expectEqual(@as(usize, 0), capture_calls);
+
+    const captured = tryCaptureRaftAfterDeadline(usize, &mutex, &capture_calls, Capture.run);
+    try std.testing.expectEqual(@as(?usize, 42), captured);
+    try std.testing.expectEqual(@as(usize, 1), capture_calls);
+
+    // Successful capture releases the critical section before the caller can
+    // perform synchronous logging.
+    try std.testing.expect(mutex.tryLock());
+    mutex.unlock();
 }
 
 test "data raft batch forwarding bounds routing campaigns deadlines and deterministic fallback" {
