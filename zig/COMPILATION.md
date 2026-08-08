@@ -137,6 +137,7 @@ the same host, target, cache state, and report set.
 | Reuse distributed archive for CAPI | `libantfly.so` temporarily grew 16.6 MB → 28.3 MB | Needed section-level GC |
 | Function/data section GC | `libantfly.so` returned to 16.55 MB | Kept |
 | Production LSM-only feature set | No `mdb_*` or LMDB backend symbols in the storage archive | Kept; LMDB remains in test/legacy profiles |
+| Opt-in build-only storage kernel | Distributed 425.652 s → 415.352 s, but added a 230.093 s unit and raised duplicate instances from 393 to 756 | Keep only as Phase 2 scaffolding; do not enable in production yet |
 
 The `/tmp` graph analysis was consolidated into
 `tools/analyze_zig_import_graph.py`. It reports lexical reachability, consumes
@@ -215,6 +216,52 @@ Artifacts from that profile were:
 The distributed/storage archive contained no `mdb_*`, `lmdb_backend`, or
 `backend_lmdb` symbols. Remaining LMDB strings are metric names, compatibility
 enums, or diagnostics rather than the production engine.
+
+### Phase 1 build-only storage-kernel result
+
+The first opt-in skeleton was measured from fresh local and global caches on
+the same macOS host, cross-compiling ARM64 Linux musl `ReleaseFast` with normal
+build concurrency. It compiled the existing coarse, opaque-handle C API DB
+implementation into a fourth PIC static archive. The distributed runtime no
+longer rooted those C API exports, while the executable and both shared C API
+libraries linked the new archive.
+
+| Unit | Compiler time | LLVM emit | Declarations | Repository Zig files |
+|---|---:|---:|---:|---:|
+| API kernel | 147.667 s | 143.258 s | 17,232 | 325 |
+| Distributed control plus direct storage ownership | 415.352 s | 406.186 s | 41,984 | 723 |
+| Experimental storage kernel | 230.093 s | 224.432 s | 25,362 | 367 |
+| Inference | 247.848 s | 239.826 s | 24,945 | 523 |
+
+The clean build completed all 26 steps. The largest sampled compiler RSS was
+about 4.34 GiB during distributed LLVM emission; this was observational
+sampling rather than a per-unit peak-RSS trace.
+
+The distributed unit improved by only 10.300 seconds (2.4%) and 721
+declarations. Meanwhile, aggregate duplicate repository-file instances rose
+from 393 to 756. The storage unit shared 363 of its 367 repository Zig files
+with distributed—98.9% of the smaller graph. This is the expected result while
+the runtimes continue to own and call storage implementations directly.
+
+Artifact boundaries remained healthy:
+
+| Artifact | Phase 1 size | Baseline size |
+|---|---:|---:|
+| `antfly` ARM64 static executable | 57,638,496 bytes | 57,640,592 bytes |
+| `libantfly.so` | 16,355,776 bytes | 16,554,944 bytes |
+| distributed archive | 33,939,148 bytes | 41,591,102 bytes |
+| experimental storage archive | 22,115,732 bytes | not present |
+
+Neither the executable nor shared C API library contained production LMDB
+implementation symbols. The shared library exported the intended `antfly_db_*`
+surface and did not retain distributed runtime entry points.
+
+Decision: the skeleton validates the link topology, PIC reuse, opaque handle
+convention, and section GC, so it remains available behind
+`-Dstorage-kernel-experiment=true`. It is not enabled by default and is not a
+go decision by itself. The next measurement must move one complete local query
+through the compiled boundary. If that does not materially reduce the
+distributed unit, the experiment stops as required by the go/no-go criteria.
 
 ## Holistic target architecture
 
@@ -429,6 +476,21 @@ zig build \
   -Dlinked-runtime-libraries=true \
   -Dproduction-lsm-only=true
 ```
+
+The opt-in Phase 1/2 storage-kernel scaffold adds:
+
+```sh
+zig build \
+  -Dtarget=aarch64-linux-musl \
+  -Doptimize=ReleaseFast \
+  -Dstrip=true \
+  -Dlinked-runtime-libraries=true \
+  -Dproduction-lsm-only=true \
+  -Dstorage-kernel-experiment=true
+```
+
+This option is intentionally off by default until the representative query
+slice meets the go/no-go criteria.
 
 Compatibility validation keeps the linked architecture but enables LMDB:
 

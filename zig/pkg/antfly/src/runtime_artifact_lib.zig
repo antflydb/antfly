@@ -21,6 +21,8 @@ const std = @import("std");
 const platform = @import("antfly_platform");
 const bridge = @import("runtime_bridge.zig");
 const unit_options = @import("runtime_library_options");
+const owns_storage_kernel = unit_options.unit == .storage_kernel or
+    (unit_options.unit == .distributed and !unit_options.storage_kernel_experiment);
 const standalone_inference_bridge = @import("standalone/inference_bridge.zig");
 const restore_staging_exports = if (unit_options.unit == .distributed)
     @import("standalone/restore_staging_exports.zig")
@@ -30,7 +32,7 @@ const api_kernel_exports = if (unit_options.unit == .api_kernel)
     @import("api/kernel_exports.zig")
 else
     struct {};
-const storage_kernel_exports = if (unit_options.unit == .distributed)
+const storage_kernel_exports = if (owns_storage_kernel)
     @import("capi/db.zig")
 else
     struct {};
@@ -187,7 +189,7 @@ comptime {
             // Importing the C ABI implementation makes its `pub export`
             // declarations roots of this PIC archive. The executable and both
             // C ABI library names link this exact compiled artifact.
-            _ = storage_kernel_exports;
+            if (!unit_options.storage_kernel_experiment) _ = storage_kernel_exports;
             exportInternal(&cliEntry, "antfly_runtime_cli");
             exportInternal(&dataEntry, "antfly_runtime_data");
             exportInternal(&metadataEntry, "antfly_runtime_metadata");
@@ -195,6 +197,13 @@ comptime {
             exportInternal(&standaloneEntry, "antfly_runtime_standalone");
             exportInternal(&restore_staging_exports.create, "antfly_restore_staging_create");
             exportInternal(&restore_staging_exports.destroy, "antfly_restore_staging_destroy");
+        },
+        .storage_kernel => {
+            // The experiment gives the existing coarse CAPI DB implementation
+            // its own PIC compilation unit. Consumer runtimes continue to own
+            // storage directly until representative operations migrate across
+            // this ABI in later phases.
+            _ = storage_kernel_exports;
         },
         .inference => {
             exportInternal(&inferenceEntry, "antfly_runtime_inference");

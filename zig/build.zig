@@ -49,6 +49,7 @@ const RuntimeArtifactRole = enum {
 
 const RuntimeLibraryUnit = enum {
     api_kernel,
+    storage_kernel,
     // CLI shares enough of the storage graph with the distributed roles that
     // co-generation shortens the measured ReleaseFast critical path.
     distributed,
@@ -1205,10 +1206,14 @@ pub fn build(b: *std.Build) void {
     const cli_focused_root = b.option(bool, "cli-focused-root", "Build the full CLI against its focused Antfly facade") orelse false;
     const runtime_artifact_role = b.option(RuntimeArtifactRole, "runtime-artifact-role", "Build one focused runtime artifact: cli, data, inference, metadata, or standalone");
     const linked_runtime_libraries = b.option(bool, "linked-runtime-libraries", "Code-generate server runtimes separately and link them into one executable") orelse false;
+    const storage_kernel_experiment = b.option(bool, "storage-kernel-experiment", "Compile the CAPI storage implementation as its own linked runtime unit") orelse false;
     const production_lsm_only = b.option(bool, "production-lsm-only", "Compile LMDB out of production runtime units") orelse linked_runtime_libraries;
     const antfly_bin_name = b.option([]const u8, "antfly-bin-name", "Installed filename for the top-level Antfly CLI") orelse "antfly";
     if (linked_runtime_libraries and edition != .full) {
         @panic("-Dlinked-runtime-libraries=true requires -Dedition=full");
+    }
+    if (storage_kernel_experiment and !linked_runtime_libraries) {
+        @panic("-Dstorage-kernel-experiment=true requires -Dlinked-runtime-libraries=true");
     }
     if (antfly_bin_name.len == 0 or std.mem.indexOfAny(u8, antfly_bin_name, "/\\") != null) {
         @panic("-Dantfly-bin-name must be a non-empty filename, not a path");
@@ -8545,19 +8550,23 @@ pub fn build(b: *std.Build) void {
 
     if (linked_runtime_libraries) {
         inline for (std.meta.tags(RuntimeLibraryUnit)) |unit| {
+            const unit_enabled = unit != .storage_kernel or storage_kernel_experiment;
+            const owns_storage_kernel = unit == .storage_kernel or
+                (unit == .distributed and !storage_kernel_experiment);
             const unit_options = b.addOptions();
             unit_options.addOption(RuntimeLibraryUnit, "unit", unit);
+            unit_options.addOption(bool, "storage_kernel_experiment", storage_kernel_experiment);
 
             const role_mod = b.createModule(.{
                 .root_source_file = b.path("pkg/antfly/src/runtime_artifact_lib.zig"),
                 .target = target,
                 .optimize = optimize,
                 .sanitize_thread = sanitize_thread,
-                .pic = if (unit == .distributed) true else null,
+                .pic = if (owns_storage_kernel) true else null,
             });
             antfly_imports.configure(b, role_mod, false, link_libc);
             role_mod.addImport("antfly-client", antfly_client_pkg_mod);
-            if (unit == .distributed) role_mod.addImport("antfly_storage_root", role_mod);
+            if (owns_storage_kernel) role_mod.addImport("antfly_storage_root", role_mod);
             role_mod.addOptions("runtime_library_options", unit_options);
             const role_usermgr_storage_mod = b.createModule(.{
                 .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
@@ -8569,19 +8578,27 @@ pub fn build(b: *std.Build) void {
             role_mod.addImport("usermgr_storage", role_usermgr_storage_mod);
 
             const role_artifact = b.addLibrary(.{
-                .name = if (unit == .distributed)
-                    "antfly-storage-kernel"
-                else
-                    b.fmt("antfly-runtime-{s}", .{@tagName(unit)}),
+                .name = switch (unit) {
+                    .storage_kernel => if (storage_kernel_experiment)
+                        "antfly-storage-kernel"
+                    else
+                        "antfly-storage-kernel-disabled",
+                    .distributed => if (storage_kernel_experiment)
+                        "antfly-runtime-distributed"
+                    else
+                        "antfly-storage-kernel",
+                    else => b.fmt("antfly-runtime-{s}", .{@tagName(unit)}),
+                },
                 .root_module = role_mod,
                 .linkage = .static,
                 .max_rss = switch (unit) {
                     .api_kernel => 5 * 1024 * 1024 * 1024,
+                    .storage_kernel => 8 * 1024 * 1024 * 1024,
                     .distributed => 11 * 1024 * 1024 * 1024,
                     .inference => 8 * 1024 * 1024 * 1024,
                 },
             });
-            if (unit == .distributed) {
+            if (owns_storage_kernel) {
                 // The executable and C ABI libraries share this one optimized
                 // PIC object. Give the final links enough section granularity
                 // to retain only the C ABI roots in the shared libraries while
@@ -8594,11 +8611,11 @@ pub fn build(b: *std.Build) void {
             // archive is PIC because the executable and C ABI libraries share
             // it; all three consumers therefore reuse the same analyzed and
             // optimized storage graph.
-            if (unit == .distributed) {
+            if (unit_enabled and owns_storage_kernel) {
                 capi_link_mod.linkLibrary(role_artifact);
                 lite_capi_link_mod.linkLibrary(role_artifact);
             }
-            antfly_main.root_module.linkLibrary(role_artifact);
+            if (unit_enabled) antfly_main.root_module.linkLibrary(role_artifact);
             if (strip) {
                 var visited = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
                 defer visited.deinit();
