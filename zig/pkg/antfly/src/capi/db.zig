@@ -38,6 +38,7 @@ const batch_api = antfly.public_api.batch;
 const query_api = antfly.public_api.query;
 const table_reads_api = antfly.public_api.table_reads;
 const distributed_graph = antfly.public_api.distributed_graph;
+const runtime_status = antfly.public_api.runtime_status;
 const Allocator = std.mem.Allocator;
 
 const lite_abi_version: u32 = 1;
@@ -2010,6 +2011,37 @@ pub fn storageOwnerDocumentArtifactManifestsJson(
         manifests,
     ) catch |err| return storageOwnerStatusFromError(err);
     out_response.* = .{ .ptr = response.ptr, .len = @intCast(response.len) };
+    return .ok;
+}
+
+pub fn storageOwnerRuntimeStatusJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.JsonOperationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerOperationTableName(handle, request) orelse return .invalid_argument;
+
+    var status = runtime_status.LocalTableRuntimeStatus{
+        .stats = handle.db.runtimeStatusStatsConsistent(handle.alloc) catch |err|
+            return storageOwnerStatusFromError(err),
+        .lsm_storage_stats = .{
+            .maintenance = handle.db.snapshotLsmMaintenanceStats(),
+            .write = handle.db.snapshotLsmWriteStats(),
+            .maintenance_score = handle.db.lsmMaintenanceScore(),
+            .maintenance_debt_hint = handle.db.lsmMaintenanceDebtHint(),
+        },
+    };
+    defer status.deinit(handle.alloc);
+    const response = std.json.Stringify.valueAlloc(handle.alloc, status, .{
+        .emit_null_optional_fields = false,
+    }) catch |err| return storageOwnerStatusFromError(err);
+    out_response.* = .{
+        .ptr = response.ptr,
+        .len = @intCast(response.len),
+    };
     return .ok;
 }
 

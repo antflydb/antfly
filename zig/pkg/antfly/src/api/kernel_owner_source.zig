@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
+const platform_time = @import("antfly_platform").time;
 const abi = @import("kernel_owner_abi");
 const client = @import("../storage/kernel_owner_client.zig");
 const db_types = @import("../storage/db/types.zig");
@@ -26,6 +27,7 @@ const metadata_api = @import("../metadata/api.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const distributed_graph = @import("distributed_graph.zig");
 const query_response = @import("query_response.zig");
+const runtime_status = @import("runtime_status.zig");
 const read_gate = @import("../raft/read_gate.zig");
 const feature_reads = @import("../raft/feature_reads.zig");
 const table_catalog = @import("table_catalog.zig");
@@ -77,6 +79,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         identity: Identity,
         owner: client.Owner,
         active_users: usize = 0,
+        retired: bool = false,
     };
 
     const Lease = struct {
@@ -90,10 +93,7 @@ pub const ProvisionedKernelOwnerSource = struct {
 
         fn deinit(self: *Lease) void {
             if (!self.active) return;
-            lock(&self.source.mutex);
-            std.debug.assert(self.entry.active_users > 0);
-            self.entry.active_users -= 1;
-            self.source.mutex.unlock();
+            self.source.release(self.entry);
             self.active = false;
         }
     };
@@ -165,8 +165,28 @@ pub const ProvisionedKernelOwnerSource = struct {
             .vtable = &.{
                 .batch = unsupportedTopLevelBatch,
                 .batch_group_local = batchGroupLocal,
+                .local_runtime_statuses = localRuntimeStatuses,
             },
         };
+    }
+
+    /// Retire every resident generation for a table. Active calls retain their
+    /// old owner until their lease drains; the next call then opens the catalog
+    /// descriptor that won the outer structural transition.
+    pub fn retireTable(self: *ProvisionedKernelOwnerSource, table_name: []const u8) usize {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        var retired_count: usize = 0;
+        var i = self.entries.items.len;
+        while (i > 0) {
+            i -= 1;
+            const entry = self.entries.items[i];
+            if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
+            retired_count += 1;
+            entry.retired = true;
+            if (entry.active_users == 0) self.destroyEntryAtIndexLocked(i);
+        }
+        return retired_count;
     }
 
     pub fn ownerCountForTest(self: *ProvisionedKernelOwnerSource) usize {
@@ -184,6 +204,28 @@ pub const ProvisionedKernelOwnerSource = struct {
 
     fn lock(mutex: *std.atomic.Mutex) void {
         platform_sync.lockYielding(mutex);
+    }
+
+    fn destroyEntryAtIndexLocked(self: *ProvisionedKernelOwnerSource, index: usize) void {
+        const entry = self.entries.orderedRemove(index);
+        std.debug.assert(entry.active_users == 0);
+        entry.owner.deinit();
+        self.alloc.free(entry.table_name);
+        self.alloc.destroy(entry);
+    }
+
+    fn release(self: *ProvisionedKernelOwnerSource, entry: *Entry) void {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        std.debug.assert(entry.active_users > 0);
+        entry.active_users -= 1;
+        if (!entry.retired or entry.active_users != 0) return;
+        for (self.entries.items, 0..) |candidate, index| {
+            if (candidate != entry) continue;
+            self.destroyEntryAtIndexLocked(index);
+            return;
+        }
+        unreachable;
     }
 
     fn loadDescriptor(
@@ -233,14 +275,21 @@ pub const ProvisionedKernelOwnerSource = struct {
 
         lock(&self.mutex);
         defer self.mutex.unlock();
-        for (self.entries.items) |entry| {
+        var stale_index: ?usize = null;
+        for (self.entries.items, 0..) |entry, index| {
             if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name)) continue;
-            if (entry.generation != descriptor.generation or !entry.identity.eql(descriptor.identity)) {
+            if (entry.retired or entry.generation != descriptor.generation or !entry.identity.eql(descriptor.identity)) {
+                entry.retired = true;
+                if (entry.active_users == 0) {
+                    stale_index = index;
+                    break;
+                }
                 return error.StorageKernelOwnerTransitionRequired;
             }
             entry.active_users += 1;
             return .{ .source = self, .entry = entry };
         }
+        if (stale_index) |index| self.destroyEntryAtIndexLocked(index);
 
         try self.entries.ensureUnusedCapacity(self.alloc, 1);
         const owned_table_name = try self.alloc.dupe(u8, table_name);
@@ -539,6 +588,53 @@ pub const ProvisionedKernelOwnerSource = struct {
         var response = try lease.owner().batchJson(table_name, request_json);
         defer response.deinit();
         return {};
+    }
+
+    fn localRuntimeStatuses(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+    ) !?runtime_status.LocalTableRuntimeStatuses {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        const group_ids = try table_catalog.resolveGroupsForSpan(
+            alloc,
+            self.catalog,
+            table_name,
+            "",
+            "",
+        );
+        defer alloc.free(group_ids);
+        if (group_ids.len == 0) return null;
+
+        const items = try alloc.alloc(runtime_status.LocalTableRuntimeStatus, group_ids.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (items[0..initialized]) |*item| item.deinit(alloc);
+            alloc.free(items);
+        }
+        for (group_ids) |group_id| {
+            var lease = try self.acquire(group_id, table_name);
+            defer lease.deinit();
+            var response = try lease.owner().runtimeStatusJson(table_name);
+            defer response.deinit();
+            var parsed = try std.json.parseFromSlice(
+                runtime_status.LocalTableRuntimeStatus,
+                alloc,
+                response.bytes(),
+                .{},
+            );
+            defer parsed.deinit();
+            items[initialized] = try parsed.value.clone(alloc);
+            items[initialized].group_id = group_id;
+            items[initialized].metadata = .{
+                .updated_at_ns = platform_time.monotonicNs(),
+                .source = .live_writer_publish,
+                .freshness = .fresh,
+                .lsm_root_generation = lease.entry.generation,
+            };
+            initialized += 1;
+        }
+        return .{ .items = items };
     }
 
     fn textStatsGroupLocal(

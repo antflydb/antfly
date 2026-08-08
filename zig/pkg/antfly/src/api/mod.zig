@@ -21,6 +21,7 @@ pub const backups = @import("backups.zig");
 pub const linear_merge = @import("linear_merge.zig");
 pub const query = @import("query.zig");
 pub const query_contract = @import("query_contract.zig");
+pub const runtime_status = @import("runtime_status.zig");
 pub const cluster_api_http = @import("cluster_api_http.zig");
 pub const retrieval_agent = @import("retrieval_agent.zig");
 pub const public_table_http = @import("public_table_http.zig");

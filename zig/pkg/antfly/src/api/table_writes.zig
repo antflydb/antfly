@@ -12881,6 +12881,9 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
     ) !?runtime_status.LocalTableRuntimeStatuses {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (self.local_write_source) |source_override| {
+            if (try source_override.localRuntimeStatuses(alloc, table_name)) |statuses| return statuses;
+        }
         if (self.localWriteOwnerSource()) |owner| return try owner.localRuntimeStatuses(alloc, table_name);
         // Status must not observe a structural generation transition, but it
         // is safe to serve immutable snapshots during ordinary group work.

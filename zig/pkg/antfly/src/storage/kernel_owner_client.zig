@@ -232,6 +232,17 @@ pub const Owner = struct {
         ));
         return response;
     }
+
+    pub fn runtimeStatusJson(self: *Owner, table_name: []const u8) !Response {
+        var response: Response = .{};
+        const request = operationRequest(table_name, "");
+        try statusToError(abi.antfly_storage_owner_runtime_status_json(
+            self.handle,
+            &request,
+            &response.buffer,
+        ));
+        return response;
+    }
 };
 
 fn operationRequest(

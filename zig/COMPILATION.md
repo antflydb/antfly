@@ -762,6 +762,46 @@ Migrate those ownership families next; do not claim a cold-build or RSS change
 until the old source is actually unreachable and the ARM64 Linux musl
 `ReleaseFast` comparison is rerun.
 
+### Phase 2l resident runtime-status and retirement foundation
+
+Runtime inspection now crosses the same resident owner used by batch and local
+queries. One owner call captures the complete `LocalTableRuntimeStatus`,
+including the consistent DB statistics and LSM maintenance/write snapshot. The
+consumer parses the response in a temporary arena, clones it into the caller's
+allocator using the existing runtime-status ownership rules, and supplies the
+outer group identity, monotonic observation timestamp, freshness, and visible
+root generation. This preserves the detailed status contract without exposing
+DB or LSM layouts in the C ABI.
+
+The internal owner ABI is now version 6. `ProvisionedKernelOwnerSource` also has
+an explicit table-retirement operation. Retirement marks every matching owner
+before closing it: an inactive owner closes immediately, while an active owner
+remains valid until its last coarse-operation lease drains and then closes on
+release. A later operation opens the winning catalog generation and identity.
+Descriptor changes observed during acquisition follow the same path, rather
+than leaving a stale owner resident or replacing one beneath an active call.
+
+Validation at this checkpoint:
+
+- provisioned cross-archive owner suite: 6/6 passed with zero leaks, including
+  a full resident status round trip, explicit retirement, physical close, and
+  successful reopen through the same read source;
+- opaque owner ABI suite: 2/2 passed with zero leaks, including status capture
+  after a batch and the new invalid-ABI entry point;
+- current provisioned write/lifecycle regression set: 68/68 passed; and
+- existing public C API suite: 10/10 passed.
+
+Decision: keep this foundation, but do not attach it globally yet. Raft apply
+currently enters `applyPreparedReplicatedBatchGroupLocal` directly so it can
+avoid remote catalog reads while applying a committed transition. Attaching
+the query owner before that path has its own coarse kernel operation would
+create two competing writer owners for one group. The next slice must add a
+prepared replicated-apply entry point and a deterministic local open descriptor
+to the Raft envelope, then attach one owner to both Raft apply and query/status
+composition. Structural notifications can retire that owner only after the
+outer generation/catalog transition has published. The legacy physical source
+remains reachable, so this checkpoint still makes no cold-build or RSS claim.
+
 ## Holistic target architecture
 
 The preferred end state is a modular monolith with a small number of compiled

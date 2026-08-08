@@ -56,6 +56,10 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     defer batch_response.deinit();
     try std.testing.expect(std.mem.indexOf(u8, batch_response.bytes(), "\"inserted\":2") != null);
 
+    var status_response = try owner.runtimeStatusJson("docs");
+    defer status_response.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, status_response.bytes(), "\"source_doc_count\":2") != null);
+
     const query_json =
         \\{"query":{"match_all":{}},"limit":10}
     ;
@@ -111,6 +115,8 @@ test "opaque storage owner validates ABI and destruction is idempotent" {
     try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_document_artifact_manifest_json(null, &invalid_operation, &response));
     try std.testing.expectEqual(@as(u64, 0), response.len);
     try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_document_artifact_manifests_json(null, &invalid_operation, &response));
+    try std.testing.expectEqual(@as(u64, 0), response.len);
+    try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_runtime_status_json(null, &invalid_operation, &response));
     try std.testing.expectEqual(@as(u64, 0), response.len);
 
     try std.testing.expectError(error.InvalidQueryRequest, client.statusToError(.invalid_query));

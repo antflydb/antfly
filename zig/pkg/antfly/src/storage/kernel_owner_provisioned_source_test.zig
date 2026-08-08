@@ -398,6 +398,29 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
     try std.testing.expectEqual(@as(usize, 14), lease_capture.count);
     try std.testing.expectEqual(@as(u64, 7001), lease_capture.last_group_id);
 
+    var statuses = (try write_source.source().localRuntimeStatuses(alloc, "articles")).?;
+    defer statuses.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
+    try std.testing.expectEqual(@as(u64, 7001), statuses.items[0].group_id);
+    try std.testing.expectEqual(@as(u64, 2), statuses.items[0].stats.doc_count);
+    try std.testing.expectEqual(.live_writer_publish, statuses.items[0].metadata.source);
+    try std.testing.expectEqual(.fresh, statuses.items[0].metadata.freshness);
+    try std.testing.expect(statuses.items[0].lsm_storage_stats != null);
+
+    try std.testing.expectEqual(@as(usize, 1), owner_source.retireTable("articles"));
+    try std.testing.expectEqual(@as(usize, 0), owner_source.ownerCountForTest());
+    var reopened_lookup = (try read_source.source().lookup(
+        alloc,
+        "articles",
+        "doc:b",
+        .{},
+        .read_index,
+    )).?;
+    defer reopened_lookup.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, reopened_lookup.json, "beta") != null);
+    try std.testing.expectEqual(@as(usize, 1), owner_source.ownerCountForTest());
+    try std.testing.expectEqual(@as(usize, 15), lease_capture.count);
+
     const group_path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root});
     defer alloc.free(group_path);
     const open_request: abi.OpenRequest = .{
