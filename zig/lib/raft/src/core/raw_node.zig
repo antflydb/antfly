@@ -75,8 +75,13 @@ pub const RawNode = struct {
     }
 
     pub fn propose(self: *RawNode, data: []const u8) !void {
+        var accepted_index: ?types.Index = null;
+        return try self.proposeWithReceipt(data, &accepted_index);
+    }
+
+    pub fn proposeWithReceipt(self: *RawNode, data: []const u8, accepted_index: *?types.Index) !void {
         self.clearReadyMessages();
-        return try self.raft.propose(data);
+        return try self.raft.proposeWithReceipt(data, accepted_index);
     }
 
     pub fn readIndex(self: *RawNode, rctx: []const u8) !void {

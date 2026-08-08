@@ -145,6 +145,7 @@ pub const StdHttpExecutor = struct {
 
     fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
         const self: *StdHttpExecutor = @ptrCast(@alignCast(ptr));
+        if (req.delivery_tracker) |tracker| tracker.markNotSent();
         try self.beginRequest();
         defer self.endRequest();
 
@@ -331,6 +332,10 @@ pub const StdHttpExecutor = struct {
         });
         defer request.deinit();
 
+        // Everything above this point is local request preparation or
+        // connection establishment. From the first send operation onward, an
+        // error cannot prove that the peer did not receive the request.
+        if (req.delivery_tracker) |tracker| tracker.markMayHaveBeenSent();
         if (req.body.len > 0 or method.requestHasBody()) {
             request.transfer_encoding = .{ .content_length = req.body.len };
             var body_buffer: [16 * 1024]u8 = undefined;
@@ -550,12 +555,14 @@ test "std http executor cancellation interrupts a request queued for the pooled 
         executor: common.RequestExecutor,
         cancellation: *const common.RequestCancellation,
         outcome: std.atomic.Value(u8) = .init(0),
+        delivery_tracker: common.RequestDeliveryTracker = .{},
 
         fn run(self: *@This()) void {
             var response = self.executor.execute(std.heap.page_allocator, .{
                 .method = .GET,
                 .uri = "http://127.0.0.1:1/never-reached",
                 .cancellation = self.cancellation,
+                .delivery_tracker = &self.delivery_tracker,
             }) catch |err| {
                 self.outcome.store(if (err == error.Cancelled) 1 else 2, .release);
                 return;
@@ -612,6 +619,7 @@ test "std http executor cancellation interrupts a request queued for the pooled 
     request_joined = true;
     try std.testing.expect(cancelled_while_queued);
     try std.testing.expectEqual(@as(u8, 1), request_state.outcome.load(.acquire));
+    try std.testing.expectEqual(.not_sent, request_state.delivery_tracker.load());
 }
 
 test "std http executor cancellation interrupts an active response wait" {
@@ -640,12 +648,14 @@ test "std http executor cancellation interrupts an active response wait" {
         uri: []const u8,
         cancellation: *const common.RequestCancellation,
         outcome: std.atomic.Value(u8) = .init(0),
+        delivery_tracker: common.RequestDeliveryTracker = .{},
 
         fn run(self: *@This()) void {
             var response = self.executor.execute(std.heap.page_allocator, .{
                 .method = .GET,
                 .uri = self.uri,
                 .cancellation = self.cancellation,
+                .delivery_tracker = &self.delivery_tracker,
             }) catch |err| {
                 self.outcome.store(if (err == error.Cancelled) 1 else 2, .release);
                 return;
@@ -692,6 +702,7 @@ test "std http executor cancellation interrupts an active response wait" {
         sleepTestMs(std.Io.Threaded.global_single_threaded.io(), 1);
     }
     try std.testing.expectEqual(@as(u8, 1), task.outcome.load(.acquire));
+    try std.testing.expectEqual(.may_have_been_sent, task.delivery_tracker.load());
     try std.testing.expect(app.exited.load(.acquire));
     try group.await(task_io.io());
     group_active = false;

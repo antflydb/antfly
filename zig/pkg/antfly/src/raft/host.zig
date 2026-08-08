@@ -715,6 +715,10 @@ pub const Host = struct {
         try self.runtime_host.propose(group_id, data);
     }
 
+    pub fn proposeWithReceipt(self: *Host, group_id: u64, data: []const u8, accepted_index: *?u64) !void {
+        try self.runtime_host.proposeWithReceipt(group_id, data, accepted_index);
+    }
+
     pub fn transferLeader(self: *Host, group_id: u64, transferee: u64) !void {
         try self.runtime_host.transferLeader(group_id, transferee);
     }
@@ -1090,6 +1094,10 @@ pub const HttpHost = struct {
 
     pub fn propose(self: *HttpHost, group_id: u64, data: []const u8) !void {
         try self.host.propose(group_id, data);
+    }
+
+    pub fn proposeWithReceipt(self: *HttpHost, group_id: u64, data: []const u8, accepted_index: *?u64) !void {
+        try self.host.proposeWithReceipt(group_id, data, accepted_index);
     }
 
     pub fn transferLeader(self: *HttpHost, group_id: u64, transferee: u64) !void {
