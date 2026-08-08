@@ -32,6 +32,17 @@ pub const ParticipantPhase = enum {
 
 pub const ExecuteResult = struct {
     participant_count: usize,
+    /// Stable sessions persist their terminal result before acknowledging the
+    /// coordinator itself. These coordinates identify that durable decision
+    /// record without recomputing it from mutable table routing.
+    coordinator_group_id: ?u64 = null,
+    coordinator_table_name: ?[]const u8 = null,
+    /// The commit decision is durable, but at least one participant still
+    /// needs phase-two delivery by foreground retry or recovery.
+    propagation_pending: bool = false,
+    /// Participant writes are durable, but the requested visibility barrier
+    /// was not reached before the response was produced.
+    visibility_pending: bool = false,
 };
 
 pub const CommitOutcome = union(enum) {

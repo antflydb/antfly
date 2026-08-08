@@ -186,6 +186,10 @@ pub fn runFromArgs(
     if (std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h") or std.mem.eql(u8, command, "help")) {
         printUsage(usage_name);
     } else if (std.mem.eql(u8, command, "run")) {
+        if (inference.run_options.isHelpRequest(command_args)) {
+            printRunUsage(usage_name);
+            return;
+        }
         if (build_options.skip_openapi) {
             print("inference run is unavailable when built with -Dskip-openapi=true\n", .{});
             return;
@@ -235,6 +239,25 @@ pub fn runFromArgs(
         print("unknown command: {s}\n", .{command});
         printUsage(usage_name);
     }
+}
+
+fn printRunUsage(usage_name: []const u8) void {
+    print(
+        \\usage: {s} run [options]
+        \\
+        \\options:
+        \\  --host <address>                    Listen address (default: 127.0.0.1)
+        \\  --port <port>                       Listen port (default: 8090)
+        \\  --models-dir <path>                 AI model directory
+        \\  --ml-dir <path>                     Predictor model directory
+        \\  --config <path>                     JSON run configuration
+        \\  --max-loaded-models <count>          Residency limit; 0 means unlimited
+        \\  --max-concurrent-requests <count>    Request concurrency limit
+        \\  --preload-model <spec>               Warm a model at startup; repeatable
+        \\  --allow-unknown-models               Allow models absent from the registry
+        \\  -h, --help                           Show this help and exit
+        \\
+    , .{usage_name});
 }
 
 fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
@@ -344,6 +367,7 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
     node.attachIo(io);
 
     try node.warmConfiguredModels(allocator);
+    node.configureForcedRunAdmissionDenialsFromEnvironmentForTesting();
     print("listening on {s}:{d}\n", .{ host, port });
     try node.serve(allocator, io, host, port);
 

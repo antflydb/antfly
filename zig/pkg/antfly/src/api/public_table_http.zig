@@ -59,11 +59,15 @@ pub const TableApi = struct {
         InvalidBatchRequest,
         UnsupportedSyncLevel,
         NotFound,
+        Conflict,
         MethodNotAllowed,
         Backpressured,
         DenseRepairBackpressure,
         Unavailable,
         WriteUnavailable,
+        OutcomeUnknown,
+        CommittedPending,
+        WriteOutcomeUnknown,
         DocIdentityUnavailable,
         HAReadOnlyStandby,
         HAPromotedStandbyRequiresPrimaryOpen,
@@ -602,6 +606,7 @@ pub fn handleTableBatch(
         error.InvalidBatchRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid batch request") },
         error.UnsupportedSyncLevel => return .{ .status = 400, .body = try alloc.dupe(u8, "unsupported sync_level") },
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
+        error.Conflict => return .{ .status = 409, .body = try alloc.dupe(u8, "batch transaction conflicted") },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.Backpressured => return .{ .status = 429, .body = try alloc.dupe(u8, "table backpressured") },
         error.DenseRepairBackpressure => return .{
@@ -612,6 +617,17 @@ pub fn handleTableBatch(
         },
         error.Unavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "maintenance routes unavailable on query-only runtime") },
         error.WriteUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "write unavailable") },
+        error.OutcomeUnknown => return .{
+            .status = 500,
+            .body = try alloc.dupe(u8, "transaction outcome is unknown; do not retry this stateless batch because it may already have committed; use a transaction session for retryable commits"),
+        },
+        error.CommittedPending => return .{
+            .status = 202,
+            .body = try batch_api.encodeBatchResponse(alloc, batch_req.resultWithStatus("committed_pending")),
+        },
+        // Do not use a retryable 5xx: clients must reconcile an ambiguous
+        // commit result instead of blindly replaying non-idempotent transforms.
+        error.WriteOutcomeUnknown => return .{ .status = 409, .body = try alloc.dupe(u8, "write outcome unknown") },
         error.DocIdentityUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "doc identity unavailable") },
         error.HAReadOnlyStandby => return .{ .status = 409, .body = try alloc.dupe(u8, "standby is read-only") },
         error.HAPromotedStandbyRequiresPrimaryOpen => return .{ .status = 409, .body = try alloc.dupe(u8, "promoted standby requires primary open") },
@@ -1584,12 +1600,12 @@ test "public table batch handler returns created batch response" {
         \\{"inserts":{"doc-a":{"title":"alpha"}}}
     , backend.iface());
     defer resp.deinit(std.testing.allocator);
-    var parsed = try std.json.parseFromSlice(struct { inserted: ?i64 = null }, std.testing.allocator, resp.body, .{});
+    var parsed = try std.json.parseFromSlice(batch_api.BatchResult, std.testing.allocator, resp.body, .{});
     defer parsed.deinit();
 
     try std.testing.expectEqual(@as(u16, 201), resp.status);
     try std.testing.expect(backend.called);
-    try std.testing.expectEqual(@as(i64, 1), parsed.value.inserted.?);
+    try std.testing.expectEqual(@as(u32, 1), parsed.value.inserted);
 }
 
 test "public create index exposes retryable storage descriptor exhaustion" {
@@ -1809,6 +1825,91 @@ test "public table batch handler maps unavailable errors" {
 
 test "public table batch handler maps write unavailable errors" {
     const Backend = struct {
+        err: TableApi.ExecuteBatchError,
+
+        fn iface(self: *@This()) TableApi {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .execute_table_batch = executeTableBatch,
+                    .execute_table_query_request = unsupportedQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableBatch(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+        ) TableApi.ExecuteBatchError!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.err;
+        }
+    };
+
+    const cases = [_]struct {
+        err: TableApi.ExecuteBatchError,
+        status: u16,
+        body: []const u8,
+    }{
+        .{ .err = error.WriteUnavailable, .status = 503, .body = "write unavailable" },
+        .{
+            .err = error.OutcomeUnknown,
+            .status = 500,
+            .body = "transaction outcome is unknown; do not retry this stateless batch because it may already have committed; use a transaction session for retryable commits",
+        },
+    };
+    for (cases) |tc| {
+        var backend = Backend{ .err = tc.err };
+        var resp = try handleTableBatch(std.testing.allocator, "docs",
+            \\{"inserts":{"doc-a":{"title":"alpha"}}}
+        , backend.iface());
+        defer resp.deinit(std.testing.allocator);
+
+        try std.testing.expectEqual(tc.status, resp.status);
+        try std.testing.expectEqualStrings(tc.body, resp.body);
+    }
+}
+
+test "public table batch handler returns accepted for durable pending commits" {
+    const Backend = struct {
+        fn iface() TableApi {
+            return .{ .ptr = undefined, .vtable = &.{
+                .execute_table_batch = executeTableBatch,
+                .execute_table_query_request = unsupportedQueryRequest,
+                .execute_table_query_view = unsupportedQueryView,
+                .execute_table_backup = unsupportedBackup,
+                .execute_table_restore = unsupportedRestore,
+                .execute_table_list_indexes = unsupportedListIndexes,
+                .execute_table_get_index = unsupportedGetIndex,
+                .execute_table_create_index = unsupportedCreateIndex,
+                .execute_table_delete_index = unsupportedDeleteIndex,
+            } };
+        }
+
+        fn executeTableBatch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) TableApi.ExecuteBatchError!void {
+            return error.CommittedPending;
+        }
+    };
+
+    var resp = try handleTableBatch(std.testing.allocator, "docs",
+        \\{"inserts":{"doc-a":{"title":"alpha"}}}
+    , Backend.iface());
+    defer resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 202), resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"inserted\":1") != null);
+}
+
+test "public table batch handler preserves ambiguous write outcomes" {
+    const Backend = struct {
         fn iface() TableApi {
             return .{
                 .ptr = undefined,
@@ -1832,7 +1933,7 @@ test "public table batch handler maps write unavailable errors" {
             _: []const u8,
             _: db_mod.types.BatchRequest,
         ) TableApi.ExecuteBatchError!void {
-            return error.WriteUnavailable;
+            return error.WriteOutcomeUnknown;
         }
     };
 
@@ -1841,8 +1942,8 @@ test "public table batch handler maps write unavailable errors" {
     , Backend.iface());
     defer resp.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(u16, 503), resp.status);
-    try std.testing.expectEqualStrings("write unavailable", resp.body);
+    try std.testing.expectEqual(@as(u16, 409), resp.status);
+    try std.testing.expectEqualStrings("write outcome unknown", resp.body);
 }
 
 test "public table batch handler maps doc identity unavailable errors" {

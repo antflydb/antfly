@@ -7562,6 +7562,23 @@ pub const IndexManager = struct {
     }
 
     pub fn vectorIndexesDependingOnArtifact(self: *const IndexManager, alloc: Allocator, artifact_name: []const u8) ![][]u8 {
+        return self.indexesDependingOnArtifactInternal(alloc, artifact_name, false);
+    }
+
+    /// Resolve every projection transitively affected by an artifact producer.
+    /// This runs only on failure/repair paths, where complete fanout is more
+    /// important than maintaining separate, eventually-divergent consumers for
+    /// vector, full-text, and graph indexes.
+    pub fn indexesDependingOnArtifact(self: *const IndexManager, alloc: Allocator, artifact_name: []const u8) ![][]u8 {
+        return self.indexesDependingOnArtifactInternal(alloc, artifact_name, true);
+    }
+
+    fn indexesDependingOnArtifactInternal(
+        self: *const IndexManager,
+        alloc: Allocator,
+        artifact_name: []const u8,
+        include_non_vector: bool,
+    ) ![][]u8 {
         var dependent_artifacts = std.StringHashMapUnmanaged(void).empty;
         defer dependent_artifacts.deinit(alloc);
         try dependent_artifacts.put(alloc, artifact_name, {});
@@ -7593,6 +7610,29 @@ pub const IndexManager = struct {
             if (!depends) continue;
             if (containsOwnedString(names.items, entry.config.name)) continue;
             try names.append(alloc, try alloc.dupe(u8, entry.config.name));
+        }
+        if (include_non_vector) {
+            var include_default_full_text = false;
+            for (self.enrichments.items) |enrichment| {
+                if (dependent_artifacts.contains(enrichment.name) and enrichment.full_text_index) {
+                    include_default_full_text = true;
+                    break;
+                }
+            }
+            for (self.text_indexes.items) |entry| {
+                const depends = if (entry.chunk_name) |name|
+                    dependent_artifacts.contains(name)
+                else
+                    include_default_full_text;
+                if (!depends or containsOwnedString(names.items, entry.config.name)) continue;
+                try names.append(alloc, try alloc.dupe(u8, entry.config.name));
+            }
+            for (self.graph_indexes.items) |entry| {
+                const source = entry.artifact_source orelse continue;
+                if (!dependent_artifacts.contains(source.artifact_name) or
+                    containsOwnedString(names.items, entry.config.name)) continue;
+                try names.append(alloc, try alloc.dupe(u8, entry.config.name));
+            }
         }
         return try names.toOwnedSlice(alloc);
     }

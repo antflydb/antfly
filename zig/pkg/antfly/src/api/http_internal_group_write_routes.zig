@@ -19,6 +19,7 @@ const distributed_txn = @import("distributed_txn.zig");
 const http_client = @import("http_client.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const http_route_helpers = @import("http_route_helpers.zig");
+const internal_batch_forwarding = @import("internal_batch_forwarding.zig");
 const internal_keys = @import("../storage/internal_keys.zig");
 const metadata_mod = @import("../metadata/domain.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
@@ -47,16 +48,54 @@ pub const TxnValidator = struct {
     }
 };
 
+pub const RoutedRaftBatchWriter = struct {
+    ptr: *anyopaque,
+    write: *const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_mod.types.BatchRequest,
+        forwarding: internal_batch_forwarding.Context,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) anyerror!?void,
+
+    fn run(
+        self: RoutedRaftBatchWriter,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_mod.types.BatchRequest,
+        forwarding: internal_batch_forwarding.Context,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) !?void {
+        return try self.write(self.ptr, alloc, group_id, table_name, req, forwarding, cancellation);
+    }
+};
+
 pub const Context = struct {
     alloc: std.mem.Allocator,
     shard_ops: ?raft_mod.ShardOperationAdapter,
     shard_db_adapter: ?metadata_mod.ShardDbAdapter = null,
     writes: ?table_writes.TableWriteSource,
+    routed_raft_batch_writer: ?RoutedRaftBatchWriter = null,
     repair_job_store: ?*repair_jobs.Store = null,
     repair_cancel_executor: ?http_common.RequestExecutor = null,
     batch_validator: BatchValidator,
     txn_validator: TxnValidator,
 };
+
+fn raftBatchOutcomeResponse(
+    alloc: std.mem.Allocator,
+    status: u16,
+    body: []const u8,
+    outcome: []const u8,
+) !http_common.HttpResponse {
+    return try http_route_helpers.textResponseWithHeaders(alloc, status, body, &.{.{
+        .name = internal_batch_forwarding.outcome_header,
+        .value = outcome,
+    }});
+}
 
 const RepairJobCancelProbe = struct {
     alloc: std.mem.Allocator,
@@ -317,7 +356,25 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
         return try http_route_helpers.jsonResponse(ctx.alloc, struct {}{});
     }
 
-    if (routes.Routes.matchGroupBatch(path)) |batch_route| {
+    const routed_batch_route = routes.Routes.matchGroupRoutedBatch(path);
+    if (routed_batch_route orelse routes.Routes.matchGroupBatch(path)) |batch_route| {
+        if (routed_batch_route == null and ctx.routed_raft_batch_writer != null) {
+            // The legacy endpoint has no end-to-end outcome contract. Reject it
+            // solely by route, before trusting headers or parsing the request,
+            // so forwarding semantics cannot bypass protocol negotiation. The
+            // 404 is deliberate: pre-protocol nodes classify it as terminal
+            // instead of replaying a transform after an ambiguous response.
+            return try http_route_helpers.textResponse(ctx.alloc, 404, "legacy raft batch forwarding unsupported");
+        }
+        const forwarding = internal_batch_forwarding.parse(req) catch {
+            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid raft batch forwarding headers");
+        };
+        if (routed_batch_route != null and forwarding == null) {
+            return try http_route_helpers.textResponse(ctx.alloc, 400, "missing raft batch forwarding headers");
+        }
+        if (routed_batch_route == null and forwarding != null) {
+            return try http_route_helpers.textResponse(ctx.alloc, 400, "raft batch forwarding headers require routed endpoint");
+        }
         const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
         var batch_req = batch_api.parseInternalBatchRequest(ctx.alloc, req.body) catch |err| switch (err) {
             error.InvalidBatchRequest => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid batch request"),
@@ -330,11 +387,38 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
             else => return err,
         };
 
-        _ = (writes.batchGroupLocal(ctx.alloc, batch_route.group_id, batch_route.table_name, batch_req.req) catch |err| switch (err) {
+        _ = ((if (forwarding) |forwarding_context|
+            if (ctx.routed_raft_batch_writer) |writer|
+                writer.run(ctx.alloc, batch_route.group_id, batch_route.table_name, batch_req.req, forwarding_context, req.cancellation)
+            else
+                return try raftBatchOutcomeResponse(
+                    ctx.alloc,
+                    503,
+                    "routed raft batch unavailable",
+                    internal_batch_forwarding.outcome_not_proposed_v1,
+                )
+        else
+            writes.batchGroupLocal(ctx.alloc, batch_route.group_id, batch_route.table_name, batch_req.req)) catch |err| switch (err) {
             error.InvalidBatchRequest => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid batch request"),
             error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
+            error.RaftBatchWriteOutcomeUnknown => {
+                // A generic 5xx retry policy could duplicate a transform that
+                // already committed. Conflict is deliberately non-retryable;
+                // the body preserves the machine-readable outcome class.
+                return try raftBatchOutcomeResponse(
+                    ctx.alloc,
+                    409,
+                    "write outcome unknown",
+                    internal_batch_forwarding.outcome_unknown_v1,
+                );
+            },
             error.LeaderUnavailable, error.GroupLeaderUnavailable, error.MetadataSnapshotUnavailable => {
-                return try http_route_helpers.textResponse(ctx.alloc, 503, "group leader unavailable");
+                return try raftBatchOutcomeResponse(
+                    ctx.alloc,
+                    503,
+                    "group leader unavailable",
+                    internal_batch_forwarding.outcome_not_proposed_v1,
+                );
             },
             else => return err,
         }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
@@ -646,9 +730,11 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
             txn_req.txn_id,
             txn_req.begin_timestamp,
             txn_req.topology_epoch,
+            txn_req.retain_terminal,
             txn_req.participants,
         ) catch |err| switch (err) {
             error.InvalidBatchRequest => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid transaction request"),
+            error.DecisionConflict => return try http_route_helpers.textResponse(ctx.alloc, 409, "decision conflict"),
             error.TopologyChanged => return try http_route_helpers.textResponse(ctx.alloc, 409, "topology changed"),
             error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
             error.UnsupportedOperation => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
@@ -696,8 +782,11 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
             txn_req.txn_id,
             txn_req.status,
             txn_req.commit_version,
+            txn_req.topology_epoch,
+            txn_req.sync_level,
         ) catch |err| switch (err) {
             error.DecisionConflict => return try http_route_helpers.textResponse(ctx.alloc, 409, "decision conflict"),
+            error.TopologyChanged => return try http_route_helpers.textResponse(ctx.alloc, 409, "topology changed"),
             error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
             error.UnsupportedOperation => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
             error.UnknownGroup, error.TxnNotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
@@ -722,6 +811,26 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
             else => return err,
         }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
         return try http_route_helpers.jsonResponse(ctx.alloc, distributed_txn.TxnStatusResponse{ .status = status });
+    }
+    if (routes.Routes.matchGroupTxnAcknowledge(path)) |txn_route| {
+        const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        var txn_req = distributed_txn.parseTxnAcknowledgeRequest(ctx.alloc, req.body) catch {
+            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid transaction request");
+        };
+        defer distributed_txn.freeTxnAcknowledgeRequest(ctx.alloc, &txn_req);
+        _ = (writes.txnAcknowledgeGroupLocal(
+            ctx.alloc,
+            txn_route.group_id,
+            txn_route.table_name,
+            txn_req.txn_id,
+            txn_req.participant,
+        ) catch |err| switch (err) {
+            error.InvalidParticipant, error.DecisionConflict => return try http_route_helpers.textResponse(ctx.alloc, 409, "decision conflict"),
+            error.UnsupportedOperation => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
+            error.UnknownGroup, error.TxnNotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
+            else => return err,
+        }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        return try http_route_helpers.jsonResponse(ctx.alloc, struct {}{});
     }
 
     return null;
@@ -1017,6 +1126,179 @@ test "internal group write routes validate batch requests" {
 
     try std.testing.expectEqual(@as(u16, 400), resp.status);
     try std.testing.expectEqualStrings("invalid batch request", resp.body);
+}
+
+test "internal group write route dispatches bounded raft forwarding context" {
+    const Capture = struct {
+        forwarding: ?internal_batch_forwarding.Context = null,
+        failure: ?anyerror = null,
+
+        fn write(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            _: db_mod.types.BatchRequest,
+            forwarding: internal_batch_forwarding.Context,
+            cancellation: ?*const http_common.RequestCancellation,
+        ) !?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(u64, 7), group_id);
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expect(cancellation != null);
+            self.forwarding = forwarding;
+            if (self.failure) |err| return err;
+            return {};
+        }
+    };
+
+    const headers = [_]http_common.RequestHeader{
+        .{ .name = internal_batch_forwarding.remaining_ms_header, .value = "425" },
+        .{ .name = internal_batch_forwarding.forwards_remaining_header, .value = "1" },
+        .{ .name = internal_batch_forwarding.campaign_allowed_header, .value = "false" },
+    };
+    var capture = Capture{};
+    var cancellation = http_common.RequestCancellation{};
+    var resp = (try handle(.{
+        .alloc = std.testing.allocator,
+        .shard_ops = null,
+        .writes = TestWriteSource.source(),
+        .routed_raft_batch_writer = .{ .ptr = &capture, .write = Capture.write },
+        .batch_validator = TestWriteSource.batchValidator(),
+        .txn_validator = TestWriteSource.txnValidator(),
+    }, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/batch-routed-v1",
+        .headers = &headers,
+        .body = "{}",
+        .cancellation = &cancellation,
+    }, "/internal/v1/groups/7/tables/docs/batch-routed-v1")).?;
+    defer resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 201), resp.status);
+    try std.testing.expectEqual(@as(u32, 425), capture.forwarding.?.remaining_ms);
+    try std.testing.expectEqual(@as(u8, 1), capture.forwarding.?.forwards_remaining);
+    try std.testing.expect(!capture.forwarding.?.campaign_allowed);
+
+    capture.forwarding = null;
+    var legacy_resp = (try handle(.{
+        .alloc = std.testing.allocator,
+        .shard_ops = null,
+        .writes = TestWriteSource.source(),
+        .routed_raft_batch_writer = .{ .ptr = &capture, .write = Capture.write },
+        .batch_validator = TestWriteSource.batchValidator(),
+        .txn_validator = TestWriteSource.txnValidator(),
+    }, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/batch",
+        .headers = &headers,
+        .body = "{}",
+        .cancellation = &cancellation,
+    }, "/internal/v1/groups/7/tables/docs/batch")).?;
+    defer legacy_resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 404), legacy_resp.status);
+    try std.testing.expectEqualStrings("legacy raft batch forwarding unsupported", legacy_resp.body);
+    try std.testing.expect(capture.forwarding == null);
+
+    capture.forwarding = null;
+    var missing_headers_resp = (try handle(.{
+        .alloc = std.testing.allocator,
+        .shard_ops = null,
+        .writes = TestWriteSource.source(),
+        .routed_raft_batch_writer = .{ .ptr = &capture, .write = Capture.write },
+        .batch_validator = TestWriteSource.batchValidator(),
+        .txn_validator = TestWriteSource.txnValidator(),
+    }, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/batch-routed-v1",
+        .body = "{}",
+    }, "/internal/v1/groups/7/tables/docs/batch-routed-v1")).?;
+    defer missing_headers_resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 400), missing_headers_resp.status);
+    try std.testing.expect(capture.forwarding == null);
+
+    capture.failure = error.RaftBatchWriteOutcomeUnknown;
+    var unknown_resp = (try handle(.{
+        .alloc = std.testing.allocator,
+        .shard_ops = null,
+        .writes = TestWriteSource.source(),
+        .routed_raft_batch_writer = .{ .ptr = &capture, .write = Capture.write },
+        .batch_validator = TestWriteSource.batchValidator(),
+        .txn_validator = TestWriteSource.txnValidator(),
+    }, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/batch-routed-v1",
+        .headers = &headers,
+        .body = "{}",
+        .cancellation = &cancellation,
+    }, "/internal/v1/groups/7/tables/docs/batch-routed-v1")).?;
+    defer unknown_resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 409), unknown_resp.status);
+    try std.testing.expectEqualStrings("write outcome unknown", unknown_resp.body);
+    try std.testing.expectEqualStrings(
+        internal_batch_forwarding.outcome_unknown_v1,
+        unknown_resp.header(internal_batch_forwarding.outcome_header).?,
+    );
+
+    capture.failure = error.LeaderUnavailable;
+    var unavailable_resp = (try handle(.{
+        .alloc = std.testing.allocator,
+        .shard_ops = null,
+        .writes = TestWriteSource.source(),
+        .routed_raft_batch_writer = .{ .ptr = &capture, .write = Capture.write },
+        .batch_validator = TestWriteSource.batchValidator(),
+        .txn_validator = TestWriteSource.txnValidator(),
+    }, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/batch-routed-v1",
+        .headers = &headers,
+        .body = "{}",
+        .cancellation = &cancellation,
+    }, "/internal/v1/groups/7/tables/docs/batch-routed-v1")).?;
+    defer unavailable_resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 503), unavailable_resp.status);
+    try std.testing.expectEqualStrings(
+        internal_batch_forwarding.outcome_not_proposed_v1,
+        unavailable_resp.header(internal_batch_forwarding.outcome_header).?,
+    );
+
+    var local_fallback_resp = (try handle(.{
+        .alloc = std.testing.allocator,
+        .shard_ops = null,
+        .writes = TestWriteSource.source(),
+        .batch_validator = TestWriteSource.batchValidator(),
+        .txn_validator = TestWriteSource.txnValidator(),
+    }, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/batch",
+        .body = "{}",
+    }, "/internal/v1/groups/7/tables/docs/batch")).?;
+    defer local_fallback_resp.deinit(std.testing.allocator);
+
+    // The fake source reports no matching group, proving the request reached
+    // batchGroupLocal instead of the absent routed writer.
+    try std.testing.expectEqual(@as(u16, 404), local_fallback_resp.status);
+
+    var legacy_headers_resp = (try handle(.{
+        .alloc = std.testing.allocator,
+        .shard_ops = null,
+        .writes = TestWriteSource.source(),
+        .batch_validator = TestWriteSource.batchValidator(),
+        .txn_validator = TestWriteSource.txnValidator(),
+    }, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/batch",
+        .headers = &headers,
+        .body = "{}",
+    }, "/internal/v1/groups/7/tables/docs/batch")).?;
+    defer legacy_headers_resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 400), legacy_headers_resp.status);
+    try std.testing.expectEqualStrings("raft batch forwarding headers require routed endpoint", legacy_headers_resp.body);
 }
 
 test "internal group write routes validate transaction status requests" {
@@ -1363,7 +1645,7 @@ const TestWriteSource = struct {
         return null;
     }
 
-    fn txnBeginGroupLocal(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: u64, _: []const []const u8) !?void {
+    fn txnBeginGroupLocal(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: u64, _: bool, _: []const []const u8) !?void {
         return null;
     }
 
@@ -1371,7 +1653,7 @@ const TestWriteSource = struct {
         return null;
     }
 
-    fn txnResolveGroupLocal(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: db_mod.types.TxnStatus, _: u64) !?void {
+    fn txnResolveGroupLocal(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: db_mod.types.TxnStatus, _: u64, _: u64, _: db_mod.types.SyncLevel) !?void {
         return null;
     }
 

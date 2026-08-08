@@ -35,9 +35,45 @@ pub const Config = struct {
     lease_ttl_ms: u64 = 30_000,
     interval_ms: u64 = 30_000,
     cutoff_ns: u64 = 5 * std.time.ns_per_min,
+    /// Stable transaction sessions may be retried for seven days. Retain the
+    /// terminal decision for an extra day so boundary retries cannot reapply.
+    retained_terminal_ns: u64 = 8 * std.time.ns_per_day,
+    /// Bound each background pass; a cursor rotates across the keyspace so
+    /// retained idempotency decisions cannot create unbounded allocations or
+    /// periodic CPU spikes.
+    max_records_per_run: usize = 16_384,
     clock: platform_clock.Clock = platform_clock.Clock.real(),
     resolver_ctx: ?*anyopaque = null,
     resolve_participant_fn: ?resolution_mod.ResolveParticipantFn = null,
+    /// Replicated DBs route all transaction metadata changes through their
+    /// coordinator Raft group. Standalone stores keep the direct local path.
+    replicated_metadata: bool = false,
+    owns_recovery_fn: ?*const fn (ctx: *anyopaque, owner_participant: []const u8) bool = null,
+    acknowledge_participant_fn: ?*const fn (
+        ctx: *anyopaque,
+        txn_id: transactions_mod.TxnId,
+        owner_participant: []const u8,
+        participant: []const u8,
+    ) anyerror!void = null,
+    cleanup_transaction_fn: ?*const fn (
+        ctx: *anyopaque,
+        txn_id: transactions_mod.TxnId,
+        owner_participant: []const u8,
+        cutoff_timestamp: u64,
+        retained_cutoff_timestamp: u64,
+    ) anyerror!void = null,
+    /// Participant represented by the DB currently being recovered. Local
+    /// effects are resolved through the DB pipeline before notifications, so
+    /// this participant can be acknowledged without recursively routing back
+    /// through the table-write source.
+    local_participant: ?[]const u8 = null,
+    local_resolution_ctx: ?*anyopaque = null,
+    resolve_local_fn: ?*const fn (
+        ctx: *anyopaque,
+        txn_id: transactions_mod.TxnId,
+        status: transactions_mod.TxnStatus,
+        commit_version: u64,
+    ) anyerror!void = null,
     resolution_extra_hooks: transactions_mod.TxnManager.RecoveryExtraBatchHooks = .{},
 };
 
@@ -57,6 +93,11 @@ pub const Runtime = if (builtin.os.tag == .freestanding) struct {
         _ = store;
         if (config.enabled and (config.resolve_participant_fn == null or config.resolver_ctx == null)) {
             return error.MissingParticipantResolver;
+        }
+        if (config.enabled and config.replicated_metadata and
+            (config.owns_recovery_fn == null or config.acknowledge_participant_fn == null or config.cleanup_transaction_fn == null))
+        {
+            return error.MissingReplicatedRecoveryHooks;
         }
         return .{
             .config = config,
@@ -92,6 +133,7 @@ pub const Runtime = if (builtin.os.tag == .freestanding) struct {
     shutdown: bool = false,
     stats_value: types.TransactionRecoveryStats = .{},
     future: ?Io.Future(void) = null,
+    scan_after: ?transactions_mod.TxnId = null,
 
     pub fn init(
         alloc: Allocator,
@@ -101,6 +143,11 @@ pub const Runtime = if (builtin.os.tag == .freestanding) struct {
     ) !Runtime {
         if (config.enabled and (config.resolve_participant_fn == null or config.resolver_ctx == null)) {
             return error.MissingParticipantResolver;
+        }
+        if (config.enabled and config.replicated_metadata and
+            (config.owns_recovery_fn == null or config.acknowledge_participant_fn == null or config.cleanup_transaction_fn == null))
+        {
+            return error.MissingReplicatedRecoveryHooks;
         }
         const io_impl = backend_runtime.io_impl;
         if (config.enabled and io_impl == null) return error.MissingBackendRuntimeIo;
@@ -172,6 +219,11 @@ pub const Runtime = if (builtin.os.tag == .freestanding) struct {
 pub fn recoverOnce(alloc: Allocator, store: anytype, config: Config) !types.TransactionRecoveryStats {
     if (!config.enabled) return .{};
     if (config.resolve_participant_fn == null or config.resolver_ctx == null) return error.MissingParticipantResolver;
+    if (config.replicated_metadata and
+        (config.owns_recovery_fn == null or config.acknowledge_participant_fn == null or config.cleanup_transaction_fn == null))
+    {
+        return error.MissingReplicatedRecoveryHooks;
+    }
 
     var runtime_store = try initRuntimeStore(alloc, store);
     defer runtime_store.deinit();
@@ -190,6 +242,7 @@ pub fn recoverOnce(alloc: Allocator, store: anytype, config: Config) !types.Tran
         .notification_successes = summary.notification_successes,
         .notification_failures = summary.notification_failures,
         .last_run_ns = now_ns,
+        .error_count = summary.record_failures,
     };
     return stats;
 }
@@ -231,10 +284,21 @@ const RunSummary = struct {
     notification_attempts: u64 = 0,
     notification_successes: u64 = 0,
     notification_failures: u64 = 0,
+    record_failures: u64 = 0,
+    next_scan_after: ?transactions_mod.TxnId = null,
 };
 
 fn runRecovery(runtime: *Runtime, now_ns: u64) !RunSummary {
-    return try runRecoveryWithConfig(runtime.alloc, runtime.store, runtime.config, now_ns);
+    const summary = try runRecoveryPageWithConfig(
+        runtime.alloc,
+        runtime.store,
+        runtime.config,
+        now_ns,
+        runtime.scan_after,
+        @max(1, runtime.config.max_records_per_run),
+    );
+    runtime.scan_after = summary.next_scan_after;
+    return summary;
 }
 
 fn runRecoveryWithConfig(
@@ -243,32 +307,167 @@ fn runRecoveryWithConfig(
     config: Config,
     now_ns: u64,
 ) !RunSummary {
+    return try runRecoveryPageWithConfig(alloc, store, config, now_ns, null, std.math.maxInt(usize));
+}
+
+fn runRecoveryPageWithConfig(
+    alloc: Allocator,
+    store: anytype,
+    config: Config,
+    now_ns: u64,
+    after: ?transactions_mod.TxnId,
+    limit: usize,
+) !RunSummary {
     var summary: RunSummary = .{};
     var manager = try transactions_mod.TxnManager.init(alloc, try backend_erased.storeFrom(alloc, store));
     defer manager.deinit();
-    const txns = try manager.listTransactions(alloc);
-    defer alloc.free(txns);
+    const page = try manager.listTransactionsPage(alloc, after, limit);
+    defer alloc.free(page.items);
+    summary.next_scan_after = page.next_after;
 
-    for (txns) |txn| {
-        if (txn.status == .pending) continue;
+    transaction: for (page.items) |txn| {
+        summary.recovery.scanned_records += 1;
+        if (txn.status == .pending) {
+            const cutoff = now_ns -| config.cutoff_ns;
+            if (txn.coordinator_known and txn.coordinator and txn.created_at > 0 and txn.created_at < cutoff) {
+                const participants = try manager.getParticipants(alloc, txn.txn_id);
+                defer transactions_mod.freeParticipantList(alloc, participants);
+                if (participants.len > 0) {
+                    if (config.owns_recovery_fn) |owns| {
+                        if (!owns(config.resolver_ctx.?, participants[0])) continue;
+                    }
+                    summary.notification_attempts += 1;
+                    config.resolve_participant_fn.?(
+                        config.resolver_ctx.?,
+                        txn.txn_id,
+                        participants[0],
+                        .aborted,
+                        now_ns,
+                    ) catch {
+                        summary.notification_failures += 1;
+                        continue;
+                    };
+                    summary.notification_successes += 1;
+                }
+            }
+            continue;
+        }
+
+        const participants = try manager.getParticipants(alloc, txn.txn_id);
+        defer transactions_mod.freeParticipantList(alloc, participants);
+        const owner_participant = if (participants.len > 0) participants[0] else null;
+        if (config.replicated_metadata and owner_participant == null) return error.InvalidParticipant;
+        if (owner_participant) |owner| if (config.owns_recovery_fn) |owns| {
+            if (!owns(config.resolver_ctx.?, owner)) continue;
+        };
+
+        const has_intents = try manager.hasIntents(txn.txn_id);
+        const has_ha_outbox = if (config.replicated_metadata) false else try manager.hasHAOutbox(txn.txn_id);
+        var local_effects_resolved = true;
+        if (has_intents or has_ha_outbox) {
+            if (config.replicated_metadata) {
+                summary.notification_attempts += 1;
+                config.resolve_participant_fn.?(
+                    config.resolver_ctx.?,
+                    txn.txn_id,
+                    owner_participant.?,
+                    txn.status,
+                    txn.commit_version,
+                ) catch {
+                    summary.notification_failures += 1;
+                    local_effects_resolved = false;
+                };
+                if (local_effects_resolved) summary.notification_successes += 1;
+            } else if (config.resolve_local_fn) |resolve_local| {
+                summary.notification_attempts += 1;
+                resolve_local(
+                    config.local_resolution_ctx orelse return error.MissingLocalTransactionResolver,
+                    txn.txn_id,
+                    txn.status,
+                    txn.commit_version,
+                ) catch {
+                    // A corrupt or otherwise poison transaction must not pin the
+                    // bounded cursor and starve work behind it. Leave its durable
+                    // effects intact for the next keyspace rotation while still
+                    // propagating the decision to independent remote participants
+                    // and recovering later transactions in this page.
+                    summary.notification_failures += 1;
+                    local_effects_resolved = false;
+                };
+                if (local_effects_resolved) summary.notification_successes += 1;
+            }
+        }
 
         const unresolved = try manager.getUnresolvedParticipants(alloc, txn.txn_id);
         defer transactions_mod.freeParticipantList(alloc, unresolved);
-        if (unresolved.len == 0) continue;
+        var all_resolved = local_effects_resolved;
+        const retained_cutoff = now_ns -| config.retained_terminal_ns;
 
         for (unresolved) |participant| {
+            // Retained coordinators use their self-acknowledgement as the
+            // durable handoff from the API session registry. Recovery must not
+            // invent it during the advertised retry window. Once that window
+            // has elapsed, the API session has expired and storage must release
+            // the topology fence even if its node-local registry was lost.
+            if (txn.status == .committed and txn.coordinator and txn.retain_terminal and owner_participant != null and
+                std.mem.eql(u8, participant, owner_participant.?) and txn.finalized_at >= retained_cutoff)
+            {
+                all_resolved = false;
+                continue;
+            }
             summary.notification_attempts += 1;
             config.resolve_participant_fn.?(config.resolver_ctx.?, txn.txn_id, participant, txn.status, txn.commit_version) catch {
                 summary.notification_failures += 1;
+                all_resolved = false;
                 continue;
             };
-            try manager.markParticipantResolved(txn.txn_id, participant);
+            if (config.replicated_metadata) {
+                config.acknowledge_participant_fn.?(
+                    config.resolver_ctx.?,
+                    txn.txn_id,
+                    owner_participant.?,
+                    participant,
+                ) catch {
+                    summary.notification_failures += 1;
+                    all_resolved = false;
+                    continue;
+                };
+            } else try manager.markParticipantResolved(txn.txn_id, participant);
             summary.notification_successes += 1;
+        }
+        if (config.replicated_metadata and all_resolved) {
+            const cutoff = now_ns -| config.cutoff_ns;
+            if (txn.finalized_at < (if (txn.retain_terminal) retained_cutoff else cutoff)) {
+                config.cleanup_transaction_fn.?(
+                    config.resolver_ctx.?,
+                    txn.txn_id,
+                    owner_participant.?,
+                    cutoff,
+                    retained_cutoff,
+                ) catch {
+                    // Cleanup is an idempotent record-local Raft operation. A
+                    // failed proposal must remain retryable without pinning the
+                    // bounded recovery cursor ahead of unrelated transactions.
+                    summary.record_failures += 1;
+                    continue :transaction;
+                };
+            }
         }
     }
 
+    if (config.replicated_metadata) return summary;
+
     const cutoff = now_ns -| config.cutoff_ns;
-    summary.recovery = try manager.recoverTransactionsWithExtraBatchHooks(cutoff, now_ns, config.resolution_extra_hooks);
+    summary.recovery = try manager.recoverTransactionSummariesWithExtraBatchHooksAndOptions(
+        page.items,
+        cutoff,
+        now_ns,
+        config.resolution_extra_hooks,
+        .{
+            .presume_abort_distributed = false,
+            .retained_cutoff_timestamp = now_ns -| config.retained_terminal_ns,
+        },
+    );
     return summary;
 }
 
@@ -346,6 +545,7 @@ fn recordRun(runtime: *Runtime, now_ns: u64, summary: RunSummary, failed: bool) 
     runtime.stats_value.notification_successes += summary.notification_successes;
     runtime.stats_value.notification_failures += summary.notification_failures;
     runtime.stats_value.last_run_ns = now_ns;
+    runtime.stats_value.error_count += summary.record_failures;
     if (failed) runtime.stats_value.error_count += 1;
 }
 
@@ -382,6 +582,215 @@ test "transaction recovery runtime recoverOnce works with memory backend store" 
     try std.testing.expectEqual(transactions_mod.TxnStatus.aborted, try manager.getTransactionStatus(txn_id));
 }
 
+test "transaction recovery drains terminal HA outbox without remaining intents" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var runtime_store = try backend.runtimeStore(alloc, .{ .name = "ha-outbox" });
+    defer runtime_store.deinit();
+
+    const txn_id: transactions_mod.TxnId = .{5} ** 16;
+    var manager = try transactions_mod.TxnManager.init(alloc, &runtime_store);
+    defer manager.deinit();
+    try manager.initTransaction(txn_id, 1_000);
+    try manager.writeIntents(txn_id, &.{.{ .key = "doc:a", .value = "{}" }}, &.{});
+    const outbox_key = transactions_mod.makeTransactionHABatchOutboxKey(txn_id);
+    _ = try manager.resolveIntentsWithExtraBatch(txn_id, .committed, 2_000, .{
+        .writes = &.{.{ .key = &outbox_key, .value = "encoded-ha-batch" }},
+    });
+    try std.testing.expect(!try manager.hasIntents(txn_id));
+    try std.testing.expect(try manager.hasHAOutbox(txn_id));
+
+    const Recorder = struct {
+        store: *backend_erased.Store,
+        calls: usize = 0,
+
+        fn resolveLocal(ptr: *anyopaque, actual_txn_id: transactions_mod.TxnId, status: transactions_mod.TxnStatus, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqual(txn_id, actual_txn_id);
+            try std.testing.expectEqual(transactions_mod.TxnStatus.committed, status);
+            var local_manager = try transactions_mod.TxnManager.init(std.testing.allocator, self.store);
+            defer local_manager.deinit();
+            try local_manager.clearHAOutbox(actual_txn_id, .batch);
+        }
+    };
+    var recorder = Recorder{ .store = &runtime_store };
+    const summary = try runRecoveryPageWithConfig(alloc, runtime_store, .{
+        .enabled = true,
+        .resolver_ctx = &recorder,
+        .resolve_participant_fn = TestResolver.resolve,
+        .local_resolution_ctx = &recorder,
+        .resolve_local_fn = Recorder.resolveLocal,
+    }, 3_000, null, 1);
+    try std.testing.expectEqual(@as(usize, 1), recorder.calls);
+    try std.testing.expectEqual(@as(u64, 1), summary.recovery.scanned_records);
+    try std.testing.expect(!try manager.hasHAOutbox(txn_id));
+}
+
+test "transaction recovery advances past a failed local resolution" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var runtime_store = try backend.runtimeStore(alloc, .{ .name = "local-resolution-fairness" });
+    defer runtime_store.deinit();
+
+    const poison_txn: transactions_mod.TxnId = .{1} ** 16;
+    const healthy_txn: transactions_mod.TxnId = .{2} ** 16;
+    const later_txn: transactions_mod.TxnId = .{3} ** 16;
+    var manager = try transactions_mod.TxnManager.init(alloc, &runtime_store);
+    defer manager.deinit();
+    try manager.initTransactionWithParticipants(poison_txn, 1_000, &.{"remote"});
+    try manager.initTransaction(healthy_txn, 1_000);
+    for ([_]transactions_mod.TxnId{ poison_txn, healthy_txn }) |txn_id| {
+        try manager.writeIntents(txn_id, &.{.{ .key = "doc:a", .value = "{}" }}, &.{});
+        const outbox_key = transactions_mod.makeTransactionHABatchOutboxKey(txn_id);
+        _ = try manager.resolveIntentsWithExtraBatch(txn_id, .committed, 2_000, .{
+            .writes = &.{.{ .key = &outbox_key, .value = "encoded-ha-batch" }},
+        });
+    }
+    try manager.initTransaction(later_txn, 2_500);
+
+    const Recorder = struct {
+        store: *backend_erased.Store,
+        calls: [2]transactions_mod.TxnId = undefined,
+        call_count: usize = 0,
+        remote_calls: usize = 0,
+
+        fn resolveLocal(ptr: *anyopaque, txn_id: transactions_mod.TxnId, _: transactions_mod.TxnStatus, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls[self.call_count] = txn_id;
+            self.call_count += 1;
+            if (std.mem.eql(u8, &txn_id, &poison_txn)) return error.PoisonTransaction;
+
+            var local_manager = try transactions_mod.TxnManager.init(std.testing.allocator, self.store);
+            defer local_manager.deinit();
+            try local_manager.clearHAOutbox(txn_id, .batch);
+        }
+
+        fn resolveParticipant(ptr: *anyopaque, txn_id: transactions_mod.TxnId, participant: []const u8, status: transactions_mod.TxnStatus, commit_version: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.remote_calls += 1;
+            try std.testing.expectEqual(poison_txn, txn_id);
+            try std.testing.expectEqualStrings("remote", participant);
+            try std.testing.expectEqual(transactions_mod.TxnStatus.committed, status);
+            try std.testing.expectEqual(@as(u64, 2_000), commit_version);
+        }
+    };
+    var recorder = Recorder{ .store = &runtime_store };
+    const summary = try runRecoveryPageWithConfig(alloc, runtime_store, .{
+        .enabled = true,
+        .resolver_ctx = &recorder,
+        .resolve_participant_fn = Recorder.resolveParticipant,
+        .local_resolution_ctx = &recorder,
+        .resolve_local_fn = Recorder.resolveLocal,
+    }, 3_000, null, 2);
+
+    try std.testing.expectEqual(@as(usize, 2), recorder.call_count);
+    try std.testing.expectEqual(poison_txn, recorder.calls[0]);
+    try std.testing.expectEqual(healthy_txn, recorder.calls[1]);
+    try std.testing.expectEqual(@as(usize, 1), recorder.remote_calls);
+    try std.testing.expectEqual(@as(u64, 3), summary.notification_attempts);
+    try std.testing.expectEqual(@as(u64, 1), summary.notification_failures);
+    try std.testing.expectEqual(@as(u64, 2), summary.notification_successes);
+    try std.testing.expect(try manager.hasHAOutbox(poison_txn));
+    try std.testing.expect(!try manager.hasHAOutbox(healthy_txn));
+    const unresolved = try manager.getUnresolvedParticipants(alloc, poison_txn);
+    defer transactions_mod.freeParticipantList(alloc, unresolved);
+    try std.testing.expectEqual(@as(usize, 0), unresolved.len);
+    try std.testing.expect(summary.next_scan_after != null);
+}
+
+test "transaction recovery advances past a failed replicated cleanup" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var runtime_store = try backend.runtimeStore(alloc, .{ .name = "replicated-cleanup-fairness" });
+    defer runtime_store.deinit();
+
+    const poison_txn: transactions_mod.TxnId = .{1} ** 16;
+    const healthy_txn: transactions_mod.TxnId = .{2} ** 16;
+    const later_txn: transactions_mod.TxnId = .{3} ** 16;
+    const owner = "owner";
+    var manager = try transactions_mod.TxnManager.init(alloc, &runtime_store);
+    defer manager.deinit();
+    for ([_]transactions_mod.TxnId{ poison_txn, healthy_txn }) |txn_id| {
+        try manager.initTransactionWithParticipantsCreatedAtAndRole(txn_id, 1_000, 1_000, &.{owner}, true);
+        try manager.resolveIntents(txn_id, .committed, 2_000);
+        try manager.markParticipantResolved(txn_id, owner);
+    }
+    try manager.initTransaction(later_txn, 2_500);
+
+    const Recorder = struct {
+        calls: [2]transactions_mod.TxnId = undefined,
+        call_count: usize = 0,
+
+        fn owns(_: *anyopaque, _: []const u8) bool {
+            return true;
+        }
+
+        fn resolve(_: *anyopaque, _: transactions_mod.TxnId, _: []const u8, _: transactions_mod.TxnStatus, _: u64) !void {
+            return error.UnexpectedParticipantResolution;
+        }
+
+        fn acknowledge(_: *anyopaque, _: transactions_mod.TxnId, _: []const u8, _: []const u8) !void {
+            return error.UnexpectedParticipantAcknowledgement;
+        }
+
+        fn cleanup(ptr: *anyopaque, txn_id: transactions_mod.TxnId, _: []const u8, _: u64, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls[self.call_count] = txn_id;
+            self.call_count += 1;
+            if (std.mem.eql(u8, &txn_id, &poison_txn)) return error.PoisonCleanup;
+        }
+    };
+    var recorder = Recorder{};
+    const summary = try runRecoveryPageWithConfig(alloc, runtime_store, .{
+        .enabled = true,
+        .cutoff_ns = 1_000,
+        .resolver_ctx = &recorder,
+        .resolve_participant_fn = Recorder.resolve,
+        .replicated_metadata = true,
+        .owns_recovery_fn = Recorder.owns,
+        .acknowledge_participant_fn = Recorder.acknowledge,
+        .cleanup_transaction_fn = Recorder.cleanup,
+    }, 10_000, null, 2);
+
+    try std.testing.expectEqual(@as(usize, 2), recorder.call_count);
+    try std.testing.expectEqual(poison_txn, recorder.calls[0]);
+    try std.testing.expectEqual(healthy_txn, recorder.calls[1]);
+    try std.testing.expectEqual(@as(u64, 1), summary.record_failures);
+    try std.testing.expect(summary.next_scan_after != null);
+}
+
+test "non-replicated transaction recovery honors the per-run page limit" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var runtime_store = try backend.runtimeStore(alloc, .{ .name = "bounded-local" });
+    defer runtime_store.deinit();
+
+    var manager = try transactions_mod.TxnManager.init(alloc, &runtime_store);
+    defer manager.deinit();
+    const txn_ids = [_]transactions_mod.TxnId{ .{1} ** 16, .{2} ** 16, .{3} ** 16 };
+    for (txn_ids) |txn_id| {
+        try manager.initTransactionWithParticipantsCreatedAtAndRole(txn_id, 1_000, 1_000, &.{}, true);
+    }
+    var ctx: u8 = 0;
+    const summary = try runRecoveryPageWithConfig(alloc, runtime_store, .{
+        .enabled = true,
+        .cutoff_ns = 1_000,
+        .resolver_ctx = &ctx,
+        .resolve_participant_fn = TestResolver.resolve,
+    }, 5_000, null, 1);
+    try std.testing.expectEqual(@as(u64, 1), summary.recovery.scanned_records);
+    try std.testing.expectEqual(@as(u64, 1), summary.recovery.auto_aborted);
+    try std.testing.expect(summary.next_scan_after != null);
+    try std.testing.expectEqual(transactions_mod.TxnStatus.aborted, try manager.getTransactionStatus(txn_ids[0]));
+    try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try manager.getTransactionStatus(txn_ids[1]));
+    try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try manager.getTransactionStatus(txn_ids[2]));
+}
+
 test "transaction recovery runtime recoverOnce works with lsm backend store" {
     const alloc = std.testing.allocator;
     var backend = lsm_backend.Backend.init(alloc, .{ .flush_threshold = 2 });
@@ -409,4 +818,154 @@ test "transaction recovery runtime recoverOnce works with lsm backend store" {
     });
     try std.testing.expectEqual(@as(u64, 1), stats.auto_aborted);
     try std.testing.expectEqual(transactions_mod.TxnStatus.aborted, try manager.getTransactionStatus(txn_id));
+}
+
+test "transaction recovery delegates stale coordinator abort to replicated resolver" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var runtime_store = try backend.runtimeStore(alloc, .{ .name = "coordinator" });
+    defer runtime_store.deinit();
+
+    const txn_id: transactions_mod.TxnId = .{7} ** 16;
+    var manager = try transactions_mod.TxnManager.init(alloc, &runtime_store);
+    defer manager.deinit();
+    try manager.initTransactionWithParticipantsCreatedAtAndRole(
+        txn_id,
+        10_000,
+        1_000,
+        &.{ "table2:4:docs:group:7", "table2:4:docs:group:8" },
+        true,
+    );
+    try manager.writeIntents(txn_id, &.{.{ .key = "doc:a", .value = "{}" }}, &.{});
+
+    const Recorder = struct {
+        calls: usize = 0,
+        expected_txn_id: transactions_mod.TxnId,
+        fn resolve(ptr: *anyopaque, actual_txn_id: transactions_mod.TxnId, participant: []const u8, status: transactions_mod.TxnStatus, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqual(self.expected_txn_id, actual_txn_id);
+            try std.testing.expectEqualStrings("table2:4:docs:group:7", participant);
+            try std.testing.expectEqual(transactions_mod.TxnStatus.aborted, status);
+        }
+    };
+    var recorder = Recorder{ .expected_txn_id = txn_id };
+    var clock = platform_clock.ManualClock{};
+    clock.setRealtimeNs(5_000);
+    const stats = try recoverOnce(alloc, &runtime_store, .{
+        .enabled = true,
+        .cutoff_ns = 3_000,
+        .clock = clock.clock(),
+        .resolver_ctx = &recorder,
+        .resolve_participant_fn = Recorder.resolve,
+    });
+    try std.testing.expectEqual(@as(usize, 1), recorder.calls);
+    try std.testing.expectEqual(@as(u64, 1), stats.notification_attempts);
+    try std.testing.expectEqual(@as(u64, 0), stats.auto_aborted);
+    try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try manager.getTransactionStatus(txn_id));
+}
+
+test "replicated recovery is coordinator-owned and acknowledges through hooks" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var runtime_store = try backend.runtimeStore(alloc, .{ .name = "replicated-coordinator" });
+    defer runtime_store.deinit();
+
+    const txn_id: transactions_mod.TxnId = .{6} ** 16;
+    const coordinator = "table2:4:docs:group:7";
+    const remote = "table2:4:docs:group:8";
+    var manager = try transactions_mod.TxnManager.init(alloc, &runtime_store);
+    defer manager.deinit();
+    try manager.initTransactionWithParticipantsCreatedAtRoleAndRetention(
+        txn_id,
+        1_000,
+        1_000,
+        &.{ coordinator, remote },
+        true,
+        true,
+    );
+    try manager.resolveIntents(txn_id, .committed, 2_000);
+
+    const Recorder = struct {
+        resolve_calls: usize = 0,
+        ack_calls: usize = 0,
+        cleanup_calls: usize = 0,
+
+        fn owns(_: *anyopaque, owner: []const u8) bool {
+            std.testing.expectEqualStrings(coordinator, owner) catch return false;
+            return true;
+        }
+
+        fn resolve(ptr: *anyopaque, actual_txn_id: transactions_mod.TxnId, participant: []const u8, status: transactions_mod.TxnStatus, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.resolve_calls += 1;
+            try std.testing.expectEqual(txn_id, actual_txn_id);
+            try std.testing.expect(std.mem.eql(u8, remote, participant) or std.mem.eql(u8, coordinator, participant));
+            try std.testing.expectEqual(transactions_mod.TxnStatus.committed, status);
+        }
+
+        fn acknowledge(ptr: *anyopaque, actual_txn_id: transactions_mod.TxnId, owner: []const u8, participant: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.ack_calls += 1;
+            try std.testing.expectEqual(txn_id, actual_txn_id);
+            try std.testing.expectEqualStrings(coordinator, owner);
+            try std.testing.expect(std.mem.eql(u8, remote, participant) or std.mem.eql(u8, coordinator, participant));
+        }
+
+        fn cleanup(ptr: *anyopaque, _: transactions_mod.TxnId, _: []const u8, _: u64, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.cleanup_calls += 1;
+        }
+    };
+
+    var recorder = Recorder{};
+    var clock = platform_clock.ManualClock{};
+    clock.setRealtimeNs(10_000);
+    const stats = try recoverOnce(alloc, &runtime_store, .{
+        .enabled = true,
+        .clock = clock.clock(),
+        .cutoff_ns = 1_000,
+        .retained_terminal_ns = 20_000,
+        .resolver_ctx = &recorder,
+        .resolve_participant_fn = Recorder.resolve,
+        .replicated_metadata = true,
+        .owns_recovery_fn = Recorder.owns,
+        .acknowledge_participant_fn = Recorder.acknowledge,
+        .cleanup_transaction_fn = Recorder.cleanup,
+    });
+    try std.testing.expectEqual(@as(usize, 1), recorder.resolve_calls);
+    try std.testing.expectEqual(@as(usize, 1), recorder.ack_calls);
+    try std.testing.expectEqual(@as(usize, 0), recorder.cleanup_calls);
+    try std.testing.expectEqual(@as(u64, 1), stats.notification_successes);
+
+    // Recovery requested remote propagation only. It neither invented the
+    // stable API handoff acknowledgement for the coordinator itself nor
+    // mutated coordinator metadata behind Raft's back.
+    const unresolved = try manager.getUnresolvedParticipants(alloc, txn_id);
+    defer transactions_mod.freeParticipantList(alloc, unresolved);
+    try std.testing.expectEqual(@as(usize, 2), unresolved.len);
+    try std.testing.expectEqualStrings(coordinator, unresolved[0]);
+    try std.testing.expectEqualStrings(remote, unresolved[1]);
+
+    // After the complete stable-session retry window, storage recovery is the
+    // final safety net for a permanently lost node-local API registry.
+    clock.setRealtimeNs(30_000);
+    const expired_stats = try recoverOnce(alloc, &runtime_store, .{
+        .enabled = true,
+        .clock = clock.clock(),
+        .cutoff_ns = 1_000,
+        .retained_terminal_ns = 20_000,
+        .resolver_ctx = &recorder,
+        .resolve_participant_fn = Recorder.resolve,
+        .replicated_metadata = true,
+        .owns_recovery_fn = Recorder.owns,
+        .acknowledge_participant_fn = Recorder.acknowledge,
+        .cleanup_transaction_fn = Recorder.cleanup,
+    });
+    try std.testing.expectEqual(@as(usize, 3), recorder.resolve_calls);
+    try std.testing.expectEqual(@as(usize, 3), recorder.ack_calls);
+    try std.testing.expectEqual(@as(usize, 1), recorder.cleanup_calls);
+    try std.testing.expectEqual(@as(u64, 2), expired_stats.notification_successes);
 }

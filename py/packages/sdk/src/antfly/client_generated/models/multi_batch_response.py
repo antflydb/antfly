@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.multi_batch_response_status import MultiBatchResponseStatus
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
@@ -20,13 +21,19 @@ class MultiBatchResponse:
     """Response for a cross-table batch operation. Contains per-table results.
 
     Attributes:
+        status (MultiBatchResponseStatus | Unset): Durable commit and visibility/propagation state.
         tables (MultiBatchResponseTables | Unset): Per-table batch results
     """
 
+    status: MultiBatchResponseStatus | Unset = UNSET
     tables: MultiBatchResponseTables | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        status: str | Unset = UNSET
+        if not isinstance(self.status, Unset):
+            status = self.status.value
+
         tables: dict[str, Any] | Unset = UNSET
         if not isinstance(self.tables, Unset):
             tables = self.tables.to_dict()
@@ -34,6 +41,8 @@ class MultiBatchResponse:
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
+        if status is not UNSET:
+            field_dict["status"] = status
         if tables is not UNSET:
             field_dict["tables"] = tables
 
@@ -44,6 +53,13 @@ class MultiBatchResponse:
         from ..models.multi_batch_response_tables import MultiBatchResponseTables
 
         d = dict(src_dict)
+        _status = d.pop("status", UNSET)
+        status: MultiBatchResponseStatus | Unset
+        if isinstance(_status, Unset):
+            status = UNSET
+        else:
+            status = MultiBatchResponseStatus(_status)
+
         _tables = d.pop("tables", UNSET)
         tables: MultiBatchResponseTables | Unset
         if isinstance(_tables, Unset):
@@ -52,6 +68,7 @@ class MultiBatchResponse:
             tables = MultiBatchResponseTables.from_dict(_tables)
 
         multi_batch_response = cls(
+            status=status,
             tables=tables,
         )
 

@@ -3749,7 +3749,7 @@ fn replicationCutoverRetirementCleared(
 }
 
 const transition_magic = "afmd1";
-const runtime_status_record_version: u16 = 11;
+const runtime_status_record_version: u16 = 12;
 const group_status_record_version: u16 = 4;
 
 const TransitionTag = enum(u8) {
@@ -4653,6 +4653,8 @@ fn appendRuntimeEnrichmentStatusRecord(
     try appendInt(alloc, out, u64, record.error_count);
     try appendInt(alloc, out, u64, record.retryable_error_count);
     try appendInt(alloc, out, u64, record.fatal_error_count);
+    try appendInt(alloc, out, u32, record.consecutive_retry_count);
+    try appendInt(alloc, out, u64, record.next_retry_at_ms);
     try out.append(alloc, if (record.retrying) 1 else 0);
     try out.append(alloc, if (record.worker_failed) 1 else 0);
     try out.append(alloc, if (record.worker_started) 1 else 0);
@@ -4709,6 +4711,8 @@ fn readRuntimeEnrichmentStatusRecord(
     const error_count = try readInt(encoded, pos, u64);
     const retryable_error_count = try readInt(encoded, pos, u64);
     const fatal_error_count = try readInt(encoded, pos, u64);
+    const consecutive_retry_count = if (version >= 12) try readInt(encoded, pos, u32) else 0;
+    const next_retry_at_ms = if (version >= 12) try readInt(encoded, pos, u64) else 0;
     if (pos.* + 4 > encoded.len) return error.InvalidMetadataTransitionEncoding;
     const retrying = encoded[pos.*] != 0;
     pos.* += 1;
@@ -4737,6 +4741,8 @@ fn readRuntimeEnrichmentStatusRecord(
         .error_count = error_count,
         .retryable_error_count = retryable_error_count,
         .fatal_error_count = fatal_error_count,
+        .consecutive_retry_count = consecutive_retry_count,
+        .next_retry_at_ms = next_retry_at_ms,
         .retrying = retrying,
         .worker_failed = worker_failed,
         .worker_started = worker_started,
@@ -9864,6 +9870,8 @@ test "metadata raft apply store runtime status codec preserves document identity
             .projection_checkpoint_status = "rebuilding",
             .projection_checkpoint_config_hash = std.math.maxInt(u64) - 7,
             .processed_requests = 17,
+            .consecutive_retry_count = 4,
+            .next_retry_at_ms = 1_753_392_345_999,
             .embed_batches_completed = 3,
             .last_embed_batch_completed_ms = 1_753_392_345_678,
             .worker_started = true,
@@ -9927,6 +9935,8 @@ test "metadata raft apply store runtime status codec preserves document identity
     try std.testing.expect(status.enrichment.worker_started);
     try std.testing.expect(status.enrichment.stalled);
     try std.testing.expectEqual(@as(u64, 17), status.enrichment.processed_requests);
+    try std.testing.expectEqual(@as(u32, 4), status.enrichment.consecutive_retry_count);
+    try std.testing.expectEqual(@as(u64, 1_753_392_345_999), status.enrichment.next_retry_at_ms);
     try std.testing.expectEqual(@as(u64, 3), status.enrichment.embed_batches_completed);
     try std.testing.expectEqual(@as(u64, 1_753_392_345_678), status.enrichment.last_embed_batch_completed_ms);
     try std.testing.expectEqual(std.math.maxInt(u64) - 7, status.enrichment.projection_checkpoint_config_hash);

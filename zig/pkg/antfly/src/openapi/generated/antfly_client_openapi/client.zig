@@ -1007,7 +1007,7 @@ pub const Client = struct {
         return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
     }
 
-    /// Reprocess a derived document artifact across a table range
+    /// Reprocess a derived asset across a table range
     /// POST /db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess
     pub fn reprocessDocumentArtifactRange(self: *@This(), table_name: []const u8, artifact_name: []const u8, body: ?types.DocumentArtifactTableReprocessRequest) !ApiResponse(types.DocumentArtifactTableReprocessResponse) {
         const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
@@ -1228,7 +1228,7 @@ pub const Client = struct {
         return ApiResponse(types.DocumentArtifactManifest).fromResponse(self.allocator, &resp);
     }
 
-    /// Reprocess a derived document artifact
+    /// Reprocess a derived asset
     /// POST /db/v1/tables/{tableName}/documents/{key}/artifacts/{artifactName}/reprocess
     pub fn reprocessDocumentArtifact(self: *@This(), table_name: []const u8, key: []const u8, artifact_name: []const u8) !ApiResponse(types.DocumentArtifactReprocessResponse) {
         const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);

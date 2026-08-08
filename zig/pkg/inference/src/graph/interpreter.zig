@@ -32,6 +32,7 @@ const ops_mod = @import("../ops/ops.zig");
 const contracts = @import("backend_contracts.zig");
 const transpose_utils = @import("transpose_utils.zig");
 const buffer_plan_mod = @import("buffer_plan.zig");
+const runtime_slice = @import("runtime_slice.zig");
 
 const Graph = ml.graph.Graph;
 const Node = ml.graph.Node;
@@ -3354,11 +3355,7 @@ pub fn executeNode(
             var starts: [8]i64 = undefined;
             var limits: [8]i64 = undefined;
             var strides: [8]i64 = undefined;
-            for (0..rank) |d| {
-                starts[d] = attrs.starts[d];
-                limits[d] = attrs.limits[d];
-                strides[d] = attrs.strides[d];
-            }
+            try runtime_slice.resolve(graph.allocator, cb, values, ins, attrs, &starts, &limits, &strides);
             const result = cb.primSlice(V.get(ins[0]), starts[0..rank], limits[0..rank], strides[0..rank], in_shape) catch |err| {
                 const actual = cb.tensorShape(V.get(ins[0]), std.heap.page_allocator) catch null;
                 defer if (actual) |shape| std.heap.page_allocator.free(shape);
@@ -5467,6 +5464,66 @@ test "runtime shape drives symbolic slice" {
         16, 17, 18,
         19, 20, 21,
     }, actual);
+}
+
+test "runtime shape expression bounds a slice of a static tensor" {
+    const allocator = std.testing.allocator;
+
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var builder = ml.graph.Builder.init(&g);
+
+    const input_ids = try builder.parameter("input_ids", Shape.init(.i64, &.{ -1, -1 }));
+    const input_shape = try g.addNode(.{
+        .op = .{ .shape_of = .{ .start = 0, .end = 2 } },
+        .output_shape = Shape.init(.i64, &.{2}),
+        .inputs = .{ input_ids, null_node, null_node, null_node },
+        .num_inputs = 1,
+    });
+    const sequence_axis = try builder.tensorConst(&.{1.0}, Shape.init(.i64, &.{}));
+    const sequence_length = try builder.gather(input_shape, sequence_axis, Shape.init(.i64, &.{}));
+    const ends = try builder.reshape(sequence_length, Shape.init(.i64, &.{1}));
+    const starts = try builder.tensorConst(&.{0.0}, Shape.init(.i64, &.{1}));
+
+    var positions: [12]f32 = undefined;
+    for (&positions, 0..) |*position, i| position.* = @floatFromInt(i);
+    const position_ids = try builder.tensorConst(&positions, Shape.init(.i64, &.{ 1, 12 }));
+    var attrs = ml.graph.node.SliceAttrs{};
+    attrs.num_axes = 2;
+    attrs.starts = .{ 0, 0, 0, 0, 0, 0, 0, 0 };
+    attrs.limits = .{ 1, -1, 0, 0, 0, 0, 0, 0 };
+    attrs.strides = .{ 1, 1, 1, 1, 1, 1, 1, 1 };
+    attrs.bound_axes[0] = 1;
+    attrs.num_bound_axes = 1;
+    attrs.runtime_limits = true;
+    const sliced = try g.addNode(.{
+        .op = .{ .slice = attrs },
+        .output_shape = Shape.init(.i64, &.{ 1, -1 }),
+        .inputs = .{ position_ids, starts, ends, null_node },
+        .num_inputs = 3,
+    });
+    try g.markOutput(sliced);
+
+    var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &ws, null);
+    var cb_val = compute.computeBackend();
+
+    const ids: [3 * 4]f32 = @splat(0);
+    const input_ids_ct = try cb_val.fromFloat32Shape(&ids, &.{ 3, 4 });
+    defer cb_val.free(input_ids_ct);
+    const rt_inputs = [_]RuntimeInput{
+        .{ .node_id = input_ids, .value = input_ids_ct },
+    };
+
+    var result = try execute(allocator, &g, &cb_val, .{ .runtime_inputs = &rt_inputs });
+    defer result.deinit(&cb_val);
+
+    const actual_shape = try cb_val.tensorShape(result.outputs[0], allocator);
+    defer allocator.free(actual_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 4 }, actual_shape);
+    const actual = try cb_val.toFloat32(result.outputs[0], allocator);
+    defer allocator.free(actual);
+    try std.testing.expectEqualSlices(f32, &.{ 0, 1, 2, 3 }, actual);
 }
 
 test "runtime shape drives symbolic concat" {

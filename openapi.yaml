@@ -2409,12 +2409,30 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/MultiBatchResponse'
+        '202':
+          description: Commit decision is durable; visibility or participant recovery is still pending
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MultiBatchResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '409':
+          description: Transaction aborted because a predicate, topology fence, or participant state conflicted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionCommitResponse'
         '404':
           $ref: '#/components/responses/NotFound'
+        '503':
+          description: The coordinator was unavailable before a commit decision; retry is safe
+          content:
+            text/plain:
+              schema:
+                type: string
         '500':
-          $ref: '#/components/responses/InternalServerError'
+          $ref: '#/components/responses/StatelessTransactionFailure'
       security:
         - BasicAuth: []
         - ApiKeyAuth: []
@@ -2464,6 +2482,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/TransactionCommitResponse'
+        '202':
+          description: Transaction committed durably with visibility or participant recovery pending
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionCommitResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
         '404':
@@ -2474,8 +2498,14 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/TransactionCommitResponse'
+        '503':
+          description: The coordinator was unavailable before a commit decision; retry is safe
+          content:
+            text/plain:
+              schema:
+                type: string
         '500':
-          $ref: '#/components/responses/InternalServerError'
+          $ref: '#/components/responses/StatelessTransactionFailure'
       security:
         - BasicAuth: []
         - ApiKeyAuth: []
@@ -2792,6 +2822,12 @@ paths:
       responses:
         '200':
           description: Session committed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionSessionCommitResponse'
+        '202':
+          description: Session committed durably with visibility or participant recovery pending
           content:
             application/json:
               schema:
@@ -3813,14 +3849,40 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/BatchResponse'
+        '202':
+          description: Commit decision is durable; visibility or participant recovery is still pending
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          description: >
+            The atomic batch conflicted, the serving replica is fenced, or the
+
+            server could not determine whether a single-group Raft command
+
+            committed. An ambiguous outcome is not safe to replay blindly when
+
+            the request contains non-idempotent transforms.
+          content:
+            text/plain:
+              schema:
+                type: string
         '429':
           $ref: '#/components/responses/DenseRepairBackpressure'
+        '503':
+          description: Write routing, document identity, or the coordinator is temporarily unavailable
+            before a commit decision
+          content:
+            text/plain:
+              schema:
+                type: string
         '500':
-          $ref: '#/components/responses/InternalServerError'
+          $ref: '#/components/responses/StatelessTransactionFailure'
       security:
         - BasicAuth: []
         - ApiKeyAuth: []
@@ -4593,13 +4655,13 @@ paths:
       - name: artifactName
         in: path
         required: true
-        description: Name of the derived document artifact.
+        description: Name of the derived asset enrichment.
         schema:
           type: string
     post:
-      summary: Reprocess a derived document artifact across a table range
+      summary: Reprocess a derived asset across a table range
       description: >
-        Runs a bounded operational repair pass for a derived document artifact
+        Runs a bounded operational repair pass for any asset producer type
 
         across source rows in key order. Use `next_key` from the response as
 
@@ -4737,7 +4799,7 @@ paths:
       - name: artifactName
         in: path
         required: true
-        description: Name of the derived document artifact.
+        description: Name of the derived asset enrichment.
         schema:
           type: string
     post:
@@ -5022,11 +5084,15 @@ paths:
         schema:
           type: string
     post:
-      summary: Reprocess a derived document artifact
+      summary: Reprocess a derived asset
       description: >
         Invalidates the current artifact state and requests the producer to
 
-        rebuild the derived document hierarchy for the source document.
+        rebuild the derived asset for the source document. Copy, generator,
+
+        reader, transcriber, extractor, and document-extraction producers are
+
+        all supported.
       tags:
         - data_operations
       operationId: reprocessDocumentArtifact
@@ -8046,6 +8112,7 @@ components:
         - missing_artifact
         - corrupt_artifact
         - unreadable_artifact
+        - enrichment_failed
     RepairTarget:
       type: string
       description: Repair subsystem to inspect or run.
@@ -8064,6 +8131,7 @@ components:
         - repairable
         - sequence
         - reason
+        - generation_attempts
         - attempts
         - first_seen_ns
         - last_seen_ns
@@ -8108,6 +8176,13 @@ components:
           description: Derived replay sequence that observed the issue.
         reason:
           $ref: '#/components/schemas/ArtifactRepairReason'
+        generation_attempts:
+          type: integer
+          format: uint64
+          description: Number of enrichment generation attempts made before this issue was parked.
+        generation_error:
+          type: string
+          description: Stable source-generation error code that caused this issue to be parked.
         attempts:
           type: integer
           format: uint64
@@ -8242,7 +8317,8 @@ components:
         - unresolved
         - in_progress
         - indexes_rebuilt
-        - indexes_degraded
+        - indexes_degraded_before
+        - indexes_degraded_after
         - controls_applied
         - limit
         - has_more
@@ -8290,10 +8366,16 @@ components:
           type: integer
           format: uint64
           description: Number of indexes rebuilt by this pass when target is index.
-        indexes_degraded:
+        indexes_degraded_before:
           type: integer
           format: uint64
-          description: Number of selected indexes that were already degraded or quarantined before repair.
+          description: Number of selected indexes that were degraded or quarantined when this repair pass
+            began.
+        indexes_degraded_after:
+          type: integer
+          format: uint64
+          description: Number of selected indexes that remain degraded or quarantined when this repair
+            pass returns.
         controls_applied:
           type: integer
           format: uint64
@@ -10362,6 +10444,12 @@ components:
     BatchResponse:
       type: object
       properties:
+        status:
+          type: string
+          enum:
+            - committed
+            - committed_pending
+          description: Durable commit and visibility/participant recovery state.
         inserted:
           type: integer
           description: Number of documents successfully inserted
@@ -10441,6 +10529,13 @@ components:
       description: >
         Response for a cross-table batch operation. Contains per-table results.
       properties:
+        status:
+          type: string
+          description: Durable commit and visibility/propagation state.
+          enum:
+            - committed
+            - committed_visibility_pending
+            - committed_recovery_pending
         tables:
           type: object
           description: Per-table batch results
@@ -10507,6 +10602,78 @@ components:
             $ref: '#/components/schemas/BatchRequest'
         sync_level:
           $ref: '#/components/schemas/SyncLevel'
+    TransactionConflictParticipant:
+      type: object
+      description: Participant location and 2PC phase where the conflict occurred.
+      properties:
+        group_id:
+          type: integer
+          format: uint64
+          description: Raft group that reported the conflict.
+        phase:
+          type: string
+          enum:
+            - begin
+            - prepare
+            - resolve
+          description: 2PC participant phase that reported the conflict.
+    TransactionConflict:
+      type: object
+      description: Structured details for an aborted transaction attempt.
+      required:
+        - table
+        - key
+        - message
+        - kind
+        - retryable
+      properties:
+        table:
+          type: string
+          description: Table where the conflict was detected.
+        key:
+          type: string
+          description: Document key associated with the conflict, when applicable.
+        message:
+          type: string
+          description: Human-readable conflict description.
+        kind:
+          type: string
+          enum:
+            - version_conflict
+            - intent_conflict
+            - topology_changed
+            - participant_unavailable
+            - doc_identity_unavailable
+            - session_lease_lost
+            - transaction_conflict
+            - torn_state
+          description: Stable machine-readable conflict classification.
+        retryable:
+          type: boolean
+          description: Whether retrying the transaction may succeed without changing its writes.
+        retry_after_ms:
+          type: integer
+          format: uint32
+          minimum: 1
+          description: Minimum suggested delay before retrying a retryable conflict.
+        retry_scope:
+          type: string
+          enum:
+            - topology
+            - participant
+            - doc_identity
+            - session
+          description: Component whose state should be refreshed before retrying.
+        expected_version:
+          type: integer
+          format: uint64
+          description: Version required by the transaction predicate.
+        current_version:
+          type: integer
+          format: uint64
+          description: Version observed while validating the transaction predicate.
+        participant:
+          $ref: '#/components/schemas/TransactionConflictParticipant'
     TransactionCommitResponse:
       type: object
       description: Result of an OCC transaction commit attempt.
@@ -10517,24 +10684,21 @@ components:
           type: string
           enum:
             - committed
+            - committed_visibility_pending
+            - committed_recovery_pending
             - aborted
-          description: Whether the transaction was committed or aborted due to a conflict
+          description: >
+            Durable transaction outcome. Pending committed states mean the
+
+            commit decision is durable while its requested visibility barrier
+
+            or participant recovery is still completing.
         conflict:
-          type: object
           description: Details about the conflict that caused an abort (only present when status is "aborted")
-          properties:
-            table:
-              type: string
-              description: Table where the conflict was detected
-            key:
-              type: string
-              description: Key that had a version mismatch
-            message:
-              type: string
-              description: Human-readable conflict description
+          $ref: '#/components/schemas/TransactionConflict'
         tables:
           type: object
-          description: Per-table batch results (only present when status is "committed")
+          description: Per-table batch results (present for every committed status)
           additionalProperties:
             $ref: '#/components/schemas/BatchResponse'
     TransactionBeginRequest:
@@ -17150,7 +17314,7 @@ components:
         backfill_state:
           x-go-type-skip-optional-pointer: true
           type: string
-          description: Operational readiness state such as ready, running, retrying, or failed.
+          description: Operational readiness state such as ready, running, retrying, degraded, or failed.
         doc_count:
           x-go-type-skip-optional-pointer: true
           type: integer
@@ -17329,6 +17493,8 @@ components:
         - skipped
         - terminal_failed
         - covered
+        - settled
+        - uncovered
         - pending
         - complete
         - healthy
@@ -17381,13 +17547,25 @@ components:
           format: uint64
           description: Raw terminal source outcomes counted by the configured policy. This may exceed
             source_total only while observation_complete is false with counter_mismatch.
+        settled:
+          type: integer
+          format: uint64
+          description: 'Source documents with any durable terminal outcome: produced, intentionally skipped,
+            or terminally failed.'
+        uncovered:
+          x-go-type-skip-optional-pointer: false
+          type: integer
+          format: uint64
+          nullable: true
+          description: Source documents without an outcome accepted by the configured coverage policy.
+            Null when observations are incomplete.
         pending:
           x-go-type-skip-optional-pointer: false
           type: integer
           format: uint64
           nullable: true
-          description: Source documents without a policy-accepted terminal outcome. Null when observations
-            are incomplete and the global value is unknown.
+          description: Source documents that have not reached any terminal outcome and may still be processing.
+            Null when observations are incomplete.
         complete:
           type: boolean
           description: Whether observations are complete, replay has reached its target, and every observed
@@ -17397,7 +17575,8 @@ components:
           description: Whether coverage is complete without terminal failures.
         degraded:
           type: boolean
-          description: Whether coverage is complete under best_effort but includes terminal failures.
+          description: Whether all sources are settled but coverage remains unhealthy under the configured
+            policy, including terminal failures or policy-rejected skips.
     EnrichmentRuntimeStatus:
       type: object
       additionalProperties: false
@@ -17417,6 +17596,8 @@ components:
         - error_count
         - retryable_error_count
         - fatal_error_count
+        - consecutive_retry_count
+        - next_retry_at_ms
         - retrying
         - worker_failed
         - worker_started
@@ -17480,6 +17661,15 @@ components:
         fatal_error_count:
           type: integer
           format: uint64
+        consecutive_retry_count:
+          type: integer
+          format: uint32
+          description: Consecutive durable worker retries for the current failed request window.
+        next_retry_at_ms:
+          type: integer
+          format: uint64
+          description: Unix epoch time in milliseconds when the current durable retry becomes eligible.
+            Zero when not retrying.
         retrying:
           type: boolean
         worker_failed:
@@ -17846,7 +18036,7 @@ components:
         backfill_state:
           x-go-type-skip-optional-pointer: true
           type: string
-          description: Operational readiness state such as ready, running, retrying, or failed.
+          description: Operational readiness state such as ready, running, retrying, degraded, or failed.
         doc_count:
           x-go-type-skip-optional-pointer: true
           type: integer
@@ -18066,7 +18256,7 @@ components:
         backfill_state:
           x-go-type-skip-optional-pointer: true
           type: string
-          description: Operational readiness state such as ready, running, retrying, or failed.
+          description: Operational readiness state such as ready, running, retrying, degraded, or failed.
         doc_count:
           x-go-type-skip-optional-pointer: true
           type: integer
@@ -23025,6 +23215,22 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
+    StatelessTransactionFailure:
+      description: >
+        Internal transaction failure. If the response says that the outcome is
+
+        unknown, the request may already have committed and the stateless
+
+        request MUST NOT be retried. Use a transaction session when a commit
+
+        must be safely retryable by transaction ID.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+        text/plain:
+          schema:
+            type: string
     DenseRepairBackpressure:
       description: Writes are temporarily limited while a dense-index rebuild catches up.
       headers:

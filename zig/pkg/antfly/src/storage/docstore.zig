@@ -1101,6 +1101,13 @@ pub const DocStore = struct {
         try self.putBatchWithReplayWithOptions(io, writes, deletes, replay, .{});
     }
 
+    /// Update the in-memory replay watermark after a replay entry was committed
+    /// by an external atomic batch (for example transaction intent resolution).
+    pub fn observeExternalReplayCommit(self: *DocStore, sequence: u64) void {
+        self.markReplayIndexAvailable();
+        self.observeCommittedReplaySequence(sequence);
+    }
+
     pub fn lastReplaySequence(self: *DocStore, fallback_last: u64) u64 {
         const next = self.nextReplaySequence(fallback_last + 1);
         return if (next <= 1) 0 else next - 1;

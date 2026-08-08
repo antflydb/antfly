@@ -38,7 +38,7 @@ class GraphIndexStats:
         backfill_active (bool | Unset): Whether the index is actively rebuilding, materializing, or catching up.
         backfill_progress (float | Unset): Rebuild progress as a ratio from 0.0 to 1.0
         backfill_items_processed (int | Unset): Number of edges indexed during current rebuild
-        backfill_state (str | Unset): Operational readiness state such as ready, running, retrying, or failed.
+        backfill_state (str | Unset): Operational readiness state such as ready, running, retrying, degraded, or failed.
         doc_count (int | Unset): Number of documents covered by the graph index.
         edge_count (int | Unset): Number of graph edges currently indexed.
         node_count (int | Unset): Number of graph nodes currently indexed.
