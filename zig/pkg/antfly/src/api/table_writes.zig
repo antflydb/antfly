@@ -11824,6 +11824,30 @@ pub const ProvisionedTableWriteSource = struct {
         group_ids: []const u64,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (comptime storage_kernel_experiment) {
+            try enforceHAWriteGateOptional(self.ha_write_gate);
+            if (group_ids.len == 0) return null;
+            const local_source = self.groupLocalWriteSource() orelse
+                return error.StorageKernelOwnerUnavailable;
+            self.beginLocalStructuralMutation(table_name);
+            var mutation_active = true;
+            errdefer if (mutation_active) self.abortLocalStructuralMutation(table_name);
+            for (group_ids) |group_id| {
+                if ((try local_source.retireTableGroupLocal(group_id, table_name)) == null)
+                    return error.StorageKernelOwnerUnavailable;
+                const trash_path = try moveDroppedGroupPathToTrash(
+                    alloc,
+                    self.replica_root_dir,
+                    table_name,
+                    group_id,
+                );
+                if (trash_path) |dropped_path| try self.deleteDroppedGroupPath(alloc, dropped_path);
+            }
+            self.finishLocalStructuralMutation(table_name);
+            mutation_active = false;
+            self.notifyLocalChange(table_name, .structural);
+            return {};
+        }
         if (self.localWriteOwnerSource()) |owner| return try owner.dropTable(alloc, table_name, group_ids);
         try enforceHAWriteGateOptional(self.ha_write_gate);
         if (group_ids.len == 0) return null;

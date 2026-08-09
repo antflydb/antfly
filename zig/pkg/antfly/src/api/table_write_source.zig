@@ -364,6 +364,11 @@ pub const TableWriteSource = struct {
             target_index_name: ?[]const u8,
             advance_index_repair: bool,
         ) anyerror!?LocalStructuralReconcileResult = null,
+        retire_table_group_local: ?*const fn (
+            ptr: *anyopaque,
+            group_id: u64,
+            table_name: []const u8,
+        ) anyerror!?void = null,
     };
 
     pub fn batch(
@@ -863,5 +868,14 @@ pub const TableWriteSource = struct {
     ) !?LocalStructuralReconcileResult {
         const fn_ptr = self.vtable.reconcile_table_group_local orelse return null;
         return try fn_ptr(self.ptr, group_id, table_name, target_index_name, advance_index_repair);
+    }
+
+    pub fn retireTableGroupLocal(
+        self: TableWriteSource,
+        group_id: u64,
+        table_name: []const u8,
+    ) !?void {
+        const fn_ptr = self.vtable.retire_table_group_local orelse return null;
+        return try fn_ptr(self.ptr, group_id, table_name);
     }
 };

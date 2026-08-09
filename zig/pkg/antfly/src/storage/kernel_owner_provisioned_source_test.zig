@@ -590,6 +590,15 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
     try std.testing.expectEqual(abi.Status.busy, abi.antfly_storage_owner_open(&open_request, &duplicate));
     try std.testing.expect(duplicate == null);
 
+    try std.testing.expect((try write_source.source().dropTable(alloc, "articles", &.{7001})) != null);
+    try std.testing.expectEqual(@as(usize, 0), owner_source.ownerCountForTest());
+    var path_io_impl = std.Io.Threaded.init(alloc, .{});
+    defer path_io_impl.deinit();
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().access(path_io_impl.io(), group_path, .{}),
+    );
+
     write_source.deinit();
     write_source_active = false;
     owner_source.deinit();

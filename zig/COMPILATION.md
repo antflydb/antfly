@@ -2177,6 +2177,28 @@ physical source, and the node repair scheduler must be routed through the same
 owner before the final source switch. No cold ReleaseFast result is credited
 until those remaining roots are removed atomically.
 
+### Phase 4c: owner-fenced table retirement
+
+The group-local write contract now includes table-owner retirement. In the
+storage experiment, drop-table first enters the existing table-wide structural
+admission fence, retires every resident opaque owner, and only then atomically
+moves and deletes each physical group path. The compile-time experimental path
+returns before the legacy local DB/cache drop implementation, so a catalog
+deletion cannot leave a live compiled owner or require a second physical DB
+owner to perform cleanup.
+
+The provisioned owner-source suite remains 6/6 and now proves that drop-table
+closes the sole resident owner, reduces the owner count to zero, removes the
+group path, and permits a later clean reopen. The complete linked Debug
+executable also rebuilds successfully with normal concurrency, the production
+LSM backend, and the storage experiment enabled.
+
+This completes ownership family 1's physical create, schema, index,
+enrichment-configuration, bounded repair admission, and retirement mechanisms.
+The durable node repair scheduler still needs to consume the bounded owner
+operation as part of ownership family 6, but no schema/index control path needs
+to open a DB in distributed code. The next family is bulk-ingest lifecycle.
+
 ## Holistic target architecture
 
 The current candidate baseline is the four-unit topology above with serverless

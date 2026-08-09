@@ -179,6 +179,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .batch_group_local = batchGroupLocal,
                 .local_runtime_statuses = localRuntimeStatuses,
                 .reconcile_table_group_local = reconcileTableGroupLocal,
+                .retire_table_group_local = retireTableGroupLocal,
             },
         };
     }
@@ -233,6 +234,15 @@ pub const ProvisionedKernelOwnerSource = struct {
             entry.retired = true;
             self.destroyEntryAtIndexLocked(i);
         }
+    }
+
+    fn retireTableGroupLocal(
+        ptr: *anyopaque,
+        group_id: u64,
+        table_name: []const u8,
+    ) !?void {
+        try retireGroupForPublication(ptr, group_id, table_name);
+        return {};
     }
 
     fn prepareSnapshot(
