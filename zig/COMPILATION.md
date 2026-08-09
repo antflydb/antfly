@@ -1570,13 +1570,179 @@ facade omission introduced with the process owner: `capi_root.zig` did not
 export `platform_sync`. Adding that focused import makes the owner context
 compile in both the linked production artifact and the standalone CAPI test.
 
-Decision: **keep the serverless physical-runtime placement, pending
-normal-runner confirmation**. It exchanges 21.140 seconds of local critical
-time for an 80.587-second API reduction, 89 fewer duplicate compiler-file
-instances, and a 3.15 MB smaller executable while staying under the 380-second
-gate. The next experiment is no longer a placement shuffle: remove the 50
+Normal-runner run `31288827248` then passed all 30 cold archive steps on the
+existing 24 GiB `arc-antfly-publish` runner, again without swap, `-j1`, or a
+larger machine:
+
+| Unit or artifact | Normal-runner result |
+|---|---:|
+| Application/storage | 12 m, 10 GB MaxRSS |
+| API protocol | 3 m, 4 GB MaxRSS |
+| Inference | 8 m, 6 GB MaxRSS |
+| Remote CLI | 1 m, 1 GB MaxRSS |
+| Thin executable link | 10 s, 435 MB MaxRSS |
+| Complete cold archive build | 13:40.16, 10,693,812 KiB process-tree peak RSS |
+| Static executable | 59,270,696 bytes |
+| `libantfly.so` | 16,675,328 bytes |
+
+This reduces complete normal-runner wall time by 1:37.61 versus the preceding
+15:17.77 four-unit baseline and cuts API from six to three reported minutes.
+Application/storage grows from eleven to twelve reported minutes, however, so
+placement alone does not satisfy the normal-runner critical-path target.
+
+Decision: **keep the serverless physical-runtime placement**. It exchanges
+21.140 seconds of local critical time for an 80.587-second API reduction, 89
+fewer duplicate compiler-file instances, a 3.15 MB smaller executable, and a
+repeatable end-to-end Linux win while staying within the existing memory
+claims. The next experiment is no longer a placement shuffle: remove the 50
 remaining physical storage files from API by routing its coarse local
 operations through the existing process-scoped opaque owner context.
+
+### Rejected exact-sort owner callback
+
+A representative local-query callback moved the complete distributed
+exact-sort merge behind the process-scoped storage owner. The ABI returned an
+owned typed response, invoked the owner once per merge, and preserved the
+existing result semantics. Focused validation passed 182 of 184 query/storage
+tests with the two expected skips, all 25 table-read tests, the linked ARM64
+production topology, and the graph-analyzer gates without leaks.
+
+Three authoritative cold API captures nevertheless made this a no-go:
+
+| Capture | API wall time | Repository files | Difference from 125.604 s baseline |
+|---|---:|---:|---:|
+| Exact-sort owner v1 | 128.865 s | 327 | +3.261 s |
+| Exact-sort owner v2 | 128.169 s | 327 | +2.565 s |
+| Exact-sort owner v3 | 128.414 s | 327 | +2.810 s |
+
+The baseline had 326 repository files. The only added file was the 212-line
+wire contract; `search_exec.zig`, `graph_exec.zig`, `db.zig`, and
+`docstore.zig` all remained in the compiler graph. The implementation was
+therefore reverted. This confirms that moving individual operations across an
+opaque callback cannot pay while the API unit still imports the broad physical
+provisioned-source implementation. The next probe must make that complete
+implementation root unreachable as one atomic control/physical source split.
+
+### Rejected API wire-root and durable-persistence boundary
+
+The next slice removed production imports of the broad `table_reads.zig` and
+`table_writes.zig` barrels from the internal read routes, HTTPX handler,
+distributed transaction coordinator, and HTTP client. It also moved complete
+artifact-reprocess, repair, and restore job KV operations behind one opaque
+application/storage-owned LSM handle. Path-backed stores and Lite's in-file
+runtime namespace used the same ABI; no LMDB implementation or per-record
+storage primitive crossed the boundary.
+
+The boundary was behaviorally sound. Linked production Debug completed, the
+cross-archive persistence/reopen test passed 1/1 without leaks, focused
+artifact/repair tests passed 25/25, public API parity passed 155/155, all graph
+gates passed, and all 13 analyzer tests passed. The ABI test also caught and
+fixed two prototype defects before measurement: Zig error-set integer values
+are not stable across compilation units, and failed C entry points must
+explicitly destroy partially initialized owners rather than rely on
+`errdefer` in a `c_int`-returning function.
+
+Authoritative cold ARM64 musl `ReleaseFast` reports rejected the combined
+slice:
+
+| Unit | Baseline | Candidate | Delta | Baseline → candidate declarations |
+|---|---:|---:|---:|---:|
+| API | 125.604 s | 129.435 s | +3.831 s | 17,332 → 17,343 |
+| Application/storage | 361.270 s | 368.114 s | +6.844 s | 42,512 → 42,557 |
+| API LLVM emission | 122.103 s | 125.833 s | +3.730 s | — |
+| Application/storage LLVM emission | 353.873 s | 360.524 s | +6.652 s | — |
+
+API removed the two barrel files and 62,329 lexical source lines, but its
+authoritative repository graph changed only from 326 to 327 files: three ABI
+files were added, and all 50 physical storage files representing 223,296
+duplicated source lines remained. Application/storage removed no files and
+grew from 723 to 726 repository files. The complete cold build still linked a
+single stripped static ARM64 executable, 59,294,744 bytes versus the
+59,270,696-byte baseline.
+
+Decision: **reject and revert**. A coherent persistence abstraction is not a
+compilation win while query, transaction, restore, and provisioned-source code
+still make the same physical implementation root reachable. Further
+micro-facades or job-store bridges should not be attempted independently. The
+next representative slice must remove the complete physical provisioned
+storage/local-query root from API in one atomic operation-level owner ABI; if
+that cannot be made unreachable, the experiment should stop rather than add
+another compiled boundary.
+
+### Rejected canonical storage-contract extraction
+
+A combined source-root probe moved transaction identity/status/recovery,
+participant-list destruction, byte ranges, split phases, and capacity-source
+contracts into one implementation-free canonical module. Transactions,
+DocStore, shard, and ResourceManager re-exported those exact definitions so
+type identity was preserved. In the same candidate, production
+`httpx_handler.zig` imported the narrow write-source and index-normalization
+modules instead of the 39,581-line `table_writes.zig` implementation barrel;
+its full DB/table imports remained available to tests only.
+
+Correctness was not the limiting factor. Linked native Debug with the
+production LSM-only topology built successfully. The focused resource suite
+passed 25/25, the transaction suite passed 37/37, DocStore and shard targets
+completed, all graph gates passed, and all 13 analyzer tests passed.
+
+The authoritative cold ARM64 musl `ReleaseFast` API capture rejected the
+slice:
+
+| Metric | Baseline | Candidate | Delta |
+|---|---:|---:|---:|
+| Compiler time | 125.604 s | 140.942 s | +15.338 s |
+| LLVM emission | 122.103 s | 137.212 s | +15.109 s |
+| Declarations | 17,332 | 17,334 | +2 |
+| Generic instances | 11,586 | 11,586 | 0 |
+| Inline calls | 5,722 | 5,722 | 0 |
+| Repository files | 326 | 325 | -1 |
+
+The candidate removed `table_writes.zig` and the 2,581-line transaction
+implementation from the API report, added the 93-line contract module, and
+still retained 50 files under `storage`. Exact generic and inline counts were
+unchanged and declarations grew by two. The slower wall/LLVM result is host
+variance, but the declaration identity is stronger evidence: removing more
+than 42,000 lexically reachable lines removed no emitted work.
+
+A symbol audit agrees with that conclusion. The baseline API object contains
+only two named physical-storage globals, both sort-diagnostic state in
+`search_exec.zig`; the application/storage object contains 3,285 named
+DB/DocStore/LSM/transaction symbols. Compiler-file reachability is useful for
+finding accidental barrels, but it is not evidence that every line in a lazy
+Zig import graph is emitted or duplicated.
+
+Decision: **reject and revert**. Do not pursue more canonical-type extraction
+or import-only cleanup as a compilation optimization. The remaining useful
+storage experiment must remove an owner that emits executable code--the
+legacy provisioned read/write/lifecycle vtables and `ProvisionedGroupStorage`
+composition--from a compiler unit. Measurements should prioritize declaration,
+object, and LLVM changes over lexical source-line counts.
+
+### Rejected isolated local-HA runtime
+
+A follow-up tested whether local HA explained the remaining application
+critical path. Two measurement-only PIC archives compiled the exact current
+application/storage roots without `cmd/ha.zig`, and the HA command alone. Both
+used fresh caches, ARM64 Linux musl `ReleaseFast`, production LSM-only mode,
+and normal concurrent code generation.
+
+| Unit | Compiler time | LLVM emission | Declarations | Repository files | Archive size |
+|---|---:|---:|---:|---:|---:|
+| Current application/storage | 361.270 s | 353.873 s | 42,512 | 723 | 40,159,728 bytes |
+| Application/storage without HA | 355.926 s | 348.423 s | 42,336 | 721 | 39,858,466 bytes |
+| Isolated HA | 30.525 s | 28.918 s | 7,971 | 75 | 2,623,550 bytes |
+
+Removing HA saves only 5.344 seconds, 176 declarations, and two repository
+files. The isolated archive duplicates 75 files--48 of them storage files--and
+raises the two-archive total by 2,322,288 bytes before final-link section GC.
+The earlier large difference between data/storage-only and combined control
+roots was therefore a union effect, not an individually removable HA cost.
+
+Decision: **reject and revert**. A 5.3-second critical-path reduction does not
+justify another runtime unit, 30.5 seconds of aggregate LLVM work, or more
+storage duplication. Do not separately split metadata or other small roles on
+the strength of lexical graph size. The next experiment must remove the
+emitting provisioned owner implementation as an atomic compiled boundary.
 
 ## Holistic target architecture
 
@@ -1584,8 +1750,9 @@ The current candidate baseline is the four-unit topology above with serverless
 local execution in application/storage. It is smaller than the rejected
 source-only coalescing, its isolated application/storage unit remains under the
 accepted local time gate, and its predecessor was reliable on the normal
-runner. It is not yet the final target: Linux confirmation of this placement is
-pending and API still emits 50 physical storage/local-query files.
+runner. It is not yet the final target: the Linux application/storage critical
+unit is still too slow and API still emits 50 physical storage/local-query
+files.
 
 The reopened target is a modular monolith with one compiled physical-storage
 owner and separately compiled control consumers:
@@ -1878,13 +2045,13 @@ zig build \
   --time-report \
   --webui=127.0.0.1:19125
 
-node tools/capture_zig_time_report.mjs \
+node zig/tools/capture_zig_time_report.mjs \
   ws://127.0.0.1:19125/ antfly-storage-kernel reports/distributed.json 30
-node tools/capture_zig_time_report.mjs \
+node zig/tools/capture_zig_time_report.mjs \
   ws://127.0.0.1:19125/ antfly-runtime-api_kernel reports/api.json 30
-node tools/capture_zig_time_report.mjs \
+node zig/tools/capture_zig_time_report.mjs \
   ws://127.0.0.1:19125/ antfly-runtime-inference reports/inference.json 30
-node tools/capture_zig_time_report.mjs \
+node zig/tools/capture_zig_time_report.mjs \
   ws://127.0.0.1:19125/ antfly-runtime-cli reports/cli.json 5
 ```
 
