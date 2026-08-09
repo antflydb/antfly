@@ -892,7 +892,10 @@ test "data descriptor factory bootstraps pristine group from complete intent pee
 const RaftTableApplyStateMachine = struct {
     alloc: std.mem.Allocator,
     write_source: antfly.public_api.ProvisionedTableWriteSource,
-    kernel_owner_source: ?antfly.public_api.ProvisionedKernelOwnerSource = null,
+    /// Borrowed from DataServer. One process-scoped owner must serve API reads,
+    /// direct writes, Raft apply, HA replay, and snapshot publication so those
+    /// paths cannot open competing physical DB owners.
+    kernel_owner_source: ?*antfly.public_api.ProvisionedKernelOwnerSource = null,
     applied_mutex: std.atomic.Mutex = .unlocked,
     applied_indexes: std.AutoHashMapUnmanaged(u64, u64) = .empty,
 
@@ -907,26 +910,23 @@ const RaftTableApplyStateMachine = struct {
         return .{
             .alloc = alloc,
             .write_source = write_source,
-            .kernel_owner_source = if (storage_kernel_experiment)
-                antfly.public_api.ProvisionedKernelOwnerSource.init(
-                    alloc,
-                    replica_root_dir,
-                    catalog,
-                    antfly.raft.read_gate.noopReadableLeaseRequester(),
-                )
-            else
-                null,
         };
     }
 
     fn deinit(self: *RaftTableApplyStateMachine) void {
         self.write_source.quiesce();
-        if (comptime storage_kernel_experiment) {
-            if (self.kernel_owner_source) |*owner_source| owner_source.deinit();
-        }
         self.write_source.deinit();
         self.applied_indexes.deinit(self.alloc);
         self.* = undefined;
+    }
+
+    fn attachKernelOwnerSource(
+        self: *RaftTableApplyStateMachine,
+        owner_source: *antfly.public_api.ProvisionedKernelOwnerSource,
+    ) void {
+        self.kernel_owner_source = owner_source;
+        _ = self.write_source.withLocalWriteSource(owner_source.writeSource());
+        _ = self.write_source.withStorageSnapshotSource(owner_source.snapshotSource());
     }
 
     fn attachProvisionedStorage(
@@ -953,13 +953,6 @@ const RaftTableApplyStateMachine = struct {
         );
         self.write_source.runtime_status_cache = &storage.runtime_status_cache;
         _ = self.write_source.withGroupVisibleRootGeneration(storage.groupVisibleRootGenerationSource());
-        if (comptime storage_kernel_experiment) {
-            if (self.kernel_owner_source) |*owner_source| {
-                _ = owner_source.withGroupVisibleRootGeneration(storage.groupVisibleRootGenerationSource());
-                _ = self.write_source.withLocalWriteSource(owner_source.writeSource());
-                _ = self.write_source.withStorageSnapshotSource(owner_source.snapshotSource());
-            }
-        }
         if (storage.backend_runtime) |runtime| self.write_source.backend_runtime = runtime;
     }
 
@@ -1010,7 +1003,7 @@ const RaftTableApplyStateMachine = struct {
             // partially applied command.
             if (!batchRequiresDocumentDbApply(decoded.batch.req)) continue;
             if (comptime storage_kernel_experiment) {
-                const owner_source = if (self.kernel_owner_source) |*source|
+                const owner_source = if (self.kernel_owner_source) |source|
                     source
                 else
                     return error.StorageKernelOwnerUnavailable;
@@ -3874,6 +3867,10 @@ pub const DataServer = struct {
     store_status_cache_mutex: std.atomic.Mutex = .unlocked,
     store_status_heartbeat_cache: StoreStatusHeartbeatCache = .{},
     provisioned_storage: antfly.public_api.ProvisionedGroupStorage,
+    /// Heap-stable because every local operation source stores a pointer to it.
+    /// It is initialized only for the compiled-storage experiment and destroyed
+    /// after all attached sources and Raft apply work have drained.
+    kernel_owner_source: ?*antfly.public_api.ProvisionedKernelOwnerSource = null,
     read_source: antfly.public_api.ProvisionedTableReadSource,
     write_source: antfly.public_api.ProvisionedTableWriteSource,
     /// Long-lived backing for the cross-shard entity-resolution candidate
@@ -4189,6 +4186,25 @@ pub const DataServer = struct {
     /// Initialize the ApiHttpServer without creating a listener.
     /// Call this when you want to use the API server with an external
     /// httpx.Server instead of the built-in StdHttpListener.
+    fn ensureKernelOwnerSource(self: *DataServer) !*antfly.public_api.ProvisionedKernelOwnerSource {
+        if (self.kernel_owner_source) |owner_source| return owner_source;
+        const owner_source = try self.alloc.create(antfly.public_api.ProvisionedKernelOwnerSource);
+        owner_source.* = antfly.public_api.ProvisionedKernelOwnerSource.init(
+            self.alloc,
+            self.write_source.replica_root_dir,
+            self.write_source.catalog,
+            self.read_source.requester,
+        );
+        _ = owner_source.withGroupVisibleRootGeneration(self.provisioned_storage.groupVisibleRootGenerationSource());
+        _ = self.read_source.withLocalReadSource(owner_source.readSource());
+        self.read_source.resident_db = null;
+        _ = self.write_source.withLocalWriteSource(owner_source.writeSource());
+        _ = self.write_source.withStorageSnapshotSource(owner_source.snapshotSource());
+        if (self.data_raft_apply) |apply_sm| apply_sm.attachKernelOwnerSource(owner_source);
+        self.kernel_owner_source = owner_source;
+        return owner_source;
+    }
+
     pub fn initApiServer(self: *DataServer) !void {
         if (self.http_server != null) return;
         var api_server_cfg = self.api_server_cfg;
@@ -4240,6 +4256,10 @@ pub const DataServer = struct {
             self.provisioned_storage.attachBackendRuntime(runtime, &self.read_source, &self.write_source);
         }
         try self.provisioned_storage.attachSources(&self.read_source, &self.write_source);
+        if (comptime storage_kernel_experiment) {
+            const owner_source = try self.ensureKernelOwnerSource();
+            _ = owner_source.withRequester(self.read_source.requester);
+        }
         if (self.data_raft) |raft| {
             try raft.attachDataApplyStoreResourceManager(&self.provisioned_storage.resource_manager);
         }
@@ -4250,6 +4270,9 @@ pub const DataServer = struct {
         _ = try self.write_source.withHAMirror(ha_primary_mirror);
         if (self.data_raft_apply) |apply_sm| {
             apply_sm.attachProvisionedStorage(&self.provisioned_storage);
+            if (comptime storage_kernel_experiment) {
+                apply_sm.attachKernelOwnerSource(self.kernel_owner_source.?);
+            }
             _ = apply_sm.write_source.withSecretStore(api_server_cfg.secret_store);
             _ = apply_sm.write_source.withRestoreAccess(api_server_cfg.node_config, restore_io);
             _ = apply_sm.write_source.withRemoteContent(api_server_cfg.remote_content);
@@ -4259,7 +4282,7 @@ pub const DataServer = struct {
             apply_sm.write_source.setLocalIndexRepairDebtHook(self.localIndexRepairDebtHook());
             _ = self.write_source.withLocalWriteOwner(&apply_sm.write_source);
         }
-        self.read_source.resident_db = self.localResidentDbSource();
+        self.read_source.resident_db = if (storage_kernel_experiment) null else self.localResidentDbSource();
         self.write_source.setLocalChangeHook(self.localChangeHook());
         self.write_source.setLocalIndexRepairDebtHook(self.localIndexRepairDebtHook());
         _ = self.write_source.withRaftBatcher(if (self.data_raft != null) self.localRaftBatcher() else null);
@@ -4316,15 +4339,12 @@ pub const DataServer = struct {
         defer self.write_source.catalog.freeAdminSnapshot(&snapshot);
         const route = try resolveHAReplicationRecordRoute(&snapshot, record);
         if (comptime storage_kernel_experiment) {
-            if (self.data_raft_apply) |apply_sm| {
-                if (apply_sm.kernel_owner_source) |*owner_source| {
-                    return try owner_source.applyHAReplicationRecordGroupLocal(
-                        route.group_id,
-                        route.table_name,
-                        record,
-                    );
-                }
-            }
+            const owner_source = try self.ensureKernelOwnerSource();
+            return try owner_source.applyHAReplicationRecordGroupLocal(
+                route.group_id,
+                route.table_name,
+                record,
+            );
         }
         try self.write_source.applyHAReplicationRecordGroupLocal(
             self.alloc,
@@ -5106,6 +5126,12 @@ pub const DataServer = struct {
             apply_sm.deinit();
             self.alloc.destroy(apply_sm);
         }
+        if (comptime storage_kernel_experiment) {
+            if (self.kernel_owner_source) |owner_source| {
+                owner_source.deinit();
+                self.alloc.destroy(owner_source);
+            }
+        }
         if (self.data_raft_store) |store| {
             store.deinit();
             self.alloc.destroy(store);
@@ -5137,6 +5163,7 @@ pub const DataServer = struct {
         self.data_raft = null;
         self.data_raft_factory = null;
         self.data_raft_apply = null;
+        self.kernel_owner_source = null;
         self.data_raft_store = null;
         self.data_raft_base_uri = null;
         self.remote_metadata = null;
@@ -5664,11 +5691,7 @@ pub const DataServer = struct {
                 const admission_source = if (self.data_raft_apply) |apply_sm| &apply_sm.write_source else &self.write_source;
                 try admission_source.preflightDenseRepairWriteAdmission(group_id, table_name);
                 if (comptime storage_kernel_experiment) {
-                    const apply_sm = self.data_raft_apply orelse return error.StorageKernelOwnerUnavailable;
-                    const owner_source = if (apply_sm.kernel_owner_source) |*source|
-                        source
-                    else
-                        return error.StorageKernelOwnerUnavailable;
+                    const owner_source = try self.ensureKernelOwnerSource();
                     storage_owner_descriptor = try owner_source.loadDescriptor(alloc, group_id, table_name);
                 }
             }
@@ -5772,11 +5795,7 @@ pub const DataServer = struct {
                     };
                 }
                 if (comptime storage_kernel_experiment) {
-                    const apply_sm = self.data_raft_apply orelse return error.StorageKernelOwnerUnavailable;
-                    const owner_source = if (apply_sm.kernel_owner_source) |*source|
-                        source
-                    else
-                        return error.StorageKernelOwnerUnavailable;
+                    const owner_source = try self.ensureKernelOwnerSource();
                     owner_source.waitForCurrentSyncGroupLocal(group_id, table_name, req.sync_level) catch |err| {
                         std.log.warn("data raft batch outcome unknown after proposal group_id={} index={} phase=sync_visibility err={s}", .{
                             group_id,
@@ -10112,7 +10131,12 @@ pub const DataServer = struct {
             // Startup warmup should only preopen query/read handles. Writer
             // opens still run recovery/replay work and can block loaded-state
             // startup for large tables.
-            try self.read_source.warmTableGroup(self.alloc, group_id, table.name);
+            if (comptime storage_kernel_experiment) {
+                const owner_source = try self.ensureKernelOwnerSource();
+                try owner_source.warmTableGroup(group_id, table.name);
+            } else {
+                try self.read_source.warmTableGroup(self.alloc, group_id, table.name);
+            }
             warmed_group_count += 1;
         }
         return warmed_group_count;
@@ -18212,9 +18236,18 @@ test "data runtime provisioned cache warmup populates runtime status without pin
     defer snapshot_statuses.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), snapshot_statuses.items.len);
     try std.testing.expectEqual(@as(u64, 77), snapshot_statuses.items[0].group_id);
-    try std.testing.expectEqual(runtime_status.RuntimeStatusSource.synthetic_config, snapshot_statuses.items[0].metadata.source);
-    try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.stale, snapshot_statuses.items[0].metadata.freshness);
-    try std.testing.expectEqual(@as(u64, 0), snapshot_statuses.items[0].stats.doc_count);
+    if (comptime storage_kernel_experiment) {
+        // The owner status operation observes the just-opened physical DB and
+        // publishes an authoritative snapshot rather than the legacy cold
+        // placeholder.
+        try std.testing.expectEqual(runtime_status.RuntimeStatusSource.live_writer_publish, snapshot_statuses.items[0].metadata.source);
+        try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.fresh, snapshot_statuses.items[0].metadata.freshness);
+        try std.testing.expectEqual(@as(u64, 0), snapshot_statuses.items[0].stats.doc_count);
+    } else {
+        try std.testing.expectEqual(runtime_status.RuntimeStatusSource.synthetic_config, snapshot_statuses.items[0].metadata.source);
+        try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.stale, snapshot_statuses.items[0].metadata.freshness);
+        try std.testing.expectEqual(@as(u64, 0), snapshot_statuses.items[0].stats.doc_count);
+    }
 
     var warmed_lookup = (try server.read_source.source().lookup(alloc, "docs", "doc:a", .{}, .read_index)).?;
     defer warmed_lookup.deinit(alloc);
@@ -18230,7 +18263,13 @@ test "data runtime provisioned cache warmup populates runtime status without pin
     });
     const post_batch_write_cache = server.provisioned_storage.write_cache.cacheStats();
     try std.testing.expectEqual(@as(u64, 0), post_batch_write_cache.hit_count);
-    try std.testing.expect(post_batch_write_cache.miss_count >= 1);
+    if (comptime storage_kernel_experiment) {
+        // The compiled owner has its own process-scoped cache; the legacy
+        // distributed cache must remain untouched.
+        try std.testing.expectEqual(@as(u64, 0), post_batch_write_cache.miss_count);
+    } else {
+        try std.testing.expect(post_batch_write_cache.miss_count >= 1);
+    }
 
     const pre_live_lookup_read_cache = server.provisioned_storage.read_cache.cacheStats();
     var live_lookup = (try server.read_source.source().lookup(alloc, "docs", "doc:b", .{}, .read_index)).?;

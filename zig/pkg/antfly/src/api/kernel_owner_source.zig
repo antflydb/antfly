@@ -354,6 +354,24 @@ pub const ProvisionedKernelOwnerSource = struct {
         return self.entries.items.len;
     }
 
+    /// Pre-open the same resident owner used by reads and writes. Warmup must
+    /// not create a second status-only DB in the distributed compilation unit;
+    /// acquiring and releasing the owner performs descriptor validation
+    /// without opening a second DB in distributed code.
+    pub fn warmTableGroup(
+        self: *ProvisionedKernelOwnerSource,
+        group_id: u64,
+        table_name: []const u8,
+    ) !void {
+        var lease = try self.acquire(group_id, table_name);
+        lease.deinit();
+        // Preserve the existing warmup contract: validate that the physical
+        // root can be opened, but do not pin a writer before startup catch-up
+        // and structural reconciliation have run. The first actual read or
+        // write will install the long-lived owner.
+        try retireGroupForPublication(self, group_id, table_name);
+    }
+
     fn visibleRootGeneration(self: *const ProvisionedKernelOwnerSource, group_id: u64) u64 {
         return if (self.group_visible_root_generation) |source|
             source.visibleRootGenerationForGroup(group_id)

@@ -8817,6 +8817,37 @@ pub fn build(b: *std.Build) void {
                     "Run provisioned group-local storage owner tests across static archives",
                 );
                 provisioned_owner_test_step.dependOn(&run_provisioned_owner_tests.step);
+
+                // The ordinary data-runtime test artifact intentionally does
+                // not link the experimental provider archive. Keep a focused
+                // cross-archive composition suite here so process-owner
+                // lifetime and DataServer routing are exercised with the same
+                // symbol boundary as the final executable.
+                const data_runtime_owner_test_mod = b.createModule(.{
+                    .root_source_file = b.path("pkg/antfly/src/data_runtime_test_root.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .link_libc = true,
+                });
+                antfly_imports.configure(b, data_runtime_owner_test_mod, true, true);
+                const data_runtime_owner_tests = b.addTest(.{
+                    .root_module = data_runtime_owner_test_mod,
+                    .filters = &.{
+                        "data runtime provisioned cache warmup populates runtime status without pinning db caches",
+                        "data server applies routed HA replication records through standby write gate",
+                    },
+                    .test_runner = .{
+                        .path = b.path("pkg/antfly/src/test_runner.zig"),
+                        .mode = .simple,
+                    },
+                });
+                data_runtime_owner_tests.root_module.linkLibrary(role_artifact);
+                const run_data_runtime_owner_tests = b.addRunArtifact(data_runtime_owner_tests);
+                const data_runtime_owner_test_step = b.step(
+                    "storage-kernel-data-runtime-test",
+                    "Run DataServer process-owner composition tests across static archives",
+                );
+                data_runtime_owner_test_step.dependOn(&run_data_runtime_owner_tests.step);
             }
             if (owns_storage_kernel) {
                 // The executable and C ABI libraries share this one optimized

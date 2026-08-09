@@ -187,6 +187,7 @@ the same host, target, cache state, and report set.
 | Serverless local runtime co-generated with application/storage | Application 361.270 s; API 125.604 s; duplicates 527 → 438; executable 62.421 MB → 59.271 MB | Keep pending normal-runner confirmation; under 380 s and removes material storage duplication |
 | Canonical storage-contract/import cut | Removed 42k lexically reachable lines but declarations 17,332 → 17,334 with identical generic/inline counts | Rejected; lazy file removal is not emitted-code removal |
 | Isolated local HA runtime | Application saved 5.344 s while a new HA unit cost 30.525 s and duplicated 75 files | Rejected; small role splitting increases aggregate LLVM work |
+| Experimental control-only provisioned write vtable | Application 366.523 s, 41,591 declarations, and only 703 KB less allocatable object data while adding a 216.358 s storage unit | Rejected; the vtable shell is small and direct runtime storage ownership remains |
 
 The `/tmp` graph analysis was consolidated into
 `tools/analyze_zig_import_graph.py`. It reports lexical reachability, consumes
@@ -1747,6 +1748,101 @@ justify another runtime unit, 30.5 seconds of aggregate LLVM work, or more
 storage duplication. Do not separately split metadata or other small roles on
 the strength of lexical graph size. The next experiment must remove the
 emitting provisioned owner implementation as an atomic compiled boundary.
+
+### Rejected control-only provisioned write-vtable probe
+
+The next upper-bound probe enabled the existing separate storage-kernel
+topology and made `ProvisionedTableWriteSource.source()` compile-time-select a
+fail-closed vtable in the distributed unit. That vtable retained only the three
+operations already implemented by the resident owner--top-level batch
+orchestration, group-local batch, and local runtime status. Every other legacy
+physical and lifecycle callback was absent. This deliberately did not claim
+runtime completeness; it asked whether the broad vtable itself was the large
+emitting root before implementing dozens of additional stable ABI operations.
+
+The experiment-enabled linked native Debug build succeeded with normal
+concurrency. A fresh-cache ARM64 Linux musl `ReleaseFast` build then completed
+all release artifacts and produced these reports:
+
+| Unit | Compiler time | LLVM emission | Declarations | Repository files |
+|---|---:|---:|---:|---:|
+| API protocol | 134.129 s | 130.653 s | 17,332 | 326 |
+| Distributed/control probe | 366.523 s | 358.347 s | 41,591 | 720 |
+| Separate storage kernel | 216.358 s | 211.319 s | 26,676 | 396 |
+| Inference | 228.304 s | 220.871 s | 24,971 | 524 |
+| Remote CLI | 36.379 s | 34.495 s | 5,804 | 53 |
+
+The current compile-once application baseline is 361.270 seconds, 42,512
+declarations, and 723 repository files. The composite probe therefore removed
+only 921 declarations and three files while becoming 5.253 seconds slower.
+Most of that declaration delta is the already-known movement of CAPI roots to
+the separate storage artifact; the earlier Phase 1 topology alone removed 721
+distributed declarations. The narrowed vtable accounts for at most the small
+remainder, not a storage implementation family. API was also 6.8% slower than
+its 125.604-second baseline, so the wall-time increase is partly host variance;
+the declaration and object results are the decisive evidence.
+
+The current application object contains 28,597,098 allocatable bytes and
+24,395,704 text bytes. The probe distributed object contains 27,894,241 and
+23,697,424 bytes respectively--only 702,857 allocatable bytes and 698,280 text
+bytes less despite omitting almost the entire write vtable. That upper bound
+is comparable to the 621,629 bytes attributed to `api.table_writes` in the
+baseline object and leaves the multi-megabyte `storage.db.*` implementation
+rooted by direct `data/runtime.zig`, `ProvisionedGroupStorage`, cache,
+maintenance, split/merge, and transition calls.
+
+The five probe reports contained 830 duplicate repository-file instances,
+including 199 duplicate storage instances across 150 storage files. The
+stripped executable grew from 59,270,696 to 70,439,360 bytes (+18.8%) while
+the additional storage unit duplicated code still owned by distributed. The
+shared C API remained small at 16,382,112 bytes.
+
+Decision: **reject and revert**. Separating or narrowing the vtable alone is
+not the atomic owner cut. The next viable experiment must change the runtime
+state model so `data/runtime.zig` no longer owns or directly calls physical DB,
+cache, maintenance, snapshot, split/merge, and generation-transition
+implementation. A control-only source becomes useful only as the outer face of
+that owner transfer, not as an independent optimization.
+
+### Restored process-scoped owner composition
+
+The first bounded prerequisite after the control-vtable result restores the
+single-owner invariant described in Phase 2p. `DataServer`, rather than the
+Raft apply adapter, now owns one heap-stable
+`ProvisionedKernelOwnerSource`. API reads, direct local writes, Raft apply,
+snapshot publication, HA replay, sync waits, descriptor capture, and startup
+warmup all borrow that same source. The apply adapter cannot destroy the
+owner, and `DataServer` destroys it only after HTTP, write-source, Raft, and
+background work have drained.
+
+Owner creation is also the attachment invariant. Any path that lazily creates
+the process owner immediately installs its local read, write, and snapshot
+sources and removes the legacy resident-DB fallback. This matters outside the
+normal API startup sequence: the first cross-archive test exposed that warmup
+could create the owner and then let a following lookup fall back to a second
+physical DB, producing `GenerationTransitionActive`. Centralizing creation and
+attachment removed that race. Warmup validates the owner root and retires it
+before startup catch-up, preserving the existing no-pinned-writer contract;
+the first actual read or write installs the resident owner.
+
+A new `storage-kernel-data-runtime-test` step links the data-runtime test
+artifact to the real experimental provider archive. It covers warmup followed
+by lookup and batch, verifies that the distributed read/write caches stay
+untouched, and exercises routed HA replay. Validation at this checkpoint:
+
+- process-owner data-runtime composition: 12/12 passed, zero leaks;
+- opaque owner ABI: 3/3 passed, zero leaks;
+- provisioned cross-archive owner: 6/6 passed, zero leaks;
+- legacy data-runtime suite: 97/97 passed, zero leaks;
+- linked native Debug production-LSM experiment built with normal concurrency;
+- all runtime/codegen/API graph gates and all 15 analyzer tests passed.
+
+Decision: **keep as a bounded prerequisite, without a compiler-time claim**.
+The previous Phase 2p profiles already established that attachment alone does
+not remove the physical implementation. A new cold profile would only repeat
+that result. The immediately following cut must move a complete lifecycle
+owner--startup catch-up/index repair, maintenance/status, or split/merge--and
+then make its legacy data-runtime functions unreachable before measuring.
 
 ## Holistic target architecture
 
