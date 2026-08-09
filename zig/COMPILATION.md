@@ -1844,6 +1844,55 @@ that result. The immediately following cut must move a complete lifecycle
 owner--startup catch-up/index repair, maintenance/status, or split/merge--and
 then make its legacy data-runtime functions unreachable before measuring.
 
+### Rejected runtime-status and startup-catch-up owner slice
+
+The next probe moved resident/transient runtime-status capture and the complete
+startup open, WAL catch-up, dense rebuild, index repair, resolver drain, and
+obsolete-generation reclamation sequence behind the compiled owner boundary.
+The transient path deliberately opened the physical writer in no-replay mode so
+the kernel, rather than an earlier normal open, observed and discharged startup
+debt. Control retained leadership admission, activation checks, status
+publication, and retry scheduling through coarse callbacks. No DB, writer,
+index, or cache layout crossed the ABI.
+
+The implementation was behaviorally viable. The cross-archive data-runtime
+suite passed 17/17 with zero leaks, covering replay debt, the no-debt busy-writer
+case, leadership retry/replay, and routed HA apply. Provisioned-source tests
+passed 6/6, opaque-owner ABI tests passed 3/3, the existing terminal-degraded
+startup regression passed, and the complete linked native Debug production-LSM
+build succeeded with normal concurrency.
+
+A cold Apple-silicon cross-build at commit `cab805020` plus the uncommitted
+probe, using Zig 0.16.0 and targeting stripped ARM64 Linux musl ReleaseFast,
+produced the following comparison against the exact detached-commit baseline:
+
+| Unit | Baseline | Probe | Delta | Declarations | Repository Zig files |
+|---|---:|---:|---:|---:|---:|
+| Distributed | 381.840 s | 382.922 s | +1.083 s | 41,930 -> 41,900 | 720 -> 720 |
+| Storage kernel | 233.023 s | 246.084 s | +13.061 s | 26,676 -> 27,605 | 395 -> 404 |
+| API kernel | 136.866 s | 139.833 s | +2.967 s | 17,332 -> 17,334 | unchanged |
+| Inference | 230.284 s | 228.708 s | -1.576 s | 24,971 -> 24,971 | unchanged |
+| CLI | 35.918 s | 35.408 s | -0.510 s | 5,804 -> 5,804 | unchanged |
+
+The distributed compiler graph was byte-for-byte identical at the file level:
+all 720 repository Zig files and 1,066,925 source lines were shared. Its LLVM
+emit time increased from 373.804 to 374.665 seconds. The distributed object
+lost only 131,833 text bytes, from 27,920,901 to 27,789,068, while the storage
+object gained 815,928 text bytes, from 17,120,855 to 17,936,783. The stripped
+executable grew from 74,033,864 to 74,730,112 bytes (+0.94%); `libantfly.so`
+remained 16,382,112 bytes. Peak compiler RSS observed during the normally
+concurrent build was approximately 3.1 GB, so memory was not the limiting
+signal in this local probe.
+
+Decision: **reject and revert**. Status and startup lifecycle are coherent
+coarse operations, but moving them does not make any storage implementation
+file unreachable from distributed control. Retaining this slice would add ABI
+surface and roughly 13 seconds of storage-kernel work without reducing the
+critical unit. The next measurement-worthy cut must be a complete local-query
+or physical runtime-owner transfer that removes implementation roots from the
+distributed compiler graph; another narrow status, callback, or lifecycle
+operation is not sufficient.
+
 ## Holistic target architecture
 
 The current candidate baseline is the four-unit topology above with serverless
@@ -2146,7 +2195,9 @@ zig build \
   --webui=127.0.0.1:19125
 
 node zig/tools/capture_zig_time_report.mjs \
-  ws://127.0.0.1:19125/ antfly-storage-kernel reports/distributed.json 30
+  ws://127.0.0.1:19125/ antfly-runtime-distributed reports/distributed.json 30
+node zig/tools/capture_zig_time_report.mjs \
+  ws://127.0.0.1:19125/ antfly-storage-kernel reports/storage.json 30
 node zig/tools/capture_zig_time_report.mjs \
   ws://127.0.0.1:19125/ antfly-runtime-api_kernel reports/api.json 30
 node zig/tools/capture_zig_time_report.mjs \
