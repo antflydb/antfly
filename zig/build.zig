@@ -50,6 +50,15 @@ const RuntimeArtifactRole = enum {
 const RuntimeLibraryUnit = enum {
     api_kernel,
     storage_kernel,
+    // Measurement-only mirror of the production PIC/storage archive with
+    // only the data runtime rooted. It is never linked into release outputs.
+    data_pic_probe,
+    // Measurement-only candidate storage-owning unit: data, standalone/Lite,
+    // restore staging, and the CAPI, but no CLI or metadata runtime.
+    storage_runtime_pic_probe,
+    // Measurement-only candidate control unit: CLI and metadata, with the
+    // storage-owning data/standalone runtime compiled separately.
+    control_probe,
     // CLI shares enough of the storage graph with the distributed roles that
     // co-generation shortens the measured ReleaseFast critical path.
     distributed,
@@ -8628,8 +8637,11 @@ pub fn build(b: *std.Build) void {
 
     if (linked_runtime_libraries) {
         inline for (std.meta.tags(RuntimeLibraryUnit)) |unit| {
-            const unit_enabled = unit != .storage_kernel or storage_kernel_experiment;
-            const owns_storage_kernel = unit == .storage_kernel or
+            const unit_enabled = unit != .data_pic_probe and unit != .storage_runtime_pic_probe and
+                unit != .control_probe and
+                (unit != .storage_kernel or storage_kernel_experiment);
+            const owns_storage_kernel = unit == .storage_kernel or unit == .data_pic_probe or
+                unit == .storage_runtime_pic_probe or
                 (unit == .distributed and !storage_kernel_experiment);
             const unit_options = b.addOptions();
             unit_options.addOption(RuntimeLibraryUnit, "unit", unit);
@@ -8661,6 +8673,9 @@ pub fn build(b: *std.Build) void {
                         "antfly-storage-kernel"
                     else
                         "antfly-storage-kernel-disabled",
+                    .data_pic_probe => "antfly-data-pic-probe",
+                    .storage_runtime_pic_probe => "antfly-storage-runtime-pic-probe",
+                    .control_probe => "antfly-control-probe",
                     .distributed => if (storage_kernel_experiment)
                         "antfly-runtime-distributed"
                     else
@@ -8676,10 +8691,37 @@ pub fn build(b: *std.Build) void {
                     // discard completed work and retry it in a later group.
                     .api_kernel => 7 * 1024 * 1024 * 1024,
                     .storage_kernel => 8 * 1024 * 1024 * 1024,
+                    .data_pic_probe => 11 * 1024 * 1024 * 1024,
+                    .storage_runtime_pic_probe => 11 * 1024 * 1024 * 1024,
+                    .control_probe => 8 * 1024 * 1024 * 1024,
                     .distributed => 11 * 1024 * 1024 * 1024,
                     .inference => 8 * 1024 * 1024 * 1024,
                 },
             });
+            if (unit == .data_pic_probe) {
+                const install_data_pic_probe = b.addInstallArtifact(role_artifact, .{});
+                const data_pic_probe_step = b.step(
+                    "data-pic-library-probe",
+                    "Build a data-only PIC storage archive for compilation profiling",
+                );
+                data_pic_probe_step.dependOn(&install_data_pic_probe.step);
+            }
+            if (unit == .storage_runtime_pic_probe) {
+                const install_storage_runtime_pic_probe = b.addInstallArtifact(role_artifact, .{});
+                const storage_runtime_pic_probe_step = b.step(
+                    "storage-runtime-pic-library-probe",
+                    "Build a data + standalone/Lite + CAPI PIC archive for compilation profiling",
+                );
+                storage_runtime_pic_probe_step.dependOn(&install_storage_runtime_pic_probe.step);
+            }
+            if (unit == .control_probe) {
+                const install_control_probe = b.addInstallArtifact(role_artifact, .{});
+                const control_probe_step = b.step(
+                    "control-library-probe",
+                    "Build a CLI + metadata control archive for compilation profiling",
+                );
+                control_probe_step.dependOn(&install_control_probe.step);
+            }
             if (unit == .storage_kernel and storage_kernel_experiment) {
                 const owner_test_mod = b.createModule(.{
                     .root_source_file = b.path("pkg/antfly/src/storage/kernel_owner_test.zig"),

@@ -18,13 +18,20 @@
 //   node tools/capture_zig_time_report.mjs \
 //     ws://127.0.0.1:PORT/ STEP_NAME_SUBSTRING report.json
 
-import { writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 
 const url = process.argv[2];
 const stepNeedle = process.argv[3];
 const outputPath = process.argv[4];
+const minLlvmSeconds = Number(process.argv[5] ?? "0");
 if (!url || !stepNeedle || !outputPath) {
-  throw new Error("usage: node capture_zig_time_report.mjs URL STEP_NEEDLE OUTPUT.json");
+  throw new Error(
+    "usage: node capture_zig_time_report.mjs URL STEP_NEEDLE OUTPUT.json [MIN_LLVM_SECONDS]",
+  );
+}
+if (!Number.isFinite(minLlvmSeconds) || minLlvmSeconds < 0) {
+  throw new Error("MIN_LLVM_SECONDS must be a non-negative number");
 }
 
 let stepNames = [];
@@ -139,6 +146,8 @@ socket.addEventListener("message", (event) => {
   if (bytes[0] !== 7 || stepNames.length === 0) return;
   const report = parseCompile(bytes);
   if (!report.step_name.includes(stepNeedle)) return;
+  if (report.stats.real_ns_llvm_emit < minLlvmSeconds * 1e9) return;
+  mkdirSync(dirname(outputPath), { recursive: true });
   writeFileSync(outputPath, `${JSON.stringify(report, null, 2)}\n`);
   console.log(`captured ${report.step_name} to ${outputPath}`);
   socket.close();

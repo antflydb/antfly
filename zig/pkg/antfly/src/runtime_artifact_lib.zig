@@ -21,10 +21,11 @@ const std = @import("std");
 const platform = @import("antfly_platform");
 const bridge = @import("runtime_bridge.zig");
 const unit_options = @import("runtime_library_options");
-const owns_storage_kernel = unit_options.unit == .storage_kernel or
+const owns_storage_kernel = unit_options.unit == .storage_kernel or unit_options.unit == .data_pic_probe or
+    unit_options.unit == .storage_runtime_pic_probe or
     (unit_options.unit == .distributed and !unit_options.storage_kernel_experiment);
 const standalone_inference_bridge = @import("standalone/inference_bridge.zig");
-const restore_staging_exports = if (unit_options.unit == .distributed)
+const restore_staging_exports = if (unit_options.unit == .distributed or unit_options.unit == .storage_runtime_pic_probe)
     @import("standalone/restore_staging_exports.zig")
 else
     struct {};
@@ -37,9 +38,19 @@ const storage_kernel_exports = if (owns_storage_kernel)
 else
     struct {};
 
-const cli_runtime = if (unit_options.unit == .distributed) @import("cli_runtime.zig") else struct {};
-const data_runtime = if (unit_options.unit == .distributed) @import("data/runtime.zig") else struct {};
-const metadata_runtime = if (unit_options.unit == .distributed) @import("metadata/runtime.zig") else struct {};
+const cli_runtime = if (unit_options.unit == .distributed or unit_options.unit == .control_probe)
+    @import("cli_runtime.zig")
+else
+    struct {};
+const data_runtime = if (unit_options.unit == .distributed or unit_options.unit == .data_pic_probe or
+    unit_options.unit == .storage_runtime_pic_probe)
+    @import("data/runtime.zig")
+else
+    struct {};
+const metadata_runtime = if (unit_options.unit == .distributed or unit_options.unit == .control_probe)
+    @import("metadata/runtime.zig")
+else
+    struct {};
 // Serverless owns HTTP/request translation and local query planning, so it
 // shares the API protocol codegen island rather than distributed topology.
 const serverless_runtime = if (unit_options.unit == .api_kernel) @import("cmd/serverless.zig") else struct {};
@@ -47,11 +58,14 @@ const inference_runtime = if (unit_options.unit == .inference) @import("inferenc
 // Standalone adds about 35 seconds when co-generated with the server roles but
 // costs 6 minutes and 8 GiB as a separate ARM64 Linux unit. Keep it co-located
 // until the shared storage kernel removes that duplicated LLVM work.
-const standalone_runtime = if (unit_options.unit == .distributed) @import("standalone/runtime.zig") else struct {};
+const standalone_runtime = if (unit_options.unit == .distributed or unit_options.unit == .storage_runtime_pic_probe)
+    @import("standalone/runtime.zig")
+else
+    struct {};
 // Lite's non-server commands share storage types with standalone, while
 // `lite serve` directly enters that runtime. Co-locating Lite, CLI, and the
 // server roles gives them one storage type identity and one LLVM unit.
-const lite_runtime = if (unit_options.unit == .distributed)
+const lite_runtime = if (unit_options.unit == .distributed or unit_options.unit == .storage_runtime_pic_probe)
     @import("cmd/lite.zig")
 else
     struct {};
@@ -200,6 +214,27 @@ comptime {
             exportInternal(&standaloneEntry, "antfly_runtime_standalone");
             exportInternal(&restore_staging_exports.create, "antfly_restore_staging_create");
             exportInternal(&restore_staging_exports.destroy, "antfly_restore_staging_destroy");
+        },
+        .data_pic_probe => {
+            // Measurement-only mirror of the production archive: retain the
+            // data entry point and the same CAPI roots, but none of the CLI,
+            // metadata, standalone, Lite, or restore-staging entry points.
+            _ = storage_kernel_exports;
+            exportInternal(&dataEntry, "antfly_runtime_data");
+        },
+        .storage_runtime_pic_probe => {
+            // Candidate storage-owning unit: keep the runtime paths that must
+            // share the physical storage implementation, while excluding the
+            // remote/control-only CLI and metadata roots.
+            _ = storage_kernel_exports;
+            exportInternal(&dataEntry, "antfly_runtime_data");
+            exportInternal(&standaloneEntry, "antfly_runtime_standalone");
+            exportInternal(&restore_staging_exports.create, "antfly_restore_staging_create");
+            exportInternal(&restore_staging_exports.destroy, "antfly_restore_staging_destroy");
+        },
+        .control_probe => {
+            exportInternal(&cliEntry, "antfly_runtime_cli");
+            exportInternal(&metadataEntry, "antfly_runtime_metadata");
         },
         .storage_kernel => {
             // The experiment gives the existing coarse CAPI DB implementation

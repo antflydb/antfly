@@ -175,8 +175,12 @@ the same host, target, cache state, and report set.
 | One-call `DB.search` probe | Distributed 415.352 s → 401.086 s, but declarations changed only 41,984 → 41,981 and storage overlap remained 98.9% | Rejected; a call boundary without storage ownership does not remove codegen |
 | Provisioned read-vtable probe | Distributed 415.352 s → 397.153 s; only 83 declarations moved | Rejected as incomplete; hosted reads retained the physical-query graph |
 | Combined provisioned + hosted read-vtable probe | Distributed 415.352 s → 367.185 s and 41,984 → 40,585 declarations | Go for a local-query island, but revert the raw prototype and redesign the ABI/ownership split |
-| Post-serverless compile-once control | Repeated cold combined distributed/storage builds: 358.589 s and 352.900 s; aggregate duplicate instances 873 → 482; executable 72.121 MB → 60.804 MB; C API unchanged at 16.382 MB | Keep the default co-generated distributed/storage archive; stop the separate opaque-kernel migration |
-| Post-main normal-runner control | Clean ARM64 musl `ReleaseFast` succeeded on the normal 24 GiB publish runner; API 5 m / 6 GB, application/storage 9 m / 10 GB, inference 6 m / 6 GB; first API attempt was discarded after exceeding its stale 5 GiB claim | Reliability and artifact gates pass, but the 9-minute critical unit misses the 380-second target; raise only the API scheduling claim and continue profiling |
+| Post-serverless compile-once control | Repeated cold combined distributed/storage builds: 358.589 s and 352.900 s; aggregate duplicate instances 873 → 482; executable 72.121 MB → 60.804 MB; C API unchanged at 16.382 MB | Historical keep decision; superseded by repeated 9–11 m normal-runner results |
+| Post-main normal-runner controls | Two clean ARM64 musl `ReleaseFast` archives succeeded on the normal 24 GiB publish runner; application/storage varied from 9 m to 11 m at 10 GB MaxRSS, with zero swap | Reliability and artifact gates pass, but the critical unit repeatedly misses the 380-second target; continue architecture work at the existing runner cost |
+| Data-only PIC storage probe | 283.018 s, 277.375 s LLVM, 593 repository files, 36,065 declarations | Establishes that PIC/CAPI storage ownership is not the excess cost |
+| Data + standalone/Lite + CAPI PIC probe | 288.171 s, only +5.153 s over data alone; 614 repository files, 37,166 declarations | Strong candidate ownership island; CLI/metadata roots account for the remaining 82.685 s |
+| CLI + metadata control-only probe | 295.647 s, 289.733 s LLVM, 600 repository files | A separate control unit meets the time gate but duplicates too much physical storage by itself |
+| API/serverless + CLI/metadata coalescing | API/control 409.246 s; storage runtime 313.292 s; duplicate instances 484 → 676; executable 61.224 MB → 72.464 MB | Rejected; moving roots without moving physical ownership misses time, overlap, and artifact gates |
 
 The `/tmp` graph analysis was consolidated into
 `tools/analyze_zig_import_graph.py`. It reports lexical reachability, consumes
@@ -1288,8 +1292,8 @@ skipped, 5/5 linked-main tests, 10/10 C API tests, all graph gates, and all 13
 analyzer tests. The final product remains one static executable with embedded
 standalone inference and normal concurrency.
 
-Decision: **keep the default compile-once topology and stop the separate
-opaque-storage-kernel migration**. The experiment answered its question: after
+Decision at that checkpoint: **keep the default compile-once topology and stop
+the separate opaque-storage-kernel migration**. The experiment answered its question: after
 the inference and serverless graph cuts, a dedicated storage compiler unit no
 longer improves the critical path and instead duplicates nearly the entire
 storage graph. The retained owner ABI work remains useful design evidence and
@@ -1302,29 +1306,31 @@ runner's memory budget.
 
 ### Post-main normal-runner control
 
-After merging current `main`, GitHub Actions run `31281549097` exercised the
-default compile-once topology on the normal `arc-antfly-publish` runner. The
-run used a clean cache, ARM64 Linux musl `ReleaseFast`, the production LSM-only
-feature set, normal build concurrency, and the existing 24 GiB pod request. It
-did not add swap, a larger runner, or serialized compilation.
+After merging current `main`, GitHub Actions runs `31281549097` and
+`31283050205` exercised the default compile-once topology on the normal
+`arc-antfly-publish` runner. Both used a clean cache, ARM64 Linux musl
+`ReleaseFast`, the production LSM-only feature set, normal build concurrency,
+and the existing 24 GiB pod request. Neither added swap, a larger runner, or
+serialized compilation.
 
 The archive build succeeded and all artifact gates passed:
 
-| Unit or artifact | Normal-runner result |
-|---|---:|
-| API protocol + serverless | 5 m, 6 GB reported MaxRSS |
-| Distributed + storage + C API exports | 9 m, 10 GB reported MaxRSS |
-| Inference | 6 m, 6 GB reported MaxRSS |
-| Thin final executable link | 10 s, 427 MB reported MaxRSS |
-| Complete archive build | 12:28.74 wall, 10,259,540 KiB peak process RSS, zero swap |
-| Static executable | 61,223,736 bytes |
-| `libantfly.so` | 16,669,872 bytes |
+| Unit or artifact | Run 1 | Run 2 |
+|---|---:|---:|
+| API protocol + serverless | 5 m, 6 GB MaxRSS | 6 m, 6 GB MaxRSS |
+| Distributed + storage + C API exports | 9 m, 10 GB MaxRSS | 11 m, 10 GB MaxRSS |
+| Inference | 6 m, 6 GB MaxRSS | 7 m, 6 GB MaxRSS |
+| Thin final executable link | 10 s, 427 MB MaxRSS | completed |
+| Complete archive build | 12:28.74, 10,259,540 KiB peak RSS | 14:45.44, 10,299,704 KiB peak RSS |
+| Swap | zero | zero |
+| Static executable | 61,223,736 bytes | 61,223,736 bytes |
+| `libantfly.so` | 16,669,872 bytes | 16,669,872 bytes |
 
-This is the first authoritative proof that the accepted three-island
+These are two independent authoritative proofs that the accepted three-island
 architecture completes the original failing build on the normal runner after
-the `main` merge. It is not proof that the performance goal is complete: the
-application/storage unit is reported at about nine minutes, above the
-380-second gate.
+the `main` merge. They establish reliability at the existing cost, but they do
+not satisfy the performance goal: the application/storage unit varies from
+nine to eleven minutes, well above the 380-second gate.
 
 The run also found a measurement-infrastructure defect. The API unit peaked at
 6.32 GB while its build-step scheduling claim was still 5 GiB. Zig therefore
@@ -1335,36 +1341,87 @@ remains within the existing 20 GB Zig scheduling budget and the runner's 4 GiB
 reserve. This corrects scheduling metadata; it does not increase runner cost,
 add memory, serialize compilation, or weaken a product boundary.
 
-Decision: **keep the compile-once architecture and correct the API claim, but
-continue the goal loop**. The next experiment must capture post-merge compiler
-reports for the application/storage unit and identify the largest newly
-analyzed or newly emitted family before selecting another coarse cut.
+Decision: **keep the API scheduling correction, but reopen the compilation
+architecture decision and continue the goal loop**. The repeated runner result
+invalidates the assumption that the 352.9--358.6-second local compile-once
+control was sufficient as the final architecture.
+
+### Control/storage root-isolation probes
+
+Fresh local ARM64 Linux musl `ReleaseFast` probes used separate local and
+global caches, production LSM-only mode, normal optimization, and real emitted
+PIC archives. A capture threshold ignored early build-script/sema-only reports.
+
+| Probe | Compiler time | LLVM emit | Declarations | Repository Zig files |
+|---|---:|---:|---:|---:|
+| Current combined application/storage | 370.856 s | 362.486 s | 40,580 | 645 |
+| Data + CAPI only, PIC | 283.018 s | 277.375 s | 36,065 | 593 |
+| Data + standalone/Lite + restore staging + CAPI, PIC | 288.171 s | 282.314 s | 37,166 | 614 |
+| CLI + metadata control only | 295.647 s | 289.733 s | 35,745 | 600 |
+
+Standalone/Lite, restore staging, and the public CAPI add only 5.153 seconds to
+the data/storage unit. Removing CLI and metadata from the current combined
+unit removes 31 repository files, 40,542 repository source lines, 3,414
+declarations, and 82.685 seconds. This is a real root-emission effect, not a
+PIC penalty.
+
+A four-unit source-only split would cap each isolated local unit below five
+minutes, but it raises aggregate duplicate repository-file instances from 484
+to 1,053. Co-generating CLI/metadata with API/serverless reduces that overlap,
+but fails the go/no-go gates:
+
+| Three-unit coalescing candidate | Result |
+|---|---:|
+| API/serverless + CLI/metadata | 409.246 s, 400.956 s LLVM, 725 repository files |
+| Data + standalone/Lite + CAPI | 313.292 s under concurrent load |
+| Inference | 226.252 s |
+| Aggregate duplicate instances | 676, up from 484 |
+| Static executable | 72,464,376 bytes, up 18.4% from 61,223,736 bytes |
+
+Decision: **revert the source-only coalescing topology and resume the opaque
+storage-owner experiment at an atomic physical-source cut**. Repartitioning
+roots proves that a sub-five-minute shape exists, but it recompiles the same
+storage implementation and carries the duplicate code in the final executable.
+The next viable change must make both legacy provisioned read and write/
+lifecycle implementations compile-time unreachable from control consumers;
+adding more individual ABI operations while either physical fallback remains
+reachable is not a valid measurement checkpoint.
 
 ## Holistic target architecture
 
-The measured production target is a modular source monolith with three compiled
-islands. Compiler-unit boundaries deliberately do not mirror every source
-ownership boundary: distributed orchestration and provisioned storage share so
-much optimized code that co-generation is both faster and substantially
-smaller than an internal ABI split.
+The current production baseline remains the three-island compile-once topology
+because it is reliable and smaller than the rejected source-only splits. It is
+not the final target: normal-runner evidence shows that its combined
+application/storage island is too slow.
+
+The reopened target is a modular monolith with one compiled physical-storage
+owner and separately compiled control consumers:
 
 ```text
 thin linked main
-├── API protocol + serverless island
-│   └── HTTP/auth/public translation plus serverless artifact execution
-├── application/storage island (PIC, sectioned)
-│   ├── CLI, data, metadata, standalone/Lite and distributed control
-│   ├── DB ownership, LSM, indexes and provisioned local queries
+├── API/serverless and distributed-control consumer islands
+│   ├── HTTP/auth/public translation, routing, topology, fanout and merge
+│   └── opaque storage handles plus coarse request/result/callback ABIs
+├── provisioned storage/local-query kernel (PIC, sectioned, compiled once)
+│   ├── DB/LSM/index ownership and complete group-local queries
+│   ├── writes, transaction participants, snapshots, restore and maintenance
 │   └── public C API exports reused by the shared libraries
 └── inference island
     └── model lifecycle plus the linked standalone inference host
 ```
 
-The application/storage archive is compiled once. The executable retains its
-runtime and storage roots; `libantfly.so` and `libantfly_zig_capi.so` link the
-same PIC object and discard runtime-only sections. Standalone remains a product
-composition mode in that archive and calls the separately compiled inference
-host. No storage call crosses an internal ABI in the production path.
+The exact grouping of API, CLI, data control, metadata control, and standalone
+composition remains a measured decision after the physical imports disappear.
+The isolated probes show that suitable sub-five-minute units exist; choosing
+their final grouping before removing physical ownership only measures duplicate
+storage code. Standalone remains a thin product composition mode and always
+links the separately compiled inference host.
+
+The kernel is not a per-backend wrapper and not an internal RPC service. It is
+one static PIC artifact linked into the executable and the C API libraries.
+Consumers cross it only for complete local operations. This preserves one
+process, one static executable, direct in-process calls, explicit ownership,
+and one optimized copy of storage/local-query code.
 
 ### Source ownership rules
 
@@ -1382,15 +1439,15 @@ imply a compiled ABI between distributed control and storage.
 | Standalone | Product-mode wiring, startup and shutdown | Another copy of inference or storage codegen |
 | C API | Public ABI adaptation | A second storage implementation |
 
-Raft and distributed transaction coordination remain source-level control
-concerns even though LLVM emits them in the same application/storage unit as
-local execution.
+Raft leadership, routing, and distributed transaction coordination remain
+control concerns. Raft apply, local transaction participation, and physical
+snapshot publication operate through the storage owner.
 
-### Criteria for any future compiled ABI
+### Criteria for the compiled storage ABI
 
-The separate storage-kernel experiment did not pay. If a future graph change
-reopens that decision, it must still follow these rules and beat the accepted
-three-unit baseline before migration resumes:
+The normal-runner and root-isolation results reopen the storage-kernel
+experiment. It must follow these rules and beat the current three-unit baseline
+before becoming the production architecture:
 
 - Handles such as storage, table, shard, and snapshot handles are opaque.
 - ABI declarations use C-compatible layouts and explicit-width types.
@@ -1412,13 +1469,15 @@ three-unit baseline before migration resumes:
 - Logical/public validation remains outside the kernel. Local physical planning
   and execution live together inside it so storage internals do not leak.
 
-## Historical separate-storage-kernel experiment plan (closed)
+## Storage-kernel experiment plan and historical checkpoints
 
-This experiment asked whether a separately compiled storage kernel could reduce
-the then-425.652-second critical path enough to justify the ABI and ownership
-migration. The repeated compile-once control above answered **no** after later
-graph cuts changed the baseline. The phases below are retained as the design
-and experiment record, not as the active production plan.
+This experiment originally asked whether a separately compiled storage kernel
+could reduce the then-425.652-second critical path enough to justify the ABI and
+ownership migration. The 352.9--358.6-second local compile-once control paused
+the migration, but the repeated 9--11-minute normal-runner result and the
+283--296-second root-isolation probes reopen it. The phases below remain the
+design and experiment record. Work resumes at the atomic physical-source cut
+identified after Phase 3, rather than repeating already validated ABI slices.
 
 ### Phase 0: reproducible baseline
 
@@ -1509,10 +1568,10 @@ possible critical path below the current 425.652 seconds once standalone and
 storage emission are no longer fused into that unit. This is a hypothesis, not
 a promised result.
 
-## Historical separate-kernel go/no-go criteria
+## Storage-kernel go/no-go criteria
 
-The separate-kernel migration was allowed to proceed beyond the query slice
-only if it demonstrated a material improvement. Its thresholds were:
+The separate-kernel migration proceeds beyond the atomic physical-source cut
+only if it demonstrates a material improvement. Its thresholds are:
 
 - reduce the 425.652-second distributed critical path to at most about 380
   seconds, with a preferred result below 350 seconds;
@@ -1534,11 +1593,12 @@ material, or if the boundary requires exposing most DB internals. A clean
 domain boundary is desirable, but not at unlimited implementation and runtime
 cost.
 
-The migration is now stopped for the stronger reason established by the
-compile-once control: the production application/storage unit already measures
-352.9--358.6 seconds, while a separate kernel adds a fourth compiler unit, 391
-duplicate repository-file instances, 11.3 MB to the executable, and a large
-internal ABI without improving the critical path.
+That conclusion is now historical. The compile-once control was locally fast,
+but the same unit repeatedly takes 9--11 minutes on the normal runner. The new
+root-isolation probes also show an 82.685-second removable control cost. The
+migration resumes only at an atomic cut that removes legacy physical sources;
+the previously rejected configuration that merely added a kernel alongside
+those sources remains invalid.
 
 ## Required validation
 
@@ -1573,7 +1633,7 @@ zig build \
   -Dproduction-lsm-only=true
 ```
 
-The closed, opt-in separate-storage diagnostic adds:
+The opt-in separate-storage experiment adds:
 
 ```sh
 zig build \
@@ -1585,9 +1645,9 @@ zig build \
   -Dstorage-kernel-experiment=true
 ```
 
-This option remains off by default. It is retained for the historical owner-ABI
-tests and future diagnostics; production should not enable it without new cold
-measurements that beat the accepted compile-once topology.
+This option remains off by default while the physical-source cut is incomplete.
+Production must not enable it until the behavioral, compiler, memory, graph,
+artifact, and normal-runner gates above pass.
 
 Compatibility validation keeps the linked architecture but enables LMDB:
 
@@ -1626,12 +1686,16 @@ zig build \
   --webui=127.0.0.1:19125
 
 node tools/capture_zig_time_report.mjs \
-  ws://127.0.0.1:19125/ antfly-storage-kernel distributed.json
+  ws://127.0.0.1:19125/ antfly-storage-kernel reports/distributed.json 30
 node tools/capture_zig_time_report.mjs \
-  ws://127.0.0.1:19125/ antfly-runtime-api_kernel api.json
+  ws://127.0.0.1:19125/ antfly-runtime-api_kernel reports/api.json 30
 node tools/capture_zig_time_report.mjs \
-  ws://127.0.0.1:19125/ antfly-runtime-inference inference.json
+  ws://127.0.0.1:19125/ antfly-runtime-inference reports/inference.json 30
 ```
+
+The optional final argument is the minimum LLVM-emission duration in seconds.
+It prevents an early build-script or sema-only report from being mistaken for
+the final optimized unit. The collector creates the output parent directory.
 
 Use a new `--cache-dir` and `--global-cache-dir` for genuine cold-cache
 comparisons. Do not compare a cold candidate with a warm baseline.
