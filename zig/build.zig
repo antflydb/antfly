@@ -5191,6 +5191,8 @@ pub fn build(b: *std.Build) void {
             "table read distributed sorted merge uses catalog runtime schema and rejects incomplete shard windows",
             "provisioned standby read gate permits stale reads and routes non-stale reads to primary",
             "provisioned local query reuses resident generation without readonly open",
+            "provisioned graph hydrate completes consistency before resident read admission",
+            "provisioned table read source falls back from read_index to stale on not leader",
             "catalog backed router skips non-serving relocation placements",
         },
         .test_runner = .{
