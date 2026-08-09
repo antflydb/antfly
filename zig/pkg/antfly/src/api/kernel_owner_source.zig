@@ -22,6 +22,7 @@ const platform_time = @import("antfly_platform").time;
 const abi = @import("kernel_owner_abi");
 const client = @import("../storage/kernel_owner_client.zig");
 const descriptor_contract = @import("../storage/kernel_owner_descriptor.zig");
+const backend_types = @import("../storage/backend_types.zig");
 const db_types = @import("../storage/db/types.zig");
 const ha_replication_record = @import("../storage/ha/replication_record.zig");
 const runtime_preflight = @import("../storage/db/runtime_preflight.zig");
@@ -177,6 +178,9 @@ pub const ProvisionedKernelOwnerSource = struct {
             .vtable = &.{
                 .batch = unsupportedTopLevelBatch,
                 .batch_group_local = batchGroupLocal,
+                .begin_bulk_ingest_group_local = beginBulkIngestGroupLocal,
+                .finish_bulk_ingest_group_local = finishBulkIngestGroupLocal,
+                .abort_bulk_ingest_group_local = abortBulkIngestGroupLocal,
                 .local_runtime_statuses = localRuntimeStatuses,
                 .reconcile_table_group_local = reconcileTableGroupLocal,
                 .retire_table_group_local = retireTableGroupLocal,
@@ -861,6 +865,119 @@ pub const ProvisionedKernelOwnerSource = struct {
         var response = try lease.owner().batchJson(table_name, request_json);
         defer response.deinit();
         return {};
+    }
+
+    fn beginBulkIngestGroupLocal(
+        ptr: *anyopaque,
+        group_id: u64,
+        table_name: []const u8,
+    ) !?void {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        var lease = try self.acquire(group_id, table_name);
+        defer lease.deinit();
+        try lease.owner().beginBulkIngest(table_name);
+        return {};
+    }
+
+    const BulkFinishCallbacks = struct {
+        options: backend_types.BulkIngestFinishOptions,
+
+        fn progress(
+            ctx: ?*anyopaque,
+            value: *const abi.BulkProgress,
+        ) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            const callback = self.options.progress_fn orelse return;
+            callback(self.options.progress_ctx.?, .{
+                .phase = switch (value.phase) {
+                    .begin => .begin,
+                    .split => .split,
+                    .publish => .publish,
+                    .complete => .complete,
+                },
+                .publish_window = value.publish_window,
+                .split_steps = value.split_steps,
+                .deferred_leaf_splits = value.deferred_leaf_splits,
+                .elapsed_ns = value.elapsed_ns,
+            });
+        }
+
+        fn admission(ctx: ?*anyopaque) callconv(.c) abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.options.checkAdmission() catch |err| return switch (err) {
+                error.WouldBlock, error.StorageBusy, error.ResourceBudgetExceeded => .busy,
+                error.Timeout => .timeout,
+                error.Canceled, error.Cancelled => .cancelled,
+                error.HAReadOnlyStandby => .read_only,
+                else => .internal,
+            };
+            return .ok;
+        }
+    };
+
+    fn finishBulkIngestGroupLocal(
+        ptr: *anyopaque,
+        group_id: u64,
+        table_name: []const u8,
+        options: backend_types.BulkIngestFinishOptions,
+    ) !?void {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        var lease = try self.acquire(group_id, table_name);
+        defer lease.deinit();
+        var callbacks = BulkFinishCallbacks{ .options = options };
+        const request = abi.BulkFinishRequest{
+            .compact = @intFromBool(options.compact),
+            .flush = @intFromBool(options.flush),
+            .has_max_deferred_l0_runs = @intFromBool(options.max_deferred_l0_runs != null),
+            .has_max_foreground_compaction_input_bytes = @intFromBool(options.max_foreground_compaction_input_bytes != null),
+            .has_max_foreground_compaction_ns = @intFromBool(options.max_foreground_compaction_ns != null),
+            .has_max_deferred_hbc_leaf_splits_per_publish = @intFromBool(options.max_deferred_hbc_leaf_splits_per_publish != null),
+            .has_max_deferred_hbc_leaf_split_members_per_publish = @intFromBool(options.max_deferred_hbc_leaf_split_members_per_publish != null),
+            .has_bulk_rebuild_hbc_leaf_min_members = @intFromBool(options.bulk_rebuild_hbc_leaf_min_members != null),
+            .table_name = .fromSlice(table_name),
+            .max_deferred_l0_runs = @intCast(options.max_deferred_l0_runs orelse 0),
+            .max_foreground_compaction_steps = @intCast(options.max_foreground_compaction_steps),
+            .max_foreground_compaction_input_bytes = options.max_foreground_compaction_input_bytes orelse 0,
+            .max_foreground_compaction_ns = options.max_foreground_compaction_ns orelse 0,
+            .max_deferred_hbc_leaf_splits_per_publish = @intCast(options.max_deferred_hbc_leaf_splits_per_publish orelse 0),
+            .max_deferred_hbc_leaf_split_members_per_publish = @intCast(options.max_deferred_hbc_leaf_split_members_per_publish orelse 0),
+            .bulk_rebuild_hbc_leaf_min_members = @intCast(options.bulk_rebuild_hbc_leaf_min_members orelse 0),
+            .callback_ctx = &callbacks,
+            .progress_fn = if (options.progress_fn != null and options.progress_ctx != null)
+                BulkFinishCallbacks.progress
+            else
+                null,
+            .admission_fn = if (options.admission_fn != null and options.admission_ctx != null)
+                BulkFinishCallbacks.admission
+            else
+                null,
+        };
+        try lease.owner().finishBulkIngest(&request);
+        return {};
+    }
+
+    fn abortBulkIngestGroupLocal(
+        ptr: *anyopaque,
+        group_id: u64,
+        table_name: []const u8,
+    ) void {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        var lease = self.acquire(group_id, table_name) catch |err| {
+            std.log.warn("storage owner bulk abort acquire failed table={s} group_id={d} err={s}", .{
+                table_name,
+                group_id,
+                @errorName(err),
+            });
+            return;
+        };
+        defer lease.deinit();
+        lease.owner().abortBulkIngest(table_name) catch |err| {
+            std.log.warn("storage owner bulk abort failed table={s} group_id={d} err={s}", .{
+                table_name,
+                group_id,
+                @errorName(err),
+            });
+        };
     }
 
     fn localRuntimeStatuses(

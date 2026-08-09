@@ -15,7 +15,7 @@
 //! Versioned internal ABI for the storage kernel's live DB owner. Keep this
 //! module free of storage and distributed-runtime imports.
 
-pub const abi_version: u32 = 12;
+pub const abi_version: u32 = 13;
 
 pub const BorrowedBytes = extern struct {
     ptr: ?[*]const u8 = null,
@@ -148,6 +148,55 @@ pub const ReconcileResult = extern struct {
     next_retry_at_ms: u64 = 0,
 };
 
+pub const TableRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved0: u32 = 0,
+    table_name: BorrowedBytes = .{},
+};
+
+pub const BulkProgressPhase = enum(u32) {
+    begin = 0,
+    split = 1,
+    publish = 2,
+    complete = 3,
+};
+
+pub const BulkProgress = extern struct {
+    phase: BulkProgressPhase,
+    _reserved0: u32 = 0,
+    publish_window: u64 = 0,
+    split_steps: u64 = 0,
+    deferred_leaf_splits: u64 = 0,
+    elapsed_ns: u64 = 0,
+};
+
+pub const BulkProgressFn = *const fn (?*anyopaque, *const BulkProgress) callconv(.c) void;
+pub const BulkAdmissionFn = *const fn (?*anyopaque) callconv(.c) Status;
+
+pub const BulkFinishRequest = extern struct {
+    version: u32 = abi_version,
+    compact: u8 = 1,
+    flush: u8 = 0,
+    has_max_deferred_l0_runs: u8 = 0,
+    has_max_foreground_compaction_input_bytes: u8 = 0,
+    has_max_foreground_compaction_ns: u8 = 0,
+    has_max_deferred_hbc_leaf_splits_per_publish: u8 = 0,
+    has_max_deferred_hbc_leaf_split_members_per_publish: u8 = 0,
+    has_bulk_rebuild_hbc_leaf_min_members: u8 = 0,
+    _reserved0: [4]u8 = .{ 0, 0, 0, 0 },
+    table_name: BorrowedBytes = .{},
+    max_deferred_l0_runs: u64 = 0,
+    max_foreground_compaction_steps: u64 = 0,
+    max_foreground_compaction_input_bytes: u64 = 0,
+    max_foreground_compaction_ns: u64 = 0,
+    max_deferred_hbc_leaf_splits_per_publish: u64 = 0,
+    max_deferred_hbc_leaf_split_members_per_publish: u64 = 0,
+    bulk_rebuild_hbc_leaf_min_members: u64 = 0,
+    callback_ctx: ?*anyopaque = null,
+    progress_fn: ?BulkProgressFn = null,
+    admission_fn: ?BulkAdmissionFn = null,
+};
+
 pub const SyncLevel = enum(u32) {
     propose = 0,
     write = 1,
@@ -242,6 +291,21 @@ pub extern fn antfly_storage_owner_reconcile(
     owner: ?*anyopaque,
     request: *const ReconcileRequest,
     out_result: *ReconcileResult,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_owner_bulk_begin(
+    owner: ?*anyopaque,
+    request: *const TableRequest,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_owner_bulk_finish(
+    owner: ?*anyopaque,
+    request: *const BulkFinishRequest,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_owner_bulk_abort(
+    owner: ?*anyopaque,
+    request: *const TableRequest,
 ) callconv(.c) Status;
 
 pub extern fn antfly_storage_owner_batch_json(

@@ -33,5 +33,6 @@ pub const platform_time = @import("antfly_platform").time;
 pub const portable_backup = @import("storage/portable_backup.zig");
 pub const public_api = @import("api/mod.zig");
 pub const raft = @import("raft/mod.zig");
+pub const storage_backend = @import("storage/backend_types.zig");
 pub const transactions = @import("storage/transactions.zig");
 pub const traversal = @import("graph/traversal.zig");

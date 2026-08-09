@@ -136,6 +136,32 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     const doc_c = std.mem.indexOf(u8, dense_response.bytes(), "doc:c") orelse return error.MissingDenseHit;
     const doc_d = std.mem.indexOf(u8, dense_response.bytes(), "doc:d") orelse return error.MissingDenseHit;
     try std.testing.expect(doc_c < doc_d);
+
+    try std.testing.expectError(error.InvalidArgument, owner.beginBulkIngest("articles"));
+    try owner.beginBulkIngest("docs");
+    var bulk_batch = try owner.batchJson(
+        "docs",
+        "{\"inserts\":{\"doc:bulk\":{\"title\":\"bulk\"}},\"sync_level\":\"write\"}",
+    );
+    defer bulk_batch.deinit();
+    try owner.finishBulkIngest(&.{
+        .compact = 0,
+        .table_name = .fromSlice("docs"),
+    });
+    var bulk_query = try owner.queryJson(
+        "docs",
+        "{\"query\":{\"match_all\":{}},\"limit\":10}",
+    );
+    defer bulk_query.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, bulk_query.bytes(), "doc:bulk") != null);
+
+    try owner.beginBulkIngest("docs");
+    try owner.abortBulkIngest("docs");
+    var post_abort_batch = try owner.batchJson(
+        "docs",
+        "{\"inserts\":{\"doc:after-abort\":{\"title\":\"ordinary\"}},\"sync_level\":\"full_index\"}",
+    );
+    defer post_abort_batch.deinit();
 }
 
 test "opaque storage owner validates ABI and destruction is idempotent" {
@@ -168,6 +194,23 @@ test "opaque storage owner validates ABI and destruction is idempotent" {
         abi.antfly_storage_owner_reconcile(null, &invalid_reconcile, &reconcile_result),
     );
     try std.testing.expectEqual(abi.abi_version, reconcile_result.version);
+
+    var invalid_table: abi.TableRequest = .{};
+    invalid_table.version = abi.abi_version + 1;
+    try std.testing.expectEqual(
+        abi.Status.invalid_abi,
+        abi.antfly_storage_owner_bulk_begin(null, &invalid_table),
+    );
+    try std.testing.expectEqual(
+        abi.Status.invalid_abi,
+        abi.antfly_storage_owner_bulk_abort(null, &invalid_table),
+    );
+    var invalid_bulk_finish: abi.BulkFinishRequest = .{};
+    invalid_bulk_finish.version = abi.abi_version + 1;
+    try std.testing.expectEqual(
+        abi.Status.invalid_abi,
+        abi.antfly_storage_owner_bulk_finish(null, &invalid_bulk_finish),
+    );
 
     var response: abi.OwnedBytes = .{};
     var invalid_operation: abi.JsonOperationRequest = .{

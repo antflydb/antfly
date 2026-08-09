@@ -112,6 +112,22 @@ pub const Owner = struct {
         return result;
     }
 
+    pub fn beginBulkIngest(self: *Owner, table_name: []const u8) !void {
+        try statusToError(abi.antfly_storage_owner_bulk_begin(self.handle, &.{
+            .table_name = .fromSlice(table_name),
+        }));
+    }
+
+    pub fn finishBulkIngest(self: *Owner, request: *const abi.BulkFinishRequest) !void {
+        try statusToError(abi.antfly_storage_owner_bulk_finish(self.handle, request));
+    }
+
+    pub fn abortBulkIngest(self: *Owner, table_name: []const u8) !void {
+        try statusToError(abi.antfly_storage_owner_bulk_abort(self.handle, &.{
+            .table_name = .fromSlice(table_name),
+        }));
+    }
+
     pub fn batchJson(self: *Owner, table_name: []const u8, request_json: []const u8) !Response {
         var response: Response = .{};
         try statusToError(abi.antfly_storage_owner_batch_json(

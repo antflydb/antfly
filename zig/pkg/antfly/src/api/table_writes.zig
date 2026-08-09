@@ -4460,6 +4460,27 @@ pub const ProvisionedTableWriteSource = struct {
     const structural_reconcile_pending_delay_ms: u64 = 100;
     const structural_reconcile_groups_per_quantum: usize = 4;
 
+    const KernelBulkSession = struct {
+        const State = enum {
+            opening,
+            active,
+            finishing,
+        };
+
+        table_name: []u8,
+        pending_group_ids: []u64,
+        pending_group_count: usize,
+        depth: usize = 1,
+        state: State = .opening,
+        abort_requested: bool = false,
+
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            alloc.free(self.table_name);
+            alloc.free(self.pending_group_ids);
+            self.* = undefined;
+        }
+    };
+
     fn structuralReconcileRetryDelayMs(failure_count: u32) u64 {
         const exponent: u6 = @intCast(@min(failure_count -| 1, 7));
         return @min(
@@ -4531,6 +4552,7 @@ pub const ProvisionedTableWriteSource = struct {
     quiesced: bool = false,
     startup_catch_up_backoffs: std.AutoHashMapUnmanaged(u64, StartupCatchUpBackoff) = .empty,
     active_table_activities: std.ArrayListUnmanaged(TableActivity) = .empty,
+    kernel_bulk_sessions: std.ArrayListUnmanaged(KernelBulkSession) = .empty,
 
     const TableActivity = struct {
         // Owned by active_table_activities; entries must be created via activityEntryLocked.
@@ -5186,6 +5208,7 @@ pub const ProvisionedTableWriteSource = struct {
     /// destroy after its optional cache owner has already gone away.
     pub fn quiesce(self: *ProvisionedTableWriteSource) void {
         if (self.quiesced) return;
+        self.abortAllKernelBulkSessions();
         self.closeDroppedTableDeletes();
         const io = self.table_activity_threaded.io();
         self.restore_repair_shutdown.store(true, .release);
@@ -5234,6 +5257,43 @@ pub const ProvisionedTableWriteSource = struct {
         }
         self.write_coalesce_queues.deinit(alloc);
         self.write_coalesce_queues = .empty;
+    }
+
+    fn findKernelBulkSessionLocked(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+    ) ?usize {
+        for (self.kernel_bulk_sessions.items, 0..) |session, index| {
+            if (std.mem.eql(u8, session.table_name, table_name)) return index;
+        }
+        return null;
+    }
+
+    fn abortAllKernelBulkSessions(self: *ProvisionedTableWriteSource) void {
+        const alloc = std.heap.page_allocator;
+        while (true) {
+            lockAtomic(&self.local_db_mutex);
+            if (self.kernel_bulk_sessions.items.len == 0) {
+                self.kernel_bulk_sessions.deinit(alloc);
+                self.kernel_bulk_sessions = .empty;
+                self.local_db_mutex.unlock();
+                return;
+            }
+            var session = self.kernel_bulk_sessions.orderedRemove(
+                self.kernel_bulk_sessions.items.len - 1,
+            );
+            self.local_db_mutex.unlock();
+
+            if (self.groupLocalWriteSource()) |local_source| {
+                for (session.pending_group_ids[0..session.pending_group_count]) |group_id| {
+                    local_source.abortBulkIngestGroupLocal(
+                        group_id,
+                        session.table_name,
+                    );
+                }
+            }
+            session.deinit(alloc);
+        }
     }
 
     fn findWriteCoalesceQueueLocked(
@@ -8444,6 +8504,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     pub fn tryFinishExpiredAutoBulkIngestAndPublishStatus(self: *ProvisionedTableWriteSource, alloc: std.mem.Allocator) ?bool {
+        if (comptime storage_kernel_experiment) return false;
         var leases = std.ArrayListUnmanaged(ProvisionedTableWriteCache.CachedDb).empty;
         defer {
             for (leases.items) |*lease| {
@@ -8462,6 +8523,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     pub fn tryFinishExpiredAutoBulkIngest(self: *ProvisionedTableWriteSource) ?bool {
+        if (comptime storage_kernel_experiment) return false;
         if (!self.local_db_mutex.tryLock()) return null;
         defer self.local_db_mutex.unlock();
 
@@ -8469,6 +8531,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     pub fn finishExpiredAutoBulkIngest(self: *ProvisionedTableWriteSource) bool {
+        if (comptime storage_kernel_experiment) return false;
         lockAtomic(&self.local_db_mutex);
         defer self.local_db_mutex.unlock();
 
@@ -8484,6 +8547,14 @@ pub const ProvisionedTableWriteSource = struct {
         group_id: u64,
         table_name: []const u8,
     ) !void {
+        if (comptime storage_kernel_experiment) {
+            lockAtomic(&self.local_db_mutex);
+            defer self.local_db_mutex.unlock();
+            if (self.findKernelBulkSessionLocked(table_name) != null) {
+                return error.AutoBulkIngestBusy;
+            }
+            return;
+        }
         const FinishLease = struct {
             cached: ProvisionedTableWriteCache.CachedDb,
             finished: bool = false,
@@ -9494,6 +9565,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     pub fn autoBulkIngestStatsBestEffort(self: *ProvisionedTableWriteSource) ProvisionedTableWriteCache.AutoBulkIngestStats {
+        if (comptime storage_kernel_experiment) return .{};
         if (!self.local_db_mutex.tryLock()) return .{};
         defer self.local_db_mutex.unlock();
         const now_ns = platform_time.monotonicNs();
@@ -11102,12 +11174,242 @@ pub const ProvisionedTableWriteSource = struct {
         return {};
     }
 
+    fn beginKernelBulkIngest(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+    ) !?void {
+        try enforceHAWriteGateOptional(self.ha_write_gate);
+        const local_source = self.groupLocalWriteSource() orelse
+            return error.StorageKernelOwnerUnavailable;
+        const session_alloc = std.heap.page_allocator;
+
+        lockAtomic(&self.local_db_mutex);
+        if (self.findKernelBulkSessionLocked(table_name)) |index| {
+            const session = &self.kernel_bulk_sessions.items[index];
+            if (session.state != .active) {
+                self.local_db_mutex.unlock();
+                return error.LsmRootWriterAlreadyOpen;
+            }
+            session.depth = std.math.add(usize, session.depth, 1) catch {
+                self.local_db_mutex.unlock();
+                return error.BulkIngestDepthOverflow;
+            };
+            self.local_db_mutex.unlock();
+            return {};
+        }
+        self.local_db_mutex.unlock();
+
+        const group_ids = try table_catalog.resolveGroupsForSpanEventually(
+            session_alloc,
+            self.catalog,
+            table_name,
+            "",
+            "",
+            5 * std.time.ns_per_s,
+            10,
+        );
+        var ownership_transferred = false;
+        errdefer if (!ownership_transferred) session_alloc.free(group_ids);
+        if (group_ids.len == 0) {
+            session_alloc.free(group_ids);
+            return null;
+        }
+        const owned_table_name = try session_alloc.dupe(u8, table_name);
+        errdefer if (!ownership_transferred) session_alloc.free(owned_table_name);
+
+        lockAtomic(&self.local_db_mutex);
+        if (self.findKernelBulkSessionLocked(table_name) != null) {
+            self.local_db_mutex.unlock();
+            return error.LsmRootWriterAlreadyOpen;
+        }
+        self.kernel_bulk_sessions.ensureUnusedCapacity(session_alloc, 1) catch |err| {
+            self.local_db_mutex.unlock();
+            return err;
+        };
+        self.kernel_bulk_sessions.appendAssumeCapacity(.{
+            .table_name = owned_table_name,
+            .pending_group_ids = group_ids,
+            .pending_group_count = group_ids.len,
+        });
+        ownership_transferred = true;
+        self.local_db_mutex.unlock();
+
+        var started_count: usize = 0;
+        var first_err: ?anyerror = null;
+        for (group_ids) |group_id| {
+            const started = local_source.beginBulkIngestGroupLocal(
+                group_id,
+                table_name,
+            ) catch |err| {
+                first_err = err;
+                break;
+            };
+            if (started == null) {
+                first_err = error.StorageKernelOwnerUnavailable;
+                break;
+            }
+            started_count += 1;
+        }
+
+        lockAtomic(&self.local_db_mutex);
+        const session_index = self.findKernelBulkSessionLocked(table_name);
+        const abort_requested = if (session_index) |index|
+            self.kernel_bulk_sessions.items[index].abort_requested
+        else
+            true;
+        if (session_index == null and first_err == null) {
+            first_err = error.InvalidBulkIngestTransition;
+        }
+        if (first_err == null and !abort_requested) {
+            self.kernel_bulk_sessions.items[session_index.?].state = .active;
+            self.local_db_mutex.unlock();
+            return {};
+        }
+        var removed = if (session_index) |index|
+            self.kernel_bulk_sessions.orderedRemove(index)
+        else
+            KernelBulkSession{
+                .table_name = owned_table_name,
+                .pending_group_ids = group_ids,
+                .pending_group_count = group_ids.len,
+            };
+        self.local_db_mutex.unlock();
+
+        for (group_ids[0..started_count]) |group_id| {
+            local_source.abortBulkIngestGroupLocal(group_id, table_name);
+        }
+        removed.deinit(session_alloc);
+        if (first_err) |err| return err;
+        return error.BulkIngestAborted;
+    }
+
+    fn finishKernelBulkIngest(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        options: backend_types.BulkIngestFinishOptions,
+    ) !?void {
+        try enforceHAWriteGateOptional(self.ha_write_gate);
+        const local_source = self.groupLocalWriteSource() orelse
+            return error.StorageKernelOwnerUnavailable;
+        const session_alloc = std.heap.page_allocator;
+
+        lockAtomic(&self.local_db_mutex);
+        const session_index = self.findKernelBulkSessionLocked(table_name) orelse {
+            self.local_db_mutex.unlock();
+            return {};
+        };
+        const session = &self.kernel_bulk_sessions.items[session_index];
+        if (session.state != .active) {
+            self.local_db_mutex.unlock();
+            return error.LsmRootWriterAlreadyOpen;
+        }
+        if (session.depth > 1) {
+            session.depth -= 1;
+            self.local_db_mutex.unlock();
+            return {};
+        }
+        const finished = alloc.alloc(bool, session.pending_group_count) catch |err| {
+            self.local_db_mutex.unlock();
+            return err;
+        };
+        @memset(finished, false);
+        const pending_group_ids = session.pending_group_ids[0..session.pending_group_count];
+        session.state = .finishing;
+        self.local_db_mutex.unlock();
+        defer alloc.free(finished);
+
+        var first_err: ?anyerror = null;
+        for (pending_group_ids, 0..) |group_id, group_index| {
+            const result = local_source.finishBulkIngestGroupLocal(
+                group_id,
+                table_name,
+                options,
+            ) catch |err| {
+                if (first_err == null) first_err = err;
+                continue;
+            };
+            if (result == null) {
+                if (first_err == null) first_err = error.StorageKernelOwnerUnavailable;
+                continue;
+            }
+            finished[group_index] = true;
+        }
+
+        lockAtomic(&self.local_db_mutex);
+        const active_index = self.findKernelBulkSessionLocked(table_name) orelse {
+            self.local_db_mutex.unlock();
+            return error.InvalidBulkIngestTransition;
+        };
+        const active = &self.kernel_bulk_sessions.items[active_index];
+        var retained_count: usize = 0;
+        for (pending_group_ids, finished) |group_id, did_finish| {
+            if (did_finish) continue;
+            active.pending_group_ids[retained_count] = group_id;
+            retained_count += 1;
+        }
+        active.pending_group_count = retained_count;
+        if (first_err) |err| {
+            active.state = .active;
+            self.local_db_mutex.unlock();
+            return err;
+        }
+        std.debug.assert(retained_count == 0);
+        var removed = self.kernel_bulk_sessions.orderedRemove(active_index);
+        self.local_db_mutex.unlock();
+        removed.deinit(session_alloc);
+        return {};
+    }
+
+    fn abortKernelBulkIngest(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+    ) void {
+        const local_source = self.groupLocalWriteSource() orelse return;
+        const session_alloc = std.heap.page_allocator;
+
+        lockAtomic(&self.local_db_mutex);
+        const session_index = self.findKernelBulkSessionLocked(table_name) orelse {
+            self.local_db_mutex.unlock();
+            return;
+        };
+        const session = &self.kernel_bulk_sessions.items[session_index];
+        if (session.state == .opening) {
+            session.abort_requested = true;
+            self.local_db_mutex.unlock();
+            return;
+        }
+        if (session.state == .finishing) {
+            self.local_db_mutex.unlock();
+            return;
+        }
+        session.state = .finishing;
+        const pending_group_ids = session.pending_group_ids[0..session.pending_group_count];
+        self.local_db_mutex.unlock();
+
+        for (pending_group_ids) |group_id| {
+            local_source.abortBulkIngestGroupLocal(group_id, table_name);
+        }
+
+        lockAtomic(&self.local_db_mutex);
+        if (self.findKernelBulkSessionLocked(table_name)) |active_index| {
+            var removed = self.kernel_bulk_sessions.orderedRemove(active_index);
+            self.local_db_mutex.unlock();
+            removed.deinit(session_alloc);
+            return;
+        }
+        self.local_db_mutex.unlock();
+    }
+
     fn beginBulkIngest(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         table_name: []const u8,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (comptime storage_kernel_experiment) {
+            return try self.beginKernelBulkIngest(table_name);
+        }
         if (self.localWriteOwnerSource()) |owner| return try owner.beginBulkIngest(alloc, table_name);
         try enforceHAWriteGateOptional(self.ha_write_gate);
 
@@ -11242,6 +11544,9 @@ pub const ProvisionedTableWriteSource = struct {
         options: backend_types.BulkIngestFinishOptions,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (comptime storage_kernel_experiment) {
+            return try self.finishKernelBulkIngest(alloc, table_name, options);
+        }
         if (self.localWriteOwnerSource()) |owner| return try owner.finishBulkIngest(alloc, table_name, options);
         try enforceHAWriteGateOptional(self.ha_write_gate);
 
@@ -11321,6 +11626,10 @@ pub const ProvisionedTableWriteSource = struct {
 
     fn abortBulkIngest(ptr: *anyopaque, table_name: []const u8) void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (comptime storage_kernel_experiment) {
+            self.abortKernelBulkIngest(table_name);
+            return;
+        }
         if (self.localWriteOwnerSource()) |owner| {
             owner.abortBulkIngest(table_name);
             return;

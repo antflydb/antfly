@@ -2199,6 +2199,51 @@ The durable node repair scheduler still needs to consume the bounded owner
 operation as part of ownership family 6, but no schema/index control path needs
 to open a DB in distributed code. The next family is bulk-ingest lifecycle.
 
+### Phase 4d: owner-side bulk-ingest lifecycle
+
+Storage-owner ABI version 13 moves the complete explicit bulk-ingest lifecycle
+behind the resident owner. Distributed control retains only table routing,
+nested-session depth, and group completion bookkeeping. One coarse begin and
+one coarse finish/abort call enter each group owner; no record, LSM run, index,
+or backend primitive crosses the ABI. Finish preserves every existing scalar
+option plus synchronous progress and admission callbacks.
+
+The table-scoped control ledger is retry safe. If a multi-group finish succeeds
+for some groups and fails for others, it retains only the unfinished group IDs;
+a retry cannot finish a successfully published owner twice. Begin failure or a
+concurrent abort rolls back every owner that actually started, source quiesce
+aborts remaining sessions before owner teardown, and an active explicit session
+continues to fence split/generation transitions.
+
+Automatic cache bulk windows require no replacement owner protocol. Production
+ordinary uploads intentionally stopped opening those windows: DB/LSM owns
+online batching and L0 maintenance, and the source's automatic-window counters
+are normally zero. Under the experiment the legacy cache cleanup methods
+therefore return the same empty result without touching a distributed physical
+cache. They still reject a transition while an explicit owner session is
+active. This preserves current behavior without reintroducing an automatic
+cache policy solely for the compilation experiment.
+
+Warm Debug validation with normal concurrency, linked runtime libraries, the
+production LSM backend, and the storage experiment enabled passed:
+
+- opaque owner ABI: 3/3, including begin/write/finish visibility, abort followed
+  by an ordinary write, wrong-table validation, and future-version rejection;
+- provisioned cross-archive owner source: 6/6, including nested begin/finish,
+  abort, transition fencing, zero automatic-window state, and one resident
+  owner throughout;
+- public C API: 10/10 with zero leaks;
+- the complete linked executable;
+- all runtime/codegen/API graph gates plus the 15/15 analyzer suite; and
+- archive/shared-library symbol inspection: all three internal bulk symbols
+  are present in the storage archive and absent from the public C API exports.
+
+Decision: keep this as ownership-family 2 preparation. It removes the remaining
+physical explicit-bulk behavior required by the future control-only source and
+does not change the intentionally disabled automatic-window policy. As with the
+preceding lifecycle slices, no cold compiler improvement is claimed before the
+atomic source-selection checkpoint.
+
 ## Holistic target architecture
 
 The current candidate baseline is the four-unit topology above with serverless

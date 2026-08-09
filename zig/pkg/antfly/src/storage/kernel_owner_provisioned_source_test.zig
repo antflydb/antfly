@@ -193,6 +193,37 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
         .timestamp_ns = 4242,
         .sync_level = .full_index,
     });
+    try std.testing.expect((try write_source.source().beginBulkIngest(alloc, "articles")) != null);
+    try std.testing.expect((try write_source.source().beginBulkIngest(alloc, "articles")) != null);
+    _ = try write_source.source().batch(alloc, "articles", .{
+        .writes = &.{.{
+            .key = "doc:bulk",
+            .value = "{\"title\":\"bulk\",\"category\":\"archive\",\"amount\":5}",
+        }},
+        .timestamp_ns = 4243,
+        .sync_level = .write,
+    });
+    try std.testing.expect((try write_source.source().finishBulkIngest(
+        alloc,
+        "articles",
+        .{ .compact = false },
+    )) != null);
+    try std.testing.expect((try write_source.source().finishBulkIngest(
+        alloc,
+        "articles",
+        .{ .compact = false },
+    )) != null);
+    try std.testing.expectEqual(@as(usize, 1), owner_source.ownerCountForTest());
+    try std.testing.expect((try write_source.source().beginBulkIngest(alloc, "articles")) != null);
+    try std.testing.expectError(
+        error.AutoBulkIngestBusy,
+        write_source.finishManagedWriterAutoBulkForTransition(7001, "articles"),
+    );
+    write_source.source().abortBulkIngest("articles");
+    try write_source.finishManagedWriterAutoBulkForTransition(7001, "articles");
+    try std.testing.expect(!write_source.finishExpiredAutoBulkIngestBestEffort());
+    try std.testing.expectEqual(@as(u64, 0), write_source.autoBulkIngestStatsBestEffort().open_entries);
+    try std.testing.expectEqual(@as(usize, 1), owner_source.ownerCountForTest());
     const structural = (try owner_source.writeSource().reconcileTableGroupLocal(
         7001,
         "articles",
@@ -316,7 +347,7 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
     switch (text_stats) {
         .fields => |fields| {
             try std.testing.expectEqual(@as(usize, 1), fields.fields.len);
-            try std.testing.expectEqual(@as(u32, 2), fields.fields[0].global_doc_count);
+            try std.testing.expectEqual(@as(u32, 3), fields.fields[0].global_doc_count);
             try std.testing.expectEqual(@as(u32, 1), fields.fields[0].term_doc_freqs[0].doc_freq);
         },
         .background_fields => return error.UnexpectedBackgroundTextStats,
@@ -492,7 +523,7 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
     defer statuses.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
     try std.testing.expectEqual(@as(u64, 7001), statuses.items[0].group_id);
-    try std.testing.expectEqual(@as(u64, 2), statuses.items[0].stats.doc_count);
+    try std.testing.expectEqual(@as(u64, 3), statuses.items[0].stats.doc_count);
     try std.testing.expectEqual(.live_writer_publish, statuses.items[0].metadata.source);
     try std.testing.expectEqual(.fresh, statuses.items[0].metadata.freshness);
     try std.testing.expect(statuses.items[0].lsm_storage_stats != null);

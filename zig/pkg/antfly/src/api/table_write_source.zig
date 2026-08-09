@@ -175,6 +175,22 @@ pub const TableWriteSource = struct {
             ptr: *anyopaque,
             table_name: []const u8,
         ) void = null,
+        begin_bulk_ingest_group_local: ?*const fn (
+            ptr: *anyopaque,
+            group_id: u64,
+            table_name: []const u8,
+        ) anyerror!?void = null,
+        finish_bulk_ingest_group_local: ?*const fn (
+            ptr: *anyopaque,
+            group_id: u64,
+            table_name: []const u8,
+            options: backend_types.BulkIngestFinishOptions,
+        ) anyerror!?void = null,
+        abort_bulk_ingest_group_local: ?*const fn (
+            ptr: *anyopaque,
+            group_id: u64,
+            table_name: []const u8,
+        ) void = null,
         batch_group_local: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -398,6 +414,34 @@ pub const TableWriteSource = struct {
     pub fn abortBulkIngest(self: TableWriteSource, table_name: []const u8) void {
         const fn_ptr = self.vtable.abort_bulk_ingest orelse return;
         fn_ptr(self.ptr, table_name);
+    }
+
+    pub fn beginBulkIngestGroupLocal(
+        self: TableWriteSource,
+        group_id: u64,
+        table_name: []const u8,
+    ) !?void {
+        const fn_ptr = self.vtable.begin_bulk_ingest_group_local orelse return null;
+        return try fn_ptr(self.ptr, group_id, table_name);
+    }
+
+    pub fn finishBulkIngestGroupLocal(
+        self: TableWriteSource,
+        group_id: u64,
+        table_name: []const u8,
+        options: backend_types.BulkIngestFinishOptions,
+    ) !?void {
+        const fn_ptr = self.vtable.finish_bulk_ingest_group_local orelse return null;
+        return try fn_ptr(self.ptr, group_id, table_name, options);
+    }
+
+    pub fn abortBulkIngestGroupLocal(
+        self: TableWriteSource,
+        group_id: u64,
+        table_name: []const u8,
+    ) void {
+        const fn_ptr = self.vtable.abort_bulk_ingest_group_local orelse return;
+        fn_ptr(self.ptr, group_id, table_name);
     }
 
     pub fn createTable(

@@ -19,6 +19,7 @@ const search_wire = @import("search_wire.zig");
 const kernel_owner_abi = @import("kernel_owner_abi");
 
 const db_mod = antfly.db;
+const backend_types = antfly.storage_backend;
 const raft_mod = antfly.raft;
 const hbc = antfly.hbc;
 const graph_mod = antfly.graph;
@@ -1817,6 +1818,113 @@ pub fn storageOwnerReconcile(
         .repair_disk_waits = @intCast(reconciled.repair_disk_waits),
         .next_retry_at_ms = reconciled.next_retry_at_ms,
     };
+    return .ok;
+}
+
+const StorageOwnerBulkCallbacks = struct {
+    request: *const kernel_owner_abi.BulkFinishRequest,
+
+    fn progress(ptr: *anyopaque, progress_value: backend_types.BulkIngestFinishOptions.Progress) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const callback = self.request.progress_fn orelse return;
+        const abi_progress = kernel_owner_abi.BulkProgress{
+            .phase = switch (progress_value.phase) {
+                .begin => .begin,
+                .split => .split,
+                .publish => .publish,
+                .complete => .complete,
+            },
+            .publish_window = progress_value.publish_window,
+            .split_steps = progress_value.split_steps,
+            .deferred_leaf_splits = progress_value.deferred_leaf_splits,
+            .elapsed_ns = progress_value.elapsed_ns,
+        };
+        callback(self.request.callback_ctx, &abi_progress);
+    }
+
+    fn admission(ptr: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const callback = self.request.admission_fn orelse return;
+        return switch (callback(self.request.callback_ctx)) {
+            .ok => {},
+            .busy => error.WouldBlock,
+            .timeout => error.Timeout,
+            .cancelled => error.Canceled,
+            .read_only => error.HAReadOnlyStandby,
+            else => error.StorageKernelCallbackFailed,
+        };
+    }
+};
+
+pub fn storageOwnerBulkBegin(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.TableRequest,
+) callconv(.c) kernel_owner_abi.Status {
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    handle.db.beginBulkIngestSession() catch |err| return storageOwnerStatusFromError(err);
+    return .ok;
+}
+
+pub fn storageOwnerBulkFinish(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.BulkFinishRequest,
+) callconv(.c) kernel_owner_abi.Status {
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    const max_deferred_l0_runs = if (request.has_max_deferred_l0_runs != 0)
+        std.math.cast(usize, request.max_deferred_l0_runs) orelse return .invalid_argument
+    else
+        null;
+    const max_foreground_compaction_steps = std.math.cast(usize, request.max_foreground_compaction_steps) orelse
+        return .invalid_argument;
+    const max_deferred_hbc_leaf_splits_per_publish = if (request.has_max_deferred_hbc_leaf_splits_per_publish != 0)
+        std.math.cast(usize, request.max_deferred_hbc_leaf_splits_per_publish) orelse return .invalid_argument
+    else
+        null;
+    const max_deferred_hbc_leaf_split_members_per_publish = if (request.has_max_deferred_hbc_leaf_split_members_per_publish != 0)
+        std.math.cast(usize, request.max_deferred_hbc_leaf_split_members_per_publish) orelse return .invalid_argument
+    else
+        null;
+    const bulk_rebuild_hbc_leaf_min_members = if (request.has_bulk_rebuild_hbc_leaf_min_members != 0)
+        std.math.cast(usize, request.bulk_rebuild_hbc_leaf_min_members) orelse return .invalid_argument
+    else
+        null;
+    var callbacks = StorageOwnerBulkCallbacks{ .request = request };
+    handle.db.finishBulkIngestSessionWithOptions(.{
+        .compact = request.compact != 0,
+        .flush = request.flush != 0,
+        .max_deferred_l0_runs = max_deferred_l0_runs,
+        .max_foreground_compaction_steps = max_foreground_compaction_steps,
+        .max_foreground_compaction_input_bytes = if (request.has_max_foreground_compaction_input_bytes != 0)
+            request.max_foreground_compaction_input_bytes
+        else
+            null,
+        .max_foreground_compaction_ns = if (request.has_max_foreground_compaction_ns != 0)
+            request.max_foreground_compaction_ns
+        else
+            null,
+        .max_deferred_hbc_leaf_splits_per_publish = max_deferred_hbc_leaf_splits_per_publish,
+        .max_deferred_hbc_leaf_split_members_per_publish = max_deferred_hbc_leaf_split_members_per_publish,
+        .bulk_rebuild_hbc_leaf_min_members = bulk_rebuild_hbc_leaf_min_members,
+        .progress_ctx = if (request.progress_fn != null) &callbacks else null,
+        .progress_fn = if (request.progress_fn != null) StorageOwnerBulkCallbacks.progress else null,
+        .admission_ctx = if (request.admission_fn != null) &callbacks else null,
+        .admission_fn = if (request.admission_fn != null) StorageOwnerBulkCallbacks.admission else null,
+    }) catch |err| return storageOwnerStatusFromError(err);
+    return .ok;
+}
+
+pub fn storageOwnerBulkAbort(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.TableRequest,
+) callconv(.c) kernel_owner_abi.Status {
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    handle.db.abortBulkIngestSession();
     return .ok;
 }
 
