@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Report potential and compiler-analyzed reachability in Antfly's Zig graph.
+"""Report potential, analyzed, and emitted reachability in Antfly's Zig graph.
 
 The source graph follows literal relative ``@import("*.zig")`` edges. It makes
 accidental barrel imports and surprising paths visible, but includes imports in
 lazy declarations and tests. A Zig ``--time-report`` JSON is the authoritative
-view of files that a particular compiler invocation actually analyzed. Passing
-multiple reports also ranks duplicate analyzed/code-generated source groups.
+view of files that a particular compiler invocation loaded and declarations it
+analyzed. A cross-compiled ELF object is the authoritative view of emitted
+machine-code/data sections. Passing multiple reports ranks both lazy file
+overlap and actual duplicate emitted modules.
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ import argparse
 import collections
 import json
 import re
+import struct
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -93,6 +96,23 @@ class TimeReport:
     raw: dict[str, object]
     repo_files: frozenset[Path]
     has_file_list: bool
+
+
+@dataclass(frozen=True)
+class ModuleEmission:
+    bytes: int
+    text_bytes: int
+    sections: int
+
+
+@dataclass(frozen=True)
+class ObjectReport:
+    name: str
+    path: Path
+    modules: dict[str, ModuleEmission]
+    alloc_bytes: int
+    text_bytes: int
+    unassigned_bytes: int
 
 
 class ImportGraph:
@@ -224,6 +244,14 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         help="summarize a Zig --time-report JSON; may be repeated",
     )
     parser.add_argument(
+        "--object",
+        action="append",
+        type=parse_named_root,
+        default=[],
+        metavar="NAME=PATH",
+        help="summarize emitted modules in an ELF Zig object; may be repeated",
+    )
+    parser.add_argument(
         "--compare",
         action="append",
         type=parse_comparison,
@@ -291,6 +319,96 @@ def load_time_report(name: str, path: Path, repo_root: Path = REPO_ROOT) -> Time
         if candidate.suffix == ".zig":
             repo_files.add(candidate)
     return TimeReport(name, path, raw, frozenset(repo_files), has_file_list)
+
+
+def elf_sections(path: Path) -> list[tuple[str, int, int]]:
+    """Return ``(name, size, flags)`` for an ELF64 little-endian object."""
+
+    data = path.read_bytes()
+    if len(data) < 64 or data[:4] != b"\x7fELF":
+        raise ValueError(f"object is not ELF: {path}")
+    if data[4] != 2 or data[5] != 1:
+        raise ValueError(f"object must be ELF64 little-endian: {path}")
+    header = struct.unpack_from("<16sHHIQQQIHHHHHH", data)
+    section_offset = header[6]
+    section_entry_size = header[11]
+    section_count = header[12]
+    string_table_index = header[13]
+    if section_entry_size < 64 or section_count == 0 or string_table_index >= section_count:
+        raise ValueError(f"unsupported ELF section table: {path}")
+    section_table_end = section_offset + section_entry_size * section_count
+    if section_table_end > len(data):
+        raise ValueError(f"truncated ELF section table: {path}")
+
+    headers = [
+        struct.unpack_from("<IIQQQQIIQQ", data, section_offset + index * section_entry_size)
+        for index in range(section_count)
+    ]
+    strings_header = headers[string_table_index]
+    strings_offset = strings_header[4]
+    strings_size = strings_header[5]
+    strings_end = strings_offset + strings_size
+    if strings_end > len(data):
+        raise ValueError(f"truncated ELF section-name table: {path}")
+    strings = data[strings_offset:strings_end]
+
+    def section_name(offset: int) -> str:
+        if offset >= len(strings):
+            return ""
+        end = strings.find(b"\0", offset)
+        if end < 0:
+            end = len(strings)
+        return strings[offset:end].decode("utf-8", errors="replace")
+
+    return [(section_name(item[0]), item[5], item[2]) for item in headers]
+
+
+def source_module_tokens(source_root: Path) -> tuple[str, ...]:
+    tokens = []
+    for path in source_root.rglob("*.zig"):
+        token = path.relative_to(source_root).with_suffix("").as_posix().replace("/", ".")
+        # One-segment module names are indistinguishable from dependencies with
+        # the same package name in stripped section symbols. Leave them
+        # unassigned instead of claiming false Antfly ownership.
+        if "." in token:
+            tokens.append(token)
+    return tuple(sorted(tokens, key=lambda value: (-len(value), value)))
+
+
+def section_source_module(section_name: str, module_tokens: Iterable[str]) -> str | None:
+    for token in module_tokens:
+        if token in section_name:
+            return token
+    return None
+
+
+def load_object_report(name: str, path: Path, source_root: Path = DEFAULT_SOURCE_ROOT) -> ObjectReport:
+    module_tokens = source_module_tokens(source_root.resolve())
+    mutable: dict[str, list[int]] = collections.defaultdict(lambda: [0, 0, 0])
+    alloc_bytes = 0
+    text_bytes = 0
+    unassigned_bytes = 0
+    for section_name, size, flags in elf_sections(path):
+        # SHF_ALLOC: the linker may retain this section in a runtime artifact.
+        if not flags & 0x2 or size == 0:
+            continue
+        alloc_bytes += size
+        is_text = section_name.startswith(".text")
+        if is_text:
+            text_bytes += size
+        module = section_source_module(section_name, module_tokens)
+        if module is None:
+            unassigned_bytes += size
+            continue
+        row = mutable[module]
+        row[0] += size
+        row[1] += size if is_text else 0
+        row[2] += 1
+    modules = {
+        module: ModuleEmission(bytes=row[0], text_bytes=row[1], sections=row[2])
+        for module, row in mutable.items()
+    }
+    return ObjectReport(name, path, modules, alloc_bytes, text_bytes, unassigned_bytes)
 
 
 def integer(value: object) -> int:
@@ -421,6 +539,102 @@ def print_aggregate_overlap(reports: Iterable[TimeReport], top_groups: int) -> N
         )
 
 
+def object_report_stats(report: ObjectReport) -> dict[str, object]:
+    return {
+        "alloc_bytes": report.alloc_bytes,
+        "text_bytes": report.text_bytes,
+        "assigned_bytes": sum(item.bytes for item in report.modules.values()),
+        "unassigned_bytes": report.unassigned_bytes,
+        "emitting_modules": len(report.modules),
+        "modules": [
+            {
+                "name": name,
+                "bytes": emission.bytes,
+                "text_bytes": emission.text_bytes,
+                "sections": emission.sections,
+            }
+            for name, emission in sorted(
+                report.modules.items(),
+                key=lambda item: (-item[1].bytes, item[0]),
+            )
+        ],
+    }
+
+
+def aggregate_object_overlap_stats(reports: Iterable[ObjectReport]) -> dict[str, object]:
+    materialized = tuple(reports)
+    occurrences: dict[str, list[ModuleEmission]] = collections.defaultdict(list)
+    for report in materialized:
+        for module, emission in report.modules.items():
+            occurrences[module].append(emission)
+    duplicated = {
+        module: emissions
+        for module, emissions in occurrences.items()
+        if len(emissions) > 1
+    }
+    rows = []
+    for module, emissions in duplicated.items():
+        total_bytes = sum(item.bytes for item in emissions)
+        total_text_bytes = sum(item.text_bytes for item in emissions)
+        rows.append(
+            {
+                "name": module,
+                "instances": len(emissions),
+                "total_bytes": total_bytes,
+                "duplicate_bytes": total_bytes - max(item.bytes for item in emissions),
+                "duplicate_text_bytes": total_text_bytes - max(item.text_bytes for item in emissions),
+            }
+        )
+    rows.sort(key=lambda row: (-int(row["duplicate_bytes"]), str(row["name"])))
+    return {
+        "available": bool(materialized),
+        "report_count": len(materialized),
+        "module_instances": sum(len(items) for items in occurrences.values()),
+        "unique_modules": len(occurrences),
+        "duplicated_modules": len(duplicated),
+        "duplicate_bytes": sum(int(row["duplicate_bytes"]) for row in rows),
+        "duplicate_text_bytes": sum(int(row["duplicate_text_bytes"]) for row in rows),
+        "modules": rows,
+    }
+
+
+def print_object_report(report: ObjectReport, top_groups: int) -> None:
+    stats = object_report_stats(report)
+    print(f"\nobject report {report.name}: {report.path}")
+    print(f"alloc section bytes\t{stats['alloc_bytes']}")
+    print(f"text section bytes\t{stats['text_bytes']}")
+    print(f"assigned Antfly bytes\t{stats['assigned_bytes']}")
+    print(f"unassigned bytes\t{stats['unassigned_bytes']}")
+    print(f"emitting Antfly modules\t{stats['emitting_modules']}")
+    print("top emitting modules\tbytes\ttext bytes\tsections")
+    modules = stats["modules"]
+    assert isinstance(modules, list)
+    for row in modules[:top_groups]:
+        assert isinstance(row, dict)
+        print(f"{row['name']}\t{row['bytes']}\t{row['text_bytes']}\t{row['sections']}")
+
+
+def print_aggregate_object_overlap(reports: Iterable[ObjectReport], top_groups: int) -> None:
+    stats = aggregate_object_overlap_stats(reports)
+    if not stats["available"] or int(stats["report_count"]) < 2:
+        return
+    print(f"\naggregate emitted overlap ({stats['report_count']} objects)")
+    print(f"module instances\t{stats['module_instances']}")
+    print(f"unique modules\t{stats['unique_modules']}")
+    print(f"duplicated modules\t{stats['duplicated_modules']}")
+    print(f"duplicate alloc bytes\t{stats['duplicate_bytes']}")
+    print(f"duplicate text bytes\t{stats['duplicate_text_bytes']}")
+    print("top duplicated emitting modules\tinstances\tduplicate bytes\tduplicate text bytes")
+    modules = stats["modules"]
+    assert isinstance(modules, list)
+    for row in modules[:top_groups]:
+        assert isinstance(row, dict)
+        print(
+            f"{row['name']}\t{row['instances']}\t"
+            f"{row['duplicate_bytes']}\t{row['duplicate_text_bytes']}"
+        )
+
+
 def print_time_report(report: TimeReport, top_groups: int) -> None:
     stats = report_stats(report)
     print(f"\ntime report {report.name}: {report.path}")
@@ -514,6 +728,7 @@ def json_report(
     graph: ImportGraph,
     graphs: dict[str, set[Path]],
     time_reports: Iterable[TimeReport] = (),
+    object_reports: Iterable[ObjectReport] = (),
     comparisons: Iterable[tuple[TimeReport, TimeReport]] = (),
 ) -> dict[str, object]:
     report: dict[str, object] = {
@@ -531,6 +746,8 @@ def json_report(
     report["server_role_union"] = {"files": union_stats.files, "lines": union_stats.lines}
     report["time_reports"] = {item.name: report_stats(item) for item in time_reports}
     report["aggregate_compiler_overlap"] = aggregate_overlap_stats(time_reports)
+    report["object_reports"] = {item.name: object_report_stats(item) for item in object_reports}
+    report["aggregate_emitted_overlap"] = aggregate_object_overlap_stats(object_reports)
     report["comparisons"] = [comparison_stats(base, candidate) for base, candidate in comparisons]
     return report
 
@@ -646,6 +863,10 @@ def main(argv: list[str] | None = None) -> int:
             name: load_time_report(name, Path(path))
             for name, path in args.time_report
         }
+        objects = {
+            name: load_object_report(name, Path(path), graph.source_root)
+            for name, path in args.object
+        }
         comparisons: list[tuple[TimeReport, TimeReport]] = []
         for base_name, candidate_name in args.compare:
             if base_name not in reports or candidate_name not in reports:
@@ -657,7 +878,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.json:
             print(
                 json.dumps(
-                    json_report(graph, graphs, reports.values(), comparisons),
+                    json_report(graph, graphs, reports.values(), objects.values(), comparisons),
                     indent=2,
                     sort_keys=True,
                 )
@@ -667,6 +888,9 @@ def main(argv: list[str] | None = None) -> int:
             for report in reports.values():
                 print_time_report(report, args.top_groups)
             print_aggregate_overlap(reports.values(), args.top_groups)
+            for report in objects.values():
+                print_object_report(report, args.top_groups)
+            print_aggregate_object_overlap(objects.values(), args.top_groups)
             for base, candidate in comparisons:
                 print_comparison(base, candidate, args.top_groups)
         if args.show_path:

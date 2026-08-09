@@ -185,11 +185,15 @@ the same host, target, cache state, and report set.
 | Remote CLI after HA/restore ownership cut | 38.029 s, 35.904 s LLVM, 5,804 declarations, 53 repository files and no Antfly storage files | Keep as an independent final codegen unit |
 | Four-unit production archive with deterministic 20 GB scheduling | 30/30 steps in 374.23 s locally and 15:17.77 on the normal runner; static executable 62.421 MB; C API 16.665 MB | Reliable, but the 11 m Linux application unit misses the performance gate |
 | Serverless local runtime co-generated with application/storage | Application 361.270 s; API 125.604 s; duplicates 527 → 438; executable 62.421 MB → 59.271 MB | Keep pending normal-runner confirmation; under 380 s and removes material storage duplication |
+| Canonical storage-contract/import cut | Removed 42k lexically reachable lines but declarations 17,332 → 17,334 with identical generic/inline counts | Rejected; lazy file removal is not emitted-code removal |
+| Isolated local HA runtime | Application saved 5.344 s while a new HA unit cost 30.525 s and duplicated 75 files | Rejected; small role splitting increases aggregate LLVM work |
 
 The `/tmp` graph analysis was consolidated into
 `tools/analyze_zig_import_graph.py`. It reports lexical reachability, consumes
-Zig time-report JSON, compares compiler units, and checks architectural
-boundaries. Its regression tests live in
+Zig time-report JSON, reads allocatable sections from cross-compiled ELF
+objects, compares loaded-file and emitted-module overlap, and checks
+architectural boundaries. Object reporting distinguishes lazy import
+reachability from machine code/data that LLVM actually emitted. Its regression tests live in
 `tools/test_analyze_zig_import_graph.py`.
 
 ## Current compilation architecture
@@ -2061,6 +2065,20 @@ the final optimized unit. The collector creates the output parent directory.
 
 Use a new `--cache-dir` and `--global-cache-dir` for genuine cold-cache
 comparisons. Do not compare a cold candidate with a warm baseline.
+
+Pass the resulting Zig compilation objects to the analyzer to rank actual
+emitted modules and cross-object duplication:
+
+```sh
+python3 zig/tools/analyze_zig_import_graph.py \
+  --object application=/path/to/libantfly-storage-kernel_zcu.o \
+  --object api=/path/to/libantfly-runtime-api_kernel_zcu.o \
+  --top-groups 30
+```
+
+Attribution uses Zig's named function/data sections. An object built without
+section granularity is still measured, but its monolithic bytes are reported
+as unassigned rather than falsely attributed from a lazy compiler file list.
 
 ## Experiment record template
 

@@ -3,6 +3,7 @@
 import importlib.util
 import io
 import json
+import struct
 import sys
 import tempfile
 import unittest
@@ -31,6 +32,70 @@ class ImportGraphTest(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(contents, encoding="utf-8")
         return path.resolve()
+
+    def write_elf_object(self, name: str, sections: list[tuple[str, int, int]]) -> Path:
+        names = bytearray(b"\0.shstrtab\0")
+        name_offsets = {"": 0, ".shstrtab": 1}
+        for section_name, _, _ in sections:
+            name_offsets[section_name] = len(names)
+            names.extend(section_name.encode())
+            names.append(0)
+        string_offset = 64
+        section_offset = (string_offset + len(names) + 7) & ~7
+        section_count = 2 + len(sections)
+        header = struct.pack(
+            "<16sHHIQQQIHHHHHH",
+            b"\x7fELF" + bytes((2, 1, 1)) + bytes(9),
+            1,
+            183,
+            1,
+            0,
+            0,
+            section_offset,
+            0,
+            64,
+            0,
+            0,
+            64,
+            section_count,
+            1,
+        )
+        section_headers = [bytes(64)]
+        section_headers.append(
+            struct.pack(
+                "<IIQQQQIIQQ",
+                name_offsets[".shstrtab"],
+                3,
+                0,
+                0,
+                string_offset,
+                len(names),
+                0,
+                0,
+                1,
+                0,
+            )
+        )
+        for section_name, size, flags in sections:
+            section_headers.append(
+                struct.pack(
+                    "<IIQQQQIIQQ",
+                    name_offsets[section_name],
+                    1,
+                    flags,
+                    0,
+                    0,
+                    size,
+                    0,
+                    0,
+                    1,
+                    0,
+                )
+            )
+        payload = header + names + bytes(section_offset - string_offset - len(names)) + b"".join(section_headers)
+        path = self.root / name
+        path.write_bytes(payload)
+        return path
 
     def write_codegen_boundaries(self):
         for name in {
@@ -216,6 +281,57 @@ class ImportGraphTest(unittest.TestCase):
         report = analyzer.TimeReport("old", self.root / "old.json", {}, frozenset(), False)
 
         self.assertFalse(analyzer.aggregate_overlap_stats([report])["available"])
+
+    def test_object_report_attributes_alloc_sections_to_longest_source_module(self):
+        source_root = self.root / "src"
+        (source_root / "storage/db").mkdir(parents=True)
+        (source_root / "storage/db.zig").write_text("pub const root = true;\n")
+        (source_root / "storage/db/db.zig").write_text("pub const implementation = true;\n")
+        object_path = self.write_elf_object(
+            "candidate.o",
+            [
+                (".text..Lstorage.db.db.DB.open", 64, 0x6),
+                (".rodata..Lstorage.db.db.DB.open", 16, 0x2),
+                (".debug_info", 4096, 0),
+            ],
+        )
+
+        report = analyzer.load_object_report("candidate", object_path, source_root)
+
+        self.assertEqual(80, report.alloc_bytes)
+        self.assertEqual(64, report.text_bytes)
+        self.assertEqual(0, report.unassigned_bytes)
+        self.assertEqual(
+            analyzer.ModuleEmission(bytes=80, text_bytes=64, sections=2),
+            report.modules["storage.db.db"],
+        )
+
+    def test_object_overlap_counts_only_bytes_beyond_largest_instance(self):
+        one = analyzer.ObjectReport(
+            "one",
+            self.root / "one.o",
+            {"storage.db.db": analyzer.ModuleEmission(100, 80, 2)},
+            100,
+            80,
+            0,
+        )
+        two = analyzer.ObjectReport(
+            "two",
+            self.root / "two.o",
+            {
+                "storage.db.db": analyzer.ModuleEmission(90, 70, 2),
+                "api.query": analyzer.ModuleEmission(20, 15, 1),
+            },
+            110,
+            85,
+            0,
+        )
+
+        stats = analyzer.aggregate_object_overlap_stats([one, two])
+
+        self.assertEqual(1, stats["duplicated_modules"])
+        self.assertEqual(90, stats["duplicate_bytes"])
+        self.assertEqual(70, stats["duplicate_text_bytes"])
 
 
 if __name__ == "__main__":
