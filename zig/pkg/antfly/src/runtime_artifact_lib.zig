@@ -58,9 +58,13 @@ const metadata_runtime = if (unit_options.unit == .distributed or unit_options.u
     @import("metadata/runtime.zig")
 else
     struct {};
-// Serverless owns HTTP/request translation and local query planning, so it
-// shares the API protocol codegen island rather than distributed topology.
-const serverless_runtime = if (unit_options.unit == .api_kernel) @import("cmd/serverless.zig") else struct {};
+// Serverless owns a complete local query/maintenance runtime. Co-generate it
+// with the application/storage owner so API protocol handling does not emit a
+// second copy of physical query and storage implementation.
+const serverless_runtime = if (unit_options.unit == .distributed or unit_options.unit == .application_pic_probe)
+    @import("cmd/serverless.zig")
+else
+    struct {};
 const inference_runtime = if (unit_options.unit == .inference) @import("inference_runtime/runtime.zig") else struct {};
 // Standalone adds about 35 seconds when co-generated with the server roles but
 // costs 6 minutes and 8 GiB as a separate ARM64 Linux unit. Keep it co-located
@@ -223,7 +227,6 @@ comptime {
             exportInternal(&api_kernel_exports.handlerStats, "antfly_api_kernel_handler_stats");
             exportInternal(&api_kernel_exports.handlerRegisterRoutes, "antfly_api_kernel_handler_register_routes");
             exportInternal(&api_kernel_exports.handlerDestroy, "antfly_api_kernel_handler_destroy");
-            exportInternal(&serverlessEntry, "antfly_runtime_serverless");
         },
         .distributed => {
             // Importing the C ABI implementation makes its `pub export`
@@ -233,6 +236,7 @@ comptime {
             exportInternal(&dataEntry, "antfly_runtime_data");
             exportInternal(&haEntry, "antfly_runtime_ha");
             exportInternal(&metadataEntry, "antfly_runtime_metadata");
+            exportInternal(&serverlessEntry, "antfly_runtime_serverless");
             exportInternal(&standaloneEntry, "antfly_runtime_standalone");
             exportInternal(&restore_staging_exports.create, "antfly_restore_staging_create");
             exportInternal(&restore_staging_exports.destroy, "antfly_restore_staging_destroy");
@@ -262,6 +266,7 @@ comptime {
             exportInternal(&dataEntry, "antfly_runtime_data");
             exportInternal(&haEntry, "antfly_runtime_ha");
             exportInternal(&metadataEntry, "antfly_runtime_metadata");
+            exportInternal(&serverlessEntry, "antfly_runtime_serverless");
             exportInternal(&standaloneEntry, "antfly_runtime_standalone");
             exportInternal(&restore_staging_exports.create, "antfly_restore_staging_create");
             exportInternal(&restore_staging_exports.destroy, "antfly_restore_staging_destroy");

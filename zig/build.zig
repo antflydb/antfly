@@ -57,7 +57,7 @@ const RuntimeLibraryUnit = enum {
     // restore staging, and the CAPI, but no CLI or metadata runtime.
     storage_runtime_pic_probe,
     // Measurement-only storage-owning application unit: data, metadata,
-    // standalone/Lite, restore staging, and CAPI, but no CLI.
+    // serverless, standalone/Lite, restore staging, and CAPI, but no CLI.
     application_pic_probe,
     // Measurement-only candidate control unit: CLI and metadata, with the
     // storage-owning data/standalone runtime compiled separately.
@@ -8699,9 +8699,9 @@ pub fn build(b: *std.Build) void {
                 .linkage = .static,
                 .max_rss = switch (unit) {
                     // A cold ARM64 Linux ReleaseFast build measured 6.32 GB
-                    // after serverless moved into this unit. Keep the claim
-                    // above the observed peak so the build runner does not
-                    // discard completed work and retry it in a later group.
+                    // while serverless was still rooted here. Keep the claim
+                    // until the smaller protocol-only unit has Linux evidence
+                    // so the build runner never discards completed work.
                     .api_kernel => 7 * 1024 * 1024 * 1024,
                     .cli => 3 * 1024 * 1024 * 1024,
                     .storage_kernel => 8 * 1024 * 1024 * 1024,
@@ -8752,7 +8752,7 @@ pub fn build(b: *std.Build) void {
                 const install_application_pic_probe = b.addInstallArtifact(role_artifact, .{});
                 const application_pic_probe_step = b.step(
                     "application-library-probe",
-                    "Build a data + metadata + standalone/Lite + CAPI archive for compilation profiling",
+                    "Build a data + metadata + serverless + standalone/Lite + CAPI archive for compilation profiling",
                 );
                 application_pic_probe_step.dependOn(&install_application_pic_probe.step);
             }

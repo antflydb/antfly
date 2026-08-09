@@ -184,6 +184,7 @@ the same host, target, cache state, and report set.
 | Application/storage without remote CLI | 340.130 s, 332.415 s LLVM, 40,037 declarations, 636 repository files | Keep; below the preferred 350-second local gate |
 | Remote CLI after HA/restore ownership cut | 38.029 s, 35.904 s LLVM, 5,804 declarations, 53 repository files and no Antfly storage files | Keep as an independent final codegen unit |
 | Four-unit production archive with deterministic 20 GB scheduling | 30/30 steps in 374.23 s locally and 15:17.77 on the normal runner; static executable 62.421 MB; C API 16.665 MB | Reliable, but the 11 m Linux application unit misses the performance gate |
+| Serverless local runtime co-generated with application/storage | Application 361.270 s; API 125.604 s; duplicates 527 → 438; executable 62.421 MB → 59.271 MB | Keep pending normal-runner confirmation; under 380 s and removes material storage duplication |
 
 The `/tmp` graph analysis was consolidated into
 `tools/analyze_zig_import_graph.py`. It reports lexical reachability, consumes
@@ -198,8 +199,8 @@ memory-budgeted concurrency:
 
 ```text
 antfly executable
-├── antfly-runtime-api_kernel   # API protocol plus serverless
-├── antfly-storage-kernel       # application roles plus shared storage/CAPI
+├── antfly-runtime-api_kernel   # public API protocol/handler implementation
+├── antfly-storage-kernel       # application/serverless roles plus storage/CAPI
 ├── antfly-runtime-inference
 └── antfly-runtime-cli          # remote/client commands only
 ```
@@ -209,10 +210,11 @@ shared libraries link the same PIC distributed/storage archive, with function
 and data sections allowing the linker to retain only C API roots.
 
 The name `antfly-storage-kernel` currently describes the archive's reuse role,
-not a pure domain boundary. It contains data, metadata, standalone/Lite, local
-HA, restore staging, and storage implementations. Remote CLI commands are a
-small independent unit. Serverless is co-generated with the API protocol unit;
-inference remains a separate safety valve and is linked into standalone.
+not a pure domain boundary. It contains data, metadata, serverless local
+execution, standalone/Lite, local HA, restore staging, and storage
+implementations. Remote CLI commands are a small independent unit. The public
+API protocol remains separate; inference remains a safety valve and is linked
+into standalone.
 
 The first ABI preparation is complete:
 
@@ -1513,32 +1515,97 @@ marginal cost when serverless was co-generated with data. If that does not make
 the physical storage implementation compile once, the follow-up is the coarse
 opaque owner ABI—not separate HTTPX, LMDB, or primitive storage libraries.
 
+### Serverless local-runtime ownership cut
+
+The post-CLI compiler reports made the remaining serverless tradeoff different
+from the earlier placement decision. Serverless has public HTTP adaptation, but
+its command also owns complete local query, maintenance, artifact, WAL, and
+segment runtimes. Keeping that complete local executor in the API artifact
+made API emit 73 storage files already present in application/storage. The
+experiment therefore left the public API kernel separate while moving the
+hidden `antfly_runtime_serverless` entry point and its implementation into the
+application/storage artifact.
+
+A fresh ARM64 Linux musl `ReleaseFast` build used cold local/global caches, the
+patched 20 GB scheduler, production LSM-only features, and normal concurrency.
+All four compiler reports were captured from the authoritative Zig time-report
+protocol:
+
+| Unit | Before | After | Change |
+|---|---:|---:|---:|
+| Application/storage compiler | 340.130 s | 361.270 s | +21.140 s |
+| Application LLVM emit | 332.415 s | 353.873 s | +21.458 s |
+| Application declarations | 40,037 | 42,512 | +2,475 |
+| Application repository files | 636 | 723 | +87 |
+| API compiler | 206.191 s | 125.604 s | -80.587 s |
+| API LLVM emit | 200.895 s | 122.103 s | -78.792 s |
+| API declarations | 23,094 | 17,332 | -5,762 |
+| API repository files | 502 | 326 | -176 |
+
+The critical application unit remains below the 380-second gate. Aggregate
+repository-file instances fell from 1,715 to 1,626 and duplicate instances
+fell from 527 to 438. Duplicated storage instances fell from 75 to 52; API's
+storage-file set fell from 73 to 50. The remaining files include real DB,
+algebraic planner, query executor, backend, maintenance, resource-manager, and
+transaction implementations—not merely small ABI contracts—so the final
+physical-owner cut is still required.
+
+Artifact shape also improved:
+
+| Artifact | Before | After | Change |
+|---|---:|---:|---:|
+| Static ARM64 `antfly` | 62,421,144 bytes | 59,270,808 bytes | -3,150,336 bytes (-5.0%) |
+| `libantfly.so` | 16,664,880 bytes | 16,675,344 bytes | +10,464 bytes (+0.06%) |
+
+The local compiler summary reported application/storage at 6 GB MaxRSS, API
+and inference at 3 GB, and CLI at 2 GB, all within their existing claims. The
+executable remains static, the shared C API exports no private runtime/kernel
+symbols, and neither artifact contains production LMDB implementation markers.
+
+Validation included 42/44 serverless tests with only the two opt-in cloud
+integrations skipped, 5/5 linked-main tests, 10/10 direct CAPI tests, the linked
+C consumer smoke, command dispatch through `serverless --help`, all graph
+gates, and all 13 analyzer tests. The direct CAPI configuration exposed a
+facade omission introduced with the process owner: `capi_root.zig` did not
+export `platform_sync`. Adding that focused import makes the owner context
+compile in both the linked production artifact and the standalone CAPI test.
+
+Decision: **keep the serverless physical-runtime placement, pending
+normal-runner confirmation**. It exchanges 21.140 seconds of local critical
+time for an 80.587-second API reduction, 89 fewer duplicate compiler-file
+instances, and a 3.15 MB smaller executable while staying under the 380-second
+gate. The next experiment is no longer a placement shuffle: remove the 50
+remaining physical storage files from API by routing its coarse local
+operations through the existing process-scoped opaque owner context.
+
 ## Holistic target architecture
 
-The current candidate baseline is the four-unit topology above. It is smaller
-than the rejected source-only coalescing, its isolated application/storage unit
-meets the preferred local time gate, and it is reliable on the normal runner.
-It is not yet the final target: the Linux unit still takes 11 minutes and
-API/serverless emits a meaningful subset of storage/local-query implementation.
+The current candidate baseline is the four-unit topology above with serverless
+local execution in application/storage. It is smaller than the rejected
+source-only coalescing, its isolated application/storage unit remains under the
+accepted local time gate, and its predecessor was reliable on the normal
+runner. It is not yet the final target: Linux confirmation of this placement is
+pending and API still emits 50 physical storage/local-query files.
 
 The reopened target is a modular monolith with one compiled physical-storage
 owner and separately compiled control consumers:
 
 ```text
 thin linked main
-├── API/serverless and distributed-control consumer islands
+├── API protocol and distributed-control consumer islands
 │   ├── HTTP/auth/public translation, routing, topology, fanout and merge
 │   └── opaque storage handles plus coarse request/result/callback ABIs
 ├── provisioned storage/local-query kernel (PIC, sectioned, compiled once)
-│   ├── DB/LSM/index ownership and complete group-local queries
+│   ├── DB/LSM/index ownership, serverless, and complete group-local queries
 │   ├── writes, transaction participants, snapshots, restore and maintenance
 │   └── public C API exports reused by the shared libraries
 └── inference island
     └── model lifecycle plus the linked standalone inference host
 ```
 
-The accepted grouping keeps remote CLI separate, and keeps data, metadata, HA,
-standalone/Lite, restore, and the C API in the application/storage unit.
+The accepted grouping keeps remote CLI separate, and keeps data, metadata,
+serverless, HA, standalone/Lite, restore, and the C API in the
+application/storage unit.
 Further regrouping is a measured decision after the remaining API physical
 imports disappear. Standalone remains a product composition mode and always
 links the separately compiled inference host.

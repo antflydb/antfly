@@ -28,6 +28,7 @@ pub const hbc = @import("storage/hbc_adapter.zig");
 pub const lite = @import("storage/lite/mod.zig");
 pub const paths = @import("graph/paths.zig");
 pub const platform_clock = @import("antfly_platform").clock;
+pub const platform_sync = @import("antfly_platform").sync;
 pub const platform_time = @import("antfly_platform").time;
 pub const portable_backup = @import("storage/portable_backup.zig");
 pub const public_api = @import("api/mod.zig");
