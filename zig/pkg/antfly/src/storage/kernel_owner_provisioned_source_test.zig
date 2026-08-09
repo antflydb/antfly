@@ -175,6 +175,9 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
     _ = read_source.withLocalReadSource(owner_source.readSource());
     _ = read_source.withGroupVisibleRootGeneration(generations.iface());
 
+    try std.testing.expect((try write_source.source().createTable(alloc, "articles", .{})) != null);
+    try std.testing.expectEqual(@as(usize, 1), owner_source.ownerCountForTest());
+
     _ = try write_source.source().batch(alloc, "articles", .{
         .writes = &.{
             .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"category\":\"news\",\"amount\":10,\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YQ==\",\"_embeddings\":{\"dense_idx\":[1,0,0]}}" },
@@ -190,7 +193,13 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
         .timestamp_ns = 4242,
         .sync_level = .full_index,
     });
-    try owner_source.reconcileTableGroup(7001, "articles");
+    const structural = (try owner_source.writeSource().reconcileTableGroupLocal(
+        7001,
+        "articles",
+        null,
+        false,
+    )).?;
+    try std.testing.expect(structural.state == .complete);
     try std.testing.expectEqual(@as(usize, 1), owner_source.ownerCountForTest());
 
     var replicated_descriptor = try owner_source.loadDescriptor(alloc, 7001, "articles");

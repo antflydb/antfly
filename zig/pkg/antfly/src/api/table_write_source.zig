@@ -26,6 +26,28 @@ const backup_contract = @import("backup_contract.zig");
 const distributed_txn = @import("distributed_txn_contract.zig");
 const runtime_status = @import("runtime_status.zig");
 
+pub const LocalStructuralReconcileState = enum {
+    complete,
+    repair_pending,
+    busy,
+    degraded,
+};
+
+pub const LocalStructuralReconcileResult = struct {
+    state: LocalStructuralReconcileState = .complete,
+    indexes_added: u64 = 0,
+    indexes_removed: u64 = 0,
+    indexes_pending: u64 = 0,
+    repair_discovered: u64 = 0,
+    repair_attempted: u64 = 0,
+    repair_repaired: u64 = 0,
+    repair_remaining: u64 = 0,
+    repair_terminal: u64 = 0,
+    repair_busy: u64 = 0,
+    repair_disk_waits: u64 = 0,
+    next_retry_at_ms: u64 = 0,
+};
+
 pub const TableWriteSource = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -335,6 +357,13 @@ pub const TableWriteSource = struct {
             table_name: []const u8,
             index_name: []const u8,
         ) anyerror!?void = null,
+        reconcile_table_group_local: ?*const fn (
+            ptr: *anyopaque,
+            group_id: u64,
+            table_name: []const u8,
+            target_index_name: ?[]const u8,
+            advance_index_repair: bool,
+        ) anyerror!?LocalStructuralReconcileResult = null,
     };
 
     pub fn batch(
@@ -823,5 +852,16 @@ pub const TableWriteSource = struct {
     ) !?void {
         const fn_ptr = self.vtable.request_table_index_structural_reconcile orelse return try self.requestTableStructuralReconcile(alloc, table_name);
         return try fn_ptr(self.ptr, alloc, table_name, index_name);
+    }
+
+    pub fn reconcileTableGroupLocal(
+        self: TableWriteSource,
+        group_id: u64,
+        table_name: []const u8,
+        target_index_name: ?[]const u8,
+        advance_index_repair: bool,
+    ) !?LocalStructuralReconcileResult {
+        const fn_ptr = self.vtable.reconcile_table_group_local orelse return null;
+        return try fn_ptr(self.ptr, group_id, table_name, target_index_name, advance_index_repair);
     }
 };

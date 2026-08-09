@@ -2140,6 +2140,43 @@ that operation before the legacy structural vtable can become unreachable.
 Consequently no cold ReleaseFast improvement is claimed for this increment;
 the next cold checkpoint remains the atomic source switch in checklist item 7.
 
+### Phase 4b: bounded owner-side structural reconciliation
+
+Storage-owner ABI version 12 adds a coarse `reconcile` operation that advances
+one complete desired-state quantum on the resident DB. It applies the projected
+schema/index/enrichment contract, advances one generated-artifact cleanup page,
+optionally advances one durable index-repair intent, and returns an explicit
+`complete`, `repair_pending`, `busy`, or `degraded` state plus bounded repair
+statistics. The call remains synchronous and borrows every input; corpus work
+is restartable and bounded behind the existing durable repair state machine.
+
+The generic group-local write contract now exposes that result without
+importing storage implementation types. Under the storage experiment, the
+existing structural reconciliation scheduler calls the opaque owner and its
+legacy DB-open/index-repair body is behind a compile-time-unreachable branch.
+Direct create-table uses the owner synchronously as its empty-table readiness
+barrier. Schema, index, and enrichment mutations retain the existing queued
+control workflow, but their physical work now enters the compiled owner.
+
+Validation passed with normal concurrency:
+
+- opaque owner: 3/3, including bounded reconstruction of a full-text index over
+  documents written before the index existed and a successful query afterward;
+- provisioned owner source: 6/6, including create, batch, reconcile, query, and
+  snapshot work through one resident owner;
+- public C API: 10/10;
+- the complete linked Debug executable with the production LSM backend and
+  storage experiment enabled; and
+- archive inspection confirmed both hidden internal symbols,
+  `antfly_storage_owner_configure` and `antfly_storage_owner_reconcile`, in the
+  compiled storage kernel.
+
+This completes the physical schema/index/enrichment reconciliation mechanism,
+but not ownership family 1 as a whole: table retirement still uses the legacy
+physical source, and the node repair scheduler must be routed through the same
+owner before the final source switch. No cold ReleaseFast result is credited
+until those remaining roots are removed atomically.
+
 ## Holistic target architecture
 
 The current candidate baseline is the four-unit topology above with serverless

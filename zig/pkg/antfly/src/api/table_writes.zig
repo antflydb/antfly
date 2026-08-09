@@ -5145,6 +5145,41 @@ pub const ProvisionedTableWriteSource = struct {
         return self.local_write_source orelse self.localWriteOwnerSource();
     }
 
+    fn reconcileTableGroupsImmediately(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        target_index_name: ?[]const u8,
+    ) !?void {
+        const local_source = self.groupLocalWriteSource() orelse
+            return error.StorageKernelOwnerUnavailable;
+        const group_ids = try table_catalog.resolveGroupsForSpanEventually(
+            alloc,
+            self.catalog,
+            table_name,
+            "",
+            "",
+            5 * std.time.ns_per_s,
+            10,
+        );
+        defer alloc.free(group_ids);
+        if (group_ids.len == 0) return null;
+        for (group_ids) |group_id| {
+            const result = (try local_source.reconcileTableGroupLocal(
+                group_id,
+                table_name,
+                target_index_name,
+                false,
+            )) orelse return error.StorageKernelOwnerUnavailable;
+            switch (result.state) {
+                .complete => {},
+                .repair_pending, .busy => return error.StorageKernelReconcilePending,
+                .degraded => return error.StorageKernelReconcileDegraded,
+            }
+        }
+        return {};
+    }
+
     /// Stop every source-owned worker before an attached storage owner begins
     /// closing cached DBs. This is deliberately separate from `deinit`: cache
     /// pointers are borrowed, so a standalone source must remain safe to
@@ -10740,6 +10775,22 @@ pub const ProvisionedTableWriteSource = struct {
         metadata: StartupCatchUpMetadata,
         observations: *std.ArrayListUnmanaged(StructuralRuntimeObservation),
     ) !StructuralReconcileGroupOutcome {
+        if (comptime storage_kernel_experiment) {
+            const local_source = self.groupLocalWriteSource() orelse
+                return error.StorageKernelOwnerUnavailable;
+            const result = (try local_source.reconcileTableGroupLocal(
+                group_id,
+                table_name,
+                metadata.target_index_name,
+                false,
+            )) orelse return error.StorageKernelOwnerUnavailable;
+            return switch (result.state) {
+                .complete => .complete,
+                .repair_pending => .repair_pending,
+                .busy => .busy,
+                .degraded => error.StorageKernelReconcileDegraded,
+            };
+        }
         // The target generation is unpublished until catch-up and sync finish.
         // Queries are routed to the retained read generation, so do not turn a
         // corpus-sized backfill into a table-wide read outage.
@@ -11398,6 +11449,10 @@ pub const ProvisionedTableWriteSource = struct {
         enrichment_json: []const u8,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (comptime storage_kernel_experiment) {
+            try self.enqueueTableStructuralReconcile(table_name);
+            return {};
+        }
         if (self.localWriteOwnerSource()) |owner| return try owner.putArtifactEnrichment(alloc, table_name, artifact_name, enrichment_json);
         try enforceHAWriteGateOptional(self.ha_write_gate);
         if (self.write_cache != null) {
@@ -11421,6 +11476,10 @@ pub const ProvisionedTableWriteSource = struct {
         artifact_name: []const u8,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (comptime storage_kernel_experiment) {
+            try self.enqueueTableStructuralReconcile(table_name);
+            return {};
+        }
         if (self.localWriteOwnerSource()) |owner| return try owner.deleteArtifactEnrichment(alloc, table_name, artifact_name);
         try enforceHAWriteGateOptional(self.ha_write_gate);
         if (self.write_cache != null) {
@@ -11444,6 +11503,11 @@ pub const ProvisionedTableWriteSource = struct {
         req: tables_api.CreateTableRequest,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (comptime storage_kernel_experiment) {
+            const reconciled = try self.reconcileTableGroupsImmediately(alloc, table_name, null);
+            if (reconciled != null) self.notifyLocalChange(table_name, .structural);
+            return reconciled;
+        }
         if (self.localWriteOwnerSource()) |owner| return try owner.createTable(alloc, table_name, req);
         try enforceHAWriteGateOptional(self.ha_write_gate);
         std.log.info("provisioned create table local begin table={s}", .{table_name});
@@ -11627,6 +11691,10 @@ pub const ProvisionedTableWriteSource = struct {
         schema_json: []const u8,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (comptime storage_kernel_experiment) {
+            try self.enqueueTableStructuralReconcile(table_name);
+            return {};
+        }
         if (self.localWriteOwnerSource()) |owner| return try owner.updateSchema(alloc, table_name, schema_json);
         try enforceHAWriteGateOptional(self.ha_write_gate);
         const group_ids = try table_catalog.resolveGroupsForSpanEventually(
@@ -11707,6 +11775,10 @@ pub const ProvisionedTableWriteSource = struct {
         index_json: []const u8,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (comptime storage_kernel_experiment) {
+            try self.enqueueTableIndexStructuralReconcile(table_name, index_name);
+            return {};
+        }
         if (self.localWriteOwnerSource()) |owner| return try owner.createIndex(alloc, table_name, index_name, index_json);
         try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginLocalStructuralIndexCacheUpdate(table_name);
@@ -11727,6 +11799,10 @@ pub const ProvisionedTableWriteSource = struct {
         index_name: []const u8,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (comptime storage_kernel_experiment) {
+            try self.enqueueTableIndexStructuralReconcile(table_name, index_name);
+            return {};
+        }
         if (self.localWriteOwnerSource()) |owner| return try owner.dropIndex(alloc, table_name, index_name);
         try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginLocalStructuralIndexCacheUpdate(table_name);
@@ -20292,6 +20368,90 @@ pub fn configureStorageKernelOwnerDb(
             .drain_resolver_backfill = false,
         });
     }
+}
+
+pub const StorageKernelReconcileState = enum {
+    complete,
+    repair_pending,
+    busy,
+    degraded,
+};
+
+pub const StorageKernelReconcileResult = struct {
+    state: StorageKernelReconcileState = .complete,
+    indexes_added: usize = 0,
+    indexes_removed: usize = 0,
+    indexes_pending: usize = 0,
+    repair_discovered: usize = 0,
+    repair_attempted: usize = 0,
+    repair_repaired: usize = 0,
+    repair_remaining: usize = 0,
+    repair_terminal: usize = 0,
+    repair_busy: usize = 0,
+    repair_disk_waits: usize = 0,
+    next_retry_at_ms: u64 = 0,
+};
+
+/// Advance one bounded desired-state/repair quantum on a resident compiled
+/// storage owner. Catalog projection and scheduling stay in distributed
+/// control; all DB/index inspection and mutation stays in the storage unit.
+pub fn reconcileStorageKernelOwnerDb(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    schema_json: []const u8,
+    indexes_json: []const u8,
+    target_index_name: ?[]const u8,
+    advance_index_repair: bool,
+) !StorageKernelReconcileResult {
+    if (schema_json.len > 0) try applyLocalTableSchemaJson(alloc, db, schema_json);
+    const provisioned = if (indexes_json.len > 0)
+        try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, db, indexes_json, .{
+            .drain_resolver_backfill = false,
+        })
+    else
+        metadata_table_provisioner.ProvisionSummary{};
+
+    var result = StorageKernelReconcileResult{
+        .indexes_added = provisioned.indexes_added,
+        .indexes_removed = provisioned.indexes_removed,
+        .indexes_pending = provisioned.indexes_pending,
+    };
+    if (provisioned.indexes_pending != 0) {
+        _ = try db.advanceGeneratedArtifactCleanupPage(target_index_name);
+    }
+
+    var repair_summary = db.indexRepairIntentSummary(alloc) catch |err| switch (err) {
+        error.DurableIndexRepairStateUnavailable => db_mod.DB.IndexRepairIntentSummary{},
+        else => return err,
+    };
+    if (advance_index_repair and repair_summary.runnable != 0) {
+        const repair = try db.repairRecoverableStartupIndexFailures(alloc, 1, .{});
+        result.repair_discovered = repair.discovered;
+        result.repair_attempted = repair.attempted;
+        result.repair_repaired = repair.repaired;
+        result.repair_remaining = repair.remaining;
+        result.repair_terminal = repair.terminal;
+        result.repair_busy = repair.busy;
+        result.repair_disk_waits = repair.disk_waits;
+        result.next_retry_at_ms = repair.next_retry_at_ms;
+        repair_summary = try db.indexRepairIntentSummary(alloc);
+    } else {
+        result.repair_remaining = repair_summary.runnable + repair_summary.paused + repair_summary.terminal;
+        result.repair_terminal = repair_summary.terminal;
+        result.next_retry_at_ms = repair_summary.earliest_retry_at_ms;
+    }
+
+    result.state = if (repair_summary.terminal != 0)
+        .degraded
+    else if (result.repair_busy != 0)
+        .busy
+    else if (repair_summary.runnable != 0 or repair_summary.paused != 0)
+        .repair_pending
+    else if (provisioned.indexes_pending != 0)
+        .busy
+    else
+        .complete;
+    return result;
 }
 
 fn loadTableIndexesJson(

@@ -178,6 +178,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .batch = unsupportedTopLevelBatch,
                 .batch_group_local = batchGroupLocal,
                 .local_runtime_statuses = localRuntimeStatuses,
+                .reconcile_table_group_local = reconcileTableGroupLocal,
             },
         };
     }
@@ -379,7 +380,19 @@ pub const ProvisionedKernelOwnerSource = struct {
         self: *ProvisionedKernelOwnerSource,
         group_id: u64,
         table_name: []const u8,
-    ) !void {
+    ) !abi.ReconcileResult {
+        return try self.reconcileTableGroupStep(group_id, table_name, null, false);
+    }
+
+    /// Advance at most one durable index-repair intent in addition to the
+    /// desired-state pass. Node scheduling decides when to request that work.
+    pub fn reconcileTableGroupStep(
+        self: *ProvisionedKernelOwnerSource,
+        group_id: u64,
+        table_name: []const u8,
+        target_index_name: ?[]const u8,
+        advance_index_repair: bool,
+    ) !abi.ReconcileResult {
         var descriptor = try self.loadDescriptor(self.alloc, group_id, table_name);
         defer descriptor.deinit(self.alloc);
         var lease = try self.acquireDescriptor(
@@ -389,11 +402,48 @@ pub const ProvisionedKernelOwnerSource = struct {
             descriptor.view(),
         );
         defer lease.deinit();
-        try lease.owner().configure(
+        return try lease.owner().reconcile(
             table_name,
             descriptor.schema_json,
             descriptor.indexes_json,
+            target_index_name,
+            advance_index_repair,
         );
+    }
+
+    fn reconcileTableGroupLocal(
+        ptr: *anyopaque,
+        group_id: u64,
+        table_name: []const u8,
+        target_index_name: ?[]const u8,
+        advance_index_repair: bool,
+    ) !?table_write_source.LocalStructuralReconcileResult {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        const result = try self.reconcileTableGroupStep(
+            group_id,
+            table_name,
+            target_index_name,
+            advance_index_repair,
+        );
+        return .{
+            .state = switch (result.state) {
+                .complete => .complete,
+                .repair_pending => .repair_pending,
+                .busy => .busy,
+                .degraded => .degraded,
+            },
+            .indexes_added = result.indexes_added,
+            .indexes_removed = result.indexes_removed,
+            .indexes_pending = result.indexes_pending,
+            .repair_discovered = result.repair_discovered,
+            .repair_attempted = result.repair_attempted,
+            .repair_repaired = result.repair_repaired,
+            .repair_remaining = result.repair_remaining,
+            .repair_terminal = result.repair_terminal,
+            .repair_busy = result.repair_busy,
+            .repair_disk_waits = result.repair_disk_waits,
+            .next_retry_at_ms = result.next_retry_at_ms,
+        };
     }
 
     fn visibleRootGeneration(self: *const ProvisionedKernelOwnerSource, group_id: u64) u64 {

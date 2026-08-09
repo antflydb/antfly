@@ -90,6 +90,30 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     try std.testing.expect(std.mem.indexOf(u8, query_response.bytes(), "doc:a") != null);
     try std.testing.expect(std.mem.indexOf(u8, query_response.bytes(), "doc:b") != null);
 
+    var reconciled = false;
+    for (0..64) |_| {
+        const result = try owner.reconcile(
+            "docs",
+            "",
+            "{\"full_text_index_v1\":{\"type\":\"full_text\"}}",
+            "full_text_index_v1",
+            true,
+        );
+        try std.testing.expect(result.state != .degraded);
+        if (result.state == .complete) {
+            reconciled = true;
+            break;
+        }
+    }
+    try std.testing.expect(reconciled);
+    var text_response = try owner.queryJson(
+        "docs",
+        "{\"full_text_search\":{\"match\":\"alpha\",\"field\":\"title\"},\"indexes\":[\"full_text_index_v1\"],\"limit\":10}",
+    );
+    defer text_response.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, text_response.bytes(), "doc:a") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text_response.bytes(), "doc:b") == null);
+
     try std.testing.expectError(
         error.InvalidArgument,
         owner.configure("articles", "", "{}"),
@@ -135,6 +159,15 @@ test "opaque storage owner validates ABI and destruction is idempotent" {
         abi.Status.invalid_abi,
         abi.antfly_storage_owner_configure(null, &invalid_configure),
     );
+
+    var invalid_reconcile: abi.ReconcileRequest = .{};
+    invalid_reconcile.version = abi.abi_version + 1;
+    var reconcile_result: abi.ReconcileResult = .{};
+    try std.testing.expectEqual(
+        abi.Status.invalid_abi,
+        abi.antfly_storage_owner_reconcile(null, &invalid_reconcile, &reconcile_result),
+    );
+    try std.testing.expectEqual(abi.abi_version, reconcile_result.version);
 
     var response: abi.OwnedBytes = .{};
     var invalid_operation: abi.JsonOperationRequest = .{

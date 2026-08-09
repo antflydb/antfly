@@ -1781,6 +1781,45 @@ pub fn storageOwnerConfigure(
     return .ok;
 }
 
+pub fn storageOwnerReconcile(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.ReconcileRequest,
+    out_result: *kernel_owner_abi.ReconcileResult,
+) callconv(.c) kernel_owner_abi.Status {
+    out_result.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    const reconciled = antfly.public_api.table_writes.reconcileStorageKernelOwnerDb(
+        handle.alloc,
+        &handle.db,
+        request.schema_json.slice(),
+        request.indexes_json.slice(),
+        if (request.target_index_name.slice().len == 0) null else request.target_index_name.slice(),
+        request.advance_index_repair != 0,
+    ) catch |err| return storageOwnerStatusFromError(err);
+    out_result.* = .{
+        .state = switch (reconciled.state) {
+            .complete => .complete,
+            .repair_pending => .repair_pending,
+            .busy => .busy,
+            .degraded => .degraded,
+        },
+        .indexes_added = @intCast(reconciled.indexes_added),
+        .indexes_removed = @intCast(reconciled.indexes_removed),
+        .indexes_pending = @intCast(reconciled.indexes_pending),
+        .repair_discovered = @intCast(reconciled.repair_discovered),
+        .repair_attempted = @intCast(reconciled.repair_attempted),
+        .repair_repaired = @intCast(reconciled.repair_repaired),
+        .repair_remaining = @intCast(reconciled.repair_remaining),
+        .repair_terminal = @intCast(reconciled.repair_terminal),
+        .repair_busy = @intCast(reconciled.repair_busy),
+        .repair_disk_waits = @intCast(reconciled.repair_disk_waits),
+        .next_retry_at_ms = reconciled.next_retry_at_ms,
+    };
+    return .ok;
+}
+
 fn storageOwnerOperationTableName(
     handle: *const Handle,
     request: *const kernel_owner_abi.JsonOperationRequest,

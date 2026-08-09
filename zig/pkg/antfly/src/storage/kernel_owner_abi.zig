@@ -15,7 +15,7 @@
 //! Versioned internal ABI for the storage kernel's live DB owner. Keep this
 //! module free of storage and distributed-runtime imports.
 
-pub const abi_version: u32 = 11;
+pub const abi_version: u32 = 12;
 
 pub const BorrowedBytes = extern struct {
     ptr: ?[*]const u8 = null,
@@ -113,6 +113,41 @@ pub const ConfigureRequest = extern struct {
     indexes_json: BorrowedBytes = .{},
 };
 
+pub const ReconcileState = enum(u32) {
+    complete = 0,
+    repair_pending = 1,
+    busy = 2,
+    degraded = 3,
+};
+
+/// Advance one bounded schema/index desired-state quantum. The target index is
+/// optional; an empty slice reconciles the complete table contract.
+pub const ReconcileRequest = extern struct {
+    version: u32 = abi_version,
+    advance_index_repair: u8 = 0,
+    _reserved0: [3]u8 = .{ 0, 0, 0 },
+    table_name: BorrowedBytes = .{},
+    schema_json: BorrowedBytes = .{},
+    indexes_json: BorrowedBytes = .{},
+    target_index_name: BorrowedBytes = .{},
+};
+
+pub const ReconcileResult = extern struct {
+    version: u32 = abi_version,
+    state: ReconcileState = .complete,
+    indexes_added: u64 = 0,
+    indexes_removed: u64 = 0,
+    indexes_pending: u64 = 0,
+    repair_discovered: u64 = 0,
+    repair_attempted: u64 = 0,
+    repair_repaired: u64 = 0,
+    repair_remaining: u64 = 0,
+    repair_terminal: u64 = 0,
+    repair_busy: u64 = 0,
+    repair_disk_waits: u64 = 0,
+    next_retry_at_ms: u64 = 0,
+};
+
 pub const SyncLevel = enum(u32) {
     propose = 0,
     write = 1,
@@ -201,6 +236,12 @@ pub extern fn antfly_storage_owner_close(owner: ?*anyopaque) callconv(.c) void;
 pub extern fn antfly_storage_owner_configure(
     owner: ?*anyopaque,
     request: *const ConfigureRequest,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_owner_reconcile(
+    owner: ?*anyopaque,
+    request: *const ReconcileRequest,
+    out_result: *ReconcileResult,
 ) callconv(.c) Status;
 
 pub extern fn antfly_storage_owner_batch_json(
