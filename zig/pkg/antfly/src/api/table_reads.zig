@@ -16571,12 +16571,10 @@ test "provisioned local query reuses resident generation without readonly open" 
 
 test "provisioned graph hydrate completes consistency before resident read admission" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-graph-hydrate-resident-db";
-
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
-    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/graph-hydrate", .{tmp.sub_path});
 
     var db = try db_mod.DB.open(alloc, path, .{});
     defer db.close();
@@ -16664,6 +16662,20 @@ test "provisioned graph hydrate completes consistency before resident read admis
         }
     };
 
+    const RootGeneration = struct {
+        fn source() GroupVisibleRootGenerationSource {
+            return .{
+                .ptr = undefined,
+                .visible_root_generation_for_group = visibleRootGeneration,
+            };
+        }
+
+        fn visibleRootGeneration(_: *anyopaque, group_id: u64) u64 {
+            std.debug.assert(group_id == 7001);
+            return 9;
+        }
+    };
+
     var resident = ResidentSource{ .db = &db };
     var tracker: ReadTracker = .{};
     var gate = GateTracker{ .reads = &tracker };
@@ -16674,6 +16686,7 @@ test "provisioned graph hydrate completes consistency before resident read admis
     );
     source.resident_db = resident.iface();
     source.prepare_for_read = tracker.iface();
+    _ = source.withGroupVisibleRootGeneration(RootGeneration.source());
 
     var worker_ctx = ProvisionedGraphWorkerContext.init(&source);
     var response = try executeProvisionedGraphHydrate(
@@ -17607,16 +17620,20 @@ test "provisioned table read source runtime status prefers shared snapshot cache
 
 test "provisioned table read source falls back from read_index to stale on not leader" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-read-fallback";
-
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
-    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/read-fallback", .{tmp.sub_path});
 
     const group_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
     defer alloc.free(group_path);
-    var db = try db_mod.DB.open(alloc, group_path, .{});
+    var db = try db_mod.DB.open(alloc, group_path, .{
+        .identity_namespace = .{
+            .table_id = 7,
+            .shard_id = 7001,
+            .range_id = 7001,
+        },
+    });
     defer db.close();
 
     try db.addIndex(.{ .name = "full_text_index_v0", .kind = .full_text, .config_json = "{}" });
@@ -17714,10 +17731,14 @@ test "provisioned table read source falls back from read_index to stale on not l
     var lookup = (try source.source().lookup(alloc, "docs", "doc:a", .{}, .read_index)).?;
     defer lookup.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 4321), lookup.version);
-    const LookupTitle = struct { title: []const u8 };
-    var parsed_lookup = try parseJsonTestBody(LookupTitle, alloc, lookup.json);
+    const LookupDocument = struct {
+        title: []const u8,
+        body: []const u8,
+    };
+    var parsed_lookup = try parseJsonTestBody(LookupDocument, alloc, lookup.json);
     defer parsed_lookup.deinit();
     try std.testing.expectEqualStrings("alpha", parsed_lookup.value.title);
+    try std.testing.expectEqualStrings("hello world", parsed_lookup.value.body);
 
     var response = (try source.source().query(alloc, "docs", .{
         .query = .{ .match = .{ .field = "body", .text = "hello" } },

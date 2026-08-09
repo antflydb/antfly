@@ -3451,8 +3451,9 @@ pub fn build(b: *std.Build) void {
     // not collect tests declared by the raft library's own root module.
     const raft_library_tests = b.addTest(.{
         .root_module = raft_engine_mod,
+        .filters = selectTestFilters(b, &.{}),
     });
-    const run_raft_library_tests = b.addRunArtifact(raft_library_tests);
+    const run_raft_library_tests = addFilteredTestRunArtifact(b, raft_library_tests);
     const raft_library_test_step = b.step("lib-raft-test", "Run standalone raft library tests");
     raft_library_test_step.dependOn(&run_raft_library_tests.step);
 
@@ -5067,6 +5068,7 @@ pub fn build(b: *std.Build) void {
     const api_transactions_docid_tests = b.addTest(.{
         .root_module = api_transactions_docid_test_mod,
         .filters = &.{
+            "transaction request parsers reject invalid unsigned integers and accept legacy epochs",
             "transaction read snapshot map keys preserve embedded delimiters",
             "transaction session commit response includes retry hints for doc identity availability conflicts",
         },
@@ -5320,6 +5322,8 @@ pub fn build(b: *std.Build) void {
     const run_api_table_reads_docid_tests = addFilteredTestRunArtifact(b, api_table_reads_docid_tests);
     const run_api_public_table_http_docid_tests = addFilteredTestRunArtifact(b, api_public_table_http_docid_tests);
     const run_raft_transition_runtime_docid_tests = addFilteredTestRunArtifact(b, raft_transition_runtime_docid_tests);
+    const api_transactions_docid_test_step = b.step("api-transactions-docid-test", "Run focused API transaction tests");
+    api_transactions_docid_test_step.dependOn(&run_api_transactions_docid_tests.step);
     const api_table_writes_docid_test_step = b.step("api-table-writes-docid-test", "Run focused API table write tests");
     api_table_writes_docid_test_step.dependOn(&run_api_table_writes_docid_tests.step);
     const api_table_writes_production_regression_tests = b.addTest(.{
