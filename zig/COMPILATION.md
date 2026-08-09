@@ -1936,6 +1936,53 @@ provisioned writers, reader/writer caches, resource manager, generation
 lifecycle, maintenance, and local query--behind one compiled owner, then expose
 only routing/orchestration callbacks and coarse operation envelopes.
 
+### Rejected API contract-import cleanup
+
+A follow-up audit tested whether the 50 physical-storage files still analyzed
+by the separately compiled API protocol unit were rooted primarily by two
+accidental implementation imports. In production builds, `httpx_handler.zig`
+was changed to import the narrow write contract and
+`http_internal_group_read_routes.zig` was changed to import the narrow read
+contract. The few pure index-normalization, vector-envelope, and text-stats
+wire helpers used by those routes were placed in storage-neutral contract
+modules. `kernel_bridge.zig` also used the narrow contract types directly.
+
+The first writer-only cold probe removed `table_writes.zig` but changed the API
+graph from only 17,332 to 17,330 declarations and 326 to 325 repository files.
+The combined read/write probe removed both broad implementation files and
+produced this cold ARM64 Linux musl `ReleaseFast` API comparison:
+
+| Metric | Exact baseline | Combined contract probe | Delta |
+|---|---:|---:|---:|
+| Compiler time | 136.866 s | 127.683 s | -9.183 s |
+| LLVM emission | 132.900 s | 124.405 s | -8.494 s |
+| Declarations | 17,332 | 17,322 | -10 |
+| Imported files | 490 | 488 | -2 |
+| Repository files | 326 | 324 | -2 |
+| Repository source lines | 664,608 | 602,279 | -62,329 |
+| Object allocatable bytes | 11,346,229 | 11,346,229 | identical |
+| Object text bytes | 8,800,424 | 8,800,424 | identical |
+
+The apparent time reduction is host variance: the optimized API objects are
+byte-for-byte identical. The two removed source files were lazy implementation
+barrels and contributed no emitted code to this unit. All 50 storage files and
+223,296 storage source lines remained in the authoritative compiler graph
+after the writer-only cut; 49 remained after the read cut, including DB,
+DocStore, LSM, algebraic query, transactions, maintenance, and backend-erasure
+modules rooted by real API behavior and shared contract types.
+
+The experiment used a temporary API-only profiling target. The focused cold
+archive build succeeded, the complete linked native Debug build with the
+separate-storage option succeeded under normal concurrency, and all 15 graph
+analyzer tests passed.
+
+Decision: **reject and revert**, including the temporary profiling target.
+Import hygiene can be done independently, but deleting lazy barrel edges does
+not reduce LLVM emission. Do not count compiler `all_files` entries or lexical
+source lines as a codegen win without an object delta. The next compilation
+experiment remains the complete physical runtime-state transfer described
+above.
+
 ## Holistic target architecture
 
 The current candidate baseline is the four-unit topology above with serverless
