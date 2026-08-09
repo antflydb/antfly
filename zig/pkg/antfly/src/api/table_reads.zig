@@ -1180,6 +1180,13 @@ pub const ResidentDbSource = struct {
         lsm_root_generation: u64,
         options: LeaseOptions,
     ) anyerror!?ResidentDbLease,
+    prepare_group_for_read_retry: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        group_id: u64,
+        lsm_root_generation: u64,
+    ) anyerror!void = null,
 
     pub fn leaseGroup(
         self: ResidentDbSource,
@@ -1190,6 +1197,21 @@ pub const ResidentDbSource = struct {
         options: LeaseOptions,
     ) !?ResidentDbLease {
         return try self.lease_group(self.ptr, alloc, table_name, group_id, lsm_root_generation, options);
+    }
+
+    /// Complete a resident writer publication without holding table read
+    /// admission. Callers must rerun routing, consistency, and admission after
+    /// this returns; the prepared resident is only a progress guarantee, not a
+    /// lease that may be used directly.
+    pub fn prepareGroupForReadRetry(
+        self: ResidentDbSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        group_id: u64,
+        lsm_root_generation: u64,
+    ) !void {
+        const prepare = self.prepare_group_for_read_retry orelse return error.StorageReadTemporarilyUnavailable;
+        return try prepare(self.ptr, alloc, table_name, group_id, lsm_root_generation);
     }
 };
 
@@ -3021,9 +3043,13 @@ pub const ProvisionedTableReadSource = struct {
         topology_epoch: u64,
         activity: ?ReadPreparation.Activity,
 
-        fn deinit(self: *PreparedKeyRead) void {
+        fn releaseActivity(self: *PreparedKeyRead) void {
             if (self.activity) |*activity| activity.deinit();
             self.activity = null;
+        }
+
+        fn deinit(self: *PreparedKeyRead) void {
+            self.releaseActivity();
         }
     };
 
@@ -3194,6 +3220,23 @@ pub const ProvisionedTableReadSource = struct {
     ) ?ReadPreparation.Activity {
         const prep = self.prepare_for_read orelse return null;
         return prep.beginRead(table_name, kind);
+    }
+
+    fn prepareResidentGroupsForReadRetry(
+        self: *ProvisionedTableReadSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        group_ids: []const u64,
+    ) !void {
+        const resident = self.resident_db orelse return error.ReadUnavailable;
+        for (group_ids) |group_id| {
+            try resident.prepareGroupForReadRetry(
+                alloc,
+                table_name,
+                group_id,
+                self.visibleRootGeneration(group_id),
+            );
+        }
     }
 
     fn prepareGroupsForReadAdmission(
@@ -3400,10 +3443,22 @@ pub const ProvisionedTableReadSource = struct {
     ) !?LookupResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHAReadAllowed(consistency);
-        var prepared = try self.prepareRoutedKeyRead(alloc, table_name, key, .{ .lookup = .{ .key = key, .opts = opts } }, consistency, .general);
-        defer prepared.deinit();
-        const group_id = prepared.group_id orelse return null;
-        return try lookupProvisionedHostedLocal(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, key, opts, .stale);
+        var attempt: usize = 0;
+        while (attempt < topology_read_attempt_limit) : (attempt += 1) {
+            var prepared = try self.prepareRoutedKeyRead(alloc, table_name, key, .{ .lookup = .{ .key = key, .opts = opts } }, consistency, .general);
+            defer prepared.deinit();
+            const group_id = prepared.group_id orelse return null;
+            return lookupProvisionedHostedLocal(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, key, opts, .stale) catch |err| switch (err) {
+                error.ResidentDbRetryRequired => {
+                    prepared.releaseActivity();
+                    try self.prepareResidentGroupsForReadRetry(alloc, table_name, &.{group_id});
+                    if (attempt + 1 < topology_read_attempt_limit) continue;
+                    return error.StorageReadTemporarilyUnavailable;
+                },
+                else => return err,
+            };
+        }
+        unreachable;
     }
 
     fn documentArtifactManifest(
@@ -3486,6 +3541,7 @@ pub const ProvisionedTableReadSource = struct {
             checkQueryDeadline(req) catch |err| return err;
             return self.queryAttempt(alloc, table_name, req, consistency) catch |err| switch (err) {
                 error.TopologyChanged => if (attempt + 1 < topology_read_attempt_limit) continue else return err,
+                error.ResidentDbRetryRequired => if (attempt + 1 < topology_read_attempt_limit) continue else return error.StorageReadTemporarilyUnavailable,
                 else => return err,
             };
         }
@@ -3508,7 +3564,14 @@ pub const ProvisionedTableReadSource = struct {
         if (group_ids.len > 1) try distributed_graph.rejectUnstampedResultRefs(req);
         const start_ns = platform_time.monotonicNs();
         if (group_ids.len == 1 and !distributed_graph.supportsCrossRange(req)) {
-            var execution = try queryHostedLocalDetailed(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_ids[0], self.visibleRootGeneration(group_ids[0]), self.managedReadRuntimeConfig(), table_name, req, .stale);
+            var execution = queryHostedLocalDetailed(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_ids[0], self.visibleRootGeneration(group_ids[0]), self.managedReadRuntimeConfig(), table_name, req, .stale) catch |err| switch (err) {
+                error.ResidentDbRetryRequired => {
+                    prepared.releaseActivity();
+                    try self.prepareResidentGroupsForReadRetry(alloc, table_name, group_ids);
+                    return err;
+                },
+                else => return err,
+            };
             defer execution.releaseDb();
             try checkQueryDeadline(execution.request);
             var result = execution.result;
@@ -3531,7 +3594,14 @@ pub const ProvisionedTableReadSource = struct {
             var base_req = req;
             base_req.graph_queries = &.{};
             base_req.expand_strategy = null;
-            var merged = try queryProvisionedAcrossGroups(self, alloc, group_ids, base_req, table_name, .stale);
+            var merged = queryProvisionedAcrossGroups(self, alloc, group_ids, base_req, table_name, .stale) catch |err| switch (err) {
+                error.ResidentDbRetryRequired => {
+                    prepared.releaseActivity();
+                    try self.prepareResidentGroupsForReadRetry(alloc, table_name, group_ids);
+                    return err;
+                },
+                else => return err,
+            };
             try checkQueryDeadline(base_req);
             defer merged.deinit();
             const graph_req = requestWithResultIdentityGeneration(req, merged);
@@ -3565,7 +3635,14 @@ pub const ProvisionedTableReadSource = struct {
             try applyQueryPostProcessing(alloc, graph_req, &merged, &meta, self.antfly_provider, self.secret_store);
             return try query_api.encodeQueryResponses(alloc, table_name, graph_req, meta, merged);
         }
-        var merged = try queryProvisionedAcrossGroups(self, alloc, group_ids, req, table_name, .stale);
+        var merged = queryProvisionedAcrossGroups(self, alloc, group_ids, req, table_name, .stale) catch |err| switch (err) {
+            error.ResidentDbRetryRequired => {
+                prepared.releaseActivity();
+                try self.prepareResidentGroupsForReadRetry(alloc, table_name, group_ids);
+                return err;
+            },
+            else => return err,
+        };
         try checkQueryDeadline(req);
         defer merged.deinit();
         var meta: query_api.QueryResponseMeta = .{
@@ -3617,9 +3694,22 @@ pub const ProvisionedTableReadSource = struct {
     ) !?LookupResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHAReadAllowed(consistency);
-        var read_activity = try self.prepareKnownGroupRead(alloc, group_id, table_name, .{ .lookup = .{ .key = key, .opts = opts } }, consistency, .general, 0);
-        defer if (read_activity) |*activity| activity.deinit();
-        return try lookupProvisionedHostedLocal(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, key, opts, .stale);
+        var attempt: usize = 0;
+        while (attempt < topology_read_attempt_limit) : (attempt += 1) {
+            var read_activity = try self.prepareKnownGroupRead(alloc, group_id, table_name, .{ .lookup = .{ .key = key, .opts = opts } }, consistency, .general, 0);
+            defer if (read_activity) |*activity| activity.deinit();
+            return lookupProvisionedHostedLocal(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, key, opts, .stale) catch |err| switch (err) {
+                error.ResidentDbRetryRequired => {
+                    if (read_activity) |*activity| activity.deinit();
+                    read_activity = null;
+                    try self.prepareResidentGroupsForReadRetry(alloc, table_name, &.{group_id});
+                    if (attempt + 1 < topology_read_attempt_limit) continue;
+                    return error.StorageReadTemporarilyUnavailable;
+                },
+                else => return err,
+            };
+        }
+        unreachable;
     }
 
     fn documentArtifactManifestGroupLocal(
@@ -3709,24 +3799,37 @@ pub const ProvisionedTableReadSource = struct {
     ) !?query_api.QueryResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHAReadAllowed(consistency);
-        var read_activity = try self.prepareKnownGroupRead(alloc, group_id, table_name, .{ .search = req }, consistency, readPreparationKindForQuery(req), 0);
-        defer if (read_activity) |*activity| activity.deinit();
-        const start_ns = platform_time.monotonicNs();
-        var execution = try queryHostedLocalDetailed(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.managedReadRuntimeConfig(), table_name, req, .stale);
-        defer execution.releaseDb();
-        var result = execution.result;
-        defer result.deinit();
-        const response_req = execution.request;
-        var meta: query_api.QueryResponseMeta = .{
-            .took_ms = @intCast(@divTrunc(platform_time.monotonicNs() - start_ns, std.time.ns_per_ms)),
-            .shard_count = 1,
-            .dense_search = execution.dense_profile,
-        };
-        defer meta.deinit(alloc);
-        try applyProvisionedQueryAggregations(self, alloc, &.{group_id}, table_name, response_req, &result, &meta, execution.db(), .stale);
-        execution.releaseDb();
-        try applyQueryPostProcessing(alloc, response_req, &result, &meta, self.antfly_provider, self.secret_store);
-        return try query_api.encodeQueryResponses(alloc, table_name, response_req, meta, result);
+        var attempt: usize = 0;
+        while (attempt < topology_read_attempt_limit) : (attempt += 1) {
+            var read_activity = try self.prepareKnownGroupRead(alloc, group_id, table_name, .{ .search = req }, consistency, readPreparationKindForQuery(req), 0);
+            defer if (read_activity) |*activity| activity.deinit();
+            const start_ns = platform_time.monotonicNs();
+            var execution = queryHostedLocalDetailed(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.managedReadRuntimeConfig(), table_name, req, .stale) catch |err| switch (err) {
+                error.ResidentDbRetryRequired => {
+                    if (read_activity) |*activity| activity.deinit();
+                    read_activity = null;
+                    try self.prepareResidentGroupsForReadRetry(alloc, table_name, &.{group_id});
+                    if (attempt + 1 < topology_read_attempt_limit) continue;
+                    return error.StorageReadTemporarilyUnavailable;
+                },
+                else => return err,
+            };
+            defer execution.releaseDb();
+            var result = execution.result;
+            defer result.deinit();
+            const response_req = execution.request;
+            var meta: query_api.QueryResponseMeta = .{
+                .took_ms = @intCast(@divTrunc(platform_time.monotonicNs() - start_ns, std.time.ns_per_ms)),
+                .shard_count = 1,
+                .dense_search = execution.dense_profile,
+            };
+            defer meta.deinit(alloc);
+            try applyProvisionedQueryAggregations(self, alloc, &.{group_id}, table_name, response_req, &result, &meta, execution.db(), .stale);
+            execution.releaseDb();
+            try applyQueryPostProcessing(alloc, response_req, &result, &meta, self.antfly_provider, self.secret_store);
+            return try query_api.encodeQueryResponses(alloc, table_name, response_req, meta, result);
+        }
+        unreachable;
     }
 
     fn searchResultGroupLocal(
@@ -3739,9 +3842,22 @@ pub const ProvisionedTableReadSource = struct {
     ) !?db_mod.types.SearchResult {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHAReadAllowed(consistency);
-        var read_activity = try self.prepareKnownGroupRead(alloc, group_id, table_name, .{ .search = req }, consistency, readPreparationKindForQuery(req), 0);
-        defer if (read_activity) |*activity| activity.deinit();
-        return try queryHostedLocal(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.managedReadRuntimeConfig(), table_name, req, .stale);
+        var attempt: usize = 0;
+        while (attempt < topology_read_attempt_limit) : (attempt += 1) {
+            var read_activity = try self.prepareKnownGroupRead(alloc, group_id, table_name, .{ .search = req }, consistency, readPreparationKindForQuery(req), 0);
+            defer if (read_activity) |*activity| activity.deinit();
+            return queryHostedLocal(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.managedReadRuntimeConfig(), table_name, req, .stale) catch |err| switch (err) {
+                error.ResidentDbRetryRequired => {
+                    if (read_activity) |*activity| activity.deinit();
+                    read_activity = null;
+                    try self.prepareResidentGroupsForReadRetry(alloc, table_name, &.{group_id});
+                    if (attempt + 1 < topology_read_attempt_limit) continue;
+                    return error.StorageReadTemporarilyUnavailable;
+                },
+                else => return err,
+            };
+        }
+        unreachable;
     }
 
     fn textStatsGroupLocal(
@@ -6110,6 +6226,29 @@ fn executeProvisionedGraphExpand(
     consistency: raft_mod.ReadConsistency,
 ) !distributed_graph.GraphExpandResponse {
     const ctx: *ProvisionedGraphWorkerContext = @ptrCast(@alignCast(ptr));
+    var attempt: usize = 0;
+    while (attempt < ProvisionedTableReadSource.topology_read_attempt_limit) : (attempt += 1) {
+        return executeProvisionedGraphExpandAttempt(ptr, alloc, group_id, table_name, req, consistency) catch |err| switch (err) {
+            error.ResidentDbRetryRequired => {
+                try ctx.source.prepareResidentGroupsForReadRetry(alloc, table_name, &.{group_id});
+                if (attempt + 1 < ProvisionedTableReadSource.topology_read_attempt_limit) continue;
+                return error.StorageReadTemporarilyUnavailable;
+            },
+            else => return err,
+        };
+    }
+    unreachable;
+}
+
+fn executeProvisionedGraphExpandAttempt(
+    ptr: *anyopaque,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    table_name: []const u8,
+    req: distributed_graph.GraphExpandRequest,
+    consistency: raft_mod.ReadConsistency,
+) !distributed_graph.GraphExpandResponse {
+    const ctx: *ProvisionedGraphWorkerContext = @ptrCast(@alignCast(ptr));
     const self = ctx.source;
     var gate_request: ?ProvisionedConsistencyRequest = null;
     var gate_req: db_mod.types.SearchRequest = undefined;
@@ -6173,6 +6312,29 @@ fn executeProvisionedGraphExpand(
 }
 
 fn executeProvisionedGraphHydrate(
+    ptr: *anyopaque,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    table_name: []const u8,
+    req: distributed_graph.GraphHydrateRequest,
+    consistency: raft_mod.ReadConsistency,
+) !distributed_graph.GraphHydrateResponse {
+    const ctx: *ProvisionedGraphWorkerContext = @ptrCast(@alignCast(ptr));
+    var attempt: usize = 0;
+    while (attempt < ProvisionedTableReadSource.topology_read_attempt_limit) : (attempt += 1) {
+        return executeProvisionedGraphHydrateAttempt(ptr, alloc, group_id, table_name, req, consistency) catch |err| switch (err) {
+            error.ResidentDbRetryRequired => {
+                try ctx.source.prepareResidentGroupsForReadRetry(alloc, table_name, &.{group_id});
+                if (attempt + 1 < ProvisionedTableReadSource.topology_read_attempt_limit) continue;
+                return error.StorageReadTemporarilyUnavailable;
+            },
+            else => return err,
+        };
+    }
+    unreachable;
+}
+
+fn executeProvisionedGraphHydrateAttempt(
     ptr: *anyopaque,
     alloc: std.mem.Allocator,
     group_id: u64,
@@ -6262,6 +6424,29 @@ fn executeHostedGraphHydrate(
 }
 
 fn executeProvisionedGraphGetEdges(
+    ptr: *anyopaque,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    table_name: []const u8,
+    req: distributed_graph.GraphEdgesRequest,
+    consistency: raft_mod.ReadConsistency,
+) anyerror!distributed_graph.GraphEdgesResponse {
+    const ctx: *ProvisionedGraphWorkerContext = @ptrCast(@alignCast(ptr));
+    var attempt: usize = 0;
+    while (attempt < ProvisionedTableReadSource.topology_read_attempt_limit) : (attempt += 1) {
+        return executeProvisionedGraphGetEdgesAttempt(ptr, alloc, group_id, table_name, req, consistency) catch |err| switch (err) {
+            error.ResidentDbRetryRequired => {
+                try ctx.source.prepareResidentGroupsForReadRetry(alloc, table_name, &.{group_id});
+                if (attempt + 1 < ProvisionedTableReadSource.topology_read_attempt_limit) continue;
+                return error.StorageReadTemporarilyUnavailable;
+            },
+            else => return err,
+        };
+    }
+    unreachable;
+}
+
+fn executeProvisionedGraphGetEdgesAttempt(
     ptr: *anyopaque,
     alloc: std.mem.Allocator,
     group_id: u64,
@@ -6381,8 +6566,10 @@ fn lookupProvisionedLocal(
     // Point lookups need only the primary document store. Prefer the existing
     // generation-matched writer/apply DB so a lookup does not open and retire a
     // second full index catalog over a path that is concurrently compacting.
-    // The source returns null when no matching writer generation is resident;
-    // query-only runtimes and cold groups then use the read cache below.
+    // Writer-backed sources return ResidentDbRetryRequired when publication is
+    // needed; their caller releases admission, prepares the writer, and reruns
+    // routing before reaching this function again. A null lease is reserved for
+    // query-only runtimes and read-compatible maintenance, which use the cache.
     if (resident_db) |source| {
         if (try source.leaseGroup(alloc, table_name, group_id, lsm_root_generation, .{ .read_activity_held = true })) |lease_value| {
             var lease = lease_value;
@@ -6855,10 +7042,11 @@ fn queryLocalDetailed(
     consistency: raft_mod.ReadConsistency,
 ) !LocalQueryExecution {
     // A provisioned writer/apply DB already owns the complete, generation-matched
-    // index catalog. Lease it before consulting the query-read cache so a cold
-    // query does not map the same potentially multi-gigabyte index a second
-    // time. The lease also holds read activity for its lifetime, preventing
-    // structural maintenance from retiring the DB while search is executing.
+    // index catalog. Lease it before consulting the query-read cache so a query
+    // does not map the same potentially multi-gigabyte index a second time.
+    // Cold writer publication is handled by the caller's admission-free retry
+    // phase. The lease holds read activity for its lifetime, preventing
+    // structural maintenance from retiring the DB during search execution.
     if (resident_db) |source| {
         if (try source.leaseGroup(alloc, table_name, group_id, lsm_root_generation, .{ .read_activity_held = true })) |lease_value| {
             validateProvisionedDbIdentityNamespace(alloc, catalog, table_name, group_id, lease_value.db) catch |err| {
@@ -17014,12 +17202,18 @@ test "provisioned graph hydrate completes consistency before resident read admis
 
     const ResidentSource = struct {
         db: *db_mod.DB,
+        active_reads: *usize,
         leases: usize = 0,
         releases: usize = 0,
+        preparations: usize = 0,
         observed_read_activity_held: bool = false,
 
         fn iface(self: *@This()) ResidentDbSource {
-            return .{ .ptr = self, .lease_group = leaseGroup };
+            return .{
+                .ptr = self,
+                .lease_group = leaseGroup,
+                .prepare_group_for_read_retry = prepareGroupForReadRetry,
+            };
         }
 
         fn leaseGroup(
@@ -17036,7 +17230,25 @@ test "provisioned graph hydrate completes consistency before resident read admis
             try std.testing.expectEqual(@as(u64, 9), lsm_root_generation);
             self.leases += 1;
             self.observed_read_activity_held = options.read_activity_held;
+            if (self.leases == 1) return error.ResidentDbRetryRequired;
             return .{ .ptr = self, .db = self.db, .release_fn = release };
+        }
+
+        fn prepareGroupForReadRetry(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            table_name: []const u8,
+            group_id: u64,
+            lsm_root_generation: u64,
+        ) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqual(@as(u64, 7001), group_id);
+            try std.testing.expectEqual(@as(u64, 9), lsm_root_generation);
+            // The retry preparation is permitted to wait for or create a
+            // writer only after the failed attempt releases admission.
+            try std.testing.expectEqual(@as(usize, 0), self.active_reads.*);
+            self.preparations += 1;
         }
 
         fn release(ptr: *anyopaque, _: std.mem.Allocator) void {
@@ -17046,6 +17258,7 @@ test "provisioned graph hydrate completes consistency before resident read admis
     };
 
     const ReadTracker = struct {
+        active_reads: *usize,
         begins: usize = 0,
         ends: usize = 0,
 
@@ -17064,12 +17277,14 @@ test "provisioned graph hydrate completes consistency before resident read admis
         fn beginRead(ptr: *anyopaque, table_name: []const u8, _: ReadPreparation.Kind) ReadPreparation.Activity {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.begins += 1;
+            self.active_reads.* += 1;
             return .{ .ptr = self, .table_name = table_name, .release_fn = endRead };
         }
 
         fn endRead(ptr: *anyopaque, _: []const u8) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.ends += 1;
+            self.active_reads.* -= 1;
         }
     };
 
@@ -17109,8 +17324,9 @@ test "provisioned graph hydrate completes consistency before resident read admis
         }
     };
 
-    var resident = ResidentSource{ .db = &db };
-    var tracker: ReadTracker = .{};
+    var active_reads: usize = 0;
+    var resident = ResidentSource{ .db = &db, .active_reads = &active_reads };
+    var tracker: ReadTracker = .{ .active_reads = &active_reads };
     var gate = GateTracker{ .reads = &tracker };
     var source = ProvisionedTableReadSource.init(
         "/tmp/antfly-graph-hydrate-fallback-must-not-open",
@@ -17132,12 +17348,13 @@ test "provisioned graph hydrate completes consistency before resident read admis
     );
     response.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 1), resident.leases);
+    try std.testing.expectEqual(@as(usize, 2), resident.leases);
     try std.testing.expectEqual(@as(usize, 1), resident.releases);
+    try std.testing.expectEqual(@as(usize, 1), resident.preparations);
     try std.testing.expect(resident.observed_read_activity_held);
-    try std.testing.expectEqual(@as(usize, 1), gate.requests);
-    try std.testing.expectEqual(@as(usize, 1), tracker.begins);
-    try std.testing.expectEqual(@as(usize, 1), tracker.ends);
+    try std.testing.expectEqual(@as(usize, 2), gate.requests);
+    try std.testing.expectEqual(@as(usize, 2), tracker.begins);
+    try std.testing.expectEqual(@as(usize, 2), tracker.ends);
 
     // Each graph callback owns exactly one short-lived table admission.
     response = try executeProvisionedGraphHydrate(
@@ -17149,11 +17366,11 @@ test "provisioned graph hydrate completes consistency before resident read admis
         .stale,
     );
     response.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 2), resident.leases);
+    try std.testing.expectEqual(@as(usize, 3), resident.leases);
     try std.testing.expectEqual(@as(usize, 2), resident.releases);
-    try std.testing.expectEqual(@as(usize, 1), gate.requests);
-    try std.testing.expectEqual(@as(usize, 2), tracker.begins);
-    try std.testing.expectEqual(@as(usize, 2), tracker.ends);
+    try std.testing.expectEqual(@as(usize, 2), gate.requests);
+    try std.testing.expectEqual(@as(usize, 3), tracker.begins);
+    try std.testing.expectEqual(@as(usize, 3), tracker.ends);
 
     // A resident source can be configured without an outer read-preparation
     // hook. In that case the worker must tell the resident owner to acquire its
@@ -17168,12 +17385,12 @@ test "provisioned graph hydrate completes consistency before resident read admis
         .stale,
     );
     response.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 3), resident.leases);
+    try std.testing.expectEqual(@as(usize, 4), resident.leases);
     try std.testing.expectEqual(@as(usize, 3), resident.releases);
     try std.testing.expect(!resident.observed_read_activity_held);
-    try std.testing.expectEqual(@as(usize, 1), gate.requests);
-    try std.testing.expectEqual(@as(usize, 2), tracker.begins);
-    try std.testing.expectEqual(@as(usize, 2), tracker.ends);
+    try std.testing.expectEqual(@as(usize, 2), gate.requests);
+    try std.testing.expectEqual(@as(usize, 3), tracker.begins);
+    try std.testing.expectEqual(@as(usize, 3), tracker.ends);
 }
 
 test "provisioned table read source managed runtime config carries inference url" {

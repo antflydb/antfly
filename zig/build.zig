@@ -5181,6 +5181,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "aggregation completeness requires exact total relation",
             "api http client forwards internal query controls and maps remote timeout",
+            "api http client preserves remote storage read contention",
             "remote shard query phases propagate deadline and request cancellation",
             "provisioned table read cache has a finite worker ceiling",
             "provisioned read cache invalidates repeated ownership moves with pinned leases",
@@ -5353,7 +5354,7 @@ pub fn build(b: *std.Build) void {
             "structural reconcile retries a transient worker failure",
             "structural reconcile returns a bounded pending quantum while a group is busy",
             "structural reconcile publishes durable index repair debt once per group",
-            "resident DB lease waits for an in-flight startup writer publication",
+            "resident DB retry preparation waits outside admission for writer publication",
             "admitted resident DB lease never waits for an in-flight writer publication",
             "write cache local mutation preempts stale startup writer",
             "structural reconcile pending set never revisits completed groups",

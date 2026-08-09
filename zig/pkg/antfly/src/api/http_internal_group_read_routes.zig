@@ -542,6 +542,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, quer
                 error.TopologyChanged => return try http_route_helpers.textResponse(alloc, 409, "topology changed"),
                 error.IdentityReadGenerationChanged => return try http_route_helpers.textResponse(alloc, 409, "identity read generation changed"),
                 error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(alloc, 409, "doc identity namespace mismatch"),
+                error.StorageReadTemporarilyUnavailable => return try http_route_helpers.textResponse(alloc, 503, "storage read temporarily unavailable"),
                 else => return err,
             }) orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
             defer result.deinit(alloc);
@@ -717,6 +718,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, quer
                 error.IdentityReadGenerationChanged => return try http_route_helpers.textResponse(alloc, 409, "identity read generation changed"),
                 error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(alloc, 409, "doc identity namespace mismatch"),
                 error.UnknownGroup, error.TableNotFound => return try http_route_helpers.textResponse(alloc, 404, "not found"),
+                error.StorageReadTemporarilyUnavailable => return try http_route_helpers.textResponse(alloc, 503, "storage read temporarily unavailable"),
                 else => return err,
             }) orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
             defer result.deinit(alloc);
@@ -751,6 +753,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, quer
                 error.IdentityReadGenerationChanged => return try http_route_helpers.textResponse(alloc, 409, "identity read generation changed"),
                 error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(alloc, 409, "doc identity namespace mismatch"),
                 error.UnknownGroup, error.TableNotFound => return try http_route_helpers.textResponse(alloc, 404, @errorName(err)),
+                error.StorageReadTemporarilyUnavailable => return try http_route_helpers.textResponse(alloc, 503, "storage read temporarily unavailable"),
                 else => return err,
             }) orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
             defer result.deinit(alloc);
@@ -789,6 +792,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, quer
                 error.IdentityReadGenerationChanged => return try http_route_helpers.textResponse(alloc, 409, "identity read generation changed"),
                 error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(alloc, 409, "doc identity namespace mismatch"),
                 error.UnknownGroup, error.TableNotFound => return try http_route_helpers.textResponse(alloc, 404, @errorName(err)),
+                error.StorageReadTemporarilyUnavailable => return try http_route_helpers.textResponse(alloc, 503, "storage read temporarily unavailable"),
                 else => return err,
             }) orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
             defer result.deinit(alloc);
@@ -856,6 +860,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, quer
                 error.IdentityReadGenerationChanged => return try http_route_helpers.textResponse(alloc, 409, "identity read generation changed"),
                 error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(alloc, 409, "doc identity namespace mismatch"),
                 error.UnknownGroup, error.TableNotFound => return try http_route_helpers.textResponse(alloc, 404, "not found"),
+                error.StorageReadTemporarilyUnavailable => return try http_route_helpers.textResponse(alloc, 503, "storage read temporarily unavailable"),
                 else => return err,
             }) orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
             defer result.deinit(alloc);
@@ -881,6 +886,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, quer
                 error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(alloc, 409, "doc identity namespace mismatch"),
                 error.UnknownGroup, error.TableNotFound => return try http_route_helpers.textResponse(alloc, 404, "not found"),
                 error.InvalidQueryRequest, error.IndexNotFound => return try http_route_helpers.textResponse(alloc, 400, "invalid graph edges request"),
+                error.StorageReadTemporarilyUnavailable => return try http_route_helpers.textResponse(alloc, 503, "storage read temporarily unavailable"),
                 else => return err,
             }) orelse return try http_route_helpers.textResponse(alloc, 404, "not found");
             defer result.deinit(alloc);

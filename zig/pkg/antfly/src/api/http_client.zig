@@ -336,6 +336,7 @@ pub const ApiHttpClient = struct {
         switch (resp.status) {
             200 => {},
             409 => return remoteGroupConflictError(resp.body),
+            503 => return remoteStorageReadUnavailableError(resp.body),
             else => return error.UnexpectedHttpStatus,
         }
         const version = for (resp.headers) |header| {
@@ -644,6 +645,7 @@ pub const ApiHttpClient = struct {
             200 => {},
             408 => return error.Timeout,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return remoteStorageReadUnavailableError(resp.body),
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -1139,6 +1141,7 @@ pub const ApiHttpClient = struct {
             408 => return error.Timeout,
             404 => return error.UnknownGroup,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return remoteStorageReadUnavailableError(resp.body),
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -1188,6 +1191,7 @@ pub const ApiHttpClient = struct {
             408 => return error.Timeout,
             404 => return error.UnknownGroup,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return remoteStorageReadUnavailableError(resp.body),
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -1237,6 +1241,7 @@ pub const ApiHttpClient = struct {
             408 => return error.Timeout,
             404 => return error.UnknownGroup,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return remoteStorageReadUnavailableError(resp.body),
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -1286,6 +1291,7 @@ pub const ApiHttpClient = struct {
             408 => return error.Timeout,
             404 => return error.UnknownGroup,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return remoteStorageReadUnavailableError(resp.body),
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -2819,9 +2825,27 @@ fn remoteGroupConflictError(body: []const u8) anyerror {
     return error.UnexpectedHttpStatus;
 }
 
+fn remoteStorageReadUnavailableError(body: []const u8) anyerror {
+    if (std.mem.eql(u8, body, "storage read temporarily unavailable")) {
+        return error.StorageReadTemporarilyUnavailable;
+    }
+    return error.UnexpectedHttpStatus;
+}
+
 test "api http client preserves remote transaction decision conflicts" {
     try std.testing.expectEqual(error.DecisionConflict, remoteGroupConflictError("decision conflict"));
     try std.testing.expectEqual(error.DecisionConflict, remoteGroupConflictError("DecisionConflict"));
+}
+
+test "api http client preserves remote storage read contention" {
+    try std.testing.expectEqual(
+        error.StorageReadTemporarilyUnavailable,
+        remoteStorageReadUnavailableError("storage read temporarily unavailable"),
+    );
+    try std.testing.expectEqual(
+        error.UnexpectedHttpStatus,
+        remoteStorageReadUnavailableError("group leader unavailable"),
+    );
 }
 
 test "api http client accepts durable pending batch responses" {

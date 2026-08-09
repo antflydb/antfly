@@ -5470,7 +5470,32 @@ pub const DataServer = struct {
         return .{
             .ptr = self,
             .lease_group = localResidentDbLeaseGroup,
+            .prepare_group_for_read_retry = localResidentDbPrepareGroupForReadRetry,
         };
+    }
+
+    fn localResidentDbPrepareGroupForReadRetry(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        group_id: u64,
+        lsm_root_generation: u64,
+    ) !void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        if (self.data_raft_apply) |apply_sm| {
+            return try apply_sm.write_source.residentDbSource().prepareGroupForReadRetry(
+                alloc,
+                table_name,
+                group_id,
+                lsm_root_generation,
+            );
+        }
+        return try self.write_source.residentDbSource().prepareGroupForReadRetry(
+            alloc,
+            table_name,
+            group_id,
+            lsm_root_generation,
+        );
     }
 
     fn localResidentDbLeaseGroup(

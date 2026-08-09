@@ -6409,7 +6409,9 @@ pub const ApiHttpServer = struct {
                     error.HAReadWaitForMetadata,
                     error.ReadUnavailable,
                     => return try textResponse(self.alloc, 503, "standby read unavailable"),
-                    error.PersistentDescriptorAdmissionExhausted => return try textResponse(self.alloc, 503, "storage read temporarily unavailable"),
+                    error.PersistentDescriptorAdmissionExhausted,
+                    error.StorageReadTemporarilyUnavailable,
+                    => return try storageReadTemporarilyUnavailableResponse(self.alloc),
                     else => {
                         std.log.err("public table lookup failed table={s} key={s} err={}", .{ table_name, decoded_key, err });
                         return try textResponse(self.alloc, 500, "lookup failed");
@@ -9062,8 +9064,10 @@ pub const ApiHttpServer = struct {
             error.HAReadWaitForApply,
             error.HAReadWaitForMetadata,
             error.ReadUnavailable,
-            error.PersistentDescriptorAdmissionExhausted,
             => return error.ReadUnavailable,
+            error.PersistentDescriptorAdmissionExhausted,
+            error.StorageReadTemporarilyUnavailable,
+            => return error.StorageReadTemporarilyUnavailable,
             error.ModelNotFound => return error.ModelNotFound,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
@@ -9133,7 +9137,10 @@ pub const ApiHttpServer = struct {
                 request_deadline_ns,
                 cancellation,
             ) catch |err| switch (err) {
-                error.DocIdentityNamespaceMismatch, error.IdentityReadGenerationChanged => {
+                error.DocIdentityNamespaceMismatch,
+                error.IdentityReadGenerationChanged,
+                error.StorageReadTemporarilyUnavailable,
+                => {
                     const now_ns = platform_time.monotonicNs();
                     if (retryDeadlineExpired(request_deadline_ns, now_ns)) return error.Timeout;
                     if (retry_timeout_ns == 0) return err;
@@ -9202,8 +9209,10 @@ pub const ApiHttpServer = struct {
                 error.HAReadWaitForApply,
                 error.HAReadWaitForMetadata,
                 error.ReadUnavailable,
-                error.PersistentDescriptorAdmissionExhausted,
                 => return error.ReadUnavailable,
+                error.PersistentDescriptorAdmissionExhausted,
+                error.StorageReadTemporarilyUnavailable,
+                => return error.StorageReadTemporarilyUnavailable,
                 error.Timeout => return error.Timeout,
                 error.Cancelled => return error.Cancelled,
                 error.InvalidManifest,
@@ -9247,8 +9256,10 @@ pub const ApiHttpServer = struct {
             error.HAReadWaitForApply,
             error.HAReadWaitForMetadata,
             error.ReadUnavailable,
-            error.PersistentDescriptorAdmissionExhausted,
             => return error.ReadUnavailable,
+            error.PersistentDescriptorAdmissionExhausted,
+            error.StorageReadTemporarilyUnavailable,
+            => return error.StorageReadTemporarilyUnavailable,
             error.Timeout => return error.Timeout,
             error.Cancelled => return error.Cancelled,
             error.InvalidManifest,
@@ -9320,8 +9331,10 @@ pub const ApiHttpServer = struct {
             error.HAReadWaitForApply,
             error.HAReadWaitForMetadata,
             error.ReadUnavailable,
-            error.PersistentDescriptorAdmissionExhausted,
             => return error.ReadUnavailable,
+            error.PersistentDescriptorAdmissionExhausted,
+            error.StorageReadTemporarilyUnavailable,
+            => return error.StorageReadTemporarilyUnavailable,
             error.Timeout => return error.Timeout,
             error.Cancelled => return error.Cancelled,
             error.InvalidManifest,
@@ -11367,7 +11380,9 @@ pub const ApiHttpServer = struct {
             error.HAReadWaitForMetadata,
             error.ReadUnavailable,
             => try textResponse(self.alloc, 503, "standby read unavailable"),
-            error.PersistentDescriptorAdmissionExhausted => try textResponse(self.alloc, 503, "storage read temporarily unavailable"),
+            error.PersistentDescriptorAdmissionExhausted,
+            error.StorageReadTemporarilyUnavailable,
+            => try storageReadTemporarilyUnavailableResponse(self.alloc),
             error.InvalidManifest,
             error.InvalidTableFile,
             error.TableBlockChecksumMismatch,
@@ -15179,6 +15194,23 @@ fn indexRebuildingResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
         .message = "required index is rebuilding",
         .retryable = true,
     });
+}
+
+fn storageReadTemporarilyUnavailableResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
+    var response = try jsonResponseWithStatus(alloc, 503, .{
+        .code = "storage_read_temporarily_unavailable",
+        .message = "storage read temporarily unavailable",
+        .retryable = true,
+    });
+    errdefer response.deinit(alloc);
+
+    response.headers = try alloc.alloc(http_common.Header, 1);
+    errdefer {
+        alloc.free(response.headers);
+        response.headers = &.{};
+    }
+    response.headers[0] = try ownedHeader(alloc, "Retry-After", "1");
+    return response;
 }
 
 fn unsupportedPublicQueryResponse(alloc: std.mem.Allocator, body: []const u8) !http_common.HttpResponse {
@@ -27074,6 +27106,7 @@ test "api http server preserves public query availability errors" {
         .{ .query_error = error.DocIdentityNamespaceMismatch, .status = 503, .body = "doc identity unavailable" },
         .{ .query_error = error.ReadUnavailable, .status = 503, .body = "standby read unavailable" },
         .{ .query_error = error.ReadRequiresPrimary, .status = 503, .body = "read requires primary" },
+        .{ .query_error = error.StorageReadTemporarilyUnavailable, .status = 503, .body = "{\"code\":\"storage_read_temporarily_unavailable\",\"message\":\"storage read temporarily unavailable\",\"retryable\":true}", .json = true },
         .{ .query_error = error.IndexRebuilding, .status = 503, .body = "{\"code\":\"index_rebuilding\",\"message\":\"required index is rebuilding\",\"retryable\":true}", .json = true },
         .{ .query_error = error.TableNotFound, .status = 404, .body = "not found" },
         .{ .query_error = error.InvalidManifest, .status = 500, .body = "{\"code\":\"table_storage_unreadable\",\"error\":\"InvalidManifest\",\"message\":\"table storage unreadable\",\"retryable\":false}", .json = true },
@@ -27091,6 +27124,10 @@ test "api http server preserves public query availability errors" {
         try std.testing.expectEqual(case.status, resp.status);
         try std.testing.expectEqualStrings(case.body, resp.body);
         try std.testing.expectEqualStrings(if (case.json) "application/json" else "text/plain", resp.content_type.?);
+        try std.testing.expectEqual(
+            case.query_error == error.StorageReadTemporarilyUnavailable,
+            resp.headers.len == 1 and std.ascii.eqlIgnoreCase(resp.headers[0].name, "Retry-After"),
+        );
 
         var multi_resp = try server.handlePublicTableMultiQuery("docs",
             \\{"query":{"match_all":{}}}

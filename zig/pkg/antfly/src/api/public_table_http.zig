@@ -85,6 +85,7 @@ pub const TableApi = struct {
         DocIdentityUnavailable,
         ReadRequiresPrimary,
         ReadUnavailable,
+        StorageReadTemporarilyUnavailable,
         IndexRebuilding,
         ModelNotFound,
         UnsupportedExactSort,
@@ -108,6 +109,7 @@ pub const TableApi = struct {
         DocIdentityUnavailable,
         ReadRequiresPrimary,
         ReadUnavailable,
+        StorageReadTemporarilyUnavailable,
         ModelNotFound,
         InternalFailure,
     };
@@ -710,6 +712,15 @@ pub fn handleTableQueryRequest(
                 std.log.warn("public table query standby unavailable table={s} err={}", .{ table_name, err });
                 return .{ .status = 503, .body = try alloc.dupe(u8, "standby read unavailable") };
             },
+            error.StorageReadTemporarilyUnavailable => {
+                std.log.warn("public table query storage temporarily unavailable table={s}", .{table_name});
+                return .{
+                    .status = 503,
+                    .body = try alloc.dupe(u8, "{\"code\":\"storage_read_temporarily_unavailable\",\"message\":\"storage read temporarily unavailable\",\"retryable\":true}"),
+                    .json = true,
+                    .retry_after_seconds = 1,
+                };
+            },
             error.IndexRebuilding => {
                 std.log.info("public table query index rebuilding table={s}", .{table_name});
                 return .{
@@ -828,6 +839,12 @@ pub fn handleTableQueryView(
         error.DocIdentityUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "doc identity unavailable") },
         error.ReadRequiresPrimary => return .{ .status = 503, .body = try alloc.dupe(u8, "read requires primary") },
         error.ReadUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "standby read unavailable") },
+        error.StorageReadTemporarilyUnavailable => return .{
+            .status = 503,
+            .body = try alloc.dupe(u8, "{\"code\":\"storage_read_temporarily_unavailable\",\"message\":\"storage read temporarily unavailable\",\"retryable\":true}"),
+            .json = true,
+            .retry_after_seconds = 1,
+        },
         error.ModelNotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "{\"error\":\"MODEL_NOT_FOUND\",\"message\":\"model not found\"}") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "query failed") },
     };
@@ -2202,6 +2219,7 @@ test "public table query handler preserves retryable failure status" {
         .{ .err = error.EmbedTransientFailure, .status = 503, .body = "query embedding temporarily unavailable" },
         .{ .err = error.EmbedUpstreamFailure, .status = 502, .body = "query embedding provider failed" },
         .{ .err = error.IndexRebuilding, .status = 503, .body = "{\"code\":\"index_rebuilding\",\"message\":\"required index is rebuilding\",\"retryable\":true}", .json = true },
+        .{ .err = error.StorageReadTemporarilyUnavailable, .status = 503, .body = "{\"code\":\"storage_read_temporarily_unavailable\",\"message\":\"storage read temporarily unavailable\",\"retryable\":true}", .json = true },
         .{ .err = error.InvalidManifest, .status = 500, .body = "{\"code\":\"table_storage_unreadable\",\"error\":\"InvalidManifest\",\"message\":\"table storage unreadable\",\"retryable\":false}", .json = true },
         .{ .err = error.CorruptInput, .status = 500, .body = "{\"code\":\"table_storage_unreadable\",\"error\":\"CorruptInput\",\"message\":\"table storage unreadable\",\"retryable\":false}", .json = true },
     };
@@ -2215,6 +2233,10 @@ test "public table query handler preserves retryable failure status" {
         try std.testing.expectEqual(tc.status, resp.status);
         try std.testing.expectEqualStrings(tc.body, resp.body);
         try std.testing.expectEqual(tc.json, resp.json);
+        try std.testing.expectEqual(
+            if (tc.err == error.StorageReadTemporarilyUnavailable) @as(?u32, 1) else null,
+            resp.retry_after_seconds,
+        );
     }
 }
 
