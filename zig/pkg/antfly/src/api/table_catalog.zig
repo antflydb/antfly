@@ -161,6 +161,33 @@ pub fn resolveGroupForKey(
     return resolveGroupForKeyFromRanges(ranges, key);
 }
 
+pub const RoutedGroupSnapshot = struct {
+    group_id: ?u64,
+    topology_epoch: u64,
+};
+
+/// Resolve a key and compute the routing epoch from one catalog snapshot.
+/// Callers can perform an external consistency barrier, acquire structural
+/// read admission, and then validate the captured epoch without a torn
+/// epoch/route pair.
+pub fn routedGroupSnapshot(
+    alloc: std.mem.Allocator,
+    catalog: CatalogSource,
+    table_name: []const u8,
+    key: []const u8,
+) !RoutedGroupSnapshot {
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const table = tables_api.findTableByName(&snapshot, table_name) orelse return .{ .group_id = null, .topology_epoch = 0 };
+    const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
+    defer metadata_admin.freeRangeRefs(alloc, ranges);
+    sortRangeRefs(ranges);
+    return .{
+        .group_id = resolveGroupForKeyFromRanges(ranges, key),
+        .topology_epoch = topologyEpochFromSortedRanges(table.*, ranges),
+    };
+}
+
 pub fn resolveGroupForKeyFromRanges(
     ranges: []const *const metadata_table_manager.RangeRecord,
     key: []const u8,
@@ -306,6 +333,54 @@ pub fn validateTopologyEpoch(
     if (expected_epoch == 0) return;
     const actual_epoch = try topologyEpoch(alloc, catalog, table_name);
     if (actual_epoch != expected_epoch) return error.TopologyChanged;
+}
+
+/// Validate an internally captured topology epoch, including the zero epoch
+/// used while a table is absent. Public graph requests use zero to mean
+/// "unstamped", so `validateTopologyEpoch` intentionally skips it; read
+/// admission needs an exact comparison to notice a table created after an
+/// absent-table snapshot was routed.
+pub fn validatePinnedTopologyEpoch(
+    alloc: std.mem.Allocator,
+    catalog: CatalogSource,
+    table_name: []const u8,
+    expected_epoch: u64,
+) !void {
+    const actual_epoch = try topologyEpoch(alloc, catalog, table_name);
+    if (actual_epoch != expected_epoch) return error.TopologyChanged;
+}
+
+/// Capture the current table topology epoch only if `group_id` is one of its
+/// published ranges. Internal group-local reads use this before a Raft wait so
+/// an obsolete group fails fast instead of waiting on a replica that has
+/// already left the table.
+pub fn groupTopologyEpoch(
+    alloc: std.mem.Allocator,
+    catalog: CatalogSource,
+    table_name: []const u8,
+    group_id: u64,
+) !u64 {
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+    const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
+    defer metadata_admin.freeRangeRefs(alloc, ranges);
+    sortRangeRefs(ranges);
+    for (ranges) |range| {
+        if (range.group_id == group_id) return topologyEpochFromSortedRanges(table.*, ranges);
+    }
+    return error.TopologyChanged;
+}
+
+pub fn validatePinnedGroupTopology(
+    alloc: std.mem.Allocator,
+    catalog: CatalogSource,
+    table_name: []const u8,
+    group_id: u64,
+    expected_epoch: u64,
+) !void {
+    if (try groupTopologyEpoch(alloc, catalog, table_name, group_id) != expected_epoch)
+        return error.TopologyChanged;
 }
 
 /// Transactions may not straddle a split or merge. The transition record is
@@ -462,6 +537,41 @@ pub fn resolveGroupsForSpan(
         try groups.append(alloc, range.group_id);
     }
     return try groups.toOwnedSlice(alloc);
+}
+
+pub const RoutedSpanSnapshot = struct {
+    group_ids: []u64,
+    topology_epoch: u64,
+};
+
+/// Resolve a span and compute the routing epoch from one catalog snapshot.
+pub fn routedSpanSnapshot(
+    alloc: std.mem.Allocator,
+    catalog: CatalogSource,
+    table_name: []const u8,
+    from_key: []const u8,
+    to_key: []const u8,
+) !RoutedSpanSnapshot {
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const table = tables_api.findTableByName(&snapshot, table_name) orelse return .{
+        .group_ids = try alloc.alloc(u64, 0),
+        .topology_epoch = 0,
+    };
+    const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
+    defer metadata_admin.freeRangeRefs(alloc, ranges);
+
+    sortRangeRefs(ranges);
+    var groups = std.ArrayListUnmanaged(u64).empty;
+    defer groups.deinit(alloc);
+    for (ranges) |range| {
+        if (!rangeOverlapsSpan(range.*, from_key, to_key)) continue;
+        try groups.append(alloc, range.group_id);
+    }
+    return .{
+        .group_ids = try groups.toOwnedSlice(alloc),
+        .topology_epoch = topologyEpochFromSortedRanges(table.*, ranges),
+    };
 }
 
 pub fn resolveGroupsForSpanEventually(
