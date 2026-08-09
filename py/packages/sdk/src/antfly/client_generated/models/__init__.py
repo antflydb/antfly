@@ -57,8 +57,7 @@ from .batch_request import BatchRequest
 from .batch_request_inserts import BatchRequestInserts
 from .batch_request_inserts_additional_property import BatchRequestInsertsAdditionalProperty
 from .batch_response import BatchResponse
-from .batch_write_response_409 import BatchWriteResponse409
-from .batch_write_response_503 import BatchWriteResponse503
+from .batch_response_status import BatchResponseStatus
 from .bedrock_embedder_config import BedrockEmbedderConfig
 from .bedrock_generator_config import BedrockGeneratorConfig
 from .bool_field_query import BoolFieldQuery
@@ -488,6 +487,7 @@ from .merge_strategy import MergeStrategy
 from .multi_batch_request import MultiBatchRequest
 from .multi_batch_request_tables import MultiBatchRequestTables
 from .multi_batch_response import MultiBatchResponse
+from .multi_batch_response_status import MultiBatchResponseStatus
 from .multi_batch_response_tables import MultiBatchResponseTables
 from .multi_match_body import MultiMatchBody
 from .multi_match_body_type import MultiMatchBodyType
@@ -674,9 +674,13 @@ from .transaction_begin_response import TransactionBeginResponse
 from .transaction_commit_request import TransactionCommitRequest
 from .transaction_commit_request_tables import TransactionCommitRequestTables
 from .transaction_commit_response import TransactionCommitResponse
-from .transaction_commit_response_conflict import TransactionCommitResponseConflict
 from .transaction_commit_response_status import TransactionCommitResponseStatus
 from .transaction_commit_response_tables import TransactionCommitResponseTables
+from .transaction_conflict import TransactionConflict
+from .transaction_conflict_kind import TransactionConflictKind
+from .transaction_conflict_participant import TransactionConflictParticipant
+from .transaction_conflict_participant_phase import TransactionConflictParticipantPhase
+from .transaction_conflict_retry_scope import TransactionConflictRetryScope
 from .transaction_read_item import TransactionReadItem
 from .transaction_savepoint_response import TransactionSavepointResponse
 from .transaction_session_cleanup_response import TransactionSessionCleanupResponse
@@ -776,8 +780,7 @@ __all__ = (
     "BatchRequestInserts",
     "BatchRequestInsertsAdditionalProperty",
     "BatchResponse",
-    "BatchWriteResponse409",
-    "BatchWriteResponse503",
+    "BatchResponseStatus",
     "BedrockEmbedderConfig",
     "BedrockGeneratorConfig",
     "BooleanQuery",
@@ -1205,6 +1208,7 @@ __all__ = (
     "MultiBatchRequest",
     "MultiBatchRequestTables",
     "MultiBatchResponse",
+    "MultiBatchResponseStatus",
     "MultiBatchResponseTables",
     "MultiMatchBody",
     "MultiMatchBodyType",
@@ -1391,9 +1395,13 @@ __all__ = (
     "TransactionCommitRequest",
     "TransactionCommitRequestTables",
     "TransactionCommitResponse",
-    "TransactionCommitResponseConflict",
     "TransactionCommitResponseStatus",
     "TransactionCommitResponseTables",
+    "TransactionConflict",
+    "TransactionConflictKind",
+    "TransactionConflictParticipant",
+    "TransactionConflictParticipantPhase",
+    "TransactionConflictRetryScope",
     "TransactionReadItem",
     "TransactionSavepointResponse",
     "TransactionSessionCleanupResponse",

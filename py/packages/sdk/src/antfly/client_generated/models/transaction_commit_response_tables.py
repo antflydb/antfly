@@ -15,7 +15,7 @@ T = TypeVar("T", bound="TransactionCommitResponseTables")
 
 @_attrs_define
 class TransactionCommitResponseTables:
-    """Per-table batch results (only present when status is "committed")"""
+    """Per-table batch results (present for every committed status)"""
 
     additional_properties: dict[str, BatchResponse] = _attrs_field(init=False, factory=dict)
 

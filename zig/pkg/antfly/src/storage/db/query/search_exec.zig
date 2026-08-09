@@ -1131,6 +1131,7 @@ pub fn searchComposed(
                 .name = "$full_text_results",
                 .hits = text_result.hits,
                 .total_hits = text_result.total_hits,
+                .total_hits_relation = text_result.total_hits_relation,
                 .resolved_doc_set = resolved_doc_set,
             });
             try owned_results.append(alloc, text_result);
@@ -1148,6 +1149,7 @@ pub fn searchComposed(
                 .name = "$full_text_results",
                 .hits = text_result.hits,
                 .total_hits = text_result.total_hits,
+                .total_hits_relation = text_result.total_hits_relation,
                 .resolved_doc_set = resolved_doc_set,
             });
             try owned_results.append(alloc, text_result);
@@ -1169,6 +1171,7 @@ pub fn searchComposed(
                 .name = full_text_query.name,
                 .hits = text_result.hits,
                 .total_hits = text_result.total_hits,
+                .total_hits_relation = text_result.total_hits_relation,
                 .resolved_doc_set = resolved_doc_set,
             });
             try owned_results.append(alloc, text_result);
@@ -1188,6 +1191,7 @@ pub fn searchComposed(
             .name = if (vector_req.sparse == null) "$embeddings_results" else "dense",
             .hits = dense_result.hits,
             .total_hits = dense_result.total_hits,
+            .total_hits_relation = dense_result.total_hits_relation,
             .resolved_doc_set = resolved_doc_set,
         });
         try owned_results.append(alloc, dense_result);
@@ -1204,6 +1208,7 @@ pub fn searchComposed(
                 .name = dense_query.name,
                 .hits = dense_result.hits,
                 .total_hits = dense_result.total_hits,
+                .total_hits_relation = dense_result.total_hits_relation,
                 .resolved_doc_set = resolved_doc_set,
             });
             try owned_results.append(alloc, dense_result);
@@ -1220,6 +1225,7 @@ pub fn searchComposed(
             .name = if (vector_req.dense == null) "$embeddings_results" else "sparse",
             .hits = sparse_result.hits,
             .total_hits = sparse_result.total_hits,
+            .total_hits_relation = sparse_result.total_hits_relation,
             .resolved_doc_set = resolved_doc_set,
         });
         try owned_results.append(alloc, sparse_result);
@@ -1236,6 +1242,7 @@ pub fn searchComposed(
                 .name = sparse_query.name,
                 .hits = sparse_result.hits,
                 .total_hits = sparse_result.total_hits,
+                .total_hits_relation = sparse_result.total_hits_relation,
                 .resolved_doc_set = resolved_doc_set,
             });
             try owned_results.append(alloc, sparse_result);
@@ -1257,6 +1264,7 @@ pub fn searchComposed(
         .name = "$fused_results",
         .hits = base.hits,
         .total_hits = base.total_hits,
+        .total_hits_relation = base.total_hits_relation,
         .resolved_doc_set = fused_resolved_doc_set,
     });
 
@@ -1419,6 +1427,7 @@ fn appendEmbeddingsResultAlias(
             .name = "$embeddings_results",
             .hits = embedding_sets.items[0].hits,
             .total_hits = embedding_sets.items[0].total_hits,
+            .total_hits_relation = embedding_sets.items[0].total_hits_relation,
             .resolved_doc_set = embedding_sets.items[0].resolved_doc_set,
         });
         return;
@@ -1433,6 +1442,7 @@ fn appendEmbeddingsResultAlias(
         .name = "$embeddings_results",
         .hits = embeddings_result.hits,
         .total_hits = embeddings_result.total_hits,
+        .total_hits_relation = embeddings_result.total_hits_relation,
         .resolved_doc_set = resolved_doc_set,
     });
     try owned_results.append(alloc, embeddings_result);

@@ -91,14 +91,14 @@ func (t *TableApi) CommitTransaction(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusConflict)
 			_ = json.NewEncoder(w).Encode(TransactionCommitResponse{
 				Status: TransactionCommitResponseStatusAborted,
-				Conflict: struct {
-					Key     string `json:"key,omitempty,omitzero"`
-					Message string `json:"message,omitempty,omitzero"`
-					Table   string `json:"table,omitempty,omitzero"`
-				}{
-					Table:   conflict.Table,
-					Key:     conflict.Key,
-					Message: conflict.Error(),
+				Conflict: TransactionConflict{
+					Table:           conflict.Table,
+					Key:             conflict.Key,
+					Message:         conflict.Error(),
+					Kind:            TransactionConflictKindVersionConflict,
+					Retryable:       false,
+					ExpectedVersion: conflict.Expected,
+					CurrentVersion:  conflict.Actual,
 				},
 			})
 			return
@@ -164,16 +164,18 @@ func (t *TableApi) CommitTransaction(w http.ResponseWriter, r *http.Request) {
 			if err := t.ln.ExecuteTransaction(ctx, pr.writes, pr.deletes, pr.transforms, allPredicates, syncLevel); err != nil {
 				// Check if it's a version conflict from the predicate check inside 2PC
 				if isVersionConflict(err) {
+					kind := TransactionConflictKindVersionConflict
+					if errors.Is(err, client.ErrIntentConflict) {
+						kind = TransactionConflictKindIntentConflict
+					}
 					w.Header().Set("Content-Type", "application/json")
 					w.WriteHeader(http.StatusConflict)
 					_ = json.NewEncoder(w).Encode(TransactionCommitResponse{
 						Status: TransactionCommitResponseStatusAborted,
-						Conflict: struct {
-							Key     string `json:"key,omitempty,omitzero"`
-							Message string `json:"message,omitempty,omitzero"`
-							Table   string `json:"table,omitempty,omitzero"`
-						}{
-							Message: err.Error(),
+						Conflict: TransactionConflict{
+							Message:   err.Error(),
+							Kind:      kind,
+							Retryable: false,
 						},
 					})
 					return

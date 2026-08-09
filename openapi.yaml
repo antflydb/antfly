@@ -2409,12 +2409,30 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/MultiBatchResponse'
+        '202':
+          description: Commit decision is durable; visibility or participant recovery is still pending
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MultiBatchResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '409':
+          description: Transaction aborted because a predicate, topology fence, or participant state conflicted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionCommitResponse'
         '404':
           $ref: '#/components/responses/NotFound'
+        '503':
+          description: The coordinator was unavailable before a commit decision; retry is safe
+          content:
+            text/plain:
+              schema:
+                type: string
         '500':
-          $ref: '#/components/responses/InternalServerError'
+          $ref: '#/components/responses/StatelessTransactionFailure'
       security:
         - BasicAuth: []
         - ApiKeyAuth: []
@@ -2464,6 +2482,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/TransactionCommitResponse'
+        '202':
+          description: Transaction committed durably with visibility or participant recovery pending
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionCommitResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
         '404':
@@ -2474,8 +2498,14 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/TransactionCommitResponse'
+        '503':
+          description: The coordinator was unavailable before a commit decision; retry is safe
+          content:
+            text/plain:
+              schema:
+                type: string
         '500':
-          $ref: '#/components/responses/InternalServerError'
+          $ref: '#/components/responses/StatelessTransactionFailure'
       security:
         - BasicAuth: []
         - ApiKeyAuth: []
@@ -2792,6 +2822,12 @@ paths:
       responses:
         '200':
           description: Session committed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionSessionCommitResponse'
+        '202':
+          description: Session committed durably with visibility or participant recovery pending
           content:
             application/json:
               schema:
@@ -3815,40 +3851,40 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/BatchResponse'
+        '202':
+          description: Commit decision is durable; visibility or participant recovery is still pending
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
           description: >
-            The batch cannot be safely replayed as a unit. Either the server
+            The atomic batch conflicted, the serving replica is fenced, or the
 
-            could not determine whether a shard-group write committed, or one
+            server could not determine whether a single-group Raft command
 
-            or more shard groups accepted their portion before a later group
+            committed. An ambiguous outcome is not safe to replay blindly when
 
-            failed. Clients must reconcile affected keys and must not blindly
-
-            replay non-idempotent transforms.
+            the request contains non-idempotent transforms.
           content:
             text/plain:
               schema:
                 type: string
-                enum:
-                  - write outcome unknown
-                  - partial write outcome
         '429':
           $ref: '#/components/responses/DenseRepairBackpressure'
         '503':
-          description: No writable Raft leader was available before any shard group accepted the batch.
+          description: Write routing, document identity, or the coordinator is temporarily unavailable
+            before a commit decision
           content:
             text/plain:
               schema:
                 type: string
-                enum:
-                  - write unavailable
         '500':
-          $ref: '#/components/responses/InternalServerError'
+          $ref: '#/components/responses/StatelessTransactionFailure'
       security:
         - BasicAuth: []
         - ApiKeyAuth: []
@@ -10789,6 +10825,12 @@ components:
     BatchResponse:
       type: object
       properties:
+        status:
+          type: string
+          enum:
+            - committed
+            - committed_pending
+          description: Durable commit and visibility/participant recovery state.
         inserted:
           type: integer
           description: Number of documents successfully inserted
@@ -10868,6 +10910,13 @@ components:
       description: >
         Response for a cross-table batch operation. Contains per-table results.
       properties:
+        status:
+          type: string
+          description: Durable commit and visibility/propagation state.
+          enum:
+            - committed
+            - committed_visibility_pending
+            - committed_recovery_pending
         tables:
           type: object
           description: Per-table batch results
@@ -10934,6 +10983,78 @@ components:
             $ref: '#/components/schemas/BatchRequest'
         sync_level:
           $ref: '#/components/schemas/SyncLevel'
+    TransactionConflictParticipant:
+      type: object
+      description: Participant location and 2PC phase where the conflict occurred.
+      properties:
+        group_id:
+          type: integer
+          format: uint64
+          description: Raft group that reported the conflict.
+        phase:
+          type: string
+          enum:
+            - begin
+            - prepare
+            - resolve
+          description: 2PC participant phase that reported the conflict.
+    TransactionConflict:
+      type: object
+      description: Structured details for an aborted transaction attempt.
+      required:
+        - table
+        - key
+        - message
+        - kind
+        - retryable
+      properties:
+        table:
+          type: string
+          description: Table where the conflict was detected.
+        key:
+          type: string
+          description: Document key associated with the conflict, when applicable.
+        message:
+          type: string
+          description: Human-readable conflict description.
+        kind:
+          type: string
+          enum:
+            - version_conflict
+            - intent_conflict
+            - topology_changed
+            - participant_unavailable
+            - doc_identity_unavailable
+            - session_lease_lost
+            - transaction_conflict
+            - torn_state
+          description: Stable machine-readable conflict classification.
+        retryable:
+          type: boolean
+          description: Whether retrying the transaction may succeed without changing its writes.
+        retry_after_ms:
+          type: integer
+          format: uint32
+          minimum: 1
+          description: Minimum suggested delay before retrying a retryable conflict.
+        retry_scope:
+          type: string
+          enum:
+            - topology
+            - participant
+            - doc_identity
+            - session
+          description: Component whose state should be refreshed before retrying.
+        expected_version:
+          type: integer
+          format: uint64
+          description: Version required by the transaction predicate.
+        current_version:
+          type: integer
+          format: uint64
+          description: Version observed while validating the transaction predicate.
+        participant:
+          $ref: '#/components/schemas/TransactionConflictParticipant'
     TransactionCommitResponse:
       type: object
       description: Result of an OCC transaction commit attempt.
@@ -10944,24 +11065,21 @@ components:
           type: string
           enum:
             - committed
+            - committed_visibility_pending
+            - committed_recovery_pending
             - aborted
-          description: Whether the transaction was committed or aborted due to a conflict
+          description: >
+            Durable transaction outcome. Pending committed states mean the
+
+            commit decision is durable while its requested visibility barrier
+
+            or participant recovery is still completing.
         conflict:
-          type: object
           description: Details about the conflict that caused an abort (only present when status is "aborted")
-          properties:
-            table:
-              type: string
-              description: Table where the conflict was detected
-            key:
-              type: string
-              description: Key that had a version mismatch
-            message:
-              type: string
-              description: Human-readable conflict description
+          $ref: '#/components/schemas/TransactionConflict'
         tables:
           type: object
-          description: Per-table batch results (only present when status is "committed")
+          description: Per-table batch results (present for every committed status)
           additionalProperties:
             $ref: '#/components/schemas/BatchResponse'
     TransactionBeginRequest:
@@ -23627,6 +23745,22 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
+    StatelessTransactionFailure:
+      description: >
+        Internal transaction failure. If the response says that the outcome is
+
+        unknown, the request may already have committed and the stateless
+
+        request MUST NOT be retried. Use a transaction session when a commit
+
+        must be safely retryable by transaction ID.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+        text/plain:
+          schema:
+            type: string
     DenseRepairBackpressure:
       description: Writes are temporarily limited while a dense-index rebuild catches up.
       headers:

@@ -6,6 +6,7 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.batch_response_status import BatchResponseStatus
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="BatchResponse")
@@ -15,17 +16,23 @@ T = TypeVar("T", bound="BatchResponse")
 class BatchResponse:
     """
     Attributes:
+        status (BatchResponseStatus | Unset): Durable commit and visibility/participant recovery state.
         inserted (int | Unset): Number of documents successfully inserted
         deleted (int | Unset): Number of documents successfully deleted
         transformed (int | Unset): Number of documents successfully transformed
     """
 
+    status: BatchResponseStatus | Unset = UNSET
     inserted: int | Unset = UNSET
     deleted: int | Unset = UNSET
     transformed: int | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        status: str | Unset = UNSET
+        if not isinstance(self.status, Unset):
+            status = self.status.value
+
         inserted = self.inserted
 
         deleted = self.deleted
@@ -35,6 +42,8 @@ class BatchResponse:
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
+        if status is not UNSET:
+            field_dict["status"] = status
         if inserted is not UNSET:
             field_dict["inserted"] = inserted
         if deleted is not UNSET:
@@ -47,6 +56,13 @@ class BatchResponse:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
+        _status = d.pop("status", UNSET)
+        status: BatchResponseStatus | Unset
+        if isinstance(_status, Unset):
+            status = UNSET
+        else:
+            status = BatchResponseStatus(_status)
+
         inserted = d.pop("inserted", UNSET)
 
         deleted = d.pop("deleted", UNSET)
@@ -54,6 +70,7 @@ class BatchResponse:
         transformed = d.pop("transformed", UNSET)
 
         batch_response = cls(
+            status=status,
             inserted=inserted,
             deleted=deleted,
             transformed=transformed,

@@ -14,6 +14,27 @@
 
 const std = @import("std");
 
+pub fn isHelpRequest(args: []const []const u8) bool {
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "help")) return true;
+        if (runFlagTakesValue(arg) and i + 1 < args.len) i += 1;
+    }
+    return false;
+}
+
+fn runFlagTakesValue(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "--host") or
+        std.mem.eql(u8, arg, "--port") or
+        std.mem.eql(u8, arg, "--models-dir") or
+        std.mem.eql(u8, arg, "--ml-dir") or
+        std.mem.eql(u8, arg, "--config") or
+        std.mem.eql(u8, arg, "--max-loaded-models") or
+        std.mem.eql(u8, arg, "--max-concurrent-requests") or
+        std.mem.eql(u8, arg, "--preload-model");
+}
+
 pub fn parseMaxLoadedModelsOverride(args: []const []const u8) !?usize {
     var override: ?usize = null;
     var i: usize = 0;
@@ -50,4 +71,12 @@ test "run cli parses max loaded models residency override" {
         @as(?usize, 0),
         try parseMaxLoadedModelsOverride(&.{ "--max-loaded-models", "0" }),
     );
+}
+
+test "inference run recognizes help before server startup" {
+    try std.testing.expect(isHelpRequest(&.{"--help"}));
+    try std.testing.expect(isHelpRequest(&.{ "--port", "8091", "-h" }));
+    try std.testing.expect(!isHelpRequest(&.{ "--host", "127.0.0.1" }));
+    try std.testing.expect(!isHelpRequest(&.{ "--config", "help" }));
+    try std.testing.expect(!isHelpRequest(&.{ "--host", "-h" }));
 }

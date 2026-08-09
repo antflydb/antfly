@@ -147,6 +147,12 @@ def test_sparse_import_and_hybrid_query_with_external_embeddings(backup_api):
         )
         == {}
     )
+    backup_api.wait_index_ready(
+        table_name, dense_index, timeout_s=30.0, interval_s=0.5, require_query_fresh=True
+    )
+    backup_api.wait_index_ready(
+        table_name, sparse_index, timeout_s=30.0, interval_s=0.5, require_query_fresh=True
+    )
 
     docs = {
         "doc1": {
@@ -354,6 +360,15 @@ def test_named_embedding_queries_use_requested_indexes(table_api):
         )
         == {}
     )
+    if table_api.backend == "stateful":
+        for index_name in ("semantic_a", "semantic_b", "sparse_a", "sparse_b"):
+            table_api.wait_index_ready(
+                table_name,
+                index_name,
+                timeout_s=30.0,
+                interval_s=0.5,
+                require_query_fresh=True,
+            )
 
     batch = table_api.batch_write(
         table_name,
