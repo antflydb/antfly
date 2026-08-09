@@ -180,6 +180,7 @@ the same host, target, cache state, and report set.
 | Data-only PIC storage probe | 283.018 s, 277.375 s LLVM, 593 repository files, 36,065 declarations | Establishes that PIC/CAPI storage ownership is not the excess cost |
 | Data + standalone/Lite + CAPI PIC probe | 288.171 s, only +5.153 s over data alone; 614 repository files, 37,166 declarations | Strong candidate ownership island; CLI/metadata roots account for the remaining 82.685 s |
 | CLI + metadata control-only probe | 295.647 s, 289.733 s LLVM, 600 repository files | A separate control unit meets the time gate but duplicates too much physical storage by itself |
+| Remote-only metadata control split | Storage 348.021 s and metadata 266.156 s, but duplicate instances 438 -> 965 and executable 59.271 MB -> 76.892 MB | Rejected; metadata still emits physical/catalog storage and cannot split before that ownership crosses the kernel ABI |
 | API/serverless + CLI/metadata coalescing | API/control 409.246 s; storage runtime 313.292 s; duplicate instances 484 → 676; executable 61.224 MB → 72.464 MB | Rejected; moving roots without moving physical ownership misses time, overlap, and artifact gates |
 | Application/storage without remote CLI | 340.130 s, 332.415 s LLVM, 40,037 declarations, 636 repository files | Keep; below the preferred 350-second local gate |
 | Remote CLI after HA/restore ownership cut | 38.029 s, 35.904 s LLVM, 5,804 declarations, 53 repository files and no Antfly storage files | Keep as an independent final codegen unit |
@@ -1982,6 +1983,65 @@ not reduce LLVM emission. Do not count compiler `all_files` entries or lexical
 source lines as a codegen win without an object delta. The next compilation
 experiment remains the complete physical runtime-state transfer described
 above.
+
+### Rejected remote-only metadata control split
+
+The next probe tested a smaller alternative to transferring the complete
+`DataServer` state immediately. Metadata's data-bearing router always reports
+its local data-group status as absent, so its public table source should only
+fan out to remote data stores. The probe compiled those impossible local read,
+write, repair, and maintenance fallbacks out of a separate CLI-plus-metadata
+control artifact and failed closed if routing nevertheless selected a local
+data group.
+
+An exact current-tree cold control proved that this was real emitted work, not
+another lazy-import result:
+
+| Control-only metric | Current control | Remote-only probe | Delta |
+|---|---:|---:|---:|
+| Compiler time | 305.614 s | 270.585 s | -35.029 s |
+| LLVM emission | 299.360 s | 265.071 s | -34.288 s |
+| Declarations | 34,690 | 32,926 | -1,764 |
+| Imported files | 760 | 741 | -19 |
+| Object allocatable bytes | 23,338,385 | 21,798,177 | -1,540,208 |
+| Object text bytes | 19,598,032 | 18,174,052 | -1,423,980 |
+
+The candidate was then linked as one complete executable with five normally
+scheduled units: API, application/storage without metadata, remote-only
+metadata control, inference, and remote CLI. A fresh ARM64 Linux musl
+`ReleaseFast` build completed all 30 steps:
+
+| Unit | Compiler time | LLVM emit | Declarations | Imported files |
+|---|---:|---:|---:|---:|
+| Application/storage | 348.021 s | 340.862 s | 40,339 | 889 |
+| Metadata control | 266.156 s | 260.443 s | 32,295 | 722 |
+| Inference | 216.549 s | 209.655 s | 24,971 | 708 |
+| API protocol | 130.187 s | 126.637 s | 17,332 | 490 |
+| Remote CLI | 37.126 s | 35.304 s | 5,804 | 205 |
+
+The maximum unit landed just below the preferred 350-second local gate, and
+the linked Debug build, all five top-level command help paths, and 5/5 linked
+main tests passed. The stripped ARM64 executable remained static with no
+dynamic section or production LMDB symbols. The C API stayed small at
+16,666,392 bytes.
+
+The holistic result nevertheless fails the architecture gates. Compared with
+the four-unit application/storage baseline, compiler file instances increased
+from 1,626 to 2,152 and duplicate instances from 438 to 965. Storage alone
+increased from 52 to 189 duplicate instances. The stripped executable grew
+from 59,270,808 to 76,892,480 bytes: +17,621,672 bytes or 29.7%, far beyond the
+approximately 5% limit. Metadata still loaded 137 storage files and emitted a
+20,592,552-byte allocatable object because its catalog, Raft application, and
+public coordination paths retain physical storage implementation.
+
+Decision: **reject and revert**. Remote-only public routing is a valid semantic
+observation and saved 35 seconds in isolation, but splitting metadata before
+moving its physical/catalog storage ownership merely creates another large
+optimized copy. Do not revive a separate metadata unit until its remaining
+storage implementation is consumed through the same opaque compiled kernel as
+data, standalone/Lite, serverless, and the C API. The next experiment must
+therefore be an atomic physical-owner transfer inside the current co-generated
+application/storage topology, not another role regrouping.
 
 ## Holistic target architecture
 
