@@ -183,7 +183,7 @@ the same host, target, cache state, and report set.
 | API/serverless + CLI/metadata coalescing | API/control 409.246 s; storage runtime 313.292 s; duplicate instances 484 → 676; executable 61.224 MB → 72.464 MB | Rejected; moving roots without moving physical ownership misses time, overlap, and artifact gates |
 | Application/storage without remote CLI | 340.130 s, 332.415 s LLVM, 40,037 declarations, 636 repository files | Keep; below the preferred 350-second local gate |
 | Remote CLI after HA/restore ownership cut | 38.029 s, 35.904 s LLVM, 5,804 declarations, 53 repository files and no Antfly storage files | Keep as an independent final codegen unit |
-| Four-unit production archive with deterministic 20 GB scheduling | 30/30 steps in 374.23 s locally; highest compiler MaxRSS 5 GB; static executable 62.421 MB; C API 16.665 MB | Keep pending normal-runner confirmation |
+| Four-unit production archive with deterministic 20 GB scheduling | 30/30 steps in 374.23 s locally and 15:17.77 on the normal runner; static executable 62.421 MB; C API 16.665 MB | Reliable, but the 11 m Linux application unit misses the performance gate |
 
 The `/tmp` graph analysis was consolidated into
 `tools/analyze_zig_import_graph.py`. It reports lexical reachability, consumes
@@ -1481,23 +1481,45 @@ option enabled, its two pre-existing Raft-snapshot fixtures still omit the
 experimental storage-snapshot source and fail closed with
 `StorageKernelSnapshotUnavailable`.
 
-Decision: **keep the four-unit topology and process-owner foundation, pending
-normal-runner confirmation**. It clears the preferred local critical-unit gate,
-keeps one static executable and the small C API, removes storage from the
-remote CLI graph, and does not increase runner cost. The goal remains open:
-API/serverless still contains meaningful duplicate storage/local-query code,
-and repeated clean normal-runner builds have not yet validated this new
-partition. The next physical-owner experiment should target that remaining API
-overlap as one coarse operation family, not split HTTPX, LMDB, or individual
-storage primitives into separate libraries.
+Normal-runner run `31287672283` then exercised the exact pushed topology on the
+existing 24 GiB `arc-antfly-publish` runner. The graph gates, cold archive,
+artifact audit, memory report, and upload all passed:
+
+| Unit or artifact | Normal-runner result |
+|---|---:|
+| Application/storage | 11 m, 10 GB MaxRSS |
+| API protocol plus serverless | 6 m, 6 GB MaxRSS |
+| Inference | 8 m, 6 GB MaxRSS |
+| Remote CLI | 1 m, 1 GB MaxRSS |
+| Thin executable link | 11 s, 420 MB MaxRSS |
+| Complete cold archive build | 15:17.77, 9,880,700 KiB process-tree peak RSS |
+| Static executable | 62,421,080 bytes |
+| `libantfly.so` | 16,664,864 bytes |
+
+This is a third clean normal-runner success without swap, a larger runner, or
+`-j1`, and the explicit dependency edges prevent random launch-order changes.
+It does not improve the authoritative Linux critical unit: application/storage
+remains at the slower end of the preceding 9--11-minute range, and total wall
+time is comparable to the preceding 14:45 control.
+
+Decision: **keep the remote-CLI ownership cut and process-owner foundation, but
+do not treat them as the performance solution**. They preserve reliability,
+remove all Antfly storage files from the CLI graph, keep artifacts within their
+budgets, and are bounded prerequisites for the remaining cut. The goal remains
+open. The next experiment should move serverless local execution from API into
+the application/storage owner: API currently duplicates 73 storage files,
+while the earlier data-plus-serverless probe measured only a 15.5-second
+marginal cost when serverless was co-generated with data. If that does not make
+the physical storage implementation compile once, the follow-up is the coarse
+opaque owner ABI—not separate HTTPX, LMDB, or primitive storage libraries.
 
 ## Holistic target architecture
 
 The current candidate baseline is the four-unit topology above. It is smaller
-and faster than the rejected source-only coalescing, and its isolated
-application/storage unit meets the preferred local time gate. It is not yet the
-final target: normal-runner confirmation is pending and API/serverless still
-emits a meaningful subset of storage/local-query implementation.
+than the rejected source-only coalescing, its isolated application/storage unit
+meets the preferred local time gate, and it is reliable on the normal runner.
+It is not yet the final target: the Linux unit still takes 11 minutes and
+API/serverless emits a meaningful subset of storage/local-query implementation.
 
 The reopened target is a modular monolith with one compiled physical-storage
 owner and separately compiled control consumers:
