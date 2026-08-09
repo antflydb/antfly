@@ -1319,9 +1319,9 @@ pub const ApiHttpClient = struct {
             .body = body,
         });
         defer resp.deinit(self.alloc);
-        if (resp.status != 201 and resp.status != 202) {
-            std.debug.print("fetchBatch unexpected status={d} uri={s} body={s}\n", .{ resp.status, uri, resp.body });
-            return error.UnexpectedHttpStatus;
+        switch (resp.status) {
+            201, 202 => {},
+            else => return remotePublicBatchError(resp.status, resp.body),
         }
         return .{
             .status = resp.status,
@@ -2823,6 +2823,48 @@ fn remoteGroupConflictError(body: []const u8) anyerror {
     if (isDocIdentityNamespaceMismatchConflictMessage(body)) return error.DocIdentityNamespaceMismatch;
     if (std.mem.eql(u8, body, "repair cancelled")) return error.Canceled;
     return error.UnexpectedHttpStatus;
+}
+
+fn remotePublicBatchError(status: u16, body: []const u8) anyerror {
+    const message = std.mem.trim(u8, body, " \t\r\n");
+    switch (status) {
+        409 => {
+            if (std.mem.eql(u8, message, "batch transaction conflicted")) return error.Conflict;
+            if (std.mem.eql(u8, message, "write outcome unknown")) return error.RaftBatchWriteOutcomeUnknown;
+            if (std.mem.eql(u8, message, "standby is read-only")) return error.HAReadOnlyStandby;
+            if (std.mem.eql(u8, message, "promoted standby requires primary open")) {
+                return error.HAPromotedStandbyRequiresPrimaryOpen;
+            }
+            if (std.mem.eql(u8, message, "fenced primary rejects writes")) return error.HAFencedPrimary;
+            return remoteGroupConflictError(message);
+        },
+        503 => {
+            if (std.mem.eql(u8, message, "write unavailable")) return error.LeaderUnavailable;
+            if (std.mem.eql(u8, message, "doc identity unavailable")) return error.DocIdentityUnavailable;
+            if (std.mem.eql(u8, message, "maintenance routes unavailable on query-only runtime")) {
+                return error.Unavailable;
+            }
+            return error.UnexpectedHttpStatus;
+        },
+        500 => {
+            if (std.mem.startsWith(u8, message, "transaction outcome is unknown")) {
+                return error.CommitDecisionUnknown;
+            }
+            return error.UnexpectedHttpStatus;
+        },
+        else => return error.UnexpectedHttpStatus,
+    }
+}
+
+test "api http client preserves public batch retry safety classifications" {
+    try std.testing.expectEqual(error.Conflict, remotePublicBatchError(409, "batch transaction conflicted"));
+    try std.testing.expectEqual(error.RaftBatchWriteOutcomeUnknown, remotePublicBatchError(409, "write outcome unknown"));
+    try std.testing.expectEqual(error.CommitDecisionUnknown, remotePublicBatchError(
+        500,
+        "transaction outcome is unknown; do not retry this stateless batch",
+    ));
+    try std.testing.expectEqual(error.LeaderUnavailable, remotePublicBatchError(503, "write unavailable"));
+    try std.testing.expectEqual(error.HAReadOnlyStandby, remotePublicBatchError(409, "standby is read-only"));
 }
 
 fn remoteStorageReadUnavailableError(body: []const u8) anyerror {

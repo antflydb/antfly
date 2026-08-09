@@ -6569,7 +6569,7 @@ fn lookupProvisionedLocal(
     // Writer-backed sources return ResidentDbRetryRequired when publication is
     // needed; their caller releases admission, prepares the writer, and reruns
     // routing before reaching this function again. A null lease is reserved for
-    // query-only runtimes and read-compatible maintenance, which use the cache.
+    // query-only runtimes, which use the cache.
     if (resident_db) |source| {
         if (try source.leaseGroup(alloc, table_name, group_id, lsm_root_generation, .{ .read_activity_held = true })) |lease_value| {
             var lease = lease_value;

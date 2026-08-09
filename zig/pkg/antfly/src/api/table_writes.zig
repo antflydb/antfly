@@ -128,6 +128,8 @@ fn startupCatchUpMonotonicMs() u64 {
 }
 const replicated_apply_writer_open_timeout_ns: u64 = 30 * std.time.ns_per_s;
 const replicated_apply_writer_open_retry_ns: u64 = 10 * std.time.ns_per_ms;
+const stateless_batch_max_attempts: u8 = 3;
+const stateless_batch_retry_base_ns: u64 = std.time.ns_per_ms;
 
 fn isTransientReplayVisibilityError(err: anyerror) bool {
     return err == error.WriterLocked or
@@ -10322,19 +10324,6 @@ pub const ProvisionedTableWriteSource = struct {
         const resident = self.snapshotResidentDbLocked(table_name, group_id, lsm_root_generation);
         self.local_db_mutex.unlock();
 
-        // Reconciliation retires the stale-schema writer before opening its
-        // replacement. During that short handoff, let the query path use its
-        // generation-pinned readonly cache instead of racing to create another
-        // writer-cache owner. Once the replacement is resident, subsequent
-        // queries lease it normally while the unpublished target builds.
-        if (resident.cached == null and self.readCompatibleMaintenanceActiveBestEffort(table_name, group_id)) {
-            if (read_request_active) {
-                self.endReadRequest(table_name);
-                read_request_active = false;
-            }
-            return null;
-        }
-
         if (resident.cached == null) {
             // Query-only runtimes have no writer owner; allow the caller to use
             // its readonly cache. Every runtime with a writer cache uses the
@@ -10414,14 +10403,18 @@ pub const ProvisionedTableWriteSource = struct {
             cached.deinit(alloc);
             return;
         }
-        if (self.readCompatibleMaintenanceActiveBestEffort(table_name, group_id)) return;
+        if (self.readCompatibleMaintenanceActiveBestEffort(table_name, group_id)) {
+            return error.StorageReadTemporarilyUnavailable;
+        }
 
         resident = self.waitForResidentDbOpen(table_name, group_id, lsm_root_generation);
         if (resident.cached) |*cached| {
             cached.deinit(alloc);
             return;
         }
-        if (self.readCompatibleMaintenanceActiveBestEffort(table_name, group_id)) return;
+        if (self.readCompatibleMaintenanceActiveBestEffort(table_name, group_id)) {
+            return error.StorageReadTemporarilyUnavailable;
+        }
 
         const cache = self.write_cache orelse self.startup_write_cache orelse return;
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
@@ -13425,6 +13418,41 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?distributed_txn.CommitOutcome {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try enforceHAWriteGateOptional(self.ha_write_gate);
+        const retry_conflicts = statelessBatchMayRetry(tables);
+        var attempt: u8 = 0;
+        while (true) : (attempt += 1) {
+            const outcome = commitProvisionedBatchOnce(self, ptr, alloc, tables, sync_level) catch |err| {
+                if (retry_conflicts and attempt + 1 < stateless_batch_max_attempts and err == error.TopologyChanged) {
+                    sleepNs(statelessBatchRetryDelayNs(attempt));
+                    continue;
+                }
+                return err;
+            };
+            if (outcome) |result| switch (result) {
+                .committed => return result,
+                .conflict => {
+                    // Every conflict outcome is returned only after the
+                    // coordinator has established that no commit decision is
+                    // durable. A fresh transaction ID is therefore safe for a
+                    // predicate-free public batch. Explicit OCC conflicts and
+                    // unknown outcomes remain visible to the caller.
+                    if (retry_conflicts and attempt + 1 < stateless_batch_max_attempts) {
+                        sleepNs(statelessBatchRetryDelayNs(attempt));
+                        continue;
+                    }
+                    return result;
+                },
+            } else return null;
+        }
+    }
+
+    fn commitProvisionedBatchOnce(
+        self: *ProvisionedTableWriteSource,
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+    ) !?distributed_txn.CommitOutcome {
         if (self.raft_batcher != null) {
             if (try self.commitSingleGroupTransactionViaRaftBatcher(alloc, tables, sync_level)) |outcome| return outcome;
         }
@@ -17033,6 +17061,124 @@ fn nextTxnId() db_mod.types.TxnId {
     std.mem.writeInt(u64, txn_id[0..8], nextTxnTimestamp(), .big);
     std.mem.writeInt(u64, txn_id[8..16], nonce, .big);
     return txn_id;
+}
+
+fn statelessBatchMayRetry(tables: []const distributed_txn.TableCommitRequest) bool {
+    for (tables) |table| {
+        if (table.predicates.len != 0) return false;
+    }
+    return true;
+}
+
+fn statelessBatchRetryDelayNs(attempt: u8) u64 {
+    return stateless_batch_retry_base_ns << @intCast(attempt);
+}
+
+test "stateless batch retries are bounded and exclude explicit OCC" {
+    const plain = [_]distributed_txn.TableCommitRequest{.{
+        .table_name = "docs",
+        .writes = &.{.{ .key = "doc:a", .value = "{}" }},
+    }};
+    try std.testing.expect(statelessBatchMayRetry(&plain));
+
+    const predicated = [_]distributed_txn.TableCommitRequest{.{
+        .table_name = "docs",
+        .predicates = &.{.{ .key = "doc:a", .expected_version = 7 }},
+    }};
+    try std.testing.expect(!statelessBatchMayRetry(&predicated));
+    try std.testing.expectEqual(std.time.ns_per_ms, statelessBatchRetryDelayNs(0));
+    try std.testing.expectEqual(2 * std.time.ns_per_ms, statelessBatchRetryDelayNs(1));
+    try std.testing.expectEqual(@as(u8, 3), stateless_batch_max_attempts);
+}
+
+test "provisioned stateless batch retries definite aborts to the production bound" {
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+    const Batcher = struct {
+        failures_remaining: u8,
+        attempts: u8 = 0,
+
+        fn batchGroup(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: u64,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+        ) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.attempts += 1;
+            if (self.failures_remaining > 0) {
+                self.failures_remaining -= 1;
+                return error.IntentConflict;
+            }
+        }
+
+        fn batchGroupLocal(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: u64,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+        ) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    var source = ProvisionedTableWriteSource.init("unused", Catalog.iface());
+    defer source.deinit();
+    var batcher = Batcher{ .failures_remaining = 2 };
+    _ = source.withRaftBatcher(.{
+        .ptr = &batcher,
+        .vtable = &.{
+            .batch_group = Batcher.batchGroup,
+            .batch_group_local = Batcher.batchGroupLocal,
+        },
+    });
+    const tables = [_]distributed_txn.TableCommitRequest{.{
+        .table_name = "docs",
+        .writes = &.{.{ .key = "doc:a", .value = "{}" }},
+    }};
+
+    const committed = (try source.source().commitBatch(std.testing.allocator, &tables, .write)).?;
+    try std.testing.expect(committed == .committed);
+    try std.testing.expectEqual(stateless_batch_max_attempts, batcher.attempts);
+
+    batcher = .{ .failures_remaining = stateless_batch_max_attempts };
+    const exhausted = (try source.source().commitBatch(std.testing.allocator, &tables, .write)).?;
+    try std.testing.expect(exhausted == .conflict);
+    try std.testing.expectEqual(stateless_batch_max_attempts, batcher.attempts);
 }
 
 fn boundConflict(table: distributed_txn.TableCommitRequest, err: anyerror) distributed_txn.CommitConflict {
@@ -39647,7 +39793,11 @@ test "resident DB lease adopts seeded write cache across visible generation bump
     try std.testing.expectError(error.ResidentDbRetryRequired, resident.leaseGroup(alloc, "docs", 7001, generation, .{}));
 
     source.reserveStructuralReconcileActivity("docs");
-    try std.testing.expect((try resident.leaseGroup(alloc, "docs", 7001, generation, .{})) == null);
+    try std.testing.expectError(error.ResidentDbRetryRequired, resident.leaseGroup(alloc, "docs", 7001, generation, .{}));
+    try std.testing.expectError(
+        error.StorageReadTemporarilyUnavailable,
+        resident.prepareGroupForReadRetry(alloc, "docs", 7001, generation),
+    );
     source.cancelStructuralReconcileReservation("docs");
     try std.testing.expectError(error.ResidentDbRetryRequired, resident.leaseGroup(alloc, "docs", 7001, generation, .{}));
 
