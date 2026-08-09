@@ -372,6 +372,30 @@ pub const ProvisionedKernelOwnerSource = struct {
         try retireGroupForPublication(self, group_id, table_name);
     }
 
+    /// Apply the latest catalog schema/index contract to the already-resident
+    /// physical group owner, or open that owner with the contract when absent.
+    /// Routing and catalog selection remain in distributed control.
+    pub fn reconcileTableGroup(
+        self: *ProvisionedKernelOwnerSource,
+        group_id: u64,
+        table_name: []const u8,
+    ) !void {
+        var descriptor = try self.loadDescriptor(self.alloc, group_id, table_name);
+        defer descriptor.deinit(self.alloc);
+        var lease = try self.acquireDescriptor(
+            group_id,
+            table_name,
+            descriptor.path,
+            descriptor.view(),
+        );
+        defer lease.deinit();
+        try lease.owner().configure(
+            table_name,
+            descriptor.schema_json,
+            descriptor.indexes_json,
+        );
+    }
+
     fn visibleRootGeneration(self: *const ProvisionedKernelOwnerSource, group_id: u64) u64 {
         return if (self.group_visible_root_generation) |source|
             source.visibleRootGenerationForGroup(group_id)

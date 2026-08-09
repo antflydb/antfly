@@ -1765,6 +1765,22 @@ pub fn storageOwnerClose(owner: ?*anyopaque) callconv(.c) void {
     antfly_db_close(owner);
 }
 
+pub fn storageOwnerConfigure(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.ConfigureRequest,
+) callconv(.c) kernel_owner_abi.Status {
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    antfly.public_api.table_writes.configureStorageKernelOwnerDb(
+        handle.alloc,
+        &handle.db,
+        request.schema_json.slice(),
+        request.indexes_json.slice(),
+    ) catch |err| return storageOwnerStatusFromError(err);
+    return .ok;
+}
+
 fn storageOwnerOperationTableName(
     handle: *const Handle,
     request: *const kernel_owner_abi.JsonOperationRequest,

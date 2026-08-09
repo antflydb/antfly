@@ -79,6 +79,19 @@ pub const Owner = struct {
         self.* = undefined;
     }
 
+    pub fn configure(
+        self: *Owner,
+        table_name: []const u8,
+        schema_json: []const u8,
+        indexes_json: []const u8,
+    ) !void {
+        try statusToError(abi.antfly_storage_owner_configure(self.handle, &.{
+            .table_name = .fromSlice(table_name),
+            .schema_json = .fromSlice(schema_json),
+            .indexes_json = .fromSlice(indexes_json),
+        }));
+    }
+
     pub fn batchJson(self: *Owner, table_name: []const u8, request_json: []const u8) !Response {
         var response: Response = .{};
         try statusToError(abi.antfly_storage_owner_batch_json(

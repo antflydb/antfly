@@ -15,7 +15,7 @@
 //! Versioned internal ABI for the storage kernel's live DB owner. Keep this
 //! module free of storage and distributed-runtime imports.
 
-pub const abi_version: u32 = 10;
+pub const abi_version: u32 = 11;
 
 pub const BorrowedBytes = extern struct {
     ptr: ?[*]const u8 = null,
@@ -103,6 +103,16 @@ pub const JsonOperationRequest = extern struct {
     request_json: BorrowedBytes = .{},
 };
 
+/// Replace the catalog-owned physical schema/index contract on one resident
+/// group owner. Both byte slices are borrowed for this synchronous call.
+pub const ConfigureRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved0: u32 = 0,
+    table_name: BorrowedBytes = .{},
+    schema_json: BorrowedBytes = .{},
+    indexes_json: BorrowedBytes = .{},
+};
+
 pub const SyncLevel = enum(u32) {
     propose = 0,
     write = 1,
@@ -187,6 +197,11 @@ pub extern fn antfly_storage_owner_open(
 ) callconv(.c) Status;
 
 pub extern fn antfly_storage_owner_close(owner: ?*anyopaque) callconv(.c) void;
+
+pub extern fn antfly_storage_owner_configure(
+    owner: ?*anyopaque,
+    request: *const ConfigureRequest,
+) callconv(.c) Status;
 
 pub extern fn antfly_storage_owner_batch_json(
     owner: ?*anyopaque,

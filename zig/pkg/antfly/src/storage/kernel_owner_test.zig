@@ -89,6 +89,29 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     try std.testing.expect(std.mem.indexOf(u8, query_response.bytes(), "docs") != null);
     try std.testing.expect(std.mem.indexOf(u8, query_response.bytes(), "doc:a") != null);
     try std.testing.expect(std.mem.indexOf(u8, query_response.bytes(), "doc:b") != null);
+
+    try std.testing.expectError(
+        error.InvalidArgument,
+        owner.configure("articles", "", "{}"),
+    );
+    try owner.configure(
+        "docs",
+        "",
+        "{\"dense_idx\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":3}}",
+    );
+    var indexed_batch = try owner.batchJson(
+        "docs",
+        "{\"inserts\":{\"doc:c\":{\"title\":\"gamma\",\"_embeddings\":{\"dense_idx\":[1,0,0]}},\"doc:d\":{\"title\":\"delta\",\"_embeddings\":{\"dense_idx\":[0,1,0]}}},\"sync_level\":\"full_index\"}",
+    );
+    defer indexed_batch.deinit();
+    var dense_response = try owner.queryJson(
+        "docs",
+        "{\"embeddings\":{\"dense_idx\":[1,0,0]},\"indexes\":[\"dense_idx\"],\"limit\":2}",
+    );
+    defer dense_response.deinit();
+    const doc_c = std.mem.indexOf(u8, dense_response.bytes(), "doc:c") orelse return error.MissingDenseHit;
+    const doc_d = std.mem.indexOf(u8, dense_response.bytes(), "doc:d") orelse return error.MissingDenseHit;
+    try std.testing.expect(doc_c < doc_d);
 }
 
 test "opaque storage owner validates ABI and destruction is idempotent" {
@@ -105,6 +128,13 @@ test "opaque storage owner validates ABI and destruction is idempotent" {
     invalid.version = abi.abi_version + 1;
     try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_open(&invalid, &owner));
     try std.testing.expect(owner == null);
+
+    var invalid_configure: abi.ConfigureRequest = .{};
+    invalid_configure.version = abi.abi_version + 1;
+    try std.testing.expectEqual(
+        abi.Status.invalid_abi,
+        abi.antfly_storage_owner_configure(null, &invalid_configure),
+    );
 
     var response: abi.OwnedBytes = .{};
     var invalid_operation: abi.JsonOperationRequest = .{

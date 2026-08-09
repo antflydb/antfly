@@ -2043,6 +2043,103 @@ data, standalone/Lite, serverless, and the C API. The next experiment must
 therefore be an atomic physical-owner transfer inside the current co-generated
 application/storage topology, not another role regrouping.
 
+### Emitted-module attribution for the atomic owner cut
+
+The earlier compiler reports proved that distributed and storage loaded nearly
+the same physical graph, but the distributed object lacked named function/data
+sections and could not attribute its emitted bytes. A diagnostic-only cold
+build enabled section granularity for that object, preserving the same source
+graph and declarations. The profiling edit was reverted after the build.
+
+The distributed unit measured 368.184 seconds, including 360.321 seconds in
+LLVM, with the same 720 repository files, 41,930 declarations, 22,159 generic
+instances, and 14,483 inline calls as the exact 381.840-second baseline. The
+time difference is host variance and is not credited to section granularity.
+The emitted objects provide the useful result:
+
+| Object result | Distributed | Storage kernel |
+|---|---:|---:|
+| Allocatable bytes | 28,202,700 | 17,523,398 |
+| Text bytes | 23,992,432 | 14,186,004 |
+| Attributed Antfly modules | 361 | 175 |
+| Attributed Antfly bytes | 15,885,059 | 9,078,329 |
+
+Across those two objects, 172 Antfly modules were emitted twice, accounting
+for 8,650,546 duplicate allocatable bytes and 8,642,944 duplicate text bytes.
+The largest duplicate implementation modules were:
+
+| Module | Duplicate text bytes |
+|---|---:|
+| `storage.db.db` | 1,880,488 |
+| `storage.db.algebraic.index` | 977,408 |
+| `storage.db.catalog.index_manager` | 785,596 |
+| `storage.db.query.search_exec` | 472,764 |
+| `storage.db.enrichment.enrichment_runtime` | 434,832 |
+| `storage.db.aggregations` | 397,984 |
+
+Those six modules alone account for 4,949,072 duplicate text bytes. The
+distributed object also emits 617,028 text bytes from `api.table_writes` and
+588,892 from `api.table_reads`. This is authoritative machine-code evidence
+that the next win is the broad physical-source cut, not another import, status,
+or command-dispatch cleanup.
+
+Decision: use the existing process-scoped opaque owner and complete its
+operation surface before changing source selection. The next candidate is one
+atomic compile-time switch: the experimental distributed unit must select a
+control-only provisioned read/write composition whose local callbacks all enter
+the owner, while the legacy physical vtable, caches, DB opens, maintenance,
+snapshot, split/merge, and generation-transition implementations become
+unreachable together. Do not measure or enable a partially switched vtable.
+
+The remaining implementation checklist is intentionally grouped by ownership
+family rather than by file:
+
+1. schema, index, enrichment-configuration, table-create, and table-retirement
+   operations;
+2. explicit and automatic bulk-ingest lifecycle;
+3. transaction participation and recovery callbacks;
+4. artifact mutation, reprocessing, and repair;
+5. backup, restore staging/publication, and rollback;
+6. startup catch-up, compaction/flush, structural reconciliation, split/merge,
+   runtime-status publication, and generation transitions; and
+7. the final control-source selection that removes distributed-owned physical
+   caches/resources and the complete legacy local vtables in one build.
+
+Each family may land as tested ABI preparation, but the next cold compiler
+go/no-go checkpoint is item 7. If that switch does not remove the dominant
+modules above from distributed, the candidate must be revised or reverted
+rather than justified by loaded-file counts.
+
+### Phase 4a: resident catalog-contract reconfiguration
+
+The first prerequisite for ownership family 1 is now implemented behind
+storage-owner ABI version 11. A resident owner accepts one synchronous,
+borrowed table/schema/index contract and applies it to the same live DB used by
+reads, writes, Raft apply, HA replay, status, and snapshots. The distributed
+`ProvisionedKernelOwnerSource` reloads the authoritative catalog descriptor and
+reuses the existing owner lease, rather than opening a second physical DB or
+replacing the process-scoped owner.
+
+Focused Debug validation with linked runtime libraries, the production LSM
+backend, and the storage experiment enabled passed:
+
+- the opaque-owner suite: 3/3 tests, including invalid ABI/table rejection and
+  live dense-index reconfiguration;
+- the provisioned owner-source suite: 6/6 tests, including preservation of one
+  resident owner across reconfiguration and subsequent read/write/snapshot
+  operations;
+- the public C API regression suite: 10/10 tests; and
+- the graph-analyzer suite: 15/15 tests.
+
+This is accepted ABI preparation, not a compiler-time result and not yet the
+completion of ownership family 1. Reconfiguration intentionally schedules
+index work without synchronously draining a corpus-sized backfill. The owner
+still needs a bounded reconcile/repair operation, and the control source must
+route table creation, index/schema/enrichment changes, and retirement through
+that operation before the legacy structural vtable can become unreachable.
+Consequently no cold ReleaseFast improvement is claimed for this increment;
+the next cold checkpoint remains the atomic source switch in checklist item 7.
+
 ## Holistic target architecture
 
 The current candidate baseline is the four-unit topology above with serverless

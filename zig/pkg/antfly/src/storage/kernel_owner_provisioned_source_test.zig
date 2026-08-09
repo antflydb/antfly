@@ -190,6 +190,8 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
         .timestamp_ns = 4242,
         .sync_level = .full_index,
     });
+    try owner_source.reconcileTableGroup(7001, "articles");
+    try std.testing.expectEqual(@as(usize, 1), owner_source.ownerCountForTest());
 
     var replicated_descriptor = try owner_source.loadDescriptor(alloc, 7001, "articles");
     defer replicated_descriptor.deinit(alloc);

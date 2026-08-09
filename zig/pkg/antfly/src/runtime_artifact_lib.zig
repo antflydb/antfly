@@ -291,6 +291,7 @@ comptime {
             exportInternal(&storage_kernel_exports.storageOwnerContextDestroy, "antfly_storage_context_destroy");
             exportInternal(&storage_kernel_exports.storageOwnerOpen, "antfly_storage_owner_open");
             exportInternal(&storage_kernel_exports.storageOwnerClose, "antfly_storage_owner_close");
+            exportInternal(&storage_kernel_exports.storageOwnerConfigure, "antfly_storage_owner_configure");
             exportInternal(&storage_kernel_exports.storageOwnerBatchJson, "antfly_storage_owner_batch_json");
             exportInternal(&storage_kernel_exports.storageOwnerReplicatedBatchJson, "antfly_storage_owner_replicated_batch_json");
             exportInternal(&storage_kernel_exports.storageOwnerWaitForSync, "antfly_storage_owner_wait_for_sync");
