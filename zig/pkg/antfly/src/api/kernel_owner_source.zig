@@ -46,6 +46,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     catalog: table_catalog.CatalogSource,
     requester: read_gate.ReadableLeaseRequester,
     group_visible_root_generation: ?table_reads.GroupVisibleRootGenerationSource = null,
+    transaction_recovery_source: ?*table_writes.ProvisionedTableWriteSource = null,
     context: client.Context = .{},
     mutex: std.atomic.Mutex = .unlocked,
     entries: std.ArrayListUnmanaged(*Entry) = .empty,
@@ -132,6 +133,14 @@ pub const ProvisionedKernelOwnerSource = struct {
         return self;
     }
 
+    pub fn withTransactionRecoverySource(
+        self: *ProvisionedKernelOwnerSource,
+        source: ?*table_writes.ProvisionedTableWriteSource,
+    ) *ProvisionedKernelOwnerSource {
+        self.transaction_recovery_source = source;
+        return self;
+    }
+
     /// Call only after every attached read/write source has drained. Owner
     /// closure is deliberately centralized here so one live DB serves both
     /// operation families for its full group lifecycle.
@@ -178,6 +187,11 @@ pub const ProvisionedKernelOwnerSource = struct {
             .vtable = &.{
                 .batch = unsupportedTopLevelBatch,
                 .batch_group_local = batchGroupLocal,
+                .txn_begin_group_local = txnBeginGroupLocal,
+                .txn_prepare_group_local = txnPrepareGroupLocal,
+                .txn_resolve_group_local = txnResolveGroupLocal,
+                .txn_status_group_local = txnStatusGroupLocal,
+                .txn_acknowledge_group_local = txnAcknowledgeGroupLocal,
                 .begin_bulk_ingest_group_local = beginBulkIngestGroupLocal,
                 .finish_bulk_ingest_group_local = finishBulkIngestGroupLocal,
                 .abort_bulk_ingest_group_local = abortBulkIngestGroupLocal,
@@ -541,6 +555,96 @@ pub const ProvisionedKernelOwnerSource = struct {
         return try self.acquireDescriptor(group_id, table_name, descriptor.path, descriptor.view());
     }
 
+    fn transactionRecoveryStatus(err: anyerror) abi.Status {
+        return switch (err) {
+            error.TxnNotFound => .transaction_not_found,
+            error.Timeout => .timeout,
+            error.Canceled, error.Cancelled => .cancelled,
+            error.WouldBlock, error.StorageBusy, error.ResourceBudgetExceeded => .busy,
+            else => .internal,
+        };
+    }
+
+    fn transactionRecoveryResolve(
+        ptr: ?*anyopaque,
+        txn_id: *const abi.TxnId,
+        participant: abi.BorrowedBytes,
+        status: abi.TxnStatus,
+        commit_version: u64,
+    ) callconv(.c) abi.Status {
+        const source: *table_writes.ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr orelse return .invalid_argument));
+        source.storageOwnerResolveRecoveryParticipant(
+            txn_id.bytes,
+            participant.slice(),
+            switch (status) {
+                .pending => return .invalid_argument,
+                .committed => .committed,
+                .aborted => .aborted,
+            },
+            commit_version,
+        ) catch |err| return transactionRecoveryStatus(err);
+        return .ok;
+    }
+
+    fn transactionRecoveryOwns(
+        ptr: ?*anyopaque,
+        owner_participant: abi.BorrowedBytes,
+    ) callconv(.c) u8 {
+        const source: *table_writes.ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr orelse return 0));
+        return @intFromBool(source.storageOwnerOwnsTransactionRecovery(owner_participant.slice()));
+    }
+
+    fn transactionRecoveryAcknowledge(
+        ptr: ?*anyopaque,
+        txn_id: *const abi.TxnId,
+        owner_participant: abi.BorrowedBytes,
+        participant: abi.BorrowedBytes,
+    ) callconv(.c) abi.Status {
+        const source: *table_writes.ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr orelse return .invalid_argument));
+        source.storageOwnerAcknowledgeRecoveryParticipant(
+            txn_id.bytes,
+            owner_participant.slice(),
+            participant.slice(),
+        ) catch |err| return transactionRecoveryStatus(err);
+        return .ok;
+    }
+
+    fn transactionRecoveryCleanup(
+        ptr: ?*anyopaque,
+        txn_id: *const abi.TxnId,
+        owner_participant: abi.BorrowedBytes,
+        cutoff_timestamp: u64,
+        retained_cutoff_timestamp: u64,
+    ) callconv(.c) abi.Status {
+        const source: *table_writes.ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr orelse return .invalid_argument));
+        source.storageOwnerCleanupRecoveryTransaction(
+            txn_id.bytes,
+            owner_participant.slice(),
+            cutoff_timestamp,
+            retained_cutoff_timestamp,
+        ) catch |err| return transactionRecoveryStatus(err);
+        return .ok;
+    }
+
+    fn transactionRecoveryConfig(self: *ProvisionedKernelOwnerSource) abi.TransactionRecoveryConfig {
+        const source = self.transaction_recovery_source orelse return .{};
+        const options = source.storageOwnerTransactionRecoveryOptions();
+        if (!options.enabled) return .{};
+        return .{
+            .enabled = 1,
+            .lease_owned = @intFromBool(options.lease_owned),
+            .replicated_metadata = @intFromBool(options.replicated_metadata),
+            .interval_ms = options.interval_ms,
+            .cutoff_ns = options.cutoff_ns,
+            .callback_ctx = source,
+            .owner_id = .fromSlice(options.owner_id),
+            .resolve_participant_fn = transactionRecoveryResolve,
+            .owns_recovery_fn = if (options.replicated_metadata) transactionRecoveryOwns else null,
+            .acknowledge_participant_fn = if (options.replicated_metadata) transactionRecoveryAcknowledge else null,
+            .cleanup_transaction_fn = if (options.replicated_metadata) transactionRecoveryCleanup else null,
+        };
+    }
+
     fn acquireDescriptor(
         self: *ProvisionedKernelOwnerSource,
         group_id: u64,
@@ -576,6 +680,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .context = self.context.handle,
             .path = abi.BorrowedBytes.fromSlice(path),
             .table_name = abi.BorrowedBytes.fromSlice(table_name),
+            .group_id = group_id,
             .lsm_root_generation = descriptor.lsm_root_generation,
             .has_identity_namespace = 1,
             .identity_table_id = descriptor.identity.table_id,
@@ -583,6 +688,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .identity_range_id = descriptor.identity.range_id,
             .schema_json = .fromSlice(descriptor.schema_json),
             .indexes_json = .fromSlice(descriptor.indexes_json),
+            .transaction_recovery = self.transactionRecoveryConfig(),
         });
         errdefer owner.deinit();
         entry.* = .{
@@ -864,6 +970,130 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer lease.deinit();
         var response = try lease.owner().batchJson(table_name, request_json);
         defer response.deinit();
+        return {};
+    }
+
+    fn applyTransactionGroupLocal(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_types.BatchRequest,
+    ) !void {
+        const request_json = try table_writes.encodeStorageKernelBatchRequest(alloc, req);
+        defer alloc.free(request_json);
+        var lease = try self.acquire(group_id, table_name);
+        defer lease.deinit();
+        var response = try lease.owner().replicatedBatchJson(table_name, request_json);
+        defer response.deinit();
+    }
+
+    fn txnBeginGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_types.TxnId,
+        begin_timestamp: u64,
+        topology_epoch: u64,
+        retain_terminal: bool,
+        participants: []const []const u8,
+    ) !?void {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        try self.applyTransactionGroupLocal(alloc, group_id, table_name, .{
+            .transaction = .{ .begin = .{
+                .txn_id = txn_id,
+                .begin_timestamp = begin_timestamp,
+                .created_at_ns = platform_time.realtimeNs(),
+                .topology_epoch = topology_epoch,
+                .retain_terminal = retain_terminal,
+                .participants = participants,
+            } },
+        });
+        return {};
+    }
+
+    fn txnPrepareGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_types.TxnId,
+        topology_epoch: u64,
+        req: db_types.TransactionIntentRequest,
+    ) !?void {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        comptime std.debug.assert(@sizeOf(db_types.TransactionWrite) == @sizeOf(db_types.BatchWrite));
+        comptime std.debug.assert(@alignOf(db_types.TransactionWrite) == @alignOf(db_types.BatchWrite));
+        const writes: []const db_types.BatchWrite = @ptrCast(req.writes);
+        try self.applyTransactionGroupLocal(alloc, group_id, table_name, .{
+            .writes = writes,
+            .deletes = req.deletes,
+            .transforms = req.transforms,
+            .predicates = req.predicates,
+            .transaction = .{ .prepare = .{
+                .txn_id = txn_id,
+                .topology_epoch = topology_epoch,
+            } },
+        });
+        return {};
+    }
+
+    fn txnResolveGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_types.TxnId,
+        status: db_types.TxnStatus,
+        commit_version: u64,
+        _: u64,
+        sync_level: db_types.SyncLevel,
+    ) !?void {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        try self.applyTransactionGroupLocal(alloc, group_id, table_name, .{
+            .sync_level = sync_level,
+            .transaction = .{ .resolve = .{
+                .txn_id = txn_id,
+                .status = status,
+                .commit_version = commit_version,
+            } },
+        });
+        return {};
+    }
+
+    fn txnStatusGroupLocal(
+        ptr: *anyopaque,
+        _: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_types.TxnId,
+    ) !?db_types.TxnStatus {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        var lease = try self.acquire(group_id, table_name);
+        defer lease.deinit();
+        return switch (try lease.owner().transactionStatus(table_name, txn_id)) {
+            .pending => .pending,
+            .committed => .committed,
+            .aborted => .aborted,
+        };
+    }
+
+    fn txnAcknowledgeGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_types.TxnId,
+        participant: []const u8,
+    ) !?void {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        try self.applyTransactionGroupLocal(alloc, group_id, table_name, .{
+            .transaction = .{ .acknowledge = .{
+                .txn_id = txn_id,
+                .participant = participant,
+            } },
+        });
         return {};
     }
 

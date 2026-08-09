@@ -5031,6 +5031,71 @@ pub const ProvisionedTableWriteSource = struct {
         return self;
     }
 
+    pub const StorageOwnerTransactionRecoveryOptions = struct {
+        enabled: bool = false,
+        lease_owned: bool = false,
+        replicated_metadata: bool = false,
+        owner_id: []const u8 = "provisioned-2pc",
+        interval_ms: u64 = 5_000,
+        cutoff_ns: u64 = 5 * std.time.ns_per_min,
+    };
+
+    pub fn storageOwnerTransactionRecoveryOptions(
+        self: *ProvisionedTableWriteSource,
+    ) StorageOwnerTransactionRecoveryOptions {
+        const cfg = self.transactionRecoveryConfig();
+        return .{
+            .enabled = cfg.enabled,
+            .lease_owned = cfg.lease_owned,
+            .replicated_metadata = cfg.replicated_metadata,
+            .owner_id = cfg.owner_id,
+            .interval_ms = cfg.interval_ms,
+            .cutoff_ns = cfg.cutoff_ns,
+        };
+    }
+
+    pub fn storageOwnerOwnsTransactionRecovery(
+        self: *ProvisionedTableWriteSource,
+        owner_participant: []const u8,
+    ) bool {
+        return ownsRecovery(self, owner_participant);
+    }
+
+    pub fn storageOwnerResolveRecoveryParticipant(
+        self: *ProvisionedTableWriteSource,
+        txn_id: db_mod.types.TxnId,
+        participant: []const u8,
+        status: db_mod.types.TxnStatus,
+        commit_version: u64,
+    ) !void {
+        try resolveRecoveryParticipant(self, txn_id, participant, status, commit_version);
+    }
+
+    pub fn storageOwnerAcknowledgeRecoveryParticipant(
+        self: *ProvisionedTableWriteSource,
+        txn_id: db_mod.types.TxnId,
+        owner_participant: []const u8,
+        participant: []const u8,
+    ) !void {
+        try acknowledgeRecoveryParticipant(self, txn_id, owner_participant, participant);
+    }
+
+    pub fn storageOwnerCleanupRecoveryTransaction(
+        self: *ProvisionedTableWriteSource,
+        txn_id: db_mod.types.TxnId,
+        owner_participant: []const u8,
+        cutoff_timestamp: u64,
+        retained_cutoff_timestamp: u64,
+    ) !void {
+        try cleanupRecoveryTransaction(
+            self,
+            txn_id,
+            owner_participant,
+            cutoff_timestamp,
+            retained_cutoff_timestamp,
+        );
+    }
+
     fn transactionRecoveryConfig(self: *ProvisionedTableWriteSource) db_mod.transaction_runtime.Config {
         const backend_runtime = self.backend_runtime orelse return .{};
         if (backend_runtime.io() == null or self.quiesced) return .{};
@@ -13684,6 +13749,17 @@ pub const ProvisionedTableWriteSource = struct {
             });
             return {};
         }
+        if (self.groupLocalWriteSource()) |owner|
+            return try owner.txnBeginGroupLocal(
+                alloc,
+                group_id,
+                table_name,
+                txn_id,
+                begin_timestamp,
+                topology_epoch,
+                retain_terminal,
+                participants,
+            );
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         if (self.write_cache) |cache| {
@@ -13740,6 +13816,15 @@ pub const ProvisionedTableWriteSource = struct {
             });
             return {};
         }
+        if (self.groupLocalWriteSource()) |owner|
+            return try owner.txnPrepareGroupLocal(
+                alloc,
+                group_id,
+                table_name,
+                txn_id,
+                topology_epoch,
+                req,
+            );
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         if (self.write_cache) |cache| {
@@ -13804,6 +13889,27 @@ pub const ProvisionedTableWriteSource = struct {
                 self.invalidateWriteCache(table_name);
             }
         }
+        if (self.groupLocalWriteSource()) |owner| {
+            if ((try owner.txnResolveGroupLocal(
+                alloc,
+                group_id,
+                table_name,
+                txn_id,
+                status,
+                commit_version,
+                topology_epoch,
+                sync_level,
+            )) == null) return null;
+            if (status == .committed) {
+                lockAtomic(&self.local_db_mutex);
+                self.markWriteCacheDirty(table_name);
+                self.invalidateReadCache(table_name);
+                self.local_db_mutex.unlock();
+                self.publishDirtyWriteCacheRuntimeStatusesBestEffort(alloc, table_name);
+                self.notifyLocalChange(table_name, .data);
+            }
+            return {};
+        }
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         if (self.write_cache) |cache| {
@@ -13851,6 +13957,8 @@ pub const ProvisionedTableWriteSource = struct {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         self.beginGroupOperation(table_name, group_id);
         defer self.endGroupOperation(table_name, group_id);
+        if (self.groupLocalWriteSource()) |owner|
+            return try owner.txnStatusGroupLocal(alloc, group_id, table_name, txn_id);
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         if (self.write_cache) |cache| {
@@ -13884,6 +13992,14 @@ pub const ProvisionedTableWriteSource = struct {
         }
         self.beginGroupOperation(table_name, group_id);
         defer self.endGroupOperation(table_name, group_id);
+        if (self.groupLocalWriteSource()) |owner|
+            return try owner.txnAcknowledgeGroupLocal(
+                alloc,
+                group_id,
+                table_name,
+                txn_id,
+                participant,
+            );
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         if (self.write_cache) |cache| {
@@ -16482,6 +16598,24 @@ fn applyGroupBatchUnchecked(
         .sync_level = req.sync_level,
     });
     if (shouldDrainManagedDbAfterBatch(req.sync_level)) try drainManagedDbBeforeClose(db);
+}
+
+/// Apply one already-committed storage-owner command using only persisted local
+/// schema and the replicated envelope. Distributed routing and topology checks
+/// stay on the caller side of the compiled boundary.
+pub fn applyStorageKernelReplicatedBatch(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    table_name: []const u8,
+    group_id: u64,
+    req: db_mod.types.BatchRequest,
+) !void {
+    try validateTableBatchAgainstLocalSchema(alloc, db, req.writes, req.deletes, req.transforms);
+    runTestBeforeBatchExecutionHook();
+    if (req.transaction != null)
+        try applyReplicatedTransactionMutation(alloc, db, table_name, group_id, req)
+    else
+        try db.batchReplicatedApply(req);
 }
 
 fn applyReplicatedTransactionMutation(

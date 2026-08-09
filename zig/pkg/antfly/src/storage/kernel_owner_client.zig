@@ -154,6 +154,24 @@ pub const Owner = struct {
         return response;
     }
 
+    pub fn transactionStatus(
+        self: *Owner,
+        table_name: []const u8,
+        txn_id: [16]u8,
+    ) !abi.TxnStatus {
+        var result: abi.TransactionStatusResult = .{};
+        try statusToError(abi.antfly_storage_owner_transaction_status(
+            self.handle,
+            &.{
+                .table_name = .fromSlice(table_name),
+                .txn_id = .{ .bytes = txn_id },
+            },
+            &result,
+        ));
+        if (result.version != abi.abi_version) return error.InvalidAbi;
+        return result.status;
+    }
+
     pub fn waitForSync(self: *Owner, table_name: []const u8, sync_level: abi.SyncLevel) !void {
         try statusToError(abi.antfly_storage_owner_wait_for_sync(
             self.handle,

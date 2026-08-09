@@ -2244,6 +2244,66 @@ does not change the intentionally disabled automatic-window policy. As with the
 preceding lifecycle slices, no cold compiler improvement is claimed before the
 atomic source-selection checkpoint.
 
+### Phase 4e: transaction participation and recovery
+
+Storage-owner ABI version 14 moves group-local transaction begin, prepare,
+resolve, status, acknowledgement, and background recovery behind the resident
+owner. Distributed control retains topology-epoch validation, transition
+admission, HA write gating, Raft proposal, leadership ownership, and participant
+routing. Transaction intent validation, durable records, local resolution,
+participant acknowledgement, cleanup, and document/index publication remain
+one coarse physical operation inside the compiled storage unit.
+
+This slice also fixes a correctness hole in the earlier experimental Raft apply
+path. The owner parsed the internal `_transaction` envelope but passed every
+request to `DB.batchReplicatedApply`, whose ordinary batch path does not execute
+transaction mutations. The new storage-kernel replicated-batch entry point
+validates against the persisted local schema and dispatches transaction
+envelopes to the same durable implementation used by the legacy apply path.
+Committed Raft transaction commands therefore can no longer be accepted while
+silently leaving their transaction phase unapplied.
+
+The owner open request now carries the real logical group ID separately from
+the document-identity shard and a versioned recovery callback table. A live
+owner owns a copied callback configuration and owner ID for exactly as long as
+its DB recovery worker can invoke them. Local recovery resolution stays inside
+the DB; remote resolution, replicated acknowledgement/cleanup, and leadership
+ownership synchronously call back into distributed control through borrowed
+participant identifiers. Owner shutdown stops the DB worker before releasing
+that callback state or the distributed write source.
+
+Warm Debug validation with normal concurrency, linked runtime libraries, the
+production LSM backend, and the storage experiment enabled passed:
+
+- opaque owner ABI: 4/4, including replicated begin/prepare/commit visibility,
+  status, validation, and a real background recovery callback crossing the
+  archive boundary before durable cleanup;
+- provisioned cross-archive owner source: 6/6, including a full transaction
+  lifecycle through the routing-aware source and the same single resident
+  owner used by reads and ordinary writes;
+- DataServer process-owner composition: 12/12;
+- public C API: 10/10;
+- complete linked Debug artifacts with the experiment both enabled and
+  disabled;
+- all runtime/codegen/API graph gates plus the 15/15 analyzer suite; and
+- symbol inspection: `antfly_storage_owner_transaction_status` and the
+  replicated-batch entry point are present in the storage archive, all
+  internal owner/runtime symbols remain absent from public C API exports, and
+  no production LMDB implementation symbol is present.
+
+The DataServer composition gate also exposed an existing LSM-only startup bug:
+the linked production role compiled LMDB out but still tried to open the legacy
+LMDB restore-job registry. LSM-only roles now retain the server's in-memory
+registry instead of failing startup. Durable restore-job persistence belongs in
+the later storage-owner restore/maintenance family; it must not reintroduce
+LMDB into the production artifact.
+
+Decision: keep this as ownership-family 3 preparation. It closes both the
+direct and Raft-applied transaction paths and preserves recovery semantics
+without fine-grained ABI crossings. No cold ReleaseFast result is credited
+until the atomic control-source selection removes the legacy transaction and
+physical DB implementations from distributed codegen.
+
 ## Holistic target architecture
 
 The current candidate baseline is the four-unit topology above with serverless

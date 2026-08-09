@@ -4196,6 +4196,7 @@ pub const DataServer = struct {
             self.read_source.requester,
         );
         _ = owner_source.withGroupVisibleRootGeneration(self.provisioned_storage.groupVisibleRootGenerationSource());
+        _ = owner_source.withTransactionRecoverySource(&self.write_source);
         _ = self.read_source.withLocalReadSource(owner_source.readSource());
         self.read_source.resident_db = null;
         _ = self.write_source.withLocalWriteSource(owner_source.writeSource());
@@ -4213,13 +4214,20 @@ pub const DataServer = struct {
         // Filesystem-backed runtimes keep API job state beside their shard
         // catalog by default. Lite overrides this after construction with an
         // engine namespace so its artifact remains genuinely single-file.
-        if (api_server_cfg.restore_job_store_path == null and
-            api_server_cfg.session_store_path == null and
-            api_server_cfg.session_store == null and
-            api_server_cfg.deployment_mode != .serverless)
-        {
-            owned_restore_job_store_path = try std.fmt.allocPrint(self.alloc, "{s}/api-restore-jobs", .{self.write_source.replica_root_dir});
-            api_server_cfg.restore_job_store_path = owned_restore_job_store_path;
+        if (comptime build_options.lmdb_enabled) {
+            if (api_server_cfg.restore_job_store_path == null and
+                api_server_cfg.session_store_path == null and
+                api_server_cfg.session_store == null and
+                api_server_cfg.deployment_mode != .serverless)
+            {
+                owned_restore_job_store_path = try std.fmt.allocPrint(self.alloc, "{s}/api-restore-jobs", .{self.write_source.replica_root_dir});
+                api_server_cfg.restore_job_store_path = owned_restore_job_store_path;
+            }
+        } else {
+            // Linked production roles intentionally compile LMDB out. Until
+            // this registry moves behind the resident LSM storage-owner ABI,
+            // retain the server's in-memory restore-job registry instead of
+            // trying to open an unavailable legacy backend at startup.
         }
         api_server_cfg.shard_ops = self.localShardOperationAdapter();
         api_server_cfg.shard_db_adapter = self.localShardDbAdapter();

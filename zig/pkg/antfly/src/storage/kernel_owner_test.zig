@@ -30,6 +30,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     var owner = try client.Owner.open(.{
         .path = .fromSlice(path),
         .table_name = .fromSlice("docs"),
+        .group_id = 7001,
         .lsm_root_generation = 0,
         .has_identity_namespace = 1,
         .identity_table_id = 7,
@@ -79,6 +80,25 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
         .previous_lsn = 0,
     });
 
+    const txn_id: [16]u8 = .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+    var txn_begin = try owner.replicatedBatchJson(
+        "docs",
+        "{\"_transaction\":{\"phase\":\"begin\",\"txn_id\":\"000102030405060708090a0b0c0d0e0f\",\"begin_timestamp\":\"42\",\"created_at_ns\":\"43\",\"topology_epoch\":\"7\",\"participants\":[\"table2:00000004:docs:7001\"]},\"sync_level\":\"write\"}",
+    );
+    defer txn_begin.deinit();
+    try std.testing.expectEqual(abi.TxnStatus.pending, try owner.transactionStatus("docs", txn_id));
+    var txn_prepare = try owner.replicatedBatchJson(
+        "docs",
+        "{\"inserts\":{\"doc:txn\":{\"title\":\"transactional\"}},\"_transaction\":{\"phase\":\"prepare\",\"txn_id\":\"000102030405060708090a0b0c0d0e0f\",\"topology_epoch\":\"7\"},\"sync_level\":\"write\"}",
+    );
+    defer txn_prepare.deinit();
+    var txn_resolve = try owner.replicatedBatchJson(
+        "docs",
+        "{\"_transaction\":{\"phase\":\"resolve\",\"txn_id\":\"000102030405060708090a0b0c0d0e0f\",\"status\":\"committed\",\"commit_version\":\"44\"},\"sync_level\":\"full_index\"}",
+    );
+    defer txn_resolve.deinit();
+    try std.testing.expectEqual(abi.TxnStatus.committed, try owner.transactionStatus("docs", txn_id));
+
     const query_json =
         \\{"query":{"match_all":{}},"limit":10}
     ;
@@ -89,6 +109,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     try std.testing.expect(std.mem.indexOf(u8, query_response.bytes(), "docs") != null);
     try std.testing.expect(std.mem.indexOf(u8, query_response.bytes(), "doc:a") != null);
     try std.testing.expect(std.mem.indexOf(u8, query_response.bytes(), "doc:b") != null);
+    try std.testing.expect(std.mem.indexOf(u8, query_response.bytes(), "doc:txn") != null);
 
     var reconciled = false;
     for (0..64) |_| {
@@ -205,6 +226,14 @@ test "opaque storage owner validates ABI and destruction is idempotent" {
         abi.Status.invalid_abi,
         abi.antfly_storage_owner_bulk_abort(null, &invalid_table),
     );
+    var invalid_txn_status: abi.TransactionStatusRequest = .{};
+    invalid_txn_status.version = abi.abi_version + 1;
+    var txn_status_result: abi.TransactionStatusResult = .{};
+    try std.testing.expectEqual(
+        abi.Status.invalid_abi,
+        abi.antfly_storage_owner_transaction_status(null, &invalid_txn_status, &txn_status_result),
+    );
+    try std.testing.expectEqual(abi.abi_version, txn_status_result.version);
     var invalid_bulk_finish: abi.BulkFinishRequest = .{};
     invalid_bulk_finish.version = abi.abi_version + 1;
     try std.testing.expectEqual(
@@ -297,6 +326,82 @@ test "opaque storage owner validates ABI and destruction is idempotent" {
     var empty: abi.OwnedBytes = .{};
     abi.antfly_storage_owner_buffer_destroy(&empty);
     abi.antfly_storage_owner_buffer_destroy(&empty);
+}
+
+test "opaque storage owner transaction recovery crosses callback ABI" {
+    const path = "/tmp/antfly-storage-kernel-owner-transaction-recovery";
+    cleanup(path);
+    defer cleanup(path);
+
+    const Capture = struct {
+        calls: std.atomic.Value(u32) = .init(0),
+
+        fn resolve(
+            ptr: ?*anyopaque,
+            txn_id: *const abi.TxnId,
+            participant: abi.BorrowedBytes,
+            status: abi.TxnStatus,
+            commit_version: u64,
+        ) callconv(.c) abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(ptr orelse return .invalid_argument));
+            const expected_txn_id: [16]u8 = @splat(0x2a);
+            if (!std.mem.eql(u8, &txn_id.bytes, &expected_txn_id) or
+                !std.mem.eql(u8, participant.slice(), "table2:00000006:remote:9002") or
+                status != .committed or commit_version != 102)
+                return .invalid_argument;
+            _ = self.calls.fetchAdd(1, .release);
+            return .ok;
+        }
+    };
+    var capture = Capture{};
+    var owner = try client.Owner.open(.{
+        .path = .fromSlice(path),
+        .table_name = .fromSlice("docs"),
+        .group_id = 9001,
+        .transaction_recovery = .{
+            .enabled = 1,
+            .lease_owned = 1,
+            .interval_ms = 10,
+            .cutoff_ns = 1,
+            .callback_ctx = &capture,
+            .owner_id = .fromSlice("owner-test"),
+            .resolve_participant_fn = Capture.resolve,
+        },
+    });
+    defer owner.deinit();
+
+    const txn_id: [16]u8 = @splat(0x2a);
+    var begin = try owner.replicatedBatchJson(
+        "docs",
+        "{\"_transaction\":{\"phase\":\"begin\",\"txn_id\":\"2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a\",\"begin_timestamp\":\"100\",\"created_at_ns\":\"1\",\"topology_epoch\":\"0\",\"participants\":[\"table2:00000004:docs:9001\",\"table2:00000006:remote:9002\"]},\"sync_level\":\"write\"}",
+    );
+    begin.deinit();
+    var resolve = try owner.replicatedBatchJson(
+        "docs",
+        "{\"_transaction\":{\"phase\":\"resolve\",\"txn_id\":\"2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a\",\"status\":\"committed\",\"commit_version\":\"102\"},\"sync_level\":\"write\"}",
+    );
+    resolve.deinit();
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    for (0..500) |_| {
+        if (capture.calls.load(.acquire) > 0) break;
+        try io_impl.io().sleep(.fromMilliseconds(2), .awake);
+    }
+    try std.testing.expectEqual(@as(u32, 1), capture.calls.load(.acquire));
+
+    var cleaned = false;
+    for (0..500) |_| {
+        _ = owner.transactionStatus("docs", txn_id) catch |err| {
+            if (err == error.TxnNotFound) {
+                cleaned = true;
+                break;
+            }
+            return err;
+        };
+        try io_impl.io().sleep(.fromMilliseconds(2), .awake);
+    }
+    try std.testing.expect(cleaned);
 }
 
 test "opaque storage context enforces owner lifetime and shares process storage state" {

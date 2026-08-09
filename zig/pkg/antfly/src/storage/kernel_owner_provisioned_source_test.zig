@@ -164,6 +164,7 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
     var write_source = table_writes.ProvisionedTableWriteSource.init(replica_root, catalog.iface());
     var write_source_active = true;
     defer if (write_source_active) write_source.deinit();
+    _ = owner_source.withTransactionRecoverySource(&write_source);
     _ = write_source.withLocalWriteSource(owner_source.writeSource());
     _ = write_source.withStorageSnapshotSource(owner_source.snapshotSource());
     _ = write_source.withGroupVisibleRootGeneration(generations.iface());
@@ -193,6 +194,55 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
         .timestamp_ns = 4242,
         .sync_level = .full_index,
     });
+    const txn_id: db_mod.types.TxnId = .{ 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0 };
+    const txn_participant = "table2:00000008:articles:7001";
+    try std.testing.expect((try write_source.source().txnBeginGroupLocal(
+        alloc,
+        7001,
+        "articles",
+        txn_id,
+        5_000,
+        0,
+        true,
+        &.{txn_participant},
+    )) != null);
+    try std.testing.expectEqual(
+        db_mod.types.TxnStatus.pending,
+        (try write_source.source().txnStatusGroupLocal(alloc, 7001, "articles", txn_id)).?,
+    );
+    try std.testing.expect((try write_source.source().txnPrepareGroupLocal(
+        alloc,
+        7001,
+        "articles",
+        txn_id,
+        0,
+        .{ .writes = &.{.{
+            .key = "doc:txn",
+            .value = "{\"title\":\"transactional\",\"category\":\"news\",\"amount\":30}",
+        }} },
+    )) != null);
+    try std.testing.expect((try write_source.source().txnResolveGroupLocal(
+        alloc,
+        7001,
+        "articles",
+        txn_id,
+        .committed,
+        5_001,
+        0,
+        .full_index,
+    )) != null);
+    try std.testing.expect((try write_source.source().txnAcknowledgeGroupLocal(
+        alloc,
+        7001,
+        "articles",
+        txn_id,
+        txn_participant,
+    )) != null);
+    try std.testing.expectEqual(
+        db_mod.types.TxnStatus.committed,
+        (try write_source.source().txnStatusGroupLocal(alloc, 7001, "articles", txn_id)).?,
+    );
+    try std.testing.expectEqual(@as(usize, 1), owner_source.ownerCountForTest());
     try std.testing.expect((try write_source.source().beginBulkIngest(alloc, "articles")) != null);
     try std.testing.expect((try write_source.source().beginBulkIngest(alloc, "articles")) != null);
     _ = try write_source.source().batch(alloc, "articles", .{
@@ -266,6 +316,10 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
     try std.testing.expectEqual(@as(u64, 4242), lookup.version);
     try std.testing.expect(std.mem.indexOf(u8, lookup.json, "alpha") != null);
     try std.testing.expect(std.mem.indexOf(u8, lookup.json, "dense_idx") == null);
+
+    var txn_lookup = (try read_source.source().lookup(alloc, "articles", "doc:txn", .{}, .read_index)).?;
+    defer txn_lookup.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, txn_lookup.json, "transactional") != null);
 
     try std.testing.expect((try read_source.source().lookup(
         alloc,
@@ -347,7 +401,7 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
     switch (text_stats) {
         .fields => |fields| {
             try std.testing.expectEqual(@as(usize, 1), fields.fields.len);
-            try std.testing.expectEqual(@as(u32, 3), fields.fields[0].global_doc_count);
+            try std.testing.expectEqual(@as(u32, 4), fields.fields[0].global_doc_count);
             try std.testing.expectEqual(@as(u32, 1), fields.fields[0].term_doc_freqs[0].doc_freq);
         },
         .background_fields => return error.UnexpectedBackgroundTextStats,
@@ -516,14 +570,14 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
     );
 
     try std.testing.expectEqual(@as(usize, 1), owner_source.ownerCountForTest());
-    try std.testing.expectEqual(@as(usize, 14), lease_capture.count);
+    try std.testing.expectEqual(@as(usize, 15), lease_capture.count);
     try std.testing.expectEqual(@as(u64, 7001), lease_capture.last_group_id);
 
     var statuses = (try write_source.source().localRuntimeStatuses(alloc, "articles")).?;
     defer statuses.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
     try std.testing.expectEqual(@as(u64, 7001), statuses.items[0].group_id);
-    try std.testing.expectEqual(@as(u64, 3), statuses.items[0].stats.doc_count);
+    try std.testing.expectEqual(@as(u64, 4), statuses.items[0].stats.doc_count);
     try std.testing.expectEqual(.live_writer_publish, statuses.items[0].metadata.source);
     try std.testing.expectEqual(.fresh, statuses.items[0].metadata.freshness);
     try std.testing.expect(statuses.items[0].lsm_storage_stats != null);
@@ -540,7 +594,7 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
     defer reopened_lookup.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, reopened_lookup.json, "beta") != null);
     try std.testing.expectEqual(@as(usize, 1), owner_source.ownerCountForTest());
-    try std.testing.expectEqual(@as(usize, 15), lease_capture.count);
+    try std.testing.expectEqual(@as(usize, 16), lease_capture.count);
 
     const accepted_snapshot = try shard_state_store.encodeGroupStateSnapshot(
         alloc,

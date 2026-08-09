@@ -15,7 +15,7 @@
 //! Versioned internal ABI for the storage kernel's live DB owner. Keep this
 //! module free of storage and distributed-runtime imports.
 
-pub const abi_version: u32 = 13;
+pub const abi_version: u32 = 14;
 
 pub const BorrowedBytes = extern struct {
     ptr: ?[*]const u8 = null,
@@ -49,6 +49,16 @@ pub const VersionedOwnedBytes = extern struct {
     version: u64 = 0,
 };
 
+pub const TxnId = extern struct {
+    bytes: [16]u8 = @splat(0),
+};
+
+pub const TxnStatus = enum(u32) {
+    pending = 0,
+    committed = 1,
+    aborted = 2,
+};
+
 pub const Status = enum(u32) {
     ok = 0,
     invalid_abi = 1,
@@ -80,12 +90,53 @@ pub const ContextRequest = extern struct {
     _reserved0: u32 = 0,
 };
 
+pub const TransactionRecoveryResolveFn = *const fn (
+    ?*anyopaque,
+    *const TxnId,
+    BorrowedBytes,
+    TxnStatus,
+    u64,
+) callconv(.c) Status;
+pub const TransactionRecoveryOwnsFn = *const fn (?*anyopaque, BorrowedBytes) callconv(.c) u8;
+pub const TransactionRecoveryAcknowledgeFn = *const fn (
+    ?*anyopaque,
+    *const TxnId,
+    BorrowedBytes,
+    BorrowedBytes,
+) callconv(.c) Status;
+pub const TransactionRecoveryCleanupFn = *const fn (
+    ?*anyopaque,
+    *const TxnId,
+    BorrowedBytes,
+    u64,
+    u64,
+) callconv(.c) Status;
+
+/// Distributed control callbacks retained by a live owner for transaction
+/// recovery. Callback byte slices are borrowed only for each synchronous call.
+pub const TransactionRecoveryConfig = extern struct {
+    enabled: u8 = 0,
+    lease_owned: u8 = 0,
+    replicated_metadata: u8 = 0,
+    _reserved0: u8 = 0,
+    _reserved1: u32 = 0,
+    interval_ms: u64 = 30_000,
+    cutoff_ns: u64 = 5 * 60 * 1_000_000_000,
+    callback_ctx: ?*anyopaque = null,
+    owner_id: BorrowedBytes = .{},
+    resolve_participant_fn: ?TransactionRecoveryResolveFn = null,
+    owns_recovery_fn: ?TransactionRecoveryOwnsFn = null,
+    acknowledge_participant_fn: ?TransactionRecoveryAcknowledgeFn = null,
+    cleanup_transaction_fn: ?TransactionRecoveryCleanupFn = null,
+};
+
 pub const OpenRequest = extern struct {
     version: u32 = abi_version,
     _reserved0: u32 = 0,
     context: ?*anyopaque = null,
     path: BorrowedBytes = .{},
     table_name: BorrowedBytes = .{},
+    group_id: u64 = 0,
     lsm_root_generation: u64 = 0,
     has_identity_namespace: u8 = 0,
     _reserved1: [7]u8 = @splat(0),
@@ -94,6 +145,7 @@ pub const OpenRequest = extern struct {
     identity_range_id: u64 = 0,
     schema_json: BorrowedBytes = .{},
     indexes_json: BorrowedBytes = .{},
+    transaction_recovery: TransactionRecoveryConfig = .{},
 };
 
 pub const JsonOperationRequest = extern struct {
@@ -152,6 +204,18 @@ pub const TableRequest = extern struct {
     version: u32 = abi_version,
     _reserved0: u32 = 0,
     table_name: BorrowedBytes = .{},
+};
+
+pub const TransactionStatusRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved0: u32 = 0,
+    table_name: BorrowedBytes = .{},
+    txn_id: TxnId = .{},
+};
+
+pub const TransactionStatusResult = extern struct {
+    version: u32 = abi_version,
+    status: TxnStatus = .pending,
 };
 
 pub const BulkProgressPhase = enum(u32) {
@@ -318,6 +382,12 @@ pub extern fn antfly_storage_owner_replicated_batch_json(
     owner: ?*anyopaque,
     request: *const JsonOperationRequest,
     out_response: *OwnedBytes,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_owner_transaction_status(
+    owner: ?*anyopaque,
+    request: *const TransactionStatusRequest,
+    out_result: *TransactionStatusResult,
 ) callconv(.c) Status;
 
 pub extern fn antfly_storage_owner_wait_for_sync(

@@ -91,6 +91,113 @@ const StorageOwnerContext = struct {
     }
 };
 
+const StorageOwnerTransactionRecovery = struct {
+    alloc: Allocator,
+    config: kernel_owner_abi.TransactionRecoveryConfig,
+    owner_id: []u8,
+
+    fn init(
+        alloc: Allocator,
+        config: kernel_owner_abi.TransactionRecoveryConfig,
+    ) !StorageOwnerTransactionRecovery {
+        return .{
+            .alloc = alloc,
+            .config = config,
+            .owner_id = try alloc.dupe(u8, config.owner_id.slice()),
+        };
+    }
+
+    fn deinit(self: *StorageOwnerTransactionRecovery) void {
+        self.alloc.free(self.owner_id);
+        self.* = undefined;
+    }
+
+    fn callbackStatus(status: kernel_owner_abi.Status) !void {
+        if (status != .ok) return error.StorageKernelRecoveryCallbackFailed;
+    }
+
+    fn resolveParticipant(
+        ptr: *anyopaque,
+        txn_id: transactions_mod.TxnId,
+        participant: []const u8,
+        status: transactions_mod.TxnStatus,
+        commit_version: u64,
+    ) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const callback = self.config.resolve_participant_fn orelse return error.MissingParticipantResolver;
+        const abi_txn_id = kernel_owner_abi.TxnId{ .bytes = txn_id };
+        try callbackStatus(callback(
+            self.config.callback_ctx,
+            &abi_txn_id,
+            .fromSlice(participant),
+            switch (status) {
+                .pending => .pending,
+                .committed => .committed,
+                .aborted => .aborted,
+            },
+            commit_version,
+        ));
+    }
+
+    fn ownsRecovery(ptr: *anyopaque, owner_participant: []const u8) bool {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const callback = self.config.owns_recovery_fn orelse return false;
+        return callback(self.config.callback_ctx, .fromSlice(owner_participant)) != 0;
+    }
+
+    fn acknowledgeParticipant(
+        ptr: *anyopaque,
+        txn_id: transactions_mod.TxnId,
+        owner_participant: []const u8,
+        participant: []const u8,
+    ) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const callback = self.config.acknowledge_participant_fn orelse return error.MissingReplicatedRecoveryHooks;
+        const abi_txn_id = kernel_owner_abi.TxnId{ .bytes = txn_id };
+        try callbackStatus(callback(
+            self.config.callback_ctx,
+            &abi_txn_id,
+            .fromSlice(owner_participant),
+            .fromSlice(participant),
+        ));
+    }
+
+    fn cleanupTransaction(
+        ptr: *anyopaque,
+        txn_id: transactions_mod.TxnId,
+        owner_participant: []const u8,
+        cutoff_timestamp: u64,
+        retained_cutoff_timestamp: u64,
+    ) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const callback = self.config.cleanup_transaction_fn orelse return error.MissingReplicatedRecoveryHooks;
+        const abi_txn_id = kernel_owner_abi.TxnId{ .bytes = txn_id };
+        try callbackStatus(callback(
+            self.config.callback_ctx,
+            &abi_txn_id,
+            .fromSlice(owner_participant),
+            cutoff_timestamp,
+            retained_cutoff_timestamp,
+        ));
+    }
+
+    fn dbConfig(self: *StorageOwnerTransactionRecovery) db_mod.transaction_runtime.Config {
+        return .{
+            .enabled = true,
+            .lease_owned = self.config.lease_owned != 0,
+            .owner_id = self.owner_id,
+            .interval_ms = self.config.interval_ms,
+            .cutoff_ns = self.config.cutoff_ns,
+            .resolver_ctx = self,
+            .resolve_participant_fn = resolveParticipant,
+            .replicated_metadata = self.config.replicated_metadata != 0,
+            .owns_recovery_fn = if (self.config.replicated_metadata != 0) ownsRecovery else null,
+            .acknowledge_participant_fn = if (self.config.replicated_metadata != 0) acknowledgeParticipant else null,
+            .cleanup_transaction_fn = if (self.config.replicated_metadata != 0) cleanupTransaction else null,
+        };
+    }
+};
+
 fn monotonicNowNs() u64 {
     return antfly.platform_time.monotonicNs();
 }
@@ -125,7 +232,9 @@ const Handle = struct {
     lite_profile: ?lite_backend.Profile = null,
     lite_inference_status: ?lite_backend.InferenceStatus = null,
     storage_owner_table_name: ?[]u8 = null,
+    storage_owner_group_id: u64 = 0,
     storage_owner_context: ?*StorageOwnerContext = null,
+    storage_owner_transaction_recovery: ?*StorageOwnerTransactionRecovery = null,
 
     fn prepareSearchRequest(self: *Handle, req: db_mod.types.SearchRequest) !void {
         const hook = self.readable_lease_hook orelse return;
@@ -188,11 +297,16 @@ const StorageSnapshot = struct {
 
 fn closeHandle(handle: *Handle) void {
     const storage_owner_context = handle.storage_owner_context;
+    const storage_owner_transaction_recovery = handle.storage_owner_transaction_recovery;
     if (handle.owned_lite_backend != null and liteOpenModeCanWrite(handle.open_mode)) {
         handle.db.sync(true) catch {};
         handle.db.syncIndexes(true) catch {};
     }
     handle.db.close();
+    if (storage_owner_transaction_recovery) |recovery| {
+        recovery.deinit();
+        handle.alloc.destroy(recovery);
+    }
     if (handle.owned_lite_backend) |*backend| {
         backend.deinit();
     }
@@ -1729,6 +1843,28 @@ pub fn storageOwnerOpen(
     else
         null;
     const alloc = std.heap.c_allocator;
+    const recovery_config = request.transaction_recovery;
+    if (recovery_config.enabled != 0) {
+        if (recovery_config.callback_ctx == null or recovery_config.resolve_participant_fn == null)
+            return .invalid_argument;
+        if (recovery_config.replicated_metadata != 0 and
+            (recovery_config.owns_recovery_fn == null or
+                recovery_config.acknowledge_participant_fn == null or
+                recovery_config.cleanup_transaction_fn == null))
+            return .invalid_argument;
+    }
+    var recovery: ?*StorageOwnerTransactionRecovery = null;
+    if (recovery_config.enabled != 0) {
+        recovery = alloc.create(StorageOwnerTransactionRecovery) catch return .out_of_memory;
+        recovery.?.* = StorageOwnerTransactionRecovery.init(alloc, recovery_config) catch {
+            alloc.destroy(recovery.?);
+            return .out_of_memory;
+        };
+    }
+    errdefer if (recovery) |value| {
+        value.deinit();
+        alloc.destroy(value);
+    };
     const owner_context = asStorageOwnerContext(request.context);
     if (owner_context) |context| context.acquire();
     var context_borrowed = owner_context != null;
@@ -1740,6 +1876,7 @@ pub fn storageOwnerOpen(
         .resource_manager = if (owner_context) |context| &context.resources.resource_manager else null,
         .identity_namespace = identity_namespace,
         .prefer_existing_identity_namespace = identity_namespace != null,
+        .transaction_recovery = if (recovery) |value| value.dbConfig() else .{},
     }) catch |err| return storageOwnerStatusFromError(err);
     errdefer db.close();
     antfly.public_api.table_writes.configureStorageKernelOwnerDb(
@@ -1755,7 +1892,9 @@ pub fn storageOwnerOpen(
         .alloc = alloc,
         .db = db,
         .storage_owner_table_name = owned_table_name,
+        .storage_owner_group_id = request.group_id,
         .storage_owner_context = owner_context,
+        .storage_owner_transaction_recovery = recovery,
     };
     out_owner.* = handle;
     context_borrowed = false;
@@ -1986,6 +2125,25 @@ pub fn storageOwnerReplicatedBatchJson(
     return .ok;
 }
 
+pub fn storageOwnerTransactionStatus(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.TransactionStatusRequest,
+    out_result: *kernel_owner_abi.TransactionStatusResult,
+) callconv(.c) kernel_owner_abi.Status {
+    out_result.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    const status = handle.db.getTransactionStatus(request.txn_id.bytes) catch |err|
+        return storageOwnerStatusFromError(err);
+    out_result.status = switch (status) {
+        .pending => .pending,
+        .committed => .committed,
+        .aborted => .aborted,
+    };
+    return .ok;
+}
+
 pub fn storageOwnerWaitForSync(
     owner: ?*anyopaque,
     request: *const kernel_owner_abi.SyncRequest,
@@ -2191,7 +2349,13 @@ fn replicatedBatchStorageKernelJson(
     var owned = batch_api.parseInternalBatchRequest(handle.alloc, request_json.bytes()) catch |err| return capi.mapError(err);
     defer owned.deinit(handle.alloc);
 
-    handle.db.batchReplicatedApply(owned.req) catch |err| return capi.mapError(err);
+    antfly.public_api.table_writes.applyStorageKernelReplicatedBatch(
+        handle.alloc,
+        &handle.db,
+        handle.storage_owner_table_name orelse return .invalid_argument,
+        handle.storage_owner_group_id,
+        owned.req,
+    ) catch |err| return capi.mapError(err);
     const response = batch_api.encodeBatchResponse(std.heap.c_allocator, owned.result()) catch |err| return capi.mapError(err);
     out_buf.* = .{
         .ptr = response.ptr,
