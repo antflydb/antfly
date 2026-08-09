@@ -6565,14 +6565,24 @@ pub const ApiHttpServer = struct {
                 };
                 defer scan_req.deinit(self.alloc);
 
-                var result = (try source.scan(
+                var result = (source.scan(
                     self.alloc,
                     table_name,
                     scan_req.from,
                     scan_req.to,
                     scan_req.opts,
                     .read_index,
-                )) orelse return try textResponse(self.alloc, 404, "not found");
+                ) catch |err| switch (err) {
+                    error.HAReadRequiresPrimary, error.ReadRequiresPrimary => return try textResponse(self.alloc, 503, "read requires primary"),
+                    error.HAReadWaitForApply,
+                    error.HAReadWaitForMetadata,
+                    error.ReadUnavailable,
+                    => return try textResponse(self.alloc, 503, "standby read unavailable"),
+                    error.PersistentDescriptorAdmissionExhausted,
+                    error.StorageReadTemporarilyUnavailable,
+                    => return try storageReadTemporarilyUnavailableResponse(self.alloc),
+                    else => return err,
+                }) orelse return try textResponse(self.alloc, 404, "not found");
                 defer result.deinit(self.alloc);
                 const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
                 defer if (row_filter_json) |value| self.alloc.free(value);
@@ -10384,6 +10394,7 @@ pub const ApiHttpServer = struct {
             error.HAReadWaitForMetadata,
             error.PersistentDescriptorAdmissionExhausted,
             => return error.ReadUnavailable,
+            error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
             error.InvalidArgument => return error.NotFound,
             else => {
                 std.log.err("public document artifact manifest lookup failed table={s} doc={s} artifact={s} err={}", .{ table_name, doc_key, artifact_name, err });
@@ -10407,6 +10418,7 @@ pub const ApiHttpServer = struct {
             error.HAReadWaitForMetadata,
             error.PersistentDescriptorAdmissionExhausted,
             => return error.ReadUnavailable,
+            error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
             error.InvalidArgument => return error.NotFound,
             else => {
                 std.log.err("public document artifact manifest list failed table={s} doc={s} err={}", .{ table_name, doc_key, err });
@@ -15196,12 +15208,8 @@ fn indexRebuildingResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
     });
 }
 
-fn storageReadTemporarilyUnavailableResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
-    var response = try jsonResponseWithStatus(alloc, 503, .{
-        .code = "storage_read_temporarily_unavailable",
-        .message = "storage read temporarily unavailable",
-        .retryable = true,
-    });
+pub fn storageReadTemporarilyUnavailableResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
+    var response = try jsonBodyResponseWithStatus(alloc, 503, public_table_http.storage_read_temporarily_unavailable_body);
     errdefer response.deinit(alloc);
 
     response.headers = try alloc.alloc(http_common.Header, 1);
