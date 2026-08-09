@@ -1893,6 +1893,49 @@ or physical runtime-owner transfer that removes implementation roots from the
 distributed compiler graph; another narrow status, callback, or lifecycle
 operation is not sufficient.
 
+### Rejected provisioned and hosted local-read fallback cuts
+
+The stable opaque owner already supplied the complete provisioned group-local
+read surface, but the orchestration source still retained its physical fallback
+at runtime. A first probe made that fallback compile-time unreachable under the
+storage experiment. It passed the cross-archive data-runtime, provisioned-owner,
+and opaque-owner suites, plus linked Debug in both production-LSM and
+LMDB-compatibility configurations.
+
+The cold result removed only 11 distributed declarations, no repository file,
+and 12,612 text bytes. Distributed measured 387.531 seconds versus the exact
+381.840-second baseline while independent units were also slightly slower. The
+hosted metadata source still retained the same physical query callbacks.
+
+A revision also removed the hosted local-read fallback. This is behaviorally
+consistent with its production metadata-server router, which reports the local
+metadata node as absent for data-bearing groups and remote-routes public data
+requests. The revised cold profile was:
+
+| Unit | Baseline | Combined read cut | Delta |
+|---|---:|---:|---:|
+| Distributed | 381.840 s | 400.370 s | +18.530 s |
+| Storage kernel | 233.023 s | 243.910 s | +10.887 s |
+| API kernel | 136.866 s | 142.245 s | +5.379 s |
+| Inference | 230.284 s | 241.212 s | +10.928 s |
+| CLI | 35.918 s | 36.693 s | +0.775 s |
+
+All long independent units were roughly 4--5% slower, so the raw distributed
+increase is host variance rather than a regression attributable to the cut.
+The structural evidence is nevertheless decisive: distributed removed only
+four repository files, 261 declarations, 96 generic instances, 65 inline
+calls, and 221,991 text bytes. The storage object was byte-identical. Hosted
+writes, data-runtime caches, and lifecycle operations continued to instantiate
+the same DB and local-query implementation.
+
+Decision: **reject and revert**. Even a complete stable read vtable is not an
+atomic ownership boundary while another consumer owns the writer/runtime that
+queries must share. Do not attempt more fallback pruning. The next viable
+experiment must move the complete physical runtime state--hosted and
+provisioned writers, reader/writer caches, resource manager, generation
+lifecycle, maintenance, and local query--behind one compiled owner, then expose
+only routing/orchestration callbacks and coarse operation envelopes.
+
 ## Holistic target architecture
 
 The current candidate baseline is the four-unit topology above with serverless
