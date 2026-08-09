@@ -73,7 +73,7 @@ fn mainImpl(init: std.process.Init) !void {
     // Server-side subcommands
     if (comptime linked_runtime_options.enabled) {
         if (std.mem.eql(u8, subcommand, "data")) return runLinkedRuntime(.data, subcommand, init, &args);
-        if (std.mem.eql(u8, subcommand, "ha")) return runLinkedRuntime(.cli, subcommand, init, &args);
+        if (std.mem.eql(u8, subcommand, "ha")) return runLinkedRuntime(.ha, subcommand, init, &args);
         if (std.mem.eql(u8, subcommand, "inference")) return runLinkedRuntime(.inference, subcommand, init, &args);
         // Lite serve embeds the standalone runtime, so keep the entire Lite
         // command in that codegen unit instead of pulling it into the CLI.
@@ -123,10 +123,11 @@ fn mainImpl(init: std.process.Init) !void {
     return error.InvalidArguments;
 }
 
-const LinkedRuntimeRole = enum { cli, data, inference, metadata, serverless, standalone };
+const LinkedRuntimeRole = enum { cli, data, ha, inference, metadata, serverless, standalone };
 
 extern fn antfly_runtime_cli(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_data(context: *const runtime_bridge.Context) callconv(.c) c_int;
+extern fn antfly_runtime_ha(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_inference(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_metadata(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_serverless(context: *const runtime_bridge.Context) callconv(.c) c_int;
@@ -147,6 +148,7 @@ fn runLinkedRuntime(
     const code = switch (role) {
         .cli => antfly_runtime_cli(&context),
         .data => antfly_runtime_data(&context),
+        .ha => antfly_runtime_ha(&context),
         .inference => antfly_runtime_inference(&context),
         .metadata => antfly_runtime_metadata(&context),
         .serverless => antfly_runtime_serverless(&context),

@@ -15,7 +15,7 @@
 //! Versioned internal ABI for the storage kernel's live DB owner. Keep this
 //! module free of storage and distributed-runtime imports.
 
-pub const abi_version: u32 = 9;
+pub const abi_version: u32 = 10;
 
 pub const BorrowedBytes = extern struct {
     ptr: ?[*]const u8 = null,
@@ -71,9 +71,19 @@ pub const Status = enum(u32) {
     internal = 255,
 };
 
+/// Process-scoped physical-storage owner. The handle owns shared caches and
+/// admission state; individual table/group owners borrow it for their full
+/// lifetime. A null context in `OpenRequest` retains the standalone ABI path
+/// used by focused C API callers and compatibility tests.
+pub const ContextRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved0: u32 = 0,
+};
+
 pub const OpenRequest = extern struct {
     version: u32 = abi_version,
     _reserved0: u32 = 0,
+    context: ?*anyopaque = null,
     path: BorrowedBytes = .{},
     table_name: BorrowedBytes = .{},
     lsm_root_generation: u64 = 0,
@@ -161,6 +171,15 @@ pub const ControlledJsonOperationRequest = extern struct {
     _reserved1: [7]u8 = @splat(0),
     cancellation_flag: ?*const anyopaque = null,
 };
+
+pub extern fn antfly_storage_context_create(
+    request: *const ContextRequest,
+    out_context: *?*anyopaque,
+) callconv(.c) Status;
+
+/// Returns `busy` while any owner still borrows the context. Null destruction
+/// is idempotent and succeeds.
+pub extern fn antfly_storage_context_destroy(context: ?*anyopaque) callconv(.c) Status;
 
 pub extern fn antfly_storage_owner_open(
     request: *const OpenRequest,

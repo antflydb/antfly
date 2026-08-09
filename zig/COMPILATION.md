@@ -181,6 +181,9 @@ the same host, target, cache state, and report set.
 | Data + standalone/Lite + CAPI PIC probe | 288.171 s, only +5.153 s over data alone; 614 repository files, 37,166 declarations | Strong candidate ownership island; CLI/metadata roots account for the remaining 82.685 s |
 | CLI + metadata control-only probe | 295.647 s, 289.733 s LLVM, 600 repository files | A separate control unit meets the time gate but duplicates too much physical storage by itself |
 | API/serverless + CLI/metadata coalescing | API/control 409.246 s; storage runtime 313.292 s; duplicate instances 484 → 676; executable 61.224 MB → 72.464 MB | Rejected; moving roots without moving physical ownership misses time, overlap, and artifact gates |
+| Application/storage without remote CLI | 340.130 s, 332.415 s LLVM, 40,037 declarations, 636 repository files | Keep; below the preferred 350-second local gate |
+| Remote CLI after HA/restore ownership cut | 38.029 s, 35.904 s LLVM, 5,804 declarations, 53 repository files and no Antfly storage files | Keep as an independent final codegen unit |
+| Four-unit production archive with deterministic 20 GB scheduling | 30/30 steps in 374.23 s locally; highest compiler MaxRSS 5 GB; static executable 62.421 MB; C API 16.665 MB | Keep pending normal-runner confirmation |
 
 The `/tmp` graph analysis was consolidated into
 `tools/analyze_zig_import_graph.py`. It reports lexical reachability, consumes
@@ -190,23 +193,26 @@ boundaries. Its regression tests live in
 
 ## Current compilation architecture
 
-The linked release currently generates three large libraries concurrently:
+The linked release currently generates four coarse libraries with normal,
+memory-budgeted concurrency:
 
 ```text
 antfly executable
 ├── antfly-runtime-api_kernel   # API protocol plus serverless
-├── antfly-storage-kernel       # distributed roles plus shared storage/CAPI
-└── antfly-runtime-inference
+├── antfly-storage-kernel       # application roles plus shared storage/CAPI
+├── antfly-runtime-inference
+└── antfly-runtime-cli          # remote/client commands only
 ```
 
-The executable links all three into one statically linked binary. The C API
+The executable links all four into one statically linked binary. The C API
 shared libraries link the same PIC distributed/storage archive, with function
 and data sections allowing the linker to retain only C API roots.
 
 The name `antfly-storage-kernel` currently describes the archive's reuse role,
-not a pure domain boundary. It contains data, metadata, standalone/Lite, CLI,
-and storage implementations. Serverless is co-generated with the API protocol
-unit; inference remains a separate safety valve.
+not a pure domain boundary. It contains data, metadata, standalone/Lite, local
+HA, restore staging, and storage implementations. Remote CLI commands are a
+small independent unit. Serverless is co-generated with the API protocol unit;
+inference remains a separate safety valve and is linked into standalone.
 
 The first ABI preparation is complete:
 
@@ -222,11 +228,14 @@ The first ABI preparation is complete:
 - LMDB-specific tests and builds can set
   `-Dproduction-lsm-only=false`; and
 - the graph checker rejects direct storage/table implementation imports from
-  the API ABI files.
+  the API ABI files; and
+- the experimental owner ABI has one process-scoped context for shared
+  resource-manager, LSM-cache, and HBC-cache state across opaque group owners.
 
-This remains useful source-level separation and protects the public API from
-accidental implementation barrels. The compile-once result below means it is
-no longer a prerequisite to a separate production storage kernel.
+This source-level separation protects the public API from accidental
+implementation barrels. The process context is retained foundation for the
+remaining physical-owner cut; it is not evidence by itself that the separate
+kernel experiment should be production-enabled.
 
 ## Historical pre-serverless clean-cache profile
 
@@ -1387,12 +1396,108 @@ lifecycle implementations compile-time unreachable from control consumers;
 adding more individual ABI operations while either physical fallback remains
 reachable is not a valid measurement checkpoint.
 
+### Remote-CLI cut and application/storage unit
+
+The next root audit found a smaller atomic cut than API coalescing. Remote CLI
+commands need HTTP clients and public wire types, but local HA owns WAL/LSM
+operator state and restore staging already belongs with standalone/Lite. Moving
+local HA into the application/storage artifact left `cli_runtime.zig` with only
+remote/client commands. Metadata remained with data because the earlier
+data-plus-metadata measurement showed only a 5.3-second marginal cost.
+
+The resulting production layout was measured from fresh local and global
+caches on the same macOS cross-compilation host, targeting ARM64 Linux musl
+`ReleaseFast`, production LSM-only features, PIC application storage, and
+normal build concurrency:
+
+| Unit | Compiler time | LLVM emit | Declarations | Repository Zig files |
+|---|---:|---:|---:|---:|
+| Application/storage: data, metadata, standalone/Lite, HA, restore, C API | 340.130 s | 332.415 s | 40,037 | 636 |
+| API protocol plus serverless | 206.191 s | 200.895 s | 23,094 | 502 |
+| Inference | 226.166 s | 218.664 s | 24,971 | 524 |
+| Remote CLI | 38.029 s | 35.904 s | 5,804 | 53 |
+
+The application/storage unit is 30.726 seconds faster than the comparable
+370.856-second combined-root probe and lands below the preferred 350-second
+gate. The CLI graph contains no file under `pkg/antfly/src/storage`; its 53
+repository files are predominantly HTTPX, generated public API types, and
+command parsing. Across all four reports there are 1,715 repository-file
+instances, 1,188 unique files, and 527 duplicate instances. API/serverless
+still duplicates 73 storage files with the application unit, so this is a
+material partition improvement rather than the final physical compile-once
+state.
+
+After adding deterministic memory-group dependencies, a second genuinely cold
+build used the patched Zig 0.16 runner and the production 20,971,520,000-byte
+`--maxrss` budget. All 30 release steps completed in 374.23 seconds real time
+(703.98 seconds user, 29.44 seconds system). Zig's per-compiler accounting
+reported 5 GB MaxRSS for application/storage, 4 GB for API, 4 GB for inference,
+and 1 GB for CLI. The host `time -l` process-tree RSS field was unavailable in
+the sandbox, so these are Zig's rounded child-process peaks rather than a claim
+about aggregate host residency. The artifacts were:
+
+| Artifact | Size | Change from post-main normal-runner control |
+|---|---:|---:|
+| Static ARM64 `antfly` | 62,421,144 bytes | +1,197,408 bytes (+2.0%) |
+| `libantfly.so` | 16,664,880 bytes | -4,992 bytes |
+| Application/storage archive | 37,225,628 bytes | not directly retained in the earlier runner artifact |
+| API archive | 20,070,070 bytes | not directly retained in the earlier runner artifact |
+| Inference archive | 22,805,418 bytes | not directly retained in the earlier runner artifact |
+| CLI archive | 2,927,196 bytes | new |
+
+The executable is an AArch64 ELF executable with no dynamic section. The
+shared C API exports its public `antfly_db_*` and `antfly_lite_*` surface while
+retaining no global runtime, API-kernel, standalone-inference, restore, or
+internal storage-owner symbols. Neither artifact contains production
+`mdb_env`, `lmdb_backend`, or `backend_lmdb` implementation markers.
+
+The release scheduler keeps the existing 20 GB Zig budget and 4 GB runner
+reserve. The launch graph is deliberate: API (7 GiB claim) and application/storage
+(11 GiB) form the initial group; an explicit compile dependency admits
+inference (8 GiB) after API completes, while another admits the short CLI
+(3 GiB) after application/storage completes. Explicit edges are necessary
+because Zig 0.16 randomizes dependency traversal; enum or link order is not a
+scheduling contract. This preserves overlap of the two long paths instead of
+allowing the CLI to delay application admission. The local profile validates
+compiler shape and artifacts; the normal Linux runner must still confirm the
+claimed schedule, peak RSS, repeatability, and end-to-end wall time.
+
+This increment also adds ABI version 10's process-scoped opaque owner context.
+It owns the shared physical resource manager and decoded-index caches, and
+group owners borrow it for their entire lifetime. Context destruction returns
+`busy` until all owners drain. The cross-archive owner suite exercises two
+owners sharing the context and verifies destruction ordering. While validating
+that path, the batch-wire audit found a stale encoder guard that rejected graph
+mutations even though the encoder already preserves them; the guard now only
+rejects a bare predicate without its required transaction.
+
+Validation for the accepted source change includes 3/3 opaque-owner ABI tests,
+6/6 cross-archive provisioned-owner tests, 69/69 broad provisioned write and
+lifecycle tests in the default production topology, 5/5 linked-main tests,
+native `ha`, `table`, and `lite` command smokes, all runtime/codegen/API graph
+gates, and all 13 graph-analyzer tests. The broad suite is not an acceptance
+claim for globally enabling the older separate-kernel experiment: with that
+option enabled, its two pre-existing Raft-snapshot fixtures still omit the
+experimental storage-snapshot source and fail closed with
+`StorageKernelSnapshotUnavailable`.
+
+Decision: **keep the four-unit topology and process-owner foundation, pending
+normal-runner confirmation**. It clears the preferred local critical-unit gate,
+keeps one static executable and the small C API, removes storage from the
+remote CLI graph, and does not increase runner cost. The goal remains open:
+API/serverless still contains meaningful duplicate storage/local-query code,
+and repeated clean normal-runner builds have not yet validated this new
+partition. The next physical-owner experiment should target that remaining API
+overlap as one coarse operation family, not split HTTPX, LMDB, or individual
+storage primitives into separate libraries.
+
 ## Holistic target architecture
 
-The current production baseline remains the three-island compile-once topology
-because it is reliable and smaller than the rejected source-only splits. It is
-not the final target: normal-runner evidence shows that its combined
-application/storage island is too slow.
+The current candidate baseline is the four-unit topology above. It is smaller
+and faster than the rejected source-only coalescing, and its isolated
+application/storage unit meets the preferred local time gate. It is not yet the
+final target: normal-runner confirmation is pending and API/serverless still
+emits a meaningful subset of storage/local-query implementation.
 
 The reopened target is a modular monolith with one compiled physical-storage
 owner and separately compiled control consumers:
@@ -1410,11 +1515,10 @@ thin linked main
     └── model lifecycle plus the linked standalone inference host
 ```
 
-The exact grouping of API, CLI, data control, metadata control, and standalone
-composition remains a measured decision after the physical imports disappear.
-The isolated probes show that suitable sub-five-minute units exist; choosing
-their final grouping before removing physical ownership only measures duplicate
-storage code. Standalone remains a thin product composition mode and always
+The accepted grouping keeps remote CLI separate, and keeps data, metadata, HA,
+standalone/Lite, restore, and the C API in the application/storage unit.
+Further regrouping is a measured decision after the remaining API physical
+imports disappear. Standalone remains a product composition mode and always
 links the separately compiled inference host.
 
 The kernel is not a per-backend wrapper and not an internal RPC service. It is
@@ -1425,8 +1529,8 @@ and one optimized copy of storage/local-query code.
 
 ### Source ownership rules
 
-These rules guide module structure and lazy-import cleanup. They no longer
-imply a compiled ABI between distributed control and storage.
+These rules guide module structure, lazy-import cleanup, and the remaining
+compiled ABI between control consumers and physical storage ownership.
 
 | Layer | Owns | Must not own |
 |---|---|---|
@@ -1691,6 +1795,8 @@ node tools/capture_zig_time_report.mjs \
   ws://127.0.0.1:19125/ antfly-runtime-api_kernel reports/api.json 30
 node tools/capture_zig_time_report.mjs \
   ws://127.0.0.1:19125/ antfly-runtime-inference reports/inference.json 30
+node tools/capture_zig_time_report.mjs \
+  ws://127.0.0.1:19125/ antfly-runtime-cli reports/cli.json 5
 ```
 
 The optional final argument is the minimum LLVM-emission duration in seconds.

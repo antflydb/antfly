@@ -461,7 +461,7 @@ pub fn encodeBatchResponse(alloc: std.mem.Allocator, result: BatchResult) ![]u8 
 }
 
 pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchRequest) ![]u8 {
-    if (req.graph_writes.len > 0 or req.graph_deletes.len > 0 or (req.predicates.len > 0 and req.transaction == null)) {
+    if (req.predicates.len > 0 and req.transaction == null) {
         return error.UnsupportedBatchRequestEncoding;
     }
     if (req.split_transition != null and

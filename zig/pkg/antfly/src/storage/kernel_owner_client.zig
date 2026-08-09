@@ -15,7 +15,25 @@
 //! Typed consumer for the compiled storage owner. It intentionally imports
 //! only the ABI contract, never DB, LSM, indexes, or storage implementation.
 
+const std = @import("std");
 const abi = @import("kernel_owner_abi");
+
+pub const Context = struct {
+    handle: ?*anyopaque = null,
+
+    pub fn ensure(self: *Context) !void {
+        if (self.handle != null) return;
+        var handle: ?*anyopaque = null;
+        try statusToError(abi.antfly_storage_context_create(&.{}, &handle));
+        self.handle = handle orelse return error.StorageKernelFailure;
+    }
+
+    pub fn deinit(self: *Context) void {
+        const status = abi.antfly_storage_context_destroy(self.handle);
+        std.debug.assert(status == .ok);
+        self.* = .{};
+    }
+};
 
 pub const Response = struct {
     buffer: abi.OwnedBytes = .{},

@@ -92,6 +92,14 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
 }
 
 test "opaque storage owner validates ABI and destruction is idempotent" {
+    var invalid_context: ?*anyopaque = undefined;
+    try std.testing.expectEqual(
+        abi.Status.invalid_abi,
+        abi.antfly_storage_context_create(&.{ .version = abi.abi_version + 1 }, &invalid_context),
+    );
+    try std.testing.expect(invalid_context == null);
+    try std.testing.expectEqual(abi.Status.ok, abi.antfly_storage_context_destroy(null));
+
     var owner: ?*anyopaque = undefined;
     var invalid: abi.OpenRequest = .{};
     invalid.version = abi.abi_version + 1;
@@ -183,4 +191,34 @@ test "opaque storage owner validates ABI and destruction is idempotent" {
     var empty: abi.OwnedBytes = .{};
     abi.antfly_storage_owner_buffer_destroy(&empty);
     abi.antfly_storage_owner_buffer_destroy(&empty);
+}
+
+test "opaque storage context enforces owner lifetime and shares process storage state" {
+    const first_path = "/tmp/antfly-storage-kernel-context-first";
+    const second_path = "/tmp/antfly-storage-kernel-context-second";
+    cleanup(first_path);
+    cleanup(second_path);
+    defer cleanup(first_path);
+    defer cleanup(second_path);
+
+    var context: ?*anyopaque = null;
+    try std.testing.expectEqual(abi.Status.ok, abi.antfly_storage_context_create(&.{}, &context));
+    try std.testing.expect(context != null);
+
+    var first = try client.Owner.open(.{
+        .context = context,
+        .path = .fromSlice(first_path),
+        .table_name = .fromSlice("first"),
+    });
+    var second = try client.Owner.open(.{
+        .context = context,
+        .path = .fromSlice(second_path),
+        .table_name = .fromSlice("second"),
+    });
+    try std.testing.expectEqual(abi.Status.busy, abi.antfly_storage_context_destroy(context));
+
+    first.deinit();
+    try std.testing.expectEqual(abi.Status.busy, abi.antfly_storage_context_destroy(context));
+    second.deinit();
+    try std.testing.expectEqual(abi.Status.ok, abi.antfly_storage_context_destroy(context));
 }

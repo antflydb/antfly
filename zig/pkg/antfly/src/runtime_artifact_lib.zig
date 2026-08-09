@@ -22,10 +22,11 @@ const platform = @import("antfly_platform");
 const bridge = @import("runtime_bridge.zig");
 const unit_options = @import("runtime_library_options");
 const owns_storage_kernel = unit_options.unit == .storage_kernel or unit_options.unit == .data_pic_probe or
-    unit_options.unit == .storage_runtime_pic_probe or
+    unit_options.unit == .storage_runtime_pic_probe or unit_options.unit == .application_pic_probe or
     (unit_options.unit == .distributed and !unit_options.storage_kernel_experiment);
 const standalone_inference_bridge = @import("standalone/inference_bridge.zig");
-const restore_staging_exports = if (unit_options.unit == .distributed or unit_options.unit == .storage_runtime_pic_probe)
+const restore_staging_exports = if (unit_options.unit == .distributed or unit_options.unit == .storage_runtime_pic_probe or
+    unit_options.unit == .application_pic_probe)
     @import("standalone/restore_staging_exports.zig")
 else
     struct {};
@@ -38,16 +39,22 @@ const storage_kernel_exports = if (owns_storage_kernel)
 else
     struct {};
 
-const cli_runtime = if (unit_options.unit == .distributed or unit_options.unit == .control_probe)
+const cli_runtime = if (unit_options.unit == .cli or unit_options.unit == .control_probe or
+    unit_options.unit == .cli_pic_probe)
     @import("cli_runtime.zig")
 else
     struct {};
+const ha_runtime = if (unit_options.unit == .distributed or unit_options.unit == .application_pic_probe)
+    @import("cmd/ha.zig")
+else
+    struct {};
 const data_runtime = if (unit_options.unit == .distributed or unit_options.unit == .data_pic_probe or
-    unit_options.unit == .storage_runtime_pic_probe)
+    unit_options.unit == .storage_runtime_pic_probe or unit_options.unit == .application_pic_probe)
     @import("data/runtime.zig")
 else
     struct {};
-const metadata_runtime = if (unit_options.unit == .distributed or unit_options.unit == .control_probe)
+const metadata_runtime = if (unit_options.unit == .distributed or unit_options.unit == .control_probe or
+    unit_options.unit == .application_pic_probe)
     @import("metadata/runtime.zig")
 else
     struct {};
@@ -58,14 +65,16 @@ const inference_runtime = if (unit_options.unit == .inference) @import("inferenc
 // Standalone adds about 35 seconds when co-generated with the server roles but
 // costs 6 minutes and 8 GiB as a separate ARM64 Linux unit. Keep it co-located
 // until the shared storage kernel removes that duplicated LLVM work.
-const standalone_runtime = if (unit_options.unit == .distributed or unit_options.unit == .storage_runtime_pic_probe)
+const standalone_runtime = if (unit_options.unit == .distributed or unit_options.unit == .storage_runtime_pic_probe or
+    unit_options.unit == .application_pic_probe)
     @import("standalone/runtime.zig")
 else
     struct {};
 // Lite's non-server commands share storage types with standalone, while
-// `lite serve` directly enters that runtime. Co-locating Lite, CLI, and the
-// server roles gives them one storage type identity and one LLVM unit.
-const lite_runtime = if (unit_options.unit == .distributed or unit_options.unit == .storage_runtime_pic_probe)
+// `lite serve` directly enters that runtime. Co-locating Lite and the server
+// roles gives them one storage type identity and one LLVM unit.
+const lite_runtime = if (unit_options.unit == .distributed or unit_options.unit == .storage_runtime_pic_probe or
+    unit_options.unit == .application_pic_probe)
     @import("cmd/lite.zig")
 else
     struct {};
@@ -90,6 +99,7 @@ pub const lite = @import("storage/lite/mod.zig");
 pub const lsm_backend = @import("storage/lsm_backend/mod.zig");
 pub const paths = @import("graph/paths.zig");
 pub const platform_clock = @import("antfly_platform").clock;
+pub const platform_sync = @import("antfly_platform").sync;
 pub const platform_time = @import("antfly_platform").time;
 pub const portable_backup = @import("storage/portable_backup.zig");
 pub const public_api = @import("api/mod.zig");
@@ -128,6 +138,14 @@ fn runCli(
     return cli_runtime.runFromIterator(init, command, args);
 }
 
+fn runHa(
+    init: std.process.Init,
+    _: []const u8,
+    args: *std.process.Args.Iterator,
+) !void {
+    return ha_runtime.runFromIterator(init, "antfly", args);
+}
+
 fn runData(init: std.process.Init, _: []const u8, args: *std.process.Args.Iterator) !void {
     return data_runtime.runFromIterator(init, "antfly", args);
 }
@@ -151,6 +169,10 @@ fn runStandalone(init: std.process.Init, command: []const u8, args: *std.process
 
 fn cliEntry(context: *const bridge.Context) callconv(.c) c_int {
     return runtimeEntry(context, "cli", runCli);
+}
+
+fn haEntry(context: *const bridge.Context) callconv(.c) c_int {
+    return runtimeEntry(context, "ha", runHa);
 }
 
 fn dataEntry(context: *const bridge.Context) callconv(.c) c_int {
@@ -208,8 +230,8 @@ comptime {
             // declarations roots of this PIC archive. The executable and both
             // C ABI library names link this exact compiled artifact.
             if (!unit_options.storage_kernel_experiment) _ = storage_kernel_exports;
-            exportInternal(&cliEntry, "antfly_runtime_cli");
             exportInternal(&dataEntry, "antfly_runtime_data");
+            exportInternal(&haEntry, "antfly_runtime_ha");
             exportInternal(&metadataEntry, "antfly_runtime_metadata");
             exportInternal(&standaloneEntry, "antfly_runtime_standalone");
             exportInternal(&restore_staging_exports.create, "antfly_restore_staging_create");
@@ -232,9 +254,27 @@ comptime {
             exportInternal(&restore_staging_exports.create, "antfly_restore_staging_create");
             exportInternal(&restore_staging_exports.destroy, "antfly_restore_staging_destroy");
         },
+        .application_pic_probe => {
+            // Candidate application/storage unit after removing only CLI.
+            // Metadata is intentionally co-generated because prior data plus
+            // metadata measurements showed near-zero marginal LLVM cost.
+            _ = storage_kernel_exports;
+            exportInternal(&dataEntry, "antfly_runtime_data");
+            exportInternal(&haEntry, "antfly_runtime_ha");
+            exportInternal(&metadataEntry, "antfly_runtime_metadata");
+            exportInternal(&standaloneEntry, "antfly_runtime_standalone");
+            exportInternal(&restore_staging_exports.create, "antfly_restore_staging_create");
+            exportInternal(&restore_staging_exports.destroy, "antfly_restore_staging_destroy");
+        },
         .control_probe => {
             exportInternal(&cliEntry, "antfly_runtime_cli");
             exportInternal(&metadataEntry, "antfly_runtime_metadata");
+        },
+        .cli_pic_probe => {
+            exportInternal(&cliEntry, "antfly_runtime_cli");
+        },
+        .cli => {
+            exportInternal(&cliEntry, "antfly_runtime_cli");
         },
         .storage_kernel => {
             // The experiment gives the existing coarse CAPI DB implementation
@@ -242,6 +282,8 @@ comptime {
             // storage directly until representative operations migrate across
             // this ABI in later phases.
             _ = storage_kernel_exports;
+            exportInternal(&storage_kernel_exports.storageOwnerContextCreate, "antfly_storage_context_create");
+            exportInternal(&storage_kernel_exports.storageOwnerContextDestroy, "antfly_storage_context_destroy");
             exportInternal(&storage_kernel_exports.storageOwnerOpen, "antfly_storage_owner_open");
             exportInternal(&storage_kernel_exports.storageOwnerClose, "antfly_storage_owner_close");
             exportInternal(&storage_kernel_exports.storageOwnerBatchJson, "antfly_storage_owner_batch_json");

@@ -45,6 +45,51 @@ const Allocator = std.mem.Allocator;
 
 const lite_abi_version: u32 = 1;
 
+const StorageOwnerContext = struct {
+    alloc: Allocator,
+    resources: antfly.public_api.provisioned_storage.PhysicalStorageResources,
+    mutex: std.atomic.Mutex = .unlocked,
+    active_owners: usize = 0,
+
+    fn init(alloc: Allocator) StorageOwnerContext {
+        return .{
+            .alloc = alloc,
+            .resources = .init(alloc),
+        };
+    }
+
+    fn lock(self: *StorageOwnerContext) void {
+        antfly.platform_sync.lockYielding(&self.mutex);
+    }
+
+    fn acquire(self: *StorageOwnerContext) void {
+        self.lock();
+        defer self.mutex.unlock();
+        self.active_owners += 1;
+    }
+
+    fn release(self: *StorageOwnerContext) void {
+        self.lock();
+        defer self.mutex.unlock();
+        std.debug.assert(self.active_owners > 0);
+        self.active_owners -= 1;
+    }
+
+    fn deinitIfIdle(self: *StorageOwnerContext) bool {
+        self.lock();
+        if (self.active_owners != 0) {
+            self.mutex.unlock();
+            return false;
+        }
+        self.mutex.unlock();
+        self.resources.deinit();
+        const alloc = self.alloc;
+        self.* = undefined;
+        alloc.destroy(self);
+        return true;
+    }
+};
+
 fn monotonicNowNs() u64 {
     return antfly.platform_time.monotonicNs();
 }
@@ -79,6 +124,7 @@ const Handle = struct {
     lite_profile: ?lite_backend.Profile = null,
     lite_inference_status: ?lite_backend.InferenceStatus = null,
     storage_owner_table_name: ?[]u8 = null,
+    storage_owner_context: ?*StorageOwnerContext = null,
 
     fn prepareSearchRequest(self: *Handle, req: db_mod.types.SearchRequest) !void {
         const hook = self.readable_lease_hook orelse return;
@@ -140,6 +186,7 @@ const StorageSnapshot = struct {
 };
 
 fn closeHandle(handle: *Handle) void {
+    const storage_owner_context = handle.storage_owner_context;
     if (handle.owned_lite_backend != null and liteOpenModeCanWrite(handle.open_mode)) {
         handle.db.sync(true) catch {};
         handle.db.syncIndexes(true) catch {};
@@ -150,6 +197,7 @@ fn closeHandle(handle: *Handle) void {
     }
     if (handle.storage_owner_table_name) |table_name| handle.alloc.free(table_name);
     handle.alloc.destroy(handle);
+    if (storage_owner_context) |context| context.release();
 }
 
 fn liteOpenModeCanWrite(open_mode: db_mod.OpenOptions.OpenMode) bool {
@@ -1637,6 +1685,30 @@ pub export fn antfly_db_open(path: ?[*:0]const u8, out_handle: ?*?*anyopaque) ca
     return .ok;
 }
 
+fn asStorageOwnerContext(ptr: ?*anyopaque) ?*StorageOwnerContext {
+    const raw = ptr orelse return null;
+    return @ptrCast(@alignCast(raw));
+}
+
+pub fn storageOwnerContextCreate(
+    request: *const kernel_owner_abi.ContextRequest,
+    out_context: *?*anyopaque,
+) callconv(.c) kernel_owner_abi.Status {
+    out_context.* = null;
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const alloc = std.heap.c_allocator;
+    const context = alloc.create(StorageOwnerContext) catch return .out_of_memory;
+    context.* = StorageOwnerContext.init(alloc);
+    context.resources.attachResourceManager();
+    out_context.* = context;
+    return .ok;
+}
+
+pub fn storageOwnerContextDestroy(context: ?*anyopaque) callconv(.c) kernel_owner_abi.Status {
+    const owner_context = asStorageOwnerContext(context) orelse return .ok;
+    return if (owner_context.deinitIfIdle()) .ok else .busy;
+}
+
 pub fn storageOwnerOpen(
     request: *const kernel_owner_abi.OpenRequest,
     out_owner: *?*anyopaque,
@@ -1656,8 +1728,15 @@ pub fn storageOwnerOpen(
     else
         null;
     const alloc = std.heap.c_allocator;
+    const owner_context = asStorageOwnerContext(request.context);
+    if (owner_context) |context| context.acquire();
+    var context_borrowed = owner_context != null;
+    defer if (context_borrowed) owner_context.?.release();
     var db = db_mod.DB.open(alloc, path, .{
+        .lsm_cache = if (owner_context) |context| &context.resources.lsm_cache else null,
+        .hbc_cache = if (owner_context) |context| &context.resources.hbc_cache else null,
         .lsm_root_generation = request.lsm_root_generation,
+        .resource_manager = if (owner_context) |context| &context.resources.resource_manager else null,
         .identity_namespace = identity_namespace,
         .prefer_existing_identity_namespace = identity_namespace != null,
     }) catch |err| return storageOwnerStatusFromError(err);
@@ -1675,8 +1754,10 @@ pub fn storageOwnerOpen(
         .alloc = alloc,
         .db = db,
         .storage_owner_table_name = owned_table_name,
+        .storage_owner_context = owner_context,
     };
     out_owner.* = handle;
+    context_borrowed = false;
     return .ok;
 }
 

@@ -220,9 +220,11 @@ run_zig_build_steps_with_retry() {
 
 (
   cd "$repo_root/zig"
-  # API and the shared PIC distributed/CLI storage kernel occupy the initial
-  # 16GiB memory-budget group. When API finishes, inference can overlap the
-  # still-running kernel within a 19GiB group.
+  # API and the shared PIC application/storage unit occupy the initial 18GiB
+  # memory-budget group. When API finishes, inference can overlap the still-
+  # running application unit within a 19GiB group. Explicit build dependencies
+  # keep Zig's randomized dependency traversal from admitting the short remote
+  # CLI unit ahead of either critical compiler unit.
   run_zig_build_steps_with_retry archive install lite-capi
 )
 

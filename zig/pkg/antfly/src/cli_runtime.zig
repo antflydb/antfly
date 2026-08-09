@@ -12,17 +12,17 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-//! Non-server CLI surfaces compiled together as one coarse codegen unit.
+//! Remote/client CLI surfaces compiled as one small codegen unit. The local
+//! HA operator command owns physical WAL/LSM state and therefore stays in the
+//! application/storage unit.
 
 const std = @import("std");
 const client = @import("client_runtime.zig");
-const ha = @import("cmd/ha.zig");
 
 pub fn runFromIterator(
     init: std.process.Init,
     command: []const u8,
     args: *std.process.Args.Iterator,
 ) !void {
-    if (std.mem.eql(u8, command, "ha")) return ha.runFromIterator(init, "antfly", args);
     return client.runFromIterator(init, command, args);
 }

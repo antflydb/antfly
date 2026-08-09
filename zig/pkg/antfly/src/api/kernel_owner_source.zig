@@ -45,6 +45,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     catalog: table_catalog.CatalogSource,
     requester: read_gate.ReadableLeaseRequester,
     group_visible_root_generation: ?table_reads.GroupVisibleRootGenerationSource = null,
+    context: client.Context = .{},
     mutex: std.atomic.Mutex = .unlocked,
     entries: std.ArrayListUnmanaged(*Entry) = .empty,
 
@@ -144,6 +145,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         }
         self.entries.deinit(self.alloc);
         self.entries = .empty;
+        self.context.deinit();
     }
 
     pub fn readSource(self: *ProvisionedKernelOwnerSource) table_read_source.TableReadSource {
@@ -463,7 +465,9 @@ pub const ProvisionedKernelOwnerSource = struct {
         errdefer self.alloc.free(owned_table_name);
         const entry = try self.alloc.create(Entry);
         errdefer self.alloc.destroy(entry);
+        try self.context.ensure();
         var owner = try client.Owner.open(.{
+            .context = self.context.handle,
             .path = abi.BorrowedBytes.fromSlice(path),
             .table_name = abi.BorrowedBytes.fromSlice(table_name),
             .lsm_root_generation = descriptor.lsm_root_generation,

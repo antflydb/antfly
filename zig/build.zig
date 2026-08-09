@@ -56,13 +56,21 @@ const RuntimeLibraryUnit = enum {
     // Measurement-only candidate storage-owning unit: data, standalone/Lite,
     // restore staging, and the CAPI, but no CLI or metadata runtime.
     storage_runtime_pic_probe,
+    // Measurement-only storage-owning application unit: data, metadata,
+    // standalone/Lite, restore staging, and CAPI, but no CLI.
+    application_pic_probe,
     // Measurement-only candidate control unit: CLI and metadata, with the
     // storage-owning data/standalone runtime compiled separately.
     control_probe,
-    // CLI shares enough of the storage graph with the distributed roles that
-    // co-generation shortens the measured ReleaseFast critical path.
+    // Measurement-only post-restore-bridge CLI unit.
+    cli_pic_probe,
+    // Application/storage unit: data, metadata, standalone/Lite, local HA,
+    // restore staging, and the shared CAPI implementation.
     distributed,
     inference,
+    // Short remote/client unit. Its compile-step gate below keeps it from
+    // competing with the initial API plus application memory group.
+    cli,
 };
 
 const snowball_languages = [_][]const u8{
@@ -8636,12 +8644,15 @@ pub fn build(b: *std.Build) void {
     });
 
     if (linked_runtime_libraries) {
+        var api_runtime_artifact: ?*std.Build.Step.Compile = null;
+        var application_runtime_artifact: ?*std.Build.Step.Compile = null;
         inline for (std.meta.tags(RuntimeLibraryUnit)) |unit| {
             const unit_enabled = unit != .data_pic_probe and unit != .storage_runtime_pic_probe and
-                unit != .control_probe and
+                unit != .application_pic_probe and unit != .control_probe and
+                unit != .cli_pic_probe and
                 (unit != .storage_kernel or storage_kernel_experiment);
             const owns_storage_kernel = unit == .storage_kernel or unit == .data_pic_probe or
-                unit == .storage_runtime_pic_probe or
+                unit == .storage_runtime_pic_probe or unit == .application_pic_probe or
                 (unit == .distributed and !storage_kernel_experiment);
             const unit_options = b.addOptions();
             unit_options.addOption(RuntimeLibraryUnit, "unit", unit);
@@ -8675,7 +8686,9 @@ pub fn build(b: *std.Build) void {
                         "antfly-storage-kernel-disabled",
                     .data_pic_probe => "antfly-data-pic-probe",
                     .storage_runtime_pic_probe => "antfly-storage-runtime-pic-probe",
+                    .application_pic_probe => "antfly-application-pic-probe",
                     .control_probe => "antfly-control-probe",
+                    .cli_pic_probe => "antfly-cli-pic-probe",
                     .distributed => if (storage_kernel_experiment)
                         "antfly-runtime-distributed"
                     else
@@ -8690,14 +8703,35 @@ pub fn build(b: *std.Build) void {
                     // above the observed peak so the build runner does not
                     // discard completed work and retry it in a later group.
                     .api_kernel => 7 * 1024 * 1024 * 1024,
+                    .cli => 3 * 1024 * 1024 * 1024,
                     .storage_kernel => 8 * 1024 * 1024 * 1024,
                     .data_pic_probe => 11 * 1024 * 1024 * 1024,
                     .storage_runtime_pic_probe => 11 * 1024 * 1024 * 1024,
+                    .application_pic_probe => 11 * 1024 * 1024 * 1024,
                     .control_probe => 8 * 1024 * 1024 * 1024,
+                    .cli_pic_probe => 8 * 1024 * 1024 * 1024,
                     .distributed => 11 * 1024 * 1024 * 1024,
                     .inference => 8 * 1024 * 1024 * 1024,
                 },
             });
+            // Zig 0.16 intentionally randomizes dependency traversal, so enum
+            // order cannot define a reliable bounded-RSS launch group. These
+            // two edges deterministically preserve the useful overlap:
+            //
+            //   API (7 GiB) + application/storage (11 GiB)
+            //   application/storage + inference (8 GiB), after API
+            //   inference + CLI (3 GiB), after application/storage
+            //
+            // This is still concurrent code generation; it only prevents a
+            // short or later unit from consuming the claim needed by a
+            // critical unit and accidentally serializing the long path.
+            switch (unit) {
+                .api_kernel => api_runtime_artifact = role_artifact,
+                .distributed => application_runtime_artifact = role_artifact,
+                .inference => role_artifact.step.dependOn(&api_runtime_artifact.?.step),
+                .cli => role_artifact.step.dependOn(&application_runtime_artifact.?.step),
+                else => {},
+            }
             if (unit == .data_pic_probe) {
                 const install_data_pic_probe = b.addInstallArtifact(role_artifact, .{});
                 const data_pic_probe_step = b.step(
@@ -8714,6 +8748,14 @@ pub fn build(b: *std.Build) void {
                 );
                 storage_runtime_pic_probe_step.dependOn(&install_storage_runtime_pic_probe.step);
             }
+            if (unit == .application_pic_probe) {
+                const install_application_pic_probe = b.addInstallArtifact(role_artifact, .{});
+                const application_pic_probe_step = b.step(
+                    "application-library-probe",
+                    "Build a data + metadata + standalone/Lite + CAPI archive for compilation profiling",
+                );
+                application_pic_probe_step.dependOn(&install_application_pic_probe.step);
+            }
             if (unit == .control_probe) {
                 const install_control_probe = b.addInstallArtifact(role_artifact, .{});
                 const control_probe_step = b.step(
@@ -8721,6 +8763,14 @@ pub fn build(b: *std.Build) void {
                     "Build a CLI + metadata control archive for compilation profiling",
                 );
                 control_probe_step.dependOn(&install_control_probe.step);
+            }
+            if (unit == .cli_pic_probe) {
+                const install_cli_pic_probe = b.addInstallArtifact(role_artifact, .{});
+                const cli_pic_probe_step = b.step(
+                    "cli-library-probe",
+                    "Build the post-restore-bridge CLI archive for compilation profiling",
+                );
+                cli_pic_probe_step.dependOn(&install_cli_pic_probe.step);
             }
             if (unit == .storage_kernel and storage_kernel_experiment) {
                 const owner_test_mod = b.createModule(.{
@@ -8777,10 +8827,12 @@ pub fn build(b: *std.Build) void {
                 role_artifact.link_data_sections = true;
             }
             // Zig's build runner uses these claims to run as many LLVM codegen
-            // steps concurrently as fit in available RAM. The distributed
-            // archive is PIC because the executable and C ABI libraries share
-            // it; all three consumers therefore reuse the same analyzed and
-            // optimized storage graph.
+            // steps concurrently as fit in available RAM. The explicit gates
+            // above make API and the application/storage archive the initial
+            // 18 GiB group, then overlap inference and CLI with the opposite
+            // long path as claims become available. The application archive
+            // is PIC because the executable and C ABI libraries share it; all
+            // three consumers reuse the same analyzed and optimized graph.
             if (unit_enabled and owns_storage_kernel) {
                 capi_link_mod.linkLibrary(role_artifact);
                 lite_capi_link_mod.linkLibrary(role_artifact);
