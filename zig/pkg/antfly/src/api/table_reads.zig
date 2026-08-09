@@ -1219,6 +1219,55 @@ const LocalQueryDbOwner = union(enum) {
     }
 };
 
+fn provisionedLocalQueryDbOwner(
+    resident_db: ?ResidentDbSource,
+    cache: ?*ProvisionedTableReadCache,
+    replica_root_dir: []const u8,
+    catalog: table_catalog.CatalogSource,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    lsm_root_generation: u64,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    table_name: []const u8,
+    read_activity_held: bool,
+) !LocalQueryDbOwner {
+    if (resident_db) |source| {
+        if (try source.leaseGroup(alloc, table_name, group_id, lsm_root_generation, .{
+            .read_activity_held = read_activity_held,
+        })) |lease_value| {
+            validateProvisionedDbIdentityNamespace(alloc, catalog, table_name, group_id, lease_value.db) catch |err| {
+                var lease = lease_value;
+                lease.release(alloc);
+                return err;
+            };
+            return .{ .resident = .{ .lease = lease_value, .alloc = alloc } };
+        }
+    }
+
+    const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
+    defer alloc.free(path);
+    if (cache) |query_cache| {
+        const lease = try query_cache.getOrOpen(path, catalog, group_id, lsm_root_generation, table_name);
+        validateProvisionedDbIdentityNamespace(alloc, catalog, table_name, group_id, lease.db) catch |err| {
+            var owned_lease = lease;
+            owned_lease.release();
+            return err;
+        };
+        return .{ .cached = lease };
+    }
+
+    const db = try openProvisionedQueryDbForTableWithRuntime(
+        alloc,
+        path,
+        catalog,
+        table_name,
+        group_id,
+        lsm_root_generation,
+        backend_runtime,
+    );
+    return .{ .owned = db };
+}
+
 const LocalQueryExecution = struct {
     request: db_mod.types.SearchRequest,
     result: db_mod.types.SearchResult,
@@ -3208,7 +3257,11 @@ pub const ProvisionedTableReadSource = struct {
             defer merged.deinit();
             const graph_req = requestWithResultIdentityGeneration(req, merged);
 
-            const worker = provisionedGraphWorker(self);
+            var worker_ctx = ProvisionedGraphWorkerContext{
+                .source = self,
+                .admitted_table_name = table_name,
+            };
+            const worker = worker_ctx.worker();
             const graph_results = try distributed_graph.executeCrossRange(alloc, self.catalog, worker, table_name, graph_req, merged, consistency);
             merged.graph_results = graph_results;
 
@@ -3433,36 +3486,13 @@ pub const ProvisionedTableReadSource = struct {
     ) !?distributed_graph.GraphExpandResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHAReadAllowed(consistency);
-        const expansions = try alloc.alloc(distributed_graph.GraphExpansion, req.frontier.len);
-        var initialized: usize = 0;
-        errdefer {
-            for (expansions[0..initialized]) |*expansion| expansion.deinit(alloc);
-            alloc.free(expansions);
-        }
-        for (req.frontier, 0..) |item, i| {
-            const search_req = try distributed_graph.frontierItemToSearchRequest(alloc, req, item);
-            defer distributed_graph.freeExpandSearchRequest(alloc, search_req);
-
-            expansions[i] = .{
-                .frontier_id = item.id,
-                .frontier_key = try alloc.dupe(u8, item.key),
-                .graph_result = graph_result_blk: {
-                    var result = try queryHostedLocal(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.managedReadRuntimeConfig(), table_name, search_req, consistency);
-                    defer result.deinit();
-                    var graph_result = if (result.graph_results.len > 0)
-                        try distributed_graph.filterGraphSearchResult(alloc, table_name, result.graph_results[0], req.exclude_nodes, req.exclude_edges)
-                    else
-                        try distributed_graph.emptyGraphSearchResult(alloc, req.name);
-                    for (graph_result.hits) |*hit| hit.deinit(alloc);
-                    if (graph_result.hits.len > 0) alloc.free(graph_result.hits);
-                    graph_result.hits = @constCast((&[_]db_mod.types.SearchHit{})[0..]);
-                    break :graph_result_blk graph_result;
-                },
-            };
-            initialized += 1;
-        }
-
-        return .{ .expansions = expansions };
+        var read_activity = self.beginPreparedRead(table_name, .general);
+        defer if (read_activity) |*activity| activity.deinit();
+        var worker_ctx = ProvisionedGraphWorkerContext{
+            .source = self,
+            .admitted_table_name = table_name,
+        };
+        return try executeProvisionedGraphExpand(&worker_ctx, alloc, group_id, table_name, req, consistency);
     }
 
     fn graphHydrateGroupLocal(
@@ -3475,8 +3505,13 @@ pub const ProvisionedTableReadSource = struct {
     ) !?distributed_graph.GraphHydrateResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHAReadAllowed(consistency);
-        try table_catalog.validateTopologyEpoch(alloc, self.catalog, table_name, req.topology_epoch);
-        return try executeProvisionedGraphHydrate(ptr, alloc, group_id, table_name, req, consistency);
+        var read_activity = self.beginPreparedRead(table_name, .general);
+        defer if (read_activity) |*activity| activity.deinit();
+        var worker_ctx = ProvisionedGraphWorkerContext{
+            .source = self,
+            .admitted_table_name = table_name,
+        };
+        return try executeProvisionedGraphHydrate(&worker_ctx, alloc, group_id, table_name, req, consistency);
     }
 
     fn graphEdgesGroupLocal(
@@ -3489,7 +3524,13 @@ pub const ProvisionedTableReadSource = struct {
     ) !?distributed_graph.GraphEdgesResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHAReadAllowed(consistency);
-        return try graphGetEdgesLocal(alloc, self.replica_root_dir, self.catalog, self.requester, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, req, consistency);
+        var read_activity = self.beginPreparedRead(table_name, .general);
+        defer if (read_activity) |*activity| activity.deinit();
+        var worker_ctx = ProvisionedGraphWorkerContext{
+            .source = self,
+            .admitted_table_name = table_name,
+        };
+        return try executeProvisionedGraphGetEdges(&worker_ctx, alloc, group_id, table_name, req, consistency);
     }
 
     fn localRuntimeStatuses(
@@ -5705,18 +5746,33 @@ fn queryHostedAcrossGroups(
     return try mergeSearchResultsWithTableRuntimeSchema(alloc, self.catalog, table_name, req, shard_results[0..initialized], req.offset, req.limit);
 }
 
-fn provisionedGraphWorker(self: *ProvisionedTableReadSource) distributed_graph.Worker {
-    return .{
-        .ptr = self,
-        .vtable = &.{
-            .execute_graph_expand = executeProvisionedGraphExpand,
-            .execute_graph_hydrate = executeProvisionedGraphHydrate,
-            .execute_graph_get_edges = executeProvisionedGraphGetEdges,
-            .fanout_io = provisionedGraphFanoutIo,
-            .fanout_width_cap = provisionedGraphFanoutWidthCap,
-        },
-    };
-}
+const ProvisionedGraphWorkerContext = struct {
+    source: *ProvisionedTableReadSource,
+    /// The public query owns this table's read-admission lease for the complete
+    /// distributed graph operation. Same-table worker calls must reuse it: a
+    /// nested admission can otherwise queue behind a committed writer that is
+    /// waiting for the outer lease to drain. Cross-table hydration acquires an
+    /// independent lease for its target table.
+    admitted_table_name: ?[]const u8 = null,
+
+    fn worker(self: *@This()) distributed_graph.Worker {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .execute_graph_expand = executeProvisionedGraphExpand,
+                .execute_graph_hydrate = executeProvisionedGraphHydrate,
+                .execute_graph_get_edges = executeProvisionedGraphGetEdges,
+                .fanout_io = provisionedGraphFanoutIo,
+                .fanout_width_cap = provisionedGraphFanoutWidthCap,
+            },
+        };
+    }
+
+    fn tableReadAlreadyAdmitted(self: *const @This(), table_name: []const u8) bool {
+        const admitted = self.admitted_table_name orelse return false;
+        return std.mem.eql(u8, admitted, table_name);
+    }
+};
 
 fn hostedGraphWorker(self: *HostedProvisionedTableReadSource) distributed_graph.Worker {
     return .{
@@ -5732,14 +5788,14 @@ fn hostedGraphWorker(self: *HostedProvisionedTableReadSource) distributed_graph.
 }
 
 fn provisionedGraphFanoutIo(ptr: *anyopaque) ?std.Io {
-    const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-    const io_impl = self.io_impl orelse return null;
+    const ctx: *ProvisionedGraphWorkerContext = @ptrCast(@alignCast(ptr));
+    const io_impl = ctx.source.io_impl orelse return null;
     return io_impl.io();
 }
 
 fn provisionedGraphFanoutWidthCap(ptr: *anyopaque) usize {
-    const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-    const io_impl = self.io_impl orelse return 1;
+    const ctx: *ProvisionedGraphWorkerContext = @ptrCast(@alignCast(ptr));
+    const io_impl = ctx.source.io_impl orelse return 1;
     return ioAsyncLimitCap(io_impl);
 }
 
@@ -5763,8 +5819,26 @@ fn executeProvisionedGraphExpand(
     req: distributed_graph.GraphExpandRequest,
     consistency: raft_mod.ReadConsistency,
 ) !distributed_graph.GraphExpandResponse {
-    const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+    const ctx: *ProvisionedGraphWorkerContext = @ptrCast(@alignCast(ptr));
+    const self = ctx.source;
     try table_catalog.validateTopologyEpoch(alloc, self.catalog, table_name, req.topology_epoch);
+    const already_admitted = ctx.tableReadAlreadyAdmitted(table_name);
+    var read_activity = if (already_admitted) null else self.beginPreparedRead(table_name, .general);
+    defer if (read_activity) |*activity| activity.deinit();
+    var db_owner = try provisionedLocalQueryDbOwner(
+        self.resident_db,
+        self.cache,
+        self.replica_root_dir,
+        self.catalog,
+        alloc,
+        group_id,
+        self.visibleRootGeneration(group_id),
+        self.backend_runtime,
+        table_name,
+        already_admitted or read_activity != null,
+    );
+    defer db_owner.deinit();
+    const reads = raft_mod.FeatureDBReads.init(group_id, self.requester);
     const expansions = try alloc.alloc(distributed_graph.GraphExpansion, req.frontier.len);
     var initialized: usize = 0;
     errdefer {
@@ -5780,7 +5854,13 @@ fn executeProvisionedGraphExpand(
             .frontier_id = item.id,
             .frontier_key = try alloc.dupe(u8, item.key),
             .graph_result = graph_result_blk: {
-                var result = try queryHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), .{ .backend_runtime = self.backend_runtime }, table_name, search_req, consistency);
+                var result = reads.searchWithConsistency(alloc, db_owner.db(), search_req, consistency) catch |err| switch (err) {
+                    error.NotLeader => if (consistency == .stale)
+                        return err
+                    else
+                        try reads.searchWithConsistency(alloc, db_owner.db(), search_req, .stale),
+                    else => return err,
+                };
                 defer result.deinit();
                 var graph_result = if (result.graph_results.len > 0)
                     try distributed_graph.filterGraphSearchResult(alloc, table_name, result.graph_results[0], req.exclude_nodes, req.exclude_edges)
@@ -5805,16 +5885,29 @@ fn executeProvisionedGraphHydrate(
     req: distributed_graph.GraphHydrateRequest,
     consistency: raft_mod.ReadConsistency,
 ) !distributed_graph.GraphHydrateResponse {
-    const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+    const ctx: *ProvisionedGraphWorkerContext = @ptrCast(@alignCast(ptr));
+    const self = ctx.source;
     try table_catalog.validateTopologyEpoch(alloc, self.catalog, table_name, req.topology_epoch);
-    const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
-    defer alloc.free(path);
-    var db = try openProvisionedQueryDbForTableWithRuntime(alloc, path, self.catalog, table_name, group_id, self.visibleRootGeneration(group_id), self.backend_runtime);
-    defer db.close();
-    try validateGraphHydrateResolvedDocFilterForDb(req, &db);
+    const already_admitted = ctx.tableReadAlreadyAdmitted(table_name);
+    var read_activity = if (already_admitted) null else self.beginPreparedRead(table_name, .general);
+    defer if (read_activity) |*activity| activity.deinit();
+    var db_owner = try provisionedLocalQueryDbOwner(
+        self.resident_db,
+        self.cache,
+        self.replica_root_dir,
+        self.catalog,
+        alloc,
+        group_id,
+        self.visibleRootGeneration(group_id),
+        self.backend_runtime,
+        table_name,
+        already_admitted or read_activity != null,
+    );
+    defer db_owner.deinit();
+    try validateGraphHydrateResolvedDocFilterForDb(req, db_owner.db());
 
     const reads = raft_mod.FeatureDBReads.init(group_id, self.requester);
-    return try graphHydrateOnOpenDb(alloc, reads, &db, req, consistency, true);
+    return try graphHydrateOnOpenDb(alloc, reads, db_owner.db(), req, consistency, true);
 }
 
 fn executeHostedGraphExpand(
@@ -5883,8 +5976,32 @@ fn executeProvisionedGraphGetEdges(
     req: distributed_graph.GraphEdgesRequest,
     consistency: raft_mod.ReadConsistency,
 ) anyerror!distributed_graph.GraphEdgesResponse {
-    const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-    return graphGetEdgesLocal(alloc, self.replica_root_dir, self.catalog, self.requester, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, req, consistency);
+    const ctx: *ProvisionedGraphWorkerContext = @ptrCast(@alignCast(ptr));
+    const self = ctx.source;
+    try table_catalog.validateTopologyEpoch(alloc, self.catalog, table_name, req.topology_epoch);
+    try distributed_graph.validateGraphEdgesTensorAccessPath(alloc, req);
+    const already_admitted = ctx.tableReadAlreadyAdmitted(table_name);
+    var read_activity = if (already_admitted) null else self.beginPreparedRead(table_name, .general);
+    defer if (read_activity) |*activity| activity.deinit();
+    var db_owner = try provisionedLocalQueryDbOwner(
+        self.resident_db,
+        self.cache,
+        self.replica_root_dir,
+        self.catalog,
+        alloc,
+        group_id,
+        self.visibleRootGeneration(group_id),
+        self.backend_runtime,
+        table_name,
+        already_admitted or read_activity != null,
+    );
+    defer db_owner.deinit();
+    _ = try currentIdentityReadGenerationForDb(req.identity_read_generation, db_owner.db());
+
+    const reads = raft_mod.FeatureDBReads.init(group_id, self.requester);
+    try reads.reads.prepareLookupWithConsistency(group_id, req.key, .{}, consistency);
+    const graph_entry = db_owner.db().core.graphIndex(req.index_name) orelse return error.IndexNotFound;
+    return .{ .edges = try graph_entry.index.getEdges(alloc, req.key, "", req.direction) };
 }
 
 fn executeHostedGraphGetEdges(
@@ -16339,6 +16456,128 @@ test "provisioned local query reuses resident generation without readonly open" 
     try std.testing.expectEqualStrings("doc:a", execution.result.hits[0].id);
     execution.releaseDb();
     try std.testing.expectEqual(@as(usize, 1), resident.releases);
+}
+
+test "provisioned graph hydrate reuses admitted resident storage owner" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-provisioned-graph-hydrate-resident-db";
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+
+    const ResidentSource = struct {
+        db: *db_mod.DB,
+        leases: usize = 0,
+        releases: usize = 0,
+        observed_read_activity_held: bool = false,
+
+        fn iface(self: *@This()) ResidentDbSource {
+            return .{ .ptr = self, .lease_group = leaseGroup };
+        }
+
+        fn leaseGroup(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            table_name: []const u8,
+            group_id: u64,
+            lsm_root_generation: u64,
+            options: ResidentDbSource.LeaseOptions,
+        ) !?ResidentDbLease {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqual(@as(u64, 7001), group_id);
+            try std.testing.expectEqual(@as(u64, 9), lsm_root_generation);
+            self.leases += 1;
+            self.observed_read_activity_held = options.read_activity_held;
+            return .{ .ptr = self, .db = self.db, .release_fn = release };
+        }
+
+        fn release(ptr: *anyopaque, _: std.mem.Allocator) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.releases += 1;
+        }
+    };
+
+    const ReadTracker = struct {
+        begins: usize = 0,
+        ends: usize = 0,
+
+        fn iface(self: *@This()) ReadPreparation {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .prepare_for_read = prepareForRead,
+                    .begin_read = beginRead,
+                },
+            };
+        }
+
+        fn prepareForRead(_: *anyopaque, _: []const u8, _: ReadPreparation.Kind) void {}
+
+        fn beginRead(ptr: *anyopaque, table_name: []const u8, _: ReadPreparation.Kind) ReadPreparation.Activity {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.begins += 1;
+            return .{ .ptr = self, .table_name = table_name, .release_fn = endRead };
+        }
+
+        fn endRead(ptr: *anyopaque, _: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.ends += 1;
+        }
+    };
+
+    var resident = ResidentSource{ .db = &db };
+    var tracker: ReadTracker = .{};
+    var source = ProvisionedTableReadSource.init(
+        "/tmp/antfly-graph-hydrate-fallback-must-not-open",
+        table_catalog.emptyCatalogSource(),
+        raft_mod.read_gate.noopReadableLeaseRequester(),
+    );
+    source.resident_db = resident.iface();
+    source.prepare_for_read = tracker.iface();
+
+    var worker_ctx = ProvisionedGraphWorkerContext{
+        .source = &source,
+        .admitted_table_name = "docs",
+    };
+    var response = try executeProvisionedGraphHydrate(
+        &worker_ctx,
+        alloc,
+        7001,
+        "docs",
+        .{ .keys = @constCast((&[_][]u8{})[0..]), .include_hits = false },
+        .stale,
+    );
+    response.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), resident.leases);
+    try std.testing.expectEqual(@as(usize, 1), resident.releases);
+    try std.testing.expect(resident.observed_read_activity_held);
+    try std.testing.expectEqual(@as(usize, 0), tracker.begins);
+    try std.testing.expectEqual(@as(usize, 0), tracker.ends);
+
+    // Hydration can cross from the query's admitted document table into a
+    // different entity table. That target must establish and release its own
+    // admission before leasing the resident owner.
+    worker_ctx.admitted_table_name = "other-table";
+    response = try executeProvisionedGraphHydrate(
+        &worker_ctx,
+        alloc,
+        7001,
+        "docs",
+        .{ .keys = @constCast((&[_][]u8{})[0..]), .include_hits = false },
+        .stale,
+    );
+    response.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), resident.leases);
+    try std.testing.expectEqual(@as(usize, 2), resident.releases);
+    try std.testing.expectEqual(@as(usize, 1), tracker.begins);
+    try std.testing.expectEqual(@as(usize, 1), tracker.ends);
 }
 
 test "provisioned table read source managed runtime config carries inference url" {
