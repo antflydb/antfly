@@ -3217,7 +3217,7 @@ fn processDocumentExtractionAsset(
                 from_generation,
                 window,
             );
-            try queueTerminalCoverageForRequest(runtime, window, request);
+            try recordIsolatedRequestError(runtime, window, request, err);
             return;
         },
     };
@@ -3243,7 +3243,7 @@ fn processDocumentExtractionAsset(
                 from_generation,
                 window,
             );
-            try queueTerminalCoverageForRequest(runtime, window, request);
+            try recordIsolatedRequestError(runtime, window, request, error.RemoteDocumentFetchFailed);
             return;
         },
     };
@@ -3315,7 +3315,7 @@ fn processDocumentExtractionAsset(
             from_generation,
             window,
         );
-        try queueTerminalCoverageForRequest(runtime, window, request);
+        try recordIsolatedRequestError(runtime, window, request, err);
         return;
     };
 
@@ -3331,10 +3331,11 @@ fn processDocumentExtractionAsset(
                 if (!(try documentExtractionManifestHasLastError(runtime.alloc, value))) {
                     // Full-index writes may precompute and persist document
                     // extraction before the generated replay reaches this
-                    // worker. Preserve the terminal coverage outcome for a
-                    // successfully empty extraction even when the replay can
-                    // otherwise skip all work by hash.
-                    if (desired_chunk_keys.items.len == 0) try queueTerminalCoverageForRequest(runtime, window, request);
+                    // worker. Preserve the final coverage outcome for an empty
+                    // extraction even when replay can skip all work by hash.
+                    if (desired_chunk_keys.items.len == 0) {
+                        try finalizeEmptyDocumentExtractionCoverage(runtime, window, request, value);
+                    }
                     runtime.skip_by_hash_count += 1;
                     return;
                 }
@@ -3495,7 +3496,7 @@ fn processDocumentExtractionAsset(
             from_generation,
             window,
         );
-        try queueTerminalCoverageForRequest(runtime, window, request);
+        try recordIsolatedRequestError(runtime, window, request, err);
         return;
     };
     try flushRuntimeKVBatchAndClear(runtime, &writes, &deletes);
@@ -3558,8 +3559,10 @@ fn processDocumentExtractionAsset(
     // A successful extraction can legitimately produce no chunk artifacts (for
     // example, an image-only PDF whose OCR output is rejected as trivial). No
     // downstream chunk or embedding request will exist to close coverage for
-    // that source, so make the terminal outcome explicit here.
-    if (desired_chunk_keys.items.len == 0) try queueTerminalCoverageForRequest(runtime, window, request);
+    // that source, so make the final outcome explicit here.
+    if (desired_chunk_keys.items.len == 0) {
+        try finalizeEmptyDocumentExtractionCoverage(runtime, window, request, manifest);
+    }
     try flushGeneratedReplayWindow(runtime, window);
 
     try writes.append(runtime.alloc, .{
@@ -6127,7 +6130,7 @@ fn processMaterializedChunkDenseRequest(
         try queueDerivedCoverageOutcome(
             runtime,
             window,
-            request.doc_key,
+            request,
             consumer_indexes,
             try materializedChunkEmptyCoverageOutcome(runtime, request, chunk_artifact_name),
         );
@@ -6346,7 +6349,7 @@ fn processMaterializedChunkSparseRequest(
         try queueDerivedCoverageOutcome(
             runtime,
             window,
-            request.doc_key,
+            request,
             consumer_indexes,
             try materializedChunkEmptyCoverageOutcome(runtime, request, chunk_artifact_name),
         );
@@ -8293,6 +8296,34 @@ fn documentExtractionEmptyCoverageOutcome(alloc: Allocator, manifest_json: []con
         0;
     if (chunk_count == 0 and (ocr_failed_count > 0 or failed_pages > 0)) return .terminal_failed;
     return .skipped;
+}
+
+fn queueCoverageOutcomeForRequest(
+    runtime: *EnrichmentRuntime,
+    window: *GeneratedReplayWindow,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    outcome: CoverageOutcome,
+) !void {
+    const indexes = try affectedIndexesForRequestAlloc(runtime, request);
+    defer freeAffectedIndexes(runtime, indexes);
+    try queueDerivedCoverageOutcome(runtime, window, request, indexes, outcome);
+}
+
+fn finalizeEmptyDocumentExtractionCoverage(
+    runtime: *EnrichmentRuntime,
+    window: *GeneratedReplayWindow,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    manifest_json: []const u8,
+) !void {
+    const outcome = try documentExtractionEmptyCoverageOutcome(runtime.alloc, manifest_json);
+    if (outcome == .terminal_failed) {
+        // Mainline coverage transitions revalidate terminal outcomes against
+        // durable repair debt. Publish that debt before queueing the guarded
+        // transition so an empty OCR failure cannot look like a healthy skip.
+        try recordIsolatedRequestError(runtime, window, request, error.DocumentExtractionProducedNoUsableText);
+        return;
+    }
+    try queueCoverageOutcomeForRequest(runtime, window, request, outcome);
 }
 
 fn materializedChunkEmptyCoverageOutcome(
