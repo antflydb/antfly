@@ -59,11 +59,11 @@ static int fail_with_buffer(const char *message, antfly_buffer *buffer) {
 }
 
 int main(void) {
-    const char *path = "/tmp/antfly-lite-c-smoke.aflite";
-    const char *restored_path = "/tmp/antfly-lite-c-smoke-restored.aflite";
-    const char *snapshot_path = "/tmp/antfly-lite-c-smoke-snapshot.aflite";
-    const char *missing_path = "/tmp/antfly-lite-c-smoke-missing.aflite";
-    const char *bad_path = "/tmp/antfly-lite-c-smoke-bad.aflite";
+    const char *path = "/tmp/antfly-c-smoke.aflite";
+    const char *restored_path = "/tmp/antfly-c-smoke-restored.aflite";
+    const char *snapshot_path = "/tmp/antfly-c-smoke-snapshot.aflite";
+    const char *missing_path = "/tmp/antfly-c-smoke-missing.aflite";
+    const char *bad_path = "/tmp/antfly-c-smoke-bad.aflite";
     (void)remove(path);
     (void)remove(restored_path);
     (void)remove(snapshot_path);

@@ -17,16 +17,7 @@ const std = @import("std");
 const structlog = @import("structlog");
 const platform = @import("antfly_platform");
 const build_options = @import("build_options");
-const linked_runtime_options = @import("linked_runtime_options");
 const runtime_bridge = @import("runtime_bridge.zig");
-const cmd = if (linked_runtime_options.enabled) struct {} else @import("cmd/mod.zig");
-const httpx = if (linked_runtime_options.enabled) struct {} else @import("httpx");
-
-// usermgr/storage_imports.zig depends back on these through the executable
-// root in the monolithic diagnostic control. They stay unreferenced in the
-// linked dispatcher, so that build does not pull either storage graph in.
-pub const storage_backend_erased = if (linked_runtime_options.enabled) struct {} else @import("storage/backend_erased.zig");
-pub const lsm_backend = if (linked_runtime_options.enabled) struct {} else @import("storage/lsm_backend/mod.zig");
 
 const antfly_cloud_binary = "antfly-cloud";
 
@@ -70,26 +61,17 @@ fn mainImpl(init: std.process.Init) !void {
         return;
     }
 
-    // Server-side subcommands
-    if (comptime linked_runtime_options.enabled) {
-        if (std.mem.eql(u8, subcommand, "data")) return runLinkedRuntime(.data, subcommand, init, &args);
-        if (std.mem.eql(u8, subcommand, "ha")) return runLinkedRuntime(.cli, subcommand, init, &args);
-        if (std.mem.eql(u8, subcommand, "inference")) return runLinkedRuntime(.inference, subcommand, init, &args);
-        // Lite serve embeds the standalone runtime, so keep the entire Lite
-        // command in that codegen unit instead of pulling it into the CLI.
-        if (std.mem.eql(u8, subcommand, "lite")) return runLinkedRuntime(.standalone, subcommand, init, &args);
-        if (std.mem.eql(u8, subcommand, "metadata")) return runLinkedRuntime(.metadata, subcommand, init, &args);
-        if (std.mem.eql(u8, subcommand, "serverless")) return runLinkedRuntime(.serverless, subcommand, init, &args);
-        if (std.mem.eql(u8, subcommand, "standalone")) return runLinkedRuntime(.standalone, subcommand, init, &args);
-    } else {
-        if (std.mem.eql(u8, subcommand, "data")) return try cmd.data.runFromIterator(runtimeInit(init), argv0, &args);
-        if (std.mem.eql(u8, subcommand, "inference")) return try cmd.inference.runFromIterator(runtimeInit(init), argv0, &args);
-        if (std.mem.eql(u8, subcommand, "metadata")) return try cmd.metadata.runFromIterator(runtimeInit(init), argv0, &args);
-        if (std.mem.eql(u8, subcommand, "standalone")) return try cmd.standalone.runFromIterator(runtimeInit(init), argv0, &args);
-        if (std.mem.eql(u8, subcommand, "serverless")) return try cmd.serverless.runFromIterator(runtimeInit(init), argv0, &args);
-        if (std.mem.eql(u8, subcommand, "lite")) return try cmd.lite.runFromIterator(runtimeInit(init), argv0, &args);
-        if (std.mem.eql(u8, subcommand, "ha")) return try cmd.ha.runFromIterator(runtimeInit(init), argv0, &args);
-    }
+    // Server-side subcommands dispatch into independently generated runtime
+    // units through the narrow internal ABI.
+    if (std.mem.eql(u8, subcommand, "data")) return runRuntimeUnit(.data, subcommand, init, &args);
+    if (std.mem.eql(u8, subcommand, "ha")) return runRuntimeUnit(.cli, subcommand, init, &args);
+    if (std.mem.eql(u8, subcommand, "inference")) return runRuntimeUnit(.inference, subcommand, init, &args);
+    // Lite serve embeds the standalone runtime, so keep the entire Lite
+    // command in that codegen unit instead of pulling it into the CLI.
+    if (std.mem.eql(u8, subcommand, "lite")) return runRuntimeUnit(.standalone, subcommand, init, &args);
+    if (std.mem.eql(u8, subcommand, "metadata")) return runRuntimeUnit(.metadata, subcommand, init, &args);
+    if (std.mem.eql(u8, subcommand, "serverless")) return runRuntimeUnit(.serverless, subcommand, init, &args);
+    if (std.mem.eql(u8, subcommand, "standalone")) return runRuntimeUnit(.standalone, subcommand, init, &args);
 
     if (std.mem.eql(u8, subcommand, "cloud")) {
         const code = try runAntflyCloud(init.gpa, init.io, &args);
@@ -105,16 +87,7 @@ fn mainImpl(init: std.process.Init) !void {
     };
     for (cli_commands) |cli_cmd| {
         if (std.mem.eql(u8, subcommand, cli_cmd)) {
-            if (comptime linked_runtime_options.enabled)
-                return runLinkedRuntime(.cli, subcommand, init, &args);
-            if (cliHelpRequested(&args)) {
-                cmd.cli.printCommandUsage(cli_cmd);
-                return;
-            }
-            return runCliCommand(init.gpa, cli_cmd, &args) catch |err| switch (err) {
-                error.ApiError => std.process.exit(1),
-                else => return err,
-            };
+            return runRuntimeUnit(.cli, subcommand, init, &args);
         }
     }
 
@@ -123,7 +96,7 @@ fn mainImpl(init: std.process.Init) !void {
     return error.InvalidArguments;
 }
 
-const LinkedRuntimeRole = enum { cli, data, inference, metadata, serverless, standalone };
+const RuntimeRole = enum { cli, data, inference, metadata, serverless, standalone };
 
 extern fn antfly_runtime_cli(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_data(context: *const runtime_bridge.Context) callconv(.c) c_int;
@@ -132,8 +105,8 @@ extern fn antfly_runtime_metadata(context: *const runtime_bridge.Context) callco
 extern fn antfly_runtime_serverless(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_standalone(context: *const runtime_bridge.Context) callconv(.c) c_int;
 
-fn runLinkedRuntime(
-    comptime role: LinkedRuntimeRole,
+fn runRuntimeUnit(
+    comptime role: RuntimeRole,
     command: []const u8,
     init: std.process.Init,
     args: *std.process.Args.Iterator,
@@ -153,17 +126,6 @@ fn runLinkedRuntime(
         .standalone => antfly_runtime_standalone(&context),
     };
     if (code != 0) std.process.exit(@intCast(code));
-}
-
-fn cliHelpRequested(args: *std.process.Args.Iterator) bool {
-    var probe = args.*;
-    var first = true;
-    while (probe.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) return true;
-        if (first and std.mem.eql(u8, arg, "help")) return true;
-        first = false;
-    }
-    return false;
 }
 
 fn runAntflyCloud(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !u8 {
@@ -215,37 +177,6 @@ fn printMissingAntflyCloud() void {
         \\Then rerun this command.
         \\
     , .{antfly_cloud_binary});
-}
-
-fn runCliCommand(allocator: std.mem.Allocator, subcommand: []const u8, args: *std.process.Args.Iterator) !void {
-    // Read global config from env vars (ANTFLY_URL, ANTFLY_TOKEN)
-    const config = cmd.cli.parseGlobalFlags();
-
-    // Initialize IO and HTTP client
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    const io = io_impl.io();
-    var http = httpx.Client.initWithConfig(allocator, io, .{});
-    defer http.deinit();
-
-    // Initialize Antfly client
-    var client = try cmd.cli.initClient(allocator, &http, config);
-    defer client.deinit();
-
-    // Dispatch to the specific command
-    if (std.mem.eql(u8, subcommand, "table")) return cmd.cli.table.run(allocator, io, &client, args);
-    if (std.mem.eql(u8, subcommand, "index")) return cmd.cli.index.run(allocator, io, &client, args);
-    if (std.mem.eql(u8, subcommand, "artifact")) return cmd.cli.artifact.run(allocator, io, &client, args);
-    if (std.mem.eql(u8, subcommand, "query")) return cmd.cli.query.run(allocator, io, &client, args);
-    if (std.mem.eql(u8, subcommand, "lookup")) return cmd.cli.query.lookup(allocator, io, &client, args);
-    if (std.mem.eql(u8, subcommand, "load")) return cmd.cli.data.load(allocator, io, &client, args);
-    if (std.mem.eql(u8, subcommand, "insert")) return cmd.cli.data.insert(allocator, io, &client, args);
-    if (std.mem.eql(u8, subcommand, "delete")) return cmd.cli.data.delete(allocator, io, &client, args);
-    if (std.mem.eql(u8, subcommand, "agents")) return cmd.cli.agents.run(allocator, io, &client, args);
-    if (std.mem.eql(u8, subcommand, "backup")) return cmd.cli.backup.runBackup(allocator, io, &client, args);
-    if (std.mem.eql(u8, subcommand, "restore")) return cmd.cli.backup.runRestore(allocator, io, &client, args);
-    if (std.mem.eql(u8, subcommand, "auth")) return cmd.cli.auth.run(allocator, io, &client, args);
-    if (std.mem.eql(u8, subcommand, "internal")) return cmd.cli.internal.run(allocator, io, &client, args);
 }
 
 fn printUsage(argv0: []const u8) void {
@@ -302,20 +233,6 @@ fn runtimeAllocator(init: std.process.Init) std.mem.Allocator {
 
 test "main cmd compiles" {
     _ = main;
-}
-
-test "client help is recognized before command execution" {
-    if (comptime linked_runtime_options.enabled) return;
-    var argv = [_][*:0]const u8{ "--table", "docs", "--help" };
-    var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
-    try std.testing.expect(cliHelpRequested(&args));
-    try std.testing.expectEqualStrings("--table", args.next().?);
-    try std.testing.expect(cmd.cli.commandUsage("query") != null);
-    try std.testing.expect(cmd.cli.commandUsage("load") != null);
-
-    var value_argv = [_][*:0]const u8{ "--key", "help" };
-    var value_args = std.process.Args.Iterator.init(.{ .vector = value_argv[0..] });
-    try std.testing.expect(!cliHelpRequested(&value_args));
 }
 
 test "cloud shim argv starts with antfly-cloud and preserves args" {

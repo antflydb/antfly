@@ -25,8 +25,7 @@ const fs_paths = @import("../common/fs_paths.zig");
 const platform_time = @import("antfly_platform").time;
 const platform = @import("antfly_platform");
 const inference_bridge = @import("inference_bridge.zig");
-const standalone_runtime_options = @import("standalone_runtime_options");
-const inline_inference_codegen = !standalone_runtime_options.linked_inference;
+const inline_inference_codegen = builtin.is_test;
 const inference_host = if (inline_inference_codegen) @import("inference_host.zig") else struct {};
 
 const AntflyApiHandler = antfly.public_api.httpx_handler.AntflyApiHandler;
@@ -1379,6 +1378,30 @@ pub fn runFromIterator(
     if (lite_backend) |*backend| {
         node_backend_runtime.ptr().db_open_configurator = backend.dbOpenConfigurator();
     }
+
+    // Restore jobs are storage-engine state. Local standalone keeps them in a
+    // dedicated LSM root; Lite keeps them in its single-file reserved
+    // namespace. Supplying the engine store during API construction avoids a
+    // legacy LMDB sidecar and makes production LSM-only startup self-contained.
+    const restore_job_root = if (lite_backend == null)
+        try std.fmt.allocPrint(alloc, "{s}/api-restore-jobs", .{resolved.replica_root_dir})
+    else
+        null;
+    defer if (restore_job_root) |path| alloc.free(path);
+    var restore_job_backend: ?antfly.lsm_backend.BackendHandle = if (restore_job_root) |path|
+        try antfly.lsm_backend.BackendHandle.open(alloc, path, .{})
+    else
+        null;
+    defer if (restore_job_backend) |*backend| backend.close();
+    var local_restore_job_store: ?antfly.storage_backend_erased.Store = if (restore_job_backend) |*backend|
+        try backend.backend.runtimeStore(alloc, .{ .name = "system/api-restore-jobs" })
+    else
+        null;
+    defer if (local_restore_job_store) |*store| store.deinit();
+    const restore_job_store = if (lite_backend) |*backend|
+        try backend.runtimeStoreForNamespace("system/api-restore-jobs")
+    else
+        &local_restore_job_store.?;
     var storage_maintenance = try antfly.storage_maintenance.Coordinator.init(
         alloc,
         if (lite_backend) |*backend| backend.maintenanceSource() else antfly.storage_maintenance.localSource,
@@ -1386,7 +1409,7 @@ pub fn runFromIterator(
     );
     defer storage_maintenance.deinit();
 
-    // Standalone always owns a local Antfly node. In the linked build its heavy
+    // Standalone always owns a local Antfly node. In production its heavy
     // implementation is code-generated in the inference archive and reached
     // through an opaque internal ABI; the shipped artifact remains one binary.
     var handle: ?*anyopaque = null;
@@ -1576,6 +1599,7 @@ pub fn runFromIterator(
             .node_config = if (loaded_config) |*cfg| cfg else null,
             .user_manager = if (user_manager) |*manager| manager else null,
             .session_store = if (lite_session_store) |*store| store else null,
+            .restore_job_store = restore_job_store,
             .session_ttl_ns = if (loaded_config) |*cfg| cfg.transaction_sessions.ttl_seconds * std.time.ns_per_s else standalone_session_ttl_ns,
             .session_cleanup_interval_ns = if (loaded_config) |*cfg| cfg.transaction_sessions.cleanup_interval_seconds * std.time.ns_per_s else standalone_session_cleanup_interval_ns,
             .session_max_count = if (loaded_config) |*cfg| cfg.transaction_sessions.max_count else standalone_session_max_count,
@@ -1648,9 +1672,6 @@ pub fn runFromIterator(
     try data_server.initApiServer();
     local_metadata.local_schema_progress_provider = localSchemaProgressProvider(&data_server);
     const api_server = &data_server.http_server.?;
-    if (lite_backend) |*backend| {
-        try api_server.attachRestoreJobRuntimeStore(try backend.runtimeStoreForNamespace("system/api-restore-jobs"));
-    }
     // Recovery is a startup concern: enqueue durable work before the listener is
     // marked ready instead of waiting for an unrelated request to arrive.
     try api_server.resumeRestoreJobsOnce();
@@ -1925,7 +1946,7 @@ fn serveUnifiedInner(
     }
 
     // Register antfly public API routes under /db/v1
-    if (comptime builtin.is_test) {
+    if (comptime ApiKernelHandler == AntflyApiHandler) {
         const public_router = metadata_openapi.server.ServerRouter(AntflyApiHandler).init(handler);
         var public_prefixed = PrefixedServer("/db/v1", httpx.Server){ .inner = &server };
         try public_router.register(&public_prefixed);

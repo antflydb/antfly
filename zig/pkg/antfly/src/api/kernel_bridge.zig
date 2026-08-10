@@ -13,7 +13,8 @@
 // limitations.
 
 //! Internal compiled boundary for the public API/storage server. Production
-//! runtimes own only opaque handles; test builds retain the direct server type.
+//! runtime units own only opaque handles; test builds retain the direct server
+//! type for focused coverage.
 
 const builtin = @import("builtin");
 const std = @import("std");
@@ -33,6 +34,7 @@ const CreateContext = abi.CreateContext;
 const CallContext = abi.CallContext;
 const HandlerCreateContext = abi.HandlerCreateContext;
 const ok: c_int = 0;
+const direct_codegen = builtin.is_test;
 
 extern fn antfly_api_kernel_create(context: *const CreateContext) callconv(.c) c_int;
 extern fn antfly_api_kernel_destroy(handle: *anyopaque) callconv(.c) void;
@@ -62,8 +64,8 @@ fn callError(status: c_int, error_code: ErrorInt) !void {
     return error.ApiKernelOperationFailed;
 }
 
-pub const ApiHttpServer = if (builtin.is_test) server_mod.ApiHttpServer else OpaqueApiHttpServer;
-pub const HttpxHandler = if (builtin.is_test) handler_mod.AntflyApiHandler else OpaqueHttpxHandler;
+pub const ApiHttpServer = if (direct_codegen) server_mod.ApiHttpServer else OpaqueApiHttpServer;
+pub const HttpxHandler = if (direct_codegen) handler_mod.AntflyApiHandler else OpaqueHttpxHandler;
 
 const OpaqueApiHttpServer = struct {
     opaque_handle: *anyopaque,
@@ -250,7 +252,7 @@ const OpaqueHttpxHandler = struct {
 };
 
 pub fn createHandler(server: *ApiHttpServer) !HttpxHandler {
-    if (comptime builtin.is_test) return .{ .api_server = server };
+    if (comptime direct_codegen) return .{ .api_server = server };
     var handle: ?*anyopaque = null;
     var error_code: ErrorInt = 0;
     const status = antfly_api_kernel_handler_create(&.{
@@ -263,7 +265,7 @@ pub fn createHandler(server: *ApiHttpServer) !HttpxHandler {
 }
 
 pub fn handlerStats(handler: *const HttpxHandler) HandlerStats {
-    if (comptime builtin.is_test) {
+    if (comptime direct_codegen) {
         const query = handler.query_admission.stats();
         const query_body = handler.query_body_admission.stats();
         const runtime = handler.runtimeStats();
@@ -286,11 +288,11 @@ pub fn handlerStats(handler: *const HttpxHandler) HandlerStats {
 }
 
 pub fn deinitHandler(handler: *HttpxHandler) void {
-    if (comptime builtin.is_test) handler.deinitRuntime() else handler.deinit();
+    if (comptime direct_codegen) handler.deinitRuntime() else handler.deinit();
 }
 
 pub fn setAntflyProvider(server: *ApiHttpServer, provider: ?managed_embedder.AntflyProvider) void {
-    if (comptime builtin.is_test)
+    if (comptime direct_codegen)
         server.antfly_provider = provider
     else
         server.setAntflyProvider(provider);

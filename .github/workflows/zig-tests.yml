@@ -470,6 +470,25 @@ jobs:
           fi
           exit "$status"
 
+      # Release packaging ships this partitioned LSM-only graph. Compile the
+      # public C API against the shared distributed archive, run its consumer,
+      # and boot the real opaque-ABI executable with both standalone engines.
+      - name: Build and smoke partitioned production runtimes
+        if: needs.changes.outputs.zig_tests == 'true'
+        working-directory: zig
+        run: |
+          set -euo pipefail
+          taskset -c "${{ steps.cpus.outputs.list }}" zig build \
+            install capi capi-smoke \
+            -Doptimize=ReleaseFast \
+            -Dstrip=true \
+            -Donnx=false \
+            -Dmetal=false \
+            -Dsystem-blas=false \
+            --build-runner "${{ steps.cpus.outputs.build_runner }}" \
+            --maxrss "${{ steps.cpus.outputs.max_rss }}"
+          bash ../scripts/ci/zig-production-runtime-smoke.sh zig-out/bin/antfly
+
       - name: Set up Java for TLA+
         if: needs.changes.outputs.model_check == 'true' || needs.changes.outputs.trace_validate == 'true'
         uses: actions/setup-java@v5

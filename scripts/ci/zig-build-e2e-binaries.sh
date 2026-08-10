@@ -46,7 +46,7 @@ cd "$repo_root/zig"
 uname -a
 zig version
 
-zig build \
+python3 tools/run_bounded_zig_build.py --zig zig -- build \
   -Dtarget="$target" \
   -Dcpu="$cpu" \
   -Doptimize="$optimize" \

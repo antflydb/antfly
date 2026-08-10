@@ -144,7 +144,6 @@ zig_build_options=(
   -Dstrip="$strip"
   -Dcpu=baseline
   -Dedition=full
-  -Dlinked-runtime-libraries=true
   -Dantfly-bin-name=antfly
   -Dantfly-version="$version"
   -Donnx=false
@@ -223,7 +222,7 @@ run_zig_build_steps_with_retry() {
   # API and the shared PIC application/storage unit occupy the initial bounded
   # memory group. Inference starts after API, while the short remote CLI unit
   # starts after application/storage, preserving useful overlap deterministically.
-  run_zig_build_steps_with_retry archive install lite-capi
+  run_zig_build_steps_with_retry archive install capi
 )
 
 test -x "$prefix/bin/antfly"

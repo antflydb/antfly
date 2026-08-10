@@ -35,12 +35,22 @@ class BuildRunnerPatchTest(unittest.TestCase):
             destination.read_text(encoding="utf-8"),
         )
 
-    def test_rejects_unknown_or_already_fixed_runner(self):
+    def test_accepts_already_fixed_runner(self):
         source = self.root / "build_runner.zig"
         destination = self.root / "patched.zig"
         source.write_text(patcher.NEW_WAKE_LOOP, encoding="utf-8")
 
-        with self.assertRaisesRegex(RuntimeError, "found 0"):
+        result = patcher.patch_build_runner(source, destination)
+
+        self.assertEqual("already-fixed", result)
+        self.assertEqual(patcher.NEW_WAKE_LOOP, destination.read_text(encoding="utf-8"))
+
+    def test_rejects_unknown_runner(self):
+        source = self.root / "build_runner.zig"
+        destination = self.root / "patched.zig"
+        source.write_text("unrecognized runner", encoding="utf-8")
+
+        with self.assertRaisesRegex(RuntimeError, "old=0 fixed=0"):
             patcher.patch_build_runner(source, destination)
 
         self.assertFalse(destination.exists())

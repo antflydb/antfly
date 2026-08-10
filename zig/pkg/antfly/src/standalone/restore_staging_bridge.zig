@@ -18,8 +18,9 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
+const direct_codegen = builtin.is_test;
 
-const direct_impl = if (builtin.is_test)
+const direct_impl = if (direct_codegen)
     @import("../storage/lite/restore_staging.zig")
 else
     struct {};
@@ -69,8 +70,8 @@ pub const StagedRestore = struct {
     table_name: []const u8,
 
     pub fn deinit(self: *StagedRestore, allocator: std.mem.Allocator) void {
-        if (comptime builtin.is_test) {
-            const state: *TestState = @ptrCast(@alignCast(self.handle));
+        if (comptime direct_codegen) {
+            const state: *DirectState = @ptrCast(@alignCast(self.handle));
             state.staged.deinit(allocator);
             allocator.destroy(state);
         } else {
@@ -80,7 +81,7 @@ pub const StagedRestore = struct {
     }
 };
 
-const TestState = if (builtin.is_test)
+const DirectState = if (direct_codegen)
     struct { staged: direct_impl.StagedRestore }
 else
     opaque {};
@@ -109,8 +110,8 @@ pub fn stageInputRestoreBackup(
     backup_id: []const u8,
     location: []const u8,
 ) !StagedRestore {
-    if (comptime builtin.is_test) {
-        const state = try allocator.create(TestState);
+    if (comptime direct_codegen) {
+        const state = try allocator.create(DirectState);
         errdefer allocator.destroy(state);
         state.* = .{ .staged = try direct_impl.stageInputRestoreBackup(allocator, input_path, table_name, backup_id, location) };
         return .{

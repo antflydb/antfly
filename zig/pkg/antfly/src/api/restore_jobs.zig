@@ -302,7 +302,7 @@ pub const Store = struct {
 
     /// Attaches durability to a storage-engine-owned namespace. The engine owns
     /// `runtime`, which must outlive this store. This is the canonical path for
-    /// single-file Lite so restore state remains inside the `.aflite` artifact.
+    /// production storage engines, including local LSM and single-file Lite.
     pub fn attachRuntime(self: *Store, runtime: *backend_erased.Store) !void {
         self.lock();
         defer self.mutex.unlock();

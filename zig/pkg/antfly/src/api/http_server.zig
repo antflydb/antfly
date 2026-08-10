@@ -632,6 +632,9 @@ pub const ApiHttpServerConfig = struct {
     artifact_reprocess_job_retention_ms: ?u64 = null,
     repair_job_store_path: ?[]const u8 = null,
     repair_job_retention_ms: ?u64 = null,
+    /// Engine-owned durable storage for restore jobs. The caller retains
+    /// ownership and must keep the store alive until server deinit completes.
+    restore_job_store: ?*backend_erased.Store = null,
     restore_job_store_path: ?[]const u8 = null,
     restore_execution_guard: ?RestoreExecutionGuard = null,
     /// Local scratch root for remote backup upload staging. When omitted, the
@@ -2024,7 +2027,9 @@ pub const ApiHttpServer = struct {
             errdefer opened.deinit();
             try server.repair_job_store.attachOpenedStore(opened);
         }
-        if (cfg.restore_job_store_path orelse cfg.session_store_path) |base_path| {
+        if (cfg.restore_job_store) |store| {
+            try server.restore_job_store.attachRuntime(store);
+        } else if (cfg.restore_job_store_path orelse cfg.session_store_path) |base_path| {
             const job_path = if (cfg.restore_job_store_path != null)
                 try alloc.dupe(u8, base_path)
             else

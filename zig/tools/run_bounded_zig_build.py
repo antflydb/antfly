@@ -91,6 +91,29 @@ def zig_lib_dir(zig: str) -> Path:
     return Path(ast.literal_eval(match.group(1)))
 
 
+def zig_version(zig: str) -> tuple[int, int, int]:
+    output = subprocess.check_output([zig, "version"], text=True).strip()
+    match = re.match(r"^(\d+)\.(\d+)\.(\d+)", output)
+    if match is None:
+        raise RuntimeError(f"could not parse `zig version` output: {output!r}")
+    return tuple(int(component) for component in match.groups())
+
+
+def prepare_build_runner(zig: str, destination: Path) -> Path | None:
+    source = zig_lib_dir(zig) / "compiler" / "build_runner.zig"
+    try:
+        patch_build_runner(source, destination)
+    except (OSError, RuntimeError):
+        # A newer Zig may reorganize the runner after incorporating the fix.
+        # In that case retain --maxrss and let the toolchain use its stock
+        # runner. The known affected release remains fail-closed if its exact
+        # loop cannot be recognized.
+        if zig_version(zig) <= (0, 16, 0):
+            raise
+        return None
+    return destination
+
+
 def has_build_option(arguments: Sequence[str], option: str) -> bool:
     for argument in arguments:
         if argument == "--":
@@ -144,10 +167,9 @@ def main() -> int:
         ).returncode
 
     with tempfile.TemporaryDirectory(prefix="antfly-zig-build-runner-") as temporary:
-        patched_runner = Path(temporary) / "build_runner.zig"
-        patch_build_runner(
-            zig_lib_dir(args.zig) / "compiler" / "build_runner.zig",
-            patched_runner,
+        patched_runner = prepare_build_runner(
+            args.zig,
+            Path(temporary) / "build_runner.zig",
         )
         return subprocess.run(
             build_command(args.zig, build_arguments, patched_runner, max_rss),

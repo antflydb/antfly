@@ -94,6 +94,29 @@ class BoundedZigBuildTest(unittest.TestCase):
             command,
         )
 
+    def test_newer_unrecognized_zig_uses_stock_runner(self):
+        with mock.patch.object(launcher, "zig_lib_dir", return_value=Path("/zig/lib")):
+            with mock.patch.object(
+                launcher,
+                "patch_build_runner",
+                side_effect=RuntimeError("unknown runner"),
+            ):
+                with mock.patch.object(launcher, "zig_version", return_value=(0, 17, 0)):
+                    self.assertIsNone(
+                        launcher.prepare_build_runner("zig", Path("/tmp/patched.zig"))
+                    )
+
+    def test_unrecognized_zig_0_16_runner_fails_closed(self):
+        with mock.patch.object(launcher, "zig_lib_dir", return_value=Path("/zig/lib")):
+            with mock.patch.object(
+                launcher,
+                "patch_build_runner",
+                side_effect=RuntimeError("unknown runner"),
+            ):
+                with mock.patch.object(launcher, "zig_version", return_value=(0, 16, 0)):
+                    with self.assertRaisesRegex(RuntimeError, "unknown runner"):
+                        launcher.prepare_build_runner("zig", Path("/tmp/patched.zig"))
+
 
 if __name__ == "__main__":
     unittest.main()

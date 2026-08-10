@@ -4143,10 +4143,10 @@ pub const DataServer = struct {
         var api_server_cfg = self.api_server_cfg;
         var owned_restore_job_store_path: ?[]u8 = null;
         defer if (owned_restore_job_store_path) |path| self.alloc.free(path);
-        // Filesystem-backed runtimes keep API job state beside their shard
-        // catalog by default. Lite overrides this after construction with an
-        // engine namespace so its artifact remains genuinely single-file.
+        // Runtimes that do not supply engine-owned persistence keep API job
+        // state beside their shard catalog as a legacy fallback.
         if (api_server_cfg.restore_job_store_path == null and
+            api_server_cfg.restore_job_store == null and
             api_server_cfg.session_store_path == null and
             api_server_cfg.session_store == null and
             api_server_cfg.deployment_mode != .serverless)

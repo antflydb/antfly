@@ -11,7 +11,7 @@ C library before running cgo-backed tests:
 
 ```sh
 cd zig
-zig build lite-capi
+zig build capi
 cd ../go/pkg/antflylite
 go test -tags antflylite_capi ./...
 ```
