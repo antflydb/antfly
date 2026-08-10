@@ -2721,6 +2721,38 @@ physical caches, resource owner, local vtables, DB opens, maintenance, and
 generation-transition implementations become unreachable together. Do not
 measure another individual lifecycle callback.
 
+### Rejected standalone/serverless root relocation
+
+With the data-transition prerequisite complete, a source-selection probe moved
+the existing standalone/Lite, serverless, and restore-staging entry roots from
+the distributed archive into the separate storage archive. The hidden runtime
+ABI, command dispatch, one-executable composition, embedded inference bridge,
+and build concurrency were unchanged. Linked native Debug completed and the
+`data`, `metadata`, `serverless`, `standalone`, and `lite` help paths all
+returned successfully.
+
+The fresh-cache Debug graph moved work but did not reduce the maximum unit:
+
+| Unit | Before | Relocated roots | Repository Zig files | Declarations |
+|---|---:|---:|---:|---:|
+| Distributed | 75.980 s | 68.658 s | 719 -> 595 | 41,980 -> 37,438 |
+| Storage kernel | 50.882 s | 75.229 s | 434 -> 707 | 29,081 -> 40,083 |
+| API kernel | 28.871 s | 28.915 s | unchanged | unchanged |
+
+Distributed removed 124 files and 112,065 source lines, but storage added 273
+files and 296,744 lines. The maximum compiler unit changed by only -0.751
+seconds in Debug, and the two units still analyzed nearly all of the same
+physical storage implementation. A cold ARM64 `ReleaseFast` build would not be
+a justified use of the measurement loop for this graph.
+
+Decision: **reject and revert**. Relocating source roots is not compiled
+deduplication. Standalone currently constructs the complete data, metadata,
+API, and Lite implementation in-process, so whichever unit owns its entry root
+inherits almost the complete application graph. The next viable boundary must
+make standalone a thin composition layer over opaque compiled runtime handles;
+moving its existing source body between archives cannot meet the critical-path
+or compile-once goals.
+
 ## Holistic target architecture
 
 The current candidate baseline is the four-unit topology above with serverless
