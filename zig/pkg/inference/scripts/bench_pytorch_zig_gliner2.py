@@ -16,7 +16,8 @@
 """Narrow GLiNER2 fp32 benchmark harness.
 
 This intentionally starts smaller than the production-readiness matrix:
-same text/labels, batch sizes 1 and 8, PyTorch MPS/CPU plus Zig native/Metal.
+same text/labels, batch sizes 1 and 8, PyTorch CUDA/MPS/CPU plus Zig
+native/Metal/CUDA.
 Metal runs go through the repository debug wrapper by default so API
 validation stays on while we are chasing kernel regressions.
 """
@@ -34,6 +35,13 @@ import sys
 import time
 from pathlib import Path
 from typing import Any
+
+from gliner2_release_contract import (
+    UPSTREAM_COMMIT,
+    verify_canonical_python_runtime,
+    verify_import_source,
+    verify_upstream_checkout,
+)
 
 
 DEFAULT_TEXT = (
@@ -66,14 +74,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-dir", default="/private/tmp/termite-gliner2-fp32-bench")
     parser.add_argument("--zig", default="zig")
     parser.add_argument("--python", default=sys.executable)
+    parser.add_argument(
+        "--upstream-source",
+        type=Path,
+        help=f"Clean upstream GLiNER2 checkout at the fixed oracle commit {UPSTREAM_COMMIT}",
+    )
     parser.add_argument("--repo-root", default=str(root))
     parser.add_argument("--skip-pytorch", action="store_true")
     parser.add_argument("--skip-zig", action="store_true")
     parser.add_argument("--skip-native", action="store_true")
     parser.add_argument("--skip-metal", action="store_true")
+    parser.add_argument("--skip-cuda", action="store_true")
     parser.add_argument("--skip-full-graph", action="store_true")
     parser.add_argument("--profile", action="store_true", help="Enable verbose GLiNER profile output in Zig runs.")
-    parser.add_argument("--pytorch-device", choices=("mps", "cpu"), action="append", default=None)
+    parser.add_argument("--pytorch-device", choices=("cuda", "mps", "cpu"), action="append", default=None)
+    parser.add_argument(
+        "--cuda-artifacts",
+        default="fatbin",
+        choices=("portable", "sm89", "fatbin"),
+        help="Embedded CUDA artifact (fatbin is the production default)",
+    )
     parser.add_argument("--zig-cache-dir", default="/private/tmp/termite-zig-cache-gliner2-bench/local")
     parser.add_argument("--zig-global-cache-dir", default="/private/tmp/termite-zig-cache-gliner2-bench/global")
     parser.add_argument("--metal-debug", action=argparse.BooleanOptionalAction, default=True)
@@ -124,18 +144,28 @@ def run_pytorch(
     device: str,
     warmup_iters: int,
     measure_iters: int,
+    oracle: dict[str, str],
 ) -> dict[str, Any]:
     import torch
+    import gliner2
     from gliner2 import GLiNER2
 
-    available = device != "mps" or torch.backends.mps.is_available()
+    imported_module = verify_import_source(GLiNER2, Path(oracle["checkout"]))
+
+    available = (
+        torch.cuda.is_available()
+        if device == "cuda"
+        else torch.backends.mps.is_available()
+        if device == "mps"
+        else True
+    )
     if not available:
         return {
             "runner": f"pytorch_{device}",
             "backend": device,
             "batch_size": batch_size,
             "status": "skipped",
-            "error": "torch.backends.mps.is_available() is false",
+            "error": f"PyTorch device {device} is unavailable",
         }
 
     model = GLiNER2.from_pretrained(model_dir)
@@ -154,6 +184,8 @@ def run_pytorch(
             )
         if device == "mps":
             torch.mps.synchronize()
+        elif device == "cuda":
+            torch.cuda.synchronize()
 
     samples: list[float] = []
     last_count = 0
@@ -161,6 +193,8 @@ def run_pytorch(
     for _ in range(measure_iters):
         if device == "mps":
             torch.mps.synchronize()
+        elif device == "cuda":
+            torch.cuda.synchronize()
         start = time.perf_counter_ns()
         with torch.inference_mode():
             result = model.batch_extract_entities(
@@ -172,6 +206,8 @@ def run_pytorch(
             )
         if device == "mps":
             torch.mps.synchronize()
+        elif device == "cuda":
+            torch.cuda.synchronize()
         samples.append((time.perf_counter_ns() - start) / 1.0e6)
         counts = [count_entities(row) for row in result]
         last_count = sum(c for c, _ in counts)
@@ -187,6 +223,15 @@ def run_pytorch(
         "score_sum": last_score_sum,
         "samples_ms": samples,
         **summarize_ms(samples),
+        "oracle": {
+            **oracle,
+            "imported_module": imported_module,
+            "python_version": __import__("platform").python_version(),
+            "unicode_version": __import__("unicodedata").unidata_version,
+            "torch_version": torch.__version__,
+            "device_name": torch.cuda.get_device_name() if device == "cuda" else device,
+            "gliner2_version": getattr(gliner2, "__version__", None),
+        },
     }
 
 
@@ -257,8 +302,11 @@ def run_zig(
         "--global-cache-dir",
         args.zig_global_cache_dir,
         "-Donnx=false",
-        "-Dmetal=true",
+        f"-Dmetal={'true' if backend == 'metal' else 'false'}",
+        f"-Dcuda={'true' if backend == 'cuda' else 'false'}",
     ]
+    if backend == "cuda":
+        cmd.append(f"-Dcuda-artifacts={args.cuda_artifacts}")
     if args.zig_release:
         cmd.append(f"--release={args.zig_release}")
     cmd.extend(args.extra_zig_build_arg)
@@ -393,9 +441,21 @@ def main() -> int:
     args = parse_args()
     labels = args.labels or list(DEFAULT_LABELS)
     batch_sizes = args.batch_sizes or [1, 8]
-    devices = args.pytorch_device or ["mps", "cpu"]
+    devices = args.pytorch_device or ["cuda", "mps", "cpu"]
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    oracle: dict[str, str] | None = None
+    if not args.skip_pytorch:
+        if args.upstream_source is None:
+            raise SystemExit("--upstream-source is required unless --skip-pytorch is set")
+        try:
+            verify_canonical_python_runtime()
+            oracle = verify_upstream_checkout(args.upstream_source)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        sys.dont_write_bytecode = True
+        sys.path.insert(0, oracle["checkout"])
 
     rows: list[dict[str, Any]] = []
     if not args.skip_pytorch:
@@ -410,6 +470,7 @@ def main() -> int:
                         device,
                         args.warmup_iters,
                         args.measure_iters,
+                        oracle,
                     )
                 except Exception as exc:
                     row = {
@@ -433,6 +494,9 @@ def main() -> int:
                 if not args.skip_full_graph:
                     rows.append(run_zig(args, labels, batch_size, "metal", "partitioned", out_dir))
                     write_outputs(out_dir, rows)
+            if not args.skip_cuda:
+                rows.append(run_zig(args, labels, batch_size, "cuda", None, out_dir))
+                write_outputs(out_dir, rows)
 
     write_outputs(out_dir, rows)
     print(out_dir / "results.csv")

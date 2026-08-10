@@ -9,7 +9,6 @@ class ConnectedModelType(str, Enum):
     GENERATOR = "generator"
     OTHER = "other"
     READER = "reader"
-    RECOGNIZER = "recognizer"
     RERANKER = "reranker"
     REWRITER = "rewriter"
     TRANSCRIBER = "transcriber"

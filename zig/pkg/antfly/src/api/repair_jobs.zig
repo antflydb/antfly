@@ -456,7 +456,12 @@ pub const Store = struct {
         total.unresolved +|= pass.unresolved;
         total.in_progress +|= pass.in_progress;
         total.indexes_rebuilt +|= pass.indexes_rebuilt;
-        total.indexes_degraded +|= pass.indexes_degraded;
+        // These are job-level state gauges for the one named index, not work
+        // counters. A bounded retry may observe the same index repeatedly;
+        // preserve whether it was degraded at any pass boundary and expose the
+        // latest post-pass state instead of accumulating repeated observations.
+        total.indexes_degraded_before = @max(total.indexes_degraded_before, pass.indexes_degraded_before);
+        total.indexes_degraded_after = pass.indexes_degraded_after;
         total.controls_applied +|= pass.controls_applied;
         total.limit = pass.limit;
         total.has_more = pass.has_more;
@@ -1349,6 +1354,56 @@ test "forced index repair job dispatches force only once" {
     defer parsed_updated.deinit();
     try std.testing.expectEqualStrings("queued", parsed_updated.value.phase);
     try std.testing.expect(!parsed_updated.value.force);
+}
+
+test "index repair job keeps degradation gauges as snapshots across retries" {
+    const alloc = std.testing.allocator;
+    var store = Store.init(alloc, .{});
+    defer store.deinit();
+
+    const started = try store.startJob(alloc, "docs", .{
+        .target = "index",
+        .index = "semantic",
+        .force = true,
+    });
+    defer alloc.free(started);
+    var queued = try std.json.parseFromSlice(JobState, alloc, started, .{ .ignore_unknown_fields = true });
+    defer queued.deinit();
+
+    const first_begin = try store.beginAdvance(alloc, queued.value);
+    defer alloc.free(first_begin.encoded);
+    var first_running = try std.json.parseFromSlice(JobState, alloc, first_begin.encoded, .{ .ignore_unknown_fields = true });
+    defer first_running.deinit();
+    const first = try store.recordPass(alloc, first_running.value, .{
+        .scanned = 1,
+        .in_progress = 1,
+        .unresolved = 1,
+        .indexes_degraded_before = 1,
+        .indexes_degraded_after = 1,
+        .debt_remaining = true,
+    });
+    defer alloc.free(first);
+    var retry = try std.json.parseFromSlice(JobState, alloc, first, .{ .ignore_unknown_fields = true });
+    defer retry.deinit();
+    try std.testing.expectEqual(@as(u64, 1), retry.value.result.indexes_degraded_before);
+    try std.testing.expectEqual(@as(u64, 1), retry.value.result.indexes_degraded_after);
+
+    const second_begin = try store.beginAdvance(alloc, retry.value);
+    defer alloc.free(second_begin.encoded);
+    var second_running = try std.json.parseFromSlice(JobState, alloc, second_begin.encoded, .{ .ignore_unknown_fields = true });
+    defer second_running.deinit();
+    const completed = try store.recordPass(alloc, second_running.value, .{
+        .scanned = 1,
+        .repaired = 1,
+        .indexes_degraded_before = 1,
+        .indexes_degraded_after = 0,
+    });
+    defer alloc.free(completed);
+    var terminal = try std.json.parseFromSlice(JobState, alloc, completed, .{ .ignore_unknown_fields = true });
+    defer terminal.deinit();
+    try std.testing.expectEqualStrings("succeeded", terminal.value.phase);
+    try std.testing.expectEqual(@as(u64, 1), terminal.value.result.indexes_degraded_before);
+    try std.testing.expectEqual(@as(u64, 0), terminal.value.result.indexes_degraded_after);
 }
 
 test "durable cancellation retries transient failures with backoff" {

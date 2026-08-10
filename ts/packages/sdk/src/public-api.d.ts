@@ -1299,7 +1299,7 @@ export interface paths {
             path: {
                 /** @description Name of the table */
                 tableName: string;
-                /** @description Name of the derived document artifact. */
+                /** @description Name of the derived asset enrichment. */
                 artifactName: string;
             };
             cookie?: never;
@@ -1307,8 +1307,8 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Reprocess a derived document artifact across a table range
-         * @description Runs a bounded operational repair pass for a derived document artifact
+         * Reprocess a derived asset across a table range
+         * @description Runs a bounded operational repair pass for any asset producer type
          *     across source rows in key order. Use `next_key` from the response as
          *     the next request's `from_key` for simple single-cursor continuation.
          *     Distributed repair controllers should persist `shard_cursors` from the
@@ -1363,7 +1363,7 @@ export interface paths {
             path: {
                 /** @description Name of the table */
                 tableName: string;
-                /** @description Name of the derived document artifact. */
+                /** @description Name of the derived asset enrichment. */
                 artifactName: string;
             };
             cookie?: never;
@@ -1513,9 +1513,11 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Reprocess a derived document artifact
+         * Reprocess a derived asset
          * @description Invalidates the current artifact state and requests the producer to
-         *     rebuild the derived document hierarchy for the source document.
+         *     rebuild the derived asset for the source document. Copy, generator,
+         *     reader, transcriber, extractor, and document-extraction producers are
+         *     all supported.
          */
         post: operations["reprocessDocumentArtifact"];
         delete?: never;
@@ -2281,7 +2283,7 @@ export interface paths {
         };
         /**
          * List available models
-         * @description Returns lists of available embedding, chunking, reranking, generator, NER, rewriter, reader, and transcriber models.
+         * @description Returns lists of available embedding, chunking, reranking, generator, extractor, rewriter, reader, and transcriber models.
          *
          *     ## Embedders
          *
@@ -2304,10 +2306,10 @@ export interface paths {
          *     - LLM models from `models_dir/generators/`
          *     - Empty if no models configured
          *
-         *     ## Recognizers
+         *     ## Extractors
          *
-         *     - ONNX models from `models_dir/recognizers/`
-         *     - Includes GLiNER models for zero-shot recognition
+         *     - Extraction-capable models from the managed model registry
+         *     - Includes GLiNER models for zero-shot entity and relation extraction
          *
          *     ## Rewriters
          *
@@ -2777,7 +2779,7 @@ export interface components {
          *     classify.
          * @enum {string}
          */
-        ConnectedModelType: "embedder" | "generator" | "reranker" | "chunker" | "recognizer" | "classifier" | "rewriter" | "reader" | "transcriber" | "extractor" | "other";
+        ConnectedModelType: "embedder" | "generator" | "reranker" | "chunker" | "classifier" | "rewriter" | "reader" | "transcriber" | "extractor" | "other";
         ConnectedModel: {
             /** @description Model identifier as reported by the provider. */
             name: string;
@@ -2805,7 +2807,7 @@ export interface components {
             /**
              * @description Models reported by the provider, grouped by model type. Keys are
              *     pluralized ConnectedModelType values ("embedders", "generators",
-             *     "rerankers", "chunkers", "recognizers", "classifiers", "rewriters",
+             *     "rerankers", "chunkers", "classifiers", "rewriters",
              *     "readers", "transcribers", "extractors") plus "other" for models
              *     the provider's listing API does not classify by task. Populated
              *     only when the request includes the "models" expansion.
@@ -3070,7 +3072,7 @@ export interface components {
          * @description Reason an artifact was added to the repair queue.
          * @enum {string}
          */
-        ArtifactRepairReason: "missing_artifact" | "corrupt_artifact" | "unreadable_artifact";
+        ArtifactRepairReason: "missing_artifact" | "corrupt_artifact" | "unreadable_artifact" | "enrichment_failed";
         /**
          * @description Repair subsystem to inspect or run.
          * @enum {string}
@@ -3108,6 +3110,13 @@ export interface components {
              */
             sequence: number;
             reason: components["schemas"]["ArtifactRepairReason"];
+            /**
+             * Format: uint64
+             * @description Number of enrichment generation attempts made before this issue was parked.
+             */
+            generation_attempts: number;
+            /** @description Stable source-generation error code that caused this issue to be parked. */
+            generation_error?: string;
             /**
              * Format: uint64
              * @description Number of repair attempts made for this issue.
@@ -3252,9 +3261,14 @@ export interface components {
             indexes_rebuilt: number;
             /**
              * Format: uint64
-             * @description Number of selected indexes that were already degraded or quarantined before repair.
+             * @description Number of selected indexes that were degraded or quarantined when this repair pass began.
              */
-            indexes_degraded: number;
+            indexes_degraded_before: number;
+            /**
+             * Format: uint64
+             * @description Number of selected indexes that remain degraded or quarantined when this repair pass returns.
+             */
+            indexes_degraded_after: number;
             /**
              * Format: uint64
              * @description Number of existing index repairs that accepted the requested control.
@@ -4591,6 +4605,11 @@ export interface components {
             sync_level?: components["schemas"]["SyncLevel"];
         };
         BatchResponse: {
+            /**
+             * @description Durable commit and visibility/participant recovery state.
+             * @enum {string}
+             */
+            status?: "committed" | "committed_pending";
             /** @description Number of documents successfully inserted */
             inserted?: number;
             /** @description Number of documents successfully deleted */
@@ -4651,6 +4670,11 @@ export interface components {
         };
         /** @description Response for a cross-table batch operation. Contains per-table results. */
         MultiBatchResponse: {
+            /**
+             * @description Durable commit and visibility/propagation state.
+             * @enum {string}
+             */
+            status?: "committed" | "committed_visibility_pending" | "committed_recovery_pending";
             /** @description Per-table batch results */
             tables?: {
                 [key: string]: components["schemas"]["BatchResponse"];
@@ -4694,23 +4718,68 @@ export interface components {
             };
             sync_level?: components["schemas"]["SyncLevel"];
         };
+        /** @description Participant location and 2PC phase where the conflict occurred. */
+        TransactionConflictParticipant: {
+            /**
+             * Format: uint64
+             * @description Raft group that reported the conflict.
+             */
+            group_id?: number;
+            /**
+             * @description 2PC participant phase that reported the conflict.
+             * @enum {string}
+             */
+            phase?: "begin" | "prepare" | "resolve";
+        };
+        /** @description Structured details for an aborted transaction attempt. */
+        TransactionConflict: {
+            /** @description Table where the conflict was detected. */
+            table: string;
+            /** @description Document key associated with the conflict, when applicable. */
+            key: string;
+            /** @description Human-readable conflict description. */
+            message: string;
+            /**
+             * @description Stable machine-readable conflict classification.
+             * @enum {string}
+             */
+            kind: "version_conflict" | "intent_conflict" | "topology_changed" | "participant_unavailable" | "doc_identity_unavailable" | "session_lease_lost" | "transaction_conflict" | "torn_state";
+            /** @description Whether retrying the transaction may succeed without changing its writes. */
+            retryable: boolean;
+            /**
+             * Format: uint32
+             * @description Minimum suggested delay before retrying a retryable conflict.
+             */
+            retry_after_ms?: number;
+            /**
+             * @description Component whose state should be refreshed before retrying.
+             * @enum {string}
+             */
+            retry_scope?: "topology" | "participant" | "doc_identity" | "session";
+            /**
+             * Format: uint64
+             * @description Version required by the transaction predicate.
+             */
+            expected_version?: number;
+            /**
+             * Format: uint64
+             * @description Version observed while validating the transaction predicate.
+             */
+            current_version?: number;
+            participant?: components["schemas"]["TransactionConflictParticipant"];
+        };
         /** @description Result of an OCC transaction commit attempt. */
         TransactionCommitResponse: {
             /**
-             * @description Whether the transaction was committed or aborted due to a conflict
+             * @description Durable transaction outcome. Pending committed states mean the
+             *     commit decision is durable while its requested visibility barrier
+             *     or participant recovery is still completing.
              * @enum {string}
              */
-            status: "committed" | "aborted";
+            status: "committed" | "committed_visibility_pending" | "committed_recovery_pending" | "aborted";
             /** @description Details about the conflict that caused an abort (only present when status is "aborted") */
-            conflict?: {
-                /** @description Table where the conflict was detected */
-                table?: string;
-                /** @description Key that had a version mismatch */
-                key?: string;
-                /** @description Human-readable conflict description */
-                message?: string;
-            };
-            /** @description Per-table batch results (only present when status is "committed") */
+            conflict?: components["schemas"]["TransactionConflict"];
+            /** @description Per-table batch results (present for every committed status) */
             tables?: {
                 [key: string]: components["schemas"]["BatchResponse"];
             };
@@ -9101,7 +9170,7 @@ export interface components {
              * @description Number of documents indexed during current rebuild
              */
             backfill_items_processed?: number;
-            /** @description Operational readiness state such as ready, running, retrying, or failed. */
+            /** @description Operational readiness state such as ready, running, retrying, degraded, or failed. */
             backfill_state?: string;
             /**
              * Format: uint64
@@ -9246,14 +9315,24 @@ export interface components {
             covered: number;
             /**
              * Format: uint64
-             * @description Source documents without a policy-accepted terminal outcome. Null when observations are incomplete and the global value is unknown.
+             * @description Source documents with any durable terminal outcome: produced, intentionally skipped, or terminally failed.
+             */
+            settled: number;
+            /**
+             * Format: uint64
+             * @description Source documents without an outcome accepted by the configured coverage policy. Null when observations are incomplete.
+             */
+            uncovered: number | null;
+            /**
+             * Format: uint64
+             * @description Source documents that have not reached any terminal outcome and may still be processing. Null when observations are incomplete.
              */
             pending: number | null;
             /** @description Whether observations are complete, replay has reached its target, and every observed source has an outcome accepted by the policy. */
             complete: boolean;
             /** @description Whether coverage is complete without terminal failures. */
             healthy: boolean;
-            /** @description Whether coverage is complete under best_effort but includes terminal failures. */
+            /** @description Whether all sources are settled but coverage remains unhealthy under the configured policy, including terminal failures or policy-rejected skips. */
             degraded: boolean;
         };
         /** @description Runtime state for the durable embeddings enrichment worker. */
@@ -9283,6 +9362,16 @@ export interface components {
             retryable_error_count: number;
             /** Format: uint64 */
             fatal_error_count: number;
+            /**
+             * Format: uint32
+             * @description Consecutive durable worker retries for the current failed request window.
+             */
+            consecutive_retry_count: number;
+            /**
+             * Format: uint64
+             * @description Unix epoch time in milliseconds when the current durable retry becomes eligible. Zero when not retrying.
+             */
+            next_retry_at_ms: number;
             retrying: boolean;
             worker_failed: boolean;
             /** @description Whether the background enrichment worker is currently running. */
@@ -9521,7 +9610,7 @@ export interface components {
              * @description Number of edges indexed during current rebuild
              */
             backfill_items_processed?: number;
-            /** @description Operational readiness state such as ready, running, retrying, or failed. */
+            /** @description Operational readiness state such as ready, running, retrying, degraded, or failed. */
             backfill_state?: string;
             /**
              * Format: uint64
@@ -9665,7 +9754,7 @@ export interface components {
              * @description Number of documents processed during current backfill
              */
             backfill_items_processed?: number;
-            /** @description Operational readiness state such as ready, running, retrying, or failed. */
+            /** @description Operational readiness state such as ready, running, retrying, degraded, or failed. */
             backfill_state?: string;
             /**
              * Format: uint64
@@ -11582,10 +11671,6 @@ export interface components {
             generators: {
                 [key: string]: components["schemas"]["InferenceModelInfo"];
             };
-            /** @description Available recognizer models from models_dir/recognizers/ */
-            recognizers: {
-                [key: string]: components["schemas"]["InferenceModelInfo"];
-            };
             /** @description Available Seq2Seq rewriter models from models_dir/rewriters/ */
             rewriters: {
                 [key: string]: components["schemas"]["InferenceModelInfo"];
@@ -11947,7 +12032,7 @@ export interface components {
          * @description Model registry kind.
          * @enum {string}
          */
-        InferenceModelKind: "generator" | "embedder" | "reranker" | "chunker" | "classifier" | "recognizer" | "rewriter" | "reader" | "transcriber" | "extractor";
+        InferenceModelKind: "generator" | "embedder" | "reranker" | "chunker" | "classifier" | "rewriter" | "reader" | "transcriber" | "extractor";
         /**
          * @description Optional backend preference for model loading or request execution.
          *     `auto` keeps the node default behavior.
@@ -12050,7 +12135,7 @@ export interface components {
              *     - `{models_dir}/embedders/` - Embedding models (ONNX)
              *     - `{models_dir}/chunkers/` - Chunking models (ONNX)
              *     - `{models_dir}/rerankers/` - Reranking models (ONNX)
-             *     - `{models_dir}/recognizers/` - Recognition models (ONNX)
+             *     - `{models_dir}/extractors/` - Entity, relation, and structured extraction models
              *     - `{models_dir}/rewriters/` - Seq2Seq rewriter models (ONNX)
              *
              *     Defaults to ~/.antfly/inference/models (set via viper). If not set, only built-in fixed chunking is available.
@@ -12556,6 +12641,7 @@ export interface components {
                 [key: string]: unknown;
             };
         };
+        /** @description Optional source and target labels constrain relation endpoints. A target requires a source. */
         ExtractionRelationSchema: {
             type: string;
             source?: string;
@@ -12567,16 +12653,25 @@ export interface components {
             /** @default false */
             multi_label?: boolean;
         };
-        ExtractionStructureField: string | {
+        ExtractionStructureField: string | ({
+            /** @enum {string} */
+            type?: "str" | "string" | "list" | "array";
+            enum?: string[];
+        } & {
             [key: string]: unknown;
-        };
+        });
         ExtractionStructureSchema: {
-            fields?: {
+            fields: {
                 [key: string]: components["schemas"]["ExtractionStructureField"];
             };
         } & {
             [key: string]: unknown;
         };
+        /**
+         * @description Selects one extraction operation family per request. Entity labels may
+         *     accompany relation schemas so relation extraction can return its
+         *     participating entities in the same response.
+         */
         ExtractionSchema: {
             entities?: string[];
             relations?: components["schemas"]["ExtractionRelationSchema"][];
@@ -12595,6 +12690,30 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        /** @description Optional cross-input entity and relation deduplication. */
+        ExtractionResolverOptions: {
+            /**
+             * Format: float
+             * @default 0.85
+             */
+            similarity_threshold?: number;
+            /** @default true */
+            type_must_match?: boolean;
+            /**
+             * Format: float
+             * @default 0
+             */
+            min_entity_confidence?: number;
+            /**
+             * Format: float
+             * @default 0
+             */
+            min_relation_confidence?: number;
+            /** @default true */
+            deduplicate_relations?: boolean;
+            /** @default true */
+            track_provenance?: boolean;
+        };
         ExtractionOptions: {
             /** Format: float */
             threshold?: number;
@@ -12602,6 +12721,7 @@ export interface components {
             include_confidence?: boolean;
             include_spans?: boolean;
             reader?: components["schemas"]["ExtractionReaderOptions"];
+            resolver?: components["schemas"]["ExtractionResolverOptions"];
         } & {
             [key: string]: unknown;
         };
@@ -12758,6 +12878,21 @@ export interface components {
             };
             content: {
                 "application/json": components["schemas"]["Error"];
+            };
+        };
+        /**
+         * @description Internal transaction failure. If the response says that the outcome is
+         *     unknown, the request may already have committed and the stateless
+         *     request MUST NOT be retried. Use a transaction session when a commit
+         *     must be safely retryable by transaction ID.
+         */
+        StatelessTransactionFailure: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+                "text/plain": string;
             };
         };
         /** @description Writes are temporarily limited while a dense-index rebuild catches up. */
@@ -12952,7 +13087,7 @@ export interface operations {
             path: {
                 connection_id: string;
                 /** @description Requires the connection capability `models.<operation>`. */
-                operation: "embed" | "generate" | "rerank" | "chunk" | "recognize" | "extract" | "rewrite" | "read" | "transcribe";
+                operation: "embed" | "generate" | "rerank" | "chunk" | "extract" | "rewrite" | "read" | "transcribe";
             };
             cookie?: never;
         };
@@ -13143,9 +13278,36 @@ export interface operations {
                     "application/json": components["schemas"]["MultiBatchResponse"];
                 };
             };
+            /** @description Commit decision is durable; visibility or participant recovery is still pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MultiBatchResponse"];
+                };
+            };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
-            500: components["responses"]["InternalServerError"];
+            /** @description Transaction aborted because a predicate, topology fence, or participant state conflicted */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TransactionCommitResponse"];
+                };
+            };
+            500: components["responses"]["StatelessTransactionFailure"];
+            /** @description The coordinator was unavailable before a commit decision; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
+                };
+            };
         };
     };
     commitTransaction: {
@@ -13170,6 +13332,15 @@ export interface operations {
                     "application/json": components["schemas"]["TransactionCommitResponse"];
                 };
             };
+            /** @description Transaction committed durably with visibility or participant recovery pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TransactionCommitResponse"];
+                };
+            };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
             /** @description Transaction aborted due to version conflict */
@@ -13181,7 +13352,16 @@ export interface operations {
                     "application/json": components["schemas"]["TransactionCommitResponse"];
                 };
             };
-            500: components["responses"]["InternalServerError"];
+            500: components["responses"]["StatelessTransactionFailure"];
+            /** @description The coordinator was unavailable before a commit decision; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
+                };
+            };
         };
     };
     listTransactionSessions: {
@@ -13479,6 +13659,15 @@ export interface operations {
         responses: {
             /** @description Session committed */
             200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TransactionSessionCommitResponse"];
+                };
+            };
+            /** @description Session committed durably with visibility or participant recovery pending */
+            202: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -14041,10 +14230,42 @@ export interface operations {
                     "application/json": components["schemas"]["BatchResponse"];
                 };
             };
+            /** @description Commit decision is durable; visibility or participant recovery is still pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchResponse"];
+                };
+            };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
+            /**
+             * @description The atomic batch conflicted, the serving replica is fenced, or the
+             *     server could not determine whether a single-group Raft command
+             *     committed. An ambiguous outcome is not safe to replay blindly when
+             *     the request contains non-idempotent transforms.
+             */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
+                };
+            };
             429: components["responses"]["DenseRepairBackpressure"];
-            500: components["responses"]["InternalServerError"];
+            500: components["responses"]["StatelessTransactionFailure"];
+            /** @description Write routing, document identity, or the coordinator is temporarily unavailable before a commit decision */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
+                };
+            };
         };
     };
     linearMerge: {
@@ -14538,7 +14759,7 @@ export interface operations {
             path: {
                 /** @description Name of the table */
                 tableName: string;
-                /** @description Name of the derived document artifact. */
+                /** @description Name of the derived asset enrichment. */
                 artifactName: string;
             };
             cookie?: never;
@@ -14636,7 +14857,7 @@ export interface operations {
             path: {
                 /** @description Name of the table */
                 tableName: string;
-                /** @description Name of the derived document artifact. */
+                /** @description Name of the derived asset enrichment. */
                 artifactName: string;
             };
             cookie?: never;

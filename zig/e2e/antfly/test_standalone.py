@@ -501,6 +501,19 @@ def test_standalone_health_endpoints(embedded_standalone_runtime):
     assert unknown.status_code == 404
 
 
+def test_standalone_retired_recognize_route_returns_not_found(backup_api):
+    """The unified public server must match the dedicated inference 404 contract."""
+    public_url = backup_api.url.removesuffix("/db/v1")
+    response = backup_api.s.post(
+        f"{public_url}/ai/v1/recognize",
+        json={"model": "antflydb/gliner2-base-v1", "texts": ["John works at Antfly."]},
+        timeout=10,
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {"error": "NOT_FOUND", "message": "resource not found"}
+
+
 def test_standalone_drop_tables_with_pending_embedded_embeddings(
     embedded_standalone_api,
     embedded_standalone_runtime,

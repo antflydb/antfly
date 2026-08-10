@@ -1,0 +1,8 @@
+{"input":"Elon Musk founded SpaceX in California.","output":{"relations":[{"founded":{"head":"Elon Musk","tail":"SpaceX","place":"California"}}]}}
+{"input":"John works at Acme in Paris.","output":{"relations":[{"employment":{"head":"John","tail":"Acme"}}]}}
+{"input":"Mary joined Globex in London.","output":{"relations":[{"employment":{"head":"Mary","tail":"Globex"}}]}}
+{"input":"Acme acquired Globex last year.","output":{"relations":[{"acquired":{"head":"Acme","tail":"Globex"}}]}}
+{"input":"John met Mary in Seattle.","output":{"relations":[{"meeting":{"head":"John","tail":"Mary","place":"Seattle"}}]}}
+{"input":"Globex is based in Seattle.","output":{"relations":[{"located_in":{"head":"Globex","tail":"Seattle"}}]}}
+{"input":"Mary founded Acme in London.","output":{"relations":[{"founded":{"head":"Mary","tail":"Acme","place":"London"}}]}}
+{"input":"John reports to Mary at Globex.","output":{"relations":[{"employment":{"head":"John","tail":"Globex"}},{"reports_to":{"head":"John","tail":"Mary"}}]}}

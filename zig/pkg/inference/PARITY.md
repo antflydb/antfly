@@ -32,17 +32,17 @@ Additional native reranker status:
 
 ### Tested Here
 
-- `zig build test` previously passed on this tree after the GLiNER classifier/extractor work, the GLiNER/REBEL relation work, the native BERT-family classifier-head work, the generic native DeBERTa session work, and the native token-classifier session work for BERT/DeBERTa recognizers.
+- `zig build test` previously passed on this tree after the GLiNER classifier/extractor work, the GLiNER/REBEL relation work, the native BERT-family classifier-head work, the generic native DeBERTa session work, and the native token-classifier session work for BERT/DeBERTa extractors.
 - A rebuilt local Zig binary with `onnx=true`, `metal=true`, and `native=true` was run against the real local Go registry at `../antfly/termite/registry/models`.
 - Live E2E results against local models:
   - `e2e/inference/test_classify.py`: 3/3 passed
-  - `e2e/inference/test_recognize.py`: 5/5 passed
-  - `e2e/inference/test_extract.py`: 3/3 passed
+  - `e2e/inference/test_extract_entities.py`: entity and relation extraction passed
+  - `e2e/inference/test_extract.py`: structured extraction passed
   - `e2e/inference/test_models.py`: 3/3 passed
   - `e2e/inference/test_read.py`: 4 passed, 4 skipped
 - Those live runs exercised:
   - ONNX classifier path via `MoritzLaurer/mDeBERTa-v3-base-mnli-xnli`
-  - native `safetensors` GLiNER recognizer / extractor / recognizer-backed relation path via `fastino/gliner2-base-v1`
+  - split GGUF GLiNER2 entity, relation, and structured extraction path via `antflydb/gliner2-base-v1:gguf:Q4_K`
   - ONNX REBEL relation path via `Babelscape/rebel-large`
   - ONNX reader path via explicit `Xenova/trocr-base-printed`
   - ONNX multistage OCR path via explicit `monkt/paddleocr-onnx`
@@ -60,16 +60,16 @@ Additional native reranker status:
   - `./zig-out/bin/antfly inference pull hf:MoritzLaurer/mDeBERTa-v3-base-mnli-xnli:native --models-dir models/classifiers`
   - the resulting model was exercised through `/api/classify` with `models` as the server model root
   - server logs confirmed the path fell through ONNX, selected `metal`, and returned live classification scores from the native DeBERTa session
-- A local native-only `safetensors` BERT token-classifier recognizer was also pulled with the Zig CLI:
-  - `./zig-out/bin/antfly inference pull hf:dslim/bert-base-NER:native --models-dir models/recognizers`
-  - the resulting model was exercised through `/api/recognize` with `models` as the server model root
+- A local native-only `safetensors` BERT token-classifier extractor was also pulled with the Zig CLI:
+  - `./zig-out/bin/antfly inference pull hf:dslim/bert-base-NER:native --models-dir models/extractrs`
+  - the resulting model was exercised through `/api/extract` with `models` as the server model root
   - server logs confirmed the path fell through ONNX, selected `metal`, and returned live entity spans from the native token-classifier session
   - focused E2E coverage passed:
-    - `ANTFLY_INFERENCE_URL=http://127.0.0.1:8097 uv run --project e2e/inference pytest -q e2e/inference/test_recognize.py -k native_safetensors_bert_token_classifier -rs`
+    - `ANTFLY_INFERENCE_URL=http://127.0.0.1:8097 uv run --project e2e/inference pytest -q e2e/inference/test_extract_entities.py -k native_safetensors_bert_token_classifier -rs`
     - result: `1 passed`
-- A local native-only `safetensors` DeBERTa token-classifier recognizer was also pulled with the Zig CLI:
-  - `./zig-out/bin/antfly inference pull hf:mukuls9971/pii-deberta-v3-xsmall:native --models-dir models/recognizers`
-  - the resulting model was exercised through `/api/recognize` with `models` as the server model root
+- A local native-only `safetensors` DeBERTa token-classifier extractor was also pulled with the Zig CLI:
+  - `./zig-out/bin/antfly inference pull hf:mukuls9971/pii-deberta-v3-xsmall:native --models-dir models/extractrs`
+  - the resulting model was exercised through `/api/extract` with `models` as the server model root
   - server logs confirmed the path fell through ONNX, selected `metal`, and returned live entity spans from the native DeBERTa token-classifier session
   - this also validated two raw-Hugging-Face gaps:
     - `num_labels` inference from `id2label` / `label2id` when `config.json` omits `num_labels`
@@ -98,13 +98,13 @@ Additional native reranker status:
 - Native BERT/DeBERTa token-classifier inference is now runtime-validated end to end for a local `dslim/bert-base-NER` `safetensors` recognizer, including:
   - raw Hugging Face `vocab.txt` tokenizer fallback
   - native backend selection
-  - offset-aware span reconstruction through `/api/recognize`
+  - offset-aware span reconstruction through `/api/extract`
 - Native DeBERTa token-classifier inference is now also runtime-validated end to end for a local `mukuls9971/pii-deberta-v3-xsmall` `safetensors` recognizer, including:
   - `num_labels` inference from label maps when not explicitly present in `config.json`
   - offset-aware span reconstruction for Hugging Face `Unigram + Metaspace` tokenizer layouts used by DeBERTa-v3
-  - aggregation of fragmented adjacent subtype labels like `IP` and `IPV4` into a single `/api/recognize` span
+  - aggregation of fragmented adjacent subtype labels like `IP` and `IPV4` into a single `/api/extract` span
   - focused E2E assertions that verify merged `jane.smith@example.org` and `203.0.113.42` entities
-- Native classifier/recognizer sessions are now preferred by the model manager when native weights are present, but they still have less runtime coverage than the long-standing ONNX paths.
+- Native classifier/extractr sessions are now preferred by the model manager when native weights are present, but they still have less runtime coverage than the long-standing ONNX paths.
 - `/api/read` live coverage still depends heavily on which reader families are installed locally:
   - generic read requests passed here
   - explicit `Xenova/trocr-base-printed` coverage now passes against the local Go registry
@@ -123,14 +123,14 @@ Additional native reranker status:
 - `/api/classify` can use either:
   - dedicated classifier models from `models_dir/classifiers/`
   - recognizer models that advertise `classification`
-- `/api/recognize` can use:
+- `/api/extract` can use:
   - standard BIO NER models
   - zero-shot GLiNER models with custom labels
-  - relation-capable recognizers when `relation_labels` are provided
+  - relation-capable extractors when relation schemas are provided
 - `/api/extract` is capability-driven:
-  - extractor models are recognizers with `extraction`
+  - extractor models provide one or more extraction capabilities
   - extraction is not a separate model family on disk
-- `/api/models` exposes recognizer capabilities and populates `extractors` from recognizers with `extraction`
+- `/ai/v1/models` exposes extractor capabilities through the `extractors` collection
 
 Concrete Go references:
 
@@ -144,14 +144,14 @@ Concrete Go references:
 ### What Zig Has
 
 - `/api/classify` resolves dedicated classifiers and recognizer-backed GLiNER2 classification
-- `/api/recognize` supports:
+- `/api/extract` supports:
   - BIO NER
   - GLiNER2 entities
   - GLiNER2 relations
   - REBEL-style seq2seq relation extraction
   - resolver flattening for both entity-only and entity+relation flows
 - `/api/extract` supports structured GLiNER2 extraction from Go-style schemas
-- `/api/models` exposes recognizer capabilities and populates `extractors` from recognizers with `extraction`
+- `/ai/v1/models` exposes extractor capabilities through the `extractors` collection
 
 Concrete Zig references:
 
@@ -166,7 +166,7 @@ Concrete Zig references:
 
 #### 1. Relation extraction
 
-Go `/api/recognize` accepts `relation_labels` and returns relation edges for models that support them.
+Go `/api/extract` accepts `relation_labels` and returns relation edges for models that support them.
 
 Zig now has parity for:
 
@@ -176,7 +176,7 @@ Zig now has parity for:
 
 Remaining impact:
 
-- broader non-GLiNER relation recognizers still need model-specific implementations
+- broader non-GLiNER relation extractors still need model-specific implementations
 
 #### 2. Structured extraction
 
@@ -189,9 +189,9 @@ Impact:
 
 #### 3. Capability-driven model listing
 
-Go derives `extractors` from recognizers with `extraction` and returns capabilities in `/api/models`.
+Go returns extractor capabilities in the `/ai/v1/models` `extractors` collection.
 
-Zig now derives `extractors` from recognizers with extraction capability and includes capability metadata in `/api/models`.
+Zig includes extractor capability metadata in `/ai/v1/models`.
 
 Remaining impact:
 
@@ -216,13 +216,13 @@ But generic native BERT/DeBERTa native-task parity still has some edges:
   - DistilBERT `pre_classifier` + `classifier`
 - native generic DeBERTa sessions now support sequence-classification logits for classifier manifests
 - native generic BERT/DeBERTa sessions now support token-classification logits for recognizer manifests
-- model loading now prefers native sessions for classifier/recognizer manifests when native weights are present, instead of defaulting to ONNX first
+- model loading now prefers native sessions for classifier/extractr manifests when native weights are present, instead of defaulting to ONNX first
 
 Remaining impact:
 
-- `safetensors` now has a real native path for generic BERT-family and DeBERTa classifier/recognizer sessions, but those paths are still less runtime-tested than the GLiNER and ONNX flows.
-- Raw Hugging Face WordPiece tokenizers without `tokenizer.json` are now handled via a synthesized tokenizer path from `vocab.txt` + tokenizer metadata, and that path is now exercised both by tokenizer-level tests and a live `/api/recognize` run for `dslim/bert-base-NER`.
-- Hugging Face `Unigram + Metaspace` tokenizer layouts used by DeBERTa-v3 now also preserve offsets through `encodeForModel(...)`, and that path is exercised by a live `/api/recognize` run for `mukuls9971/pii-deberta-v3-xsmall`.
+- `safetensors` now has a real native path for generic BERT-family and DeBERTa classifier/extractr sessions, but those paths are still less runtime-tested than the GLiNER and ONNX flows.
+- Raw Hugging Face WordPiece tokenizers without `tokenizer.json` are now handled via a synthesized tokenizer path from `vocab.txt` + tokenizer metadata, and that path is now exercised both by tokenizer-level tests and a live `/api/extract` run for `dslim/bert-base-NER`.
+- Hugging Face `Unigram + Metaspace` tokenizer layouts used by DeBERTa-v3 now also preserve offsets through `encodeForModel(...)`, and that path is exercised by a live `/api/extract` run for `mukuls9971/pii-deberta-v3-xsmall`.
 
 ### Current Build Status
 
@@ -315,8 +315,8 @@ The Zig OCR surface has much better implementation parity than it did at the sta
 
 Do first:
 
-- Make `/api/models` capability-aware for recognizers
-- Populate `extractors` from recognizers with `extraction`
+- Make `/ai/v1/models` capability-aware for extractors
+- Populate the public `extractors` collection
 - Stop treating extractor parity as a separate on-disk model family
 
 Why first:
@@ -336,7 +336,7 @@ Add next:
 Why next:
 
 - Zig already has native GLiNER2 NER infrastructure
-- Best cost/benefit path to immediate recognizer parity
+- Best cost/benefit path to immediate entity-extraction parity
 
 Status:
 
@@ -346,13 +346,13 @@ Status:
 
 Add next:
 
-- route `/api/recognize` through a seq2seq relation extractor for REBEL-style recognizers
+- route `/api/extract` through a seq2seq relation extractor for REBEL-style models
 - parse generated triplets from special-token and plain-text fallback output
 - return entities + relations through the same recognize response shape
 
 Why:
 
-- Go already treats REBEL as a recognizer + relation extractor
+- Go already treats REBEL as a relation extractor
 - The Zig repo already has shared encoder/decoder generation infrastructure and a local `Babelscape/rebel-large` model checkout
 
 Status:
@@ -361,14 +361,14 @@ Status:
 
 Remaining:
 
-- other non-GLiNER relation-capable recognizers still need explicit support
+- other non-GLiNER relation-capable extractors still need explicit support
 
 ### Phase 3: Relation extraction parity
 
 Add after GLiNER classification/extraction:
 
 - GLiNER2 relation extraction
-- `/api/recognize` relation response plumbing
+- `/api/extract` relation response plumbing
 - optional REBEL parity
 
 Why later:
@@ -404,7 +404,7 @@ Status:
 - BERT/RoBERTa/DistilBERT token-classification: done
 - generic DeBERTa sequence-classification: done
 - generic DeBERTa token-classification: done
-- end-to-end runtime coverage against local safetensors classifier/recognizer models: still incomplete
+- end-to-end runtime coverage against local safetensors classifier/extractr models: still incomplete
 
 ## Immediate Next Work
 

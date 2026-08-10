@@ -168,11 +168,11 @@ pub const DeleteArtifactEnrichmentPathParams = struct {
     artifact_name: []const u8,
 };
 
-/// Reprocess a derived document artifact across a table range
+/// Reprocess a derived asset across a table range
 pub const ReprocessDocumentArtifactRangePathParams = struct {
     /// Name of the table
     table_name: []const u8,
-    /// Name of the derived document artifact.
+    /// Name of the derived asset enrichment.
     artifact_name: []const u8,
 };
 
@@ -185,7 +185,7 @@ pub fn parseReprocessDocumentArtifactRangeBody(allocator: std.mem.Allocator, bod
 pub const StartDocumentArtifactReprocessJobPathParams = struct {
     /// Name of the table
     table_name: []const u8,
-    /// Name of the derived document artifact.
+    /// Name of the derived asset enrichment.
     artifact_name: []const u8,
 };
 
@@ -300,7 +300,7 @@ pub const GetDocumentArtifactManifestParams = struct {
     detail: ?[]const u8 = null,
 };
 
-/// Reprocess a derived document artifact
+/// Reprocess a derived asset
 pub const ReprocessDocumentArtifactPathParams = struct {
     /// Name of the table
     table_name: []const u8,
@@ -970,7 +970,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.deleteArtifactEnrichment(ctx, table_name, artifact_name);
         }
 
-        /// Reprocess a derived document artifact across a table range
+        /// Reprocess a derived asset across a table range
         /// POST /tables/{tableName}/artifacts/{artifactName}/reprocess
         fn reprocessDocumentArtifactRange(ctx: *httpx.Context) anyerror!httpx.Response {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
@@ -1080,7 +1080,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.getDocumentArtifactManifest(ctx, table_name, key, artifact_name, query_params);
         }
 
-        /// Reprocess a derived document artifact
+        /// Reprocess a derived asset
         /// POST /tables/{tableName}/documents/{key}/artifacts/{artifactName}/reprocess
         fn reprocessDocumentArtifact(ctx: *httpx.Context) anyerror!httpx.Response {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });

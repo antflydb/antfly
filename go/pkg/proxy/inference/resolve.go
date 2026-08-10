@@ -408,7 +408,7 @@ func resolveWorkloadType(operation OperationType, headers map[string]string) Wor
 	}
 
 	switch operation {
-	case "embed", "embeddings", "rerank", "recognize", "extract":
+	case "embed", "embeddings", "rerank", "extract":
 		return WorkloadTypeReadHeavy
 	case "chunk", "generate", "chat.completions":
 		return WorkloadTypeWriteHeavy

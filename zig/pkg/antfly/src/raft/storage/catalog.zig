@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const fs_paths = @import("../../common/fs_paths.zig");
+const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
 const raft_engine = @import("raft_engine");
 const platform_sync = @import("antfly_platform").sync;
 
@@ -471,7 +472,7 @@ pub const FileReplicaCatalog = struct {
     pub fn init(alloc: std.mem.Allocator, path: []const u8) !FileReplicaCatalog {
         var self = FileReplicaCatalog{
             .alloc = alloc,
-            .io_impl = std.Io.Threaded.init(alloc, .{}),
+            .io_impl = threaded_io_limits.initService(alloc),
             .path = try alloc.dupe(u8, path),
         };
         errdefer {

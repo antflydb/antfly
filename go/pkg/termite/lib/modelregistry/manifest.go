@@ -36,7 +36,7 @@ const (
 	ModelTypeChunker     ModelType = "chunker"
 	ModelTypeReranker    ModelType = "reranker"
 	ModelTypeGenerator   ModelType = "generator"
-	ModelTypeRecognizer  ModelType = "recognizer"
+	ModelTypeExtractor   ModelType = "extractor"
 	ModelTypeRewriter    ModelType = "rewriter"
 	ModelTypeClassifier  ModelType = "classifier"
 	ModelTypeReader      ModelType = "reader"
@@ -49,7 +49,7 @@ var AllModelTypes = []ModelType{
 	ModelTypeChunker,
 	ModelTypeReranker,
 	ModelTypeGenerator,
-	ModelTypeRecognizer,
+	ModelTypeExtractor,
 	ModelTypeRewriter,
 	ModelTypeClassifier,
 	ModelTypeReader,
@@ -67,7 +67,7 @@ const (
 	// CapabilityAudio indicates the model can embed audio (e.g., CLAP audio encoder)
 	CapabilityAudio Capability = "audio"
 
-	// Recognizer capabilities - describe what extraction tasks the model supports
+	// Extractor capabilities describe the extraction tasks a model supports.
 
 	// CapabilityLabels indicates the model performs entity extraction (NER)
 	// extracting labeled spans from text (e.g., PER, ORG, LOC)
@@ -121,8 +121,8 @@ func ParseModelType(s string) (ModelType, error) {
 		return ModelTypeReranker, nil
 	case "generator", "generators":
 		return ModelTypeGenerator, nil
-	case "recognizer", "recognizers":
-		return ModelTypeRecognizer, nil
+	case "extractor", "extractors":
+		return ModelTypeExtractor, nil
 	case "rewriter", "rewriters":
 		return ModelTypeRewriter, nil
 	case "classifier", "classifiers":
@@ -132,7 +132,7 @@ func ParseModelType(s string) (ModelType, error) {
 	case "transcriber", "transcribers":
 		return ModelTypeTranscriber, nil
 	default:
-		return "", fmt.Errorf("unknown model type: %s (valid: embedder, chunker, reranker, generator, recognizer, rewriter, classifier, reader, transcriber)", s)
+		return "", fmt.Errorf("unknown model type: %s (valid: embedder, chunker, reranker, generator, extractor, rewriter, classifier, reader, transcriber)", s)
 	}
 }
 
@@ -152,8 +152,8 @@ func (t ModelType) DirName() string {
 		return "rerankers"
 	case ModelTypeGenerator:
 		return "generators"
-	case ModelTypeRecognizer:
-		return "recognizers"
+	case ModelTypeExtractor:
+		return "extractors"
 	case ModelTypeRewriter:
 		return "rewriters"
 	case ModelTypeClassifier:
@@ -584,8 +584,8 @@ func (m *ModelManifest) Validate() error {
 			return fmt.Errorf("rewriter model must include encoder.onnx and decoder.onnx")
 		}
 	} else if hasEncoderOnnx && hasDecoderOnnx {
-		// Seq2seq recognizers (REBEL) have encoder/decoder instead of model.onnx
-		// This is valid for recognizers with 'relations' capability
+		// Seq2seq extractors (REBEL) have encoder/decoder instead of model.onnx.
+		// This is valid for extractors with the relations capability.
 	} else if !hasAnyOnnx {
 		return fmt.Errorf("manifest must include at least one .onnx model file")
 	}

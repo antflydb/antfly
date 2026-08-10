@@ -54,6 +54,7 @@ from .batch_request import BatchRequest
 from .batch_request_inserts import BatchRequestInserts
 from .batch_request_inserts_additional_property import BatchRequestInsertsAdditionalProperty
 from .batch_response import BatchResponse
+from .batch_response_status import BatchResponseStatus
 from .bedrock_embedder_config import BedrockEmbedderConfig
 from .bedrock_generator_config import BedrockGeneratorConfig
 from .bool_field_query import BoolFieldQuery
@@ -210,12 +211,14 @@ from .extraction_relation import ExtractionRelation
 from .extraction_relation_endpoint import ExtractionRelationEndpoint
 from .extraction_relation_schema import ExtractionRelationSchema
 from .extraction_request import ExtractionRequest
+from .extraction_resolver_options import ExtractionResolverOptions
 from .extraction_response import ExtractionResponse
 from .extraction_response_object import ExtractionResponseObject
 from .extraction_response_usage import ExtractionResponseUsage
 from .extraction_schema import ExtractionSchema
 from .extraction_schema_structures import ExtractionSchemaStructures
 from .extraction_structure_field_type_1 import ExtractionStructureFieldType1
+from .extraction_structure_field_type_1_type import ExtractionStructureFieldType1Type
 from .extraction_structure_schema import ExtractionStructureSchema
 from .extraction_structure_schema_fields import ExtractionStructureSchemaFields
 from .extraction_token import ExtractionToken
@@ -370,7 +373,6 @@ from .inference_models_response_extractors import InferenceModelsResponseExtract
 from .inference_models_response_generators import InferenceModelsResponseGenerators
 from .inference_models_response_object import InferenceModelsResponseObject
 from .inference_models_response_readers import InferenceModelsResponseReaders
-from .inference_models_response_recognizers import InferenceModelsResponseRecognizers
 from .inference_models_response_rerankers import InferenceModelsResponseRerankers
 from .inference_models_response_rewriters import InferenceModelsResponseRewriters
 from .inference_models_response_transcribers import InferenceModelsResponseTranscribers
@@ -469,6 +471,7 @@ from .merge_strategy import MergeStrategy
 from .multi_batch_request import MultiBatchRequest
 from .multi_batch_request_tables import MultiBatchRequestTables
 from .multi_batch_response import MultiBatchResponse
+from .multi_batch_response_status import MultiBatchResponseStatus
 from .multi_batch_response_tables import MultiBatchResponseTables
 from .multi_match_body import MultiMatchBody
 from .multi_match_body_type import MultiMatchBodyType
@@ -635,9 +638,13 @@ from .transaction_begin_response import TransactionBeginResponse
 from .transaction_commit_request import TransactionCommitRequest
 from .transaction_commit_request_tables import TransactionCommitRequestTables
 from .transaction_commit_response import TransactionCommitResponse
-from .transaction_commit_response_conflict import TransactionCommitResponseConflict
 from .transaction_commit_response_status import TransactionCommitResponseStatus
 from .transaction_commit_response_tables import TransactionCommitResponseTables
+from .transaction_conflict import TransactionConflict
+from .transaction_conflict_kind import TransactionConflictKind
+from .transaction_conflict_participant import TransactionConflictParticipant
+from .transaction_conflict_participant_phase import TransactionConflictParticipantPhase
+from .transaction_conflict_retry_scope import TransactionConflictRetryScope
 from .transaction_read_item import TransactionReadItem
 from .transaction_savepoint_response import TransactionSavepointResponse
 from .transaction_session_cleanup_response import TransactionSessionCleanupResponse
@@ -734,6 +741,7 @@ __all__ = (
     "BatchRequestInserts",
     "BatchRequestInsertsAdditionalProperty",
     "BatchResponse",
+    "BatchResponseStatus",
     "BedrockEmbedderConfig",
     "BedrockGeneratorConfig",
     "BooleanQuery",
@@ -888,12 +896,14 @@ __all__ = (
     "ExtractionRelationEndpoint",
     "ExtractionRelationSchema",
     "ExtractionRequest",
+    "ExtractionResolverOptions",
     "ExtractionResponse",
     "ExtractionResponseObject",
     "ExtractionResponseUsage",
     "ExtractionSchema",
     "ExtractionSchemaStructures",
     "ExtractionStructureFieldType1",
+    "ExtractionStructureFieldType1Type",
     "ExtractionStructureSchema",
     "ExtractionStructureSchemaFields",
     "ExtractionToken",
@@ -1048,7 +1058,6 @@ __all__ = (
     "InferenceModelsResponseGenerators",
     "InferenceModelsResponseObject",
     "InferenceModelsResponseReaders",
-    "InferenceModelsResponseRecognizers",
     "InferenceModelsResponseRerankers",
     "InferenceModelsResponseRewriters",
     "InferenceModelsResponseTranscribers",
@@ -1147,6 +1156,7 @@ __all__ = (
     "MultiBatchRequest",
     "MultiBatchRequestTables",
     "MultiBatchResponse",
+    "MultiBatchResponseStatus",
     "MultiBatchResponseTables",
     "MultiMatchBody",
     "MultiMatchBodyType",
@@ -1313,9 +1323,13 @@ __all__ = (
     "TransactionCommitRequest",
     "TransactionCommitRequestTables",
     "TransactionCommitResponse",
-    "TransactionCommitResponseConflict",
     "TransactionCommitResponseStatus",
     "TransactionCommitResponseTables",
+    "TransactionConflict",
+    "TransactionConflictKind",
+    "TransactionConflictParticipant",
+    "TransactionConflictParticipantPhase",
+    "TransactionConflictRetryScope",
     "TransactionReadItem",
     "TransactionSavepointResponse",
     "TransactionSessionCleanupResponse",

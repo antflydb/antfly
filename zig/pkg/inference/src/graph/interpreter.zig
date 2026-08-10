@@ -31,6 +31,8 @@ const ml = @import("ml");
 const ops_mod = @import("../ops/ops.zig");
 const contracts = @import("backend_contracts.zig");
 const transpose_utils = @import("transpose_utils.zig");
+const buffer_plan_mod = @import("buffer_plan.zig");
+const runtime_slice = @import("runtime_slice.zig");
 
 const Graph = ml.graph.Graph;
 const Node = ml.graph.Node;
@@ -64,13 +66,31 @@ pub const RuntimeInput = struct {
 pub const CachedAnalysis = struct {
     reachable: []const bool,
     last_use: []const u32,
+    /// Last use of the complete backing-storage alias group for each node.
+    /// This is stricter than `last_use` and is used only to decide whether an
+    /// in-place consume/donation is safe.
+    donation_last_use: []const u32,
+    runtime_shape_capture: []const bool,
+    gather_add_bias_preserve: []const bool,
 
     /// Compute and allocate a CachedAnalysis for the given graph.
     pub fn compute(allocator: std.mem.Allocator, graph: *const Graph) !CachedAnalysis {
         const reachable = try computeReachable(allocator, graph);
         errdefer allocator.free(reachable);
         const last_use = try computeLastUse(allocator, graph, reachable);
-        return .{ .reachable = reachable, .last_use = last_use };
+        errdefer allocator.free(last_use);
+        const donation_last_use = try computeDonationLastUse(allocator, graph, reachable, last_use);
+        errdefer allocator.free(donation_last_use);
+        const runtime_shape_capture = try computeRuntimeShapeCaptureSet(allocator, graph);
+        errdefer allocator.free(runtime_shape_capture);
+        const gather_add_bias_preserve = try computeGatherAddBiasPreserveSet(allocator, graph, reachable);
+        return .{
+            .reachable = reachable,
+            .last_use = last_use,
+            .donation_last_use = donation_last_use,
+            .runtime_shape_capture = runtime_shape_capture,
+            .gather_add_bias_preserve = gather_add_bias_preserve,
+        };
     }
 
     /// Compute analysis for a bounded capture. This executes only the
@@ -84,15 +104,33 @@ pub const CachedAnalysis = struct {
         const reachable = try computeReachableFromNodes(allocator, graph, target_node_ids);
         errdefer allocator.free(reachable);
         const last_use = try computeLastUse(allocator, graph, reachable);
-        return .{ .reachable = reachable, .last_use = last_use };
+        errdefer allocator.free(last_use);
+        const donation_last_use = try computeDonationLastUse(allocator, graph, reachable, last_use);
+        errdefer allocator.free(donation_last_use);
+        const runtime_shape_capture = try computeRuntimeShapeCaptureSet(allocator, graph);
+        errdefer allocator.free(runtime_shape_capture);
+        const gather_add_bias_preserve = try computeGatherAddBiasPreserveSet(allocator, graph, reachable);
+        return .{
+            .reachable = reachable,
+            .last_use = last_use,
+            .donation_last_use = donation_last_use,
+            .runtime_shape_capture = runtime_shape_capture,
+            .gather_add_bias_preserve = gather_add_bias_preserve,
+        };
     }
 
     /// Free the backing arrays.
     pub fn deinit(self: *CachedAnalysis, allocator: std.mem.Allocator) void {
         allocator.free(self.reachable);
         allocator.free(self.last_use);
+        allocator.free(self.donation_last_use);
+        allocator.free(self.runtime_shape_capture);
+        allocator.free(self.gather_add_bias_preserve);
         self.reachable = &.{};
         self.last_use = &.{};
+        self.donation_last_use = &.{};
+        self.runtime_shape_capture = &.{};
+        self.gather_add_bias_preserve = &.{};
     }
 };
 
@@ -110,7 +148,7 @@ pub const ExecuteOptions = struct {
     /// caller afterward.  Donated buffers that are not consumed as
     /// outputs are freed by the interpreter at cleanup.
     ///
-    /// This follows the decode-loop pattern: in the decode loop the same-
+    /// This follows the GoMLX pattern: in the decode loop the same-
     /// shaped KV tensors are passed every step, and donation lets
     /// backends reuse them without allocating.
     donate: ?[]const bool = null,
@@ -135,6 +173,26 @@ pub const ExecuteOptions = struct {
     /// provided, execute() skips recomputing these per-call — a win
     /// for the decode loop where the graph never changes.
     cached_analysis: ?CachedAnalysis = null,
+
+    /// Pre-computed graph buffer/lifetime plan. This is invariant for a fixed
+    /// graph and partition plan, so compiled training sessions can borrow it
+    /// across repeated steps.
+    cached_buffer_plan: ?*const buffer_plan_mod.BufferPlan = null,
+
+    /// Skip Metal graph-fusion probes for graphs whose hot path is already
+    /// covered by backend primitive/runtime commands.
+    skip_metal_fused_patterns: bool = false,
+
+    /// Collect detailed partition-executor counters. Training uses the graph
+    /// executor as a single-device fast path and can skip this unless stats
+    /// tracing is explicitly enabled.
+    collect_partition_stats: bool = true,
+
+    /// Preserve runtime input residency instead of eagerly materializing them
+    /// on the partition backend. This keeps graph-exec training semantically
+    /// aligned with the direct interpreter, where labels, masks, and borrowed
+    /// weights stay in the representation supplied by the caller.
+    preserve_runtime_input_residency: bool = false,
 };
 
 /// Result of graph execution. Caller owns the output tensors and must
@@ -230,6 +288,12 @@ fn containsCt(values: []const CT, needle: CT) bool {
     return false;
 }
 
+fn nullCtAliases(values: []?CT, needle: CT) void {
+    for (values) |*value| {
+        if (value.* == needle) value.* = null;
+    }
+}
+
 fn graphExecTraceEnabled() bool {
     const value = platform.env.getenv("TERMITE_GRAPH_EXEC_TRACE") orelse return false;
     return value.len > 0 and !std.mem.eql(u8, value, "0") and !std.ascii.eqlIgnoreCase(value, "false");
@@ -239,11 +303,100 @@ fn graphOpProfileEnabled() bool {
     return platform.env.getenvBoolDefault("TERMITE_GRAPH_OP_PROFILE", false);
 }
 
+fn graphFiniteTraceEnabled() bool {
+    return platform.env.getenvBoolDefault("TERMITE_GRAPH_FINITE_TRACE", false);
+}
+
+fn graphFiniteTraceMaxElems() usize {
+    const value = platform.env.getenv("TERMITE_GRAPH_FINITE_TRACE_MAX_ELEMS") orelse return 200_000;
+    return std.fmt.parseUnsigned(usize, value, 10) catch 200_000;
+}
+
 fn graphOpSlowThresholdNs() u64 {
     const value = platform.env.getenv("TERMITE_GRAPH_OP_SLOW_MS") orelse return 0;
     const ms = std.fmt.parseFloat(f64, value) catch return 0;
     if (ms <= 0) return 0;
     return @intFromFloat(ms * 1_000_000.0);
+}
+
+fn checkNodeFinite(
+    allocator: std.mem.Allocator,
+    graph: *const Graph,
+    cb: *const ComputeBackend,
+    node_id: NodeId,
+    ct: CT,
+    max_elems: usize,
+) !void {
+    const shape = cb.tensorShape(ct, allocator) catch return;
+    defer allocator.free(shape);
+    var elem_count: usize = 1;
+    for (shape) |dim| {
+        if (dim <= 0) return;
+        const dim_usize: usize = @intCast(dim);
+        elem_count = std.math.mul(usize, elem_count, dim_usize) catch return;
+    }
+    if (max_elems > 0 and elem_count > max_elems) return;
+    const data = cb.toFloat32(ct, allocator) catch return;
+    defer allocator.free(data);
+    for (data, 0..) |value, idx| {
+        if (!std.math.isFinite(value)) {
+            const node = graph.node(node_id);
+            std.debug.print(
+                "[graph-finite] first_nonfinite node={} op={s} idx={} value={d} shape={any} declared_shape={any}\n",
+                .{
+                    node_id,
+                    @tagName(std.meta.activeTag(node.op)),
+                    idx,
+                    value,
+                    shape,
+                    node.output_shape,
+                },
+            );
+            for (node.getInputs(), 0..) |input_id, input_idx| {
+                if (input_id == null_node or input_id >= graph.nodeCount()) continue;
+                const input_node = graph.node(input_id);
+                std.debug.print(
+                    "[graph-finite] input{} id={} op={s} shape={any}\n",
+                    .{ input_idx, input_id, @tagName(std.meta.activeTag(input_node.op)), input_node.output_shape },
+                );
+            }
+            return error.NonFiniteGraphNode;
+        }
+    }
+    if (platform.env.getenvBoolDefault("TERMITE_GRAPH_ABS_TRACE", false)) {
+        var abs_sum: f64 = 0;
+        for (data) |value| abs_sum += @abs(value);
+        std.debug.print("[abs] {d} {d:.6}\n", .{ node_id, abs_sum });
+    }
+    if (graphZeroTraceEnabled()) {
+        var abs_sum: f64 = 0;
+        for (data) |value| abs_sum += @abs(value);
+        if (abs_sum == 0 and data.len > 0) {
+            const node = graph.node(node_id);
+            std.debug.print(
+                "[graph-zero] node={} op={s} numel={} declared_shape={any}\n",
+                .{ node_id, @tagName(std.meta.activeTag(node.op)), data.len, node.output_shape },
+            );
+        }
+    }
+    if (platform.env.getenv("TERMITE_GRAPH_NODE_VALUES")) |spec| {
+        var it = std.mem.splitScalar(u8, spec, ',');
+        while (it.next()) |tok| {
+            const want = std.fmt.parseUnsigned(u32, std.mem.trim(u8, tok, " "), 10) catch continue;
+            if (want != node_id) continue;
+            var abs_sum: f64 = 0;
+            for (data) |value| abs_sum += @abs(value);
+            const node = graph.node(node_id);
+            std.debug.print(
+                "[node-values] node={} op={s} ct=0x{x} len={} first4={any} abs_sum={d:.6}\n",
+                .{ node_id, @tagName(std.meta.activeTag(node.op)), @intFromPtr(ct), data.len, data[0..@min(4, data.len)], abs_sum },
+            );
+        }
+    }
+}
+
+fn graphZeroTraceEnabled() bool {
+    return platform.env.getenvBoolDefault("TERMITE_GRAPH_ZERO_TRACE", false);
 }
 
 fn graphExecDiag(comptime fmt: []const u8, args: anytype) void {
@@ -340,6 +493,104 @@ pub fn computeLastUse(allocator: std.mem.Allocator, graph: *const Graph, reachab
     return last_use;
 }
 
+/// Compute the last use of every backing-storage alias group.
+///
+/// A native reshape is a zero-copy view. Looking only at the reshape node's
+/// own last consumer can therefore authorize an in-place op while the source
+/// tensor still has a future consumer. That future consumer then observes the
+/// mutated bytes. This occurs naturally in multi-head loss graphs: one branch
+/// consumes a flattened encoder view before the next branch creates its own
+/// view of the same encoder output.
+///
+/// Keep ordinary `last_use` for freeing individual handles. For donation,
+/// group zero-copy pass-through/view nodes with their input and use the latest
+/// consumer anywhere in the group.
+fn computeDonationLastUse(
+    allocator: std.mem.Allocator,
+    graph: *const Graph,
+    reachable: []const bool,
+    last_use: []const u32,
+) ![]u32 {
+    const count = graph.nodeCount();
+    const roots = try allocator.alloc(NodeId, count);
+    defer allocator.free(roots);
+    for (roots, 0..) |*root, i| root.* = @intCast(i);
+
+    for (0..count) |i| {
+        if (!reachable[i]) continue;
+        const node_id: NodeId = @intCast(i);
+        const node = graph.node(node_id);
+        const aliases_input = switch (node.op) {
+            .reshape,
+            .transpose,
+            .broadcast_in_dim,
+            .slice,
+            .convert_dtype,
+            .fused_eval_tensor,
+            .fused_to_float32,
+            => true,
+            else => false,
+        };
+        if (!aliases_input or node.num_inputs == 0) continue;
+        const input_id = node.inputs[0];
+        if (input_id == null_node or input_id >= count) continue;
+        roots[i] = roots[@intCast(input_id)];
+    }
+
+    const donation_last_use = try allocator.dupe(u32, last_use);
+    for (0..count) |i| {
+        if (!reachable[i]) continue;
+        const root_idx: usize = @intCast(roots[i]);
+        donation_last_use[root_idx] = @max(donation_last_use[root_idx], last_use[i]);
+    }
+    for (0..count) |i| {
+        if (!reachable[i]) continue;
+        donation_last_use[i] = donation_last_use[@intCast(roots[i])];
+    }
+    return donation_last_use;
+}
+
+fn computeGatherAddBiasPreserveSet(allocator: std.mem.Allocator, graph: *const Graph, reachable: []const bool) ![]bool {
+    const count = graph.nodeCount();
+    const preserve = try allocator.alloc(bool, count);
+    @memset(preserve, false);
+
+    for (0..count) |i| {
+        if (!reachable[i]) continue;
+        const gather_node = graph.node(@intCast(i));
+        if (gather_node.op != .gather) continue;
+        const gather_attrs = switch (gather_node.op) {
+            .gather => |attrs| attrs,
+            else => unreachable,
+        };
+        if (gather_attrs.axis != 0) continue;
+
+        const gather_inputs = gather_node.getInputs();
+        if (gather_inputs.len < 2 or gather_inputs[0] == null_node or gather_inputs[0] >= count) continue;
+        const add_id = gather_inputs[0];
+        const add_node = graph.node(add_id);
+        if (add_node.op != .add) continue;
+        const add_inputs = add_node.getInputs();
+        if (add_inputs.len != 2) continue;
+
+        const lhs = add_inputs[0];
+        const rhs = add_inputs[1];
+        if (lhs == null_node or rhs == null_node or lhs >= count or rhs >= count) continue;
+        var lhs_buf: [8]i64 = undefined;
+        var rhs_buf: [8]i64 = undefined;
+        const lhs_shape = fillShapeDims(graph, lhs, &lhs_buf);
+        const rhs_shape = fillShapeDims(graph, rhs, &rhs_buf);
+        const can_fuse =
+            (lhs_shape.len == 2 and rhs_shape.len == 1 and lhs_shape[1] == rhs_shape[0]) or
+            (rhs_shape.len == 2 and lhs_shape.len == 1 and rhs_shape[1] == lhs_shape[0]);
+        if (!can_fuse) continue;
+        preserve[lhs] = true;
+        preserve[rhs] = true;
+    }
+
+    return preserve;
+}
+
 /// Execute a graph through a real backend.
 pub fn execute(
     allocator: std.mem.Allocator,
@@ -350,6 +601,8 @@ pub fn execute(
     const count = graph.nodeCount();
     const trace_nodes = graphExecTraceEnabled();
     const profile_ops = graphOpProfileEnabled();
+    const finite_trace = graphFiniteTraceEnabled();
+    const finite_trace_max_elems = graphFiniteTraceMaxElems();
     const slow_op_threshold_ns = graphOpSlowThresholdNs();
     var op_profiler = OpProfiler{ .allocator = allocator };
     defer op_profiler.deinit();
@@ -369,18 +622,26 @@ pub fn execute(
     defer if (!have_cache) allocator.free(reachable);
     const last_use = if (options.cached_analysis) |ca| ca.last_use else try computeLastUse(allocator, graph, reachable);
     defer if (!have_cache) allocator.free(last_use);
+    const donation_last_use = if (options.cached_analysis) |ca| ca.donation_last_use else try computeDonationLastUse(allocator, graph, reachable, last_use);
+    defer if (!have_cache) allocator.free(donation_last_use);
+    const gather_add_bias_preserve = if (options.cached_analysis) |ca| ca.gather_add_bias_preserve else try computeGatherAddBiasPreserveSet(allocator, graph, reachable);
+    defer if (!have_cache) allocator.free(gather_add_bias_preserve);
 
-    // 3. Build runtime input lookup + donation set
-    var rt_map = std.AutoHashMapUnmanaged(NodeId, CT).empty;
-    defer rt_map.deinit(allocator);
-    var donated = std.AutoHashMapUnmanaged(NodeId, void).empty;
-    defer donated.deinit(allocator);
+    // 3. Build runtime input lookup + donation set. Dense indexed arrays
+    // avoid a hash lookup for every graph node during compiled training.
+    const rt_values = try allocator.alloc(?CT, count);
+    defer allocator.free(rt_values);
+    @memset(rt_values, null);
+    const donated_values = try allocator.alloc(bool, count);
+    defer allocator.free(donated_values);
+    @memset(donated_values, false);
     if (options.runtime_inputs) |inputs| {
         for (inputs, 0..) |ri, idx| {
-            try rt_map.put(allocator, ri.node_id, ri.value);
+            if (ri.node_id >= count) continue;
+            rt_values[@intCast(ri.node_id)] = ri.value;
             if (options.donate) |d| {
                 if (idx < d.len and d[idx]) {
-                    try donated.put(allocator, ri.node_id, {});
+                    donated_values[@intCast(ri.node_id)] = true;
                 }
             }
         }
@@ -391,8 +652,8 @@ pub fn execute(
     defer allocator.free(values);
     @memset(values, null);
 
-    const shape_capture = try computeRuntimeShapeCaptureSet(allocator, graph);
-    defer allocator.free(shape_capture);
+    const shape_capture = if (options.cached_analysis) |ca| ca.runtime_shape_capture else try computeRuntimeShapeCaptureSet(allocator, graph);
+    defer if (!have_cache) allocator.free(shape_capture);
 
     var runtime_shapes: ?[]?[]i64 = null;
     if (shapeCaptureSetHasAny(shape_capture)) {
@@ -411,7 +672,7 @@ pub fn execute(
     var exec_state = ExecState{
         .attention_layer = 0,
         .options = options,
-        .last_use = last_use,
+        .last_use = donation_last_use,
         .runtime_shapes = runtime_shapes,
     };
 
@@ -421,7 +682,7 @@ pub fn execute(
         const node_id: NodeId = @intCast(i);
 
         // Check for runtime input override
-        if (rt_map.get(node_id)) |rt_val| {
+        if (rt_values[i]) |rt_val| {
             if (trace_nodes) {
                 const node = graph.node(node_id);
                 graphExecDiag("node runtime id={} op={s} shape={any} rss={}", .{
@@ -504,16 +765,26 @@ pub fn execute(
             });
         }
         logNodeRuntimeShape(graph, cb, node_id, values[i].?);
+        if (finite_trace) {
+            try checkNodeFinite(
+                allocator,
+                graph,
+                cb,
+                node_id,
+                values[i].?,
+                finite_trace_max_elems,
+            );
+        }
         try recordRuntimeShape(allocator, cb, runtime_shapes, shape_capture, node_id, values[i].?);
-        try cloneOutputIfAliasedInputWouldBeFreed(
+        try cloneOutputIfAliasedInputWouldBeFreedFast(
             allocator,
             graph,
             cb,
             values,
             node_id,
             last_use,
-            rt_map,
-            donated,
+            rt_values,
+            donated_values,
         );
 
         // Free inputs whose last consumer is this node
@@ -521,9 +792,11 @@ pub fn execute(
         for (n.getInputs()) |input_id| {
             if (input_id == null_node or input_id >= count) continue;
             if (last_use[input_id] == i) {
+                if (gather_add_bias_preserve[input_id]) continue;
                 // Don't free non-donated runtime inputs (caller owns them).
                 // Donated inputs are owned by the interpreter now.
-                if (rt_map.contains(input_id) and !donated.contains(input_id)) continue;
+                const input_idx: usize = @intCast(input_id);
+                if (rt_values[input_idx] != null and !donated_values[input_idx]) continue;
                 if (values[input_id]) |ct| {
                     if (values[i]) |out_ct| {
                         if (ct == out_ct and canKeepAliasedOutput(n.op)) {
@@ -531,8 +804,12 @@ pub fn execute(
                             continue;
                         }
                     }
+                    // Clear every alias before releasing the handle. Keeping
+                    // raw addresses of already-freed handles is ABA-unsafe:
+                    // the allocator may recycle an address for a later live
+                    // tensor during this same execution.
+                    nullCtAliases(values, ct);
                     cb.free(ct);
-                    values[input_id] = null;
                 }
             }
         }
@@ -551,7 +828,7 @@ pub fn execute(
         var aliases_rt = false;
         if (options.runtime_inputs) |inputs| {
             for (inputs) |ri| {
-                if (!donated.contains(ri.node_id) and ri.value == ct) {
+                if (ri.node_id < donated_values.len and !donated_values[@intCast(ri.node_id)] and ri.value == ct) {
                     aliases_rt = true;
                     break;
                 }
@@ -590,10 +867,12 @@ pub fn execute(
         if (is_output) continue;
         // Skip non-donated runtime inputs — caller owns them.
         // Donated inputs are interpreter-owned; free if still live.
-        if (rt_map.contains(@intCast(i)) and !donated.contains(@intCast(i))) continue;
+        if (rt_values[i] != null and !donated_values[i]) continue;
         // Free any remaining handles (parameters, donated inputs, or
         // intermediates that weren't caught by liveness-based freeing)
-        cb.free(values[i].?);
+        const ct = values[i].?;
+        nullCtAliases(values, ct);
+        cb.free(ct);
     }
 
     // 8. Free MoE routing state from the last layer.
@@ -619,17 +898,22 @@ pub fn captureNodeValues(
     defer if (!have_cache) allocator.free(reachable);
     const last_use = if (options.cached_analysis) |ca| ca.last_use else try computeLastUse(allocator, graph, reachable);
     defer if (!have_cache) allocator.free(last_use);
+    const donation_last_use = if (options.cached_analysis) |ca| ca.donation_last_use else try computeDonationLastUse(allocator, graph, reachable, last_use);
+    defer if (!have_cache) allocator.free(donation_last_use);
 
-    var rt_map = std.AutoHashMapUnmanaged(NodeId, CT).empty;
-    defer rt_map.deinit(allocator);
-    var donated = std.AutoHashMapUnmanaged(NodeId, void).empty;
-    defer donated.deinit(allocator);
+    const rt_values = try allocator.alloc(?CT, count);
+    defer allocator.free(rt_values);
+    @memset(rt_values, null);
+    const donated_values = try allocator.alloc(bool, count);
+    defer allocator.free(donated_values);
+    @memset(donated_values, false);
     if (options.runtime_inputs) |inputs| {
         for (inputs, 0..) |ri, idx| {
-            try rt_map.put(allocator, ri.node_id, ri.value);
+            if (ri.node_id >= count) continue;
+            rt_values[@intCast(ri.node_id)] = ri.value;
             if (options.donate) |d| {
                 if (idx < d.len and d[idx]) {
-                    try donated.put(allocator, ri.node_id, {});
+                    donated_values[@intCast(ri.node_id)] = true;
                 }
             }
         }
@@ -639,8 +923,8 @@ pub fn captureNodeValues(
     defer allocator.free(values);
     @memset(values, null);
 
-    const shape_capture = try computeRuntimeShapeCaptureSet(allocator, graph);
-    defer allocator.free(shape_capture);
+    const shape_capture = if (options.cached_analysis) |ca| ca.runtime_shape_capture else try computeRuntimeShapeCaptureSet(allocator, graph);
+    defer if (!have_cache) allocator.free(shape_capture);
 
     var runtime_shapes: ?[]?[]i64 = null;
     if (shapeCaptureSetHasAny(shape_capture)) {
@@ -667,7 +951,7 @@ pub fn captureNodeValues(
     var exec_state = ExecState{
         .attention_layer = 0,
         .options = options,
-        .last_use = last_use,
+        .last_use = donation_last_use,
         .runtime_shapes = runtime_shapes,
     };
     defer exec_state.freeMoeState();
@@ -677,7 +961,7 @@ pub fn captureNodeValues(
 
         const node_id: NodeId = @intCast(i);
 
-        if (rt_map.get(node_id)) |rt_val| {
+        if (rt_values[i]) |rt_val| {
             values[i] = rt_val;
             logNodeRuntimeShape(graph, cb, node_id, rt_val);
             try recordRuntimeShape(allocator, cb, runtime_shapes, shape_capture, node_id, rt_val);
@@ -699,22 +983,23 @@ pub fn captureNodeValues(
         logNodeRuntimeShape(graph, cb, node_id, values[i].?);
         try recordRuntimeShape(allocator, cb, runtime_shapes, shape_capture, node_id, values[i].?);
         try maybeCaptureNodeValue(allocator, graph, cb, capture_node_ids, captured, node_id, values[i].?);
-        try cloneOutputIfAliasedInputWouldBeFreed(
+        try cloneOutputIfAliasedInputWouldBeFreedFast(
             allocator,
             graph,
             cb,
             values,
             node_id,
             last_use,
-            rt_map,
-            donated,
+            rt_values,
+            donated_values,
         );
 
         const n = graph.node(node_id);
         for (n.getInputs()) |input_id| {
             if (input_id == null_node or input_id >= count) continue;
             if (last_use[input_id] == i) {
-                if (rt_map.contains(input_id) and !donated.contains(input_id)) continue;
+                const input_idx: usize = @intCast(input_id);
+                if (rt_values[input_idx] != null and !donated_values[input_idx]) continue;
                 if (values[input_id]) |ct| {
                     if (values[i]) |out_ct| {
                         if (ct == out_ct and canKeepAliasedOutput(n.op)) {
@@ -788,9 +1073,44 @@ pub fn cloneOutputIfAliasedInputWouldBeFreed(
     }
 }
 
+fn cloneOutputIfAliasedInputWouldBeFreedFast(
+    allocator: std.mem.Allocator,
+    graph: *const Graph,
+    cb: *const ComputeBackend,
+    values: []?CT,
+    node_id: NodeId,
+    last_use: []const u32,
+    rt_values: []const ?CT,
+    donated_values: []const bool,
+) !void {
+    const out_idx: usize = @intCast(node_id);
+    const output_ct = values[out_idx] orelse return;
+    const n = graph.node(node_id);
+
+    for (n.getInputs()) |input_id| {
+        if (input_id == null_node or input_id >= values.len) continue;
+        const input_ct = values[@intCast(input_id)] orelse continue;
+        if (input_ct != output_ct) continue;
+
+        const input_idx: usize = @intCast(input_id);
+        const input_is_non_donated_runtime = input_idx < rt_values.len and rt_values[input_idx] != null and !donated_values[input_idx];
+        const input_dies_now = last_use[input_idx] == out_idx;
+        if (canKeepAliasedOutput(n.op) and input_dies_now and !input_is_non_donated_runtime) {
+            // Last-use consume paths transfer ownership from the input slot to
+            // the output slot later in execute() by nulling the input instead
+            // of freeing it. Keep the aliased output in that specific case.
+            return;
+        }
+
+        values[out_idx] = try cloneTensorForShape(allocator, cb, output_ct, n.output_shape);
+        return;
+    }
+}
+
 pub fn canKeepAliasedOutput(op: anytype) bool {
     return switch (op) {
         .fused_gelu,
+        .fused_gelu_exact,
         .fused_relu,
         .fused_silu,
         .fused_quick_gelu,
@@ -1147,7 +1467,7 @@ fn positiveResolvedDim(actual: ?[]const i64, shape: Shape, axis: usize) !usize {
     return positiveShapeDim(shape, axis);
 }
 
-/// For shape-tracking backends, reshape a tensor to its declared
+/// For shape-tracking backends (MLX), reshape a tensor to its declared
 /// shape when the declared shape is fully concrete, the actual rank differs,
 /// and element counts match. Returns
 /// the reshaped tensor (owned, caller must free) or null (no reshape
@@ -1160,6 +1480,9 @@ fn ensureDeclaredShape(cb: *const ComputeBackend, val: CT, declared: Shape) ?CT 
         dims[d] = declared.dim(@intCast(d));
         if (dims[d] <= 0) return null;
     }
+    if (cb.tensorShapeMatches(val, dims[0..rank]) catch null) |matches| {
+        return if (matches) null else cb.primReshape(val, dims[0..rank]) catch null;
+    }
     const actual = cb.tensorShape(val, std.heap.page_allocator) catch {
         return cb.primReshape(val, dims[0..rank]) catch null;
     };
@@ -1170,34 +1493,97 @@ fn ensureDeclaredShape(cb: *const ComputeBackend, val: CT, declared: Shape) ?CT 
     return cb.primReshape(val, dims[0..rank]) catch null;
 }
 
-const DispatchTensor = struct {
-    value: CT,
-    shape: []const i64,
-    owned: ?CT = null,
-
-    fn deinit(self: DispatchTensor, cb: *const ComputeBackend) void {
-        if (self.owned) |ct| cb.free(ct);
-    }
-};
-
-fn dispatchTensorWithShape(
+fn executeGeluBackwardFallback(
+    allocator: std.mem.Allocator,
+    output_shape: Shape,
     cb: *const ComputeBackend,
-    state: *const ExecState,
-    graph: *const Graph,
-    node_id: NodeId,
-    value: CT,
-    runtime_buf: *[8]i64,
-    declared_buf: *[8]i64,
-) DispatchTensor {
-    const runtime_shape = runtimeOrDeclaredShape(state, graph, node_id, runtime_buf);
-    if (ensureDeclaredShape(cb, value, graph.node(node_id).output_shape)) |reshaped| {
-        return .{
-            .value = reshaped,
-            .shape = fillShapeDims(graph, node_id, declared_buf),
-            .owned = reshaped,
-        };
+    input: CT,
+    upstream_grad: CT,
+    exact: bool,
+) !CT {
+    const input_data = try cb.toFloat32(input, allocator);
+    defer allocator.free(input_data);
+    const upstream_data = try cb.toFloat32(upstream_grad, allocator);
+    defer allocator.free(upstream_data);
+    if (input_data.len != upstream_data.len) return error.ShapeMismatch;
+
+    const output = try allocator.alloc(f32, input_data.len);
+    defer allocator.free(output);
+    for (input_data, upstream_data, output) |x, upstream, *dst| {
+        if (!std.math.isFinite(x)) {
+            dst.* = 0.0;
+            continue;
+        }
+        if (exact) {
+            const cdf = 0.5 * (1.0 + erfApproxF32(x * 0.7071067811865476));
+            const pdf = std.math.exp(-0.5 * x * x) * 0.3989422804014327;
+            const derivative = cdf + x * pdf;
+            dst.* = if (std.math.isFinite(derivative)) upstream * derivative else 0.0;
+            continue;
+        }
+        const x2 = x * x;
+        const inner = 0.7978845608028654 * (x + 0.044715 * x * x2);
+        if (inner > 10.0) {
+            dst.* = upstream;
+            continue;
+        }
+        if (inner < -10.0) {
+            dst.* = 0.0;
+            continue;
+        }
+        const t = std.math.tanh(inner);
+        const sech2 = 1.0 - t * t;
+        const derivative = 0.5 * (1.0 + t) + 0.5 * x * sech2 * 0.7978845608028654 * (1.0 + 0.134145 * x2);
+        dst.* = if (std.math.isFinite(derivative)) upstream * derivative else 0.0;
     }
-    return .{ .value = value, .shape = runtime_shape };
+
+    var shape_buf: [8]i32 = undefined;
+    const rank = output_shape.rank();
+    if (rank > shape_buf.len) return error.UnsupportedShape;
+    for (0..rank) |axis| {
+        const dim = output_shape.dim(@intCast(axis));
+        if (dim <= 0) return error.UnsupportedShape;
+        shape_buf[axis] = @intCast(dim);
+    }
+    return cb.fromFloat32Shape(output, shape_buf[0..rank]);
+}
+
+fn executeExactGeluFallback(
+    allocator: std.mem.Allocator,
+    output_shape: Shape,
+    cb: *const ComputeBackend,
+    input: CT,
+) !CT {
+    const input_data = try cb.toFloat32(input, allocator);
+    defer allocator.free(input_data);
+
+    const output = try allocator.alloc(f32, input_data.len);
+    defer allocator.free(output);
+    for (input_data, output) |x, *dst| {
+        if (!std.math.isFinite(x)) {
+            dst.* = 0.0;
+            continue;
+        }
+        dst.* = 0.5 * x * (1.0 + erfApproxF32(x * 0.7071067811865476));
+    }
+
+    var shape_buf: [8]i32 = undefined;
+    const rank = output_shape.rank();
+    if (rank > shape_buf.len) return error.UnsupportedShape;
+    for (0..rank) |axis| {
+        const dim = output_shape.dim(@intCast(axis));
+        if (dim <= 0) return error.UnsupportedShape;
+        shape_buf[axis] = @intCast(dim);
+    }
+    return cb.fromFloat32Shape(output, shape_buf[0..rank]);
+}
+
+fn erfApproxF32(x: f32) f32 {
+    const sign: f32 = if (x < 0) -1.0 else 1.0;
+    const ax = @abs(x);
+    const t = 1.0 / (1.0 + 0.3275911 * ax);
+    const poly = (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t;
+    return sign * (1.0 - poly * @exp(-(ax * ax)));
 }
 
 fn graphTraceShapesEnabled() bool {
@@ -1575,6 +1961,34 @@ fn isNonDonatedRuntimeInput(options: ExecuteOptions, node_id: NodeId) bool {
 
 /// Dispatch a single node to the backend, using side channels from
 /// ExecState for stateful ops.
+/// Derive the [batch*seq] 0/1 key mask from the additive attn_bias [bh,S,S]
+/// (bias < -1e8 at padded keys). Mirrors metal_partition_executor's
+/// attentionMaskFromBias so the fused-attention path matches the decomposed one.
+fn disentangledMaskFromBias(
+    allocator: std.mem.Allocator,
+    cb: *const ComputeBackend,
+    attn_bias: CT,
+    batch: usize,
+    seq_len: usize,
+    num_heads: usize,
+) ![]i64 {
+    const bias = try cb.toFloat32(attn_bias, allocator);
+    defer allocator.free(bias);
+    const mask = try allocator.alloc(i64, batch * seq_len);
+    errdefer allocator.free(mask);
+    if (bias.len < batch * num_heads * seq_len * seq_len) {
+        @memset(mask, 1);
+        return mask;
+    }
+    for (0..batch) |b| {
+        for (0..seq_len) |k| {
+            const idx = ((b * num_heads) * seq_len + 0) * seq_len + k;
+            mask[b * seq_len + k] = if (bias[idx] < -1.0e8) 0 else 1;
+        }
+    }
+    return mask;
+}
+
 pub fn executeNode(
     graph: *const Graph,
     cb: *const ComputeBackend,
@@ -1648,6 +2062,9 @@ pub fn executeNode(
         },
 
         .fused_embedding_lookup => |attrs| {
+            if (try cb.embeddingLookupTensor(V.get(ins[0]), V.get(ins[1]), attrs.total, attrs.dim)) |device_result| {
+                return device_result;
+            }
             var owned_ids: ?[]i64 = null;
             defer if (owned_ids) |buf| std.heap.page_allocator.free(buf);
             const ids = blk: {
@@ -1671,6 +2088,10 @@ pub fn executeNode(
             return cb.layerNorm(V.get(ins[0]), V.get(ins[1]), V.get(ins[2]), attrs.dim, attrs.eps);
         },
 
+        .fused_layer_norm_backward => |attrs| {
+            return (try cb.layerNormBackward(V.get(ins[0]), V.get(ins[1]), V.get(ins[2]), V.get(ins[3]), attrs.dim, attrs.eps)) orelse error.UnsupportedPrimitiveOp;
+        },
+
         .fused_rms_norm => |attrs| {
             if (state.isLastUseBy(ins[0], node_id) and !isNonDonatedRuntimeInput(state.options, ins[0])) {
                 if (try cb.rmsNormConsumeInput(V.get(ins[0]), V.get(ins[1]), attrs.dim, attrs.eps)) |consumed| return consumed;
@@ -1683,6 +2104,35 @@ pub fn executeNode(
                 if (try cb.unaryConsume(.gelu, V.get(ins[0]))) |consumed| return consumed;
             }
             return cb.gelu(V.get(ins[0]));
+        },
+
+        .fused_gelu_exact => {
+            if (try cb.geluExact(V.get(ins[0]))) |device_result| return device_result;
+            return executeExactGeluFallback(graph.allocator, n.output_shape, cb, V.get(ins[0]));
+        },
+
+        .fused_gelu_backward => {
+            const elem_count_i64 = n.output_shape.numElements() orelse return error.UnsupportedShape;
+            if (elem_count_i64 <= 0) return error.UnsupportedShape;
+            if (try cb.decoderRuntimeApplyGeluBackward(&.{
+                .input = V.get(ins[0]),
+                .upstream_grad = V.get(ins[1]),
+                .dim = @intCast(elem_count_i64),
+                .exact = false,
+            })) |fused| return fused;
+            return executeGeluBackwardFallback(graph.allocator, graph.node(ins[0]).output_shape, cb, V.get(ins[0]), V.get(ins[1]), false);
+        },
+
+        .fused_gelu_exact_backward => {
+            const elem_count_i64 = n.output_shape.numElements() orelse return error.UnsupportedShape;
+            if (elem_count_i64 <= 0) return error.UnsupportedShape;
+            if (try cb.decoderRuntimeApplyGeluBackward(&.{
+                .input = V.get(ins[0]),
+                .upstream_grad = V.get(ins[1]),
+                .dim = @intCast(elem_count_i64),
+                .exact = true,
+            })) |fused| return fused;
+            return executeGeluBackwardFallback(graph.allocator, graph.node(ins[0]).output_shape, cb, V.get(ins[0]), V.get(ins[1]), true);
         },
 
         .fused_relu => {
@@ -1732,6 +2182,37 @@ pub fn executeNode(
                 if (try cb.multiplyConsumeLeft(V.get(ins[0]), V.get(ins[1]))) |consumed| return consumed;
             }
             return cb.multiply(V.get(ins[0]), V.get(ins[1]));
+        },
+
+        .fused_masked_bce_with_logits_loss => |attrs| {
+            var out_shape_buf: [8]i64 = undefined;
+            const out_shape = fillShapeDims(graph, node_id, &out_shape_buf);
+            return cb.maskedBceWithLogitsLoss(&.{
+                .logits = V.get(ins[0]),
+                .labels = V.get(ins[1]),
+                .mask = V.get(ins[2]),
+                .positive_weight = attrs.positive_weight,
+                .negative_weight = attrs.negative_weight,
+                .eps = attrs.eps,
+                .mean_reduction = attrs.reduction == .mean,
+                .output_shape = out_shape,
+            });
+        },
+
+        .fused_masked_bce_with_logits_backward => |attrs| {
+            var logits_shape_buf: [8]i64 = undefined;
+            const logits_shape = fillShapeDims(graph, ins[0], &logits_shape_buf);
+            return cb.maskedBceWithLogitsBackward(&.{
+                .logits = V.get(ins[0]),
+                .labels = V.get(ins[1]),
+                .mask = V.get(ins[2]),
+                .upstream = V.get(ins[3]),
+                .positive_weight = attrs.positive_weight,
+                .negative_weight = attrs.negative_weight,
+                .eps = attrs.eps,
+                .mean_reduction = attrs.reduction == .mean,
+                .logits_shape = logits_shape,
+            });
         },
 
         .fused_add_mul_scalar => {
@@ -1881,6 +2362,77 @@ pub fn executeNode(
                 attrs.num_kv_heads,
                 attrs.head_dim,
             );
+        },
+
+        .fused_disentangled_attention => |attrs| {
+            // input0 = qkv_packed [3*B*S, H]; input1 = qr_kr_packed [2*num_rel, H];
+            // input2 = attn_bias [bh, S, S]. Slice the packed inputs back into
+            // q/k/v and q_r/k_r, derive the padding mask from attn_bias, then
+            // call the fused attention op (device kernel / host fallback).
+            if (try cb.disentangledRelativeAttentionPacked(
+                V.get(ins[0]),
+                V.get(ins[1]),
+                V.get(ins[2]),
+                attrs.batch,
+                attrs.seq_len,
+                attrs.num_heads,
+                attrs.head_dim,
+            )) |packed_result| return packed_result;
+            const bs: i64 = @intCast(attrs.batch * attrs.seq_len);
+            const h: i64 = @intCast(attrs.num_heads * attrs.head_dim);
+            const num_rel: i64 = @intCast(2 * attrs.seq_len - 1);
+            const qkv = V.get(ins[0]);
+            const qkv_shape = [_]i64{ 3 * bs, h };
+            const q = try cb.primSlice(qkv, &.{ 0, 0 }, &.{ bs, h }, &.{ 1, 1 }, &qkv_shape);
+            defer cb.free(q);
+            const k = try cb.primSlice(qkv, &.{ bs, 0 }, &.{ 2 * bs, h }, &.{ 1, 1 }, &qkv_shape);
+            defer cb.free(k);
+            const v = try cb.primSlice(qkv, &.{ 2 * bs, 0 }, &.{ 3 * bs, h }, &.{ 1, 1 }, &qkv_shape);
+            defer cb.free(v);
+            const qr_kr = V.get(ins[1]);
+            const qr_shape = [_]i64{ 2 * num_rel, h };
+            const q_r = try cb.primSlice(qr_kr, &.{ 0, 0 }, &.{ num_rel, h }, &.{ 1, 1 }, &qr_shape);
+            defer cb.free(q_r);
+            const k_r = try cb.primSlice(qr_kr, &.{ num_rel, 0 }, &.{ 2 * num_rel, h }, &.{ 1, 1 }, &qr_shape);
+            defer cb.free(k_r);
+            const mask = try disentangledMaskFromBias(graph.allocator, cb, V.get(ins[2]), attrs.batch, attrs.seq_len, attrs.num_heads);
+            defer graph.allocator.free(mask);
+            return cb.disentangledRelativeAttention(q, k, v, q_r, k_r, mask, attrs.batch, attrs.seq_len, attrs.num_heads, attrs.head_dim);
+        },
+
+        .fused_disentangled_attention_backward => |attrs| {
+            // input0/1/2 as forward; input3 = dOut [B*S, H]. Returns packed
+            // grads [dQ;dK;dV;dQ_r;dK_r] = [3*B*S + 2*num_rel, H].
+            if (try cb.disentangledRelativeAttentionBackwardPacked(
+                V.get(ins[0]),
+                V.get(ins[1]),
+                V.get(ins[2]),
+                V.get(ins[3]),
+                attrs.batch,
+                attrs.seq_len,
+                attrs.num_heads,
+                attrs.head_dim,
+            )) |packed_result| return packed_result;
+            const bs: i64 = @intCast(attrs.batch * attrs.seq_len);
+            const h: i64 = @intCast(attrs.num_heads * attrs.head_dim);
+            const num_rel: i64 = @intCast(2 * attrs.seq_len - 1);
+            const qkv = V.get(ins[0]);
+            const qkv_shape = [_]i64{ 3 * bs, h };
+            const q = try cb.primSlice(qkv, &.{ 0, 0 }, &.{ bs, h }, &.{ 1, 1 }, &qkv_shape);
+            defer cb.free(q);
+            const k = try cb.primSlice(qkv, &.{ bs, 0 }, &.{ 2 * bs, h }, &.{ 1, 1 }, &qkv_shape);
+            defer cb.free(k);
+            const v = try cb.primSlice(qkv, &.{ 2 * bs, 0 }, &.{ 3 * bs, h }, &.{ 1, 1 }, &qkv_shape);
+            defer cb.free(v);
+            const qr_kr = V.get(ins[1]);
+            const qr_shape = [_]i64{ 2 * num_rel, h };
+            const q_r = try cb.primSlice(qr_kr, &.{ 0, 0 }, &.{ num_rel, h }, &.{ 1, 1 }, &qr_shape);
+            defer cb.free(q_r);
+            const k_r = try cb.primSlice(qr_kr, &.{ num_rel, 0 }, &.{ 2 * num_rel, h }, &.{ 1, 1 }, &qr_shape);
+            defer cb.free(k_r);
+            const mask = try disentangledMaskFromBias(graph.allocator, cb, V.get(ins[2]), attrs.batch, attrs.seq_len, attrs.num_heads);
+            defer graph.allocator.free(mask);
+            return cb.disentangledRelativeAttentionBackward(q, k, v, q_r, k_r, mask, V.get(ins[3]), attrs.batch, attrs.seq_len, attrs.num_heads, attrs.head_dim);
         },
 
         .fused_relative_position_bias => |attrs| {
@@ -2125,7 +2677,14 @@ pub fn executeNode(
             defer std.heap.page_allocator.free(actual);
             const runtime_dims = resolveRuntimeReshapeDims(actual, graph.node(ins[0]).output_shape, n.output_shape, &out_dims) orelse return result;
             if (safeElementCountFromDims(runtime_dims) != safeElementCountFromDims(actual)) return result;
-            return cb.primReshape(result, runtime_dims) catch result;
+            const reshaped = cb.primReshape(result, runtime_dims) catch return result;
+            // A consume path may return the graph input handle itself. That
+            // handle is still present in `values[ins[0]]` and the normal
+            // last-use cleanup owns it; freeing it here would double-free it.
+            // Fresh results and temporary declared-shape aliases are local to
+            // this branch and must release their pre-reshape handle.
+            if (reshaped != result and result != input_ct) cb.free(result);
+            return reshaped;
         },
 
         .fused_log_softmax => |attrs| {
@@ -2154,7 +2713,9 @@ pub fn executeNode(
             defer std.heap.page_allocator.free(actual);
             const runtime_dims = resolveRuntimeReshapeDims(actual, graph.node(ins[0]).output_shape, n.output_shape, &out_dims) orelse return result;
             if (safeElementCountFromDims(runtime_dims) != safeElementCountFromDims(actual)) return result;
-            return cb.primReshape(result, runtime_dims) catch result;
+            const reshaped = cb.primReshape(result, runtime_dims) catch return result;
+            if (reshaped != result and result != input_ct) cb.free(result);
+            return reshaped;
         },
 
         .fused_argmax_last_row => |attrs| {
@@ -2231,9 +2792,9 @@ pub fn executeNode(
             return cb.primAbs(V.get(ins[0]));
         },
         .add, .mul, .sub, .div, .less_than => {
-            // For backends that track tensor shapes, ensure inputs
+            // For backends that track tensor shapes (MLX), ensure inputs
             // match their declared shapes before the binary op. The native
-            // backend uses flat arrays and ignores shapes, but shape-tracking backends use
+            // backend uses flat arrays and ignores shapes, but MLX uses
             // numpy-style broadcasting which requires correct shapes.
             const a_val = V.get(ins[0]);
             const b_val = V.get(ins[1]);
@@ -2451,29 +3012,29 @@ pub fn executeNode(
 
         .reduce_sum => |attrs| {
             var sbuf: [8]i64 = undefined;
-            const in_shape = runtimeOrDeclaredShape(state, graph, ins[0], &sbuf);
+            const in_shape = fillShapeDims(graph, ins[0], &sbuf);
             return cb.primReduceSum(V.get(ins[0]), attrs.axes[0..attrs.num_axes], in_shape);
         },
         .reduce_max => |attrs| {
             var sbuf: [8]i64 = undefined;
-            const in_shape = runtimeOrDeclaredShape(state, graph, ins[0], &sbuf);
+            const in_shape = fillShapeDims(graph, ins[0], &sbuf);
             return cb.primReduceMax(V.get(ins[0]), attrs.axes[0..attrs.num_axes], in_shape);
         },
         .reduce_mean => |attrs| {
             var sbuf: [8]i64 = undefined;
-            const in_shape = runtimeOrDeclaredShape(state, graph, ins[0], &sbuf);
+            const in_shape = fillShapeDims(graph, ins[0], &sbuf);
             return cb.primReduceMean(V.get(ins[0]), attrs.axes[0..attrs.num_axes], in_shape);
         },
         .argmax => |attrs| {
             var sbuf: [8]i64 = undefined;
-            const in_shape = runtimeOrDeclaredShape(state, graph, ins[0], &sbuf);
+            const in_shape = fillShapeDims(graph, ins[0], &sbuf);
             return cb.primArgMax(V.get(ins[0]), attrs.axis, attrs.keepdims, in_shape);
         },
         .reshape => |attrs| {
             const rank = attrs.new_shape.rank();
             var dims: [8]i64 = undefined;
             for (0..rank) |d| dims[d] = attrs.new_shape.dim(@intCast(d));
-            const reshaped_input = ensureDeclaredShape(cb, V.get(ins[0]), graph.node(ins[0]).output_shape);
+            var reshaped_input = ensureDeclaredShape(cb, V.get(ins[0]), graph.node(ins[0]).output_shape);
             defer if (reshaped_input) |v| cb.free(v);
             const input_value = reshaped_input orelse V.get(ins[0]);
             var resolved_dims: [8]i64 = undefined;
@@ -2486,6 +3047,12 @@ pub fn executeNode(
                 }
                 break :blk resolveRuntimeReshapeDims(actual, graph.node(ins[0]).output_shape, attrs.new_shape, &resolved_dims) orelse dims[0..rank];
             };
+            if (cb.tensorShapeMatches(input_value, runtime_dims) catch null) |matches| {
+                if (matches) {
+                    if (reshaped_input != null) reshaped_input = null;
+                    return input_value;
+                }
+            }
             const result = cb.primReshape(input_value, runtime_dims) catch |err| {
                 std.log.warn("reshape execution failed node_id={d} input_id={d} target_shape={any} declared_shape={any} err={s}", .{
                     node_id,
@@ -2507,18 +3074,18 @@ pub fn executeNode(
         },
         .transpose => |attrs| {
             var sbuf: [8]i64 = undefined;
-            var declared_buf: [8]i64 = undefined;
-            const input = dispatchTensorWithShape(cb, state, graph, ins[0], V.get(ins[0]), &sbuf, &declared_buf);
-            defer input.deinit(cb);
+            const in_shape = fillShapeDims(graph, ins[0], &sbuf);
+            const r = ensureDeclaredShape(cb, V.get(ins[0]), graph.node(ins[0]).output_shape);
+            defer if (r) |v| cb.free(v);
             var perm_buf: [ml.graph.shape.max_rank]u8 = undefined;
-            const perm = transpose_utils.effectivePerm(attrs, input.shape.len, &perm_buf);
-            const result = cb.primTranspose(input.value, perm, input.shape) catch |err| {
+            const perm = transpose_utils.effectivePerm(attrs, graph.node(ins[0]).output_shape.rank(), &perm_buf);
+            const result = cb.primTranspose(r orelse V.get(ins[0]), perm, in_shape) catch |err| {
                 if (err == error.UnsupportedShape) {
                     const input_node = graph.node(ins[0]);
                     std.log.warn("transpose execution failed node_id={d} input_id={d} shape={any} perm={any}", .{
                         node_id,
                         ins[0],
-                        input.shape,
+                        in_shape,
                         perm,
                     });
                     std.log.warn("transpose input node op={s} declared_shape={any}", .{
@@ -2550,50 +3117,51 @@ pub fn executeNode(
         },
         .broadcast_in_dim => |attrs| {
             var sbuf: [8]i64 = undefined;
-            var declared_buf: [8]i64 = undefined;
-            const input = dispatchTensorWithShape(cb, state, graph, ins[0], V.get(ins[0]), &sbuf, &declared_buf);
-            defer input.deinit(cb);
+            const in_shape = fillShapeDims(graph, ins[0], &sbuf);
             const rank = attrs.target_shape.rank();
             var target_dims: [8]i64 = undefined;
             for (0..rank) |d| target_dims[d] = attrs.target_shape.dim(@intCast(d));
+            const reshaped = ensureDeclaredShape(cb, V.get(ins[0]), graph.node(ins[0]).output_shape);
+            defer if (reshaped) |r| cb.free(r);
             const result = try cb.primBroadcastInDim(
-                input.value,
+                reshaped orelse V.get(ins[0]),
                 target_dims[0..rank],
                 attrs.broadcast_axes[0..attrs.num_axes],
-                input.shape,
+                in_shape,
             );
             return result;
         },
         .dot_general => |attrs| {
             var lbuf: [8]i64 = undefined;
             var rbuf: [8]i64 = undefined;
-            var lhs_declared_buf: [8]i64 = undefined;
-            var rhs_declared_buf: [8]i64 = undefined;
-            const lhs = dispatchTensorWithShape(cb, state, graph, ins[0], V.get(ins[0]), &lbuf, &lhs_declared_buf);
-            defer lhs.deinit(cb);
-            const rhs = dispatchTensorWithShape(cb, state, graph, ins[1], V.get(ins[1]), &rbuf, &rhs_declared_buf);
-            defer rhs.deinit(cb);
+            const lhs_shape = fillShapeDims(graph, ins[0], &lbuf);
+            const rhs_shape = fillShapeDims(graph, ins[1], &rbuf);
+            // Reshape inputs to declared shapes for shape-tracking backends.
+            const lhs_r = ensureDeclaredShape(cb, V.get(ins[0]), graph.node(ins[0]).output_shape);
+            defer if (lhs_r) |r| cb.free(r);
+            const rhs_r = ensureDeclaredShape(cb, V.get(ins[1]), graph.node(ins[1]).output_shape);
+            defer if (rhs_r) |r| cb.free(r);
             const result = cb.primDotGeneral(
-                lhs.value,
-                rhs.value,
-                lhs.shape,
-                rhs.shape,
+                lhs_r orelse V.get(ins[0]),
+                rhs_r orelse V.get(ins[1]),
+                lhs_shape,
+                rhs_shape,
                 attrs.lhs_contracting[0..attrs.num_contracting],
                 attrs.rhs_contracting[0..attrs.num_contracting],
                 attrs.lhs_batch[0..attrs.num_batch],
                 attrs.rhs_batch[0..attrs.num_batch],
             ) catch |err| {
-                if (err == error.UnsupportedShape or err == error.UnsupportedPrimitiveOp) {
-                    const lhs_actual = cb.tensorShape(lhs.value, std.heap.page_allocator) catch null;
+                if (err == error.UnsupportedShape) {
+                    const lhs_actual = cb.tensorShape(lhs_r orelse V.get(ins[0]), std.heap.page_allocator) catch null;
                     defer if (lhs_actual) |shape| std.heap.page_allocator.free(shape);
-                    const rhs_actual = cb.tensorShape(rhs.value, std.heap.page_allocator) catch null;
+                    const rhs_actual = cb.tensorShape(rhs_r orelse V.get(ins[1]), std.heap.page_allocator) catch null;
                     defer if (rhs_actual) |shape| std.heap.page_allocator.free(shape);
                     std.log.warn("dot_general execution failed node_id={d} lhs_id={d} rhs_id={d} lhs_shape={any} rhs_shape={any} lhs_contracting={any} rhs_contracting={any} lhs_batch={any} rhs_batch={any}", .{
                         node_id,
                         ins[0],
                         ins[1],
-                        lhs.shape,
-                        rhs.shape,
+                        lhs_shape,
+                        rhs_shape,
                         attrs.lhs_contracting[0..attrs.num_contracting],
                         attrs.rhs_contracting[0..attrs.num_contracting],
                         attrs.lhs_batch[0..attrs.num_batch],
@@ -2697,6 +3265,19 @@ pub fn executeNode(
                     dest_buf[axis] = dim;
                     dims_i32[axis] = @intCast(dim);
                 }
+                scatter_values = V.get(ins[0]);
+                indices = V.get(ins[1]);
+                dest_shape = dest_buf[0..rank];
+                values_shape = runtimeOrDeclaredShape(state, graph, ins[0], &values_buf);
+                indices_shape = runtimeOrDeclaredShape(state, graph, ins[1], &indices_buf);
+
+                if (cb.primScatterAdd(scatter_values, indices, values_shape, dest_shape, attrs.axis)) |result| {
+                    return result;
+                } else |err| switch (err) {
+                    error.UnsupportedPrimitiveOp, error.UnsupportedTensorType, error.UnsupportedShape => {},
+                    else => return err,
+                }
+
                 const elem_count_i64 = out_shape.numElements() orelse return error.UnsupportedShape;
                 if (elem_count_i64 < 0) return error.UnsupportedShape;
                 const elem_count: usize = @intCast(elem_count_i64);
@@ -2704,13 +3285,7 @@ pub fn executeNode(
                 defer std.heap.page_allocator.free(zeros);
                 @memset(zeros, 0.0);
                 generated_dest = try cb.fromFloat32Shape(zeros, dims_i32[0..rank]);
-
                 dest = generated_dest.?;
-                scatter_values = V.get(ins[0]);
-                indices = V.get(ins[1]);
-                dest_shape = dest_buf[0..rank];
-                values_shape = runtimeOrDeclaredShape(state, graph, ins[0], &values_buf);
-                indices_shape = runtimeOrDeclaredShape(state, graph, ins[1], &indices_buf);
             } else {
                 dest = V.get(ins[0]);
                 scatter_values = V.get(ins[1]);
@@ -2734,26 +3309,53 @@ pub fn executeNode(
         .gather => |attrs| {
             var sbuf: [8]i64 = undefined;
             const in_shape = runtimeOrDeclaredShape(state, graph, ins[0], &sbuf);
+            if (attrs.axis == 0) gather_add_bias: {
+                const input_node = graph.node(ins[0]);
+                if (input_node.op != .add) break :gather_add_bias;
+                const add_inputs = input_node.getInputs();
+                if (add_inputs.len != 2) break :gather_add_bias;
+                const lhs = add_inputs[0];
+                const rhs = add_inputs[1];
+                var lhs_buf: [8]i64 = undefined;
+                var rhs_buf: [8]i64 = undefined;
+                const lhs_shape = fillShapeDims(graph, lhs, &lhs_buf);
+                const rhs_shape = fillShapeDims(graph, rhs, &rhs_buf);
+
+                var matrix_id: NodeId = null_node;
+                var bias_id: NodeId = null_node;
+                var matrix_shape_buf: [8]i64 = undefined;
+                var matrix_shape: []const i64 = &.{};
+                if (lhs_shape.len == 2 and rhs_shape.len == 1 and lhs_shape[1] == rhs_shape[0]) {
+                    matrix_id = lhs;
+                    bias_id = rhs;
+                    @memcpy(matrix_shape_buf[0..lhs_shape.len], lhs_shape);
+                    matrix_shape = matrix_shape_buf[0..lhs_shape.len];
+                } else if (rhs_shape.len == 2 and lhs_shape.len == 1 and rhs_shape[1] == lhs_shape[0]) {
+                    matrix_id = rhs;
+                    bias_id = lhs;
+                    @memcpy(matrix_shape_buf[0..rhs_shape.len], rhs_shape);
+                    matrix_shape = matrix_shape_buf[0..rhs_shape.len];
+                } else {
+                    break :gather_add_bias;
+                }
+
+                const matrix = V.getOpt(matrix_id) orelse break :gather_add_bias;
+                const bias = V.getOpt(bias_id) orelse break :gather_add_bias;
+                if (try cb.primGatherAddBiasAxis0(matrix, bias, V.get(ins[1]), matrix_shape)) |fused| {
+                    return fused;
+                }
+            }
             const result = try cb.primGather(V.get(ins[0]), V.get(ins[1]), attrs.axis, in_shape);
             return result;
         },
         .slice => |attrs| {
             var sbuf: [8]i64 = undefined;
-            const in_shape = runtimeOrDeclaredShape(state, graph, ins[0], &sbuf);
-            var declared_buf: [8]i64 = undefined;
-            const declared_shape = fillShapeDims(graph, ins[0], &declared_buf);
+            const in_shape = fillShapeDims(graph, ins[0], &sbuf);
             const rank = @as(usize, attrs.num_axes);
             var starts: [8]i64 = undefined;
             var limits: [8]i64 = undefined;
             var strides: [8]i64 = undefined;
-            for (0..rank) |d| {
-                starts[d] = attrs.starts[d];
-                limits[d] = attrs.limits[d];
-                strides[d] = attrs.strides[d];
-                if (limits[d] < 0 and d < declared_shape.len and d < in_shape.len and declared_shape[d] < 0 and starts[d] == 0 and strides[d] == 1 and in_shape[d] > 0) {
-                    limits[d] = in_shape[d];
-                }
-            }
+            try runtime_slice.resolve(graph.allocator, cb, values, ins, attrs, &starts, &limits, &strides);
             const result = cb.primSlice(V.get(ins[0]), starts[0..rank], limits[0..rank], strides[0..rank], in_shape) catch |err| {
                 const actual = cb.tensorShape(V.get(ins[0]), std.heap.page_allocator) catch null;
                 defer if (actual) |shape| std.heap.page_allocator.free(shape);
@@ -2821,8 +3423,8 @@ pub fn executeNode(
         .concat_prim => |attrs| {
             var abuf: [8]i64 = undefined;
             var bbuf: [8]i64 = undefined;
-            const a_shape = runtimeOrDeclaredShape(state, graph, ins[0], &abuf);
-            const b_shape = runtimeOrDeclaredShape(state, graph, ins[1], &bbuf);
+            const a_shape = fillShapeDims(graph, ins[0], &abuf);
+            const b_shape = fillShapeDims(graph, ins[1], &bbuf);
             return cb.primConcatPrim(V.get(ins[0]), V.get(ins[1]), attrs.axis, a_shape, b_shape) catch |err| {
                 const a_inputs = graph.node(ins[0]).getInputs();
                 const b_inputs = graph.node(ins[1]).getInputs();
@@ -3044,6 +3646,19 @@ test "computeReachable skips vjp_alternate subgraph" {
     try std.testing.expectEqual(@as(usize, 4), reachable_count);
 }
 
+test "nullCtAliases clears every slot for a released handle" {
+    const first: CT = @ptrFromInt(0x1000);
+    const second: CT = @ptrFromInt(0x2000);
+    var values = [_]?CT{ first, second, first, null };
+
+    nullCtAliases(&values, first);
+
+    try std.testing.expect(values[0] == null);
+    try std.testing.expect(values[1] == second);
+    try std.testing.expect(values[2] == null);
+    try std.testing.expect(values[3] == null);
+}
+
 test "computeLastUse tracks dependencies" {
     const allocator = std.testing.allocator;
     var g = Graph.init(allocator);
@@ -3071,6 +3686,33 @@ test "computeLastUse tracks dependencies" {
 
     // output node should never be freed (sentinel value)
     try std.testing.expectEqual(std.math.maxInt(u32), last_use[out]);
+}
+
+test "donation last use includes future sibling reshape aliases" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = ml.graph.Builder.init(&g);
+
+    const x = try b.parameter("x", Shape.init(.f32, &.{4}));
+    const early_view = try b.reshape(x, Shape.init(.f32, &.{ 2, 2 }));
+    const two = try b.scalarConst(.f32, 2.0);
+    const scaled = try b.mul(early_view, two);
+    const later_view = try b.reshape(x, Shape.init(.f32, &.{ 2, 2 }));
+    const later_sum = try b.reduceSum(later_view, &.{ 0, 1 });
+    try g.markOutput(scaled);
+    try g.markOutput(later_sum);
+
+    const reachable = try computeReachable(allocator, &g);
+    defer allocator.free(reachable);
+    const last_use = try computeLastUse(allocator, &g, reachable);
+    defer allocator.free(last_use);
+    const donation_last_use = try computeDonationLastUse(allocator, &g, reachable, last_use);
+    defer allocator.free(donation_last_use);
+
+    try std.testing.expectEqual(scaled, last_use[early_view]);
+    try std.testing.expectEqual(later_sum, donation_last_use[early_view]);
+    try std.testing.expect(donation_last_use[early_view] > scaled);
 }
 
 test "computeReachable with chained ops" {
@@ -3341,6 +3983,9 @@ const TestCompute = struct {
     fn stubDeberta(_: *anyopaque, _: CT, _: CT, _: CT, _: CT, _: CT, _: []const i64, _: usize, _: usize, _: usize, _: usize) anyerror!CT {
         return error.UnsupportedPrimitiveOp;
     }
+    fn stubDebertaBackward(_: *anyopaque, _: CT, _: CT, _: CT, _: CT, _: CT, _: []const i64, _: CT, _: usize, _: usize, _: usize, _: usize) anyerror!CT {
+        return error.UnsupportedPrimitiveOp;
+    }
     fn stubWindowedAttn(_: *anyopaque, _: CT, _: CT, _: CT, _: CT, _: CT, _: CT, _: CT, _: usize, _: usize, _: usize, _: usize, _: usize, _: usize) anyerror!CT {
         return error.UnsupportedPrimitiveOp;
     }
@@ -3503,6 +4148,7 @@ const TestCompute = struct {
         .crossAttention = &stubCrossAttn,
         .relativePositionBias = &stubRelPosBias,
         .disentangledRelativeAttention = &stubDeberta,
+        .disentangledRelativeAttentionBackward = &stubDebertaBackward,
         .windowedSelfAttention = &stubWindowedAttn,
         .channelSelfAttention = &stubChannelAttn,
         .tokenGridConv2d = &stubTokenConv,
@@ -3658,6 +4304,66 @@ test "primitive elementwise ops broadcast scalar constants in interpreter" {
     }
 }
 
+test "interpreter fused gelu backward fallback matches tanh derivative" {
+    const allocator = std.testing.allocator;
+
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var builder = ml.graph.Builder.init(&g);
+
+    const x = try builder.parameter("x", Shape.init(.f32, &.{ 2, 4 }));
+    const upstream = try builder.parameter("upstream", Shape.init(.f32, &.{ 2, 4 }));
+    const out = try g.addNode(.{
+        .op = .{ .fused_gelu_backward = {} },
+        .output_shape = Shape.init(.f32, &.{ 2, 4 }),
+        .inputs = .{ x, upstream, null_node, null_node },
+        .num_inputs = 2,
+    });
+    try g.markOutput(out);
+
+    var tc_backend = TestCompute.init(allocator);
+    defer tc_backend.deinit();
+    defer tc_backend.freeWeights();
+    var cb = tc_backend.backend();
+
+    const x_data = [_]f32{ -4.0, -1.0, -0.25, 0.0, 0.25, 1.0, 4.0, 12.0 };
+    const upstream_data = [_]f32{ 0.5, 1.25, -2.0, 3.0, -0.75, 0.8, 1.1, -1.2 };
+    const x_ct = try cb.fromFloat32(&x_data);
+    const upstream_ct = try cb.fromFloat32(&upstream_data);
+    const rt_inputs = [_]RuntimeInput{
+        .{ .node_id = x, .value = x_ct },
+        .{ .node_id = upstream, .value = upstream_ct },
+    };
+
+    var result = try execute(allocator, &g, &cb, .{
+        .runtime_inputs = &rt_inputs,
+    });
+    defer result.deinit(&cb);
+
+    const actual = try cb.toFloat32(result.outputs[0], allocator);
+    defer allocator.free(actual);
+    cb.free(x_ct);
+    cb.free(upstream_ct);
+
+    const sqrt_2_over_pi: f32 = 0.7978845608028654;
+    try std.testing.expectEqual(@as(usize, x_data.len), actual.len);
+    for (x_data, upstream_data, actual) |xv, up, got| {
+        const x2 = xv * xv;
+        const inner = sqrt_2_over_pi * (xv + 0.044715 * xv * x2);
+        const expected = if (inner > 10.0)
+            up
+        else if (inner < -10.0)
+            0.0
+        else blk: {
+            const t = std.math.tanh(inner);
+            const sech2 = 1.0 - t * t;
+            const derivative = 0.5 * (1.0 + t) + 0.5 * xv * sech2 * sqrt_2_over_pi * (1.0 + 0.134145 * x2);
+            break :blk up * derivative;
+        };
+        try std.testing.expectApproxEqAbs(expected, got, 1e-6);
+    }
+}
+
 test "scatter_add interpreter uses dest values and explicit indices input" {
     const allocator = std.testing.allocator;
 
@@ -3760,43 +4466,6 @@ test "shouldReshapeToDeclaredShape preserves concrete runtime batch" {
     ));
 }
 
-test "dispatchTensorWithShape pairs declared reshape with declared shape" {
-    const allocator = std.testing.allocator;
-
-    var g = Graph.init(allocator);
-    defer g.deinit();
-    var builder = ml.graph.Builder.init(&g);
-
-    const x = try builder.parameter("x", Shape.init(.f32, &.{ 1, 6 }));
-
-    var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
-    var compute = NativeCompute.init(allocator, &ws, null);
-    var cb_val = compute.computeBackend();
-
-    const x_ct = try cb_val.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6 }, &.{6});
-    defer cb_val.free(x_ct);
-
-    const runtime_shape = [_]i64{6};
-    const runtime_shapes = [_]?[]const i64{runtime_shape[0..]};
-    const state = ExecState{
-        .attention_layer = 0,
-        .options = .{},
-        .runtime_shapes = runtime_shapes[0..],
-    };
-
-    var runtime_buf: [8]i64 = undefined;
-    var declared_buf: [8]i64 = undefined;
-    const input = dispatchTensorWithShape(&cb_val, &state, &g, x, x_ct, &runtime_buf, &declared_buf);
-    defer input.deinit(&cb_val);
-
-    try std.testing.expect(input.owned != null);
-    try std.testing.expectEqualSlices(i64, &.{ 1, 6 }, input.shape);
-
-    const actual_shape = try cb_val.tensorShape(input.value, allocator);
-    defer allocator.free(actual_shape);
-    try std.testing.expectEqualSlices(i64, &.{ 1, 6 }, actual_shape);
-}
-
 test "resolveRuntimeReshapeDims preserves runtime batch for exported singleton reshape" {
     var out: [8]i64 = undefined;
     const resolved = resolveRuntimeReshapeDims(
@@ -3891,18 +4560,6 @@ test "resolveProjectionRestoreFromSourceActual restores packed attention output 
     ) orelse return error.TestUnexpectedResult;
 
     try std.testing.expectEqualSlices(i64, &.{ 3, 512, 128 }, resolved);
-}
-
-test "resolveProjectionRestoreFromSourceActual restores nomic qkv projection suffix" {
-    var out: [8]i64 = undefined;
-    const resolved = resolveProjectionRestoreFromSourceActual(
-        &.{ 1, 512, 768 },
-        Shape.init(.f32, &.{ -1, -1, 3, 12, 64 }),
-        1 * 512 * 3 * 12 * 64,
-        &out,
-    ) orelse return error.TestUnexpectedResult;
-
-    try std.testing.expectEqualSlices(i64, &.{ 1, 512, 3, 12, 64 }, resolved);
 }
 
 test "isLeadingAxisFlatten validates only true leading-axis flatten" {
@@ -4428,6 +5085,48 @@ const native_mod = if (build_options.enable_native) @import("../ops/native_compu
 const NativeCompute = if (build_options.enable_native) native_mod.NativeCompute else opaque {};
 const WeightStore = if (build_options.enable_native) native_mod.WeightStore else opaque {};
 
+test "native interpreter does not donate a reshape view before a future sibling view" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var bld = ml.graph.Builder.init(&g);
+
+    const x = try bld.parameter("x", Shape.init(.f32, &.{4}));
+    const early_view = try bld.reshape(x, Shape.init(.f32, &.{ 2, 2 }));
+    const two = try bld.scalarConst(.f32, 2.0);
+    const scaled = try bld.mul(early_view, two);
+    // Deliberately create this sibling view after `scaled`. Without
+    // alias-group liveness, native's in-place multiply mutates `x` before
+    // this node executes and the sum becomes 20 instead of 10.
+    const later_view = try bld.reshape(x, Shape.init(.f32, &.{ 2, 2 }));
+    const later_sum = try bld.reduceSum(later_view, &.{ 0, 1 });
+    try g.markOutput(scaled);
+    try g.markOutput(later_sum);
+
+    var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &ws, null);
+    var cb_val = compute.computeBackend();
+
+    const x_ct = try cb_val.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{4});
+    defer cb_val.free(x_ct);
+    const rt_inputs = [_]RuntimeInput{.{ .node_id = x, .value = x_ct }};
+
+    var result = try execute(allocator, &g, &cb_val, .{ .runtime_inputs = &rt_inputs });
+    defer result.deinit(&cb_val);
+
+    const scaled_data = try cb_val.toFloat32(result.outputs[0], allocator);
+    defer allocator.free(scaled_data);
+    try std.testing.expectEqualSlices(f32, &.{ 2, 4, 6, 8 }, scaled_data);
+    const sum_data = try cb_val.toFloat32(result.outputs[1], allocator);
+    defer allocator.free(sum_data);
+    try std.testing.expectEqualSlices(f32, &.{10}, sum_data);
+    const original_data = try cb_val.toFloat32(x_ct, allocator);
+    defer allocator.free(original_data);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, original_data);
+}
+
 test "execute lowered graph through native backend" {
     // Build: y = linear(x, w, b) = x @ w^T + b
     // Lower to primitives and execute. Verify output matches hand-computed values.
@@ -4765,6 +5464,66 @@ test "runtime shape drives symbolic slice" {
         16, 17, 18,
         19, 20, 21,
     }, actual);
+}
+
+test "runtime shape expression bounds a slice of a static tensor" {
+    const allocator = std.testing.allocator;
+
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var builder = ml.graph.Builder.init(&g);
+
+    const input_ids = try builder.parameter("input_ids", Shape.init(.i64, &.{ -1, -1 }));
+    const input_shape = try g.addNode(.{
+        .op = .{ .shape_of = .{ .start = 0, .end = 2 } },
+        .output_shape = Shape.init(.i64, &.{2}),
+        .inputs = .{ input_ids, null_node, null_node, null_node },
+        .num_inputs = 1,
+    });
+    const sequence_axis = try builder.tensorConst(&.{1.0}, Shape.init(.i64, &.{}));
+    const sequence_length = try builder.gather(input_shape, sequence_axis, Shape.init(.i64, &.{}));
+    const ends = try builder.reshape(sequence_length, Shape.init(.i64, &.{1}));
+    const starts = try builder.tensorConst(&.{0.0}, Shape.init(.i64, &.{1}));
+
+    var positions: [12]f32 = undefined;
+    for (&positions, 0..) |*position, i| position.* = @floatFromInt(i);
+    const position_ids = try builder.tensorConst(&positions, Shape.init(.i64, &.{ 1, 12 }));
+    var attrs = ml.graph.node.SliceAttrs{};
+    attrs.num_axes = 2;
+    attrs.starts = .{ 0, 0, 0, 0, 0, 0, 0, 0 };
+    attrs.limits = .{ 1, -1, 0, 0, 0, 0, 0, 0 };
+    attrs.strides = .{ 1, 1, 1, 1, 1, 1, 1, 1 };
+    attrs.bound_axes[0] = 1;
+    attrs.num_bound_axes = 1;
+    attrs.runtime_limits = true;
+    const sliced = try g.addNode(.{
+        .op = .{ .slice = attrs },
+        .output_shape = Shape.init(.i64, &.{ 1, -1 }),
+        .inputs = .{ position_ids, starts, ends, null_node },
+        .num_inputs = 3,
+    });
+    try g.markOutput(sliced);
+
+    var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &ws, null);
+    var cb_val = compute.computeBackend();
+
+    const ids: [3 * 4]f32 = @splat(0);
+    const input_ids_ct = try cb_val.fromFloat32Shape(&ids, &.{ 3, 4 });
+    defer cb_val.free(input_ids_ct);
+    const rt_inputs = [_]RuntimeInput{
+        .{ .node_id = input_ids, .value = input_ids_ct },
+    };
+
+    var result = try execute(allocator, &g, &cb_val, .{ .runtime_inputs = &rt_inputs });
+    defer result.deinit(&cb_val);
+
+    const actual_shape = try cb_val.tensorShape(result.outputs[0], allocator);
+    defer allocator.free(actual_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 4 }, actual_shape);
+    const actual = try cb_val.toFloat32(result.outputs[0], allocator);
+    defer allocator.free(actual);
+    try std.testing.expectEqualSlices(f32, &.{ 0, 1, 2, 3 }, actual);
 }
 
 test "runtime shape drives symbolic concat" {

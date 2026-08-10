@@ -49,6 +49,14 @@ def assert_openai_list_response(resp: dict, expected_len: int | None = None) -> 
     assert usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"], resp
 
 
+def assert_extraction_response(resp: dict, expected_len: int | None = None) -> None:
+    assert resp["object"] == "extraction", resp
+    assert isinstance(resp["model"], str), resp
+    assert isinstance(resp["data"], list), resp
+    if expected_len is not None:
+        assert len(resp["data"]) == expected_len, resp
+
+
 # -- Test data generators --
 
 # 1x1 white PNG, pre-encoded

@@ -18,6 +18,7 @@ const builtin = @import("builtin");
 const platform = @import("antfly_platform");
 const byte_copy = @import("../../common/byte_copy.zig");
 const fs_paths = @import("../../common/fs_paths.zig");
+const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
 
 const Allocator = std.mem.Allocator;
 const CounterU64 = platform.atomic.Value(u64);
@@ -60,10 +61,13 @@ pub const NativeStorageStats = struct {
 pub fn nativeFdAdmissionCapacityForSoftLimit(soft_limit: u64) usize {
     if (soft_limit == std.math.maxInt(u64)) return unlimited_fd_admission_capacity;
     // Public inbound sockets independently receive at most one quarter of the
-    // process table. Give native storage one third, leaving at least five
-    // twelfths for listeners, Raft, outbound providers, logs, and operator
-    // recovery traffic even when the deployment lowers RLIMIT_NOFILE.
-    const bounded = @max(@as(u64, 1), soft_limit / 3);
+    // process table. Give native storage one half, leaving the final quarter
+    // for listeners, Raft, outbound providers, logs, and operator recovery
+    // traffic. A third was too conservative: at RLIMIT_NOFILE=256 the 85-slot
+    // pool could not retain the lifetime locks required by a normal multi-shard
+    // graph/full-text workload even though the process still had ample OS
+    // descriptor headroom.
+    const bounded = @max(@as(u64, 1), soft_limit / 2);
     return @intCast(@min(bounded, unlimited_fd_admission_capacity));
 }
 
@@ -336,7 +340,7 @@ fn openNativePathLockFileWithCache(
     options: NativePathLockFileOptions,
     fd_cache: *FdCache,
 ) !NativePathLockFile {
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = threaded_io_limits.initService(allocator);
     errdefer io_impl.deinit();
 
     const open_descriptor_count = createPathDescriptorCount(path);
@@ -1033,7 +1037,9 @@ else
 
                 if (builtin.is_test and test_fd_cache_pause_after_open.load(.acquire)) {
                     test_fd_cache_open_paused.store(true, .release);
-                    while (!test_fd_cache_release_after_open.load(.acquire)) std.Thread.yield() catch {};
+                    while (!test_fd_cache_release_after_open.load(.acquire)) {
+                        io.sleep(.fromMilliseconds(1), .awake) catch {};
+                    }
                 }
 
                 const entry = try self.allocator.create(Entry);
@@ -1465,7 +1471,9 @@ const NativeStorageState = struct {
         state.allocator = allocator;
         state.refs = .init(1);
         state.closing = .init(false);
-        state.threaded = std.Io.Threaded.init(allocator, .{});
+        // Native storage state may outlive its owning DB while range futures
+        // drain. Prevent that retained runtime from growing without a bound.
+        state.threaded = threaded_io_limits.initService(allocator);
         errdefer state.threaded.deinit();
         // NativeStorage.init is used by repository, recovery, and status
         // helpers as well as BackendRuntime-owned stores. All production
@@ -1778,7 +1786,7 @@ else blk: {
 
             pub fn initWithPool(allocator: Allocator, kind: RuntimeKind, pool: ?*NativeStoragePool) !NativeStorage {
                 var runtime = switch (kind) {
-                    .threaded => .{ .threaded = std.Io.Threaded.init(allocator, .{}) },
+                    .threaded => .{ .threaded = threaded_io_limits.initService(allocator) },
                     .evented => blk2: {
                         var evented: std.Io.Evented = undefined;
                         try std.Io.Evented.init(&evented, allocator, .{});
@@ -3430,6 +3438,17 @@ test "native atomic write sink supports patching and crc before finish" {
     try std.testing.expectEqualStrings("hello world", written);
 }
 
+test "native storage retained runtime has a finite worker ceiling" {
+    if (!supports_native_storage) return error.SkipZigTest;
+
+    var native = try NativeStorage.init(std.testing.allocator, .threaded);
+    defer native.deinit();
+    try std.testing.expectEqual(
+        std.Io.Limit.limited(threaded_io_limits.service),
+        native.state.threaded.concurrent_limit,
+    );
+}
+
 test "native fd cache retries an open that straddles a mutation fence" {
     if (!supports_posix_fd_cache or builtin.single_threaded) return error.SkipZigTest;
 
@@ -3437,6 +3456,7 @@ test "native fd cache retries an open that straddles a mutation fence" {
     defer pool.deinit();
     var native = try NativeStorage.initWithPool(std.testing.allocator, .threaded, &pool);
     defer native.deinit();
+
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
@@ -3658,9 +3678,10 @@ test "native fd cache evicts to per-store budget" {
 }
 
 test "native fd admission reserves non-storage process capacity" {
-    try std.testing.expectEqual(@as(usize, 2), nativeFdAdmissionCapacityForSoftLimit(8));
-    try std.testing.expectEqual(@as(usize, 21), nativeFdAdmissionCapacityForSoftLimit(64));
-    try std.testing.expectEqual(@as(usize, 341), nativeFdAdmissionCapacityForSoftLimit(1024));
+    try std.testing.expectEqual(@as(usize, 4), nativeFdAdmissionCapacityForSoftLimit(8));
+    try std.testing.expectEqual(@as(usize, 32), nativeFdAdmissionCapacityForSoftLimit(64));
+    try std.testing.expectEqual(@as(usize, 128), nativeFdAdmissionCapacityForSoftLimit(256));
+    try std.testing.expectEqual(@as(usize, 512), nativeFdAdmissionCapacityForSoftLimit(1024));
     try std.testing.expectEqual(unlimited_fd_admission_capacity, nativeFdAdmissionCapacityForSoftLimit(std.math.maxInt(u64)));
     try std.testing.expectEqual(unlimited_fd_admission_capacity, nativeFdAdmissionCapacityForSoftLimit(1_048_576));
 }

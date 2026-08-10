@@ -674,7 +674,7 @@ func extractModelNames(r io.Reader) ([]string, error) {
 		}
 	}
 
-	for _, key := range []string{"models", "data", "embedders", "generators", "rerankers", "chunkers", "recognizers", "extractors", "rewriters", "classifiers", "readers", "transcribers"} {
+	for _, key := range []string{"models", "data", "embedders", "generators", "rerankers", "chunkers", "extractors", "rewriters", "classifiers", "readers", "transcribers"} {
 		if raw, ok := doc[key]; ok {
 			addFromCollection(raw)
 		}
@@ -1005,7 +1005,6 @@ func (p *Proxy) Start(ctx context.Context) error {
 	apiMux.HandleFunc("/ai/v1/embeddings", p.handleEmbeddings)
 	apiMux.HandleFunc("/ai/v1/chunk", p.handleChunk)
 	apiMux.HandleFunc("/ai/v1/rerank", p.handleRerank)
-	apiMux.HandleFunc("/ai/v1/recognize", p.handleRecognize)
 	apiMux.HandleFunc("/ai/v1/extract", p.handleExtract)
 	apiMux.HandleFunc("/ai/v1/generate", p.handleGenerate)
 	apiMux.HandleFunc("/ai/v1/chat/completions", p.handleChatCompletions)
@@ -1071,10 +1070,6 @@ func (p *Proxy) handleChunk(w http.ResponseWriter, r *http.Request) {
 // handleRerank routes reranking requests
 func (p *Proxy) handleRerank(w http.ResponseWriter, r *http.Request) {
 	p.proxyRequest(w, r, "rerank")
-}
-
-func (p *Proxy) handleRecognize(w http.ResponseWriter, r *http.Request) {
-	p.proxyRequest(w, r, "recognize")
 }
 
 func (p *Proxy) handleExtract(w http.ResponseWriter, r *http.Request) {

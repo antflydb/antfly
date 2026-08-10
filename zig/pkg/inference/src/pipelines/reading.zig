@@ -639,14 +639,7 @@ pub const ReadingPipeline = struct {
         if (debug_cuda_session) std.log.info("reading: pixel tensor init done", .{});
         defer pv_tensor.deinit();
 
-        const is_native_florence = session_factory.getFlorenceConfig(self.vision_encoder) != null;
-        var prompt_ids_i64: ?[]i64 = null;
-        defer if (prompt_ids_i64) |ids| allocator.free(ids);
-        var prompt_tensor: ?backends.Tensor = null;
-        defer if (prompt_tensor) |*t| t.deinit();
-
-        const encoder_outputs = if (is_native_florence) blk: {
-            const florence_cfg = session_factory.getFlorenceConfig(self.vision_encoder).?;
+        const encoder_outputs = if (session_factory.getFlorenceConfig(self.vision_encoder)) |florence_cfg| blk: {
             const prompt_text = self.config.prompt orelse "<OCR>";
             const prompt_i32 = try buildFlorencePromptIds(
                 allocator,
@@ -656,18 +649,12 @@ pub const ReadingPipeline = struct {
             );
             defer allocator.free(prompt_i32);
 
-            const prompt_len = prompt_i32.len;
-            const prompt_i64 = try allocator.alloc(i64, prompt_len);
-            errdefer allocator.free(prompt_i64);
-            for (prompt_i32, 0..) |id, i| prompt_i64[i] = id;
-            prompt_ids_i64 = prompt_i64;
-
-            const prompt_shape = [_]i64{ 1, @intCast(prompt_len) };
-            var pt = try backends.Tensor.initInt64(allocator, "input_ids", &prompt_shape, prompt_i64);
-            errdefer pt.deinit();
-            prompt_tensor = pt;
-
-            break :blk try self.vision_encoder.run(&.{ pv_tensor, prompt_tensor.? }, allocator);
+            break :blk try runFlorenceVisionEncoder(
+                self.vision_encoder,
+                allocator,
+                pv_tensor,
+                prompt_i32,
+            );
         } else try self.vision_encoder.run(&.{pv_tensor}, allocator);
         if (debug_cuda_session) std.log.info("reading: vision encoder run done outputs={d}", .{encoder_outputs.len});
         defer {
@@ -685,6 +672,28 @@ pub const ReadingPipeline = struct {
         const result = try self.decodeFromEncoderOutputs(encoder_outputs, null);
         logReadProfile("decode_from_encoder", decode_start);
         return result;
+    }
+
+    fn runFlorenceVisionEncoder(
+        vision_encoder: backends.Session,
+        allocator: std.mem.Allocator,
+        pixel_tensor: backends.Tensor,
+        prompt_ids: []const i32,
+    ) ![]backends.Tensor {
+        const prompt_i64 = try allocator.alloc(i64, prompt_ids.len);
+        defer allocator.free(prompt_i64);
+        for (prompt_ids, 0..) |id, i| prompt_i64[i] = id;
+
+        const prompt_shape = [_]i64{ 1, @intCast(prompt_ids.len) };
+        var prompt_tensor = try backends.Tensor.initInt64(
+            allocator,
+            "input_ids",
+            &prompt_shape,
+            prompt_i64,
+        );
+        defer prompt_tensor.deinit();
+
+        return vision_encoder.run(&.{ pixel_tensor, prompt_tensor }, allocator);
     }
 
     fn readNativeFlorencePixelValues(self: *ReadingPipeline, pixel_values: []const f32, florence_cfg: florence_arch.Config) !ReadResult {
@@ -1541,7 +1550,9 @@ fn buildFlorencePromptIds(
 }
 
 fn normalizeFlorencePrompt(prompt: []const u8) []const u8 {
-    if (std.mem.eql(u8, prompt, "<OCR>")) return "What is the text in the image?";
+    // /read is an OCR endpoint, so an explicitly empty prompt follows the same
+    // OCR default as an omitted prompt (which the caller represents as <OCR>).
+    if (prompt.len == 0 or std.mem.eql(u8, prompt, "<OCR>")) return "What is the text in the image?";
     if (std.mem.eql(u8, prompt, "<OCR_WITH_REGION>")) return "What is the text in the image, with regions?";
     if (std.mem.eql(u8, prompt, "<CAPTION>")) return "What does the image describe?";
     if (std.mem.eql(u8, prompt, "<DETAILED_CAPTION>")) return "Describe in detail what is shown in the image.";
@@ -1550,6 +1561,11 @@ fn normalizeFlorencePrompt(prompt: []const u8) []const u8 {
     if (std.mem.eql(u8, prompt, "<DENSE_REGION_CAPTION>")) return "Locate the objects in the image, with their descriptions.";
     if (std.mem.eql(u8, prompt, "<REGION_PROPOSAL>")) return "Locate the region proposals in the image.";
     return prompt;
+}
+
+test "Florence defaults an empty read prompt to OCR" {
+    try std.testing.expectEqualStrings("What is the text in the image?", normalizeFlorencePrompt(""));
+    try std.testing.expectEqualStrings("What is the text in the image?", normalizeFlorencePrompt("<OCR>"));
 }
 
 fn cleanupPureText(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
@@ -1650,6 +1666,78 @@ fn wouldRepeatNgram(prefix: []const i64, candidate: i64, no_repeat_ngram_size: u
         if (prefix[start + context_len] == candidate) return true;
     }
     return false;
+}
+
+const AdmissionDenyingFlorenceSession = struct {
+    run_called: bool = false,
+
+    fn session(self: *AdmissionDenyingFlorenceSession) backends.Session {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .run = run,
+                .inputInfo = inputInfo,
+                .outputInfo = outputInfo,
+                .backend = backend,
+                .close = close,
+            },
+        };
+    }
+
+    fn run(
+        ptr: *anyopaque,
+        inputs: []const backends.Tensor,
+        _: std.mem.Allocator,
+    ) anyerror![]backends.Tensor {
+        const self: *AdmissionDenyingFlorenceSession = @ptrCast(@alignCast(ptr));
+        self.run_called = true;
+        try std.testing.expectEqual(@as(usize, 2), inputs.len);
+        try std.testing.expectEqualStrings("pixel_values", inputs[0].name);
+        try std.testing.expectEqualStrings("input_ids", inputs[1].name);
+        try std.testing.expectEqual(backends.DType.i64, inputs[1].dtype);
+        try std.testing.expectEqualSlices(i64, &.{ 11, 22, 33 }, inputs[1].asInt64());
+        return error.ResourceTemporarilyUnavailable;
+    }
+
+    fn inputInfo(_: *anyopaque) []const backends.TensorInfo {
+        return &.{
+            .{ .name = "pixel_values", .dtype = .f32, .shape = &.{ -1, 3, -1, -1 } },
+            .{ .name = "input_ids", .dtype = .i64, .shape = &.{ -1, -1 } },
+        };
+    }
+
+    fn outputInfo(_: *anyopaque) []const backends.TensorInfo {
+        return &.{.{ .name = "last_hidden_state", .dtype = .f32, .shape = &.{ -1, -1, -1 } }};
+    }
+
+    fn backend(_: *anyopaque) backends.BackendType {
+        return .native;
+    }
+
+    fn close(_: *anyopaque) void {}
+};
+
+test "Florence prompt tensor cleanup survives encoder admission denial" {
+    const allocator = std.testing.allocator;
+    var fake = AdmissionDenyingFlorenceSession{};
+    var pixel_tensor = try backends.Tensor.initFloat32(
+        allocator,
+        "pixel_values",
+        &.{ 1, 3, 1, 1 },
+        &.{ 0.0, 0.0, 0.0 },
+    );
+    defer pixel_tensor.deinit();
+
+    try std.testing.expectError(
+        error.ResourceTemporarilyUnavailable,
+        ReadingPipeline.runFlorenceVisionEncoder(
+            fake.session(),
+            allocator,
+            pixel_tensor,
+            &.{ 11, 22, 33 },
+        ),
+    );
+    try std.testing.expect(fake.run_called);
 }
 
 test "wouldRepeatNgram detects repeated trigram continuation" {

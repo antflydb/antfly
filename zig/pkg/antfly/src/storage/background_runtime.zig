@@ -17,6 +17,7 @@ const std = @import("std");
 const platform = @import("antfly_platform");
 const runtime_backend = @import("runtime_backend.zig");
 const storage_io = @import("lsm_backend/storage_io.zig");
+const threaded_io_limits = @import("../common/threaded_io_limits.zig");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -24,6 +25,7 @@ const AtomicU64 = platform.atomic.Value(u64);
 
 pub const Backend = runtime_backend.Backend;
 pub const IoImpl = if (builtin.os.tag == .freestanding) void else Io.Threaded;
+pub const default_io_concurrent_limit: u32 = threaded_io_limits.service;
 
 pub const Config = struct {
     backend: Backend = runtime_backend.defaultExecutorBackend(),
@@ -92,7 +94,13 @@ fn initIoLane(alloc: Allocator) !*IoImpl {
     } else {
         const io_impl = try alloc.create(IoImpl);
         errdefer alloc.destroy(io_impl);
-        io_impl.* = Io.Threaded.init(alloc, .{});
+        // Backend runtimes are process-long and own several independent I/O
+        // lanes. Threaded retains concurrent workers until deinit, so a finite
+        // ceiling prevents any lane from converting a transient fan-out spike
+        // into an unbounded kernel-thread/stack reservation ratchet.
+        io_impl.* = Io.Threaded.init(alloc, .{
+            .concurrent_limit = .limited(default_io_concurrent_limit),
+        });
         return io_impl;
     }
 }

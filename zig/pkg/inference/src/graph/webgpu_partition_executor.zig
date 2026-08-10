@@ -30,6 +30,7 @@ const native_partition_executor = @import("native_partition_executor.zig");
 const interpreter = @import("interpreter.zig");
 const operator_plan_mod = @import("operator_plan.zig");
 const webgpu_capabilities = @import("webgpu_capabilities.zig");
+const runtime_slice = @import("runtime_slice.zig");
 
 const Graph = ml.graph.Graph;
 const NodeId = ml.graph.NodeId;
@@ -496,11 +497,7 @@ fn executeCommandNode(
             var starts: [ml.graph.shape.max_rank]i64 = undefined;
             var limits: [ml.graph.shape.max_rank]i64 = undefined;
             var strides: [ml.graph.shape.max_rank]i64 = undefined;
-            for (0..rank) |axis| {
-                starts[axis] = attrs.starts[axis];
-                limits[axis] = attrs.limits[axis];
-                strides[axis] = attrs.strides[axis];
-            }
+            try runtime_slice.resolve(graph.allocator, cb, values, inputs, attrs, &starts, &limits, &strides);
             break :blk try cb.primSlice(input, starts[0..rank], limits[0..rank], strides[0..rank], in_shape);
         },
         .concat_prim => |attrs| blk: {

@@ -177,8 +177,6 @@ pub fn runFromIterator(
         return try inference.native_transcribe.main(alloc, io, try collectArgs(alloc, args));
     } else if (std.mem.eql(u8, command, "read")) {
         return try inference.native_read.main(alloc, io, try collectArgs(alloc, args));
-    } else if (std.mem.eql(u8, command, "recognize")) {
-        return try inference.native_recognize.main(alloc, io, try collectArgs(alloc, args));
     } else if (std.mem.eql(u8, command, "extract")) {
         return try inference.native_extract.main(alloc, io, try collectArgs(alloc, args));
     } else if (std.mem.eql(u8, command, "compare")) {
@@ -203,6 +201,21 @@ pub fn runFromIterator(
 }
 
 fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
+    // Help is side-effect free and wins over every run option, even if it
+    // follows an otherwise invalid value. Probe a copy so normal parsing can
+    // still consume the original iterator.
+    var help_probe = args.*;
+    var first_arg = true;
+    while (help_probe.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h") or
+            (first_arg and std.mem.eql(u8, arg, "help")))
+        {
+            printUsage();
+            return;
+        }
+        first_arg = false;
+    }
+
     var host: []const u8 = "127.0.0.1";
     var port: u16 = 8090;
     var models_dir: []const u8 = defaultModelsDir(alloc);
@@ -214,7 +227,10 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
     defer preload_models.deinit(alloc);
 
     while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--host")) {
+        if (isHelpArg(arg)) {
+            printUsage();
+            return;
+        } else if (std.mem.eql(u8, arg, "--host")) {
             host = args.next() orelse host;
         } else if (std.mem.eql(u8, arg, "--port")) {
             if (args.next()) |p| port = std.fmt.parseInt(u16, p, 10) catch 8090;
@@ -263,6 +279,7 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
     // work, and backend sessions all compose with the same executor.
     node.attachIo(io);
     try node.warmConfiguredGenerators(alloc);
+    node.configureForcedRunAdmissionDenialsFromEnvironmentForTesting();
     std.debug.print("listening on {s}:{d}\n", .{ host, port });
     try node.serve(alloc, io, host, port);
 }
@@ -593,8 +610,7 @@ fn printUsage() void {
         \\  run-artifact Run or validate compiled artifacts
         \\  transcribe  Run audio transcription
         \\  read        Run image/document reading
-        \\  recognize   Run entity recognition
-        \\  extract     Run structured extraction
+        \\  extract     Run entity, relation, or structured extraction
         \\  compare     Compare generation outputs
         \\  finetune    Run LoRA finetuning
         \\  smoke       Run a model smoke test
@@ -641,6 +657,12 @@ test "inference pull recognizes help before model resolution" {
     try std.testing.expect(isHelpArg("-h"));
     try std.testing.expect(isHelpArg("help"));
     try std.testing.expect(!isHelpArg("antflydb/clipclap"));
+}
+
+test "inference run recognizes help before server startup" {
+    try std.testing.expect(isHelpArg("--help"));
+    try std.testing.expect(isHelpArg("-h"));
+    try std.testing.expect(isHelpArg("help"));
 }
 
 test "inference pull classifies order independent value flags" {

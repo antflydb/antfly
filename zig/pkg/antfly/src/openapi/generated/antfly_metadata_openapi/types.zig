@@ -481,12 +481,14 @@ pub const ArtifactRepairReason = enum {
     missing_artifact,
     corrupt_artifact,
     unreadable_artifact,
+    enrichment_failed,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .missing_artifact => "missing_artifact",
             .corrupt_artifact => "corrupt_artifact",
             .unreadable_artifact => "unreadable_artifact",
+            .enrichment_failed => "enrichment_failed",
         };
         try jw.write(s);
     }
@@ -500,6 +502,7 @@ pub const ArtifactRepairReason = enum {
             .{ "missing_artifact", .missing_artifact },
             .{ "corrupt_artifact", .corrupt_artifact },
             .{ "unreadable_artifact", .unreadable_artifact },
+            .{ "enrichment_failed", .enrichment_failed },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -550,6 +553,8 @@ pub const BatchRequest = struct {
 };
 
 pub const BatchResponse = struct {
+    /// Durable commit and visibility/participant recovery state.
+    status: ?[]const u8 = null,
     /// Number of documents successfully inserted
     inserted: ?i64 = null,
     /// Number of documents successfully deleted
@@ -820,7 +825,6 @@ pub const ConnectedModelType = enum {
     generator,
     reranker,
     chunker,
-    recognizer,
     classifier,
     rewriter,
     reader,
@@ -834,7 +838,6 @@ pub const ConnectedModelType = enum {
             .generator => "generator",
             .reranker => "reranker",
             .chunker => "chunker",
-            .recognizer => "recognizer",
             .classifier => "classifier",
             .rewriter => "rewriter",
             .reader => "reader",
@@ -855,7 +858,6 @@ pub const ConnectedModelType = enum {
             .{ "generator", .generator },
             .{ "reranker", .reranker },
             .{ "chunker", .chunker },
-            .{ "recognizer", .recognizer },
             .{ "classifier", .classifier },
             .{ "rewriter", .rewriter },
             .{ "reader", .reader },
@@ -1428,7 +1430,7 @@ pub const InferenceConnection = struct {
     names: ?[]const []const u8 = null,
     /// Model types this instance is configured for.
     configured_model_types: ?[]const ConnectedModelType = null,
-    /// Models reported by the provider, grouped by model type. Keys are pluralized ConnectedModelType values ("embedders", "generators", "rerankers", "chunkers", "recognizers", "classifiers", "rewriters", "readers", "transcribers", "extractors") plus "other" for models the provider's listing API does not classify by task. Populated only when the request includes the "models" expansion.
+    /// Models reported by the provider, grouped by model type. Keys are pluralized ConnectedModelType values ("embedders", "generators", "rerankers", "chunkers", "classifiers", "rewriters", "readers", "transcribers", "extractors") plus "other" for models the provider's listing API does not classify by task. Populated only when the request includes the "models" expansion.
     models: ?std.json.ArrayHashMap([]const ConnectedModel) = null,
 };
 
@@ -1828,6 +1830,8 @@ pub const MultiBatchRequest = struct {
 
 /// Response for a cross-table batch operation. Contains per-table results.
 pub const MultiBatchResponse = struct {
+    /// Durable commit and visibility/propagation state.
+    status: ?[]const u8 = null,
     /// Per-table batch results
     tables: ?std.json.ArrayHashMap(BatchResponse) = null,
 };
@@ -2892,6 +2896,10 @@ pub const TableRepairIssue = struct {
     /// Derived replay sequence that observed the issue.
     sequence: i64,
     reason: ArtifactRepairReason,
+    /// Number of enrichment generation attempts made before this issue was parked.
+    generation_attempts: i64,
+    /// Stable source-generation error code that caused this issue to be parked.
+    generation_error: ?[]const u8 = null,
     /// Number of repair attempts made for this issue.
     attempts: i64,
     /// Monotonic timestamp when this issue was first recorded.
@@ -3003,8 +3011,10 @@ pub const TableRepairRunResult = struct {
     in_progress: i64,
     /// Number of indexes rebuilt by this pass when target is index.
     indexes_rebuilt: i64,
-    /// Number of selected indexes that were already degraded or quarantined before repair.
-    indexes_degraded: i64,
+    /// Number of selected indexes that were degraded or quarantined when this repair pass began.
+    indexes_degraded_before: i64,
+    /// Number of selected indexes that remain degraded or quarantined when this repair pass returns.
+    indexes_degraded_after: i64,
     /// Number of existing index repairs that accepted the requested control.
     controls_applied: i64,
     /// Effective repair limit.
@@ -3089,12 +3099,43 @@ pub const TransactionCommitRequest = struct {
 
 /// Result of an OCC transaction commit attempt.
 pub const TransactionCommitResponse = struct {
-    /// Whether the transaction was committed or aborted due to a conflict
+    /// Durable transaction outcome. Pending committed states mean the commit decision is durable while its requested visibility barrier or participant recovery is still completing.
     status: []const u8,
     /// Details about the conflict that caused an abort (only present when status is "aborted")
-    conflict: ?std.json.Value = null,
-    /// Per-table batch results (only present when status is "committed")
+    conflict: ?TransactionConflict = null,
+    /// Per-table batch results (present for every committed status)
     tables: ?std.json.ArrayHashMap(BatchResponse) = null,
+};
+
+/// Structured details for an aborted transaction attempt.
+pub const TransactionConflict = struct {
+    /// Table where the conflict was detected.
+    table: []const u8,
+    /// Document key associated with the conflict, when applicable.
+    key: []const u8,
+    /// Human-readable conflict description.
+    message: []const u8,
+    /// Stable machine-readable conflict classification.
+    kind: []const u8,
+    /// Whether retrying the transaction may succeed without changing its writes.
+    retryable: bool,
+    /// Minimum suggested delay before retrying a retryable conflict.
+    retry_after_ms: ?i64 = null,
+    /// Component whose state should be refreshed before retrying.
+    retry_scope: ?[]const u8 = null,
+    /// Version required by the transaction predicate.
+    expected_version: ?i64 = null,
+    /// Version observed while validating the transaction predicate.
+    current_version: ?i64 = null,
+    participant: ?TransactionConflictParticipant = null,
+};
+
+/// Participant location and 2PC phase where the conflict occurred.
+pub const TransactionConflictParticipant = struct {
+    /// Raft group that reported the conflict.
+    group_id: ?i64 = null,
+    /// 2PC participant phase that reported the conflict.
+    phase: ?[]const u8 = null,
 };
 
 /// A key that was read as part of an OCC transaction, along with the version observed at read time. Used to detect conflicts at commit time.
@@ -3119,11 +3160,11 @@ pub const TransactionSessionCleanupResponse = struct {
 };
 
 pub const TransactionSessionCommitResponse = struct {
-    /// Whether the transaction was committed or aborted due to a conflict
+    /// Durable transaction outcome. Pending committed states mean the commit decision is durable while its requested visibility barrier or participant recovery is still completing.
     status: []const u8,
     /// Details about the conflict that caused an abort (only present when status is "aborted")
-    conflict: ?std.json.Value = null,
-    /// Per-table batch results (only present when status is "committed")
+    conflict: ?TransactionConflict = null,
+    /// Per-table batch results (present for every committed status)
     tables: ?std.json.ArrayHashMap(BatchResponse) = null,
     transaction_id: []const u8,
 };

@@ -10,6 +10,7 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.extraction_reader_options import ExtractionReaderOptions
+    from ..models.extraction_resolver_options import ExtractionResolverOptions
 
 
 T = TypeVar("T", bound="ExtractionOptions")
@@ -24,6 +25,7 @@ class ExtractionOptions:
         include_confidence (bool | Unset):
         include_spans (bool | Unset):
         reader (ExtractionReaderOptions | Unset):
+        resolver (ExtractionResolverOptions | Unset): Optional cross-input entity and relation deduplication.
     """
 
     threshold: float | Unset = UNSET
@@ -31,6 +33,7 @@ class ExtractionOptions:
     include_confidence: bool | Unset = UNSET
     include_spans: bool | Unset = UNSET
     reader: ExtractionReaderOptions | Unset = UNSET
+    resolver: ExtractionResolverOptions | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -46,6 +49,10 @@ class ExtractionOptions:
         if not isinstance(self.reader, Unset):
             reader = self.reader.to_dict()
 
+        resolver: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.resolver, Unset):
+            resolver = self.resolver.to_dict()
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
@@ -59,12 +66,15 @@ class ExtractionOptions:
             field_dict["include_spans"] = include_spans
         if reader is not UNSET:
             field_dict["reader"] = reader
+        if resolver is not UNSET:
+            field_dict["resolver"] = resolver
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.extraction_reader_options import ExtractionReaderOptions
+        from ..models.extraction_resolver_options import ExtractionResolverOptions
 
         d = dict(src_dict)
         threshold = d.pop("threshold", UNSET)
@@ -82,12 +92,20 @@ class ExtractionOptions:
         else:
             reader = ExtractionReaderOptions.from_dict(_reader)
 
+        _resolver = d.pop("resolver", UNSET)
+        resolver: ExtractionResolverOptions | Unset
+        if isinstance(_resolver, Unset):
+            resolver = UNSET
+        else:
+            resolver = ExtractionResolverOptions.from_dict(_resolver)
+
         extraction_options = cls(
             threshold=threshold,
             flat_ner=flat_ner,
             include_confidence=include_confidence,
             include_spans=include_spans,
             reader=reader,
+            resolver=resolver,
         )
 
         extraction_options.additional_properties = d

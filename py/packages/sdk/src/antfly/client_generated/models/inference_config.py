@@ -31,7 +31,7 @@ class InferenceConfig:
             - `{models_dir}/embedders/` - Embedding models (ONNX)
             - `{models_dir}/chunkers/` - Chunking models (ONNX)
             - `{models_dir}/rerankers/` - Reranking models (ONNX)
-            - `{models_dir}/recognizers/` - Recognition models (ONNX)
+            - `{models_dir}/extractors/` - Entity, relation, and structured extraction models
             - `{models_dir}/rewriters/` - Seq2Seq rewriter models (ONNX)
 
             Defaults to ~/.antfly/inference/models (set via viper). If not set, only built-in fixed chunking is available.

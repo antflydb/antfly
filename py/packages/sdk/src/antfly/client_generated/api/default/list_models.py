@@ -61,8 +61,8 @@ def sync_detailed(
 ) -> Response[InferenceError | InferenceModelsResponse]:
     r"""List available models
 
-     Returns lists of available embedding, chunking, reranking, generator, NER, rewriter, reader, and
-    transcriber models.
+     Returns lists of available embedding, chunking, reranking, generator, extractor, rewriter, reader,
+    and transcriber models.
 
     ## Embedders
 
@@ -86,10 +86,10 @@ def sync_detailed(
     - LLM models from `models_dir/generators/`
     - Empty if no models configured
 
-    ## Recognizers
+    ## Extractors
 
-    - ONNX models from `models_dir/recognizers/`
-    - Includes GLiNER models for zero-shot recognition
+    - Extraction-capable models from the managed model registry
+    - Includes GLiNER models for zero-shot entity and relation extraction
 
     ## Rewriters
 
@@ -131,8 +131,8 @@ def sync(
 ) -> InferenceError | InferenceModelsResponse | None:
     r"""List available models
 
-     Returns lists of available embedding, chunking, reranking, generator, NER, rewriter, reader, and
-    transcriber models.
+     Returns lists of available embedding, chunking, reranking, generator, extractor, rewriter, reader,
+    and transcriber models.
 
     ## Embedders
 
@@ -156,10 +156,10 @@ def sync(
     - LLM models from `models_dir/generators/`
     - Empty if no models configured
 
-    ## Recognizers
+    ## Extractors
 
-    - ONNX models from `models_dir/recognizers/`
-    - Includes GLiNER models for zero-shot recognition
+    - Extraction-capable models from the managed model registry
+    - Includes GLiNER models for zero-shot entity and relation extraction
 
     ## Rewriters
 
@@ -197,8 +197,8 @@ async def asyncio_detailed(
 ) -> Response[InferenceError | InferenceModelsResponse]:
     r"""List available models
 
-     Returns lists of available embedding, chunking, reranking, generator, NER, rewriter, reader, and
-    transcriber models.
+     Returns lists of available embedding, chunking, reranking, generator, extractor, rewriter, reader,
+    and transcriber models.
 
     ## Embedders
 
@@ -222,10 +222,10 @@ async def asyncio_detailed(
     - LLM models from `models_dir/generators/`
     - Empty if no models configured
 
-    ## Recognizers
+    ## Extractors
 
-    - ONNX models from `models_dir/recognizers/`
-    - Includes GLiNER models for zero-shot recognition
+    - Extraction-capable models from the managed model registry
+    - Includes GLiNER models for zero-shot entity and relation extraction
 
     ## Rewriters
 
@@ -265,8 +265,8 @@ async def asyncio(
 ) -> InferenceError | InferenceModelsResponse | None:
     r"""List available models
 
-     Returns lists of available embedding, chunking, reranking, generator, NER, rewriter, reader, and
-    transcriber models.
+     Returns lists of available embedding, chunking, reranking, generator, extractor, rewriter, reader,
+    and transcriber models.
 
     ## Embedders
 
@@ -290,10 +290,10 @@ async def asyncio(
     - LLM models from `models_dir/generators/`
     - Empty if no models configured
 
-    ## Recognizers
+    ## Extractors
 
-    - ONNX models from `models_dir/recognizers/`
-    - Includes GLiNER models for zero-shot recognition
+    - Extraction-capable models from the managed model registry
+    - Includes GLiNER models for zero-shot entity and relation extraction
 
     ## Rewriters
 

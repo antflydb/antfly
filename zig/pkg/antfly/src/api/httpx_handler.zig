@@ -49,6 +49,7 @@ const query_builder_agent = @import("query_builder_agent.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_api = @import("../metadata/api.zig");
+const metadata_authority = @import("../metadata/authority.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
 const test_contract_helpers = @import("test_contract_helpers.zig");
 const platform_time = @import("antfly_platform").time;
@@ -225,7 +226,23 @@ pub const AntflyApiHandler = struct {
 
     fn respondOwnedApiResponse(ctx: *httpx.Context, resp: anytype) !httpx.Response {
         defer resp.deinit(ctx.allocator);
-        return respondApiResponseBody(ctx, resp.status, resp.body);
+        const Response = @TypeOf(resp.*);
+        _ = ctx.status(resp.status);
+        const is_json = if (@hasField(Response, "json")) resp.json else resp.status >= 200 and resp.status < 300;
+        if (is_json) {
+            try ctx.setHeader("content-type", "application/json");
+        } else {
+            try ctx.setHeader("content-type", "text/plain; charset=utf-8");
+        }
+        if (@hasField(Response, "retry_after_seconds")) {
+            if (resp.retry_after_seconds) |seconds| {
+                var retry_after_buf: [10]u8 = undefined;
+                const retry_after = try std.fmt.bufPrint(&retry_after_buf, "{d}", .{seconds});
+                try ctx.setHeader("Retry-After", retry_after);
+            }
+        }
+        _ = ctx.response.body(resp.body);
+        return ctx.response.build();
     }
 
     fn respondApiResponseBody(ctx: *httpx.Context, status: u16, body: []const u8) !httpx.Response {
@@ -667,15 +684,29 @@ pub const AntflyApiHandler = struct {
         return ctx.text("");
     }
 
+    const CommitResponseMode = enum {
+        transaction,
+        multi_batch,
+    };
+
     pub fn multiBatchWrite(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const alloc = ctx.allocator;
         const body_data = (try ctx.body()) orelse {
             _ = ctx.status(400);
             return ctx.text("missing body");
         };
-        return try handleTableBatchOffEventLoop(ctx, self.api_server.cfg.backend_runtime, "", body_data, self.api_server.tableApi());
+        var commit_req = transactions_api.parseMultiBatchRequest(alloc, body_data) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {
+                _ = ctx.status(400);
+                return ctx.text("invalid multi-batch request");
+            },
+        };
+        defer commit_req.deinit(alloc);
+        return try self.executeCommitRequest(ctx, authenticated_identity, &commit_req, .multi_batch);
     }
 
     pub fn commitTransaction(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -683,10 +714,6 @@ pub const AntflyApiHandler = struct {
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
-        const source = self.api_server.table_writes orelse {
-            _ = ctx.status(404);
-            return ctx.text("not found");
-        };
         const body_data = (try ctx.body()) orelse {
             _ = ctx.status(400);
             return ctx.text("invalid transaction commit request");
@@ -699,7 +726,22 @@ pub const AntflyApiHandler = struct {
             else => return err,
         };
         defer commit_req.deinit(alloc);
-        if (!(try self.api_server.transactionRequestAuthorized(authenticated_identity, commit_req))) {
+        return try self.executeCommitRequest(ctx, authenticated_identity, &commit_req, .transaction);
+    }
+
+    fn executeCommitRequest(
+        self: *AntflyApiHandler,
+        ctx: *httpx.Context,
+        authenticated_identity: ?AuthenticatedIdentity,
+        commit_req: *transactions_api.OwnedTransactionCommitRequest,
+        response_mode: CommitResponseMode,
+    ) !httpx.Response {
+        const alloc = ctx.allocator;
+        const source = self.api_server.table_writes orelse {
+            _ = ctx.status(404);
+            return ctx.text("not found");
+        };
+        if (!(try self.api_server.transactionRequestAuthorized(authenticated_identity, commit_req.*))) {
             _ = ctx.status(403);
             return ctx.text("forbidden");
         }
@@ -707,13 +749,17 @@ pub const AntflyApiHandler = struct {
         const distributed_tables = try commit_req.distributedTables(alloc);
         defer if (distributed_tables.len > 0) alloc.free(distributed_tables);
         self.api_server.validateCommitTablesAgainstSchema(distributed_tables) catch |err| switch (err) {
-            error.InvalidBatchRequest => {
+            error.InvalidBatchRequest,
+            error.InvalidArgument,
+            error.InvalidGraphEdges,
+            error.UnsupportedTransformOperation,
+            => {
                 _ = ctx.status(400);
                 return ctx.text("invalid transaction commit request");
             },
             else => return err,
         };
-        if (try self.api_server.validateCommitReadSet(commit_req)) |conflict| {
+        if (try self.api_server.validateCommitReadSet(commit_req.*)) |conflict| {
             var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
             defer arena_impl.deinit();
             const response = try transactions_api.buildCommitResponse(
@@ -726,8 +772,15 @@ pub const AntflyApiHandler = struct {
             return ctx.json(response);
         }
 
-        const outcome = (source.commitTransaction(alloc, distributed_tables, commit_req.sync_level) catch |err| switch (err) {
-            error.InvalidBatchRequest => {
+        const outcome = ((switch (response_mode) {
+            .transaction => source.commitTransaction(alloc, distributed_tables, commit_req.sync_level),
+            .multi_batch => source.commitBatch(alloc, distributed_tables, commit_req.sync_level),
+        }) catch |err| switch (err) {
+            error.InvalidBatchRequest,
+            error.InvalidArgument,
+            error.InvalidGraphEdges,
+            error.UnsupportedTransformOperation,
+            => {
                 _ = ctx.status(400);
                 return ctx.text("invalid transaction commit request");
             },
@@ -779,6 +832,50 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(409);
                 return ctx.json(response);
             },
+            error.CommitVisibilityNotSatisfied => {
+                var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
+                defer arena_impl.deinit();
+                _ = ctx.status(202);
+                return switch (response_mode) {
+                    .transaction => ctx.json(try transactions_api.buildCommitResponse(
+                        arena_impl.allocator(),
+                        "committed_visibility_pending",
+                        null,
+                        commit_req.tables,
+                    )),
+                    .multi_batch => ctx.json(try transactions_api.buildMultiBatchResponse(
+                        arena_impl.allocator(),
+                        "committed_visibility_pending",
+                        commit_req.tables,
+                    )),
+                };
+            },
+            error.CommitPropagationIncomplete => {
+                var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
+                defer arena_impl.deinit();
+                _ = ctx.status(202);
+                return switch (response_mode) {
+                    .transaction => ctx.json(try transactions_api.buildCommitResponse(
+                        arena_impl.allocator(),
+                        "committed_recovery_pending",
+                        null,
+                        commit_req.tables,
+                    )),
+                    .multi_batch => ctx.json(try transactions_api.buildMultiBatchResponse(
+                        arena_impl.allocator(),
+                        "committed_recovery_pending",
+                        commit_req.tables,
+                    )),
+                };
+            },
+            error.CommitDecisionUnknown => {
+                _ = ctx.status(500);
+                return ctx.text("transaction outcome is unknown; do not retry this stateless request because it may already have committed; use a transaction session for retryable commits");
+            },
+            error.AbortDecisionNotDurable, error.TransactionBeginFailed => {
+                _ = ctx.status(503);
+                return ctx.text("transaction coordinator is temporarily unavailable");
+            },
             error.UnsupportedOperation => {
                 _ = ctx.status(405);
                 return ctx.text("method not allowed");
@@ -794,14 +891,36 @@ pub const AntflyApiHandler = struct {
         };
 
         switch (outcome) {
-            .committed => {
+            .committed => |committed| {
                 var arena_impl = std.heap.ArenaAllocator.init(alloc);
                 defer arena_impl.deinit();
-                const response = try transactions_api.buildCommitResponse(arena_impl.allocator(), "committed", null, commit_req.tables);
-                return ctx.json(response);
+                switch (response_mode) {
+                    .transaction => {
+                        const status: []const u8 = if (committed.propagation_pending)
+                            "committed_recovery_pending"
+                        else if (committed.visibility_pending)
+                            "committed_visibility_pending"
+                        else
+                            "committed";
+                        const response = try transactions_api.buildCommitResponse(arena_impl.allocator(), status, null, commit_req.tables);
+                        if (committed.propagation_pending or committed.visibility_pending) _ = ctx.status(202);
+                        return ctx.json(response);
+                    },
+                    .multi_batch => {
+                        const status: []const u8 = if (committed.propagation_pending)
+                            "committed_recovery_pending"
+                        else if (committed.visibility_pending)
+                            "committed_visibility_pending"
+                        else
+                            "committed";
+                        const response = try transactions_api.buildMultiBatchResponse(arena_impl.allocator(), status, commit_req.tables);
+                        _ = ctx.status(if (committed.propagation_pending or committed.visibility_pending) 202 else 201);
+                        return ctx.json(response);
+                    },
+                }
             },
             .conflict => |conflict| {
-                const enriched_conflict = try self.api_server.enrichCommitConflict(commit_req, conflict);
+                const enriched_conflict = try self.api_server.enrichCommitConflict(commit_req.*, conflict);
                 var arena_impl = std.heap.ArenaAllocator.init(alloc);
                 defer arena_impl.deinit();
                 const response = try transactions_api.buildCommitResponse(
@@ -954,6 +1073,10 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(409);
                 return ctx.text("session lease lost");
             },
+            error.TransactionCommitSealed => {
+                _ = ctx.status(409);
+                return ctx.text("transaction commit is sealed");
+            },
             else => return err,
         }) orelse {
             _ = ctx.status(404);
@@ -1061,6 +1184,10 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(409);
                 return ctx.text("session lease lost");
             },
+            error.TransactionCommitSealed => {
+                _ = ctx.status(409);
+                return ctx.text("transaction commit is sealed");
+            },
             else => return err,
         }) orelse {
             _ = ctx.status(404);
@@ -1126,6 +1253,10 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(409);
                 return ctx.text("session lease lost");
             },
+            error.TransactionCommitSealed => {
+                _ = ctx.status(409);
+                return ctx.text("transaction commit is sealed");
+            },
             else => return err,
         }) orelse {
             _ = ctx.status(404);
@@ -1163,6 +1294,10 @@ pub const AntflyApiHandler = struct {
             error.SessionLeaseLost => {
                 _ = ctx.status(409);
                 return ctx.text("session lease lost");
+            },
+            error.TransactionCommitSealed => {
+                _ = ctx.status(409);
+                return ctx.text("transaction commit is sealed");
             },
             error.SavepointLimitExceeded => {
                 _ = ctx.status(409);
@@ -1209,6 +1344,10 @@ pub const AntflyApiHandler = struct {
             error.SessionLeaseLost => {
                 _ = ctx.status(409);
                 return ctx.text("session lease lost");
+            },
+            error.TransactionCommitSealed => {
+                _ = ctx.status(409);
+                return ctx.text("transaction commit is sealed");
             },
             else => return err,
         }) orelse {
@@ -1264,6 +1403,10 @@ pub const AntflyApiHandler = struct {
             };
         }
         var commit_req = (self.api_server.txn_sessions.cloneCommitRequest(alloc, txn_id, if (parsed_req) |*value| value else null) catch |err| switch (err) {
+            error.TransactionCommitRequestMismatch => {
+                _ = ctx.status(409);
+                return ctx.text("transaction commit retry body does not match the sealed request");
+            },
             error.SessionLeaseLost => {
                 var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
                 defer arena_impl.deinit();
@@ -1288,10 +1431,57 @@ pub const AntflyApiHandler = struct {
             return ctx.text("forbidden");
         }
 
+        if (try self.api_server.txn_sessions.getTerminalCommit(alloc, txn_id)) |terminal_value| {
+            var terminal = terminal_value;
+            defer terminal.deinit(alloc);
+            var status = terminal.status;
+            // A complete terminal response is durable before the coordinator
+            // self-participant is released. Retrying that final ACK is safe;
+            // pending terminal states must instead replay phase two under the
+            // same transaction ID through session maintenance.
+            if (status == .committed and !terminal.coordinator_acknowledged) {
+                if (terminal.coordinator_group_id) |coordinator_group_id| {
+                    const coordinator_table_name = terminal.coordinator_table_name orelse return error.InvalidTransactionSessionRecord;
+                    const acknowledged = source.acknowledgeTransactionCommit(
+                        alloc,
+                        txn_id,
+                        coordinator_group_id,
+                        coordinator_table_name,
+                    ) catch |err| blk: {
+                        std.log.warn("stable transaction coordinator acknowledgement retry deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
+                        break :blk null;
+                    };
+                    if (acknowledged == null) {
+                        status = .committed_recovery_pending;
+                    } else if ((self.api_server.txn_sessions.markTerminalCoordinatorAcknowledged(alloc, txn_id) catch |err| blk: {
+                        std.log.warn("failed to persist stable transaction coordinator acknowledgement txn_id={x} err={s}", .{ txn_id, @errorName(err) });
+                        break :blk null;
+                    }) == null) {
+                        status = .committed_recovery_pending;
+                    }
+                }
+            }
+            var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
+            defer arena_impl.deinit();
+            const response = try transactions_api.buildSessionCommitResponse(
+                arena_impl.allocator(),
+                txn_id,
+                status.text(),
+                null,
+                commit_req.tables,
+            );
+            _ = ctx.status(if (status == .committed) 200 else 202);
+            return ctx.json(response);
+        }
+
         const distributed_tables = try commit_req.distributedTables(alloc);
         defer if (distributed_tables.len > 0) alloc.free(distributed_tables);
         self.api_server.validateCommitTablesAgainstSchema(distributed_tables) catch |err| switch (err) {
-            error.InvalidBatchRequest => {
+            error.InvalidBatchRequest,
+            error.InvalidArgument,
+            error.InvalidGraphEdges,
+            error.UnsupportedTransformOperation,
+            => {
                 _ = ctx.status(400);
                 return ctx.text("invalid transaction commit request");
             },
@@ -1312,12 +1502,35 @@ pub const AntflyApiHandler = struct {
             return ctx.json(response);
         }
 
+        // Persist the exact sealed request as recoverable work before 2PC can
+        // choose a durable decision. This closes the response/crash window:
+        // maintenance can replay the same transaction ID without duplicating
+        // non-idempotent transforms.
+        _ = (self.api_server.txn_sessions.markCommitExecutionStarted(alloc, txn_id) catch |err| switch (err) {
+            error.SessionLeaseLost => {
+                _ = ctx.status(409);
+                return ctx.text("session lease lost");
+            },
+            else => return err,
+        }) orelse {
+            _ = ctx.status(404);
+            return ctx.text("not found");
+        };
+
         const outcome = (source.commitTransactionWithId(alloc, txn_id, session.begin_timestamp, distributed_tables, session.sync_level) catch |err| switch (err) {
-            error.InvalidBatchRequest => {
+            error.InvalidBatchRequest,
+            error.InvalidArgument,
+            error.InvalidGraphEdges,
+            error.UnsupportedTransformOperation,
+            => {
+                // Participant validation terminally aborts this transaction
+                // ID, so retaining the session would only produce conflicts.
+                _ = self.api_server.txn_sessions.remove(alloc, txn_id);
                 _ = ctx.status(400);
                 return ctx.text("invalid transaction commit request");
             },
             error.TopologyChanged => {
+                _ = self.api_server.txn_sessions.remove(alloc, txn_id);
                 var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
                 defer arena_impl.deinit();
                 const response = try transactions_api.buildSessionCommitResponse(
@@ -1331,6 +1544,7 @@ pub const AntflyApiHandler = struct {
                 return ctx.json(response);
             },
             error.DecisionConflict => {
+                _ = self.api_server.txn_sessions.remove(alloc, txn_id);
                 var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
                 defer arena_impl.deinit();
                 const response = try transactions_api.buildSessionCommitResponse(
@@ -1344,6 +1558,7 @@ pub const AntflyApiHandler = struct {
                 return ctx.json(response);
             },
             error.DocIdentityNamespaceMismatch => {
+                _ = self.api_server.txn_sessions.remove(alloc, txn_id);
                 var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
                 defer arena_impl.deinit();
                 const response = try transactions_api.buildSessionCommitResponse(
@@ -1357,14 +1572,17 @@ pub const AntflyApiHandler = struct {
                 return ctx.json(response);
             },
             error.UnsupportedOperation => {
+                _ = self.api_server.txn_sessions.remove(alloc, txn_id);
                 _ = ctx.status(405);
                 return ctx.text("method not allowed");
             },
             error.TableNotFound => {
+                _ = self.api_server.txn_sessions.remove(alloc, txn_id);
                 _ = ctx.status(404);
                 return ctx.text("not found");
             },
             error.UnknownGroup => {
+                _ = self.api_server.txn_sessions.remove(alloc, txn_id);
                 var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
                 defer arena_impl.deinit();
                 const response = try transactions_api.buildSessionCommitResponse(
@@ -1377,6 +1595,22 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(409);
                 return ctx.json(response);
             },
+            error.CommitVisibilityNotSatisfied => {
+                _ = ctx.status(503);
+                return ctx.text("transaction committed, but the requested visibility barrier was not reached");
+            },
+            error.CommitPropagationIncomplete => {
+                _ = ctx.status(503);
+                return ctx.text("transaction committed; participant recovery is pending");
+            },
+            error.CommitDecisionUnknown => {
+                _ = ctx.status(503);
+                return ctx.text("transaction outcome is unknown; retry this transaction id");
+            },
+            error.AbortDecisionNotDurable, error.TransactionBeginFailed => {
+                _ = ctx.status(503);
+                return ctx.text("transaction coordinator is temporarily unavailable");
+            },
             else => return err,
         }) orelse {
             _ = ctx.status(404);
@@ -1384,11 +1618,54 @@ pub const AntflyApiHandler = struct {
         };
 
         switch (outcome) {
-            .committed => {
-                _ = self.api_server.txn_sessions.remove(alloc, txn_id);
+            .committed => |committed| {
+                var status: transactions_api.TerminalCommitStatus = if (committed.propagation_pending)
+                    .committed_recovery_pending
+                else if (committed.visibility_pending)
+                    .committed_visibility_pending
+                else
+                    .committed;
+                _ = (self.api_server.txn_sessions.recordTerminalCommit(
+                    alloc,
+                    txn_id,
+                    status,
+                    committed.coordinator_group_id,
+                    committed.coordinator_table_name,
+                ) catch |err| {
+                    std.log.err("failed to persist stable transaction terminal result txn_id={x} err={s}", .{ txn_id, @errorName(err) });
+                    _ = ctx.status(503);
+                    return ctx.text("transaction committed; durable response handoff is pending");
+                }) orelse {
+                    _ = ctx.status(503);
+                    return ctx.text("transaction committed; durable response handoff is pending");
+                };
+
+                if (status == .committed) {
+                    if (committed.coordinator_group_id) |coordinator_group_id| {
+                        const coordinator_table_name = committed.coordinator_table_name orelse return error.InvalidTransactionSessionRecord;
+                        const acknowledged = source.acknowledgeTransactionCommit(
+                            alloc,
+                            txn_id,
+                            coordinator_group_id,
+                            coordinator_table_name,
+                        ) catch |err| blk: {
+                            std.log.warn("stable transaction coordinator acknowledgement deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
+                            break :blk null;
+                        };
+                        if (acknowledged == null) {
+                            status = .committed_recovery_pending;
+                        } else if ((self.api_server.txn_sessions.markTerminalCoordinatorAcknowledged(alloc, txn_id) catch |err| blk: {
+                            std.log.warn("failed to persist stable transaction acknowledgement txn_id={x} err={s}", .{ txn_id, @errorName(err) });
+                            break :blk null;
+                        }) == null) {
+                            status = .committed_recovery_pending;
+                        }
+                    }
+                }
                 var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
                 defer arena_impl.deinit();
-                const response = try transactions_api.buildSessionCommitResponse(arena_impl.allocator(), txn_id, "committed", null, commit_req.tables);
+                const response = try transactions_api.buildSessionCommitResponse(arena_impl.allocator(), txn_id, status.text(), null, commit_req.tables);
+                _ = ctx.status(if (status == .committed) 200 else 202);
                 return ctx.json(response);
             },
             .conflict => |conflict| {
@@ -1983,8 +2260,8 @@ pub const AntflyApiHandler = struct {
             return ctx.text("unsupported table index configuration");
         };
         std.log.info("public create table begin table={s}", .{decoded_table_name});
-        const metadata_create_timeout_ns = 5 * std.time.ns_per_s;
-        const metadata_create_poll_ns = 50 * std.time.ns_per_ms;
+        const metadata_create_timeout_ns = http_server_mod.default_metadata_mutation_retry_timeout_ns;
+        const metadata_create_poll_ns = http_server_mod.default_metadata_mutation_retry_poll_ns;
         const metadata_create_start_ns = platform_time.monotonicNs();
         while (true) {
             self.api_server.source.createTable(alloc, decoded_table_name, create_req) catch |err| switch (err) {
@@ -2001,7 +2278,8 @@ pub const AntflyApiHandler = struct {
                     return ctx.text("method not allowed");
                 },
                 error.UnexpectedHttpStatus => {
-                    if (platform_time.monotonicNs() -| metadata_create_start_ns >= metadata_create_timeout_ns) {
+                    const elapsed_ns = platform_time.monotonicNs() -| metadata_create_start_ns;
+                    if (!http_server_mod.shouldRetryMetadataMutation(err, elapsed_ns, metadata_create_timeout_ns)) {
                         std.log.err("public create table metadata create failed table={s} err={}", .{ decoded_table_name, err });
                         return err;
                     }
@@ -2009,6 +2287,14 @@ pub const AntflyApiHandler = struct {
                     continue;
                 },
                 else => {
+                    if (metadata_authority.isRetryableError(err)) {
+                        const elapsed_ns = platform_time.monotonicNs() -| metadata_create_start_ns;
+                        if (http_server_mod.shouldRetryMetadataMutation(err, elapsed_ns, metadata_create_timeout_ns)) {
+                            sleepNs(metadata_create_poll_ns);
+                            continue;
+                        }
+                        return error.NotLeader;
+                    }
                     std.log.err("public create table metadata create failed table={s} err={}", .{ decoded_table_name, err });
                     return err;
                 },
@@ -2401,14 +2687,30 @@ pub const AntflyApiHandler = struct {
         };
         defer scan_req.deinit(alloc);
 
-        var result = (try source.scan(
+        var result = (source.scan(
             alloc,
             decoded_table_name,
             scan_req.from,
             scan_req.to,
             scan_req.opts,
             .read_index,
-        )) orelse {
+        ) catch |err| switch (err) {
+            error.HAReadRequiresPrimary, error.ReadRequiresPrimary => {
+                _ = ctx.status(503);
+                return ctx.text("read requires primary");
+            },
+            error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => {
+                _ = ctx.status(503);
+                return ctx.text("standby read unavailable");
+            },
+            error.PersistentDescriptorAdmissionExhausted,
+            error.StorageReadTemporarilyUnavailable,
+            => {
+                var response = try http_server_mod.storageReadTemporarilyUnavailableResponse(self.api_server.alloc);
+                return respondWithAllocator(ctx, &response, self.api_server.alloc);
+            },
+            else => return err,
+        }) orelse {
             _ = ctx.status(404);
             return ctx.text("not found");
         };
@@ -2458,6 +2760,12 @@ pub const AntflyApiHandler = struct {
             error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => {
                 _ = ctx.status(503);
                 return ctx.text("standby read unavailable");
+            },
+            error.PersistentDescriptorAdmissionExhausted,
+            error.StorageReadTemporarilyUnavailable,
+            => {
+                var response = try http_server_mod.storageReadTemporarilyUnavailableResponse(self.api_server.alloc);
+                return respondWithAllocator(ctx, &response, self.api_server.alloc);
             },
             else => return err,
         }) orelse {
@@ -3758,6 +4066,339 @@ const SchemaReconcileWriteSource = struct {
     }
 };
 
+test "httpx multi batch route uses the batch commit hook and public response contract" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
+
+    const FakeWrites = struct {
+        batch_calls: usize = 0,
+        transaction_calls: usize = 0,
+        batch_commit_calls: usize = 0,
+        fail_batch_commit: bool = false,
+        unknown_batch_commit: bool = false,
+        defer_batch_commit: bool = false,
+        defer_transaction_commit: bool = false,
+
+        fn source(self: *@This()) table_writes.TableWriteSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .batch = batch,
+                    .commit_transaction = commitTransaction,
+                    .commit_batch = commitBatch,
+                },
+            };
+        }
+
+        fn batch(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+        ) anyerror!?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.batch_calls += 1;
+            return error.TestUnexpectedResult;
+        }
+
+        fn commitTransaction(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const distributed_txn.TableCommitRequest,
+            _: db_mod.types.SyncLevel,
+        ) anyerror!?distributed_txn.CommitOutcome {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.transaction_calls += 1;
+            if (self.defer_transaction_commit) return .{ .committed = .{
+                .participant_count = 2,
+                .visibility_pending = true,
+            } };
+            return error.TestUnexpectedResult;
+        }
+
+        fn commitBatch(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            tables: []const distributed_txn.TableCommitRequest,
+            sync_level: db_mod.types.SyncLevel,
+        ) anyerror!?distributed_txn.CommitOutcome {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.batch_commit_calls += 1;
+            if (self.fail_batch_commit) return error.CommitPropagationIncomplete;
+            if (self.unknown_batch_commit) return error.CommitDecisionUnknown;
+            if (self.defer_batch_commit) return .{ .committed = .{
+                .participant_count = 2,
+                .propagation_pending = true,
+            } };
+            try std.testing.expectEqual(@as(usize, 2), tables.len);
+            try std.testing.expectEqualStrings("users", tables[0].table_name);
+            try std.testing.expectEqualStrings("orders", tables[1].table_name);
+            try std.testing.expectEqual(@as(usize, 1), tables[0].writes.len);
+            try std.testing.expectEqual(@as(usize, 1), tables[1].deletes.len);
+            try std.testing.expectEqual(db_mod.types.SyncLevel.write, sync_level);
+            return .{ .committed = .{ .participant_count = 2 } };
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var status = AuthStatusSource{};
+    var writes = FakeWrites{};
+    var api_server = ApiHttpServer.init(alloc, .{}, status.iface(), null, writes.source());
+    var e2e_server: HttpxE2eServer = undefined;
+    e2e_server.init(alloc, &api_server) catch |err| switch (err) {
+        // Restricted test environments may forbid even loopback listeners.
+        // The same test runs normally in CI and release validation.
+        error.Unexpected => return error.SkipZigTest,
+        else => return err,
+    };
+    defer e2e_server.deinit();
+
+    var client_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer client_io.deinit();
+    var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base_url = try e2e_server.baseUrl(alloc);
+    defer alloc.free(base_url);
+    const batch_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/batch", .{base_url});
+    defer alloc.free(batch_url);
+    const transaction_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/transactions/commit", .{base_url});
+    defer alloc.free(transaction_url);
+    const headers = [_][2][]const u8{.{ "content-type", "application/json" }};
+
+    var response = try requestWithRetry(
+        &client,
+        client_io.io(),
+        .POST,
+        batch_url,
+        "{\"tables\":{\"users\":{\"inserts\":{\"user:1\":{\"name\":\"Alice\"}}},\"orders\":{\"deletes\":[\"order:old\"]}},\"sync_level\":\"write\"}",
+        &headers,
+        20,
+    );
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 201), response.status.code);
+    try std.testing.expectEqualStrings("application/json", response.contentType().?);
+    var parsed = try std.json.parseFromSlice(transactions_api.MultiBatchResponse, alloc, response.body.?, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u32, 1), parsed.value.tables.map.get("users").?.inserted);
+    try std.testing.expectEqual(@as(u32, 1), parsed.value.tables.map.get("orders").?.deleted);
+    try std.testing.expectEqual(@as(usize, 1), writes.batch_commit_calls);
+    try std.testing.expectEqual(@as(usize, 0), writes.transaction_calls);
+    try std.testing.expectEqual(@as(usize, 0), writes.batch_calls);
+
+    writes.defer_batch_commit = true;
+    var pending = try requestWithRetry(
+        &client,
+        client_io.io(),
+        .POST,
+        batch_url,
+        "{\"tables\":{\"users\":{\"inserts\":{\"user:2\":{\"name\":\"Bob\"}}},\"orders\":{\"deletes\":[\"order:old\"]}},\"sync_level\":\"write\"}",
+        &headers,
+        20,
+    );
+    defer pending.deinit();
+    try std.testing.expectEqual(@as(u16, 202), pending.status.code);
+    var pending_parsed = try std.json.parseFromSlice(transactions_api.MultiBatchResponse, alloc, pending.body.?, .{});
+    defer pending_parsed.deinit();
+    try std.testing.expectEqualStrings("committed_recovery_pending", pending_parsed.value.status);
+    writes.defer_batch_commit = false;
+
+    writes.defer_transaction_commit = true;
+    var transaction_pending = try requestWithRetry(
+        &client,
+        client_io.io(),
+        .POST,
+        transaction_url,
+        "{\"read_set\":[],\"tables\":{\"users\":{\"inserts\":{\"user:3\":{\"name\":\"Carol\"}}}}}",
+        &headers,
+        20,
+    );
+    defer transaction_pending.deinit();
+    try std.testing.expectEqual(@as(u16, 202), transaction_pending.status.code);
+    var transaction_pending_parsed = try std.json.parseFromSlice(transactions_api.CommitResponse, alloc, transaction_pending.body.?, .{});
+    defer transaction_pending_parsed.deinit();
+    try std.testing.expectEqualStrings("committed_visibility_pending", transaction_pending_parsed.value.status);
+    try std.testing.expectEqual(@as(usize, 1), writes.transaction_calls);
+    writes.defer_transaction_commit = false;
+
+    var rejected = try requestWithRetry(
+        &client,
+        client_io.io(),
+        .POST,
+        batch_url,
+        "{\"read_set\":[],\"tables\":{\"users\":{\"deletes\":[\"user:1\"]}}}",
+        &headers,
+        20,
+    );
+    defer rejected.deinit();
+    try std.testing.expectEqual(@as(u16, 400), rejected.status.code);
+    try std.testing.expectEqual(@as(usize, 2), writes.batch_commit_calls);
+
+    writes.fail_batch_commit = true;
+    var committed_pending = try requestWithRetry(
+        &client,
+        client_io.io(),
+        .POST,
+        batch_url,
+        "{\"tables\":{\"users\":{\"inserts\":{\"user:2\":{\"name\":\"Bob\"}}},\"orders\":{\"deletes\":[\"order:old\"]}},\"sync_level\":\"write\"}",
+        &headers,
+        20,
+    );
+    defer committed_pending.deinit();
+    try std.testing.expectEqual(@as(u16, 202), committed_pending.status.code);
+    var committed_pending_parsed = try std.json.parseFromSlice(transactions_api.MultiBatchResponse, alloc, committed_pending.body.?, .{});
+    defer committed_pending_parsed.deinit();
+    try std.testing.expectEqualStrings("committed_recovery_pending", committed_pending_parsed.value.status);
+    try std.testing.expectEqual(@as(usize, 3), writes.batch_commit_calls);
+
+    writes.fail_batch_commit = false;
+    writes.unknown_batch_commit = true;
+    var unknown = try requestWithRetry(
+        &client,
+        client_io.io(),
+        .POST,
+        batch_url,
+        "{\"tables\":{\"users\":{\"inserts\":{\"user:2\":{\"name\":\"Bob\"}}},\"orders\":{\"deletes\":[\"order:old\"]}},\"sync_level\":\"write\"}",
+        &headers,
+        20,
+    );
+    defer unknown.deinit();
+    try std.testing.expectEqual(@as(u16, 500), unknown.status.code);
+    try std.testing.expectEqualStrings(
+        "transaction outcome is unknown; do not retry this stateless request because it may already have committed; use a transaction session for retryable commits",
+        unknown.body.?,
+    );
+    try std.testing.expectEqual(@as(usize, 4), writes.batch_commit_calls);
+}
+
+test "httpx stable transaction commit durably hands off recovery before acknowledgement" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
+
+    const FakeWrites = struct {
+        commit_calls: usize = 0,
+        acknowledge_calls: usize = 0,
+
+        fn source(self: *@This()) table_writes.TableWriteSource {
+            return .{ .ptr = self, .vtable = &.{
+                .batch = batch,
+                .commit_transaction_with_id = commitTransactionWithId,
+                .acknowledge_transaction_commit = acknowledgeTransactionCommit,
+            } };
+        }
+
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+            return error.TestUnexpectedResult;
+        }
+
+        fn commitTransactionWithId(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: db_mod.types.TxnId,
+            _: u64,
+            tables: []const distributed_txn.TableCommitRequest,
+            sync_level: db_mod.types.SyncLevel,
+        ) anyerror!?distributed_txn.CommitOutcome {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.commit_calls += 1;
+            try std.testing.expectEqual(@as(usize, 1), tables.len);
+            try std.testing.expectEqualStrings("docs", tables[0].table_name);
+            try std.testing.expectEqual(
+                if (self.commit_calls == 1) db_mod.types.SyncLevel.propose else db_mod.types.SyncLevel.write,
+                sync_level,
+            );
+            return .{ .committed = .{
+                .participant_count = 1,
+                .coordinator_group_id = 7001,
+                .coordinator_table_name = "docs",
+                .propagation_pending = self.commit_calls == 1,
+            } };
+        }
+
+        fn acknowledgeTransactionCommit(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: db_mod.types.TxnId,
+            coordinator_group_id: u64,
+            coordinator_table_name: []const u8,
+        ) anyerror!?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.acknowledge_calls += 1;
+            try std.testing.expectEqual(@as(u64, 7001), coordinator_group_id);
+            try std.testing.expectEqualStrings("docs", coordinator_table_name);
+            if (self.acknowledge_calls == 1) return error.InjectedAcknowledgementFailure;
+            return {};
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var status = AuthStatusSource{};
+    var writes = FakeWrites{};
+    var api_server = ApiHttpServer.init(alloc, .{}, status.iface(), null, writes.source());
+    defer api_server.deinit();
+    var e2e_server: HttpxE2eServer = undefined;
+    e2e_server.init(alloc, &api_server) catch |err| switch (err) {
+        error.Unexpected => return error.SkipZigTest,
+        else => return err,
+    };
+    defer e2e_server.deinit();
+
+    var client_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer client_io.deinit();
+    var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base_url = try e2e_server.baseUrl(alloc);
+    defer alloc.free(base_url);
+    const begin_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/transactions/begin", .{base_url});
+    defer alloc.free(begin_url);
+    const headers = [_][2][]const u8{.{ "content-type", "application/json" }};
+
+    var begin = try requestWithRetry(
+        &client,
+        client_io.io(),
+        .POST,
+        begin_url,
+        "{\"sync_level\":\"propose\"}",
+        &headers,
+        20,
+    );
+    defer begin.deinit();
+    try std.testing.expectEqual(@as(u16, 201), begin.status.code);
+    var parsed_begin = try std.json.parseFromSlice(transactions_api.BeginResponse, alloc, begin.body.?, .{});
+    defer parsed_begin.deinit();
+    const commit_url = try std.fmt.allocPrint(
+        alloc,
+        "{s}/db/v1/transactions/{s}/commit",
+        .{ base_url, parsed_begin.value.transaction_id },
+    );
+    defer alloc.free(commit_url);
+    const commit_body = "{\"read_set\":[],\"tables\":{\"docs\":{\"inserts\":{\"counter\":{\"value\":1}}}}}";
+
+    var first = try requestWithRetry(&client, client_io.io(), .POST, commit_url, commit_body, &headers, 20);
+    defer first.deinit();
+    try std.testing.expectEqual(@as(u16, 202), first.status.code);
+    var parsed_first = try std.json.parseFromSlice(transactions_api.SessionCommitResponse, alloc, first.body.?, .{});
+    defer parsed_first.deinit();
+    try std.testing.expectEqualStrings("committed_recovery_pending", parsed_first.value.status);
+    try std.testing.expectEqual(@as(usize, 1), writes.commit_calls);
+    try std.testing.expectEqual(@as(usize, 0), writes.acknowledge_calls);
+
+    // Recovery upgrades proposal-only phase two to a durable write. The first
+    // final ACK fails, and the next pass retries only that idempotent handoff.
+    try api_server.runSessionMaintenanceOnce();
+    try std.testing.expectEqual(@as(usize, 2), writes.commit_calls);
+    try std.testing.expectEqual(@as(usize, 1), writes.acknowledge_calls);
+    try api_server.runSessionMaintenanceOnce();
+    try std.testing.expectEqual(@as(usize, 2), writes.commit_calls);
+    try std.testing.expectEqual(@as(usize, 2), writes.acknowledge_calls);
+
+    var retry = try requestWithRetry(&client, client_io.io(), .POST, commit_url, commit_body, &headers, 20);
+    defer retry.deinit();
+    try std.testing.expectEqual(@as(u16, 200), retry.status.code);
+    var parsed_retry = try std.json.parseFromSlice(transactions_api.SessionCommitResponse, alloc, retry.body.?, .{});
+    defer parsed_retry.deinit();
+    try std.testing.expectEqualStrings("committed", parsed_retry.value.status);
+    try std.testing.expectEqual(@as(usize, 2), writes.commit_calls);
+    try std.testing.expectEqual(@as(usize, 2), writes.acknowledge_calls);
+}
+
 test "httpx internal request conversion preserves protocol headers" {
     const alloc = std.testing.allocator;
 
@@ -3775,6 +4416,23 @@ test "httpx internal request conversion preserves protocol headers" {
     try std.testing.expectEqualStrings("session-123", converted.value.header("mcp-session-id") orelse return error.MissingHeader);
     try std.testing.expectEqualStrings("application/json", converted.value.content_type orelse return error.MissingContentType);
     try std.testing.expectEqualStrings("{}", converted.value.body);
+}
+
+test "httpx owned response preserves retryable JSON metadata" {
+    const alloc = std.testing.allocator;
+    var request = try httpx.Request.init(alloc, .GET, "http://127.0.0.1/db/v1/tables/docs/doc:a");
+    defer request.deinit();
+    var ctx = httpx.Context.init(alloc, undefined, &request);
+    defer ctx.deinit();
+
+    var owned = try public_table_http.storageReadTemporarilyUnavailableOwnedResponse(alloc);
+    var response = try AntflyApiHandler.respondOwnedApiResponse(&ctx, &owned);
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(u16, 503), response.status.code);
+    try std.testing.expectEqualStrings("application/json", response.headers.get("content-type").?);
+    try std.testing.expectEqualStrings("1", response.headers.get("Retry-After").?);
+    try std.testing.expectEqualStrings(public_table_http.storage_read_temporarily_unavailable_body, response.body.?);
 }
 
 test "httpx query admission rejects saturated queries without blocking control routes" {

@@ -141,7 +141,7 @@ const inference_delegated_steps = [_][]const u8{
     "bench-linalg",
     "bench-audio",
     "bench-gliner2-native",
-    "gliner2-production-readiness",
+    "gliner2-entity-training-readiness",
     "test-finetune",
     "test",
     "wasm",
@@ -149,6 +149,7 @@ const inference_delegated_steps = [_][]const u8{
 
 const release_scale_test_filters = [_][]const u8{
     "db dense default dynamic 0.2 percent numeric filter exact scores bounded candidates",
+    "one percent native filter routes through integrated dense search exactly",
     "db one real delete keeps filtered full text on complement path across restart",
     "db production ingest preserves high-frequency keyword recall across clean restarts",
 };
@@ -1680,6 +1681,8 @@ pub fn build(b: *std.Build) void {
             .onnx_graph = termite_onnx_graph_mod,
             .pjrt = termite_pjrt_mod,
             .generating_openapi = generating_openapi_mod,
+            .extraction_openapi = extraction_openapi_mod,
+            .extracting = extracting_mod,
         },
     });
     const inference_build_options_mod = inference_graph.build_options_mod;
@@ -1826,6 +1829,25 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     antfly_imports.configure(b, lib_test_mod, true, true);
+
+    const metadata_unit_test_root_paths = [_][]const u8{
+        "pkg/antfly/src/metadata_reconciler_test_root.zig",
+        "pkg/antfly/src/metadata_service_http_test_root.zig",
+        "pkg/antfly/src/metadata_core_test_root.zig",
+        "pkg/antfly/src/metadata_planning_transition_test_root.zig",
+        "pkg/antfly/src/metadata_table_provisioner_test_root.zig",
+        "pkg/antfly/src/metadata_replication_backfill_test_root.zig",
+        "pkg/antfly/src/metadata_storage_test_root.zig",
+    };
+    var metadata_unit_test_mods: [metadata_unit_test_root_paths.len]*std.Build.Module = undefined;
+    for (metadata_unit_test_root_paths, &metadata_unit_test_mods) |root_path, *test_mod| {
+        test_mod.* = b.createModule(.{
+            .root_source_file = b.path(root_path),
+            .target = target,
+            .optimize = optimize,
+        });
+        antfly_imports.configure(b, test_mod.*, true, true);
+    }
 
     const raft_sim_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/raft_sim_test_root.zig"),
@@ -2568,6 +2590,7 @@ pub fn build(b: *std.Build) void {
             "table repair job store persists monotonic next id across stale durable writes",
             "table repair job cleanup pages durable expired jobs",
             "forced index repair job dispatches force only once",
+            "index repair job keeps degradation gauges as snapshots across retries",
             "named index repair cancellation remains nonterminal until durable controls finish",
             "named index repair cancellation restarts its durable traversal after job store recovery",
             "durable cancellation retries transient failures with backoff",
@@ -3222,6 +3245,7 @@ pub fn build(b: *std.Build) void {
         "table contract rejects unsupported index kinds before admission",
         "provisioned primary lookup lease fails on identity namespace mismatch",
         "inference pull recognizes help before model resolution",
+        "inference run recognizes help before server startup",
         "inference pull classifies order independent value flags",
         "inference pull rejects flags from the other model domain",
         "api http public sort capability gate validates mapped sortable fields",
@@ -3476,8 +3500,9 @@ pub fn build(b: *std.Build) void {
     // not collect tests declared by the raft library's own root module.
     const raft_library_tests = b.addTest(.{
         .root_module = raft_engine_mod,
+        .filters = selectTestFilters(b, &.{}),
     });
-    const run_raft_library_tests = b.addRunArtifact(raft_library_tests);
+    const run_raft_library_tests = addFilteredTestRunArtifact(b, raft_library_tests);
     const raft_library_test_step = b.step("lib-raft-test", "Run standalone raft library tests");
     raft_library_test_step.dependOn(&run_raft_library_tests.step);
 
@@ -3539,12 +3564,29 @@ pub fn build(b: *std.Build) void {
 
     const raft_transport_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        // The top-level Raft declaration walk makes the nested transport test
-        // declarations reachable; the qualified filter then keeps execution
-        // scoped to the transport package.
         .filters = &.{ "raft integration module compiles", "raft.transport." },
     });
     const run_raft_transport_tests = addFilteredTestRunArtifact(b, raft_transport_tests);
+
+    const http_low_fd_ratchet_filter = "std http listener process threads and descriptors recover after cancellation storms";
+    const http_low_fd_ratchet_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        // Compile the shared HTTP module for declaration reachability, but
+        // execute only the process-level regression below. The wider common
+        // and transport buckets contain high-cardinality socket tests that do
+        // not fit inside this target's 256-descriptor process limit.
+        .filters = &.{ "common.", http_low_fd_ratchet_filter },
+    });
+    const run_http_low_fd_ratchet_tests = addFilteredTestRunArtifactWithRuntimeFilters(
+        b,
+        http_low_fd_ratchet_tests,
+        &.{http_low_fd_ratchet_filter},
+    );
+    const http_low_fd_ratchet_test_step = b.step(
+        "http-low-fd-ratchet-test",
+        "Run the process-level low-FD HTTP worker ratchet regression",
+    );
+    http_low_fd_ratchet_test_step.dependOn(&run_http_low_fd_ratchet_tests.step);
 
     const lib_raft_sim_default_filters = [_][]const u8{
         "managed host simulation drives add and peer refresh through deterministic steps",
@@ -3784,6 +3826,8 @@ pub fn build(b: *std.Build) void {
         "data runtime provisioned root refresh spawn failure preserves retry bookkeeping",
         "data runtime background maintenance is due for dense posting cadence without lsm debt",
         "remote metadata source pins one cluster incarnation across cache invalidation",
+        "remote metadata source retains mutation authority across cache invalidation",
+        "remote metadata cache orders heads monotonically within an incarnation",
         "remote metadata source shares backend runtime io across a bounded executor pool",
         "data runtime treats metadata leadership churn as retryable bootstrap failure",
         "data runtime metadata bootstrap retry delay is bounded and jittered",
@@ -3805,7 +3849,12 @@ pub fn build(b: *std.Build) void {
         "data server can register a store without enabling data raft",
         "data server registered data raft uses wal state backend by default",
         "data raft ticker advances consensus independently of control rounds",
-        "data raft batch forwarding escapes a leaderless local placement",
+        "raft batch round trips deterministic transaction begin",
+        "data raft forwarding distinguishes safe retries from ambiguous outcomes",
+        "expired data raft deadline snapshots never wait and release before returning",
+        "data raft batch forwarding bounds routing campaigns deadlines and deterministic fallback",
+        "internal batch forwarding headers are all-or-none and strictly parsed",
+        "metadata http client shares deadline and cancellation across retries",
         "data server wires configured HA executors into API server",
         "data server mirrors managed primary writes into HA replication log",
         "data server fail-closed sync policy rejects primary writes before local commit",
@@ -4138,6 +4187,8 @@ pub fn build(b: *std.Build) void {
             "executeSearchGraphWithSets preserves node ordinals",
             "cloneNamedSetAsResult preserves hit ordinals",
             "fuseNamedSets preserves source hit ordinals",
+            "fuseNamedSets reports a lower bound while any source window is truncated",
+            "db search marks a truncated fused candidate union as a lower bound",
             "fuseNamedSets deduplicates aliases by ordinal when complete",
             "fuseNamedSets drops conflicting source hit ordinals",
             "applyGraphUnion deduplicates by ordinals when hit pages are complete",
@@ -4186,6 +4237,14 @@ pub fn build(b: *std.Build) void {
             "storage.db.db.test.db recoverTransactions",
             "storage.db.db.test.db participant recovery",
             "storage.db.db.test.db batch enforces optimistic version predicates",
+            "coordinator recovery durably aborts a stale prepared transaction",
+            "idempotent begin upgrades a legacy transaction coordinator role",
+            "transaction recovery delegates stale coordinator abort to replicated resolver",
+            "replicated recovery is coordinator-owned and acknowledges through hooks",
+            "transaction recovery drains terminal HA outbox without remaining intents",
+            "non-replicated transaction recovery honors the per-run page limit",
+            "retained terminal transactions honor the extended retry cutoff",
+            "topology fence retains committed coordinator recovery obligations",
         },
     });
     const run_lib_db_txn_tests = addFilteredTestRunArtifact(b, lib_db_txn_tests);
@@ -4193,21 +4252,7 @@ pub fn build(b: *std.Build) void {
     lib_db_txn_step.dependOn(&run_lib_db_txn_tests.step);
 
     const lib_metadata_runtime_filters = selectTestFilters(b, &.{"metadata."});
-    const lib_metadata_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = compileFiltersWithAnchors(b, &.{"metadata."}, lib_metadata_runtime_filters),
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lib_metadata_tests = addFilteredTestRunArtifactWithRuntimeFilters(
-        b,
-        lib_metadata_tests,
-        lib_metadata_runtime_filters,
-    );
     const lib_metadata_test_step = b.step("lib-metadata-test", "Run root-module metadata tests only");
-    lib_metadata_test_step.dependOn(&run_lib_metadata_tests.step);
 
     const lib_metadata_table_workflow_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -4418,6 +4463,7 @@ pub fn build(b: *std.Build) void {
         "public table query handler preserves structured filter diagnostics",
         "api http server serves retrieval agent response envelope",
         "api http server serves table batch writes",
+        "api http server routes table batches through the batch commit hook",
         "auto bulk max-window request waits for idle finish",
         "auto bulk group writes release leases so idle finish can publish",
         "auto bulk background finish skips entries with active foreground leases",
@@ -4461,6 +4507,7 @@ pub fn build(b: *std.Build) void {
         "api http server returns retryable not leader when cluster backup read barrier times out",
         "api http server cluster backup succeeds after load balanced metadata timeout retry",
         "api http server does not advertise a retry after cluster backup side effects begin",
+        "public metadata mutation retries transient authority loss only within its deadline",
         "api http server rejects restore before persistence without an asynchronous worker",
         "configured api http server attaches durable restore job persistence",
         "restore job list paginates after authorization filtering",
@@ -4525,6 +4572,9 @@ pub fn build(b: *std.Build) void {
         "distributed join preserves native public filters when adding join predicates",
         "scan request errors map to stable client responses",
         "httpx antfly scan honors optional body and documented bad requests",
+        "httpx multi batch route uses the batch commit hook and public response contract",
+        "httpx stable transaction commit durably hands off recovery before acknowledgement",
+        "httpx owned response preserves retryable JSON metadata",
         "httpx query admission rejects saturated queries without blocking control routes",
         "httpx query admission releases a cancelled query slot",
         "httpx rejects pipelined H1 query work when disconnect ownership is ambiguous",
@@ -4535,6 +4585,7 @@ pub fn build(b: *std.Build) void {
         "api http invalid filter query response names the offending node",
         "api http unsupported filter query response names the offending node",
         "public api smoke e2e creates table inserts and queries documents",
+        "provisioned table write source routes batch writes across ranges",
         "public api e2e recreates managed embeddings index after corrupt artifact",
         "public api split e2e uses distributed global text stats for bm25 and significant_terms",
         "public api multi-node e2e routes CRUD from a non-host node",
@@ -4760,6 +4811,7 @@ pub fn build(b: *std.Build) void {
             "cluster backup maintenance queue expires inactive repositories",
             "restore repository contention backoff is bounded and increasing",
             "restore retry deadline wakeup is interruptible without polling",
+            "owned backup runtime has a finite worker ceiling",
             "backup staging uses configured storage authority and exclusive generations",
             "owned restore verifies declared artifact identity instead of accepting staged bytes",
             "cluster restore repository errors preserve operational failure semantics",
@@ -4783,6 +4835,14 @@ pub fn build(b: *std.Build) void {
         .root_module = api_session_maintenance_test_mod,
         .filters = &.{
             "durable session mutations publish only after persistence succeeds",
+            "durable transaction sessions retain terminal commit coordinator handoff",
+            "transaction session commit request is sealed across retries",
+            "durable recovery index tracks only validated commit execution and terminal handoff",
+            "durable recovery scan rotates fairly beyond one maintenance batch",
+            "in-memory recovery scan rotates fairly when the first page remains pending",
+            "background recovery adopts an expired shared-store owner lease",
+            "api http server retries stable terminal commits without replaying writes",
+            "api session maintenance recovers crash window after durable 2pc commit",
             "transaction session registry adopts durable session ownership",
             "transaction session registry only adopts durable sessions after lease expiry",
             "transaction session registry reports status and cleans expired durable sessions",
@@ -5044,6 +5104,7 @@ pub fn build(b: *std.Build) void {
     const api_transactions_docid_tests = b.addTest(.{
         .root_module = api_transactions_docid_test_mod,
         .filters = &.{
+            "transaction request parsers reject invalid unsigned integers and accept legacy epochs",
             "transaction read snapshot map keys preserve embedded delimiters",
             "transaction session commit response includes retry hints for doc identity availability conflicts",
         },
@@ -5056,14 +5117,36 @@ pub fn build(b: *std.Build) void {
         .root_module = api_table_writes_docid_test_mod,
         .filters = selectTestFilters(b, &.{
             "auto bulk group writes release leases so idle finish can publish",
+            "provisioned table write source has a finite worker ceiling",
             "provisioned native storage metrics bypass an empty busy write cache",
             "provisioned table write source rejects stale doc identity namespace before write",
             "replicated split destination seeds inherited doc identity before range publication",
             "internal batch parser rejects mixed split transition commands",
             "internal batch parser requires source acknowledgements to be metadata-only",
             "internal batch split identity round trips the full u64 id space",
+            "internal batch codec round trips replicated transaction phases",
+            "txn resolve codec preserves sync level and accepts legacy requests",
+            "distributed txn coordinator groups by range and commits all participants",
+            "stable distributed transaction retry resumes a durable commit decision",
+            "distributed txn retries an ambiguous coordinator decision under the same id",
+            "distributed txn bounds unresolved coordinator decision retries",
+            "distributed txn participant fanout is bounded and concurrent",
+            "distributed txn coordinator aborts begun participants on prepare failure",
+            "distributed txn coordinator never aborts after durable commit decision",
+            "distributed txn coordinator never restarts a transaction id on topology change",
+            "db transaction recovery runtime resolves table-group participants through distributed txn resolver",
+            "bound stable single-group transaction retry does not reapply transforms",
+            "bound single-group batch reports prepared intent conflicts",
             "internal group write routes map shard doc identity mismatch to conflict",
             "api http client preserves group doc identity conflicts",
+            "api http client preserves public batch retry safety classifications",
+            "api http client forwards bounded raft batch routing context without allocation",
+            "api http client rejects unsupported routed batch protocol without legacy replay",
+            "api http client requires explicit not-proposed marker and tracks delivery phase",
+            "internal group write route dispatches bounded raft forwarding context",
+            "raft batch aggregation makes failures after an accepted group non-retryable",
+            "stateless batch retries are bounded and exclude explicit OCC",
+            "provisioned stateless batch retries definite aborts to the production bound",
             "bound table write source backs up and restores a local table",
             "bound table write source backs up and restores a portable local table",
             "provisioned table write source backs up a portable local table",
@@ -5136,6 +5219,12 @@ pub fn build(b: *std.Build) void {
         .root_module = api_table_reads_docid_test_mod,
         .filters = &.{
             "aggregation completeness requires exact total relation",
+            "api http client forwards internal query controls and maps remote timeout",
+            "api http client preserves remote storage read contention",
+            "api http client preserves storage read contention across group read endpoints",
+            "internal group read routes preserve retryable resident storage failures",
+            "remote shard query phases propagate deadline and request cancellation",
+            "provisioned table read cache has a finite worker ceiling",
             "provisioned read cache invalidates repeated ownership moves with pinned leases",
             "provisioned read cache exclusive access drains active read leases",
             "provisioned read cache group exclusive drains only the published group",
@@ -5146,6 +5235,13 @@ pub fn build(b: *std.Build) void {
             "table read distributed sorted merge uses catalog runtime schema and rejects incomplete shard windows",
             "provisioned standby read gate permits stale reads and routes non-stale reads to primary",
             "provisioned local query reuses resident generation without readonly open",
+            "provisioned auxiliary reads publish resident databases outside read admission",
+            "provisioned graph hydrate completes consistency before resident read admission",
+            "provisioned consistency read reroutes after topology changes before admission",
+            "provisioned stale read admits before routing without a redundant catalog validation",
+            "distributed graph source read rejects topology change before aggregation",
+            "provisioned reads reject a group removed from the table topology",
+            "provisioned table read source falls back from read_index to stale on not leader",
             "catalog backed router skips non-serving relocation placements",
         },
         .test_runner = .{
@@ -5158,6 +5254,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "public table batch handler maps doc identity unavailable errors",
             "public table batch handler maps write unavailable errors",
+            "public table batch handler preserves ambiguous write outcomes",
             "public table batch handler maps HA write gate errors",
             "public table batch handler returns concise dense repair backpressure",
             "public create index exposes retryable storage descriptor exhaustion",
@@ -5222,6 +5319,7 @@ pub fn build(b: *std.Build) void {
             "public index config encoders redact coverage incarnation",
             "identical index mutation retries preserve coverage incarnation",
             "derived coverage evaluation is policy exact and observation gated",
+            "settled terminal enrichment debt is degraded rather than rebuilding",
             "derived coverage aggregation rejects mixed config observations",
             "index status exposes compact repair state without internal diagnostics",
             "rebuild quarantine remains an explicit failed public index status",
@@ -5271,6 +5369,8 @@ pub fn build(b: *std.Build) void {
     const run_api_table_reads_docid_tests = addFilteredTestRunArtifact(b, api_table_reads_docid_tests);
     const run_api_public_table_http_docid_tests = addFilteredTestRunArtifact(b, api_public_table_http_docid_tests);
     const run_raft_transition_runtime_docid_tests = addFilteredTestRunArtifact(b, raft_transition_runtime_docid_tests);
+    const api_transactions_docid_test_step = b.step("api-transactions-docid-test", "Run focused API transaction tests");
+    api_transactions_docid_test_step.dependOn(&run_api_transactions_docid_tests.step);
     const api_table_writes_docid_test_step = b.step("api-table-writes-docid-test", "Run focused API table write tests");
     api_table_writes_docid_test_step.dependOn(&run_api_table_writes_docid_tests.step);
     const api_table_writes_production_regression_tests = b.addTest(.{
@@ -5287,6 +5387,7 @@ pub fn build(b: *std.Build) void {
             "provisioned table transition activity excludes writers but preserves reads",
             "provisioned table transition waiter queues ahead of later writers",
             "provisioned table transition waiter queues ahead of later readers",
+            "provisioned table group operation waiter queues ahead of later readers",
             "provisioned table write request queues structural reconcile ahead of later writes",
             "structural reconcile reservation defers metadata group refresh without blocking admitted work",
             "queued structural reconcile reserves write admission before its worker starts",
@@ -5295,7 +5396,8 @@ pub fn build(b: *std.Build) void {
             "structural reconcile retries a transient worker failure",
             "structural reconcile returns a bounded pending quantum while a group is busy",
             "structural reconcile publishes durable index repair debt once per group",
-            "resident DB lease waits for an in-flight startup writer publication",
+            "resident DB retry preparation waits outside admission for writer publication",
+            "admitted resident DB lease never waits for an in-flight writer publication",
             "write cache local mutation preempts stale startup writer",
             "structural reconcile pending set never revisits completed groups",
             "structural reconcile completion rejects ranges added after contract capture",
@@ -5568,9 +5670,10 @@ pub fn build(b: *std.Build) void {
     const lib_storage_default_filters = [_][]const u8{
         "storage.",
     };
+    const lib_storage_runtime_filters = selectTestFilters(b, &lib_storage_default_filters);
     const lib_storage_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &lib_storage_default_filters),
+        .filters = lib_storage_runtime_filters,
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -5723,6 +5826,7 @@ pub fn build(b: *std.Build) void {
         .root_module = api_artifact_reprocess_jobs_test_mod,
         .filters = &.{
             "forced index repair job dispatches force only once",
+            "index repair job keeps degradation gauges as snapshots across retries",
             "named index repair cancellation remains nonterminal until durable controls finish",
             "named index repair cancellation restarts its durable traversal after job store recovery",
             "durable cancellation scan rotates past a backed off head window",
@@ -6063,6 +6167,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_raft_runtime_tests.step);
     unit_test_step.dependOn(&run_raft_restore_tests.step);
     unit_test_step.dependOn(&run_raft_ready_continuation_tests.step);
+    unit_test_step.dependOn(&run_raft_transport_tests.step);
 
     // Progress mode uses one union-filtered root artifact too. Storage and
     // metadata module paths overlap, while raft-transport is a strict subset
@@ -6454,13 +6559,14 @@ pub fn build(b: *std.Build) void {
     const release_blocker_regression_filters = [_][]const u8{
         "non-visible doc set complements visibility per generation",
         "built-in exact dense scorer filters metadata before vector reads",
+        "one percent filtered route preserves exact recall with candidate-linear IO",
         "sorted unique vector id subtraction handles sparse and dense exclusions",
     };
     const release_blocker_regression_tests = b.addTest(.{
         .root_module = db_test_mod,
         // A root DB test keeps query/search_exec and dense_exact reachable to
         // Zig's compile-time test discovery. Runtime filters below execute
-        // only the three fast primitives, never this corpus-scale anchor.
+        // only the fast primitives, never this corpus-scale anchor.
         .filters = compileFiltersWithAnchors(
             b,
             &.{"db dense default dynamic 0.2 percent numeric filter exact scores bounded candidates"},
@@ -6639,34 +6745,129 @@ pub fn build(b: *std.Build) void {
     const derived_log_test_step = b.step("derived-log-test", "Run storage/db/derived/derived_log unit tests");
     derived_log_test_step.dependOn(&run_derived_log_unit_tests.step);
 
-    // `root-test`, `lib-storage-test`, and `lib-metadata-test` are useful
-    // focused aliases, but all compile the same root module. Use one
-    // union-filtered artifact in the default aggregate so an overlapping test
-    // is executed only once.
-    const unit_root_default_filters = lib_unit_default_filters ++ lib_storage_default_filters ++ [_][]const u8{"metadata."};
-    const unit_root_filters = selectTestFilters(b, &unit_root_default_filters);
-    const unit_root_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = unit_root_filters,
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_unit_root_tests = b.addRunArtifact(unit_root_tests);
-    addRuntimeTestFilters(b, run_unit_root_tests, unit_root_filters);
+    // Keep the default root coverage in bounded compile/run artifacts. A
+    // single union of API, storage, and metadata tests creates a very large
+    // process whose startup competes with the compiler's resident pages on CI.
+    // Reuse the focused compile artifacts and partition overlaps at runtime so
+    // each selected test still executes exactly once.
+    const run_unit_storage_tests = b.addRunArtifact(lib_storage_tests);
+    addRuntimeTestFilters(b, run_unit_storage_tests, lib_storage_runtime_filters);
+    addRuntimeSkipTestFilters(run_unit_storage_tests, lib_unit_filters);
     for (root_test_skip_filters) |filter| {
-        run_unit_root_tests.addArgs(&.{ "--skip-test-filter", filter });
+        run_unit_storage_tests.addArgs(&.{ "--skip-test-filter", filter });
     }
-    addRuntimeSkipTestFilters(run_unit_root_tests, &release_scale_test_filters);
+    addRuntimeSkipTestFilters(run_unit_storage_tests, &release_scale_test_filters);
+
+    // The complete metadata namespace pulls in the simulation harness and a
+    // large amount of control-plane code even though the default unit target
+    // excludes simulations at runtime. Compile the production metadata tests
+    // in module-owned shards so no individual Linux test image has to load the
+    // entire namespace. An explicit, flat production test root gives every
+    // shard a stable compile-time ownership prefix without traversing the
+    // public metadata namespace or its simulation imports. The sets are
+    // disjoint, and the default runtime selection uses the same ownership
+    // prefixes so an accidental empty shard is a hard failure.
+    const unit_metadata_shard_filters = [_][]const []const u8{
+        &.{"metadata.reconciler."},
+        &.{
+            "metadata.service.",
+            "metadata.http_client.",
+            "metadata.http_routes.",
+            "metadata.http_server.",
+        },
+        &.{
+            "metadata.state.",
+            "metadata.runtime.",
+            "metadata.server.",
+            "metadata.api.",
+            "metadata.admin.",
+            "metadata.authority.",
+            "metadata.incarnation.",
+            "metadata.reconcile_lease.",
+            "metadata.store_observer.",
+        },
+        &.{
+            "metadata.placement_planner.",
+            "metadata.control_loop.",
+            "metadata.table_manager.",
+            "metadata.table_workflow.",
+            "metadata.transition_state.",
+            "metadata.transition_actions.",
+            "metadata.transition_controller.",
+            "metadata.transition_driver.",
+        },
+        &.{"metadata.table_provisioner."},
+        &.{"metadata.replication_backfill."},
+        &.{"metadata.storage."},
+    };
+    const unit_metadata_sharded_test_step = b.step(
+        "unit-metadata-test",
+        "Run the production metadata portion of the default unit-test target in bounded shards",
+    );
+    const unit_metadata_shard_names = [_][]const u8{
+        "metadata-reconciler-tests",
+        "metadata-service-http-tests",
+        "metadata-core-tests",
+        "metadata-planning-transition-tests",
+        "metadata-table-provisioner-tests",
+        "metadata-replication-backfill-tests",
+        "metadata-storage-tests",
+    };
+    const metadata_runtime_filter_is_default =
+        lib_metadata_runtime_filters.len == 1 and
+        std.mem.eql(u8, lib_metadata_runtime_filters[0], "metadata.");
+    for (
+        unit_metadata_shard_filters,
+        unit_metadata_shard_names,
+        metadata_unit_test_mods,
+    ) |shard_filters, shard_name, test_mod| {
+        const unit_metadata_tests = b.addTest(.{
+            .name = shard_name,
+            .root_module = test_mod,
+            .filters = shard_filters,
+            .test_runner = .{
+                .path = b.path("pkg/antfly/src/test_runner.zig"),
+                .mode = .simple,
+            },
+        });
+        const run_unit_metadata_tests = b.addRunArtifact(unit_metadata_tests);
+        const runtime_filters = if (metadata_runtime_filter_is_default)
+            shard_filters
+        else
+            lib_metadata_runtime_filters;
+        addRuntimeTestFilters(b, run_unit_metadata_tests, runtime_filters);
+        // A focused caller filter generally belongs to only one aggregate
+        // artifact. Permit the other metadata shards to be empty, while
+        // keeping the default CI selection strict so a stale shard filter
+        // cannot silently remove coverage.
+        if (!metadata_runtime_filter_is_default) {
+            run_unit_metadata_tests.addArg("--allow-empty-test-filter");
+        }
+        addRuntimeSkipTestFilters(run_unit_metadata_tests, lib_unit_filters);
+        for (root_test_skip_filters) |filter| {
+            run_unit_metadata_tests.addArgs(&.{ "--skip-test-filter", filter });
+        }
+        unit_test_step.dependOn(&run_unit_metadata_tests.step);
+
+        // The standalone metadata step owns its selected metadata tests. Use a
+        // separate run policy so a caller filter is not mistaken for the root
+        // aggregate's overlap exclusion and skipped everywhere.
+        const run_focused_metadata_tests = b.addRunArtifact(unit_metadata_tests);
+        addRuntimeTestFilters(b, run_focused_metadata_tests, runtime_filters);
+        if (!metadata_runtime_filter_is_default) {
+            run_focused_metadata_tests.addArg("--allow-empty-test-filter");
+        }
+        for (root_test_skip_filters) |filter| {
+            run_focused_metadata_tests.addArgs(&.{ "--skip-test-filter", filter });
+        }
+        unit_metadata_sharded_test_step.dependOn(&run_focused_metadata_tests.step);
+        lib_metadata_test_step.dependOn(&run_focused_metadata_tests.step);
+    }
 
     // Default Antfly unit coverage is hermetic: no network fetchers, no
     // benchmarks, and no soak/conformance suites that require external corpora.
-    // The root storage suite already discovers LMDB, docstore, shard, WAL,
-    // persistent, index-manager, DB, and derived-log tests. Do not also wire
-    // their focused aliases into this aggregate: Zig discovers imported tests
-    // transitively, so doing both ran the same test in as many as three test
-    // binaries. The focused aliases remain available for direct invocation.
+    // Runtime exclusions above give explicit API filters first ownership,
+    // storage second ownership, and module-sharded metadata third ownership.
     dependOnAll(unit_test_step, &.{
         &run_lib_json_tests.step,
         &run_lib_onnx_tests.step,
@@ -6674,7 +6875,8 @@ pub fn build(b: *std.Build) void {
         &run_httpx_tests.step,
         &run_api_json_helpers_tests.step,
         &run_antfly_client_pkg_tests.step,
-        &run_unit_root_tests.step,
+        &run_lib_unit_tests.step,
+        &run_unit_storage_tests.step,
         &run_sparse_unit_tests.step,
     });
 

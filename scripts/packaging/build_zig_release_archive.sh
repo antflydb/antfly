@@ -157,15 +157,56 @@ zig_install_args=(
   --global-cache-dir "$cache_root/global"
 )
 
+run_zig_build_step() {
+  local step="$1"
+  local -a command=(zig build)
+
+  if [ -n "$jobs" ]; then
+    command+=("-j$jobs")
+  fi
+  command+=("${zig_build_options[@]}" "$step" "${zig_install_args[@]}")
+  "${command[@]}"
+}
+
+run_zig_build_step_with_retry() {
+  local step="$1"
+  local first_attempt_log="$work_root/${step}-attempt-1.log"
+  local retry_log="$work_root/${step}-attempt-2.log"
+  local status
+
+  set +e
+  run_zig_build_step "$step" 2>&1 | tee "$first_attempt_log"
+  status=${PIPESTATUS[0]}
+  set -e
+
+  if [ "$status" -eq 0 ]; then
+    return 0
+  fi
+
+  # Zig 0.16 can fail the first ARM64 musl ReleaseSmall compile in LLVM's
+  # allocation path even though the runner has ample available memory. A replay
+  # using the local cache populated by that failed compile has been observed to
+  # complete at the same peak RSS. Limit the retry to that known failure mode so
+  # unrelated compiler and source errors still fail immediately.
+  if [ "$target" != aarch64-linux-musl ] || \
+     [ "$optimize" != ReleaseSmall ] || \
+     ! grep -Eq 'std::bad_alloc|LLVM ERROR: out of memory|Buffer allocation failed' "$first_attempt_log"
+  then
+    return "$status"
+  fi
+
+  echo "::warning::Zig ARM64 ReleaseSmall hit a compiler allocation failure; retrying $step once with the populated local cache"
+  set +e
+  run_zig_build_step "$step" 2>&1 | tee "$retry_log"
+  status=${PIPESTATUS[0]}
+  set -e
+  return "$status"
+}
+
 (
   cd "$repo_root/zig"
-  if [ -n "$jobs" ]; then
-    zig build "-j$jobs" "${zig_build_options[@]}" install "${zig_install_args[@]}"
-    zig build "-j$jobs" "${zig_build_options[@]}" lite-capi "${zig_install_args[@]}"
-  else
-    zig build "${zig_build_options[@]}" install "${zig_install_args[@]}"
-    zig build "${zig_build_options[@]}" lite-capi "${zig_install_args[@]}"
-  fi
+  run_zig_build_step_with_retry install
+  run_zig_build_step_with_retry lite-capi
 )
 
 test -x "$prefix/bin/antfly"

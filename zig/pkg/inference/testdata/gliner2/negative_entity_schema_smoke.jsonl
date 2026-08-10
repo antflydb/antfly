@@ -1,0 +1,2 @@
+{"input":"Acme","output":{"entities":{"person":[],"organization":["Acme"]}}}
+{"input":"fine","output":{"entities":{"person":[],"organization":[]}}}

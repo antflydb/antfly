@@ -19,6 +19,11 @@
 # Mixed-load lifecycle race soak:
 #   ANTFLY_E2E_REGRESSION_WORKERS=3 ANTFLY_E2E_REGRESSION_REPEATS=20 \
 #     scripts/ci/zig-e2e-regression-loop.sh
+#
+# Constrained file-descriptor soak:
+#   ANTFLY_E2E_NOFILE_LIMIT=256 ANTFLY_E2E_REGRESSION_REPEATS=10 \
+#     scripts/ci/zig-e2e-regression-loop.sh \
+#     e2e/antfly/test_resolution.py::test_multinode_autograph_resolves_promotes_and_hydrates_entities
 
 set -euo pipefail
 
@@ -27,6 +32,7 @@ repo_root="$(cd "$script_dir/../.." && pwd)"
 repeats="${ANTFLY_E2E_REGRESSION_REPEATS:-20}"
 workers="${ANTFLY_E2E_REGRESSION_WORKERS:-1}"
 preserve_failure_limit="${ANTFLY_E2E_PRESERVE_FAILURE_LIMIT:-1}"
+nofile_limit="${ANTFLY_E2E_NOFILE_LIMIT:-}"
 
 if [[ ! "$repeats" =~ ^[1-9][0-9]*$ ]]; then
   echo "ANTFLY_E2E_REGRESSION_REPEATS must be a positive integer" >&2
@@ -38,6 +44,10 @@ if [[ ! "$workers" =~ ^[1-9][0-9]*$ ]]; then
 fi
 if [[ ! "$preserve_failure_limit" =~ ^[0-9]+$ ]]; then
   echo "ANTFLY_E2E_PRESERVE_FAILURE_LIMIT must be a non-negative integer" >&2
+  exit 2
+fi
+if [[ -n "$nofile_limit" && ! "$nofile_limit" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ANTFLY_E2E_NOFILE_LIMIT must be a positive integer" >&2
   exit 2
 fi
 
@@ -55,6 +65,17 @@ if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
     cd "$repo_root/zig"
     zig build -Dedition=full install -fincremental
   )
+fi
+
+if [[ -n "$nofile_limit" ]]; then
+  current_nofile_limit="$(ulimit -n)"
+  if [[ "$current_nofile_limit" != "unlimited" ]] && ((nofile_limit > current_nofile_limit)); then
+    printf 'ANTFLY_E2E_NOFILE_LIMIT=%s exceeds the current soft limit %s\n' \
+      "$nofile_limit" "$current_nofile_limit" >&2
+    exit 2
+  fi
+  ulimit -n "$nofile_limit"
+  printf 'E2E regression file-descriptor soft limit: %s\n' "$nofile_limit"
 fi
 
 if ((workers > 1)); then
@@ -85,6 +106,7 @@ if ((workers > 1)); then
     env \
       SKIP_BUILD=1 \
       ANTFLY_E2E_REGRESSION_WORKERS=1 \
+      ANTFLY_E2E_NOFILE_LIMIT="$nofile_limit" \
       ANTFLY_E2E_REGRESSION_WORKER_ID="$worker" \
       UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/antfly-ci-uv-cache}-worker-${worker}" \
       PYTHONPYCACHEPREFIX="${PYTHONPYCACHEPREFIX:-/tmp/antfly-pycache}-worker-${worker}" \

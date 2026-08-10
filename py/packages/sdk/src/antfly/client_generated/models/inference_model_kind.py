@@ -8,7 +8,6 @@ class InferenceModelKind(str, Enum):
     EXTRACTOR = "extractor"
     GENERATOR = "generator"
     READER = "reader"
-    RECOGNIZER = "recognizer"
     RERANKER = "reranker"
     REWRITER = "rewriter"
     TRANSCRIBER = "transcriber"

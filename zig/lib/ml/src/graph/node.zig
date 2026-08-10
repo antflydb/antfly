@@ -154,6 +154,13 @@ pub const SliceAttrs = struct {
     limits: [max_rank]i64 = .{0} ** max_rank,
     strides: [max_rank]i64 = .{1} ** max_rank,
     num_axes: u8 = 0,
+    /// ONNX Slice can derive starts/limits from runtime shape subgraphs.
+    /// When either flag is set, node inputs are [data, starts, limits] and
+    /// bound_axes maps those compact input tensors onto the full-rank attrs.
+    bound_axes: [max_rank]u8 = .{0} ** max_rank,
+    num_bound_axes: u8 = 0,
+    runtime_starts: bool = false,
+    runtime_limits: bool = false,
 };
 
 pub const ConcatAttrs = struct {
@@ -351,6 +358,18 @@ pub const SoftmaxAttrs = struct {
     dim: u32, // size of last dimension (softmax axis)
 };
 
+pub const MaskedBceReduction = enum(u8) {
+    sum,
+    mean,
+};
+
+pub const MaskedBceWithLogitsAttrs = struct {
+    positive_weight: f32 = 1.0,
+    negative_weight: f32 = 1.0,
+    eps: f32 = 1e-6,
+    reduction: MaskedBceReduction = .mean,
+};
+
 // ── Node ───────────────────────────────────────────────────────────────
 
 /// Discriminated union of all ops in the graph IR.
@@ -396,8 +415,12 @@ pub const OpCode = union(enum) {
     fused_linear_no_bias: LinearAttrs,
     fused_embedding_lookup: EmbeddingAttrs,
     fused_layer_norm: NormAttrs,
+    fused_layer_norm_backward: NormAttrs,
     fused_rms_norm: NormAttrs,
     fused_gelu: void,
+    fused_gelu_exact: void,
+    fused_gelu_backward: void,
+    fused_gelu_exact_backward: void,
     fused_relu: void,
     fused_silu: void,
     fused_quick_gelu: void,
@@ -411,6 +434,8 @@ pub const OpCode = union(enum) {
     fused_causal_self_attention: AttentionAttrs,
     fused_cross_attention: CrossAttentionAttrs,
     fused_gqa_causal_attention: AttentionAttrs,
+    fused_disentangled_attention: AttentionAttrs,
+    fused_disentangled_attention_backward: AttentionAttrs,
     fused_relative_position_bias: RelativePositionBiasAttrs,
     fused_rope: RopeAttrs,
     fused_conv1d: Conv1dAttrs,
@@ -430,6 +455,8 @@ pub const OpCode = union(enum) {
     fused_argmax_last_row: ArgmaxAttrs,
     fused_softmax: SoftmaxAttrs,
     fused_log_softmax: SoftmaxAttrs,
+    fused_masked_bce_with_logits_loss: MaskedBceWithLogitsAttrs,
+    fused_masked_bce_with_logits_backward: MaskedBceWithLogitsAttrs,
 
     pub fn isFused(self: OpCode) bool {
         return switch (self) {
