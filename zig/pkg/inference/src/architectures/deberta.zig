@@ -98,6 +98,30 @@ fn metalEncoderLayerExecutionEnabled() bool {
     return true;
 }
 
+fn metalDebertaWeightMirrorMaxBytes() usize {
+    const mb = platform.env.getenvUsize("TERMITE_METAL_DEBERTA_WEIGHT_MIRROR_MAX_MB") orelse 768;
+    return std.math.mul(usize, mb, 1024 * 1024) catch std.math.maxInt(usize);
+}
+
+fn debertaDenseMirrorBytes(config: Config) ?usize {
+    const layers: usize = @intCast(config.num_hidden_layers);
+    const hidden: usize = @intCast(config.hidden_size);
+    const intermediate: usize = @intCast(config.intermediate_size);
+    const hidden_squared = std.math.mul(usize, hidden, hidden) catch return null;
+    const hidden_intermediate = std.math.mul(usize, hidden, intermediate) catch return null;
+    const hidden_projections = std.math.mul(usize, hidden_squared, 4) catch return null;
+    const ffn_projections = std.math.mul(usize, hidden_intermediate, 2) catch return null;
+    const elements_per_layer = std.math.add(usize, hidden_projections, ffn_projections) catch return null;
+    const total_elements = std.math.mul(usize, elements_per_layer, layers) catch return null;
+    return std.math.mul(usize, total_elements, @sizeOf(u16)) catch null;
+}
+
+fn useMetalDebertaF16Mirrors(config: Config, prefer_weight_mirrors: bool) bool {
+    if (!prefer_weight_mirrors or platform.env.getenvBool("TERMITE_METAL_DISABLE_DEBERTA_WEIGHT_MIRRORS")) return false;
+    const mirror_bytes = debertaDenseMirrorBytes(config) orelse return false;
+    return mirror_bytes <= metalDebertaWeightMirrorMaxBytes();
+}
+
 const DebertaLinearSlotKind = enum(usize) {
     q = 0,
     k = 1,
@@ -134,6 +158,7 @@ pub fn preplanMetalDebertaEncoderFrame(
     config: Config,
     batch: usize,
     seq_len: usize,
+    prefer_weight_mirrors: bool,
 ) !bool {
     if (cb.kind() != .metal) return false;
     if (!metalEncoderFrameEnabled()) return false;
@@ -146,6 +171,7 @@ pub fn preplanMetalDebertaEncoderFrame(
     const heads: usize = @intCast(config.num_attention_heads);
     if (layer_count == 0 or batch == 0 or seq_len == 0 or H == 0 or I == 0 or heads == 0) return false;
     if (H % heads != 0) return false;
+    const prefer_f16_mirrors = useMetalDebertaF16Mirrors(config, prefer_weight_mirrors);
 
     const layers = try allocator.alloc(ops.DebertaEncoderLayerSpec, layer_count);
     defer allocator.free(layers);
@@ -216,12 +242,36 @@ pub fn preplanMetalDebertaEncoderFrame(
         const attn_ln_slot = debertaLayerNormSlot(layer, .attention_output);
         const ffn_ln_slot = debertaLayerNormSlot(layer, .output);
 
-        if (!(try cb.decoderRuntimePrepareLinear(&.{ .slot = q_slot, .weight = q_w, .bias = q_b, .in_dim = H, .out_dim = H, .retain_dense_fallback = true }))) return false;
-        if (!(try cb.decoderRuntimePrepareLinear(&.{ .slot = k_slot, .weight = k_w, .bias = k_b, .in_dim = H, .out_dim = H, .retain_dense_fallback = true }))) return false;
-        if (!(try cb.decoderRuntimePrepareLinear(&.{ .slot = v_slot, .weight = v_w, .bias = v_b, .in_dim = H, .out_dim = H, .retain_dense_fallback = true }))) return false;
-        if (!(try cb.decoderRuntimePrepareLinear(&.{ .slot = attn_o_slot, .weight = attn_o_w, .bias = attn_o_b, .in_dim = H, .out_dim = H, .retain_dense_fallback = true }))) return false;
-        if (!(try cb.decoderRuntimePrepareLinear(&.{ .slot = ffn_i_slot, .weight = ffn_i_w, .bias = ffn_i_b, .in_dim = H, .out_dim = I, .retain_dense_fallback = true }))) return false;
-        if (!(try cb.decoderRuntimePrepareLinear(&.{ .slot = ffn_o_slot, .weight = ffn_o_w, .bias = ffn_o_b, .in_dim = I, .out_dim = H, .retain_dense_fallback = true }))) return false;
+        const PrepSpec = struct {
+            slot: usize,
+            weight: CT,
+            bias: CT,
+            in_dim: usize,
+            out_dim: usize,
+        };
+        const prep_specs = [_]PrepSpec{
+            .{ .slot = q_slot, .weight = q_w, .bias = q_b, .in_dim = H, .out_dim = H },
+            .{ .slot = k_slot, .weight = k_w, .bias = k_b, .in_dim = H, .out_dim = H },
+            .{ .slot = v_slot, .weight = v_w, .bias = v_b, .in_dim = H, .out_dim = H },
+            .{ .slot = attn_o_slot, .weight = attn_o_w, .bias = attn_o_b, .in_dim = H, .out_dim = H },
+            .{ .slot = ffn_i_slot, .weight = ffn_i_w, .bias = ffn_i_b, .in_dim = H, .out_dim = I },
+            .{ .slot = ffn_o_slot, .weight = ffn_o_w, .bias = ffn_o_b, .in_dim = I, .out_dim = H },
+        };
+        for (prep_specs) |spec| {
+            if (!(try cb.decoderRuntimePrepareLinear(&.{
+                .slot = spec.slot,
+                .weight = spec.weight,
+                .bias = spec.bias,
+                .in_dim = spec.in_dim,
+                .out_dim = spec.out_dim,
+                .retain_dense_fallback = true,
+                // GLiNER explicitly opts into these bounded mirrors. Other
+                // DeBERTa users retain the existing quantized runtime path.
+                .dense_fallback_max_bytes = if (prefer_f16_mirrors) 32 * 1024 * 1024 else null,
+                .allow_direct_quant_fallback = prefer_f16_mirrors,
+                .prefer_f16_mps_fallback = prefer_f16_mirrors,
+            }))) return false;
+        }
         if (!(try cb.decoderRuntimePrepareLayerNorm(&.{ .slot = attn_ln_slot, .weight = attn_ln_w, .bias = attn_ln_b, .hidden_size = H }))) return false;
         if (!(try cb.decoderRuntimePrepareLayerNorm(&.{ .slot = ffn_ln_slot, .weight = ffn_ln_w, .bias = ffn_ln_b, .hidden_size = H }))) return false;
 
@@ -266,8 +316,9 @@ pub fn forwardCt(
     attention_mask: []const i64,
     batch: usize,
     seq_len: usize,
+    prefer_weight_mirrors: bool,
 ) !CT {
-    return forwardCtProfiled(cb, allocator, config, input_ids, attention_mask, batch, seq_len, null);
+    return forwardCtProfiled(cb, allocator, config, input_ids, attention_mask, batch, seq_len, prefer_weight_mirrors, null);
 }
 
 pub fn forwardCtProfiled(
@@ -278,12 +329,13 @@ pub fn forwardCtProfiled(
     attention_mask: []const i64,
     batch: usize,
     seq_len: usize,
+    prefer_weight_mirrors: bool,
     profile: ?*EncoderProfile,
 ) !CT {
     const H = config.hidden_size;
     const total = batch * seq_len;
 
-    _ = try preplanMetalDebertaEncoderFrame(cb, allocator, config, batch, seq_len);
+    _ = try preplanMetalDebertaEncoderFrame(cb, allocator, config, batch, seq_len, prefer_weight_mirrors);
 
     var encoder_frame_active = false;
     if (cb.kind() == .metal and metalEncoderFrameEnabled() and !cb.decoderRuntimeHasActiveFrame()) {
@@ -327,7 +379,7 @@ pub fn forward(
     batch: usize,
     seq_len: usize,
 ) ![]f32 {
-    const hidden = try forwardCt(cb, allocator, config, input_ids, attention_mask, batch, seq_len);
+    const hidden = try forwardCt(cb, allocator, config, input_ids, attention_mask, batch, seq_len, false);
     defer cb.free(hidden);
     return cb.toFloat32(hidden, allocator);
 }

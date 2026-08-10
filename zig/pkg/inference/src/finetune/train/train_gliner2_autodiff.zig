@@ -1220,6 +1220,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
             preplan_config,
             @intCast(effective_batch_size),
             effective_seq_len,
+            false,
         ) catch |err| blk: {
             print("warning: Metal DeBERTa encoder frame preplan failed: {s}; continuing with graph runtime fallback\n", .{@errorName(err)});
             break :blk false;

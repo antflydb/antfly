@@ -625,6 +625,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     zero_bias_cache: std.AutoHashMapUnmanaged(usize, []f32) = .empty,
     static_transpose_cache: std.AutoHashMapUnmanaged(StaticTransposeKey, MetalTensor) = .empty,
     dynamic_linear_slots: std.AutoHashMapUnmanaged(DynamicLinearSlotKey, usize) = .empty,
+    eager_quant_mirrors_preferred: bool = false,
     dynamic_layer_norm_slots: std.AutoHashMapUnmanaged(DynamicLayerNormSlotKey, usize) = .empty,
     dynamic_rms_norm_slots: std.AutoHashMapUnmanaged(DynamicRmsNormSlotKey, usize) = .empty,
     next_dynamic_linear_slot: usize = metal_runtime.decoder_runtime_linear_slot_capacity,
@@ -3521,6 +3522,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var zero_it = self.zero_bias_cache.iterator();
         while (zero_it.next()) |entry| self.allocator.free(entry.value_ptr.*);
         self.zero_bias_cache.deinit(self.allocator);
+        // Dynamic slots are keyed per backend instance while the slot pool
+        // lives on the shared provider. Release ours so request-local compute
+        // backends cannot strand prepared weights or dense mirrors.
+        var dynamic_slot_it = self.dynamic_linear_slots.valueIterator();
+        while (dynamic_slot_it.next()) |slot| {
+            metal_runtime.clearRawLinearSlot(self.provider_impl, slot.*);
+        }
         var transpose_it = self.static_transpose_cache.iterator();
         while (transpose_it.next()) |entry| entry.value_ptr.deinit();
         self.static_transpose_cache.deinit(self.allocator);
@@ -4331,6 +4339,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const slot = self.nextFreeDynamicLinearSlot() orelse return null;
         const weight_buf = toBuf(weight);
         const retain_dense_fallback = weight_buf.quantized_storage != null or weight_buf.runtime_quantized_storage != null;
+        const dense_mirror = retain_dense_fallback and self.eager_quant_mirrors_preferred and
+            !getenvBool("TERMITE_METAL_DISABLE_DYNAMIC_SLOT_MIRRORS");
         if (!(try decoderRuntimePrepareLinearOp(self, &.{
             .slot = slot,
             .weight = weight,
@@ -4338,6 +4348,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .in_dim = in_dim,
             .out_dim = out_dim,
             .retain_dense_fallback = retain_dense_fallback,
+            .dense_fallback_max_bytes = if (dense_mirror) 32 * 1024 * 1024 else null,
+            .allow_direct_quant_fallback = dense_mirror,
+            .prefer_f16_mps_fallback = dense_mirror,
         }))) return null;
         try self.dynamic_linear_slots.put(self.allocator, key, slot);
         return slot;
@@ -10520,6 +10533,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return self.ctFromOwnedMetalTensor(tensor);
         }
         return null;
+    }
+
+    fn preferEagerQuantMirrorsOp(ctx: *anyopaque, enabled: bool) void {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        self.eager_quant_mirrors_preferred = enabled;
     }
 
     fn glinerLabelGruCombinedOp(ctx: *anyopaque, request: *const ops.GlinerLabelGruCombinedRequest) anyerror!?CT {
@@ -22654,6 +22672,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .retain_dense_fallback = request.retain_dense_fallback,
             .disable_mapped_quant_weight = request.disable_mapped_quant_weight,
             .dense_fallback_max_bytes = request.dense_fallback_max_bytes,
+            .allow_direct_quant_fallback = request.allow_direct_quant_fallback,
+            .prefer_f16_mps_fallback = request.prefer_f16_mps_fallback,
             .dense_bf16_bytes = dense_bf16_bytes,
             .dense_bf16_no_copy_safe = dense_bf16_no_copy_safe,
         }, &self.timing_stats);
@@ -23698,6 +23718,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.debertaEmbeddings = debertaEmbeddingsOp;
         vt.takeRows = takeRowsOp;
         vt.glinerWordEmbeddings = glinerWordEmbeddingsOp;
+        vt.preferEagerQuantMirrors = preferEagerQuantMirrorsOp;
         vt.glinerLabelGruCombined = glinerLabelGruCombinedOp;
         vt.gelu = geluOp;
         vt.geluNew = geluNewOp;
@@ -25764,6 +25785,48 @@ test "metal_compute: transpose dot and conv use device resident Metal kernels" {
     const conv2_data = try metal_cb.toFloat32(conv2, allocator);
     defer allocator.free(conv2_data);
     try std.testing.expectEqualSlices(f32, &[_]f32{ 5422, 6533, 8755, 9866 }, conv2_data);
+}
+
+test "metal_compute: conv2d keeps batched inputs device resident" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const input_host = try metal_cb.fromFloat32Shape(&[_]f32{
+        1, 2, 3, 4,
+        5, 6, 7, 8,
+    }, &.{ 2, 1, 2, 2 });
+    defer metal_cb.free(input_host);
+    const weight_host = try metal_cb.fromFloat32Shape(&[_]f32{2}, &.{ 1, 1, 1, 1 });
+    defer metal_cb.free(weight_host);
+    const bias_host = try metal_cb.fromFloat32Shape(&[_]f32{1}, &.{1});
+    defer metal_cb.free(bias_host);
+
+    const input_mt = try metal_compute.ownedDeviceMetalTensorFromCt(input_host);
+    const input = try metal_compute.ctFromOwnedMetalTensor(input_mt);
+    defer metal_cb.free(input);
+    const weight_mt = try metal_compute.ownedDeviceMetalTensorFromCt(weight_host);
+    const weight = try metal_compute.ctFromOwnedMetalTensor(weight_mt);
+    defer metal_cb.free(weight);
+    const bias_mt = try metal_compute.ownedDeviceMetalTensorFromCt(bias_host);
+    const bias = try metal_compute.ctFromOwnedMetalTensor(bias_mt);
+    defer metal_cb.free(bias);
+
+    const output = try metal_cb.conv2d(input, weight, bias, 2, 1, 1, 2, 2, 1, 1, 1, 1, 0, 0, 1);
+    defer metal_cb.free(output);
+    try std.testing.expect(MetalCompute.debugHasDeviceTensor(&metal_cb, output));
+    const actual = try metal_cb.toFloat32(output, allocator);
+    defer allocator.free(actual);
+    try std.testing.expectEqualSlices(f32, &[_]f32{
+        3,  5,  7,  9,
+        11, 13, 15, 17,
+    }, actual);
 }
 
 test "metal_compute: inferReshapeShape ignores collapsed singleton when restoring attention heads" {

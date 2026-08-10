@@ -104,6 +104,7 @@ test {
     _ = linalg;
     _ = graph;
     _ = architectures;
+    _ = @import("architectures/clap.zig");
     _ = architectures.clipclap_format;
     _ = architectures.projector_format;
     _ = @import("server/model_manager.zig");
@@ -133,6 +134,7 @@ test {
     _ = native_smoke;
     _ = cuda_info;
     _ = cuda_microbench;
+    _ = metal_runtime;
     _ = native_compute.native;
     if (build_options.enable_metal) {
         _ = native_compute.metal;

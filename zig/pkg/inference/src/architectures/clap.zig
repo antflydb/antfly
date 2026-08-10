@@ -225,24 +225,31 @@ fn patchEmbed(
         }
     }
 
-    const tokens = try allocator.alloc(f32, token_count * dim);
-    errdefer allocator.free(tokens);
+    const tokens = if (channels == 1)
+        // Normal batched CLAP requests do not use the singleton fusion path.
+        // Submit one convolution so the backend can process the batch without
+        // per-item command-buffer commits.
+        try patchEmbedUnfusedBatch(cb, allocator, image, batch, height, width, ac)
+    else blk: {
+        const item_tokens = try allocator.alloc(f32, token_count * dim);
+        errdefer allocator.free(item_tokens);
 
-    const plane = height * width;
-    for (0..batch) |b| {
-        const long_item = ac.enable_fusion and channels >= 4 and b < is_longer.len and is_longer[b] != 0;
-        const sample = image[b * channels * plane ..][0 .. channels * plane];
-        const embedded = if (long_item)
-            try patchEmbedFusedItem(cb, allocator, sample, channels, height, width, ac)
-        else
-            try patchEmbedSingleItem(cb, allocator, sample[0..plane], height, width, ac);
-        defer allocator.free(embedded);
+        const plane = height * width;
+        for (0..batch) |b| {
+            const long_item = ac.enable_fusion and channels >= 4 and b < is_longer.len and is_longer[b] != 0;
+            const sample = image[b * channels * plane ..][0 .. channels * plane];
+            const embedded = if (long_item)
+                try patchEmbedFusedItem(cb, allocator, sample, channels, height, width, ac)
+            else
+                try patchEmbedSingleItem(cb, allocator, sample[0..plane], height, width, ac);
+            defer allocator.free(embedded);
 
-        for (0..(out_h * out_w)) |tok| {
-            const dst = (b * out_h * out_w + tok) * dim;
-            @memcpy(tokens[dst..][0..dim], embedded[tok * dim ..][0..dim]);
+            const dst = item_tokens[b * out_h * out_w * dim ..][0 .. out_h * out_w * dim];
+            @memcpy(dst, embedded);
         }
-    }
+        break :blk item_tokens;
+    };
+    errdefer allocator.free(tokens);
 
     if (!ac.enable_patch_layer_norm) return tokens;
     const normed = try layerNormData(
@@ -267,7 +274,23 @@ fn patchEmbedSingleItem(
     width: usize,
     ac: clap_mod.Config.AudioConfig,
 ) ![]f32 {
-    const in_ct = try cb.fromFloat32Shape(image, &[_]i32{ 1, 1, @intCast(height), @intCast(width) });
+    return patchEmbedUnfusedBatch(cb, allocator, image, 1, height, width, ac);
+}
+
+fn patchEmbedUnfusedBatch(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    image: []const f32,
+    batch: usize,
+    height: usize,
+    width: usize,
+    ac: clap_mod.Config.AudioConfig,
+) ![]f32 {
+    const image_area = std.math.mul(usize, height, width) catch return error.InvalidInputShape;
+    const expected = std.math.mul(usize, batch, image_area) catch return error.InvalidInputShape;
+    if (batch == 0 or image.len != expected) return error.InvalidInputShape;
+
+    const in_ct = try cb.fromFloat32Shape(image, &[_]i32{ @intCast(batch), 1, @intCast(height), @intCast(width) });
     defer cb.free(in_ct);
     const proj_w = try cb.getWeight("audio_model.audio_encoder.patch_embed.proj.weight");
     defer cb.free(proj_w);
@@ -277,7 +300,7 @@ fn patchEmbedSingleItem(
         in_ct,
         proj_w,
         proj_b,
-        1,
+        batch,
         1,
         ac.patch_embeds_hidden_size,
         height,
@@ -295,7 +318,7 @@ fn patchEmbedSingleItem(
     const out_w = (width - ac.patch_size) / ac.patch_stride[1] + 1;
     const out = try cb.toFloat32(out_ct, allocator);
     defer allocator.free(out);
-    return convOutputToTokens(allocator, out, out_h, out_w, ac.patch_embeds_hidden_size);
+    return convOutputToBatchTokens(allocator, out, batch, out_h, out_w, ac.patch_embeds_hidden_size);
 }
 
 fn patchEmbedFusedItem(
@@ -654,26 +677,50 @@ fn patchMerge(
     return cb.toFloat32(reduction_ct, allocator);
 }
 
-fn convOutputToTokens(
+fn convOutputToBatchTokens(
     allocator: std.mem.Allocator,
     out: []const f32,
+    batch: usize,
     out_h: usize,
     out_w: usize,
     dim_u32: u32,
 ) ![]f32 {
     const dim: usize = dim_u32;
-    const tokens = try allocator.alloc(f32, out_h * out_w * dim);
+    const plane = std.math.mul(usize, out_h, out_w) catch return error.InvalidInputShape;
+    const item_elements = std.math.mul(usize, plane, dim) catch return error.InvalidInputShape;
+    const total_elements = std.math.mul(usize, batch, item_elements) catch return error.InvalidInputShape;
+    if (batch == 0 or out.len != total_elements) return error.InvalidInputShape;
+
+    const tokens = try allocator.alloc(f32, total_elements);
     errdefer allocator.free(tokens);
-    for (0..out_h) |y| {
-        for (0..out_w) |x| {
-            const token_idx = (y * out_w + x) * dim;
-            const src_base = y * out_w + x;
-            for (0..dim) |c| {
-                tokens[token_idx + c] = out[src_base + c * out_h * out_w];
+    for (0..batch) |b| {
+        for (0..out_h) |y| {
+            for (0..out_w) |x| {
+                const token_idx = (b * plane + y * out_w + x) * dim;
+                const src_base = b * item_elements + y * out_w + x;
+                for (0..dim) |c| {
+                    tokens[token_idx + c] = out[src_base + c * plane];
+                }
             }
         }
     }
     return tokens;
+}
+
+test "CLAP convolution output conversion preserves batch rows" {
+    const allocator = std.testing.allocator;
+    // NCHW: two batches, two channels, one row, two columns.
+    const nchw = [_]f32{
+        1, 2, 3, 4,
+        5, 6, 7, 8,
+    };
+    const tokens = try convOutputToBatchTokens(allocator, &nchw, 2, 1, 2, 2);
+    defer allocator.free(tokens);
+
+    try std.testing.expectEqualSlices(f32, &.{
+        1, 3, 2, 4,
+        5, 7, 6, 8,
+    }, tokens);
 }
 
 fn tokensToImage(
