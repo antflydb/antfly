@@ -8238,7 +8238,13 @@ pub const ProvisionedTableWriteSource = struct {
         if (self.startup_write_cache) |cache| pruneCache(self, cache);
     }
 
-    pub fn reconcileReplicaRootTablesWithWriteCacheLocked(
+    /// Reconciles provisioned DB state without holding `local_db_mutex` across
+    /// DB work. Resolver catch-up can acquire a resident DB lease while
+    /// reconciling indexes, so carrying the cache mutex into that work creates
+    /// a lock inversion (`local_db_mutex` -> resolver catch-up mutex ->
+    /// `local_db_mutex`). Cache entries are pinned by a lease instead; the
+    /// mutex only protects cache admission and metadata publication.
+    pub fn reconcileReplicaRootTablesWithWriteCache(
         self: *ProvisionedTableWriteSource,
         alloc: std.mem.Allocator,
         metadata_group_id: u64,
@@ -8260,11 +8266,15 @@ pub const ProvisionedTableWriteSource = struct {
             },
         );
 
-        if (cache.backend_runtime == null) cache.backend_runtime = backend_runtime orelse self.backend_runtime;
-        cache.antfly_provider = self.antfly_provider;
-        cache.inference_api_url = self.inference_api_url;
-        cache.secret_store = self.secret_store;
-        cache.remote_content = self.remote_content;
+        {
+            lockAtomic(&self.local_db_mutex);
+            defer self.local_db_mutex.unlock();
+            if (cache.backend_runtime == null) cache.backend_runtime = backend_runtime orelse self.backend_runtime;
+            cache.antfly_provider = self.antfly_provider;
+            cache.inference_api_url = self.inference_api_url;
+            cache.secret_store = self.secret_store;
+            cache.remote_content = self.remote_content;
+        }
 
         var summary: metadata_table_provisioner.ProvisionSummary = .{};
         for (hosted_group_ids) |group_id| {
@@ -8294,54 +8304,62 @@ pub const ProvisionedTableWriteSource = struct {
                 .shard_id = metadata_table_manager.rangeDocIdentityShardId(range),
                 .range_id = metadata_table_manager.rangeDocIdentityRangeId(range),
             };
-            if (cache.snapshotLeaseOrAdoptSeededLocked(group_id, lsm_root_generation, table.name)) |cached_db| {
-                var cached = cached_db;
-                defer cached.deinit(alloc);
-                try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, cached.db);
-                try applyLocalTableSchemaJson(alloc, cached.db, table.schema_json);
-                const index_summary = try metadata_table_provisioner.reconcileDbIndexes(alloc, cached.db, table.indexes_json);
-                summary.merge(index_summary);
-                if (index_summary.indexes_pending != 0) {
-                    // Admission can materialize durable repair debt before a
-                    // newly opened DB has its runtime visibility hook. Hand
-                    // the authoritative pending result to the owner directly;
-                    // enqueue is idempotent and the aggregate debt audit
-                    // removes the group once every intent is clear.
-                    self.notifyLocalIndexRepairDebt(table.name, group_id, .enqueue);
-                }
-                try cache.replaceTableMetadataLocked(table.name, table.indexes_json, table.schema_json);
-                continue;
-            }
-            var opened: ?db_mod.DB = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
-                alloc,
-                path,
-                table.indexes_json,
-                cache.lsm_cache,
-                cache.hbc_cache,
-                lsm_root_generation,
-                cache.resource_manager,
-                .default,
-                cache.backend_runtime,
-                self.antfly_provider,
-                self.secret_store,
-                self.remote_content,
-                identity_namespace,
-            );
-            defer if (opened) |*db| db.close();
-            summary.dbs_opened += 1;
+            var admitted_new_cache_entry = false;
+            var cached = blk: {
+                lockAtomic(&self.local_db_mutex);
+                const existing = cache.snapshotLeaseOrAdoptSeededLocked(
+                    group_id,
+                    lsm_root_generation,
+                    table.name,
+                );
+                self.local_db_mutex.unlock();
+                if (existing) |value| break :blk value;
 
-            try applyLocalTableSchemaJson(alloc, &opened.?, table.schema_json);
+                const metadata: StartupCatchUpMetadata = .{
+                    .indexes_json = table.indexes_json,
+                    .schema_json = table.schema_json,
+                    .identity_namespace = identity_namespace,
+                };
+                const opened = try self.getOrOpenCachedDbModeAtGeneration(
+                    alloc,
+                    cache,
+                    path,
+                    group_id,
+                    lsm_root_generation,
+                    table.name,
+                    .default,
+                    null,
+                    null,
+                    metadata,
+                );
+                admitted_new_cache_entry = true;
+                summary.dbs_opened += 1;
+                break :blk opened;
+            };
+            defer cached.deinit(alloc);
+
+            try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, cached.db);
+            try applyLocalTableSchemaJson(alloc, cached.db, table.schema_json);
             // The open helper performs initial desired-state reconciliation,
             // but intentionally returns only the DB. Reconcile once more at
             // this cache-admission boundary so a staged same-name retirement
             // cannot lose its pending retry signal. This pass is idempotent;
             // if cleanup already completed it admits the replacement now.
-            const index_summary = try metadata_table_provisioner.reconcileDbIndexes(alloc, &opened.?, table.indexes_json);
+            const index_summary = try metadata_table_provisioner.reconcileDbIndexes(alloc, cached.db, table.indexes_json);
             summary.merge(index_summary);
-            if (index_summary.indexes_pending != 0) {
+            if (index_summary.indexes_pending != 0 and !admitted_new_cache_entry) {
+                // A newly admitted managed DB publishes the pending edge via
+                // its installed visibility hook. An existing lease may have
+                // observed the edge before this owner began reconciliation,
+                // so retain the idempotent aggregate-debt audit for that path.
                 self.notifyLocalIndexRepairDebt(table.name, group_id, .enqueue);
             }
-            try cache.seedCreatedDbLocked(&opened, group_id, lsm_root_generation, table.name, table.indexes_json, table.schema_json);
+            {
+                lockAtomic(&self.local_db_mutex);
+                defer self.local_db_mutex.unlock();
+                try cache.replaceTableMetadataLocked(table.name, table.indexes_json, table.schema_json);
+                try cache.replaceEntrySchemaLocked(cached.entry.?, table.schema_json);
+            }
         }
         return summary;
     }
@@ -40004,7 +40022,7 @@ test "replica root reconcile seeds write cache across generation bump" {
     source.write_cache = &write_cache;
     _ = source.withGroupVisibleRootGeneration(testingVisibleRootGenerationSource(&generation));
 
-    const summary = try source.reconcileReplicaRootTablesWithWriteCacheLocked(
+    const summary = try source.reconcileReplicaRootTablesWithWriteCache(
         alloc,
         1,
         &hosted_groups,
@@ -40020,7 +40038,7 @@ test "replica root reconcile seeds write cache across generation bump" {
     const misses_before = write_cache.miss_count.load(.monotonic);
 
     generation = 2;
-    const refreshed_summary = try source.reconcileReplicaRootTablesWithWriteCacheLocked(
+    const refreshed_summary = try source.reconcileReplicaRootTablesWithWriteCache(
         alloc,
         1,
         &hosted_groups,
@@ -40121,7 +40139,7 @@ test "replica root reconcile enqueues newly admitted managed full text repair" {
     var capture: DebtCapture = .{};
     source.setLocalIndexRepairDebtHook(.{ .ptr = &capture, .on_change = DebtCapture.onDebt });
 
-    const summary = try source.reconcileReplicaRootTablesWithWriteCacheLocked(
+    const summary = try source.reconcileReplicaRootTablesWithWriteCache(
         alloc,
         1,
         &hosted_groups,

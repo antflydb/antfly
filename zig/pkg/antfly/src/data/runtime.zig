@@ -6564,9 +6564,7 @@ pub const DataServer = struct {
                 defer activity.deinit();
 
                 var group_id_one = [_]u64{group_id};
-                lockAtomic(refresh_write_source.localDbMutex());
-                defer refresh_write_source.localDbMutex().unlock();
-                break :reconcile refresh_write_source.reconcileReplicaRootTablesWithWriteCacheLocked(
+                break :reconcile refresh_write_source.reconcileReplicaRootTablesWithWriteCache(
                     self.alloc,
                     metadata_group_id,
                     group_id_one[0..],
@@ -9181,8 +9179,7 @@ pub const DataServer = struct {
             defer activity.deinit();
 
             var group_ids = [_]u64{group_id};
-            lockAtomic(write_source.localDbMutex());
-            const result = write_source.reconcileReplicaRootTablesWithWriteCacheLocked(
+            const result = write_source.reconcileReplicaRootTablesWithWriteCache(
                 self.alloc,
                 snapshot.status.metadata_group_id,
                 group_ids[0..],
@@ -9190,7 +9187,6 @@ pub const DataServer = struct {
                 provisioning_ranges,
                 backend_runtime,
             );
-            write_source.localDbMutex().unlock();
             _ = try result;
             reconciled = true;
         }
@@ -11801,9 +11797,6 @@ pub const DataServer = struct {
         var indexes_pending: usize = 0;
         const fingerprint = blk: {
             const next_fingerprint = blk_fingerprint: {
-                lockAtomic(refresh_write_source.localDbMutex());
-                defer refresh_write_source.localDbMutex().unlock();
-
                 try self.reportLocalSchemaProgress(head.metadata_group_id, registration.node_id, local_group_ids, snapshot.tables, snapshot.ranges);
 
                 break :blk_fingerprint antfly.metadata.table_provisioner.provisioningFingerprint(
@@ -11834,19 +11827,15 @@ pub const DataServer = struct {
                     defer activity.deinit();
 
                     var group_ids_one = [_]u64{group_id};
-                    {
-                        lockAtomic(refresh_write_source.localDbMutex());
-                        defer refresh_write_source.localDbMutex().unlock();
-                        const summary = try refresh_write_source.reconcileReplicaRootTablesWithWriteCacheLocked(
-                            self.alloc,
-                            head.metadata_group_id,
-                            group_ids_one[0..],
-                            snapshot.tables,
-                            provisioning_ranges,
-                            backend_runtime,
-                        );
-                        indexes_pending += summary.indexes_pending;
-                    }
+                    const summary = try refresh_write_source.reconcileReplicaRootTablesWithWriteCache(
+                        self.alloc,
+                        head.metadata_group_id,
+                        group_ids_one[0..],
+                        snapshot.tables,
+                        provisioning_ranges,
+                        backend_runtime,
+                    );
+                    indexes_pending += summary.indexes_pending;
                 }
             }
             // Provisioning reconciles schema and index metadata into the live
