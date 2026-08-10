@@ -30,6 +30,8 @@ pub const CatalogSource = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
+        /// Snapshot slices and all transitively referenced bytes must remain
+        /// valid until the matching `free_admin_snapshot` call returns.
         admin_snapshot: *const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot,
         free_admin_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void,
         /// Production sources must fail closed when either linearizable

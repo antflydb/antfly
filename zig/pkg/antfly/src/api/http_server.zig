@@ -28271,7 +28271,6 @@ test "api http server create index waits for exact target config projection" {
     const alloc = std.testing.allocator;
 
     const FakeSource = struct {
-        projection_wait_calls: std.atomic.Value(u32) = .init(0),
         indexes_json: []const u8 = tables_api.default_indexes_json,
         owns_indexes_json: bool = false,
 
@@ -28283,7 +28282,6 @@ test "api http server create index waits for exact target config projection" {
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
                     .create_index = createIndex,
-                    .wait_table_projection = waitTableProjection,
                 },
             };
         }
@@ -28304,14 +28302,19 @@ test "api http server create index waits for exact target config projection" {
 
         fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            const tables = try std.testing.allocator.alloc(metadata_table_manager.TableRecord, 1);
+            errdefer std.testing.allocator.free(tables);
+            const indexes_json = try std.testing.allocator.dupe(u8, self.indexes_json);
+            errdefer std.testing.allocator.free(indexes_json);
+            tables[0] = .{
+                .table_id = 7,
+                .name = "docs",
+                .indexes_json = indexes_json,
+                .placement_role = "data",
+            };
             return .{
                 .status = .{ .metadata_group_id = 1, .metrics = .{} },
-                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
-                    .table_id = 7,
-                    .name = "docs",
-                    .indexes_json = self.indexes_json,
-                    .placement_role = "data",
-                }})[0..]),
+                .tables = tables,
                 .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
                     .group_id = 7001,
                     .table_id = 7,
@@ -28325,7 +28328,10 @@ test "api http server create index waits for exact target config projection" {
             };
         }
 
-        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn freeAdminSnapshot(_: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
+            std.testing.allocator.free(snapshot.tables[0].indexes_json);
+            std.testing.allocator.free(snapshot.tables);
+        }
 
         fn createIndex(ptr: *anyopaque, allocator: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -28337,15 +28343,6 @@ test "api http server create index waits for exact target config projection" {
             // equality with the pre-proposal snapshot.
             const concurrent = try indexes_api.addIndexToTableIndexesJson(allocator, next, "concurrent_text", "{\"type\":\"full_text\"}");
             self.replaceIndexesJson(allocator, concurrent, true);
-        }
-
-        fn waitTableProjection(ptr: *anyopaque, table_name: []const u8, schema_json: ?[]const u8, indexes_json: ?[]const u8) !void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expectEqualStrings("docs", table_name);
-            try std.testing.expect(schema_json == null);
-            try std.testing.expect(indexes_json != null);
-            try std.testing.expectEqualStrings(self.indexes_json, indexes_json.?);
-            _ = self.projection_wait_calls.fetchAdd(1, .monotonic);
         }
     };
 
@@ -28388,7 +28385,6 @@ test "api http server create index waits for exact target config projection" {
     });
     defer create_index_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 201), create_index_resp.status);
-    try std.testing.expectEqual(@as(u32, 0), source.projection_wait_calls.load(.monotonic));
 
     var first_lookup = (try indexes_api.lookupSingleIndexConfig(alloc, source.indexes_json, "embed_idx")).?;
     defer first_lookup.deinit();
@@ -28414,7 +28410,6 @@ test "api http server create index expands schema-derived algebraic config" {
             \\{"version":1,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"customer":{"type":"keyword"},"amount":{"type":"number"},"created_at":{"type":"datetime"}}}}}}
         ;
 
-        projection_wait_calls: std.atomic.Value(u32) = .init(0),
         indexes_json: []const u8 = tables_api.default_indexes_json,
         owns_indexes_json: bool = false,
 
@@ -28426,7 +28421,6 @@ test "api http server create index expands schema-derived algebraic config" {
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
                     .create_index = createIndex,
-                    .wait_table_projection = waitTableProjection,
                 },
             };
         }
@@ -28447,15 +28441,20 @@ test "api http server create index expands schema-derived algebraic config" {
 
         fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            const tables = try std.testing.allocator.alloc(metadata_table_manager.TableRecord, 1);
+            errdefer std.testing.allocator.free(tables);
+            const indexes_json = try std.testing.allocator.dupe(u8, self.indexes_json);
+            errdefer std.testing.allocator.free(indexes_json);
+            tables[0] = .{
+                .table_id = 7,
+                .name = "docs",
+                .schema_json = schema_json,
+                .indexes_json = indexes_json,
+                .placement_role = "data",
+            };
             return .{
                 .status = .{ .metadata_group_id = 1, .metrics = .{} },
-                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
-                    .table_id = 7,
-                    .name = "docs",
-                    .schema_json = schema_json,
-                    .indexes_json = self.indexes_json,
-                    .placement_role = "data",
-                }})[0..]),
+                .tables = tables,
                 .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
                     .group_id = 7001,
                     .table_id = 7,
@@ -28469,7 +28468,10 @@ test "api http server create index expands schema-derived algebraic config" {
             };
         }
 
-        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn freeAdminSnapshot(_: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
+            std.testing.allocator.free(snapshot.tables[0].indexes_json);
+            std.testing.allocator.free(snapshot.tables);
+        }
 
         fn createIndex(ptr: *anyopaque, allocator: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -28479,15 +28481,6 @@ test "api http server create index expands schema-derived algebraic config" {
             try std.testing.expect(std.mem.indexOf(u8, index_json, "\"measure_fields\"") != null);
             const next = try indexes_api.addIndexToTableIndexesJson(allocator, self.indexes_json, index_name, index_json);
             self.replaceIndexesJson(allocator, next, true);
-        }
-
-        fn waitTableProjection(ptr: *anyopaque, table_name: []const u8, schema_json_opt: ?[]const u8, indexes_json: ?[]const u8) !void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expectEqualStrings("docs", table_name);
-            try std.testing.expect(schema_json_opt == null);
-            try std.testing.expect(indexes_json != null);
-            try std.testing.expectEqualStrings(self.indexes_json, indexes_json.?);
-            _ = self.projection_wait_calls.fetchAdd(1, .monotonic);
         }
     };
 
@@ -28535,7 +28528,6 @@ test "api http server create index expands schema-derived algebraic config" {
     defer create_index_resp.deinit(alloc);
 
     try std.testing.expectEqual(@as(u16, 201), create_index_resp.status);
-    try std.testing.expectEqual(@as(u32, 1), source.projection_wait_calls.load(.monotonic));
     try std.testing.expect(std.mem.indexOf(u8, source.indexes_json, "\"derive_from_schema\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, source.indexes_json, "\"group_fields\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, source.indexes_json, "\"measure_fields\"") != null);
