@@ -1534,6 +1534,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     scraping_mod.addImport("objectstore", objectstore_mod);
+    scraping_mod.addImport("httpx", httpx_mod);
     const reranking_mod = b.createModule(.{
         .root_source_file = b.path("lib/reranking/src/mod.zig"),
         .target = target,

@@ -15,6 +15,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const objectstore = @import("objectstore");
+const httpx = @import("httpx");
 
 const Allocator = std.mem.Allocator;
 
@@ -365,74 +366,158 @@ fn downloadHttpOutcomeAlloc(
 ) !DownloadOutcome {
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
-    try validateUrlSecurity(uri, security, io_impl.io());
 
-    var client = std.http.Client{
-        .allocator = alloc,
-        .io = io_impl.io(),
-    };
+    const max_size_u64 = if (security) |cfg|
+        cfg.max_download_size_bytes orelse (100 * 1024 * 1024)
+    else
+        100 * 1024 * 1024;
+    const max_size = std.math.cast(usize, max_size_u64) orelse return error.StreamTooLong;
+    const timeout_ms: ?u64 = if (security) |cfg|
+        if (cfg.download_timeout_seconds) |seconds|
+            if (seconds > 0) @as(u64, seconds) * std.time.ms_per_s else null
+        else
+            null
+    else
+        null;
+    var timeouts = httpx.Timeouts{};
+    if (timeout_ms) |limit| {
+        timeouts = httpx.Timeouts.uniform(limit);
+        timeouts.request_ms = limit;
+    }
+    const block_private = if (security) |cfg| cfg.block_private_ips orelse false else false;
+    var client = httpx.Client.initWithConfig(alloc, io_impl.io(), .{
+        .timeouts = timeouts,
+        .retry_policy = httpx.RetryPolicy.noRetry(),
+        .redirect_policy = httpx.RedirectPolicy.noFollow(),
+        .user_agent = if (security) |cfg| cfg.user_agent orelse "AntflyDB/1.0" else "AntflyDB/1.0",
+        .max_response_size = max_size,
+        .keep_alive = false,
+        .cookies_enabled = false,
+        .resolved_address_validator = if (block_private) validatePublicResolvedAddress else null,
+    });
     defer client.deinit();
 
-    var headers = std.ArrayListUnmanaged(std.http.Header).empty;
+    var headers = std.ArrayListUnmanaged([2][]const u8).empty;
     defer headers.deinit(alloc);
-    try headers.append(alloc, .{
-        .name = "User-Agent",
-        .value = if (security) |cfg| cfg.user_agent orelse "AntflyDB/1.0" else "AntflyDB/1.0",
-    });
     if (http_headers) |extra_headers| {
         for (extra_headers) |header| {
             if (header.name.len == 0) continue;
-            try headers.append(alloc, .{ .name = header.name, .value = header.value });
+            try headers.append(alloc, .{ header.name, header.value });
         }
     }
 
-    var request = try std.http.Client.request(&client, .GET, uri, .{
-        .keep_alive = false,
-        // Redirects must be revalidated before connecting. The standard
-        // client's automatic redirect loop does not expose that boundary, so
-        // treat redirects as ordinary non-success responses here.
-        .redirect_behavior = .unhandled,
-        .extra_headers = headers.items,
-    });
-    defer request.deinit();
+    var current_url = try formatUriAlloc(alloc, uri);
+    defer alloc.free(current_url);
+    const started_ns = std.Io.Clock.awake.now(io_impl.io()).nanoseconds;
+    var send_credentials = true;
+    const max_redirects: usize = 5;
+    var redirects: usize = 0;
+    while (true) {
+        const current_uri = try std.Uri.parse(current_url);
+        try validateHttpUri(current_uri);
+        try validateUrlAdmission(current_uri, security);
 
-    if (security) |cfg| {
-        if (cfg.block_private_ips orelse false) {
-            try validateConnectedPeer(request.connection.?);
-        }
-    }
-
-    try request.sendBodiless();
-    var response = try request.receiveHead(&.{});
-    if (response.head.status.class() != .success) {
-        return .{
-            .http_error = .{
-                .status = @intFromEnum(response.head.status),
-                .message = "remote fetch failed",
-            },
+        const remaining_timeout_ms: ?u64 = if (timeout_ms) |limit| blk: {
+            const now_ns = std.Io.Clock.awake.now(io_impl.io()).nanoseconds;
+            const elapsed_ns: u64 = @intCast(@max(0, now_ns - started_ns));
+            const elapsed_ms = elapsed_ns / std.time.ns_per_ms;
+            if (elapsed_ms >= limit) return error.Timeout;
+            break :blk limit - elapsed_ms;
+        } else null;
+        var response = client.request(.GET, current_url, .{
+            .headers = if (send_credentials and headers.items.len > 0) headers.items else null,
+            .timeout_ms = remaining_timeout_ms,
+            .follow_redirects = false,
+            .max_response_size = max_size,
+        }) catch |err| switch (err) {
+            error.ResponseTooLarge => return error.StreamTooLong,
+            else => return err,
         };
+        defer response.deinit();
+
+        if (response.ok()) {
+            const mime = trimMimeParameters(response.contentType() orelse "application/octet-stream");
+            const owned_mime = try alloc.dupe(u8, mime);
+            errdefer alloc.free(owned_mime);
+            const body = try alloc.dupe(u8, response.body orelse "");
+            return .{ .ok = .{ .content_type = owned_mime, .data = body } };
+        }
+
+        if (isSupportedRedirect(response.status.code)) {
+            if (redirects >= max_redirects) return error.TooManyRedirects;
+            const location = response.location() orelse return error.InvalidRedirect;
+            const next_url = try resolveRedirectUrlAlloc(alloc, current_uri, location);
+            errdefer alloc.free(next_url);
+            const next_uri = try std.Uri.parse(next_url);
+            try validateHttpUri(next_uri);
+            try validateUrlAdmission(next_uri, security);
+            if (!sameOrigin(current_uri, next_uri)) send_credentials = false;
+            alloc.free(current_url);
+            current_url = next_url;
+            redirects += 1;
+            continue;
+        }
+
+        return .{ .http_error = .{
+            .status = response.status.code,
+            .message = "remote fetch failed",
+        } };
     }
+}
 
-    const mime = if (response.head.content_type) |value|
-        trimMimeParameters(value)
-    else
-        "application/octet-stream";
-    const owned_mime = try alloc.dupe(u8, mime);
-    errdefer alloc.free(owned_mime);
+fn validatePublicResolvedAddress(_: ?*anyopaque, address: httpx.Address) !void {
+    if (!isPublicAddress(address)) return error.PrivateIpBlocked;
+}
 
-    const max_size: usize = if (security) |cfg|
-        @intCast(cfg.max_download_size_bytes orelse (100 * 1024 * 1024))
-    else
-        100 * 1024 * 1024;
+fn validateHttpUri(uri: std.Uri) !void {
+    if (!std.mem.eql(u8, uri.scheme, "http") and !std.mem.eql(u8, uri.scheme, "https"))
+        return error.UnsupportedUrlScheme;
+    if (uri.host == null) return error.InvalidHost;
+    // Embedded userinfo is both ambiguous and easy to leak through logs or
+    // redirects; remote credentials must come from the named secret config.
+    if (uri.user != null or uri.password != null) return error.InvalidHost;
+}
 
-    var transfer_buffer: [512]u8 = undefined;
-    const body = try response.reader(&transfer_buffer).allocRemaining(alloc, .limited(max_size));
-    errdefer alloc.free(body);
+fn isSupportedRedirect(status: u16) bool {
+    return switch (status) {
+        301, 302, 303, 307, 308 => true,
+        else => false,
+    };
+}
 
-    return .{ .ok = .{
-        .content_type = owned_mime,
-        .data = body,
-    } };
+fn effectiveHttpPort(uri: std.Uri) u16 {
+    return uri.port orelse if (std.mem.eql(u8, uri.scheme, "https")) 443 else 80;
+}
+
+fn sameOrigin(lhs: std.Uri, rhs: std.Uri) bool {
+    const lhs_host = lhs.host orelse return false;
+    const rhs_host = rhs.host orelse return false;
+    return std.ascii.eqlIgnoreCase(lhs.scheme, rhs.scheme) and
+        std.ascii.eqlIgnoreCase(lhs_host.percent_encoded, rhs_host.percent_encoded) and
+        effectiveHttpPort(lhs) == effectiveHttpPort(rhs);
+}
+
+fn formatUriAlloc(alloc: Allocator, uri: std.Uri) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try uri.format(&out.writer);
+    return try out.toOwnedSlice();
+}
+
+fn resolveRedirectUrlAlloc(alloc: Allocator, base: std.Uri, location: []const u8) ![]u8 {
+    // resolveInPlace needs scratch only when merging relative paths. The base
+    // path plus location is the strict upper bound for that merged path.
+    const merged_path_capacity = std.math.add(usize, base.path.percent_encoded.len, location.len + 1) catch
+        return error.OutOfMemory;
+    const scratch_len = std.math.add(usize, location.len, merged_path_capacity) catch
+        return error.OutOfMemory;
+    const storage = try alloc.alloc(u8, scratch_len);
+    defer alloc.free(storage);
+    @memcpy(storage[0..location.len], location);
+    var remaining = storage;
+    var resolved = try std.Uri.resolveInPlace(base, location.len, &remaining);
+    resolved.fragment = null;
+    return try formatUriAlloc(alloc, resolved);
 }
 
 fn downloadFileAlloc(
@@ -484,6 +569,17 @@ fn downloadS3Alloc(
     defer alloc.free(joined_path);
     try validatePathSecurity(joined_path, security);
 
+    const endpoint_url = try std.fmt.allocPrint(alloc, "{s}://{s}/", .{
+        if (creds_cfg.use_ssl orelse true) "https" else "http",
+        endpoint,
+    });
+    defer alloc.free(endpoint_url);
+    const endpoint_uri = try std.Uri.parse(endpoint_url);
+    try validateHttpUri(endpoint_uri);
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    try validateUrlAdmission(endpoint_uri, security);
+
     const creds = objectstore.S3Credentials{
         .endpoint = try alloc.dupe(u8, endpoint),
         .use_ssl = creds_cfg.use_ssl orelse true,
@@ -496,18 +592,37 @@ fn downloadS3Alloc(
     var client = try objectstore.S3.Client.init(alloc, .{
         .credentials = creds,
         .addressing_style = .path,
+        .request_timeout_ms = if (security) |cfg|
+            if (cfg.download_timeout_seconds) |seconds|
+                if (seconds > 0) @as(u64, seconds) * std.time.ms_per_s else null
+            else
+                null
+        else
+            null,
+        .io = io_impl.io(),
+        .resolved_address_validator = if (security) |cfg|
+            if (cfg.block_private_ips orelse false) validatePublicResolvedAddress else null
+        else
+            null,
     });
     defer client.deinit();
 
     var store_client = client.client();
-    var result = try store_client.getObject(bucket, key, .{});
+    const max_response_bytes: ?usize = if (security) |cfg|
+        if (cfg.max_download_size_bytes) |limit|
+            std.math.cast(usize, limit) orelse return error.StreamTooLong
+        else
+            null
+    else
+        null;
+    var result = store_client.getObject(bucket, key, .{
+        .skip_metadata_probe = true,
+        .max_response_bytes = max_response_bytes,
+    }) catch |err| switch (err) {
+        error.ResponseTooLarge => return error.StreamTooLong,
+        else => return err,
+    };
     defer result.deinit(alloc);
-
-    if (security) |cfg| {
-        if (cfg.max_download_size_bytes) |max_size| {
-            if (result.body.len > max_size) return error.StreamTooLong;
-        }
-    }
 
     _ = original_uri;
     return .{
@@ -526,17 +641,21 @@ fn parseS3LocationAlloc(
     const path = trimLeftSlash(parsed.path.percent_encoded);
     if (path.len == 0) return error.InvalidS3Url;
 
-    const host_is_endpoint = std.mem.indexOfScalar(u8, host_text, '.') != null or std.mem.indexOfScalar(u8, host_text, ':') != null;
+    const configured_endpoint = creds_cfg.endpoint orelse return error.MissingEndpoint;
+    // Legacy endpoint-in-URI syntax remains supported only when it names the
+    // configured endpoint exactly. The request URI must never select an
+    // arbitrary credential-bearing network destination.
+    const host_is_endpoint = try s3AuthorityMatchesEndpointAlloc(alloc, parsed, configured_endpoint);
     if (host_is_endpoint) {
         const slash = std.mem.indexOfScalar(u8, path, '/') orelse return error.InvalidS3Url;
+        if (slash == 0 or slash + 1 >= path.len) return error.InvalidS3Url;
         return .{
             try alloc.dupe(u8, path[0..slash]),
             try alloc.dupe(u8, path[slash + 1 ..]),
-            try alloc.dupe(u8, host_text),
+            try alloc.dupe(u8, configured_endpoint),
         };
     }
 
-    const configured_endpoint = creds_cfg.endpoint orelse return error.MissingEndpoint;
     return .{
         try alloc.dupe(u8, host_text),
         try alloc.dupe(u8, path),
@@ -544,7 +663,17 @@ fn parseS3LocationAlloc(
     };
 }
 
-fn validateUrlSecurity(parsed: std.Uri, security: ?*const ContentSecurityConfig, io: std.Io) !void {
+fn s3AuthorityMatchesEndpointAlloc(alloc: Allocator, parsed: std.Uri, endpoint: []const u8) !bool {
+    const endpoint_url = try std.fmt.allocPrint(alloc, "http://{s}/", .{endpoint});
+    defer alloc.free(endpoint_url);
+    const endpoint_uri = std.Uri.parse(endpoint_url) catch return false;
+    const parsed_host = parsed.host orelse return false;
+    const endpoint_host = endpoint_uri.host orelse return false;
+    return std.ascii.eqlIgnoreCase(parsed_host.percent_encoded, endpoint_host.percent_encoded) and
+        parsed.port == endpoint_uri.port;
+}
+
+fn validateUrlAdmission(parsed: std.Uri, security: ?*const ContentSecurityConfig) !void {
     const cfg = security orelse return;
     const host = (parsed.host orelse return error.InvalidHost).percent_encoded;
     if (host.len == 0) return error.InvalidHost;
@@ -558,10 +687,6 @@ fn validateUrlSecurity(parsed: std.Uri, security: ?*const ContentSecurityConfig,
             }
         }
         if (!allowed) return error.HostNotAllowed;
-    }
-
-    if (cfg.block_private_ips orelse false) {
-        try validateResolvedHost(host, parsed.port orelse if (std.mem.eql(u8, parsed.scheme, "https")) 443 else 80, io);
     }
 }
 
@@ -615,56 +740,6 @@ fn pathIsWithinRoot(root: []const u8, path: []const u8) bool {
     return path.len > root.len and
         std.mem.startsWith(u8, path, root) and
         path[root.len] == std.fs.path.sep;
-}
-
-fn validateResolvedHost(host: []const u8, port: u16, io: std.Io) !void {
-    if (std.ascii.eqlIgnoreCase(host, "localhost") or std.ascii.endsWithIgnoreCase(host, ".localhost") or
-        std.ascii.endsWithIgnoreCase(host, ".local")) return error.PrivateIpBlocked;
-
-    if (std.Io.net.IpAddress.parse(host, port)) |address| {
-        if (!isPublicAddress(address)) return error.PrivateIpBlocked;
-        return;
-    } else |_| {}
-
-    const host_name = std.Io.net.HostName.init(host) catch return error.InvalidHost;
-    var lookup_buffer: [32]std.Io.net.HostName.LookupResult = undefined;
-    var lookup_queue: std.Io.Queue(std.Io.net.HostName.LookupResult) = .init(&lookup_buffer);
-    try std.Io.net.HostName.lookup(host_name, io, &lookup_queue, .{ .port = port });
-    var found_address = false;
-    while (true) {
-        const result = lookup_queue.getOne(io) catch |err| switch (err) {
-            error.Closed => break,
-            else => return err,
-        };
-        switch (result) {
-            .address => |address| {
-                found_address = true;
-                // Mixed public/private DNS answers are rejected. Otherwise an
-                // attacker can steer the client's address selection.
-                if (!isPublicAddress(address)) return error.PrivateIpBlocked;
-            },
-            .canonical_name => {},
-        }
-    }
-    if (!found_address) return error.InvalidHost;
-}
-
-fn validateConnectedPeer(connection: *std.http.Client.Connection) !void {
-    // Ip literals have no DNS race, but use the same peer check on supported
-    // server platforms to protect against resolver or transport surprises.
-    if (builtin.os.tag == .windows) {
-        // std.Io does not currently expose a portable peer-address query on
-        // Windows. Fail closed rather than leaving DNS rebinding exploitable.
-        return error.PeerAddressVerificationUnavailable;
-    } else {
-        var storage: std.Io.Threaded.PosixAddress = undefined;
-        var storage_len: std.posix.socklen_t = @sizeOf(std.Io.Threaded.PosixAddress);
-        try std.posix.getpeername(connection.stream_reader.stream.socket.handle, &storage.any, &storage_len);
-        if (!isPublicAddress(std.Io.Threaded.addressFromPosix(&storage))) {
-            connection.closing = true;
-            return error.PrivateIpBlocked;
-        }
-    }
 }
 
 fn isPublicAddress(address: std.Io.net.IpAddress) bool {
@@ -863,4 +938,53 @@ test "remote address policy rejects non-public ranges" {
     try std.testing.expect(!isPublicAddress(try parse("::ffff:127.0.0.1", 80)));
     try std.testing.expect(isPublicAddress(try parse("8.8.8.8", 80)));
     try std.testing.expect(isPublicAddress(try parse("2606:4700:4700::1111", 80)));
+}
+
+test "redirect resolution is RFC 3986 compliant and origin aware" {
+    const alloc = std.testing.allocator;
+    const base = try std.Uri.parse("https://cdn.example.com/a/b/document.pdf?old=1");
+    const relative = try resolveRedirectUrlAlloc(alloc, base, "../images/page.png?size=2#ignored");
+    defer alloc.free(relative);
+    try std.testing.expectEqualStrings("https://cdn.example.com/a/images/page.png?size=2", relative);
+    try std.testing.expect(sameOrigin(base, try std.Uri.parse(relative)));
+
+    const cross_origin = try resolveRedirectUrlAlloc(alloc, base, "https://assets.example.net/page.png");
+    defer alloc.free(cross_origin);
+    try std.testing.expect(!sameOrigin(base, try std.Uri.parse(cross_origin)));
+}
+
+test "s3 URI cannot override the configured endpoint" {
+    const alloc = std.testing.allocator;
+    const creds = S3CredentialsConfig{ .endpoint = @constCast("s3.example.com") };
+
+    const endpoint_style = try parseS3LocationAlloc(alloc, try std.Uri.parse("s3://s3.example.com/media/document.pdf"), &creds);
+    defer {
+        alloc.free(endpoint_style[0]);
+        alloc.free(endpoint_style[1]);
+        alloc.free(endpoint_style[2]);
+    }
+    try std.testing.expectEqualStrings("media", endpoint_style[0]);
+    try std.testing.expectEqualStrings("document.pdf", endpoint_style[1]);
+    try std.testing.expectEqualStrings("s3.example.com", endpoint_style[2]);
+
+    const attacker_style = try parseS3LocationAlloc(alloc, try std.Uri.parse("s3://attacker.example/private/secret"), &creds);
+    defer {
+        alloc.free(attacker_style[0]);
+        alloc.free(attacker_style[1]);
+        alloc.free(attacker_style[2]);
+    }
+    try std.testing.expectEqualStrings("attacker.example", attacker_style[0]);
+    try std.testing.expectEqualStrings("private/secret", attacker_style[1]);
+    try std.testing.expectEqualStrings("s3.example.com", attacker_style[2]);
+
+    const minio_creds = S3CredentialsConfig{ .endpoint = @constCast("minio:9000") };
+    const port_style = try parseS3LocationAlloc(alloc, try std.Uri.parse("s3://minio:9000/media/document.pdf"), &minio_creds);
+    defer {
+        alloc.free(port_style[0]);
+        alloc.free(port_style[1]);
+        alloc.free(port_style[2]);
+    }
+    try std.testing.expectEqualStrings("media", port_style[0]);
+    try std.testing.expectEqualStrings("document.pdf", port_style[1]);
+    try std.testing.expectEqualStrings("minio:9000", port_style[2]);
 }

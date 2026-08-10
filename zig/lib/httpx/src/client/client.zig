@@ -55,6 +55,11 @@ const H2Connection = h2_mod.H2Connection;
 const hpack = @import("../protocol/hpack.zig");
 const Stream = @import("../protocol/stream.zig").Stream;
 
+/// Admission hook invoked on the exact DNS result immediately before the
+/// socket connect. It lets callers enforce network policy without a
+/// resolve-then-connect rebinding window.
+pub const ResolvedAddressValidator = *const fn (context: ?*anyopaque, address: Address) anyerror!void;
+
 /// HTTP client configuration.
 pub const ClientConfig = struct {
     base_url: ?[]const u8 = null,
@@ -78,6 +83,9 @@ pub const ClientConfig = struct {
     pool_max_connections: u32 = 20,
     pool_max_per_host: u32 = 5,
     max_cookies: usize = 1000,
+    cookies_enabled: bool = true,
+    resolved_address_validator: ?ResolvedAddressValidator = null,
+    resolved_address_validator_context: ?*anyopaque = null,
     /// Send a PING health check after this many ms of no frames received on
     /// an H2 connection. 0 = disabled. Similar to Go's http2.Transport.ReadIdleTimeout.
     h2_read_idle_timeout_ms: u64 = 30_000,
@@ -435,6 +443,14 @@ pub const Client = struct {
         self.h2_conns.deinit(self.allocator);
     }
 
+    fn resolveValidatedAddress(self: *Self, host: []const u8, port: u16) !Address {
+        const address = try resolveAddress(self.io, host, port);
+        if (self.config.resolved_address_validator) |validate| {
+            try validate(self.config.resolved_address_validator_context, address);
+        }
+        return address;
+    }
+
     /// Adds an interceptor to the client.
     pub fn addInterceptor(self: *Self, interceptor: Interceptor) !void {
         try self.interceptors.append(self.allocator, interceptor);
@@ -513,7 +529,7 @@ pub const Client = struct {
             try req.headers.set(HeaderName.ACCEPT_ENCODING, "gzip, deflate");
         }
 
-        try self.attachCookies(&req);
+        if (self.config.cookies_enabled) try self.attachCookies(&req);
 
         for (self.interceptors.items) |interceptor| {
             if (interceptor.request_fn) |f| {
@@ -524,7 +540,7 @@ pub const Client = struct {
         var response = try self.executeRequest(&req, reqOpts.timeout_ms, reqOpts.cancellation);
         errdefer response.deinit();
 
-        try self.storeCookies(&response);
+        if (self.config.cookies_enabled) try self.storeCookies(&response);
 
         for (self.interceptors.items) |interceptor| {
             if (interceptor.response_fn) |f| {
@@ -607,7 +623,7 @@ pub const Client = struct {
             try req.headers.set(HeaderName.ACCEPT_ENCODING, "gzip, deflate");
         }
 
-        try self.attachCookies(&req);
+        if (self.config.cookies_enabled) try self.attachCookies(&req);
 
         for (self.interceptors.items) |interceptor| {
             if (interceptor.request_fn) |f| {
@@ -618,7 +634,7 @@ pub const Client = struct {
         var response = try self.executeRequestToWriter(&req, reqOpts.timeout_ms, writer, progress_cb, progress_ctx, reqOpts.cancellation);
         errdefer response.deinit();
 
-        try self.storeCookies(&response);
+        if (self.config.cookies_enabled) try self.storeCookies(&response);
 
         for (self.interceptors.items) |interceptor| {
             if (interceptor.response_fn) |f| {
@@ -1196,7 +1212,7 @@ pub const Client = struct {
         }
 
         if (req.uri.isTls()) {
-            if (self.config.keep_alive) {
+            if (self.config.keep_alive and self.config.resolved_address_validator == null) {
                 var tls_conn = try self.tls_pool.getConnection(host, port);
                 var ok = false;
                 defer {
@@ -1210,7 +1226,7 @@ pub const Client = struct {
             }
 
             // Non-pooled TLS fallback (keep_alive disabled).
-            const addr = try resolveAddress(self.io, host, port);
+            const addr = try self.resolveValidatedAddress(host, port);
             var socket = try Socket.connect(addr, self.io);
             defer socket.close();
             try applyTimeouts(&socket, timeout_ms, write_timeout_ms, deadline_ms);
@@ -1219,7 +1235,7 @@ pub const Client = struct {
             return self.executeOnNewTls(&socket, host, req);
         }
 
-        if (self.config.keep_alive) {
+        if (self.config.keep_alive and self.config.resolved_address_validator == null) {
             var conn = try self.pool.getConnection(host, port);
             var ok = false;
             defer {
@@ -1232,7 +1248,7 @@ pub const Client = struct {
             return self.executeOnSocket(&conn.socket, req, &ok);
         }
 
-        const addr = try resolveAddress(self.io, host, port);
+        const addr = try self.resolveValidatedAddress(host, port);
         var socket = try Socket.connect(addr, self.io);
         defer socket.close();
         try applyTimeouts(&socket, timeout_ms, write_timeout_ms, deadline_ms);
@@ -1270,7 +1286,7 @@ pub const Client = struct {
         }
 
         if (req.uri.isTls()) {
-            if (self.config.keep_alive) {
+            if (self.config.keep_alive and self.config.resolved_address_validator == null) {
                 var tls_conn = try self.tls_pool.getConnection(host, port);
                 var ok = false;
                 defer {
@@ -1283,7 +1299,7 @@ pub const Client = struct {
                 return self.executeOnTlsToWriter(&tls_conn.session, req, writer, progress_cb, progress_ctx, &ok);
             }
 
-            const addr = try resolveAddress(self.io, host, port);
+            const addr = try self.resolveValidatedAddress(host, port);
             var socket = try Socket.connect(addr, self.io);
             defer socket.close();
             try applyTimeouts(&socket, timeout_ms, write_timeout_ms, deadline_ms);
@@ -1292,7 +1308,7 @@ pub const Client = struct {
             return self.executeOnNewTlsToWriter(&socket, host, req, writer, progress_cb, progress_ctx);
         }
 
-        if (self.config.keep_alive) {
+        if (self.config.keep_alive and self.config.resolved_address_validator == null) {
             var conn = try self.pool.getConnection(host, port);
             var ok = false;
             defer {
@@ -1305,7 +1321,7 @@ pub const Client = struct {
             return self.executeOnSocketToWriter(&conn.socket, req, writer, progress_cb, progress_ctx, &ok);
         }
 
-        const addr = try resolveAddress(self.io, host, port);
+        const addr = try self.resolveValidatedAddress(host, port);
         var socket = try Socket.connect(addr, self.io);
         defer socket.close();
         try applyTimeouts(&socket, timeout_ms, write_timeout_ms, deadline_ms);
@@ -1454,7 +1470,7 @@ pub const Client = struct {
         entry.recv_running = false;
         errdefer self.allocator.destroy(entry);
 
-        const addr = try resolveAddress(self.io, host, port);
+        const addr = try self.resolveValidatedAddress(host, port);
         entry.socket = try Socket.connect(addr, self.io);
         // Guard socket close only until fibers take ownership (recv_running).
         // After fibers start, the errdefer at line ~521 handles shutdown.
@@ -3280,6 +3296,21 @@ test "client resolveAddress falls back to hostname lookup" {
         .ip4 => |ip4| try std.testing.expectEqual(@as(u16, 443), ip4.port),
         .ip6 => |ip6| try std.testing.expectEqual(@as(u16, 443), ip6.port),
     }
+}
+
+test "client validates the exact resolved address before connect" {
+    const Reject = struct {
+        fn validate(_: ?*anyopaque, _: Address) !void {
+            return error.AddressRejected;
+        }
+    };
+    var client = Client.initWithConfig(std.testing.allocator, std.testing.io, .{
+        .keep_alive = false,
+        .retry_policy = types.RetryPolicy.noRetry(),
+        .resolved_address_validator = Reject.validate,
+    });
+    defer client.deinit();
+    try std.testing.expectError(error.AddressRejected, client.get("http://127.0.0.1:1/", .{}));
 }
 
 test "H2StreamReader reads pre-buffered data and returns EOF" {

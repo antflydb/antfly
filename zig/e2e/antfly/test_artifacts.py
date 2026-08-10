@@ -966,7 +966,9 @@ def test_artifact_coverage_terminal_outcomes_by_policy_after_restart(
             and coverage.get("skipped") == 1
             and coverage.get("terminal_failed") == 1
             and coverage.get("covered") == expected_covered
-            and coverage.get("pending") == 3 - expected_covered
+            # Pending is unsettled work, not policy-specific uncovered work.
+            # All three source documents have reached terminal outcomes.
+            and coverage.get("pending") == 0
             and coverage.get("observation_complete") is True
             and coverage.get("complete") is expected_complete
             and coverage.get("healthy") is False
@@ -976,7 +978,7 @@ def test_artifact_coverage_terminal_outcomes_by_policy_after_restart(
         if expected_complete:
             if coverage.get("degraded") is not True:
                 return None
-        elif status.get("backfill_state") != "failed":
+        elif status.get("backfill_state") != "degraded":
             return None
         return current
 

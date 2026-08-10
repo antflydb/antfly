@@ -535,6 +535,81 @@ fn textBatchByteStats(texts: []const []const u8) TextBatchByteStats {
     return stats;
 }
 
+/// Records request-path embedding work in the same runtime counters as the
+/// replay worker. These calls deliberately use the request allocator and do
+/// not add retry/backoff: the synchronous caller owns its latency and retry
+/// policy, while runtime status must still reflect all provider work.
+pub fn embedDenseTracked(
+    runtime: *EnrichmentRuntime,
+    alloc: Allocator,
+    dense_embedder: embedder_mod.DenseEmbedder,
+    embedding_name: []const u8,
+    text: []const u8,
+    dims: u32,
+) ![]f32 {
+    noteEmbedBatchStarted(runtime, 1, text.len, text.len);
+    const started_ns = runtime.config.clock.nowRealtimeNs();
+    const vector = dense_embedder.embedDense(alloc, embedding_name, text, dims) catch |err| {
+        noteEmbedBatchFinished(runtime, 1, text.len, text.len, elapsedNsSince(runtime, started_ns), false);
+        return err;
+    };
+    noteEmbedBatchFinished(runtime, 1, text.len, text.len, elapsedNsSince(runtime, started_ns), true);
+    return vector;
+}
+
+pub fn embedDenseBatchTracked(
+    runtime: *EnrichmentRuntime,
+    alloc: Allocator,
+    dense_embedder: embedder_mod.DenseEmbedder,
+    embedding_name: []const u8,
+    texts: []const []const u8,
+    dims: u32,
+) ![]const []const f32 {
+    const stats = textBatchByteStats(texts);
+    noteEmbedBatchStarted(runtime, texts.len, stats.total_bytes, stats.max_bytes);
+    const started_ns = runtime.config.clock.nowRealtimeNs();
+    const vectors = dense_embedder.embedDenseBatch(alloc, embedding_name, texts, dims) catch |err| {
+        noteEmbedBatchFinished(runtime, texts.len, stats.total_bytes, stats.max_bytes, elapsedNsSince(runtime, started_ns), false);
+        return err;
+    };
+    if (vectors.len != texts.len) {
+        embedder_mod.freeDenseEmbeddingBatch(alloc, vectors);
+        noteEmbedBatchFinished(runtime, texts.len, stats.total_bytes, stats.max_bytes, elapsedNsSince(runtime, started_ns), false);
+        return error.InvalidEmbeddingResponse;
+    }
+    noteEmbedBatchFinished(runtime, texts.len, stats.total_bytes, stats.max_bytes, elapsedNsSince(runtime, started_ns), true);
+    return vectors;
+}
+
+pub fn embedDensePartsTracked(
+    runtime: *EnrichmentRuntime,
+    alloc: Allocator,
+    dense_embedder: embedder_mod.DenseEmbedder,
+    embedding_name: []const u8,
+    parts: []const template.ContentPart,
+    dims: u32,
+) ![]f32 {
+    var total_bytes: usize = 0;
+    var max_bytes: usize = 0;
+    for (parts) |part| {
+        const bytes = switch (part) {
+            .text => |text| text.len,
+            .media_url => |url| url.len,
+            .binary => |binary| binary.data.len,
+        };
+        total_bytes +|= bytes;
+        max_bytes = @max(max_bytes, bytes);
+    }
+    noteEmbedBatchStarted(runtime, 1, total_bytes, max_bytes);
+    const started_ns = runtime.config.clock.nowRealtimeNs();
+    const vector = dense_embedder.embedDenseParts(alloc, embedding_name, parts, dims) catch |err| {
+        noteEmbedBatchFinished(runtime, 1, total_bytes, max_bytes, elapsedNsSince(runtime, started_ns), false);
+        return err;
+    };
+    noteEmbedBatchFinished(runtime, 1, total_bytes, max_bytes, elapsedNsSince(runtime, started_ns), true);
+    return vector;
+}
+
 fn boundedTextBatchEnd(texts: []const []const u8, start: usize, max_items: usize, max_bytes: usize) usize {
     var end = start;
     var bytes: usize = 0;
@@ -3767,7 +3842,10 @@ pub fn completeDocumentExtractionGeneratedTextForRequest(
     source_content_type: []const u8,
     extraction: *document_extraction_mod.Result,
 ) !void {
-    const producer = runtime.config.asset_producer orelse return;
+    const generated_text_enabled = document_extraction_mod.ocrEnabledForRoute(config, extraction.route_type) or
+        config.transcription_enabled;
+    if (!generated_text_enabled) return;
+    const producer = runtime.config.asset_producer orelse return error.MissingAssetProducer;
     const batch_policy = requestGeneratedTextBatchPolicy(alloc, request);
     try completeRuntimeDocumentExtractionGeneratedTextBatch(runtime, alloc, producer, config, batch_policy, source_url, source_bytes, extraction.route_type, source_content_type, extraction.units, .ocr, null);
     try completeRuntimeDocumentExtractionGeneratedTextBatch(runtime, alloc, producer, config, batch_policy, source_url, source_bytes, extraction.route_type, source_content_type, extraction.units, .transcript, null);
@@ -10715,6 +10793,8 @@ test "synchronous document extraction OCR batches honor request execution item c
 
     var fake = FakeProducer{};
     const producer = fake.producer();
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{});
+    defer resource_manager.deinit(alloc);
     var runtime = EnrichmentRuntime{
         .alloc = alloc,
         .io_impl = null,
@@ -10727,7 +10807,10 @@ test "synchronous document extraction OCR batches honor request execution item c
         .write_fn = undefined,
         .notify_ctx = undefined,
         .notify_fn = undefined,
-        .config = .{ .asset_producer = producer },
+        .config = .{
+            .asset_producer = producer,
+            .resource_manager = &resource_manager,
+        },
         .ownership = undefined,
     };
 

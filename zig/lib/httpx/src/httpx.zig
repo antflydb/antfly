@@ -141,6 +141,7 @@ pub const Response = response.Response;
 pub const ResponseBuilder = response.ResponseBuilder;
 
 pub const Socket = socket.Socket;
+pub const Address = socket.Address;
 pub const TcpListener = socket.TcpListener;
 pub const UdpSocket = socket.UdpSocket;
 
@@ -202,6 +203,7 @@ pub const WriterProgressCallback = client_mod.WriterProgressCallback;
 pub const Interceptor = client_mod.Interceptor;
 pub const RequestInterceptor = client_mod.RequestInterceptor;
 pub const ResponseInterceptor = client_mod.ResponseInterceptor;
+pub const ResolvedAddressValidator = client_mod.ResolvedAddressValidator;
 
 pub const ConnectionPool = pool.ConnectionPool;
 pub const PoolConfig = pool.PoolConfig;
@@ -266,7 +268,6 @@ pub fn any(allocator: std.mem.Allocator, client: *Client, specs: []const Request
 pub fn race(allocator: std.mem.Allocator, client: *Client, specs: []const RequestSpec) !RequestResult {
     return concurrency.race(allocator, client, specs);
 }
-
 
 /// Convenience function to create a GET request.
 pub fn get(allocator: std.mem.Allocator, io: std.Io, url: []const u8) !Response {
