@@ -1184,6 +1184,7 @@ pub fn build(b: *std.Build) void {
     const sanitize_thread = b.option(bool, "sanitize-thread", "Enable ThreadSanitizer for the Antfly runtime") orelse false;
     const include_ha_tests_in_aggregates = b.option(bool, "ha-tests", "Include hot-standby HA suites in aggregate test steps") orelse true;
     const edition = b.option(BuildEdition, "edition", "Build edition: full or inference") orelse .full;
+    const cli_focused_root = b.option(bool, "cli-focused-root", "Build the full CLI against its focused Antfly facade") orelse false;
     const antfly_bin_name = b.option([]const u8, "antfly-bin-name", "Installed filename for the top-level Antfly CLI") orelse "antfly";
     if (antfly_bin_name.len == 0 or std.mem.indexOfAny(u8, antfly_bin_name, "/\\") != null) {
         @panic("-Dantfly-bin-name must be a non-empty filename, not a path");
@@ -1844,6 +1845,17 @@ pub fn build(b: *std.Build) void {
         antfly_imports.configure(b, test_mod.*, true, true);
     }
 
+    const cli_lib_mod = if (cli_focused_root) blk: {
+        const mod = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly/src/cli_root.zig"),
+            .target = target,
+            .optimize = optimize,
+            .sanitize_thread = sanitize_thread,
+        });
+        antfly_imports.configure(b, mod, false, link_libc);
+        break :blk mod;
+    } else lib_mod;
+
     const raft_sim_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/raft_sim_test_root.zig"),
         .target = target,
@@ -1901,6 +1913,17 @@ pub fn build(b: *std.Build) void {
     usermgr_storage_lib_mod.addImport("antfly_root", lib_mod);
     usermgr_storage_lib_mod.addImport("antfly_platform", platform_mod);
     lib_mod.addImport("usermgr_storage", usermgr_storage_lib_mod);
+
+    if (cli_focused_root) {
+        const cli_usermgr_storage_mod = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        cli_usermgr_storage_mod.addImport("antfly_root", cli_lib_mod);
+        cli_usermgr_storage_mod.addImport("antfly_platform", platform_mod);
+        cli_lib_mod.addImport("usermgr_storage", cli_usermgr_storage_mod);
+    }
 
     const usermgr_storage_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
@@ -8577,7 +8600,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .sanitize_thread = sanitize_thread,
         });
-        mod.addImport("antfly-zig", lib_mod);
+        mod.addImport("antfly-zig", cli_lib_mod);
         mod.addImport("antfly-client", antfly_client_pkg_mod);
         mod.addImport("httpx", httpx_mod);
         mod.addImport("antfly_vellum", vellum_mod);
