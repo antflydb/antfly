@@ -1196,7 +1196,6 @@ pub fn build(b: *std.Build) void {
     const cli_focused_root = b.option(bool, "cli-focused-root", "Build the full CLI against its focused Antfly facade") orelse false;
     const runtime_artifact_role = b.option(RuntimeArtifactRole, "runtime-artifact-role", "Build one focused server runtime artifact: data, inference, metadata, or standalone");
     const linked_runtime_libraries = b.option(bool, "linked-runtime-libraries", "Code-generate server runtimes separately and link them into one executable") orelse false;
-    const standalone_embedded_inference = b.option(bool, "standalone-embedded-inference", "Compile the embedded inference node into the standalone runtime") orelse true;
     const antfly_bin_name = b.option([]const u8, "antfly-bin-name", "Installed filename for the top-level Antfly CLI") orelse "antfly";
     if (linked_runtime_libraries and edition != .full) {
         @panic("-Dlinked-runtime-libraries=true requires -Dedition=full");
@@ -1706,7 +1705,7 @@ pub fn build(b: *std.Build) void {
     const inference_chunker_mod = inference_graph.inference_chunker_mod;
     const inference_server_mod = inference_graph.inference_mod;
     const standalone_runtime_options = b.addOptions();
-    standalone_runtime_options.addOption(bool, "embedded_inference", standalone_embedded_inference);
+    standalone_runtime_options.addOption(bool, "linked_inference", linked_runtime_libraries);
 
     const hf_tokenizer_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -8686,6 +8685,15 @@ pub fn build(b: *std.Build) void {
                 .name = b.fmt("antfly-runtime-{s}", .{@tagName(role)}),
                 .root_module = role_mod,
                 .linkage = .static,
+                // Zig's build runner uses these claims to run as many LLVM
+                // codegen steps concurrently as fit in available RAM. The
+                // focused ARM64 ReleaseFast measurements peaked near 10 GiB
+                // for data/metadata; inference receives extra headroom for
+                // the standalone provider and route adapters it also owns.
+                .max_rss = switch (role) {
+                    .inference => 18 * 1024 * 1024 * 1024,
+                    .data, .metadata, .standalone => 13 * 1024 * 1024 * 1024,
+                },
             });
             if (strip) {
                 var visited = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);

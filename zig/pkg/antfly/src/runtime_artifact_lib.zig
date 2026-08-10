@@ -20,6 +20,7 @@ const std = @import("std");
 const platform = @import("antfly_platform");
 const bridge = @import("runtime_bridge.zig");
 const role_options = @import("runtime_artifact_options");
+const standalone_inference_bridge = @import("standalone/inference_bridge.zig");
 
 const runtime = switch (role_options.role) {
     .data => @import("data/runtime.zig"),
@@ -27,6 +28,10 @@ const runtime = switch (role_options.role) {
     .metadata => @import("metadata/runtime.zig"),
     .standalone => @import("standalone/runtime.zig"),
 };
+const standalone_runtime = if (role_options.role == .inference)
+    @import("standalone/runtime.zig")
+else
+    struct {};
 
 // The user-manager storage adapter deliberately imports these through the
 // compilation root so it shares their exact Zig type identity.
@@ -53,6 +58,47 @@ fn runtimeEntry(context: *const bridge.Context) callconv(.c) c_int {
 
 comptime {
     @export(&runtimeEntry, .{ .name = "antfly_runtime_" ++ @tagName(role_options.role) });
+    if (role_options.role == .inference) {
+        @export(&standaloneInferenceCreate, .{ .name = "antfly_standalone_inference_create" });
+        @export(&standaloneInferenceConfigure, .{ .name = "antfly_standalone_inference_configure" });
+        @export(&standaloneInferenceProvider, .{ .name = "antfly_standalone_inference_provider" });
+        @export(&standaloneInferenceRegisterRoutes, .{ .name = "antfly_standalone_inference_register_routes" });
+        @export(&standaloneInferenceDestroy, .{ .name = "antfly_standalone_inference_destroy" });
+    }
+}
+
+fn standaloneInferenceCreate(context: *const standalone_inference_bridge.CreateContext) callconv(.c) c_int {
+    context.out_handle.* = standalone_runtime.linkedInferenceCreate(context) catch |err| {
+        return reportStandaloneInferenceFailure("create", err);
+    };
+    return 0;
+}
+
+fn standaloneInferenceConfigure(context: *const standalone_inference_bridge.ConfigureContext) callconv(.c) c_int {
+    standalone_runtime.linkedInferenceConfigure(context) catch |err| {
+        return reportStandaloneInferenceFailure("configure", err);
+    };
+    return 0;
+}
+
+fn standaloneInferenceProvider(context: *const standalone_inference_bridge.ProviderContext) callconv(.c) void {
+    standalone_runtime.linkedInferenceProvider(context);
+}
+
+fn standaloneInferenceRegisterRoutes(context: *const standalone_inference_bridge.RoutesContext) callconv(.c) c_int {
+    standalone_runtime.linkedInferenceRegisterRoutes(context) catch |err| {
+        return reportStandaloneInferenceFailure("register_routes", err);
+    };
+    return 0;
+}
+
+fn standaloneInferenceDestroy(handle: *anyopaque) callconv(.c) void {
+    standalone_runtime.linkedInferenceDestroy(handle);
+}
+
+fn reportStandaloneInferenceFailure(comptime operation: []const u8, err: anyerror) c_int {
+    std.log.err("standalone inference bridge failed operation={s} err={}", .{ operation, err });
+    return 1;
 }
 
 fn runtimeInit(init: std.process.Init) std.process.Init {
