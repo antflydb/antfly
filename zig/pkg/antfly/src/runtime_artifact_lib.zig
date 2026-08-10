@@ -35,7 +35,7 @@ const storage_kernel_exports = if (unit_options.unit == .distributed)
 else
     struct {};
 
-const cli_runtime = if (unit_options.unit == .distributed) @import("cli_runtime.zig") else struct {};
+const cli_runtime = if (unit_options.unit == .cli) @import("cli_runtime.zig") else struct {};
 const data_runtime = if (unit_options.unit == .distributed) @import("data/runtime.zig") else struct {};
 const metadata_runtime = if (unit_options.unit == .distributed) @import("metadata/runtime.zig") else struct {};
 const serverless_runtime = if (unit_options.unit == .distributed) @import("cmd/serverless.zig") else struct {};
@@ -45,8 +45,8 @@ const inference_runtime = if (unit_options.unit == .inference) @import("inferenc
 // until the shared storage kernel removes that duplicated LLVM work.
 const standalone_runtime = if (unit_options.unit == .distributed) @import("standalone/runtime.zig") else struct {};
 // Lite's non-server commands share storage types with standalone, while
-// `lite serve` directly enters that runtime. Co-locating Lite, CLI, and the
-// server roles gives them one storage type identity and one LLVM unit.
+// `lite serve` directly enters that runtime. Co-locating Lite and the server
+// roles gives them one storage type identity and one LLVM unit.
 const lite_runtime = if (unit_options.unit == .distributed)
     @import("cmd/lite.zig")
 else
@@ -188,7 +188,6 @@ comptime {
             // declarations roots of this PIC archive. The executable and both
             // C ABI library names link this exact compiled artifact.
             _ = storage_kernel_exports;
-            exportInternal(&cliEntry, "antfly_runtime_cli");
             exportInternal(&dataEntry, "antfly_runtime_data");
             exportInternal(&metadataEntry, "antfly_runtime_metadata");
             exportInternal(&serverlessEntry, "antfly_runtime_serverless");
@@ -203,6 +202,9 @@ comptime {
             exportInternal(&standaloneInferenceProvider, "antfly_standalone_inference_provider");
             exportInternal(&standaloneInferenceRegisterRoutes, "antfly_standalone_inference_register_routes");
             exportInternal(&standaloneInferenceDestroy, "antfly_standalone_inference_destroy");
+        },
+        .cli => {
+            exportInternal(&cliEntry, "antfly_runtime_cli");
         },
     }
 }

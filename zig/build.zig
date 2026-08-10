@@ -49,10 +49,10 @@ const RuntimeArtifactRole = enum {
 
 const RuntimeLibraryUnit = enum {
     api_kernel,
-    // CLI shares enough of the storage graph with the distributed roles that
-    // co-generation shortens the measured ReleaseFast critical path.
     distributed,
     inference,
+    // Remote/client commands do not own storage or server runtimes.
+    cli,
 };
 
 const snowball_languages = [_][]const u8{
@@ -183,6 +183,40 @@ const DelegatedInferenceBuildSteps = struct {
 fn dependOnAll(step: *std.Build.Step, dependencies: []const *std.Build.Step) void {
     for (dependencies) |dependency| {
         step.dependOn(dependency);
+    }
+}
+
+fn assignDefaultAggregateMaxRss(
+    b: *std.Build,
+    root: *std.Build.Step,
+    compile_max_rss: usize,
+    run_max_rss: usize,
+) void {
+    var visited = std.AutoHashMap(*std.Build.Step, void).init(b.allocator);
+    defer visited.deinit();
+    assignDefaultAggregateMaxRssRecursive(root, compile_max_rss, run_max_rss, &visited);
+}
+
+fn assignDefaultAggregateMaxRssRecursive(
+    step: *std.Build.Step,
+    compile_max_rss: usize,
+    run_max_rss: usize,
+    visited: *std.AutoHashMap(*std.Build.Step, void),
+) void {
+    const entry = visited.getOrPut(step) catch @panic("OOM");
+    if (entry.found_existing) return;
+    if (step.max_rss == 0) switch (step.id) {
+        .compile => step.max_rss = compile_max_rss,
+        .run => step.max_rss = run_max_rss,
+        else => {},
+    };
+    for (step.dependencies.items) |dependency| {
+        assignDefaultAggregateMaxRssRecursive(
+            dependency,
+            compile_max_rss,
+            run_max_rss,
+            visited,
+        );
     }
 }
 
@@ -6806,18 +6840,148 @@ pub fn build(b: *std.Build) void {
     const derived_log_test_step = b.step("derived-log-test", "Run storage/db/derived/derived_log unit tests");
     derived_log_test_step.dependOn(&run_derived_log_unit_tests.step);
 
-    // Keep the default root coverage in bounded compile/run artifacts. A
-    // single union of API, storage, and metadata tests creates a very large
-    // process whose startup competes with the compiler's resident pages on CI.
-    // Reuse the focused compile artifacts and partition overlaps at runtime so
-    // each selected test still executes exactly once.
-    const run_unit_storage_tests = b.addRunArtifact(lib_storage_tests);
-    addRuntimeTestFilters(b, run_unit_storage_tests, lib_storage_runtime_filters);
-    addRuntimeSkipTestFilters(run_unit_storage_tests, lib_unit_filters);
-    for (root_test_skip_filters) |filter| {
-        run_unit_storage_tests.addArgs(&.{ "--skip-test-filter", filter });
+    // The root storage filter used to produce one roughly 2,400-test codegen
+    // unit. Split it by implementation domain so CI never has to retain the
+    // complete DB, HA, LSM, Lite, and storage utility test graph in one compiler
+    // process. These compile-time prefixes are disjoint; the existing runtime
+    // filters below continue to own overlap and caller-selected filtering.
+    const unit_storage_shard_filters = [_][]const []const u8{
+        &.{"storage.db.algebraic."},
+        &.{
+            "storage.db.derived.",
+            "storage.db.enrichment.",
+        },
+        &.{
+            "storage.db.catalog.",
+            "storage.db.maintenance.",
+            "storage.db.query.",
+        },
+        &.{
+            "storage.db.aggregations.",
+            "storage.db.apply_rw_lock.",
+            "storage.db.artifact_ids.",
+            "storage.db.backfill_state.",
+            "storage.db.batcher.",
+            "storage.db.config.",
+            "storage.db.db.",
+            "storage.db.dense_exact.",
+            "storage.db.doc_filter_wire.",
+            "storage.db.doc_identity.",
+            "storage.db.doc_set.",
+            "storage.db.document_mapper.",
+            "storage.db.document_query.",
+            "storage.db.generation_lifecycle.",
+            "storage.db.lease.",
+            "storage.db.mod.",
+            "storage.db.ownership.",
+            "storage.db.planning_stats.",
+            "storage.db.promotion_runtime.",
+            "storage.db.query_metrics.",
+            "storage.db.range_state.",
+            "storage.db.resolution_runtime.",
+            "storage.db.root_identity.",
+            "storage.db.template_remote_stub.",
+            "storage.db.template_stub.",
+            "storage.db.transform.",
+            "storage.db.typed_doc_values_coverage.",
+            "storage.db.types.",
+        },
+        &.{"storage.ha."},
+        &.{
+            "storage.lite.",
+            "storage.lsm.",
+            "storage.lsm_backend.",
+            "storage.lsm_backend_sim_test.",
+        },
+        &.{
+            "storage.backend_adapter.",
+            "storage.backend_conformance_test.",
+            "storage.backend_erased.",
+            "storage.backend_types.",
+            "storage.background_runtime.",
+            "storage.backup_codec.",
+            "storage.coverage_identity.",
+            "storage.derived_log_test_root.",
+            "storage.docstore.",
+            "storage.enrichment.",
+            "storage.filesystem_capacity.",
+            "storage.hbc_adapter.",
+            "storage.internal_keys.",
+            "storage.lmdb.",
+            "storage.lmdb_backend.",
+            "storage.maintenance.",
+            "storage.mem_backend.",
+            "storage.object_storage.",
+            "storage.persistent.",
+            "storage.portable_backup.",
+            "storage.resource_manager.",
+            "storage.schema.",
+            "storage.shard.",
+            "storage.sim_runtime.",
+            "storage.transactions.",
+            "storage.ttl.",
+            "storage.wal.",
+        },
+    };
+    const unit_storage_shard_names = [_][]const u8{
+        "storage-algebraic-tests",
+        "storage-derived-enrichment-tests",
+        "storage-query-catalog-tests",
+        "storage-db-core-tests",
+        "storage-ha-tests",
+        "storage-lsm-lite-tests",
+        "storage-utility-tests",
+    };
+    const unit_storage_shard_max_rss = [_]usize{
+        4 * 1024 * 1024 * 1024,
+        5 * 1024 * 1024 * 1024,
+        5 * 1024 * 1024 * 1024,
+        8 * 1024 * 1024 * 1024,
+        5 * 1024 * 1024 * 1024,
+        4 * 1024 * 1024 * 1024,
+        5 * 1024 * 1024 * 1024,
+    };
+    const unit_storage_sharded_test_step = b.step(
+        "unit-storage-test",
+        "Run the storage portion of the default unit-test target in bounded codegen shards",
+    );
+    const storage_runtime_filter_is_default =
+        lib_storage_runtime_filters.len == 1 and
+        std.mem.eql(u8, lib_storage_runtime_filters[0], "storage.");
+    var unit_storage_tail: ?*std.Build.Step = null;
+    for (
+        unit_storage_shard_filters,
+        unit_storage_shard_names,
+        unit_storage_shard_max_rss,
+    ) |shard_filters, shard_name, shard_max_rss| {
+        if (!include_ha_tests_in_aggregates and std.mem.eql(u8, shard_name, "storage-ha-tests")) {
+            continue;
+        }
+        const unit_storage_tests = b.addTest(.{
+            .name = shard_name,
+            .root_module = lib_test_mod,
+            .filters = shard_filters,
+            .test_runner = .{
+                .path = b.path("pkg/antfly/src/test_runner.zig"),
+                .mode = .simple,
+            },
+            .max_rss = shard_max_rss,
+        });
+        if (unit_storage_tail) |previous| unit_storage_tests.step.dependOn(previous);
+        const run_unit_storage_tests = b.addRunArtifact(unit_storage_tests);
+        addRuntimeTestFilters(b, run_unit_storage_tests, lib_storage_runtime_filters);
+        if (!storage_runtime_filter_is_default) {
+            run_unit_storage_tests.addArg("--allow-empty-test-filter");
+        }
+        addRuntimeSkipTestFilters(run_unit_storage_tests, lib_unit_filters);
+        for (root_test_skip_filters) |filter| {
+            run_unit_storage_tests.addArgs(&.{ "--skip-test-filter", filter });
+        }
+        addRuntimeSkipTestFilters(run_unit_storage_tests, &release_scale_test_filters);
+        unit_test_step.dependOn(&run_unit_storage_tests.step);
+        unit_storage_sharded_test_step.dependOn(&run_unit_storage_tests.step);
+        unit_storage_tail = &run_unit_storage_tests.step;
     }
-    addRuntimeSkipTestFilters(run_unit_storage_tests, &release_scale_test_filters);
 
     // The complete metadata namespace pulls in the simulation harness and a
     // large amount of control-plane code even though the default unit target
@@ -6874,14 +7038,25 @@ pub fn build(b: *std.Build) void {
         "metadata-replication-backfill-tests",
         "metadata-storage-tests",
     };
+    const unit_metadata_shard_max_rss = [_]usize{
+        5 * 1024 * 1024 * 1024,
+        5 * 1024 * 1024 * 1024,
+        5 * 1024 * 1024 * 1024,
+        5 * 1024 * 1024 * 1024,
+        5 * 1024 * 1024 * 1024,
+        5 * 1024 * 1024 * 1024,
+        6 * 1024 * 1024 * 1024,
+    };
     const metadata_runtime_filter_is_default =
         lib_metadata_runtime_filters.len == 1 and
         std.mem.eql(u8, lib_metadata_runtime_filters[0], "metadata.");
+    var unit_metadata_tail: ?*std.Build.Step = null;
     for (
         unit_metadata_shard_filters,
         unit_metadata_shard_names,
         metadata_unit_test_mods,
-    ) |shard_filters, shard_name, test_mod| {
+        unit_metadata_shard_max_rss,
+    ) |shard_filters, shard_name, test_mod, shard_max_rss| {
         const unit_metadata_tests = b.addTest(.{
             .name = shard_name,
             .root_module = test_mod,
@@ -6890,7 +7065,9 @@ pub fn build(b: *std.Build) void {
                 .path = b.path("pkg/antfly/src/test_runner.zig"),
                 .mode = .simple,
             },
+            .max_rss = shard_max_rss,
         });
+        if (unit_metadata_tail) |previous| unit_metadata_tests.step.dependOn(previous);
         const run_unit_metadata_tests = b.addRunArtifact(unit_metadata_tests);
         const runtime_filters = if (metadata_runtime_filter_is_default)
             shard_filters
@@ -6909,6 +7086,7 @@ pub fn build(b: *std.Build) void {
             run_unit_metadata_tests.addArgs(&.{ "--skip-test-filter", filter });
         }
         unit_test_step.dependOn(&run_unit_metadata_tests.step);
+        unit_metadata_tail = &run_unit_metadata_tests.step;
 
         // The standalone metadata step owns its selected metadata tests. Use a
         // separate run policy so a caller filter is not mistaken for the root
@@ -6937,7 +7115,6 @@ pub fn build(b: *std.Build) void {
         &run_api_json_helpers_tests.step,
         &run_antfly_client_pkg_tests.step,
         &run_lib_unit_tests.step,
-        &run_unit_storage_tests.step,
         &run_sparse_unit_tests.step,
     });
 
@@ -8719,6 +8896,8 @@ pub fn build(b: *std.Build) void {
     });
 
     if (linked_runtime_libraries) {
+        var api_runtime_artifact: ?*std.Build.Step.Compile = null;
+        var distributed_runtime_artifact: ?*std.Build.Step.Compile = null;
         inline for (std.meta.tags(RuntimeLibraryUnit)) |unit| {
             const unit_options = b.addOptions();
             unit_options.addOption(RuntimeLibraryUnit, "unit", unit);
@@ -8754,8 +8933,19 @@ pub fn build(b: *std.Build) void {
                     .api_kernel => 5 * 1024 * 1024 * 1024,
                     .distributed => 11 * 1024 * 1024 * 1024,
                     .inference => 8 * 1024 * 1024 * 1024,
+                    .cli => 3 * 1024 * 1024 * 1024,
                 },
             });
+            // Dependency traversal is randomized in Zig 0.16. Preserve the
+            // measured bounded-memory schedule explicitly: API overlaps the
+            // application/storage unit, inference starts after API, and the
+            // short CLI unit starts after application/storage.
+            switch (unit) {
+                .api_kernel => api_runtime_artifact = role_artifact,
+                .distributed => distributed_runtime_artifact = role_artifact,
+                .inference => role_artifact.step.dependOn(&api_runtime_artifact.?.step),
+                .cli => role_artifact.step.dependOn(&distributed_runtime_artifact.?.step),
+            }
             if (unit == .distributed) {
                 // The executable and C ABI libraries share this one optimized
                 // PIC object. Give the final links enough section granularity
@@ -8836,6 +9026,17 @@ pub fn build(b: *std.Build) void {
     const antfly_main_test_step = b.step("antfly-main-test", "Run top-level Antfly CLI tests");
     antfly_main_test_step.dependOn(&run_antfly_main_tests.step);
     unit_test_step.dependOn(&run_antfly_main_tests.step);
+
+    // The aggregate intentionally runs with normal CPU concurrency. Give every
+    // compile step a conservative scheduler claim unless it already has a
+    // measured, domain-specific claim above; CI supplies the cgroup-aware
+    // aggregate budget through --maxrss.
+    assignDefaultAggregateMaxRss(
+        b,
+        unit_test_step,
+        7 * 1024 * 1024 * 1024,
+        6 * 1024 * 1024 * 1024,
+    );
 
     const install_antfly = b.addInstallArtifact(antfly_main, .{ .dest_sub_path = antfly_bin_name });
     const install_antfarm_assets = b.addInstallDirectory(.{
