@@ -40,9 +40,13 @@ const BuildEdition = enum {
 };
 
 const RuntimeArtifactRole = enum {
+    client,
     data,
+    ha,
     inference,
+    lite,
     metadata,
+    serverless,
     standalone,
 };
 
@@ -8619,15 +8623,22 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .sanitize_thread = sanitize_thread,
         });
-        mod.addImport("antfly-zig", cli_lib_mod);
         mod.addImport("antfly-client", antfly_client_pkg_mod);
-        mod.addImport("httpx", httpx_mod);
-        mod.addImport("antfly_vellum", vellum_mod);
-        mod.addImport("raft_engine", raft_engine_mod);
-        mod.addImport("structlog", structlog_mod);
-        mod.addImport("antfly_platform", platform_mod);
-        mod.addImport("handlebars", handlebars_mod);
-        mod.addOptions("build_options", build_options);
+        if (linked_runtime_libraries) {
+            mod.addImport("structlog", structlog_mod);
+            mod.addImport("antfly_platform", platform_mod);
+            mod.addOptions("build_options", build_options);
+        } else {
+            antfly_imports.configure(b, mod, false, link_libc);
+            const main_usermgr_storage_mod = b.createModule(.{
+                .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
+                .target = target,
+                .optimize = optimize,
+            });
+            main_usermgr_storage_mod.addImport("antfly_root", mod);
+            main_usermgr_storage_mod.addImport("antfly_platform", platform_mod);
+            mod.addImport("usermgr_storage", main_usermgr_storage_mod);
+        }
         mod.addOptions("linked_runtime_options", linked_runtime_options);
         break :blk mod;
     } else blk: {
@@ -8671,6 +8682,7 @@ pub fn build(b: *std.Build) void {
                 .sanitize_thread = sanitize_thread,
             });
             antfly_imports.configure(b, role_mod, false, link_libc);
+            role_mod.addImport("antfly-client", antfly_client_pkg_mod);
             role_mod.addOptions("runtime_artifact_options", role_options);
             const role_usermgr_storage_mod = b.createModule(.{
                 .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
@@ -8692,7 +8704,8 @@ pub fn build(b: *std.Build) void {
                 // the standalone provider and route adapters it also owns.
                 .max_rss = switch (role) {
                     .inference => 18 * 1024 * 1024 * 1024,
-                    .data, .metadata, .standalone => 13 * 1024 * 1024 * 1024,
+                    .ha => 8 * 1024 * 1024 * 1024,
+                    .client, .data, .lite, .metadata, .serverless, .standalone => 13 * 1024 * 1024 * 1024,
                 },
             });
             if (strip) {
@@ -8715,6 +8728,7 @@ pub fn build(b: *std.Build) void {
             .sanitize_thread = sanitize_thread,
         });
         antfly_imports.configure(b, role_mod, false, link_libc);
+        role_mod.addImport("antfly-client", antfly_client_pkg_mod);
         role_mod.addOptions("runtime_artifact_options", role_options);
         const role_usermgr_storage_mod = b.createModule(.{
             .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),

@@ -14,14 +14,20 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
-const antfly = @import("antfly-zig");
 const structlog = @import("structlog");
 const cmd = @import("cmd/mod.zig");
 const httpx = @import("httpx");
 const antfly_client = @import("antfly-client");
 const platform = @import("antfly_platform");
+const build_options = @import("build_options");
 const linked_runtime_options = @import("linked_runtime_options");
 const runtime_bridge = @import("runtime_bridge.zig");
+
+// usermgr/storage_imports.zig depends back on these through the executable
+// root in the monolithic diagnostic control. They stay unreferenced in the
+// linked dispatcher, so that build does not pull either storage graph in.
+pub const storage_backend_erased = @import("storage/backend_erased.zig");
+pub const lsm_backend = @import("storage/lsm_backend/mod.zig");
 
 const antfly_cloud_binary = "antfly-cloud";
 
@@ -30,16 +36,18 @@ pub const std_options: std.Options = .{
 };
 
 pub fn main(init: std.process.Init) void {
-    mainImpl(init) catch |err| {
-        const message = switch (err) {
-            error.FileNotFound => "required file was not found; check the configured path",
-            error.AddressInUse => "listen address is already in use",
-            error.InvalidCharacter, error.InvalidArguments => "invalid command-line value; run with --help",
-            else => "startup failed; see the preceding diagnostic for details",
-        };
-        std.debug.print("antfly: {s}\n", .{message});
-        std.process.exit(1);
+    mainImpl(init) catch |err| failMain(err);
+}
+
+fn failMain(err: anyerror) noreturn {
+    const message = switch (err) {
+        error.FileNotFound => "required file was not found; check the configured path",
+        error.AddressInUse => "listen address is already in use",
+        error.InvalidCharacter, error.InvalidArguments => "invalid command-line value; run with --help",
+        else => "startup failed; see the preceding diagnostic for details",
     };
+    std.debug.print("antfly: {s}\n", .{message});
+    std.process.exit(1);
 }
 
 fn mainImpl(init: std.process.Init) !void {
@@ -65,19 +73,22 @@ fn mainImpl(init: std.process.Init) !void {
 
     // Server-side subcommands
     if (comptime linked_runtime_options.enabled) {
-        if (std.mem.eql(u8, subcommand, "data")) return runLinkedRuntime(.data, init, &args);
-        if (std.mem.eql(u8, subcommand, "inference")) return runLinkedRuntime(.inference, init, &args);
-        if (std.mem.eql(u8, subcommand, "metadata")) return runLinkedRuntime(.metadata, init, &args);
-        if (std.mem.eql(u8, subcommand, "standalone")) return runLinkedRuntime(.standalone, init, &args);
+        if (std.mem.eql(u8, subcommand, "data")) return runLinkedRuntime(.data, subcommand, init, &args);
+        if (std.mem.eql(u8, subcommand, "ha")) return runLinkedRuntime(.ha, subcommand, init, &args);
+        if (std.mem.eql(u8, subcommand, "inference")) return runLinkedRuntime(.inference, subcommand, init, &args);
+        if (std.mem.eql(u8, subcommand, "lite")) return runLinkedRuntime(.lite, subcommand, init, &args);
+        if (std.mem.eql(u8, subcommand, "metadata")) return runLinkedRuntime(.metadata, subcommand, init, &args);
+        if (std.mem.eql(u8, subcommand, "serverless")) return runLinkedRuntime(.serverless, subcommand, init, &args);
+        if (std.mem.eql(u8, subcommand, "standalone")) return runLinkedRuntime(.standalone, subcommand, init, &args);
     } else {
         if (std.mem.eql(u8, subcommand, "data")) return try cmd.data.runFromIterator(runtimeInit(init), argv0, &args);
         if (std.mem.eql(u8, subcommand, "inference")) return try cmd.inference.runFromIterator(runtimeInit(init), argv0, &args);
         if (std.mem.eql(u8, subcommand, "metadata")) return try cmd.metadata.runFromIterator(runtimeInit(init), argv0, &args);
         if (std.mem.eql(u8, subcommand, "standalone")) return try cmd.standalone.runFromIterator(runtimeInit(init), argv0, &args);
+        if (std.mem.eql(u8, subcommand, "serverless")) return try cmd.serverless.runFromIterator(runtimeInit(init), argv0, &args);
+        if (std.mem.eql(u8, subcommand, "lite")) return try cmd.lite.runFromIterator(runtimeInit(init), argv0, &args);
+        if (std.mem.eql(u8, subcommand, "ha")) return try cmd.ha.runFromIterator(runtimeInit(init), argv0, &args);
     }
-    if (std.mem.eql(u8, subcommand, "serverless")) return try cmd.serverless.runFromIterator(runtimeInit(init), argv0, &args);
-    if (std.mem.eql(u8, subcommand, "lite")) return try cmd.lite.runFromIterator(runtimeInit(init), argv0, &args);
-    if (std.mem.eql(u8, subcommand, "ha")) return try cmd.ha.runFromIterator(runtimeInit(init), argv0, &args);
 
     if (std.mem.eql(u8, subcommand, "cloud")) {
         const code = try runAntflyCloud(init.gpa, init.io, &args);
@@ -93,6 +104,8 @@ fn mainImpl(init: std.process.Init) !void {
     };
     for (cli_commands) |cli_cmd| {
         if (std.mem.eql(u8, subcommand, cli_cmd)) {
+            if (comptime linked_runtime_options.enabled)
+                return runLinkedRuntime(.client, subcommand, init, &args);
             if (cliHelpRequested(&args)) {
                 cmd.cli.printCommandUsage(cli_cmd);
                 return;
@@ -109,22 +122,37 @@ fn mainImpl(init: std.process.Init) !void {
     return error.InvalidArguments;
 }
 
-const LinkedRuntimeRole = enum { data, inference, metadata, standalone };
+const LinkedRuntimeRole = enum { client, data, ha, inference, lite, metadata, serverless, standalone };
 
+extern fn antfly_runtime_client(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_data(context: *const runtime_bridge.Context) callconv(.c) c_int;
+extern fn antfly_runtime_ha(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_inference(context: *const runtime_bridge.Context) callconv(.c) c_int;
+extern fn antfly_runtime_lite(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_metadata(context: *const runtime_bridge.Context) callconv(.c) c_int;
+extern fn antfly_runtime_serverless(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_standalone(context: *const runtime_bridge.Context) callconv(.c) c_int;
 
-fn runLinkedRuntime(comptime role: LinkedRuntimeRole, init: std.process.Init, args: *std.process.Args.Iterator) void {
+fn runLinkedRuntime(
+    comptime role: LinkedRuntimeRole,
+    command: []const u8,
+    init: std.process.Init,
+    args: *std.process.Args.Iterator,
+) void {
     const context = runtime_bridge.Context{
         .init = @ptrCast(&init),
         .args = @ptrCast(args),
+        .command_ptr = command.ptr,
+        .command_len = command.len,
     };
     const code = switch (role) {
+        .client => antfly_runtime_client(&context),
         .data => antfly_runtime_data(&context),
+        .ha => antfly_runtime_ha(&context),
         .inference => antfly_runtime_inference(&context),
+        .lite => antfly_runtime_lite(&context),
         .metadata => antfly_runtime_metadata(&context),
+        .serverless => antfly_runtime_serverless(&context),
         .standalone => antfly_runtime_standalone(&context),
     };
     if (code != 0) std.process.exit(@intCast(code));
@@ -256,7 +284,7 @@ fn printUsage(argv0: []const u8) void {
 }
 
 fn printVersion() void {
-    std.debug.print("antfly {s} (zig runtime)\n", .{antfly.build_options.antfly_version});
+    std.debug.print("antfly {s} (zig runtime)\n", .{build_options.antfly_version});
 }
 
 fn runtimeInit(init: std.process.Init) std.process.Init {

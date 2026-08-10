@@ -20,4 +20,6 @@
 pub const Context = extern struct {
     init: *const anyopaque,
     args: *anyopaque,
+    command_ptr: [*]const u8,
+    command_len: usize,
 };

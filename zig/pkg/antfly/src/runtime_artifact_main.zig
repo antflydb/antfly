@@ -20,10 +20,16 @@ const platform = @import("antfly_platform");
 const role_options = @import("runtime_artifact_options");
 const structlog = @import("structlog");
 
-const data_runtime = @import("data/runtime.zig");
-const inference_runtime = @import("inference_runtime/runtime.zig");
-const metadata_runtime = @import("metadata/runtime.zig");
-const standalone_runtime = @import("standalone/runtime.zig");
+const runtime = switch (role_options.role) {
+    .client => @import("client_runtime.zig"),
+    .data => @import("data/runtime.zig"),
+    .ha => @import("cmd/ha.zig"),
+    .inference => @import("inference_runtime/runtime.zig"),
+    .lite => @import("cmd/lite.zig"),
+    .metadata => @import("metadata/runtime.zig"),
+    .serverless => @import("cmd/serverless.zig"),
+    .standalone => @import("standalone/runtime.zig"),
+};
 
 // The user-manager storage adapter deliberately imports these through the
 // compilation root so it shares their exact Zig type identity.
@@ -54,14 +60,13 @@ fn mainImpl(init: std.process.Init) !void {
     defer args.deinit();
     _ = args.next();
 
-    const argv0 = "antfly " ++ @tagName(role_options.role);
     const runtime_init = runtimeInit(init);
-    return switch (role_options.role) {
-        .data => data_runtime.runFromIterator(runtime_init, argv0, &args),
-        .inference => inference_runtime.runFromIterator(runtime_init, argv0, &args),
-        .metadata => metadata_runtime.runFromIterator(runtime_init, argv0, &args),
-        .standalone => standalone_runtime.runFromIterator(runtime_init, argv0, &args),
-    };
+    if (comptime role_options.role == .client) {
+        const command = args.next() orelse return error.InvalidArguments;
+        return runtime.runFromIterator(runtime_init, command, &args);
+    }
+    const argv0 = "antfly";
+    return runtime.runFromIterator(runtime_init, argv0, &args);
 }
 
 fn runtimeInit(init: std.process.Init) std.process.Init {
