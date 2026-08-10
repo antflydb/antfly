@@ -219,6 +219,10 @@ pub const ProvisionedKernelOwnerSource = struct {
             .vtable = &.{
                 .retire_group_for_publication = retireGroupForPublication,
                 .prepare = prepareSnapshot,
+                .prepare_restore = prepareRestore,
+                .reconcile_restore = reconcileRestore,
+                .repair_published_restore = repairPublishedRestore,
+                .promote = promoteSnapshot,
                 .publish_prepared = publishPreparedSnapshot,
                 .commit = commitSnapshot,
                 .rollback = rollbackSnapshot,
@@ -292,6 +296,92 @@ pub const ProvisionedKernelOwnerSource = struct {
             .encoded_snapshot = .fromSlice(request.encoded_snapshot),
         });
         return snapshot.handle orelse error.StorageKernelFailure;
+    }
+
+    const EncodedRestoreRequest = struct {
+        alloc: std.mem.Allocator,
+        manifest_json: []u8,
+        request: abi.RestorePrepareRequest,
+
+        fn deinit(self: *EncodedRestoreRequest) void {
+            self.alloc.free(self.manifest_json);
+            self.* = undefined;
+        }
+    };
+
+    fn encodeRestoreRequest(
+        self: *ProvisionedKernelOwnerSource,
+        request: storage_snapshot_source.RestoreRequest,
+    ) !EncodedRestoreRequest {
+        const manifest_json = try std.json.Stringify.valueAlloc(self.alloc, request.manifest.*, .{
+            .emit_null_optional_fields = false,
+        });
+        return .{
+            .alloc = self.alloc,
+            .manifest_json = manifest_json,
+            .request = .{
+                .path = .fromSlice(request.path),
+                .table_name = .fromSlice(request.table_name),
+                .group_id = request.group_id,
+                .lsm_root_generation = request.lsm_root_generation,
+                .has_identity_namespace = @intFromBool(request.identity != null),
+                .identity_table_id = if (request.identity) |identity| identity.table_id else 0,
+                .identity_shard_id = if (request.identity) |identity| identity.shard_id else 0,
+                .identity_range_id = if (request.identity) |identity| identity.range_id else 0,
+                .backup_root = .fromSlice(request.backup_root),
+                .backup_id = .fromSlice(request.manifest.backup_id),
+                .artifact_backup_id = .fromSlice(request.artifact_backup_id),
+                .source_identity = .fromSlice(request.source_identity),
+                .snapshot_path = .fromSlice(request.shard.snapshot_path),
+                .expected_artifact_size_bytes = request.shard.artifact_size_bytes,
+                .expected_artifact_sha256 = .fromSlice(request.shard.artifact_sha256),
+                .manifest_json = .fromSlice(manifest_json),
+            },
+        };
+    }
+
+    fn prepareRestore(
+        ptr: *anyopaque,
+        request: storage_snapshot_source.RestoreRequest,
+    ) !storage_snapshot_source.RestorePreparation {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        var encoded = try self.encodeRestoreRequest(request);
+        defer encoded.deinit();
+        return switch (try client.Snapshot.prepareRestore(encoded.request)) {
+            .prepared => |snapshot| .{ .prepared = .{
+                .source = self.snapshotSource(),
+                .handle = snapshot.handle orelse return error.StorageKernelFailure,
+            } },
+            .already_imported => .already_imported,
+        };
+    }
+
+    fn reconcileRestore(
+        ptr: *anyopaque,
+        request: storage_snapshot_source.RestoreRequest,
+    ) !void {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        var encoded = try self.encodeRestoreRequest(request);
+        defer encoded.deinit();
+        try client.Snapshot.reconcileRestore(encoded.request);
+    }
+
+    fn repairPublishedRestore(
+        ptr: *anyopaque,
+        request: storage_snapshot_source.RestoreRequest,
+    ) !void {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        var encoded = try self.encodeRestoreRequest(request);
+        defer encoded.deinit();
+        var lease = try self.acquire(request.group_id, request.table_name);
+        defer lease.deinit();
+        try lease.owner().repairRestore(&encoded.request);
+    }
+
+    fn promoteSnapshot(ptr: *anyopaque, snapshot_handle: *anyopaque) !void {
+        _ = ptr;
+        var snapshot = client.Snapshot{ .handle = snapshot_handle };
+        try snapshot.promote();
     }
 
     fn publishPreparedSnapshot(ptr: *anyopaque, snapshot_handle: *anyopaque) !bool {

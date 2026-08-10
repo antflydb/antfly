@@ -17,6 +17,7 @@
 //! catalog validation and generation admission remain in distributed control.
 
 const descriptor_contract = @import("../storage/kernel_owner_descriptor.zig");
+const backup_contract = @import("backup_contract.zig");
 
 pub const PrepareRequest = struct {
     path: []const u8,
@@ -27,6 +28,19 @@ pub const PrepareRequest = struct {
     schema_json: []const u8,
     indexes_json: []const u8,
     encoded_snapshot: []const u8,
+};
+
+pub const RestoreRequest = struct {
+    path: []const u8,
+    table_name: []const u8,
+    group_id: u64,
+    lsm_root_generation: u64,
+    identity: ?descriptor_contract.Identity,
+    backup_root: []const u8,
+    artifact_backup_id: []const u8,
+    source_identity: []const u8,
+    manifest: *const backup_contract.TableBackupManifest,
+    shard: *const backup_contract.ShardSnapshot,
 };
 
 pub const Source = struct {
@@ -43,6 +57,19 @@ pub const Source = struct {
             ptr: *anyopaque,
             request: PrepareRequest,
         ) anyerror!*anyopaque,
+        prepare_restore: *const fn (
+            ptr: *anyopaque,
+            request: RestoreRequest,
+        ) anyerror!RestorePreparation,
+        reconcile_restore: *const fn (
+            ptr: *anyopaque,
+            request: RestoreRequest,
+        ) anyerror!void,
+        repair_published_restore: *const fn (
+            ptr: *anyopaque,
+            request: RestoreRequest,
+        ) anyerror!void,
+        promote: *const fn (ptr: *anyopaque, snapshot: *anyopaque) anyerror!void,
         publish_prepared: *const fn (
             ptr: *anyopaque,
             snapshot: *anyopaque,
@@ -62,12 +89,33 @@ pub const Source = struct {
             .handle = try self.vtable.prepare(self.ptr, request),
         };
     }
+
+    pub fn prepareRestore(self: Source, request: RestoreRequest) !RestorePreparation {
+        return try self.vtable.prepare_restore(self.ptr, request);
+    }
+
+    pub fn reconcileRestore(self: Source, request: RestoreRequest) !void {
+        try self.vtable.reconcile_restore(self.ptr, request);
+    }
+
+    pub fn repairPublishedRestore(self: Source, request: RestoreRequest) !void {
+        try self.vtable.repair_published_restore(self.ptr, request);
+    }
+};
+
+pub const RestorePreparation = union(enum) {
+    prepared: Prepared,
+    already_imported,
 };
 
 pub const Prepared = struct {
     source: Source,
     handle: *anyopaque,
     active: bool = true,
+
+    pub fn promote(self: *Prepared) !void {
+        try self.source.vtable.promote(self.source.ptr, self.handle);
+    }
 
     pub fn publishPrepared(self: *Prepared) !bool {
         return try self.source.vtable.publish_prepared(self.source.ptr, self.handle);

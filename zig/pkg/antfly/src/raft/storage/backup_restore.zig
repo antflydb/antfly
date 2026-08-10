@@ -622,7 +622,7 @@ fn stageRestoreFile(
     return staging_path;
 }
 
-fn cleanupSnapshotsForPublishedRestore(alloc: std.mem.Allocator, path: []const u8) void {
+pub fn cleanupSnapshotsForPublishedRestore(alloc: std.mem.Allocator, path: []const u8) void {
     const snapshot_dir = std.fmt.allocPrint(alloc, "{s}.snapshots", .{path}) catch return;
     defer alloc.free(snapshot_dir);
     destroyPathIfExists(snapshot_dir);

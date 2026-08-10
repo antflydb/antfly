@@ -304,6 +304,10 @@ comptime {
             exportInternal(&storage_kernel_exports.storageOwnerApplyHAReplicationRecord, "antfly_storage_owner_apply_ha_replication_record");
             exportInternal(&storage_kernel_exports.storageOwnerBackupJson, "antfly_storage_owner_backup_json");
             exportInternal(&storage_kernel_exports.storageSnapshotPrepare, "antfly_storage_snapshot_prepare");
+            exportInternal(&storage_kernel_exports.storageRestorePrepare, "antfly_storage_restore_prepare");
+            exportInternal(&storage_kernel_exports.storageRestoreReconcile, "antfly_storage_restore_reconcile");
+            exportInternal(&storage_kernel_exports.storageOwnerRestoreRepair, "antfly_storage_owner_restore_repair");
+            exportInternal(&storage_kernel_exports.storageSnapshotPromote, "antfly_storage_snapshot_promote");
             exportInternal(&storage_kernel_exports.storageSnapshotPublishPrepared, "antfly_storage_snapshot_publish_prepared");
             exportInternal(&storage_kernel_exports.storageSnapshotCommit, "antfly_storage_snapshot_commit");
             exportInternal(&storage_kernel_exports.storageSnapshotRollback, "antfly_storage_snapshot_rollback");

@@ -13018,6 +13018,8 @@ pub const ProvisionedTableWriteSource = struct {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         if (self.localWriteOwnerSource()) |owner| return try owner.restoreTableReserved(alloc, table_name, plan);
         try enforceHAWriteGateOptional(self.ha_write_gate);
+        if (comptime storage_kernel_experiment)
+            return try self.restoreTableKernel(alloc, table_name, plan);
         try backups_api.validateRestorableManifestLayout(plan.manifest);
         try backups_api.validateRestoreManifest(alloc, plan.manifest, plan.manifest.backup_id);
         if (plan.reconcile_only and plan.replace_existing) return error.InvalidBackupRequest;
@@ -13179,6 +13181,131 @@ pub const ProvisionedTableWriteSource = struct {
         self.publishRestoreRepairComplete(table_name);
         self.notifyLocalChange(table_name, .structural);
         if (publication_outcome == .durability_uncertain) return error.GenerationDurabilityUncertain;
+    }
+
+    /// Keeps routing, lifecycle admission, catalog publication, and cache
+    /// invalidation in distributed control while the compiled storage unit
+    /// owns artifact materialization, validation, repair, and generation
+    /// publication as one coarse operation.
+    fn restoreTableKernel(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        plan: backups_api.TableRestorePlan,
+    ) !?void {
+        const snapshot_source = self.storage_snapshot_source orelse
+            return error.StorageKernelSnapshotUnavailable;
+        try backups_api.validateRestorableManifestLayout(plan.manifest);
+        try backups_api.validateRestoreManifest(alloc, plan.manifest, plan.manifest.backup_id);
+        if (plan.reconcile_only and plan.replace_existing) return error.InvalidBackupRequest;
+
+        const source_identity = try backups_api.canonicalRestoreSourceIdentityAlloc(alloc, plan.source_location);
+        defer alloc.free(source_identity);
+        const source_shard = &plan.manifest.shards[0];
+        const group_id = if (plan.replace_existing)
+            (try table_catalog.resolveSingleRangeGroup(alloc, self.catalog, table_name)) orelse
+                return null
+        else
+            source_shard.group_id;
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        const identity_namespace = try loadTableIdentityNamespaceForGroup(
+            alloc,
+            self.catalog,
+            table_name,
+            group_id,
+        );
+        const request: storage_snapshot_source.RestoreRequest = .{
+            .path = path,
+            .table_name = table_name,
+            .group_id = group_id,
+            .lsm_root_generation = self.visibleRootGeneration(group_id),
+            .identity = if (identity_namespace) |identity| .{
+                .table_id = identity.table_id,
+                .shard_id = identity.shard_id,
+                .range_id = identity.range_id,
+            } else null,
+            .backup_root = plan.backup_root,
+            .artifact_backup_id = plan.artifact_backup_id,
+            .source_identity = source_identity,
+            .manifest = plan.manifest,
+            .shard = source_shard,
+        };
+
+        const ready_deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+        const restore_io = plan.io orelse self.table_activity_threaded.io();
+        while (true) {
+            if (std.Io.Dir.cwd().statFile(restore_io, path, .{})) |_| break else |_| {}
+            if (platform_time.monotonicNs() >= ready_deadline_ns) break;
+            sleepNs(50 * std.time.ns_per_ms);
+        }
+        runTestBeforeRestoreWorkHook();
+
+        if (plan.reconcile_only) {
+            var transition = try self.beginLocalTableGenerationTransitionFromPreparation(table_name);
+            errdefer transition.abort();
+            defer transition.deinit();
+            try snapshot_source.retireGroupForPublication(group_id, table_name);
+            self.invalidateSharedPathCaches(path);
+            try snapshot_source.reconcileRestore(request);
+            self.invalidateSharedPathCaches(path);
+            transition.finishMutation();
+            self.publishRestoreRepairComplete(table_name);
+            self.notifyLocalChange(table_name, .structural);
+            return {};
+        }
+
+        var preparation = try snapshot_source.prepareRestore(request);
+        switch (preparation) {
+            .already_imported => {
+                var transition = try self.beginLocalTableGenerationTransitionFromPreparation(table_name);
+                errdefer transition.abort();
+                defer transition.deinit();
+                try snapshot_source.repairPublishedRestore(request);
+                if (plan.publication_hook) |hook| try hook.publish();
+                self.invalidateSharedPathCaches(path);
+                transition.finishMutation();
+                self.publishRestoreRepairComplete(table_name);
+                self.notifyLocalChange(table_name, .structural);
+                return {};
+            },
+            .prepared => |*prepared| {
+                defer prepared.deinit();
+                var transition = try self.beginLocalTableGenerationTransitionFromPreparation(table_name);
+                errdefer transition.abort();
+                defer transition.deinit();
+                try snapshot_source.retireGroupForPublication(group_id, table_name);
+                self.invalidateSharedPathCaches(path);
+                try prepared.promote();
+
+                var definition_published = false;
+                errdefer if (definition_published) {
+                    if (plan.publication_hook) |hook| hook.rollback() catch |rollback_err| {
+                        std.log.err("restore metadata rollback failed phase=storage_publication class={s}", .{@errorName(rollback_err)});
+                    };
+                };
+                if (plan.publication_hook) |hook| {
+                    try hook.publish();
+                    definition_published = true;
+                }
+
+                const durability_uncertain = try prepared.publishPrepared();
+                var publication_pending = true;
+                errdefer if (publication_pending) prepared.rollback() catch |rollback_err| {
+                    std.log.err("restore storage rollback failed phase=catalog_validation class={s}", .{@errorName(rollback_err)});
+                };
+                try prepared.commit();
+                publication_pending = false;
+                definition_published = false;
+
+                self.invalidateSharedPathCaches(path);
+                transition.finishMutation();
+                self.publishRestoreRepairComplete(table_name);
+                self.notifyLocalChange(table_name, .structural);
+                if (durability_uncertain) return error.GenerationDurabilityUncertain;
+            },
+        }
+        return {};
     }
 
     fn commitTransaction(
@@ -13718,6 +13845,7 @@ pub const ProvisionedTableWriteSource = struct {
 
         try snapshot_source.retireGroupForPublication(group_id, table_name);
         self.invalidateSharedPathCaches(path);
+        try prepared.promote();
         const durability_uncertain = try prepared.publishPrepared();
         var publication_pending = true;
         errdefer if (publication_pending) prepared.rollback() catch |rollback_err| {
@@ -21161,6 +21289,83 @@ pub fn configureStorageKernelOwnerDb(
             .drain_resolver_backfill = false,
         });
     }
+}
+
+/// Opens an isolated restore candidate with the same enrichment machinery as
+/// the managed writer path. The compiled storage unit supplies a short-lived
+/// backend runtime; provider/secret callbacks are a separate process-runtime
+/// capability and may be absent for self-contained or externally embedded
+/// index definitions.
+pub fn openStorageKernelRestoreDb(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    indexes_json: []const u8,
+    lsm_root_generation: u64,
+    backend_runtime: *db_mod.background_runtime.BackendRuntime,
+    identity_namespace: ?doc_identity.Namespace,
+    staged_generation: *const db_mod.generation_lifecycle.StagedGeneration,
+) !db_mod.DB {
+    return try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
+        alloc,
+        path,
+        indexes_json,
+        null,
+        null,
+        lsm_root_generation,
+        null,
+        .restore_repair,
+        backend_runtime,
+        null,
+        null,
+        null,
+        identity_namespace,
+        .{ .staged_generation = staged_generation },
+    );
+}
+
+/// Completes the durable restore-repair contract inside the compiled storage
+/// unit. Callers may pass the restored manifest definition while repairing an
+/// isolated candidate; a resident live owner is already configured from the
+/// authoritative catalog and therefore passes empty definition slices.
+pub fn repairStorageKernelRestoreDb(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    group_id: u64,
+    schema_json: []const u8,
+    indexes_json: []const u8,
+) !void {
+    try configureStorageKernelOwnerDb(alloc, db, schema_json, indexes_json);
+    const timeout_ns = 30 * std.time.ns_per_s;
+    const start_ns = platform_time.monotonicNs();
+    var attempts: usize = 0;
+    std.log.info("storage-kernel restore repair begin group_id={d}", .{group_id});
+    while (try db.restoreRuntimeRepairNeeded()) {
+        attempts += 1;
+        const repaired = db.repairRestoreRuntimeStateStepIfNeeded(alloc) catch |err| switch (err) {
+            // The managed process runtime normally advances a durable shadow
+            // repair concurrently. A short-lived compiled restore owner has
+            // no background lifetime after the ABI call, so advance one
+            // recoverable generation repair synchronously before retrying the
+            // completion proof.
+            error.RestoreRuntimeRepairIncomplete => blk: {
+                const repair = try db.repairRecoverableStartupIndexFailures(alloc, 1, .{});
+                if (repair.attempted == 0 and repair.repaired == 0) return err;
+                break :blk true;
+            },
+            else => return err,
+        };
+        if (repaired) {
+            db.clearDenseHbcCaches();
+        }
+        if (platform_time.monotonicNs() -| start_ns >= timeout_ns)
+            return error.TableVisibilityTimeout;
+    }
+    try db.sync(true);
+    try db.syncIndexes(true);
+    std.log.info("storage-kernel restore repair complete group_id={d} attempts={d}", .{
+        group_id,
+        attempts,
+    });
 }
 
 pub const StorageKernelReconcileState = enum {

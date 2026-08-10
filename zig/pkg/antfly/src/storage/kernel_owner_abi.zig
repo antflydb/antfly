@@ -15,7 +15,7 @@
 //! Versioned internal ABI for the storage kernel's live DB owner. Keep this
 //! module free of storage and distributed-runtime imports.
 
-pub const abi_version: u32 = 16;
+pub const abi_version: u32 = 17;
 
 pub const BorrowedBytes = extern struct {
     ptr: ?[*]const u8 = null,
@@ -78,6 +78,11 @@ pub const Status = enum(u32) {
     identity_read_generation_changed = 15,
     timeout = 16,
     cancelled = 17,
+    restore_identity_mismatch = 18,
+    invalid_backup = 19,
+    backup_integrity = 20,
+    unsupported_backup_migration = 21,
+    restore_identity_namespace_mismatch = 22,
     internal = 255,
 };
 
@@ -327,6 +332,41 @@ pub const SnapshotPrepareRequest = extern struct {
     encoded_snapshot: BorrowedBytes = .{},
 };
 
+/// Coarse local backup-restore request. The manifest is a complete JSON value
+/// and every byte slice is borrowed for the synchronous prepare/reconcile call.
+pub const RestorePrepareRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved0: u32 = 0,
+    path: BorrowedBytes = .{},
+    table_name: BorrowedBytes = .{},
+    group_id: u64 = 0,
+    lsm_root_generation: u64 = 0,
+    has_identity_namespace: u8 = 0,
+    _reserved1: [7]u8 = @splat(0),
+    identity_table_id: u64 = 0,
+    identity_shard_id: u64 = 0,
+    identity_range_id: u64 = 0,
+    backup_root: BorrowedBytes = .{},
+    backup_id: BorrowedBytes = .{},
+    artifact_backup_id: BorrowedBytes = .{},
+    source_identity: BorrowedBytes = .{},
+    snapshot_path: BorrowedBytes = .{},
+    expected_artifact_size_bytes: u64 = 0,
+    expected_artifact_sha256: BorrowedBytes = .{},
+    manifest_json: BorrowedBytes = .{},
+};
+
+pub const RestorePrepareState = enum(u32) {
+    prepared = 0,
+    already_imported = 1,
+};
+
+pub const RestorePrepareResult = extern struct {
+    version: u32 = abi_version,
+    state: RestorePrepareState = .prepared,
+    snapshot: ?*anyopaque = null,
+};
+
 pub const SnapshotPublishResult = extern struct {
     durability_uncertain: u8 = 0,
     _reserved0: [7]u8 = @splat(0),
@@ -452,6 +492,22 @@ pub extern fn antfly_storage_snapshot_prepare(
     request: *const SnapshotPrepareRequest,
     out_snapshot: *?*anyopaque,
 ) callconv(.c) Status;
+
+pub extern fn antfly_storage_restore_prepare(
+    request: *const RestorePrepareRequest,
+    out_result: *RestorePrepareResult,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_restore_reconcile(
+    request: *const RestorePrepareRequest,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_owner_restore_repair(
+    owner: ?*anyopaque,
+    request: *const RestorePrepareRequest,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_snapshot_promote(snapshot: ?*anyopaque) callconv(.c) Status;
 
 pub extern fn antfly_storage_snapshot_publish_prepared(
     snapshot: ?*anyopaque,

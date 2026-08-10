@@ -43,6 +43,15 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
 
     const Catalog = struct {
         const metadata_incarnation: metadata_api.MetadataClusterIncarnation = "31313131313131313131313131313131".*;
+        const indexes_json =
+            \\{"dense_idx":{"type":"embeddings","external":true,"dimension":3},
+            \\ "full_text_index_v0":{"type":"full_text","enrichments":[{"name":"document_units_v1","kind":"asset","field":"url","content_type":"application/json","producer_json":"{\"type\":\"document_extraction\",\"config\":{}}"}]},
+            \\ "alg":{"type":"algebraic","version":1,"table":"articles","schema_version":1,
+            \\        "group_fields":[{"name":"category","path":"category","type":"keyword"}],
+            \\        "measure_fields":[{"name":"amount","path":"amount","type":"number"}],
+            \\        "materializations":[{"name":"sum_by_category","op":"sum","group_by":["category"],"measure":"amount"}]},
+            \\ "relations_graph":{"type":"graph","edge_types":[{"name":"mentions"}]}}
+        ;
 
         accept_publication: bool = true,
 
@@ -68,15 +77,7 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
                     .table_id = 7,
                     .name = "articles",
                     .placement_role = "data",
-                    .indexes_json =
-                    \\{"dense_idx":{"type":"embeddings","external":true,"dimension":3},
-                    \\ "full_text_index_v0":{"type":"full_text","enrichments":[{"name":"document_units_v1","kind":"asset","field":"url","content_type":"application/json","producer_json":"{\"type\":\"document_extraction\",\"config\":{}}"}]},
-                    \\ "alg":{"type":"algebraic","version":1,"table":"articles","schema_version":1,
-                    \\        "group_fields":[{"name":"category","path":"category","type":"keyword"}],
-                    \\        "measure_fields":[{"name":"amount","path":"amount","type":"number"}],
-                    \\        "materializations":[{"name":"sum_by_category","op":"sum","group_by":["category"],"measure":"amount"}]},
-                    \\ "relations_graph":{"type":"graph","edge_types":[{"name":"mentions"}]}}
-                    ,
+                    .indexes_json = indexes_json,
                 }})[0..]),
                 .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
                     .group_id = 7001,
@@ -250,13 +251,17 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
         .{ .format = .portable, .backup_id = "portable-owner" },
         .{ .format = .native, .backup_id = "native-owner" },
     };
-    for (backup_formats) |backup| {
+    var restore_shards: [backup_formats.len]?[]backup_contract.ShardSnapshot = @splat(null);
+    defer for (&restore_shards) |*shards| {
+        if (shards.*) |value| table_writes.freeStorageKernelBackupShards(alloc, value);
+    };
+    for (backup_formats, 0..) |backup, backup_index| {
         const shards = (try write_source.source().backupTable(alloc, "articles", .{
             .backup_root = backup_root,
             .backup_id = backup.backup_id,
             .format = backup.format,
         })).?;
-        defer table_writes.freeStorageKernelBackupShards(alloc, shards);
+        restore_shards[backup_index] = shards;
         try std.testing.expectEqual(@as(usize, 1), shards.len);
         try std.testing.expectEqual(@as(u64, 7001), shards[0].group_id);
         try std.testing.expect(shards[0].artifact_size_bytes > 0);
@@ -715,6 +720,129 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
     try std.testing.expect(std.mem.indexOf(u8, reopened_lookup.json, "beta") != null);
     try std.testing.expectEqual(@as(usize, 1), owner_source.ownerCountForTest());
     try std.testing.expectEqual(@as(usize, 18), lease_capture.count);
+
+    const restore_source_location = try std.fmt.allocPrint(alloc, "file://{s}", .{backup_root});
+    defer alloc.free(restore_source_location);
+    const PublicationHook = struct {
+        publish_count: usize = 0,
+        rollback_count: usize = 0,
+        fail_publish: bool = false,
+
+        fn iface(self: *@This()) backup_contract.RestorePublicationHook {
+            return .{
+                .ptr = self,
+                .publish_definition = publish,
+                .rollback_definition = rollback,
+            };
+        }
+
+        fn publish(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.publish_count += 1;
+            if (self.fail_publish) return error.TestRestoreDefinitionRejected;
+        }
+
+        fn rollback(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.rollback_count += 1;
+        }
+    };
+    for (backup_formats, 0..) |backup, backup_index| {
+        const mutation_key = if (backup.format == .portable) "doc:after-portable" else "doc:after-native";
+        _ = try write_source.source().batch(alloc, "articles", .{
+            .writes = &.{.{
+                .key = mutation_key,
+                .value = "{\"title\":\"must disappear after restore\"}",
+            }},
+            .timestamp_ns = 6000 + @as(u64, @intCast(backup_index)),
+            .sync_level = .full_index,
+        });
+        var mutation_lookup = (try read_source.source().lookup(
+            alloc,
+            "articles",
+            mutation_key,
+            .{},
+            .read_index,
+        )).?;
+        mutation_lookup.deinit(alloc);
+
+        const backup_manifest: backup_contract.TableBackupManifest = .{
+            .format = backup.format,
+            .backup_id = backup.backup_id,
+            .table_name = "articles",
+            .description = "storage owner restore composition",
+            .schema_json = "",
+            .read_schema_json = "",
+            .indexes_json = Catalog.indexes_json,
+            .replication_sources_json = "",
+            .shards = restore_shards[backup_index].?,
+        };
+        const restore_plan: backup_contract.TableRestorePlan = .{
+            .backup_root = backup_root,
+            .manifest = &backup_manifest,
+            .artifact_backup_id = backup.backup_id,
+            .source_location = restore_source_location,
+            .replace_existing = true,
+        };
+        if (backup_index == 0) {
+            var hook = PublicationHook{ .fail_publish = true };
+            var rejected_plan = restore_plan;
+            rejected_plan.publication_hook = hook.iface();
+            try std.testing.expectError(
+                error.TestRestoreDefinitionRejected,
+                write_source.source().restoreTable(alloc, "articles", rejected_plan),
+            );
+            try std.testing.expectEqual(@as(usize, 1), hook.publish_count);
+            try std.testing.expectEqual(@as(usize, 0), hook.rollback_count);
+            var retained_lookup = (try read_source.source().lookup(
+                alloc,
+                "articles",
+                mutation_key,
+                .{},
+                .read_index,
+            )).?;
+            retained_lookup.deinit(alloc);
+        }
+        try std.testing.expect((try write_source.source().restoreTable(
+            alloc,
+            "articles",
+            restore_plan,
+        )) != null);
+        try std.testing.expect((try read_source.source().lookup(
+            alloc,
+            "articles",
+            mutation_key,
+            .{},
+            .read_index,
+        )) == null);
+        var restored_lookup = (try read_source.source().lookup(
+            alloc,
+            "articles",
+            "doc:a",
+            .{},
+            .read_index,
+        )).?;
+        defer restored_lookup.deinit(alloc);
+        try std.testing.expect(std.mem.indexOf(u8, restored_lookup.json, "alpha") != null);
+        try std.testing.expectEqual(@as(usize, 1), owner_source.ownerCountForTest());
+
+        // An exact retry repairs through the same resident owner, and a
+        // reconcile-only pass validates the committed physical identity.
+        try std.testing.expect((try write_source.source().restoreTable(
+            alloc,
+            "articles",
+            restore_plan,
+        )) != null);
+        var reconcile_plan = restore_plan;
+        reconcile_plan.reconcile_only = true;
+        reconcile_plan.replace_existing = false;
+        try std.testing.expect((try write_source.source().restoreTable(
+            alloc,
+            "articles",
+            reconcile_plan,
+        )) != null);
+        try std.testing.expectEqual(@as(usize, 0), owner_source.ownerCountForTest());
+    }
 
     const accepted_snapshot = try shard_state_store.encodeGroupStateSnapshot(
         alloc,

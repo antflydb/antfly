@@ -2405,6 +2405,75 @@ restore-job persistence still need coarse owner contracts. No cold ReleaseFast
 result is credited before the atomic source-selection checkpoint in checklist
 item 7.
 
+### Phase 4h: owner-side restore materialization and publication
+
+Storage-owner ABI version 17 moves the physical half of a complete local
+backup restore behind four coarse operations: prepare, promote, reconcile, and
+repair an already published generation. Prepare accepts one borrowed manifest
+and artifact descriptor, validates backup and identity integrity, materializes
+an isolated candidate, opens it with the managed restore-repair mode, advances
+durable runtime repair, synchronizes DB and indexes, and seals the candidate.
+No record, index entry, LSM file, restore phase, or scheduler primitive crosses
+the ABI.
+
+Distributed control retains table routing, lifecycle admission, catalog
+publication hooks, cache invalidation, and structural notifications. A new
+restore follows this ordered state machine while holding the existing local
+generation transition:
+
+1. storage prepares and seals an isolated candidate;
+2. storage promotes the preparation into an exclusive generation transition;
+3. distributed control publishes the authoritative table definition; and
+4. storage publishes and commits the physical generation.
+
+Failure before physical publication leaves the live generation unchanged. A
+failure after definition publication invokes the definition rollback hook and
+the storage snapshot rollback path. Commit removes superseded snapshot state.
+An exact retry validates the imported artifact identity and repairs through the
+same resident owner; reconcile-only mode validates and completes a committed
+restore under a process-exclusive transition. The previously shared snapshot
+publication API now exposes promotion explicitly so Raft snapshot replacement
+preserves the same `prepare -> promote -> publish -> commit` ordering.
+
+The short-lived candidate owns its backend scheduler and uses the managed
+restore-repair runtime; `std.Io` is not an ABI type. Completion also advances a
+recoverable durable index-shadow repair synchronously when the process runtime
+would otherwise outlive the ABI call. Provider, secret, and remote-content
+capabilities required by production-generated enrichments are not smuggled
+through this restore request: making those process-scoped capabilities
+available to every resident and candidate owner remains part of ownership
+family 6 and is required before the atomic source switch.
+
+Warm Debug validation with normal concurrency, linked runtime libraries, the
+production LSM backend, and the storage experiment enabled passed:
+
+- opaque owner ABI: 4/4, including future-version rejection and null snapshot
+  promotion rejection;
+- provisioned cross-archive owner source: 6/6, restoring native and portable
+  artifacts, discarding post-backup mutations, preserving original data,
+  rejecting catalog publication without changing the live generation, exact
+  retry, reconcile-only completion, and single-owner reuse;
+- DataServer process-owner composition: 12/12;
+- public C API: 10/10;
+- complete linked Debug artifacts with the experiment both enabled and
+  disabled;
+- all runtime/codegen/API graph gates plus the 15/15 analyzer suite; and
+- artifact inspection: the 105,956,216-byte enabled Debug storage archive
+  defines the hidden `antfly_storage_restore_prepare`,
+  `antfly_storage_restore_reconcile`,
+  `antfly_storage_owner_restore_repair`, and
+  `antfly_storage_snapshot_promote` entry points and no native `mdb_*`
+  implementation symbols; the 48,686,640-byte Debug public C API dylib exports
+  no internal storage-owner/context/restore/snapshot symbols.
+
+Decision: keep this as the physical restore half of ownership-family 5. Local
+backup materialization, restore materialization, integrity repair, generation
+publication, rollback, idempotent retry, and committed reconciliation now have
+coarse compiled-owner contracts. Durable user-facing restore-job persistence
+remains a control-plane concern, while its local physical work must continue to
+enter this owner. No cold ReleaseFast result is credited before the atomic
+source-selection checkpoint in checklist item 7.
+
 ## Holistic target architecture
 
 The current candidate baseline is the four-unit topology above with serverless

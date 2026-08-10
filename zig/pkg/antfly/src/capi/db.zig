@@ -42,6 +42,8 @@ const table_reads_api = antfly.public_api.table_reads;
 const distributed_graph = antfly.public_api.distributed_graph;
 const runtime_status = antfly.public_api.runtime_status;
 const shard_state_store = antfly.data_snapshot;
+const backups_api = antfly.public_api.backups;
+const backup_restore = antfly.raft.storage.backup_restore;
 const Allocator = std.mem.Allocator;
 
 const lite_abi_version: u32 = 1;
@@ -283,6 +285,8 @@ const StorageSnapshot = struct {
     preparation: db_mod.generation_lifecycle.PreparationTransition,
     staged: db_mod.generation_lifecycle.StagedGeneration,
     transition: ?db_mod.generation_lifecycle.ExclusiveTransition = null,
+    restore_live_path: ?[]u8 = null,
+    promoted: bool = false,
     published: bool = false,
     finalized: bool = false,
 
@@ -290,6 +294,7 @@ const StorageSnapshot = struct {
         self.staged.deinit();
         if (self.transition) |*transition| transition.deinit();
         self.preparation.deinit();
+        if (self.restore_live_path) |path| self.alloc.free(path);
         const alloc = self.alloc;
         self.* = undefined;
         alloc.destroy(self);
@@ -2233,6 +2238,213 @@ pub fn storageOwnerBackupJson(
     return .ok;
 }
 
+const RestoreRequestScope = struct {
+    alloc: Allocator,
+    manifest: std.json.Parsed(backups_api.TableBackupManifest),
+    local_location: []u8,
+
+    fn init(alloc: Allocator, request: *const kernel_owner_abi.RestorePrepareRequest) !RestoreRequestScope {
+        const path = request.path.slice();
+        const table_name = request.table_name.slice();
+        const backup_root = request.backup_root.slice();
+        if (path.len == 0 or table_name.len == 0 or backup_root.len == 0 or
+            request.group_id == 0 or request.backup_id.slice().len == 0 or
+            request.artifact_backup_id.slice().len == 0 or
+            request.source_identity.slice().len == 0 or
+            request.snapshot_path.slice().len == 0 or
+            request.manifest_json.slice().len == 0)
+        {
+            return error.InvalidArgument;
+        }
+        var manifest = try std.json.parseFromSlice(
+            backups_api.TableBackupManifest,
+            alloc,
+            request.manifest_json.slice(),
+            .{ .allocate = .alloc_always },
+        );
+        errdefer manifest.deinit();
+        const local_location = try std.fmt.allocPrint(alloc, "file://{s}", .{backup_root});
+        return .{
+            .alloc = alloc,
+            .manifest = manifest,
+            .local_location = local_location,
+        };
+    }
+
+    fn source(
+        self: *const RestoreRequestScope,
+        request: *const kernel_owner_abi.RestorePrepareRequest,
+    ) backup_restore.RestoreSource {
+        return .{
+            .backup_id = request.backup_id.slice(),
+            .artifact_backup_id = request.artifact_backup_id.slice(),
+            .location = self.local_location,
+            .identity_location = request.source_identity.slice(),
+            .snapshot_path = request.snapshot_path.slice(),
+            .authority = .staged_local,
+            .expected_artifact_size_bytes = request.expected_artifact_size_bytes,
+            .expected_artifact_sha256 = request.expected_artifact_sha256.slice(),
+            .manifest = &self.manifest.value,
+        };
+    }
+
+    fn deinit(self: *RestoreRequestScope) void {
+        self.alloc.free(self.local_location);
+        self.manifest.deinit();
+        self.* = undefined;
+    }
+};
+
+fn prepareStorageRestore(
+    request: *const kernel_owner_abi.RestorePrepareRequest,
+) !?*StorageSnapshot {
+    const alloc = std.heap.c_allocator;
+    var scope = try RestoreRequestScope.init(alloc, request);
+    defer scope.deinit();
+    const restore_source = scope.source(request);
+    const path = request.path.slice();
+    const identity_namespace: ?db_mod.DocIdentityNamespace = if (request.has_identity_namespace != 0)
+        .{
+            .table_id = request.identity_table_id,
+            .shard_id = request.identity_shard_id,
+            .range_id = request.identity_range_id,
+        }
+    else
+        null;
+
+    var preparation = try db_mod.generation_lifecycle.beginProcessPreparationWithRuntime(path, null);
+    var preparation_owned = true;
+    errdefer if (preparation_owned) preparation.deinit();
+    var staged = (try backup_restore.prepareRestoreSnapshotToPathWithPreparation(
+        &preparation,
+        alloc,
+        path,
+        request.group_id,
+        restore_source,
+        .{
+            .expected_table_name = request.table_name.slice(),
+            .expected_identity_namespace = identity_namespace,
+        },
+    )) orelse {
+        preparation.deinit();
+        preparation_owned = false;
+        return null;
+    };
+    var staged_owned = true;
+    errdefer if (staged_owned) staged.deinit();
+
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{
+        .backend = .io_threaded,
+    });
+    defer backend_runtime.deinit();
+    var db = try antfly.public_api.table_writes.openStorageKernelRestoreDb(
+        alloc,
+        staged.path(),
+        scope.manifest.value.indexes_json,
+        request.lsm_root_generation,
+        backend_runtime.ptr(),
+        identity_namespace,
+        &staged,
+    );
+    var db_open = true;
+    defer if (db_open) db.close();
+    try antfly.public_api.table_writes.repairStorageKernelRestoreDb(
+        alloc,
+        &db,
+        request.group_id,
+        scope.manifest.value.schema_json,
+        scope.manifest.value.indexes_json,
+    );
+    db.close();
+    db_open = false;
+    try staged.seal();
+
+    const restore_live_path = try alloc.dupe(u8, path);
+    errdefer alloc.free(restore_live_path);
+    const snapshot = try alloc.create(StorageSnapshot);
+    snapshot.* = .{
+        .alloc = alloc,
+        .preparation = preparation,
+        .staged = staged,
+        .restore_live_path = restore_live_path,
+    };
+    preparation_owned = false;
+    staged_owned = false;
+    return snapshot;
+}
+
+pub fn storageRestorePrepare(
+    request: *const kernel_owner_abi.RestorePrepareRequest,
+    out_result: *kernel_owner_abi.RestorePrepareResult,
+) callconv(.c) kernel_owner_abi.Status {
+    out_result.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const snapshot = prepareStorageRestore(request) catch |err| {
+        std.log.err("storage-kernel restore prepare failed group_id={} class={s}", .{
+            request.group_id,
+            @errorName(err),
+        });
+        return storageOwnerStatusFromError(err);
+    };
+    if (snapshot) |value| {
+        out_result.* = .{ .state = .prepared, .snapshot = value };
+    } else {
+        out_result.* = .{ .state = .already_imported };
+    }
+    return .ok;
+}
+
+pub fn storageRestoreReconcile(
+    request: *const kernel_owner_abi.RestorePrepareRequest,
+) callconv(.c) kernel_owner_abi.Status {
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const alloc = std.heap.c_allocator;
+    var scope = RestoreRequestScope.init(alloc, request) catch |err| return storageOwnerStatusFromError(err);
+    defer scope.deinit();
+    var transition = db_mod.generation_lifecycle.beginProcessExclusive(request.path.slice()) catch |err|
+        return storageOwnerStatusFromError(err);
+    defer transition.deinit();
+    backup_restore.reconcileCommittedRestoreWithExclusiveTransition(
+        &transition,
+        alloc,
+        request.path.slice(),
+        request.group_id,
+        scope.source(request),
+    ) catch |err| return storageOwnerStatusFromError(err);
+    return .ok;
+}
+
+pub fn storageOwnerRestoreRepair(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.RestorePrepareRequest,
+) callconv(.c) kernel_owner_abi.Status {
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    const path = handle.storage_owner_path orelse return .invalid_argument;
+    if (!std.mem.eql(u8, path, request.path.slice()) or
+        handle.storage_owner_group_id != request.group_id)
+    {
+        return .invalid_argument;
+    }
+    var scope = RestoreRequestScope.init(handle.alloc, request) catch |err| return storageOwnerStatusFromError(err);
+    defer scope.deinit();
+    backup_restore.validateImportedRestoreIdentity(
+        handle.alloc,
+        path,
+        request.group_id,
+        scope.source(request),
+    ) catch |err| return storageOwnerStatusFromError(err);
+    antfly.public_api.table_writes.repairStorageKernelRestoreDb(
+        handle.alloc,
+        &handle.db,
+        request.group_id,
+        "",
+        "",
+    ) catch |err| return storageOwnerStatusFromError(err);
+    return .ok;
+}
+
 fn prepareStorageSnapshot(request: *const kernel_owner_abi.SnapshotPrepareRequest) !*StorageSnapshot {
     const alloc = std.heap.c_allocator;
     const path = request.path.slice();
@@ -2334,11 +2546,18 @@ pub fn storageSnapshotPublishPrepared(
 ) callconv(.c) kernel_owner_abi.Status {
     out_result.* = .{};
     const snapshot: *StorageSnapshot = @ptrCast(@alignCast(snapshot_handle orelse return .invalid_argument));
-    if (snapshot.published or snapshot.finalized) return .invalid_argument;
-    snapshot.transition = snapshot.preparation.promote() catch |err| return storageOwnerStatusFromError(err);
+    if (!snapshot.promoted or snapshot.published or snapshot.finalized) return .invalid_argument;
     const outcome = snapshot.staged.publishPrepared() catch |err| return storageOwnerStatusFromError(err);
     snapshot.published = true;
     out_result.durability_uncertain = @intFromBool(outcome == .durability_uncertain);
+    return .ok;
+}
+
+pub fn storageSnapshotPromote(snapshot_handle: ?*anyopaque) callconv(.c) kernel_owner_abi.Status {
+    const snapshot: *StorageSnapshot = @ptrCast(@alignCast(snapshot_handle orelse return .invalid_argument));
+    if (snapshot.promoted or snapshot.published or snapshot.finalized) return .invalid_argument;
+    snapshot.transition = snapshot.preparation.promote() catch |err| return storageOwnerStatusFromError(err);
+    snapshot.promoted = true;
     return .ok;
 }
 
@@ -2346,6 +2565,8 @@ pub fn storageSnapshotCommit(snapshot_handle: ?*anyopaque) callconv(.c) kernel_o
     const snapshot: *StorageSnapshot = @ptrCast(@alignCast(snapshot_handle orelse return .invalid_argument));
     if (!snapshot.published or snapshot.finalized) return .invalid_argument;
     snapshot.staged.commitPublication() catch |err| return storageOwnerStatusFromError(err);
+    if (snapshot.restore_live_path) |path|
+        backup_restore.cleanupSnapshotsForPublishedRestore(snapshot.alloc, path);
     snapshot.finalized = true;
     return .ok;
 }
@@ -2904,6 +3125,7 @@ fn storageOwnerStatusFromCapi(status: capi.ErrorCode) kernel_owner_abi.Status {
 }
 
 fn storageOwnerStatusFromError(err: anyerror) kernel_owner_abi.Status {
+    if (backups_api.isArtifactIntegrityError(err)) return .backup_integrity;
     return switch (err) {
         error.InvalidArgument, error.InvalidArguments => .invalid_argument,
         error.NotFound, error.FileNotFound => .not_found,
@@ -2919,8 +3141,12 @@ fn storageOwnerStatusFromError(err: anyerror) kernel_owner_abi.Status {
         error.UnsupportedQueryRequest => .unsupported_query,
         error.IndexNotFound => .index_not_found,
         error.IdentityReadGenerationChanged => .identity_read_generation_changed,
-        error.Timeout => .timeout,
+        error.Timeout, error.TableVisibilityTimeout => .timeout,
         error.Canceled, error.Cancelled => .cancelled,
+        error.RestoreIdentityMismatch => .restore_identity_mismatch,
+        error.InvalidBackupRequest => .invalid_backup,
+        error.UnsupportedBackupMigrationState => .unsupported_backup_migration,
+        error.IdentityNamespaceMismatch => .restore_identity_namespace_mismatch,
         else => .internal,
     };
 }

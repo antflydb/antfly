@@ -228,6 +228,10 @@ pub const Owner = struct {
         return response;
     }
 
+    pub fn repairRestore(self: *Owner, request: *const abi.RestorePrepareRequest) !void {
+        try statusToError(abi.antfly_storage_owner_restore_repair(self.handle, request));
+    }
+
     pub fn queryJson(self: *Owner, table_name: []const u8, request_json: []const u8) !Response {
         var response: Response = .{};
         try statusToError(abi.antfly_storage_owner_query_json(
@@ -448,6 +452,29 @@ pub const Snapshot = struct {
         return .{ .handle = handle orelse return error.StorageKernelFailure };
     }
 
+    pub fn prepareRestore(request: abi.RestorePrepareRequest) !RestorePreparation {
+        var result: abi.RestorePrepareResult = .{};
+        try statusToError(abi.antfly_storage_restore_prepare(&request, &result));
+        if (result.version != abi.abi_version) return error.InvalidAbiVersion;
+        return switch (result.state) {
+            .prepared => .{ .prepared = .{
+                .handle = result.snapshot orelse return error.StorageKernelFailure,
+            } },
+            .already_imported => blk: {
+                if (result.snapshot != null) return error.StorageKernelFailure;
+                break :blk .already_imported;
+            },
+        };
+    }
+
+    pub fn reconcileRestore(request: abi.RestorePrepareRequest) !void {
+        try statusToError(abi.antfly_storage_restore_reconcile(&request));
+    }
+
+    pub fn promote(self: *Snapshot) !void {
+        try statusToError(abi.antfly_storage_snapshot_promote(self.handle));
+    }
+
     pub fn publishPrepared(self: *Snapshot) !bool {
         var result: abi.SnapshotPublishResult = .{};
         try statusToError(abi.antfly_storage_snapshot_publish_prepared(self.handle, &result));
@@ -466,6 +493,11 @@ pub const Snapshot = struct {
         abi.antfly_storage_snapshot_destroy(self.handle);
         self.* = undefined;
     }
+};
+
+pub const RestorePreparation = union(enum) {
+    prepared: Snapshot,
+    already_imported,
 };
 
 fn operationRequest(
@@ -513,6 +545,11 @@ pub fn statusToError(status: abi.Status) !void {
         .identity_read_generation_changed => error.IdentityReadGenerationChanged,
         .timeout => error.Timeout,
         .cancelled => error.Cancelled,
+        .restore_identity_mismatch => error.RestoreIdentityMismatch,
+        .invalid_backup => error.InvalidBackupRequest,
+        .backup_integrity => error.BackupArtifactIntegrityMismatch,
+        .unsupported_backup_migration => error.UnsupportedBackupMigrationState,
+        .restore_identity_namespace_mismatch => error.IdentityNamespaceMismatch,
         .internal => error.StorageKernelFailure,
     };
 }
