@@ -5186,6 +5186,8 @@ pub fn build(b: *std.Build) void {
             "aggregation completeness requires exact total relation",
             "api http client forwards internal query controls and maps remote timeout",
             "api http client preserves remote storage read contention",
+            "api http client preserves storage read contention across group read endpoints",
+            "internal group read routes preserve retryable resident storage failures",
             "remote shard query phases propagate deadline and request cancellation",
             "provisioned table read cache has a finite worker ceiling",
             "provisioned read cache invalidates repeated ownership moves with pinned leases",

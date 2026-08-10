@@ -11083,11 +11083,20 @@ fn applyProvisionedQueryAggregations(
                 consistency,
             );
         }
-        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_ids[0]);
-        defer alloc.free(path);
-        var db = try openProvisionedQueryDbForTableWithRuntime(alloc, path, self.catalog, table_name, group_ids[0], self.visibleRootGeneration(group_ids[0]), self.backend_runtime);
-        defer db.close();
-        return try applyCapturedDbQueryAggregations(alloc, self.requester, group_ids[0], table_name, "provisioned-local", req, result, meta, &db, consistency);
+        var db_owner = try provisionedLocalQueryDbOwner(
+            self.resident_db,
+            self.cache,
+            self.replica_root_dir,
+            self.catalog,
+            alloc,
+            group_ids[0],
+            self.visibleRootGeneration(group_ids[0]),
+            self.backend_runtime,
+            table_name,
+            true,
+        );
+        defer db_owner.deinit();
+        return try applyCapturedDbQueryAggregations(alloc, self.requester, group_ids[0], table_name, "provisioned-local", req, result, meta, db_owner.db(), consistency);
     }
 
     if (try tryApplyProvisionedAlgebraicDistributedAggregations(self, alloc, group_ids, table_name, aggregation_req, meta)) return;
@@ -11137,11 +11146,26 @@ fn tryApplyProvisionedAlgebraicDistributedAggregations(
     defer query_api.freeAggregationRequests(alloc, requests);
     if (requests.len == 0) return false;
 
-    const first_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_ids[0]);
-    defer alloc.free(first_path);
-    var first_db = try openProvisionedQueryDbForTableWithRuntime(alloc, first_path, self.catalog, table_name, group_ids[0], self.visibleRootGeneration(group_ids[0]), self.backend_runtime);
-    defer first_db.close();
-    if (!(try algebraicIndexFreshEnoughForRequest(alloc, req, &first_db))) return false;
+    // The query coordinator still owns table read admission here. Lease the
+    // writer/apply DB instead of opening a second full query catalog while an
+    // apply or maintenance owner may be waiting for that admission. A cold
+    // resident propagates ResidentDbRetryRequired to queryAttempt, which drops
+    // admission and publishes the writer before retrying.
+    var first_owner = try provisionedLocalQueryDbOwner(
+        self.resident_db,
+        self.cache,
+        self.replica_root_dir,
+        self.catalog,
+        alloc,
+        group_ids[0],
+        self.visibleRootGeneration(group_ids[0]),
+        self.backend_runtime,
+        table_name,
+        true,
+    );
+    defer first_owner.deinit();
+    const first_db = first_owner.db();
+    if (!(try algebraicIndexFreshEnoughForRequest(alloc, req, first_db))) return false;
     const first_entry = if (req.index_name) |index_name|
         first_db.core.index_manager.algebraicIndex(index_name) orelse return false
     else
@@ -11173,7 +11197,7 @@ fn tryApplyProvisionedAlgebraicDistributedAggregations(
         }
         var request_plan = (try algebraicDistributedTensorProgramForAggregationRequestAlloc(alloc, &first_entry.index, request, constraints, req.identity_read_generation)) orelse return false;
         defer request_plan.deinit(alloc);
-        var merged = (try collectProvisionedAlgebraicDistributedPartials(self, alloc, group_ids, table_name, req, first_entry.index.name, request_plan.access_paths, request_plan.asProgram())) orelse return false;
+        var merged = (try collectProvisionedAlgebraicDistributedPartials(self, alloc, group_ids, table_name, req, first_entry.index.name, request_plan.access_paths, request_plan.asProgram(), first_db)) orelse return false;
         defer merged.deinit(alloc);
         var result = (try algebraicAggregationFromDistributedPartialsAlloc(alloc, &first_entry.index, request, constraints, merged)) orelse return false;
         var result_owned = true;
@@ -11216,6 +11240,7 @@ fn collectProvisionedAlgebraicDistributedPartials(
     selected_index_name: []const u8,
     access_paths: []const algebraic_ir.PhysicalAccessPath,
     tensor_program: algebraic_ir.TensorProgram,
+    captured_first_db: ?*db_mod.DB,
 ) !?db_mod.algebraic.distributed.MergeSet {
     try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
     if (searchRequestHasResolvedDocFilter(req)) return null;
@@ -11231,15 +11256,30 @@ fn collectProvisionedAlgebraicDistributedPartials(
         partials.deinit(alloc);
     }
 
-    for (group_ids) |group_id| {
-        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
-        defer alloc.free(path);
-        var db = try openProvisionedQueryDbForTableWithRuntime(alloc, path, self.catalog, table_name, group_id, self.visibleRootGeneration(group_id), self.backend_runtime);
-        defer db.close();
-        if (!(try algebraicIndexFreshEnoughForRequest(alloc, req, &db))) return null;
+    for (group_ids, 0..) |group_id, group_index| {
+        var db_owner: ?LocalQueryDbOwner = null;
+        defer if (db_owner) |*owner| owner.deinit();
+        const db = if (group_index == 0 and captured_first_db != null)
+            captured_first_db.?
+        else blk: {
+            db_owner = try provisionedLocalQueryDbOwner(
+                self.resident_db,
+                self.cache,
+                self.replica_root_dir,
+                self.catalog,
+                alloc,
+                group_id,
+                self.visibleRootGeneration(group_id),
+                self.backend_runtime,
+                table_name,
+                true,
+            );
+            break :blk db_owner.?.db();
+        };
+        if (!(try algebraicIndexFreshEnoughForRequest(alloc, req, db))) return null;
         var parsed = try parseAlgebraicPartialsRequest(alloc, body);
         defer parsed.deinit(alloc);
-        const shard_partials = try collectAlgebraicPartialsFromDbForRequest(alloc, &db, parsed);
+        const shard_partials = try collectAlgebraicPartialsFromDbForRequest(alloc, db, parsed);
         defer if (shard_partials.len > 0) alloc.free(shard_partials);
         for (shard_partials) |partial| try partials.append(alloc, partial);
     }
@@ -19237,7 +19277,7 @@ test "distributed table reads reject stale doc identity before multigroup fanout
     const text_analysis = introducer_mod.TextAnalysisConfig{};
     try std.testing.expect((try collectProvisionedAlgebraicDistributedPartials(&healthy_source, alloc, group_ids[0..], "docs", resolved_explicit_req, "alg", &.{}, .{
         .output = .{ .input = 0 },
-    })) == null);
+    }, null)) == null);
     try std.testing.expectError(error.UnsupportedQueryRequest, collectProvisionedAggregationTextStats(&healthy_source, alloc, group_ids[0..], "docs", resolved_explicit_req, stats_hits, &text_analysis));
     try std.testing.expectError(error.UnsupportedQueryRequest, collectProvisionedAggregationBackgroundTextStats(&healthy_source, alloc, group_ids[0..], "docs", resolved_background_req, stats_hits, &text_analysis));
 
@@ -19260,7 +19300,7 @@ test "distributed table reads reject stale doc identity before multigroup fanout
     }, &.{}, &text_analysis));
     try std.testing.expectError(error.DocIdentityNamespaceMismatch, collectProvisionedAlgebraicDistributedPartials(&source, alloc, group_ids[0..], "docs", .{}, "alg", &.{}, .{
         .output = .{ .input = 0 },
-    }));
+    }, null));
 }
 
 test "internal worker doc identity exchange audit covers every boundary" {
@@ -20630,7 +20670,58 @@ test "provisioned distributed aggregations collect path terms nested cardinality
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
     };
 
+    const ResidentSource = struct {
+        left: *db_mod.DB,
+        right: *db_mod.DB,
+        fail_next: bool = true,
+        attempts: usize = 0,
+        leases: usize = 0,
+        releases: usize = 0,
+
+        fn iface(self: *@This()) ResidentDbSource {
+            return .{
+                .ptr = self,
+                .lease_group = leaseGroup,
+            };
+        }
+
+        fn leaseGroup(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            table_name: []const u8,
+            group_id: u64,
+            _: u64,
+            options: ResidentDbSource.LeaseOptions,
+        ) !?ResidentDbLease {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expect(options.read_activity_held);
+            self.attempts += 1;
+            if (self.fail_next) {
+                self.fail_next = false;
+                return error.ResidentDbRetryRequired;
+            }
+            self.leases += 1;
+            return .{
+                .ptr = self,
+                .db = switch (group_id) {
+                    7001 => self.left,
+                    7002 => self.right,
+                    else => return error.TestUnexpectedResult,
+                },
+                .release_fn = release,
+            };
+        }
+
+        fn release(ptr: *anyopaque, _: std.mem.Allocator) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.releases += 1;
+        }
+    };
+
+    var resident = ResidentSource{ .left = &left_db, .right = &right_db };
     var source = ProvisionedTableReadSource.init(path, FakeCatalog.iface(), raft_mod.read_gate.noopReadableLeaseRequester());
+    source.resident_db = resident.iface();
     var group_ids = [_]u64{ 7001, 7002 };
     var meta: query_api.QueryResponseMeta = .{};
     defer meta.deinit(alloc);
@@ -20640,6 +20731,7 @@ test "provisioned distributed aggregations collect path terms nested cardinality
         \\{"by_tier":{"type":"terms","field":"/meta/tier","sub_aggregations":{"product_cardinality":{"type":"cardinality","field":"product"},"tier_cardinality":{"type":"cardinality","field":"/meta/tier"}}}}
         ,
     };
+    try std.testing.expectError(error.ResidentDbRetryRequired, tryApplyProvisionedAlgebraicDistributedAggregations(&source, alloc, group_ids[0..], "docs", req, &meta));
     try std.testing.expect(try tryApplyProvisionedAlgebraicDistributedAggregations(&source, alloc, group_ids[0..], "docs", req, &meta));
     var stamped_meta: query_api.QueryResponseMeta = .{};
     defer stamped_meta.deinit(alloc);
@@ -20648,6 +20740,12 @@ test "provisioned distributed aggregations collect path terms nested cardinality
     var stamped_req = req;
     stamped_req.identity_read_generation = current_generation;
     try std.testing.expect(try tryApplyProvisionedAlgebraicDistributedAggregations(&source, alloc, group_ids[0..], "docs", stamped_req, &stamped_meta));
+    // Each request leases the representative group once and reuses it for its
+    // partial; only the second shard needs another lease. No readonly DB open
+    // is permitted behind the resident writer source.
+    try std.testing.expectEqual(@as(usize, 5), resident.attempts);
+    try std.testing.expectEqual(@as(usize, 4), resident.leases);
+    try std.testing.expectEqual(resident.leases, resident.releases);
 
     const FakeRouter = struct {
         fn iface() table_router.HostedGroupRouter {
