@@ -4598,6 +4598,7 @@ pub fn build(b: *std.Build) void {
 
     const lib_api_auth_default_filters = [_][]const u8{
         "api http server requires auth on public routes when enabled",
+        "api http server document scan requires table read permission",
         "api http server returns retryable not leader when local reconcile lease is lost",
         "api http server returns retryable not leader when metadata proposal is dropped",
         "api http server returns retryable not leader through public table adapter mutation",
