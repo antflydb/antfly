@@ -2824,7 +2824,8 @@ test "table provisioner restores local shard data from metadata restore intent" 
     try std.testing.expect(std.mem.indexOf(u8, doc, "\"alpha\"") != null);
 
     const FakeCatalog = struct {
-        restore_location: []const u8,
+        tables: [1]table_manager.TableRecord,
+        ranges: [1]table_manager.RangeRecord,
 
         fn iface(self: *@This()) table_catalog.CatalogSource {
             return .{
@@ -2840,20 +2841,8 @@ test "table provisioner restores local shard data from metadata restore intent" 
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return .{
                 .status = .{ .metadata_group_id = 100, .metrics = .{} },
-                .tables = @constCast((&[_]table_manager.TableRecord{.{
-                    .table_id = 7,
-                    .name = "docs",
-                    .indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"}}",
-                    .restore_backup_id = "snap1",
-                    .restore_location = self.restore_location,
-                    .placement_role = "data",
-                }})[0..]),
-                .ranges = @constCast((&[_]table_manager.RangeRecord{.{
-                    .group_id = 2001,
-                    .table_id = 7,
-                    .start_key = "doc:a",
-                    .end_key = null,
-                }})[0..]),
+                .tables = self.tables[0..],
+                .ranges = self.ranges[0..],
                 .stores = @constCast((&[_]table_manager.StoreRecord{})[0..]),
                 .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
                 .split_transitions = @constCast((&[_]@import("transition_state.zig").SplitTransitionRecord{})[0..]),
@@ -2864,7 +2853,22 @@ test "table provisioner restores local shard data from metadata restore intent" 
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
     };
 
-    var fake_catalog = FakeCatalog{ .restore_location = restore_location };
+    var fake_catalog = FakeCatalog{
+        .tables = .{.{
+            .table_id = 7,
+            .name = "docs",
+            .indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"}}",
+            .restore_backup_id = "snap1",
+            .restore_location = restore_location,
+            .placement_role = "data",
+        }},
+        .ranges = .{.{
+            .group_id = 2001,
+            .table_id = 7,
+            .start_key = "doc:a",
+            .end_key = null,
+        }},
+    };
     var read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         fake_catalog.iface(),

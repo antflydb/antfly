@@ -21,6 +21,7 @@ The request auth layer builds an `AuthenticatedIdentity` with:
 - `metadata`: trusted user metadata used by stored row-filter `$auth` references
 
 Route authorization is coarse-grained and permission based. Document-level read narrowing is enforced separately by row filters.
+Table lookup, query, and document-scan routes require `read` permission on the target table.
 
 ## Row Filter Enforcement
 
