@@ -147,6 +147,20 @@ pub const DataApplySnapshotRequest = extern struct {
     snapshot: BorrowedBytes = .{},
 };
 
+pub const DataApplyPrepareSnapshotRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved0: u32 = 0,
+    group_id: u64 = 0,
+    applied_index: u64 = 0,
+};
+
+pub const DataApplyPreparedSnapshotResult = extern struct {
+    version: u32 = abi_version,
+    _reserved0: u32 = 0,
+    path: OwnedBytes = .{},
+    size: u64 = 0,
+};
+
 pub const DataApplyGroupRequest = extern struct {
     version: u32 = abi_version,
     _reserved0: u32 = 0,
@@ -557,6 +571,25 @@ pub extern fn antfly_data_apply_store_install_snapshot(
     store: ?*anyopaque,
     request: *const DataApplySnapshotRequest,
 ) callconv(.c) Status;
+
+pub extern fn antfly_data_apply_store_prepare_snapshot(
+    store: ?*anyopaque,
+    request: *const DataApplyPrepareSnapshotRequest,
+    out_prepared: *?*anyopaque,
+) callconv(.c) Status;
+
+pub extern fn antfly_data_apply_prepared_snapshot_materialize(
+    prepared: ?*anyopaque,
+    out_result: *DataApplyPreparedSnapshotResult,
+) callconv(.c) Status;
+
+pub extern fn antfly_data_apply_prepared_snapshot_cancel(
+    prepared: ?*anyopaque,
+) callconv(.c) Status;
+
+pub extern fn antfly_data_apply_prepared_snapshot_destroy(
+    prepared: ?*anyopaque,
+) callconv(.c) void;
 
 pub extern fn antfly_data_apply_store_latest(
     store: ?*anyopaque,

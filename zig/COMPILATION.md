@@ -2625,6 +2625,8 @@ ABI version 20 adds only lifecycle-sized operations:
   context and its resource manager;
 - apply one encoded committed Raft batch;
 - build or install one complete group snapshot;
+- prepare one MVCC snapshot view on the Raft thread, materialize it to a
+  bounded-memory spool file on the worker, cancel it, and destroy it;
 - read one copied scalar apply watermark;
 - replace the admitted active-group set; and
 - begin, commit, abort, and destroy one atomic active-group transition.
@@ -2637,21 +2639,24 @@ coarse buffers and scalars to this client.
 
 The owner suite now passes 5/5 with zero leaks. Its new case applies an encoded
 committed entry, verifies the latest watermark, commits and aborts placement
-transitions, builds a snapshot, installs it into a second store, verifies the
+transitions, captures and materializes a prepared snapshot, verifies
+cancellation, builds a snapshot, installs it into a second store, verifies the
 restored watermark, rejects malformed group slices and future ABI versions,
 and proves that the shared process context remains busy until both stores
-close. The 6/6 provisioned cross-archive suite and 10/10 CAPI suite also pass.
-The graph gate treats the new client as a kernel contract so a direct DB,
-docstore, or backend import fails validation.
+close. The physical data-storage suite passes 57/57 with LMDB compatibility
+enabled, including all prepared-snapshot and split-projection tests. The 6/6
+provisioned cross-archive suite and 10/10 CAPI suite also pass. The graph gate
+treats the new client as a kernel contract so a direct DB, docstore, or backend
+import fails validation.
 
 Decision: **keep as an unattached ownership foundation with no compiler-time
-claim**. It is not yet valid to redirect `ManagedHttpHost`: the existing apply
-store supports off-thread prepared snapshots, and data transition control
-still calls its split projection directly. The next atomic slice must add the
-prepared-snapshot handle and coarse projection/split operations, then select
-the client for the experimental distributed build in one change. Until that
-selection makes the physical `RaftApplyStore` unreachable, do not measure or
-claim a distributed graph reduction.
+claim**. It is not yet valid to redirect `ManagedHttpHost`: data transition
+control still calls the store's split projection directly and sometimes passes
+a live DB/backend store into it. The next atomic slice must add coarse
+projection/reconciliation and split/merge operations, then select the client
+for the experimental distributed build in one change. Until that selection
+makes the physical `RaftApplyStore` unreachable, do not measure or claim a
+distributed graph reduction.
 
 ## Holistic target architecture
 

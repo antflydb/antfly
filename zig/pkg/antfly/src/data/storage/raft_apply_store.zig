@@ -1317,7 +1317,12 @@ pub const RaftApplyStore = struct {
         return try shard_state_store.buildSnapshot(&group_store.store, alloc, group_id);
     }
 
-    const PreparedSnapshot = struct {
+    pub const PreparedSnapshotFile = struct {
+        path: []u8,
+        size: u64,
+    };
+
+    pub const PreparedSnapshot = struct {
         owner: *RaftApplyStore,
         txn: docstore.DocStore.Txn,
         group_id: u64,
@@ -1328,14 +1333,26 @@ pub const RaftApplyStore = struct {
                 .ptr = self,
                 .vtable = &.{
                     .materialize = materialize,
-                    .cancel = cancel,
-                    .deinit = PreparedSnapshot.deinit,
+                    .cancel = cancelSource,
+                    .deinit = deinitSource,
                 },
             };
         }
 
         fn materialize(ptr: *anyopaque, alloc: std.mem.Allocator) !raft_engine.runtime.storage_iface.SnapshotMaterialization {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            const materialized = try self.materializeFile(alloc);
+            defer alloc.free(materialized.path);
+            errdefer std.Io.Dir.cwd().deleteFile(self.owner.io_impl.io(), materialized.path) catch {};
+            return .{ .artifact = try raft_storage_mod.file_snapshot_artifact.FileSnapshotArtifact.create(
+                alloc,
+                self.owner.io_impl.io(),
+                materialized.path,
+                materialized.size,
+            ) };
+        }
+
+        pub fn materializeFile(self: *@This(), alloc: std.mem.Allocator) !PreparedSnapshotFile {
             if (self.cancelled.load(.acquire)) return error.SnapshotBuildCancelled;
             const io = self.owner.io_impl.io();
             const spool_dir = try std.fmt.allocPrint(alloc, "{s}/snapshot-spool", .{self.owner.root_dir});
@@ -1346,7 +1363,7 @@ pub const RaftApplyStore = struct {
                 self.group_id,
                 snapshot_spool_nonce.fetchAdd(1, .monotonic),
             });
-            defer alloc.free(path);
+            errdefer alloc.free(path);
             errdefer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
             var size: u64 = 0;
@@ -1360,21 +1377,24 @@ pub const RaftApplyStore = struct {
                 try file.sync(io);
                 size = (try file.stat(io)).size;
             }
-            return .{ .artifact = try raft_storage_mod.file_snapshot_artifact.FileSnapshotArtifact.create(
-                alloc,
-                io,
-                path,
-                size,
-            ) };
+            return .{ .path = path, .size = size };
         }
 
-        fn cancel(ptr: *anyopaque) void {
+        fn cancelSource(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.cancel();
+        }
+
+        pub fn cancel(self: *@This()) void {
             self.cancelled.store(true, .release);
         }
 
-        fn deinit(ptr: *anyopaque) void {
+        fn deinitSource(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.destroy();
+        }
+
+        pub fn destroy(self: *@This()) void {
             self.txn.abort();
             self.owner.releaseSnapshotReader(self.group_id);
             std.heap.page_allocator.destroy(self);
@@ -1383,6 +1403,11 @@ pub const RaftApplyStore = struct {
 
     fn prepareSnapshot(ptr: *anyopaque, group_id: u64, applied_index: u64) !?raft_engine.runtime.storage_iface.SnapshotSource {
         const self: *RaftApplyStore = @ptrCast(@alignCast(ptr));
+        const prepared = (try self.prepareSnapshotHandle(group_id, applied_index)) orelse return null;
+        return prepared.source();
+    }
+
+    pub fn prepareSnapshotHandle(self: *RaftApplyStore, group_id: u64, applied_index: u64) !?*PreparedSnapshot {
         const io = self.io_impl.io();
         const shard = self.batchShard(group_id);
         shard.mutex.lockUncancelable(io);
@@ -1413,7 +1438,7 @@ pub const RaftApplyStore = struct {
             .txn = txn,
             .group_id = group_id,
         };
-        return prepared.source();
+        return prepared;
     }
 
     fn installSnapshotFromRaft(

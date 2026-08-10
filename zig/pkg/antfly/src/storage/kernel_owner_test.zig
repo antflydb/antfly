@@ -684,6 +684,24 @@ test "opaque data raft apply owner preserves batch snapshot and placement lifecy
     aborted.abort();
     aborted.deinit();
 
+    var prepared = (try source.prepareSnapshot(81, 9)) orelse return error.TestExpectedEqual;
+    defer prepared.deinit();
+    var materialized = try prepared.materializeFile(std.testing.allocator);
+    defer materialized.deinit(std.testing.allocator);
+    const materialized_bytes = try std.Io.Dir.cwd().readFileAlloc(
+        std.Options.debug_io,
+        materialized.path,
+        std.testing.allocator,
+        .limited(materialized.size + 1),
+    );
+    defer std.testing.allocator.free(materialized_bytes);
+    try std.testing.expectEqual(materialized.size, @as(u64, @intCast(materialized_bytes.len)));
+
+    var cancelled = (try source.prepareSnapshot(81, 9)) orelse return error.TestExpectedEqual;
+    defer cancelled.deinit();
+    cancelled.cancel();
+    try std.testing.expectError(error.Cancelled, cancelled.materializeFile(std.testing.allocator));
+
     const snapshot = try source.buildSnapshot(std.testing.allocator, 81);
     defer std.testing.allocator.free(snapshot);
     try std.testing.expect(snapshot.len > 0);

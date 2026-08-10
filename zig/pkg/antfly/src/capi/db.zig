@@ -105,6 +105,11 @@ const DataApplyGroupTransitionHandle = struct {
     active: bool = true,
 };
 
+const DataApplyPreparedSnapshotHandle = struct {
+    prepared: *data_raft_apply.RaftApplyStore.PreparedSnapshot,
+    materialized: bool = false,
+};
+
 const StorageOwnerTransactionRecovery = struct {
     alloc: Allocator,
     config: kernel_owner_abi.TransactionRecoveryConfig,
@@ -1882,6 +1887,10 @@ fn asDataApplyGroupTransition(ptr: ?*anyopaque) ?*DataApplyGroupTransitionHandle
     return @ptrCast(@alignCast(ptr orelse return null));
 }
 
+fn asDataApplyPreparedSnapshot(ptr: ?*anyopaque) ?*DataApplyPreparedSnapshotHandle {
+    return @ptrCast(@alignCast(ptr orelse return null));
+}
+
 pub fn dataApplyStoreOpen(
     request: *const kernel_owner_abi.DataApplyOpenRequest,
     out_store: *?*anyopaque,
@@ -1968,6 +1977,58 @@ pub fn dataApplyStoreInstallSnapshot(
     ) catch |err| return storageOwnerStatusFromError(err);
     if (!installed) return .internal;
     return .ok;
+}
+
+pub fn dataApplyStorePrepareSnapshot(
+    store_ptr: ?*anyopaque,
+    request: *const kernel_owner_abi.DataApplyPrepareSnapshotRequest,
+    out_prepared: *?*anyopaque,
+) callconv(.c) kernel_owner_abi.Status {
+    out_prepared.* = null;
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asDataApplyStore(store_ptr) orelse return .invalid_argument;
+    const prepared = handle.store.prepareSnapshotHandle(request.group_id, request.applied_index) catch |err|
+        return storageOwnerStatusFromError(err);
+    const value = prepared orelse return .ok;
+    const owned = handle.alloc.create(DataApplyPreparedSnapshotHandle) catch {
+        value.destroy();
+        return .out_of_memory;
+    };
+    owned.* = .{ .prepared = value };
+    out_prepared.* = owned;
+    return .ok;
+}
+
+pub fn dataApplyPreparedSnapshotMaterialize(
+    prepared_ptr: ?*anyopaque,
+    out_result: *kernel_owner_abi.DataApplyPreparedSnapshotResult,
+) callconv(.c) kernel_owner_abi.Status {
+    out_result.* = .{};
+    const handle = asDataApplyPreparedSnapshot(prepared_ptr) orelse return .invalid_argument;
+    if (handle.materialized) return .invalid_argument;
+    const materialized = handle.prepared.materializeFile(std.heap.c_allocator) catch |err|
+        return storageOwnerStatusFromError(err);
+    handle.materialized = true;
+    out_result.* = .{
+        .path = .{
+            .ptr = if (materialized.path.len == 0) null else materialized.path.ptr,
+            .len = @intCast(materialized.path.len),
+        },
+        .size = materialized.size,
+    };
+    return .ok;
+}
+
+pub fn dataApplyPreparedSnapshotCancel(prepared_ptr: ?*anyopaque) callconv(.c) kernel_owner_abi.Status {
+    const handle = asDataApplyPreparedSnapshot(prepared_ptr) orelse return .invalid_argument;
+    handle.prepared.cancel();
+    return .ok;
+}
+
+pub fn dataApplyPreparedSnapshotDestroy(prepared_ptr: ?*anyopaque) callconv(.c) void {
+    const handle = asDataApplyPreparedSnapshot(prepared_ptr) orelse return;
+    handle.prepared.destroy();
+    std.heap.c_allocator.destroy(handle);
 }
 
 pub fn dataApplyStoreLatest(
@@ -3404,7 +3465,7 @@ fn storageOwnerStatusFromError(err: anyerror) kernel_owner_abi.Status {
         error.IndexNotFound => .index_not_found,
         error.IdentityReadGenerationChanged => .identity_read_generation_changed,
         error.Timeout, error.TableVisibilityTimeout => .timeout,
-        error.Canceled, error.Cancelled => .cancelled,
+        error.Canceled, error.Cancelled, error.SnapshotBuildCancelled => .cancelled,
         error.RestoreIdentityMismatch => .restore_identity_mismatch,
         error.InvalidBackupRequest => .invalid_backup,
         error.UnsupportedBackupMigrationState => .unsupported_backup_migration,

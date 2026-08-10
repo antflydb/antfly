@@ -82,6 +82,15 @@ pub const RaftApplyStore = struct {
         }));
     }
 
+    pub fn prepareSnapshot(self: *RaftApplyStore, group_id: u64, applied_index: u64) !?PreparedSnapshot {
+        var handle: ?*anyopaque = null;
+        try statusToError(abi.antfly_data_apply_store_prepare_snapshot(self.handle, &.{
+            .group_id = group_id,
+            .applied_index = applied_index,
+        }, &handle));
+        return if (handle) |value| .{ .handle = value } else null;
+    }
+
     pub fn latestBatch(self: *RaftApplyStore, group_id: u64) !?AppliedDataBatch {
         var result: abi.DataApplyLatestResult = .{};
         try statusToError(abi.antfly_data_apply_store_latest(self.handle, &.{
@@ -139,6 +148,43 @@ pub const RaftApplyStore = struct {
             self.* = undefined;
         }
     };
+
+    pub const PreparedSnapshot = struct {
+        handle: ?*anyopaque,
+
+        pub const MaterializedFile = struct {
+            path: []u8,
+            size: u64,
+
+            pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+                std.Io.Dir.cwd().deleteFile(std.Options.debug_io, self.path) catch {};
+                alloc.free(self.path);
+                self.* = undefined;
+            }
+        };
+
+        pub fn materializeFile(self: *PreparedSnapshot, alloc: std.mem.Allocator) !MaterializedFile {
+            var result: abi.DataApplyPreparedSnapshotResult = .{};
+            try statusToError(abi.antfly_data_apply_prepared_snapshot_materialize(self.handle, &result));
+            defer abi.antfly_storage_owner_buffer_destroy(&result.path);
+            if (result.version != abi.abi_version) return error.InvalidAbiVersion;
+            const path = alloc.dupe(u8, result.path.slice()) catch |err| {
+                std.Io.Dir.cwd().deleteFile(std.Options.debug_io, result.path.slice()) catch {};
+                return err;
+            };
+            return .{ .path = path, .size = result.size };
+        }
+
+        pub fn cancel(self: *PreparedSnapshot) void {
+            const status = abi.antfly_data_apply_prepared_snapshot_cancel(self.handle);
+            std.debug.assert(status == .ok);
+        }
+
+        pub fn deinit(self: *PreparedSnapshot) void {
+            abi.antfly_data_apply_prepared_snapshot_destroy(self.handle);
+            self.* = undefined;
+        }
+    };
 };
 
 fn groupsRequest(group_ids: []const u64) abi.DataApplyGroupsRequest {
@@ -158,6 +204,7 @@ fn statusToError(status: abi.Status) !void {
         .read_only => error.ReadOnly,
         .out_of_memory => error.OutOfMemory,
         .corrupted => error.Corrupted,
+        .cancelled => error.Cancelled,
         else => error.StorageKernelFailure,
     };
 }

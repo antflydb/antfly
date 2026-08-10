@@ -297,6 +297,10 @@ comptime {
             exportInternal(&storage_kernel_exports.dataApplyStoreApplyBatch, "antfly_data_apply_store_apply_batch");
             exportInternal(&storage_kernel_exports.dataApplyStoreBuildSnapshot, "antfly_data_apply_store_build_snapshot");
             exportInternal(&storage_kernel_exports.dataApplyStoreInstallSnapshot, "antfly_data_apply_store_install_snapshot");
+            exportInternal(&storage_kernel_exports.dataApplyStorePrepareSnapshot, "antfly_data_apply_store_prepare_snapshot");
+            exportInternal(&storage_kernel_exports.dataApplyPreparedSnapshotMaterialize, "antfly_data_apply_prepared_snapshot_materialize");
+            exportInternal(&storage_kernel_exports.dataApplyPreparedSnapshotCancel, "antfly_data_apply_prepared_snapshot_cancel");
+            exportInternal(&storage_kernel_exports.dataApplyPreparedSnapshotDestroy, "antfly_data_apply_prepared_snapshot_destroy");
             exportInternal(&storage_kernel_exports.dataApplyStoreLatest, "antfly_data_apply_store_latest");
             exportInternal(&storage_kernel_exports.dataApplyStoreRetainGroups, "antfly_data_apply_store_retain_groups");
             exportInternal(&storage_kernel_exports.dataApplyStoreBeginGroupTransition, "antfly_data_apply_store_begin_group_transition");
