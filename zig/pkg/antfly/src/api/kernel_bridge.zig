@@ -29,39 +29,36 @@ const backend_erased = @import("../storage/backend_erased.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const httpx = @import("httpx");
 
-const ErrorInt = abi.ErrorInt;
 const CreateContext = abi.CreateContext;
 const CallContext = abi.CallContext;
 const HandlerCreateContext = abi.HandlerCreateContext;
-const ok: c_int = 0;
 const direct_codegen = builtin.is_test;
 
-extern fn antfly_api_kernel_create(context: *const CreateContext) callconv(.c) c_int;
+extern fn antfly_api_kernel_create(context: *const CreateContext) callconv(.c) abi.Status;
 extern fn antfly_api_kernel_destroy(handle: *anyopaque) callconv(.c) void;
-extern fn antfly_api_kernel_request_stats(context: *const CallContext) callconv(.c) c_int;
-extern fn antfly_api_kernel_set_provider(context: *const CallContext) callconv(.c) c_int;
-extern fn antfly_api_kernel_set_ha_executor(context: *const CallContext) callconv(.c) c_int;
-extern fn antfly_api_kernel_executor(context: *const CallContext) callconv(.c) c_int;
-extern fn antfly_api_kernel_streaming_executor(context: *const CallContext) callconv(.c) c_int;
-extern fn antfly_api_kernel_attach_runtime_restore_store(context: *const CallContext) callconv(.c) c_int;
-extern fn antfly_api_kernel_attach_replicated_restore_store(context: *const CallContext) callconv(.c) c_int;
-extern fn antfly_api_kernel_resume_restore_jobs(context: *const CallContext) callconv(.c) c_int;
-extern fn antfly_api_kernel_poll_restore_jobs(context: *const CallContext) callconv(.c) c_int;
-extern fn antfly_api_kernel_prepare_restore_leadership(context: *const CallContext) callconv(.c) c_int;
-extern fn antfly_api_kernel_schedule_session_maintenance(context: *const CallContext) callconv(.c) c_int;
-extern fn antfly_api_kernel_storage_maintenance_active(context: *const CallContext) callconv(.c) c_int;
-extern fn antfly_api_kernel_handle(context: *const CallContext) callconv(.c) c_int;
-extern fn antfly_api_kernel_handle_internal(context: *const CallContext) callconv(.c) c_int;
-extern fn antfly_api_kernel_handler_create(context: *const HandlerCreateContext) callconv(.c) c_int;
-extern fn antfly_api_kernel_handler_init(context: *const CallContext) callconv(.c) c_int;
-extern fn antfly_api_kernel_handler_stats(context: *const CallContext) callconv(.c) c_int;
-extern fn antfly_api_kernel_handler_register_routes(context: *const CallContext) callconv(.c) c_int;
+extern fn antfly_api_kernel_request_stats(context: *const CallContext) callconv(.c) abi.Status;
+extern fn antfly_api_kernel_set_provider(context: *const CallContext) callconv(.c) abi.Status;
+extern fn antfly_api_kernel_set_ha_executor(context: *const CallContext) callconv(.c) abi.Status;
+extern fn antfly_api_kernel_executor(context: *const CallContext) callconv(.c) abi.Status;
+extern fn antfly_api_kernel_streaming_executor(context: *const CallContext) callconv(.c) abi.Status;
+extern fn antfly_api_kernel_attach_runtime_restore_store(context: *const CallContext) callconv(.c) abi.Status;
+extern fn antfly_api_kernel_attach_replicated_restore_store(context: *const CallContext) callconv(.c) abi.Status;
+extern fn antfly_api_kernel_resume_restore_jobs(context: *const CallContext) callconv(.c) abi.Status;
+extern fn antfly_api_kernel_poll_restore_jobs(context: *const CallContext) callconv(.c) abi.Status;
+extern fn antfly_api_kernel_prepare_restore_leadership(context: *const CallContext) callconv(.c) abi.Status;
+extern fn antfly_api_kernel_schedule_session_maintenance(context: *const CallContext) callconv(.c) abi.Status;
+extern fn antfly_api_kernel_storage_maintenance_active(context: *const CallContext) callconv(.c) abi.Status;
+extern fn antfly_api_kernel_handle(context: *const CallContext) callconv(.c) abi.Status;
+extern fn antfly_api_kernel_handle_internal(context: *const CallContext) callconv(.c) abi.Status;
+extern fn antfly_api_kernel_handler_create(context: *const HandlerCreateContext) callconv(.c) abi.Status;
+extern fn antfly_api_kernel_handler_init(context: *const CallContext) callconv(.c) abi.Status;
+extern fn antfly_api_kernel_handler_stats(context: *const CallContext) callconv(.c) abi.Status;
+extern fn antfly_api_kernel_handler_register_routes(context: *const CallContext) callconv(.c) abi.Status;
 extern fn antfly_api_kernel_handler_destroy(handle: *anyopaque) callconv(.c) void;
 
-fn callError(status: c_int, error_code: ErrorInt) !void {
-    if (status == ok) return;
-    if (error_code != 0) return @errorFromInt(error_code);
-    return error.ApiKernelOperationFailed;
+fn callError(status: abi.Status) !void {
+    if (status.isOk()) return;
+    return abi.errorFromStatus(status);
 }
 
 pub const ApiHttpServer = if (direct_codegen) server_mod.ApiHttpServer else OpaqueApiHttpServer;
@@ -190,7 +187,6 @@ fn createOpaqueServer(
     var writes_copy = write_source;
     var handle: ?*anyopaque = null;
     var request_alloc: std.mem.Allocator = undefined;
-    var error_code: ErrorInt = 0;
     const status = antfly_api_kernel_create(&.{
         .owner_alloc = &alloc_copy,
         .cfg = &cfg_copy,
@@ -200,24 +196,22 @@ fn createOpaqueServer(
         .fallible = fallible,
         .out_handle = &handle,
         .out_request_alloc = &request_alloc,
-        .error_code = &error_code,
     });
-    try callError(status, error_code);
+    try callError(status);
     return .{ .opaque_handle = handle orelse return error.ApiKernelOperationFailed, .alloc = request_alloc, .cfg = cfg };
 }
 
 fn callFallible(
-    comptime function: fn (*const CallContext) callconv(.c) c_int,
+    comptime function: fn (*const CallContext) callconv(.c) abi.Status,
     handle: *anyopaque,
     input: ?*const anyopaque,
     output: ?*anyopaque,
 ) !void {
-    var error_code: ErrorInt = 0;
-    try callError(function(&.{ .handle = handle, .input = input, .output = output, .error_code = &error_code }), error_code);
+    try callError(function(&.{ .handle = handle, .input = input, .output = output }));
 }
 
 fn callInfallible(
-    comptime function: fn (*const CallContext) callconv(.c) c_int,
+    comptime function: fn (*const CallContext) callconv(.c) abi.Status,
     handle: *anyopaque,
     input: ?*const anyopaque,
     output: ?*anyopaque,
@@ -254,13 +248,11 @@ const OpaqueHttpxHandler = struct {
 pub fn createHandler(server: *ApiHttpServer) !HttpxHandler {
     if (comptime direct_codegen) return .{ .api_server = server };
     var handle: ?*anyopaque = null;
-    var error_code: ErrorInt = 0;
     const status = antfly_api_kernel_handler_create(&.{
         .api_server_handle = server.opaque_handle,
         .out_handle = &handle,
-        .error_code = &error_code,
     });
-    try callError(status, error_code);
+    try callError(status);
     return .{ .handle = handle orelse return error.ApiKernelOperationFailed };
 }
 

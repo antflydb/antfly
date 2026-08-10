@@ -684,7 +684,7 @@ Current binary/image split:
 
 Build graph steps:
 
-- `zig build install -Dedition=full`
+- `zig build antfly -Dedition=full`
 - `zig build serverless-test`
 
 GitHub Actions:
@@ -971,7 +971,7 @@ export ANTFLY_SERVERLESS_SPARSE_EMBEDDING_INDEX_NAME=serverless_sparse
 export ANTFLY_SERVERLESS_CHUNK_EMBEDDING_INDEX_NAME=serverless_chunk
 export ANTFLY_SERVERLESS_CHUNK_EMBEDDING_DIMS=768
 
-zig build install -Dedition=full
+zig build antfly -Dedition=full
 ./zig-out/bin/antfly serverless maintenance
 ```
 

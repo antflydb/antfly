@@ -222,7 +222,7 @@ run_zig_build_steps_with_retry() {
   # API and the shared PIC application/storage unit occupy the initial bounded
   # memory group. Inference starts after API, while the short remote CLI unit
   # starts after application/storage, preserving useful overlap deterministically.
-  run_zig_build_steps_with_retry archive install capi
+  run_zig_build_steps_with_retry archive antfly capi
 )
 
 test -x "$prefix/bin/antfly"

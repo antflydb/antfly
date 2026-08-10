@@ -25,6 +25,7 @@ const distributed_stats_mod = @import("../search/distributed_stats.zig");
 const query_api = @import("query_response.zig");
 const distributed_graph = @import("distributed_graph.zig");
 const runtime_status = @import("runtime_status.zig");
+const runtime_callback_abi = @import("../runtime_callback_abi.zig");
 
 pub const LookupResponse = struct {
     json: []u8,
@@ -81,6 +82,7 @@ pub const ParsedTextStatsHttpResponse = union(enum) {
 pub const TableReadSource = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
 
     pub const VTable = struct {
         lookup: *const fn (
@@ -312,6 +314,7 @@ pub const TableReadSource = struct {
             consistency: read_gate.ReadConsistency,
         ) anyerror!?db_types.DocumentArtifactManifestList = null,
     };
+    const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
     pub fn lookup(
         self: TableReadSource,
@@ -321,7 +324,7 @@ pub const TableReadSource = struct {
         opts: db_types.LookupOptions,
         consistency: read_gate.ReadConsistency,
     ) !?LookupResponse {
-        return try self.vtable.lookup(self.ptr, alloc, table_name, key, opts, consistency);
+        return try BoundaryAbi.call("lookup", self.boundary_dispatch, self.vtable.lookup, .{ self.ptr, alloc, table_name, key, opts, consistency });
     }
 
     pub fn scan(
@@ -333,7 +336,7 @@ pub const TableReadSource = struct {
         opts: db_types.ScanOptions,
         consistency: read_gate.ReadConsistency,
     ) !?ScanResponse {
-        return try self.vtable.scan(self.ptr, alloc, table_name, from_key, to_key, opts, consistency);
+        return try BoundaryAbi.call("scan", self.boundary_dispatch, self.vtable.scan, .{ self.ptr, alloc, table_name, from_key, to_key, opts, consistency });
     }
 
     pub fn documentArtifactManifest(
@@ -345,7 +348,7 @@ pub const TableReadSource = struct {
         consistency: read_gate.ReadConsistency,
     ) !?db_types.DocumentArtifactManifest {
         const fn_ptr = self.vtable.document_artifact_manifest orelse return null;
-        return try fn_ptr(self.ptr, alloc, table_name, doc_key, artifact_name, consistency);
+        return try BoundaryAbi.call("document_artifact_manifest", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, doc_key, artifact_name, consistency });
     }
 
     pub fn documentArtifactManifestGroupLocal(
@@ -358,7 +361,7 @@ pub const TableReadSource = struct {
         consistency: read_gate.ReadConsistency,
     ) !?db_types.DocumentArtifactManifest {
         const fn_ptr = self.vtable.document_artifact_manifest_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, doc_key, artifact_name, consistency);
+        return try BoundaryAbi.call("document_artifact_manifest_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, doc_key, artifact_name, consistency });
     }
 
     pub fn documentArtifactManifests(
@@ -369,7 +372,7 @@ pub const TableReadSource = struct {
         consistency: read_gate.ReadConsistency,
     ) !?db_types.DocumentArtifactManifestList {
         const fn_ptr = self.vtable.document_artifact_manifests orelse return null;
-        return try fn_ptr(self.ptr, alloc, table_name, doc_key, consistency);
+        return try BoundaryAbi.call("document_artifact_manifests", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, doc_key, consistency });
     }
 
     pub fn documentArtifactManifestsGroupLocal(
@@ -381,7 +384,7 @@ pub const TableReadSource = struct {
         consistency: read_gate.ReadConsistency,
     ) !?db_types.DocumentArtifactManifestList {
         const fn_ptr = self.vtable.document_artifact_manifests_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, doc_key, consistency);
+        return try BoundaryAbi.call("document_artifact_manifests_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, doc_key, consistency });
     }
 
     pub fn query(
@@ -391,7 +394,7 @@ pub const TableReadSource = struct {
         req: db_types.SearchRequest,
         consistency: read_gate.ReadConsistency,
     ) !?query_api.QueryResponse {
-        return try self.vtable.query(self.ptr, alloc, table_name, req, consistency);
+        return try BoundaryAbi.call("query", self.boundary_dispatch, self.vtable.query, .{ self.ptr, alloc, table_name, req, consistency });
     }
 
     pub fn preflightQuery(
@@ -403,7 +406,7 @@ pub const TableReadSource = struct {
         max_work: u32,
     ) !?runtime_preflight.RuntimePreflightSummary {
         const fn_ptr = self.vtable.preflight_query orelse return null;
-        return try fn_ptr(self.ptr, alloc, table_name, req, consistency, max_work);
+        return try BoundaryAbi.call("preflight_query", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, req, consistency, max_work });
     }
 
     pub fn preflightQueryGroupLocal(
@@ -416,7 +419,7 @@ pub const TableReadSource = struct {
         max_work: u32,
     ) !?runtime_preflight.RuntimePreflightSummary {
         const fn_ptr = self.vtable.preflight_query_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, req, consistency, max_work);
+        return try BoundaryAbi.call("preflight_query_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, req, consistency, max_work });
     }
 
     pub fn lookupGroupLocal(
@@ -429,7 +432,7 @@ pub const TableReadSource = struct {
         consistency: read_gate.ReadConsistency,
     ) !?LookupResponse {
         const fn_ptr = self.vtable.lookup_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, key, opts, consistency);
+        return try BoundaryAbi.call("lookup_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, key, opts, consistency });
     }
 
     pub fn scanGroupLocal(
@@ -443,7 +446,7 @@ pub const TableReadSource = struct {
         consistency: read_gate.ReadConsistency,
     ) !?ScanResponse {
         const fn_ptr = self.vtable.scan_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, from_key, to_key, opts, consistency);
+        return try BoundaryAbi.call("scan_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, from_key, to_key, opts, consistency });
     }
 
     pub fn queryGroupLocal(
@@ -455,7 +458,7 @@ pub const TableReadSource = struct {
         consistency: read_gate.ReadConsistency,
     ) !?query_api.QueryResponse {
         const fn_ptr = self.vtable.query_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, req, consistency);
+        return try BoundaryAbi.call("query_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, req, consistency });
     }
 
     pub fn searchResultGroupLocal(
@@ -467,7 +470,7 @@ pub const TableReadSource = struct {
         consistency: read_gate.ReadConsistency,
     ) !?db_types.SearchResult {
         const fn_ptr = self.vtable.search_result_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, req, consistency);
+        return try BoundaryAbi.call("search_result_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, req, consistency });
     }
 
     pub fn textStatsGroupLocal(
@@ -478,7 +481,7 @@ pub const TableReadSource = struct {
         body: []const u8,
     ) !?query_api.QueryResponse {
         const fn_ptr = self.vtable.text_stats_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, body);
+        return try BoundaryAbi.call("text_stats_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, body });
     }
 
     pub fn algebraicPartialsGroupLocal(
@@ -489,7 +492,7 @@ pub const TableReadSource = struct {
         body: []const u8,
     ) !?query_api.QueryResponse {
         const fn_ptr = self.vtable.algebraic_partials_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, body);
+        return try BoundaryAbi.call("algebraic_partials_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, body });
     }
 
     pub fn joinPartitionGroupLocal(
@@ -500,7 +503,7 @@ pub const TableReadSource = struct {
         body: []const u8,
     ) !?query_api.QueryResponse {
         const fn_ptr = self.vtable.join_partition_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, body);
+        return try BoundaryAbi.call("join_partition_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, body });
     }
 
     pub fn joinRowsGroupLocal(
@@ -511,7 +514,7 @@ pub const TableReadSource = struct {
         body: []const u8,
     ) !?query_api.QueryResponse {
         const fn_ptr = self.vtable.join_rows_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, body);
+        return try BoundaryAbi.call("join_rows_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, body });
     }
 
     pub fn joinUnmatchedGroupLocal(
@@ -522,7 +525,7 @@ pub const TableReadSource = struct {
         body: []const u8,
     ) !?query_api.QueryResponse {
         const fn_ptr = self.vtable.join_unmatched_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, body);
+        return try BoundaryAbi.call("join_unmatched_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, body });
     }
 
     pub fn joinFinalizeGroupLocal(
@@ -533,7 +536,7 @@ pub const TableReadSource = struct {
         body: []const u8,
     ) !?query_api.QueryResponse {
         const fn_ptr = self.vtable.join_finalize_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, body);
+        return try BoundaryAbi.call("join_finalize_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, body });
     }
 
     pub fn joinPartitionGroupLocalWithTimeout(
@@ -545,7 +548,7 @@ pub const TableReadSource = struct {
         timeout_ms: ?u32,
     ) !?query_api.QueryResponse {
         if (self.vtable.join_partition_group_local_with_timeout) |fn_ptr| {
-            return try fn_ptr(self.ptr, alloc, group_id, table_name, body, timeout_ms);
+            return try BoundaryAbi.call("join_partition_group_local_with_timeout", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, body, timeout_ms });
         }
         if (timeout_ms != null) return error.UnsupportedDeadline;
         return try self.joinPartitionGroupLocal(alloc, group_id, table_name, body);
@@ -560,7 +563,7 @@ pub const TableReadSource = struct {
         timeout_ms: ?u32,
     ) !?query_api.QueryResponse {
         if (self.vtable.join_rows_group_local_with_timeout) |fn_ptr| {
-            return try fn_ptr(self.ptr, alloc, group_id, table_name, body, timeout_ms);
+            return try BoundaryAbi.call("join_rows_group_local_with_timeout", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, body, timeout_ms });
         }
         if (timeout_ms != null) return error.UnsupportedDeadline;
         return try self.joinRowsGroupLocal(alloc, group_id, table_name, body);
@@ -575,7 +578,7 @@ pub const TableReadSource = struct {
         timeout_ms: ?u32,
     ) !?query_api.QueryResponse {
         if (self.vtable.join_unmatched_group_local_with_timeout) |fn_ptr| {
-            return try fn_ptr(self.ptr, alloc, group_id, table_name, body, timeout_ms);
+            return try BoundaryAbi.call("join_unmatched_group_local_with_timeout", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, body, timeout_ms });
         }
         if (timeout_ms != null) return error.UnsupportedDeadline;
         return try self.joinUnmatchedGroupLocal(alloc, group_id, table_name, body);
@@ -590,7 +593,7 @@ pub const TableReadSource = struct {
         timeout_ms: ?u32,
     ) !?query_api.QueryResponse {
         if (self.vtable.join_finalize_group_local_with_timeout) |fn_ptr| {
-            return try fn_ptr(self.ptr, alloc, group_id, table_name, body, timeout_ms);
+            return try BoundaryAbi.call("join_finalize_group_local_with_timeout", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, body, timeout_ms });
         }
         if (timeout_ms != null) return error.UnsupportedDeadline;
         return try self.joinFinalizeGroupLocal(alloc, group_id, table_name, body);
@@ -604,7 +607,7 @@ pub const TableReadSource = struct {
         body: []const u8,
     ) !?query_api.QueryResponse {
         const fn_ptr = self.vtable.join_job_state_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, body);
+        return try BoundaryAbi.call("join_job_state_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, body });
     }
 
     pub fn graphExpandGroupLocal(
@@ -616,7 +619,7 @@ pub const TableReadSource = struct {
         consistency: read_gate.ReadConsistency,
     ) !?distributed_graph.GraphExpandResponse {
         const fn_ptr = self.vtable.graph_expand_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, req, consistency);
+        return try BoundaryAbi.call("graph_expand_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, req, consistency });
     }
 
     pub fn graphHydrateGroupLocal(
@@ -628,7 +631,7 @@ pub const TableReadSource = struct {
         consistency: read_gate.ReadConsistency,
     ) !?distributed_graph.GraphHydrateResponse {
         const fn_ptr = self.vtable.graph_hydrate_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, req, consistency);
+        return try BoundaryAbi.call("graph_hydrate_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, req, consistency });
     }
 
     pub fn graphEdgesGroupLocal(
@@ -640,7 +643,7 @@ pub const TableReadSource = struct {
         consistency: read_gate.ReadConsistency,
     ) !?distributed_graph.GraphEdgesResponse {
         const fn_ptr = self.vtable.graph_edges_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, req, consistency);
+        return try BoundaryAbi.call("graph_edges_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, req, consistency });
     }
 
     pub fn localRuntimeStatuses(
@@ -649,7 +652,7 @@ pub const TableReadSource = struct {
         table_name: []const u8,
     ) !?runtime_status.LocalTableRuntimeStatuses {
         const fn_ptr = self.vtable.local_runtime_statuses orelse return null;
-        return try fn_ptr(self.ptr, alloc, table_name);
+        return try BoundaryAbi.call("local_runtime_statuses", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name });
     }
 
     pub fn lsmStorageStats(
@@ -658,7 +661,7 @@ pub const TableReadSource = struct {
         table_name: []const u8,
     ) !?LsmStorageStats {
         const fn_ptr = self.vtable.lsm_storage_stats orelse return null;
-        return try fn_ptr(self.ptr, alloc, table_name);
+        return try BoundaryAbi.call("lsm_storage_stats", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name });
     }
 
     pub fn observedDynamicFieldCapabilitySets(
@@ -667,6 +670,6 @@ pub const TableReadSource = struct {
         table_name: []const u8,
     ) !?[]ObservedDynamicFieldCapabilitySet {
         const fn_ptr = self.vtable.observed_dynamic_field_capability_sets orelse return null;
-        return try fn_ptr(self.ptr, alloc, table_name);
+        return try BoundaryAbi.call("observed_dynamic_field_capability_sets", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name });
     }
 };

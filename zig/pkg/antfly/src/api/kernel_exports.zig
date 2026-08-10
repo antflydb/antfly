@@ -26,7 +26,8 @@ const metadata_openapi = @import("antfly_metadata_openapi");
 const usermgr_openapi = @import("antfly_usermgr_openapi");
 const httpx = @import("httpx");
 
-const ErrorInt = abi.ErrorInt;
+extern fn antfly_distributed_httpx_register(context: *const abi.RouteContext) callconv(.c) abi.Status;
+
 pub const CreateContext = abi.CreateContext;
 pub const CallContext = abi.CallContext;
 pub const HandlerCreateContext = abi.HandlerCreateContext;
@@ -41,9 +42,8 @@ const HandlerState = struct {
     handler: handler_mod.AntflyApiHandler,
 };
 
-fn fail(error_code: *ErrorInt, err: anyerror) c_int {
-    error_code.* = @intFromError(err);
-    return 1;
+fn fail(err: anyerror) abi.Status {
+    return abi.statusFromError(err);
 }
 
 fn serverState(context: *const CallContext) *ServerState {
@@ -58,28 +58,28 @@ fn output(comptime T: type, context: *const CallContext) *T {
     return @ptrCast(@alignCast(context.output orelse @panic("missing API kernel output")));
 }
 
-pub fn create(context: *const CreateContext) callconv(.c) c_int {
+pub fn create(context: *const CreateContext) callconv(.c) abi.Status {
     const owner_alloc_ptr: *const std.mem.Allocator = @ptrCast(@alignCast(context.owner_alloc));
     const cfg: *const server_mod.ApiHttpServerConfig = @ptrCast(@alignCast(context.cfg));
     const source: *const server_mod.StatusSource = @ptrCast(@alignCast(context.source));
     const reads: *const ?table_reads.TableReadSource = @ptrCast(@alignCast(context.table_reads));
     const writes: *const ?table_writes.TableWriteSource = @ptrCast(@alignCast(context.table_writes));
     const owner_alloc = owner_alloc_ptr.*;
-    const state = owner_alloc.create(ServerState) catch |err| return fail(context.error_code, err);
+    const state = owner_alloc.create(ServerState) catch |err| return fail(err);
     errdefer owner_alloc.destroy(state);
 
     state.* = .{
         .owner_alloc = owner_alloc,
         .server = if (context.fallible)
             server_mod.ApiHttpServer.initWithConfig(owner_alloc, cfg.*, source.*, reads.*, writes.*) catch |err|
-                return fail(context.error_code, err)
+                return fail(err)
         else
             server_mod.ApiHttpServer.initWithProcessRequestAllocator(owner_alloc, cfg.*, source.*, reads.*, writes.*),
     };
     context.out_handle.* = state;
     const out_alloc: *std.mem.Allocator = @ptrCast(@alignCast(context.out_request_alloc));
     out_alloc.* = state.server.alloc;
-    return 0;
+    return .ok;
 }
 
 pub fn destroy(opaque_handle: *anyopaque) callconv(.c) void {
@@ -89,102 +89,102 @@ pub fn destroy(opaque_handle: *anyopaque) callconv(.c) void {
     owner_alloc.destroy(state);
 }
 
-pub fn requestStats(context: *const CallContext) callconv(.c) c_int {
+pub fn requestStats(context: *const CallContext) callconv(.c) abi.Status {
     output(server_mod.ApiHttpServer.RequestStats, context).* = serverState(context).server.requestStats();
-    return 0;
+    return .ok;
 }
 
-pub fn setProvider(context: *const CallContext) callconv(.c) c_int {
+pub fn setProvider(context: *const CallContext) callconv(.c) abi.Status {
     serverState(context).server.antfly_provider = input(?managed_embedder.AntflyProvider, context).*;
-    return 0;
+    return .ok;
 }
 
-pub fn setHAExecutor(context: *const CallContext) callconv(.c) c_int {
+pub fn setHAExecutor(context: *const CallContext) callconv(.c) abi.Status {
     serverState(context).server.setHAInternalExecutor(input(?http_common.RequestExecutor, context).*);
-    return 0;
+    return .ok;
 }
 
-pub fn executor(context: *const CallContext) callconv(.c) c_int {
+pub fn executor(context: *const CallContext) callconv(.c) abi.Status {
     output(http_common.RequestExecutor, context).* = serverState(context).server.executor();
-    return 0;
+    return .ok;
 }
 
-pub fn streamingExecutor(context: *const CallContext) callconv(.c) c_int {
+pub fn streamingExecutor(context: *const CallContext) callconv(.c) abi.Status {
     output(http_common.StreamingRequestExecutor, context).* = serverState(context).server.streamingExecutor();
-    return 0;
+    return .ok;
 }
 
-pub fn attachRuntimeRestoreStore(context: *const CallContext) callconv(.c) c_int {
+pub fn attachRuntimeRestoreStore(context: *const CallContext) callconv(.c) abi.Status {
     serverState(context).server.attachRestoreJobRuntimeStore(@constCast(input(backend_erased.Store, context))) catch |err|
-        return fail(context.error_code, err);
-    return 0;
+        return fail(err);
+    return .ok;
 }
 
-pub fn attachReplicatedRestoreStore(context: *const CallContext) callconv(.c) c_int {
+pub fn attachReplicatedRestoreStore(context: *const CallContext) callconv(.c) abi.Status {
     serverState(context).server.attachReplicatedRestoreJobStore(input(restore_jobs.ReplicatedPersistence, context).*) catch |err|
-        return fail(context.error_code, err);
-    return 0;
+        return fail(err);
+    return .ok;
 }
 
-pub fn resumeRestoreJobs(context: *const CallContext) callconv(.c) c_int {
-    serverState(context).server.resumeRestoreJobsOnce() catch |err| return fail(context.error_code, err);
-    return 0;
+pub fn resumeRestoreJobs(context: *const CallContext) callconv(.c) abi.Status {
+    serverState(context).server.resumeRestoreJobsOnce() catch |err| return fail(err);
+    return .ok;
 }
 
-pub fn pollRestoreJobs(context: *const CallContext) callconv(.c) c_int {
-    serverState(context).server.pollRestoreJobsOnce() catch |err| return fail(context.error_code, err);
-    return 0;
+pub fn pollRestoreJobs(context: *const CallContext) callconv(.c) abi.Status {
+    serverState(context).server.pollRestoreJobsOnce() catch |err| return fail(err);
+    return .ok;
 }
 
-pub fn prepareRestoreLeadership(context: *const CallContext) callconv(.c) c_int {
-    serverState(context).server.prepareRestoreLeadership(input(u64, context).*) catch |err| return fail(context.error_code, err);
-    return 0;
+pub fn prepareRestoreLeadership(context: *const CallContext) callconv(.c) abi.Status {
+    serverState(context).server.prepareRestoreLeadership(input(u64, context).*) catch |err| return fail(err);
+    return .ok;
 }
 
-pub fn scheduleSessionMaintenance(context: *const CallContext) callconv(.c) c_int {
-    serverState(context).server.scheduleSessionMaintenance() catch |err| return fail(context.error_code, err);
-    return 0;
+pub fn scheduleSessionMaintenance(context: *const CallContext) callconv(.c) abi.Status {
+    serverState(context).server.scheduleSessionMaintenance() catch |err| return fail(err);
+    return .ok;
 }
 
-pub fn storageMaintenanceActive(context: *const CallContext) callconv(.c) c_int {
+pub fn storageMaintenanceActive(context: *const CallContext) callconv(.c) abi.Status {
     output(bool, context).* = serverState(context).server.storageMaintenanceExclusiveActive();
-    return 0;
+    return .ok;
 }
 
-pub fn handle(context: *const CallContext) callconv(.c) c_int {
+pub fn handle(context: *const CallContext) callconv(.c) abi.Status {
     output(http_common.HttpResponse, context).* = serverState(context).server.handle(input(http_common.HttpRequest, context).*) catch |err|
-        return fail(context.error_code, err);
-    return 0;
+        return fail(err);
+    return .ok;
 }
 
-pub fn handleInternal(context: *const CallContext) callconv(.c) c_int {
+pub fn handleInternal(context: *const CallContext) callconv(.c) abi.Status {
     output(?http_common.HttpResponse, context).* = serverState(context).server.handleInternalRoute(input(http_common.HttpRequest, context).*) catch |err|
-        return fail(context.error_code, err);
-    return 0;
+        return fail(err);
+    return .ok;
 }
 
-pub fn handlerCreate(context: *const HandlerCreateContext) callconv(.c) c_int {
+pub fn handlerCreate(context: *const HandlerCreateContext) callconv(.c) abi.Status {
     const api_state: *ServerState = @ptrCast(@alignCast(context.api_server_handle));
-    const state = api_state.owner_alloc.create(HandlerState) catch |err| return fail(context.error_code, err);
+    const state = api_state.owner_alloc.create(HandlerState) catch |err| return fail(err);
     state.* = .{
         .alloc = api_state.owner_alloc,
         .handler = .{ .api_server = &api_state.server },
     };
     context.out_handle.* = state;
-    return 0;
+    return .ok;
 }
 
 fn handlerState(context: *const CallContext) *HandlerState {
     return @ptrCast(@alignCast(context.handle));
 }
 
-pub fn handlerInit(context: *const CallContext) callconv(.c) c_int {
+pub fn handlerInit(context: *const CallContext) callconv(.c) abi.Status {
     handlerState(context).handler.initRuntime(input(std.mem.Allocator, context).*) catch |err|
-        return fail(context.error_code, err);
-    return 0;
+        return fail(err);
+    return .ok;
 }
 
-pub fn handlerStats(context: *const CallContext) callconv(.c) c_int {
+pub fn handlerStats(context: *const CallContext) callconv(.c) abi.Status {
     const handler = &handlerState(context).handler;
     const query = handler.query_admission.stats();
     const query_body = handler.query_body_admission.stats();
@@ -203,18 +203,19 @@ pub fn handlerStats(context: *const CallContext) callconv(.c) c_int {
         .peer_observer_failures_total = runtime.peer_observer_failures_total,
         .active_peer_observers = runtime.active_peer_observers,
     };
-    return 0;
+    return .ok;
 }
 
-pub fn handlerRegisterRoutes(context: *const CallContext) callconv(.c) c_int {
+pub fn handlerRegisterRoutes(context: *const CallContext) callconv(.c) abi.Status {
     const server: *httpx.Server = @constCast(input(httpx.Server, context));
     const handler = &handlerState(context).handler;
     const public_router = metadata_openapi.server.ServerRouter(handler_mod.AntflyApiHandler).init(handler);
-    var public_prefixed = PrefixedServer("/db/v1", httpx.Server){ .inner = server };
-    public_router.register(&public_prefixed) catch |err| return fail(context.error_code, err);
+    var public_prefixed = BoundaryServer("/db/v1"){ .inner = server };
+    public_router.register(&public_prefixed) catch |err| return fail(err);
     const usermgr_router = usermgr_openapi.server.ServerRouter(handler_mod.AntflyApiHandler).init(handler);
-    usermgr_router.register(server) catch |err| return fail(context.error_code, err);
-    return 0;
+    var usermgr_boundary = BoundaryServer(""){ .inner = server };
+    usermgr_router.register(&usermgr_boundary) catch |err| return fail(err);
+    return .ok;
 }
 
 pub fn handlerDestroy(opaque_handle: *anyopaque) callconv(.c) void {
@@ -224,24 +225,49 @@ pub fn handlerDestroy(opaque_handle: *anyopaque) callconv(.c) void {
     alloc.destroy(state);
 }
 
-fn PrefixedServer(comptime prefix: []const u8, comptime ServerType: type) type {
+fn stableHandler(comptime handler: httpx.Handler) httpx.Handler {
     return struct {
-        inner: *ServerType,
+        fn call(context: *httpx.Context) anyerror!httpx.Response {
+            return handler(context) catch |err| {
+                // Interpret and log the error while still in the API owner's
+                // codegen unit. The distributed server sees only a response.
+                std.log.err("API route failed err={s}", .{@errorName(err)});
+                return httpx.Response.init(context.allocator, 500);
+            };
+        }
+    }.call;
+}
 
-        pub fn get(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
-            try self.inner.get(prefix ++ path, handler);
+fn BoundaryServer(comptime prefix: []const u8) type {
+    return struct {
+        inner: *httpx.Server,
+
+        fn register(self: *const @This(), method: abi.HttpMethod, comptime path: []const u8, comptime handler: httpx.Handler) !void {
+            const full_path = prefix ++ path;
+            const status = antfly_distributed_httpx_register(&.{
+                .server = self.inner,
+                .method = method,
+                .path_ptr = full_path.ptr,
+                .path_len = full_path.len,
+                .handler = @ptrCast(stableHandler(handler)),
+            });
+            if (!status.isOk()) return abi.errorFromStatus(status);
         }
 
-        pub fn post(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
-            try self.inner.post(prefix ++ path, handler);
+        pub fn get(self: *const @This(), comptime path: []const u8, comptime handler: httpx.Handler) !void {
+            try self.register(.get, path, handler);
         }
 
-        pub fn put(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
-            try self.inner.put(prefix ++ path, handler);
+        pub fn post(self: *const @This(), comptime path: []const u8, comptime handler: httpx.Handler) !void {
+            try self.register(.post, path, handler);
         }
 
-        pub fn delete(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
-            try self.inner.delete(prefix ++ path, handler);
+        pub fn put(self: *const @This(), comptime path: []const u8, comptime handler: httpx.Handler) !void {
+            try self.register(.put, path, handler);
+        }
+
+        pub fn delete(self: *const @This(), comptime path: []const u8, comptime handler: httpx.Handler) !void {
+            try self.register(.delete, path, handler);
         }
     };
 }

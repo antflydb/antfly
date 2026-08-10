@@ -45,6 +45,11 @@ const raft_host = @import("../raft/host.zig");
 const raft_mod = @import("../raft/mod.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const db_mod = struct {
+    // The production API runtime only consumes the focused declarations below.
+    // A handful of tests still construct the concrete storage DB directly;
+    // keep that dependency test-only so it cannot rejoin the API codegen unit.
+    pub const DB = if (builtin.is_test) @import("../storage/db/db.zig").DB else struct {};
+    pub const backfill_state = if (builtin.is_test) @import("../storage/db/backfill_state.zig") else struct {};
     pub const types = @import("../storage/db/types.zig");
     pub const RuntimePreflightSummary = @import("../storage/db/runtime_preflight.zig").RuntimePreflightSummary;
     pub const background_runtime = @import("../storage/background_runtime.zig");
@@ -114,6 +119,7 @@ const mcp = @import("antfly_mcp");
 const a2a = @import("antfly_a2a");
 const protocol_adapters = @import("protocol_adapters.zig");
 const ard_catalog = @import("ard_catalog.zig");
+const runtime_callback_abi = @import("../runtime_callback_abi.zig");
 const parseJsonValueAlloc = json_helpers.parseJsonValueAlloc;
 const parseOwnedJsonValueAlloc = json_helpers.parseOwnedJsonValueAlloc;
 const parseOwnedJsonObjectMapAlloc = json_helpers.parseOwnedJsonObjectMapAlloc;
@@ -744,6 +750,7 @@ pub const AuthenticatedIdentity = struct {
 pub const StatusSource = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
 
     pub const VTable = struct {
         status: *const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataStatus,
@@ -783,24 +790,25 @@ pub const StatusSource = struct {
         configure_extension: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.ConfigureExtensionRequest) anyerror!extension_domain.InstalledExtension = null,
         restore_extensions: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, installed: []const extension_domain.InstalledExtension, members: []const extension_domain.ExtensionMember, dependencies: []const extension_domain.ExtensionDependency) anyerror!void = null,
     };
+    const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
     pub fn status(self: StatusSource) !metadata_api.MetadataStatus {
-        return try self.vtable.status(self.ptr);
+        return try BoundaryAbi.call("status", self.boundary_dispatch, self.vtable.status, .{self.ptr});
     }
 
     pub fn adminSnapshot(self: StatusSource) !?metadata_api.AdminSnapshot {
         const fn_ptr = self.vtable.admin_snapshot orelse return null;
-        return try fn_ptr(self.ptr);
+        return try BoundaryAbi.call("admin_snapshot", self.boundary_dispatch, fn_ptr, .{self.ptr});
     }
 
     pub fn cachedAdminSnapshot(self: StatusSource) !?metadata_api.AdminSnapshot {
         const fn_ptr = self.vtable.cached_admin_snapshot orelse return null;
-        return try fn_ptr(self.ptr);
+        return try BoundaryAbi.call("cached_admin_snapshot", self.boundary_dispatch, fn_ptr, .{self.ptr});
     }
 
     pub fn ensureLinearizableRead(self: StatusSource) !void {
         const fn_ptr = self.vtable.ensure_linearizable_read orelse return;
-        return try fn_ptr(self.ptr);
+        return try BoundaryAbi.call("ensure_linearizable_read", self.boundary_dispatch, fn_ptr, .{self.ptr});
     }
 
     pub fn freeAdminSnapshot(self: StatusSource, snapshot: *metadata_api.AdminSnapshot) void {
@@ -810,12 +818,12 @@ pub const StatusSource = struct {
 
     pub fn createTable(self: StatusSource, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) !void {
         const fn_ptr = self.vtable.create_table orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, alloc, table_name, req);
+        return try BoundaryAbi.call("create_table", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, req });
     }
 
     pub fn replaceTableDefinition(self: StatusSource, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !void {
         const fn_ptr = self.vtable.replace_table_definition orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, expected, replacement);
+        return try BoundaryAbi.call("replace_table_definition", self.boundary_dispatch, fn_ptr, .{ self.ptr, expected, replacement });
     }
 
     pub fn restoreTable(
@@ -828,109 +836,109 @@ pub const StatusSource = struct {
         manifest: *const backups_api.TableBackupManifest,
     ) !bool {
         const fn_ptr = self.vtable.restore_table orelse return false;
-        try fn_ptr(self.ptr, alloc, table_name, location_uri, connection, artifact_backup_id, manifest);
+        try BoundaryAbi.call("restore_table", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, location_uri, connection, artifact_backup_id, manifest });
         return true;
     }
 
     pub fn dropTable(self: StatusSource, alloc: std.mem.Allocator, table_name: []const u8) !void {
         const fn_ptr = self.vtable.drop_table orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, alloc, table_name);
+        return try BoundaryAbi.call("drop_table", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name });
     }
 
     /// Returns the generation committed by an authoritative backend when the
     /// source supports versioned results. Legacy/direct sources return null.
     pub fn updateSchema(self: StatusSource, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !?u32 {
         if (self.vtable.update_schema_versioned) |fn_ptr| {
-            return try fn_ptr(self.ptr, alloc, table_name, schema_json);
+            return try BoundaryAbi.call("update_schema_versioned", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, schema_json });
         }
         const fn_ptr = self.vtable.update_schema orelse return error.UnsupportedOperation;
-        try fn_ptr(self.ptr, alloc, table_name, schema_json);
+        try BoundaryAbi.call("update_schema", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, schema_json });
         return null;
     }
 
     pub fn createIndex(self: StatusSource, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
         const fn_ptr = self.vtable.create_index orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, alloc, table_name, index_name, index_json);
+        return try BoundaryAbi.call("create_index", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, index_name, index_json });
     }
 
     pub fn dropIndex(self: StatusSource, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) !void {
         const fn_ptr = self.vtable.drop_index orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, alloc, table_name, index_name);
+        return try BoundaryAbi.call("drop_index", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, index_name });
     }
 
     pub fn putArtifactEnrichment(self: StatusSource, alloc: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8, enrichment_json: []const u8) !void {
         const fn_ptr = self.vtable.put_artifact_enrichment orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, alloc, table_name, artifact_name, enrichment_json);
+        return try BoundaryAbi.call("put_artifact_enrichment", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, artifact_name, enrichment_json });
     }
 
     pub fn deleteArtifactEnrichment(self: StatusSource, alloc: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8) !void {
         const fn_ptr = self.vtable.delete_artifact_enrichment orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, alloc, table_name, artifact_name);
+        return try BoundaryAbi.call("delete_artifact_enrichment", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, artifact_name });
     }
 
     pub fn waitTableLifecycle(self: StatusSource, table_name: []const u8, expected: TableVisibility) !bool {
         const fn_ptr = self.vtable.wait_table_lifecycle orelse return false;
-        try fn_ptr(self.ptr, table_name, expected);
+        try BoundaryAbi.call("wait_table_lifecycle", self.boundary_dispatch, fn_ptr, .{ self.ptr, table_name, expected });
         return true;
     }
 
     pub fn waitTableProjection(self: StatusSource, table_name: []const u8, schema_json: ?[]const u8, indexes_json: ?[]const u8) !bool {
         const fn_ptr = self.vtable.wait_table_projection orelse return false;
-        try fn_ptr(self.ptr, table_name, schema_json, indexes_json);
+        try BoundaryAbi.call("wait_table_projection", self.boundary_dispatch, fn_ptr, .{ self.ptr, table_name, schema_json, indexes_json });
         return true;
     }
 
     pub fn runRound(self: StatusSource) !bool {
         const fn_ptr = self.vtable.run_round orelse return false;
-        try fn_ptr(self.ptr);
+        try BoundaryAbi.call("run_round", self.boundary_dispatch, fn_ptr, .{self.ptr});
         return true;
     }
 
     pub fn getJoinShuffleLease(self: StatusSource, job_id: u64) !?metadata_table_manager.ShuffleJoinLeaseRecord {
         const fn_ptr = self.vtable.get_join_shuffle_lease orelse return null;
-        return try fn_ptr(self.ptr, job_id);
+        return try BoundaryAbi.call("get_join_shuffle_lease", self.boundary_dispatch, fn_ptr, .{ self.ptr, job_id });
     }
 
     pub fn upsertJoinShuffleLease(self: StatusSource, record: metadata_table_manager.ShuffleJoinLeaseRecord) !bool {
         const fn_ptr = self.vtable.upsert_join_shuffle_lease orelse return false;
-        try fn_ptr(self.ptr, record);
+        try BoundaryAbi.call("upsert_join_shuffle_lease", self.boundary_dispatch, fn_ptr, .{ self.ptr, record });
         return true;
     }
 
     pub fn removeJoinShuffleLease(self: StatusSource, job_id: u64) !bool {
         const fn_ptr = self.vtable.remove_join_shuffle_lease orelse return false;
-        try fn_ptr(self.ptr, job_id);
+        try BoundaryAbi.call("remove_join_shuffle_lease", self.boundary_dispatch, fn_ptr, .{ self.ptr, job_id });
         return true;
     }
 
     pub fn installExtension(self: StatusSource, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.InstallExtensionRequest) !extension_domain.InstalledExtension {
         const fn_ptr = self.vtable.install_extension orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, alloc, name, req);
+        return try BoundaryAbi.call("install_extension", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, name, req });
     }
 
     pub fn updateExtension(self: StatusSource, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.UpdateExtensionRequest) !extension_domain.InstalledExtension {
         const fn_ptr = self.vtable.update_extension orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, alloc, name, req);
+        return try BoundaryAbi.call("update_extension", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, name, req });
     }
 
     pub fn dropExtension(self: StatusSource, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.DropExtensionRequest) !void {
         const fn_ptr = self.vtable.drop_extension orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, alloc, name, req);
+        return try BoundaryAbi.call("drop_extension", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, name, req });
     }
 
     pub fn enableExtension(self: StatusSource, alloc: std.mem.Allocator, name: []const u8) !extension_domain.InstalledExtension {
         const fn_ptr = self.vtable.enable_extension orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, alloc, name);
+        return try BoundaryAbi.call("enable_extension", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, name });
     }
 
     pub fn disableExtension(self: StatusSource, alloc: std.mem.Allocator, name: []const u8) !extension_domain.InstalledExtension {
         const fn_ptr = self.vtable.disable_extension orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, alloc, name);
+        return try BoundaryAbi.call("disable_extension", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, name });
     }
 
     pub fn configureExtension(self: StatusSource, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.ConfigureExtensionRequest) !extension_domain.InstalledExtension {
         const fn_ptr = self.vtable.configure_extension orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, alloc, name, req);
+        return try BoundaryAbi.call("configure_extension", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, name, req });
     }
 
     pub fn restoreExtensions(
@@ -941,7 +949,7 @@ pub const StatusSource = struct {
         dependencies: []const extension_domain.ExtensionDependency,
     ) !void {
         const fn_ptr = self.vtable.restore_extensions orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, alloc, installed, members, dependencies);
+        return try BoundaryAbi.call("restore_extensions", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, installed, members, dependencies });
     }
 
     fn makeServiceVTable(comptime T: type) VTable {

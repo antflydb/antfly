@@ -16,9 +16,13 @@
 //! Keep this file free of production imports so both codegen units agree on one
 //! ABI definition without pulling either implementation across the boundary.
 
-const std = @import("std");
+const error_abi = @import("../runtime_error_abi.zig");
 
-pub const ErrorInt = std.meta.Int(.unsigned, @bitSizeOf(anyerror));
+pub const Status = error_abi.Status;
+pub const BoundaryErrors = error_abi.BoundaryErrors;
+pub const statusCode = error_abi.statusCode;
+pub const statusFromError = error_abi.statusFromError;
+pub const errorFromStatus = error_abi.errorFromStatus;
 
 pub const CreateContext = extern struct {
     owner_alloc: *const anyopaque,
@@ -29,20 +33,32 @@ pub const CreateContext = extern struct {
     fallible: bool,
     out_handle: *?*anyopaque,
     out_request_alloc: *anyopaque,
-    error_code: *ErrorInt,
 };
 
 pub const CallContext = extern struct {
     handle: *anyopaque,
     input: ?*const anyopaque = null,
     output: ?*anyopaque = null,
-    error_code: *ErrorInt,
 };
 
 pub const HandlerCreateContext = extern struct {
     api_server_handle: *anyopaque,
     out_handle: *?*anyopaque,
-    error_code: *ErrorInt,
+};
+
+pub const HttpMethod = enum(c_int) {
+    get,
+    post,
+    put,
+    delete,
+};
+
+pub const RouteContext = extern struct {
+    server: *anyopaque,
+    method: HttpMethod,
+    path_ptr: [*]const u8,
+    path_len: usize,
+    handler: *const anyopaque,
 };
 
 pub const HandlerStats = extern struct {

@@ -22,6 +22,8 @@ const platform = @import("antfly_platform");
 const bridge = @import("runtime_bridge.zig");
 const unit_options = @import("runtime_library_options");
 const standalone_inference_bridge = @import("standalone/inference_bridge.zig");
+const api_kernel_abi = @import("api/kernel_abi.zig");
+const httpx = @import("httpx");
 const restore_staging_exports = if (unit_options.unit == .distributed)
     @import("standalone/restore_staging_exports.zig")
 else
@@ -194,6 +196,7 @@ comptime {
             exportInternal(&standaloneEntry, "antfly_runtime_standalone");
             exportInternal(&restore_staging_exports.create, "antfly_restore_staging_create");
             exportInternal(&restore_staging_exports.destroy, "antfly_restore_staging_destroy");
+            exportInternal(&distributedHttpxRegister, "antfly_distributed_httpx_register");
         },
         .inference => {
             exportInternal(&inferenceEntry, "antfly_runtime_inference");
@@ -207,6 +210,20 @@ comptime {
             exportInternal(&cliEntry, "antfly_runtime_cli");
         },
     }
+}
+
+fn distributedHttpxRegister(context: *const api_kernel_abi.RouteContext) callconv(.c) api_kernel_abi.Status {
+    const server: *httpx.Server = @ptrCast(@alignCast(context.server));
+    const handler: httpx.Handler = @ptrCast(@alignCast(context.handler));
+    const path = context.path_ptr[0..context.path_len];
+    const result = switch (context.method) {
+        .get => server.get(path, handler),
+        .post => server.post(path, handler),
+        .put => server.put(path, handler),
+        .delete => server.delete(path, handler),
+    };
+    result catch |err| return api_kernel_abi.statusFromError(err);
+    return .ok;
 }
 
 fn standaloneInferenceCreate(context: *const standalone_inference_bridge.CreateContext) callconv(.c) c_int {

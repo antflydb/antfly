@@ -44,6 +44,8 @@ const db_embedder = @import("../storage/db/enrichment/embedder.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const std_http_listener = @import("../raft/transport/std_http_listener.zig");
 const enrichment_types = @import("../storage/db/enrichment/enrichment_types.zig");
+const runtime_callback_abi = @import("../runtime_callback_abi.zig");
+const runtime_error_abi = @import("../runtime_error_abi.zig");
 
 fn getenv(name: [*:0]const u8) ?[*:0]u8 {
     if (!builtin.link_libc) return null;
@@ -71,6 +73,7 @@ pub const EmbeddingRequestContext = struct {
 
 pub const AntflyProvider = struct {
     ptr: *anyopaque,
+    boundary_dispatch: runtime_callback_abi.CallbackDispatch = &antflyProviderBoundaryDispatch,
     embed_dense_texts: *const fn (
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -154,6 +157,17 @@ pub const AntflyProvider = struct {
         alloc: std.mem.Allocator,
     ) anyerror![]u8 = null,
 };
+
+const AntflyProviderBoundary = runtime_callback_abi.Boundary(AntflyProvider);
+
+fn antflyProviderBoundaryDispatch(
+    field_index: u16,
+    callback: *const anyopaque,
+    args: *const anyopaque,
+    output: ?*anyopaque,
+) callconv(.c) runtime_error_abi.Status {
+    return AntflyProviderBoundary.local_dispatch(field_index, callback, args, output);
+}
 
 pub const InitOptions = struct {
     antfly_provider: ?AntflyProvider = null,
@@ -1920,9 +1934,9 @@ fn embedWithEntryParts(
                 const context = embeddingRequestContext(entry);
                 try context.check();
                 const vectors = if (local.embed_dense_parts_with_context) |embed_parts_with_context|
-                    try embed_parts_with_context(local.ptr, alloc, entry.model, parts, context)
+                    try AntflyProviderBoundary.call("embed_dense_parts_with_context", local.boundary_dispatch, embed_parts_with_context, .{ local.ptr, alloc, entry.model, parts, context })
                 else
-                    try embed_parts(local.ptr, alloc, entry.model, parts);
+                    try AntflyProviderBoundary.call("embed_dense_parts", local.boundary_dispatch, embed_parts, .{ local.ptr, alloc, entry.model, parts });
                 defer db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
                 try context.check();
                 if (vectors.len == 0) return error.EmptyEmbeddingResponse;
@@ -1984,7 +1998,7 @@ fn embedSparseBatchWithEntry(
         .antfly => {
             if (entry.antfly_provider) |local| {
                 try waitForEntryPacer(entry);
-                const embeddings = try local.embed_sparse_texts(local.ptr, alloc, entry.model, texts);
+                const embeddings = try AntflyProviderBoundary.call("embed_sparse_texts", local.boundary_dispatch, local.embed_sparse_texts, .{ local.ptr, alloc, entry.model, texts });
                 errdefer db_embedder.freeSparseEmbeddingBatch(alloc, embeddings);
                 try validateSparseBatch(embeddings, texts.len);
                 return embeddings;
@@ -2192,9 +2206,9 @@ fn embedBatchWithEntry(
                 const context = embeddingRequestContext(entry);
                 try context.check();
                 const vectors = if (local.embed_dense_texts_with_context) |embed_with_context|
-                    try embed_with_context(local.ptr, alloc, entry.model, texts, context)
+                    try AntflyProviderBoundary.call("embed_dense_texts_with_context", local.boundary_dispatch, embed_with_context, .{ local.ptr, alloc, entry.model, texts, context })
                 else
-                    try local.embed_dense_texts(local.ptr, alloc, entry.model, texts);
+                    try AntflyProviderBoundary.call("embed_dense_texts", local.boundary_dispatch, local.embed_dense_texts, .{ local.ptr, alloc, entry.model, texts });
                 errdefer db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
                 context.check() catch |err| {
                     db_embedder.freeDenseEmbeddingBatch(alloc, vectors);

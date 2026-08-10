@@ -35,7 +35,7 @@ RUN case "${TARGETARCH}" in \
         *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
     esac && \
     cd zig && \
-    zig build -j"${ZIG_BUILD_JOBS}" -Dtarget="${zig_target}" -Doptimize="${ZIG_OPTIMIZE}" -Dedition=full install --prefix /out
+    zig build -j"${ZIG_BUILD_JOBS}" -Dtarget="${zig_target}" -Doptimize="${ZIG_OPTIMIZE}" -Dedition=full antfly --prefix /out
 
 FROM --platform=$BUILDPLATFORM alpine:3.21 AS wasmtime
 

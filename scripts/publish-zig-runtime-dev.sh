@@ -126,7 +126,7 @@ echo "Building $arch Zig runtime artifact for $zig_target"
 (
   cd "$repo_root/zig"
   zig build \
-    install \
+    antfly \
     -Dtarget="$zig_target" \
     -Doptimize=ReleaseFast \
     -Dedition=full \

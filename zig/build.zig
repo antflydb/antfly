@@ -8829,10 +8829,12 @@ pub fn build(b: *std.Build) void {
         .root_module = antfly_main_mod,
     });
 
-    if (edition == .full) {
-        var api_runtime_artifact: ?*std.Build.Step.Compile = null;
-        var distributed_runtime_artifact: ?*std.Build.Step.Compile = null;
-        inline for (std.meta.tags(RuntimeLibraryUnit)) |unit| {
+    var api_runtime_artifact: ?*std.Build.Step.Compile = null;
+    var distributed_runtime_artifact: ?*std.Build.Step.Compile = null;
+    inline for (std.meta.tags(RuntimeLibraryUnit)) |unit| {
+        // The C API reuses the distributed PIC archive independently of the
+        // executable edition. Other runtime units exist only in the full graph.
+        if (edition == .full or unit == .distributed) {
             const unit_options = b.addOptions();
             unit_options.addOption(RuntimeLibraryUnit, "unit", unit);
 
@@ -8896,7 +8898,7 @@ pub fn build(b: *std.Build) void {
             if (unit == .distributed) {
                 libantfly_link_mod.linkLibrary(role_artifact);
             }
-            antfly_main.root_module.linkLibrary(role_artifact);
+            if (edition == .full) antfly_main.root_module.linkLibrary(role_artifact);
             if (strip) {
                 var visited = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
                 defer visited.deinit();
@@ -8980,6 +8982,11 @@ pub fn build(b: *std.Build) void {
     b.getInstallStep().dependOn(&install_antfly.step);
     if (edition == .full) {
         b.getInstallStep().dependOn(&install_antfarm_assets.step);
+    }
+    const antfly_step = b.step("antfly", "Build and install the top-level Antfly CLI");
+    antfly_step.dependOn(&install_antfly.step);
+    if (edition == .full) {
+        antfly_step.dependOn(&install_antfarm_assets.step);
     }
 
     const lite_core_main_mod = b.createModule(.{
@@ -9112,13 +9119,6 @@ pub fn build(b: *std.Build) void {
     lite_dev_step.dependOn(&run_cabi_packaging_tests.step);
     lite_dev_step.dependOn(&run_capi_tests.step);
     lite_dev_step.dependOn(&run_antfly_embedded_pkg_tests.step);
-
-    const run_antfly = b.addRunArtifact(antfly_main);
-    if (b.args) |args| {
-        run_antfly.addArgs(args);
-    }
-    const antfly_step = b.step("antfly", "Run the top-level Antfly CLI");
-    antfly_step.dependOn(&run_antfly.step);
 
     const run_recall_harness_default = b.addRunArtifact(recall_harness);
     run_recall_harness_default.stdio = .inherit;

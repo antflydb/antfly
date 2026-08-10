@@ -7,6 +7,7 @@ const backend_erased = @import("../storage/backend_erased.zig");
 const mem_backend = @import("../storage/mem_backend.zig");
 const platform_sync = @import("antfly_platform").sync;
 const platform_time = @import("antfly_platform").time;
+const runtime_callback_abi = @import("../runtime_callback_abi.zig");
 
 const key_prefix = "\x00\x00__api_restore_jobs__:";
 const restore_job_retention_ms: u64 = 7 * 24 * 60 * 60 * 1000;
@@ -125,6 +126,7 @@ pub const OpenedStore = struct {
 pub const ReplicatedPersistence = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
 
     pub const OwnedRow = struct { key: []u8, value: []u8 };
     pub const VTable = struct {
@@ -134,6 +136,27 @@ pub const ReplicatedPersistence = struct {
         delete: *const fn (ptr: *anyopaque, key: []const u8) anyerror!void,
         delete_many: *const fn (ptr: *anyopaque, keys: []const []const u8) anyerror!void,
     };
+    const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
+
+    pub fn load(self: ReplicatedPersistence, alloc: std.mem.Allocator) ![]OwnedRow {
+        return try BoundaryAbi.call("load", self.boundary_dispatch, self.vtable.load, .{ self.ptr, alloc });
+    }
+
+    pub fn get(self: ReplicatedPersistence, alloc: std.mem.Allocator, key: []const u8) !?[]u8 {
+        return try BoundaryAbi.call("get", self.boundary_dispatch, self.vtable.get, .{ self.ptr, alloc, key });
+    }
+
+    pub fn put(self: ReplicatedPersistence, key: []const u8, value: []const u8) !void {
+        try BoundaryAbi.call("put", self.boundary_dispatch, self.vtable.put, .{ self.ptr, key, value });
+    }
+
+    pub fn delete(self: ReplicatedPersistence, key: []const u8) !void {
+        try BoundaryAbi.call("delete", self.boundary_dispatch, self.vtable.delete, .{ self.ptr, key });
+    }
+
+    pub fn deleteMany(self: ReplicatedPersistence, keys: []const []const u8) !void {
+        try BoundaryAbi.call("delete_many", self.boundary_dispatch, self.vtable.delete_many, .{ self.ptr, keys });
+    }
 
     pub fn freeRows(alloc: std.mem.Allocator, rows: []OwnedRow) void {
         for (rows) |row| {
@@ -352,7 +375,7 @@ pub const Store = struct {
         self.replicated = persistence;
         errdefer self.replicated = null;
         errdefer self.clearInMemoryLocked();
-        const rows = try persistence.vtable.load(persistence.ptr, self.alloc);
+        const rows = try persistence.load(self.alloc);
         defer ReplicatedPersistence.freeRows(self.alloc, rows);
         for (rows) |row| try self.attachReplicatedRowLocked(row.key, row.value);
         self.sortPendingLocked();
@@ -403,7 +426,7 @@ pub const Store = struct {
         defer self.mutex.unlock();
         const persistence = self.replicated orelse return;
         self.clearInMemoryLocked();
-        const rows = try persistence.vtable.load(persistence.ptr, self.alloc);
+        const rows = try persistence.load(self.alloc);
         defer ReplicatedPersistence.freeRows(self.alloc, rows);
         var expired_keys = std.ArrayListUnmanaged([]const u8).empty;
         defer expired_keys.deinit(self.alloc);
@@ -791,7 +814,7 @@ pub const Store = struct {
 
         const key = try jobKey(alloc, job_id);
         defer alloc.free(key);
-        const fresh = try replicated.vtable.get(replicated.ptr, alloc, key);
+        const fresh = try replicated.get(alloc, key);
         defer if (fresh) |value| alloc.free(value);
         self.lock();
         defer self.mutex.unlock();
@@ -1369,7 +1392,7 @@ pub const Store = struct {
             try txn.put(key, value);
             return txn.commit();
         }
-        if (self.replicated) |replicated| return replicated.vtable.put(replicated.ptr, key, value);
+        if (self.replicated) |replicated| return replicated.put(key, value);
         return error.RestoreJobPersistenceUnavailable;
     }
 
@@ -1384,7 +1407,7 @@ pub const Store = struct {
             };
             return txn.commit();
         }
-        if (self.replicated) |replicated| return replicated.vtable.delete(replicated.ptr, key);
+        if (self.replicated) |replicated| return replicated.delete(key);
         return error.RestoreJobPersistenceUnavailable;
     }
 
@@ -1408,7 +1431,7 @@ pub const Store = struct {
             };
             return txn.commit();
         }
-        if (self.replicated) |replicated| return replicated.vtable.delete_many(replicated.ptr, keys);
+        if (self.replicated) |replicated| return replicated.deleteMany(keys);
         return error.RestoreJobPersistenceUnavailable;
     }
 

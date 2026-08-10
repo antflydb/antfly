@@ -39,7 +39,7 @@ fi
 
 cd "$repo_root/zig"
 if [[ ! -x ./zig-out/bin/antfly ]]; then
-  echo "missing ./zig-out/bin/antfly; rerun without SKIP_BUILD=1 or build install -Dedition=full first" >&2
+  echo "missing ./zig-out/bin/antfly; rerun without SKIP_BUILD=1 or build antfly -Dedition=full first" >&2
   exit 1
 fi
 chmod +x ./zig-out/bin/antfly

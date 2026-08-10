@@ -16,7 +16,7 @@ Options:
   --target TARGET        Zig target. Default: aarch64-linux-musl
   --optimize MODE        Zig optimize mode. Default: ReleaseFast
   --strip true|false     Omit debug information. Default: false
-  --install-step STEP    Build step. Default: install
+  --install-step STEP    Build step. Default: antfly
   --jobs N               Zig build jobs. Default: 1
   --interval SEC         Sampling interval. Default: 1
   --sample-threshold MB  Capture one macOS sample at this RSS. Default: 8500
@@ -42,7 +42,7 @@ prefix="/tmp/antfly-zig-build-memory-prefix"
 target="aarch64-linux-musl"
 optimize="ReleaseFast"
 strip="false"
-install_step="install"
+install_step="antfly"
 jobs="1"
 interval="1"
 sample_threshold_mb="8500"

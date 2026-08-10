@@ -1691,8 +1691,10 @@ pub fn runFromIterator(
     // ---------------------------------------------------------------
 
     var handler = try antfly.public_api.kernel_bridge.createHandler(api_server);
-    errdefer antfly.public_api.kernel_bridge.deinitHandler(&handler);
-    try handler.initRuntime(alloc);
+    handler.initRuntime(alloc) catch |err| {
+        antfly.public_api.kernel_bridge.deinitHandler(&handler);
+        return err;
+    };
     defer antfly.public_api.kernel_bridge.deinitHandler(&handler);
 
     const bind_host = public_listener.bind_host;

@@ -479,7 +479,18 @@ jobs:
         run: |
           set -euo pipefail
           taskset -c "${{ steps.cpus.outputs.list }}" zig build \
-            install capi capi-smoke \
+            antfly capi capi-smoke \
+            -Doptimize=ReleaseFast \
+            -Dstrip=true \
+            -Donnx=false \
+            -Dmetal=false \
+            -Dsystem-blas=false \
+            --build-runner "${{ steps.cpus.outputs.build_runner }}" \
+            --maxrss "${{ steps.cpus.outputs.max_rss }}"
+          # C API packaging is independent of which executable edition is
+          # installed and must reuse the same distributed PIC archive.
+          taskset -c "${{ steps.cpus.outputs.list }}" zig build capi \
+            -Dedition=inference \
             -Doptimize=ReleaseFast \
             -Dstrip=true \
             -Donnx=false \

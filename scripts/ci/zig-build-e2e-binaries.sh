@@ -52,6 +52,6 @@ python3 tools/run_bounded_zig_build.py --zig zig -- build \
   -Doptimize="$optimize" \
   -Dstrip="$strip" \
   -Dedition=full \
-  install
+  antfly
 
 chmod +x zig-out/bin/antfly
