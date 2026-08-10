@@ -7044,13 +7044,15 @@ pub fn build(b: *std.Build) void {
         5 * 1024 * 1024 * 1024,
         5 * 1024 * 1024 * 1024,
         5 * 1024 * 1024 * 1024,
-        5 * 1024 * 1024 * 1024,
+        7 * 1024 * 1024 * 1024,
         6 * 1024 * 1024 * 1024,
     };
     const metadata_runtime_filter_is_default =
         lib_metadata_runtime_filters.len == 1 and
         std.mem.eql(u8, lib_metadata_runtime_filters[0], "metadata.");
-    var unit_metadata_tail: ?*std.Build.Step = null;
+    var unit_metadata_compile_tail: ?*std.Build.Step = null;
+    var unit_metadata_aggregate_run_tail: ?*std.Build.Step = null;
+    var unit_metadata_focused_run_tail: ?*std.Build.Step = null;
     for (
         unit_metadata_shard_filters,
         unit_metadata_shard_names,
@@ -7067,7 +7069,8 @@ pub fn build(b: *std.Build) void {
             },
             .max_rss = shard_max_rss,
         });
-        if (unit_metadata_tail) |previous| unit_metadata_tests.step.dependOn(previous);
+        if (unit_metadata_compile_tail) |previous| unit_metadata_tests.step.dependOn(previous);
+        unit_metadata_compile_tail = &unit_metadata_tests.step;
         const run_unit_metadata_tests = b.addRunArtifact(unit_metadata_tests);
         const runtime_filters = if (metadata_runtime_filter_is_default)
             shard_filters
@@ -7085,8 +7088,11 @@ pub fn build(b: *std.Build) void {
         for (root_test_skip_filters) |filter| {
             run_unit_metadata_tests.addArgs(&.{ "--skip-test-filter", filter });
         }
+        if (unit_metadata_aggregate_run_tail) |previous| {
+            run_unit_metadata_tests.step.dependOn(previous);
+        }
         unit_test_step.dependOn(&run_unit_metadata_tests.step);
-        unit_metadata_tail = &run_unit_metadata_tests.step;
+        unit_metadata_aggregate_run_tail = &run_unit_metadata_tests.step;
 
         // The standalone metadata step owns its selected metadata tests. Use a
         // separate run policy so a caller filter is not mistaken for the root
@@ -7099,8 +7105,12 @@ pub fn build(b: *std.Build) void {
         for (root_test_skip_filters) |filter| {
             run_focused_metadata_tests.addArgs(&.{ "--skip-test-filter", filter });
         }
+        if (unit_metadata_focused_run_tail) |previous| {
+            run_focused_metadata_tests.step.dependOn(previous);
+        }
         unit_metadata_sharded_test_step.dependOn(&run_focused_metadata_tests.step);
         lib_metadata_test_step.dependOn(&run_focused_metadata_tests.step);
+        unit_metadata_focused_run_tail = &run_focused_metadata_tests.step;
     }
 
     // Default Antfly unit coverage is hermetic: no network fetchers, no

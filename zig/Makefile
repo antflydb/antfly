@@ -38,11 +38,11 @@ force-download-onnx: ## Force re-download of ONNX Runtime + GenAI.
 build: download-onnx ## Build antfly with embedded inference + ONNX inference.
 	$(ZIG) build install $(ZIG_BUILD_FLAGS)
 
-test: ## Run the default Zig test aggregate.
-	$(ZIG) build test
+test: ## Run the default Zig test aggregate with bounded scheduler memory.
+	python3 tools/run_bounded_zig_build.py --zig "$(ZIG)" -- build test $(ZIG_BUILD_FLAGS)
 
-unit-test: ## Run hermetic Antfly unit tests.
-	$(ZIG) build unit-test $(ZIG_BUILD_FLAGS)
+unit-test: ## Run hermetic Antfly unit tests with bounded scheduler memory.
+	python3 tools/run_bounded_zig_build.py --zig "$(ZIG)" -- build unit-test $(ZIG_BUILD_FLAGS)
 
 clean-onnx: ## Remove downloaded ONNX Runtime files.
 	rm -rf $(ONNXRUNTIME_ROOT)

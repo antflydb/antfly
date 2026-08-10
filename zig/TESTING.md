@@ -8,7 +8,7 @@ special-purpose test tiers.
 Run the default test suite from the repository root:
 
 ```sh
-zig build test
+make zig-test
 ```
 
 `zig build test` depends on the default package aggregates:
@@ -25,7 +25,7 @@ targets.
 Pull-request CI runs fast required checks:
 
 - `zig build check-snowball`
-- `zig build unit-test`
+- `make zig-unit-test`
 - `zig build -Doptimize=ReleaseFast install -Dedition=full`
 - shared release-binary smoke checks
 - `e2e-base`
@@ -34,7 +34,7 @@ Pull-request CI runs fast required checks:
 Merge queue and `main` push CI also run the default aggregate:
 
 ```sh
-zig build test
+make zig-test
 ```
 
 Nightly/manual validation should use broader checks such as `e2e-full`,
@@ -72,13 +72,19 @@ package with the root build's relevant backend options forwarded.
 Run the hermetic unit and focused integration bucket:
 
 ```sh
-zig build unit-test
+make zig-unit-test
 ```
 
 `unit-test` is where default, no-fetch Antfly, storage, and shared-library unit
 coverage belongs. Focused aliases such as `lib-json-test`, `db-test`, and
 `wal-test` remain available for narrower iteration, but broad module suites are
 wired into `unit-test` once.
+
+The aggregate Make targets reserve 20% memory headroom and use the patched Zig
+0.16 build runner so ready steps retain their declared RSS reservations. Set
+`ANTFLY_ZIG_MAX_RSS` to an explicit byte count to override the detected budget.
+From the `zig/` directory, the equivalent targets are `make test` and
+`make unit-test`.
 
 Run mocked-time and modeled simulation checks:
 
