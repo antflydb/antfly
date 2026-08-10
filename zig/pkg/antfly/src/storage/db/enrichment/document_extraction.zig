@@ -285,6 +285,7 @@ pub const Unit = struct {
     ocr_rendered_height: ?u32 = null,
     ocr_rendered_bytes: ?u64 = null,
     ocr_failure_stage: ?[]u8 = null,
+    ocr_failure_retryable: ?bool = null,
     ocr_trigger_reasons: ?[]u8 = null,
     ocr_embedded_quality: ?[]u8 = null,
     ocr_output_quality: ?[]u8 = null,
@@ -350,6 +351,7 @@ pub const OcrFailureDetail = struct {
     retained_method: []const u8,
     error_message: []const u8,
     failure_stage: ?[]const u8 = null,
+    retryable: bool,
 };
 
 pub const StreamInfo = struct {

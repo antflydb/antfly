@@ -3610,6 +3610,7 @@ fn processDocumentExtractionAsset(
                     .retained_method = unit.method,
                     .error_message = unit.extraction_warning orelse "OCR failed without a recorded cause",
                     .failure_stage = unit.ocr_failure_stage,
+                    .retryable = unit.ocr_failure_retryable orelse false,
                 });
             }
         }
@@ -4402,6 +4403,11 @@ fn applyRuntimeGeneratedUnitText(
     errdefer parsed.deinit(alloc);
     if (kind == .ocr and document_extraction_mod.isOcrPromptEcho(parsed.text, ocr_prompt)) return error.OcrPromptEcho;
     if (kind == .ocr and !document_extraction_mod.hasMeaningfulOcrContent(parsed.text)) return error.TrivialOcrOutput;
+    if (kind == .ocr) {
+        if (unit.ocr_failure_stage) |value| alloc.free(value);
+        unit.ocr_failure_stage = null;
+        unit.ocr_failure_retryable = null;
+    }
     if (kind == .ocr and !std.mem.eql(u8, unit.unit_type, "image")) {
         unit.ocr_attempted = true;
         const embedded_quality = document_extraction_mod.assessOcrQuality(unit.text, quality_config);
@@ -4495,6 +4501,7 @@ fn markRuntimeGeneratedUnitTextFailure(
             unit.ocr_used = false;
             unit.ocr_confidence = null;
             unit.ocr_bbox = null;
+            unit.ocr_failure_retryable = isRetryableEnrichmentError(err);
             if (std.mem.eql(u8, unit.unit_type, "image")) {
                 alloc.free(unit.text);
                 unit.text = try alloc.dupe(u8, "");
@@ -4618,6 +4625,7 @@ fn runtimeDocumentGeneratedTextPartsJsonAlloc(
         .ocr_rendered_height = unit.ocr_rendered_height,
         .ocr_rendered_bytes = unit.ocr_rendered_bytes,
         .ocr_failure_stage = unit.ocr_failure_stage,
+        .ocr_failure_retryable = unit.ocr_failure_retryable,
         .ocr_trigger_reasons = unit.ocr_trigger_reasons,
         .ocr_embedded_quality = unit.ocr_embedded_quality,
         .ocr_output_quality = unit.ocr_output_quality,
@@ -4818,6 +4826,7 @@ fn cloneDocumentExtractionUnit(alloc: Allocator, unit: document_extraction_mod.U
         .ocr_rendered_height = unit.ocr_rendered_height,
         .ocr_rendered_bytes = unit.ocr_rendered_bytes,
         .ocr_failure_stage = ocr_failure_stage,
+        .ocr_failure_retryable = unit.ocr_failure_retryable,
         .ocr_trigger_reasons = ocr_trigger_reasons,
         .ocr_embedded_quality = ocr_embedded_quality,
         .ocr_output_quality = ocr_output_quality,
@@ -5449,6 +5458,7 @@ fn buildDocumentUnitChunkPayloadAlloc(
         .ocr_rendered_height = unit.ocr_rendered_height,
         .ocr_rendered_bytes = unit.ocr_rendered_bytes,
         .ocr_failure_stage = unit.ocr_failure_stage,
+        .ocr_failure_retryable = unit.ocr_failure_retryable,
         .ocr_trigger_reasons = unit.ocr_trigger_reasons,
         .ocr_embedded_quality = unit.ocr_embedded_quality,
         .ocr_output_quality = unit.ocr_output_quality,
@@ -8170,6 +8180,7 @@ fn documentExtractionUnitFingerprintAlloc(alloc: Allocator, unit: document_extra
     if (unit.ocr_rendered_height) |value| hasher.update(std.mem.asBytes(&value));
     if (unit.ocr_rendered_bytes) |value| hasher.update(std.mem.asBytes(&value));
     if (unit.ocr_failure_stage) |value| hasher.update(value);
+    if (unit.ocr_failure_retryable) |value| hasher.update(if (value) "ocr_failure_retryable:1" else "ocr_failure_retryable:0");
     if (unit.ocr_trigger_reasons) |value| hasher.update(value);
     if (unit.ocr_embedded_quality) |value| hasher.update(value);
     if (unit.ocr_output_quality) |value| hasher.update(value);
@@ -8427,6 +8438,7 @@ fn documentUnitPayloadAlloc(
         .ocr_rendered_height = unit.ocr_rendered_height,
         .ocr_rendered_bytes = unit.ocr_rendered_bytes,
         .ocr_failure_stage = unit.ocr_failure_stage,
+        .ocr_failure_retryable = unit.ocr_failure_retryable,
         .ocr_trigger_reasons = unit.ocr_trigger_reasons,
         .ocr_embedded_quality = unit.ocr_embedded_quality,
         .ocr_output_quality = unit.ocr_output_quality,
@@ -8450,6 +8462,7 @@ fn documentUnitPayloadAlloc(
             .ocr_rendered_height = unit.ocr_rendered_height,
             .ocr_rendered_bytes = unit.ocr_rendered_bytes,
             .ocr_failure_stage = unit.ocr_failure_stage,
+            .ocr_failure_retryable = unit.ocr_failure_retryable,
             .ocr_trigger_reasons = unit.ocr_trigger_reasons,
             .ocr_embedded_quality = unit.ocr_embedded_quality,
             .ocr_output_quality = unit.ocr_output_quality,
@@ -8484,6 +8497,7 @@ fn documentUnitPayloadAlloc(
                 .ocr_rendered_height = unit.ocr_rendered_height,
                 .ocr_rendered_bytes = unit.ocr_rendered_bytes,
                 .ocr_failure_stage = unit.ocr_failure_stage,
+                .ocr_failure_retryable = unit.ocr_failure_retryable,
                 .ocr_trigger_reasons = unit.ocr_trigger_reasons,
                 .ocr_embedded_quality = unit.ocr_embedded_quality,
                 .ocr_output_quality = unit.ocr_output_quality,
@@ -9166,7 +9180,7 @@ fn documentExtractionManifestPayloadAlloc(
         try appendJsonFieldString(alloc, &out, &detail_first, "retained_method", detail.retained_method);
         try appendJsonFieldString(alloc, &out, &detail_first, "error_message", detail.error_message);
         if (detail.failure_stage) |stage| try appendJsonFieldString(alloc, &out, &detail_first, "failure_stage", stage);
-        try appendJsonFieldBool(alloc, &out, &detail_first, "retryable", true);
+        try appendJsonFieldBool(alloc, &out, &detail_first, "retryable", detail.retryable);
         try out.append(alloc, '}');
     }
     try out.append(alloc, ']');
@@ -11038,6 +11052,7 @@ test "document extraction rejects and records Florence prompt echoes" {
     try std.testing.expectEqualStrings("failed_ocr", units[0].extraction_status.?);
     try std.testing.expectEqualStrings("", units[0].text);
     try std.testing.expect(!units[0].ocr_used);
+    try std.testing.expectEqual(@as(?bool, false), units[0].ocr_failure_retryable);
     try std.testing.expect(std.mem.indexOf(u8, units[0].extraction_warning.?, "OcrPromptEcho") != null);
 }
 
@@ -11106,6 +11121,7 @@ test "document extraction missing OCR model is a terminal unit failure" {
 
     try std.testing.expectEqualStrings("failed_ocr", units[0].extraction_status.?);
     try std.testing.expect(!units[0].ocr_used);
+    try std.testing.expectEqual(@as(?bool, true), units[0].ocr_failure_retryable);
     try std.testing.expect(std.mem.indexOf(u8, units[0].extraction_warning.?, "ModelNotFound") != null);
 }
 
@@ -11578,15 +11594,26 @@ test "enrichment runtime document extraction manifest uses v2 range and merge sh
         .route_type = @constCast("text"),
         .units = @constCast(units[0..]),
         .ocr_attempted_count = 1,
-        .ocr_failed_count = 1,
-        .ocr_failed_page_numbers = &.{5},
-        .ocr_failure_details = &.{.{
-            .page_number = 5,
-            .unit_id = "unit:b",
-            .retained_method = "pdf_text",
-            .error_message = "pdf_ocr failed: UnsupportedStreamFilter",
-            .failure_stage = "render",
-        }},
+        .ocr_failed_count = 2,
+        .ocr_failed_page_numbers = &.{ 5, 6 },
+        .ocr_failure_details = &.{
+            .{
+                .page_number = 5,
+                .unit_id = "unit:b",
+                .retained_method = "pdf_text",
+                .error_message = "pdf_ocr failed: UnsupportedStreamFilter",
+                .failure_stage = "render",
+                .retryable = false,
+            },
+            .{
+                .page_number = 6,
+                .unit_id = "unit:c",
+                .retained_method = "pdf_text",
+                .error_message = "pdf_ocr failed: ReadTransientFailure",
+                .failure_stage = "inference",
+                .retryable = true,
+            },
+        },
     };
     const desired_descriptors = [_]DocumentExtractionUnitDescriptor{
         .{ .key = unit_keys[0], .fingerprint = "same-fingerprint" },
@@ -11672,7 +11699,8 @@ test "enrichment runtime document extraction manifest uses v2 range and merge sh
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"ocr_failure_details\":[{\"page_number\":5") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"error_message\":\"pdf_ocr failed: UnsupportedStreamFilter\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"failure_stage\":\"render\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"retryable\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"retryable\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"failure_stage\":\"inference\",\"retryable\":true") != null);
 
     const in_progress = try documentExtractionManifestPayloadAlloc(
         alloc,

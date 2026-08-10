@@ -302,6 +302,12 @@ pub const Runtime = struct {
             .ignore_unknown_fields = true,
         });
         defer cfg_parsed.deinit();
+        // The Antfly reader contract returns one independently addressable
+        // result per input image. OpenAI and Vertex accept multiple images in
+        // one prompt, but produce one response for the prompt as a whole, so
+        // flattening requests across those providers loses the request/result
+        // boundary. Let the generic batch path execute them sequentially.
+        if (!readerSupportsPerImageBatch(cfg_parsed.value.provider)) return error.BatchIncompatible;
         const sources = try alloc.alloc(ReaderSource, requests.len);
         var sources_filled: usize = 0;
         defer {
@@ -650,6 +656,10 @@ fn toolCallArgumentsOutputAlloc(alloc: Allocator, calls: []const generating_runt
 
 fn isLocalReaderProvider(provider: readers.Provider, url: ?[]const u8) bool {
     return provider == .antfly and url == null;
+}
+
+fn readerSupportsPerImageBatch(provider: readers.Provider) bool {
+    return provider == .antfly;
 }
 
 fn isLocalTranscriberProvider(provider: transcribing.Provider, url: ?[]const u8) bool {
@@ -1442,6 +1452,70 @@ test "asset producer runtime batches compatible antfly reader requests" {
     try std.testing.expectEqualStrings("first", results[0]);
     try std.testing.expectEqualStrings("second", results[1]);
     try std.testing.expectEqual(@as(usize, 1), local.read_calls);
+}
+
+fn expectSingleImageOpenAiReaderRequest(req: httpx.testing_mod.RequestInfo) !void {
+    try std.testing.expectEqual(.POST, req.method);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, req.body, "\"type\":\"image_url\""));
+}
+
+test "asset producer runtime keeps prompt-level remote readers sequential" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    var server = try httpx.TestServer.start(alloc, io, &.{
+        .{ .method = .POST, .path = "/chat/completions", .assert_request = expectSingleImageOpenAiReaderRequest, .respond = .{
+            .body = "{\"choices\":[{\"message\":{\"content\":\"ocr text\"}}]}",
+        } },
+    });
+    defer server.deinit();
+
+    var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+    defer client.deinit();
+    var runtime = Runtime.init(alloc, &client);
+    const producer = runtime.producer();
+    const cfg_json = try std.fmt.allocPrint(
+        alloc,
+        "{{\"provider\":\"openai\",\"model\":\"vision-reader\",\"base_url\":\"{s}\"}}",
+        .{server.baseUrl()},
+    );
+    defer alloc.free(cfg_json);
+
+    var results: ?[][]u8 = null;
+    var run_err: ?anyerror = null;
+    var group = std.Io.Group.init;
+    const Fiber = struct {
+        fn run(
+            a: Allocator,
+            p: asset_producer.Producer,
+            cfg: []const u8,
+            out: *?[][]u8,
+            err_out: *?anyerror,
+        ) std.Io.Cancelable!void {
+            out.* = p.produceBatch(a, &.{
+                .{ .producer_type = .reader, .config_json = cfg, .source_text = "data:image/png;base64,aaa", .content_type = "text/plain" },
+                .{ .producer_type = .reader, .config_json = cfg, .source_text = "data:image/png;base64,bbb", .content_type = "text/plain" },
+            }) catch |err| {
+                err_out.* = err;
+                return;
+            };
+        }
+    };
+
+    try group.concurrent(io, Fiber.run, .{ alloc, producer, cfg_json, &results, &run_err });
+    try server.handleOne();
+    try server.handleOne();
+    try group.await(io);
+    if (run_err) |err| return err;
+    defer {
+        for (results.?) |result| alloc.free(result);
+        alloc.free(results.?);
+    }
+    try std.testing.expectEqual(@as(usize, 2), results.?.len);
+    try std.testing.expectEqualStrings("ocr text", results.?[0]);
+    try std.testing.expectEqualStrings("ocr text", results.?[1]);
 }
 
 test "asset producer runtime chunks local antfly reader batches to inference cap" {

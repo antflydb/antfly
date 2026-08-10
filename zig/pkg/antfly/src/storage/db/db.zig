@@ -26769,6 +26769,7 @@ fn buildDocumentUnitChunkPayloadAlloc(
         .ocr_rendered_height = unit.ocr_rendered_height,
         .ocr_rendered_bytes = unit.ocr_rendered_bytes,
         .ocr_failure_stage = unit.ocr_failure_stage,
+        .ocr_failure_retryable = unit.ocr_failure_retryable,
         .ocr_trigger_reasons = unit.ocr_trigger_reasons,
         .ocr_embedded_quality = unit.ocr_embedded_quality,
         .ocr_output_quality = unit.ocr_output_quality,
@@ -26832,6 +26833,7 @@ fn documentExtractionUnitFingerprintAlloc(alloc: Allocator, unit: document_extra
     if (unit.ocr_rendered_height) |value| hasher.update(std.mem.asBytes(&value));
     if (unit.ocr_rendered_bytes) |value| hasher.update(std.mem.asBytes(&value));
     if (unit.ocr_failure_stage) |value| hasher.update(value);
+    if (unit.ocr_failure_retryable) |value| hasher.update(if (value) "ocr_failure_retryable:1" else "ocr_failure_retryable:0");
     if (unit.ocr_trigger_reasons) |value| hasher.update(value);
     if (unit.ocr_embedded_quality) |value| hasher.update(value);
     if (unit.ocr_output_quality) |value| hasher.update(value);
@@ -27076,6 +27078,7 @@ fn documentUnitPayloadAlloc(
         .ocr_rendered_height = unit.ocr_rendered_height,
         .ocr_rendered_bytes = unit.ocr_rendered_bytes,
         .ocr_failure_stage = unit.ocr_failure_stage,
+        .ocr_failure_retryable = unit.ocr_failure_retryable,
         .ocr_trigger_reasons = unit.ocr_trigger_reasons,
         .ocr_embedded_quality = unit.ocr_embedded_quality,
         .ocr_output_quality = unit.ocr_output_quality,
@@ -27099,6 +27102,7 @@ fn documentUnitPayloadAlloc(
             .ocr_rendered_height = unit.ocr_rendered_height,
             .ocr_rendered_bytes = unit.ocr_rendered_bytes,
             .ocr_failure_stage = unit.ocr_failure_stage,
+            .ocr_failure_retryable = unit.ocr_failure_retryable,
             .ocr_trigger_reasons = unit.ocr_trigger_reasons,
             .ocr_embedded_quality = unit.ocr_embedded_quality,
             .ocr_output_quality = unit.ocr_output_quality,
@@ -27133,6 +27137,7 @@ fn documentUnitPayloadAlloc(
                 .ocr_rendered_height = unit.ocr_rendered_height,
                 .ocr_rendered_bytes = unit.ocr_rendered_bytes,
                 .ocr_failure_stage = unit.ocr_failure_stage,
+                .ocr_failure_retryable = unit.ocr_failure_retryable,
                 .ocr_trigger_reasons = unit.ocr_trigger_reasons,
                 .ocr_embedded_quality = unit.ocr_embedded_quality,
                 .ocr_output_quality = unit.ocr_output_quality,
@@ -27772,7 +27777,7 @@ fn documentExtractionManifestPayloadAlloc(
         try appendJsonFieldString(alloc, &out, &detail_first, "retained_method", unit.method);
         try appendJsonFieldString(alloc, &out, &detail_first, "error_message", unit.extraction_warning orelse "OCR failed without a recorded cause");
         if (unit.ocr_failure_stage) |stage| try appendJsonFieldString(alloc, &out, &detail_first, "failure_stage", stage);
-        try appendJsonFieldBool(alloc, &out, &detail_first, "retryable", true);
+        try appendJsonFieldBool(alloc, &out, &detail_first, "retryable", unit.ocr_failure_retryable orelse false);
         try out.append(alloc, '}');
     }
     try out.append(alloc, ']');

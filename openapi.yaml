@@ -8038,7 +8038,7 @@ components:
           description: Number of pages whose OCR rendering or recognition failed.
         ocr_failed_page_numbers:
           type: array
-          description: Up to 32 one-based page numbers with retryable OCR failures.
+          description: Up to 32 one-based page numbers where OCR failed.
           items:
             type: integer
             format: uint32

@@ -2173,7 +2173,7 @@ pub const DocumentArtifactManifest = struct {
     ocr_retained_embedded_count: ?i64 = null,
     /// Number of pages whose OCR rendering or recognition failed.
     ocr_failed_count: ?i64 = null,
-    /// Up to 32 one-based page numbers with retryable OCR failures.
+    /// Up to 32 one-based page numbers where OCR failed.
     ocr_failed_page_numbers: ?[]const i64 = null,
     /// Whether additional failed page numbers were omitted from the summary.
     ocr_failed_pages_truncated: ?bool = null,
