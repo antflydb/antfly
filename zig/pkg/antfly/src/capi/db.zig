@@ -42,6 +42,7 @@ const table_reads_api = antfly.public_api.table_reads;
 const distributed_graph = antfly.public_api.distributed_graph;
 const runtime_status = antfly.public_api.runtime_status;
 const shard_state_store = antfly.data_snapshot;
+const data_raft_apply = antfly.data_raft_apply;
 const backups_api = antfly.public_api.backups;
 const backup_restore = antfly.raft.storage.backup_restore;
 const Allocator = std.mem.Allocator;
@@ -91,6 +92,17 @@ const StorageOwnerContext = struct {
         alloc.destroy(self);
         return true;
     }
+};
+
+const DataApplyStoreHandle = struct {
+    alloc: Allocator,
+    store: data_raft_apply.RaftApplyStore,
+    context: ?*StorageOwnerContext,
+};
+
+const DataApplyGroupTransitionHandle = struct {
+    transition: data_raft_apply.RaftApplyStore.ActiveGroupTransition,
+    active: bool = true,
 };
 
 const StorageOwnerTransactionRecovery = struct {
@@ -1860,6 +1872,181 @@ pub fn storageOwnerContextMetrics(
         .lsm_run_table_physical_block = storageOwnerContextCacheKindStats(stats.run_table_physical_block),
     };
     return .ok;
+}
+
+fn asDataApplyStore(ptr: ?*anyopaque) ?*DataApplyStoreHandle {
+    return @ptrCast(@alignCast(ptr orelse return null));
+}
+
+fn asDataApplyGroupTransition(ptr: ?*anyopaque) ?*DataApplyGroupTransitionHandle {
+    return @ptrCast(@alignCast(ptr orelse return null));
+}
+
+pub fn dataApplyStoreOpen(
+    request: *const kernel_owner_abi.DataApplyOpenRequest,
+    out_store: *?*anyopaque,
+) callconv(.c) kernel_owner_abi.Status {
+    out_store.* = null;
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const root_dir = request.root_dir.slice();
+    if (root_dir.len == 0) return .invalid_argument;
+    const alloc = std.heap.c_allocator;
+    const context = asStorageOwnerContext(request.context);
+    if (context) |value| value.acquire();
+    var context_borrowed = context != null;
+    defer if (context_borrowed) context.?.release();
+    var store = data_raft_apply.RaftApplyStore.init(alloc, .{
+        .root_dir = root_dir,
+        .no_sync = request.no_sync != 0,
+        .read_only = request.read_only != 0,
+        .resource_manager = if (context) |value| &value.resources.resource_manager else null,
+    }) catch |err| return storageOwnerStatusFromError(err);
+    errdefer store.deinit();
+    const handle = alloc.create(DataApplyStoreHandle) catch return .out_of_memory;
+    handle.* = .{
+        .alloc = alloc,
+        .store = store,
+        .context = context,
+    };
+    context_borrowed = false;
+    out_store.* = handle;
+    return .ok;
+}
+
+pub fn dataApplyStoreClose(store_ptr: ?*anyopaque) callconv(.c) void {
+    const handle = asDataApplyStore(store_ptr) orelse return;
+    const alloc = handle.alloc;
+    const context = handle.context;
+    handle.store.deinit();
+    handle.* = undefined;
+    alloc.destroy(handle);
+    if (context) |value| value.release();
+}
+
+pub fn dataApplyStoreApplyBatch(
+    store_ptr: ?*anyopaque,
+    request: *const kernel_owner_abi.DataApplyBatchRequest,
+) callconv(.c) kernel_owner_abi.Status {
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asDataApplyStore(store_ptr) orelse return .invalid_argument;
+    handle.store.snapshotBuilder().applyBatch(.{
+        .group_id = request.group_id,
+        .commit_index = request.commit_index,
+        .entries_bytes = request.entries.slice(),
+    }) catch |err| return storageOwnerStatusFromError(err);
+    return .ok;
+}
+
+pub fn dataApplyStoreBuildSnapshot(
+    store_ptr: ?*anyopaque,
+    request: *const kernel_owner_abi.DataApplyGroupRequest,
+    out_snapshot: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_snapshot.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asDataApplyStore(store_ptr) orelse return .invalid_argument;
+    const snapshot = handle.store.snapshotBuilder().buildSnapshot(handle.alloc, request.group_id) catch |err|
+        return storageOwnerStatusFromError(err);
+    out_snapshot.* = .{
+        .ptr = if (snapshot.len == 0) null else snapshot.ptr,
+        .len = @intCast(snapshot.len),
+    };
+    return .ok;
+}
+
+pub fn dataApplyStoreInstallSnapshot(
+    store_ptr: ?*anyopaque,
+    request: *const kernel_owner_abi.DataApplySnapshotRequest,
+) callconv(.c) kernel_owner_abi.Status {
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asDataApplyStore(store_ptr) orelse return .invalid_argument;
+    const installed = handle.store.snapshotBuilder().installSnapshot(
+        handle.alloc,
+        request.group_id,
+        request.commit_index,
+        request.snapshot.slice(),
+    ) catch |err| return storageOwnerStatusFromError(err);
+    if (!installed) return .internal;
+    return .ok;
+}
+
+pub fn dataApplyStoreLatest(
+    store_ptr: ?*anyopaque,
+    request: *const kernel_owner_abi.DataApplyGroupRequest,
+    out_result: *kernel_owner_abi.DataApplyLatestResult,
+) callconv(.c) kernel_owner_abi.Status {
+    out_result.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asDataApplyStore(store_ptr) orelse return .invalid_argument;
+    const latest = handle.store.latestBatch(request.group_id) catch |err|
+        return storageOwnerStatusFromError(err);
+    const value = latest orelse return .ok;
+    out_result.* = .{
+        .present = 1,
+        .commit_index = value.commit_index,
+        .entry_count = @intCast(value.entry_count),
+        .normal_entry_count = @intCast(value.normal_entry_count),
+        .admin_entry_count = @intCast(value.admin_entry_count),
+        .last_entry_term = value.last_entry_term,
+        .last_entry_index = value.last_entry_index,
+    };
+    return .ok;
+}
+
+pub fn dataApplyStoreRetainGroups(
+    store_ptr: ?*anyopaque,
+    request: *const kernel_owner_abi.DataApplyGroupsRequest,
+) callconv(.c) kernel_owner_abi.Status {
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asDataApplyStore(store_ptr) orelse return .invalid_argument;
+    const groups = request.slice() orelse return .invalid_argument;
+    handle.store.retainActiveGroups(groups) catch |err| return storageOwnerStatusFromError(err);
+    return .ok;
+}
+
+pub fn dataApplyStoreBeginGroupTransition(
+    store_ptr: ?*anyopaque,
+    request: *const kernel_owner_abi.DataApplyGroupsRequest,
+    out_transition: *?*anyopaque,
+) callconv(.c) kernel_owner_abi.Status {
+    out_transition.* = null;
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asDataApplyStore(store_ptr) orelse return .invalid_argument;
+    const groups = request.slice() orelse return .invalid_argument;
+    var transition = handle.store.beginActiveGroupTransition(groups) catch |err|
+        return storageOwnerStatusFromError(err);
+    errdefer transition.deinit();
+    const owned = handle.alloc.create(DataApplyGroupTransitionHandle) catch return .out_of_memory;
+    owned.* = .{ .transition = transition };
+    out_transition.* = owned;
+    return .ok;
+}
+
+pub fn dataApplyStoreCommitGroupTransition(
+    transition_ptr: ?*anyopaque,
+) callconv(.c) kernel_owner_abi.Status {
+    const handle = asDataApplyGroupTransition(transition_ptr) orelse return .invalid_argument;
+    if (!handle.active) return .invalid_argument;
+    handle.transition.commit();
+    handle.active = false;
+    return .ok;
+}
+
+pub fn dataApplyStoreAbortGroupTransition(
+    transition_ptr: ?*anyopaque,
+) callconv(.c) kernel_owner_abi.Status {
+    const handle = asDataApplyGroupTransition(transition_ptr) orelse return .invalid_argument;
+    if (!handle.active) return .ok;
+    handle.transition.abort();
+    handle.active = false;
+    return .ok;
+}
+
+pub fn dataApplyStoreDestroyGroupTransition(transition_ptr: ?*anyopaque) callconv(.c) void {
+    const handle = asDataApplyGroupTransition(transition_ptr) orelse return;
+    if (handle.active) handle.transition.abort();
+    handle.transition.deinit();
+    std.heap.c_allocator.destroy(handle);
 }
 
 pub fn storageOwnerOpen(

@@ -15,7 +15,7 @@
 //! Versioned internal ABI for the storage kernel's live DB owner. Keep this
 //! module free of storage and distributed-runtime imports.
 
-pub const abi_version: u32 = 19;
+pub const abi_version: u32 = 20;
 
 pub const BorrowedBytes = extern struct {
     ptr: ?[*]const u8 = null,
@@ -117,6 +117,65 @@ pub const ContextMetricsResult = extern struct {
     lsm_run_table_index: ContextCacheKindStats = .{},
     lsm_run_table_block: ContextCacheKindStats = .{},
     lsm_run_table_physical_block: ContextCacheKindStats = .{},
+};
+
+/// Process-owned data-Raft apply/projection store. Requests are deliberately
+/// batch-, snapshot-, and placement-sized; no record or backend primitive
+/// crosses this ABI.
+pub const DataApplyOpenRequest = extern struct {
+    version: u32 = abi_version,
+    no_sync: u8 = 0,
+    read_only: u8 = 0,
+    _reserved0: u16 = 0,
+    context: ?*anyopaque = null,
+    root_dir: BorrowedBytes = .{},
+};
+
+pub const DataApplyBatchRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved0: u32 = 0,
+    group_id: u64 = 0,
+    commit_index: u64 = 0,
+    entries: BorrowedBytes = .{},
+};
+
+pub const DataApplySnapshotRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved0: u32 = 0,
+    group_id: u64 = 0,
+    commit_index: u64 = 0,
+    snapshot: BorrowedBytes = .{},
+};
+
+pub const DataApplyGroupRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved0: u32 = 0,
+    group_id: u64 = 0,
+};
+
+pub const DataApplyGroupsRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved0: u32 = 0,
+    group_ids: ?[*]const u64 = null,
+    group_count: u64 = 0,
+
+    pub fn slice(self: DataApplyGroupsRequest) ?[]const u64 {
+        if (self.group_count == 0) return &.{};
+        const ptr = self.group_ids orelse return null;
+        return ptr[0..@intCast(self.group_count)];
+    }
+};
+
+pub const DataApplyLatestResult = extern struct {
+    version: u32 = abi_version,
+    present: u8 = 0,
+    _reserved0: [3]u8 = .{ 0, 0, 0 },
+    commit_index: u64 = 0,
+    entry_count: u64 = 0,
+    normal_entry_count: u64 = 0,
+    admin_entry_count: u64 = 0,
+    last_entry_term: u64 = 0,
+    last_entry_index: u64 = 0,
 };
 
 pub const TransactionRecoveryResolveFn = *const fn (
@@ -475,6 +534,58 @@ pub extern fn antfly_storage_context_metrics(
     context: ?*anyopaque,
     out_result: *ContextMetricsResult,
 ) callconv(.c) Status;
+
+pub extern fn antfly_data_apply_store_open(
+    request: *const DataApplyOpenRequest,
+    out_store: *?*anyopaque,
+) callconv(.c) Status;
+
+pub extern fn antfly_data_apply_store_close(store: ?*anyopaque) callconv(.c) void;
+
+pub extern fn antfly_data_apply_store_apply_batch(
+    store: ?*anyopaque,
+    request: *const DataApplyBatchRequest,
+) callconv(.c) Status;
+
+pub extern fn antfly_data_apply_store_build_snapshot(
+    store: ?*anyopaque,
+    request: *const DataApplyGroupRequest,
+    out_snapshot: *OwnedBytes,
+) callconv(.c) Status;
+
+pub extern fn antfly_data_apply_store_install_snapshot(
+    store: ?*anyopaque,
+    request: *const DataApplySnapshotRequest,
+) callconv(.c) Status;
+
+pub extern fn antfly_data_apply_store_latest(
+    store: ?*anyopaque,
+    request: *const DataApplyGroupRequest,
+    out_result: *DataApplyLatestResult,
+) callconv(.c) Status;
+
+pub extern fn antfly_data_apply_store_retain_groups(
+    store: ?*anyopaque,
+    request: *const DataApplyGroupsRequest,
+) callconv(.c) Status;
+
+pub extern fn antfly_data_apply_store_begin_group_transition(
+    store: ?*anyopaque,
+    request: *const DataApplyGroupsRequest,
+    out_transition: *?*anyopaque,
+) callconv(.c) Status;
+
+pub extern fn antfly_data_apply_store_commit_group_transition(
+    transition: ?*anyopaque,
+) callconv(.c) Status;
+
+pub extern fn antfly_data_apply_store_abort_group_transition(
+    transition: ?*anyopaque,
+) callconv(.c) Status;
+
+pub extern fn antfly_data_apply_store_destroy_group_transition(
+    transition: ?*anyopaque,
+) callconv(.c) void;
 
 pub extern fn antfly_storage_owner_open(
     request: *const OpenRequest,

@@ -15,6 +15,7 @@
 const std = @import("std");
 const abi = @import("kernel_owner_abi");
 const client = @import("kernel_owner_client.zig");
+const data_apply_client = @import("data_raft_apply_client.zig");
 
 fn cleanup(path: []const u8) void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -624,4 +625,78 @@ test "opaque storage context enforces owner lifetime and shares process storage 
     try std.testing.expectEqual(abi.Status.busy, abi.antfly_storage_context_destroy(context));
     second.deinit();
     try std.testing.expectEqual(abi.Status.ok, abi.antfly_storage_context_destroy(context));
+}
+
+test "opaque data raft apply owner preserves batch snapshot and placement lifecycle" {
+    const source_root = "/tmp/antfly-storage-kernel-data-apply-source";
+    const restored_root = "/tmp/antfly-storage-kernel-data-apply-restored";
+    cleanup(source_root);
+    cleanup(restored_root);
+    defer cleanup(source_root);
+    defer cleanup(restored_root);
+
+    var context = client.Context{};
+    try context.ensure();
+    defer context.deinit();
+
+    var invalid_store: ?*anyopaque = @ptrFromInt(1);
+    try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_data_apply_store_open(&.{
+        .version = abi.abi_version + 1,
+        .root_dir = .fromSlice(source_root),
+    }, &invalid_store));
+    try std.testing.expect(invalid_store == null);
+
+    var source = try data_apply_client.RaftApplyStore.init(std.testing.allocator, .{
+        .root_dir = source_root,
+        .context = context.handle,
+    });
+    defer source.deinit();
+
+    const payload = "opaque-data-apply";
+    var encoded: [4 + 8 + 8 + 1 + 4 + payload.len]u8 = undefined;
+    var pos: usize = 0;
+    std.mem.writeInt(u32, encoded[pos..][0..4], 1, .little);
+    pos += 4;
+    std.mem.writeInt(u64, encoded[pos..][0..8], 4, .little);
+    pos += 8;
+    std.mem.writeInt(u64, encoded[pos..][0..8], 9, .little);
+    pos += 8;
+    encoded[pos] = 0;
+    pos += 1;
+    std.mem.writeInt(u32, encoded[pos..][0..4], payload.len, .little);
+    pos += 4;
+    @memcpy(encoded[pos..], payload);
+    try source.applyBatch(81, 9, &encoded);
+    const latest = (try source.latestBatch(81)) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, 9), latest.commit_index);
+    try std.testing.expectEqual(@as(u64, 9), latest.last_entry_index);
+    try std.testing.expectEqual(@as(usize, 1), latest.normal_entry_count);
+
+    var placement = try source.beginActiveGroupTransition(&.{81});
+    placement.commit();
+    placement.deinit();
+    try source.retainActiveGroups(&.{81});
+    try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_data_apply_store_retain_groups(
+        source.handle,
+        &.{ .group_count = 1 },
+    ));
+    var aborted = try source.beginActiveGroupTransition(&.{ 81, 82 });
+    aborted.abort();
+    aborted.deinit();
+
+    const snapshot = try source.buildSnapshot(std.testing.allocator, 81);
+    defer std.testing.allocator.free(snapshot);
+    try std.testing.expect(snapshot.len > 0);
+
+    var restored = try data_apply_client.RaftApplyStore.init(std.testing.allocator, .{
+        .root_dir = restored_root,
+        .context = context.handle,
+    });
+    defer restored.deinit();
+    try restored.installSnapshot(81, 9, snapshot);
+    const restored_latest = (try restored.latestBatch(81)) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(latest.commit_index, restored_latest.commit_index);
+    try std.testing.expectEqual(latest.last_entry_index, restored_latest.last_entry_index);
+
+    try std.testing.expectEqual(abi.Status.busy, abi.antfly_storage_context_destroy(context.handle));
 }

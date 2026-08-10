@@ -2616,6 +2616,43 @@ the boundary. The kernel operation granularity is one committed apply batch,
 snapshot phase, split/merge phase, or bounded projection page--never one record
 or one LSM call.
 
+### Phase 4j: opaque data-Raft apply owner foundation
+
+The process-scoped kernel now owns an optional opaque data-Raft apply store.
+ABI version 20 adds only lifecycle-sized operations:
+
+- open and close one apply/projection store while borrowing the process storage
+  context and its resource manager;
+- apply one encoded committed Raft batch;
+- build or install one complete group snapshot;
+- read one copied scalar apply watermark;
+- replace the admitted active-group set; and
+- begin, commit, abort, and destroy one atomic active-group transition.
+
+The consumer in `storage/data_raft_apply_client.zig` imports only the ABI
+contract and `std`. It deliberately does not import the Raft state-machine
+implementation to manufacture its callback vtable. A later adapter in the
+distributed Raft unit will own that callback composition while delegating the
+coarse buffers and scalars to this client.
+
+The owner suite now passes 5/5 with zero leaks. Its new case applies an encoded
+committed entry, verifies the latest watermark, commits and aborts placement
+transitions, builds a snapshot, installs it into a second store, verifies the
+restored watermark, rejects malformed group slices and future ABI versions,
+and proves that the shared process context remains busy until both stores
+close. The 6/6 provisioned cross-archive suite and 10/10 CAPI suite also pass.
+The graph gate treats the new client as a kernel contract so a direct DB,
+docstore, or backend import fails validation.
+
+Decision: **keep as an unattached ownership foundation with no compiler-time
+claim**. It is not yet valid to redirect `ManagedHttpHost`: the existing apply
+store supports off-thread prepared snapshots, and data transition control
+still calls its split projection directly. The next atomic slice must add the
+prepared-snapshot handle and coarse projection/split operations, then select
+the client for the experimental distributed build in one change. Until that
+selection makes the physical `RaftApplyStore` unreachable, do not measure or
+claim a distributed graph reduction.
+
 ## Holistic target architecture
 
 The current candidate baseline is the four-unit topology above with serverless

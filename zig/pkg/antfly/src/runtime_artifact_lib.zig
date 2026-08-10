@@ -93,6 +93,7 @@ else
 pub const aggregation = @import("search/aggregation.zig");
 pub const backup_codec = @import("storage/backup_codec.zig");
 pub const data_snapshot = @import("data/storage/shard_state_store.zig");
+pub const data_raft_apply = @import("data/storage/raft_apply_store.zig");
 pub const db = @import("storage/db/mod.zig");
 pub const geo = @import("search/geo.zig");
 pub const graph = @import("graph/graph.zig");
@@ -291,6 +292,17 @@ comptime {
             exportInternal(&storage_kernel_exports.storageOwnerContextCreate, "antfly_storage_context_create");
             exportInternal(&storage_kernel_exports.storageOwnerContextDestroy, "antfly_storage_context_destroy");
             exportInternal(&storage_kernel_exports.storageOwnerContextMetrics, "antfly_storage_context_metrics");
+            exportInternal(&storage_kernel_exports.dataApplyStoreOpen, "antfly_data_apply_store_open");
+            exportInternal(&storage_kernel_exports.dataApplyStoreClose, "antfly_data_apply_store_close");
+            exportInternal(&storage_kernel_exports.dataApplyStoreApplyBatch, "antfly_data_apply_store_apply_batch");
+            exportInternal(&storage_kernel_exports.dataApplyStoreBuildSnapshot, "antfly_data_apply_store_build_snapshot");
+            exportInternal(&storage_kernel_exports.dataApplyStoreInstallSnapshot, "antfly_data_apply_store_install_snapshot");
+            exportInternal(&storage_kernel_exports.dataApplyStoreLatest, "antfly_data_apply_store_latest");
+            exportInternal(&storage_kernel_exports.dataApplyStoreRetainGroups, "antfly_data_apply_store_retain_groups");
+            exportInternal(&storage_kernel_exports.dataApplyStoreBeginGroupTransition, "antfly_data_apply_store_begin_group_transition");
+            exportInternal(&storage_kernel_exports.dataApplyStoreCommitGroupTransition, "antfly_data_apply_store_commit_group_transition");
+            exportInternal(&storage_kernel_exports.dataApplyStoreAbortGroupTransition, "antfly_data_apply_store_abort_group_transition");
+            exportInternal(&storage_kernel_exports.dataApplyStoreDestroyGroupTransition, "antfly_data_apply_store_destroy_group_transition");
             exportInternal(&storage_kernel_exports.storageOwnerOpen, "antfly_storage_owner_open");
             exportInternal(&storage_kernel_exports.storageOwnerClose, "antfly_storage_owner_close");
             exportInternal(&storage_kernel_exports.storageOwnerConfigure, "antfly_storage_owner_configure");
