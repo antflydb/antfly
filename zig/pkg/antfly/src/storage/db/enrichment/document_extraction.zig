@@ -171,6 +171,7 @@ pub fn remoteContentErrorIsPermanent(err: anyerror) bool {
         error.HostNotAllowed,
         error.PrivateIpBlocked,
         error.PathNotAllowed,
+        error.PeerAddressVerificationUnavailable,
         error.UnsupportedRemoteContentCredential,
         => true,
         else => false,

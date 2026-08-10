@@ -13,6 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const objectstore = @import("objectstore");
 
 const Allocator = std.mem.Allocator;
@@ -230,14 +231,16 @@ pub fn downloadContentOutcomeAllocWithHeaders(
 
     const parsed = try std.Uri.parse(uri);
     if (std.mem.eql(u8, parsed.scheme, "http") or std.mem.eql(u8, parsed.scheme, "https")) {
-        try validateUrlSecurity(parsed, security);
         return try downloadHttpOutcomeAlloc(alloc, parsed, security, http_headers);
     }
     if (std.mem.eql(u8, parsed.scheme, "file")) {
+        if (parsed.host) |host| {
+            if (host.percent_encoded.len > 0 and !std.ascii.eqlIgnoreCase(host.percent_encoded, "localhost"))
+                return error.InvalidHost;
+        }
         const path_buf = try alloc.dupe(u8, parsed.path.percent_encoded);
         defer alloc.free(path_buf);
         const path = std.Uri.percentDecodeInPlace(path_buf);
-        try validatePathSecurity(path, security);
         return .{ .ok = try downloadFileAlloc(alloc, path, security) };
     }
     if (std.mem.eql(u8, parsed.scheme, "s3")) {
@@ -362,6 +365,7 @@ fn downloadHttpOutcomeAlloc(
 ) !DownloadOutcome {
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
+    try validateUrlSecurity(uri, security, io_impl.io());
 
     var client = std.http.Client{
         .allocator = alloc,
@@ -384,9 +388,19 @@ fn downloadHttpOutcomeAlloc(
 
     var request = try std.http.Client.request(&client, .GET, uri, .{
         .keep_alive = false,
+        // Redirects must be revalidated before connecting. The standard
+        // client's automatic redirect loop does not expose that boundary, so
+        // treat redirects as ordinary non-success responses here.
+        .redirect_behavior = .unhandled,
         .extra_headers = headers.items,
     });
     defer request.deinit();
+
+    if (security) |cfg| {
+        if (cfg.block_private_ips orelse false) {
+            try validateConnectedPeer(request.connection.?);
+        }
+    }
 
     try request.sendBodiless();
     var response = try request.receiveHead(&.{});
@@ -426,20 +440,28 @@ fn downloadFileAlloc(
     path: []const u8,
     security: ?*const ContentSecurityConfig,
 ) !DownloadedContent {
+    const file_security = security orelse return error.PathNotAllowed;
+    const allowed_paths = file_security.allowed_paths orelse return error.PathNotAllowed;
+    if (allowed_paths.len == 0) return error.PathNotAllowed;
+
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
-    const limit: usize = if (security) |cfg|
-        @intCast(cfg.max_download_size_bytes orelse (100 * 1024 * 1024))
-    else
-        100 * 1024 * 1024;
-    var file = try std.Io.Dir.openFileAbsolute(io_impl.io(), path, .{});
+    const canonical_path = std.Io.Dir.cwd().realPathFileAlloc(io_impl.io(), path, alloc) catch return error.PathNotAllowed;
+    defer alloc.free(canonical_path);
+    try validateCanonicalFilePathSecurity(alloc, io_impl.io(), canonical_path, security);
+
+    const limit: usize = @intCast(file_security.max_download_size_bytes orelse (100 * 1024 * 1024));
+    const preflight_stat = try std.Io.Dir.cwd().statFile(io_impl.io(), canonical_path, .{});
+    if (preflight_stat.kind != .file) return error.PathNotAllowed;
+    var file = try std.Io.Dir.openFileAbsolute(io_impl.io(), canonical_path, .{ .allow_directory = false });
     defer file.close(io_impl.io());
+    try validateOpenedFileSecurity(alloc, io_impl.io(), file, security);
     var reader = file.reader(io_impl.io(), &.{});
     const data = try reader.interface.allocRemaining(alloc, .limited(limit));
     errdefer alloc.free(data);
     return .{
-        .content_type = try alloc.dupe(u8, guessMimeType(path)),
+        .content_type = try alloc.dupe(u8, guessMimeType(canonical_path)),
         .data = data,
     };
 }
@@ -522,9 +544,10 @@ fn parseS3LocationAlloc(
     };
 }
 
-fn validateUrlSecurity(parsed: std.Uri, security: ?*const ContentSecurityConfig) !void {
+fn validateUrlSecurity(parsed: std.Uri, security: ?*const ContentSecurityConfig, io: std.Io) !void {
     const cfg = security orelse return;
     const host = (parsed.host orelse return error.InvalidHost).percent_encoded;
+    if (host.len == 0) return error.InvalidHost;
 
     if (cfg.allowed_hosts) |allowed_hosts| {
         var allowed = false;
@@ -538,10 +561,12 @@ fn validateUrlSecurity(parsed: std.Uri, security: ?*const ContentSecurityConfig)
     }
 
     if (cfg.block_private_ips orelse false) {
-        if (isPrivateHost(host)) return error.PrivateIpBlocked;
+        try validateResolvedHost(host, parsed.port orelse if (std.mem.eql(u8, parsed.scheme, "https")) 443 else 80, io);
     }
 }
 
+/// S3 allowlists are logical bucket/key prefixes rather than filesystem
+/// roots. Keep their existing semantics separate from local-file admission.
 fn validatePathSecurity(path: []const u8, security: ?*const ContentSecurityConfig) !void {
     const cfg = security orelse return;
     const allowed_paths = cfg.allowed_paths orelse return;
@@ -551,26 +576,129 @@ fn validatePathSecurity(path: []const u8, security: ?*const ContentSecurityConfi
     return error.PathNotAllowed;
 }
 
-fn isPrivateHost(host: []const u8) bool {
-    if (std.ascii.eqlIgnoreCase(host, "localhost")) return true;
-    if (std.mem.endsWith(u8, host, ".local")) return true;
+fn validateOpenedFileSecurity(
+    alloc: Allocator,
+    io: std.Io,
+    file: std.Io.File,
+    security: ?*const ContentSecurityConfig,
+) !void {
+    if ((try file.stat(io)).kind != .file) return error.PathNotAllowed;
 
-    const address = std.Io.net.IpAddress.parse(host, 0) catch return false;
+    var opened_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const opened_path_len = file.realPath(io, &opened_path_buffer) catch return error.PathNotAllowed;
+    try validateCanonicalFilePathSecurity(alloc, io, opened_path_buffer[0..opened_path_len], security);
+}
+
+fn validateCanonicalFilePathSecurity(
+    alloc: Allocator,
+    io: std.Io,
+    canonical_path: []const u8,
+    security: ?*const ContentSecurityConfig,
+) !void {
+    const cfg = security orelse return error.PathNotAllowed;
+    const allowed_paths = cfg.allowed_paths orelse return error.PathNotAllowed;
+    if (allowed_paths.len == 0) return error.PathNotAllowed;
+    for (allowed_paths) |allowed| {
+        if (allowed.len == 0) continue;
+        const canonical_root = std.Io.Dir.cwd().realPathFileAlloc(io, allowed, alloc) catch continue;
+        const contained = pathIsWithinRoot(canonical_root, canonical_path);
+        alloc.free(canonical_root);
+        if (contained) return;
+    }
+    return error.PathNotAllowed;
+}
+
+fn pathIsWithinRoot(root: []const u8, path: []const u8) bool {
+    if (std.mem.eql(u8, root, path)) return true;
+    if (root.len == 1 and root[0] == std.fs.path.sep)
+        return path.len > 0 and path[0] == std.fs.path.sep;
+    return path.len > root.len and
+        std.mem.startsWith(u8, path, root) and
+        path[root.len] == std.fs.path.sep;
+}
+
+fn validateResolvedHost(host: []const u8, port: u16, io: std.Io) !void {
+    if (std.ascii.eqlIgnoreCase(host, "localhost") or std.ascii.endsWithIgnoreCase(host, ".localhost") or
+        std.ascii.endsWithIgnoreCase(host, ".local")) return error.PrivateIpBlocked;
+
+    if (std.Io.net.IpAddress.parse(host, port)) |address| {
+        if (!isPublicAddress(address)) return error.PrivateIpBlocked;
+        return;
+    } else |_| {}
+
+    const host_name = std.Io.net.HostName.init(host) catch return error.InvalidHost;
+    var lookup_buffer: [32]std.Io.net.HostName.LookupResult = undefined;
+    var lookup_queue: std.Io.Queue(std.Io.net.HostName.LookupResult) = .init(&lookup_buffer);
+    try std.Io.net.HostName.lookup(host_name, io, &lookup_queue, .{ .port = port });
+    var found_address = false;
+    while (true) {
+        const result = lookup_queue.getOne(io) catch |err| switch (err) {
+            error.Closed => break,
+            else => return err,
+        };
+        switch (result) {
+            .address => |address| {
+                found_address = true;
+                // Mixed public/private DNS answers are rejected. Otherwise an
+                // attacker can steer the client's address selection.
+                if (!isPublicAddress(address)) return error.PrivateIpBlocked;
+            },
+            .canonical_name => {},
+        }
+    }
+    if (!found_address) return error.InvalidHost;
+}
+
+fn validateConnectedPeer(connection: *std.http.Client.Connection) !void {
+    // Ip literals have no DNS race, but use the same peer check on supported
+    // server platforms to protect against resolver or transport surprises.
+    if (builtin.os.tag == .windows) {
+        // std.Io does not currently expose a portable peer-address query on
+        // Windows. Fail closed rather than leaving DNS rebinding exploitable.
+        return error.PeerAddressVerificationUnavailable;
+    } else {
+        var storage: std.Io.Threaded.PosixAddress = undefined;
+        var storage_len: std.posix.socklen_t = @sizeOf(std.Io.Threaded.PosixAddress);
+        try std.posix.getpeername(connection.stream_reader.stream.socket.handle, &storage.any, &storage_len);
+        if (!isPublicAddress(std.Io.Threaded.addressFromPosix(&storage))) {
+            connection.closing = true;
+            return error.PrivateIpBlocked;
+        }
+    }
+}
+
+fn isPublicAddress(address: std.Io.net.IpAddress) bool {
     return switch (address) {
         .ip4 => |ip4| {
             const b = ip4.bytes;
-            return b[0] == 10 or
-                (b[0] == 172 and b[1] >= 16 and b[1] <= 31) or
-                (b[0] == 192 and b[1] == 168) or
+            return !(b[0] == 0 or
+                b[0] == 10 or
+                (b[0] == 100 and (b[1] & 0xc0) == 0x40) or
+                b[0] == 127 or
                 (b[0] == 169 and b[1] == 254) or
-                b[0] == 127;
+                (b[0] == 172 and b[1] >= 16 and b[1] <= 31) or
+                (b[0] == 192 and b[1] == 0 and (b[2] == 0 or b[2] == 2)) or
+                (b[0] == 192 and b[1] == 88 and b[2] == 99) or
+                (b[0] == 192 and b[1] == 168) or
+                (b[0] == 198 and (b[1] == 18 or b[1] == 19)) or
+                (b[0] == 198 and b[1] == 51 and b[2] == 100) or
+                (b[0] == 203 and b[1] == 0 and b[2] == 113) or
+                b[0] >= 224);
         },
         .ip6 => |ip6| {
             const b = ip6.bytes;
-            return !ip6.interface.isNone() or
-                b[0] == 0xfe and (b[1] & 0xc0) == 0x80 or
-                (b[0] & 0xfe) == 0xfc or
-                (b[0] == 0 and b[1] == 0 and b[2] == 0 and b[3] == 0 and b[4] == 0 and b[5] == 0 and b[6] == 0 and b[7] == 0 and b[8] == 0 and b[9] == 0 and b[10] == 0 and b[11] == 0 and b[12] == 0 and b[13] == 0 and b[14] == 0 and b[15] == 1);
+            if (std.Io.net.Ip4Address.fromIp6(ip6)) |ip4| return isPublicAddress(.{ .ip4 = ip4 });
+            const zero_96_prefix = std.mem.eql(u8, b[0..12], &([_]u8{0} ** 12));
+            const is_nat64 = std.mem.eql(u8, b[0..12], &.{ 0, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0 });
+            if (is_nat64) {
+                return isPublicAddress(.{ .ip4 = .{ .bytes = b[12..16].*, .port = ip6.port } });
+            }
+            return ip6.interface.isNone() and
+                !zero_96_prefix and
+                (b[0] & 0xfe) != 0xfc and
+                !(b[0] == 0xfe and (b[1] & 0xc0) >= 0x80) and
+                b[0] != 0xff and
+                !std.mem.eql(u8, b[0..4], &.{ 0x20, 0x01, 0x0d, 0xb8 });
         },
     };
 }
@@ -663,10 +791,49 @@ test "download content reads percent encoded file uri" {
     const uri = try std.mem.replaceOwned(u8, alloc, raw_uri, " ", "%20");
     defer alloc.free(uri);
 
-    var downloaded = try downloadContentAlloc(alloc, uri, null, null);
+    try std.testing.expectError(error.PathNotAllowed, downloadContentAlloc(alloc, uri, null, null));
+
+    const allowed_root = std.fs.path.dirname(abs_path).?;
+    const allowed_paths = [_][]u8{@constCast(allowed_root)};
+    var downloaded = try downloadContentAlloc(alloc, uri, &.{ .allowed_paths = &allowed_paths }, null);
     defer downloaded.deinit(alloc);
     try std.testing.expectEqualStrings("image/png", downloaded.content_type);
     try std.testing.expectEqualStrings("png-bytes", downloaded.data);
+}
+
+test "download content file allowlist uses canonical path boundaries" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "allowed");
+    try tmp.dir.createDirPath(std.testing.io, "allowed-escape");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "allowed/safe.txt", .data = "safe" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "allowed-escape/secret.txt", .data = "secret" });
+
+    const tmp_rel = try std.fs.path.join(alloc, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer alloc.free(tmp_rel);
+    const tmp_abs = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, tmp_rel, alloc);
+    defer alloc.free(tmp_abs);
+    const allowed_root = try std.fs.path.join(alloc, &.{ tmp_abs, "allowed" });
+    defer alloc.free(allowed_root);
+    const escaped_path = try std.fs.path.join(alloc, &.{ tmp_abs, "allowed-escape", "secret.txt" });
+    defer alloc.free(escaped_path);
+    const escaped_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{escaped_path});
+    defer alloc.free(escaped_uri);
+    const allowed_paths = [_][]u8{allowed_root};
+    try std.testing.expectError(error.PathNotAllowed, downloadContentAlloc(alloc, escaped_uri, &.{ .allowed_paths = &allowed_paths }, null));
+    const directory_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{allowed_root});
+    defer alloc.free(directory_uri);
+    try std.testing.expectError(error.PathNotAllowed, downloadContentAlloc(alloc, directory_uri, &.{ .allowed_paths = &allowed_paths }, null));
+
+    if (builtin.os.tag != .windows) {
+        try tmp.dir.symLink(std.testing.io, "../allowed-escape/secret.txt", "allowed/link.txt", .{});
+        const link_path = try std.fs.path.join(alloc, &.{ tmp_abs, "allowed", "link.txt" });
+        defer alloc.free(link_path);
+        const link_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{link_path});
+        defer alloc.free(link_uri);
+        try std.testing.expectError(error.PathNotAllowed, downloadContentAlloc(alloc, link_uri, &.{ .allowed_paths = &allowed_paths }, null));
+    }
 }
 
 test "download content blocks disallowed hosts" {
@@ -682,4 +849,18 @@ test "download content blocks private ip literals" {
     try std.testing.expectError(error.PrivateIpBlocked, downloadContentAlloc(alloc, "http://127.0.0.1/test.png", &.{
         .block_private_ips = true,
     }, null));
+}
+
+test "remote address policy rejects non-public ranges" {
+    const parse = std.Io.net.IpAddress.parse;
+    try std.testing.expect(!isPublicAddress(try parse("0.0.0.0", 80)));
+    try std.testing.expect(!isPublicAddress(try parse("100.64.0.1", 80)));
+    try std.testing.expect(!isPublicAddress(try parse("169.254.169.254", 80)));
+    try std.testing.expect(!isPublicAddress(try parse("192.168.1.1", 80)));
+    try std.testing.expect(!isPublicAddress(try parse("::1", 80)));
+    try std.testing.expect(!isPublicAddress(try parse("fc00::1", 80)));
+    try std.testing.expect(!isPublicAddress(try parse("fe80::1", 80)));
+    try std.testing.expect(!isPublicAddress(try parse("::ffff:127.0.0.1", 80)));
+    try std.testing.expect(isPublicAddress(try parse("8.8.8.8", 80)));
+    try std.testing.expect(isPublicAddress(try parse("2606:4700:4700::1111", 80)));
 }

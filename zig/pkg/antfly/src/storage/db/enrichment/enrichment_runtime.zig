@@ -3787,6 +3787,49 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatch(
     kind: RuntimeGeneratedUnitTextKind,
     pdf_session_override: ?*document_extraction_mod.PdfRenderSession,
 ) !void {
+    var budgeted_allocator: ?resource_manager_mod.BudgetedAllocator = if (runtime.config.resource_manager orelse runtime.index_manager.resource_manager) |manager|
+        resource_manager_mod.BudgetedAllocator.init(manager, .document_extraction_working_set, alloc, 1)
+    else
+        null;
+    defer if (budgeted_allocator) |*budgeted| budgeted.deinit();
+    const working_alloc = if (budgeted_allocator) |*budgeted| budgeted.allocator() else alloc;
+    completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
+        runtime,
+        alloc,
+        working_alloc,
+        producer,
+        config,
+        batch_policy,
+        source_url,
+        source_bytes,
+        route_type,
+        source_content_type,
+        units,
+        kind,
+        pdf_session_override,
+    ) catch |err| {
+        if (budgeted_allocator) |*budgeted| {
+            if (budgeted.denied()) return error.DocumentExtractionWorkingSetTooLarge;
+        }
+        return err;
+    };
+}
+
+fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
+    runtime: *EnrichmentRuntime,
+    alloc: Allocator,
+    working_alloc: Allocator,
+    producer: asset_producer_mod.Producer,
+    config: document_extraction_mod.Config,
+    batch_policy: GeneratedTextBatchPolicy,
+    source_url: []const u8,
+    source_bytes: []const u8,
+    route_type: []const u8,
+    source_content_type: []const u8,
+    units: []document_extraction_mod.Unit,
+    kind: RuntimeGeneratedUnitTextKind,
+    pdf_session_override: ?*document_extraction_mod.PdfRenderSession,
+) !void {
     const enabled = switch (kind) {
         .ocr => document_extraction_mod.ocrEnabledForRoute(config, route_type),
         .transcript => config.transcription_enabled,
@@ -3817,13 +3860,13 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatch(
     const ocr_prompt = if (kind == .ocr) document_extraction_mod.effectiveOcrPrompt(config) else "";
 
     var requests = std.ArrayListUnmanaged(asset_producer_mod.Request).empty;
-    defer requests.deinit(alloc);
+    defer requests.deinit(working_alloc);
     var unit_indices = std.ArrayListUnmanaged(usize).empty;
-    defer unit_indices.deinit(alloc);
+    defer unit_indices.deinit(working_alloc);
     var parts_values = std.ArrayListUnmanaged([]u8).empty;
     defer {
-        clearRuntimeGeneratedTextBatchParts(alloc, &parts_values);
-        parts_values.deinit(alloc);
+        clearRuntimeGeneratedTextBatchParts(working_alloc, &parts_values);
+        parts_values.deinit(working_alloc);
     }
 
     var batch_bytes: usize = 0;
@@ -3837,13 +3880,13 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatch(
     for (units, 0..) |unit, idx| {
         if (unit.extraction_status == null or !std.mem.eql(u8, unit.extraction_status.?, pending_status)) continue;
         var rendered: ?[]u8 = null;
-        defer if (rendered) |png| alloc.free(png);
+        defer if (rendered) |png| working_alloc.free(png);
         if (kind == .ocr) {
             units[idx].ocr_attempted = true;
             if (std.mem.eql(u8, route_type, "pdf")) {
                 units[idx].ocr_render_dpi = config.ocr_render_dpi;
                 const render_started_ns = runtime.config.clock.nowRealtimeNs();
-                const rendered_page = pdf_session.?.renderPagePngAdaptiveAlloc(alloc, unit.page_number orelse 1, config.ocr_render_dpi, config.ocr_max_rendered_pixels, config.ocr_max_rendered_dimension) catch |err| {
+                const rendered_page = pdf_session.?.renderPagePngAdaptiveAlloc(working_alloc, unit.page_number orelse 1, config.ocr_render_dpi, config.ocr_max_rendered_pixels, config.ocr_max_rendered_dimension) catch |err| {
                     logRuntimeOcrRenderProfile(runtime, source_fingerprint, unit.page_number, config.ocr_render_dpi, null, null, null, null, render_started_ns, @errorName(err));
                     if (shouldYieldRequestError(runtime, err)) return err;
                     try setRuntimeGeneratedUnitFailureStage(alloc, &units[idx], kind, "render");
@@ -3870,11 +3913,11 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatch(
             }
         }
         const parts_json = if (rendered) |png|
-            try document_extraction_mod.ocrPagePartsJsonAlloc(alloc, config, route_type, source_content_type, unit, png)
+            try document_extraction_mod.ocrPagePartsJsonAlloc(working_alloc, config, route_type, source_content_type, unit, png)
         else
-            try runtimeDocumentGeneratedTextPartsJsonAlloc(alloc, route_type, source_content_type, unit);
+            try runtimeDocumentGeneratedTextPartsJsonAlloc(working_alloc, route_type, source_content_type, unit);
         var owns_parts_json = true;
-        errdefer if (owns_parts_json) alloc.free(parts_json);
+        errdefer if (owns_parts_json) working_alloc.free(parts_json);
         const request = asset_producer_mod.Request{
             .producer_type = producer_type,
             .config_json = config_json,
@@ -3887,24 +3930,24 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatch(
         if (request_bytes > batch_policy.max_bytes) {
             try setRuntimeGeneratedUnitFailureStage(alloc, &units[idx], kind, "request");
             try markRuntimeGeneratedUnitTextFailure(alloc, &units[idx], method, kind, error.GeneratedTextRequestTooLarge);
-            alloc.free(parts_json);
+            working_alloc.free(parts_json);
             owns_parts_json = false;
             continue;
         }
         if (requests.items.len > 0 and (requests.items.len >= batch_policy.max_items or batch_bytes + request_bytes > batch_policy.max_bytes)) {
-            try flushRuntimeGeneratedTextBatch(runtime, alloc, producer, requests.items, unit_indices.items, &parts_values, units, method, kind, config.ocr_quality, ocr_prompt, source_fingerprint);
+            try flushRuntimeGeneratedTextBatch(runtime, alloc, working_alloc, producer, requests.items, unit_indices.items, &parts_values, units, method, kind, config.ocr_quality, ocr_prompt, source_fingerprint);
             requests.clearRetainingCapacity();
             unit_indices.clearRetainingCapacity();
             batch_bytes = 0;
         }
-        try parts_values.append(alloc, parts_json);
+        try parts_values.append(working_alloc, parts_json);
         owns_parts_json = false;
-        try unit_indices.append(alloc, idx);
-        try requests.append(alloc, request);
+        try unit_indices.append(working_alloc, idx);
+        try requests.append(working_alloc, request);
         batch_bytes = addUsizeSaturating(batch_bytes, request_bytes);
     }
     if (requests.items.len > 0) {
-        try flushRuntimeGeneratedTextBatch(runtime, alloc, producer, requests.items, unit_indices.items, &parts_values, units, method, kind, config.ocr_quality, ocr_prompt, source_fingerprint);
+        try flushRuntimeGeneratedTextBatch(runtime, alloc, working_alloc, producer, requests.items, unit_indices.items, &parts_values, units, method, kind, config.ocr_quality, ocr_prompt, source_fingerprint);
     }
 }
 
@@ -3926,6 +3969,7 @@ fn clearRuntimeGeneratedTextBatchParts(
 fn flushRuntimeGeneratedTextBatch(
     runtime: *EnrichmentRuntime,
     alloc: Allocator,
+    working_alloc: Allocator,
     producer: asset_producer_mod.Producer,
     requests: []const asset_producer_mod.Request,
     unit_indices: []const usize,
@@ -3949,12 +3993,12 @@ fn flushRuntimeGeneratedTextBatch(
                 try setRuntimeGeneratedUnitFailureStage(alloc, &units[unit_idx], kind, "inference");
                 try markRuntimeGeneratedUnitTextFailure(alloc, &units[unit_idx], method, kind, err);
             }
-            clearRuntimeGeneratedTextBatchParts(alloc, parts_values);
+            clearRuntimeGeneratedTextBatchParts(working_alloc, parts_values);
             return;
         }
         if (shouldYieldRequestError(runtime, err)) return err;
         for (unit_indices) |unit_idx| try setRuntimeGeneratedUnitFailureStage(alloc, &units[unit_idx], kind, "inference");
-        return try flushRuntimeGeneratedTextBatchSequential(runtime, alloc, producer, requests, unit_indices, parts_values, units, method, kind, quality_config, ocr_prompt, source_fingerprint, @errorName(err));
+        return try flushRuntimeGeneratedTextBatchSequential(runtime, alloc, working_alloc, producer, requests, unit_indices, parts_values, units, method, kind, quality_config, ocr_prompt, source_fingerprint, @errorName(err));
     };
     if (produced.len != requests.len) {
         for (produced) |item| {
@@ -3962,7 +4006,7 @@ fn flushRuntimeGeneratedTextBatch(
         }
         alloc.free(produced);
         logRuntimeOcrBatchProfile(runtime, source_fingerprint, units, unit_indices, requests.len, request_bytes, "serial_fallback", "response_count_mismatch", started_ns);
-        return try flushRuntimeGeneratedTextBatchSequential(runtime, alloc, producer, requests, unit_indices, parts_values, units, method, kind, quality_config, ocr_prompt, source_fingerprint, "response_count_mismatch");
+        return try flushRuntimeGeneratedTextBatchSequential(runtime, alloc, working_alloc, producer, requests, unit_indices, parts_values, units, method, kind, quality_config, ocr_prompt, source_fingerprint, "response_count_mismatch");
     }
     logRuntimeOcrBatchProfile(runtime, source_fingerprint, units, unit_indices, requests.len, request_bytes, "batch", null, started_ns);
 
@@ -3980,12 +4024,13 @@ fn flushRuntimeGeneratedTextBatch(
             try markRuntimeGeneratedUnitTextFailure(alloc, &units[unit_idx], method, kind, err);
         };
     }
-    clearRuntimeGeneratedTextBatchParts(alloc, parts_values);
+    clearRuntimeGeneratedTextBatchParts(working_alloc, parts_values);
 }
 
 fn flushRuntimeGeneratedTextBatchSequential(
     runtime: *EnrichmentRuntime,
     alloc: Allocator,
+    working_alloc: Allocator,
     producer: asset_producer_mod.Producer,
     requests: []const asset_producer_mod.Request,
     unit_indices: []const usize,
@@ -4020,7 +4065,7 @@ fn flushRuntimeGeneratedTextBatchSequential(
             try markRuntimeGeneratedUnitTextFailure(alloc, &units[unit_idx], method, kind, err);
         };
     }
-    clearRuntimeGeneratedTextBatchParts(alloc, parts_values);
+    clearRuntimeGeneratedTextBatchParts(working_alloc, parts_values);
 }
 
 fn runtimeGeneratedTextBatchBytes(requests: []const asset_producer_mod.Request) usize {
@@ -4899,6 +4944,33 @@ test "document extraction reserves PDF decoder peak memory atomically" {
     try tracker.setBytes(40);
     try std.testing.expectEqual(@as(u64, 100), manager.sliceStats(.document_extraction_working_set).used_bytes);
     try std.testing.expectError(error.DocumentExtractionWorkingSetTooLarge, tracker.setBytes(41));
+}
+
+test "document extraction transient allocator composes with reserved baseline" {
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{
+        .soft_limit_bytes = 0,
+        .hard_limit_bytes = 100,
+    };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    var tracker = RuntimeDocumentExtractionResourceTracker{ .manager = &manager };
+    defer tracker.deinit();
+    try tracker.setDownloadedBytes(60);
+
+    var budgeted = resource_manager_mod.BudgetedAllocator.init(
+        &manager,
+        .document_extraction_working_set,
+        std.testing.allocator,
+        1,
+    );
+    defer budgeted.deinit();
+    const transient_alloc = budgeted.allocator();
+    const canvas = try transient_alloc.alloc(u8, 40);
+    try std.testing.expectEqual(@as(u64, 100), manager.sliceStats(.document_extraction_working_set).used_bytes);
+    try std.testing.expectError(error.OutOfMemory, transient_alloc.alloc(u8, 1));
+    try std.testing.expect(budgeted.denied());
+    transient_alloc.free(canvas);
+    try std.testing.expectEqual(@as(u64, 60), manager.sliceStats(.document_extraction_working_set).used_bytes);
 }
 
 fn addUsizeSaturating(a: usize, b: usize) usize {

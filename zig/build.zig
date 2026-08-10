@@ -2711,6 +2711,13 @@ pub fn build(b: *std.Build) void {
     const lib_extracting_test_step = b.step("lib-extracting-test", "Run standalone lib/extracting tests");
     lib_extracting_test_step.dependOn(&run_lib_extracting_tests.step);
 
+    const lib_scraping_tests = b.addTest(.{
+        .root_module = scraping_mod,
+    });
+    const run_lib_scraping_tests = b.addRunArtifact(lib_scraping_tests);
+    const lib_scraping_test_step = b.step("lib-scraping-test", "Run standalone lib/scraping tests");
+    lib_scraping_test_step.dependOn(&run_lib_scraping_tests.step);
+
     const image_test_mod = b.createModule(.{
         .root_source_file = b.path("lib/image/image_test_root.zig"),
         .target = target,
@@ -3984,6 +3991,7 @@ pub fn build(b: *std.Build) void {
             "remote fetch classification retries only transient failures",
             "remote HTTP failures consume retry budget before terminal coverage",
             "document extraction reserves PDF decoder peak memory atomically",
+            "document extraction transient allocator composes with reserved baseline",
             "enrichment runtime document extraction manifest uses v2 range and merge shape",
             "db document extraction failure manifest preserves prior artifacts",
         },
@@ -6160,6 +6168,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_a2a_tests.step);
     unit_test_step.dependOn(&run_lib_image_tests.step);
     unit_test_step.dependOn(&run_lib_pdf_tests.step);
+    unit_test_step.dependOn(&run_lib_scraping_tests.step);
     unit_test_step.dependOn(&run_lib_audio_tests.step);
     unit_test_step.dependOn(&run_hf_tokenizer_tests.step);
     unit_test_step.dependOn(delegated_inference_steps.inference_test);
