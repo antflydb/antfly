@@ -4447,7 +4447,8 @@ fn parseXrefTableGuarded(
         var i: usize = 0;
         while (i < count) : (i += 1) {
             const entry_line = try readLine(bytes, &cursor);
-            const parsed = try parseXrefEntry(start + i, entry_line);
+            const index = std.math.add(usize, start, i) catch return error.MalformedXrefTable;
+            const parsed = try parseXrefEntry(index, entry_line);
             if (parsed) |entry| try putXref(alloc, entries, entry);
         }
     }
@@ -4575,10 +4576,11 @@ fn parseXrefEntry(index: usize, line: []const u8) !?XrefEntry {
         error.Overflow => return null,
         error.InvalidCharacter => return error.MalformedXrefTable,
     };
+    const object_id = std.math.cast(u32, index) orelse return error.MalformedXrefTable;
 
     return .{
         .ptr = .{
-            .id = @intCast(index),
+            .id = object_id,
             .gen = @intCast(generation),
         },
         .offset = object_offset,
@@ -4765,7 +4767,10 @@ fn parseXrefWidths(obj: *const syntax.Object) ![3]usize {
     var widths: [3]usize = undefined;
     for (obj.array, 0..) |item, i| {
         const value = item.asInteger() orelse return error.MalformedXrefStream;
-        if (value < 0) return error.MalformedXrefStream;
+        // XRef fields are decoded into u64. Wider fields would silently
+        // discard high bytes in readBigEndianInt and can also overflow the
+        // record-width arithmetic below.
+        if (value < 0 or value > @sizeOf(u64)) return error.MalformedXrefStream;
         widths[i] = @intCast(value);
     }
     return widths;
@@ -4778,7 +4783,8 @@ fn parseXrefStreamEntries(
     stream_obj: *const syntax.Object,
     entries: *std.ArrayList(XrefEntry),
 ) !void {
-    const total_width = widths[0] + widths[1] + widths[2];
+    const first_two_widths = std.math.add(usize, widths[0], widths[1]) catch return error.MalformedXrefStream;
+    const total_width = std.math.add(usize, first_two_widths, widths[2]) catch return error.MalformedXrefStream;
     if (total_width == 0 or decoded.len % total_width != 0) return error.MalformedXrefStream;
 
     var spans = std.ArrayList(struct { start: usize, count: usize }).empty;
@@ -4791,24 +4797,35 @@ fn parseXrefStreamEntries(
             const start = index_obj.array[i].asInteger() orelse return error.MalformedXrefStream;
             const count = index_obj.array[i + 1].asInteger() orelse return error.MalformedXrefStream;
             if (start < 0 or count < 0) return error.MalformedXrefStream;
-            try spans.append(alloc, .{ .start = @intCast(start), .count = @intCast(count) });
+            const start_usize = std.math.cast(usize, start) orelse return error.MalformedXrefStream;
+            const count_usize = std.math.cast(usize, count) orelse return error.MalformedXrefStream;
+            if (count_usize > 0) {
+                const last = std.math.add(usize, start_usize, count_usize - 1) catch return error.MalformedXrefStream;
+                if (last > std.math.maxInt(u32)) return error.MalformedXrefStream;
+            }
+            try spans.append(alloc, .{ .start = start_usize, .count = count_usize });
         }
     } else {
         const size_obj = stream_obj.get("Size") orelse return error.MalformedXrefStream;
         const size = size_obj.asInteger() orelse return error.MalformedXrefStream;
         if (size < 0) return error.MalformedXrefStream;
-        try spans.append(alloc, .{ .start = 0, .count = @intCast(size) });
+        const count = std.math.cast(usize, size) orelse return error.MalformedXrefStream;
+        if (count != 0 and count - 1 > std.math.maxInt(u32)) return error.MalformedXrefStream;
+        try spans.append(alloc, .{ .start = 0, .count = count });
     }
 
     var expected_records: usize = 0;
-    for (spans.items) |span| expected_records += span.count;
-    if (expected_records * total_width != decoded.len) return error.MalformedXrefStream;
+    for (spans.items) |span| {
+        expected_records = std.math.add(usize, expected_records, span.count) catch return error.MalformedXrefStream;
+    }
+    if (expected_records != decoded.len / total_width) return error.MalformedXrefStream;
 
     var cursor: usize = 0;
     for (spans.items) |span| {
         var i: usize = 0;
         while (i < span.count) : (i += 1) {
-            const obj_id = span.start + i;
+            const obj_id_usize = std.math.add(usize, span.start, i) catch return error.MalformedXrefStream;
+            const obj_id = std.math.cast(u32, obj_id_usize) orelse return error.MalformedXrefStream;
             const entry_type = if (widths[0] == 0) @as(u64, 1) else readBigEndianInt(decoded[cursor .. cursor + widths[0]]);
             cursor += widths[0];
             const field2 = readBigEndianInt(decoded[cursor .. cursor + widths[1]]);
@@ -4817,27 +4834,28 @@ fn parseXrefStreamEntries(
             cursor += widths[2];
 
             switch (entry_type) {
-                0 => try putXref(alloc, entries, .{
-                    .ptr = .{ .id = @intCast(obj_id), .gen = @intCast(field3) },
-                    .offset = @intCast(field2),
-                    .in_use = false,
-                    .compressed_obj_stream_id = null,
-                    .compressed_index = null,
-                }),
-                1 => try putXref(alloc, entries, .{
-                    .ptr = .{ .id = @intCast(obj_id), .gen = @intCast(field3) },
-                    .offset = @intCast(field2),
-                    .in_use = true,
-                    .compressed_obj_stream_id = null,
-                    .compressed_index = null,
-                }),
-                2 => try putXref(alloc, entries, .{
-                    .ptr = .{ .id = @intCast(obj_id), .gen = 0 },
-                    .offset = 0,
-                    .in_use = true,
-                    .compressed_obj_stream_id = @intCast(field2),
-                    .compressed_index = @intCast(field3),
-                }),
+                0, 1 => {
+                    const generation = std.math.cast(u16, field3) orelse return error.MalformedXrefStream;
+                    const object_offset = std.math.cast(usize, field2) orelse return error.MalformedXrefStream;
+                    try putXref(alloc, entries, .{
+                        .ptr = .{ .id = obj_id, .gen = generation },
+                        .offset = object_offset,
+                        .in_use = entry_type == 1,
+                        .compressed_obj_stream_id = null,
+                        .compressed_index = null,
+                    });
+                },
+                2 => {
+                    const stream_id = std.math.cast(u32, field2) orelse return error.MalformedXrefStream;
+                    const compressed_index = std.math.cast(usize, field3) orelse return error.MalformedXrefStream;
+                    try putXref(alloc, entries, .{
+                        .ptr = .{ .id = obj_id, .gen = 0 },
+                        .offset = 0,
+                        .in_use = true,
+                        .compressed_obj_stream_id = stream_id,
+                        .compressed_index = compressed_index,
+                    });
+                },
                 else => return error.MalformedXrefStream,
             }
         }
@@ -10228,6 +10246,41 @@ test "xref parser ignores an out-of-range generation sentinel" {
     try std.testing.expectError(
         error.MalformedXrefTable,
         parseXrefEntry(1, "0000000000 invalid n"),
+    );
+}
+
+test "xref parser rejects numeric fields that exceed internal representations" {
+    if (@bitSizeOf(usize) > @bitSizeOf(u32)) {
+        try std.testing.expectError(
+            error.MalformedXrefTable,
+            parseXrefEntry(@as(usize, std.math.maxInt(u32)) + 1, "0000000000 00000 n"),
+        );
+    }
+
+    var width_items = [_]syntax.Object{
+        .{ .integer = 1 },
+        .{ .integer = 9 },
+        .{ .integer = 1 },
+    };
+    var width_object: syntax.Object = .{ .array = &width_items };
+    try std.testing.expectError(error.MalformedXrefStream, parseXrefWidths(&width_object));
+
+    var header = [_]syntax.DictEntry{.{
+        .key = @constCast("Size"),
+        .value = .{ .integer = 1 },
+    }};
+    var stream_object: syntax.Object = .{ .stream = .{
+        .header = &header,
+        .data_offset = 0,
+        .data_length = 0,
+    } };
+    var entries = std.ArrayList(XrefEntry).empty;
+    defer entries.deinit(std.testing.allocator);
+    // One in-use record with generation 65536 cannot be represented by
+    // ObjRef.gen and must be rejected instead of trapping at @intCast.
+    try std.testing.expectError(
+        error.MalformedXrefStream,
+        parseXrefStreamEntries(std.testing.allocator, &.{ 1, 0, 1, 0, 0 }, .{ 1, 1, 3 }, &stream_object, &entries),
     );
 }
 

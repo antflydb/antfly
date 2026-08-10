@@ -521,6 +521,76 @@ fn noteEmbedBatchFinished(runtime: *EnrichmentRuntime, items: usize, bytes: usiz
     }
 }
 
+// Request-path embeddings can overlap each other and the single replay
+// worker. They contribute to the cumulative and last-completed telemetry, but
+// deliberately do not overwrite the replay worker's single active-batch
+// snapshot. Treating concurrent request batches as that one slot lets the
+// first completion clear another still-running batch from runtime status.
+fn noteTrackedRequestEmbedBatchStarted(runtime: *EnrichmentRuntime, items: usize) void {
+    if (comptime builtin.os.tag == .freestanding) {
+        runtime.embed_batches_started += 1;
+        runtime.embed_items_started += @intCast(items);
+        return;
+    }
+
+    if (runtime.io_impl) |io_impl| {
+        const io = io_impl.io();
+        runtime.mutex.lockUncancelable(io);
+        defer runtime.mutex.unlock(io);
+        runtime.embed_batches_started += 1;
+        runtime.embed_items_started += @intCast(items);
+    } else {
+        runtime.embed_batches_started += 1;
+        runtime.embed_items_started += @intCast(items);
+    }
+}
+
+fn noteTrackedRequestEmbedBatchFinished(
+    runtime: *EnrichmentRuntime,
+    items: usize,
+    bytes: usize,
+    max_bytes: usize,
+    elapsed_ns: u64,
+    success: bool,
+) void {
+    if (!success) return;
+
+    if (comptime builtin.os.tag == .freestanding) {
+        runtime.embed_batches_completed += 1;
+        runtime.embed_items_completed += @intCast(items);
+        runtime.last_embed_batch_items = @intCast(items);
+        runtime.last_embed_batch_bytes = @intCast(bytes);
+        runtime.last_embed_batch_max_bytes = @intCast(max_bytes);
+        runtime.last_embed_batch_completed_ms = @max(runtime.last_embed_batch_completed_ms, runtime.config.clock.nowRealtimeMs());
+        runtime.last_embed_batch_ns = elapsed_ns;
+        runtime.total_embed_ns += elapsed_ns;
+        return;
+    }
+
+    if (runtime.io_impl) |io_impl| {
+        const io = io_impl.io();
+        runtime.mutex.lockUncancelable(io);
+        defer runtime.mutex.unlock(io);
+        runtime.embed_batches_completed += 1;
+        runtime.embed_items_completed += @intCast(items);
+        runtime.last_embed_batch_items = @intCast(items);
+        runtime.last_embed_batch_bytes = @intCast(bytes);
+        runtime.last_embed_batch_max_bytes = @intCast(max_bytes);
+        runtime.last_embed_batch_completed_ms = @max(runtime.last_embed_batch_completed_ms, runtime.config.clock.nowRealtimeMs());
+        runtime.last_embed_batch_ns = elapsed_ns;
+        runtime.total_embed_ns += elapsed_ns;
+    } else {
+        runtime.embed_batches_completed += 1;
+        runtime.embed_items_completed += @intCast(items);
+        runtime.last_embed_batch_items = @intCast(items);
+        runtime.last_embed_batch_bytes = @intCast(bytes);
+        runtime.last_embed_batch_max_bytes = @intCast(max_bytes);
+        runtime.last_embed_batch_completed_ms = @max(runtime.last_embed_batch_completed_ms, runtime.config.clock.nowRealtimeMs());
+        runtime.last_embed_batch_ns = elapsed_ns;
+        runtime.total_embed_ns += elapsed_ns;
+    }
+}
+
 const TextBatchByteStats = struct {
     total_bytes: usize = 0,
     max_bytes: usize = 0,
@@ -547,13 +617,13 @@ pub fn embedDenseTracked(
     text: []const u8,
     dims: u32,
 ) ![]f32 {
-    noteEmbedBatchStarted(runtime, 1, text.len, text.len);
+    noteTrackedRequestEmbedBatchStarted(runtime, 1);
     const started_ns = runtime.config.clock.nowRealtimeNs();
     const vector = dense_embedder.embedDense(alloc, embedding_name, text, dims) catch |err| {
-        noteEmbedBatchFinished(runtime, 1, text.len, text.len, elapsedNsSince(runtime, started_ns), false);
+        noteTrackedRequestEmbedBatchFinished(runtime, 1, text.len, text.len, elapsedNsSince(runtime, started_ns), false);
         return err;
     };
-    noteEmbedBatchFinished(runtime, 1, text.len, text.len, elapsedNsSince(runtime, started_ns), true);
+    noteTrackedRequestEmbedBatchFinished(runtime, 1, text.len, text.len, elapsedNsSince(runtime, started_ns), true);
     return vector;
 }
 
@@ -566,18 +636,18 @@ pub fn embedDenseBatchTracked(
     dims: u32,
 ) ![]const []const f32 {
     const stats = textBatchByteStats(texts);
-    noteEmbedBatchStarted(runtime, texts.len, stats.total_bytes, stats.max_bytes);
+    noteTrackedRequestEmbedBatchStarted(runtime, texts.len);
     const started_ns = runtime.config.clock.nowRealtimeNs();
     const vectors = dense_embedder.embedDenseBatch(alloc, embedding_name, texts, dims) catch |err| {
-        noteEmbedBatchFinished(runtime, texts.len, stats.total_bytes, stats.max_bytes, elapsedNsSince(runtime, started_ns), false);
+        noteTrackedRequestEmbedBatchFinished(runtime, texts.len, stats.total_bytes, stats.max_bytes, elapsedNsSince(runtime, started_ns), false);
         return err;
     };
     if (vectors.len != texts.len) {
         embedder_mod.freeDenseEmbeddingBatch(alloc, vectors);
-        noteEmbedBatchFinished(runtime, texts.len, stats.total_bytes, stats.max_bytes, elapsedNsSince(runtime, started_ns), false);
+        noteTrackedRequestEmbedBatchFinished(runtime, texts.len, stats.total_bytes, stats.max_bytes, elapsedNsSince(runtime, started_ns), false);
         return error.InvalidEmbeddingResponse;
     }
-    noteEmbedBatchFinished(runtime, texts.len, stats.total_bytes, stats.max_bytes, elapsedNsSince(runtime, started_ns), true);
+    noteTrackedRequestEmbedBatchFinished(runtime, texts.len, stats.total_bytes, stats.max_bytes, elapsedNsSince(runtime, started_ns), true);
     return vectors;
 }
 
@@ -600,14 +670,46 @@ pub fn embedDensePartsTracked(
         total_bytes +|= bytes;
         max_bytes = @max(max_bytes, bytes);
     }
-    noteEmbedBatchStarted(runtime, 1, total_bytes, max_bytes);
+    noteTrackedRequestEmbedBatchStarted(runtime, 1);
     const started_ns = runtime.config.clock.nowRealtimeNs();
     const vector = dense_embedder.embedDenseParts(alloc, embedding_name, parts, dims) catch |err| {
-        noteEmbedBatchFinished(runtime, 1, total_bytes, max_bytes, elapsedNsSince(runtime, started_ns), false);
+        noteTrackedRequestEmbedBatchFinished(runtime, 1, total_bytes, max_bytes, elapsedNsSince(runtime, started_ns), false);
         return err;
     };
-    noteEmbedBatchFinished(runtime, 1, total_bytes, max_bytes, elapsedNsSince(runtime, started_ns), true);
+    noteTrackedRequestEmbedBatchFinished(runtime, 1, total_bytes, max_bytes, elapsedNsSince(runtime, started_ns), true);
     return vector;
+}
+
+test "request embedding telemetry preserves an overlapping replay batch snapshot" {
+    var runtime = EnrichmentRuntime{
+        .alloc = std.testing.allocator,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .ownership = undefined,
+    };
+
+    noteEmbedBatchStarted(&runtime, 4, 400, 125);
+    noteTrackedRequestEmbedBatchStarted(&runtime, 2);
+    noteTrackedRequestEmbedBatchFinished(&runtime, 2, 80, 40, 10, true);
+    try std.testing.expectEqual(@as(u64, 4), runtime.active_embed_batch_items);
+    try std.testing.expectEqual(@as(u64, 400), runtime.active_embed_batch_bytes);
+    try std.testing.expectEqual(@as(u64, 125), runtime.active_embed_batch_max_bytes);
+
+    noteEmbedBatchFinished(&runtime, 4, 400, 125, 20, true);
+    try std.testing.expectEqual(@as(u64, 0), runtime.active_embed_batch_items);
+    try std.testing.expectEqual(@as(u64, 2), runtime.embed_batches_started);
+    try std.testing.expectEqual(@as(u64, 2), runtime.embed_batches_completed);
+    try std.testing.expectEqual(@as(u64, 6), runtime.embed_items_started);
+    try std.testing.expectEqual(@as(u64, 6), runtime.embed_items_completed);
 }
 
 fn boundedTextBatchEnd(texts: []const []const u8, start: usize, max_items: usize, max_bytes: usize) usize {
@@ -654,6 +756,8 @@ fn enrichmentErrorDisposition(err: anyerror) EnrichmentErrorDisposition {
         error.InvalidDocumentExtractionConfig,
         error.InvalidEnrichmentConfig,
         error.InvalidEmbeddingResponse,
+        error.OcrPromptEcho,
+        error.TrivialOcrOutput,
         error.UnsupportedEmbeddingProvider,
         error.UnsupportedReaderProvider,
         error.MissingAssetProducer,
@@ -850,6 +954,8 @@ test "enrichment treats missing local model as retryable" {
 test "enrichment retries unknown errors and isolates known permanent errors" {
     try std.testing.expectEqual(EnrichmentErrorDisposition.retryable_request, enrichmentErrorDisposition(error.UnexpectedEndOfInput));
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.UnsupportedEmbeddingProvider));
+    try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.OcrPromptEcho));
+    try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.TrivialOcrOutput));
     try std.testing.expectEqual(EnrichmentErrorDisposition.fatal_worker, enrichmentErrorDisposition(error.OutOfMemory));
 }
 
@@ -10885,6 +10991,8 @@ test "document extraction rejects and records Florence prompt echoes" {
 
     var fake = EchoProducer{};
     const producer = fake.producer();
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{});
+    defer resource_manager.deinit(alloc);
     var runtime = EnrichmentRuntime{
         .alloc = alloc,
         .io_impl = null,
@@ -10897,7 +11005,10 @@ test "document extraction rejects and records Florence prompt echoes" {
         .write_fn = undefined,
         .notify_ctx = undefined,
         .notify_fn = undefined,
-        .config = .{ .asset_producer = producer },
+        .config = .{
+            .asset_producer = producer,
+            .resource_manager = &resource_manager,
+        },
         .ownership = undefined,
     };
     var units = [_]document_extraction_mod.Unit{.{
@@ -10949,6 +11060,8 @@ test "document extraction missing OCR model is a terminal unit failure" {
 
     var fake = MissingModelProducer{};
     const producer = fake.producer();
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{});
+    defer resource_manager.deinit(alloc);
     var runtime = EnrichmentRuntime{
         .alloc = alloc,
         .io_impl = null,
@@ -10961,7 +11074,10 @@ test "document extraction missing OCR model is a terminal unit failure" {
         .write_fn = undefined,
         .notify_ctx = undefined,
         .notify_fn = undefined,
-        .config = .{ .asset_producer = producer },
+        .config = .{
+            .asset_producer = producer,
+            .resource_manager = &resource_manager,
+        },
         .ownership = undefined,
     };
     var units = [_]document_extraction_mod.Unit{.{
@@ -11254,6 +11370,8 @@ test "document extraction generated OCR batch fallback isolates permanent unit f
 
     var fake = FallbackProducer{};
     const producer = fake.producer();
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{});
+    defer resource_manager.deinit(alloc);
     var runtime = EnrichmentRuntime{
         .alloc = alloc,
         .io_impl = null,
@@ -11266,7 +11384,10 @@ test "document extraction generated OCR batch fallback isolates permanent unit f
         .write_fn = undefined,
         .notify_ctx = undefined,
         .notify_fn = undefined,
-        .config = .{ .asset_producer = producer },
+        .config = .{
+            .asset_producer = producer,
+            .resource_manager = &resource_manager,
+        },
         .ownership = undefined,
     };
 
@@ -11354,6 +11475,8 @@ test "document extraction generated OCR batch fallback isolates malformed batch 
 
     var fake = FallbackProducer{};
     const producer = fake.producer();
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{});
+    defer resource_manager.deinit(alloc);
     var runtime = EnrichmentRuntime{
         .alloc = alloc,
         .io_impl = null,
@@ -11366,7 +11489,10 @@ test "document extraction generated OCR batch fallback isolates malformed batch 
         .write_fn = undefined,
         .notify_ctx = undefined,
         .notify_fn = undefined,
-        .config = .{ .asset_producer = producer },
+        .config = .{
+            .asset_producer = producer,
+            .resource_manager = &resource_manager,
+        },
         .ownership = undefined,
     };
 

@@ -188,6 +188,12 @@ const HttpxTransport = struct {
                 .request_ms = timeout_ms,
             },
         } else .{};
+        // S3 authorization is signed for one exact authority and path. Never
+        // replay it across an HTTP redirect: doing so would bypass the
+        // caller's endpoint admission policy and expose the signed request (and
+        // a temporary-session token, when present) to the redirect target.
+        client_config.redirect_policy = httpx.RedirectPolicy.noFollow();
+        client_config.cookies_enabled = false;
         client_config.resolved_address_validator = resolved_address_validator;
         client_config.resolved_address_validator_context = resolved_address_validator_context;
         return .{
@@ -251,6 +257,8 @@ test "s3 http transport borrows a shared io runtime" {
     var transport = try HttpxTransport.init(alloc, null, shared.io(), null, null);
     defer transport.deinit();
     try std.testing.expect(transport.io_impl == null);
+    try std.testing.expect(!transport.client.config.redirect_policy.follow_redirects);
+    try std.testing.expect(!transport.client.config.cookies_enabled);
 
     var fallback = try HttpxTransport.init(alloc, null, null, null, null);
     defer fallback.deinit();

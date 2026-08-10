@@ -53345,7 +53345,7 @@ test "db document extraction unit ranges split by text bytes" {
     try std.testing.expectEqual(@as(usize, 1), documentExtractionUnitRangeIndex(&units, 2));
 }
 
-test "db document extraction failure records last error and clears stale children" {
+test "db document extraction failure preserves last-known-good children and recovers" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
@@ -53396,20 +53396,41 @@ test "db document extraction failure records last error and clears stale childre
     try std.testing.expectEqual(@as(u64, before.generation + 1), after.generation);
     try std.testing.expectEqualStrings("error", after.route_type);
     try std.testing.expectEqualStrings("failed", after.merge_status);
-    try std.testing.expectEqual(@as(usize, 0), after.unit_count);
-    try std.testing.expectEqual(@as(usize, 0), after.child_range_count);
-    try std.testing.expect(after.state_json == null);
+    try std.testing.expectEqual(@as(usize, 1), after.unit_count);
+    try std.testing.expectEqual(@as(usize, 1), after.child_range_count);
+    try std.testing.expect(after.state_json != null);
     try std.testing.expect(after.last_error_code != null);
     try std.testing.expectEqualStrings("InvalidDataUri", after.last_error_code.?);
     try std.testing.expect(after.last_error_message != null);
     try std.testing.expectEqualStrings("remote content download failed", after.last_error_message.?);
     try std.testing.expect(std.mem.indexOf(u8, after.manifest_json, "\"last_error\"") != null);
-    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, stale_unit_key));
+    {
+        const retained_unit = try db.core.store.get(alloc, stale_unit_key);
+        defer alloc.free(retained_unit);
+    }
 
     var list = try db.listDocumentArtifactManifests(alloc, "doc:a");
     defer list.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), list.artifacts.len);
     try std.testing.expectEqualStrings("InvalidDataUri", list.artifacts[0].last_error_code.?);
+
+    // A failure manifest must remain eligible for repair even when the restored
+    // source matches the retained state fingerprint.
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"data:text/plain;base64,YWxwaGE=\"}",
+        }},
+        .sync_level = .full_index,
+    });
+
+    var repaired = (try db.getDocumentArtifactManifest(alloc, "doc:a", "document_units_v1")) orelse return error.TestUnexpectedResult;
+    defer repaired.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, after.generation + 1), repaired.generation);
+    try std.testing.expectEqualStrings("text", repaired.route_type);
+    try std.testing.expectEqualStrings("converged", repaired.merge_status);
+    try std.testing.expectEqual(@as(usize, 1), repaired.unit_count);
+    try std.testing.expect(repaired.last_error_code == null);
 }
 
 test "db document extraction skips stable unit local rewrites while replaying full text from stored artifacts" {
