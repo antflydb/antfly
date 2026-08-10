@@ -29,6 +29,7 @@ const ha_replication_record = @import("../storage/ha/replication_record.zig");
 const runtime_preflight = @import("../storage/db/runtime_preflight.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
+const backup_contract = @import("backup_contract.zig");
 const distributed_graph = @import("distributed_graph.zig");
 const query_response = @import("query_response.zig");
 const runtime_status = @import("runtime_status.zig");
@@ -188,6 +189,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .vtable = &.{
                 .batch = unsupportedTopLevelBatch,
                 .batch_group_local = batchGroupLocal,
+                .backup_table_group_local = backupTableGroupLocal,
                 .txn_begin_group_local = txnBeginGroupLocal,
                 .txn_prepare_group_local = txnPrepareGroupLocal,
                 .txn_resolve_group_local = txnResolveGroupLocal,
@@ -384,6 +386,75 @@ pub const ProvisionedKernelOwnerSource = struct {
             .commit_timestamp_ns = record.commit_timestamp_ns,
             .payload = record.payload,
         });
+    }
+
+    const BackupShardWire = struct {
+        group_id: u64,
+        start_key: []const u8,
+        end_key: ?[]const u8 = null,
+        snapshot_path: []const u8,
+        artifact_size_bytes: u64 = 0,
+        artifact_sha256: []const u8 = "",
+    };
+
+    fn backupTableGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        plan: backup_contract.TableBackupPlan,
+    ) !?[]backup_contract.ShardSnapshot {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        var lease = try self.acquire(group_id, table_name);
+        defer lease.deinit();
+        var response = try lease.owner().backupJson(
+            table_name,
+            plan.backup_root,
+            plan.backup_id,
+            switch (plan.format) {
+                .native => .native,
+                .portable => .portable,
+            },
+        );
+        defer response.deinit();
+        var parsed = try std.json.parseFromSlice(
+            []BackupShardWire,
+            alloc,
+            response.bytes(),
+            .{},
+        );
+        defer parsed.deinit();
+        if (parsed.value.len != 1 or parsed.value[0].group_id != group_id)
+            return error.StorageKernelFailure;
+        const shards = try alloc.alloc(backup_contract.ShardSnapshot, parsed.value.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (shards[0..initialized]) |shard| shard.deinit(alloc);
+            alloc.free(shards);
+        }
+        for (parsed.value, 0..) |shard, i| {
+            const start_key = try alloc.dupe(u8, shard.start_key);
+            errdefer alloc.free(start_key);
+            const end_key = if (shard.end_key) |value| try alloc.dupe(u8, value) else null;
+            errdefer if (end_key) |value| alloc.free(value);
+            const snapshot_path = try alloc.dupe(u8, shard.snapshot_path);
+            errdefer alloc.free(snapshot_path);
+            const artifact_sha256 = if (shard.artifact_sha256.len > 0)
+                try alloc.dupe(u8, shard.artifact_sha256)
+            else
+                "";
+            errdefer if (artifact_sha256.len > 0) alloc.free(@constCast(artifact_sha256));
+            shards[i] = .{
+                .group_id = shard.group_id,
+                .start_key = start_key,
+                .end_key = end_key,
+                .snapshot_path = snapshot_path,
+                .artifact_size_bytes = shard.artifact_size_bytes,
+                .artifact_sha256 = artifact_sha256,
+            };
+            initialized += 1;
+        }
+        return shards;
     }
 
     pub fn ownerCountForTest(self: *ProvisionedKernelOwnerSource) usize {

@@ -2360,6 +2360,51 @@ repair scheduler remains ownership family 6, not an excuse to carry its
 physical DB implementation in distributed control. No cold ReleaseFast result
 is credited before the atomic source-selection checkpoint in checklist item 7.
 
+### Phase 4g: owner-side local backup materialization
+
+Storage-owner ABI version 16 moves one complete group-local backup operation
+behind the resident owner. Both native snapshots and portable `.afb` exports
+now read the same live DB used by queries, writes, transactions, and repair,
+then return one owned shard descriptor with its byte range, relative artifact
+path, size, and SHA-256 integrity value. No record, LSM run, index entry,
+directory entry, or storage-backend primitive crosses the boundary.
+
+The API layer deliberately retains backup reservation, filesystem/object-store
+scope validation, remote transport, manifest construction and conditional
+publication, ambiguous-outcome fencing, and rollback cleanup. Only local
+artifact materialization moves. `std.Io` is not treated as an ABI type: the
+compiled storage unit owns the filesystem scheduler for this coarse synchronous
+operation, while distributed control's existing scheduler continues to own
+reservation, transport, and publication. The experimental branch fails with
+`StorageKernelOwnerUnavailable` when its group-local callback is absent and
+cannot silently reopen the DB through the legacy source.
+
+Warm Debug validation with normal concurrency, linked runtime libraries, the
+production LSM backend, and the storage experiment enabled passed:
+
+- opaque owner ABI: 4/4, including native and portable backup through the live
+  owner plus wrong-table, invalid-version, and invalid-format rejection;
+- provisioned cross-archive owner source: 6/6, verifying both artifact formats,
+  integrity metadata, and preservation of one resident owner;
+- DataServer process-owner composition: 12/12;
+- public C API: 10/10;
+- complete linked Debug artifacts with the experiment both enabled and
+  disabled;
+- all runtime/codegen/API graph gates plus the 15/15 analyzer suite; and
+- artifact inspection: the 101,807,792-byte Debug storage archive defines the
+  hidden `antfly_storage_owner_backup_json` entry point and no native `mdb_*`
+  implementation symbols; the public C API libraries remain approximately
+  48.7 MB in Debug and export no storage-owner/context/runtime symbols.
+
+Decision: keep this as the backup half of ownership-family 5. It removes the
+remaining production local backup DB open/export path required by the future
+control-only source without moving publication policy or remote I/O into the
+kernel. Backup does not complete the family: backup-restore materialization,
+generation publication/rollback, idempotent reconciliation, and durable
+restore-job persistence still need coarse owner contracts. No cold ReleaseFast
+result is credited before the atomic source-selection checkpoint in checklist
+item 7.
+
 ## Holistic target architecture
 
 The current candidate baseline is the four-unit topology above with serverless

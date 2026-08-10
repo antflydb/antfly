@@ -15,7 +15,7 @@
 //! Versioned internal ABI for the storage kernel's live DB owner. Keep this
 //! module free of storage and distributed-runtime imports.
 
-pub const abi_version: u32 = 15;
+pub const abi_version: u32 = 16;
 
 pub const BorrowedBytes = extern struct {
     ptr: ?[*]const u8 = null,
@@ -296,6 +296,22 @@ pub const HAReplicationRecordRequest = extern struct {
     payload: BorrowedBytes = .{},
 };
 
+pub const BackupFormat = enum(u32) {
+    native = 0,
+    portable = 1,
+};
+
+/// Materialize one complete local shard backup through the resident owner.
+/// The caller retains reservation, remote transport, and manifest publication;
+/// all byte slices are borrowed only for this synchronous operation.
+pub const BackupRequest = extern struct {
+    version: u32 = abi_version,
+    format: u32 = @intFromEnum(BackupFormat.native),
+    table_name: BorrowedBytes = .{},
+    backup_root: BorrowedBytes = .{},
+    backup_id: BorrowedBytes = .{},
+};
+
 pub const SnapshotPrepareRequest = extern struct {
     version: u32 = abi_version,
     _reserved0: u32 = 0,
@@ -424,6 +440,12 @@ pub extern fn antfly_storage_owner_wait_for_sync(
 pub extern fn antfly_storage_owner_apply_ha_replication_record(
     owner: ?*anyopaque,
     request: *const HAReplicationRecordRequest,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_owner_backup_json(
+    owner: ?*anyopaque,
+    request: *const BackupRequest,
+    out_response: *OwnedBytes,
 ) callconv(.c) Status;
 
 pub extern fn antfly_storage_snapshot_prepare(

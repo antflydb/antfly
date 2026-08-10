@@ -103,6 +103,13 @@ pub const TableWriteSource = struct {
             table_name: []const u8,
             plan: backup_contract.TableBackupPlan,
         ) anyerror!?[]backup_contract.ShardSnapshot = null,
+        backup_table_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            plan: backup_contract.TableBackupPlan,
+        ) anyerror!?[]backup_contract.ShardSnapshot = null,
         backup_table_to_location: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -532,6 +539,17 @@ pub const TableWriteSource = struct {
     ) !?[]backup_contract.ShardSnapshot {
         const fn_ptr = self.vtable.backup_table orelse return null;
         return try fn_ptr(self.ptr, alloc, table_name, plan);
+    }
+
+    pub fn backupTableGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        plan: backup_contract.TableBackupPlan,
+    ) !?[]backup_contract.ShardSnapshot {
+        const fn_ptr = self.vtable.backup_table_group_local orelse return null;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, plan);
     }
 
     pub fn backupTableToLocation(

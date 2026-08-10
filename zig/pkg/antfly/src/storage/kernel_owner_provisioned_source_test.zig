@@ -15,6 +15,7 @@
 const std = @import("std");
 const abi = @import("kernel_owner_abi");
 const kernel_owner_source = @import("../api/kernel_owner_source.zig");
+const backup_contract = @import("../api/backup_contract.zig");
 const db_mod = @import("db/mod.zig");
 const distributed_graph = @import("../api/distributed_graph.zig");
 const metadata_api = @import("../metadata/api.zig");
@@ -238,6 +239,35 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
         txn_id,
         txn_participant,
     )) != null);
+
+    const backup_root = "/tmp/antfly-storage-kernel-provisioned-source-backups";
+    cleanup(backup_root);
+    defer cleanup(backup_root);
+    const backup_formats = [_]struct {
+        format: backup_contract.BackupFormat,
+        backup_id: []const u8,
+    }{
+        .{ .format = .portable, .backup_id = "portable-owner" },
+        .{ .format = .native, .backup_id = "native-owner" },
+    };
+    for (backup_formats) |backup| {
+        const shards = (try write_source.source().backupTable(alloc, "articles", .{
+            .backup_root = backup_root,
+            .backup_id = backup.backup_id,
+            .format = backup.format,
+        })).?;
+        defer table_writes.freeStorageKernelBackupShards(alloc, shards);
+        try std.testing.expectEqual(@as(usize, 1), shards.len);
+        try std.testing.expectEqual(@as(u64, 7001), shards[0].group_id);
+        try std.testing.expect(shards[0].artifact_size_bytes > 0);
+        try std.testing.expectEqual(@as(usize, 64), shards[0].artifact_sha256.len);
+        const artifact_path = try std.fs.path.join(alloc, &.{ backup_root, shards[0].snapshot_path });
+        defer alloc.free(artifact_path);
+        var backup_io_impl = std.Io.Threaded.init(alloc, .{});
+        defer backup_io_impl.deinit();
+        _ = try std.Io.Dir.cwd().statFile(backup_io_impl.io(), artifact_path, .{});
+    }
+    try std.testing.expectEqual(@as(usize, 1), owner_source.ownerCountForTest());
     try std.testing.expectEqual(
         db_mod.types.TxnStatus.committed,
         (try write_source.source().txnStatusGroupLocal(alloc, 7001, "articles", txn_id)).?,

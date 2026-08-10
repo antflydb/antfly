@@ -231,6 +231,7 @@ const Handle = struct {
     owned_lite_backend: ?lite_backend.Handle = null,
     lite_profile: ?lite_backend.Profile = null,
     lite_inference_status: ?lite_backend.InferenceStatus = null,
+    storage_owner_path: ?[]u8 = null,
     storage_owner_table_name: ?[]u8 = null,
     storage_owner_group_id: u64 = 0,
     storage_owner_context: ?*StorageOwnerContext = null,
@@ -310,6 +311,7 @@ fn closeHandle(handle: *Handle) void {
     if (handle.owned_lite_backend) |*backend| {
         backend.deinit();
     }
+    if (handle.storage_owner_path) |path| handle.alloc.free(path);
     if (handle.storage_owner_table_name) |table_name| handle.alloc.free(table_name);
     handle.alloc.destroy(handle);
     if (storage_owner_context) |context| context.release();
@@ -1885,12 +1887,15 @@ pub fn storageOwnerOpen(
         request.schema_json.slice(),
         request.indexes_json.slice(),
     ) catch |err| return storageOwnerStatusFromError(err);
+    const owned_path = alloc.dupe(u8, path) catch return .out_of_memory;
+    errdefer alloc.free(owned_path);
     const owned_table_name = alloc.dupe(u8, table_name) catch return .out_of_memory;
     errdefer alloc.free(owned_table_name);
     const handle = alloc.create(Handle) catch return .out_of_memory;
     handle.* = .{
         .alloc = alloc,
         .db = db,
+        .storage_owner_path = owned_path,
         .storage_owner_table_name = owned_table_name,
         .storage_owner_group_id = request.group_id,
         .storage_owner_context = owner_context,
@@ -2188,6 +2193,43 @@ pub fn storageOwnerApplyHAReplicationRecord(
         .commit_timestamp_ns = request.commit_timestamp_ns,
         .payload = request.payload.slice(),
     }) catch |err| return storageOwnerStatusFromError(err);
+    return .ok;
+}
+
+pub fn storageOwnerBackupJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.BackupRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const format: kernel_owner_abi.BackupFormat = switch (request.format) {
+        @intFromEnum(kernel_owner_abi.BackupFormat.native) => .native,
+        @intFromEnum(kernel_owner_abi.BackupFormat.portable) => .portable,
+        else => return .invalid_argument,
+    };
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    const path = handle.storage_owner_path orelse return .invalid_argument;
+    if (request.backup_root.slice().len == 0 or request.backup_id.slice().len == 0)
+        return .invalid_argument;
+    const shards = antfly.public_api.table_writes.backupStorageKernelOwnerDb(
+        handle.alloc,
+        &handle.db,
+        path,
+        handle.storage_owner_group_id,
+        request.backup_root.slice(),
+        request.backup_id.slice(),
+        switch (format) {
+            .native => .native,
+            .portable => .portable,
+        },
+    ) catch |err| return storageOwnerStatusFromError(err);
+    defer antfly.public_api.table_writes.freeStorageKernelBackupShards(handle.alloc, shards);
+    const response = std.json.Stringify.valueAlloc(handle.alloc, shards, .{
+        .emit_null_optional_fields = false,
+    }) catch |err| return storageOwnerStatusFromError(err);
+    out_response.* = .{ .ptr = response.ptr, .len = @intCast(response.len) };
     return .ok;
 }
 

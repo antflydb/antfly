@@ -24,8 +24,11 @@ fn cleanup(path: []const u8) void {
 
 test "opaque storage owner performs coarse batch and query on one live DB" {
     const path = "/tmp/antfly-storage-kernel-owner-batch-query";
+    const backup_root = "/tmp/antfly-storage-kernel-owner-backups";
     cleanup(path);
+    cleanup(backup_root);
     defer cleanup(path);
+    defer cleanup(backup_root);
 
     var owner = try client.Owner.open(.{
         .path = .fromSlice(path),
@@ -273,6 +276,31 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
         "{\"inserts\":{\"doc:after-abort\":{\"title\":\"ordinary\"}},\"sync_level\":\"full_index\"}",
     );
     defer post_abort_batch.deinit();
+
+    var portable_backup = try owner.backupJson(
+        "docs",
+        backup_root,
+        "portable-owner",
+        .portable,
+    );
+    defer portable_backup.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, portable_backup.bytes(), "\"group_id\":7001") != null);
+    try std.testing.expect(std.mem.indexOf(u8, portable_backup.bytes(), "portable-owner.afb") != null);
+    try std.testing.expect(std.mem.indexOf(u8, portable_backup.bytes(), "\"artifact_sha256\"") != null);
+
+    var native_backup = try owner.backupJson(
+        "docs",
+        backup_root,
+        "native-owner",
+        .native,
+    );
+    defer native_backup.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, native_backup.bytes(), "\"group_id\":7001") != null);
+    try std.testing.expect(std.mem.indexOf(u8, native_backup.bytes(), "native-owner") != null);
+    try std.testing.expectError(
+        error.InvalidArgument,
+        owner.backupJson("articles", backup_root, "wrong-table", .native),
+    );
 }
 
 test "opaque storage owner validates ABI and destruction is idempotent" {
@@ -354,6 +382,19 @@ test "opaque storage owner validates ABI and destruction is idempotent" {
         abi.Status.invalid_abi,
         abi.antfly_storage_owner_apply_ha_replication_record(null, &invalid_ha),
     );
+    var invalid_backup: abi.BackupRequest = .{};
+    invalid_backup.version = abi.abi_version + 1;
+    try std.testing.expectEqual(
+        abi.Status.invalid_abi,
+        abi.antfly_storage_owner_backup_json(null, &invalid_backup, &response),
+    );
+    try std.testing.expectEqual(@as(u64, 0), response.len);
+    const invalid_backup_format = abi.BackupRequest{ .format = std.math.maxInt(u32) };
+    try std.testing.expectEqual(
+        abi.Status.invalid_argument,
+        abi.antfly_storage_owner_backup_json(null, &invalid_backup_format, &response),
+    );
+    try std.testing.expectEqual(@as(u64, 0), response.len);
     var snapshot: ?*anyopaque = undefined;
     var invalid_snapshot: abi.SnapshotPrepareRequest = .{};
     invalid_snapshot.version = abi.abi_version + 1;

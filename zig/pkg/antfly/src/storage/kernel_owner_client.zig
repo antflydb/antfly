@@ -207,6 +207,27 @@ pub const Owner = struct {
         ));
     }
 
+    pub fn backupJson(
+        self: *Owner,
+        table_name: []const u8,
+        backup_root: []const u8,
+        backup_id: []const u8,
+        format: abi.BackupFormat,
+    ) !Response {
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_backup_json(
+            self.handle,
+            &.{
+                .format = @intFromEnum(format),
+                .table_name = .fromSlice(table_name),
+                .backup_root = .fromSlice(backup_root),
+                .backup_id = .fromSlice(backup_id),
+            },
+            &response.buffer,
+        ));
+        return response;
+    }
+
     pub fn queryJson(self: *Owner, table_name: []const u8, request_json: []const u8) !Response {
         var response: Response = .{};
         try statusToError(abi.antfly_storage_owner_query_json(

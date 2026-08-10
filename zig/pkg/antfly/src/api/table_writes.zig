@@ -12849,6 +12849,16 @@ pub const ProvisionedTableWriteSource = struct {
             self.endGroupOperation(table_name, group_id);
         }
 
+        if (comptime storage_kernel_experiment) {
+            const local_source = self.groupLocalWriteSource() orelse
+                return error.StorageKernelOwnerUnavailable;
+            return (try local_source.backupTableGroupLocal(
+                alloc,
+                group_id,
+                table_name,
+                plan,
+            )) orelse return error.StorageKernelOwnerUnavailable;
+        }
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         if (plan.format == .portable) {
@@ -20884,6 +20894,46 @@ fn exportPortableBackupShard(
     errdefer shards[0].deinit(alloc);
     try backups_api.populateShardArtifactIntegrity(alloc, shared_io, .portable, dest_path, &shards[0]);
     return shards;
+}
+
+/// Materialize one complete shard backup through the compiled live owner.
+/// Reservation, remote transport, and manifest publication deliberately stay
+/// in distributed control; the storage unit owns DB snapshot/export work.
+pub fn backupStorageKernelOwnerDb(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    db_path: []const u8,
+    group_id: u64,
+    backup_root: []const u8,
+    backup_id: []const u8,
+    format: backups_api.BackupFormat,
+) ![]backups_api.ShardSnapshot {
+    const plan: backups_api.TableBackupPlan = .{
+        .backup_root = backup_root,
+        .backup_id = backup_id,
+        .format = format,
+        // std.Io is intentionally not an ABI type. The storage unit creates
+        // and owns the filesystem scheduler used by this coarse operation.
+        .io = null,
+    };
+    if (format == .portable)
+        return try exportPortableBackupShard(alloc, db, backup_root, backup_id, group_id, null);
+    var native_snapshot = try ProvisionedTableWriteSource.prepareNativeBackupShardSnapshot(
+        alloc,
+        db,
+        db_path,
+        group_id,
+        plan,
+    );
+    defer native_snapshot.deinit(alloc);
+    return try ProvisionedTableWriteSource.copyPreparedNativeBackupShardSnapshot(alloc, &native_snapshot);
+}
+
+pub fn freeStorageKernelBackupShards(
+    alloc: std.mem.Allocator,
+    shards: []const backups_api.ShardSnapshot,
+) void {
+    freeBackupShards(alloc, shards);
 }
 
 fn exportPortableBackupFile(alloc: std.mem.Allocator, store: *db_mod.docstore.DocStore, path: []const u8, shared_io: ?std.Io) !void {
