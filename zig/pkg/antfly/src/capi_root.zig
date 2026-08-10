@@ -18,6 +18,8 @@
 
 pub const aggregation = @import("search/aggregation.zig");
 pub const backup_codec = @import("storage/backup_codec.zig");
+pub const common_config = @import("common/config.zig");
+pub const common_secrets = @import("common/secrets.zig");
 pub const data_snapshot = @import("data/storage/shard_state_store.zig");
 pub const data_raft_apply = @import("data/storage/raft_apply_store.zig");
 pub const data_raft_projection_wire = @import("storage/data_raft_projection_wire.zig");
@@ -35,6 +37,7 @@ pub const platform_time = @import("antfly_platform").time;
 pub const portable_backup = @import("storage/portable_backup.zig");
 pub const public_api = @import("api/mod.zig");
 pub const raft = @import("raft/mod.zig");
+pub const raft_catalog = @import("raft/catalog.zig");
 pub const storage_backend = @import("storage/backend_types.zig");
 pub const transactions = @import("storage/transactions.zig");
 pub const traversal = @import("graph/traversal.zig");

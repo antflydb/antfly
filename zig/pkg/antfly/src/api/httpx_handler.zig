@@ -59,7 +59,7 @@ const raft_reconciler = @import("../raft/reconciler.zig");
 const casbin = @import("antfly_casbin");
 const builtin = @import("builtin");
 
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = @import("../storage/db/selected_root.zig").db;
 const metadata_openapi = @import("antfly_metadata_openapi");
 const usermgr_openapi = @import("antfly_usermgr_openapi");
 

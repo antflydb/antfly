@@ -26,12 +26,9 @@ const scraping = @import("antfly_scraping");
 const table_catalog = @import("table_catalog.zig");
 const table_reads = @import("table_reads.zig");
 const table_writes = @import("table_writes.zig");
-const build_options = @import("build_options");
+const storage_source_options = @import("storage_source_options");
 
-const storage_kernel_experiment = if (@hasDecl(build_options, "storage_kernel_experiment"))
-    @field(build_options, "storage_kernel_experiment")
-else
-    false;
+const storage_kernel_experiment = storage_source_options.control_only;
 
 const ProvisionedLsmCache = if (storage_kernel_experiment) void else lsm_backend.Cache;
 const ProvisionedHbcCache = if (storage_kernel_experiment) void else hbc_mod.Cache;

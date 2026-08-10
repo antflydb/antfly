@@ -15,7 +15,7 @@
 //! Versioned internal ABI for the storage kernel's live DB owner. Keep this
 //! module free of storage and distributed-runtime imports.
 
-pub const abi_version: u32 = 22;
+pub const abi_version: u32 = 25;
 
 pub const BorrowedBytes = extern struct {
     ptr: ?[*]const u8 = null,
@@ -390,6 +390,25 @@ pub const JsonOperationRequest = extern struct {
     request_json: BorrowedBytes = .{},
 };
 
+/// Synchronous coarse dispatch of one generated document-artifact child range.
+/// The JSON bytes are borrowed only for the callback and encode the value-only
+/// child-range batch contract. Returning an error leaves the provider's durable
+/// outbox entry intact so a later batch can retry it.
+pub const DocumentChildRangeDispatchFn = *const fn (
+    ?*anyopaque,
+    u64,
+    BorrowedBytes,
+) callconv(.c) Status;
+
+pub const BatchJsonOperationRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved0: u32 = 0,
+    table_name: BorrowedBytes = .{},
+    request_json: BorrowedBytes = .{},
+    document_child_range_dispatch_ctx: ?*anyopaque = null,
+    document_child_range_dispatch_fn: ?DocumentChildRangeDispatchFn = null,
+};
+
 /// Replace the catalog-owned physical schema/index contract on one resident
 /// group owner. Both byte slices are borrowed for this synchronous call.
 pub const ConfigureRequest = extern struct {
@@ -612,6 +631,26 @@ pub const RestorePrepareRequest = extern struct {
     manifest_json: BorrowedBytes = .{},
 };
 
+/// Complete Raft replica restore bootstrap. Configuration and secret-store
+/// handles are borrowed opaque process-local capabilities for this synchronous
+/// call; all restore materialization remains inside the compiled storage unit.
+pub const RestoreBootstrapRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved0: u32 = 0,
+    replica_root_dir: BorrowedBytes = .{},
+    group_id: u64 = 0,
+    backup_id: BorrowedBytes = .{},
+    artifact_backup_id: BorrowedBytes = .{},
+    location: BorrowedBytes = .{},
+    snapshot_path: BorrowedBytes = .{},
+    connection: BorrowedBytes = .{},
+    artifact_size_bytes: u64 = 0,
+    artifact_sha256: BorrowedBytes = .{},
+    required_capability: BorrowedBytes = .{},
+    secret_store: ?*anyopaque = null,
+    node_config: ?*const anyopaque = null,
+};
+
 pub const RestorePrepareState = enum(u32) {
     prepared = 0,
     already_imported = 1,
@@ -798,6 +837,20 @@ pub extern fn antfly_storage_owner_reconcile(
     out_result: *ReconcileResult,
 ) callconv(.c) Status;
 
+/// Checks the resident owner's complete write-admission policy before a
+/// distributed leader commits work to Raft. A busy result means the write is
+/// currently backpressured and must not be proposed.
+pub extern fn antfly_storage_owner_preflight_write_admission(
+    owner: ?*anyopaque,
+    request: *const TableRequest,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_owner_find_median_key(
+    owner: ?*anyopaque,
+    request: *const TableRequest,
+    out_key: *OwnedBytes,
+) callconv(.c) Status;
+
 pub extern fn antfly_storage_owner_bulk_begin(
     owner: ?*anyopaque,
     request: *const TableRequest,
@@ -815,7 +868,7 @@ pub extern fn antfly_storage_owner_bulk_abort(
 
 pub extern fn antfly_storage_owner_batch_json(
     owner: ?*anyopaque,
-    request: *const JsonOperationRequest,
+    request: *const BatchJsonOperationRequest,
     out_response: *OwnedBytes,
 ) callconv(.c) Status;
 
@@ -859,6 +912,10 @@ pub extern fn antfly_storage_restore_prepare(
 
 pub extern fn antfly_storage_restore_reconcile(
     request: *const RestorePrepareRequest,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_restore_apply_bootstrap(
+    request: *const RestoreBootstrapRequest,
 ) callconv(.c) Status;
 
 pub extern fn antfly_storage_owner_restore_repair(
@@ -954,6 +1011,18 @@ pub extern fn antfly_storage_owner_artifact_operation_json(
 pub extern fn antfly_storage_owner_runtime_status_json(
     owner: ?*anyopaque,
     request: *const JsonOperationRequest,
+    out_response: *OwnedBytes,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_owner_restore_state_json(
+    owner: ?*anyopaque,
+    request: *const JsonOperationRequest,
+    out_response: *OwnedBytes,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_owner_text_memory_json(
+    owner: ?*anyopaque,
+    request: *const TableRequest,
     out_response: *OwnedBytes,
 ) callconv(.c) Status;
 

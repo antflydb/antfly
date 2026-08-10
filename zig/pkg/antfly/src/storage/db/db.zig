@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const ha_contract = @import("ha_contract.zig");
 const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
 const build_options = @import("build_options");
@@ -395,26 +396,8 @@ fn deinitOwnedEnrichmentConfig(alloc: Allocator, cfg: *enrichment_runtime_mod.Co
     }
 }
 
-pub const HAAsyncEffectMirror = struct {
-    primary: *ha_primary_mod.Primary,
-    last_lsn: ?*std.atomic.Value(u64) = null,
-    failure_count: ?*std.atomic.Value(u64) = null,
-    sync_policy: ha_primary_mod.SyncPolicy = .{},
-    sync_wait_ctx: ?*anyopaque = null,
-    sync_wait_fn: ?HASyncWaitFn = null,
-    last_gate_lsn: ?*std.atomic.Value(u64) = null,
-    last_gate_action: ?*std.atomic.Value(u8) = null,
-    sync_reject_count: ?*std.atomic.Value(u64) = null,
-    sync_wait_count: ?*std.atomic.Value(u64) = null,
-    sync_degraded_count: ?*std.atomic.Value(u64) = null,
-};
-
-pub const HASyncWaitFn = *const fn (
-    ctx: *anyopaque,
-    primary: *ha_primary_mod.Primary,
-    target_lsn: u64,
-    policy: ha_primary_mod.SyncPolicy,
-) anyerror!void;
+pub const HAAsyncEffectMirror = ha_contract.AsyncEffectMirror;
+pub const HASyncWaitFn = ha_contract.SyncWaitFn;
 
 pub const HAProgressPollFn = *const fn (
     ctx: *anyopaque,
@@ -510,52 +493,10 @@ fn haSyncPolicyIncludesStandby(policy: ha_primary_mod.SyncPolicy, slot_name: []c
     return false;
 }
 
-pub const HAAsyncBatchMirror = HAAsyncEffectMirror;
-pub const HAAsyncMetadataMirror = HAAsyncEffectMirror;
-
-pub const SharedHAWriteGate = struct {
-    state: *const ha_public_gate_state_mod.State,
-    /// Sources track the live role. DB instances pin the generation they opened
-    /// with so a promotion cannot pair old runtime hooks with the new primary.
-    generation: ?u64 = null,
-};
-
-pub const HAWriteGate = union(enum) {
-    primary: *ha_primary_mod.Primary,
-    fenced_primary: ha_write_gate_mod.FencedPrimary,
-    standby: *ha_standby_mod.Standby,
-    shared: SharedHAWriteGate,
-
-    pub fn check(self: HAWriteGate) !void {
-        switch (self) {
-            .shared => |shared| return try shared.state.checkWrite(shared.generation),
-            else => {},
-        }
-
-        const decision = switch (self) {
-            .primary => |primary| try ha_write_gate_mod.evaluatePrimary(primary, .{}),
-            .fenced_primary => |fenced| try ha_write_gate_mod.evaluateFencedPrimary(fenced, .{}),
-            .standby => |standby| try ha_write_gate_mod.evaluateStandby(standby, .{}),
-            .shared => unreachable,
-        };
-        switch (decision.action) {
-            .allow_write => {},
-            .reject_read_only_standby => return error.HAReadOnlyStandby,
-            .open_promoted_primary => return error.HAPromotedStandbyRequiresPrimaryOpen,
-            .reject_fenced_primary => return error.HAFencedPrimary,
-        }
-    }
-
-    pub fn pinned(self: HAWriteGate) HAWriteGate {
-        return switch (self) {
-            .shared => |shared| .{ .shared = .{
-                .state = shared.state,
-                .generation = shared.generation orelse shared.state.currentGeneration(),
-            } },
-            else => self,
-        };
-    }
-};
+pub const HAAsyncBatchMirror = ha_contract.AsyncBatchMirror;
+pub const HAAsyncMetadataMirror = ha_contract.AsyncMetadataMirror;
+pub const SharedHAWriteGate = ha_contract.SharedWriteGate;
+pub const HAWriteGate = ha_contract.WriteGate;
 
 fn haWriteGateIsStandby(gate: ?HAWriteGate) bool {
     const configured = gate orelse return false;

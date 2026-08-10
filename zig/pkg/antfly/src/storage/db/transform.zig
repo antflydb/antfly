@@ -58,21 +58,7 @@ pub fn validateTransformOpType(op: types.TransformOpType) !void {
 }
 
 pub fn transformOpText(op: types.TransformOpType) []const u8 {
-    return switch (op) {
-        .set => "$set",
-        .set_on_insert => "$setOnInsert",
-        .unset => "$unset",
-        .inc => "$inc",
-        .push => "$push",
-        .pull => "$pull",
-        .add_to_set => "$addToSet",
-        .pop => "$pop",
-        .mul => "$mul",
-        .min => "$min",
-        .max => "$max",
-        .current_date => "$currentDate",
-        .rename => "$rename",
-    };
+    return types.transformOpText(op);
 }
 
 const PreparedValue = union(enum) {

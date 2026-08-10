@@ -15,7 +15,7 @@
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
 const batch_api = @import("batch.zig");
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = @import("../storage/db/selected_root.zig").db;
 const distributed_txn = @import("distributed_txn.zig");
 const backend_erased = @import("../storage/backend_erased.zig");
 const docstore_mod = @import("../storage/docstore.zig");
@@ -3005,7 +3005,7 @@ fn encodeTableBatchRequest(alloc: std.mem.Allocator, table: TableCommitRequest) 
             for (transform.operations, 0..) |op, op_index| {
                 if (op_index > 0) try out.append(alloc, ',');
                 try out.appendSlice(alloc, "{\"op\":");
-                try appendJsonString(alloc, &out, db_mod.transform.transformOpText(op.op));
+                try appendJsonString(alloc, &out, db_mod.types.transformOpText(op.op));
                 try out.appendSlice(alloc, ",\"path\":");
                 try appendJsonString(alloc, &out, op.path);
                 if (op.value_json) |value_json| {

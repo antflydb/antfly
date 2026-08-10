@@ -39,6 +39,7 @@ const index_manager_mod = @import("catalog/index_manager.zig");
 const backend_erased = @import("../backend_erased.zig");
 const background_runtime_mod = @import("../background_runtime.zig");
 const types = @import("types.zig");
+const runtime_callbacks = @import("runtime_callbacks.zig");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -60,41 +61,7 @@ pub const DerivedRecordWriter = *const fn (ptr: *anyopaque, batch: derived_types
 /// over the cluster transport (topology lookup + group routing +
 /// fetchGroupLookup / vector-worker). Unlike the in-store seam this works at the
 /// logical entity-key level (the cross-shard impl decodes keys on each shard).
-pub const CandidateSource = struct {
-    ptr: *anyopaque,
-    vtable: *const VTable,
-
-    pub const Consume = *const fn (ctx: *anyopaque, entity_key: []const u8, value: []const u8) anyerror!void;
-    pub const NearestQuery = struct {
-        index_name: []const u8,
-        embedding: []const f32,
-        k: usize,
-    };
-    pub const ScanOptions = struct {
-        limit: usize = 0,
-    };
-
-    pub const VTable = struct {
-        /// Fetch the entity doc for `key` in `table` (owned bytes or null).
-        get: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, table: []const u8, key: []const u8) anyerror!?[]u8,
-        /// Scan `table` for entities whose key starts with `prefix`.
-        scan_prefix: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, table: []const u8, prefix: []const u8, opts: ScanOptions, ctx: *anyopaque, consume: Consume) anyerror!void = null,
-        /// The nearest entities in `table` for a named dense index.
-        nearest: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, table: []const u8, query: NearestQuery, ctx: *anyopaque, consume: Consume) anyerror!void = null,
-    };
-
-    pub fn get(self: CandidateSource, allocator: std.mem.Allocator, table: []const u8, key: []const u8) anyerror!?[]u8 {
-        return self.vtable.get(self.ptr, allocator, table, key);
-    }
-    pub fn scanPrefix(self: CandidateSource, allocator: std.mem.Allocator, table: []const u8, prefix: []const u8, opts: ScanOptions, ctx: *anyopaque, consume: Consume) anyerror!void {
-        const f = self.vtable.scan_prefix orelse return error.ScanUnsupported;
-        return f(self.ptr, allocator, table, prefix, opts, ctx, consume);
-    }
-    pub fn nearest(self: CandidateSource, allocator: std.mem.Allocator, table: []const u8, query: NearestQuery, ctx: *anyopaque, consume: Consume) anyerror!void {
-        const f = self.vtable.nearest orelse return error.NearestUnsupported;
-        return f(self.ptr, allocator, table, query, ctx, consume);
-    }
-};
+pub const CandidateSource = runtime_callbacks.CandidateSource;
 
 pub const ResolutionOutput = struct {
     /// Name of the resolution artifact to write (borrows the matched config).

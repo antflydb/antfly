@@ -44,6 +44,7 @@ const lsm_backend_mod = @import("../../lsm_backend/mod.zig");
 const resource_manager_mod = @import("../../resource_manager.zig");
 const docstore_mod = @import("../../docstore.zig");
 const schema_mod = @import("../../schema.zig");
+const text_analysis_config = @import("../text_analysis_config.zig");
 const analysis_mod = @import("../../../search/analysis.zig");
 const ttl_mod = @import("../../ttl.zig");
 const lmdb = if (storage_build_options.lmdb_enabled or builtin.is_test) @import("../../lmdb.zig") else struct {
@@ -491,46 +492,7 @@ test "text merge bounded task allocator enforces live reservation" {
     try std.testing.expectEqual(@as(usize, 64), stats.peak_bytes);
 }
 
-pub const TextMemoryAttributionStats = struct {
-    text_indexes: u64 = 0,
-    text_segments: u64 = 0,
-    text_segment_bytes: u64 = 0,
-    text_mmap_segment_bytes: u64 = 0,
-    text_heap_segment_bytes: u64 = 0,
-    text_max_segment_bytes: u64 = 0,
-    stored_fields_bytes: u64 = 0,
-    inverted_text_bytes: u64 = 0,
-    inverted_header_bytes: u64 = 0,
-    inverted_norm_bytes: u64 = 0,
-    inverted_term_dict_bytes: u64 = 0,
-    inverted_term_block_bytes: u64 = 0,
-    inverted_term_index_bytes: u64 = 0,
-    inverted_fst_bytes: u64 = 0,
-    inverted_bloom_bytes: u64 = 0,
-    inverted_postings_bytes: u64 = 0,
-    inverted_postings_header_bytes: u64 = 0,
-    inverted_block_max_bytes: u64 = 0,
-    inverted_chunk_meta_bytes: u64 = 0,
-    inverted_postings_payload_bytes: u64 = 0,
-    inverted_positions_bytes: u64 = 0,
-    inverted_skip_bytes: u64 = 0,
-    inverted_one_hit_terms: u64 = 0,
-    inverted_single_doc_postings_terms: u64 = 0,
-    inverted_postings_terms: u64 = 0,
-    inverted_postings_doc_frequency_total: u64 = 0,
-    inverted_projected_posting_count_blocks_64: u64 = 0,
-    inverted_projected_posting_count_blocks_128: u64 = 0,
-    inverted_projected_posting_count_blocks_256: u64 = 0,
-    typed_doc_values_bytes: u64 = 0,
-    doc_ordinals_bytes: u64 = 0,
-    section_index_bytes: u64 = 0,
-    configured_lmdb_main_map_bytes: u64 = 0,
-    configured_lmdb_wal_map_bytes: u64 = 0,
-    text_segment_estimated_resident_bytes: u64 = 0,
-    text_segment_recently_touched_bytes: u64 = 0,
-    text_segment_cold_mapped_bytes: u64 = 0,
-    text_segment_residency_evictions: u64 = 0,
-};
+pub const TextMemoryAttributionStats = @import("../text_memory_stats.zig").TextMemoryAttributionStats;
 
 const TextBatchMutationStats = struct {
     indexed_any: bool = false,
@@ -17160,13 +17122,7 @@ pub fn parseTextAnalysisForIndexConfig(
     raw: []const u8,
     runtime_schema: ?schema_mod.TableSchema,
 ) !introducer_mod.TextAnalysisConfig {
-    var cfg = try introducer_mod.parseTextAnalysisConfig(alloc, raw);
-    errdefer introducer_mod.freeTextAnalysisConfig(alloc, cfg);
-
-    if (runtime_schema) |schema| {
-        try appendSchemaFieldAnalyzers(alloc, &cfg, schema);
-    }
-    return cfg;
+    return try text_analysis_config.parseForIndexConfig(alloc, raw, runtime_schema);
 }
 
 fn openTextPersistentIndexWithRetry(
@@ -17233,49 +17189,6 @@ fn sleepBeforeTextPersistentOpenRetry(attempt: usize) void {
         const spins = 64 * (capped + 1);
         for (0..spins) |_| std.atomic.spinLoopHint();
     }
-}
-
-fn appendSchemaFieldAnalyzers(
-    alloc: Allocator,
-    cfg: *introducer_mod.TextAnalysisConfig,
-    schema: schema_mod.TableSchema,
-) !void {
-    const FieldAnalyzer = std.meta.Child(@TypeOf(cfg.field_analyzers));
-    var extra_count: usize = 0;
-    for (schema.full_text_documents) |doc| {
-        for (doc.fields) |field| {
-            if (std.mem.eql(u8, field.emitted_name, "_all")) continue;
-            extra_count += 1;
-        }
-    }
-    if (extra_count == 0) return;
-
-    const original_len = cfg.field_analyzers.len;
-    const combined = try alloc.alloc(FieldAnalyzer, original_len + extra_count);
-    var initialized: usize = 0;
-    errdefer {
-        for (combined[original_len..initialized]) |item| {
-            alloc.free(item.field_name);
-            alloc.free(item.analyzer_name);
-        }
-        alloc.free(combined);
-    }
-
-    for (cfg.field_analyzers, 0..) |item, i| combined[i] = item;
-    initialized = original_len;
-    for (schema.full_text_documents) |doc| {
-        for (doc.fields) |field| {
-            if (std.mem.eql(u8, field.emitted_name, "_all")) continue;
-            combined[initialized] = .{
-                .field_name = try alloc.dupe(u8, field.emitted_name),
-                .analyzer_name = try alloc.dupe(u8, field.analyzer),
-            };
-            initialized += 1;
-        }
-    }
-
-    if (cfg.field_analyzers.len > 0) alloc.free(cfg.field_analyzers);
-    cfg.field_analyzers = combined;
 }
 
 fn appendObservedFieldAnalyzers(

@@ -1164,6 +1164,13 @@ pub const RaftApplyStore = struct {
     }
 
     pub fn listPlacementIntents(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]raft_reconciler.PlacementIntent {
+        // The in-memory placement projection is updated while a committed
+        // batch holds apply_mutex. Clone it under the same lock so background
+        // snapshot readers cannot copy an intent while apply frees/replaces
+        // its owned bootstrap strings.
+        const io = self.io_impl.io();
+        self.apply_mutex.lockUncancelable(io);
+        defer self.apply_mutex.unlock(io);
         try self.ensurePlacementIntentsLoaded(alloc, group_id);
 
         var count: usize = 0;
@@ -1187,6 +1194,9 @@ pub const RaftApplyStore = struct {
     }
 
     pub fn listLocalPlacementIntents(self: *RaftApplyStore, alloc: std.mem.Allocator, metadata_group_id: u64, local_node_id: u64) ![]raft_reconciler.PlacementIntent {
+        const io = self.io_impl.io();
+        self.apply_mutex.lockUncancelable(io);
+        defer self.apply_mutex.unlock(io);
         try self.ensurePlacementIntentsLoaded(alloc, metadata_group_id);
 
         var count: usize = 0;

@@ -14,15 +14,21 @@
 
 const std = @import("std");
 const raft_engine = @import("raft_engine");
-const build_options = @import("build_options");
+const storage_source_options = @import("storage_source_options");
+const control_only_storage_sources = storage_source_options.control_only;
 const backups_api = @import("../api/backups.zig");
 const common_config = @import("../common/config.zig");
 const catalog = @import("catalog.zig");
 const data_storage = @import("../data/storage/mod.zig");
 const data_apply_client = @import("../storage/data_raft_apply_client.zig");
+const kernel_owner_abi = @import("kernel_owner_abi");
+const kernel_owner_client = @import("../storage/kernel_owner_client.zig");
 const host_mod = @import("host.zig");
 const leader_runtime = @import("leader_runtime.zig");
-const metadata_table_provisioner = @import("../metadata/table_provisioner.zig");
+const metadata_table_provisioner = if (control_only_storage_sources)
+    struct {}
+else
+    @import("../metadata/table_provisioner.zig");
 const metadata_storage = @import("../metadata/storage/mod.zig");
 const metadata_view = @import("metadata_view.zig");
 const reconciler = @import("reconciler.zig");
@@ -31,10 +37,7 @@ const storage = @import("storage/mod.zig");
 const backup_restore = @import("storage/backup_restore.zig");
 const background_runtime = @import("../storage/background_runtime.zig");
 const resource_manager = @import("../storage/resource_manager.zig");
-const storage_kernel_experiment = if (@hasDecl(build_options, "storage_kernel_experiment"))
-    @field(build_options, "storage_kernel_experiment")
-else
-    false;
+const storage_kernel_experiment = control_only_storage_sources;
 pub const DataApplyStore = if (storage_kernel_experiment) data_apply_client.RaftApplyStore else data_storage.RaftApplyStore;
 
 pub const ManagedHostConfig = struct {
@@ -726,6 +729,23 @@ const ReplicaBackupRestoreBootstrapper = struct {
     fn prepareBackupRestore(ptr: *anyopaque, record: catalog.ReplicaRecord) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         const restore = record.backup_restore_bootstrap orelse return;
+        if (comptime control_only_storage_sources) {
+            try kernel_owner_client.Snapshot.applyRestoreBootstrap(.{
+                .replica_root_dir = kernel_owner_abi.BorrowedBytes.fromSlice(self.replica_root_dir),
+                .group_id = record.group_id,
+                .backup_id = kernel_owner_abi.BorrowedBytes.fromSlice(restore.backup_id),
+                .artifact_backup_id = kernel_owner_abi.BorrowedBytes.fromSlice(restore.artifact_backup_id),
+                .location = kernel_owner_abi.BorrowedBytes.fromSlice(restore.location),
+                .snapshot_path = kernel_owner_abi.BorrowedBytes.fromSlice(restore.snapshot_path),
+                .connection = kernel_owner_abi.BorrowedBytes.fromSlice(restore.connection),
+                .artifact_size_bytes = restore.artifact_size_bytes,
+                .artifact_sha256 = kernel_owner_abi.BorrowedBytes.fromSlice(restore.artifact_sha256),
+                .required_capability = kernel_owner_abi.BorrowedBytes.fromSlice(self.open_options.required_capability),
+                .secret_store = self.open_options.secret_store,
+                .node_config = self.open_options.node_config,
+            });
+            return;
+        }
         try metadata_table_provisioner.applyBackupRestoreBootstrapWithOptions(
             std.heap.page_allocator,
             self.replica_root_dir,

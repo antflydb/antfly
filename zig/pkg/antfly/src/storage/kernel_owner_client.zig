@@ -147,6 +147,24 @@ pub const Owner = struct {
         return result;
     }
 
+    pub fn preflightWriteAdmission(self: *Owner, table_name: []const u8) !void {
+        const status = abi.antfly_storage_owner_preflight_write_admission(self.handle, &.{
+            .table_name = .fromSlice(table_name),
+        });
+        if (status == .busy) return error.DenseRepairBackpressure;
+        try statusToError(status);
+    }
+
+    pub fn findMedianKey(self: *Owner, table_name: []const u8) !?Response {
+        var response: Response = .{};
+        const status = abi.antfly_storage_owner_find_median_key(self.handle, &.{
+            .table_name = .fromSlice(table_name),
+        }, &response.buffer);
+        if (status == .not_found) return null;
+        try statusToError(status);
+        return response;
+    }
+
     pub fn beginBulkIngest(self: *Owner, table_name: []const u8) !void {
         try statusToError(abi.antfly_storage_owner_bulk_begin(self.handle, &.{
             .table_name = .fromSlice(table_name),
@@ -164,12 +182,30 @@ pub const Owner = struct {
     }
 
     pub fn batchJson(self: *Owner, table_name: []const u8, request_json: []const u8) !Response {
+        return try self.batchJsonWithDocumentChildRangeDispatcher(
+            table_name,
+            request_json,
+            null,
+            null,
+        );
+    }
+
+    pub fn batchJsonWithDocumentChildRangeDispatcher(
+        self: *Owner,
+        table_name: []const u8,
+        request_json: []const u8,
+        dispatch_ctx: ?*anyopaque,
+        dispatch_fn: ?abi.DocumentChildRangeDispatchFn,
+    ) !Response {
+        if ((dispatch_ctx == null) != (dispatch_fn == null)) return error.InvalidArgument;
         var response: Response = .{};
         try statusToError(abi.antfly_storage_owner_batch_json(
             self.handle,
             &.{
                 .table_name = .fromSlice(table_name),
                 .request_json = .fromSlice(request_json),
+                .document_child_range_dispatch_ctx = dispatch_ctx,
+                .document_child_range_dispatch_fn = dispatch_fn,
             },
             &response.buffer,
         ));
@@ -462,6 +498,29 @@ pub const Owner = struct {
         return response;
     }
 
+    pub fn restoreStateJson(self: *Owner, table_name: []const u8) !?Response {
+        var response: Response = .{};
+        const request = operationRequest(table_name, "");
+        const status = abi.antfly_storage_owner_restore_state_json(
+            self.handle,
+            &request,
+            &response.buffer,
+        );
+        if (status == .not_found) return null;
+        try statusToError(status);
+        return response;
+    }
+
+    pub fn textMemoryJson(self: *Owner, table_name: []const u8) !Response {
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_text_memory_json(
+            self.handle,
+            &.{ .table_name = .fromSlice(table_name) },
+            &response.buffer,
+        ));
+        return response;
+    }
+
     pub fn maintenance(
         self: *Owner,
         table_name: []const u8,
@@ -522,6 +581,10 @@ pub const Snapshot = struct {
 
     pub fn reconcileRestore(request: abi.RestorePrepareRequest) !void {
         try statusToError(abi.antfly_storage_restore_reconcile(&request));
+    }
+
+    pub fn applyRestoreBootstrap(request: abi.RestoreBootstrapRequest) !void {
+        try statusToError(abi.antfly_storage_restore_apply_bootstrap(&request));
     }
 
     pub fn promote(self: *Snapshot) !void {

@@ -151,6 +151,11 @@ socket.addEventListener("message", (event) => {
   writeFileSync(outputPath, `${JSON.stringify(report, null, 2)}\n`);
   console.log(`captured ${report.step_name} to ${outputPath}`);
   socket.close();
+  // Zig 0.16's build web UI does not always complete the WebSocket close
+  // handshake while it remains open for profiling. The report write is
+  // synchronous, so terminate the one-shot collector after capture instead
+  // of leaving CI and local measurement sessions attached indefinitely.
+  process.exit(0);
 });
 socket.addEventListener("error", () => {
   process.exitCode = 1;

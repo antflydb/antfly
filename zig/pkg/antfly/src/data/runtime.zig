@@ -15,6 +15,8 @@
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
 const build_options = @import("build_options");
+const storage_source_options = @import("storage_source_options");
+const control_only_storage_sources = storage_source_options.control_only;
 const antfly = @import("runtime_root.zig");
 const indexes_api = @import("../api/indexes.zig");
 const json_helpers = @import("../api/json_helpers.zig");
@@ -64,10 +66,32 @@ const platform_time = @import("antfly_platform").time;
 const platform = @import("antfly_platform");
 const raft_engine = @import("raft_engine");
 
-const storage_kernel_experiment = if (@hasDecl(build_options, "storage_kernel_experiment"))
-    @field(build_options, "storage_kernel_experiment")
-else
-    false;
+fn seedControlOnlyStorageOwnerForTest(
+    path: []const u8,
+    table_name: []const u8,
+    group_id: u64,
+    identity: doc_identity.Namespace,
+    batch_json: []const u8,
+) !void {
+    if (comptime !control_only_storage_sources) unreachable;
+    var owner = try kernel_owner_client.Owner.open(.{
+        .path = .fromSlice(path),
+        .table_name = .fromSlice(table_name),
+        .group_id = group_id,
+        .has_identity_namespace = 1,
+        .identity_table_id = identity.table_id,
+        .identity_shard_id = identity.shard_id,
+        .identity_range_id = identity.range_id,
+    });
+    defer owner.deinit();
+    var response = try owner.batchJson(table_name, batch_json);
+    defer response.deinit();
+}
+
+// Source selection is a property of this compiler unit, not of the overall
+// build. Provider and ordinary test units keep physical storage even when the
+// linked experiment is enabled; only consumer units enter the opaque ABI.
+const storage_kernel_experiment = control_only_storage_sources;
 const StorageKernelContext = if (storage_kernel_experiment)
     kernel_owner_client.Context
 else
@@ -4312,7 +4336,7 @@ pub const DataServer = struct {
             self.read_source.requester,
         );
         _ = owner_source.withGroupVisibleRootGeneration(self.provisioned_storage.groupVisibleRootGenerationSource());
-        _ = owner_source.withTransactionRecoverySource(&self.write_source);
+        _ = owner_source.withTransactionRecoverySource(self.write_source.transactionRecoverySource());
         if (comptime storage_kernel_experiment) {
             if (self.storage_kernel_context) |context|
                 _ = owner_source.withStorageContextHandle(context.handle);
@@ -5663,6 +5687,7 @@ pub const DataServer = struct {
             .vtable = &.{
                 .fetch_median_key = localFetchMedianKey,
                 .schema_index_ready = localSchemaIndexReady,
+                .restore_state = localRestoreState,
             },
         };
     }
@@ -5684,7 +5709,7 @@ pub const DataServer = struct {
         };
     }
 
-    fn promotionLeadershipSource(self: *DataServer) ?antfly.public_api.table_writes.ProvisionedTableWriteCache.PromotionLeadershipSource {
+    fn promotionLeadershipSource(self: *DataServer) ?antfly.public_api.table_writes.PromotionLeadershipSource {
         if (self.group_leadership_source == null) return null;
         return .{
             .ptr = self,
@@ -7045,6 +7070,27 @@ pub const DataServer = struct {
             .backend_runtime = try self.ensureBackendRuntime(),
         };
         return try fallback.adapter().schemaIndexReady(alloc, table_name, group_id, schema_version, read_schema_version);
+    }
+
+    fn localRestoreState(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        group_id: u64,
+    ) !?@import("../storage/restore_state_contract.zig").State {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        if (comptime control_only_storage_sources) {
+            return try (try self.ensureKernelOwnerSource()).restoreState(
+                alloc,
+                group_id,
+                table_name,
+            );
+        }
+        var fallback = antfly.metadata.FallbackLocalShardDbAdapter{
+            .replica_root_dir = self.write_source.replica_root_dir,
+            .backend_runtime = try self.ensureBackendRuntime(),
+        };
+        return try fallback.adapter().restoreState(alloc, table_name, group_id);
     }
 
     fn kernelLocalTransitionRequest(
@@ -10051,6 +10097,7 @@ pub const DataServer = struct {
         group_id: u64,
         status: *runtime_status.LocalTableRuntimeStatus,
     ) void {
+        if (comptime control_only_storage_sources) return;
         if (self.data_raft_apply) |apply_sm| {
             switch (apply_sm.write_source.probeManagedWriterGroupBestEffort(table_name, group_id)) {
                 .leased => |cached| {
@@ -10105,6 +10152,7 @@ pub const DataServer = struct {
             status.disk_bytes_known = true;
         }
         if (status.created_at_millis == 0) {
+            if (comptime control_only_storage_sources) return;
             if (db) |ptr| {
                 status.created_at_millis = (ptr.getGroupCreatedAtMillis(self.alloc, group_id) catch null) orelse 0;
             }
@@ -12056,6 +12104,7 @@ pub const DataServer = struct {
             }
             switch (self.probeManagedWriterGroupBestEffort(table.name, group_id)) {
                 .leased => |cached| {
+                    if (comptime control_only_storage_sources) unreachable;
                     var lease = cached;
                     const release_alloc = if (lease.cache) |cache| cache.alloc else std.heap.page_allocator;
                     defer lease.deinit(release_alloc);
@@ -17382,7 +17431,15 @@ test "data runtime local split fallback preserves source identity namespace" {
         .shard_id = 180,
         .range_id = 9000,
     };
-    {
+    if (comptime control_only_storage_sources) {
+        try seedControlOnlyStorageOwnerForTest(
+            source_db_path,
+            "docs",
+            180,
+            source_namespace,
+            "{\"inserts\":{\"doc:t\":{\"v\":\"right\"}},\"sync_level\":\"write\"}",
+        );
+    } else {
         var db = try antfly.db.DB.open(alloc, source_db_path, .{
             .identity_namespace = source_namespace,
             .start_index_workers = false,
@@ -17421,13 +17478,24 @@ test "data runtime local split fallback preserves source identity namespace" {
                     .name = "docs",
                     .placement_role = "data",
                 }})[0..]),
-                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{.{
-                    .group_id = 180,
-                    .table_id = 7,
-                    .range_id = 9000,
-                    .start_key = "doc:a",
-                    .end_key = "doc:z",
-                }})[0..]),
+                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{
+                    .{
+                        .group_id = 180,
+                        .table_id = 7,
+                        .range_id = 9000,
+                        .start_key = "doc:a",
+                        .end_key = "doc:m",
+                    },
+                    .{
+                        .group_id = 181,
+                        .table_id = 7,
+                        .range_id = 9001,
+                        .start_key = "doc:m",
+                        .end_key = "doc:z",
+                        .doc_identity_shard_id = 180,
+                        .doc_identity_range_id = 9000,
+                    },
+                })[0..]),
                 .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
                 .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
                 .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{.{
@@ -17514,29 +17582,46 @@ test "data runtime local split fallback preserves source identity namespace" {
         .table_contract = FakeCatalog.table_contract,
     } });
 
-    // The compiled-kernel architecture intentionally keeps group owners
-    // resident. Drain them before this white-box durability inspection opens
-    // the physical DB directly outside the owner ABI.
-    if (comptime storage_kernel_experiment) {
-        _ = server.kernel_owner_source.?.retireTable("docs");
+    if (comptime control_only_storage_sources) {
+        var replayed = (try server.read_source.source().lookupGroupLocal(
+            alloc,
+            181,
+            "docs",
+            "doc:t",
+            .{},
+            .read_index,
+        )).?;
+        defer replayed.deinit(alloc);
+        try std.testing.expect(std.mem.indexOf(u8, replayed.json, "\"v\":\"right\"") != null);
+
+        var statuses = (try server.kernel_owner_source.?.writeSource().localRuntimeStatuses(alloc, "docs")).?;
+        defer statuses.deinit(alloc);
+        const destination_status = for (statuses.items) |*status| {
+            if (status.group_id == 181) break status;
+        } else return error.TestUnexpectedResult;
+        try std.testing.expectEqual(source_namespace.table_id, destination_status.stats.doc_identity.namespace_table_id);
+        try std.testing.expectEqual(source_namespace.shard_id, destination_status.stats.doc_identity.namespace_shard_id);
+        try std.testing.expectEqual(source_namespace.range_id, destination_status.stats.doc_identity.namespace_range_id);
+        try std.testing.expectEqual(@as(u64, 1), destination_status.stats.doc_identity.allocated_ordinals);
+        try std.testing.expect(!destination_status.stats.doc_identity.rebuild_required);
+    } else {
+        var dest = try antfly.db.DB.open(alloc, destination_db_path, .{
+            .identity_namespace = source_namespace,
+            .start_index_workers = false,
+        });
+        defer dest.close();
+
+        const replayed = (try dest.get(alloc, "doc:t")) orelse return error.TestUnexpectedResult;
+        defer alloc.free(replayed);
+        try std.testing.expectEqualStrings("{\"v\":\"right\"}", replayed);
+
+        const stats = try dest.runtimeStatusStatsConsistent(alloc);
+        try std.testing.expectEqual(source_namespace.table_id, stats.doc_identity.namespace_table_id);
+        try std.testing.expectEqual(source_namespace.shard_id, stats.doc_identity.namespace_shard_id);
+        try std.testing.expectEqual(source_namespace.range_id, stats.doc_identity.namespace_range_id);
+        try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.allocated_ordinals);
+        try std.testing.expect(!stats.doc_identity.rebuild_required);
     }
-
-    var dest = try antfly.db.DB.open(alloc, destination_db_path, .{
-        .identity_namespace = source_namespace,
-        .start_index_workers = false,
-    });
-    defer dest.close();
-
-    const replayed = (try dest.get(alloc, "doc:t")) orelse return error.TestUnexpectedResult;
-    defer alloc.free(replayed);
-    try std.testing.expectEqualStrings("{\"v\":\"right\"}", replayed);
-
-    const stats = try dest.runtimeStatusStatsConsistent(alloc);
-    try std.testing.expectEqual(source_namespace.table_id, stats.doc_identity.namespace_table_id);
-    try std.testing.expectEqual(source_namespace.shard_id, stats.doc_identity.namespace_shard_id);
-    try std.testing.expectEqual(source_namespace.range_id, stats.doc_identity.namespace_range_id);
-    try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.allocated_ordinals);
-    try std.testing.expect(!stats.doc_identity.rebuild_required);
 }
 
 test "data runtime split apply store seeding reuses cached source writer" {
@@ -17569,7 +17654,15 @@ test "data runtime split apply store seeding reuses cached source writer" {
         },
     };
 
-    {
+    if (comptime control_only_storage_sources) {
+        try seedControlOnlyStorageOwnerForTest(
+            source_db_path,
+            "docs",
+            180,
+            source_namespace,
+            "{\"inserts\":{\"doc:t\":{\"v\":\"right\"}},\"sync_level\":\"write\"}",
+        );
+    } else {
         var db = try antfly.db.DB.open(alloc, source_db_path, .{
             .identity_namespace = source_namespace,
             .start_index_workers = false,
@@ -17809,7 +17902,15 @@ test "data runtime local merge fallback uses its durable table contract" {
         },
     };
 
-    {
+    if (comptime control_only_storage_sources) {
+        try seedControlOnlyStorageOwnerForTest(
+            donor_db_path,
+            "docs",
+            190,
+            donor_namespace,
+            "{\"inserts\":{\"doc:t\":{\"v\":\"donor\"}},\"sync_level\":\"write\"}",
+        );
+    } else {
         var db = try antfly.db.DB.open(alloc, donor_db_path, .{
             .identity_namespace = donor_namespace,
             .start_index_workers = false,
@@ -17821,7 +17922,15 @@ test "data runtime local merge fallback uses its durable table contract" {
         });
     }
 
-    {
+    if (comptime control_only_storage_sources) {
+        try seedControlOnlyStorageOwnerForTest(
+            receiver_db_path,
+            "docs",
+            191,
+            old_namespace,
+            "{\"inserts\":{\"doc:b\":{\"v\":\"receiver\"}},\"sync_level\":\"write\"}",
+        );
+    } else {
         var db = try antfly.db.DB.open(alloc, receiver_db_path, .{
             .identity_namespace = old_namespace,
             .start_index_workers = false,
@@ -17910,36 +18019,52 @@ test "data runtime local merge fallback uses its durable table contract" {
         .table_contract = table_contract,
     } });
 
-    // See the split test above: raw DB inspection is test-only and must first
-    // drain the process-resident opaque owners.
-    if (comptime storage_kernel_experiment) {
-        _ = server.kernel_owner_source.?.retireTable("docs");
+    if (comptime control_only_storage_sources) {
+        var receiver_doc = (try server.read_source.source().lookupGroupLocal(
+            alloc,
+            191,
+            "docs",
+            "doc:b",
+            .{},
+            .read_index,
+        )).?;
+        defer receiver_doc.deinit(alloc);
+        try std.testing.expect(std.mem.indexOf(u8, receiver_doc.json, "\"v\":\"receiver\"") != null);
+
+        var statuses = (try server.kernel_owner_source.?.writeSource().localRuntimeStatuses(alloc, "docs")).?;
+        defer statuses.deinit(alloc);
+        const receiver_status = for (statuses.items) |*status| {
+            if (status.group_id == 191) break status;
+        } else return error.TestUnexpectedResult;
+        try std.testing.expectEqual(target_namespace.table_id, receiver_status.stats.doc_identity.namespace_table_id);
+        try std.testing.expectEqual(target_namespace.shard_id, receiver_status.stats.doc_identity.namespace_shard_id);
+        try std.testing.expectEqual(target_namespace.range_id, receiver_status.stats.doc_identity.namespace_range_id);
+    } else {
+        var reopened = try antfly.db.DB.open(alloc, receiver_db_path, .{
+            .identity_namespace = target_namespace,
+            .start_index_workers = false,
+        });
+        defer reopened.close();
+
+        const replayed = (try reopened.get(alloc, "doc:t")) orelse return error.TestUnexpectedResult;
+        defer alloc.free(replayed);
+        try std.testing.expectEqualStrings("{\"v\":\"donor\"}", replayed);
+
+        const stats = try reopened.runtimeStatusStatsConsistent(alloc);
+        try std.testing.expectEqual(target_namespace.table_id, stats.doc_identity.namespace_table_id);
+        try std.testing.expectEqual(target_namespace.shard_id, stats.doc_identity.namespace_shard_id);
+        try std.testing.expectEqual(target_namespace.range_id, stats.doc_identity.namespace_range_id);
+
+        var txn = try reopened.core.store.beginProbeTxn();
+        defer txn.abort();
+        const receiver_ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:b")) orelse return error.TestUnexpectedResult;
+        const receiver_state = (try doc_identity.lookupStateTxn(&txn, receiver_ordinal)) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(doc_identity.canonicalDocIdForNamespace(target_namespace, "doc:b"), receiver_state.canonical_doc_id);
+        const donor_ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:t")) orelse return error.TestUnexpectedResult;
+        const donor_state = (try doc_identity.lookupStateTxn(&txn, donor_ordinal)) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(doc_identity.canonicalDocIdForNamespace(target_namespace, "doc:t"), donor_state.canonical_doc_id);
+        try std.testing.expect(receiver_ordinal != donor_ordinal);
     }
-
-    var reopened = try antfly.db.DB.open(alloc, receiver_db_path, .{
-        .identity_namespace = target_namespace,
-        .start_index_workers = false,
-    });
-    defer reopened.close();
-
-    const replayed = (try reopened.get(alloc, "doc:t")) orelse return error.TestUnexpectedResult;
-    defer alloc.free(replayed);
-    try std.testing.expectEqualStrings("{\"v\":\"donor\"}", replayed);
-
-    const stats = try reopened.runtimeStatusStatsConsistent(alloc);
-    try std.testing.expectEqual(target_namespace.table_id, stats.doc_identity.namespace_table_id);
-    try std.testing.expectEqual(target_namespace.shard_id, stats.doc_identity.namespace_shard_id);
-    try std.testing.expectEqual(target_namespace.range_id, stats.doc_identity.namespace_range_id);
-
-    var txn = try reopened.core.store.beginProbeTxn();
-    defer txn.abort();
-    const receiver_ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:b")) orelse return error.TestUnexpectedResult;
-    const receiver_state = (try doc_identity.lookupStateTxn(&txn, receiver_ordinal)) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(doc_identity.canonicalDocIdForNamespace(target_namespace, "doc:b"), receiver_state.canonical_doc_id);
-    const donor_ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:t")) orelse return error.TestUnexpectedResult;
-    const donor_state = (try doc_identity.lookupStateTxn(&txn, donor_ordinal)) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(doc_identity.canonicalDocIdForNamespace(target_namespace, "doc:t"), donor_state.canonical_doc_id);
-    try std.testing.expect(receiver_ordinal != donor_ordinal);
 }
 
 test "data runtime local split key cache is scoped by root and change generation" {
@@ -18642,7 +18767,15 @@ test "data runtime background refresh publishes a cold placeholder without DB op
     const db_path = try std.fmt.allocPrint(alloc, "{s}/group-77/table-db", .{replica_root_dir});
     defer alloc.free(db_path);
 
-    {
+    if (comptime control_only_storage_sources) {
+        try seedControlOnlyStorageOwnerForTest(
+            db_path,
+            "docs",
+            77,
+            .{ .table_id = 7, .shard_id = 77, .range_id = 77 },
+            "{\"inserts\":{\"doc:a\":{\"title\":\"alpha\"}},\"sync_level\":\"write\"}",
+        );
+    } else {
         var db = try antfly.db.DB.open(alloc, db_path, .{
             .identity_namespace = .{ .table_id = 7, .shard_id = 77, .range_id = 77 },
         });
@@ -18779,7 +18912,15 @@ test "data runtime provisioned cache warmup populates runtime status without pin
     const db_path = try antfly.metadata.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 77);
     defer alloc.free(db_path);
 
-    {
+    if (comptime control_only_storage_sources) {
+        try seedControlOnlyStorageOwnerForTest(
+            db_path,
+            "docs",
+            77,
+            .{ .table_id = 7, .shard_id = 77, .range_id = 77 },
+            "{\"inserts\":{\"doc:a\":{\"title\":\"alpha\"}},\"sync_level\":\"write\"}",
+        );
+    } else {
         var db = try antfly.db.DB.open(alloc, db_path, .{
             .identity_namespace = .{ .table_id = 7, .shard_id = 77, .range_id = 77 },
         });
@@ -18896,9 +19037,18 @@ test "data runtime provisioned cache warmup populates runtime status without pin
         try std.testing.expectEqual(@as(usize, 0), owner_source.ownerCountForTest());
         const owner_cache = owner_source.cacheStats();
         try std.testing.expectEqual(@as(u64, 0), owner_cache.hit_count);
-        try std.testing.expectEqual(@as(u64, 1), owner_cache.miss_count);
+        // A control-only consumer observes three deliberately transient
+        // phases through the compiled owner: open validation, authoritative
+        // status, and startup reconciliation. The earlier hybrid experiment
+        // counted only the first in this cache because the other two still
+        // opened DBs inside the distributed unit.
+        try std.testing.expectEqual(
+            @as(u64, if (control_only_storage_sources) 3 else 1),
+            owner_cache.miss_count,
+        );
     } else {
         try std.testing.expectEqual(@as(usize, 0), server.provisioned_storage.read_cache.entries.items.len);
+        try std.testing.expectEqual(@as(usize, 0), server.provisioned_storage.startup_write_cache.entries.items.len);
     }
     try std.testing.expectEqual(@as(u64, 1), server.provisioned_warmup_started.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), server.provisioned_warmup_completed.load(.monotonic));
@@ -18918,18 +19068,14 @@ test "data runtime provisioned cache warmup populates runtime status without pin
     defer snapshot_statuses.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), snapshot_statuses.items.len);
     try std.testing.expectEqual(@as(u64, 77), snapshot_statuses.items[0].group_id);
-    if (comptime storage_kernel_experiment) {
-        // The owner status operation observes the just-opened physical DB and
-        // publishes an authoritative snapshot rather than the legacy cold
-        // placeholder.
-        try std.testing.expectEqual(runtime_status.RuntimeStatusSource.live_writer_publish, snapshot_statuses.items[0].metadata.source);
-        try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.fresh, snapshot_statuses.items[0].metadata.freshness);
-        try std.testing.expectEqual(@as(u64, 0), snapshot_statuses.items[0].stats.doc_count);
-    } else {
-        try std.testing.expectEqual(runtime_status.RuntimeStatusSource.synthetic_config, snapshot_statuses.items[0].metadata.source);
-        try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.stale, snapshot_statuses.items[0].metadata.freshness);
-        try std.testing.expectEqual(@as(u64, 0), snapshot_statuses.items[0].stats.doc_count);
-    }
+    // Warmup performs synchronous startup reconciliation in tests. Both the
+    // physical and compiled-owner paths publish the authoritative observation
+    // made through that transient writer, then close the writer before this
+    // assertion. The source describes how the snapshot was produced; it does
+    // not mean that a writer remains pinned in either cache.
+    try std.testing.expectEqual(runtime_status.RuntimeStatusSource.live_writer_publish, snapshot_statuses.items[0].metadata.source);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.fresh, snapshot_statuses.items[0].metadata.freshness);
+    try std.testing.expectEqual(@as(u64, 0), snapshot_statuses.items[0].stats.doc_count);
 
     var warmed_lookup = (try server.read_source.source().lookup(alloc, "docs", "doc:a", .{}, .read_index)).?;
     defer warmed_lookup.deinit(alloc);
@@ -18939,7 +19085,10 @@ test "data runtime provisioned cache warmup populates runtime status without pin
         try std.testing.expectEqual(@as(usize, 1), owner_source.ownerCountForTest());
         const owner_cache = owner_source.cacheStats();
         try std.testing.expectEqual(@as(u64, 0), owner_cache.hit_count);
-        try std.testing.expectEqual(@as(u64, 2), owner_cache.miss_count);
+        try std.testing.expectEqual(
+            @as(u64, if (control_only_storage_sources) 4 else 2),
+            owner_cache.miss_count,
+        );
     } else {
         const post_lookup_read_cache = server.provisioned_storage.read_cache.cacheStats();
         try std.testing.expectEqual(@as(u64, 0), post_lookup_read_cache.hit_count);
@@ -18954,7 +19103,10 @@ test "data runtime provisioned cache warmup populates runtime status without pin
     if (comptime storage_kernel_experiment) {
         const owner_cache = server.kernel_owner_source.?.cacheStats();
         try std.testing.expectEqual(@as(u64, 1), owner_cache.hit_count);
-        try std.testing.expectEqual(@as(u64, 2), owner_cache.miss_count);
+        try std.testing.expectEqual(
+            @as(u64, if (control_only_storage_sources) 4 else 2),
+            owner_cache.miss_count,
+        );
     } else {
         const post_batch_write_cache = server.provisioned_storage.write_cache.cacheStats();
         try std.testing.expectEqual(@as(u64, 0), post_batch_write_cache.hit_count);

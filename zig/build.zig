@@ -64,6 +64,9 @@ const RuntimeLibraryUnit = enum {
     control_probe,
     // Measurement-only post-restore-bridge CLI unit.
     cli_pic_probe,
+    // Measurement-only control island combining the public API kernel with
+    // data, metadata, and HA control over the opaque storage-owner ABI.
+    control_api_probe,
     // Application/storage unit: data, metadata, standalone/Lite, local HA,
     // restore staging, and the shared CAPI implementation.
     distributed,
@@ -662,8 +665,22 @@ const AntflyRootImports = struct {
     };
 
     fn configure(self: @This(), b: *std.Build, mod: *std.Build.Module, include_lmdb_c: bool, link_libc: bool) void {
+        self.configureStorageSources(b, mod, include_lmdb_c, link_libc, false);
+    }
+
+    fn configureStorageSources(
+        self: @This(),
+        b: *std.Build,
+        mod: *std.Build.Module,
+        include_lmdb_c: bool,
+        link_libc: bool,
+        control_only: bool,
+    ) void {
         mod.addOptions("build_options", self.build_options);
         mod.addOptions("standalone_runtime_options", self.standalone_runtime_options);
+        const storage_source_options = b.addOptions();
+        storage_source_options.addOption(bool, "control_only", control_only);
+        mod.addOptions("storage_source_options", storage_source_options);
         inline for (import_table) |entry| {
             mod.addImport(entry.name, @field(self, entry.field));
         }
@@ -4642,6 +4659,8 @@ pub fn build(b: *std.Build) void {
         "api query contract bounds expanded binding output bytes",
         "api query contract combines public and internal filter representations losslessly",
         "structured filter grammar validates ranges without a runtime schema",
+        "control structured-filter admission covers canonical compounds and typed leaves",
+        "control structured-filter admission rejects ambiguous and malformed values",
         "api query contract preserves canonical structured compounds without speculative parsing",
         "api query contract cleans up partially parsed direct query arrays",
         "api query contract reports the failing nested filter node",
@@ -8767,10 +8786,15 @@ pub fn build(b: *std.Build) void {
     if (linked_runtime_libraries) {
         var api_runtime_artifact: ?*std.Build.Step.Compile = null;
         var application_runtime_artifact: ?*std.Build.Step.Compile = null;
+        var inference_runtime_artifact: ?*std.Build.Step.Compile = null;
+        var storage_owner_tests: ?*std.Build.Step.Compile = null;
+        var storage_provisioned_owner_tests: ?*std.Build.Step.Compile = null;
+        var storage_data_runtime_owner_tests: ?*std.Build.Step.Compile = null;
         inline for (std.meta.tags(RuntimeLibraryUnit)) |unit| {
             const unit_enabled = unit != .data_pic_probe and unit != .storage_runtime_pic_probe and
                 unit != .application_pic_probe and unit != .control_probe and
-                unit != .cli_pic_probe and
+                unit != .cli_pic_probe and unit != .control_api_probe and
+                (unit != .api_kernel or !storage_kernel_experiment) and
                 (unit != .storage_kernel or storage_kernel_experiment);
             const owns_storage_kernel = unit == .storage_kernel or unit == .data_pic_probe or
                 unit == .storage_runtime_pic_probe or unit == .application_pic_probe or
@@ -8786,7 +8810,13 @@ pub fn build(b: *std.Build) void {
                 .sanitize_thread = sanitize_thread,
                 .pic = if (owns_storage_kernel) true else null,
             });
-            antfly_imports.configure(b, role_mod, false, link_libc);
+            antfly_imports.configureStorageSources(
+                b,
+                role_mod,
+                false,
+                link_libc,
+                storage_kernel_experiment and !owns_storage_kernel,
+            );
             role_mod.addImport("antfly-client", antfly_client_pkg_mod);
             if (owns_storage_kernel) role_mod.addImport("antfly_storage_root", role_mod);
             role_mod.addOptions("runtime_library_options", unit_options);
@@ -8810,6 +8840,7 @@ pub fn build(b: *std.Build) void {
                     .application_pic_probe => "antfly-application-pic-probe",
                     .control_probe => "antfly-control-probe",
                     .cli_pic_probe => "antfly-cli-pic-probe",
+                    .control_api_probe => "antfly-control-api-probe",
                     .distributed => if (storage_kernel_experiment)
                         "antfly-runtime-distributed"
                     else
@@ -8831,6 +8862,7 @@ pub fn build(b: *std.Build) void {
                     .application_pic_probe => 11 * 1024 * 1024 * 1024,
                     .control_probe => 8 * 1024 * 1024 * 1024,
                     .cli_pic_probe => 8 * 1024 * 1024 * 1024,
+                    .control_api_probe => 11 * 1024 * 1024 * 1024,
                     .distributed => 11 * 1024 * 1024 * 1024,
                     .inference => 8 * 1024 * 1024 * 1024,
                 },
@@ -8847,9 +8879,17 @@ pub fn build(b: *std.Build) void {
             // short or later unit from consuming the claim needed by a
             // critical unit and accidentally serializing the long path.
             switch (unit) {
-                .api_kernel => api_runtime_artifact = role_artifact,
-                .distributed => application_runtime_artifact = role_artifact,
-                .inference => role_artifact.step.dependOn(&api_runtime_artifact.?.step),
+                .api_kernel => if (!storage_kernel_experiment) {
+                    api_runtime_artifact = role_artifact;
+                },
+                .distributed => {
+                    application_runtime_artifact = role_artifact;
+                    if (storage_kernel_experiment) api_runtime_artifact = role_artifact;
+                },
+                .inference => {
+                    inference_runtime_artifact = role_artifact;
+                    role_artifact.step.dependOn(&api_runtime_artifact.?.step);
+                },
                 .cli => role_artifact.step.dependOn(&application_runtime_artifact.?.step),
                 else => {},
             }
@@ -8893,6 +8933,14 @@ pub fn build(b: *std.Build) void {
                 );
                 cli_pic_probe_step.dependOn(&install_cli_pic_probe.step);
             }
+            if (unit == .control_api_probe) {
+                const install_control_api_probe = b.addInstallArtifact(role_artifact, .{});
+                const control_api_probe_step = b.step(
+                    "control-api-library-probe",
+                    "Build a combined public API plus distributed-control archive over the opaque storage kernel",
+                );
+                control_api_probe_step.dependOn(&install_control_api_probe.step);
+            }
             if (unit == .storage_kernel and storage_kernel_experiment) {
                 const owner_test_mod = b.createModule(.{
                     .root_source_file = b.path("pkg/antfly/src/storage/kernel_owner_test.zig"),
@@ -8909,6 +8957,7 @@ pub fn build(b: *std.Build) void {
                     },
                 });
                 owner_tests.root_module.linkLibrary(role_artifact);
+                storage_owner_tests = owner_tests;
                 const run_owner_tests = b.addRunArtifact(owner_tests);
                 const owner_test_step = b.step(
                     "storage-kernel-owner-test",
@@ -8922,7 +8971,13 @@ pub fn build(b: *std.Build) void {
                     .optimize = optimize,
                     .link_libc = true,
                 });
-                antfly_imports.configure(b, provisioned_owner_test_mod, true, true);
+                antfly_imports.configureStorageSources(
+                    b,
+                    provisioned_owner_test_mod,
+                    true,
+                    true,
+                    true,
+                );
                 const provisioned_owner_tests = b.addTest(.{
                     .root_module = provisioned_owner_test_mod,
                     .filters = &.{"provisioned batch lookup scan and query share one opaque live storage owner"},
@@ -8932,6 +8987,7 @@ pub fn build(b: *std.Build) void {
                     },
                 });
                 provisioned_owner_tests.root_module.linkLibrary(role_artifact);
+                storage_provisioned_owner_tests = provisioned_owner_tests;
                 const run_provisioned_owner_tests = b.addRunArtifact(provisioned_owner_tests);
                 const provisioned_owner_test_step = b.step(
                     "storage-kernel-provisioned-source-test",
@@ -8950,7 +9006,7 @@ pub fn build(b: *std.Build) void {
                     .optimize = optimize,
                     .link_libc = true,
                 });
-                antfly_imports.configure(b, data_runtime_owner_test_mod, true, true);
+                antfly_imports.configureStorageSources(b, data_runtime_owner_test_mod, true, true, true);
                 const data_runtime_owner_tests = b.addTest(.{
                     .root_module = data_runtime_owner_test_mod,
                     .filters = &.{
@@ -8967,6 +9023,7 @@ pub fn build(b: *std.Build) void {
                     },
                 });
                 data_runtime_owner_tests.root_module.linkLibrary(role_artifact);
+                storage_data_runtime_owner_tests = data_runtime_owner_tests;
                 const run_data_runtime_owner_tests = b.addRunArtifact(data_runtime_owner_tests);
                 const data_runtime_owner_test_step = b.step(
                     "storage-kernel-data-runtime-test",
@@ -8974,11 +9031,13 @@ pub fn build(b: *std.Build) void {
                 );
                 data_runtime_owner_test_step.dependOn(&run_data_runtime_owner_tests.step);
             }
-            if (owns_storage_kernel) {
+            if (owns_storage_kernel or unit == .control_api_probe) {
                 // The executable and C ABI libraries share this one optimized
                 // PIC object. Give the final links enough section granularity
                 // to retain only the C ABI roots in the shared libraries while
                 // the executable retains the runtime entry points as well.
+                // The excluded control/API probe uses the same granularity so
+                // the graph analyzer can attribute remaining cross-unit code.
                 role_artifact.link_function_sections = true;
                 role_artifact.link_data_sections = true;
             }
@@ -8999,6 +9058,20 @@ pub fn build(b: *std.Build) void {
                 defer visited.deinit();
                 setStripRecursively(role_mod, &visited);
             }
+        }
+
+        // These focused suites exercise the storage archive exactly as it is
+        // composed into the final executable. The archive owns standalone and
+        // serverless, whose intentionally external API and embedded-inference
+        // entry points are supplied by their independently generated units.
+        for ([_]?*std.Build.Step.Compile{
+            storage_owner_tests,
+            storage_provisioned_owner_tests,
+            storage_data_runtime_owner_tests,
+        }) |maybe_tests| {
+            const tests = maybe_tests orelse continue;
+            tests.root_module.linkLibrary(api_runtime_artifact.?);
+            tests.root_module.linkLibrary(inference_runtime_artifact.?);
         }
     }
 

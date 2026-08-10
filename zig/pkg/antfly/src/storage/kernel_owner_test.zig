@@ -169,6 +169,9 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
         "{\"inserts\":{\"doc:artifact\":{\"title\":\"artifact\",\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YQ==\"},\"doc:c\":{\"title\":\"gamma\",\"_embeddings\":{\"dense_idx\":[1,0,0]}},\"doc:d\":{\"title\":\"delta\",\"_embeddings\":{\"dense_idx\":[0,1,0]}}},\"sync_level\":\"full_index\"}",
     );
     defer indexed_batch.deinit();
+    var text_memory = try owner.textMemoryJson("docs");
+    defer text_memory.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, text_memory.bytes(), "\"text_indexes\":1") != null);
     var dense_response = try owner.queryJson(
         "docs",
         "{\"embeddings\":{\"dense_idx\":[1,0,0]},\"indexes\":[\"dense_idx\"],\"limit\":2}",
@@ -203,13 +206,45 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     var placement = try owner.artifactOperationJson(
         "docs",
         .update_child_range_placement,
-        "{\"doc_key\":\"doc:artifact\",\"artifact_name\":\"document_units_v1\",\"update\":{\"range_id\":\"range:000000\",\"placement\":\"remote\",\"owner_group_id\":7002,\"placement_generation\":3}}",
+        "{\"doc_key\":\"doc:artifact\",\"artifact_name\":\"document_units_v1\",\"update\":{\"range_id\":\"range:000000\",\"placement\":\"remote\",\"owner_group_id\":7002,\"placement_generation\":3,\"route_status\":\"remote_committed\",\"split_eligible\":true}}",
         null,
         null,
         false,
     );
     defer placement.deinit();
     try std.testing.expect(std.mem.indexOf(u8, placement.bytes(), "\"handled\":true") != null);
+
+    const ChildRangeCapture = struct {
+        calls: usize = 0,
+        owner_group_id: u64 = 0,
+        saw_document: bool = false,
+        saw_artifact: bool = false,
+
+        fn dispatch(
+            ptr: ?*anyopaque,
+            owner_group_id: u64,
+            request_json: abi.BorrowedBytes,
+        ) callconv(.c) abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(ptr orelse return .invalid_argument));
+            self.calls += 1;
+            self.owner_group_id = owner_group_id;
+            self.saw_document = std.mem.indexOf(u8, request_json.slice(), "\"doc_key\":\"doc:artifact\"") != null;
+            self.saw_artifact = std.mem.indexOf(u8, request_json.slice(), "\"artifact_name\":\"document_units_v1\"") != null;
+            return .ok;
+        }
+    };
+    var child_range_capture = ChildRangeCapture{};
+    var routed_batch = try owner.batchJsonWithDocumentChildRangeDispatcher(
+        "docs",
+        "{\"inserts\":{\"doc:artifact\":{\"title\":\"artifact updated\",\"url\":\"data:text/plain;base64,YmV0YQ==\"}},\"sync_level\":\"full_index\"}",
+        &child_range_capture,
+        ChildRangeCapture.dispatch,
+    );
+    defer routed_batch.deinit();
+    try std.testing.expectEqual(@as(usize, 1), child_range_capture.calls);
+    try std.testing.expectEqual(@as(u64, 7002), child_range_capture.owner_group_id);
+    try std.testing.expect(child_range_capture.saw_document);
+    try std.testing.expect(child_range_capture.saw_artifact);
 
     var empty_child_batch = try owner.artifactOperationJson(
         "docs",
@@ -387,16 +422,21 @@ test "opaque storage owner validates ABI and destruction is idempotent" {
     );
 
     var response: abi.OwnedBytes = .{};
+    var invalid_batch_operation: abi.BatchJsonOperationRequest = .{
+        .table_name = .fromSlice("docs"),
+        .request_json = .fromSlice("{}"),
+    };
+    invalid_batch_operation.version = abi.abi_version + 1;
+    try std.testing.expectEqual(
+        abi.Status.invalid_abi,
+        abi.antfly_storage_owner_batch_json(null, &invalid_batch_operation, &response),
+    );
+    try std.testing.expectEqual(@as(u64, 0), response.len);
     var invalid_operation: abi.JsonOperationRequest = .{
         .table_name = .fromSlice("docs"),
         .request_json = .fromSlice("{}"),
     };
     invalid_operation.version = abi.abi_version + 1;
-    try std.testing.expectEqual(
-        abi.Status.invalid_abi,
-        abi.antfly_storage_owner_batch_json(null, &invalid_operation, &response),
-    );
-    try std.testing.expectEqual(@as(u64, 0), response.len);
     var invalid_sync: abi.SyncRequest = .{};
     invalid_sync.version = abi.abi_version + 1;
     try std.testing.expectEqual(
@@ -442,6 +482,12 @@ test "opaque storage owner validates ABI and destruction is idempotent" {
     try std.testing.expectEqual(
         abi.Status.invalid_abi,
         abi.antfly_storage_restore_reconcile(&invalid_restore),
+    );
+    var invalid_restore_bootstrap: abi.RestoreBootstrapRequest = .{};
+    invalid_restore_bootstrap.version = abi.abi_version + 1;
+    try std.testing.expectEqual(
+        abi.Status.invalid_abi,
+        abi.antfly_storage_restore_apply_bootstrap(&invalid_restore_bootstrap),
     );
     try std.testing.expectEqual(
         abi.Status.invalid_abi,
@@ -502,6 +548,8 @@ test "opaque storage owner validates ABI and destruction is idempotent" {
     );
     try std.testing.expectEqual(@as(u64, 0), response.len);
     try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_runtime_status_json(null, &invalid_operation, &response));
+    try std.testing.expectEqual(@as(u64, 0), response.len);
+    try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_restore_state_json(null, &invalid_operation, &response));
     try std.testing.expectEqual(@as(u64, 0), response.len);
 
     try std.testing.expectError(error.InvalidQueryRequest, client.statusToError(.invalid_query));

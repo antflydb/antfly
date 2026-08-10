@@ -22,7 +22,7 @@ const cache_budget = @import("../common/cache_budget.zig");
 const common_secrets = @import("../common/secrets.zig");
 const platform_time = @import("antfly_platform").time;
 const scraping = @import("antfly_scraping");
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = @import("../storage/db/selected_root.zig").db;
 
 pub const max_query_embedding_input_bytes: usize = 1024 * 1024;
 pub const max_query_embedding_template_bytes: usize = 64 * 1024;

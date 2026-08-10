@@ -14,6 +14,8 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
+const storage_source_options = @import("storage_source_options");
+const control_only_storage_sources = storage_source_options.control_only;
 const platform = @import("antfly_platform");
 const platform_sync = @import("antfly_platform").sync;
 const metadata_openapi = @import("antfly_metadata_openapi");
@@ -33,7 +35,10 @@ const raft_mod = @import("../raft/mod.zig");
 const backup_restore = @import("../raft/storage/backup_restore.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const shard_state_store = @import("../data/storage/shard_state_store.zig");
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = if (control_only_storage_sources)
+    @import("../storage/db/control_root.zig")
+else
+    @import("../storage/db/mod.zig");
 const transactions_mod = @import("../storage/transactions.zig");
 const doc_identity = @import("../storage/db/doc_identity.zig");
 const graph_mod = @import("../graph/graph.zig");
@@ -53,6 +58,7 @@ const table_reads = @import("table_reads.zig");
 const storage_snapshot_source = @import("storage_snapshot_source.zig");
 const storage_maintenance_source = @import("storage_maintenance_source.zig");
 const table_write_source = @import("table_write_source.zig");
+const transaction_recovery_source = @import("transaction_recovery_source.zig");
 const table_index_config = @import("table_index_config.zig");
 const table_router = @import("table_router.zig");
 const tables_api = @import("tables.zig");
@@ -61,10 +67,7 @@ const coverage_policy_mod = @import("coverage_policy.zig");
 const query_api = @import("query.zig");
 const runtime_status = @import("runtime_status.zig");
 
-const storage_kernel_experiment = if (@hasDecl(build_options, "storage_kernel_experiment"))
-    @field(build_options, "storage_kernel_experiment")
-else
-    false;
+const storage_kernel_experiment = control_only_storage_sources;
 
 fn publishRuntimeStatusGroupForTest(
     cache: *runtime_status.TableRuntimeSnapshotCache,
@@ -198,35 +201,7 @@ fn consumeTestWriterOpenPersistentDescriptorFailure() bool {
 const dropped_table_trash_dir_name = ".antfly-drop-trash";
 
 fn accumulateTextMemoryAttributionStats(dst: *db_mod.TextMemoryAttributionStats, src: db_mod.TextMemoryAttributionStats) void {
-    dst.text_indexes +|= src.text_indexes;
-    dst.text_segments +|= src.text_segments;
-    dst.text_segment_bytes +|= src.text_segment_bytes;
-    dst.text_mmap_segment_bytes +|= src.text_mmap_segment_bytes;
-    dst.text_heap_segment_bytes +|= src.text_heap_segment_bytes;
-    dst.text_max_segment_bytes = @max(dst.text_max_segment_bytes, src.text_max_segment_bytes);
-    dst.stored_fields_bytes +|= src.stored_fields_bytes;
-    dst.inverted_text_bytes +|= src.inverted_text_bytes;
-    dst.inverted_header_bytes +|= src.inverted_header_bytes;
-    dst.inverted_norm_bytes +|= src.inverted_norm_bytes;
-    dst.inverted_term_dict_bytes +|= src.inverted_term_dict_bytes;
-    dst.inverted_term_block_bytes +|= src.inverted_term_block_bytes;
-    dst.inverted_term_index_bytes +|= src.inverted_term_index_bytes;
-    dst.inverted_fst_bytes +|= src.inverted_fst_bytes;
-    dst.inverted_bloom_bytes +|= src.inverted_bloom_bytes;
-    dst.inverted_postings_bytes +|= src.inverted_postings_bytes;
-    dst.inverted_postings_header_bytes +|= src.inverted_postings_header_bytes;
-    dst.inverted_block_max_bytes +|= src.inverted_block_max_bytes;
-    dst.inverted_chunk_meta_bytes +|= src.inverted_chunk_meta_bytes;
-    dst.inverted_postings_payload_bytes +|= src.inverted_postings_payload_bytes;
-    dst.inverted_positions_bytes +|= src.inverted_positions_bytes;
-    dst.inverted_skip_bytes +|= src.inverted_skip_bytes;
-    dst.inverted_one_hit_terms +|= src.inverted_one_hit_terms;
-    dst.inverted_postings_terms +|= src.inverted_postings_terms;
-    dst.typed_doc_values_bytes +|= src.typed_doc_values_bytes;
-    dst.doc_ordinals_bytes +|= src.doc_ordinals_bytes;
-    dst.section_index_bytes +|= src.section_index_bytes;
-    dst.configured_lmdb_main_map_bytes +|= src.configured_lmdb_main_map_bytes;
-    dst.configured_lmdb_wal_map_bytes +|= src.configured_lmdb_wal_map_bytes;
+    dst.accumulate(src);
 }
 
 test "full text memory attribution aggregation includes norm bytes" {
@@ -841,6 +816,21 @@ fn deleteGroupPathIfPresent(
     try std.Io.Dir.cwd().deleteTree(io_impl.io(), path);
 }
 
+const PromotionLeadershipSourceContract = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        is_local_leader: *const fn (ptr: *anyopaque, group_id: u64) bool,
+    };
+
+    pub fn isLocalLeader(self: PromotionLeadershipSourceContract, group_id: u64) bool {
+        return self.vtable.is_local_leader(self.ptr, group_id);
+    }
+};
+
+pub const PromotionLeadershipSource = PromotionLeadershipSourceContract;
+
 pub const ProvisionedTableWriteCache = struct {
     const TableEvictionHook = struct {
         ptr: *anyopaque,
@@ -869,7 +859,7 @@ pub const ProvisionedTableWriteCache = struct {
     /// Source-group leadership predicate for promotion ownership. When set, each
     /// managed DB gets a group-specific `PromotionOwner` so only the local leader
     /// promotes resolution replay into cross-shard entity writes.
-    promotion_leadership_source: ?PromotionLeadershipSource = null,
+    promotion_leadership_source: ?PromotionLeadershipSourceContract = null,
     /// Optional HA ownership gate applied when this cache opens managed writer
     /// DBs. Changing the gate retires live cached DBs so the next operation
     /// reopens with the correct primary/standby role and background runtimes.
@@ -1103,22 +1093,11 @@ pub const ProvisionedTableWriteCache = struct {
         entry.managed_config_fingerprint = managedConfigFingerprint(indexes_json);
     }
 
-    pub const PromotionLeadershipSource = struct {
-        ptr: *anyopaque,
-        vtable: *const VTable,
-
-        pub const VTable = struct {
-            is_local_leader: *const fn (ptr: *anyopaque, group_id: u64) bool,
-        };
-
-        pub fn isLocalLeader(self: PromotionLeadershipSource, group_id: u64) bool {
-            return self.vtable.is_local_leader(self.ptr, group_id);
-        }
-    };
+    pub const PromotionLeadershipSource = PromotionLeadershipSourceContract;
 
     const PromotionOwnerState = struct {
         group_id: u64 = 0,
-        leadership_source: ?PromotionLeadershipSource = null,
+        leadership_source: ?PromotionLeadershipSourceContract = null,
 
         fn owner(self: *PromotionOwnerState) ?db_mod.PromotionOwner {
             if (self.leadership_source == null) return null;
@@ -1214,7 +1193,7 @@ pub const ProvisionedTableWriteCache = struct {
         return a.?.ptr == b.?.ptr and a.?.vtable == b.?.vtable;
     }
 
-    fn promotionLeadershipSourcesEqual(a: ?PromotionLeadershipSource, b: ?PromotionLeadershipSource) bool {
+    fn promotionLeadershipSourcesEqual(a: ?PromotionLeadershipSourceContract, b: ?PromotionLeadershipSourceContract) bool {
         if (a == null or b == null) return a == null and b == null;
         return a.?.ptr == b.?.ptr and a.?.vtable == b.?.vtable;
     }
@@ -1293,7 +1272,7 @@ pub const ProvisionedTableWriteCache = struct {
         self: *const ProvisionedTableWriteCache,
         candidate_source: ?db_mod.CandidateSource,
         entity_sink_value: ?db_mod.EntitySink,
-        leadership_source: ?PromotionLeadershipSource,
+        leadership_source: ?PromotionLeadershipSourceContract,
     ) bool {
         return candidateSourcesEqual(self.resolution_candidate_source, candidate_source) and
             entitySinksEqual(self.entity_sink, entity_sink_value) and
@@ -1304,7 +1283,7 @@ pub const ProvisionedTableWriteCache = struct {
         self: *ProvisionedTableWriteCache,
         candidate_source: ?db_mod.CandidateSource,
         entity_sink_value: ?db_mod.EntitySink,
-        leadership_source: ?PromotionLeadershipSource,
+        leadership_source: ?PromotionLeadershipSourceContract,
     ) void {
         if (self.runtimeHooksEqual(candidate_source, entity_sink_value, leadership_source)) return;
         self.resolution_candidate_source = candidate_source;
@@ -1329,7 +1308,7 @@ pub const ProvisionedTableWriteCache = struct {
         self.refreshRuntimeHooksLocked();
     }
 
-    pub fn setPromotionLeadershipSource(self: *ProvisionedTableWriteCache, source: ?PromotionLeadershipSource) void {
+    pub fn setPromotionLeadershipSource(self: *ProvisionedTableWriteCache, source: ?PromotionLeadershipSourceContract) void {
         lockAtomic(&self.open_mutex);
         defer self.open_mutex.unlock();
         if (promotionLeadershipSourcesEqual(self.promotion_leadership_source, source)) return;
@@ -3390,6 +3369,9 @@ var hosted_managed_db_cache_registry_mutex: std.atomic.Mutex = .unlocked;
 var hosted_managed_db_cache_registry: std.ArrayListUnmanaged(*HostedManagedDbCache) = .empty;
 
 pub fn closeHostedManagedDbCacheForRoot(replica_root_dir: []const u8) void {
+    // Control-only runtime units never instantiate the legacy physical hosted
+    // DB cache; their lifecycle is owned by ProvisionedKernelOwnerSource.
+    if (comptime control_only_storage_sources) return;
     const alloc = std.heap.page_allocator;
     var removed: ?*HostedManagedDbCache = null;
     lockAtomic(&hosted_managed_db_cache_registry_mutex);
@@ -3440,6 +3422,16 @@ fn hostedManagedDbCacheForRootIfPresent(replica_root_dir: []const u8) ?*HostedMa
 }
 
 pub fn hostedManagedDbCacheDiagnosticsForRoot(replica_root_dir: []const u8) HostedManagedDbCacheDiagnostics {
+    if (comptime control_only_storage_sources) {
+        lockAtomic(&hosted_managed_db_cache_registry_mutex);
+        defer hosted_managed_db_cache_registry_mutex.unlock();
+        const cached_roots: u64 = @intCast(hosted_managed_db_cache_registry.items.len);
+        for (hosted_managed_db_cache_registry.items) |selected| {
+            if (std.mem.eql(u8, selected.replica_root_dir, replica_root_dir))
+                return .{ .present = true, .cached_roots = cached_roots };
+        }
+        return .{ .cached_roots = cached_roots };
+    }
     lockAtomic(&hosted_managed_db_cache_registry_mutex);
     defer hosted_managed_db_cache_registry_mutex.unlock();
     const cached_roots: u64 = @intCast(hosted_managed_db_cache_registry.items.len);
@@ -4664,7 +4656,7 @@ pub const ProvisionedTableWriteSource = struct {
     remote_content: ?*const scraping.RemoteContentConfig = null,
     resolution_candidate_source: ?db_mod.CandidateSource = null,
     entity_sink: ?db_mod.EntitySink = null,
-    promotion_leadership_source: ?ProvisionedTableWriteCache.PromotionLeadershipSource = null,
+    promotion_leadership_source: ?PromotionLeadershipSource = null,
     ha_write_gate: ?db_mod.HAWriteGate = null,
     ha_async_mirror: ?db_mod.HAAsyncEffectMirror = null,
     dirty_write_tables_mutex: std.atomic.Mutex = .unlocked,
@@ -5030,7 +5022,7 @@ pub const ProvisionedTableWriteSource = struct {
 
     pub fn withPromotionLeadershipSource(
         self: *ProvisionedTableWriteSource,
-        leadership_source: ?ProvisionedTableWriteCache.PromotionLeadershipSource,
+        leadership_source: ?PromotionLeadershipSource,
     ) *ProvisionedTableWriteSource {
         self.promotion_leadership_source = leadership_source;
         self.syncRuntimeHooksToCaches();
@@ -5041,6 +5033,11 @@ pub const ProvisionedTableWriteSource = struct {
         self: *ProvisionedTableWriteSource,
         gate: ?db_mod.HAWriteGate,
     ) !*ProvisionedTableWriteSource {
+        if (comptime control_only_storage_sources) {
+            self.ha_write_gate = gate;
+            self.resetCachedVisibilityAfterOwnershipChange();
+            return self;
+        }
         var locks = WriteCacheTransitionLocks.init(self, true, true);
         defer locks.deinit();
         const changed = !ProvisionedTableWriteCache.haWriteGatesEqual(self.ha_write_gate, gate);
@@ -5060,6 +5057,7 @@ pub const ProvisionedTableWriteSource = struct {
     /// standby, so even a manually assembled cache that predates the normal
     /// entry-install invariant fails before any irreversible HA mutation.
     pub fn prepareHAConfigTransition(self: *ProvisionedTableWriteSource) !void {
+        if (comptime control_only_storage_sources) return;
         var locks = WriteCacheTransitionLocks.init(self, true, true);
         defer locks.deinit();
         try locks.reserveClearCapacity();
@@ -5069,6 +5067,11 @@ pub const ProvisionedTableWriteSource = struct {
         self: *ProvisionedTableWriteSource,
         mirror: ?db_mod.HAAsyncEffectMirror,
     ) !*ProvisionedTableWriteSource {
+        if (comptime control_only_storage_sources) {
+            self.ha_async_mirror = mirror;
+            self.resetCachedVisibilityAfterOwnershipChange();
+            return self;
+        }
         var locks = WriteCacheTransitionLocks.init(self, true, true);
         defer locks.deinit();
         const changed = !ProvisionedTableWriteCache.haAsyncMirrorsEqual(self.ha_async_mirror, mirror);
@@ -5091,6 +5094,11 @@ pub const ProvisionedTableWriteSource = struct {
         self: *ProvisionedTableWriteSource,
         mirror: ?db_mod.HAAsyncEffectMirror,
     ) *ProvisionedTableWriteSource {
+        if (comptime control_only_storage_sources) {
+            self.ha_async_mirror = mirror;
+            self.resetCachedVisibilityAfterOwnershipChange();
+            return self;
+        }
         var locks = WriteCacheTransitionLocks.init(self, true, true);
         defer locks.deinit();
         const changed = !ProvisionedTableWriteCache.haAsyncMirrorsEqual(self.ha_async_mirror, mirror);
@@ -5109,12 +5117,15 @@ pub const ProvisionedTableWriteSource = struct {
         // A role/mirror transition retires every local writer authority at
         // once. Invalidate both observation planes only after the caches have
         // drained so no pre-transition status can be served as current.
-        if (self.read_cache) |cache| cache.clear();
+        if (comptime !control_only_storage_sources) {
+            if (self.read_cache) |cache| cache.clear();
+        }
         if (self.runtime_status_cache) |cache| cache.clear();
         self.clearAllDirtyWriteTables();
     }
 
     fn syncRuntimeHooksToCaches(self: *ProvisionedTableWriteSource) void {
+        if (comptime control_only_storage_sources) return;
         if (self.write_cache) |cache| self.syncRuntimeHooksToCache(cache);
         if (self.startup_write_cache) |cache| {
             if (self.write_cache != cache) self.syncRuntimeHooksToCache(cache);
@@ -5156,18 +5167,81 @@ pub const ProvisionedTableWriteSource = struct {
         return self;
     }
 
-    pub const StorageOwnerTransactionRecoveryOptions = struct {
-        enabled: bool = false,
-        lease_owned: bool = false,
-        replicated_metadata: bool = false,
-        owner_id: []const u8 = "provisioned-2pc",
-        interval_ms: u64 = 5_000,
-        cutoff_ns: u64 = 5 * std.time.ns_per_min,
-    };
+    pub const StorageOwnerTransactionRecoveryOptions = transaction_recovery_source.Options;
+
+    pub fn transactionRecoverySource(self: *ProvisionedTableWriteSource) transaction_recovery_source.Source {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .options = transactionRecoveryOptionsAdapter,
+                .owns = transactionRecoveryOwnsAdapter,
+                .resolve = transactionRecoveryResolveAdapter,
+                .acknowledge = transactionRecoveryAcknowledgeAdapter,
+                .cleanup = transactionRecoveryCleanupAdapter,
+            },
+        };
+    }
+
+    fn transactionRecoveryOptionsAdapter(ptr: *anyopaque) transaction_recovery_source.Options {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        return self.storageOwnerTransactionRecoveryOptions();
+    }
+
+    fn transactionRecoveryOwnsAdapter(ptr: *anyopaque, owner_participant: []const u8) bool {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        return self.storageOwnerOwnsTransactionRecovery(owner_participant);
+    }
+
+    fn transactionRecoveryResolveAdapter(
+        ptr: *anyopaque,
+        txn_id: db_mod.types.TxnId,
+        participant: []const u8,
+        status: db_mod.types.TxnStatus,
+        commit_version: u64,
+    ) !void {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        return self.storageOwnerResolveRecoveryParticipant(txn_id, participant, status, commit_version);
+    }
+
+    fn transactionRecoveryAcknowledgeAdapter(
+        ptr: *anyopaque,
+        txn_id: db_mod.types.TxnId,
+        owner_participant: []const u8,
+        participant: []const u8,
+    ) !void {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        return self.storageOwnerAcknowledgeRecoveryParticipant(txn_id, owner_participant, participant);
+    }
+
+    fn transactionRecoveryCleanupAdapter(
+        ptr: *anyopaque,
+        txn_id: db_mod.types.TxnId,
+        owner_participant: []const u8,
+        cutoff_timestamp: u64,
+        retained_cutoff_timestamp: u64,
+    ) !void {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        return self.storageOwnerCleanupRecoveryTransaction(
+            txn_id,
+            owner_participant,
+            cutoff_timestamp,
+            retained_cutoff_timestamp,
+        );
+    }
 
     pub fn storageOwnerTransactionRecoveryOptions(
         self: *ProvisionedTableWriteSource,
     ) StorageOwnerTransactionRecoveryOptions {
+        if (comptime control_only_storage_sources) {
+            const backend_runtime = self.backend_runtime orelse return .{};
+            if (backend_runtime.io() == null or self.quiesced) return .{};
+            const replicated = self.raft_batcher != null;
+            return .{
+                .enabled = true,
+                .lease_owned = !replicated,
+                .replicated_metadata = replicated,
+            };
+        }
         const cfg = self.transactionRecoveryConfig();
         return .{
             .enabled = cfg.enabled,
@@ -5272,7 +5346,11 @@ pub const ProvisionedTableWriteSource = struct {
             });
             return;
         }
-        _ = (try self.source().txnResolveGroupLocal(
+        const local_source = if (comptime control_only_storage_sources)
+            self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable
+        else
+            self.source();
+        _ = (try local_source.txnResolveGroupLocal(
             alloc,
             ref.group_id,
             ref.table_name,
@@ -5469,6 +5547,10 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn abortAllKernelBulkSessions(self: *ProvisionedTableWriteSource) void {
+        // Physical/test sources never create opaque kernel bulk sessions. In
+        // those units the cache and its mutex may already have been destroyed
+        // before this borrowed write source is torn down.
+        if (comptime !control_only_storage_sources) return;
         const alloc = std.heap.page_allocator;
         while (true) {
             lockAtomic(&self.local_db_mutex);
@@ -5552,6 +5634,13 @@ pub const ProvisionedTableWriteSource = struct {
         group_id: u64,
         table_name: []const u8,
     ) !void {
+        if (comptime control_only_storage_sources) {
+            const local_source = self.groupLocalWriteSource() orelse
+                return error.StorageKernelOwnerUnavailable;
+            _ = (try local_source.preflightWriteAdmissionGroupLocal(group_id, table_name)) orelse
+                return error.StorageKernelOwnerUnavailable;
+            return;
+        }
         if (self.local_write_owner) |owner| return owner.preflightDenseRepairWriteAdmission(group_id, table_name);
 
         const write_manager = if (self.write_cache) |cache| cache.resource_manager else null;
@@ -6387,11 +6476,13 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn drainWriteCachePendingCloses(self: *ProvisionedTableWriteSource) void {
+        if (comptime control_only_storage_sources) return;
         if (self.write_cache) |cache| cache.drainPendingCloses();
         if (self.startup_write_cache) |cache| cache.drainPendingCloses();
     }
 
     fn drainWriteCachePendingClosesForGroups(self: *ProvisionedTableWriteSource, table_name: []const u8, group_ids: []const u64) void {
+        if (comptime control_only_storage_sources) return;
         for (group_ids) |group_id| {
             if (self.write_cache) |cache| cache.drainPendingClosesForGroupTable(group_id, table_name);
             if (self.startup_write_cache) |cache| cache.drainPendingClosesForGroupTable(group_id, table_name);
@@ -6531,7 +6622,9 @@ pub const ProvisionedTableWriteSource = struct {
 
         var read_cache_exclusive = try self.beginReadCacheExclusive(table_name);
         errdefer {
-            if (read_cache_exclusive) |*exclusive| exclusive.deinit();
+            if (comptime !control_only_storage_sources) {
+                if (read_cache_exclusive) |*exclusive| exclusive.deinit();
+            }
         }
 
         lockAtomic(&self.local_db_mutex);
@@ -6553,7 +6646,9 @@ pub const ProvisionedTableWriteSource = struct {
         errdefer self.endStructuralTableActivity(table_name);
 
         var read_cache_exclusive = try self.beginReadCacheExclusive(table_name);
-        errdefer if (read_cache_exclusive) |*exclusive| exclusive.deinit();
+        errdefer if (comptime !control_only_storage_sources) {
+            if (read_cache_exclusive) |*exclusive| exclusive.deinit();
+        };
 
         lockAtomic(&self.local_db_mutex);
         self.invalidateWriteCache(table_name);
@@ -6620,7 +6715,19 @@ pub const ProvisionedTableWriteSource = struct {
         group_id: u64,
     ) !LocalGroupGenerationTransition {
         var read_cache_exclusive = try self.beginReadCacheGroupExclusive(group_id);
-        errdefer if (read_cache_exclusive) |*exclusive| exclusive.deinit();
+        errdefer if (comptime !control_only_storage_sources) {
+            if (read_cache_exclusive) |*exclusive| exclusive.deinit();
+        };
+
+        if (comptime control_only_storage_sources) {
+            self.invalidateRuntimeStatusCache(table_name);
+            return .{
+                .source = self,
+                .table_name = table_name,
+                .group_id = group_id,
+                .read_cache_exclusive = read_cache_exclusive,
+            };
+        }
 
         lockAtomic(&self.local_db_mutex);
         errdefer self.local_db_mutex.unlock();
@@ -6637,11 +6744,21 @@ pub const ProvisionedTableWriteSource = struct {
         };
     }
 
+    const ReadCacheExclusiveGroupAccess = if (control_only_storage_sources)
+        struct {}
+    else
+        table_reads.ProvisionedTableReadCache.ExclusiveGroupAccess;
+
+    const ReadCacheExclusiveTableAccess = if (control_only_storage_sources)
+        struct {}
+    else
+        table_reads.ProvisionedTableReadCache.ExclusiveTableAccess;
+
     const LocalGroupGenerationTransition = struct {
         source: *ProvisionedTableWriteSource,
         table_name: []const u8,
         group_id: u64,
-        read_cache_exclusive: ?table_reads.ProvisionedTableReadCache.ExclusiveGroupAccess = null,
+        read_cache_exclusive: ?ReadCacheExclusiveGroupAccess = null,
         preparation_open: bool = true,
 
         fn finishMutation(self: *@This()) void {
@@ -6668,9 +6785,11 @@ pub const ProvisionedTableWriteSource = struct {
         }
 
         fn releaseReadExclusive(self: *@This()) void {
-            if (self.read_cache_exclusive) |*exclusive| {
-                exclusive.deinit();
-                self.read_cache_exclusive = null;
+            if (comptime !control_only_storage_sources) {
+                if (self.read_cache_exclusive) |*exclusive| {
+                    exclusive.deinit();
+                    self.read_cache_exclusive = null;
+                }
             }
         }
     };
@@ -6678,7 +6797,7 @@ pub const ProvisionedTableWriteSource = struct {
     const LocalTableGenerationTransition = struct {
         source: *ProvisionedTableWriteSource,
         table_name: []const u8,
-        read_cache_exclusive: ?table_reads.ProvisionedTableReadCache.ExclusiveTableAccess = null,
+        read_cache_exclusive: ?ReadCacheExclusiveTableAccess = null,
         mutation_open: bool = true,
 
         fn finishMutation(self: *@This()) void {
@@ -6709,9 +6828,11 @@ pub const ProvisionedTableWriteSource = struct {
         }
 
         fn releaseReadExclusive(self: *@This()) void {
-            if (self.read_cache_exclusive) |*exclusive| {
-                exclusive.deinit();
-                self.read_cache_exclusive = null;
+            if (comptime !control_only_storage_sources) {
+                if (self.read_cache_exclusive) |*exclusive| {
+                    exclusive.deinit();
+                    self.read_cache_exclusive = null;
+                }
             }
         }
     };
@@ -7370,13 +7491,16 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn invalidateReadCache(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        if (self.read_cache) |cache| cache.invalidateTable(table_name);
+        if (comptime !control_only_storage_sources) {
+            if (self.read_cache) |cache| cache.invalidateTable(table_name);
+        }
     }
 
     fn beginReadCacheExclusive(
         self: *ProvisionedTableWriteSource,
         table_name: []const u8,
-    ) !?table_reads.ProvisionedTableReadCache.ExclusiveTableAccess {
+    ) !?ReadCacheExclusiveTableAccess {
+        if (comptime control_only_storage_sources) return null;
         const cache = self.read_cache orelse return null;
         return try cache.beginExclusiveTableAccess(table_name);
     }
@@ -7384,12 +7508,21 @@ pub const ProvisionedTableWriteSource = struct {
     fn beginReadCacheGroupExclusive(
         self: *ProvisionedTableWriteSource,
         group_id: u64,
-    ) !?table_reads.ProvisionedTableReadCache.ExclusiveGroupAccess {
+    ) !?ReadCacheExclusiveGroupAccess {
+        if (comptime control_only_storage_sources) return null;
         const cache = self.read_cache orelse return null;
         return try cache.beginExclusiveGroupAccess(group_id);
     }
 
     fn invalidateWriteCacheForTable(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
+        if (comptime control_only_storage_sources) {
+            // The compiled storage owner is retired by the coarse operation
+            // that publishes the replacement generation. Distributed control
+            // has no physical DB cache to walk after that handoff; it only
+            // owns the visibility debt associated with the old generation.
+            self.clearDirtyWriteTable(table_name);
+            return;
+        }
         lockAtomic(&self.local_db_mutex);
         if (self.write_cache) |cache| cache.invalidateTable(table_name);
         self.local_db_mutex.unlock();
@@ -7401,6 +7534,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn invalidateSharedPathCaches(self: *ProvisionedTableWriteSource, path: []const u8) void {
+        if (comptime control_only_storage_sources) return;
         var write_lsm_cache: ?*lsm_backend.Cache = null;
         var startup_lsm_cache: ?*lsm_backend.Cache = null;
         var write_hbc_cache: ?*hbc_mod.Cache = null;
@@ -7641,6 +7775,10 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn invalidateWriteCache(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
+        if (comptime control_only_storage_sources) {
+            self.clearDirtyWriteTable(table_name);
+            return;
+        }
         _ = self.publishWriteCacheStatusBeforeInvalidate(table_name);
         self.detachWriteCacheVisibilityHooksBeforeInvalidate(table_name);
         if (self.write_cache) |cache| cache.invalidateTable(table_name);
@@ -7719,6 +7857,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     pub fn pruneStaleWriteCacheLocked(self: *ProvisionedTableWriteSource) void {
+        if (comptime control_only_storage_sources) return;
         const pruneCache = struct {
             fn run(write_source: *ProvisionedTableWriteSource, cache: *ProvisionedTableWriteCache) void {
                 var i: usize = 0;
@@ -7780,6 +7919,30 @@ pub const ProvisionedTableWriteSource = struct {
         ranges: []const metadata_table_manager.RangeRecord,
         backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
     ) !metadata_table_provisioner.ProvisionSummary {
+        if (comptime control_only_storage_sources) {
+            const local_source = self.groupLocalWriteSource() orelse
+                return error.StorageKernelOwnerUnavailable;
+            var summary: metadata_table_provisioner.ProvisionSummary = .{};
+            for (hosted_group_ids) |group_id| {
+                if (group_id == metadata_group_id) continue;
+                const range = findRangeRecord(ranges, group_id) orelse continue;
+                const table = findTableRecord(tables, range.table_id) orelse continue;
+                summary.groups_considered += 1;
+                const result = (try local_source.reconcileTableGroupLocal(
+                    group_id,
+                    table.name,
+                    null,
+                    false,
+                )) orelse return error.StorageKernelOwnerUnavailable;
+                summary.indexes_added += @intCast(result.indexes_added);
+                summary.indexes_removed += @intCast(result.indexes_removed);
+                summary.indexes_pending += @intCast(result.indexes_pending);
+                if (result.indexes_pending != 0) {
+                    self.notifyLocalIndexRepairDebt(table.name, group_id, .enqueue);
+                }
+            }
+            return summary;
+        }
         const cache = self.write_cache orelse return try metadata_table_provisioner.reconcileReplicaRootWithOptions(
             alloc,
             self.replica_root_dir,
@@ -7896,6 +8059,7 @@ pub const ProvisionedTableWriteSource = struct {
         dest: *ProvisionedTableWriteSource,
         table_name: []const u8,
     ) !usize {
+        if (comptime control_only_storage_sources) return 0;
         if (self == dest) return 0;
         const source_cache = self.write_cache orelse return 0;
         const dest_cache = dest.write_cache orelse return 0;
@@ -7927,6 +8091,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     pub fn clearStartupWriteCache(self: *ProvisionedTableWriteSource) !void {
+        if (comptime control_only_storage_sources) return;
         var locks = WriteCacheTransitionLocks.init(self, false, true);
         defer locks.deinit();
         try locks.reserveClearCapacity();
@@ -7935,6 +8100,10 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     pub fn clearWriteCache(self: *ProvisionedTableWriteSource) !void {
+        if (comptime control_only_storage_sources) {
+            self.clearAllDirtyWriteTables();
+            return;
+        }
         var locks = WriteCacheTransitionLocks.init(self, true, true);
         defer locks.deinit();
         try locks.reserveClearCapacity();
@@ -8164,6 +8333,11 @@ pub const ProvisionedTableWriteSource = struct {
         lsm_root_generation: u64,
         table_name: []const u8,
     ) !?[]u8 {
+        if (comptime control_only_storage_sources) {
+            const local_source = self.groupLocalWriteSource() orelse
+                return error.StorageKernelOwnerUnavailable;
+            return try local_source.findMedianKeyGroupLocal(alloc, group_id, table_name);
+        }
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
 
@@ -8252,6 +8426,33 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         metadata: StartupCatchUpMetadata,
     ) !StartupCatchUpResult {
+        if (comptime control_only_storage_sources) {
+            const local_source = self.groupLocalWriteSource() orelse
+                return error.StorageKernelOwnerUnavailable;
+            const result = (try local_source.reconcileTableGroupLocalTransient(
+                group_id,
+                table_name,
+                metadata.target_index_name,
+                metadata.advance_index_repairs,
+            )) orelse return error.StorageKernelOwnerUnavailable;
+            const progressed = result.indexes_added != 0 or
+                result.indexes_removed != 0 or
+                result.repair_attempted != 0 or
+                result.repair_repaired != 0;
+            return .{
+                .had_debt = result.state != .complete or progressed,
+                .cleared_debt = result.state == .complete and progressed,
+                .terminal_degraded = result.state == .degraded,
+                .busy = result.state == .busy,
+                .made_progress = progressed,
+                .index_repair_pending = result.state == .repair_pending or result.repair_remaining != 0,
+                .index_repair_attempted = result.repair_attempted != 0,
+                .index_repair_repaired = result.repair_repaired != 0,
+                .index_repair_degraded = result.state == .degraded or result.repair_terminal != 0,
+                .index_repair_disk_wait = result.repair_disk_waits != 0,
+                .index_repair_retry_at_ms = result.next_retry_at_ms,
+            };
+        }
         if (self.local_write_owner) |owner| {
             return try owner.catchUpTableGroupBestEffortWithMetadata(alloc, group_id, table_name, metadata);
         }
@@ -8946,6 +9147,16 @@ pub const ProvisionedTableWriteSource = struct {
         alloc: std.mem.Allocator,
         table_name: []const u8,
     ) void {
+        if (comptime control_only_storage_sources) {
+            const snapshot_cache = self.runtime_status_cache orelse return;
+            const owner = self.local_write_source orelse return;
+            var statuses = (owner.localRuntimeStatuses(alloc, table_name) catch return) orelse return;
+            defer statuses.deinit(alloc);
+            const token = snapshot_cache.capturePublicationToken(table_name) catch return;
+            _ = snapshot_cache.publishGroups(token, table_name, statuses.items) catch return;
+            self.clearDirtyWriteTable(table_name);
+            return;
+        }
         // Status is derived observability state. Never queue it behind a
         // structural transition: callers can already hold a table request or
         // group operation, and re-entering writer-preferring admission while a
@@ -9079,7 +9290,7 @@ pub const ProvisionedTableWriteSource = struct {
         return cache.bulkIngestSessionOpenForTable(table_name);
     }
 
-    pub const ManagedWriterGroupProbe = union(enum) {
+    const PhysicalManagedWriterGroupProbe = union(enum) {
         absent,
         unknown,
         leased: ProvisionedTableWriteCache.CachedDb,
@@ -9096,11 +9307,27 @@ pub const ProvisionedTableWriteSource = struct {
         }
     };
 
+    const ControlManagedWriterGroupProbe = union(enum) {
+        absent,
+        unknown,
+        leased: void,
+
+        pub fn deinit(self: *@This()) void {
+            self.* = .absent;
+        }
+    };
+
+    pub const ManagedWriterGroupProbe = if (control_only_storage_sources)
+        ControlManagedWriterGroupProbe
+    else
+        PhysicalManagedWriterGroupProbe;
+
     pub fn probeManagedWriterGroupBestEffort(
         self: *ProvisionedTableWriteSource,
         table_name: []const u8,
         group_id: u64,
     ) ManagedWriterGroupProbe {
+        if (comptime control_only_storage_sources) return .unknown;
         if (!self.local_db_mutex.tryLock()) return .unknown;
         const lsm_root_generation = self.visibleRootGeneration(group_id);
         var leased: ?ProvisionedTableWriteCache.CachedDb = null;
@@ -9139,6 +9366,15 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         group_id: u64,
     ) !?runtime_status.LocalTableRuntimeStatus {
+        if (comptime control_only_storage_sources) {
+            const local_source = self.local_write_source orelse return null;
+            var statuses = (try local_source.localRuntimeStatuses(alloc, table_name)) orelse return null;
+            defer statuses.deinit(alloc);
+            for (statuses.items) |status| {
+                if (status.group_id == group_id) return try status.clone(alloc);
+            }
+            return null;
+        }
         return switch (self.probeManagedWriterGroupBestEffort(table_name, group_id)) {
             .absent, .unknown => null,
             .leased => |cached| blk: {
@@ -9183,6 +9419,7 @@ pub const ProvisionedTableWriteSource = struct {
         group_id: u64,
         status: *runtime_status.LocalTableRuntimeStatus,
     ) void {
+        if (comptime control_only_storage_sources) return;
         switch (self.probeManagedWriterGroupBestEffort(table_name, group_id)) {
             .absent, .unknown => {},
             .leased => |cached| {
@@ -9667,6 +9904,10 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     pub fn lsmMaintenanceStats(self: *ProvisionedTableWriteSource) lsm_backend.Backend.MaintenanceStats {
+        if (comptime control_only_storage_sources) {
+            if (self.runtime_status_cache) |snapshot_cache| return snapshot_cache.summary().lsm_storage.maintenance;
+            return .{};
+        }
         lockAtomic(&self.local_db_mutex);
         defer self.local_db_mutex.unlock();
         var stats = lsm_backend.Backend.MaintenanceStats{};
@@ -9679,6 +9920,10 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     pub fn lsmMaintenanceStatsBestEffort(self: *ProvisionedTableWriteSource) lsm_backend.Backend.MaintenanceStats {
+        if (comptime control_only_storage_sources) {
+            if (self.runtime_status_cache) |snapshot_cache| return snapshot_cache.summary().lsm_storage.maintenance;
+            return .{};
+        }
         if (!self.local_db_mutex.tryLock()) return .{};
         defer self.local_db_mutex.unlock();
         var stats = lsm_backend.Backend.MaintenanceStats{};
@@ -9693,6 +9938,10 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     pub fn lsmWriteStatsBestEffort(self: *ProvisionedTableWriteSource) lsm_backend.Backend.WriteStats {
+        if (comptime control_only_storage_sources) {
+            if (self.runtime_status_cache) |snapshot_cache| return snapshot_cache.summary().lsm_storage.write;
+            return .{};
+        }
         if (!self.local_db_mutex.tryLock()) return .{};
         defer self.local_db_mutex.unlock();
         var stats = lsm_backend.Backend.WriteStats{};
@@ -9711,6 +9960,7 @@ pub const ProvisionedTableWriteSource = struct {
         // Sampling it directly keeps process-wide admission pressure visible
         // while the table cache is empty or its state lock is contended.
         if (self.backend_runtime) |runtime| return runtime.snapshotNativeStorageStats();
+        if (comptime control_only_storage_sources) return null;
 
         // Standalone callers may not bind a backend runtime. Preserve their
         // legacy per-DB fallback while a cache entry is available.
@@ -9747,6 +9997,10 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     pub fn asyncIndexingStatsBestEffort(self: *ProvisionedTableWriteSource) db_mod.types.AsyncIndexingStats {
+        if (comptime control_only_storage_sources) {
+            if (self.runtime_status_cache) |snapshot_cache| return snapshot_cache.summary().async_indexing;
+            return .{};
+        }
         const startup_active = self.startup_catch_up_active.load(.monotonic);
         if (!self.local_db_mutex.tryLock()) {
             if (self.runtime_status_cache) |snapshot_cache| return snapshot_cache.summary().async_indexing;
@@ -9783,6 +10037,10 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     pub fn textMemoryAttributionStatsBestEffort(self: *ProvisionedTableWriteSource) db_mod.TextMemoryAttributionStats {
+        if (comptime control_only_storage_sources) {
+            if (self.local_write_source) |write_source| return write_source.textMemoryAttributionStatsBestEffort();
+            return .{};
+        }
         if (!self.local_db_mutex.tryLock()) return .{};
         defer self.local_db_mutex.unlock();
         const cache = self.write_cache orelse return .{};
@@ -9795,6 +10053,10 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     pub fn textMergeStatsBestEffort(self: *ProvisionedTableWriteSource) db_mod.types.TextMergeStats {
+        if (comptime control_only_storage_sources) {
+            if (self.runtime_status_cache) |snapshot_cache| return snapshot_cache.summary().text_merge;
+            return .{};
+        }
         if (!self.local_db_mutex.tryLock()) {
             if (self.runtime_status_cache) |snapshot_cache| return snapshot_cache.summary().text_merge;
             return .{};
@@ -12756,6 +13018,14 @@ pub const ProvisionedTableWriteSource = struct {
         group: GroupBatch,
         req: db_mod.types.BatchRequest,
     ) !void {
+        if (comptime control_only_storage_sources) {
+            const local_source = self.groupLocalWriteSource() orelse
+                return error.StorageKernelOwnerUnavailable;
+            if ((try local_source.batchGroupLocal(alloc, group.group_id, table_name, req)) == null) {
+                return error.TableNotFound;
+            }
+            return;
+        }
         if (self.local_write_source) |source_override| {
             if ((try source_override.batchGroupLocal(alloc, group.group_id, table_name, req)) == null) {
                 return error.TableNotFound;
@@ -13570,6 +13840,11 @@ pub const ProvisionedTableWriteSource = struct {
             try batcher.batchGroupLocal(alloc, group_id, table_name, req);
             return {};
         }
+        if (comptime control_only_storage_sources) {
+            const owner = self.groupLocalWriteSource() orelse
+                return error.StorageKernelOwnerUnavailable;
+            return try owner.batchGroupLocal(alloc, group_id, table_name, req);
+        }
         if (self.groupLocalWriteSource()) |owner| return try owner.batchGroupLocal(alloc, group_id, table_name, req);
         try enforceHAWriteGateOptional(self.ha_write_gate);
         return try self.applyReplicatedBatchGroupLocal(alloc, group_id, table_name, req);
@@ -13620,13 +13895,28 @@ pub const ProvisionedTableWriteSource = struct {
         req: db_mod.types.BatchRequest,
         metadata_source: ReplicatedApplyMetadataSource,
     ) !?void {
-        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
-        defer alloc.free(path);
         const apply_req = req;
         const split_identity_namespace = try validateSplitReplicationForApply(apply_req, group_id);
         if (metadata_source == .catalog) if (apply_req.split_replication) |replication| {
             try validateSplitReplicationIdentityAgainstCatalog(alloc, self.catalog, table_name, replication);
         };
+        if (comptime control_only_storage_sources) {
+            const owner = self.groupLocalWriteSource() orelse
+                return error.StorageKernelOwnerUnavailable;
+            self.beginGroupOperation(table_name, group_id);
+            defer self.endGroupOperation(table_name, group_id);
+            lockAtomic(&self.local_db_mutex);
+            self.invalidateReadCache(table_name);
+            self.markWriteCacheDirty(table_name);
+            self.local_db_mutex.unlock();
+            _ = (try owner.batchGroupLocal(alloc, group_id, table_name, apply_req)) orelse
+                return error.StorageKernelOwnerUnavailable;
+            self.publishDirtyWriteCacheRuntimeStatusesBestEffort(alloc, table_name);
+            self.notifyLocalChange(table_name, .data);
+            return {};
+        }
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
         self.beginGroupOperation(table_name, group_id);
         lockAtomic(&self.local_db_mutex);
         self.invalidateReadCache(table_name);
@@ -14114,6 +14404,20 @@ pub const ProvisionedTableWriteSource = struct {
             });
             return {};
         }
+        if (comptime control_only_storage_sources) {
+            const owner = self.groupLocalWriteSource() orelse
+                return error.StorageKernelOwnerUnavailable;
+            return try owner.txnBeginGroupLocal(
+                alloc,
+                group_id,
+                table_name,
+                txn_id,
+                begin_timestamp,
+                topology_epoch,
+                retain_terminal,
+                participants,
+            );
+        }
         if (self.groupLocalWriteSource()) |owner|
             return try owner.txnBeginGroupLocal(
                 alloc,
@@ -14180,6 +14484,18 @@ pub const ProvisionedTableWriteSource = struct {
                 .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch } },
             });
             return {};
+        }
+        if (comptime control_only_storage_sources) {
+            const owner = self.groupLocalWriteSource() orelse
+                return error.StorageKernelOwnerUnavailable;
+            return try owner.txnPrepareGroupLocal(
+                alloc,
+                group_id,
+                table_name,
+                txn_id,
+                topology_epoch,
+                req,
+            );
         }
         if (self.groupLocalWriteSource()) |owner|
             return try owner.txnPrepareGroupLocal(
@@ -14275,6 +14591,8 @@ pub const ProvisionedTableWriteSource = struct {
             }
             return {};
         }
+        if (comptime control_only_storage_sources)
+            return error.StorageKernelOwnerUnavailable;
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         if (self.write_cache) |cache| {
@@ -14322,6 +14640,11 @@ pub const ProvisionedTableWriteSource = struct {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         self.beginGroupOperation(table_name, group_id);
         defer self.endGroupOperation(table_name, group_id);
+        if (comptime control_only_storage_sources) {
+            const owner = self.groupLocalWriteSource() orelse
+                return error.StorageKernelOwnerUnavailable;
+            return try owner.txnStatusGroupLocal(alloc, group_id, table_name, txn_id);
+        }
         if (self.groupLocalWriteSource()) |owner|
             return try owner.txnStatusGroupLocal(alloc, group_id, table_name, txn_id);
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
@@ -14357,6 +14680,17 @@ pub const ProvisionedTableWriteSource = struct {
         }
         self.beginGroupOperation(table_name, group_id);
         defer self.endGroupOperation(table_name, group_id);
+        if (comptime control_only_storage_sources) {
+            const owner = self.groupLocalWriteSource() orelse
+                return error.StorageKernelOwnerUnavailable;
+            return try owner.txnAcknowledgeGroupLocal(
+                alloc,
+                group_id,
+                table_name,
+                txn_id,
+                participant,
+            );
+        }
         if (self.groupLocalWriteSource()) |owner|
             return try owner.txnAcknowledgeGroupLocal(
                 alloc,
@@ -14389,6 +14723,10 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
     ) !?runtime_status.LocalTableRuntimeStatuses {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (comptime control_only_storage_sources) {
+            const owner = self.local_write_source orelse return null;
+            return try owner.localRuntimeStatuses(alloc, table_name);
+        }
         if (self.local_write_source) |source_override| {
             if (try source_override.localRuntimeStatuses(alloc, table_name)) |statuses| return statuses;
         }
@@ -15540,6 +15878,9 @@ pub const HostedProvisionedTableWriteSource = struct {
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     foreground_derived_progress: bool = false,
+    /// Optional local physical-operation provider. Hosted routing and remote
+    /// forwarding remain here while the compiled storage unit owns local DBs.
+    local_write_source: ?TableWriteSource = null,
 
     pub fn init(
         replica_root_dir: []const u8,
@@ -15620,6 +15961,52 @@ pub const HostedProvisionedTableWriteSource = struct {
         return self;
     }
 
+    pub fn withLocalWriteSource(
+        self: *HostedProvisionedTableWriteSource,
+        source_override: ?TableWriteSource,
+    ) *HostedProvisionedTableWriteSource {
+        self.local_write_source = source_override;
+        return self;
+    }
+
+    fn groupLocalWriteSource(self: *HostedProvisionedTableWriteSource) ?TableWriteSource {
+        return self.local_write_source;
+    }
+
+    fn reconcileLocalOwnerGroups(
+        self: *HostedProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        target_index_name: ?[]const u8,
+    ) !void {
+        const local_source = self.groupLocalWriteSource() orelse
+            return error.StorageKernelOwnerUnavailable;
+        const group_ids = try table_catalog.resolveGroupsForSpanEventually(
+            alloc,
+            self.catalog,
+            table_name,
+            "",
+            "",
+            5 * std.time.ns_per_s,
+            10,
+        );
+        defer alloc.free(group_ids);
+        for (group_ids) |group_id| {
+            if (self.router.localStatus(group_id) != .active) continue;
+            const result = (try local_source.reconcileTableGroupLocal(
+                group_id,
+                table_name,
+                target_index_name,
+                false,
+            )) orelse return error.StorageKernelOwnerUnavailable;
+            switch (result.state) {
+                .complete => {},
+                .repair_pending, .busy => return error.StorageKernelReconcilePending,
+                .degraded => return error.StorageKernelReconcileDegraded,
+            }
+        }
+    }
+
     fn transactionRecoveryConfig(self: *HostedProvisionedTableWriteSource) db_mod.transaction_runtime.Config {
         const backend_runtime = self.backend_runtime orelse return .{};
         if (backend_runtime.io() == null) return .{};
@@ -15656,6 +16043,7 @@ pub const HostedProvisionedTableWriteSource = struct {
     }
 
     fn invalidateManagedCache(self: *HostedProvisionedTableWriteSource, table_name: []const u8) void {
+        if (comptime control_only_storage_sources) return;
         const hosted_cache = hostedManagedDbCacheForRootIfPresent(self.replica_root_dir) orelse return;
         lockAtomic(&hosted_cache.mutex);
         hosted_cache.write_cache.invalidateTable(table_name);
@@ -15989,6 +16377,10 @@ pub const HostedProvisionedTableWriteSource = struct {
         _: []const u8,
     ) !?void {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (comptime control_only_storage_sources) {
+            try self.reconcileLocalOwnerGroups(alloc, table_name, index_name);
+            return {};
+        }
         const deadline_ns = platform_time.monotonicNs() + replicated_apply_writer_open_timeout_ns;
         while (true) {
             self.reconcileCachedIndexCreate(alloc, table_name, index_name) catch |err| switch (err) {
@@ -16015,6 +16407,13 @@ pub const HostedProvisionedTableWriteSource = struct {
         enrichment_json: []const u8,
     ) !?void {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (comptime control_only_storage_sources) {
+            // Metadata projection already contains this enrichment. The
+            // owner reconciles the complete desired table contract so
+            // dependency ordering and removals remain atomic with indexes.
+            try self.reconcileLocalOwnerGroups(alloc, table_name, null);
+            return {};
+        }
         self.invalidateManagedCache(table_name);
         try putLocalArtifactEnrichment(alloc, self.catalog, self.replica_root_dir, self.backend_runtime, table_name, artifact_name, enrichment_json);
         self.invalidateManagedCache(table_name);
@@ -16027,6 +16426,10 @@ pub const HostedProvisionedTableWriteSource = struct {
         artifact_name: []const u8,
     ) !?void {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (comptime control_only_storage_sources) {
+            try self.reconcileLocalOwnerGroups(alloc, table_name, null);
+            return {};
+        }
         self.invalidateManagedCache(table_name);
         try dropLocalArtifactEnrichment(alloc, self.catalog, self.replica_root_dir, self.backend_runtime, table_name, artifact_name);
         self.invalidateManagedCache(table_name);
@@ -16039,6 +16442,10 @@ pub const HostedProvisionedTableWriteSource = struct {
         index_name: []const u8,
     ) !?void {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (comptime control_only_storage_sources) {
+            try self.reconcileLocalOwnerGroups(alloc, table_name, null);
+            return {};
+        }
         const deadline_ns = platform_time.monotonicNs() + replicated_apply_writer_open_timeout_ns;
         while (true) {
             self.invalidateManagedCache(table_name);
@@ -16098,6 +16505,17 @@ pub const HostedProvisionedTableWriteSource = struct {
 
                 switch (route.*) {
                     .local => {
+                        if (comptime control_only_storage_sources) {
+                            const local_source = self.groupLocalWriteSource() orelse
+                                return error.StorageKernelOwnerUnavailable;
+                            _ = (try local_source.batchGroupLocal(
+                                alloc,
+                                group.group_id,
+                                table_name,
+                                groupBatchRequest(group, req),
+                            )) orelse return error.TableNotFound;
+                            continue;
+                        }
                         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group.group_id);
                         defer alloc.free(path);
                         const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
@@ -16146,6 +16564,17 @@ pub const HostedProvisionedTableWriteSource = struct {
                     error.FileNotFound => return null,
                     else => return err,
                 };
+                if (comptime control_only_storage_sources) {
+                    const local_source = self.groupLocalWriteSource() orelse
+                        return error.StorageKernelOwnerUnavailable;
+                    _ = (try local_source.batchGroupLocal(
+                        alloc,
+                        group.group_id,
+                        table_name,
+                        groupBatchRequest(group, req),
+                    )) orelse return error.TableNotFound;
+                    continue;
+                }
                 const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
                 var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group.group_id, table_name, .default_async);
                 defer cached.deinit(hosted_cache.write_cache.alloc);
@@ -16321,6 +16750,13 @@ pub const HostedProvisionedTableWriteSource = struct {
         topology_epoch: u64,
     ) !?void {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (comptime control_only_storage_sources) {
+            if (topology_epoch != 0)
+                try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
+            const local_source = self.groupLocalWriteSource() orelse
+                return error.StorageKernelOwnerUnavailable;
+            return try local_source.batchGroupLocal(alloc, group_id, table_name, req);
+        }
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
@@ -16409,6 +16845,11 @@ pub const HostedProvisionedTableWriteSource = struct {
         txn_id: db_mod.types.TxnId,
     ) !?db_mod.types.TxnStatus {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (comptime control_only_storage_sources) {
+            const local_source = self.groupLocalWriteSource() orelse
+                return error.StorageKernelOwnerUnavailable;
+            return try local_source.txnStatusGroupLocal(alloc, group_id, table_name, txn_id);
+        }
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
@@ -16437,6 +16878,10 @@ pub const HostedProvisionedTableWriteSource = struct {
         table_name: []const u8,
     ) !?runtime_status.LocalTableRuntimeStatuses {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (comptime control_only_storage_sources) {
+            const local_source = self.groupLocalWriteSource() orelse return null;
+            return try local_source.localRuntimeStatuses(alloc, table_name);
+        }
         if (hostedManagedDbCacheForRootIfPresent(self.replica_root_dir)) |hosted_cache| {
             {
                 lockAtomic(&hosted_cache.mutex);
@@ -16468,6 +16913,22 @@ pub const HostedProvisionedTableWriteSource = struct {
         );
         defer alloc.free(group_ids);
         if (group_ids.len == 0) return null;
+
+        if (comptime control_only_storage_sources) {
+            const local_source = self.groupLocalWriteSource() orelse
+                return error.StorageKernelOwnerUnavailable;
+            for (group_ids) |group_id| {
+                if (self.router.localStatus(group_id) != .active) continue;
+                if ((try local_source.corruptEmbeddingArtifactGroupLocal(
+                    alloc,
+                    group_id,
+                    table_name,
+                    doc_key,
+                    index_name,
+                )) != null) return {};
+            }
+            return error.NotFound;
+        }
 
         for (group_ids) |group_id| {
             const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
@@ -16867,6 +17328,17 @@ pub const HostedProvisionedTableWriteSource = struct {
         artifact_name: []const u8,
     ) !?bool {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (comptime control_only_storage_sources) {
+            const local_source = self.groupLocalWriteSource() orelse
+                return error.StorageKernelOwnerUnavailable;
+            return try local_source.reprocessDocumentArtifactGroupLocal(
+                alloc,
+                group_id,
+                table_name,
+                doc_key,
+                artifact_name,
+            );
+        }
         self.invalidateManagedCache(table_name);
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
@@ -16891,6 +17363,18 @@ pub const HostedProvisionedTableWriteSource = struct {
         update: db_mod.types.DocumentArtifactChildRangePlacementUpdate,
     ) !?bool {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (comptime control_only_storage_sources) {
+            const local_source = self.groupLocalWriteSource() orelse
+                return error.StorageKernelOwnerUnavailable;
+            return try local_source.updateDocumentArtifactChildRangePlacementGroupLocal(
+                alloc,
+                group_id,
+                table_name,
+                doc_key,
+                artifact_name,
+                update,
+            );
+        }
         self.invalidateManagedCache(table_name);
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
@@ -16910,11 +17394,23 @@ pub const HostedProvisionedTableWriteSource = struct {
         alloc: std.mem.Allocator,
         group_id: u64,
         table_name: []const u8,
-        _: []const u8,
-        _: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
         child_batch: db_mod.DocumentArtifactChildRangeApplyBatch,
     ) !?u64 {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (comptime control_only_storage_sources) {
+            const local_source = self.groupLocalWriteSource() orelse
+                return error.StorageKernelOwnerUnavailable;
+            return try local_source.applyDocumentArtifactChildRangeBatchGroupLocal(
+                alloc,
+                group_id,
+                table_name,
+                doc_key,
+                artifact_name,
+                child_batch,
+            );
+        }
         self.invalidateManagedCache(table_name);
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
@@ -16938,6 +17434,17 @@ pub const HostedProvisionedTableWriteSource = struct {
         req: db_mod.types.DocumentArtifactTableReprocessRequest,
     ) !?db_mod.types.DocumentArtifactTableReprocessResult {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (comptime control_only_storage_sources) {
+            const local_source = self.groupLocalWriteSource() orelse
+                return error.StorageKernelOwnerUnavailable;
+            return try local_source.reprocessDocumentArtifactRangeGroupLocal(
+                alloc,
+                group_id,
+                table_name,
+                artifact_name,
+                req,
+            );
+        }
         self.invalidateManagedCache(table_name);
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
@@ -16961,6 +17468,16 @@ pub const HostedProvisionedTableWriteSource = struct {
         req: db_mod.types.ArtifactRepairListRequest,
     ) !?db_mod.types.ArtifactRepairListResult {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (comptime control_only_storage_sources) {
+            const local_source = self.groupLocalWriteSource() orelse
+                return error.StorageKernelOwnerUnavailable;
+            return try local_source.listArtifactRepairIssuesGroupLocal(
+                alloc,
+                group_id,
+                table_name,
+                req,
+            );
+        }
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
@@ -17000,6 +17517,17 @@ pub const HostedProvisionedTableWriteSource = struct {
     ) !?db_mod.types.ArtifactRepairResult {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         if (options.cancelled()) return error.Canceled;
+        if (comptime control_only_storage_sources) {
+            const local_source = self.groupLocalWriteSource() orelse
+                return error.StorageKernelOwnerUnavailable;
+            return try local_source.repairArtifactIssuesGroupLocalControlled(
+                alloc,
+                group_id,
+                table_name,
+                req,
+                options,
+            );
+        }
         self.invalidateManagedCache(table_name);
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
@@ -17106,7 +17634,12 @@ fn applyGroupBatchUnchecked(
     req: db_mod.types.BatchRequest,
 ) !void {
     runTestBeforeBatchExecutionHook();
-    try db.batch(.{
+    try db.batch(groupBatchRequest(group, req));
+    if (shouldDrainManagedDbAfterBatch(req.sync_level)) try drainManagedDbBeforeClose(db);
+}
+
+fn groupBatchRequest(group: GroupBatch, req: db_mod.types.BatchRequest) db_mod.types.BatchRequest {
+    return .{
         .writes = group.writes.items,
         .deletes = group.deletes.items,
         .transforms = group.transforms.items,
@@ -17115,8 +17648,7 @@ fn applyGroupBatchUnchecked(
         .predicates = req.predicates,
         .timestamp_ns = req.timestamp_ns,
         .sync_level = req.sync_level,
-    });
-    if (shouldDrainManagedDbAfterBatch(req.sync_level)) try drainManagedDbBeforeClose(db);
+    };
 }
 
 /// Apply one already-committed storage-owner command using only persisted local
@@ -22079,7 +22611,7 @@ fn encodeRemoteBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReq
             for (transform.operations, 0..) |op, op_index| {
                 if (op_index > 0) try out.append(alloc, ',');
                 try out.appendSlice(alloc, "{\"op\":");
-                try appendJsonString(alloc, &out, db_mod.transform.transformOpText(op.op));
+                try appendJsonString(alloc, &out, db_mod.types.transformOpText(op.op));
                 try out.appendSlice(alloc, ",\"path\":");
                 try appendJsonString(alloc, &out, op.path);
                 if (op.value_json) |value_json| {

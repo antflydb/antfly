@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const batch_api = @import("batch.zig");
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = @import("../storage/db/selected_root.zig").db;
 const distributed_txn = @import("distributed_txn.zig");
 const http_client = @import("http_client.zig");
 const http_common = @import("../raft/transport/http_common.zig");

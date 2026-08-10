@@ -99,6 +99,27 @@ pub const TransformOpType = enum {
     rename,
 };
 
+/// Canonical public wire spelling for document transform operations. Keep the
+/// representation beside the value contract so routing/serialization code
+/// does not need to import the physical transform executor.
+pub fn transformOpText(op: TransformOpType) []const u8 {
+    return switch (op) {
+        .set => "$set",
+        .set_on_insert => "$setOnInsert",
+        .unset => "$unset",
+        .inc => "$inc",
+        .push => "$push",
+        .pull => "$pull",
+        .add_to_set => "$addToSet",
+        .pop => "$pop",
+        .mul => "$mul",
+        .min => "$min",
+        .max => "$max",
+        .current_date => "$currentDate",
+        .rename => "$rename",
+    };
+}
+
 pub const TransformOp = struct {
     op: TransformOpType,
     path: []const u8,

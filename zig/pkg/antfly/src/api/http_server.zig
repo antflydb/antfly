@@ -16,6 +16,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const platform = @import("antfly_platform");
 const build_options = @import("build_options");
+const storage_source_options = @import("storage_source_options");
 const scraping = @import("antfly_scraping");
 const fs_paths = @import("../common/fs_paths.zig");
 const common_secrets = @import("../common/secrets.zig");
@@ -44,21 +45,24 @@ const http_common = @import("../raft/transport/http_common.zig");
 const raft_host = @import("../raft/host.zig");
 const raft_mod = @import("../raft/mod.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
-const db_mod = struct {
-    pub const types = @import("../storage/db/types.zig");
-    pub const RuntimePreflightSummary = @import("../storage/db/runtime_preflight.zig").RuntimePreflightSummary;
-    pub const background_runtime = @import("../storage/background_runtime.zig");
-    pub const aggregations = @import("../storage/db/aggregations.zig");
-    pub const SortRejectionDiagnostic = db_query_search.SortRejectionDiagnostic;
+const db_mod = if (builtin.is_test and !storage_source_options.control_only)
+    @import("../storage/db/mod.zig")
+else
+    struct {
+        pub const types = @import("../storage/db/types.zig");
+        pub const RuntimePreflightSummary = @import("../storage/db/runtime_preflight.zig").RuntimePreflightSummary;
+        pub const background_runtime = @import("../storage/background_runtime.zig");
+        pub const aggregations = @import("../storage/db/aggregations.zig");
+        pub const SortRejectionDiagnostic = db_query_search.SortRejectionDiagnostic;
 
-    pub const resetLastSortRejectionDiagnostic = db_query_search.resetLastSortRejectionDiagnostic;
-    pub const recordSortRejectionDiagnostic = db_query_search.recordSortRejectionDiagnostic;
-    pub const peekLastSortRejectionDiagnostic = db_query_search.peekLastSortRejectionDiagnostic;
-    pub const takeLastSortRejectionDiagnostic = db_query_search.takeLastSortRejectionDiagnostic;
-};
+        pub const resetLastSortRejectionDiagnostic = db_query_search.resetLastSortRejectionDiagnostic;
+        pub const recordSortRejectionDiagnostic = db_query_search.recordSortRejectionDiagnostic;
+        pub const peekLastSortRejectionDiagnostic = db_query_search.peekLastSortRejectionDiagnostic;
+        pub const takeLastSortRejectionDiagnostic = db_query_search.takeLastSortRejectionDiagnostic;
+    };
 const graph_mod = @import("../graph/graph.zig");
 const backend_erased = @import("../storage/backend_erased.zig");
-const db_query_search = @import("../storage/db/query/search_exec.zig");
+const db_query_search = @import("../storage/db/runtime_preflight.zig");
 const storage_schema = @import("../storage/schema.zig");
 const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 const table_catalog = @import("table_catalog.zig");

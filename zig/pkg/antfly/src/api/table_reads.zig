@@ -14,6 +14,8 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const storage_source_options = @import("storage_source_options");
+const control_only_storage_sources = storage_source_options.control_only;
 const indexes_openapi = @import("antfly_indexes_openapi");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const scraping = @import("antfly_scraping");
@@ -29,10 +31,13 @@ const metadata_transition_state = @import("../metadata/transition_state.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const raft_mod = @import("../raft/mod.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = if (control_only_storage_sources)
+    @import("../storage/db/control_root.zig")
+else
+    @import("../storage/db/mod.zig");
 const doc_set = @import("../storage/db/doc_set.zig");
-const doc_identity = @import("../storage/db/doc_identity.zig");
-const db_embedder = @import("../storage/db/enrichment/embedder.zig");
+const doc_identity = if (control_only_storage_sources) struct {} else @import("../storage/db/doc_identity.zig");
+const db_embedder = if (control_only_storage_sources) struct {} else @import("../storage/db/enrichment/embedder.zig");
 const ha_public_gate_state = @import("../storage/ha/public_gate_state.zig");
 const ha_read_gate_mod = @import("../storage/ha/read_gate.zig");
 const ha_standby_mod = @import("../storage/ha/standby.zig");
@@ -40,8 +45,12 @@ const storage_schema = @import("../storage/schema.zig");
 const hbc_mod = @import("../storage/hbc_adapter.zig");
 const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 const resource_manager_mod = @import("../storage/resource_manager.zig");
-const db_query_search = @import("../storage/db/query/search_exec.zig");
-const index_manager_mod = @import("../storage/db/catalog/index_manager.zig");
+const db_query_search = if (control_only_storage_sources)
+    @import("../storage/db/query/control_contract.zig")
+else
+    @import("../storage/db/query/search_exec.zig");
+const index_manager_mod = if (control_only_storage_sources) struct {} else @import("../storage/db/catalog/index_manager.zig");
+const text_analysis_config = @import("../storage/db/text_analysis_config.zig");
 const introducer_mod = @import("../introducer.zig");
 const graph_mod = @import("../graph/graph.zig");
 const graph_paths = @import("../graph/paths.zig");
@@ -56,12 +65,7 @@ const query_contract = @import("query_contract.zig");
 const distributed_graph = @import("distributed_graph.zig");
 const runtime_status = @import("runtime_status.zig");
 const table_read_source = @import("table_read_source.zig");
-const build_options = @import("build_options");
-
-const storage_kernel_experiment = if (@hasDecl(build_options, "storage_kernel_experiment"))
-    @field(build_options, "storage_kernel_experiment")
-else
-    false;
+const storage_kernel_experiment = control_only_storage_sources;
 
 fn publishRuntimeStatusGroupForTest(
     cache: *runtime_status.TableRuntimeSnapshotCache,
@@ -182,7 +186,14 @@ pub const testing = if (builtin.is_test) struct {
     }
 } else struct {};
 
-pub const ProvisionedTableReadCache = struct {
+const ControlProvisionedTableReadCache = struct {
+    antfly_provider: ?managed_embedder.AntflyProvider = null,
+    inference_api_url: ?[]const u8 = null,
+    secret_store: ?*common_secrets.FileStore = null,
+    remote_content: ?*const scraping.RemoteContentConfig = null,
+};
+
+const PhysicalProvisionedTableReadCache = struct {
     alloc: std.mem.Allocator,
     threaded: Io.Threaded,
     lsm_cache: ?*lsm_backend.Cache = null,
@@ -986,6 +997,11 @@ pub const ProvisionedTableReadCache = struct {
     }
 };
 
+pub const ProvisionedTableReadCache = if (control_only_storage_sources)
+    ControlProvisionedTableReadCache
+else
+    PhysicalProvisionedTableReadCache;
+
 test "provisioned table read cache has a finite worker ceiling" {
     var cache = ProvisionedTableReadCache.init(std.testing.allocator);
     defer cache.deinit();
@@ -1177,12 +1193,12 @@ pub const ResidentDbSource = struct {
     }
 };
 
-const LocalQueryDbOwner = union(enum) {
+const PhysicalLocalQueryDbOwner = union(enum) {
     resident: struct {
         lease: ResidentDbLease,
         alloc: std.mem.Allocator,
     },
-    cached: ProvisionedTableReadCache.Lease,
+    cached: PhysicalProvisionedTableReadCache.Lease,
     owned: db_mod.DB,
 
     fn db(self: *@This()) *db_mod.DB {
@@ -1203,6 +1219,19 @@ const LocalQueryDbOwner = union(enum) {
     }
 };
 
+/// Control-only consumers route local queries through `TableReadSource` and
+/// must never own a physical DB. Keep the shared orchestration structs
+/// representable without embedding the deliberately opaque control-side DB.
+const LocalQueryDbOwner = if (control_only_storage_sources) struct {
+    fn db(_: *@This()) *db_mod.DB {
+        unreachable;
+    }
+
+    fn deinit(_: *@This()) void {
+        unreachable;
+    }
+} else PhysicalLocalQueryDbOwner;
+
 fn provisionedLocalQueryDbOwner(
     resident_db: ?ResidentDbSource,
     cache: ?*ProvisionedTableReadCache,
@@ -1215,41 +1244,45 @@ fn provisionedLocalQueryDbOwner(
     table_name: []const u8,
     read_activity_held: bool,
 ) !LocalQueryDbOwner {
-    if (resident_db) |source| {
-        if (try source.leaseGroup(alloc, table_name, group_id, lsm_root_generation, .{
-            .read_activity_held = read_activity_held,
-        })) |lease_value| {
-            validateProvisionedDbIdentityNamespace(alloc, catalog, table_name, group_id, lease_value.db) catch |err| {
-                var lease = lease_value;
-                lease.release(alloc);
+    if (comptime control_only_storage_sources) {
+        unreachable;
+    } else {
+        if (resident_db) |source| {
+            if (try source.leaseGroup(alloc, table_name, group_id, lsm_root_generation, .{
+                .read_activity_held = read_activity_held,
+            })) |lease_value| {
+                validateProvisionedDbIdentityNamespace(alloc, catalog, table_name, group_id, lease_value.db) catch |err| {
+                    var lease = lease_value;
+                    lease.release(alloc);
+                    return err;
+                };
+                return .{ .resident = .{ .lease = lease_value, .alloc = alloc } };
+            }
+        }
+
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
+        defer alloc.free(path);
+        if (cache) |query_cache| {
+            const lease = try query_cache.getOrOpen(path, catalog, group_id, lsm_root_generation, table_name);
+            validateProvisionedDbIdentityNamespace(alloc, catalog, table_name, group_id, lease.db) catch |err| {
+                var owned_lease = lease;
+                owned_lease.release();
                 return err;
             };
-            return .{ .resident = .{ .lease = lease_value, .alloc = alloc } };
+            return .{ .cached = lease };
         }
-    }
 
-    const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
-    defer alloc.free(path);
-    if (cache) |query_cache| {
-        const lease = try query_cache.getOrOpen(path, catalog, group_id, lsm_root_generation, table_name);
-        validateProvisionedDbIdentityNamespace(alloc, catalog, table_name, group_id, lease.db) catch |err| {
-            var owned_lease = lease;
-            owned_lease.release();
-            return err;
-        };
-        return .{ .cached = lease };
+        const db = try openProvisionedQueryDbForTableWithRuntime(
+            alloc,
+            path,
+            catalog,
+            table_name,
+            group_id,
+            lsm_root_generation,
+            backend_runtime,
+        );
+        return .{ .owned = db };
     }
-
-    const db = try openProvisionedQueryDbForTableWithRuntime(
-        alloc,
-        path,
-        catalog,
-        table_name,
-        group_id,
-        lsm_root_generation,
-        backend_runtime,
-    );
-    return .{ .owned = db };
 }
 
 const LocalQueryExecution = struct {
@@ -2628,6 +2661,11 @@ pub const ProvisionedTableReadSource = struct {
     }
 
     pub fn warmTableGroup(self: *ProvisionedTableReadSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8) !void {
+        if (comptime control_only_storage_sources) {
+            var statuses = (try self.groupLocalSource().localRuntimeStatuses(alloc, table_name)) orelse return;
+            defer statuses.deinit(alloc);
+            return;
+        }
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         var read_activity = self.beginPreparedRead(table_name, .general);
@@ -3671,6 +3709,22 @@ pub const ProvisionedTableReadSource = struct {
         table_name: []const u8,
     ) !?LsmStorageStats {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        if (comptime control_only_storage_sources) {
+            const local_source = self.local_read_source orelse return null;
+            var statuses = (try local_source.localRuntimeStatuses(alloc, table_name)) orelse return null;
+            defer statuses.deinit(alloc);
+            var out: LsmStorageStats = .{};
+            var observed = false;
+            for (statuses.items) |status| {
+                const stats = status.lsm_storage_stats orelse continue;
+                observed = true;
+                lsm_backend.Backend.accumulateMaintenanceStats(&out.maintenance, stats.maintenance);
+                lsm_backend.Backend.accumulateWriteStats(&out.write, stats.write);
+                out.maintenance_score = @max(out.maintenance_score, stats.maintenance_score);
+                out.maintenance_debt_hint = @max(out.maintenance_debt_hint, stats.maintenance_debt_hint);
+            }
+            return if (observed) out else null;
+        }
         var read_activity = self.beginPreparedRead(table_name, .general);
         defer if (read_activity) |*activity| activity.deinit();
         const group_ids = try table_catalog.resolveGroupsForSpan(alloc, self.catalog, table_name, "", "");
@@ -3708,6 +3762,10 @@ pub const ProvisionedTableReadSource = struct {
         table_name: []const u8,
     ) !?[]ObservedDynamicFieldCapabilitySet {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        if (comptime control_only_storage_sources) {
+            const local_source = self.local_read_source orelse return null;
+            return try local_source.observedDynamicFieldCapabilitySets(alloc, table_name);
+        }
         var read_activity = self.beginPreparedRead(table_name, .general);
         defer if (read_activity) |*activity| activity.deinit();
         const group_ids = try table_catalog.resolveGroupsForSpan(alloc, self.catalog, table_name, "", "");
@@ -6222,21 +6280,26 @@ fn executeProvisionedGraphExpand(
     consistency: raft_mod.ReadConsistency,
 ) !distributed_graph.GraphExpandResponse {
     const ctx: *ProvisionedGraphWorkerContext = @ptrCast(@alignCast(ptr));
-    if (ctx.source.local_read_source) |source| {
+    if (comptime control_only_storage_sources) {
+        const source = ctx.source.local_read_source orelse return error.StorageKernelOwnerUnavailable;
         return (try source.graphExpandGroupLocal(alloc, group_id, table_name, req, consistency)) orelse return error.TableNotFound;
+    } else {
+        if (ctx.source.local_read_source) |source| {
+            return (try source.graphExpandGroupLocal(alloc, group_id, table_name, req, consistency)) orelse return error.TableNotFound;
+        }
+        var attempt: usize = 0;
+        while (attempt < ProvisionedTableReadSource.topology_read_attempt_limit) : (attempt += 1) {
+            return executeProvisionedGraphExpandAttempt(ptr, alloc, group_id, table_name, req, consistency) catch |err| switch (err) {
+                error.ResidentDbRetryRequired => {
+                    try ctx.source.prepareResidentGroupsForReadRetry(alloc, table_name, &.{group_id});
+                    if (attempt + 1 < ProvisionedTableReadSource.topology_read_attempt_limit) continue;
+                    return error.StorageReadTemporarilyUnavailable;
+                },
+                else => return err,
+            };
+        }
+        unreachable;
     }
-    var attempt: usize = 0;
-    while (attempt < ProvisionedTableReadSource.topology_read_attempt_limit) : (attempt += 1) {
-        return executeProvisionedGraphExpandAttempt(ptr, alloc, group_id, table_name, req, consistency) catch |err| switch (err) {
-            error.ResidentDbRetryRequired => {
-                try ctx.source.prepareResidentGroupsForReadRetry(alloc, table_name, &.{group_id});
-                if (attempt + 1 < ProvisionedTableReadSource.topology_read_attempt_limit) continue;
-                return error.StorageReadTemporarilyUnavailable;
-            },
-            else => return err,
-        };
-    }
-    unreachable;
 }
 
 fn executeProvisionedGraphExpandAttempt(
@@ -6315,21 +6378,26 @@ fn executeProvisionedGraphHydrate(
     consistency: raft_mod.ReadConsistency,
 ) !distributed_graph.GraphHydrateResponse {
     const ctx: *ProvisionedGraphWorkerContext = @ptrCast(@alignCast(ptr));
-    if (ctx.source.local_read_source) |source| {
+    if (comptime control_only_storage_sources) {
+        const source = ctx.source.local_read_source orelse return error.StorageKernelOwnerUnavailable;
         return (try source.graphHydrateGroupLocal(alloc, group_id, table_name, req, consistency)) orelse return error.TableNotFound;
+    } else {
+        if (ctx.source.local_read_source) |source| {
+            return (try source.graphHydrateGroupLocal(alloc, group_id, table_name, req, consistency)) orelse return error.TableNotFound;
+        }
+        var attempt: usize = 0;
+        while (attempt < ProvisionedTableReadSource.topology_read_attempt_limit) : (attempt += 1) {
+            return executeProvisionedGraphHydrateAttempt(ptr, alloc, group_id, table_name, req, consistency) catch |err| switch (err) {
+                error.ResidentDbRetryRequired => {
+                    try ctx.source.prepareResidentGroupsForReadRetry(alloc, table_name, &.{group_id});
+                    if (attempt + 1 < ProvisionedTableReadSource.topology_read_attempt_limit) continue;
+                    return error.StorageReadTemporarilyUnavailable;
+                },
+                else => return err,
+            };
+        }
+        unreachable;
     }
-    var attempt: usize = 0;
-    while (attempt < ProvisionedTableReadSource.topology_read_attempt_limit) : (attempt += 1) {
-        return executeProvisionedGraphHydrateAttempt(ptr, alloc, group_id, table_name, req, consistency) catch |err| switch (err) {
-            error.ResidentDbRetryRequired => {
-                try ctx.source.prepareResidentGroupsForReadRetry(alloc, table_name, &.{group_id});
-                if (attempt + 1 < ProvisionedTableReadSource.topology_read_attempt_limit) continue;
-                return error.StorageReadTemporarilyUnavailable;
-            },
-            else => return err,
-        };
-    }
-    unreachable;
 }
 
 fn executeProvisionedGraphHydrateAttempt(
@@ -6421,21 +6489,26 @@ fn executeProvisionedGraphGetEdges(
     consistency: raft_mod.ReadConsistency,
 ) anyerror!distributed_graph.GraphEdgesResponse {
     const ctx: *ProvisionedGraphWorkerContext = @ptrCast(@alignCast(ptr));
-    if (ctx.source.local_read_source) |source| {
+    if (comptime control_only_storage_sources) {
+        const source = ctx.source.local_read_source orelse return error.StorageKernelOwnerUnavailable;
         return (try source.graphEdgesGroupLocal(alloc, group_id, table_name, req, consistency)) orelse return error.TableNotFound;
+    } else {
+        if (ctx.source.local_read_source) |source| {
+            return (try source.graphEdgesGroupLocal(alloc, group_id, table_name, req, consistency)) orelse return error.TableNotFound;
+        }
+        var attempt: usize = 0;
+        while (attempt < ProvisionedTableReadSource.topology_read_attempt_limit) : (attempt += 1) {
+            return executeProvisionedGraphGetEdgesAttempt(ptr, alloc, group_id, table_name, req, consistency) catch |err| switch (err) {
+                error.ResidentDbRetryRequired => {
+                    try ctx.source.prepareResidentGroupsForReadRetry(alloc, table_name, &.{group_id});
+                    if (attempt + 1 < ProvisionedTableReadSource.topology_read_attempt_limit) continue;
+                    return error.StorageReadTemporarilyUnavailable;
+                },
+                else => return err,
+            };
+        }
+        unreachable;
     }
-    var attempt: usize = 0;
-    while (attempt < ProvisionedTableReadSource.topology_read_attempt_limit) : (attempt += 1) {
-        return executeProvisionedGraphGetEdgesAttempt(ptr, alloc, group_id, table_name, req, consistency) catch |err| switch (err) {
-            error.ResidentDbRetryRequired => {
-                try ctx.source.prepareResidentGroupsForReadRetry(alloc, table_name, &.{group_id});
-                if (attempt + 1 < ProvisionedTableReadSource.topology_read_attempt_limit) continue;
-                return error.StorageReadTemporarilyUnavailable;
-            },
-            else => return err,
-        };
-    }
-    unreachable;
 }
 
 fn executeProvisionedGraphGetEdgesAttempt(
@@ -7631,13 +7704,13 @@ fn loadTableAggregationTextAnalysis(
     defer alloc.free(config_json);
 
     if (table.schema_json.len == 0) {
-        return try index_manager_mod.parseTextAnalysisForIndexConfig(alloc, config_json, null);
+        return try text_analysis_config.parseForIndexConfig(alloc, config_json, null);
     }
     var parsed_schema = try tables_api.parseValidatedTableSchema(alloc, table.schema_json);
     defer parsed_schema.deinit(alloc);
     const runtime_schema = try tables_api.deriveRuntimeTableSchema(alloc, parsed_schema);
     defer storage_schema.freeSchema(alloc, runtime_schema);
-    return try index_manager_mod.parseTextAnalysisForIndexConfig(alloc, config_json, runtime_schema);
+    return try text_analysis_config.parseForIndexConfig(alloc, config_json, runtime_schema);
 }
 
 fn loadTableIdentityNamespaceForGroup(
@@ -10899,35 +10972,37 @@ fn applyProvisionedQueryAggregations(
 ) !void {
     if (req.aggregations_json.len == 0) return;
     const aggregation_req = requestWithResultIdentityGeneration(req, result.*);
-    if (group_ids.len == 1) {
-        if (captured_db) |db| {
-            return try applyCapturedDbQueryAggregations(
+    if (comptime !control_only_storage_sources) {
+        if (group_ids.len == 1) {
+            if (captured_db) |db| {
+                return try applyCapturedDbQueryAggregations(
+                    alloc,
+                    self.requester,
+                    group_ids[0],
+                    table_name,
+                    "provisioned-local",
+                    req,
+                    result,
+                    meta,
+                    db,
+                    consistency,
+                );
+            }
+            var db_owner = try provisionedLocalQueryDbOwner(
+                self.resident_db,
+                self.cache,
+                self.replica_root_dir,
+                self.catalog,
                 alloc,
-                self.requester,
                 group_ids[0],
+                self.visibleRootGeneration(group_ids[0]),
+                self.backend_runtime,
                 table_name,
-                "provisioned-local",
-                req,
-                result,
-                meta,
-                db,
-                consistency,
+                true,
             );
+            defer db_owner.deinit();
+            return try applyCapturedDbQueryAggregations(alloc, self.requester, group_ids[0], table_name, "provisioned-local", req, result, meta, db_owner.db(), consistency);
         }
-        var db_owner = try provisionedLocalQueryDbOwner(
-            self.resident_db,
-            self.cache,
-            self.replica_root_dir,
-            self.catalog,
-            alloc,
-            group_ids[0],
-            self.visibleRootGeneration(group_ids[0]),
-            self.backend_runtime,
-            table_name,
-            true,
-        );
-        defer db_owner.deinit();
-        return try applyCapturedDbQueryAggregations(alloc, self.requester, group_ids[0], table_name, "provisioned-local", req, result, meta, db_owner.db(), consistency);
     }
 
     if (try tryApplyProvisionedAlgebraicDistributedAggregations(self, alloc, group_ids, table_name, aggregation_req, meta)) return;
@@ -10969,6 +11044,10 @@ fn tryApplyProvisionedAlgebraicDistributedAggregations(
     req: db_mod.types.SearchRequest,
     meta: *query_api.QueryResponseMeta,
 ) !bool {
+    // The existing accelerated planner borrows the first physical algebraic
+    // index. A control-only consumer cannot do that; use the exact distributed
+    // text/full-result path until the planner itself has a coarse owner ABI.
+    if (comptime control_only_storage_sources) return false;
     if (group_ids.len <= 1 or req.aggregations_json.len == 0) return false;
     if (!canConsiderAlgebraicAggregations(req)) return false;
     const constraints = (try algebraicConstraintsForRequestAlloc(alloc, req)) orelse return false;
@@ -11133,7 +11212,7 @@ fn applyHostedProvisionedQueryAggregations(
 ) !void {
     if (req.aggregations_json.len == 0) return;
     const aggregation_req = requestWithResultIdentityGeneration(req, result.*);
-    if (group_ids.len == 1) {
+    if (comptime !control_only_storage_sources) if (group_ids.len == 1) {
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_ids[0], routePolicyForConsistency(consistency))) orelse return error.TableNotFound;
         defer route.deinit(alloc);
 
@@ -11151,7 +11230,7 @@ fn applyHostedProvisionedQueryAggregations(
             },
             .remote => {},
         }
-    }
+    };
 
     if (try tryApplyHostedAlgebraicDistributedAggregations(self, alloc, group_ids, table_name, aggregation_req, meta, consistency)) return;
 
@@ -11193,6 +11272,11 @@ fn tryApplyHostedAlgebraicDistributedAggregations(
     meta: *query_api.QueryResponseMeta,
     consistency: raft_mod.ReadConsistency,
 ) !bool {
+    // Algebraic planning currently borrows a physical index to construct the
+    // distributed tensor program. Control-only callers retain exact
+    // full-result aggregation until planning is exposed as a coarse owner
+    // operation.
+    if (comptime control_only_storage_sources) return false;
     if (group_ids.len <= 1 or req.aggregations_json.len == 0) return false;
     if (!canConsiderAlgebraicAggregations(req)) return false;
     const representative_group_id: ?u64 = blk: {

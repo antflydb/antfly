@@ -13,6 +13,8 @@
 // limitations.
 
 const std = @import("std");
+const storage_source_options = @import("storage_source_options");
+const control_only_storage_sources = storage_source_options.control_only;
 const backups_api = @import("../api/backups.zig");
 const common_config = @import("../common/config.zig");
 const fs_paths = @import("../common/fs_paths.zig");
@@ -21,7 +23,7 @@ const table_manager = @import("table_manager.zig");
 const raft_catalog = @import("../raft/catalog.zig");
 const backup_restore = @import("../raft/storage/backup_restore.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = @import("../storage/db/selected_root.zig").db;
 const change_journal_mod = @import("../storage/db/derived/change_journal.zig");
 const internal_keys = @import("../storage/internal_keys.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
@@ -34,6 +36,7 @@ const raft_mod = @import("../raft/mod.zig");
 const backend_runtime_mod = @import("../storage/background_runtime.zig");
 const shard_db_adapter_mod = @import("shard_db_adapter.zig");
 const doc_identity = @import("../storage/db/doc_identity.zig");
+const restore_state_contract = @import("../storage/restore_state_contract.zig");
 
 pub const ProvisionSummary = struct {
     groups_considered: usize = 0,
@@ -75,6 +78,11 @@ pub const ReconcileReplicaRootOptions = struct {
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     shard_db_adapter: ?shard_db_adapter_mod.ShardDbAdapter = null,
     restore_open_options: backups_api.OpenOptions = .{},
+};
+
+pub const RestoreProgressOptions = struct {
+    shared_io: ?std.Io = null,
+    shard_db_adapter: ?shard_db_adapter_mod.ShardDbAdapter = null,
 };
 
 fn provisioningDbOpenOptions() db_mod.OpenOptions {
@@ -598,15 +606,15 @@ pub fn collectLocalRestoreProgress(
     tables: []const table_manager.TableRecord,
     ranges: []const table_manager.RangeRecord,
 ) ![]table_manager.RestoreProgressRecord {
-    return try collectLocalRestoreProgressUsingIo(
+    return try collectLocalRestoreProgressWithOptions(
         alloc,
-        null,
         replica_root_dir,
         metadata_group_id,
         local_node_id,
         hosted_group_ids,
         tables,
         ranges,
+        .{},
     );
 }
 
@@ -620,41 +628,77 @@ pub fn collectLocalRestoreProgressUsingIo(
     tables: []const table_manager.TableRecord,
     ranges: []const table_manager.RangeRecord,
 ) ![]table_manager.RestoreProgressRecord {
-    if (shared_io) |io| {
-        return try collectLocalRestoreProgressWithIo(
-            alloc,
-            io,
-            replica_root_dir,
-            metadata_group_id,
-            local_node_id,
-            hosted_group_ids,
-            tables,
-            ranges,
-        );
-    }
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-    return try collectLocalRestoreProgressWithIo(
+    return try collectLocalRestoreProgressWithOptions(
         alloc,
-        io_impl.io(),
         replica_root_dir,
         metadata_group_id,
         local_node_id,
         hosted_group_ids,
         tables,
         ranges,
+        .{ .shared_io = shared_io },
     );
 }
 
-fn collectLocalRestoreProgressWithIo(
+pub fn collectLocalRestoreProgressWithOptions(
     alloc: std.mem.Allocator,
-    io: std.Io,
     replica_root_dir: []const u8,
     metadata_group_id: u64,
     local_node_id: u64,
     hosted_group_ids: []const u64,
     tables: []const table_manager.TableRecord,
     ranges: []const table_manager.RangeRecord,
+    options: RestoreProgressOptions,
+) ![]table_manager.RestoreProgressRecord {
+    if (options.shard_db_adapter != null or comptime control_only_storage_sources) {
+        return try collectLocalRestoreProgressFromSources(
+            alloc,
+            replica_root_dir,
+            metadata_group_id,
+            local_node_id,
+            hosted_group_ids,
+            tables,
+            ranges,
+            options,
+        );
+    }
+    if (options.shared_io != null) {
+        return try collectLocalRestoreProgressFromSources(
+            alloc,
+            replica_root_dir,
+            metadata_group_id,
+            local_node_id,
+            hosted_group_ids,
+            tables,
+            ranges,
+            options,
+        );
+    }
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    var threaded_options = options;
+    threaded_options.shared_io = io_impl.io();
+    return try collectLocalRestoreProgressFromSources(
+        alloc,
+        replica_root_dir,
+        metadata_group_id,
+        local_node_id,
+        hosted_group_ids,
+        tables,
+        ranges,
+        threaded_options,
+    );
+}
+
+fn collectLocalRestoreProgressFromSources(
+    alloc: std.mem.Allocator,
+    replica_root_dir: []const u8,
+    metadata_group_id: u64,
+    local_node_id: u64,
+    hosted_group_ids: []const u64,
+    tables: []const table_manager.TableRecord,
+    ranges: []const table_manager.RangeRecord,
+    options: RestoreProgressOptions,
 ) ![]table_manager.RestoreProgressRecord {
     var out = std.ArrayListUnmanaged(table_manager.RestoreProgressRecord).empty;
     errdefer {
@@ -668,9 +712,27 @@ fn collectLocalRestoreProgressWithIo(
         const table = findTable(tables, range.table_id) orelse continue;
         const restore = resolveRestoreIntent(range, table) orelse continue;
 
-        const path = try groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
-        defer alloc.free(path);
-        var state = (try db_mod.DB.readRestoreStateForPathWithIo(alloc, io, path)) orelse continue;
+        var state: restore_state_contract.State = if (options.shard_db_adapter) |adapter|
+            (try adapter.restoreState(alloc, table.name, group_id)) orelse continue
+        else state: {
+            if (comptime control_only_storage_sources) return error.StorageKernelOwnerUnavailable;
+            const io = options.shared_io orelse return error.StorageKernelOwnerUnavailable;
+            const path = try groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
+            defer alloc.free(path);
+            var physical = (try db_mod.DB.readRestoreStateForPathWithIo(alloc, io, path)) orelse continue;
+            defer physical.deinit(alloc);
+            break :state try (restore_state_contract.State{
+                .backup_id = physical.backup_id,
+                .location = physical.location,
+                .artifact_sha256 = physical.artifact_sha256,
+                .snapshot_path = physical.snapshot_path,
+                .group_id = physical.group_id,
+                .phase = physical.phase,
+                .primary_restored = physical.primary_restored,
+                .runtime_repair_complete = physical.runtime_repair_complete,
+                .last_error = physical.last_error,
+            }).cloneAlloc(alloc);
+        };
         defer state.deinit(alloc);
         if (!std.mem.eql(u8, state.backup_id, restore.backup_id)) continue;
         if (!std.mem.eql(u8, state.location, restore.location)) continue;
@@ -719,6 +781,99 @@ fn collectLocalRestoreProgressWithIo(
         }
     }.lessThan);
     return try out.toOwnedSlice(alloc);
+}
+
+test "table provisioner reads restore progress through shard owner adapter" {
+    const RestoreStateAdapter = struct {
+        called: bool = false,
+
+        fn fetchMedianKey(_: *anyopaque, _: std.mem.Allocator, _: u64) !?[]u8 {
+            return null;
+        }
+
+        fn schemaIndexReady(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: u64,
+            _: u32,
+            _: u32,
+        ) !bool {
+            return false;
+        }
+
+        fn restoreState(
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            group_id: u64,
+        ) !?restore_state_contract.State {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqual(@as(u64, 2001), group_id);
+            self.called = true;
+            return try (restore_state_contract.State{
+                .backup_id = "backup-1",
+                .location = "s3://backups/backup-1",
+                .artifact_sha256 = "abc123",
+                .snapshot_path = "backup-1/groups/2001",
+                .group_id = group_id,
+                .phase = "runtime_repaired",
+                .primary_restored = true,
+                .runtime_repair_complete = true,
+                .last_error = "",
+            }).cloneAlloc(alloc);
+        }
+
+        fn adapter(self: *@This()) shard_db_adapter_mod.ShardDbAdapter {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .fetch_median_key = fetchMedianKey,
+                    .schema_index_ready = schemaIndexReady,
+                    .restore_state = restoreState,
+                },
+            };
+        }
+    };
+
+    var source: RestoreStateAdapter = .{};
+    const progress = try collectLocalRestoreProgressWithOptions(
+        std.testing.allocator,
+        "/unused/control-unit-must-not-open-this-path",
+        100,
+        7,
+        &.{ 100, 2001 },
+        &.{.{
+            .table_id = 9,
+            .name = "docs",
+        }},
+        &.{.{
+            .group_id = 2001,
+            .table_id = 9,
+            .start_key = "doc:a",
+            .end_key = "doc:z",
+            .restore_backup_id = "backup-1",
+            .restore_artifact_backup_id = "backup-1",
+            .restore_location = "s3://backups/backup-1",
+            .restore_snapshot_path = "backup-1/groups/2001",
+            .restore_artifact_sha256 = "abc123",
+        }},
+        .{ .shard_db_adapter = source.adapter() },
+    );
+    defer {
+        for (progress) |record| table_manager.freeRestoreProgress(std.testing.allocator, record);
+        std.testing.allocator.free(progress);
+    }
+
+    try std.testing.expect(source.called);
+    try std.testing.expectEqual(@as(usize, 1), progress.len);
+    try std.testing.expectEqual(@as(u64, 9), progress[0].table_id);
+    try std.testing.expectEqual(@as(u64, 7), progress[0].node_id);
+    try std.testing.expectEqual(@as(u64, 2001), progress[0].group_id);
+    try std.testing.expect(progress[0].primary_restored);
+    try std.testing.expect(progress[0].runtime_repair_complete);
+    try std.testing.expectEqualStrings("runtime_repaired", progress[0].phase);
 }
 
 pub fn applyRestoreIntentIfNeeded(
@@ -1270,6 +1425,9 @@ fn localRangeHasSchemaVersionIndex(
 ) !bool {
     if (options.shard_db_adapter) |adapter| {
         return try adapter.schemaIndexReady(alloc, table_name, group_id, schema_version, read_schema_version);
+    }
+    if (comptime control_only_storage_sources) {
+        return error.StorageKernelOwnerUnavailable;
     }
 
     const path = try groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);

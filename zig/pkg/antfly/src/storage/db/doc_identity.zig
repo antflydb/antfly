@@ -17,20 +17,12 @@ const Allocator = std.mem.Allocator;
 const docstore_mod = @import("../docstore.zig");
 const internal_keys = @import("../internal_keys.zig");
 const doc_set = @import("doc_set.zig");
+const namespace_contract = @import("doc_identity_namespace.zig");
 
 pub const DocOrdinal = doc_set.DocOrdinal;
 
-pub const Namespace = struct {
-    table_id: u64 = 0,
-    shard_id: u64 = 0,
-    range_id: u64 = 0,
-
-    pub fn eql(self: Namespace, other: Namespace) bool {
-        return self.table_id == other.table_id and self.shard_id == other.shard_id and self.range_id == other.range_id;
-    }
-};
-
-pub const default_namespace = Namespace{};
+pub const Namespace = namespace_contract.Namespace;
+pub const default_namespace = namespace_contract.default_namespace;
 
 pub const NamespaceMismatchPolicy = enum {
     reject,

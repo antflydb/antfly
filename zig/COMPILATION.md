@@ -1,6 +1,6 @@
 # Antfly Zig compilation architecture
 
-Last updated: 2026-08-08
+Last updated: 2026-08-10
 
 ## Main goal
 
@@ -189,6 +189,7 @@ the same host, target, cache state, and report set.
 | Canonical storage-contract/import cut | Removed 42k lexically reachable lines but declarations 17,332 → 17,334 with identical generic/inline counts | Rejected; lazy file removal is not emitted-code removal |
 | Isolated local HA runtime | Application saved 5.344 s while a new HA unit cost 30.525 s and duplicated 75 files | Rejected; small role splitting increases aggregate LLVM work |
 | Experimental control-only provisioned write vtable | Application 366.523 s, 41,591 declarations, and only 703 KB less allocatable object data while adding a 216.358 s storage unit | Rejected; the vtable shell is small and direct runtime storage ownership remains |
+| Atomic control-only physical-source cut | Focused distributed control 236 s; full cold archive 509 s -> 458 s; storage 316 s / 4.03 GiB and distributed 233 s / 2.98 GiB; executable 71.79 MB -> 65.27 MB | Keep behind the experiment; production enablement remains pending repeated normal-runner proof |
 
 The `/tmp` graph analysis was consolidated into
 `tools/analyze_zig_import_graph.py`. It reports lexical reachability, consumes
@@ -200,8 +201,8 @@ reachability from machine code/data that LLVM actually emitted. Its regression t
 
 ## Current compilation architecture
 
-The linked release currently generates four coarse libraries with normal,
-memory-budgeted concurrency:
+The default linked release currently generates four coarse libraries with
+normal, memory-budgeted concurrency:
 
 ```text
 antfly executable
@@ -241,9 +242,25 @@ The first ABI preparation is complete:
   resource-manager, LSM-cache, and HBC-cache state across opaque group owners.
 
 This source-level separation protects the public API from accidental
-implementation barrels. The process context is retained foundation for the
-remaining physical-owner cut; it is not evidence by itself that the separate
-kernel experiment should be production-enabled.
+implementation barrels. The process context was the foundation for the
+physical-owner cut now selected by the opt-in composition; its existence alone
+still is not evidence that the experiment should be production-enabled.
+
+The opt-in experiment now selects a different four-unit composition:
+
+```text
+antfly executable
+├── antfly-runtime-distributed  # API plus data/metadata/HA control consumers
+├── antfly-storage-kernel       # physical storage, serverless, standalone/Lite, CAPI
+├── antfly-runtime-inference    # inference plus standalone inference host
+└── antfly-runtime-cli          # remote/client commands only
+```
+
+In that composition, the distributed unit is compiled with control-only
+storage sources and can reach physical local operations only through opaque
+owner, data-apply, wire, and callback contracts. The same sectioned PIC storage
+archive supplies the executable and C API libraries. This remains opt-in until
+the normal Linux runner confirms the local cold-build result repeatedly.
 
 ## Historical pre-serverless clean-cache profile
 
@@ -2753,15 +2770,106 @@ make standalone a thin composition layer over opaque compiled runtime handles;
 moving its existing source body between archives cannot meet the critical-path
 or compile-once goals.
 
+### Phase 4l: atomic control-only physical-source cut
+
+The ownership prerequisites now permit the measurement-worthy cut that the
+earlier vtable probes could not make. `storage_source_options.control_only` is
+a property of each compiler unit rather than a global behavioral flag. The
+storage-owning unit selects the physical DB root; the distributed unit selects
+contract-only roots for DB types, query validation, document identity, runtime
+callbacks, and HA contracts. Data and metadata retain routing, Raft and
+transition policy, public/API control, retries, and lifecycle orchestration,
+but their local operations enter the one process-scoped kernel owner.
+
+This is an atomic selection. The experimental distributed unit cannot fall
+back to its former provisioned DB caches, construct the physical data apply
+store, inspect restore state directly, or reopen DBs for split, merge, status,
+maintenance, and startup reconciliation. Provider and ordinary test units
+continue to select physical storage, which preserves independent legacy
+coverage and prevents the build-wide option from accidentally turning the
+provider into its own client.
+
+A focused cold ARM64 Linux musl `ReleaseFast` control/API probe established the
+source-cut signal before paying for the full archive:
+
+| Metric | Before source selection | Control-only root |
+|---|---:|---:|
+| Compiler time | 341.1 s | 236 s |
+| Peak compiler RSS | 5.19 GiB | measured below 3 GiB in the full composition |
+| Emitted text | 21,747,232 B | 16,534,856 B |
+| Attributed emitting modules | 309 | 260 |
+
+The focused object no longer emitted the physical DB implementation family.
+The complete cold comparison then used fresh local and global caches, normal
+build concurrency, the same ARM64 Linux musl `ReleaseFast` target, stripping,
+production LSM-only mode, and the same local host:
+
+| Metric | Pre-cut topology | Source-selected candidate |
+|---|---:|---:|
+| Complete build | 509 s | 458 s |
+| Storage kernel | part of 509 s build | 316 s / 4.03 GiB |
+| Distributed/API control | part of 509 s build | 233 s / 2.98 GiB |
+| Inference | part of 509 s build | 202 s / 3.34 GiB |
+| Remote CLI | part of 509 s build | 33 s / 0.74 GiB |
+| Final link | part of 509 s build | 12 s / 0.37 GiB |
+| Largest compiler RSS | 6.08 GiB | 4.03 GiB |
+| Static stripped executable | 71,792,160 B | 65,273,152 B |
+| Distributed/API archive | 31,987,980 B | 23,861,542 B |
+| Storage archive | 36,675,058 B | 36,705,768 B |
+| Inference archive | 22,805,380 B | 22,805,382 B |
+| CLI archive | 2,927,158 B | 2,927,160 B |
+
+Both application-critical compilation units are below the preferred
+350-second local gate, while the complete build improves by 51 seconds and the
+executable shrinks by about 9.1%. The full wall time is intentionally longer
+than the largest unit: under the deterministic memory schedule, storage and
+distributed start together, then inference starts after distributed and
+overlaps the tail of storage. This preserves normal parallel code generation
+without exceeding the existing claims. It is not evidence for lowering those
+claims before Linux measurements.
+
+Artifact validation found one stripped static ARM64 executable, a 16,682,120 B
+`libantfly.so`, and one 36,705,768 B storage archive reused by both product
+links. The storage archive contains no native `mdb_*`, `lmdb_backend`, or
+`backend_lmdb` symbol. The C API dynamic symbol table retains public
+`antfly_db_open` and `antfly_db_close` while excluding internal storage-owner
+and runtime entry points.
+
+Current correctness validation with normal concurrency includes:
+
+- public API parity: 158/158 passed with zero leaks;
+- opaque owner ABI: 8/8 passed with zero leaks;
+- provisioned owner source: 6/6 passed with zero leaks;
+- cross-archive DataServer composition: 13/13 passed with zero leaks;
+- four legacy physical split/merge/cache/warmup regressions: 4/4 passed with
+  zero leaks;
+- five focused metadata server, restore, replication, and apply-store tests;
+- a complete linked native Debug build with the experiment enabled;
+- all runtime, codegen, and API graph gates; and
+- all 15 analyzer tests.
+
+The warmup validation also exposed a stale expectation already present on
+`origin/main`: synchronous test-mode startup reconciliation publishes a fresh
+snapshot through a transient writer, rather than leaving the earlier synthetic
+placeholder. The corrected regression now asserts that authoritative source
+and also proves both physical write caches are empty afterward.
+
+Decision: **keep this increment behind the opt-in experiment**. It is the first
+candidate that makes the ownership architecture materially true and meets both
+local per-unit time gates while shrinking total wall time and artifacts. The
+production/default decision remains **revise/pending** until repeated cold
+builds on the normal Linux runner confirm reliability, time, RSS, symbols, and
+behavior. Do not enable the option by default, merge it, lower memory claims,
+or increase runner cost from this local result alone.
+
 ## Holistic target architecture
 
-The current candidate baseline is the four-unit topology above with serverless
-local execution in application/storage. It is smaller than the rejected
-source-only coalescing, its isolated application/storage unit remains under the
-accepted local time gate, and its predecessor was reliable on the normal
-runner. It is not yet the final target: the Linux application/storage critical
-unit is still too slow and API still emits 50 physical storage/local-query
-files.
+The current local candidate is the opt-in four-unit source-selected topology
+above. Unlike the rejected source-only coalescing probes, it gives the
+distributed/API unit only control sources and gives the storage unit the one
+physical implementation. Both units are below the preferred 350-second local
+gate. It is not yet the production baseline because the normal Linux runner has
+not repeated the cold result.
 
 The reopened target is a modular monolith with one compiled physical-storage
 owner and separately compiled control consumers:
@@ -2779,12 +2887,12 @@ thin linked main
     └── model lifecycle plus the linked standalone inference host
 ```
 
-The accepted grouping keeps remote CLI separate, and keeps data, metadata,
-serverless, HA, standalone/Lite, restore, and the C API in the
-application/storage unit.
-Further regrouping is a measured decision after the remaining API physical
-imports disappear. Standalone remains a product composition mode and always
-links the separately compiled inference host.
+The candidate grouping keeps remote CLI separate; co-generates API with the
+data, metadata, and HA control consumers; and keeps serverless local execution,
+standalone/Lite, restore, physical storage, and the C API in the storage unit.
+Further regrouping is a measured decision, not a prerequisite for normal-runner
+validation. Standalone remains a product composition mode and always links the
+separately compiled inference host.
 
 The kernel is not a per-backend wrapper and not an internal RPC service. It is
 one static PIC artifact linked into the executable and the C API libraries.
@@ -3014,9 +3122,11 @@ zig build \
   -Dstorage-kernel-experiment=true
 ```
 
-This option remains off by default while the physical-source cut is incomplete.
-Production must not enable it until the behavioral, compiler, memory, graph,
-artifact, and normal-runner gates above pass.
+The atomic physical-source cut is complete in the opt-in data, metadata, HA,
+and API consumer unit, but the option remains off by default while repeated
+normal-runner proof is missing. Production must not enable it until the
+behavioral, compiler, memory, graph, artifact, and normal-runner gates above
+pass.
 
 Compatibility validation keeps the linked architecture but enables LMDB:
 

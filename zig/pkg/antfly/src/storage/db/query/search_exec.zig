@@ -36,6 +36,7 @@ const roaring = @import("../../../encoding/roaring.zig");
 const snappy = @import("../../../encoding/snappy.zig");
 const distributed_stats_mod = @import("../../../search/distributed_stats.zig");
 const runtime_preflight = @import("../runtime_preflight.zig");
+const control_contract = @import("control_contract.zig");
 const analysis_mod = @import("../../../search/analysis.zig");
 const introducer_mod = @import("../../../introducer.zig");
 const mapper_mod = @import("../document_mapper.zig");
@@ -77,42 +78,13 @@ const bench_query_profile_unknown = std.math.maxInt(u64);
 const bench_query_profile_disabled = std.math.maxInt(u64) - 1;
 var bench_query_profile_every_cache: std.atomic.Value(u64) = .init(bench_query_profile_unknown);
 
-pub const SortRejectionDiagnostic = struct {
-    field: []const u8 = "",
-    reason: []const u8 = "unsupported_exact_sort",
-    detail: []const u8 = "unsupported_exact_sort",
-};
-
-threadlocal var last_sort_rejection_diagnostic: ?SortRejectionDiagnostic = null;
-threadlocal var last_sort_rejection_field_buf: [256]u8 = undefined;
-
-pub fn resetLastSortRejectionDiagnostic() void {
-    last_sort_rejection_diagnostic = null;
-}
-
-pub fn takeLastSortRejectionDiagnostic() ?SortRejectionDiagnostic {
-    const diagnostic = last_sort_rejection_diagnostic;
-    last_sort_rejection_diagnostic = null;
-    return diagnostic;
-}
-
-pub fn peekLastSortRejectionDiagnostic() ?SortRejectionDiagnostic {
-    return last_sort_rejection_diagnostic;
-}
-
-pub fn recordSortRejectionDiagnostic(field: []const u8, reason: []const u8, detail: []const u8) void {
-    const field_len = @min(field.len, last_sort_rejection_field_buf.len);
-    if (field_len > 0) @memcpy(last_sort_rejection_field_buf[0..field_len], field[0..field_len]);
-    last_sort_rejection_diagnostic = .{
-        .field = last_sort_rejection_field_buf[0..field_len],
-        .reason = reason,
-        .detail = detail,
-    };
-}
-
-pub fn recordSortRejectionDiagnosticForTesting(field: []const u8, reason: []const u8, detail: []const u8) void {
-    recordSortRejectionDiagnostic(field, reason, detail);
-}
+pub const SortRejectionDiagnostic = runtime_preflight.SortRejectionDiagnostic;
+pub const resetLastSortRejectionDiagnostic = runtime_preflight.resetLastSortRejectionDiagnostic;
+pub const takeLastSortRejectionDiagnostic = runtime_preflight.takeLastSortRejectionDiagnostic;
+pub const peekLastSortRejectionDiagnostic = runtime_preflight.peekLastSortRejectionDiagnostic;
+pub const recordSortRejectionDiagnostic = runtime_preflight.recordSortRejectionDiagnostic;
+pub const recordSortRejectionDiagnosticForTesting = runtime_preflight.recordSortRejectionDiagnosticForTesting;
+const textQueryIsScoreBearing = runtime_preflight.textQueryIsScoreBearing;
 
 pub const SearchTextDispatcher = struct {
     ctx: ?*anyopaque,
@@ -210,21 +182,8 @@ pub const SearchTextStatsExecutor = struct {
     ) anyerror![]?[]u8 = null,
 };
 
-pub const ExplicitTextStatRequest = struct {
-    index_name: ?[]const u8 = null,
-    field: []const u8,
-    terms: []const []const u8 = &.{},
-    resolved_doc_filter: ?*const doc_set.ResolvedDocFilter = null,
-};
-
-pub const ExplicitBackgroundTextStatRequest = struct {
-    aggregation_name: []const u8,
-    index_name: ?[]const u8 = null,
-    field: []const u8,
-    terms: []const []const u8 = &.{},
-    background_query: aggregations_mod.BackgroundQuery,
-    resolved_doc_filter: ?*const doc_set.ResolvedDocFilter = null,
-};
+pub const ExplicitTextStatRequest = control_contract.ExplicitTextStatRequest;
+pub const ExplicitBackgroundTextStatRequest = control_contract.ExplicitBackgroundTextStatRequest;
 
 const SearchRequestTextStatEntry = struct {
     field: []const u8 = "",
@@ -345,85 +304,7 @@ pub const DenseSearchExecutor = struct {
     ) anyerror!types.SearchResult,
 };
 
-pub const DenseSearchProfile = struct {
-    pub const DebugHit = struct {
-        id: u64 = 0,
-        distance: f32 = 0,
-        error_bound: f32 = 0,
-        lower_bound: f32 = 0,
-        upper_bound: f32 = 0,
-    };
-
-    pub const DebugPair = struct {
-        left: DebugHit = .{},
-        right: DebugHit = .{},
-        distance_gap: f32 = 0,
-        interval_gap: f32 = 0,
-        overlaps: bool = false,
-    };
-
-    total_ns: u64 = 0,
-    index_lookup_ns: u64 = 0,
-    constraint_ns: u64 = 0,
-    hbc_search_ns: u64 = 0,
-    hbc_runtime_txn_ns: u64 = 0,
-    hbc_scratch_acquire_ns: u64 = 0,
-    hbc_node_cache_lookup_ns: u64 = 0,
-    hbc_quantized_cache_lookup_ns: u64 = 0,
-    resolved_search_width: u32 = 0,
-    resolved_epsilon: f32 = 0,
-    native_filter_candidate_count: u64 = 0,
-    search_route: []const u8 = "",
-    route_reason: []const u8 = "",
-    hbc_nodes_visited: u64 = 0,
-    hbc_leaves_explored: u64 = 0,
-    hbc_approx_vectors_scored: u64 = 0,
-    hbc_exact_vectors_scored: u64 = 0,
-    hbc_leaf_payload_stale: u64 = 0,
-    hbc_leaf_payload_missing: u64 = 0,
-    hbc_reranked_vectors: u64 = 0,
-    hbc_approx_candidate_count: u64 = 0,
-    hbc_rerank_candidate_count: u64 = 0,
-    hbc_ambiguous_top_k_pairs: u64 = 0,
-    hbc_ambiguous_boundary_pairs: u64 = 0,
-    hbc_ambiguous_distance_over_hits: u64 = 0,
-    hbc_ambiguous_distance_under_hits: u64 = 0,
-    hbc_full_rerank_due_to_threshold: bool = false,
-    hbc_top_k_count: u64 = 0,
-    hbc_min_distance_gap_top_k: f32 = 0,
-    hbc_min_interval_gap_top_k: f32 = 0,
-    hbc_closest_pair_top_k: ?DebugPair = null,
-    hbc_boundary_pair: ?DebugPair = null,
-    hbc_boundary_tail_error_avg: f32 = 0,
-    hbc_boundary_tail_error_max: f32 = 0,
-    hbc_boundary_tail_distance_gap_avg: f32 = 0,
-    hbc_boundary_tail_distance_gap_min: f32 = 0,
-    hbc_boundary_tail_distance_gap_max: f32 = 0,
-    hbc_boundary_tail_interval_gap_avg: f32 = 0,
-    hbc_boundary_tail_interval_gap_min: f32 = 0,
-    hbc_boundary_tail_interval_gap_max: f32 = 0,
-    hbc_approx_top_count: u64 = 0,
-    hbc_approx_top: [5]DebugHit = .{ .{}, .{}, .{}, .{}, .{} },
-    hbc_rerank_external_score_ns: u64 = 0,
-    hbc_rerank_vector_load_ns: u64 = 0,
-    hbc_rerank_metadata_lookup_ns: u64 = 0,
-    hbc_rerank_artifact_key_ns: u64 = 0,
-    hbc_rerank_artifact_read_ns: u64 = 0,
-    hbc_rerank_artifact_decode_ns: u64 = 0,
-    hbc_rerank_artifact_distance_ns: u64 = 0,
-    hbc_rerank_lsm_cache_hits: u64 = 0,
-    hbc_rerank_lsm_cache_misses: u64 = 0,
-    hbc_rerank_distance_ns: u64 = 0,
-    doc_key_resolve_ns: u64 = 0,
-    doc_ordinal_lookup_ns: u64 = 0,
-    load_projected_document_ns: u64 = 0,
-    postprocess_ns: u64 = 0,
-    raw_hit_count: u32 = 0,
-    returned_hit_count: u32 = 0,
-    inline_metadata_hits: u32 = 0,
-    fetched_metadata_hits: u32 = 0,
-    lookup_doc_key_hits: u32 = 0,
-};
+pub const DenseSearchProfile = control_contract.DenseSearchProfile;
 
 pub const ProfiledDenseSearchResult = struct {
     result: types.SearchResult,
@@ -809,122 +690,7 @@ pub fn preflightSearchRequestAlloc(
 }
 
 pub fn deriveEstimateFields(summary: *RuntimePreflightSummary) void {
-    summary.text_result_upper_bound = textResultUpperBound(summary.*);
-    summary.text_term_doc_freq_total = textTermDocFreqTotal(summary.*);
-    summary.corpus_doc_count_estimate = estimatedCorpusDocCount(summary.*);
-    summary.result_doc_upper_bound = resultDocUpperBound(summary.*);
-    summary.result_doc_estimate = resultDocEstimate(summary.*);
-    summary.selectivity_lower_bound_ratio = selectivityLowerBoundRatio(summary.*);
-    summary.selectivity_sample_ratio = selectivitySampleRatio(summary.*);
-    summary.selectivity_upper_bound_ratio = selectivityUpperBoundRatio(summary.*);
-    summary.effective_stored_projection_doc_estimate_total = if (summary.result_doc_estimate) |estimate|
-        @min(summary.stored_projection_doc_upper_bound_total, estimate)
-    else
-        null;
-    summary.effective_stored_projection_doc_upper_bound_total = if (summary.result_doc_upper_bound) |bound|
-        @min(summary.stored_projection_doc_upper_bound_total, bound)
-    else
-        summary.stored_projection_doc_upper_bound_total;
-    summary.effective_rerank_doc_estimate = if (summary.result_doc_estimate) |estimate|
-        @min(summary.rerank_doc_upper_bound, estimate)
-    else
-        null;
-    summary.effective_rerank_doc_upper_bound = if (summary.result_doc_upper_bound) |bound|
-        @min(summary.rerank_doc_upper_bound, bound)
-    else
-        summary.rerank_doc_upper_bound;
-    summary.aggregation_second_pass_doc_estimate = if (summary.aggregation_may_scan_full_results) summary.result_doc_estimate else null;
-    summary.aggregation_second_pass_doc_upper_bound = if (summary.aggregation_may_scan_full_results) summary.result_doc_upper_bound else null;
-}
-
-fn textResultUpperBound(summary: RuntimePreflightSummary) ?u32 {
-    var total_bound: u64 = 0;
-    var has_terms = false;
-    for (summary.text_query_stats) |item| {
-        var field_bound: u64 = 0;
-        for (item.term_doc_freqs) |term| {
-            field_bound +|= term.doc_freq;
-            has_terms = true;
-        }
-        if (field_bound == 0) continue;
-        const capped_field_bound = @min(field_bound, item.global_doc_count);
-        total_bound +|= capped_field_bound;
-    }
-    if (!has_terms) return null;
-    if (estimatedCorpusDocCount(summary)) |corpus_docs| {
-        total_bound = @min(total_bound, corpus_docs);
-    }
-    return @intCast(@min(total_bound, @as(u64, std.math.maxInt(u32))));
-}
-
-fn textTermDocFreqTotal(summary: RuntimePreflightSummary) u64 {
-    var total: u64 = 0;
-    for (summary.text_query_stats) |item| {
-        for (item.term_doc_freqs) |term| total +|= term.doc_freq;
-    }
-    return total;
-}
-
-fn estimatedCorpusDocCount(summary: RuntimePreflightSummary) ?u64 {
-    var corpus_docs: u64 = 0;
-    for (summary.text_query_stats) |item| corpus_docs = @max(corpus_docs, item.global_doc_count);
-    for (summary.text_indexes) |item| corpus_docs = @max(corpus_docs, item.doc_count);
-    for (summary.embedding_indexes) |item| corpus_docs = @max(corpus_docs, item.doc_count);
-    for (summary.graph_indexes) |item| corpus_docs = @max(corpus_docs, item.node_count);
-    return if (corpus_docs > 0) corpus_docs else null;
-}
-
-fn selectivityUpperBoundRatio(summary: RuntimePreflightSummary) ?f32 {
-    const bound = summary.result_doc_upper_bound orelse return null;
-    const corpus_docs = estimatedCorpusDocCount(summary) orelse return null;
-    if (corpus_docs == 0) return null;
-    return @as(f32, @floatFromInt(bound)) / @as(f32, @floatFromInt(corpus_docs));
-}
-
-fn selectivityLowerBoundRatio(summary: RuntimePreflightSummary) ?f32 {
-    const lower_bound = summary.structured_filter_doc_count_lower_bound orelse return null;
-    const corpus_docs = estimatedCorpusDocCount(summary) orelse return null;
-    if (corpus_docs == 0) return null;
-    return @as(f32, @floatFromInt(lower_bound)) / @as(f32, @floatFromInt(corpus_docs));
-}
-
-fn selectivitySampleRatio(summary: RuntimePreflightSummary) ?f32 {
-    const sample_estimate = summary.structured_filter_doc_count_sample_estimate orelse return null;
-    const corpus_docs = estimatedCorpusDocCount(summary) orelse return null;
-    if (corpus_docs == 0) return null;
-    return @as(f32, @floatFromInt(sample_estimate)) / @as(f32, @floatFromInt(corpus_docs));
-}
-
-fn resultDocUpperBound(summary: RuntimePreflightSummary) ?u32 {
-    var bound = summary.positive_id_result_upper_bound;
-    if (summary.structured_filter_doc_count_sample_estimate == null) if (summary.structured_filter_doc_count_estimate) |structured_count| {
-        const structured_bound: u32 = @intCast(@min(structured_count, @as(u64, std.math.maxInt(u32))));
-        bound = if (bound) |existing| @min(existing, structured_bound) else structured_bound;
-    };
-    if (summary.text_result_upper_bound) |text_bound| {
-        bound = if (bound) |existing| @min(existing, text_bound) else text_bound;
-    }
-    return bound;
-}
-
-fn resultDocEstimate(summary: RuntimePreflightSummary) ?u32 {
-    var estimate: ?u32 = null;
-    if (summary.structured_filter_count_budget_limit != null) {
-        if (summary.structured_filter_doc_count_sample_estimate) |structured_count| {
-            estimate = @intCast(@min(structured_count, @as(u64, std.math.maxInt(u32))));
-        } else if (summary.structured_filter_doc_count_estimate) |structured_count| {
-            estimate = @intCast(@min(structured_count, @as(u64, std.math.maxInt(u32))));
-        }
-    } else if (summary.structured_filter_doc_count_estimate) |structured_count| {
-        estimate = @intCast(@min(structured_count, @as(u64, std.math.maxInt(u32))));
-    } else if (summary.structured_filter_doc_count_sample_estimate) |structured_count| {
-        estimate = @intCast(@min(structured_count, @as(u64, std.math.maxInt(u32))));
-    }
-    if (estimate) |value| {
-        if (summary.result_doc_upper_bound) |bound| return @min(value, bound);
-        return value;
-    }
-    return null;
+    runtime_preflight.deriveEstimateFields(summary);
 }
 
 pub fn emptySearchResult(alloc: Allocator) !types.SearchResult {
@@ -957,10 +723,7 @@ fn freeOwnedStringSlice(alloc: Allocator, values: []const []const u8) void {
 }
 
 pub fn isTextQuery(query: types.Query) bool {
-    return switch (query) {
-        .match_none, .match_all, .phrase, .multi_phrase, .term, .fuzzy, .numeric_range, .date_range, .doc_id, .bool_field, .geo_distance, .geo_bbox, .term_range, .ip_range, .geo_shape, .match, .match_phrase, .prefix, .wildcard, .regexp => true,
-        else => false,
-    };
+    return control_contract.isTextQuery(query);
 }
 
 pub fn searchComposed(
@@ -1372,10 +1135,7 @@ fn findComposedNamedSet(named_sets: []const graph_exec.NamedResultSet, name: []c
 }
 
 pub fn isDefaultMatchAll(query: types.Query) bool {
-    return switch (query) {
-        .match_all => true,
-        else => false,
-    };
+    return control_contract.isDefaultMatchAll(query);
 }
 
 fn hasSearchRequestFullTextResults(req: types.SearchRequest) bool {
@@ -14405,65 +14165,9 @@ fn requestHasScoreSort(req: types.SearchRequest) bool {
     return false;
 }
 
-fn textQueryIsScoreBearing(query: types.TextQuery) bool {
-    return switch (query) {
-        .phrase,
-        .multi_phrase,
-        .term,
-        .match,
-        .multi_match_bool_prefix,
-        .match_phrase,
-        .fuzzy,
-        .prefix,
-        .wildcard,
-        .regexp,
-        => true,
-        .bool_query => |bool_query| textBoolQueryIsScoreBearing(bool_query),
-        .match_none,
-        .match_all,
-        .numeric_range,
-        .date_range,
-        .term_range,
-        .doc_id,
-        .bool_field,
-        .geo_distance,
-        .geo_bbox,
-        .ip_range,
-        .geo_shape,
-        => false,
-    };
-}
-
-fn textBoolQueryIsScoreBearing(query: types.TextBoolQuery) bool {
-    for (query.must) |child| {
-        if (textQueryIsScoreBearing(child)) return true;
-    }
-    for (query.should) |child| {
-        if (textQueryIsScoreBearing(child)) return true;
-    }
-    return false;
-}
-
-pub fn searchRequestHasScoreBearingTextSource(req: types.SearchRequest) bool {
-    if (req.full_text) |query| {
-        if (textQueryIsScoreBearing(query)) return true;
-    }
-    for (req.full_text_queries) |query| {
-        if (textQueryIsScoreBearing(query.query)) return true;
-    }
-    return false;
-}
-
-pub fn searchRequestHasScoreBearingVectorSource(req: types.SearchRequest) bool {
-    return req.dense != null or
-        req.sparse != null or
-        req.dense_queries.len > 0 or
-        req.sparse_queries.len > 0;
-}
-
-pub fn searchRequestHasScoreBearingSource(req: types.SearchRequest) bool {
-    return searchRequestHasScoreBearingTextSource(req) or searchRequestHasScoreBearingVectorSource(req);
-}
+pub const searchRequestHasScoreBearingTextSource = runtime_preflight.searchRequestHasScoreBearingTextSource;
+pub const searchRequestHasScoreBearingVectorSource = runtime_preflight.searchRequestHasScoreBearingVectorSource;
+pub const searchRequestHasScoreBearingSource = runtime_preflight.searchRequestHasScoreBearingSource;
 
 fn validateScoreSortHasScoreBearingTextSource(req: types.SearchRequest) !void {
     if (requestHasScoreSort(req) and !searchRequestHasScoreBearingTextSource(req)) {

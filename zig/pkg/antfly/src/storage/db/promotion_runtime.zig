@@ -40,6 +40,7 @@ const backend_erased = @import("../backend_erased.zig");
 const background_runtime_mod = @import("../background_runtime.zig");
 const resolution_runtime = @import("resolution_runtime.zig");
 const types = @import("types.zig");
+const runtime_callbacks = @import("runtime_callbacks.zig");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -54,61 +55,17 @@ pub const scope_name = "promotion";
 /// idempotent merge transform (set canonical fields, union aliases). The
 /// promoter calls this once per resolved mention.
 /// One canonical entity upsert: the document `doc_json` at `key` in `table`.
-pub const EntityUpsert = struct {
-    table: []const u8,
-    key: []const u8,
-    doc_json: []const u8,
-};
+pub const EntityUpsert = runtime_callbacks.EntityUpsert;
 
-pub const MissingSinkPolicy = enum {
-    /// Hold the applied sequence until a sink is injected; production routing or
-    /// metadata gaps must not permanently drop promotion work.
-    wait,
-    /// Explicitly disable promotion and advance applied sequence without writes.
-    disabled,
-};
+pub const MissingSinkPolicy = runtime_callbacks.MissingSinkPolicy;
 
-pub const EntitySink = struct {
-    ptr: *anyopaque,
-    vtable: *const VTable,
-
-    pub const VTable = struct {
-        /// Upsert the entity at `key` in `table` with the canonical document
-        /// `doc_json`. Must be idempotent under replay.
-        upsert: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, table: []const u8, key: []const u8, doc_json: []const u8) anyerror!void,
-        /// Upsert all entities resolved from one document atomically (a single
-        /// multi-participant transaction), so a document never lands a partial
-        /// set of its entities. Optional: when absent, `upsertBatch` falls back
-        /// to per-entity upserts.
-        upsert_batch: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, entries: []const EntityUpsert) anyerror!void = null,
-    };
-
-    pub fn upsert(self: EntitySink, allocator: std.mem.Allocator, table: []const u8, key: []const u8, doc_json: []const u8) anyerror!void {
-        return self.vtable.upsert(self.ptr, allocator, table, key, doc_json);
-    }
-
-    pub fn upsertBatch(self: EntitySink, allocator: std.mem.Allocator, entries: []const EntityUpsert) anyerror!void {
-        if (self.vtable.upsert_batch) |f| return f(self.ptr, allocator, entries);
-        for (entries) |e| try self.upsert(allocator, e.table, e.key, e.doc_json);
-    }
-};
+pub const EntitySink = runtime_callbacks.EntitySink;
 
 /// Dynamic ownership predicate for promotion work belonging to this DB's source
 /// shard. Standalone/local DBs leave this unset and are always owners; raft
 /// apply-side DBs inject a leadership-backed owner so followers keep the
 /// promotion checkpoint unapplied until they become leader.
-pub const PromotionOwner = struct {
-    ptr: *anyopaque,
-    vtable: *const VTable,
-
-    pub const VTable = struct {
-        is_local_owner: *const fn (ptr: *anyopaque) bool,
-    };
-
-    pub fn isLocalOwner(self: PromotionOwner) bool {
-        return self.vtable.is_local_owner(self.ptr);
-    }
-};
+pub const PromotionOwner = runtime_callbacks.PromotionOwner;
 
 /// The canonical entity document shape (RESOLUTION.md). `aliases` seeds the
 /// union the sink's merge transform grows as more mentions resolve to the same

@@ -26,6 +26,7 @@ const descriptor_contract = @import("../storage/kernel_owner_descriptor.zig");
 const backend_types = @import("../storage/backend_types.zig");
 const db_types = @import("../storage/db/types.zig");
 const document_artifact_child_range = @import("../storage/db/document_artifact_child_range.zig");
+const text_memory = @import("../storage/db/text_memory_stats.zig");
 const ha_replication_record = @import("../storage/ha/replication_record.zig");
 const runtime_preflight = @import("../storage/db/runtime_preflight.zig");
 const metadata_api = @import("../metadata/api.zig");
@@ -34,6 +35,7 @@ const backup_contract = @import("backup_contract.zig");
 const distributed_graph = @import("distributed_graph.zig");
 const query_response = @import("query_response.zig");
 const runtime_status = @import("runtime_status.zig");
+const restore_state_contract = @import("../storage/restore_state_contract.zig");
 const read_gate = @import("../raft/read_gate.zig");
 const feature_reads = @import("../raft/feature_reads.zig");
 const table_catalog = @import("table_catalog.zig");
@@ -43,6 +45,7 @@ const storage_snapshot_source = @import("storage_snapshot_source.zig");
 const storage_maintenance_source = @import("storage_maintenance_source.zig");
 const table_write_source = @import("table_write_source.zig");
 const table_writes = @import("table_writes.zig");
+const transaction_recovery_source = @import("transaction_recovery_source.zig");
 
 pub const ProvisionedKernelOwnerSource = struct {
     alloc: std.mem.Allocator,
@@ -50,7 +53,8 @@ pub const ProvisionedKernelOwnerSource = struct {
     catalog: table_catalog.CatalogSource,
     requester: read_gate.ReadableLeaseRequester,
     group_visible_root_generation: ?table_reads.GroupVisibleRootGenerationSource = null,
-    transaction_recovery_source: ?*table_writes.ProvisionedTableWriteSource = null,
+    transaction_recovery_source: ?transaction_recovery_source.Source = null,
+    document_child_range_dispatch_source: ?table_write_source.TableWriteSource = null,
     context: client.Context = .{},
     owns_context: bool = true,
     mutex: std.atomic.Mutex = .unlocked,
@@ -103,6 +107,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     const Lease = struct {
         source: *ProvisionedKernelOwnerSource,
         entry: *Entry,
+        created: bool,
         active: bool = true,
 
         fn owner(self: *Lease) *client.Owner {
@@ -148,9 +153,21 @@ pub const ProvisionedKernelOwnerSource = struct {
 
     pub fn withTransactionRecoverySource(
         self: *ProvisionedKernelOwnerSource,
-        source: ?*table_writes.ProvisionedTableWriteSource,
+        source: ?transaction_recovery_source.Source,
     ) *ProvisionedKernelOwnerSource {
         self.transaction_recovery_source = source;
+        return self;
+    }
+
+    /// Generated child-range artifacts are routed by the distributed table
+    /// source while the physical owner retains the durable outbox. The source
+    /// is borrowed for synchronous batch calls and is never retained by the
+    /// compiled provider.
+    pub fn withDocumentChildRangeDispatchSource(
+        self: *ProvisionedKernelOwnerSource,
+        source: table_write_source.TableWriteSource,
+    ) *ProvisionedKernelOwnerSource {
+        self.document_child_range_dispatch_source = source;
         return self;
     }
 
@@ -229,7 +246,11 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .update_document_artifact_child_range_placement_group_local = updateDocumentArtifactChildRangePlacementGroupLocal,
                 .apply_document_artifact_child_range_batch_group_local = applyDocumentArtifactChildRangeBatchGroupLocal,
                 .local_runtime_statuses = localRuntimeStatuses,
+                .text_memory_attribution_stats_best_effort = textMemoryAttributionStatsBestEffort,
+                .preflight_write_admission_group_local = preflightWriteAdmissionGroupLocal,
+                .find_median_key_group_local = findMedianKeyGroupLocal,
                 .reconcile_table_group_local = reconcileTableGroupLocal,
+                .reconcile_table_group_local_transient = reconcileTableGroupLocalTransient,
                 .retire_table_group_local = retireTableGroupLocal,
             },
         };
@@ -281,6 +302,35 @@ pub const ProvisionedKernelOwnerSource = struct {
     pub fn storageContextHandle(self: *ProvisionedKernelOwnerSource) !?*anyopaque {
         try self.context.ensure();
         return self.context.handle;
+    }
+
+    /// Read one durable restore marker through the compiled storage owner.
+    /// The returned wire value is fully owned by `alloc` and contains no DB
+    /// implementation types.
+    pub fn restoreState(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+    ) !?restore_state_contract.State {
+        var retire_after = false;
+        const result = result: {
+            var lease = try self.acquire(group_id, table_name);
+            defer lease.deinit();
+            retire_after = lease.created;
+            var response = (try lease.owner().restoreStateJson(table_name)) orelse break :result null;
+            defer response.deinit();
+            var parsed = try std.json.parseFromSlice(
+                restore_state_contract.State,
+                alloc,
+                response.bytes(),
+                .{},
+            );
+            defer parsed.deinit();
+            break :result try parsed.value.cloneAlloc(alloc);
+        };
+        if (retire_after) retireGroupForPublication(self, group_id, table_name) catch {};
+        return result;
     }
 
     /// Run one bounded projection reconciliation while borrowing the same
@@ -772,6 +822,23 @@ pub const ProvisionedKernelOwnerSource = struct {
         target_index_name: ?[]const u8,
         advance_index_repair: bool,
     ) !abi.ReconcileResult {
+        return try self.reconcileTableGroupStepWithRetention(
+            group_id,
+            table_name,
+            target_index_name,
+            advance_index_repair,
+            true,
+        );
+    }
+
+    fn reconcileTableGroupStepWithRetention(
+        self: *ProvisionedKernelOwnerSource,
+        group_id: u64,
+        table_name: []const u8,
+        target_index_name: ?[]const u8,
+        advance_index_repair: bool,
+        retain_cold_owner: bool,
+    ) !abi.ReconcileResult {
         var descriptor = try self.loadDescriptor(self.alloc, group_id, table_name);
         defer descriptor.deinit(self.alloc);
         var lease = try self.acquireDescriptor(
@@ -780,14 +847,24 @@ pub const ProvisionedKernelOwnerSource = struct {
             descriptor.path,
             descriptor.view(),
         );
-        defer lease.deinit();
-        return try lease.owner().reconcile(
+        const retire_after = lease.created and !retain_cold_owner;
+        const result = lease.owner().reconcile(
             table_name,
             descriptor.schema_json,
             descriptor.indexes_json,
             target_index_name,
             advance_index_repair,
-        );
+        ) catch |err| {
+            lease.deinit();
+            if (retire_after) retireGroupForPublication(self, group_id, table_name) catch {};
+            return err;
+        };
+        lease.deinit();
+        // A concurrent foreground operation may have adopted this newly
+        // opened owner after reconciliation. In that case it is legitimately
+        // resident and retirement reports StorageBusy.
+        if (retire_after) retireGroupForPublication(self, group_id, table_name) catch {};
+        return result;
     }
 
     fn reconcileTableGroupLocal(
@@ -804,6 +881,12 @@ pub const ProvisionedKernelOwnerSource = struct {
             target_index_name,
             advance_index_repair,
         );
+        return localStructuralReconcileResult(result);
+    }
+
+    fn localStructuralReconcileResult(
+        result: abi.ReconcileResult,
+    ) table_write_source.LocalStructuralReconcileResult {
         return .{
             .state = switch (result.state) {
                 .complete => .complete,
@@ -823,6 +906,50 @@ pub const ProvisionedKernelOwnerSource = struct {
             .repair_disk_waits = result.repair_disk_waits,
             .next_retry_at_ms = result.next_retry_at_ms,
         };
+    }
+
+    fn reconcileTableGroupLocalTransient(
+        ptr: *anyopaque,
+        group_id: u64,
+        table_name: []const u8,
+        target_index_name: ?[]const u8,
+        advance_index_repair: bool,
+    ) !?table_write_source.LocalStructuralReconcileResult {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        const result = try self.reconcileTableGroupStepWithRetention(
+            group_id,
+            table_name,
+            target_index_name,
+            advance_index_repair,
+            false,
+        );
+        return localStructuralReconcileResult(result);
+    }
+
+    fn preflightWriteAdmissionGroupLocal(
+        ptr: *anyopaque,
+        group_id: u64,
+        table_name: []const u8,
+    ) !?void {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        var lease = try self.acquire(group_id, table_name);
+        defer lease.deinit();
+        try lease.owner().preflightWriteAdmission(table_name);
+        return {};
+    }
+
+    fn findMedianKeyGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+    ) !?[]u8 {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        var lease = try self.acquire(group_id, table_name);
+        defer lease.deinit();
+        var response = (try lease.owner().findMedianKey(table_name)) orelse return null;
+        defer response.deinit();
+        return try alloc.dupe(u8, response.bytes());
     }
 
     fn visibleRootGeneration(self: *const ProvisionedKernelOwnerSource, group_id: u64) u64 {
@@ -858,9 +985,10 @@ pub const ProvisionedKernelOwnerSource = struct {
         unreachable;
     }
 
-    fn snapshotMaintenanceLeases(
+    fn snapshotOwnerLeases(
         self: *ProvisionedKernelOwnerSource,
         best_effort: bool,
+        skip_bulk_ingest: bool,
     ) !?[]Lease {
         if (best_effort) {
             if (!self.mutex.tryLock()) return null;
@@ -871,15 +999,15 @@ pub const ProvisionedKernelOwnerSource = struct {
 
         var count: usize = 0;
         for (self.entries.items) |entry| {
-            if (entry.retired or entry.bulk_ingest_active.load(.acquire)) continue;
+            if (entry.retired or (skip_bulk_ingest and entry.bulk_ingest_active.load(.acquire))) continue;
             count += 1;
         }
         const leases = try self.alloc.alloc(Lease, count);
         var initialized: usize = 0;
         for (self.entries.items) |entry| {
-            if (entry.retired or entry.bulk_ingest_active.load(.acquire)) continue;
+            if (entry.retired or (skip_bulk_ingest and entry.bulk_ingest_active.load(.acquire))) continue;
             entry.active_users += 1;
-            leases[initialized] = .{ .source = self, .entry = entry };
+            leases[initialized] = .{ .source = self, .entry = entry, .created = false };
             initialized += 1;
         }
         std.debug.assert(initialized == count);
@@ -896,7 +1024,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         best_effort: bool,
     ) !storage_maintenance_source.RoundResult {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
-        const maybe_leases = try self.snapshotMaintenanceLeases(best_effort);
+        const maybe_leases = try self.snapshotOwnerLeases(best_effort, true);
         const leases = maybe_leases orelse return .{};
         defer self.releaseMaintenanceLeases(leases);
 
@@ -936,7 +1064,7 @@ pub const ProvisionedKernelOwnerSource = struct {
 
     fn runDensePostingMaintenanceRound(ptr: *anyopaque) !usize {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
-        const maybe_leases = try self.snapshotMaintenanceLeases(true);
+        const maybe_leases = try self.snapshotOwnerLeases(true, true);
         const leases = maybe_leases orelse return 0;
         defer self.releaseMaintenanceLeases(leases);
 
@@ -964,7 +1092,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         best_effort: bool,
     ) !storage_maintenance_source.Snapshot {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
-        const maybe_leases = try self.snapshotMaintenanceLeases(best_effort);
+        const maybe_leases = try self.snapshotOwnerLeases(best_effort, true);
         const leases = maybe_leases orelse return .{};
         defer self.releaseMaintenanceLeases(leases);
 
@@ -1050,8 +1178,9 @@ pub const ProvisionedKernelOwnerSource = struct {
         status: abi.TxnStatus,
         commit_version: u64,
     ) callconv(.c) abi.Status {
-        const source: *table_writes.ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr orelse return .invalid_argument));
-        source.storageOwnerResolveRecoveryParticipant(
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr orelse return .invalid_argument));
+        const source = self.transaction_recovery_source orelse return .invalid_argument;
+        source.resolve(
             txn_id.bytes,
             participant.slice(),
             switch (status) {
@@ -1068,8 +1197,9 @@ pub const ProvisionedKernelOwnerSource = struct {
         ptr: ?*anyopaque,
         owner_participant: abi.BorrowedBytes,
     ) callconv(.c) u8 {
-        const source: *table_writes.ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr orelse return 0));
-        return @intFromBool(source.storageOwnerOwnsTransactionRecovery(owner_participant.slice()));
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr orelse return 0));
+        const source = self.transaction_recovery_source orelse return 0;
+        return @intFromBool(source.owns(owner_participant.slice()));
     }
 
     fn transactionRecoveryAcknowledge(
@@ -1078,8 +1208,9 @@ pub const ProvisionedKernelOwnerSource = struct {
         owner_participant: abi.BorrowedBytes,
         participant: abi.BorrowedBytes,
     ) callconv(.c) abi.Status {
-        const source: *table_writes.ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr orelse return .invalid_argument));
-        source.storageOwnerAcknowledgeRecoveryParticipant(
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr orelse return .invalid_argument));
+        const source = self.transaction_recovery_source orelse return .invalid_argument;
+        source.acknowledge(
             txn_id.bytes,
             owner_participant.slice(),
             participant.slice(),
@@ -1094,8 +1225,9 @@ pub const ProvisionedKernelOwnerSource = struct {
         cutoff_timestamp: u64,
         retained_cutoff_timestamp: u64,
     ) callconv(.c) abi.Status {
-        const source: *table_writes.ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr orelse return .invalid_argument));
-        source.storageOwnerCleanupRecoveryTransaction(
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr orelse return .invalid_argument));
+        const source = self.transaction_recovery_source orelse return .invalid_argument;
+        source.cleanup(
             txn_id.bytes,
             owner_participant.slice(),
             cutoff_timestamp,
@@ -1106,7 +1238,7 @@ pub const ProvisionedKernelOwnerSource = struct {
 
     fn transactionRecoveryConfig(self: *ProvisionedKernelOwnerSource) abi.TransactionRecoveryConfig {
         const source = self.transaction_recovery_source orelse return .{};
-        const options = source.storageOwnerTransactionRecoveryOptions();
+        const options = source.options();
         if (!options.enabled) return .{};
         return .{
             .enabled = 1,
@@ -1114,7 +1246,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .replicated_metadata = @intFromBool(options.replicated_metadata),
             .interval_ms = options.interval_ms,
             .cutoff_ns = options.cutoff_ns,
-            .callback_ctx = source,
+            .callback_ctx = self,
             .owner_id = .fromSlice(options.owner_id),
             .resolve_participant_fn = transactionRecoveryResolve,
             .owns_recovery_fn = if (options.replicated_metadata) transactionRecoveryOwns else null,
@@ -1145,7 +1277,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             }
             entry.active_users += 1;
             _ = self.owner_cache_hits.fetchAdd(1, .monotonic);
-            return .{ .source = self, .entry = entry };
+            return .{ .source = self, .entry = entry, .created = false };
         }
         if (stale_index) |index| self.destroyEntryAtIndexLocked(index);
 
@@ -1180,7 +1312,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         };
         self.entries.appendAssumeCapacity(entry);
         _ = self.owner_cache_misses.fetchAdd(1, .monotonic);
-        return .{ .source = self, .entry = entry };
+        return .{ .source = self, .entry = entry, .created = true };
     }
 
     fn prepareQueryRead(
@@ -1448,9 +1580,76 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer alloc.free(request_json);
         var lease = try self.acquire(group_id, table_name);
         defer lease.deinit();
-        var response = try lease.owner().batchJson(table_name, request_json);
+        var dispatch_context = if (self.document_child_range_dispatch_source) |source|
+            DocumentChildRangeDispatchContext{
+                .alloc = alloc,
+                .source = source,
+                .table_name = table_name,
+            }
+        else
+            null;
+        var response = try lease.owner().batchJsonWithDocumentChildRangeDispatcher(
+            table_name,
+            request_json,
+            if (dispatch_context) |*context| context else null,
+            if (dispatch_context != null) dispatchDocumentChildRange else null,
+        );
         defer response.deinit();
         return {};
+    }
+
+    const DocumentChildRangeDispatchContext = struct {
+        alloc: std.mem.Allocator,
+        source: table_write_source.TableWriteSource,
+        table_name: []const u8,
+    };
+
+    fn dispatchDocumentChildRange(
+        ptr: ?*anyopaque,
+        owner_group_id: u64,
+        request_json: abi.BorrowedBytes,
+    ) callconv(.c) abi.Status {
+        const context: *DocumentChildRangeDispatchContext = @ptrCast(@alignCast(ptr orelse
+            return .invalid_argument));
+        var parsed = std.json.parseFromSlice(
+            table_writes.StorageKernelArtifactChildRangeBatchRequest,
+            context.alloc,
+            request_json.slice(),
+            .{ .allocate = .alloc_always },
+        ) catch |err| return documentChildRangeDispatchStatusFromError(err);
+        defer parsed.deinit();
+        const sequence = context.source.applyDocumentArtifactChildRangeBatch(
+            context.alloc,
+            owner_group_id,
+            context.table_name,
+            parsed.value.doc_key,
+            parsed.value.artifact_name,
+            parsed.value.batch,
+        ) catch |err| return documentChildRangeDispatchStatusFromError(err);
+        if (sequence == null) return .not_found;
+        return .ok;
+    }
+
+    fn documentChildRangeDispatchStatusFromError(err: anyerror) abi.Status {
+        return switch (err) {
+            error.InvalidArgument, error.InvalidArguments => .invalid_argument,
+            error.NotFound, error.FileNotFound, error.TableNotFound => .not_found,
+            error.VersionConflict => .version_conflict,
+            error.IntentConflict, error.DecisionConflict => .intent_conflict,
+            error.TxnNotFound => .transaction_not_found,
+            error.LsmRootWriterAlreadyOpen, error.GenerationTransitionActive, error.WouldBlock => .busy,
+            error.ReadOnly => .read_only,
+            error.OutOfMemory => .out_of_memory,
+            error.Corrupted => .corrupted,
+            error.DocIdentityNamespaceMismatch => .identity_namespace_mismatch,
+            error.InvalidQueryRequest => .invalid_query,
+            error.UnsupportedQueryRequest => .unsupported_query,
+            error.IndexNotFound => .index_not_found,
+            error.IdentityReadGenerationChanged => .identity_read_generation_changed,
+            error.Timeout, error.TableVisibilityTimeout => .timeout,
+            error.Canceled, error.Cancelled => .cancelled,
+            else => .internal,
+        };
     }
 
     fn executeArtifactOperation(
@@ -1986,28 +2185,60 @@ pub const ProvisionedKernelOwnerSource = struct {
             alloc.free(items);
         }
         for (group_ids) |group_id| {
-            var lease = try self.acquire(group_id, table_name);
-            defer lease.deinit();
-            var response = try lease.owner().runtimeStatusJson(table_name);
-            defer response.deinit();
-            var parsed = try std.json.parseFromSlice(
-                runtime_status.LocalTableRuntimeStatus,
-                alloc,
-                response.bytes(),
-                .{},
-            );
-            defer parsed.deinit();
-            items[initialized] = try parsed.value.clone(alloc);
-            items[initialized].group_id = group_id;
-            items[initialized].metadata = .{
-                .updated_at_ns = platform_time.monotonicNs(),
-                .source = .live_writer_publish,
-                .freshness = .fresh,
-                .lsm_root_generation = lease.entry.generation,
+            const retire_after = status: {
+                var lease = try self.acquire(group_id, table_name);
+                defer lease.deinit();
+                var response = try lease.owner().runtimeStatusJson(table_name);
+                defer response.deinit();
+                var parsed = try std.json.parseFromSlice(
+                    runtime_status.LocalTableRuntimeStatus,
+                    alloc,
+                    response.bytes(),
+                    .{},
+                );
+                defer parsed.deinit();
+                items[initialized] = try parsed.value.clone(alloc);
+                items[initialized].group_id = group_id;
+                items[initialized].metadata = .{
+                    .updated_at_ns = platform_time.monotonicNs(),
+                    .source = .live_writer_publish,
+                    .freshness = .fresh,
+                    .lsm_root_generation = lease.entry.generation,
+                };
+                break :status lease.created;
             };
+            // Status collection is observational. Keep a foreground owner,
+            // but do not pin a writer merely because the status cache was
+            // cold. A concurrent adopter makes retirement report StorageBusy
+            // and legitimately retains the owner.
+            if (retire_after) retireGroupForPublication(self, group_id, table_name) catch {};
             initialized += 1;
         }
         return .{ .items = items };
+    }
+
+    fn textMemoryAttributionStatsBestEffort(
+        ptr: *anyopaque,
+    ) text_memory.TextMemoryAttributionStats {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        const maybe_leases = self.snapshotOwnerLeases(true, false) catch return .{};
+        const leases = maybe_leases orelse return .{};
+        defer self.releaseMaintenanceLeases(leases);
+
+        var result: text_memory.TextMemoryAttributionStats = .{};
+        for (leases) |*lease| {
+            var response = lease.owner().textMemoryJson(lease.entry.table_name) catch continue;
+            defer response.deinit();
+            var parsed = std.json.parseFromSlice(
+                text_memory.TextMemoryAttributionStats,
+                self.alloc,
+                response.bytes(),
+                .{},
+            ) catch continue;
+            defer parsed.deinit();
+            result.accumulate(parsed.value);
+        }
+        return result;
     }
 
     fn textStatsGroupLocal(

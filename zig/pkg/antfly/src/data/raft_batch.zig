@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const batch_api = @import("../api/batch.zig");
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = @import("../storage/db/selected_root.zig").db;
 const descriptor_contract = @import("../storage/kernel_owner_descriptor.zig");
 
 pub const OwnedStorageOwnerDescriptor = struct {

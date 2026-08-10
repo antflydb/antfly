@@ -19,6 +19,7 @@ const std = @import("std");
 const db_mod = struct {
     pub const types = @import("../storage/db/types.zig");
     pub const DocumentArtifactChildRangeApplyBatch = @import("../storage/db/document_artifact_child_range.zig").ApplyBatch;
+    pub const TextMemoryAttributionStats = @import("../storage/db/text_memory_stats.zig").TextMemoryAttributionStats;
 };
 const backend_types = @import("../storage/backend_types.zig");
 const table_create_contract = @import("table_create_contract.zig");
@@ -377,6 +378,20 @@ pub const TableWriteSource = struct {
             alloc: std.mem.Allocator,
             table_name: []const u8,
         ) anyerror!?runtime_status.LocalTableRuntimeStatuses = null,
+        text_memory_attribution_stats_best_effort: ?*const fn (
+            ptr: *anyopaque,
+        ) db_mod.TextMemoryAttributionStats = null,
+        preflight_write_admission_group_local: ?*const fn (
+            ptr: *anyopaque,
+            group_id: u64,
+            table_name: []const u8,
+        ) anyerror!?void = null,
+        find_median_key_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+        ) anyerror!?[]u8 = null,
         request_table_structural_reconcile: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -389,6 +404,13 @@ pub const TableWriteSource = struct {
             index_name: []const u8,
         ) anyerror!?void = null,
         reconcile_table_group_local: ?*const fn (
+            ptr: *anyopaque,
+            group_id: u64,
+            table_name: []const u8,
+            target_index_name: ?[]const u8,
+            advance_index_repair: bool,
+        ) anyerror!?LocalStructuralReconcileResult = null,
+        reconcile_table_group_local_transient: ?*const fn (
             ptr: *anyopaque,
             group_id: u64,
             table_name: []const u8,
@@ -922,6 +944,13 @@ pub const TableWriteSource = struct {
         return try fn_ptr(self.ptr, alloc, table_name);
     }
 
+    pub fn textMemoryAttributionStatsBestEffort(
+        self: TableWriteSource,
+    ) db_mod.TextMemoryAttributionStats {
+        const fn_ptr = self.vtable.text_memory_attribution_stats_best_effort orelse return .{};
+        return fn_ptr(self.ptr);
+    }
+
     pub fn requestTableStructuralReconcile(
         self: TableWriteSource,
         alloc: std.mem.Allocator,
@@ -929,6 +958,25 @@ pub const TableWriteSource = struct {
     ) !?void {
         const fn_ptr = self.vtable.request_table_structural_reconcile orelse return null;
         return try fn_ptr(self.ptr, alloc, table_name);
+    }
+
+    pub fn preflightWriteAdmissionGroupLocal(
+        self: TableWriteSource,
+        group_id: u64,
+        table_name: []const u8,
+    ) !?void {
+        const fn_ptr = self.vtable.preflight_write_admission_group_local orelse return null;
+        return try fn_ptr(self.ptr, group_id, table_name);
+    }
+
+    pub fn findMedianKeyGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+    ) !?[]u8 {
+        const fn_ptr = self.vtable.find_median_key_group_local orelse return null;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name);
     }
 
     pub fn requestTableIndexStructuralReconcile(
@@ -949,6 +997,25 @@ pub const TableWriteSource = struct {
         advance_index_repair: bool,
     ) !?LocalStructuralReconcileResult {
         const fn_ptr = self.vtable.reconcile_table_group_local orelse return null;
+        return try fn_ptr(self.ptr, group_id, table_name, target_index_name, advance_index_repair);
+    }
+
+    /// Reconcile through a resident owner when one already exists, but do not
+    /// turn a cold startup inspection into a long-lived writer owner.
+    pub fn reconcileTableGroupLocalTransient(
+        self: TableWriteSource,
+        group_id: u64,
+        table_name: []const u8,
+        target_index_name: ?[]const u8,
+        advance_index_repair: bool,
+    ) !?LocalStructuralReconcileResult {
+        const fn_ptr = self.vtable.reconcile_table_group_local_transient orelse
+            return try self.reconcileTableGroupLocal(
+                group_id,
+                table_name,
+                target_index_name,
+                advance_index_repair,
+            );
         return try fn_ptr(self.ptr, group_id, table_name, target_index_name, advance_index_repair);
     }
 
