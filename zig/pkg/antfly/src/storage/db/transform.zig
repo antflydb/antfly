@@ -52,7 +52,7 @@ pub fn validateDocumentTransform(alloc: Allocator, transform: types.DocumentTran
 
 pub fn validateTransformOpType(op: types.TransformOpType) !void {
     switch (op) {
-        .set, .set_on_insert, .unset, .inc, .push, .add_to_set, .max => {},
+        .set, .set_on_insert, .unset, .inc, .push, .add_to_set, .min, .max => {},
         else => return error.UnsupportedTransformOperation,
     }
 }
@@ -167,7 +167,7 @@ fn prepareTransformOp(
                 prepared.value = .{ .json = try cloneJsonValue(alloc, parsed.value) };
             }
         },
-        .inc, .max => {
+        .inc, .min, .max => {
             const value_json = op.value_json orelse return error.InvalidArgument;
             var parsed = std.json.parseFromSlice(
                 std.json.Value,
@@ -215,6 +215,7 @@ fn applyPreparedTransformOp(
             var value = try op.takeJson();
             try addPreparedValueToSet(alloc, &root.object, path, &value);
         },
+        .min => try applyNumericOp(alloc, &root.object, path, try op.number(), .min),
         .max => try applyNumericOp(alloc, &root.object, path, try op.number(), .max),
         else => return error.UnsupportedTransformOperation,
     }
@@ -301,7 +302,7 @@ pub fn graphProjectionPath(path: []const u8) !?GraphProjectionPath {
     };
 }
 
-const NumericTransform = enum { add, max };
+const NumericTransform = enum { add, min, max };
 
 fn applyNumericOp(
     alloc: Allocator,
@@ -315,6 +316,7 @@ fn applyNumericOp(
         const current_num = try jsonNumberFromValue(current.*);
         const next = switch (operation) {
             .add => current_num + operand,
+            .min => if (operand < current_num) operand else return,
             .max => if (operand > current_num) operand else return,
         };
         if (!std.math.isFinite(next)) return error.InvalidArgument;
@@ -535,7 +537,7 @@ fn freeJsonValue(alloc: Allocator, value: *std.json.Value) void {
     }
 }
 
-test "resolve document transform supports set setOnInsert max inc push and addToSet" {
+test "resolve document transform supports set setOnInsert min max inc push and addToSet" {
     const alloc = std.testing.allocator;
 
     const transform: types.DocumentTransform = .{
@@ -543,6 +545,7 @@ test "resolve document transform supports set setOnInsert max inc push and addTo
         .upsert = false,
         .operations = &.{
             .{ .op = .set_on_insert, .path = "owner", .value_json = "\"system\"" },
+            .{ .op = .min, .path = "priority", .value_json = "3" },
             .{ .op = .max, .path = "version", .value_json = "10" },
             .{ .op = .set, .path = "status", .value_json = "\"updated\"" },
             .{ .op = .inc, .path = "views", .value_json = "2" },
@@ -553,13 +556,14 @@ test "resolve document transform supports set setOnInsert max inc push and addTo
 
     const resolved = try resolveDocumentTransform(
         alloc,
-        "{\"version\":5,\"views\":1,\"tags\":[\"db\"]}",
+        "{\"priority\":5,\"version\":5,\"views\":1,\"tags\":[\"db\"]}",
         transform,
     );
     defer alloc.free(resolved.?);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, resolved.?, .{});
     defer parsed.deinit();
+    try std.testing.expectEqual(@as(f64, 3), try jsonNumberFromValue(parsed.value.object.get("priority").?));
     try std.testing.expectEqual(@as(f64, 10), try jsonNumberFromValue(parsed.value.object.get("version").?));
     try std.testing.expectEqual(@as(f64, 3), try jsonNumberFromValue(parsed.value.object.get("views").?));
     try std.testing.expectEqualStrings("updated", parsed.value.object.get("status").?.string);
@@ -567,6 +571,48 @@ test "resolve document transform supports set setOnInsert max inc push and addTo
     try std.testing.expectEqual(@as(usize, 2), parsed.value.object.get("tags").?.array.items.len);
     try std.testing.expectEqual(@as(usize, 1), parsed.value.object.get("events").?.array.items.len);
     try std.testing.expectEqualStrings("published", parsed.value.object.get("events").?.array.items[0].object.get("type").?.string);
+}
+
+test "min only lowers numeric values and follows missing document semantics" {
+    const alloc = std.testing.allocator;
+    const lower = [_]types.TransformOp{
+        .{ .op = .min, .path = "score", .value_json = "5" },
+        .{ .op = .min, .path = "unchanged", .value_json = "12" },
+        .{ .op = .min, .path = "missing", .value_json = "7" },
+    };
+    const resolved = (try resolveDocumentTransform(alloc, "{\"score\":10,\"unchanged\":8}", .{
+        .key = "doc:existing",
+        .operations = &lower,
+    })).?;
+    defer alloc.free(resolved);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, resolved, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(f64, 5), try jsonNumberFromValue(parsed.value.object.get("score").?));
+    try std.testing.expectEqual(@as(f64, 8), try jsonNumberFromValue(parsed.value.object.get("unchanged").?));
+    try std.testing.expectEqual(@as(f64, 7), try jsonNumberFromValue(parsed.value.object.get("missing").?));
+
+    try std.testing.expectError(
+        error.InvalidArgument,
+        resolveDocumentTransform(alloc, "{\"score\":\"high\"}", .{
+            .key = "doc:non-numeric",
+            .operations = lower[0..1],
+        }),
+    );
+
+    try std.testing.expect((try resolveDocumentTransform(alloc, null, .{
+        .key = "doc:missing",
+        .operations = lower[0..1],
+    })) == null);
+
+    const upserted = (try resolveDocumentTransform(alloc, null, .{
+        .key = "doc:new",
+        .operations = lower[0..1],
+        .upsert = true,
+    })).?;
+    defer alloc.free(upserted);
+    var upserted_parsed = try std.json.parseFromSlice(std.json.Value, alloc, upserted, .{});
+    defer upserted_parsed.deinit();
+    try std.testing.expectEqual(@as(f64, 5), try jsonNumberFromValue(upserted_parsed.value.object.get("score").?));
 }
 
 test "push appends to existing arrays and rejects non-array targets" {
@@ -627,7 +673,7 @@ test "resolve document transform skips missing document without upsert" {
 test "unsupported transforms fail atomically instead of reporting success" {
     const alloc = std.testing.allocator;
     const unsupported = [_]types.TransformOpType{
-        .pull, .pop, .mul, .min, .current_date, .rename,
+        .pull, .pop, .mul, .current_date, .rename,
     };
     for (unsupported) |op| {
         const operations = [_]types.TransformOp{
@@ -709,6 +755,17 @@ test "invalid transform operands are rejected before missing-document no-op reso
         resolveDocumentTransform(std.testing.allocator, null, .{
             .key = "doc:missing",
             .operations = &non_numeric_increment,
+        }),
+    );
+
+    const non_numeric_min = [_]types.TransformOp{
+        .{ .op = .min, .path = "count", .value_json = "\"one\"" },
+    };
+    try std.testing.expectError(
+        error.InvalidArgument,
+        resolveDocumentTransform(std.testing.allocator, null, .{
+            .key = "doc:missing",
+            .operations = &non_numeric_min,
         }),
     );
 

@@ -1905,6 +1905,7 @@ fn parseTransformOpType(text: []const u8) ?db_mod.types.TransformOpType {
     if (std.mem.eql(u8, text, "$unset")) return .unset;
     if (std.mem.eql(u8, text, "$inc")) return .inc;
     if (std.mem.eql(u8, text, "$addToSet")) return .add_to_set;
+    if (std.mem.eql(u8, text, "$min")) return .min;
     if (std.mem.eql(u8, text, "$max")) return .max;
     return null;
 }
@@ -1978,6 +1979,7 @@ test "txn prepare parser round-trips transforms" {
                 .key = "doc:a",
                 .operations = &.{
                     .{ .op = .set, .path = "status", .value_json = "\"updated\"" },
+                    .{ .op = .min, .path = "priority", .value_json = "2" },
                     .{ .op = .max, .path = "version", .value_json = "3" },
                 },
                 .upsert = true,
@@ -1994,6 +1996,8 @@ test "txn prepare parser round-trips transforms" {
     try std.testing.expectEqualStrings("doc:a", parsed.req.transforms[0].key);
     try std.testing.expectEqual(db_mod.types.TransformOpType.set, parsed.req.transforms[0].operations[0].op);
     try std.testing.expectEqualStrings("\"updated\"", parsed.req.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(db_mod.types.TransformOpType.min, parsed.req.transforms[0].operations[1].op);
+    try std.testing.expectEqualStrings("2", parsed.req.transforms[0].operations[1].value_json.?);
 }
 
 test "transaction request parsers release owned prefixes after malformed input" {
