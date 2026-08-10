@@ -290,6 +290,7 @@ comptime {
             _ = storage_kernel_exports;
             exportInternal(&storage_kernel_exports.storageOwnerContextCreate, "antfly_storage_context_create");
             exportInternal(&storage_kernel_exports.storageOwnerContextDestroy, "antfly_storage_context_destroy");
+            exportInternal(&storage_kernel_exports.storageOwnerContextMetrics, "antfly_storage_context_metrics");
             exportInternal(&storage_kernel_exports.storageOwnerOpen, "antfly_storage_owner_open");
             exportInternal(&storage_kernel_exports.storageOwnerClose, "antfly_storage_owner_close");
             exportInternal(&storage_kernel_exports.storageOwnerConfigure, "antfly_storage_owner_configure");

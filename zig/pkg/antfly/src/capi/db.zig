@@ -1831,6 +1831,37 @@ pub fn storageOwnerContextDestroy(context: ?*anyopaque) callconv(.c) kernel_owne
     return if (owner_context.deinitIfIdle()) .ok else .busy;
 }
 
+fn storageOwnerContextCacheKindStats(stats: anytype) kernel_owner_abi.ContextCacheKindStats {
+    return .{
+        .hits = stats.hits,
+        .misses = stats.misses,
+        .inserts = stats.inserts,
+        .evictions = stats.evictions,
+        .invalidations = stats.invalidations,
+        .waits = stats.waits,
+        .used_bytes = @intCast(stats.used_bytes),
+    };
+}
+
+pub fn storageOwnerContextMetrics(
+    context: ?*anyopaque,
+    out_result: *kernel_owner_abi.ContextMetricsResult,
+) callconv(.c) kernel_owner_abi.Status {
+    out_result.* = .{};
+    const owner_context = asStorageOwnerContext(context) orelse return .invalid_argument;
+    const stats = owner_context.resources.lsm_cache.snapshotStats();
+    out_result.* = .{
+        .lsm_cache_used_bytes = @intCast(stats.used_bytes),
+        .lsm_cache_entry_count = @intCast(stats.entry_count),
+        .lsm_run_state = storageOwnerContextCacheKindStats(stats.run_state),
+        .lsm_run_table_raw = storageOwnerContextCacheKindStats(stats.run_table_raw),
+        .lsm_run_table_index = storageOwnerContextCacheKindStats(stats.run_table_index),
+        .lsm_run_table_block = storageOwnerContextCacheKindStats(stats.run_table_block),
+        .lsm_run_table_physical_block = storageOwnerContextCacheKindStats(stats.run_table_physical_block),
+    };
+    return .ok;
+}
+
 pub fn storageOwnerOpen(
     request: *const kernel_owner_abi.OpenRequest,
     out_owner: *?*anyopaque,

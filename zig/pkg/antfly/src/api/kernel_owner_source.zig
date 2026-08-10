@@ -53,8 +53,15 @@ pub const ProvisionedKernelOwnerSource = struct {
     context: client.Context = .{},
     mutex: std.atomic.Mutex = .unlocked,
     entries: std.ArrayListUnmanaged(*Entry) = .empty,
+    owner_cache_hits: std.atomic.Value(u64) = .init(0),
+    owner_cache_misses: std.atomic.Value(u64) = .init(0),
 
     const Identity = descriptor_contract.Identity;
+
+    pub const CacheStats = struct {
+        hit_count: u64 = 0,
+        miss_count: u64 = 0,
+    };
 
     pub const LoadedDescriptor = struct {
         path: []u8,
@@ -242,6 +249,35 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .snapshot = maintenanceSnapshot,
             },
         };
+    }
+
+    /// Process-owner reuse replaces the legacy read/write cache split. Report
+    /// one shared acquisition counter to both compatibility metric names until
+    /// those public metrics are renamed around the owner model.
+    pub fn cacheStats(self: *const ProvisionedKernelOwnerSource) CacheStats {
+        return .{
+            .hit_count = self.owner_cache_hits.load(.monotonic),
+            .miss_count = self.owner_cache_misses.load(.monotonic),
+        };
+    }
+
+    pub fn contextMetrics(self: *ProvisionedKernelOwnerSource) !abi.ContextMetricsResult {
+        return try self.context.metrics();
+    }
+
+    pub fn retireAll(self: *ProvisionedKernelOwnerSource) usize {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        var retired_count: usize = 0;
+        var i = self.entries.items.len;
+        while (i > 0) {
+            i -= 1;
+            const entry = self.entries.items[i];
+            retired_count += 1;
+            entry.retired = true;
+            if (entry.active_users == 0) self.destroyEntryAtIndexLocked(i);
+        }
+        return retired_count;
     }
 
     /// Retire every resident generation for a table. Active calls retain their
@@ -976,6 +1012,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 return error.StorageKernelOwnerTransitionRequired;
             }
             entry.active_users += 1;
+            _ = self.owner_cache_hits.fetchAdd(1, .monotonic);
             return .{ .source = self, .entry = entry };
         }
         if (stale_index) |index| self.destroyEntryAtIndexLocked(index);
@@ -1010,6 +1047,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .active_users = 1,
         };
         self.entries.appendAssumeCapacity(entry);
+        _ = self.owner_cache_misses.fetchAdd(1, .monotonic);
         return .{ .source = self, .entry = entry };
     }
 

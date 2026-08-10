@@ -2569,6 +2569,53 @@ metric snapshots and physical lifecycle probes, then use those coarse owner
 contracts to make the legacy provisioned DB source unreachable in the
 experimental distributed unit.
 
+### Rejected local-role placement probes after the physical-cache cut
+
+After the process owner became the only provisioned read/write cache under the
+experiment, three cold ARM64 Linux musl `ReleaseFast` probes tested whether
+moving complete runtime roles into the storage archive could serve as the
+final composition. These were diagnostic placement probes, not ownership
+boundaries. All used normal build concurrency and completed the full 29-step
+linked build.
+
+| Storage-archive additions | Distributed | Storage | Repository files in distributed | Duplicate file instances | Executable |
+|---|---:|---:|---:|---:|---:|
+| None; source/cache cut only | 381.185 s | 251.340 s | 717 | 848 | 75,038,432 B |
+| Standalone + Lite + restore staging | 359.957 s | 324.636 s | 688 | 1,013 | 80,098,968 B |
+| Above + serverless | 317.725 s | 354.506 s | 593 | 1,011 | 80,099,872 B |
+| Above + metadata | 288.411 s | 376.890 s | 572 | 1,008 | 80,111,776 B |
+
+The final probe placed data plus HA in distributed and every local-storage role
+in the storage archive. It demonstrated the available control-root reduction:
+distributed dropped by 92.774 seconds and 145 repository files relative to the
+source/cache-only candidate. It also demonstrated why role placement is not
+the architecture:
+
+- the critical unit merely moved to the 376.890-second storage archive;
+- aggregate duplicate instances increased from 848 to 1,008;
+- the executable grew 5,073,344 bytes (6.8%), beyond the approximately 5%
+  artifact gate;
+- the storage archive grew to 40,146,808 bytes and would couple the small CAPI
+  artifact to server runtimes; and
+- data plus HA still emitted physical DB, LSM, catalog, query, and split-state
+  code through the data Raft apply/projection owner.
+
+The process-scoped physical-cache change itself removed no compiler files from
+distributed: 717 files remained, while declarations changed only from 41,680
+to 41,655. Its 381.185-second result is within host variance of the preceding
+373.506-second source-only profile. It remains useful only as a prerequisite
+to an atomic physical-owner cut and has no independent compiler-time claim.
+
+Decision: **reject the role-placement topology and restore the prior runtime
+composition**. Retain its measurements as an upper bound. The next experiment
+must move the complete data Raft apply/projection and split/merge storage owner
+behind the compiled kernel ABI. Distributed should retain Raft orchestration,
+routing, retries, and transition policy, but it must not construct
+`RaftApplyStore`, hold `DB` transition leases, or pass backend stores across
+the boundary. The kernel operation granularity is one committed apply batch,
+snapshot phase, split/merge phase, or bounded projection page--never one record
+or one LSM call.
+
 ## Holistic target architecture
 
 The current candidate baseline is the four-unit topology above with serverless

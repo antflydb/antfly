@@ -56,6 +56,12 @@ const query_contract = @import("query_contract.zig");
 const distributed_graph = @import("distributed_graph.zig");
 const runtime_status = @import("runtime_status.zig");
 const table_read_source = @import("table_read_source.zig");
+const build_options = @import("build_options");
+
+const storage_kernel_experiment = if (@hasDecl(build_options, "storage_kernel_experiment"))
+    @field(build_options, "storage_kernel_experiment")
+else
+    false;
 
 fn publishRuntimeStatusGroupForTest(
     cache: *runtime_status.TableRuntimeSnapshotCache,
@@ -2407,6 +2413,9 @@ pub const ProvisionedTableReadSource = struct {
     }
 
     fn groupLocalSource(self: *ProvisionedTableReadSource) TableReadSource {
+        if (comptime storage_kernel_experiment) {
+            return self.local_read_source orelse @panic("storage kernel owner read source unavailable");
+        }
         return self.local_read_source orelse self.physicalSource();
     }
 
@@ -3352,6 +3361,9 @@ pub const HostedProvisionedTableReadSource = struct {
     }
 
     fn groupLocalSource(self: *HostedProvisionedTableReadSource) TableReadSource {
+        if (comptime storage_kernel_experiment) {
+            return self.local_read_source orelse @panic("storage kernel owner read source unavailable");
+        }
         return self.local_read_source orelse self.physicalSource();
     }
 

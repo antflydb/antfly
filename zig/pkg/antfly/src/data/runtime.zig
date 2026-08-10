@@ -934,6 +934,12 @@ const RaftTableApplyStateMachine = struct {
         self: *RaftTableApplyStateMachine,
         storage: *antfly.public_api.ProvisionedGroupStorage,
     ) void {
+        if (comptime storage_kernel_experiment) {
+            self.write_source.runtime_status_cache = &storage.runtime_status_cache;
+            _ = self.write_source.withGroupVisibleRootGeneration(storage.groupVisibleRootGenerationSource());
+            if (storage.backend_runtime) |runtime| self.write_source.backend_runtime = runtime;
+            return;
+        }
         // This resident writer is the preferred freshness-sensitive read
         // owner. Without the shared cache, its first read decodes and retains
         // a private index for every LSM run, bypassing both the cache bound and
@@ -1080,6 +1086,11 @@ pub const HealthSource = struct {
         refreshes: u64,
     };
 
+    const OwnerCacheStats = struct {
+        hit_count: u64 = 0,
+        miss_count: u64 = 0,
+    };
+
     pub fn readiness(self: *HealthSource) antfly.common.health_server.ReadinessChecker {
         return .{
             .ptr = self,
@@ -1104,8 +1115,22 @@ pub const HealthSource = struct {
     fn writeMetrics(ptr: *anyopaque, writer: *std.Io.Writer) anyerror!void {
         const self: *HealthSource = @ptrCast(@alignCast(ptr));
         const runtime_summary = self.data_server.provisioned_storage.runtime_status_cache.summary();
-        const read_cache_stats = self.data_server.provisioned_storage.read_cache.cacheStats();
-        const write_cache_stats = self.data_server.provisioned_storage.write_cache.cacheStats();
+        const read_cache_stats: OwnerCacheStats = if (comptime storage_kernel_experiment) blk: {
+            if (self.data_server.kernel_owner_source) |source| {
+                const stats = source.cacheStats();
+                break :blk .{ .hit_count = stats.hit_count, .miss_count = stats.miss_count };
+            }
+            break :blk .{};
+        } else blk: {
+            const stats = self.data_server.provisioned_storage.read_cache.cacheStats();
+            break :blk .{ .hit_count = stats.hit_count, .miss_count = stats.miss_count };
+        };
+        const write_cache_stats: OwnerCacheStats = if (comptime storage_kernel_experiment)
+            read_cache_stats
+        else blk: {
+            const stats = self.data_server.provisioned_storage.write_cache.cacheStats();
+            break :blk .{ .hit_count = stats.hit_count, .miss_count = stats.miss_count };
+        };
         const live_write_source = self.data_server.liveRuntimeWriteSource();
         const auto_bulk_stats = live_write_source.autoBulkIngestStatsBestEffort();
         const fanout_metrics = antfly.public_api.table_reads.parallelFanoutMetricsSnapshot();
@@ -1291,7 +1316,10 @@ pub const HealthSource = struct {
         try health_metrics.appendPromMetric(writer, "antfly_data_provisioned_write_cache_hits_total", "counter", "Provisioned write-cache hits served from already-open local table DBs", write_cache_stats.hit_count);
         try health_metrics.appendPromMetric(writer, "antfly_data_provisioned_write_cache_misses_total", "counter", "Provisioned write-cache opens that had to open a local table DB", write_cache_stats.miss_count);
         try writeResourceMetrics(writer, &self.data_server.provisioned_storage.resource_manager);
-        try writeLsmCacheMetrics(writer, self.data_server.provisioned_storage.lsm_cache.snapshotStats());
+        try writeLsmCacheMetrics(writer, if (comptime storage_kernel_experiment)
+            self.data_server.storageOwnerLsmCacheStatsBestEffort()
+        else
+            self.data_server.provisioned_storage.lsm_cache.snapshotStats());
         try writeLsmNativeStorageMetrics(writer, live_write_source.lsmNativeStorageStatsBestEffort());
         try writeFullTextMemoryMetrics(writer, live_write_source.textMemoryAttributionStatsBestEffort());
         try writeProcessMemoryMetrics(writer, process_memory_mod.snapshot());
@@ -1982,6 +2010,18 @@ fn writeLsmCacheMetrics(writer: *std.Io.Writer, stats: lsm_backend_mod.CacheStat
     try writeLsmCacheKindMetricFamily(writer, stats, .evictions, "antfly_lsm_cache_evictions_total", "counter", "Shared LSM cache evictions");
     try writeLsmCacheKindMetricFamily(writer, stats, .invalidations, "antfly_lsm_cache_invalidations_total", "counter", "Shared LSM cache invalidations");
     try writeLsmCacheKindMetricFamily(writer, stats, .waits, "antfly_lsm_cache_waits_total", "counter", "Shared LSM cache pending-load waits");
+}
+
+fn storageOwnerLsmCacheKindStats(stats: anytype) lsm_backend_mod.CacheKindStats {
+    return .{
+        .hits = stats.hits,
+        .misses = stats.misses,
+        .inserts = stats.inserts,
+        .evictions = stats.evictions,
+        .invalidations = stats.invalidations,
+        .waits = stats.waits,
+        .used_bytes = @intCast(stats.used_bytes),
+    };
 }
 
 fn writeLsmNativeStorageMetrics(writer: *std.Io.Writer, stats: ?lsm_backend_mod.NativeStorageStats) !void {
@@ -4206,6 +4246,20 @@ pub const DataServer = struct {
         if (self.data_raft_apply) |apply_sm| apply_sm.attachKernelOwnerSource(owner_source);
         self.kernel_owner_source = owner_source;
         return owner_source;
+    }
+
+    fn storageOwnerLsmCacheStatsBestEffort(self: *DataServer) lsm_backend_mod.CacheStats {
+        const owner_source = self.kernel_owner_source orelse return .{};
+        const metrics = owner_source.contextMetrics() catch return .{};
+        return .{
+            .used_bytes = @intCast(metrics.lsm_cache_used_bytes),
+            .entry_count = @intCast(metrics.lsm_cache_entry_count),
+            .run_state = storageOwnerLsmCacheKindStats(metrics.lsm_run_state),
+            .run_table_raw = storageOwnerLsmCacheKindStats(metrics.lsm_run_table_raw),
+            .run_table_index = storageOwnerLsmCacheKindStats(metrics.lsm_run_table_index),
+            .run_table_block = storageOwnerLsmCacheKindStats(metrics.lsm_run_table_block),
+            .run_table_physical_block = storageOwnerLsmCacheKindStats(metrics.lsm_run_table_physical_block),
+        };
     }
 
     pub fn initApiServer(self: *DataServer) !void {
@@ -8701,6 +8755,55 @@ pub const DataServer = struct {
                         continue;
                     }
 
+                    if (comptime storage_kernel_experiment) {
+                        var owner_statuses = (try self.write_source.source().localRuntimeStatuses(
+                            alloc,
+                            table.name,
+                        )) orelse {
+                            try reports.append(alloc, collectLocalGroupStatusWithoutDb(
+                                group_id,
+                                group_leadership_source,
+                                group_membership_source,
+                                stores,
+                                merged_group_statuses,
+                                split_transitions,
+                                merge_transitions,
+                                split_observations,
+                                merge_observations,
+                            ));
+                            continue;
+                        };
+                        defer owner_statuses.deinit(alloc);
+                        for (owner_statuses.items) |owner_status| {
+                            if (owner_status.group_id != group_id) continue;
+                            try reports.append(alloc, collectLocalGroupStatusFromRuntimeStatus(
+                                owner_status,
+                                null,
+                                group_id,
+                                group_leadership_source,
+                                group_membership_source,
+                                stores,
+                                merged_group_statuses,
+                                split_transitions,
+                                merge_transitions,
+                                split_observations,
+                                merge_observations,
+                            ));
+                            break;
+                        } else try reports.append(alloc, collectLocalGroupStatusWithoutDb(
+                            group_id,
+                            group_leadership_source,
+                            group_membership_source,
+                            stores,
+                            merged_group_statuses,
+                            split_transitions,
+                            merge_transitions,
+                            split_observations,
+                            merge_observations,
+                        ));
+                        continue;
+                    }
+
                     var db = antfly.public_api.table_writes.openManagedDbForStatusWithIndexesJsonAndCache(
                         alloc,
                         db_path,
@@ -8769,6 +8872,21 @@ pub const DataServer = struct {
             // unavailable: status collection must not manufacture a second DB
             // owner for a root managed by data Raft.
             if (self.data_raft != null or groupHasActiveTransition(group_id, split_transitions, merge_transitions)) {
+                try reports.append(alloc, collectLocalGroupStatusWithoutDb(
+                    group_id,
+                    group_leadership_source,
+                    group_membership_source,
+                    stores,
+                    merged_group_statuses,
+                    split_transitions,
+                    merge_transitions,
+                    split_observations,
+                    merge_observations,
+                ));
+                continue;
+            }
+
+            if (comptime storage_kernel_experiment) {
                 try reports.append(alloc, collectLocalGroupStatusWithoutDb(
                     group_id,
                     group_leadership_source,
@@ -11878,7 +11996,9 @@ pub const DataServer = struct {
         const refresh_write_source = self.liveRuntimeWriteSource();
         self.provisioned_storage.pruneGroupVisibleRootGenerations(local_group_ids);
         if (local_group_ids.len == 0) {
-            self.provisioned_storage.read_cache.clear();
+            if (comptime storage_kernel_experiment) {
+                if (self.kernel_owner_source) |owner_source| _ = owner_source.retireAll();
+            } else self.provisioned_storage.read_cache.clear();
             try refresh_write_source.clearWriteCache();
             if (refresh_write_source != &self.write_source and
                 !writeSourcesShareCaches(refresh_write_source, &self.write_source))
@@ -18224,23 +18344,34 @@ test "data runtime provisioned cache warmup populates runtime status without pin
     try server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
 
     try std.testing.expectEqual(@as(usize, 0), server.write_source.cachedWriteDbCount());
-    try std.testing.expectEqual(@as(usize, 0), server.provisioned_storage.read_cache.entries.items.len);
+    if (comptime !storage_kernel_experiment)
+        try std.testing.expectEqual(@as(usize, 0), server.provisioned_storage.read_cache.entries.items.len);
 
     try server.requestProvisionedCacheWarmup();
 
     try std.testing.expectEqual(@as(usize, 0), server.write_source.cachedWriteDbCount());
-    try std.testing.expectEqual(@as(usize, 0), server.provisioned_storage.read_cache.entries.items.len);
+    if (comptime storage_kernel_experiment) {
+        const owner_source = server.kernel_owner_source.?;
+        try std.testing.expectEqual(@as(usize, 0), owner_source.ownerCountForTest());
+        const owner_cache = owner_source.cacheStats();
+        try std.testing.expectEqual(@as(u64, 0), owner_cache.hit_count);
+        try std.testing.expectEqual(@as(u64, 1), owner_cache.miss_count);
+    } else {
+        try std.testing.expectEqual(@as(usize, 0), server.provisioned_storage.read_cache.entries.items.len);
+    }
     try std.testing.expectEqual(@as(u64, 1), server.provisioned_warmup_started.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), server.provisioned_warmup_completed.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 0), server.provisioned_warmup_failed.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), server.provisioned_warmup_last_group_count.load(.monotonic));
     try std.testing.expect(server.provisioned_warmup_last_duration_ns.load(.monotonic) > 0);
-    const warmed_read_cache = server.provisioned_storage.read_cache.cacheStats();
-    try std.testing.expectEqual(@as(u64, 0), warmed_read_cache.hit_count);
-    try std.testing.expectEqual(@as(u64, 0), warmed_read_cache.miss_count);
-    const warmed_write_cache = server.provisioned_storage.write_cache.cacheStats();
-    try std.testing.expectEqual(@as(u64, 0), warmed_write_cache.hit_count);
-    try std.testing.expectEqual(@as(u64, 0), warmed_write_cache.miss_count);
+    if (comptime !storage_kernel_experiment) {
+        const warmed_read_cache = server.provisioned_storage.read_cache.cacheStats();
+        try std.testing.expectEqual(@as(u64, 0), warmed_read_cache.hit_count);
+        try std.testing.expectEqual(@as(u64, 0), warmed_read_cache.miss_count);
+        const warmed_write_cache = server.provisioned_storage.write_cache.cacheStats();
+        try std.testing.expectEqual(@as(u64, 0), warmed_write_cache.hit_count);
+        try std.testing.expectEqual(@as(u64, 0), warmed_write_cache.miss_count);
+    }
 
     var snapshot_statuses = (try server.provisioned_storage.runtime_status_cache.snapshot(alloc, "docs")).?;
     defer snapshot_statuses.deinit(alloc);
@@ -18262,32 +18393,51 @@ test "data runtime provisioned cache warmup populates runtime status without pin
     var warmed_lookup = (try server.read_source.source().lookup(alloc, "docs", "doc:a", .{}, .read_index)).?;
     defer warmed_lookup.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, warmed_lookup.json, "\"alpha\"") != null);
-    const post_lookup_read_cache = server.provisioned_storage.read_cache.cacheStats();
-    try std.testing.expectEqual(@as(u64, 0), post_lookup_read_cache.hit_count);
-    try std.testing.expectEqual(@as(u64, 0), post_lookup_read_cache.miss_count);
+    if (comptime storage_kernel_experiment) {
+        const owner_source = server.kernel_owner_source.?;
+        try std.testing.expectEqual(@as(usize, 1), owner_source.ownerCountForTest());
+        const owner_cache = owner_source.cacheStats();
+        try std.testing.expectEqual(@as(u64, 0), owner_cache.hit_count);
+        try std.testing.expectEqual(@as(u64, 2), owner_cache.miss_count);
+    } else {
+        const post_lookup_read_cache = server.provisioned_storage.read_cache.cacheStats();
+        try std.testing.expectEqual(@as(u64, 0), post_lookup_read_cache.hit_count);
+        try std.testing.expectEqual(@as(u64, 0), post_lookup_read_cache.miss_count);
+    }
 
     _ = try server.write_source.source().batch(alloc, "docs", .{
         .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"beta\"}" }},
         .timestamp_ns = 2,
         .sync_level = .write,
     });
-    const post_batch_write_cache = server.provisioned_storage.write_cache.cacheStats();
-    try std.testing.expectEqual(@as(u64, 0), post_batch_write_cache.hit_count);
     if (comptime storage_kernel_experiment) {
-        // The compiled owner has its own process-scoped cache; the legacy
-        // distributed cache must remain untouched.
-        try std.testing.expectEqual(@as(u64, 0), post_batch_write_cache.miss_count);
+        const owner_cache = server.kernel_owner_source.?.cacheStats();
+        try std.testing.expectEqual(@as(u64, 1), owner_cache.hit_count);
+        try std.testing.expectEqual(@as(u64, 2), owner_cache.miss_count);
     } else {
+        const post_batch_write_cache = server.provisioned_storage.write_cache.cacheStats();
+        try std.testing.expectEqual(@as(u64, 0), post_batch_write_cache.hit_count);
         try std.testing.expect(post_batch_write_cache.miss_count >= 1);
     }
 
-    const pre_live_lookup_read_cache = server.provisioned_storage.read_cache.cacheStats();
+    const pre_live_lookup_read_cache = if (comptime storage_kernel_experiment)
+        server.kernel_owner_source.?.cacheStats()
+    else
+        server.provisioned_storage.read_cache.cacheStats();
     var live_lookup = (try server.read_source.source().lookup(alloc, "docs", "doc:b", .{}, .read_index)).?;
     defer live_lookup.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, live_lookup.json, "\"beta\"") != null);
-    const post_live_lookup_read_cache = server.provisioned_storage.read_cache.cacheStats();
-    try std.testing.expectEqual(pre_live_lookup_read_cache.hit_count, post_live_lookup_read_cache.hit_count);
-    try std.testing.expectEqual(pre_live_lookup_read_cache.miss_count, post_live_lookup_read_cache.miss_count);
+    const post_live_lookup_read_cache = if (comptime storage_kernel_experiment)
+        server.kernel_owner_source.?.cacheStats()
+    else
+        server.provisioned_storage.read_cache.cacheStats();
+    if (comptime storage_kernel_experiment) {
+        try std.testing.expectEqual(pre_live_lookup_read_cache.hit_count + 1, post_live_lookup_read_cache.hit_count);
+        try std.testing.expectEqual(pre_live_lookup_read_cache.miss_count, post_live_lookup_read_cache.miss_count);
+    } else {
+        try std.testing.expectEqual(pre_live_lookup_read_cache.hit_count, post_live_lookup_read_cache.hit_count);
+        try std.testing.expectEqual(pre_live_lookup_read_cache.miss_count, post_live_lookup_read_cache.miss_count);
+    }
 }
 
 test "data runtime provisioned cache warmup defers while startup catch-up is active" {

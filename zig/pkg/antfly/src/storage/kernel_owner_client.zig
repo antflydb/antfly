@@ -33,6 +33,14 @@ pub const Context = struct {
         std.debug.assert(status == .ok);
         self.* = .{};
     }
+
+    pub fn metrics(self: *Context) !abi.ContextMetricsResult {
+        try self.ensure();
+        var result: abi.ContextMetricsResult = .{};
+        try statusToError(abi.antfly_storage_context_metrics(self.handle, &result));
+        if (result.version != abi.abi_version) return error.InvalidAbiVersion;
+        return result;
+    }
 };
 
 pub const Response = struct {

@@ -181,6 +181,10 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
 
     try std.testing.expect((try write_source.source().createTable(alloc, "articles", .{})) != null);
     try std.testing.expectEqual(@as(usize, 1), owner_source.ownerCountForTest());
+    const initial_cache_stats = owner_source.cacheStats();
+    try std.testing.expect(initial_cache_stats.miss_count >= 1);
+    const initial_context_metrics = try owner_source.contextMetrics();
+    try std.testing.expectEqual(abi.abi_version, initial_context_metrics.version);
     const initial_maintenance = try owner_source.maintenanceSource().maintenanceSnapshot(false);
     try std.testing.expectEqual(@as(usize, 1), initial_maintenance.owner_count);
     _ = write_source.lsmMaintenanceScoreBestEffort();
@@ -720,6 +724,7 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
     try std.testing.expectEqual(@as(usize, 1), owner_source.ownerCountForTest());
     try std.testing.expectEqual(@as(usize, 17), lease_capture.count);
     try std.testing.expectEqual(@as(u64, 7001), lease_capture.last_group_id);
+    try std.testing.expect(owner_source.cacheStats().hit_count > initial_cache_stats.hit_count);
 
     var statuses = (try write_source.source().localRuntimeStatuses(alloc, "articles")).?;
     defer statuses.deinit(alloc);

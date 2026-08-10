@@ -15,7 +15,7 @@
 //! Versioned internal ABI for the storage kernel's live DB owner. Keep this
 //! module free of storage and distributed-runtime imports.
 
-pub const abi_version: u32 = 18;
+pub const abi_version: u32 = 19;
 
 pub const BorrowedBytes = extern struct {
     ptr: ?[*]const u8 = null,
@@ -93,6 +93,30 @@ pub const Status = enum(u32) {
 pub const ContextRequest = extern struct {
     version: u32 = abi_version,
     _reserved0: u32 = 0,
+};
+
+pub const ContextCacheKindStats = extern struct {
+    hits: u64 = 0,
+    misses: u64 = 0,
+    inserts: u64 = 0,
+    evictions: u64 = 0,
+    invalidations: u64 = 0,
+    waits: u64 = 0,
+    used_bytes: u64 = 0,
+};
+
+/// Process-scoped physical cache metrics. These are copied across the ABI in
+/// one snapshot so control-plane observability never imports the cache owner.
+pub const ContextMetricsResult = extern struct {
+    version: u32 = abi_version,
+    _reserved0: u32 = 0,
+    lsm_cache_used_bytes: u64 = 0,
+    lsm_cache_entry_count: u64 = 0,
+    lsm_run_state: ContextCacheKindStats = .{},
+    lsm_run_table_raw: ContextCacheKindStats = .{},
+    lsm_run_table_index: ContextCacheKindStats = .{},
+    lsm_run_table_block: ContextCacheKindStats = .{},
+    lsm_run_table_physical_block: ContextCacheKindStats = .{},
 };
 
 pub const TransactionRecoveryResolveFn = *const fn (
@@ -446,6 +470,11 @@ pub extern fn antfly_storage_context_create(
 /// Returns `busy` while any owner still borrows the context. Null destruction
 /// is idempotent and succeeds.
 pub extern fn antfly_storage_context_destroy(context: ?*anyopaque) callconv(.c) Status;
+
+pub extern fn antfly_storage_context_metrics(
+    context: ?*anyopaque,
+    out_result: *ContextMetricsResult,
+) callconv(.c) Status;
 
 pub extern fn antfly_storage_owner_open(
     request: *const OpenRequest,

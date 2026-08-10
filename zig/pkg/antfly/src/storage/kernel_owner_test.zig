@@ -602,6 +602,11 @@ test "opaque storage context enforces owner lifetime and shares process storage 
     var context: ?*anyopaque = null;
     try std.testing.expectEqual(abi.Status.ok, abi.antfly_storage_context_create(&.{}, &context));
     try std.testing.expect(context != null);
+    var metrics: abi.ContextMetricsResult = undefined;
+    try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_context_metrics(null, &metrics));
+    try std.testing.expectEqual(abi.Status.ok, abi.antfly_storage_context_metrics(context, &metrics));
+    try std.testing.expectEqual(abi.abi_version, metrics.version);
+    try std.testing.expectEqual(@as(u64, 0), metrics.lsm_cache_entry_count);
 
     var first = try client.Owner.open(.{
         .context = context,

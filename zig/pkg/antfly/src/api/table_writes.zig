@@ -5360,6 +5360,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn groupLocalWriteSource(self: *ProvisionedTableWriteSource) ?TableWriteSource {
+        if (comptime storage_kernel_experiment) return self.local_write_source;
         return self.local_write_source orelse self.localWriteOwnerSource();
     }
 
