@@ -35,6 +35,7 @@ pub fn main(init: std.process.Init.Minimal) void {
     };
     var include_filters: std.ArrayList([]const u8) = .empty;
     var exclude_filters: std.ArrayList([]const u8) = .empty;
+    var allow_empty_test_filter = false;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -54,6 +55,8 @@ pub fn main(init: std.process.Init.Minimal) void {
             i += 1;
             if (i >= args.len) @panic("missing value for --skip-test-filter");
             appendFilter(arena, "--skip-test-filter", &exclude_filters, args[i]);
+        } else if (std.mem.eql(u8, arg, "--allow-empty-test-filter")) {
+            allow_empty_test_filter = true;
         } else if (std.mem.startsWith(u8, arg, "--cache-dir=")) {
             // Accepted for compatibility with the default test runner.
         } else if (std.mem.eql(u8, arg, "--listen=-")) {
@@ -84,12 +87,17 @@ pub fn main(init: std.process.Init.Minimal) void {
     for (test_filters, 0..) |filter, filter_index| {
         if (matched_filter_counts[filter_index] != 0) continue;
         missing_filter_count += 1;
-        std.debug.print("test filter matched no declared tests: {s}\n", .{filter});
+        if (!allow_empty_test_filter) {
+            std.debug.print("test filter matched no declared tests: {s}\n", .{filter});
+        }
     }
-    if (missing_filter_count != 0) {
+    if (missing_filter_count != 0 and !allow_empty_test_filter) {
         std.process.exit(1);
     }
     if (total_count == 0) {
+        if (allow_empty_test_filter) {
+            return;
+        }
         std.debug.print("test selection matched no runnable tests\n", .{});
         std.process.exit(1);
     }

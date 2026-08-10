@@ -1825,6 +1825,25 @@ pub fn build(b: *std.Build) void {
     });
     antfly_imports.configure(b, lib_test_mod, true, true);
 
+    const metadata_unit_test_root_paths = [_][]const u8{
+        "pkg/antfly/src/metadata_reconciler_test_root.zig",
+        "pkg/antfly/src/metadata_service_http_test_root.zig",
+        "pkg/antfly/src/metadata_core_test_root.zig",
+        "pkg/antfly/src/metadata_planning_transition_test_root.zig",
+        "pkg/antfly/src/metadata_table_provisioner_test_root.zig",
+        "pkg/antfly/src/metadata_replication_backfill_test_root.zig",
+        "pkg/antfly/src/metadata_storage_test_root.zig",
+    };
+    var metadata_unit_test_mods: [metadata_unit_test_root_paths.len]*std.Build.Module = undefined;
+    for (metadata_unit_test_root_paths, &metadata_unit_test_mods) |root_path, *test_mod| {
+        test_mod.* = b.createModule(.{
+            .root_source_file = b.path(root_path),
+            .target = target,
+            .optimize = optimize,
+        });
+        antfly_imports.configure(b, test_mod.*, true, true);
+    }
+
     const raft_sim_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/raft_sim_test_root.zig"),
         .target = target,
@@ -4203,21 +4222,7 @@ pub fn build(b: *std.Build) void {
     lib_db_txn_step.dependOn(&run_lib_db_txn_tests.step);
 
     const lib_metadata_runtime_filters = selectTestFilters(b, &.{"metadata."});
-    const lib_metadata_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = compileFiltersWithAnchors(b, &.{"metadata."}, lib_metadata_runtime_filters),
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lib_metadata_tests = addFilteredTestRunArtifactWithRuntimeFilters(
-        b,
-        lib_metadata_tests,
-        lib_metadata_runtime_filters,
-    );
     const lib_metadata_test_step = b.step("lib-metadata-test", "Run root-module metadata tests only");
-    lib_metadata_test_step.dependOn(&run_lib_metadata_tests.step);
 
     const lib_metadata_table_workflow_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -6722,18 +6727,116 @@ pub fn build(b: *std.Build) void {
     }
     addRuntimeSkipTestFilters(run_unit_storage_tests, &release_scale_test_filters);
 
-    const run_unit_metadata_tests = b.addRunArtifact(lib_metadata_tests);
-    addRuntimeTestFilters(b, run_unit_metadata_tests, lib_metadata_runtime_filters);
-    addRuntimeSkipTestFilters(run_unit_metadata_tests, lib_unit_filters);
-    addRuntimeSkipTestFilters(run_unit_metadata_tests, &.{"storage."});
-    for (root_test_skip_filters) |filter| {
-        run_unit_metadata_tests.addArgs(&.{ "--skip-test-filter", filter });
+    // The complete metadata namespace pulls in the simulation harness and a
+    // large amount of control-plane code even though the default unit target
+    // excludes simulations at runtime. Compile the production metadata tests
+    // in module-owned shards so no individual Linux test image has to load the
+    // entire namespace. An explicit, flat production test root gives every
+    // shard a stable compile-time ownership prefix without traversing the
+    // public metadata namespace or its simulation imports. The sets are
+    // disjoint, and the default runtime selection uses the same ownership
+    // prefixes so an accidental empty shard is a hard failure.
+    const unit_metadata_shard_filters = [_][]const []const u8{
+        &.{"metadata.reconciler."},
+        &.{
+            "metadata.service.",
+            "metadata.http_client.",
+            "metadata.http_routes.",
+            "metadata.http_server.",
+        },
+        &.{
+            "metadata.state.",
+            "metadata.runtime.",
+            "metadata.server.",
+            "metadata.api.",
+            "metadata.admin.",
+            "metadata.authority.",
+            "metadata.incarnation.",
+            "metadata.reconcile_lease.",
+            "metadata.store_observer.",
+        },
+        &.{
+            "metadata.placement_planner.",
+            "metadata.control_loop.",
+            "metadata.table_manager.",
+            "metadata.table_workflow.",
+            "metadata.transition_state.",
+            "metadata.transition_actions.",
+            "metadata.transition_controller.",
+            "metadata.transition_driver.",
+        },
+        &.{"metadata.table_provisioner."},
+        &.{"metadata.replication_backfill."},
+        &.{"metadata.storage."},
+    };
+    const unit_metadata_sharded_test_step = b.step(
+        "unit-metadata-test",
+        "Run the production metadata portion of the default unit-test target in bounded shards",
+    );
+    const unit_metadata_shard_names = [_][]const u8{
+        "metadata-reconciler-tests",
+        "metadata-service-http-tests",
+        "metadata-core-tests",
+        "metadata-planning-transition-tests",
+        "metadata-table-provisioner-tests",
+        "metadata-replication-backfill-tests",
+        "metadata-storage-tests",
+    };
+    const metadata_runtime_filter_is_default =
+        lib_metadata_runtime_filters.len == 1 and
+        std.mem.eql(u8, lib_metadata_runtime_filters[0], "metadata.");
+    for (
+        unit_metadata_shard_filters,
+        unit_metadata_shard_names,
+        metadata_unit_test_mods,
+    ) |shard_filters, shard_name, test_mod| {
+        const unit_metadata_tests = b.addTest(.{
+            .name = shard_name,
+            .root_module = test_mod,
+            .filters = shard_filters,
+            .test_runner = .{
+                .path = b.path("pkg/antfly/src/test_runner.zig"),
+                .mode = .simple,
+            },
+        });
+        const run_unit_metadata_tests = b.addRunArtifact(unit_metadata_tests);
+        const runtime_filters = if (metadata_runtime_filter_is_default)
+            shard_filters
+        else
+            lib_metadata_runtime_filters;
+        addRuntimeTestFilters(b, run_unit_metadata_tests, runtime_filters);
+        // A focused caller filter generally belongs to only one aggregate
+        // artifact. Permit the other metadata shards to be empty, while
+        // keeping the default CI selection strict so a stale shard filter
+        // cannot silently remove coverage.
+        if (!metadata_runtime_filter_is_default) {
+            run_unit_metadata_tests.addArg("--allow-empty-test-filter");
+        }
+        addRuntimeSkipTestFilters(run_unit_metadata_tests, lib_unit_filters);
+        for (root_test_skip_filters) |filter| {
+            run_unit_metadata_tests.addArgs(&.{ "--skip-test-filter", filter });
+        }
+        unit_test_step.dependOn(&run_unit_metadata_tests.step);
+
+        // The standalone metadata step owns its selected metadata tests. Use a
+        // separate run policy so a caller filter is not mistaken for the root
+        // aggregate's overlap exclusion and skipped everywhere.
+        const run_focused_metadata_tests = b.addRunArtifact(unit_metadata_tests);
+        addRuntimeTestFilters(b, run_focused_metadata_tests, runtime_filters);
+        if (!metadata_runtime_filter_is_default) {
+            run_focused_metadata_tests.addArg("--allow-empty-test-filter");
+        }
+        for (root_test_skip_filters) |filter| {
+            run_focused_metadata_tests.addArgs(&.{ "--skip-test-filter", filter });
+        }
+        unit_metadata_sharded_test_step.dependOn(&run_focused_metadata_tests.step);
+        lib_metadata_test_step.dependOn(&run_focused_metadata_tests.step);
     }
 
     // Default Antfly unit coverage is hermetic: no network fetchers, no
     // benchmarks, and no soak/conformance suites that require external corpora.
     // Runtime exclusions above give explicit API filters first ownership,
-    // storage second ownership, and metadata third ownership.
+    // storage second ownership, and module-sharded metadata third ownership.
     dependOnAll(unit_test_step, &.{
         &run_lib_json_tests.step,
         &run_lib_onnx_tests.step,
@@ -6743,7 +6846,6 @@ pub fn build(b: *std.Build) void {
         &run_antfly_client_pkg_tests.step,
         &run_lib_unit_tests.step,
         &run_unit_storage_tests.step,
-        &run_unit_metadata_tests.step,
         &run_sparse_unit_tests.step,
     });
 
