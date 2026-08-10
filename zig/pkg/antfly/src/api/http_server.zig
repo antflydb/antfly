@@ -14650,6 +14650,7 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: http_commo
     };
     if (routes.Routes.matchTableLookup(path)) |lookup| return try tablePermission(alloc, lookup.table_name, .read);
     if (routes.Routes.matchTableQuery(path)) |query| return try tablePermission(alloc, query.table_name, .read);
+    if (routes.Routes.matchTableScan(path)) |scan| return try tablePermission(alloc, scan.table_name, .read);
     if (routes.Routes.matchTableDocumentArtifacts(path)) |artifact| return try tablePermission(alloc, artifact.table_name, switch (method) {
         .GET => .read,
         .POST, .PUT, .DELETE => return null,
@@ -14895,6 +14896,13 @@ test "document artifact routes declare read and admin permissions" {
 }
 
 test "required permissions decode table path resources" {
+    {
+        const required = (try requiredPermissionForRequest(std.testing.allocator, .POST, "/tables/docs%20table/documents")).?;
+        defer required.deinit(std.testing.allocator);
+        try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+        try std.testing.expectEqualStrings("docs table", required.resource);
+        try std.testing.expectEqual(usermgr.PermissionType.read, required.permission_type);
+    }
     {
         const required = (try requiredPermissionForRequest(std.testing.allocator, .GET, "/tables/docs%20table/artifacts")).?;
         defer required.deinit(std.testing.allocator);
@@ -21235,6 +21243,94 @@ test "api http server requires auth on public routes when enabled" {
     var readyz = try server.handle(.{ .method = .GET, .uri = routes.Routes.readyz });
     defer readyz.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), readyz.status);
+}
+
+test "api http server document scan requires table read permission" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/api-scan-auth", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:secret", .value = "{\"title\":\"classified\"}" },
+        },
+    });
+
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .status = status },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{
+                .metadata_group_id = 77,
+                .metrics = .{},
+                .projected_stores = 1,
+            };
+        }
+    };
+
+    var auth = try initTestAuthManager(alloc);
+    try bindTestAuthManager(alloc, &auth);
+    defer auth.manager.deinit();
+    defer auth.policy_store.deinit();
+    defer auth.store.deinit();
+
+    var other_table_permission = [_]usermgr.Permission{
+        try usermgr.Permission.initOwned(alloc, .table, "public", .read),
+    };
+    defer other_table_permission[0].deinit(alloc);
+    var other_table_reader = try auth.manager.createUser("other-reader", "reader", &other_table_permission);
+    defer other_table_reader.deinit(alloc);
+
+    var secrets_permission = [_]usermgr.Permission{
+        try usermgr.Permission.initOwned(alloc, .table, "secrets", .read),
+    };
+    defer secrets_permission[0].deinit(alloc);
+    var secrets_reader = try auth.manager.createUser("secrets-reader", "reader", &secrets_permission);
+    defer secrets_reader.deinit(alloc);
+
+    var read_source = table_reads.BoundTableReadSource.init("secrets", 1, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(alloc, .{
+        .auth_enabled = true,
+        .user_manager = &auth.manager,
+    }, source.iface(), read_source.source(), null);
+    defer server.deinit();
+
+    const other_reader_auth = try encodeBasicAuthorization(alloc, "other-reader", "reader");
+    defer alloc.free(other_reader_auth);
+    var forbidden = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/secrets/documents",
+        .authorization = other_reader_auth,
+        .body = "",
+    });
+    defer forbidden.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 403), forbidden.status);
+    try std.testing.expectEqualStrings("text/plain", forbidden.content_type.?);
+    try std.testing.expectEqualStrings("forbidden", forbidden.body);
+
+    const secrets_reader_auth = try encodeBasicAuthorization(alloc, "secrets-reader", "reader");
+    defer alloc.free(secrets_reader_auth);
+    var allowed = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/secrets/documents",
+        .authorization = secrets_reader_auth,
+        .body = "",
+    });
+    defer allowed.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), allowed.status);
+    try std.testing.expectEqualStrings("application/x-ndjson", allowed.content_type.?);
+    try std.testing.expect(std.mem.indexOf(u8, allowed.body, "\"_id\":\"doc:secret\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, allowed.body, "\"title\":\"classified\"") != null);
 }
 
 test "api http server dispatches HA admin and internal executors" {
