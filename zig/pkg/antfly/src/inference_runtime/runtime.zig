@@ -664,7 +664,7 @@ test "inference runtime module compiles" {
     _ = spawnServerProcess;
 }
 
-test "inference run recognizes help before server startup" {
+test "inference run detects trailing help without consuming arguments" {
     var argv = [_][*:0]const u8{ "--host", "127.0.0.1", "--help" };
     var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
     try std.testing.expect(runHelpRequested(&args));
