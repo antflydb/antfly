@@ -226,7 +226,23 @@ pub const AntflyApiHandler = struct {
 
     fn respondOwnedApiResponse(ctx: *httpx.Context, resp: anytype) !httpx.Response {
         defer resp.deinit(ctx.allocator);
-        return respondApiResponseBody(ctx, resp.status, resp.body);
+        const Response = @TypeOf(resp.*);
+        _ = ctx.status(resp.status);
+        const is_json = if (@hasField(Response, "json")) resp.json else resp.status >= 200 and resp.status < 300;
+        if (is_json) {
+            try ctx.setHeader("content-type", "application/json");
+        } else {
+            try ctx.setHeader("content-type", "text/plain; charset=utf-8");
+        }
+        if (@hasField(Response, "retry_after_seconds")) {
+            if (resp.retry_after_seconds) |seconds| {
+                var retry_after_buf: [10]u8 = undefined;
+                const retry_after = try std.fmt.bufPrint(&retry_after_buf, "{d}", .{seconds});
+                try ctx.setHeader("Retry-After", retry_after);
+            }
+        }
+        _ = ctx.response.body(resp.body);
+        return ctx.response.build();
     }
 
     fn respondApiResponseBody(ctx: *httpx.Context, status: u16, body: []const u8) !httpx.Response {
@@ -2671,14 +2687,30 @@ pub const AntflyApiHandler = struct {
         };
         defer scan_req.deinit(alloc);
 
-        var result = (try source.scan(
+        var result = (source.scan(
             alloc,
             decoded_table_name,
             scan_req.from,
             scan_req.to,
             scan_req.opts,
             .read_index,
-        )) orelse {
+        ) catch |err| switch (err) {
+            error.HAReadRequiresPrimary, error.ReadRequiresPrimary => {
+                _ = ctx.status(503);
+                return ctx.text("read requires primary");
+            },
+            error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => {
+                _ = ctx.status(503);
+                return ctx.text("standby read unavailable");
+            },
+            error.PersistentDescriptorAdmissionExhausted,
+            error.StorageReadTemporarilyUnavailable,
+            => {
+                var response = try http_server_mod.storageReadTemporarilyUnavailableResponse(self.api_server.alloc);
+                return respondWithAllocator(ctx, &response, self.api_server.alloc);
+            },
+            else => return err,
+        }) orelse {
             _ = ctx.status(404);
             return ctx.text("not found");
         };
@@ -2728,6 +2760,12 @@ pub const AntflyApiHandler = struct {
             error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => {
                 _ = ctx.status(503);
                 return ctx.text("standby read unavailable");
+            },
+            error.PersistentDescriptorAdmissionExhausted,
+            error.StorageReadTemporarilyUnavailable,
+            => {
+                var response = try http_server_mod.storageReadTemporarilyUnavailableResponse(self.api_server.alloc);
+                return respondWithAllocator(ctx, &response, self.api_server.alloc);
             },
             else => return err,
         }) orelse {
@@ -4378,6 +4416,23 @@ test "httpx internal request conversion preserves protocol headers" {
     try std.testing.expectEqualStrings("session-123", converted.value.header("mcp-session-id") orelse return error.MissingHeader);
     try std.testing.expectEqualStrings("application/json", converted.value.content_type orelse return error.MissingContentType);
     try std.testing.expectEqualStrings("{}", converted.value.body);
+}
+
+test "httpx owned response preserves retryable JSON metadata" {
+    const alloc = std.testing.allocator;
+    var request = try httpx.Request.init(alloc, .GET, "http://127.0.0.1/db/v1/tables/docs/doc:a");
+    defer request.deinit();
+    var ctx = httpx.Context.init(alloc, undefined, &request);
+    defer ctx.deinit();
+
+    var owned = try public_table_http.storageReadTemporarilyUnavailableOwnedResponse(alloc);
+    var response = try AntflyApiHandler.respondOwnedApiResponse(&ctx, &owned);
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(u16, 503), response.status.code);
+    try std.testing.expectEqualStrings("application/json", response.headers.get("content-type").?);
+    try std.testing.expectEqualStrings("1", response.headers.get("Retry-After").?);
+    try std.testing.expectEqualStrings(public_table_http.storage_read_temporarily_unavailable_body, response.body.?);
 }
 
 test "httpx query admission rejects saturated queries without blocking control routes" {
