@@ -5635,9 +5635,10 @@ pub fn build(b: *std.Build) void {
     const lib_storage_default_filters = [_][]const u8{
         "storage.",
     };
+    const lib_storage_runtime_filters = selectTestFilters(b, &lib_storage_default_filters);
     const lib_storage_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &lib_storage_default_filters),
+        .filters = lib_storage_runtime_filters,
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -6708,34 +6709,31 @@ pub fn build(b: *std.Build) void {
     const derived_log_test_step = b.step("derived-log-test", "Run storage/db/derived/derived_log unit tests");
     derived_log_test_step.dependOn(&run_derived_log_unit_tests.step);
 
-    // `root-test`, `lib-storage-test`, and `lib-metadata-test` are useful
-    // focused aliases, but all compile the same root module. Use one
-    // union-filtered artifact in the default aggregate so an overlapping test
-    // is executed only once.
-    const unit_root_default_filters = lib_unit_default_filters ++ lib_storage_default_filters ++ [_][]const u8{"metadata."};
-    const unit_root_filters = selectTestFilters(b, &unit_root_default_filters);
-    const unit_root_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = unit_root_filters,
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_unit_root_tests = b.addRunArtifact(unit_root_tests);
-    addRuntimeTestFilters(b, run_unit_root_tests, unit_root_filters);
+    // Keep the default root coverage in bounded compile/run artifacts. A
+    // single union of API, storage, and metadata tests creates a very large
+    // process whose startup competes with the compiler's resident pages on CI.
+    // Reuse the focused compile artifacts and partition overlaps at runtime so
+    // each selected test still executes exactly once.
+    const run_unit_storage_tests = b.addRunArtifact(lib_storage_tests);
+    addRuntimeTestFilters(b, run_unit_storage_tests, lib_storage_runtime_filters);
+    addRuntimeSkipTestFilters(run_unit_storage_tests, lib_unit_filters);
     for (root_test_skip_filters) |filter| {
-        run_unit_root_tests.addArgs(&.{ "--skip-test-filter", filter });
+        run_unit_storage_tests.addArgs(&.{ "--skip-test-filter", filter });
     }
-    addRuntimeSkipTestFilters(run_unit_root_tests, &release_scale_test_filters);
+    addRuntimeSkipTestFilters(run_unit_storage_tests, &release_scale_test_filters);
+
+    const run_unit_metadata_tests = b.addRunArtifact(lib_metadata_tests);
+    addRuntimeTestFilters(b, run_unit_metadata_tests, lib_metadata_runtime_filters);
+    addRuntimeSkipTestFilters(run_unit_metadata_tests, lib_unit_filters);
+    addRuntimeSkipTestFilters(run_unit_metadata_tests, &.{"storage."});
+    for (root_test_skip_filters) |filter| {
+        run_unit_metadata_tests.addArgs(&.{ "--skip-test-filter", filter });
+    }
 
     // Default Antfly unit coverage is hermetic: no network fetchers, no
     // benchmarks, and no soak/conformance suites that require external corpora.
-    // The root storage suite already discovers LMDB, docstore, shard, WAL,
-    // persistent, index-manager, DB, and derived-log tests. Do not also wire
-    // their focused aliases into this aggregate: Zig discovers imported tests
-    // transitively, so doing both ran the same test in as many as three test
-    // binaries. The focused aliases remain available for direct invocation.
+    // Runtime exclusions above give explicit API filters first ownership,
+    // storage second ownership, and metadata third ownership.
     dependOnAll(unit_test_step, &.{
         &run_lib_json_tests.step,
         &run_lib_onnx_tests.step,
@@ -6743,7 +6741,9 @@ pub fn build(b: *std.Build) void {
         &run_httpx_tests.step,
         &run_api_json_helpers_tests.step,
         &run_antfly_client_pkg_tests.step,
-        &run_unit_root_tests.step,
+        &run_lib_unit_tests.step,
+        &run_unit_storage_tests.step,
+        &run_unit_metadata_tests.step,
         &run_sparse_unit_tests.step,
     });
 
