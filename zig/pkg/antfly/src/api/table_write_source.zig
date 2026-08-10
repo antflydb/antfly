@@ -111,6 +111,12 @@ pub const TableWriteSource = struct {
             tables: []const distributed_txn.TableCommitRequest,
             sync_level: db_mod.types.SyncLevel,
         ) anyerror!?distributed_txn.CommitOutcome = null,
+        commit_batch: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            tables: []const distributed_txn.TableCommitRequest,
+            sync_level: db_mod.types.SyncLevel,
+        ) anyerror!?distributed_txn.CommitOutcome = null,
         commit_transaction_with_id: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -119,6 +125,13 @@ pub const TableWriteSource = struct {
             tables: []const distributed_txn.TableCommitRequest,
             sync_level: db_mod.types.SyncLevel,
         ) anyerror!?distributed_txn.CommitOutcome = null,
+        acknowledge_transaction_commit: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            txn_id: db_mod.types.TxnId,
+            coordinator_group_id: u64,
+            coordinator_table_name: []const u8,
+        ) anyerror!?void = null,
         batch: *const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -155,6 +168,7 @@ pub const TableWriteSource = struct {
             txn_id: db_mod.types.TxnId,
             begin_timestamp: u64,
             topology_epoch: u64,
+            retain_terminal: bool,
             participants: []const []const u8,
         ) anyerror!?void = null,
         txn_prepare_group_local: ?*const fn (
@@ -174,6 +188,8 @@ pub const TableWriteSource = struct {
             txn_id: db_mod.types.TxnId,
             status: db_mod.types.TxnStatus,
             commit_version: u64,
+            topology_epoch: u64,
+            sync_level: db_mod.types.SyncLevel,
         ) anyerror!?void = null,
         txn_status_group_local: ?*const fn (
             ptr: *anyopaque,
@@ -182,6 +198,14 @@ pub const TableWriteSource = struct {
             table_name: []const u8,
             txn_id: db_mod.types.TxnId,
         ) anyerror!?db_mod.types.TxnStatus = null,
+        txn_acknowledge_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            txn_id: db_mod.types.TxnId,
+            participant: []const u8,
+        ) anyerror!?void = null,
         corrupt_embedding_artifact: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -484,6 +508,16 @@ pub const TableWriteSource = struct {
         return try fn_ptr(self.ptr, alloc, tables, sync_level);
     }
 
+    pub fn commitBatch(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+    ) !?distributed_txn.CommitOutcome {
+        const fn_ptr = self.vtable.commit_batch orelse self.vtable.commit_transaction orelse return null;
+        return try fn_ptr(self.ptr, alloc, tables, sync_level);
+    }
+
     pub fn commitTransactionWithId(
         self: TableWriteSource,
         alloc: std.mem.Allocator,
@@ -494,6 +528,17 @@ pub const TableWriteSource = struct {
     ) !?distributed_txn.CommitOutcome {
         const fn_ptr = self.vtable.commit_transaction_with_id orelse return null;
         return try fn_ptr(self.ptr, alloc, txn_id, begin_timestamp, tables, sync_level);
+    }
+
+    pub fn acknowledgeTransactionCommit(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+        coordinator_group_id: u64,
+        coordinator_table_name: []const u8,
+    ) !?void {
+        const fn_ptr = self.vtable.acknowledge_transaction_commit orelse return null;
+        return try fn_ptr(self.ptr, alloc, txn_id, coordinator_group_id, coordinator_table_name);
     }
 
     pub fn batchGroupLocal(
@@ -515,10 +560,11 @@ pub const TableWriteSource = struct {
         txn_id: db_mod.types.TxnId,
         begin_timestamp: u64,
         topology_epoch: u64,
+        retain_terminal: bool,
         participants: []const []const u8,
     ) !?void {
         const fn_ptr = self.vtable.txn_begin_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, txn_id, begin_timestamp, topology_epoch, participants);
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, txn_id, begin_timestamp, topology_epoch, retain_terminal, participants);
     }
 
     pub fn txnPrepareGroupLocal(
@@ -542,9 +588,11 @@ pub const TableWriteSource = struct {
         txn_id: db_mod.types.TxnId,
         status: db_mod.types.TxnStatus,
         commit_version: u64,
+        topology_epoch: u64,
+        sync_level: db_mod.types.SyncLevel,
     ) !?void {
         const fn_ptr = self.vtable.txn_resolve_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, txn_id, status, commit_version);
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level);
     }
 
     pub fn txnStatusGroupLocal(
@@ -556,6 +604,18 @@ pub const TableWriteSource = struct {
     ) !?db_mod.types.TxnStatus {
         const fn_ptr = self.vtable.txn_status_group_local orelse return null;
         return try fn_ptr(self.ptr, alloc, group_id, table_name, txn_id);
+    }
+
+    pub fn txnAcknowledgeGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_mod.types.TxnId,
+        participant: []const u8,
+    ) !?void {
+        const fn_ptr = self.vtable.txn_acknowledge_group_local orelse return null;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, txn_id, participant);
     }
 
     pub fn corruptEmbeddingArtifact(

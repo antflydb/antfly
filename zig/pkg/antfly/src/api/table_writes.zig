@@ -3374,7 +3374,9 @@ const TestEmbeddingRequest = struct {
     input: std.json.Value,
 };
 
-pub const TableWriteSource = struct {
+pub const TableWriteSource = table_write_source.TableWriteSource;
+
+const LegacyTableWriteSource = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 

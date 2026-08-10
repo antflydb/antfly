@@ -54,6 +54,7 @@ pub const restore_jobs = @import("restore_jobs.zig");
 pub const http_internal_group_read_routes = @import("http_internal_group_read_routes.zig");
 pub const http_internal_group_write_routes = @import("http_internal_group_write_routes.zig");
 pub const http_internal_group_join_routes = @import("http_internal_group_join_routes.zig");
+pub const internal_batch_forwarding = @import("internal_batch_forwarding.zig");
 pub const http_server = @import("http_server.zig");
 pub const kernel_bridge = @import("kernel_bridge.zig");
 pub const http_client = @import("http_client.zig");
