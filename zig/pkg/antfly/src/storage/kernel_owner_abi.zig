@@ -15,7 +15,7 @@
 //! Versioned internal ABI for the storage kernel's live DB owner. Keep this
 //! module free of storage and distributed-runtime imports.
 
-pub const abi_version: u32 = 14;
+pub const abi_version: u32 = 15;
 
 pub const BorrowedBytes = extern struct {
     ptr: ?[*]const u8 = null,
@@ -330,6 +330,32 @@ pub const ControlledJsonOperationRequest = extern struct {
     cancellation_flag: ?*const anyopaque = null,
 };
 
+pub const ArtifactOperation = enum(u32) {
+    corrupt_embedding = 0,
+    reprocess_document = 1,
+    reprocess_document_range = 2,
+    list_repair_issues = 3,
+    repair_issues = 4,
+    update_child_range_placement = 5,
+    apply_child_range_batch = 6,
+};
+
+pub const CancellationCheckFn = *const fn (?*anyopaque) callconv(.c) u8;
+
+/// One complete artifact mutation, reprocessing, or repair operation. The JSON
+/// payload is the same coarse request shape used by the internal HTTP routes.
+/// Cancellation is borrowed for the synchronous call and is never retained.
+pub const ArtifactOperationRequest = extern struct {
+    version: u32 = abi_version,
+    operation: u32 = @intFromEnum(ArtifactOperation.reprocess_document),
+    table_name: BorrowedBytes = .{},
+    request_json: BorrowedBytes = .{},
+    cancellation_ctx: ?*anyopaque = null,
+    cancellation_fn: ?CancellationCheckFn = null,
+    defer_durable_index_repair_execution: u8 = 0,
+    _reserved0: [7]u8 = @splat(0),
+};
+
 pub extern fn antfly_storage_context_create(
     request: *const ContextRequest,
     out_context: *?*anyopaque,
@@ -479,6 +505,12 @@ pub extern fn antfly_storage_owner_document_artifact_manifest_json(
 pub extern fn antfly_storage_owner_document_artifact_manifests_json(
     owner: ?*anyopaque,
     request: *const JsonOperationRequest,
+    out_response: *OwnedBytes,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_owner_artifact_operation_json(
+    owner: ?*anyopaque,
+    request: *const ArtifactOperationRequest,
     out_response: *OwnedBytes,
 ) callconv(.c) Status;
 

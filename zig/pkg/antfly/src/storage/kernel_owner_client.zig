@@ -366,6 +366,31 @@ pub const Owner = struct {
         return response;
     }
 
+    pub fn artifactOperationJson(
+        self: *Owner,
+        table_name: []const u8,
+        operation: abi.ArtifactOperation,
+        request_json: []const u8,
+        cancellation_ctx: ?*anyopaque,
+        cancellation_fn: ?abi.CancellationCheckFn,
+        defer_durable_index_repair_execution: bool,
+    ) !Response {
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_artifact_operation_json(
+            self.handle,
+            &.{
+                .operation = @intFromEnum(operation),
+                .table_name = .fromSlice(table_name),
+                .request_json = .fromSlice(request_json),
+                .cancellation_ctx = cancellation_ctx,
+                .cancellation_fn = cancellation_fn,
+                .defer_durable_index_repair_execution = @intFromBool(defer_durable_index_repair_execution),
+            },
+            &response.buffer,
+        ));
+        return response;
+    }
+
     pub fn runtimeStatusJson(self: *Owner, table_name: []const u8) !Response {
         var response: Response = .{};
         const request = operationRequest(table_name, "");

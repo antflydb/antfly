@@ -2304,6 +2304,62 @@ without fine-grained ABI crossings. No cold ReleaseFast result is credited
 until the atomic control-source selection removes the legacy transaction and
 physical DB implementations from distributed codegen.
 
+### Phase 4f: artifact mutation, reprocessing, and repair
+
+Storage-owner ABI version 15 moves the complete group-local artifact operation
+surface behind one coarse, tagged operation call. The owner now performs
+single-document and bounded-range reprocessing, repair listing and execution,
+child-range placement mutation, child-range batch application, and the internal
+embedding-corruption diagnostic. Requests and owned results use the same JSON
+shapes already carried by the internal HTTP routes; no document, embedding,
+posting, child record, or backend primitive crosses the ABI independently.
+
+Distributed control continues to resolve tables and groups, enforce the HA
+write gate, hold table/group lifecycle admission, invalidate read/status
+caches, aggregate paginated results, and publish local-change and repair-debt
+notifications. The experimental group-local branches are compile-time
+exclusive: a missing compiled-owner callback now fails with
+`StorageKernelOwnerUnavailable` instead of silently opening a second physical
+DB. The diagnostic corruption endpoint gained an explicit group-local contract
+for the same reason.
+
+Repair cancellation crosses a borrowed synchronous callback and is never
+retained. Index-repair admission still sets
+`defer_durable_index_repair_execution` before entering the owner, preserving the
+bounded operator-request behavior. Rich yield, activation, and capacity
+callbacks are rejected explicitly at this boundary rather than silently
+dropped. Those controls belong to the storage-owned durable repair scheduler
+that will move with startup catch-up and maintenance in ownership family 6.
+
+This slice also fixed a wire-result omission: the shared repair-result decoder
+now preserves `controls_applied`, so operator pause/resume results cannot lose
+that count when returned through either a remote group or the compiled owner.
+
+Warm Debug validation with normal concurrency, linked runtime libraries, the
+production LSM backend, and the storage experiment enabled passed:
+
+- opaque owner ABI: 4/4, exercising all seven tagged artifact operations,
+  cancellation across the ABI, and invalid-version rejection;
+- provisioned cross-archive owner source: 6/6, including placement mutation,
+  document and range reprocessing, repair listing, child-range batch handling,
+  diagnostic corruption, cancellation, and preservation of one resident owner;
+- DataServer process-owner composition: 12/12;
+- public C API: 10/10;
+- complete linked Debug artifacts with the experiment both enabled and
+  disabled;
+- all runtime/codegen/API graph gates plus the 15/15 analyzer suite; and
+- symbol inspection: `antfly_storage_owner_artifact_operation_json` is present
+  in the compiled storage archive, all internal storage-owner/context/runtime
+  symbols remain absent from public C API exports, and no production LMDB
+  implementation symbol is present.
+
+Decision: keep this as ownership-family 4 preparation. Every current
+control-originated artifact mutation/reprocessing/repair path can enter the
+same resident physical owner without a fine-grained ABI. The durable node
+repair scheduler remains ownership family 6, not an excuse to carry its
+physical DB implementation in distributed control. No cold ReleaseFast result
+is credited before the atomic source-selection checkpoint in checklist item 7.
+
 ## Holistic target architecture
 
 The current candidate baseline is the four-unit topology above with serverless

@@ -251,6 +251,14 @@ pub const TableWriteSource = struct {
             doc_key: []const u8,
             index_name: []const u8,
         ) anyerror!?void = null,
+        corrupt_embedding_artifact_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            doc_key: []const u8,
+            index_name: []const u8,
+        ) anyerror!?void = null,
         reprocess_document_artifact: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -705,6 +713,18 @@ pub const TableWriteSource = struct {
     ) !?void {
         const fn_ptr = self.vtable.corrupt_embedding_artifact orelse return null;
         return try fn_ptr(self.ptr, alloc, table_name, doc_key, index_name);
+    }
+
+    pub fn corruptEmbeddingArtifactGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        index_name: []const u8,
+    ) !?void {
+        const fn_ptr = self.vtable.corrupt_embedding_artifact_group_local orelse return null;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, doc_key, index_name);
     }
 
     pub fn reprocessDocumentArtifact(

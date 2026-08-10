@@ -508,7 +508,7 @@ fn cloneArtifactRepairIssueAlloc(alloc: std.mem.Allocator, issue: db_mod.types.A
     return out;
 }
 
-fn parseArtifactRepairListResultAlloc(alloc: std.mem.Allocator, body: []const u8) !db_mod.types.ArtifactRepairListResult {
+pub fn parseStorageKernelArtifactRepairListResult(alloc: std.mem.Allocator, body: []const u8) !db_mod.types.ArtifactRepairListResult {
     var parsed = try std.json.parseFromSlice(db_mod.types.ArtifactRepairListResult, alloc, body, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
 
@@ -533,7 +533,7 @@ fn parseArtifactRepairListResultAlloc(alloc: std.mem.Allocator, body: []const u8
     };
 }
 
-fn parseArtifactRepairResultAlloc(alloc: std.mem.Allocator, body: []const u8) !db_mod.types.ArtifactRepairResult {
+pub fn parseStorageKernelArtifactRepairResult(alloc: std.mem.Allocator, body: []const u8) !db_mod.types.ArtifactRepairResult {
     var parsed = try std.json.parseFromSlice(db_mod.types.ArtifactRepairResult, alloc, body, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
 
@@ -550,6 +550,7 @@ fn parseArtifactRepairResultAlloc(alloc: std.mem.Allocator, body: []const u8) !d
         .indexes_rebuilt = parsed.value.indexes_rebuilt,
         .indexes_degraded_before = parsed.value.indexes_degraded_before,
         .indexes_degraded_after = parsed.value.indexes_degraded_after,
+        .controls_applied = parsed.value.controls_applied,
         .limit = parsed.value.limit,
         .next_cursor = if (parsed.value.next_cursor) |cursor| try alloc.dupe(u8, cursor) else null,
         .has_more = parsed.value.has_more,
@@ -557,7 +558,7 @@ fn parseArtifactRepairResultAlloc(alloc: std.mem.Allocator, body: []const u8) !d
     };
 }
 
-fn parseDocumentArtifactTableReprocessResultAlloc(alloc: std.mem.Allocator, body: []const u8) !db_mod.types.DocumentArtifactTableReprocessResult {
+pub fn parseStorageKernelDocumentArtifactTableReprocessResult(alloc: std.mem.Allocator, body: []const u8) !db_mod.types.DocumentArtifactTableReprocessResult {
     const RemoteFailure = struct {
         key: []const u8,
         error_code: []const u8,
@@ -627,6 +628,126 @@ fn parseDocumentArtifactTableReprocessResultAlloc(alloc: std.mem.Allocator, body
         .failures = failures,
         .shard_cursors = shard_cursors,
     };
+}
+
+pub const StorageKernelArtifactDocumentRequest = struct {
+    doc_key: []const u8,
+    artifact_name: []const u8,
+};
+
+pub const StorageKernelEmbeddingCorruptionRequest = struct {
+    doc_key: []const u8,
+    index_name: []const u8,
+};
+
+pub const StorageKernelArtifactRangeRequest = struct {
+    artifact_name: []const u8,
+    request: db_mod.types.DocumentArtifactTableReprocessRequest,
+};
+
+pub const StorageKernelArtifactPlacementRequest = struct {
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    update: db_mod.types.DocumentArtifactChildRangePlacementUpdate,
+};
+
+pub const StorageKernelArtifactChildRangeBatchRequest = struct {
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    batch: db_mod.DocumentArtifactChildRangeApplyBatch,
+};
+
+pub const StorageKernelHandledResponse = struct {
+    handled: bool,
+};
+
+pub const StorageKernelSequenceResponse = struct {
+    sequence: u64,
+};
+
+pub fn encodeStorageKernelArtifactDocumentRequest(
+    alloc: std.mem.Allocator,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, StorageKernelArtifactDocumentRequest{
+        .doc_key = doc_key,
+        .artifact_name = artifact_name,
+    }, .{});
+}
+
+pub fn encodeStorageKernelEmbeddingCorruptionRequest(
+    alloc: std.mem.Allocator,
+    doc_key: []const u8,
+    index_name: []const u8,
+) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, StorageKernelEmbeddingCorruptionRequest{
+        .doc_key = doc_key,
+        .index_name = index_name,
+    }, .{});
+}
+
+pub fn encodeStorageKernelArtifactRangeRequest(
+    alloc: std.mem.Allocator,
+    artifact_name: []const u8,
+    request: db_mod.types.DocumentArtifactTableReprocessRequest,
+) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, StorageKernelArtifactRangeRequest{
+        .artifact_name = artifact_name,
+        .request = request,
+    }, .{ .emit_null_optional_fields = false });
+}
+
+pub fn encodeStorageKernelArtifactRepairListRequest(
+    alloc: std.mem.Allocator,
+    request: db_mod.types.ArtifactRepairListRequest,
+) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, request, .{ .emit_null_optional_fields = false });
+}
+
+pub fn encodeStorageKernelArtifactRepairRequest(
+    alloc: std.mem.Allocator,
+    request: db_mod.types.ArtifactRepairRunRequest,
+) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, request, .{ .emit_null_optional_fields = false });
+}
+
+pub fn encodeStorageKernelArtifactPlacementRequest(
+    alloc: std.mem.Allocator,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    update: db_mod.types.DocumentArtifactChildRangePlacementUpdate,
+) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, StorageKernelArtifactPlacementRequest{
+        .doc_key = doc_key,
+        .artifact_name = artifact_name,
+        .update = update,
+    }, .{ .emit_null_optional_fields = false });
+}
+
+pub fn encodeStorageKernelArtifactChildRangeBatchRequest(
+    alloc: std.mem.Allocator,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    batch: db_mod.DocumentArtifactChildRangeApplyBatch,
+) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, StorageKernelArtifactChildRangeBatchRequest{
+        .doc_key = doc_key,
+        .artifact_name = artifact_name,
+        .batch = batch,
+    }, .{ .emit_null_optional_fields = false });
+}
+
+pub fn parseStorageKernelHandledResponse(alloc: std.mem.Allocator, body: []const u8) !bool {
+    var parsed = try std.json.parseFromSlice(StorageKernelHandledResponse, alloc, body, .{});
+    defer parsed.deinit();
+    return parsed.value.handled;
+}
+
+pub fn parseStorageKernelSequenceResponse(alloc: std.mem.Allocator, body: []const u8) !u64 {
+    var parsed = try std.json.parseFromSlice(StorageKernelSequenceResponse, alloc, body, .{});
+    defer parsed.deinit();
+    return parsed.value.sequence;
 }
 
 const DroppedTableDeleteWork = struct {
@@ -11794,6 +11915,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .txn_status_group_local = txnStatusGroupLocal,
                 .txn_acknowledge_group_local = txnAcknowledgeGroupLocal,
                 .corrupt_embedding_artifact = corruptEmbeddingArtifact,
+                .corrupt_embedding_artifact_group_local = corruptEmbeddingArtifactGroupLocal,
                 .reprocess_document_artifact = reprocessDocumentArtifact,
                 .reprocess_document_artifact_range = reprocessDocumentArtifactRange,
                 .list_artifact_repair_issues = listArtifactRepairIssues,
@@ -14219,6 +14341,17 @@ pub const ProvisionedTableWriteSource = struct {
         index_name: []const u8,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (comptime storage_kernel_experiment) {
+            const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, doc_key)) orelse return null;
+            return try corruptEmbeddingArtifactGroupLocal(
+                ptr,
+                alloc,
+                group_id,
+                table_name,
+                doc_key,
+                index_name,
+            );
+        }
         if (self.localWriteOwnerSource()) |owner| return try owner.corruptEmbeddingArtifact(alloc, table_name, doc_key, index_name);
         try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginTableRequest(table_name);
@@ -14274,6 +14407,64 @@ pub const ProvisionedTableWriteSource = struct {
         }
 
         return error.NotFound;
+    }
+
+    fn corruptEmbeddingArtifactGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        index_name: []const u8,
+    ) !?void {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try enforceHAWriteGateOptional(self.ha_write_gate);
+        self.beginTableRequest(table_name);
+        defer self.endTableRequest(table_name);
+        self.beginGroupOperation(table_name, group_id);
+        defer self.endGroupOperation(table_name, group_id);
+
+        if (comptime storage_kernel_experiment) {
+            const local_source = self.groupLocalWriteSource() orelse
+                return error.StorageKernelOwnerUnavailable;
+            _ = (try local_source.corruptEmbeddingArtifactGroupLocal(
+                alloc,
+                group_id,
+                table_name,
+                doc_key,
+                index_name,
+            )) orelse return error.StorageKernelOwnerUnavailable;
+        } else {
+            const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+            defer alloc.free(path);
+            const handled = if (self.write_cache) |cache| blk: {
+                var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default, null, null);
+                defer cached.deinit(alloc);
+                break :blk try corruptEmbeddingArtifactInDb(alloc, cached.db, doc_key, index_name);
+            } else blk: {
+                var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(
+                    alloc,
+                    path,
+                    self.catalog,
+                    table_name,
+                    group_id,
+                    self.backend_runtime,
+                    self.ha_write_gate,
+                    self.ha_async_mirror,
+                );
+                defer db.close();
+                try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
+                break :blk try corruptEmbeddingArtifactInDb(alloc, &db, doc_key, index_name);
+            };
+            if (!handled) return error.NotFound;
+        }
+
+        lockAtomic(&self.local_db_mutex);
+        self.invalidateReadCache(table_name);
+        self.markWriteCacheDirty(table_name);
+        self.local_db_mutex.unlock();
+        self.notifyLocalChange(table_name, .data);
+        return {};
     }
 
     fn reprocessDocumentArtifact(
@@ -14556,7 +14747,9 @@ pub const ProvisionedTableWriteSource = struct {
         artifact_name: []const u8,
     ) !?bool {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (self.localWriteOwnerSource()) |owner| return try owner.reprocessDocumentArtifactGroupLocal(alloc, group_id, table_name, doc_key, artifact_name);
+        if (comptime !storage_kernel_experiment) {
+            if (self.localWriteOwnerSource()) |owner| return try owner.reprocessDocumentArtifactGroupLocal(alloc, group_id, table_name, doc_key, artifact_name);
+        }
         try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginTableRequest(table_name);
         defer self.endTableRequest(table_name);
@@ -14568,13 +14761,25 @@ pub const ProvisionedTableWriteSource = struct {
         self.markWriteCacheDirty(table_name);
         self.local_db_mutex.unlock();
 
-        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
-        defer alloc.free(path);
-        const handled = if (self.write_cache) |cache| blk: {
+        const handled = if (comptime storage_kernel_experiment) owner_blk: {
+            const local_source = self.groupLocalWriteSource() orelse
+                return error.StorageKernelOwnerUnavailable;
+            break :owner_blk (try local_source.reprocessDocumentArtifactGroupLocal(
+                alloc,
+                group_id,
+                table_name,
+                doc_key,
+                artifact_name,
+            )) orelse return error.StorageKernelOwnerUnavailable;
+        } else if (self.write_cache) |cache| blk: {
+            const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+            defer alloc.free(path);
             var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default, null, null);
             defer cached.deinit(alloc);
             break :blk try cached.db.reprocessDocumentArtifact(alloc, doc_key, artifact_name);
         } else blk: {
+            const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+            defer alloc.free(path);
             const indexes_json = try loadTableIndexesJson(alloc, self.catalog, table_name);
             defer if (indexes_json) |value| alloc.free(value);
             var db = if (indexes_json) |value|
@@ -14621,7 +14826,9 @@ pub const ProvisionedTableWriteSource = struct {
         update: db_mod.types.DocumentArtifactChildRangePlacementUpdate,
     ) !?bool {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (self.localWriteOwnerSource()) |owner| return try owner.updateDocumentArtifactChildRangePlacementGroupLocal(alloc, group_id, table_name, doc_key, artifact_name, update);
+        if (comptime !storage_kernel_experiment) {
+            if (self.localWriteOwnerSource()) |owner| return try owner.updateDocumentArtifactChildRangePlacementGroupLocal(alloc, group_id, table_name, doc_key, artifact_name, update);
+        }
         try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginTableRequest(table_name);
         defer self.endTableRequest(table_name);
@@ -14633,13 +14840,26 @@ pub const ProvisionedTableWriteSource = struct {
         self.markWriteCacheDirty(table_name);
         self.local_db_mutex.unlock();
 
-        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
-        defer alloc.free(path);
-        const handled = if (self.write_cache) |cache| blk: {
+        const handled = if (comptime storage_kernel_experiment) owner_blk: {
+            const local_source = self.groupLocalWriteSource() orelse
+                return error.StorageKernelOwnerUnavailable;
+            break :owner_blk (try local_source.updateDocumentArtifactChildRangePlacementGroupLocal(
+                alloc,
+                group_id,
+                table_name,
+                doc_key,
+                artifact_name,
+                update,
+            )) orelse return error.StorageKernelOwnerUnavailable;
+        } else if (self.write_cache) |cache| blk: {
+            const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+            defer alloc.free(path);
             var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default, null, null);
             defer cached.deinit(alloc);
             break :blk try cached.db.updateDocumentArtifactChildRangePlacement(alloc, doc_key, artifact_name, update);
         } else blk: {
+            const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+            defer alloc.free(path);
             const indexes_json = try loadTableIndexesJson(alloc, self.catalog, table_name);
             defer if (indexes_json) |value| alloc.free(value);
             var db = if (indexes_json) |value|
@@ -14686,7 +14906,9 @@ pub const ProvisionedTableWriteSource = struct {
         child_batch: db_mod.DocumentArtifactChildRangeApplyBatch,
     ) !?u64 {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (self.localWriteOwnerSource()) |owner| return try owner.applyDocumentArtifactChildRangeBatchGroupLocal(alloc, group_id, table_name, doc_key, artifact_name, child_batch);
+        if (comptime !storage_kernel_experiment) {
+            if (self.localWriteOwnerSource()) |owner| return try owner.applyDocumentArtifactChildRangeBatchGroupLocal(alloc, group_id, table_name, doc_key, artifact_name, child_batch);
+        }
         try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginTableRequest(table_name);
         defer self.endTableRequest(table_name);
@@ -14698,13 +14920,26 @@ pub const ProvisionedTableWriteSource = struct {
         self.markWriteCacheDirty(table_name);
         self.local_db_mutex.unlock();
 
-        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
-        defer alloc.free(path);
-        const sequence = if (self.write_cache) |cache| blk: {
+        const sequence = if (comptime storage_kernel_experiment) owner_blk: {
+            const local_source = self.groupLocalWriteSource() orelse
+                return error.StorageKernelOwnerUnavailable;
+            break :owner_blk (try local_source.applyDocumentArtifactChildRangeBatchGroupLocal(
+                alloc,
+                group_id,
+                table_name,
+                doc_key,
+                artifact_name,
+                child_batch,
+            )) orelse return error.StorageKernelOwnerUnavailable;
+        } else if (self.write_cache) |cache| blk: {
+            const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+            defer alloc.free(path);
             var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default_async, null, null);
             defer cached.deinit(alloc);
             break :blk try cached.db.applyDocumentArtifactChildRangeBatch(child_batch);
         } else blk: {
+            const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+            defer alloc.free(path);
             const indexes_json = try loadTableIndexesJson(alloc, self.catalog, table_name);
             defer if (indexes_json) |value| alloc.free(value);
             var db = if (indexes_json) |value|
@@ -14750,7 +14985,9 @@ pub const ProvisionedTableWriteSource = struct {
         req: db_mod.types.DocumentArtifactTableReprocessRequest,
     ) !?db_mod.types.DocumentArtifactTableReprocessResult {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (self.localWriteOwnerSource()) |owner| return try owner.reprocessDocumentArtifactRangeGroupLocal(alloc, group_id, table_name, artifact_name, req);
+        if (comptime !storage_kernel_experiment) {
+            if (self.localWriteOwnerSource()) |owner| return try owner.reprocessDocumentArtifactRangeGroupLocal(alloc, group_id, table_name, artifact_name, req);
+        }
         try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginTableRequest(table_name);
         defer self.endTableRequest(table_name);
@@ -14762,13 +14999,25 @@ pub const ProvisionedTableWriteSource = struct {
         self.markWriteCacheDirty(table_name);
         self.local_db_mutex.unlock();
 
-        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
-        defer alloc.free(path);
-        var result = if (self.write_cache) |cache| blk: {
+        var result = if (comptime storage_kernel_experiment) owner_blk: {
+            const local_source = self.groupLocalWriteSource() orelse
+                return error.StorageKernelOwnerUnavailable;
+            break :owner_blk (try local_source.reprocessDocumentArtifactRangeGroupLocal(
+                alloc,
+                group_id,
+                table_name,
+                artifact_name,
+                req,
+            )) orelse return error.StorageKernelOwnerUnavailable;
+        } else if (self.write_cache) |cache| blk: {
+            const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+            defer alloc.free(path);
             var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default, null, null);
             defer cached.deinit(alloc);
             break :blk try cached.db.reprocessDocumentArtifactRange(alloc, artifact_name, req);
         } else blk: {
+            const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+            defer alloc.free(path);
             const indexes_json = try loadTableIndexesJson(alloc, self.catalog, table_name);
             defer if (indexes_json) |value| alloc.free(value);
             var db = if (indexes_json) |value|
@@ -14814,19 +15063,32 @@ pub const ProvisionedTableWriteSource = struct {
         req: db_mod.types.ArtifactRepairListRequest,
     ) !?db_mod.types.ArtifactRepairListResult {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (self.localWriteOwnerSource()) |owner| return try owner.listArtifactRepairIssuesGroupLocal(alloc, group_id, table_name, req);
+        if (comptime !storage_kernel_experiment) {
+            if (self.localWriteOwnerSource()) |owner| return try owner.listArtifactRepairIssuesGroupLocal(alloc, group_id, table_name, req);
+        }
         self.beginTableRequest(table_name);
         defer self.endTableRequest(table_name);
         self.beginGroupOperation(table_name, group_id);
         defer self.endGroupOperation(table_name, group_id);
 
-        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
-        defer alloc.free(path);
-        return if (self.write_cache) |cache| blk: {
+        return if (comptime storage_kernel_experiment) owner_blk: {
+            const local_source = self.groupLocalWriteSource() orelse
+                return error.StorageKernelOwnerUnavailable;
+            break :owner_blk (try local_source.listArtifactRepairIssuesGroupLocal(
+                alloc,
+                group_id,
+                table_name,
+                req,
+            )) orelse return error.StorageKernelOwnerUnavailable;
+        } else if (self.write_cache) |cache| blk: {
+            const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+            defer alloc.free(path);
             var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default, null, null);
             defer cached.deinit(alloc);
             break :blk try cached.db.listArtifactRepairIssuesPage(alloc, req);
         } else blk: {
+            const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+            defer alloc.free(path);
             const indexes_json = try loadTableIndexesJson(alloc, self.catalog, table_name);
             defer if (indexes_json) |value| alloc.free(value);
             var db = if (indexes_json) |value|
@@ -14883,7 +15145,6 @@ pub const ProvisionedTableWriteSource = struct {
         options: db_mod.types.ArtifactRepairRunOptions,
     ) !?db_mod.types.ArtifactRepairResult {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (self.localWriteOwnerSource()) |owner| return try owner.repairArtifactIssuesGroupLocalControlled(alloc, group_id, table_name, req, options);
         if (options.cancelled()) return error.Canceled;
         var effective_options = options;
         if (req.target == .index and req.control == null) {
@@ -14892,6 +15153,9 @@ pub const ProvisionedTableWriteSource = struct {
             // perform the admitted long-running work. This request remains a
             // bounded metadata operation and cannot stall foreground writes.
             effective_options.defer_durable_index_repair_execution = true;
+        }
+        if (comptime !storage_kernel_experiment) {
+            if (self.localWriteOwnerSource()) |owner| return try owner.repairArtifactIssuesGroupLocalControlled(alloc, group_id, table_name, req, effective_options);
         }
         const notify_cancellation = req.target == .index and req.control == .pause_automatic;
         if (notify_cancellation) self.notifyLocalIndexRepairDebt(table_name, group_id, .cancel);
@@ -14902,13 +15166,25 @@ pub const ProvisionedTableWriteSource = struct {
         self.beginGroupOperation(table_name, group_id);
         defer self.endGroupOperation(table_name, group_id);
 
-        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
-        defer alloc.free(path);
-        var result = if (self.write_cache) |cache| blk: {
+        var result = if (comptime storage_kernel_experiment) owner_blk: {
+            const local_source = self.groupLocalWriteSource() orelse
+                return error.StorageKernelOwnerUnavailable;
+            break :owner_blk (try local_source.repairArtifactIssuesGroupLocalControlled(
+                alloc,
+                group_id,
+                table_name,
+                req,
+                effective_options,
+            )) orelse return error.StorageKernelOwnerUnavailable;
+        } else if (self.write_cache) |cache| blk: {
+            const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+            defer alloc.free(path);
             var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default, null, null);
             defer cached.deinit(alloc);
             break :blk try cached.db.repairArtifactIssuesWithRequestOptions(alloc, req, effective_options);
         } else blk: {
+            const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+            defer alloc.free(path);
             const indexes_json = try loadTableIndexesJson(alloc, self.catalog, table_name);
             defer if (indexes_json) |value| alloc.free(value);
             var db = if (indexes_json) |value|
@@ -16053,7 +16329,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                             else => return err,
                         };
                         defer response.deinit(alloc);
-                        break :blk try parseDocumentArtifactTableReprocessResultAlloc(alloc, response.body);
+                        break :blk try parseStorageKernelDocumentArtifactTableReprocessResult(alloc, response.body);
                     },
                 };
                 defer group_result.deinit(alloc);
@@ -16136,7 +16412,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                             else => return err,
                         };
                         defer response.deinit(alloc);
-                        break :remote_blk try parseArtifactRepairListResultAlloc(alloc, response.body);
+                        break :remote_blk try parseStorageKernelArtifactRepairListResult(alloc, response.body);
                     },
                 };
             } else (try listArtifactRepairIssuesGroupLocal(ptr, alloc, group_id, table_name, group_req)) orelse continue;
@@ -16254,7 +16530,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                             else => return err,
                         };
                         defer response.deinit(alloc);
-                        break :remote_blk try parseArtifactRepairResultAlloc(alloc, response.body);
+                        break :remote_blk try parseStorageKernelArtifactRepairResult(alloc, response.body);
                     },
                 };
             } else (try repairArtifactIssuesGroupLocalControlled(ptr, alloc, group_id, table_name, group_req, options)) orelse continue;
@@ -17811,7 +18087,7 @@ fn seedManagedIndexReplayFromStoredDocsIfNeeded(
     return true;
 }
 
-fn corruptEmbeddingArtifactInDb(
+pub fn corruptEmbeddingArtifactInDb(
     alloc: std.mem.Allocator,
     db: *db_mod.DB,
     doc_key: []const u8,

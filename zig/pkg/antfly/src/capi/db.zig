@@ -2658,6 +2658,160 @@ pub fn storageOwnerDocumentArtifactManifestsJson(
     return .ok;
 }
 
+const StorageOwnerArtifactCancellation = struct {
+    request: *const kernel_owner_abi.ArtifactOperationRequest,
+
+    fn requested(ptr: *anyopaque) bool {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const callback = self.request.cancellation_fn orelse return false;
+        return callback(self.request.cancellation_ctx) != 0;
+    }
+};
+
+fn storageOwnerArtifactJsonResponse(
+    alloc: std.mem.Allocator,
+    out_response: *kernel_owner_abi.OwnedBytes,
+    value: anytype,
+) kernel_owner_abi.Status {
+    const response = std.json.Stringify.valueAlloc(alloc, value, .{
+        .emit_null_optional_fields = false,
+    }) catch |err| return storageOwnerStatusFromError(err);
+    out_response.* = .{ .ptr = response.ptr, .len = @intCast(response.len) };
+    return .ok;
+}
+
+pub fn storageOwnerArtifactOperationJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.ArtifactOperationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const operation: kernel_owner_abi.ArtifactOperation = switch (request.operation) {
+        0...@intFromEnum(kernel_owner_abi.ArtifactOperation.apply_child_range_batch) => @enumFromInt(request.operation),
+        else => return .invalid_argument,
+    };
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+
+    switch (operation) {
+        .corrupt_embedding => {
+            var parsed = std.json.parseFromSlice(
+                antfly.public_api.table_writes.StorageKernelEmbeddingCorruptionRequest,
+                handle.alloc,
+                request.request_json.slice(),
+                .{},
+            ) catch return .invalid_argument;
+            defer parsed.deinit();
+            const handled = antfly.public_api.table_writes.corruptEmbeddingArtifactInDb(
+                handle.alloc,
+                &handle.db,
+                parsed.value.doc_key,
+                parsed.value.index_name,
+            ) catch |err| return storageOwnerStatusFromError(err);
+            if (!handled) return .not_found;
+            return storageOwnerArtifactJsonResponse(handle.alloc, out_response, .{ .handled = true });
+        },
+        .reprocess_document => {
+            var parsed = std.json.parseFromSlice(
+                antfly.public_api.table_writes.StorageKernelArtifactDocumentRequest,
+                handle.alloc,
+                request.request_json.slice(),
+                .{},
+            ) catch return .invalid_argument;
+            defer parsed.deinit();
+            const handled = handle.db.reprocessDocumentArtifact(
+                handle.alloc,
+                parsed.value.doc_key,
+                parsed.value.artifact_name,
+            ) catch |err| return storageOwnerStatusFromError(err);
+            return storageOwnerArtifactJsonResponse(handle.alloc, out_response, .{ .handled = handled });
+        },
+        .reprocess_document_range => {
+            var parsed = std.json.parseFromSlice(
+                antfly.public_api.table_writes.StorageKernelArtifactRangeRequest,
+                handle.alloc,
+                request.request_json.slice(),
+                .{},
+            ) catch return .invalid_argument;
+            defer parsed.deinit();
+            var result = handle.db.reprocessDocumentArtifactRange(
+                handle.alloc,
+                parsed.value.artifact_name,
+                parsed.value.request,
+            ) catch |err| return storageOwnerStatusFromError(err);
+            defer result.deinit(handle.alloc);
+            return storageOwnerArtifactJsonResponse(handle.alloc, out_response, result);
+        },
+        .list_repair_issues => {
+            var parsed = std.json.parseFromSlice(
+                db_mod.types.ArtifactRepairListRequest,
+                handle.alloc,
+                request.request_json.slice(),
+                .{},
+            ) catch return .invalid_argument;
+            defer parsed.deinit();
+            var result = handle.db.listArtifactRepairIssuesPage(
+                handle.alloc,
+                parsed.value,
+            ) catch |err| return storageOwnerStatusFromError(err);
+            defer result.deinit(handle.alloc);
+            return storageOwnerArtifactJsonResponse(handle.alloc, out_response, result);
+        },
+        .repair_issues => {
+            var parsed = std.json.parseFromSlice(
+                db_mod.types.ArtifactRepairRunRequest,
+                handle.alloc,
+                request.request_json.slice(),
+                .{},
+            ) catch return .invalid_argument;
+            defer parsed.deinit();
+            var cancellation = StorageOwnerArtifactCancellation{ .request = request };
+            var result = handle.db.repairArtifactIssuesWithRequestOptions(
+                handle.alloc,
+                parsed.value,
+                .{
+                    .cancel_check = if (request.cancellation_fn != null) .{
+                        .ptr = &cancellation,
+                        .is_requested = StorageOwnerArtifactCancellation.requested,
+                    } else null,
+                    .defer_durable_index_repair_execution = request.defer_durable_index_repair_execution != 0,
+                },
+            ) catch |err| return storageOwnerStatusFromError(err);
+            defer result.deinit(handle.alloc);
+            return storageOwnerArtifactJsonResponse(handle.alloc, out_response, result);
+        },
+        .update_child_range_placement => {
+            var parsed = std.json.parseFromSlice(
+                antfly.public_api.table_writes.StorageKernelArtifactPlacementRequest,
+                handle.alloc,
+                request.request_json.slice(),
+                .{},
+            ) catch return .invalid_argument;
+            defer parsed.deinit();
+            const handled = handle.db.updateDocumentArtifactChildRangePlacement(
+                handle.alloc,
+                parsed.value.doc_key,
+                parsed.value.artifact_name,
+                parsed.value.update,
+            ) catch |err| return storageOwnerStatusFromError(err);
+            return storageOwnerArtifactJsonResponse(handle.alloc, out_response, .{ .handled = handled });
+        },
+        .apply_child_range_batch => {
+            var parsed = std.json.parseFromSlice(
+                antfly.public_api.table_writes.StorageKernelArtifactChildRangeBatchRequest,
+                handle.alloc,
+                request.request_json.slice(),
+                .{},
+            ) catch return .invalid_argument;
+            defer parsed.deinit();
+            const sequence = handle.db.applyDocumentArtifactChildRangeBatch(parsed.value.batch) catch |err|
+                return storageOwnerStatusFromError(err);
+            return storageOwnerArtifactJsonResponse(handle.alloc, out_response, .{ .sequence = sequence });
+        },
+    }
+}
+
 pub fn storageOwnerRuntimeStatusJson(
     owner: ?*anyopaque,
     request: *const kernel_owner_abi.JsonOperationRequest,
@@ -2724,7 +2878,7 @@ fn storageOwnerStatusFromError(err: anyerror) kernel_owner_abi.Status {
         error.IndexNotFound => .index_not_found,
         error.IdentityReadGenerationChanged => .identity_read_generation_changed,
         error.Timeout => .timeout,
-        error.Cancelled => .cancelled,
+        error.Canceled, error.Cancelled => .cancelled,
         else => .internal,
     };
 }

@@ -24,6 +24,7 @@ const client = @import("../storage/kernel_owner_client.zig");
 const descriptor_contract = @import("../storage/kernel_owner_descriptor.zig");
 const backend_types = @import("../storage/backend_types.zig");
 const db_types = @import("../storage/db/types.zig");
+const document_artifact_child_range = @import("../storage/db/document_artifact_child_range.zig");
 const ha_replication_record = @import("../storage/ha/replication_record.zig");
 const runtime_preflight = @import("../storage/db/runtime_preflight.zig");
 const metadata_api = @import("../metadata/api.zig");
@@ -195,6 +196,14 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .begin_bulk_ingest_group_local = beginBulkIngestGroupLocal,
                 .finish_bulk_ingest_group_local = finishBulkIngestGroupLocal,
                 .abort_bulk_ingest_group_local = abortBulkIngestGroupLocal,
+                .corrupt_embedding_artifact_group_local = corruptEmbeddingArtifactGroupLocal,
+                .reprocess_document_artifact_group_local = reprocessDocumentArtifactGroupLocal,
+                .reprocess_document_artifact_range_group_local = reprocessDocumentArtifactRangeGroupLocal,
+                .list_artifact_repair_issues_group_local = listArtifactRepairIssuesGroupLocal,
+                .repair_artifact_issues_group_local = repairArtifactIssuesGroupLocal,
+                .repair_artifact_issues_group_local_controlled = repairArtifactIssuesGroupLocalControlled,
+                .update_document_artifact_child_range_placement_group_local = updateDocumentArtifactChildRangePlacementGroupLocal,
+                .apply_document_artifact_child_range_batch_group_local = applyDocumentArtifactChildRangeBatchGroupLocal,
                 .local_runtime_statuses = localRuntimeStatuses,
                 .reconcile_table_group_local = reconcileTableGroupLocal,
                 .retire_table_group_local = retireTableGroupLocal,
@@ -971,6 +980,275 @@ pub const ProvisionedKernelOwnerSource = struct {
         var response = try lease.owner().batchJson(table_name, request_json);
         defer response.deinit();
         return {};
+    }
+
+    fn executeArtifactOperation(
+        self: *ProvisionedKernelOwnerSource,
+        group_id: u64,
+        table_name: []const u8,
+        operation: abi.ArtifactOperation,
+        request_json: []const u8,
+        cancellation_ctx: ?*anyopaque,
+        cancellation_fn: ?abi.CancellationCheckFn,
+        defer_durable_index_repair_execution: bool,
+    ) !client.Response {
+        var lease = try self.acquire(group_id, table_name);
+        defer lease.deinit();
+        return try lease.owner().artifactOperationJson(
+            table_name,
+            operation,
+            request_json,
+            cancellation_ctx,
+            cancellation_fn,
+            defer_durable_index_repair_execution,
+        );
+    }
+
+    fn corruptEmbeddingArtifactGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        index_name: []const u8,
+    ) !?void {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        const request_json = try table_writes.encodeStorageKernelEmbeddingCorruptionRequest(
+            alloc,
+            doc_key,
+            index_name,
+        );
+        defer alloc.free(request_json);
+        var response = try self.executeArtifactOperation(
+            group_id,
+            table_name,
+            .corrupt_embedding,
+            request_json,
+            null,
+            null,
+            false,
+        );
+        defer response.deinit();
+        if (!try table_writes.parseStorageKernelHandledResponse(alloc, response.bytes())) return error.NotFound;
+        return {};
+    }
+
+    fn reprocessDocumentArtifactGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+    ) !?bool {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        const request_json = try table_writes.encodeStorageKernelArtifactDocumentRequest(
+            alloc,
+            doc_key,
+            artifact_name,
+        );
+        defer alloc.free(request_json);
+        var response = try self.executeArtifactOperation(
+            group_id,
+            table_name,
+            .reprocess_document,
+            request_json,
+            null,
+            null,
+            false,
+        );
+        defer response.deinit();
+        return try table_writes.parseStorageKernelHandledResponse(alloc, response.bytes());
+    }
+
+    fn reprocessDocumentArtifactRangeGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        artifact_name: []const u8,
+        request: db_types.DocumentArtifactTableReprocessRequest,
+    ) !?db_types.DocumentArtifactTableReprocessResult {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        const request_json = try table_writes.encodeStorageKernelArtifactRangeRequest(
+            alloc,
+            artifact_name,
+            request,
+        );
+        defer alloc.free(request_json);
+        var response = try self.executeArtifactOperation(
+            group_id,
+            table_name,
+            .reprocess_document_range,
+            request_json,
+            null,
+            null,
+            false,
+        );
+        defer response.deinit();
+        return try table_writes.parseStorageKernelDocumentArtifactTableReprocessResult(
+            alloc,
+            response.bytes(),
+        );
+    }
+
+    fn listArtifactRepairIssuesGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        request: db_types.ArtifactRepairListRequest,
+    ) !?db_types.ArtifactRepairListResult {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        const request_json = try table_writes.encodeStorageKernelArtifactRepairListRequest(alloc, request);
+        defer alloc.free(request_json);
+        var response = try self.executeArtifactOperation(
+            group_id,
+            table_name,
+            .list_repair_issues,
+            request_json,
+            null,
+            null,
+            false,
+        );
+        defer response.deinit();
+        return try table_writes.parseStorageKernelArtifactRepairListResult(alloc, response.bytes());
+    }
+
+    const ArtifactRepairCancellation = struct {
+        check: db_types.RepairCancelCheck,
+
+        fn requested(ctx: ?*anyopaque) callconv(.c) u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return 0));
+            return @intFromBool(self.check.requested());
+        }
+    };
+
+    fn validateArtifactRepairControls(options: db_types.ArtifactRepairRunOptions) !void {
+        const defaults = db_types.ArtifactRepairRunOptions{};
+        if (options.yield_check != null or
+            options.activation_check != null or
+            options.capacity_source != null or
+            options.capacity_check != null or
+            options.owner_epoch != defaults.owner_epoch or
+            options.max_activation_gap_sequences != defaults.max_activation_gap_sequences or
+            options.max_convergence_rounds != defaults.max_convergence_rounds or
+            options.max_activation_pause_ms != defaults.max_activation_pause_ms or
+            options.estimated_candidate_bytes != defaults.estimated_candidate_bytes or
+            options.planned_disk_bytes != defaults.planned_disk_bytes or
+            options.capacity_domain_id != defaults.capacity_domain_id or
+            !std.meta.eql(options.capacity_observation, defaults.capacity_observation) or
+            options.executing_durable_index_repair != defaults.executing_durable_index_repair)
+        {
+            return error.UnsupportedStorageKernelRepairControls;
+        }
+    }
+
+    fn repairArtifactIssuesGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        request: db_types.ArtifactRepairRunRequest,
+    ) !?db_types.ArtifactRepairResult {
+        return try repairArtifactIssuesGroupLocalControlled(
+            ptr,
+            alloc,
+            group_id,
+            table_name,
+            request,
+            .{},
+        );
+    }
+
+    fn repairArtifactIssuesGroupLocalControlled(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        request: db_types.ArtifactRepairRunRequest,
+        options: db_types.ArtifactRepairRunOptions,
+    ) !?db_types.ArtifactRepairResult {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        try validateArtifactRepairControls(options);
+        if (options.cancelled()) return error.Canceled;
+        const request_json = try table_writes.encodeStorageKernelArtifactRepairRequest(alloc, request);
+        defer alloc.free(request_json);
+        var cancellation: ?ArtifactRepairCancellation = if (options.cancel_check) |check|
+            .{ .check = check }
+        else
+            null;
+        var response = try self.executeArtifactOperation(
+            group_id,
+            table_name,
+            .repair_issues,
+            request_json,
+            if (cancellation) |*value| value else null,
+            if (cancellation != null) ArtifactRepairCancellation.requested else null,
+            options.defer_durable_index_repair_execution,
+        );
+        defer response.deinit();
+        return try table_writes.parseStorageKernelArtifactRepairResult(alloc, response.bytes());
+    }
+
+    fn updateDocumentArtifactChildRangePlacementGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        update: db_types.DocumentArtifactChildRangePlacementUpdate,
+    ) !?bool {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        const request_json = try table_writes.encodeStorageKernelArtifactPlacementRequest(
+            alloc,
+            doc_key,
+            artifact_name,
+            update,
+        );
+        defer alloc.free(request_json);
+        var response = try self.executeArtifactOperation(
+            group_id,
+            table_name,
+            .update_child_range_placement,
+            request_json,
+            null,
+            null,
+            false,
+        );
+        defer response.deinit();
+        return try table_writes.parseStorageKernelHandledResponse(alloc, response.bytes());
+    }
+
+    fn applyDocumentArtifactChildRangeBatchGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        batch: document_artifact_child_range.ApplyBatch,
+    ) !?u64 {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        const request_json = try table_writes.encodeStorageKernelArtifactChildRangeBatchRequest(
+            alloc,
+            doc_key,
+            artifact_name,
+            batch,
+        );
+        defer alloc.free(request_json);
+        var response = try self.executeArtifactOperation(
+            group_id,
+            table_name,
+            .apply_child_range_batch,
+            request_json,
+            null,
+            null,
+            false,
+        );
+        defer response.deinit();
+        return try table_writes.parseStorageKernelSequenceResponse(alloc, response.bytes());
     }
 
     fn applyTransactionGroupLocal(

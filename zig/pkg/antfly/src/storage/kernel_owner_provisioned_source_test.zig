@@ -556,6 +556,96 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
         .read_index,
     )) == null);
 
+    try std.testing.expectEqual(@as(?bool, true), try write_source.source().updateDocumentArtifactChildRangePlacement(
+        alloc,
+        "articles",
+        "doc:a",
+        "document_units_v1",
+        .{
+            .range_id = "range:000000",
+            .placement = "remote",
+            .owner_group_id = 7002,
+            .placement_generation = 3,
+            .route_status = "remote_committed",
+        },
+    ));
+    var moved_manifest = (try read_source.source().documentArtifactManifest(
+        alloc,
+        "articles",
+        "doc:a",
+        "document_units_v1",
+        .read_index,
+    )) orelse return error.MissingDocumentArtifactManifest;
+    defer moved_manifest.deinit(alloc);
+    try std.testing.expectEqualStrings("remote", moved_manifest.child_ranges[0].placement);
+    try std.testing.expectEqual(@as(?u64, 7002), moved_manifest.child_ranges[0].owner_group_id);
+
+    const generation_before_reprocess = moved_manifest.generation;
+    try std.testing.expectEqual(@as(?bool, true), try write_source.source().reprocessDocumentArtifact(
+        alloc,
+        "articles",
+        "doc:a",
+        "document_units_v1",
+    ));
+    var reprocessed_manifest = (try read_source.source().documentArtifactManifest(
+        alloc,
+        "articles",
+        "doc:a",
+        "document_units_v1",
+        .read_index,
+    )) orelse return error.MissingDocumentArtifactManifest;
+    defer reprocessed_manifest.deinit(alloc);
+    try std.testing.expect(reprocessed_manifest.generation > generation_before_reprocess);
+
+    var range_reprocess = (try write_source.source().reprocessDocumentArtifactRangeGroupLocal(
+        alloc,
+        7001,
+        "articles",
+        "document_units_v1",
+        .{ .from_key = "doc:a", .to_key = "doc:b", .limit = 1 },
+    )) orelse return error.StorageKernelArtifactOperationMissing;
+    defer range_reprocess.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), range_reprocess.scanned);
+    try std.testing.expectEqual(@as(usize, 1), range_reprocess.reprocessed);
+
+    var repair_issues = (try write_source.source().listArtifactRepairIssuesGroupLocal(
+        alloc,
+        7001,
+        "articles",
+        .{ .limit = 10 },
+    )) orelse return error.StorageKernelArtifactOperationMissing;
+    defer repair_issues.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 10), repair_issues.limit);
+
+    try std.testing.expectEqual(@as(?u64, 0), try write_source.source().applyDocumentArtifactChildRangeBatchGroupLocal(
+        alloc,
+        7001,
+        "articles",
+        "doc:a",
+        "document_units_v1",
+        .{},
+    ));
+    try std.testing.expect((try write_source.source().corruptEmbeddingArtifact(
+        alloc,
+        "articles",
+        "doc:a",
+        "dense_idx",
+    )) != null);
+
+    const CancelRepair = struct {
+        fn requested(_: *anyopaque) bool {
+            return true;
+        }
+    };
+    var cancel_token: u8 = 0;
+    try std.testing.expectError(error.Canceled, write_source.source().repairArtifactIssuesGroupLocalControlled(
+        alloc,
+        7001,
+        "articles",
+        .{ .limit = 10 },
+        .{ .cancel_check = .{ .ptr = &cancel_token, .is_requested = CancelRepair.requested } },
+    ));
+
     var cancellation = std.atomic.Value(bool).init(true);
     edges_req.cancellation = &cancellation;
     try std.testing.expectError(
@@ -570,7 +660,7 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
     );
 
     try std.testing.expectEqual(@as(usize, 1), owner_source.ownerCountForTest());
-    try std.testing.expectEqual(@as(usize, 15), lease_capture.count);
+    try std.testing.expectEqual(@as(usize, 17), lease_capture.count);
     try std.testing.expectEqual(@as(u64, 7001), lease_capture.last_group_id);
 
     var statuses = (try write_source.source().localRuntimeStatuses(alloc, "articles")).?;
@@ -594,7 +684,7 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
     defer reopened_lookup.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, reopened_lookup.json, "beta") != null);
     try std.testing.expectEqual(@as(usize, 1), owner_source.ownerCountForTest());
-    try std.testing.expectEqual(@as(usize, 16), lease_capture.count);
+    try std.testing.expectEqual(@as(usize, 18), lease_capture.count);
 
     const accepted_snapshot = try shard_state_store.encodeGroupStateSnapshot(
         alloc,

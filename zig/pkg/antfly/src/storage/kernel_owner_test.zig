@@ -142,11 +142,13 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     try owner.configure(
         "docs",
         "",
-        "{\"dense_idx\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":3}}",
+        \\{"dense_idx":{"type":"embeddings","external":true,"dimension":3},
+        \\ "full_text_index_v0":{"type":"full_text","enrichments":[{"name":"document_units_v1","kind":"asset","field":"url","content_type":"application/json","producer_json":"{\"type\":\"document_extraction\",\"config\":{}}"}]}}
+        ,
     );
     var indexed_batch = try owner.batchJson(
         "docs",
-        "{\"inserts\":{\"doc:c\":{\"title\":\"gamma\",\"_embeddings\":{\"dense_idx\":[1,0,0]}},\"doc:d\":{\"title\":\"delta\",\"_embeddings\":{\"dense_idx\":[0,1,0]}}},\"sync_level\":\"full_index\"}",
+        "{\"inserts\":{\"doc:artifact\":{\"title\":\"artifact\",\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YQ==\"},\"doc:c\":{\"title\":\"gamma\",\"_embeddings\":{\"dense_idx\":[1,0,0]}},\"doc:d\":{\"title\":\"delta\",\"_embeddings\":{\"dense_idx\":[0,1,0]}}},\"sync_level\":\"full_index\"}",
     );
     defer indexed_batch.deinit();
     var dense_response = try owner.queryJson(
@@ -157,6 +159,94 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     const doc_c = std.mem.indexOf(u8, dense_response.bytes(), "doc:c") orelse return error.MissingDenseHit;
     const doc_d = std.mem.indexOf(u8, dense_response.bytes(), "doc:d") orelse return error.MissingDenseHit;
     try std.testing.expect(doc_c < doc_d);
+
+    var reprocessed = try owner.artifactOperationJson(
+        "docs",
+        .reprocess_document,
+        "{\"doc_key\":\"doc:artifact\",\"artifact_name\":\"document_units_v1\"}",
+        null,
+        null,
+        false,
+    );
+    defer reprocessed.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, reprocessed.bytes(), "\"handled\":true") != null);
+
+    var reprocessed_range = try owner.artifactOperationJson(
+        "docs",
+        .reprocess_document_range,
+        "{\"artifact_name\":\"document_units_v1\",\"request\":{\"from_key\":\"doc:artifact\",\"to_key\":\"doc:b\",\"limit\":1}}",
+        null,
+        null,
+        false,
+    );
+    defer reprocessed_range.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, reprocessed_range.bytes(), "\"reprocessed\":1") != null);
+
+    var placement = try owner.artifactOperationJson(
+        "docs",
+        .update_child_range_placement,
+        "{\"doc_key\":\"doc:artifact\",\"artifact_name\":\"document_units_v1\",\"update\":{\"range_id\":\"range:000000\",\"placement\":\"remote\",\"owner_group_id\":7002,\"placement_generation\":3}}",
+        null,
+        null,
+        false,
+    );
+    defer placement.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, placement.bytes(), "\"handled\":true") != null);
+
+    var empty_child_batch = try owner.artifactOperationJson(
+        "docs",
+        .apply_child_range_batch,
+        "{\"doc_key\":\"doc:artifact\",\"artifact_name\":\"document_units_v1\",\"batch\":{}}",
+        null,
+        null,
+        false,
+    );
+    defer empty_child_batch.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, empty_child_batch.bytes(), "\"sequence\":0") != null);
+
+    var corrupted = try owner.artifactOperationJson(
+        "docs",
+        .corrupt_embedding,
+        "{\"doc_key\":\"doc:c\",\"index_name\":\"dense_idx\"}",
+        null,
+        null,
+        false,
+    );
+    defer corrupted.deinit();
+    var repair_issues = try owner.artifactOperationJson(
+        "docs",
+        .list_repair_issues,
+        "{\"artifact_kind\":\"embedding\",\"limit\":10}",
+        null,
+        null,
+        false,
+    );
+    defer repair_issues.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, repair_issues.bytes(), "\"issues\"") != null);
+
+    const Cancel = struct {
+        fn requested(_: ?*anyopaque) callconv(.c) u8 {
+            return 1;
+        }
+    };
+    try std.testing.expectError(error.Cancelled, owner.artifactOperationJson(
+        "docs",
+        .repair_issues,
+        "{\"artifact_kind\":\"embedding\",\"limit\":10}",
+        null,
+        Cancel.requested,
+        false,
+    ));
+    var repaired = try owner.artifactOperationJson(
+        "docs",
+        .repair_issues,
+        "{\"artifact_kind\":\"embedding\",\"limit\":10}",
+        null,
+        null,
+        false,
+    );
+    defer repaired.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, repaired.bytes(), "\"scanned\":0") != null);
 
     try std.testing.expectError(error.InvalidArgument, owner.beginBulkIngest("articles"));
     try owner.beginBulkIngest("docs");
@@ -312,6 +402,18 @@ test "opaque storage owner validates ABI and destruction is idempotent" {
     try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_document_artifact_manifest_json(null, &invalid_operation, &response));
     try std.testing.expectEqual(@as(u64, 0), response.len);
     try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_document_artifact_manifests_json(null, &invalid_operation, &response));
+    try std.testing.expectEqual(@as(u64, 0), response.len);
+    const invalid_artifact_operation = abi.ArtifactOperationRequest{ .version = abi.abi_version + 1 };
+    try std.testing.expectEqual(
+        abi.Status.invalid_abi,
+        abi.antfly_storage_owner_artifact_operation_json(null, &invalid_artifact_operation, &response),
+    );
+    try std.testing.expectEqual(@as(u64, 0), response.len);
+    const invalid_artifact_tag = abi.ArtifactOperationRequest{ .operation = std.math.maxInt(u32) };
+    try std.testing.expectEqual(
+        abi.Status.invalid_argument,
+        abi.antfly_storage_owner_artifact_operation_json(null, &invalid_artifact_tag, &response),
+    );
     try std.testing.expectEqual(@as(u64, 0), response.len);
     try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_runtime_status_json(null, &invalid_operation, &response));
     try std.testing.expectEqual(@as(u64, 0), response.len);
