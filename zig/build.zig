@@ -40,13 +40,10 @@ const BuildEdition = enum {
 };
 
 const RuntimeArtifactRole = enum {
-    client,
+    cli,
     data,
-    ha,
     inference,
-    lite,
     metadata,
-    serverless,
     standalone,
 };
 
@@ -8704,9 +8701,8 @@ pub fn build(b: *std.Build) void {
                 // let --maxrss admit safe pairs without globally forcing -j1.
                 .max_rss = switch (role) {
                     .inference => 16 * 1024 * 1024 * 1024,
-                    .ha => 8 * 1024 * 1024 * 1024,
                     .data, .metadata => 11 * 1024 * 1024 * 1024,
-                    .client, .lite, .serverless, .standalone => 13 * 1024 * 1024 * 1024,
+                    .cli, .standalone => 13 * 1024 * 1024 * 1024,
                 },
             });
             if (strip) {

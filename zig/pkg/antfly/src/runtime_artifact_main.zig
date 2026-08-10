@@ -21,13 +21,10 @@ const role_options = @import("runtime_artifact_options");
 const structlog = @import("structlog");
 
 const runtime = switch (role_options.role) {
-    .client => @import("client_runtime.zig"),
+    .cli => @import("cli_runtime.zig"),
     .data => @import("data/runtime.zig"),
-    .ha => @import("cmd/ha.zig"),
     .inference => @import("inference_runtime/runtime.zig"),
-    .lite => @import("cmd/lite.zig"),
     .metadata => @import("metadata/runtime.zig"),
-    .serverless => @import("cmd/serverless.zig"),
     .standalone => @import("standalone/runtime.zig"),
 };
 
@@ -61,7 +58,7 @@ fn mainImpl(init: std.process.Init) !void {
     _ = args.next();
 
     const runtime_init = runtimeInit(init);
-    if (comptime role_options.role == .client) {
+    if (comptime role_options.role == .cli) {
         const command = args.next() orelse return error.InvalidArguments;
         return runtime.runFromIterator(runtime_init, command, &args);
     }
