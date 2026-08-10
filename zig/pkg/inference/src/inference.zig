@@ -88,6 +88,7 @@ test {
     _ = audio;
     _ = chunker;
     _ = pipelines;
+    _ = @import("pipelines/gliner.zig");
     _ = extractors;
     _ = server;
     _ = cache;

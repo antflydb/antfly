@@ -102,6 +102,12 @@ pub const RerankingPipeline = struct {
         const max_len = self.config.max_length;
         const batch = documents.len;
 
+        // Admission must cover tokenizer and packing buffers too. Reserve the
+        // configured upper bound before allocating them; dynamic sessions may
+        // still execute the shorter, batch-local sequence below.
+        var run_permit = try self.admitTextRun(batch, max_len);
+        defer run_permit.deinit();
+
         const encoded = try alloc.alloc(tokenizer_mod.EncodeResult, batch);
         defer alloc.free(encoded);
         var encoded_count: usize = 0;
@@ -142,9 +148,6 @@ pub const RerankingPipeline = struct {
                 row_mask,
             );
         }
-
-        var run_permit = try self.admitTextRun(batch, effective_len);
-        defer run_permit.deinit();
 
         var run = try self.runTextEncoder(
             all_ids,
@@ -514,6 +517,34 @@ test "cross encoder trims dynamic batches but preserves fixed input shapes" {
     try std.testing.expectEqual(@as(usize, 8), fixed_session.last_sequence.load(.acquire));
 }
 
+test "cross encoder admission rejects before tokenization" {
+    const memory = @import("../runtime/tier/memory.zig");
+    var controller = memory.AdmissionController{};
+    controller.configureForcedRunDenialsForTesting(1);
+
+    var session_state = FakeRerankingSession{ .fixed_sequence = false };
+    var admitted_session = session_state.session();
+    admitted_session.run_admission = .{
+        .controller = &controller,
+        .backend_class = .cpu,
+        .limits = .{},
+        .static_workspace_bytes = 1,
+    };
+    var tokenizer_state = FakeRerankingTokenizer{};
+    var pipeline = RerankingPipeline.init(
+        std.testing.allocator,
+        admitted_session,
+        tokenizer_state.tokenizer(),
+        .{ .max_length = 8 },
+    );
+
+    try std.testing.expectError(
+        error.ResourceTemporarilyUnavailable,
+        pipeline.rerank("query", &.{"document"}),
+    );
+    try std.testing.expectEqual(@as(usize, 0), tokenizer_state.encode_count.load(.acquire));
+}
+
 test "reranking execution gate blocks the session forward pass" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
@@ -628,6 +659,8 @@ const FakeRerankingSession = struct {
 };
 
 const FakeRerankingTokenizer = struct {
+    encode_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+
     fn tokenizer(self: *FakeRerankingTokenizer) Tokenizer {
         return .{ .ptr = self, .vtable = vtable() };
     }
@@ -645,7 +678,9 @@ const FakeRerankingTokenizer = struct {
         };
     }
 
-    fn encode(_: *anyopaque, allocator: std.mem.Allocator, text: []const u8) anyerror![]i32 {
+    fn encode(ptr: *anyopaque, allocator: std.mem.Allocator, text: []const u8) anyerror![]i32 {
+        const self: *FakeRerankingTokenizer = @ptrCast(@alignCast(ptr));
+        _ = self.encode_count.fetchAdd(1, .acq_rel);
         const ids = try allocator.alloc(i32, 1);
         ids[0] = if (text.len == 0) 1 else @intCast(text[0]);
         return ids;
