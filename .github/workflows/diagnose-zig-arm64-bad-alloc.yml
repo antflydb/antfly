@@ -63,12 +63,13 @@ jobs:
           # Keep 4000Mi of the ARC pod's 24000Mi request outside Zig's
           # scheduling budget. Step max_rss values are scheduling claims, not
           # a complete accounting of build-runner state and page cache. Claims
-          # admit API and the PIC application/storage unit as an 18GiB initial
-          # group. When API finishes, inference can overlap the application
-          # unit within a 19GiB group. Explicit build dependencies keep Zig's
-          # randomized dependency traversal from admitting the short remote CLI
-          # unit ahead of either critical compiler unit. The pod reserve covers
-          # runner state, linker work, page cache, and measurement drift.
+          # admit the 11GiB distributed-control consumer and 8GiB PIC storage
+          # kernel as the initial 19GiB group. When distributed finishes,
+          # inference and the remote CLI can overlap the storage tail in another
+          # 19GiB group. Explicit build dependencies keep Zig's randomized
+          # traversal from admitting either downstream unit ahead of the two
+          # critical units. The pod reserve covers runner state, linker work,
+          # page cache, and measurement drift.
           cd zig
           /usr/bin/time -v -o "$RUNNER_TEMP/linked-runtime.time" \
             zig build install lite-capi \
@@ -81,6 +82,8 @@ jobs:
             -Dmetal=false \
             -Dsystem-blas=false \
             -Dlinked-runtime-libraries=true \
+            -Dproduction-lsm-only=true \
+            -Dstorage-kernel-experiment=true \
             --prefix "$RUNNER_TEMP/linked-runtime" \
             --cache-dir "$RUNNER_TEMP/linked-runtime-cache/local" \
             --global-cache-dir "$RUNNER_TEMP/linked-runtime-cache/global" \
@@ -103,7 +106,7 @@ jobs:
           grep -Eq 'Machine:.*AArch64' "$RUNNER_TEMP/linked-runtime.elf-header"
           grep -Eq 'Machine:.*AArch64' "$RUNNER_TEMP/lite-capi.elf-header"
           grep -Eq 'GLOBAL.*antfly_db_open$' "$RUNNER_TEMP/lite-capi.symbols"
-          if grep -Eq 'GLOBAL.*antfly_(runtime_|api_kernel_|standalone_inference_|storage_kernel_link_anchor)' "$RUNNER_TEMP/lite-capi.symbols"; then
+          if grep -Eq 'GLOBAL.*antfly_(runtime_|api_kernel_|standalone_inference_|storage_kernel_link_anchor|storage_context_|storage_owner_|storage_snapshot_|storage_restore_|data_apply_store_)' "$RUNNER_TEMP/lite-capi.symbols"; then
             echo "private executable ABI leaked from libantfly.so" >&2
             exit 1
           fi
