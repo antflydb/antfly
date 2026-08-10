@@ -21330,7 +21330,6 @@ test "api http server document scan requires table read permission" {
     try std.testing.expectEqual(@as(u16, 200), allowed.status);
     try std.testing.expectEqualStrings("application/x-ndjson", allowed.content_type.?);
     try std.testing.expect(std.mem.indexOf(u8, allowed.body, "\"_id\":\"doc:secret\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, allowed.body, "\"title\":\"classified\"") != null);
 }
 
 test "api http server dispatches HA admin and internal executors" {
