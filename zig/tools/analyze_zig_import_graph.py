@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Report static relative-import reachability in the Antfly Zig source tree.
+"""Report potential and compiler-analyzed reachability in Antfly's Zig graph.
 
-This is intentionally a source-graph tool, not a model of Zig semantic analysis
-or LLVM code generation. It follows literal relative ``@import("*.zig")``
-edges, which makes accidental barrel/root imports and surprising dependency
-paths visible before measuring an optimized compiler invocation.
+The source graph follows literal relative ``@import("*.zig")`` edges. It makes
+accidental barrel imports and surprising paths visible, but includes imports in
+lazy declarations and tests. A Zig ``--time-report`` JSON is the authoritative
+view of files that a particular compiler invocation actually analyzed.
 """
 
 from __future__ import annotations
@@ -48,6 +48,14 @@ RUNTIME_BOUNDARIES = (
 CODEGEN_BOUNDARIES = (
     ("cli_runtime.zig", "standalone/runtime.zig"),
     ("cli_runtime.zig", "inference_runtime/runtime.zig"),
+    ("data/domain.zig", "data/runtime.zig"),
+    ("metadata/domain.zig", "metadata/runtime.zig"),
+    ("data/runtime.zig", "metadata/runtime.zig"),
+    ("metadata/runtime.zig", "data/runtime.zig"),
+    ("raft/mod.zig", "metadata/sim_harness.zig"),
+    ("standalone/inference_host.zig", "standalone/runtime.zig"),
+    ("standalone/inference_host.zig", "data/runtime.zig"),
+    ("standalone/inference_host.zig", "metadata/runtime.zig"),
 )
 
 
@@ -55,6 +63,15 @@ CODEGEN_BOUNDARIES = (
 class GraphStats:
     files: int
     lines: int
+
+
+@dataclass(frozen=True)
+class TimeReport:
+    name: str
+    path: Path
+    raw: dict[str, object]
+    repo_files: frozenset[Path]
+    has_file_list: bool
 
 
 class ImportGraph:
@@ -144,8 +161,15 @@ class ImportGraph:
 def parse_named_root(value: str) -> tuple[str, str]:
     name, separator, path = value.partition("=")
     if not separator or not name or not path:
-        raise argparse.ArgumentTypeError("roots must use NAME=RELATIVE/PATH.zig")
+        raise argparse.ArgumentTypeError("values must use NAME=PATH")
     return name, path
+
+
+def parse_comparison(value: str) -> tuple[str, str]:
+    base, separator, candidate = value.partition(",")
+    if not separator or not base or not candidate:
+        raise argparse.ArgumentTypeError("comparisons must use BASE,CANDIDATE")
+    return base, candidate
 
 
 def arguments(argv: list[str] | None = None) -> argparse.Namespace:
@@ -171,6 +195,29 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
         help="show a shortest relative-import path; may be repeated",
     )
     parser.add_argument(
+        "--time-report",
+        action="append",
+        type=parse_named_root,
+        default=[],
+        metavar="NAME=PATH",
+        help="summarize a Zig --time-report JSON; may be repeated",
+    )
+    parser.add_argument(
+        "--compare",
+        action="append",
+        type=parse_comparison,
+        default=[],
+        metavar="BASE,CANDIDATE",
+        help="compare analyzed files in two named time reports; may be repeated",
+    )
+    parser.add_argument(
+        "--top-groups",
+        type=int,
+        default=12,
+        metavar="N",
+        help="show the N largest or most-changed repository source groups",
+    )
+    parser.add_argument(
         "--check-runtime-boundary",
         action="store_true",
         help="fail if a production runtime can statically reach the public root.zig barrel",
@@ -178,7 +225,7 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--check-codegen-boundary",
         action="store_true",
-        help="fail if the focused CLI can statically reach standalone or inference runtime codegen",
+        help="fail if focused codegen/domain units can reach excluded runtime or simulation roots",
     )
     parser.add_argument("--largest", type=int, default=0, metavar="N", help="show the N largest files per graph")
     parser.add_argument("--json", action="store_true", help="emit the summary as JSON")
@@ -189,7 +236,181 @@ def analyze(graph: ImportGraph, roots: dict[str, str]) -> dict[str, set[Path]]:
     return {name: graph.closure([graph.resolve_source(path)]) for name, path in roots.items()}
 
 
-def json_report(graph: ImportGraph, graphs: dict[str, set[Path]]) -> dict[str, object]:
+def load_time_report(name: str, path: Path, repo_root: Path = REPO_ROOT) -> TimeReport:
+    repo_root = repo_root.resolve()
+    with path.open(encoding="utf-8") as source:
+        raw = json.load(source)
+    if not isinstance(raw, dict):
+        raise ValueError(f"time report is not a JSON object: {path}")
+
+    file_values = raw.get("all_files")
+    has_file_list = isinstance(file_values, list)
+    repo_files: set[Path] = set()
+    for value in file_values if isinstance(file_values, list) else []:
+        if not isinstance(value, str):
+            continue
+        candidate = Path(value)
+        if not candidate.is_absolute():
+            # Antfly's build is normally invoked from zig/, and Zig preserves
+            # source paths relative to that working directory in the report.
+            choices = (repo_root / "zig" / candidate, repo_root / candidate)
+            candidate = next((item for item in choices if item.is_file()), choices[0])
+        candidate = candidate.resolve()
+        try:
+            candidate.relative_to(repo_root)
+        except ValueError:
+            continue
+        if candidate.suffix == ".zig":
+            repo_files.add(candidate)
+    return TimeReport(name, path, raw, frozenset(repo_files), has_file_list)
+
+
+def integer(value: object) -> int:
+    return value if isinstance(value, int) else 0
+
+
+def seconds(value: object) -> float:
+    return integer(value) / 1_000_000_000
+
+
+def source_lines(path: Path) -> int:
+    try:
+        with path.open("rb") as source:
+            return sum(1 for _ in source)
+    except OSError:
+        return 0
+
+
+def source_group(path: Path, repo_root: Path = REPO_ROOT) -> str:
+    parts = path.relative_to(repo_root).parts
+    if parts[:4] == ("zig", "pkg", "antfly", "src") and len(parts) > 4:
+        return f"zig/pkg/antfly/src/{parts[4]}"
+    if parts[:2] == ("zig", "lib") and len(parts) > 2:
+        return f"zig/lib/{parts[2]}"
+    if parts[:2] == ("zig", "pkg") and len(parts) > 2:
+        return f"zig/pkg/{parts[2]}"
+    return "/".join(parts[:2])
+
+
+def report_stats(report: TimeReport) -> dict[str, object]:
+    stats_value = report.raw.get("stats")
+    stats = stats_value if isinstance(stats_value, dict) else {}
+    total = seconds(report.raw.get("total_ns"))
+    llvm = seconds(stats.get("real_ns_llvm_emit"))
+    return {
+        "total_seconds": total,
+        "llvm_emit_seconds": llvm,
+        "llvm_emit_fraction": llvm / total if total else 0,
+        "sema_cpu_seconds": seconds(stats.get("cpu_ns_sema")),
+        "imported_files": integer(stats.get("imported_files")) or integer(report.raw.get("file_count")),
+        "declarations": integer(report.raw.get("declaration_count")),
+        "generic_instances": integer(stats.get("generic_instances")),
+        "inline_calls": integer(stats.get("inline_calls")),
+        "repo_file_list_available": report.has_file_list,
+        "repo_zig_files": len(report.repo_files) if report.has_file_list else None,
+        "repo_zig_lines": sum(source_lines(path) for path in report.repo_files) if report.has_file_list else None,
+    }
+
+
+def grouped_files(paths: Iterable[Path], repo_root: Path = REPO_ROOT) -> list[tuple[str, int, int]]:
+    groups: dict[str, list[Path]] = collections.defaultdict(list)
+    for path in paths:
+        groups[source_group(path, repo_root)].append(path)
+    return sorted(
+        (
+            (name, len(group_paths), sum(source_lines(path) for path in group_paths))
+            for name, group_paths in groups.items()
+        ),
+        key=lambda row: (-row[2], row[0]),
+    )
+
+
+def print_time_report(report: TimeReport, top_groups: int) -> None:
+    stats = report_stats(report)
+    print(f"\ntime report {report.name}: {report.path}")
+    print(f"total seconds\t{stats['total_seconds']:.3f}")
+    print(
+        f"LLVM emit seconds\t{stats['llvm_emit_seconds']:.3f}\t"
+        f"{stats['llvm_emit_fraction']:.1%}"
+    )
+    print(f"sema CPU seconds\t{stats['sema_cpu_seconds']:.3f}")
+    print(f"imported files\t{stats['imported_files']}")
+    print(f"declarations\t{stats['declarations']}")
+    print(f"generic instances\t{stats['generic_instances']}")
+    print(f"inline calls\t{stats['inline_calls']}")
+    if not report.has_file_list:
+        print("repository Zig files\tunavailable (report has no all_files field)")
+        return
+    print(f"repository Zig files\t{stats['repo_zig_files']}\t{stats['repo_zig_lines']} lines")
+    print("top repository groups\tfiles\tlines")
+    for name, files, lines in grouped_files(report.repo_files)[:top_groups]:
+        print(f"{name}\t{files}\t{lines}")
+
+
+def comparison_stats(base: TimeReport, candidate: TimeReport) -> dict[str, object]:
+    base_total = seconds(base.raw.get("total_ns"))
+    candidate_total = seconds(candidate.raw.get("total_ns"))
+    result: dict[str, object] = {
+        "base": base.name,
+        "candidate": candidate.name,
+        "base_total_seconds": base_total,
+        "candidate_total_seconds": candidate_total,
+        "total_seconds_delta": candidate_total - base_total,
+        "file_comparison_available": base.has_file_list and candidate.has_file_list,
+    }
+    if base.has_file_list and candidate.has_file_list:
+        added = candidate.repo_files - base.repo_files
+        removed = base.repo_files - candidate.repo_files
+        result.update(
+            {
+                "repo_zig_files_delta": len(candidate.repo_files) - len(base.repo_files),
+                "added_files": len(added),
+                "added_lines": sum(source_lines(path) for path in added),
+                "removed_files": len(removed),
+                "removed_lines": sum(source_lines(path) for path in removed),
+            }
+        )
+    return result
+
+
+def print_comparison(base: TimeReport, candidate: TimeReport, top_groups: int) -> None:
+    stats = comparison_stats(base, candidate)
+    print(f"\ncompare {base.name} -> {candidate.name}")
+    print(
+        f"total seconds\t{stats['base_total_seconds']:.3f}\t"
+        f"{stats['candidate_total_seconds']:.3f}\t{stats['total_seconds_delta']:+.3f}"
+    )
+    if not stats["file_comparison_available"]:
+        print("file comparison unavailable: both reports must contain all_files")
+        return
+
+    added = candidate.repo_files - base.repo_files
+    removed = base.repo_files - candidate.repo_files
+    print(f"repository Zig files delta\t{stats['repo_zig_files_delta']:+d}")
+    print(f"added\t{stats['added_files']} files\t{stats['added_lines']} lines")
+    print(f"removed\t{stats['removed_files']} files\t{stats['removed_lines']} lines")
+
+    changes: dict[str, list[int]] = collections.defaultdict(lambda: [0, 0, 0, 0])
+    for path in added:
+        row = changes[source_group(path)]
+        row[0] += 1
+        row[1] += source_lines(path)
+    for path in removed:
+        row = changes[source_group(path)]
+        row[2] += 1
+        row[3] += source_lines(path)
+    ranked = sorted(changes.items(), key=lambda item: (-(item[1][1] + item[1][3]), item[0]))
+    print("changed repository groups\tadded files/lines\tremoved files/lines")
+    for name, (added_files, added_lines, removed_files, removed_lines) in ranked[:top_groups]:
+        print(f"{name}\t+{added_files}/+{added_lines}\t-{removed_files}/-{removed_lines}")
+
+
+def json_report(
+    graph: ImportGraph,
+    graphs: dict[str, set[Path]],
+    time_reports: Iterable[TimeReport] = (),
+    comparisons: Iterable[tuple[TimeReport, TimeReport]] = (),
+) -> dict[str, object]:
     report: dict[str, object] = {
         "source_root": str(graph.source_root),
         "roots": {},
@@ -203,6 +424,8 @@ def json_report(graph: ImportGraph, graphs: dict[str, set[Path]]) -> dict[str, o
     role_union = set().union(*(graphs[name] for name in available_roles)) if available_roles else set()
     union_stats = graph.stats(role_union)
     report["server_role_union"] = {"files": union_stats.files, "lines": union_stats.lines}
+    report["time_reports"] = {item.name: report_stats(item) for item in time_reports}
+    report["comparisons"] = [comparison_stats(base, candidate) for base, candidate in comparisons]
     return report
 
 
@@ -286,10 +509,32 @@ def main(argv: list[str] | None = None) -> int:
         graph = ImportGraph(args.source_root)
         roots = dict(args.root) if args.root else DEFAULT_ROOTS
         graphs = analyze(graph, roots)
+        reports = {
+            name: load_time_report(name, Path(path))
+            for name, path in args.time_report
+        }
+        comparisons: list[tuple[TimeReport, TimeReport]] = []
+        for base_name, candidate_name in args.compare:
+            if base_name not in reports or candidate_name not in reports:
+                raise ValueError(
+                    "comparison names must match --time-report names: "
+                    f"{base_name},{candidate_name}"
+                )
+            comparisons.append((reports[base_name], reports[candidate_name]))
         if args.json:
-            print(json.dumps(json_report(graph, graphs), indent=2, sort_keys=True))
+            print(
+                json.dumps(
+                    json_report(graph, graphs, reports.values(), comparisons),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
         else:
             print_report(graph, graphs, args.largest)
+            for report in reports.values():
+                print_time_report(report, args.top_groups)
+            for base, candidate in comparisons:
+                print_comparison(base, candidate, args.top_groups)
         if args.show_path:
             show_paths(graph, args.show_path)
         if args.check_runtime_boundary and not check_runtime_boundary(graph):

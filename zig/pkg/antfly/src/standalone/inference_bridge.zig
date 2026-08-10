@@ -16,12 +16,56 @@
 //! code-generated inference runtime. These are intermediate link boundaries,
 //! not a public or stable C API.
 
+pub const String = extern struct {
+    ptr: [*]const u8,
+    len: usize,
+
+    pub fn init(value: []const u8) String {
+        return .{ .ptr = value.ptr, .len = value.len };
+    }
+
+    pub fn slice(self: String) []const u8 {
+        return self.ptr[0..self.len];
+    }
+};
+
+pub const OptionalString = extern struct {
+    ptr: ?[*]const u8 = null,
+    len: usize = 0,
+
+    pub fn init(value: ?[]const u8) OptionalString {
+        const present = value orelse return .{};
+        return .{ .ptr = present.ptr, .len = present.len };
+    }
+
+    pub fn slice(self: OptionalString) ?[]const u8 {
+        const ptr = self.ptr orelse return null;
+        return ptr[0..self.len];
+    }
+};
+
+pub const WarmModel = extern struct {
+    kind: String,
+    name: String,
+    backend: OptionalString = .{},
+    format: OptionalString = .{},
+    quantization: OptionalString = .{},
+};
+
 pub const CreateContext = extern struct {
     init: *const anyopaque,
-    cli: *const anyopaque,
     loaded_config: ?*const anyopaque,
     data_dir_ptr: [*]const u8,
     data_dir_len: usize,
+    models_dir: OptionalString,
+    ml_dir: OptionalString,
+    host_limit_bytes: usize,
+    backend_limit_bytes: usize,
+    combined_limit_bytes: usize,
+    kv_limit_bytes: usize,
+    scratch_limit_bytes: usize,
+    preload_ptr: ?[*]const WarmModel,
+    preload_len: usize,
     out_handle: *?*anyopaque,
 };
 

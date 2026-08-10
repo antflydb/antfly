@@ -19,7 +19,6 @@ const httpx = @import("httpx");
 const antfly = @import("runtime_root.zig");
 const group_ids = @import("../common/group_ids.zig");
 const threaded_io_limits = @import("../common/threaded_io_limits.zig");
-const inference = @import("inference_server");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const usermgr_openapi = @import("antfly_usermgr_openapi");
 const fs_paths = @import("../common/fs_paths.zig");
@@ -28,8 +27,11 @@ const platform = @import("antfly_platform");
 const inference_bridge = @import("inference_bridge.zig");
 const standalone_runtime_options = @import("standalone_runtime_options");
 const inline_inference_codegen = !standalone_runtime_options.linked_inference;
+const inference_host = if (inline_inference_codegen) @import("inference_host.zig") else struct {};
 
 const AntflyApiHandler = antfly.public_api.httpx_handler.AntflyApiHandler;
+const ApiHttpServer = antfly.public_api.ApiHttpServer;
+const ApiKernelHandler = antfly.public_api.kernel_bridge.HttpxHandler;
 const http_common = antfly.common.http;
 const public_api_max_requests_per_connection: u32 = 64;
 const public_api_max_body_size: usize = antfly.common.http.default_max_request_bytes;
@@ -114,7 +116,7 @@ const CliConfig = struct {
     inference_combined_budget_mb: usize = 0,
     inference_kv_budget_mb: usize = 0,
     inference_scratch_budget_mb: usize = 0,
-    inference_preload_models: std.ArrayListUnmanaged(inference.server.WarmModel) = .empty,
+    inference_preload_models: std.ArrayListUnmanaged(inference_bridge.WarmModel) = .empty,
     data_dir: ?[]const u8 = null,
     storage_engine: ?antfly.common.config.StorageEngine = null,
     storage_path: ?[]const u8 = null,
@@ -186,7 +188,7 @@ const ResolvedPaths = struct {
 const StandaloneHealthSource = struct {
     data_server: *antfly.data.runtime.DataServer,
     unified_api_ready: *const std.atomic.Value(bool),
-    handler: *const AntflyApiHandler,
+    handler: *const ApiKernelHandler,
     unified_lifecycle: *UnifiedServerLifecycle,
 
     fn readiness(self: *StandaloneHealthSource) antfly.common.health_server.ReadinessChecker {
@@ -219,17 +221,15 @@ const StandaloneHealthSource = struct {
         var data_health = antfly.data.runtime.HealthSource{ .data_server = self.data_server };
         try data_health.metricsWriter().writeMetrics(writer);
 
-        const query = self.handler.query_admission.stats();
-        const query_body = self.handler.query_body_admission.stats();
-        const handler = self.handler.runtimeStats();
-        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_capacity", "gauge", "Maximum concurrent expensive public queries", query.capacity);
-        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_in_flight", "gauge", "Currently executing expensive public queries", query.in_flight);
-        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_peak_in_flight", "gauge", "Peak concurrent expensive public queries since process start", query.peak_in_flight);
-        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_rejected_total", "counter", "Public queries rejected by admission control", query.rejected_total);
-        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_body_capacity", "gauge", "Maximum concurrent streaming H2 query bodies", query_body.capacity);
-        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_bodies_in_flight", "gauge", "Streaming H2 query bodies currently admitted", query_body.in_flight);
-        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_body_peak_in_flight", "gauge", "Peak concurrent streaming H2 query bodies since process start", query_body.peak_in_flight);
-        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_body_rejected_total", "counter", "Streaming H2 query bodies rejected by admission control", query_body.rejected_total);
+        const handler = antfly.public_api.kernel_bridge.handlerStats(self.handler);
+        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_capacity", "gauge", "Maximum concurrent expensive public queries", handler.query_capacity);
+        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_in_flight", "gauge", "Currently executing expensive public queries", handler.query_in_flight);
+        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_peak_in_flight", "gauge", "Peak concurrent expensive public queries since process start", handler.query_peak_in_flight);
+        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_rejected_total", "counter", "Public queries rejected by admission control", handler.query_rejected_total);
+        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_body_capacity", "gauge", "Maximum concurrent streaming H2 query bodies", handler.query_body_capacity);
+        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_bodies_in_flight", "gauge", "Streaming H2 query bodies currently admitted", handler.query_body_in_flight);
+        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_body_peak_in_flight", "gauge", "Peak concurrent streaming H2 query bodies since process start", handler.query_body_peak_in_flight);
+        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_body_rejected_total", "counter", "Streaming H2 query bodies rejected by admission control", handler.query_body_rejected_total);
         try antfly.common.health_server.appendPromMetric(writer, "antfly_http_cancellation_watcher_start_failures_total", "counter", "Public queries rejected because peer observation could not be scheduled", handler.cancellation_watcher_start_failures_total);
         try antfly.common.health_server.appendPromMetric(writer, "antfly_http_peer_disconnects_total", "counter", "Public query peer disconnects propagated to cancellation", handler.peer_disconnect_cancellations_total);
         try antfly.common.health_server.appendPromMetric(writer, "antfly_http_peer_observer_failures_total", "counter", "Public queries cancelled after peer observation failed", handler.peer_observer_failures_total);
@@ -1389,41 +1389,30 @@ pub fn runFromIterator(
     // Standalone always owns a local Antfly node. In the linked build its heavy
     // implementation is code-generated in the inference archive and reached
     // through an opaque internal ABI; the shipped artifact remains one binary.
-    var resolved_warm_models = if (comptime inline_inference_codegen)
-        try resolveInferenceWarmModels(alloc, cli, if (loaded_config) |*cfg| cfg else null)
-    else
-        ResolvedWarmModels{ .items = &.{} };
-    defer resolved_warm_models.deinit(alloc);
-    var antfly_node = if (comptime inline_inference_codegen) blk: {
-        var antfly_node_cfg = inference.server.NodeConfig{
-            .models_dir = resolveInferenceModelsDir(cli, if (loaded_config) |*cfg| cfg else null) orelse
-                antfly.inference_runtime.defaultModelsDirForDataDir(alloc, data_dir),
-            .ml_dir = resolveInferenceMlDir(cli, if (loaded_config) |*cfg| cfg else null) orelse
-                antfly.inference_runtime.defaultMlDirForDataDir(alloc, data_dir),
-            .generation_budget_overrides = resolveInferenceBudgetOverrides(cli),
-            .preload = resolved_warm_models.items,
-        };
-        if (loaded_config) |*cfg| {
-            if (cfg.effectiveAntflyContentSecurity()) |security| antfly_node_cfg.content_security = security.*;
-            if (cfg.inference.s3_credentials) |creds| antfly_node_cfg.s3_credentials = creds;
-            if (cfg.inference.keep_alive) |value|
-                antfly_node_cfg.keep_alive_ms = try parseInferenceKeepAliveMs(value);
-            if (cfg.inference.max_loaded_models) |value|
-                antfly_node_cfg.max_loaded_models =
-                    std.math.cast(usize, value) orelse return error.InvalidInferenceModelCacheConfig;
-        }
-        break :blk try inference.server.Node.init(alloc, antfly_node_cfg);
+    var handle: ?*anyopaque = null;
+    const inference_create_context = inference_bridge.CreateContext{
+        .init = &init,
+        .loaded_config = if (loaded_config) |*cfg| cfg else null,
+        .data_dir_ptr = data_dir.ptr,
+        .data_dir_len = data_dir.len,
+        .models_dir = inference_bridge.OptionalString.init(cli.inference_models_dir),
+        .ml_dir = inference_bridge.OptionalString.init(cli.inference_ml_dir),
+        .host_limit_bytes = mbToBytes(cli.inference_host_budget_mb),
+        .backend_limit_bytes = mbToBytes(cli.inference_backend_budget_mb),
+        .combined_limit_bytes = mbToBytes(cli.inference_combined_budget_mb),
+        .kv_limit_bytes = mbToBytes(cli.inference_kv_budget_mb),
+        .scratch_limit_bytes = mbToBytes(cli.inference_scratch_budget_mb),
+        .preload_ptr = if (cli.inference_preload_models.items.len == 0)
+            null
+        else
+            cli.inference_preload_models.items.ptr,
+        .preload_len = cli.inference_preload_models.items.len,
+        .out_handle = &handle,
+    };
+    const antfly_node = if (comptime inline_inference_codegen) blk: {
+        break :blk try inference_host.linkedInferenceCreate(&inference_create_context);
     } else blk: {
-        var handle: ?*anyopaque = null;
-        const context = inference_bridge.CreateContext{
-            .init = &init,
-            .cli = &cli,
-            .loaded_config = if (loaded_config) |*cfg| cfg else null,
-            .data_dir_ptr = data_dir.ptr,
-            .data_dir_len = data_dir.len,
-            .out_handle = &handle,
-        };
-        if (inference_bridge.antfly_standalone_inference_create(&context) != 0)
+        if (inference_bridge.antfly_standalone_inference_create(&inference_create_context) != 0)
             return error.InferenceRuntimeStartupFailed;
         break :blk handle orelse return error.InferenceRuntimeStartupFailed;
     };
@@ -1433,7 +1422,7 @@ pub fn runFromIterator(
     var antfly_node_needs_errdeinit = true;
     errdefer if (antfly_node_needs_errdeinit) {
         if (comptime inline_inference_codegen)
-            antfly_node.deinit()
+            inference_host.linkedInferenceDestroy(antfly_node)
         else
             inference_bridge.antfly_standalone_inference_destroy(antfly_node);
     };
@@ -1620,43 +1609,30 @@ pub fn runFromIterator(
         // The earlier data_server.deinit defer performs final storage teardown.
         data_server.quiesceBackgroundWork();
         if (comptime inline_inference_codegen)
-            antfly_node.deinit()
+            inference_host.linkedInferenceDestroy(antfly_node)
         else
             inference_bridge.antfly_standalone_inference_destroy(antfly_node);
     }
 
+    var attached_io: std.Io = undefined;
+    const io_ptr: ?*const anyopaque = if (node_backend_runtime.ptr().io()) |io| blk: {
+        attached_io = io;
+        break :blk &attached_io;
+    } else null;
+    const configure_context = inference_bridge.ConfigureContext{
+        .handle = antfly_node,
+        .resource_manager = &data_server.provisioned_storage.resource_manager,
+        .io = io_ptr,
+    };
     if (comptime inline_inference_codegen) {
-        antfly_node.configureAdmissionResourceBudget(inferenceAdmissionResourceBudget(
-            &data_server.provisioned_storage.resource_manager,
-        ));
-        antfly_node.config.prompt_cache_resource_usage_observer = promptCacheResourceUsageObserver(&data_server.provisioned_storage.resource_manager);
-        try antfly_node.configureTokenizerCaches(.{
-            // Keep the small lock-free front table hot while providing enough
-            // second-tier slots for large ingestion corpora. The table and every
-            // admitted entry are charged to inference.tokenizer_cache; pressure
-            // can decline the optional table without making model warmup fail.
-            .bulk_slots_per_shard = 16 * 1024,
-            .resource_budget = tokenizerCacheResourceBudget(
-                &data_server.provisioned_storage.resource_manager,
-            ),
-        });
-        if (node_backend_runtime.ptr().io()) |io| antfly_node.attachIo(io);
-        antfly_node.warmConfiguredModels(alloc) catch |err| {
-            std.log.err("standalone startup failed step=warm_inference_models err={}", .{err});
-            return err;
-        };
-        data_server.setAntflyProvider(localAntflyProvider(&antfly_node));
-    } else {
-        var attached_io: std.Io = undefined;
-        const io_ptr: ?*const anyopaque = if (node_backend_runtime.ptr().io()) |io| blk: {
-            attached_io = io;
-            break :blk &attached_io;
-        } else null;
-        const configure_context = inference_bridge.ConfigureContext{
+        try inference_host.linkedInferenceConfigure(&configure_context);
+        var provider: antfly.inference.managed_embedder.AntflyProvider = undefined;
+        inference_host.linkedInferenceProvider(&.{
             .handle = antfly_node,
-            .resource_manager = &data_server.provisioned_storage.resource_manager,
-            .io = io_ptr,
-        };
+            .out_provider = &provider,
+        });
+        data_server.setAntflyProvider(provider);
+    } else {
         if (inference_bridge.antfly_standalone_inference_configure(&configure_context) != 0)
             return error.InferenceRuntimeStartupFailed;
 
@@ -1693,9 +1669,10 @@ pub fn runFromIterator(
     // Unified httpx.Server — all routes on a single port
     // ---------------------------------------------------------------
 
-    var handler = AntflyApiHandler{ .api_server = api_server };
+    var handler = try antfly.public_api.kernel_bridge.createHandler(api_server);
+    errdefer antfly.public_api.kernel_bridge.deinitHandler(&handler);
     try handler.initRuntime(alloc);
-    defer handler.deinitRuntime();
+    defer antfly.public_api.kernel_bridge.deinitHandler(&handler);
 
     const bind_host = public_listener.bind_host;
     const bind_port = public_listener.bind_port;
@@ -1737,7 +1714,7 @@ pub fn runFromIterator(
             bind_host,
             bind_port,
             &handler,
-            &antfly_node,
+            antfly_node,
             api_server,
             &unified_api_ready,
             &unified_lifecycle,
@@ -1872,654 +1849,6 @@ pub fn runLite(
     try runFromIterator(init, "antfly standalone", &args);
 }
 
-const LinkedInferenceState = struct {
-    alloc: std.mem.Allocator,
-    node: inference.server.Node,
-    warm_models: ResolvedWarmModels,
-};
-
-/// Creates the standalone inference implementation inside the independently
-/// code-generated inference runtime. The C wrapper is exported by
-/// runtime_artifact_lib.zig; keeping the implementation here avoids a second
-/// copy of the provider and route adapters.
-pub fn linkedInferenceCreate(context: *const inference_bridge.CreateContext) !*anyopaque {
-    const init: *const std.process.Init = @ptrCast(@alignCast(context.init));
-    const cli: *const CliConfig = @ptrCast(@alignCast(context.cli));
-    const loaded_config: ?*const antfly.common.config.Config = if (context.loaded_config) |cfg|
-        @ptrCast(@alignCast(cfg))
-    else
-        null;
-    const data_dir = context.data_dir_ptr[0..context.data_dir_len];
-    const alloc = init.gpa;
-
-    const state = try alloc.create(LinkedInferenceState);
-    errdefer alloc.destroy(state);
-    var warm_models = try resolveInferenceWarmModels(alloc, cli.*, loaded_config);
-    errdefer warm_models.deinit(alloc);
-
-    var node_config = inference.server.NodeConfig{
-        .models_dir = resolveInferenceModelsDir(cli.*, loaded_config) orelse
-            antfly.inference_runtime.defaultModelsDirForDataDir(alloc, data_dir),
-        .ml_dir = resolveInferenceMlDir(cli.*, loaded_config) orelse
-            antfly.inference_runtime.defaultMlDirForDataDir(alloc, data_dir),
-        .generation_budget_overrides = resolveInferenceBudgetOverrides(cli.*),
-        .preload = warm_models.items,
-    };
-    if (loaded_config) |cfg| {
-        if (cfg.effectiveAntflyContentSecurity()) |security| node_config.content_security = security.*;
-        if (cfg.inference.s3_credentials) |creds| node_config.s3_credentials = creds;
-        if (cfg.inference.keep_alive) |value|
-            node_config.keep_alive_ms = try parseInferenceKeepAliveMs(value);
-        if (cfg.inference.max_loaded_models) |value|
-            node_config.max_loaded_models =
-                std.math.cast(usize, value) orelse return error.InvalidInferenceModelCacheConfig;
-    }
-
-    state.* = .{
-        .alloc = alloc,
-        .node = try inference.server.Node.init(alloc, node_config),
-        .warm_models = warm_models,
-    };
-    return state;
-}
-
-pub fn linkedInferenceConfigure(context: *const inference_bridge.ConfigureContext) !void {
-    const state: *LinkedInferenceState = @ptrCast(@alignCast(context.handle));
-    const manager: *antfly.resource_manager.ResourceManager = @ptrCast(@alignCast(context.resource_manager));
-    state.node.configureAdmissionResourceBudget(inferenceAdmissionResourceBudget(manager));
-    state.node.config.prompt_cache_resource_usage_observer = promptCacheResourceUsageObserver(manager);
-    try state.node.configureTokenizerCaches(.{
-        .bulk_slots_per_shard = 16 * 1024,
-        .resource_budget = tokenizerCacheResourceBudget(manager),
-    });
-    if (context.io) |io_ptr| {
-        const io: *const std.Io = @ptrCast(@alignCast(io_ptr));
-        state.node.attachIo(io.*);
-    }
-    state.node.warmConfiguredModels(state.alloc) catch |err| {
-        std.log.err("standalone startup failed step=warm_inference_models err={}", .{err});
-        return err;
-    };
-}
-
-pub fn linkedInferenceProvider(context: *const inference_bridge.ProviderContext) void {
-    const state: *LinkedInferenceState = @ptrCast(@alignCast(context.handle));
-    const provider: *antfly.inference.managed_embedder.AntflyProvider = @ptrCast(@alignCast(context.out_provider));
-    provider.* = localAntflyProvider(&state.node);
-}
-
-pub fn linkedInferenceRegisterRoutes(context: *const inference_bridge.RoutesContext) !void {
-    const state: *LinkedInferenceState = @ptrCast(@alignCast(context.handle));
-    const server: *httpx.Server = @ptrCast(@alignCast(context.server));
-    try state.node.registerRoutesOn(inference.server.public_api_prefix, server);
-    try state.node.registerAiRoutesOn(inference.server.ai_api_prefix, server);
-}
-
-pub fn linkedInferenceDestroy(handle: *anyopaque) void {
-    const state: *LinkedInferenceState = @ptrCast(@alignCast(handle));
-    const alloc = state.alloc;
-    state.node.deinit();
-    state.warm_models.deinit(alloc);
-    alloc.destroy(state);
-}
-
-fn localAntflyProvider(node: *inference.server.Node) antfly.inference.managed_embedder.AntflyProvider {
-    return .{
-        .ptr = node,
-        .embed_dense_texts = localAntflyEmbedDenseTexts,
-        .embed_dense_texts_with_context = localAntflyEmbedDenseTextsWithContext,
-        .embed_sparse_texts = localAntflyEmbedSparseTexts,
-        .embed_dense_parts = localAntflyEmbedDenseParts,
-        .embed_dense_parts_with_context = localAntflyEmbedDensePartsWithContext,
-        .rerank_texts = localAntflyRerankTexts,
-        .generate_text = localAntflyGenerateText,
-        .generate_messages = localAntflyGenerateMessages,
-        .read_images = localAntflyReadImages,
-        .transcribe_audio = localAntflyTranscribeAudio,
-        .extract = localAntflyExtract,
-        .list_models_json = localAntflyListModelsJson,
-    };
-}
-
-fn promptCacheResourceUsageObserver(manager: *antfly.resource_manager.ResourceManager) inference.runtime.kv.prompt_cache.ResourceUsageObserver {
-    return .{
-        .context = manager,
-        .update = observePromptCacheResourceUsage,
-    };
-}
-
-fn inferenceAdmissionResourceBudget(
-    manager: *antfly.resource_manager.ResourceManager,
-) inference.runtime.tier.memory.AdmissionResourceBudget {
-    return .{
-        .context = manager,
-        .try_reserve = reserveInferenceAdmissionResources,
-        .release = releaseInferenceAdmissionResources,
-    };
-}
-
-fn inferenceAdmissionSliceAmounts(
-    amounts: inference.runtime.tier.memory.AdmissionAmounts,
-) ![3]antfly.resource_manager.SliceAmount {
-    const model_residency = try std.math.add(
-        usize,
-        amounts.host_weight_bytes,
-        amounts.backend_weight_bytes,
-    );
-    const kv_working_set = try std.math.add(
-        usize,
-        amounts.host_kv_bytes,
-        amounts.backend_kv_bytes,
-    );
-    const scratch_working_set = try std.math.add(
-        usize,
-        amounts.host_scratch_bytes,
-        amounts.backend_scratch_bytes,
-    );
-    return .{
-        .{ .slice = .inference_model_residency, .bytes = @intCast(model_residency) },
-        .{ .slice = .inference_kv_working_set, .bytes = @intCast(kv_working_set) },
-        .{ .slice = .inference_scratch_working_set, .bytes = @intCast(scratch_working_set) },
-    };
-}
-
-fn reserveInferenceAdmissionResources(
-    context: *anyopaque,
-    amounts: inference.runtime.tier.memory.AdmissionAmounts,
-) inference.runtime.tier.memory.AdmissionResourceError!void {
-    const manager: *antfly.resource_manager.ResourceManager = @ptrCast(@alignCast(context));
-    const slices = inferenceAdmissionSliceAmounts(amounts) catch
-        return error.ResourceLimitExceeded;
-    manager.reserveBatchClassified(&slices) catch |err| switch (err) {
-        error.ResourceRequestTooLarge => return error.ResourceLimitExceeded,
-        error.ResourceTemporarilyUnavailable => return error.ResourceTemporarilyUnavailable,
-        // Duplicate slices are impossible in the fixed bridge plan.
-        error.DuplicateResourceSlice => unreachable,
-    };
-}
-
-fn releaseInferenceAdmissionResources(
-    context: *anyopaque,
-    amounts: inference.runtime.tier.memory.AdmissionAmounts,
-) void {
-    const manager: *antfly.resource_manager.ResourceManager = @ptrCast(@alignCast(context));
-    const slices = inferenceAdmissionSliceAmounts(amounts) catch unreachable;
-    manager.releaseBatch(&slices);
-}
-
-test "inference admission bridge charges combined native residency to resource manager" {
-    var budgets = antfly.resource_manager.Options.defaultBudgets();
-    budgets[@intFromEnum(antfly.resource_manager.Slice.inference_model_residency)] =
-        .{ .hard_limit_bytes = 100 };
-    var manager = antfly.resource_manager.ResourceManager.init(.{ .budgets = budgets });
-    const budget = inferenceAdmissionResourceBudget(&manager);
-
-    try std.testing.expectError(
-        error.ResourceLimitExceeded,
-        budget.try_reserve(budget.context, .{
-            .host_weight_bytes = 80,
-            .backend_weight_bytes = 30,
-        }),
-    );
-    try std.testing.expectEqual(
-        @as(u64, 0),
-        manager.sliceStats(.inference_model_residency).used_bytes,
-    );
-
-    const admitted = inference.runtime.tier.memory.AdmissionAmounts{
-        .host_weight_bytes = 60,
-        .backend_weight_bytes = 30,
-    };
-    try budget.try_reserve(budget.context, admitted);
-    try std.testing.expectEqual(
-        @as(u64, 90),
-        manager.sliceStats(.inference_model_residency).used_bytes,
-    );
-    try std.testing.expectError(
-        error.ResourceTemporarilyUnavailable,
-        budget.try_reserve(budget.context, .{
-            .host_weight_bytes = 11,
-        }),
-    );
-    budget.release(budget.context, admitted);
-    try std.testing.expectEqual(
-        @as(u64, 0),
-        manager.sliceStats(.inference_model_residency).used_bytes,
-    );
-}
-
-fn observePromptCacheResourceUsage(context: *anyopaque, current: *u64, next: u64) void {
-    const manager: *antfly.resource_manager.ResourceManager = @ptrCast(@alignCast(context));
-    manager.observeUsage(.inference_prompt_cache, current, next);
-}
-
-fn tokenizerCacheResourceBudget(
-    manager: *antfly.resource_manager.ResourceManager,
-) inference.hf_tokenizer.HfTokenizer.BpeCacheResourceBudget {
-    return .{
-        .context = manager,
-        .try_reserve = reserveTokenizerCacheBytes,
-        .release = releaseTokenizerCacheBytes,
-    };
-}
-
-fn reserveTokenizerCacheBytes(context: *anyopaque, bytes: usize) bool {
-    const manager: *antfly.resource_manager.ResourceManager =
-        @ptrCast(@alignCast(context));
-    // Cache growth is optional: honor the slice's shrink policy at the soft
-    // boundary by declining new entries/workspace retention. reserve() below
-    // remains the atomic hard guard if another producer wins the race.
-    if (manager.admissionDecision(
-        .inference_tokenizer_cache,
-        @intCast(bytes),
-    ).action == .shrink_cache) return false;
-    var reservation = manager.reserve(
-        .inference_tokenizer_cache,
-        @intCast(bytes),
-    ) catch return false;
-    // The tokenizer owns the reservation until its entry/cache is released.
-    reservation.released = true;
-    return true;
-}
-
-fn releaseTokenizerCacheBytes(context: *anyopaque, bytes: usize) void {
-    const manager: *antfly.resource_manager.ResourceManager =
-        @ptrCast(@alignCast(context));
-    manager.releaseBytes(.inference_tokenizer_cache, @intCast(bytes));
-}
-
-fn localAntflyListModelsJson(ptr: *anyopaque, alloc: std.mem.Allocator) anyerror![]u8 {
-    const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    return try node.listModelsJsonAlloc(alloc, io_impl.io());
-}
-
-fn localAntflyEmbedDenseTexts(
-    ptr: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    texts: []const []const u8,
-) anyerror![][]f32 {
-    const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
-    return try node.embedDenseTextsDirect(alloc, model, texts);
-}
-
-fn localAntflyEmbedDenseTextsWithContext(
-    ptr: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    texts: []const []const u8,
-    context: antfly.inference.managed_embedder.EmbeddingRequestContext,
-) anyerror![][]f32 {
-    const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
-    return try node.embedDenseTextsDirectWithContext(alloc, context.io, context.deadline_ns, model, texts);
-}
-
-fn localAntflyEmbedDenseParts(
-    ptr: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    parts: []const antfly.template.ContentPart,
-) anyerror![][]f32 {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-    return try localAntflyEmbedDensePartsWithExecutionContext(ptr, alloc, model, parts, io_impl.io(), null);
-}
-
-fn localAntflyEmbedDensePartsWithExecutionContext(
-    ptr: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    parts: []const antfly.template.ContentPart,
-    io: std.Io,
-    deadline_ns: ?u64,
-) anyerror![][]f32 {
-    const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
-    var values = std.json.Array.init(alloc);
-    defer values.deinit();
-    var encoded_buffers = std.ArrayListUnmanaged([]u8).empty;
-    defer {
-        for (encoded_buffers.items) |buf| alloc.free(buf);
-        encoded_buffers.deinit(alloc);
-    }
-
-    for (parts) |part| {
-        switch (part) {
-            .text => |text| {
-                var obj = std.json.ObjectMap.empty;
-                errdefer obj.deinit(alloc);
-                try obj.put(alloc, "type", .{ .string = "text" });
-                try obj.put(alloc, "text", .{ .string = text });
-                try values.append(.{ .object = obj });
-            },
-            .media_url => |url| {
-                var image_url = std.json.ObjectMap.empty;
-                errdefer image_url.deinit(alloc);
-                try image_url.put(alloc, "url", .{ .string = url });
-
-                var obj = std.json.ObjectMap.empty;
-                errdefer obj.deinit(alloc);
-                try obj.put(alloc, "type", .{ .string = "image_url" });
-                try obj.put(alloc, "image_url", .{ .object = image_url });
-                try values.append(.{ .object = obj });
-            },
-            .binary => |binary_part| {
-                const encoded_len = std.base64.standard.Encoder.calcSize(binary_part.data.len);
-                const encoded = try alloc.alloc(u8, encoded_len);
-                errdefer alloc.free(encoded);
-                _ = std.base64.standard.Encoder.encode(encoded, binary_part.data);
-                try encoded_buffers.append(alloc, encoded);
-
-                var obj = std.json.ObjectMap.empty;
-                errdefer {
-                    obj.deinit(alloc);
-                    _ = encoded_buffers.pop();
-                    alloc.free(encoded);
-                }
-                try obj.put(alloc, "type", .{ .string = "media" });
-                try obj.put(alloc, "data", .{ .string = encoded });
-                try obj.put(alloc, "mime_type", .{ .string = binary_part.mime_type });
-                try values.append(.{ .object = obj });
-            },
-        }
-    }
-
-    return try node.embedDenseJsonInputDirectWithContext(alloc, io, deadline_ns, model, .{ .array = values });
-}
-
-fn localAntflyEmbedDensePartsWithContext(
-    ptr: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    parts: []const antfly.template.ContentPart,
-    context: antfly.inference.managed_embedder.EmbeddingRequestContext,
-) anyerror![][]f32 {
-    return try localAntflyEmbedDensePartsWithExecutionContext(ptr, alloc, model, parts, context.io, context.deadline_ns);
-}
-
-fn localAntflyEmbedSparseTexts(
-    ptr: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    texts: []const []const u8,
-) anyerror![]antfly.db.embedder.SparseEmbedding {
-    const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
-    const sparse = try node.embedSparseTextsDirect(alloc, model, texts);
-    errdefer {
-        for (sparse) |*item| item.deinit(alloc);
-        alloc.free(sparse);
-    }
-    const out = try alloc.alloc(antfly.db.embedder.SparseEmbedding, sparse.len);
-    errdefer alloc.free(out);
-    for (sparse, 0..) |item, i| {
-        out[i] = .{
-            .indices = item.indices,
-            .values = item.values,
-        };
-    }
-    alloc.free(sparse);
-    return out;
-}
-
-fn localAntflyRerankTexts(
-    ptr: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    query: []const u8,
-    documents: []const []const u8,
-) anyerror![]f32 {
-    const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
-    return try node.rerankTextsDirect(alloc, model, query, documents);
-}
-
-fn localAntflyGenerateText(
-    ptr: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    roles: []const []const u8,
-    contents: []const []const u8,
-) anyerror![]u8 {
-    const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
-    return try node.generateTextDirect(alloc, model, roles, contents);
-}
-
-fn localAntflyGenerateMessages(
-    ptr: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    messages: []const antfly.inference.ChatMessage,
-) anyerror![]u8 {
-    const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
-    var converted = try convertLocalGenerateMessages(alloc, messages);
-    defer converted.deinit(alloc);
-    return try node.generateMessagesDirect(alloc, model, converted.messages);
-}
-
-fn localAntflyReadImages(
-    ptr: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    request: antfly.readers.Request,
-) anyerror![]antfly.readers.Result {
-    const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
-    return try node.readImagesDirect(alloc, model, request);
-}
-
-fn localAntflyTranscribeAudio(
-    ptr: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    request: antfly.transcribing.Request,
-) anyerror!antfly.transcribing.Response {
-    const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
-    return try node.transcribeAudioDirect(alloc, model, request);
-}
-
-fn localAntflyExtract(
-    ptr: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    request: antfly.extracting.Request,
-) anyerror!antfly.extracting.Response {
-    const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
-    return try node.extractDirect(alloc, model, request);
-}
-
-const LocalGenerateMessages = struct {
-    messages: []inference.pipelines.GenerationMessage,
-    owned_texts: std.ArrayListUnmanaged([]u8) = .empty,
-    owned_media: std.ArrayListUnmanaged([]u8) = .empty,
-    owned_slices: std.ArrayListUnmanaged([]const []const u8) = .empty,
-    owned_parts: std.ArrayListUnmanaged([]inference.pipelines.GenerationMessage.ContentPart) = .empty,
-
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        for (self.owned_texts.items) |text| alloc.free(text);
-        self.owned_texts.deinit(alloc);
-        for (self.owned_media.items) |media| alloc.free(media);
-        self.owned_media.deinit(alloc);
-        for (self.owned_slices.items) |slice| alloc.free(slice);
-        self.owned_slices.deinit(alloc);
-        for (self.owned_parts.items) |parts| alloc.free(parts);
-        self.owned_parts.deinit(alloc);
-        alloc.free(self.messages);
-        self.* = undefined;
-    }
-};
-
-fn convertLocalGenerateMessages(
-    alloc: std.mem.Allocator,
-    messages: []const antfly.inference.ChatMessage,
-) !LocalGenerateMessages {
-    var out = LocalGenerateMessages{
-        .messages = try alloc.alloc(inference.pipelines.GenerationMessage, messages.len),
-    };
-    errdefer out.deinit(alloc);
-
-    for (messages, 0..) |message, i| {
-        out.messages[i] = try convertLocalGenerateMessage(alloc, &out, message);
-    }
-    return out;
-}
-
-fn convertLocalGenerateMessage(
-    alloc: std.mem.Allocator,
-    owner: *LocalGenerateMessages,
-    message: antfly.inference.ChatMessage,
-) !inference.pipelines.GenerationMessage {
-    const role = message.role.toSlice();
-    const content = message.content orelse {
-        const text = try alloc.dupe(u8, "");
-        var text_owned = true;
-        errdefer if (text_owned) alloc.free(text);
-        try owner.owned_texts.append(alloc, text);
-        text_owned = false;
-        return .{ .role = role, .content = text };
-    };
-
-    return switch (content) {
-        .text => |text_value| blk: {
-            const text = try alloc.dupe(u8, text_value);
-            var text_owned = true;
-            errdefer if (text_owned) alloc.free(text);
-            try owner.owned_texts.append(alloc, text);
-            text_owned = false;
-            break :blk .{ .role = role, .content = text };
-        },
-        .parts => |parts| try convertLocalGenerateParts(alloc, owner, role, parts),
-    };
-}
-
-fn convertLocalGenerateParts(
-    alloc: std.mem.Allocator,
-    owner: *LocalGenerateMessages,
-    role: []const u8,
-    parts: []const antfly.inference.ContentPart,
-) !inference.pipelines.GenerationMessage {
-    var text_buf = std.ArrayListUnmanaged(u8).empty;
-    errdefer text_buf.deinit(alloc);
-    var images = std.ArrayListUnmanaged([]const u8).empty;
-    errdefer images.deinit(alloc);
-    var audio = std.ArrayListUnmanaged([]const u8).empty;
-    errdefer audio.deinit(alloc);
-    var out_parts = std.ArrayListUnmanaged(inference.pipelines.GenerationMessage.ContentPart).empty;
-    errdefer out_parts.deinit(alloc);
-
-    for (parts) |part| {
-        switch (part) {
-            .text => |text| {
-                const start = text_buf.items.len;
-                try text_buf.appendSlice(alloc, text);
-                _ = start;
-                try out_parts.append(alloc, .{ .text = text });
-            },
-            .image_url => |image_url| {
-                const decoded = try decodeLocalGenerateDataUri(alloc, image_url.url, null);
-                var decoded_owned = true;
-                errdefer if (decoded_owned) alloc.free(decoded.data);
-                if (!std.mem.startsWith(u8, decoded.mime_type, "image/")) {
-                    return error.UnsupportedGeneratorProvider;
-                }
-                try images.append(alloc, decoded.data);
-                try out_parts.append(alloc, .{ .image = images.items.len - 1 });
-                try owner.owned_media.append(alloc, decoded.data);
-                decoded_owned = false;
-            },
-            .media => |media| {
-                const raw = media.url orelse media.data;
-                const decoded = try decodeLocalGenerateDataUri(alloc, raw, media.mime_type);
-                var decoded_owned = true;
-                errdefer if (decoded_owned) alloc.free(decoded.data);
-                if (std.mem.startsWith(u8, decoded.mime_type, "image/")) {
-                    try images.append(alloc, decoded.data);
-                    try out_parts.append(alloc, .{ .image = images.items.len - 1 });
-                    try owner.owned_media.append(alloc, decoded.data);
-                    decoded_owned = false;
-                } else if (std.mem.startsWith(u8, decoded.mime_type, "audio/")) {
-                    try audio.append(alloc, decoded.data);
-                    try out_parts.append(alloc, .{ .audio = audio.items.len - 1 });
-                    try owner.owned_media.append(alloc, decoded.data);
-                    decoded_owned = false;
-                } else {
-                    return error.UnsupportedGeneratorProvider;
-                }
-            },
-        }
-    }
-
-    const text = try text_buf.toOwnedSlice(alloc);
-    var text_owned = true;
-    errdefer if (text_owned) alloc.free(text);
-    try owner.owned_texts.append(alloc, text);
-    text_owned = false;
-    const image_slice = if (images.items.len > 0) blk: {
-        const slice = try images.toOwnedSlice(alloc);
-        var slice_owned = true;
-        errdefer if (slice_owned) alloc.free(slice);
-        try owner.owned_slices.append(alloc, slice);
-        slice_owned = false;
-        break :blk slice;
-    } else null;
-    const audio_slice = if (audio.items.len > 0) blk: {
-        const slice = try audio.toOwnedSlice(alloc);
-        var slice_owned = true;
-        errdefer if (slice_owned) alloc.free(slice);
-        try owner.owned_slices.append(alloc, slice);
-        slice_owned = false;
-        break :blk slice;
-    } else null;
-    const content_parts = if (out_parts.items.len > 0) blk: {
-        const slice = try out_parts.toOwnedSlice(alloc);
-        var slice_owned = true;
-        errdefer if (slice_owned) alloc.free(slice);
-        try owner.owned_parts.append(alloc, slice);
-        slice_owned = false;
-        break :blk slice;
-    } else null;
-
-    return .{
-        .role = role,
-        .content = text,
-        .image_bytes = image_slice,
-        .audio_bytes = audio_slice,
-        .content_parts = content_parts,
-    };
-}
-
-const DecodedLocalMedia = struct {
-    data: []u8,
-    mime_type: []const u8,
-};
-
-fn decodeLocalGenerateDataUri(
-    alloc: std.mem.Allocator,
-    raw: []const u8,
-    declared_mime_type: ?[]const u8,
-) !DecodedLocalMedia {
-    var mime_type = declared_mime_type orelse "application/octet-stream";
-    var payload = raw;
-    if (std.mem.startsWith(u8, raw, "data:")) {
-        const comma = std.mem.indexOfScalar(u8, raw, ',') orelse return error.UnsupportedGeneratorProvider;
-        const meta = raw["data:".len..comma];
-        if (!std.mem.endsWith(u8, meta, ";base64")) return error.UnsupportedGeneratorProvider;
-        const embedded_mime = meta[0 .. meta.len - ";base64".len];
-        if (embedded_mime.len > 0) {
-            if (declared_mime_type) |declared| {
-                if (!std.mem.eql(u8, declared, embedded_mime)) return error.UnsupportedGeneratorProvider;
-            }
-            mime_type = embedded_mime;
-        }
-        payload = raw[comma + 1 ..];
-    }
-
-    const decoded_len = try std.base64.standard.Decoder.calcSizeForSlice(payload);
-    const decoded = try alloc.alloc(u8, decoded_len);
-    errdefer alloc.free(decoded);
-    try std.base64.standard.Decoder.decode(decoded, payload);
-    return .{ .data = decoded, .mime_type = mime_type };
-}
-
-// ---------------------------------------------------------------
 // Unified server thread
 // ---------------------------------------------------------------
 
@@ -2528,9 +1857,9 @@ fn serveUnifiedWithInference(
     io: std.Io,
     bind_host: []const u8,
     bind_port: u16,
-    handler: *AntflyApiHandler,
-    antfly_node: *inference.server.Node,
-    api_server: *antfly.public_api.http_server.ApiHttpServer,
+    handler: *ApiKernelHandler,
+    antfly_node: *anyopaque,
+    api_server: *ApiHttpServer,
     unified_api_ready: *std.atomic.Value(bool),
     lifecycle: *UnifiedServerLifecycle,
 ) void {
@@ -2549,9 +1878,9 @@ fn serveUnifiedWithLinkedInference(
     io: std.Io,
     bind_host: []const u8,
     bind_port: u16,
-    handler: *AntflyApiHandler,
+    handler: *ApiKernelHandler,
     inference_handle: *anyopaque,
-    api_server: *antfly.public_api.http_server.ApiHttpServer,
+    api_server: *ApiHttpServer,
     unified_api_ready: *std.atomic.Value(bool),
     lifecycle: *UnifiedServerLifecycle,
 ) void {
@@ -2571,9 +1900,9 @@ fn serveUnifiedInner(
     io: std.Io,
     bind_host: []const u8,
     bind_port: u16,
-    handler: *AntflyApiHandler,
-    antfly_node: if (inline_inference) *inference.server.Node else *anyopaque,
-    api_server: *antfly.public_api.http_server.ApiHttpServer,
+    handler: *ApiKernelHandler,
+    antfly_node: *anyopaque,
+    api_server: *ApiHttpServer,
     unified_api_ready: *std.atomic.Value(bool),
     lifecycle: *UnifiedServerLifecycle,
 ) !void {
@@ -2584,8 +1913,10 @@ fn serveUnifiedInner(
 
     // Register inference AI routes under /ai/v1 and Traditional ML routes under /ml/v1.
     if (comptime inline_inference) {
-        try antfly_node.registerRoutesOn(inference.server.public_api_prefix, &server);
-        try antfly_node.registerAiRoutesOn(inference.server.ai_api_prefix, &server);
+        try inference_host.linkedInferenceRegisterRoutes(&.{
+            .handle = antfly_node,
+            .server = &server,
+        });
     } else {
         if (inference_bridge.antfly_standalone_inference_register_routes(&.{
             .handle = antfly_node,
@@ -2594,13 +1925,15 @@ fn serveUnifiedInner(
     }
 
     // Register antfly public API routes under /db/v1
-    const public_router = metadata_openapi.server.ServerRouter(AntflyApiHandler).init(handler);
-    var public_prefixed = PrefixedServer("/db/v1", httpx.Server){ .inner = &server };
-    try public_router.register(&public_prefixed);
-
-    // Register user management routes under /auth/v1
-    const usermgr_router = usermgr_openapi.server.ServerRouter(AntflyApiHandler).init(handler);
-    try usermgr_router.register(&server);
+    if (comptime builtin.is_test) {
+        const public_router = metadata_openapi.server.ServerRouter(AntflyApiHandler).init(handler);
+        var public_prefixed = PrefixedServer("/db/v1", httpx.Server){ .inner = &server };
+        try public_router.register(&public_prefixed);
+        const usermgr_router = usermgr_openapi.server.ServerRouter(AntflyApiHandler).init(handler);
+        try usermgr_router.register(&server);
+    } else {
+        try handler.registerRoutes(&server);
+    }
 
     // Health/ready at root level
     try server.get("/healthz", healthzHandler);
@@ -3255,36 +2588,51 @@ fn extensionBridgeHandler(ctx: *httpx.Context) anyerror!httpx.Response {
 
 // Module-level pointer set by the serve thread before listen().
 // Used by explicitly registered protocol/internal bridge handlers.
-var active_api_server: ?*antfly.public_api.http_server.ApiHttpServer = null;
+var active_api_server: ?*ApiHttpServer = null;
 
 // ---------------------------------------------------------------
 // CLI parsing
 // ---------------------------------------------------------------
 
-fn parsePreloadModelKind(value: []const u8) ?inference.server.WarmModelKind {
-    inline for (std.meta.fields(inference.server.WarmModelKind)) |field| {
-        if (std.mem.eql(u8, value, field.name)) return @enumFromInt(field.value);
-    }
-    return null;
+fn validPreloadModelKind(value: []const u8) bool {
+    return std.mem.eql(u8, value, "embedder") or
+        std.mem.eql(u8, value, "reranker") or
+        std.mem.eql(u8, value, "generator") or
+        std.mem.eql(u8, value, "chunker") or
+        std.mem.eql(u8, value, "classifier") or
+        std.mem.eql(u8, value, "rewriter") or
+        std.mem.eql(u8, value, "reader") or
+        std.mem.eql(u8, value, "transcriber") or
+        std.mem.eql(u8, value, "extractor");
 }
 
-fn parsePreloadModelFlag(value: []const u8) !inference.server.WarmModel {
+fn validInferenceBackend(value: []const u8) bool {
+    return std.mem.eql(u8, value, "native") or
+        std.mem.eql(u8, value, "onnx") or
+        std.mem.eql(u8, value, "metal") or
+        std.mem.eql(u8, value, "cuda") or
+        std.mem.eql(u8, value, "xla") or
+        std.mem.eql(u8, value, "pjrt") or
+        std.mem.eql(u8, value, "wasm") or
+        std.mem.eql(u8, value, "webgpu");
+}
+
+fn parsePreloadModelFlag(value: []const u8) !inference_bridge.WarmModel {
     const separator = std.mem.indexOfScalar(u8, value, ':') orelse return error.InvalidArguments;
     const kind_name = value[0..separator];
     var model_name = value[separator + 1 ..];
-    var backend: ?inference.backends.BackendType = null;
+    var backend: ?[]const u8 = null;
     if (std.mem.indexOfScalar(u8, model_name, ':')) |backend_separator| {
         const backend_name = model_name[0..backend_separator];
-        backend = antfly.inference_runtime.parseBackendType(backend_name) orelse return error.InvalidArguments;
+        if (!validInferenceBackend(backend_name)) return error.InvalidArguments;
+        backend = backend_name;
         model_name = model_name[backend_separator + 1 ..];
     }
     if (model_name.len == 0) return error.InvalidArguments;
     return .{
-        .kind = parsePreloadModelKind(kind_name) orelse return error.InvalidArguments,
-        .name = model_name,
-        .backend = backend,
-        .format = null,
-        .quantization = null,
+        .kind = inference_bridge.String.init(if (validPreloadModelKind(kind_name)) kind_name else return error.InvalidArguments),
+        .name = inference_bridge.String.init(model_name),
+        .backend = inference_bridge.OptionalString.init(backend),
     };
 }
 
@@ -4075,94 +3423,21 @@ fn resolveInferenceModelsDir(cli: CliConfig, cfg: ?*const antfly.common.config.C
     return null;
 }
 
-fn parseInferenceKeepAliveMs(raw: []const u8) !u64 {
-    if (std.mem.eql(u8, raw, "0")) return 0;
-    if (raw.len == 0) return error.InvalidInferenceModelCacheConfig;
-    var i: usize = 0;
-    var total_ns: u64 = 0;
-    while (i < raw.len) {
-        const start = i;
-        while (i < raw.len and std.ascii.isDigit(raw[i])) : (i += 1) {}
-        if (i == start) return error.InvalidInferenceModelCacheConfig;
-        const value = std.fmt.parseUnsigned(u64, raw[start..i], 10) catch
-            return error.InvalidInferenceModelCacheConfig;
-        const unit_ns: u64 = if (std.mem.startsWith(u8, raw[i..], "ms")) blk: {
-            i += 2;
-            break :blk std.time.ns_per_ms;
-        } else if (i < raw.len and raw[i] == 's') blk: {
-            i += 1;
-            break :blk std.time.ns_per_s;
-        } else if (i < raw.len and raw[i] == 'm') blk: {
-            i += 1;
-            break :blk std.time.ns_per_min;
-        } else if (i < raw.len and raw[i] == 'h') blk: {
-            i += 1;
-            break :blk std.time.ns_per_hour;
-        } else return error.InvalidInferenceModelCacheConfig;
-        const part_ns = std.math.mul(u64, value, unit_ns) catch
-            return error.InvalidInferenceModelCacheConfig;
-        total_ns = std.math.add(u64, total_ns, part_ns) catch
-            return error.InvalidInferenceModelCacheConfig;
-    }
-    if (total_ns == 0) return 0;
-    return @max(@as(u64, 1), total_ns / std.time.ns_per_ms);
-}
-
-test "standalone inference keep alive parses compound durations and zero" {
-    try std.testing.expectEqual(@as(u64, 0), try parseInferenceKeepAliveMs("0"));
-    try std.testing.expectEqual(@as(u64, 0), try parseInferenceKeepAliveMs("0s"));
-    try std.testing.expectEqual(
-        @as(u64, 90_000),
-        try parseInferenceKeepAliveMs("1m30s"),
-    );
-    try std.testing.expectError(
-        error.InvalidInferenceModelCacheConfig,
-        parseInferenceKeepAliveMs("forever"),
-    );
-}
-
 fn resolveInferenceMlDir(cli: CliConfig, cfg: ?*const antfly.common.config.Config) ?[]const u8 {
     if (cli.inference_ml_dir) |value| return value;
     if (cfg) |loaded| return loaded.inference.ml_dir;
     return null;
 }
 
-const ResolvedWarmModels = struct {
-    items: []const inference.server.WarmModel,
-    owned: bool = false,
-
-    fn deinit(self: *ResolvedWarmModels, alloc: std.mem.Allocator) void {
-        if (self.owned and self.items.len > 0) alloc.free(self.items);
-        self.* = undefined;
-    }
+const InferenceBudgetOverrides = struct {
+    host_limit_bytes: usize,
+    backend_limit_bytes: usize,
+    combined_limit_bytes: usize,
+    kv_limit_bytes: usize,
+    scratch_limit_bytes: usize,
 };
 
-fn resolveInferenceWarmModels(
-    alloc: std.mem.Allocator,
-    cli: CliConfig,
-    cfg: ?*const antfly.common.config.Config,
-) !ResolvedWarmModels {
-    if (cli.inference_preload_models.items.len > 0) {
-        return .{ .items = cli.inference_preload_models.items };
-    }
-    const loaded = cfg orelse return .{ .items = &.{} };
-    if (loaded.inference.preload.len == 0) return .{ .items = &.{} };
-
-    const out = try alloc.alloc(inference.server.WarmModel, loaded.inference.preload.len);
-    errdefer alloc.free(out);
-    for (loaded.inference.preload, 0..) |model, i| {
-        out[i] = .{
-            .kind = parsePreloadModelKind(model.kind) orelse return error.InvalidConfig,
-            .name = model.name,
-            .backend = antfly.inference_runtime.parseOptionalBackendType(model.backend) catch return error.InvalidConfig,
-            .format = model.format,
-            .quantization = model.quantization,
-        };
-    }
-    return .{ .items = out, .owned = true };
-}
-
-fn resolveInferenceBudgetOverrides(cli: CliConfig) antfly.inference_runtime.ServerBudgetOverrides {
+fn resolveInferenceBudgetOverrides(cli: CliConfig) InferenceBudgetOverrides {
     return .{
         .host_limit_bytes = mbToBytes(cli.inference_host_budget_mb),
         .backend_limit_bytes = mbToBytes(cli.inference_backend_budget_mb),
@@ -4429,7 +3704,7 @@ test "standalone runtime local generator accepts media url data uris" {
         } },
     }};
 
-    var converted = try convertLocalGenerateMessages(alloc, &messages);
+    var converted = try inference_host.convertLocalGenerateMessages(alloc, &messages);
     defer converted.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 1), converted.messages.len);
@@ -4487,7 +3762,7 @@ test "standalone protocol bridge releases converted request headers" {
     };
 
     var source = FakeSource{};
-    var api_server = antfly.public_api.http_server.ApiHttpServer.init(
+    var api_server = ApiHttpServer.init(
         std.testing.allocator,
         .{},
         source.iface(),
@@ -4790,9 +4065,9 @@ test "parse cli accepts canonical host port and models dir flags" {
     try std.testing.expectEqualStrings("/tmp/models", cfg.inference_models_dir.?);
     try std.testing.expectEqualStrings("/tmp/ml", cfg.inference_ml_dir.?);
     try std.testing.expectEqual(@as(usize, 1), cfg.inference_preload_models.items.len);
-    try std.testing.expectEqual(inference.server.WarmModelKind.generator, cfg.inference_preload_models.items[0].kind);
-    try std.testing.expectEqualStrings("gemma-e2b", cfg.inference_preload_models.items[0].name);
-    try std.testing.expectEqual(inference.backends.BackendType.metal, cfg.inference_preload_models.items[0].backend.?);
+    try std.testing.expectEqualStrings("generator", cfg.inference_preload_models.items[0].kind.slice());
+    try std.testing.expectEqualStrings("gemma-e2b", cfg.inference_preload_models.items[0].name.slice());
+    try std.testing.expectEqualStrings("metal", cfg.inference_preload_models.items[0].backend.slice().?);
     try std.testing.expectEqualStrings("/tmp/antfly-data", cfg.data_dir.?);
 }
 
@@ -5699,14 +4974,12 @@ test "inference config falls back to common config" {
 
     try std.testing.expectEqualStrings("/tmp/antfly-models", resolveInferenceModelsDir(.{}, &cfg).?);
     try std.testing.expectEqualStrings("/tmp/antfly-ml", resolveInferenceMlDir(.{}, &cfg).?);
-    var warm_models = try resolveInferenceWarmModels(alloc, .{}, &cfg);
-    defer warm_models.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), warm_models.items.len);
-    try std.testing.expectEqual(inference.server.WarmModelKind.generator, warm_models.items[0].kind);
-    try std.testing.expectEqualStrings("antflydb/gemma-e2b", warm_models.items[0].name);
-    try std.testing.expectEqual(inference.backends.BackendType.metal, warm_models.items[0].backend.?);
-    try std.testing.expectEqualStrings("gguf", warm_models.items[0].format.?);
-    try std.testing.expectEqualStrings("q4_k", warm_models.items[0].quantization.?);
+    try std.testing.expectEqual(@as(usize, 1), cfg.inference.preload.len);
+    try std.testing.expectEqualStrings("generator", cfg.inference.preload[0].kind);
+    try std.testing.expectEqualStrings("antflydb/gemma-e2b", cfg.inference.preload[0].name);
+    try std.testing.expectEqualStrings("metal", cfg.inference.preload[0].backend.?);
+    try std.testing.expectEqualStrings("gguf", cfg.inference.preload[0].format.?);
+    try std.testing.expectEqualStrings("q4_k", cfg.inference.preload[0].quantization.?);
 }
 
 test "standalone runtime resolves paths from common storage base dir" {

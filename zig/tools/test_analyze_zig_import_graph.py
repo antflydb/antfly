@@ -2,6 +2,7 @@
 
 import importlib.util
 import io
+import json
 import sys
 import tempfile
 import unittest
@@ -30,6 +31,16 @@ class ImportGraphTest(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(contents, encoding="utf-8")
         return path.resolve()
+
+    def write_codegen_boundaries(self):
+        for name in {
+            source for source, _ in analyzer.CODEGEN_BOUNDARIES
+        } | {
+            target for _, target in analyzer.CODEGEN_BOUNDARIES
+        }:
+            path = self.root / name
+            if not path.exists():
+                self.write(name, "pub const value = 1;\n")
 
     def test_follows_only_existing_relative_zig_imports_inside_root(self):
         entry = self.write(
@@ -67,8 +78,7 @@ class ImportGraphTest(unittest.TestCase):
     def test_codegen_boundary_accepts_focused_cli(self):
         self.write("cli_runtime.zig", 'const client = @import("client.zig");\n')
         self.write("client.zig", "pub const value = 1;\n")
-        self.write("standalone/runtime.zig", "pub const value = 2;\n")
-        self.write("inference_runtime/runtime.zig", "pub const value = 3;\n")
+        self.write_codegen_boundaries()
         graph = analyzer.ImportGraph(self.root)
 
         self.assertTrue(analyzer.check_codegen_boundary(graph))
@@ -76,8 +86,7 @@ class ImportGraphTest(unittest.TestCase):
     def test_codegen_boundary_rejects_transitive_runtime_import(self):
         self.write("cli_runtime.zig", 'const command = @import("cmd/lite.zig");\n')
         self.write("cmd/lite.zig", 'const runtime = @import("../standalone/runtime.zig");\n')
-        self.write("standalone/runtime.zig", "pub const value = 2;\n")
-        self.write("inference_runtime/runtime.zig", "pub const value = 3;\n")
+        self.write_codegen_boundaries()
         graph = analyzer.ImportGraph(self.root)
 
         diagnostics = io.StringIO()
@@ -87,6 +96,54 @@ class ImportGraphTest(unittest.TestCase):
             "cli_runtime.zig -> cmd/lite.zig -> standalone/runtime.zig",
             diagnostics.getvalue(),
         )
+
+    def test_codegen_boundary_rejects_inference_host_runtime_import(self):
+        self.write_codegen_boundaries()
+        self.write(
+            "standalone/inference_host.zig",
+            'const runtime = @import("runtime.zig");\n',
+        )
+        graph = analyzer.ImportGraph(self.root)
+
+        diagnostics = io.StringIO()
+        with redirect_stderr(diagnostics):
+            self.assertFalse(analyzer.check_codegen_boundary(graph))
+        self.assertIn(
+            "standalone/inference_host.zig -> standalone/runtime.zig",
+            diagnostics.getvalue(),
+        )
+
+    def test_time_report_resolves_paths_relative_to_zig_directory(self):
+        source = self.write("zig/pkg/antfly/src/example.zig", "pub const value = 1;\n")
+        report_path = self.root / "report.json"
+        report_path.write_text(
+            json.dumps(
+                {
+                    "total_ns": 2_000_000_000,
+                    "stats": {
+                        "imported_files": 4,
+                        "real_ns_llvm_emit": 1_500_000_000,
+                    },
+                    "all_files": ["pkg/antfly/src/example.zig"],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        report = analyzer.load_time_report("example", report_path, self.root)
+
+        self.assertEqual(frozenset({source}), report.repo_files)
+        self.assertTrue(report.has_file_list)
+        self.assertEqual(2.0, analyzer.report_stats(report)["total_seconds"])
+
+    def test_time_report_does_not_treat_missing_file_list_as_empty_graph(self):
+        report_path = self.root / "report.json"
+        report_path.write_text(json.dumps({"total_ns": 1}), encoding="utf-8")
+
+        report = analyzer.load_time_report("old", report_path, self.root)
+
+        self.assertFalse(report.has_file_list)
+        self.assertIsNone(analyzer.report_stats(report)["repo_zig_files"])
 
 
 if __name__ == "__main__":

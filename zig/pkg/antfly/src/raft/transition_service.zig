@@ -13,10 +13,10 @@
 // limitations.
 
 const std = @import("std");
-const metadata = @import("../metadata/mod.zig");
+const metadata = @import("../metadata/domain.zig");
 const shard_ops = @import("shard_ops.zig");
 const transition_runtime = @import("transition_runtime.zig");
-const data = @import("../data/mod.zig");
+const data = @import("../data/domain.zig");
 const platform_time = @import("antfly_platform").time;
 const raft_state_machine = @import("state_machine/mod.zig");
 

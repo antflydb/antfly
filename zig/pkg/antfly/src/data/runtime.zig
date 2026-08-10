@@ -4257,7 +4257,7 @@ pub const DataServer = struct {
             self.read_source.source(),
             self.write_source.source(),
         );
-        self.http_server.?.antfly_provider = self.read_source.antfly_provider;
+        antfly.public_api.kernel_bridge.setAntflyProvider(&self.http_server.?, self.read_source.antfly_provider);
     }
 
     pub fn applyHAReplicationRecord(self: *DataServer, record: antfly.ha.replication_record.RecordView) !void {
@@ -4719,7 +4719,7 @@ pub const DataServer = struct {
         if (self.data_raft_apply) |apply_sm| {
             _ = apply_sm.write_source.withAntflyProvider(provider);
         }
-        if (self.http_server) |*server| server.antfly_provider = provider;
+        if (self.http_server) |*server| antfly.public_api.kernel_bridge.setAntflyProvider(server, provider);
         self.syncInferenceRuntimeConfig();
     }
 

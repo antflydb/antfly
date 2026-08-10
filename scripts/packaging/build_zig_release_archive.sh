@@ -144,6 +144,7 @@ zig_build_options=(
   -Dstrip="$strip"
   -Dcpu=baseline
   -Dedition=full
+  -Dlinked-runtime-libraries=true
   -Dantfly-bin-name=antfly
   -Dantfly-version="$version"
   -Donnx=false

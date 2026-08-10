@@ -12,7 +12,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const metadata = @import("../metadata/mod.zig");
+const metadata = @import("../metadata/domain.zig");
 
 pub const host = @import("host.zig");
 pub const metadata_apply = @import("metadata_apply.zig");
@@ -25,7 +25,6 @@ pub const leader_runtime = @import("leader_runtime.zig");
 pub const managed_host = @import("managed_host.zig");
 pub const read_gate = @import("read_gate.zig");
 pub const runtime_loop = @import("runtime_loop.zig");
-pub const sim_harness = @import("sim_harness.zig");
 pub const transition_checker = @import("transition_checker.zig");
 pub const shard_ops = @import("shard_ops.zig");
 pub const hosted_shard_ops = @import("hosted_shard_ops.zig");
@@ -98,13 +97,6 @@ pub const RuntimeStepResult = runtime_loop.RuntimeStepResult;
 pub const MemoryUpdateSource = runtime_loop.MemoryUpdateSource;
 pub const ManagedHostRuntime = runtime_loop.ManagedHostRuntime;
 pub const ManagedHttpHostRuntime = runtime_loop.ManagedHttpHostRuntime;
-pub const ManagedHostSimulationConfig = sim_harness.ManagedHostSimulationConfig;
-pub const ManagedHostSimulationDeps = sim_harness.ManagedHostSimulationDeps;
-pub const ManagedHostSimulation = sim_harness.ManagedHostSimulation;
-pub const ManagedHttpHostSimulationConfig = sim_harness.ManagedHttpHostSimulationConfig;
-pub const ManagedHttpHostSimulationDeps = sim_harness.ManagedHttpHostSimulationDeps;
-pub const ManagedHttpHostSimulation = sim_harness.ManagedHttpHostSimulation;
-pub const ManagedHttpClusterSimulation = sim_harness.ManagedHttpClusterSimulation;
 pub const MergePairObservation = transition_checker.MergePairObservation;
 pub const MergeTransitionCheckError = transition_checker.MergeTransitionCheckError;
 pub const TransitionEnrichmentCheckError = transition_checker.TransitionEnrichmentCheckError;
@@ -207,13 +199,6 @@ test "raft integration module compiles" {
     _ = MemoryUpdateSource;
     _ = ManagedHostRuntime;
     _ = ManagedHttpHostRuntime;
-    _ = ManagedHostSimulationConfig;
-    _ = ManagedHostSimulationDeps;
-    _ = ManagedHostSimulation;
-    _ = ManagedHttpHostSimulationConfig;
-    _ = ManagedHttpHostSimulationDeps;
-    _ = ManagedHttpHostSimulation;
-    _ = ManagedHttpClusterSimulation;
     _ = MergePairObservation;
     _ = MergeTransitionCheckError;
     _ = TransitionEnrichmentCheckError;
@@ -268,7 +253,6 @@ test "raft integration module compiles" {
     _ = read_gate;
     _ = transport;
     _ = runtime_loop;
-    _ = sim_harness;
     _ = transition_checker;
     _ = shard_ops;
     _ = hosted_shard_ops;

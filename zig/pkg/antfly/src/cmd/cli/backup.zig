@@ -18,7 +18,7 @@ const antfly_client = @import("antfly-client");
 const cli = @import("mod.zig");
 const platform_time = antfly.platform_time;
 
-const lite_restore_staging = antfly.lite.restore_staging;
+const lite_restore_staging = @import("../../standalone/restore_staging_bridge.zig");
 const portable_backup = antfly.portable_backup;
 
 const default_restore_wait_timeout_ms: u64 = 30 * 60 * 1000;

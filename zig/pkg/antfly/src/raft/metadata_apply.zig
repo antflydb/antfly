@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const catalog = @import("catalog.zig");
-const metadata = @import("../metadata/mod.zig");
+const metadata = @import("../metadata/domain.zig");
 const metadata_view = @import("metadata_view.zig");
 const peer_resolver = @import("peer_resolver.zig");
 const runtime_loop = @import("runtime_loop.zig");
