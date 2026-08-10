@@ -3106,6 +3106,50 @@ pub fn storageOwnerRuntimeStatusJson(
     return .ok;
 }
 
+pub fn storageOwnerMaintenance(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.MaintenanceRequest,
+    out_result: *kernel_owner_abi.MaintenanceResult,
+) callconv(.c) kernel_owner_abi.Status {
+    out_result.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    const action = std.enums.fromInt(kernel_owner_abi.MaintenanceAction, request.action) orelse
+        return .invalid_argument;
+
+    switch (action) {
+        .inspect, .inspect_best_effort => {},
+        .lsm_step => {
+            out_result.progressed = @intFromBool(handle.db.runLsmMaintenanceStep() catch |err|
+                return storageOwnerStatusFromError(err));
+        },
+        .lsm_step_best_effort => {
+            out_result.progressed = @intFromBool(handle.db.runLsmMaintenanceStepBestEffort() catch |err|
+                return storageOwnerStatusFromError(err));
+        },
+        .dense_posting_idle => {
+            const steps = handle.db.runDensePostingMaintenanceForIdle() catch |err|
+                return storageOwnerStatusFromError(err);
+            out_result.dense_steps = @intCast(steps);
+            out_result.progressed = @intFromBool(steps != 0);
+        },
+    }
+
+    out_result.maintenance_score = switch (action) {
+        .inspect, .lsm_step => @max(
+            handle.db.lsmMaintenanceScore(),
+            handle.db.lsmMaintenanceDebtHint(),
+        ),
+        .inspect_best_effort, .lsm_step_best_effort, .dense_posting_idle => handle.db.lsmMaintenanceDebtHint(),
+    };
+    if (handle.db.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
+        out_result.has_next_wake_delay = 1;
+        out_result.next_wake_delay_ns = delay_ns;
+    }
+    return .ok;
+}
+
 pub fn storageOwnerBufferDestroy(buffer: *kernel_owner_abi.OwnedBytes) callconv(.c) void {
     antfly_db_buffer_free(buffer.ptr, @intCast(buffer.len));
     buffer.* = .{};

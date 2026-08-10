@@ -426,6 +426,24 @@ pub const Owner = struct {
         ));
         return response;
     }
+
+    pub fn maintenance(
+        self: *Owner,
+        table_name: []const u8,
+        action: abi.MaintenanceAction,
+    ) !abi.MaintenanceResult {
+        var result: abi.MaintenanceResult = .{};
+        try statusToError(abi.antfly_storage_owner_maintenance(
+            self.handle,
+            &.{
+                .action = @intFromEnum(action),
+                .table_name = .fromSlice(table_name),
+            },
+            &result,
+        ));
+        if (result.version != abi.abi_version) return error.InvalidAbiVersion;
+        return result;
+    }
 };
 
 pub const HAReplicationRecord = struct {

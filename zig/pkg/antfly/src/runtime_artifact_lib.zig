@@ -325,6 +325,7 @@ comptime {
             exportInternal(&storage_kernel_exports.storageOwnerDocumentArtifactManifestsJson, "antfly_storage_owner_document_artifact_manifests_json");
             exportInternal(&storage_kernel_exports.storageOwnerArtifactOperationJson, "antfly_storage_owner_artifact_operation_json");
             exportInternal(&storage_kernel_exports.storageOwnerRuntimeStatusJson, "antfly_storage_owner_runtime_status_json");
+            exportInternal(&storage_kernel_exports.storageOwnerMaintenance, "antfly_storage_owner_maintenance");
             exportInternal(&storage_kernel_exports.storageOwnerBufferDestroy, "antfly_storage_owner_buffer_destroy");
         },
         .inference => {

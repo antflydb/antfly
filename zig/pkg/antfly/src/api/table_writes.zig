@@ -51,6 +51,7 @@ const storage_schema = @import("../storage/schema.zig");
 const table_catalog = @import("table_catalog.zig");
 const table_reads = @import("table_reads.zig");
 const storage_snapshot_source = @import("storage_snapshot_source.zig");
+const storage_maintenance_source = @import("storage_maintenance_source.zig");
 const table_write_source = @import("table_write_source.zig");
 const table_index_config = @import("table_index_config.zig");
 const table_router = @import("table_router.zig");
@@ -4651,6 +4652,7 @@ pub const ProvisionedTableWriteSource = struct {
     /// storage owner supplies only group-local operations.
     local_write_source: ?TableWriteSource = null,
     storage_snapshot_source: ?storage_snapshot_source.Source = null,
+    storage_maintenance_source: ?storage_maintenance_source.Source = null,
     seed_create_table_writers: bool = true,
     group_visible_root_generation: ?table_reads.GroupVisibleRootGenerationSource = null,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
@@ -5336,6 +5338,14 @@ pub const ProvisionedTableWriteSource = struct {
         snapshot_source: ?storage_snapshot_source.Source,
     ) *ProvisionedTableWriteSource {
         self.storage_snapshot_source = snapshot_source;
+        return self;
+    }
+
+    pub fn withStorageMaintenanceSource(
+        self: *ProvisionedTableWriteSource,
+        maintenance_source: ?storage_maintenance_source.Source,
+    ) *ProvisionedTableWriteSource {
+        self.storage_maintenance_source = maintenance_source;
         return self;
     }
 
@@ -8578,6 +8588,11 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     pub fn runLsmMaintenanceRoundDetailed(self: *ProvisionedTableWriteSource) !LsmMaintenanceRoundResult {
+        if (comptime storage_kernel_experiment) {
+            const maintenance_source = self.storage_maintenance_source orelse return .{};
+            const result = try maintenance_source.runLsmRound(false);
+            return .{ .progressed = result.progressed, .group_id = result.group_id };
+        }
         var primary_only = false;
         var leased = blk: {
             lockAtomic(&self.local_db_mutex);
@@ -8618,6 +8633,11 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     pub fn runLsmMaintenanceRoundBestEffortDetailed(self: *ProvisionedTableWriteSource) !LsmMaintenanceRoundResult {
+        if (comptime storage_kernel_experiment) {
+            const maintenance_source = self.storage_maintenance_source orelse return .{};
+            const result = try maintenance_source.runLsmRound(true);
+            return .{ .progressed = result.progressed, .group_id = result.group_id };
+        }
         if (!self.local_db_mutex.tryLock()) return .{};
         var primary_only = false;
         var leased = blk: {
@@ -8658,6 +8678,10 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     pub fn runDensePostingMaintenanceRoundBestEffort(self: *ProvisionedTableWriteSource) !usize {
+        if (comptime storage_kernel_experiment) {
+            const maintenance_source = self.storage_maintenance_source orelse return 0;
+            return try maintenance_source.runDensePostingRound();
+        }
         if (!self.local_db_mutex.tryLock()) return 0;
         var leases = std.ArrayListUnmanaged(ProvisionedTableWriteCache.CachedDb).empty;
         var lease_alloc: std.mem.Allocator = std.heap.page_allocator;
@@ -8963,6 +8987,10 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     pub fn lsmMaintenanceScore(self: *ProvisionedTableWriteSource) u64 {
+        if (comptime storage_kernel_experiment) {
+            const maintenance_source = self.storage_maintenance_source orelse return 0;
+            return (maintenance_source.maintenanceSnapshot(false) catch return 0).maintenance_score;
+        }
         lockAtomic(&self.local_db_mutex);
         defer self.local_db_mutex.unlock();
         return if (self.write_cache) |cache| @max(
@@ -8972,6 +9000,10 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     pub fn lsmMaintenanceScoreBestEffort(self: *ProvisionedTableWriteSource) u64 {
+        if (comptime storage_kernel_experiment) {
+            const maintenance_source = self.storage_maintenance_source orelse return 0;
+            return (maintenance_source.maintenanceSnapshot(true) catch return 0).maintenance_score;
+        }
         if (!self.local_db_mutex.tryLock()) return 0;
         defer self.local_db_mutex.unlock();
         return if (self.write_cache) |cache| @max(
@@ -8981,6 +9013,10 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     pub fn nextLsmMaintenanceWakeDelayNsBestEffort(self: *ProvisionedTableWriteSource) ?u64 {
+        if (comptime storage_kernel_experiment) {
+            const maintenance_source = self.storage_maintenance_source orelse return null;
+            return (maintenance_source.maintenanceSnapshot(true) catch return null).next_wake_delay_ns;
+        }
         if (!self.local_db_mutex.tryLock()) return null;
         defer self.local_db_mutex.unlock();
         const cache = self.write_cache orelse return null;
@@ -8993,6 +9029,11 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     pub fn hasActiveBulkIngestSession(self: *ProvisionedTableWriteSource) bool {
+        if (comptime storage_kernel_experiment) {
+            if (!self.local_db_mutex.tryLock()) return true;
+            defer self.local_db_mutex.unlock();
+            return self.kernel_bulk_sessions.items.len != 0;
+        }
         if (!self.local_db_mutex.tryLock()) return true;
         defer self.local_db_mutex.unlock();
         const cache = self.write_cache orelse return false;
@@ -9006,6 +9047,11 @@ pub const ProvisionedTableWriteSource = struct {
         self: *ProvisionedTableWriteSource,
         table_name: []const u8,
     ) bool {
+        if (comptime storage_kernel_experiment) {
+            if (!self.local_db_mutex.tryLock()) return true;
+            defer self.local_db_mutex.unlock();
+            return self.findKernelBulkSessionLocked(table_name) != null;
+        }
         if (!self.local_db_mutex.tryLock()) return true;
         defer self.local_db_mutex.unlock();
         const cache = self.write_cache orelse return false;

@@ -927,6 +927,7 @@ const RaftTableApplyStateMachine = struct {
         self.kernel_owner_source = owner_source;
         _ = self.write_source.withLocalWriteSource(owner_source.writeSource());
         _ = self.write_source.withStorageSnapshotSource(owner_source.snapshotSource());
+        _ = self.write_source.withStorageMaintenanceSource(owner_source.maintenanceSource());
     }
 
     fn attachProvisionedStorage(
@@ -4201,6 +4202,7 @@ pub const DataServer = struct {
         self.read_source.resident_db = null;
         _ = self.write_source.withLocalWriteSource(owner_source.writeSource());
         _ = self.write_source.withStorageSnapshotSource(owner_source.snapshotSource());
+        _ = self.write_source.withStorageMaintenanceSource(owner_source.maintenanceSource());
         if (self.data_raft_apply) |apply_sm| apply_sm.attachKernelOwnerSource(owner_source);
         self.kernel_owner_source = owner_source;
         return owner_source;

@@ -39,6 +39,7 @@ const table_catalog = @import("table_catalog.zig");
 const table_read_source = @import("table_read_source.zig");
 const table_reads = @import("table_reads.zig");
 const storage_snapshot_source = @import("storage_snapshot_source.zig");
+const storage_maintenance_source = @import("storage_maintenance_source.zig");
 const table_write_source = @import("table_write_source.zig");
 const table_writes = @import("table_writes.zig");
 
@@ -87,6 +88,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         owner: client.Owner,
         active_users: usize = 0,
         retired: bool = false,
+        bulk_ingest_active: std.atomic.Value(bool) = .init(false),
     };
 
     const Lease = struct {
@@ -227,6 +229,17 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .commit = commitSnapshot,
                 .rollback = rollbackSnapshot,
                 .destroy = destroySnapshot,
+            },
+        };
+    }
+
+    pub fn maintenanceSource(self: *ProvisionedKernelOwnerSource) storage_maintenance_source.Source {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .run_lsm_round = runLsmMaintenanceRound,
+                .run_dense_posting_round = runDensePostingMaintenanceRound,
+                .snapshot = maintenanceSnapshot,
             },
         };
     }
@@ -675,6 +688,133 @@ pub const ProvisionedKernelOwnerSource = struct {
             return;
         }
         unreachable;
+    }
+
+    fn snapshotMaintenanceLeases(
+        self: *ProvisionedKernelOwnerSource,
+        best_effort: bool,
+    ) !?[]Lease {
+        if (best_effort) {
+            if (!self.mutex.tryLock()) return null;
+        } else {
+            lock(&self.mutex);
+        }
+        defer self.mutex.unlock();
+
+        var count: usize = 0;
+        for (self.entries.items) |entry| {
+            if (entry.retired or entry.bulk_ingest_active.load(.acquire)) continue;
+            count += 1;
+        }
+        const leases = try self.alloc.alloc(Lease, count);
+        var initialized: usize = 0;
+        for (self.entries.items) |entry| {
+            if (entry.retired or entry.bulk_ingest_active.load(.acquire)) continue;
+            entry.active_users += 1;
+            leases[initialized] = .{ .source = self, .entry = entry };
+            initialized += 1;
+        }
+        std.debug.assert(initialized == count);
+        return leases;
+    }
+
+    fn releaseMaintenanceLeases(self: *ProvisionedKernelOwnerSource, leases: []Lease) void {
+        for (leases) |*lease| lease.deinit();
+        self.alloc.free(leases);
+    }
+
+    fn runLsmMaintenanceRound(
+        ptr: *anyopaque,
+        best_effort: bool,
+    ) !storage_maintenance_source.RoundResult {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        const maybe_leases = try self.snapshotMaintenanceLeases(best_effort);
+        const leases = maybe_leases orelse return .{};
+        defer self.releaseMaintenanceLeases(leases);
+
+        var selected_index: ?usize = null;
+        var selected_score: u64 = 0;
+        var selected_due = false;
+        for (leases, 0..) |*lease, index| {
+            const status = lease.owner().maintenance(
+                lease.entry.table_name,
+                if (best_effort) .inspect_best_effort else .inspect,
+            ) catch |err| {
+                if (best_effort) continue;
+                return err;
+            };
+            const due = status.has_next_wake_delay != 0 and status.next_wake_delay_ns == 0;
+            if (!due and status.maintenance_score == 0) continue;
+            if (selected_index == null or
+                (due and !selected_due) or
+                (due == selected_due and status.maintenance_score > selected_score))
+            {
+                selected_index = index;
+                selected_score = status.maintenance_score;
+                selected_due = due;
+            }
+        }
+        const index = selected_index orelse return .{};
+        const lease = &leases[index];
+        const result = try lease.owner().maintenance(
+            lease.entry.table_name,
+            if (best_effort) .lsm_step_best_effort else .lsm_step,
+        );
+        return .{
+            .progressed = result.progressed != 0,
+            .group_id = lease.entry.group_id,
+        };
+    }
+
+    fn runDensePostingMaintenanceRound(ptr: *anyopaque) !usize {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        const maybe_leases = try self.snapshotMaintenanceLeases(true);
+        const leases = maybe_leases orelse return 0;
+        defer self.releaseMaintenanceLeases(leases);
+
+        var total_steps: usize = 0;
+        for (leases) |*lease| {
+            const result = lease.owner().maintenance(
+                lease.entry.table_name,
+                .dense_posting_idle,
+            ) catch |err| {
+                std.log.warn("storage owner dense posting maintenance failed table={s} group_id={d} err={s}", .{
+                    lease.entry.table_name,
+                    lease.entry.group_id,
+                    @errorName(err),
+                });
+                continue;
+            };
+            total_steps = std.math.add(usize, total_steps, @intCast(result.dense_steps)) catch
+                std.math.maxInt(usize);
+        }
+        return total_steps;
+    }
+
+    fn maintenanceSnapshot(
+        ptr: *anyopaque,
+        best_effort: bool,
+    ) !storage_maintenance_source.Snapshot {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        const maybe_leases = try self.snapshotMaintenanceLeases(best_effort);
+        const leases = maybe_leases orelse return .{};
+        defer self.releaseMaintenanceLeases(leases);
+
+        var result = storage_maintenance_source.Snapshot{ .owner_count = leases.len };
+        for (leases) |*lease| {
+            const status = lease.owner().maintenance(
+                lease.entry.table_name,
+                if (best_effort) .inspect_best_effort else .inspect,
+            ) catch continue;
+            result.maintenance_score = @max(result.maintenance_score, status.maintenance_score);
+            if (status.has_next_wake_delay != 0) {
+                result.next_wake_delay_ns = if (result.next_wake_delay_ns) |current|
+                    @min(current, status.next_wake_delay_ns)
+                else
+                    status.next_wake_delay_ns;
+            }
+        }
+        return result;
     }
 
     pub fn loadDescriptor(
@@ -1545,6 +1685,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         var lease = try self.acquire(group_id, table_name);
         defer lease.deinit();
         try lease.owner().beginBulkIngest(table_name);
+        lease.entry.bulk_ingest_active.store(true, .release);
         return {};
     }
 
@@ -1622,6 +1763,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 null,
         };
         try lease.owner().finishBulkIngest(&request);
+        lease.entry.bulk_ingest_active.store(false, .release);
         return {};
     }
 
@@ -1646,7 +1788,9 @@ pub const ProvisionedKernelOwnerSource = struct {
                 group_id,
                 @errorName(err),
             });
+            return;
         };
+        lease.entry.bulk_ingest_active.store(false, .release);
     }
 
     fn localRuntimeStatuses(

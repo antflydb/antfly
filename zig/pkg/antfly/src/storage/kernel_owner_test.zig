@@ -64,6 +64,20 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     defer status_response.deinit();
     try std.testing.expect(std.mem.indexOf(u8, status_response.bytes(), "\"source_doc_count\":2") != null);
 
+    const maintenance = try owner.maintenance("docs", .inspect);
+    try std.testing.expectEqual(abi.abi_version, maintenance.version);
+    try std.testing.expectEqual(@as(u8, 0), maintenance.progressed);
+    try std.testing.expectError(error.InvalidArgument, owner.maintenance("articles", .inspect));
+    const invalid_maintenance = abi.MaintenanceRequest{
+        .action = std.math.maxInt(u32),
+        .table_name = .fromSlice("docs"),
+    };
+    var invalid_maintenance_result: abi.MaintenanceResult = .{};
+    try std.testing.expectEqual(
+        abi.Status.invalid_argument,
+        abi.antfly_storage_owner_maintenance(owner.handle, &invalid_maintenance, &invalid_maintenance_result),
+    );
+
     var replicated_response = try owner.replicatedBatchJson(
         "docs",
         "{\"inserts\":{\"doc:c\":{\"title\":\"gamma\"}},\"sync_level\":\"full_index\"}",
@@ -357,6 +371,18 @@ test "opaque storage owner validates ABI and destruction is idempotent" {
     try std.testing.expectEqual(
         abi.Status.invalid_abi,
         abi.antfly_storage_owner_bulk_finish(null, &invalid_bulk_finish),
+    );
+    var invalid_maintenance: abi.MaintenanceRequest = .{};
+    invalid_maintenance.version = abi.abi_version + 1;
+    var maintenance_result: abi.MaintenanceResult = .{};
+    try std.testing.expectEqual(
+        abi.Status.invalid_abi,
+        abi.antfly_storage_owner_maintenance(null, &invalid_maintenance, &maintenance_result),
+    );
+    try std.testing.expectEqual(abi.abi_version, maintenance_result.version);
+    try std.testing.expectEqual(
+        abi.Status.invalid_argument,
+        abi.antfly_storage_owner_maintenance(null, &.{}, &maintenance_result),
     );
 
     var response: abi.OwnedBytes = .{};

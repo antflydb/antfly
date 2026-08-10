@@ -15,7 +15,7 @@
 //! Versioned internal ABI for the storage kernel's live DB owner. Keep this
 //! module free of storage and distributed-runtime imports.
 
-pub const abi_version: u32 = 17;
+pub const abi_version: u32 = 18;
 
 pub const BorrowedBytes = extern struct {
     ptr: ?[*]const u8 = null,
@@ -209,6 +209,32 @@ pub const TableRequest = extern struct {
     version: u32 = abi_version,
     _reserved0: u32 = 0,
     table_name: BorrowedBytes = .{},
+};
+
+/// Whole-DB maintenance operations. Each invocation crosses the compiled
+/// boundary once and performs at most one bounded storage quantum.
+pub const MaintenanceAction = enum(u32) {
+    inspect = 0,
+    inspect_best_effort = 1,
+    lsm_step = 2,
+    lsm_step_best_effort = 3,
+    dense_posting_idle = 4,
+};
+
+pub const MaintenanceRequest = extern struct {
+    version: u32 = abi_version,
+    action: u32 = @intFromEnum(MaintenanceAction.inspect),
+    table_name: BorrowedBytes = .{},
+};
+
+pub const MaintenanceResult = extern struct {
+    version: u32 = abi_version,
+    progressed: u8 = 0,
+    has_next_wake_delay: u8 = 0,
+    _reserved0: [2]u8 = @splat(0),
+    dense_steps: u64 = 0,
+    maintenance_score: u64 = 0,
+    next_wake_delay_ns: u64 = 0,
 };
 
 pub const TransactionStatusRequest = extern struct {
@@ -596,6 +622,12 @@ pub extern fn antfly_storage_owner_runtime_status_json(
     owner: ?*anyopaque,
     request: *const JsonOperationRequest,
     out_response: *OwnedBytes,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_owner_maintenance(
+    owner: ?*anyopaque,
+    request: *const MaintenanceRequest,
+    out_result: *MaintenanceResult,
 ) callconv(.c) Status;
 
 pub extern fn antfly_storage_owner_buffer_destroy(

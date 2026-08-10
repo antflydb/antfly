@@ -47,6 +47,7 @@ pub const provisioned_storage = @import("provisioned_storage.zig");
 pub const table_reads = @import("table_reads.zig");
 pub const table_writes = @import("table_writes.zig");
 pub const kernel_owner_source = @import("kernel_owner_source.zig");
+pub const storage_maintenance_source = @import("storage_maintenance_source.zig");
 pub const distributed_candidate_source = @import("distributed_candidate_source.zig");
 pub const distributed_entity_sink = @import("distributed_entity_sink.zig");
 pub const distributed_join = @import("distributed_join.zig");

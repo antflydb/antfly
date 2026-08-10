@@ -169,6 +169,7 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
     _ = owner_source.withTransactionRecoverySource(&write_source);
     _ = write_source.withLocalWriteSource(owner_source.writeSource());
     _ = write_source.withStorageSnapshotSource(owner_source.snapshotSource());
+    _ = write_source.withStorageMaintenanceSource(owner_source.maintenanceSource());
     _ = write_source.withGroupVisibleRootGeneration(generations.iface());
     var read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
@@ -180,6 +181,12 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
 
     try std.testing.expect((try write_source.source().createTable(alloc, "articles", .{})) != null);
     try std.testing.expectEqual(@as(usize, 1), owner_source.ownerCountForTest());
+    const initial_maintenance = try owner_source.maintenanceSource().maintenanceSnapshot(false);
+    try std.testing.expectEqual(@as(usize, 1), initial_maintenance.owner_count);
+    _ = write_source.lsmMaintenanceScoreBestEffort();
+    _ = write_source.nextLsmMaintenanceWakeDelayNsBestEffort();
+    const initial_round = try owner_source.maintenanceSource().runLsmRound(false);
+    if (initial_round.group_id) |group_id| try std.testing.expectEqual(@as(u64, 7001), group_id);
 
     _ = try write_source.source().batch(alloc, "articles", .{
         .writes = &.{
@@ -279,6 +286,15 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
     );
     try std.testing.expectEqual(@as(usize, 1), owner_source.ownerCountForTest());
     try std.testing.expect((try write_source.source().beginBulkIngest(alloc, "articles")) != null);
+    try std.testing.expect(write_source.hasActiveBulkIngestSession());
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        (try owner_source.maintenanceSource().maintenanceSnapshot(false)).owner_count,
+    );
+    try std.testing.expectEqual(
+        @as(?u64, null),
+        (try owner_source.maintenanceSource().runLsmRound(false)).group_id,
+    );
     try std.testing.expect((try write_source.source().beginBulkIngest(alloc, "articles")) != null);
     _ = try write_source.source().batch(alloc, "articles", .{
         .writes = &.{.{
@@ -293,11 +309,18 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
         "articles",
         .{ .compact = false },
     )) != null);
+    try std.testing.expect(write_source.hasActiveBulkIngestSession());
     try std.testing.expect((try write_source.source().finishBulkIngest(
         alloc,
         "articles",
         .{ .compact = false },
     )) != null);
+    try std.testing.expect(!write_source.hasActiveBulkIngestSession());
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        (try owner_source.maintenanceSource().maintenanceSnapshot(false)).owner_count,
+    );
+    _ = try write_source.runDensePostingMaintenanceRoundBestEffort();
     try std.testing.expectEqual(@as(usize, 1), owner_source.ownerCountForTest());
     try std.testing.expect((try write_source.source().beginBulkIngest(alloc, "articles")) != null);
     try std.testing.expectError(

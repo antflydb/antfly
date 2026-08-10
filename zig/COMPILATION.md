@@ -2474,6 +2474,101 @@ remains a control-plane concern, while its local physical work must continue to
 enter this owner. No cold ReleaseFast result is credited before the atomic
 source-selection checkpoint in checklist item 7.
 
+### Phase 4i: owner-side maintenance scheduling boundary
+
+The post-restore cold baseline was captured at commit `032b292f5` on the
+14-logical-CPU ARM64 macOS host with Zig 0.16.0. Both baseline and candidate
+used fresh local and global caches, normal build concurrency, the
+`aarch64-linux-musl` target, `ReleaseFast`, stripping, linked runtime libraries,
+the production LSM-only configuration, and the storage-kernel experiment.
+
+The baseline compiler reports were:
+
+| Unit | Total | LLVM emit | Declarations | Repository files |
+|---|---:|---:|---:|---:|
+| distributed | 371.179 s | 363.555 s | 41,950 | 720 |
+| storage | 242.400 s | 236.988 s | 28,083 | 418 |
+| inference | 224.570 s | 217.700 s | 24,971 | 524 |
+| API | 134.458 s | 130.704 s | 17,333 | 326 |
+| CLI | 35.144 s | 33.465 s | 5,804 | 53 |
+
+Across those reports, 2,041 repository-file instances represented 1,189 unique
+files: 852 duplicate instances across 493 files. Storage accounted for 200
+duplicate instances and approximately 595,000 duplicated source lines. A
+separate normal-concurrency run completed in 368 seconds, with 6,341,472 KiB
+maximum single-compiler RSS and 10,433,296 KiB peak aggregate compiler RSS.
+The stripped executable was 75,286,416 bytes.
+
+Storage-owner ABI version 18 moves the complete LSM and dense-posting
+maintenance quantum behind one coarse call. Distributed control still owns
+resource admission, HA job gating, wake scheduling, retry policy, metrics, and
+runtime-status invalidation. It can inspect owner pressure, select a resident
+group, request one exact or best-effort LSM quantum, or request one idle dense
+posting round. DB, primary-store, index-manager, compaction, and posting details
+never cross the ABI.
+
+The process owner takes short-lived leases on all eligible resident owners,
+selects immediate-wake work before the largest maintenance score, and executes
+at most one LSM quantum per control round. Dense maintenance remains one call
+per resident owner rather than one call per index or posting. An owner records
+its physical bulk-ingest window atomically. The control-side session ledger and
+owner-side flag both exclude opening, active, and partially failed bulk
+sessions from maintenance; a failed finish keeps the owner excluded until an
+abort or successful retry.
+
+The comparable cold candidate produced:
+
+| Unit | Total | LLVM emit | Declarations | Repository files | Baseline delta |
+|---|---:|---:|---:|---:|---:|
+| distributed | 379.403 s | 370.947 s | 41,946 | 721 | +8.224 s |
+| storage | 252.812 s | 246.897 s | 28,098 | 418 | +10.412 s |
+| inference | 222.350 s | 215.525 s | 24,971 | 524 | -2.220 s |
+| API | 145.484 s | 141.295 s | 17,333 | 326 | +11.027 s |
+| CLI | 35.208 s | 33.509 s | 5,804 | 53 | +0.064 s |
+
+The independent cold normal-concurrency build completed in 364 seconds versus
+the 368-second baseline. Its maximum individual compiler RSS was 7,383,088 KiB
+for distributed, and peak aggregate compiler RSS was 11,472,944 KiB. These are
+about 1 GiB above the earlier samples but remain within the existing claims and
+far below the original 18--20 GiB failure profile. Because overall wall time
+improved while several individual time reports regressed, no small timing win
+or loss is credited from these single-host samples. The critical unit remains
+inside the 380-second gate by less than one second; normal-runner confirmation
+is still required.
+
+The ownership signal is small but direct:
+
+- the distributed archive shrank from 32,902,274 to 32,890,032 bytes, while
+  its object text shrank by 8,752 bytes;
+- the storage archive grew from 25,528,498 to 25,538,236 bytes, while its
+  attributed text grew by 5,564 bytes;
+- the storage archive defines hidden `antfly_storage_owner_maintenance`, and
+  distributed retains only an undefined reference to that entry point;
+- the final stripped executable shrank from 75,286,416 to 75,283,520 bytes;
+  and
+- aggregate compiler overlap remained effectively unchanged at 2,042 file
+  instances, 1,190 unique files, and 852 duplicate instances. This slice moves
+  emitted maintenance code, not the remaining physical source roots.
+
+Warm validation passed the 4/4 owner ABI suite, 6/6 cross-archive provisioned
+suite, 12/12 DataServer composition suite, 10/10 public C API suite, complete
+linked Debug builds with the experiment enabled, disabled, and with LMDB
+compatibility enabled, all runtime, codegen, and API graph gates, and all 15
+analyzer tests. The provisioned suite
+explicitly verifies that a nested bulk session removes its owner from the
+maintenance snapshot until the final successful finish. The cold product is
+one stripped, statically linked ARM64 musl executable, and the storage archive
+contains no native `mdb_*` implementation symbol.
+
+Decision: **keep** this as the first ownership-family 6 prerequisite. It moves
+real optimized maintenance text in the correct direction without binary growth,
+per-backend ABI calls, reduced concurrency, or a runner-cost change. It is not
+the atomic source cut and earns no claim that the duplicate compiler graph has
+shrunk. The next experiment must redirect the remaining local runtime/storage
+metric snapshots and physical lifecycle probes, then use those coarse owner
+contracts to make the legacy provisioned DB source unreachable in the
+experimental distributed unit.
+
 ## Holistic target architecture
 
 The current candidate baseline is the four-unit topology above with serverless
