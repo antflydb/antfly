@@ -595,18 +595,18 @@ test "min only lowers numeric values and follows missing document semantics" {
         error.InvalidArgument,
         resolveDocumentTransform(alloc, "{\"score\":\"high\"}", .{
             .key = "doc:non-numeric",
-            .operations = &lower[0..1],
+            .operations = lower[0..1],
         }),
     );
 
     try std.testing.expect((try resolveDocumentTransform(alloc, null, .{
         .key = "doc:missing",
-        .operations = &lower[0..1],
+        .operations = lower[0..1],
     })) == null);
 
     const upserted = (try resolveDocumentTransform(alloc, null, .{
         .key = "doc:new",
-        .operations = &lower[0..1],
+        .operations = lower[0..1],
         .upsert = true,
     })).?;
     defer alloc.free(upserted);
