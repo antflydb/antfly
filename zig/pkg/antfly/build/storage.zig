@@ -48,7 +48,63 @@ pub fn makeRootBuildOptions(
     link_libc: bool,
     standalone_runtime_focused_test: bool,
     lite_local_inference_runtime: bool,
+    lmdb_enabled: bool,
     antfly_version: []const u8,
+) *std.Build.Step.Options {
+    return makeRootBuildOptionsWithUsermgrStorageAdapter(
+        b,
+        backend,
+        evented_async_io,
+        storage_sim_soak,
+        with_tla,
+        link_libc,
+        standalone_runtime_focused_test,
+        lite_local_inference_runtime,
+        lmdb_enabled,
+        antfly_version,
+        true,
+    );
+}
+
+pub fn makeFocusedRootBuildOptions(
+    b: *std.Build,
+    backend: LmdbBackend,
+    evented_async_io: bool,
+    storage_sim_soak: bool,
+    with_tla: bool,
+    link_libc: bool,
+    standalone_runtime_focused_test: bool,
+    lite_local_inference_runtime: bool,
+    lmdb_enabled: bool,
+    antfly_version: []const u8,
+) *std.Build.Step.Options {
+    return makeRootBuildOptionsWithUsermgrStorageAdapter(
+        b,
+        backend,
+        evented_async_io,
+        storage_sim_soak,
+        with_tla,
+        link_libc,
+        standalone_runtime_focused_test,
+        lite_local_inference_runtime,
+        lmdb_enabled,
+        antfly_version,
+        false,
+    );
+}
+
+fn makeRootBuildOptionsWithUsermgrStorageAdapter(
+    b: *std.Build,
+    backend: LmdbBackend,
+    evented_async_io: bool,
+    storage_sim_soak: bool,
+    with_tla: bool,
+    link_libc: bool,
+    standalone_runtime_focused_test: bool,
+    lite_local_inference_runtime: bool,
+    lmdb_enabled: bool,
+    antfly_version: []const u8,
+    usermgr_storage_adapter: bool,
 ) *std.Build.Step.Options {
     const options = b.addOptions();
     options.addOption([]const u8, "lmdb_backend", @tagName(backend));
@@ -58,8 +114,9 @@ pub fn makeRootBuildOptions(
     options.addOption(bool, "link_libc", link_libc);
     options.addOption(bool, "standalone_runtime_focused_test", standalone_runtime_focused_test);
     options.addOption(bool, "lite_local_inference_runtime", lite_local_inference_runtime);
+    options.addOption(bool, "lmdb_enabled", lmdb_enabled);
     options.addOption(bool, "bench_minimal_deps", false);
-    options.addOption(bool, "usermgr_storage_adapter", true);
+    options.addOption(bool, "usermgr_storage_adapter", usermgr_storage_adapter);
     options.addOption([]const u8, "antfly_version", antfly_version);
     options.addOption([]const u8, "ard_openapi_ard_yaml", readBuildFileAlloc(b, "../specs/openapi/ard/api.yaml"));
     options.addOption([]const u8, "ard_openapi_antfly_yaml", readBuildFileAlloc(b, "../openapi.yaml"));

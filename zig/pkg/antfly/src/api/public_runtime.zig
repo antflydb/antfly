@@ -13,18 +13,20 @@
 // limitations.
 
 const std = @import("std");
+const linked_runtime_options = @import("linked_runtime_options");
 const http_common = @import("../raft/transport/http_common.zig");
 const http_server = @import("http_server.zig");
+const kernel_bridge = @import("kernel_bridge.zig");
 const metadata_service = @import("../metadata/service.zig");
 const pgwire = @import("../pgwire/mod.zig");
 const pgwire_backend = @import("pgwire_backend.zig");
-const raft = @import("../raft/mod.zig");
+const raft = @import("../raft/domain.zig");
 const table_reads = @import("table_reads.zig");
 const table_router = @import("table_router.zig");
 const table_writes = @import("table_writes.zig");
 const backend_runtime_mod = @import("../storage/background_runtime.zig");
 
-pub const ApiHttpServer = http_server.ApiHttpServer;
+pub const ApiHttpServer = if (linked_runtime_options.enabled) kernel_bridge.ApiHttpServer else http_server.ApiHttpServer;
 pub const ApiHttpServerConfig = http_server.ApiHttpServerConfig;
 pub const metadataNotLeaderResponse = http_server.metadataNotLeaderResponse;
 
@@ -142,6 +144,10 @@ pub const PublicApiSurface = struct {
                 std.log.err("pgwire listener requires a public API server; omit --pgwire-port", .{});
                 return error.InvalidArguments;
             };
+            if (comptime linked_runtime_options.enabled) {
+                std.log.err("pgwire listener is not supported with linked API-kernel runtime libraries yet; omit --pgwire-port", .{});
+                return error.InvalidArguments;
+            }
             if ((cfg.auth_enabled or api_server.cfg.trusted_principal_secret != null) and api_server.cfg.user_manager == null) {
                 std.log.err("{s}", .{cfg.auth_error_message});
                 return error.InvalidArguments;

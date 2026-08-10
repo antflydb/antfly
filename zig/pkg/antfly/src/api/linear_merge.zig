@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const db_mod = @import("../storage/db/mod.zig");
-const raft_mod = @import("../raft/mod.zig");
+const raft_mod = @import("../raft/domain.zig");
 const table_reads = @import("table_reads.zig");
 const table_writes = @import("table_writes.zig");
 const public_limits = @import("public_limits.zig");

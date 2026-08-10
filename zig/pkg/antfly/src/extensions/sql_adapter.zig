@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const extension_domain = @import("mod.zig");
+const extension_lifecycle = @import("lifecycle.zig");
 const sql_adapter = @import("../sql/mod.zig");
 const tables_api = @import("../metadata/catalog/table_ddl.zig");
 const metadata_api = @import("../metadata/api.zig");
@@ -94,7 +95,7 @@ fn executeCreate(
     }
 
     const package_name = try packageNameForSqlExtension(&snapshot, plan.extension_name, plan.version);
-    var installed = try extension_domain.lifecycle.installPackageOnService(service, alloc, plan.extension_name, package_name, .{
+    var installed = try extension_lifecycle.installPackageOnService(service, alloc, plan.extension_name, package_name, .{
         .version = plan.version orelse "",
         .scope = .{ .kind = .cluster },
         .config_json = "{}",
@@ -108,7 +109,7 @@ fn executeUpdate(
     alloc: std.mem.Allocator,
     plan: sql_adapter.UpdateExtensionPlan,
 ) !tables_api.AppliedRelationalSqlDdlRecord {
-    var installed = try extension_domain.lifecycle.updateOnService(service, alloc, plan.extension_name, .{
+    var installed = try extension_lifecycle.updateOnService(service, alloc, plan.extension_name, .{
         .target_version = plan.target_version orelse "",
     });
     defer installed.deinitOwned(alloc);
@@ -128,7 +129,7 @@ fn executeDrop(
         }
     }
 
-    try extension_domain.lifecycle.dropOnService(service, alloc, plan.extension_name, .{
+    try extension_lifecycle.dropOnService(service, alloc, plan.extension_name, .{
         .mode = if (plan.cascade) .cascade else .restrict,
     });
     return try changedRecordAlloc(alloc);

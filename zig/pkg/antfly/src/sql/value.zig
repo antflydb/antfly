@@ -14,13 +14,13 @@
 
 const std = @import("std");
 
+const default_value_runtime = @import("default_value_runtime.zig");
 const expr_json_path = @import("expr/json_path.zig");
 const expr_operator = @import("expr/operator.zig");
 const expr_parse = @import("expr/parse.zig");
 const expr_token = @import("expr/token.zig");
 const parser = @import("parser.zig");
 const platform_time = @import("antfly_platform").time;
-const relational_rows = @import("relational_rows.zig");
 const runtime_schema = @import("../storage/schema.zig");
 const token_mod = @import("token.zig");
 
@@ -303,7 +303,7 @@ pub fn parseSqlColumnValueAlloc(
 ) ![]const u8 {
     if (parser.matchKeywordTag(tokens, pos, .default)) {
         const default_value = column.default_value orelse return error.UnsupportedSqlShape;
-        return try relational_rows.relationalDefaultValueJsonAlloc(alloc, default_value);
+        return try default_value_runtime.relationalDefaultValueJsonAlloc(alloc, default_value);
     }
     if (expr_token.peekSqlNowExpressionSyntax(tokens, pos.*)) {
         if (column.field_type != .numeric and column.field_type != .datetime) return error.InvalidSqlCatalog;
@@ -398,7 +398,7 @@ pub fn parseUuidV4ValueJsonAlloc(
     pos: *usize,
 ) ![]const u8 {
     try parseSqlUuidV4Call(tokens, pos);
-    return try relational_rows.relationalDefaultValueJsonAlloc(alloc, .{ .kind = .uuid_v4, .value_json = "" });
+    return try default_value_runtime.relationalDefaultValueJsonAlloc(alloc, .{ .kind = .uuid_v4, .value_json = "" });
 }
 
 pub fn parseConvertFromJsonAlloc(
@@ -1670,7 +1670,7 @@ test "sql adapter value validates json values and defaults" {
     try std.testing.expectError(error.UnsupportedSqlShape, validateDefaultValueForColumnAlloc(alloc, numeric_column, .{ .kind = .literal, .value_json = "\"bad\"" }));
     try std.testing.expectError(error.UnsupportedSqlShape, validateDefaultValueForColumnAlloc(alloc, array_column, .{ .kind = .uuid_v4, .value_json = "" }));
     try std.testing.expectError(error.UnsupportedSqlShape, validateDefaultValueForColumnAlloc(alloc, keyword_column, .{ .kind = .sequence_next, .value_json = "{\"sequence\":\"usage_id_seq\"}" }));
-    try std.testing.expectError(error.UnsupportedSqlShape, relational_rows.relationalDefaultValueJsonAlloc(alloc, .{ .kind = .sequence_next, .value_json = "{\"sequence\":\"usage_id_seq\"}" }));
+    try std.testing.expectError(error.UnsupportedSqlShape, default_value_runtime.relationalDefaultValueJsonAlloc(alloc, .{ .kind = .sequence_next, .value_json = "{\"sequence\":\"usage_id_seq\"}" }));
 
     try validateSqlArrayElementValueJson(alloc, text_array_column, "\"blue\"");
     try validateSqlArrayValueJson(alloc, text_array_column, "[\"blue\",\"green\"]");

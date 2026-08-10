@@ -14,7 +14,9 @@
 
 const std = @import("std");
 
-const db_mod = @import("../../storage/db/mod.zig");
+const db_mod = struct {
+    pub const types = @import("../../storage/db/types.zig");
+};
 const expr_condition = @import("condition.zig");
 const expr_generated_validate = @import("generated_validate.zig");
 const expr_operator = @import("operator.zig");

@@ -25,6 +25,7 @@ const SweepResult = antfly.db.IndexManager.GraphMetricPlannedSchedulerSweepResul
 const HttpQueryResponse = antfly.public_api.http_client.QueryResponse;
 const local_db_writer_lock_retries: usize = 10_000;
 const local_db_writer_lock_sleep_ms: u64 = 5;
+const process_subcommand = "__graph-metric-maintenance";
 
 const ExitReason = enum {
     max_ticks,
@@ -1416,7 +1417,7 @@ fn buildSupervisorChildArgv(
     errdefer out.deinit(alloc);
 
     try out.append(alloc, cfg.executable orelse argv0);
-    try out.append(alloc, "graph-metric-maintenance");
+    try out.append(alloc, process_subcommand);
     try appendSupervisorTargetArgs(&out, alloc, target);
     try out.append(alloc, "--role");
     try out.append(alloc, switch (role) {
@@ -1922,8 +1923,16 @@ const LoopbackSupervisorChildRunner = struct {
     ) !ChildRunSummary {
         _ = io;
         if (argv.len < 3) return error.InvalidArguments;
-        if (!std.mem.eql(u8, argv[1], "graph-metric-maintenance")) return error.InvalidArguments;
-        var args = std.process.Args.Iterator.init(.{ .vector = argv[2..] });
+        if (!std.mem.eql(u8, argv[1], process_subcommand)) return error.InvalidArguments;
+        const argv_z = try alloc.alloc([*:0]const u8, argv.len - 2);
+        defer alloc.free(argv_z);
+        var initialized: usize = 0;
+        defer for (argv_z[0..initialized]) |arg| alloc.free(std.mem.span(arg));
+        for (argv[2..], argv_z) |arg, *arg_z| {
+            arg_z.* = (try alloc.dupeZ(u8, arg)).ptr;
+            initialized += 1;
+        }
+        var args = std.process.Args.Iterator.init(.{ .vector = argv_z });
         var cli = try parseCli(alloc, &args);
         defer cli.deinit(alloc);
         const db_path = cli.db_path orelse return error.InvalidArguments;
@@ -2014,12 +2023,12 @@ fn requestInProcessServiceMaintenanceForTest(
     return try parseServiceMaintenanceResponse(alloc, response.body);
 }
 
-fn expectParseCliInvalid(alloc: std.mem.Allocator, argv: []const []const u8) !void {
+fn expectParseCliInvalid(alloc: std.mem.Allocator, argv: []const [*:0]const u8) !void {
     var args = std.process.Args.Iterator.init(.{ .vector = argv });
     try std.testing.expectError(error.InvalidArguments, parseCli(alloc, &args));
 }
 
-fn expectParseSupervisorInvalid(alloc: std.mem.Allocator, argv: []const []const u8) !void {
+fn expectParseSupervisorInvalid(alloc: std.mem.Allocator, argv: []const [*:0]const u8) !void {
     var args = std.process.Args.Iterator.init(.{ .vector = argv });
     try std.testing.expectError(error.InvalidArguments, parseSupervisorCli(alloc, &args));
 }
@@ -2735,6 +2744,7 @@ test "graph metric maintenance service owners fence abandoned degree leases and 
         .lease_ttl_ms = 200,
         .max_metrics_per_round = 4,
         .max_pages_per_round = 2,
+        .test_hold_after_run_ms = 1,
         .test_now_ms = 1000,
     };
     const coordinator_a_start = try requestInProcessServiceMaintenanceForTest(
@@ -2802,6 +2812,7 @@ test "graph metric maintenance service owners fence abandoned degree leases and 
         .lease_ttl_ms = 200,
         .max_metrics_per_round = 4,
         .max_pages_per_round = 2,
+        .test_hold_after_run_ms = 1,
         .test_now_ms = 2000,
     };
     defer worker_pool_a.deinit(alloc);
@@ -2828,6 +2839,7 @@ test "graph metric maintenance service owners fence abandoned degree leases and 
         .lease_ttl_ms = 200,
         .max_metrics_per_round = 4,
         .max_pages_per_round = 2,
+        .test_hold_after_run_ms = 1,
         .test_now_ms = 2100,
     };
     defer worker_pool_b.deinit(alloc);
@@ -3033,8 +3045,11 @@ test "graph metric maintenance service owners drain pagerank through internal ro
             try std.testing.expect(!worker_summary.stats.has_lease);
             try std.testing.expect(service.calls >= 4);
             const top = try graph_entry.index.graphMetricTopK("pagerank", 3);
-            defer top.deinit();
-            try std.testing.expect(top.items.len > 0);
+            defer {
+                for (top) |*score| score.deinit(alloc);
+                alloc.free(top);
+            }
+            try std.testing.expect(top.len > 0);
             return;
         }
         if (idle_rounds >= 6) break;
@@ -3299,6 +3314,7 @@ test "graph metric maintenance service owners fence abandoned pagerank leases an
         .lease_ttl_ms = 200,
         .max_metrics_per_round = 4,
         .max_pages_per_round = 3,
+        .test_hold_after_run_ms = 1,
         .test_now_ms = 1000,
     };
     const coordinator_a_start = try requestInProcessServiceMaintenanceForTest(
@@ -3366,6 +3382,7 @@ test "graph metric maintenance service owners fence abandoned pagerank leases an
         .lease_ttl_ms = 200,
         .max_metrics_per_round = 4,
         .max_pages_per_round = 3,
+        .test_hold_after_run_ms = 1,
         .test_now_ms = 2000,
     };
     defer worker_pool_a.deinit(alloc);
@@ -3392,6 +3409,7 @@ test "graph metric maintenance service owners fence abandoned pagerank leases an
         .lease_ttl_ms = 200,
         .max_metrics_per_round = 4,
         .max_pages_per_round = 3,
+        .test_hold_after_run_ms = 1,
         .test_now_ms = 2100,
     };
     defer worker_pool_b.deinit(alloc);
@@ -3468,8 +3486,11 @@ test "graph metric maintenance service owners fence abandoned pagerank leases an
             try std.testing.expect(!coordinator_summary.stats.has_lease);
             try std.testing.expect(!worker_summary.stats.has_lease);
             const top = try graph_entry.index.graphMetricTopK("pagerank", 3);
-            defer top.deinit();
-            try std.testing.expect(top.items.len > 0);
+            defer {
+                for (top) |*score| score.deinit(alloc);
+                alloc.free(top);
+            }
+            try std.testing.expect(top.len > 0);
             return;
         }
         if (idle_rounds >= 6) break;
@@ -3493,7 +3514,7 @@ test "graph metric maintenance command rejects duplicate worker pool ids" {
 
 test "graph metric maintenance command rejects worker id lists for single-owner roles" {
     const alloc = std.testing.allocator;
-    const coordinator_argv = [_][]const u8{
+    const coordinator_argv = [_][*:0]const u8{
         "--db-path",    "/tmp/antfly-graph-metric-command-test",
         "--role",       "coordinator",
         "--runtime-id", "runtime-a",
@@ -3503,7 +3524,7 @@ test "graph metric maintenance command rejects worker id lists for single-owner 
     var coordinator_args = std.process.Args.Iterator.init(.{ .vector = coordinator_argv[0..] });
     try std.testing.expectError(error.InvalidArguments, parseCli(alloc, &coordinator_args));
 
-    const worker_argv = [_][]const u8{
+    const worker_argv = [_][*:0]const u8{
         "--db-path",    "/tmp/antfly-graph-metric-command-test",
         "--role",       "worker",
         "--runtime-id", "runtime-a",
@@ -3689,7 +3710,7 @@ test "graph metric maintenance supervisor builds coordinator and worker pool arg
     var coordinator = try buildSupervisorChildArgv(alloc, "fallback-antfly", db_target, cfg, .coordinator, "/tmp/coordinator-summary.json");
     defer coordinator.deinit(alloc);
     try std.testing.expectEqualStrings("/tmp/antfly", coordinator.argv.items[0]);
-    try std.testing.expectEqualStrings("graph-metric-maintenance", coordinator.argv.items[1]);
+    try std.testing.expectEqualStrings(process_subcommand, coordinator.argv.items[1]);
     try std.testing.expect(argvValueEquals(coordinator.argv.items, "--db-path", "/tmp/db"));
     try std.testing.expect(argvValueEquals(coordinator.argv.items, "--role", "coordinator"));
     try std.testing.expect(argvValueEquals(coordinator.argv.items, "--runtime-id", "coord-owner"));
@@ -3823,6 +3844,8 @@ test "graph metric maintenance supervisor restart policy is bounded" {
 
 test "graph metric maintenance supervisor loops until global idle" {
     const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
     const sequence = [_]ChildRunSummary{
         fakeChild(false, 0),
         fakeChild(true, 0),
@@ -3837,7 +3860,7 @@ test "graph metric maintenance supervisor loops until global idle" {
         FakeSupervisorChildRunner,
         &runner,
         FakeSupervisorChildRunner.run,
-        std.testing.Io.null,
+        io_impl.io(),
         alloc,
         "antfly",
         .{ .db_path = "/tmp/db" },
@@ -3861,6 +3884,8 @@ test "graph metric maintenance supervisor loops until global idle" {
 
 test "graph metric maintenance supervisor drives degree through child role argv" {
     const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -3913,7 +3938,7 @@ test "graph metric maintenance supervisor drives degree through child role argv"
         LoopbackSupervisorChildRunner,
         &runner,
         LoopbackSupervisorChildRunner.run,
-        std.testing.Io.null,
+        io_impl.io(),
         alloc,
         "antfly",
         .{ .db_path = path },
@@ -3988,6 +4013,8 @@ test "graph metric maintenance supervisor drives degree through child role argv"
 
 test "graph metric maintenance supervisor stops at restart limit" {
     const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
     const sequence = [_]ChildRunSummary{
         fakeChild(null, 17),
         fakeChild(false, 0),
@@ -4002,7 +4029,7 @@ test "graph metric maintenance supervisor stops at restart limit" {
         FakeSupervisorChildRunner,
         &runner,
         FakeSupervisorChildRunner.run,
-        std.testing.Io.null,
+        io_impl.io(),
         alloc,
         "antfly",
         .{ .db_path = "/tmp/db" },

@@ -5,9 +5,12 @@
 
 const std = @import("std");
 
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = struct {
+    pub const DB = @import("../storage/db/db.zig").DB;
+    pub const types = @import("../storage/db/types.zig");
+};
 const relational_rows = @import("../storage/db/relational_rows.zig");
-const raft_mod = @import("../raft/mod.zig");
+const raft_mod = @import("../raft/domain.zig");
 const json_helpers = @import("../common/json_helpers.zig");
 const regex_mod = @import("../search/regex.zig");
 const document_sql_corpus = @import("document_sql_corpus.zig");

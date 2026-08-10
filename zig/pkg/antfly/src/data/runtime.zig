@@ -13,8 +13,9 @@
 // limitations.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const platform_sync = @import("antfly_platform").sync;
-const antfly = @import("../root.zig");
+const antfly = @import("runtime_root.zig");
 const indexes_api = @import("../api/indexes.zig");
 const json_helpers = @import("../common/json_helpers.zig");
 const fs_paths = @import("../common/fs_paths.zig");
@@ -103,6 +104,8 @@ const TransitionActionLanes = struct {
 const runtime_status_refresh_max_db_opens_per_run: usize = 16;
 const runtime_status_disk_usage_refresh_interval_ns: u64 = 30 * std.time.ns_per_s;
 const auto_bulk_finish_poll_interval_ms: u64 = 250;
+const graph_metric_maintenance_idle_interval_ns: u64 = std.time.ns_per_s;
+const graph_metric_maintenance_retry_interval_ns: u64 = 250 * std.time.ns_per_ms;
 const provisioned_startup_catch_up_interval_ms: u64 = std.time.ms_per_s;
 const provisioned_index_repair_interval_ms: u64 = 5 * std.time.ms_per_s;
 const default_provisioned_index_repair_discovery_interval_ms: u64 = 30 * std.time.ms_per_s;
@@ -3771,6 +3774,7 @@ pub const DataServer = struct {
     lsm_maintenance_next_eligible_ns: std.atomic.Value(u64) = .init(0),
     lsm_maintenance_obsolete_reclaim_due_ns: std.atomic.Value(u64) = .init(0),
     dense_posting_maintenance_next_eligible_ns: std.atomic.Value(u64) = .init(0),
+    graph_metric_maintenance_next_eligible_ns: u64 = 0,
 
     const lsm_maintenance_worker_idle_sleep_ns = 250 * std.time.ns_per_ms;
     const lsm_maintenance_worker_retry_sleep_ns = 100 * std.time.ns_per_ms;
@@ -4040,13 +4044,15 @@ pub const DataServer = struct {
         // Filesystem-backed runtimes keep API job state beside their shard
         // catalog by default. Lite overrides this after construction with an
         // engine namespace so its artifact remains genuinely single-file.
-        if (api_server_cfg.restore_job_store_path == null and
-            api_server_cfg.session_store_path == null and
-            api_server_cfg.session_store == null and
-            api_server_cfg.deployment_mode != .serverless)
-        {
-            owned_restore_job_store_path = try std.fmt.allocPrint(self.alloc, "{s}/api-restore-jobs", .{self.write_source.replica_root_dir});
-            api_server_cfg.restore_job_store_path = owned_restore_job_store_path;
+        if (comptime build_options.lmdb_enabled) {
+            if (api_server_cfg.restore_job_store_path == null and
+                api_server_cfg.session_store_path == null and
+                api_server_cfg.session_store == null and
+                api_server_cfg.deployment_mode != .serverless)
+            {
+                owned_restore_job_store_path = try std.fmt.allocPrint(self.alloc, "{s}/api-restore-jobs", .{self.write_source.replica_root_dir});
+                api_server_cfg.restore_job_store_path = owned_restore_job_store_path;
+            }
         }
         api_server_cfg.shard_ops = self.localShardOperationAdapter();
         api_server_cfg.shard_db_adapter = self.localShardDbAdapter();
@@ -4139,7 +4145,7 @@ pub const DataServer = struct {
             self.read_source.source(),
             self.write_source.source(),
         );
-        self.http_server.?.antfly_provider = self.read_source.antfly_provider;
+        antfly.public_api.kernel_bridge.setAntflyProvider(&self.http_server.?, self.read_source.antfly_provider);
     }
 
     pub fn applyHAReplicationRecord(self: *DataServer, record: antfly.ha.replication_record.RecordView) !void {
@@ -4601,7 +4607,7 @@ pub const DataServer = struct {
         if (self.data_raft_apply) |apply_sm| {
             _ = apply_sm.write_source.withAntflyProvider(provider);
         }
-        if (self.http_server) |*server| server.antfly_provider = provider;
+        if (self.http_server) |*server| antfly.public_api.kernel_bridge.setAntflyProvider(server, provider);
         self.syncInferenceRuntimeConfig();
     }
 
@@ -4770,6 +4776,7 @@ pub const DataServer = struct {
             std.log.warn("auto bulk ingest finish start deferred err={}", .{err});
         };
         self.requestLsmMaintenanceBackground() catch try self.runLsmMaintenanceForegroundRound();
+        self.runGraphMetricMaintenanceRound();
         if (self.data_raft != null and self.remote_metadata != null) {
             const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
             if (self.last_data_raft_metadata_sync_at_ms == 0 or
@@ -4941,8 +4948,8 @@ pub const DataServer = struct {
         self.provisioned_index_repair_cancel_groups.deinit(self.alloc);
         self.provisioned_index_repair_routes.deinit(self.alloc);
         self.store_status_heartbeat_cache.clear(self.alloc);
-        self.provisioned_storage.deinit();
         self.write_source.deinit();
+        self.provisioned_storage.deinit();
         if (self.remote_metadata) |remote_metadata| {
             remote_metadata.deinit();
             self.alloc.destroy(remote_metadata);
@@ -4993,6 +5000,29 @@ pub const DataServer = struct {
             => {},
             else => return err,
         };
+    }
+
+    fn runGraphMetricMaintenanceRound(self: *DataServer) void {
+        const now_ns = platform_time.monotonicNs();
+        if (now_ns < self.graph_metric_maintenance_next_eligible_ns) return;
+        if (!self.haOwnerJobCanRun(.derived_effect_writer)) {
+            self.graph_metric_maintenance_next_eligible_ns = now_ns +| graph_metric_maintenance_idle_interval_ns;
+            return;
+        }
+
+        const result = self.liveRuntimeWriteSource().runGraphMetricMaintenanceRoundBestEffort() catch |err| {
+            self.graph_metric_maintenance_next_eligible_ns = now_ns +| graph_metric_maintenance_retry_interval_ns;
+            std.log.warn("graph metric maintenance round failed err={s}", .{@errorName(err)});
+            return;
+        };
+        self.graph_metric_maintenance_next_eligible_ns = now_ns +| if (result.progressed)
+            graph_metric_maintenance_retry_interval_ns
+        else
+            graph_metric_maintenance_idle_interval_ns;
+        if (result.progressed) {
+            self.runtime_status_dirty.store(true, .release);
+            self.markStoreStatusDirtyImmediate();
+        }
     }
 
     fn requestLsmMaintenanceBackground(self: *DataServer) !void {
@@ -22792,6 +22822,10 @@ test "storage.ha data server rejects writes and owner jobs after primary promoti
         .sync_level = .write,
     }));
     try std.testing.expect(!server.haOwnerJobCanRun(.compaction_publish));
+    try std.testing.expect(!server.haOwnerJobCanRun(.derived_effect_writer));
+    server.graph_metric_maintenance_next_eligible_ns = 0;
+    server.runGraphMetricMaintenanceRound();
+    try std.testing.expect(server.graph_metric_maintenance_next_eligible_ns != 0);
 }
 
 test "data server applies routed HA replication records through standby write gate" {

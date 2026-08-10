@@ -4686,7 +4686,7 @@ fn runSupervisorProcess(
 ) !void {
     const argv = [_][]const u8{
         antfly_exe,
-        "graph-metric-maintenance",
+        "__graph-metric-maintenance",
         "supervise",
         "--db-path",
         db_path,
@@ -4778,7 +4778,7 @@ fn runLaunchProcess(
     defer std.Io.Dir.cwd().deleteTree(io, summary_dir) catch {};
     const argv = [_][]const u8{
         antfly_exe,
-        "graph-metric-maintenance",
+        "__graph-metric-maintenance",
         "launch",
         "--db-path",
         db_path,
@@ -8274,7 +8274,7 @@ fn runAndKillCoordinatorAfterReady(
 ) !void {
     const argv = [_][]const u8{
         antfly_exe,
-        "graph-metric-maintenance",
+        "__graph-metric-maintenance",
         "--db-path",
         db_path,
         "--role",
@@ -8337,7 +8337,7 @@ fn runAndKillServiceCoordinatorAfterReady(
 ) !void {
     const argv = [_][]const u8{
         antfly_exe,
-        "graph-metric-maintenance",
+        "__graph-metric-maintenance",
         "--base-uri",
         base_uri,
         "--group-id",
@@ -8409,7 +8409,7 @@ fn runAndKillServiceWorkerPoolAfterReadyWithMaxPages(
 ) !void {
     const argv = [_][]const u8{
         antfly_exe,
-        "graph-metric-maintenance",
+        "__graph-metric-maintenance",
         "--base-uri",
         base_uri,
         "--group-id",
@@ -8534,7 +8534,7 @@ fn runAndKillWorkerRoleAfterReady(
 ) !void {
     const argv = [_][]const u8{
         antfly_exe,
-        "graph-metric-maintenance",
+        "__graph-metric-maintenance",
         "--db-path",
         db_path,
         "--role",
@@ -8901,7 +8901,7 @@ fn runCoordinatorRoleProcessAt(
 ) !RoleRunSummary {
     const argv = [_][]const u8{
         antfly_exe,
-        "graph-metric-maintenance",
+        "__graph-metric-maintenance",
         "--db-path",
         db_path,
         "--role",
@@ -8924,7 +8924,7 @@ fn runCoordinatorRoleProcessAt(
     if (test_now_ms) |now_ms| {
         const argv_with_now = [_][]const u8{
             antfly_exe,
-            "graph-metric-maintenance",
+            "__graph-metric-maintenance",
             "--db-path",
             db_path,
             "--role",
@@ -8967,7 +8967,7 @@ fn runServiceCoordinatorRoleProcessAt(
 ) !RoleRunSummary {
     const argv = [_][]const u8{
         antfly_exe,
-        "graph-metric-maintenance",
+        "__graph-metric-maintenance",
         "--base-uri",
         base_uri,
         "--group-id",
@@ -9010,7 +9010,7 @@ fn runWorkerRoleProcessAt(
 ) !RoleRunSummary {
     const argv = [_][]const u8{
         antfly_exe,
-        "graph-metric-maintenance",
+        "__graph-metric-maintenance",
         "--db-path",
         db_path,
         "--role",
@@ -9049,7 +9049,7 @@ fn runWorkerPoolRoleProcess(
 ) !RoleRunSummary {
     const argv = [_][]const u8{
         antfly_exe,
-        "graph-metric-maintenance",
+        "__graph-metric-maintenance",
         "--db-path",
         db_path,
         "--role",
@@ -9118,7 +9118,7 @@ fn runServiceWorkerPoolRoleProcessAtWithMaxPages(
 ) !RoleRunSummary {
     const argv = [_][]const u8{
         antfly_exe,
-        "graph-metric-maintenance",
+        "__graph-metric-maintenance",
         "--base-uri",
         base_uri,
         "--group-id",
@@ -9348,7 +9348,7 @@ fn roleProcessJsonFieldForbidden(field: []const u8) bool {
 
 fn verifyRoleProcessArgvScoped(argv: []const []const u8) !void {
     if (argv.len < 4) return error.GraphMetricRoleProcessFailed;
-    if (!std.mem.eql(u8, argv[1], "graph-metric-maintenance")) return error.GraphMetricRoleProcessFailed;
+    if (!std.mem.eql(u8, argv[1], "__graph-metric-maintenance")) return error.GraphMetricRoleProcessFailed;
     try verifyRoleProcessArgvAllowlist(argv);
     const has_db_path = processArgvContains(argv, "--db-path");
     const has_base_uri = processArgvContains(argv, "--base-uri") or processArgvContains(argv, "--service-base-uri");
@@ -9438,7 +9438,7 @@ fn roleProcessArgvFlagAllowed(flag: []const u8) bool {
 fn verifyRoleProcessArgvPreflightSelfTest() !void {
     try verifyRoleProcessArgvScoped(&.{
         "antfly",
-        "graph-metric-maintenance",
+        "__graph-metric-maintenance",
         "--db-path",
         "/tmp/db",
         "--role",
@@ -9460,7 +9460,7 @@ fn verifyRoleProcessArgvPreflightSelfTest() !void {
     });
     try verifyRoleProcessArgvScoped(&.{
         "antfly",
-        "graph-metric-maintenance",
+        "__graph-metric-maintenance",
         "--db-path",
         "/tmp/db",
         "--role",
@@ -9486,7 +9486,7 @@ fn verifyRoleProcessArgvPreflightSelfTest() !void {
     });
     try verifyRoleProcessArgvScoped(&.{
         "antfly",
-        "graph-metric-maintenance",
+        "__graph-metric-maintenance",
         "--db-path",
         "/tmp/db",
         "--role",
@@ -9512,7 +9512,7 @@ fn verifyRoleProcessArgvPreflightSelfTest() !void {
     });
     try verifyRoleProcessArgvScoped(&.{
         "antfly",
-        "graph-metric-maintenance",
+        "__graph-metric-maintenance",
         "--base-uri",
         "http://127.0.0.1:8080",
         "--group-id",
@@ -9538,7 +9538,7 @@ fn verifyRoleProcessArgvPreflightSelfTest() !void {
     });
     try verifyRoleProcessArgvScoped(&.{
         "antfly",
-        "graph-metric-maintenance",
+        "__graph-metric-maintenance",
         "--base-uri",
         "http://127.0.0.1:8080",
         "--group-id",
@@ -9569,7 +9569,7 @@ fn verifyRoleProcessArgvPreflightSelfTest() !void {
 
     try expectRoleProcessArgvRejected(&.{
         "antfly",
-        "graph-metric-maintenance",
+        "__graph-metric-maintenance",
         "--db-path",
         "/tmp/db",
         "--role",
@@ -9593,7 +9593,7 @@ fn verifyRoleProcessArgvPreflightSelfTest() !void {
     });
     try expectRoleProcessArgvRejected(&.{
         "antfly",
-        "graph-metric-maintenance",
+        "__graph-metric-maintenance",
         "--db-path",
         "/tmp/db",
         "--role",
@@ -9615,7 +9615,7 @@ fn verifyRoleProcessArgvPreflightSelfTest() !void {
     });
     try expectRoleProcessArgvRejected(&.{
         "antfly",
-        "graph-metric-maintenance",
+        "__graph-metric-maintenance",
         "--db-path",
         "/tmp/db",
         "--role",
@@ -9639,7 +9639,7 @@ fn verifyRoleProcessArgvPreflightSelfTest() !void {
     });
     try expectRoleProcessArgvRejected(&.{
         "antfly",
-        "graph-metric-maintenance",
+        "__graph-metric-maintenance",
         "--db-path",
         "/tmp/db",
         "--base-uri",
@@ -9667,7 +9667,7 @@ fn verifyRoleProcessArgvPreflightSelfTest() !void {
     });
     try expectRoleProcessArgvRejected(&.{
         "antfly",
-        "graph-metric-maintenance",
+        "__graph-metric-maintenance",
         "--base-uri",
         "http://127.0.0.1:8080",
         "--group-id",
@@ -9691,7 +9691,7 @@ fn verifyRoleProcessArgvPreflightSelfTest() !void {
     });
     try expectRoleProcessArgvRejected(&.{
         "antfly",
-        "graph-metric-maintenance",
+        "__graph-metric-maintenance",
         "--db-path",
         "/tmp/db",
         "--role",
@@ -9717,7 +9717,7 @@ fn verifyRoleProcessArgvPreflightSelfTest() !void {
     });
     try expectRoleProcessArgvRejected(&.{
         "antfly",
-        "graph-metric-maintenance",
+        "__graph-metric-maintenance",
         "--db-path",
         "/tmp/db",
         "--role",
@@ -9743,7 +9743,7 @@ fn verifyRoleProcessArgvPreflightSelfTest() !void {
     });
     try expectRoleProcessArgvRejected(&.{
         "antfly",
-        "graph-metric-maintenance",
+        "__graph-metric-maintenance",
         "--db-path",
         "/tmp/db",
         "--role",
@@ -9769,7 +9769,7 @@ fn verifyRoleProcessArgvPreflightSelfTest() !void {
     });
     try expectRoleProcessArgvRejected(&.{
         "antfly",
-        "graph-metric-maintenance",
+        "__graph-metric-maintenance",
         "--db-path",
         "/tmp/db",
         "--role",

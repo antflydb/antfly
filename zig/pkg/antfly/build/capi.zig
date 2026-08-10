@@ -16,6 +16,8 @@ const std = @import("std");
 const antfly_tests_build = @import("tests.zig");
 
 pub const CApiSteps = struct {
+    capi_lib: *std.Build.Step.Compile,
+    lite_capi_lib: *std.Build.Step.Compile,
     install_capi_lib: *std.Build.Step.InstallArtifact,
     install_antfly_capi_lib: *std.Build.Step.InstallArtifact,
     install_capi_header: *std.Build.Step.InstallFile,
@@ -33,7 +35,9 @@ pub fn addCApiSteps(ctx: anytype) CApiSteps {
     const optimize = ctx.optimize;
     const strip = ctx.strip;
     const lib_mod = ctx.lib_mod;
+    const platform_mod = ctx.platform_mod;
     const structlog_mod = ctx.structlog_mod;
+    const reuse_runtime_storage = ctx.reuse_runtime_storage;
 
     const capi_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/capi/db.zig"),
@@ -41,14 +45,22 @@ pub fn addCApiSteps(ctx: anytype) CApiSteps {
         .optimize = optimize,
     });
     capi_mod.addImport("antfly-zig", lib_mod);
+    capi_mod.addImport("antfly_platform", platform_mod);
     capi_mod.addImport("structlog", structlog_mod);
     capi_mod.strip = strip;
 
+    const capi_link_mod = if (reuse_runtime_storage) b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/capi/link_anchor.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+    }) else capi_mod;
     const capi_lib = b.addLibrary(.{
         .linkage = .dynamic,
         .name = "antfly_zig_capi",
-        .root_module = capi_mod,
+        .root_module = capi_link_mod,
     });
+    capi_lib.link_gc_sections = true;
     const install_capi_lib = b.addInstallArtifact(capi_lib, .{});
 
     const lite_capi_mod = b.createModule(.{
@@ -57,14 +69,22 @@ pub fn addCApiSteps(ctx: anytype) CApiSteps {
         .optimize = optimize,
     });
     lite_capi_mod.addImport("antfly-zig", lib_mod);
+    lite_capi_mod.addImport("antfly_platform", platform_mod);
     lite_capi_mod.addImport("structlog", structlog_mod);
     lite_capi_mod.strip = strip;
 
+    const lite_capi_link_mod = if (reuse_runtime_storage) b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/capi/link_anchor.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+    }) else lite_capi_mod;
     const lite_capi_lib = b.addLibrary(.{
         .linkage = .dynamic,
         .name = "antfly",
-        .root_module = lite_capi_mod,
+        .root_module = lite_capi_link_mod,
     });
+    lite_capi_lib.link_gc_sections = true;
     const install_antfly_capi_lib = b.addInstallArtifact(lite_capi_lib, .{});
     const install_capi_header = b.addInstallFileWithDir(
         b.path("pkg/antfly/include/antfly.h"),
@@ -159,6 +179,8 @@ pub fn addCApiSteps(ctx: anytype) CApiSteps {
     capi_test.step.dependOn(&run_lite_capi_smoke.step);
 
     return .{
+        .capi_lib = capi_lib,
+        .lite_capi_lib = lite_capi_lib,
         .install_capi_lib = install_capi_lib,
         .install_antfly_capi_lib = install_antfly_capi_lib,
         .install_capi_header = install_capi_header,

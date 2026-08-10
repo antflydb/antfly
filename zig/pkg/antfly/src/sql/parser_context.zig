@@ -31,7 +31,9 @@ const expr_row_parse = @import("expr/row_parse.zig");
 const plan = @import("plan.zig");
 const relational_rows = @import("relational_rows.zig");
 const runtime_schema = @import("../storage/schema.zig");
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = struct {
+    pub const types = @import("../storage/db/types.zig");
+};
 const token_mod = @import("token.zig");
 const value_mod = @import("value.zig");
 

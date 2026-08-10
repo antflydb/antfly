@@ -2372,6 +2372,8 @@ fn restorePortableBackupToLiteFile(
 
         var opts = db_mod.OpenOptions{
             .open_mode = .writer,
+            .start_index_workers = false,
+            .start_optional_runtimes = false,
             .external_derived_checkpoints = false,
         };
         try backend.configureDbOpenOptions(&opts);

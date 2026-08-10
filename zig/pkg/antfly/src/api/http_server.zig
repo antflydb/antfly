@@ -44,8 +44,10 @@ const table_contract = @import("table_contract.zig");
 const metadata_admin = @import("../metadata/admin.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_authority = @import("../metadata/authority.zig");
-const metadata_mod = @import("../metadata/mod.zig");
+const metadata_mod = @import("../metadata/domain.zig");
 const extension_domain = @import("../extensions/mod.zig");
+const extension_lifecycle = @import("../extensions/lifecycle.zig");
+const extension_sql_adapter = @import("../extensions/sql_adapter.zig");
 const metadata_reconciler = @import("../metadata/reconciler.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
@@ -54,7 +56,7 @@ const schema_mod = @import("../schema/mod.zig");
 const runtime_schema_mod = @import("../storage/schema.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const raft_host = @import("../raft/host.zig");
-const raft_mod = @import("../raft/mod.zig");
+const raft_mod = @import("../raft/domain.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const lsm_backend = @import("../storage/lsm_backend/mod.zig");
@@ -6926,7 +6928,7 @@ pub const ApiHttpServer = struct {
                     }
                     return error.UnsupportedSqlShape;
                 },
-                .extension => return try extension_domain.sql_adapter.executeRelationalSqlExtensionNoopAlloc(self.alloc),
+                .extension => return try extension_sql_adapter.executeRelationalSqlExtensionNoopAlloc(self.alloc),
                 else => return error.UnsupportedSqlShape,
             },
             .moved => return error.UnsupportedSqlShape,
@@ -31159,7 +31161,7 @@ fn installExtensionOnService(
     extension_name: []const u8,
     request: extension_domain.InstallExtensionRequest,
 ) !extension_domain.InstalledExtension {
-    return try extension_domain.lifecycle.installOnService(service, alloc, extension_name, request);
+    return try extension_lifecycle.installOnService(service, alloc, extension_name, request);
 }
 
 fn updateExtensionOnService(
@@ -31168,7 +31170,7 @@ fn updateExtensionOnService(
     extension_name: []const u8,
     request: extension_domain.UpdateExtensionRequest,
 ) !extension_domain.InstalledExtension {
-    return try extension_domain.lifecycle.updateOnService(service, alloc, extension_name, request);
+    return try extension_lifecycle.updateOnService(service, alloc, extension_name, request);
 }
 
 fn dropExtensionOnService(
@@ -31177,15 +31179,15 @@ fn dropExtensionOnService(
     extension_name: []const u8,
     request: extension_domain.DropExtensionRequest,
 ) !void {
-    return try extension_domain.lifecycle.dropOnService(service, alloc, extension_name, request);
+    return try extension_lifecycle.dropOnService(service, alloc, extension_name, request);
 }
 
 fn enableExtensionOnService(service: anytype, alloc: std.mem.Allocator, extension_name: []const u8) !extension_domain.InstalledExtension {
-    return try extension_domain.lifecycle.enableOnService(service, alloc, extension_name);
+    return try extension_lifecycle.enableOnService(service, alloc, extension_name);
 }
 
 fn disableExtensionOnService(service: anytype, alloc: std.mem.Allocator, extension_name: []const u8) !extension_domain.InstalledExtension {
-    return try extension_domain.lifecycle.disableOnService(service, alloc, extension_name);
+    return try extension_lifecycle.disableOnService(service, alloc, extension_name);
 }
 
 fn configureExtensionOnService(
@@ -31194,7 +31196,7 @@ fn configureExtensionOnService(
     extension_name: []const u8,
     request: extension_domain.ConfigureExtensionRequest,
 ) !extension_domain.InstalledExtension {
-    return try extension_domain.lifecycle.configureOnService(service, alloc, extension_name, request);
+    return try extension_lifecycle.configureOnService(service, alloc, extension_name, request);
 }
 
 fn restoreExtensionsOnService(
@@ -31205,7 +31207,7 @@ fn restoreExtensionsOnService(
     dependencies: []const extension_domain.ExtensionDependency,
 ) !void {
     if (installed.len == 0 and members.len == 0 and dependencies.len == 0) return;
-    try extension_domain.lifecycle.restoreOnService(service, installed, members, dependencies);
+    try extension_lifecycle.restoreOnService(service, installed, members, dependencies);
 }
 
 fn findExtensionPackageVersion(snapshot: *const metadata_api.AdminSnapshot, name: []const u8, version: []const u8) ?*const extension_domain.PackageManifest {

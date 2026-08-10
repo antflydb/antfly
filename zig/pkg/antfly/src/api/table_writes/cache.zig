@@ -18,7 +18,7 @@ const scraping = @import("antfly_scraping");
 
 const common_secrets = @import("../../common/secrets.zig");
 const metadata_api = @import("../../metadata/api.zig");
-const metadata_mod = @import("../../metadata/mod.zig");
+const metadata_mod = @import("../../metadata/domain.zig");
 const metadata_table_manager = @import("../../metadata/table_manager.zig");
 const metadata_transition_state = @import("../../metadata/transition_state.zig");
 const raft_reconciler = @import("../../raft/reconciler.zig");

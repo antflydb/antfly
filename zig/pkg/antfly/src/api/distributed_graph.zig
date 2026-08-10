@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const raft_mod = @import("../raft/mod.zig");
+const raft_mod = @import("../raft/domain.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const graph_query_mod = @import("../graph/query.zig");
 const graph_mod = @import("../graph/graph.zig");

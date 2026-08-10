@@ -25,6 +25,36 @@ pub var selected_test_filter: ?[]const u8 = null;
 
 pub const no_default_filters = [_][]const u8{};
 
+pub const SQLPlannerTestFilters = struct {
+    pub const focused = [_][]const u8{
+        "sql.ast.",
+        "sql.binder.",
+        "sql.catalog_resources.",
+        "sql.ddl_plan.",
+        "sql.document_plan.",
+        "sql.expr.",
+        "sql.generated_parser.",
+        "sql.generated_read_validate.",
+        "sql.grammar.",
+        "sql.lexer.",
+        "sql.lower_dml.",
+        "sql.lower_expr.",
+        "sql.lowering_context.",
+        "sql.parser.",
+        "sql.parser_context.",
+        "sql.plan.",
+        "sql.query_function.",
+        "sql.row_claim.",
+        "sql.scalar_subquery_default.",
+        "sql.select_set.",
+        "sql.source_binding.",
+        "sql.statement_kind.",
+        "sql.token.",
+        "sql.tokenized.",
+        "sql.value.",
+    };
+};
+
 pub const DBTestStep = struct {
     name: []const u8,
     description: []const u8,
@@ -2657,11 +2687,6 @@ pub const PackageTestFilters = struct {
         "storage.lite.",
     };
 
-    pub const lite_cli = [_][]const u8{
-        "cmd.lite",
-        "cmd.cli.backup",
-    };
-
     pub const lsm_backend_sim = [_][]const u8{
         "lsm backend simulation",
     };
@@ -2682,7 +2707,7 @@ pub const PackageTestFilters = struct {
 pub const DataTestFilters = struct {
     pub const runtime = [_][]const u8{
         "data runtime status refresh publishes synthetic missing status for absent local group db",
-        "data runtime status refresh budget reuses cached group status instead of opening db",
+        "data runtime status refresh budget preserves fresh cached group status for visible generation",
         "data runtime status refresh reuses managed writer snapshot instead of reopening table db",
         "runtime status observation cannot erase a startup catch-up retry",
         "data raft batch forwarding escapes a leaderless local placement",
@@ -2698,7 +2723,7 @@ pub const DataTestFilters = struct {
         "runtime status disk scan retries only when maintenance invalidates its group",
         "cached repair telemetry is runtime facts",
         "data runtime local split fallback preserves source identity namespace",
-        "data runtime local merge fallback derives receiver identity namespace from catalog",
+        "data runtime local merge fallback uses its durable table contract",
         "data runtime resolves extension package store env before local default",
         "data runtime cli accepts ARD identity flags",
         "data public API listener uses public API request body limit",
@@ -3009,7 +3034,6 @@ pub const StandaloneRuntimeTestFilters = struct {
         "standalone public listener lease is exclusive and immediately reusable",
         "parse cli accepts inference budget overrides",
         "inference config falls back to common config",
-        "inference admission bridge charges combined native residency to resource manager",
         "standalone runtime resolves paths from common storage base dir",
         "standalone runtime resolves extension package store env before local default",
         "standalone Lite enforces one shard and one replica",
@@ -3019,6 +3043,10 @@ pub const StandaloneRuntimeTestFilters = struct {
         "standalone metadata rejects corrupt catalog without double-freeing owned paths",
         "standalone metadata finalizes schema migration from resident runtime evidence",
         "standalone unified server lifecycle propagates startup failure",
+    };
+
+    pub const inference_host = [_][]const u8{
+        "inference admission bridge charges combined native residency to resource manager",
     };
 };
 
@@ -4558,6 +4586,13 @@ pub fn selectTestFilters(
     b: *std.Build,
     default_filters: []const []const u8,
 ) []const []const u8 {
+    if (selected_test_filter) |filter| {
+        if (filter.len != 0) {
+            const filters = b.allocator.alloc([]const u8, 1) catch @panic("OOM");
+            filters[0] = filter;
+            return filters;
+        }
+    }
     return build_test_filters.select(
         b.allocator,
         b.args orelse &.{},
@@ -4745,7 +4780,7 @@ fn addNamedFilteredTest(
 ) *std.Build.Step.Run {
     const tests = b.addTest(.{
         .root_module = module,
-        .filters = filters,
+        .filters = selectTestFilters(b, filters),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,

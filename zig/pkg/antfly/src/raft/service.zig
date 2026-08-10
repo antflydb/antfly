@@ -14,8 +14,8 @@
 
 const std = @import("std");
 const raft_engine = @import("raft_engine");
-const data = @import("../data/mod.zig");
-const metadata = @import("../metadata/mod.zig");
+const data = @import("../data/domain.zig");
+const metadata = @import("../metadata/domain.zig");
 const db_types = @import("../storage/db/types.zig");
 const catalog = @import("catalog.zig");
 const feature_reads = @import("feature_reads.zig");
@@ -1047,7 +1047,7 @@ test "metadata service managed host steps queued transitions only during control
     };
 
     const FakeSplit = struct {
-        status: @import("../data/mod.zig").SplitTransitionStatus = .{
+        status: @import("../data/domain.zig").SplitTransitionStatus = .{
             .phase = .prepare,
             .source_split_phase = .prepare,
             .bootstrapped = false,
@@ -1074,7 +1074,7 @@ test "metadata service managed host steps queued transitions only during control
             };
         }
 
-        fn observeStatus(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !@import("../data/mod.zig").SplitTransitionStatus {
+        fn observeStatus(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !@import("../data/domain.zig").SplitTransitionStatus {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.status;
         }
@@ -1208,7 +1208,7 @@ test "managed host service queues transition metadata updates after sync" {
     };
 
     const FakeSplit = struct {
-        status: @import("../data/mod.zig").SplitTransitionStatus = .{
+        status: @import("../data/domain.zig").SplitTransitionStatus = .{
             .phase = .prepare,
             .source_split_phase = .prepare,
             .bootstrapped = false,
@@ -1235,7 +1235,7 @@ test "managed host service queues transition metadata updates after sync" {
             };
         }
 
-        fn observeStatus(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !@import("../data/mod.zig").SplitTransitionStatus {
+        fn observeStatus(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !@import("../data/domain.zig").SplitTransitionStatus {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.status;
         }
@@ -1369,7 +1369,7 @@ test "managed host service seeds queued transitions from projected metadata stor
     };
 
     const FakeSplit = struct {
-        status: @import("../data/mod.zig").SplitTransitionStatus = .{
+        status: @import("../data/domain.zig").SplitTransitionStatus = .{
             .phase = .prepare,
             .source_split_phase = .prepare,
             .bootstrapped = false,
@@ -1396,7 +1396,7 @@ test "managed host service seeds queued transitions from projected metadata stor
             };
         }
 
-        fn observeStatus(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !@import("../data/mod.zig").SplitTransitionStatus {
+        fn observeStatus(ptr: *anyopaque, _: u64, _: u64, _: u64, _: u64) !@import("../data/domain.zig").SplitTransitionStatus {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.status;
         }

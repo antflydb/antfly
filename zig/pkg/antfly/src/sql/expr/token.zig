@@ -15,7 +15,9 @@
 const std = @import("std");
 
 const ast = @import("../ast.zig");
-const db_mod = @import("../../storage/db/mod.zig");
+const db_mod = struct {
+    pub const types = @import("../../storage/db/types.zig");
+};
 const parser = @import("../parser.zig");
 const token_mod = @import("../token.zig");
 

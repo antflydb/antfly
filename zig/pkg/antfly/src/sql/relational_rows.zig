@@ -14,7 +14,15 @@
 
 const std = @import("std");
 
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = struct {
+    pub const DB = @import("../storage/db/db.zig").DB;
+    pub const document_mapper = @import("../storage/db/document_mapper.zig");
+    pub const relational_collation = @import("../storage/db/relational_collation.zig");
+    pub const relational_store = @import("../storage/db/relational_store.zig");
+    pub const transform = @import("../storage/db/transform.zig");
+    pub const types = @import("../storage/db/types.zig");
+};
+const default_value_runtime = @import("default_value_runtime.zig");
 const expr_text = @import("expr/text.zig");
 const expr_type = @import("expr/type.zig");
 const json_helpers = @import("../common/json_helpers.zig");
@@ -25,6 +33,7 @@ const regex_mod = @import("antfly_regex");
 const runtime_schema = @import("../storage/schema.zig");
 const rowsource = @import("../storage/rowsource/mod.zig");
 const row_spill = @import("row_spill.zig");
+const scalar_subquery_default = @import("scalar_subquery_default.zig");
 const relational_collation = db_mod.relational_collation;
 
 const physical_primary_key_prefix = "\x00antfly-rel-pk:";
@@ -16729,7 +16738,7 @@ fn expressionValueJsonWithExplicitSourceAlloc(
         else
             try std.fmt.allocPrint(alloc, "{d}", .{platform_time.realtimeNs()}),
         .uuid_v4 => blk: {
-            const uuid = try randomUuidV4String();
+            const uuid = try default_value_runtime.uuidV4String();
             break :blk try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(uuid[0..], .{})});
         },
         .coalesce => blk: {
@@ -19003,15 +19012,9 @@ pub fn relationalDefaultValueJsonWithContextAlloc(
     default_context: DefaultValueContext,
 ) ![]u8 {
     return switch (default_value.kind) {
-        .literal => try alloc.dupe(u8, default_value.value_json),
-        .now_ns => try std.fmt.allocPrint(alloc, "{d}", .{platform_time.realtimeNs()}),
-        .current_date_ns => try std.fmt.allocPrint(alloc, "{d}", .{currentUtcDateStartNs()}),
+        .literal, .now_ns, .current_date_ns, .uuid_v4 => try default_value_runtime.relationalDefaultValueJsonAlloc(alloc, default_value),
         .sequence_next => try sequenceDefaultValueJsonAlloc(alloc, default_value.value_json, default_context.sequence_resolver orelse return error.UnsupportedSqlShape),
         .scalar_subquery => try scalarSubqueryDefaultValueJsonAlloc(alloc, default_value.value_json, default_context.scalar_subquery_resolver orelse return error.UnsupportedSqlShape),
-        .uuid_v4 => blk: {
-            const uuid = try randomUuidV4String();
-            break :blk try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(uuid[0..], .{})});
-        },
     };
 }
 
@@ -19038,6 +19041,7 @@ pub fn validateScalarSubqueryDefaultPayloadAlloc(
     alloc: std.mem.Allocator,
     value_json: []const u8,
 ) !void {
+    try scalar_subquery_default.validatePayloadAlloc(alloc, value_json);
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidRowsRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidRowsRequest;
@@ -19931,35 +19935,6 @@ fn validateSequenceDefaultJsonValue(alloc: std.mem.Allocator, value_json: []cons
         .integer, .float => {},
         else => return error.InvalidRowsRequest,
     }
-}
-
-fn currentUtcDateStartNs() u64 {
-    const now_ns = platform_time.realtimeNs();
-    return now_ns - (now_ns % ns_per_day);
-}
-
-fn randomUuidV4String() ![36]u8 {
-    var bytes: [16]u8 = undefined;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    try io_impl.io().randomSecure(&bytes);
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-
-    var out: [36]u8 = undefined;
-    const hex = "0123456789abcdef";
-    var src: usize = 0;
-    var dst: usize = 0;
-    while (src < bytes.len) : (src += 1) {
-        if (dst == 8 or dst == 13 or dst == 18 or dst == 23) {
-            out[dst] = '-';
-            dst += 1;
-        }
-        out[dst] = hex[bytes[src] >> 4];
-        out[dst + 1] = hex[bytes[src] & 0x0f];
-        dst += 2;
-    }
-    return out;
 }
 
 fn schemaHasGeneratedColumns(schema: runtime_schema.TableSchema) bool {

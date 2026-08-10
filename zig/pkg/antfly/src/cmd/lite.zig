@@ -92,6 +92,10 @@ pub fn runFromIterator(init: std.process.Init, argv0: []const u8, args: *std.pro
     return try dispatchSubcommand(init, argv0, subcommand, args);
 }
 
+pub fn runSqlFromIterator(init: std.process.Init, args: *std.process.Args.Iterator) !void {
+    return lite_sql.runFromSqlArgs(init.gpa, init.io, args);
+}
+
 fn dispatchSubcommand(init: std.process.Init, argv0: []const u8, subcommand: []const u8, args: *std.process.Args.Iterator) !void {
     const allocator = init.gpa;
     const io = init.io;

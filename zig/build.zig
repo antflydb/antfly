@@ -39,11 +39,20 @@ const makeLmdbBuildOptions = antfly_storage_build.makeLmdbBuildOptions;
 const makeLmdbEngineModule = antfly_storage_build.makeLmdbEngineModule;
 const makeLmdbModule = antfly_storage_build.makeLmdbModule;
 const makeRootBuildOptions = antfly_storage_build.makeRootBuildOptions;
+const makeFocusedRootBuildOptions = antfly_storage_build.makeFocusedRootBuildOptions;
 const selectTestFilters = antfly_tests_build.selectTestFilters;
 
 const BuildEdition = enum {
     full,
     inference,
+};
+
+const RuntimeLibraryUnit = enum {
+    application,
+    api_kernel,
+    distributed,
+    inference,
+    cli,
 };
 
 fn dependOnAll(step: *std.Build.Step, dependencies: []const *std.Build.Step) void {
@@ -57,6 +66,35 @@ fn expectQuietSuccess(run: *std.Build.Step.Run) *std.Build.Step {
     run.expectExitCode(0);
     run.expectStdErrMatch("");
     return &run.step;
+}
+
+fn addZigImportGraphToolSteps(b: *std.Build) void {
+    const report = b.addSystemCommand(&.{
+        "python3",
+        "tools/analyze_zig_import_graph.py",
+    });
+    report.setCwd(b.path("."));
+    if (b.args) |args| {
+        report.addArgs(args);
+    } else {
+        report.addArg("--json");
+    }
+    report.has_side_effects = true;
+
+    const report_step = b.step("zig-import-graph", "Report Antfly Zig import graph reachability and compiler time-report overlap");
+    report_step.dependOn(&report.step);
+
+    const tests = b.addSystemCommand(&.{
+        "python3",
+        "-m",
+        "unittest",
+        "tools/test_analyze_zig_import_graph.py",
+        "tools/test_patch_zig_0_16_build_runner_maxrss.py",
+    });
+    tests.setCwd(b.path("."));
+
+    const test_step = b.step("zig-import-graph-tool-test", "Run Zig import graph and compiler scheduler tool tests");
+    test_step.dependOn(&tests.step);
 }
 
 const FfmpegPaths = struct {
@@ -182,7 +220,9 @@ fn setStripRecursively(module: *std.Build.Module, visited: *std.AutoHashMap(*std
 }
 
 const AntflyRootImports = struct {
-    build_options: *std.Build.Step.Options,
+    build_options: *std.Build.Module,
+    linked_runtime_options: *std.Build.Module,
+    standalone_runtime_options: *std.Build.Module,
     lmdb_engine: *std.Build.Module,
     raft_engine: *std.Build.Module,
     public_openapi: *std.Build.Module,
@@ -318,7 +358,9 @@ const AntflyRootImports = struct {
     };
 
     pub fn configure(self: @This(), b: *std.Build, mod: *std.Build.Module, include_lmdb_c: bool, link_libc: bool) void {
-        mod.addOptions("build_options", self.build_options);
+        mod.addImport("build_options", self.build_options);
+        mod.addImport("linked_runtime_options", self.linked_runtime_options);
+        mod.addImport("standalone_runtime_options", self.standalone_runtime_options);
         inline for (import_table) |entry| {
             mod.addImport(entry.name, @field(self, entry.field));
         }
@@ -351,6 +393,8 @@ fn addSnowballModule(b: *std.Build, lib_mod: *std.Build.Module) void {
 }
 
 pub fn build(b: *std.Build) void {
+    addZigImportGraphToolSteps(b);
+
     // Keep focused test inventories in pkg/antfly/build/tests.zig. build.zig
     // wires durable suites and modules; it should not grow exact test-title
     // lists as API/storage refactors move coverage closer to implementation.
@@ -382,8 +426,15 @@ pub fn build(b: *std.Build) void {
     const sanitize_thread = b.option(bool, "sanitize-thread", "Enable ThreadSanitizer for the Antfly runtime") orelse false;
     const include_ha_tests_in_aggregates = b.option(bool, "ha-tests", "Include hot-standby HA suites in aggregate test steps") orelse true;
     const edition = b.option(BuildEdition, "edition", "Build edition: full or inference") orelse .full;
+    const linked_runtime_libraries = b.option(bool, "linked-runtime-libraries", "Code-generate Antfly runtime islands separately and link them into the executable") orelse false;
+    const coalesced_application_runtime = b.option(bool, "coalesced-application-runtime", "Code-generate API and distributed runtime entry points in one application unit") orelse false;
+    const production_lsm_only = b.option(bool, "production-lsm-only", "Compile LMDB out of production runtime units") orelse linked_runtime_libraries;
+    const runtime_analysis_sections = b.option(bool, "runtime-analysis-sections", "Emit named function/data sections in every linked runtime unit for ELF duplication analysis") orelse false;
     const antfly_bin_name = b.option([]const u8, "antfly-bin-name", "Installed filename for the top-level Antfly CLI") orelse "antfly";
     antfly_tests_build.selected_test_filter = b.option([]const u8, "test-filter", "Run selectable Zig test steps with a single test-name filter");
+    if (linked_runtime_libraries and edition != .full) {
+        @panic("-Dlinked-runtime-libraries=true requires -Dedition=full");
+    }
     if (antfly_bin_name.len == 0 or std.mem.indexOfAny(u8, antfly_bin_name, "/\\") != null) {
         @panic("-Dantfly-bin-name must be a non-empty filename, not a path");
     }
@@ -437,8 +488,19 @@ pub fn build(b: *std.Build) void {
     });
 
     const lmdb_build_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
-    const build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, false, lite_local_inference_runtime, antfly_version);
-    const standalone_runtime_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, true, lite_local_inference_runtime, antfly_version);
+    const build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, false, lite_local_inference_runtime, !production_lsm_only, antfly_version);
+    const standalone_runtime_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, true, lite_local_inference_runtime, !production_lsm_only, antfly_version);
+    const sql_planner_build_options = makeFocusedRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, false, lite_local_inference_runtime, !production_lsm_only, antfly_version);
+    const linked_runtime_options = b.addOptions();
+    linked_runtime_options.addOption(bool, "enabled", linked_runtime_libraries);
+    const standalone_runtime_options = b.addOptions();
+    standalone_runtime_options.addOption(bool, "linked_inference", false);
+    const linked_standalone_runtime_options = b.addOptions();
+    linked_standalone_runtime_options.addOption(bool, "linked_inference", true);
+    const build_options_mod = build_options.createModule();
+    const linked_runtime_options_mod = linked_runtime_options.createModule();
+    const standalone_runtime_options_mod = standalone_runtime_options.createModule();
+    const linked_standalone_runtime_options_mod = linked_standalone_runtime_options.createModule();
     const lmdb_engine_mod = makeLmdbEngineModule(b, target, optimize, link_libc, lmdb_build_options);
     const lmdb_engine_wasm_mod = makeLmdbEngineModule(b, wasm_target, optimize, false, lmdb_build_options);
     const raft_engine_mod = b.createModule(.{
@@ -861,7 +923,9 @@ pub fn build(b: *std.Build) void {
     synthesizing_mod.addImport("httpx", httpx_mod);
 
     const antfly_imports = AntflyRootImports{
-        .build_options = build_options,
+        .build_options = build_options_mod,
+        .linked_runtime_options = linked_runtime_options_mod,
+        .standalone_runtime_options = standalone_runtime_options_mod,
         .lmdb_engine = lmdb_engine_mod,
         .raft_engine = raft_engine_mod,
         .public_openapi = public_openapi_mod,
@@ -1198,7 +1262,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .strip = strip,
         .lib_mod = lib_mod,
+        .platform_mod = platform_mod,
         .structlog_mod = structlog_mod,
+        .reuse_runtime_storage = linked_runtime_libraries and !coalesced_application_runtime,
     });
 
     const fuzz_tabular_loader_mod = b.createModule(.{
@@ -1410,30 +1476,6 @@ pub fn build(b: *std.Build) void {
     const lite_native_test_step = b.step("lite-native-test", "Run Antfly Lite native tests");
     lite_native_test_step.dependOn(&run_lite_native_tests.step);
 
-    const lite_cli_test_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/lite_cli_test.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    lite_cli_test_mod.addImport("antfly-zig", lib_mod);
-    lite_cli_test_mod.addImport("antfly-client", antfly_client_pkg_mod);
-    lite_cli_test_mod.addImport("httpx", httpx_mod);
-    lite_cli_test_mod.addImport("antfly_vellum", vellum_mod);
-    lite_cli_test_mod.addImport("raft_engine", raft_engine_mod);
-    lite_cli_test_mod.addImport("structlog", structlog_mod);
-    lite_cli_test_mod.addImport("antfly_platform", platform_mod);
-    lite_cli_test_mod.addImport("handlebars", handlebars_mod);
-    lite_cli_test_mod.addOptions("build_options", build_options);
-    const lite_cli_tests = b.addTest(.{
-        .root_module = lite_cli_test_mod,
-        .filters = antfly_tests_build.selectTestFilters(b, &antfly_tests_build.PackageTestFilters.lite_cli),
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lite_cli_tests = b.addRunArtifact(lite_cli_tests);
-
     const recall_test_run = antfly_tests_build.addModuleTestStep(
         b,
         lib_test_mod,
@@ -1560,13 +1602,13 @@ pub fn build(b: *std.Build) void {
 
     const data_runtime_tests = b.addTest(.{
         .root_module = data_runtime_test_mod,
-        .filters = &antfly_tests_build.DataTestFilters.runtime,
+        .filters = selectTestFilters(b, &antfly_tests_build.DataTestFilters.runtime),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
     });
-    const run_data_runtime_tests = b.addRunArtifact(data_runtime_tests);
+    const run_data_runtime_tests = antfly_tests_build.addFilteredTestRunArtifact(b, data_runtime_tests);
 
     const run_lib_data_storage_tests = antfly_tests_build.addModuleTestStep(
         b,
@@ -1776,7 +1818,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     var standalone_runtime_imports = antfly_imports;
-    standalone_runtime_imports.build_options = standalone_runtime_build_options;
+    standalone_runtime_imports.build_options = standalone_runtime_build_options.createModule();
     standalone_runtime_imports.configure(b, standalone_runtime_test_mod, true, true);
     const usermgr_storage_standalone_runtime_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
@@ -1788,7 +1830,7 @@ pub fn build(b: *std.Build) void {
     standalone_runtime_test_mod.addImport("usermgr_storage", usermgr_storage_standalone_runtime_test_mod);
     const standalone_tests = b.addTest(.{
         .root_module = standalone_runtime_test_mod,
-        .filters = &antfly_tests_build.StandaloneRuntimeTestFilters.focused,
+        .filters = selectTestFilters(b, &antfly_tests_build.StandaloneRuntimeTestFilters.focused),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -1798,9 +1840,26 @@ pub fn build(b: *std.Build) void {
     const lib_standalone_runtime_test_step = b.step("lib-standalone-runtime-test", "Run focused standalone runtime tests");
     lib_standalone_runtime_test_step.dependOn(&run_lib_standalone_runtime_tests.step);
 
+    const standalone_inference_host_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/standalone_inference_host_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, standalone_inference_host_test_mod, false, true);
+    const standalone_inference_host_tests = b.addTest(.{
+        .root_module = standalone_inference_host_test_mod,
+        .filters = selectTestFilters(b, &antfly_tests_build.StandaloneRuntimeTestFilters.inference_host),
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_standalone_inference_host_tests = antfly_tests_build.addFilteredTestRunArtifact(b, standalone_inference_host_tests);
+
     const runtime_test_step = b.step("runtime-test", "Run focused data and standalone runtime tests");
     runtime_test_step.dependOn(&run_data_runtime_tests.step);
     runtime_test_step.dependOn(&run_lib_standalone_runtime_tests.step);
+    runtime_test_step.dependOn(&run_standalone_inference_host_tests.step);
 
     const raft_test_step = b.step("raft-test", "Run raft unit and transport tests");
     raft_test_step.dependOn(&run_raft_unit_tests.step);
@@ -1828,7 +1887,6 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_antfly_embedded_pkg_tests.step);
     unit_test_step.dependOn(&capi_steps.run_capi_tests.step);
     unit_test_step.dependOn(&run_lite_native_tests.step);
-    unit_test_step.dependOn(&run_lite_cli_tests.step);
     unit_test_step.dependOn(&main_capture_tests.cmd.step);
     unit_test_step.dependOn(&lib_db_test.run.step);
     unit_test_step.dependOn(&lib_db_module_tests.result_shape.step);
@@ -1978,6 +2036,24 @@ pub fn build(b: *std.Build) void {
     const db_storage_tests = antfly_tests_build.addDBStorageTestSteps(b, db_test_mod);
     sim_test_step.dependOn(&db_storage_tests.sim.step);
 
+    const sql_planner_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/sql_planner_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    var sql_planner_imports = antfly_imports;
+    sql_planner_imports.build_options = sql_planner_build_options.createModule();
+    sql_planner_imports.configure(b, sql_planner_test_mod, false, link_libc);
+    sql_planner_test_mod.addImport("antfly_transcribing", transcribing_db_test_stub_mod);
+    const sql_planner_tests = antfly_tests_build.addModuleTestStep(
+        b,
+        sql_planner_test_mod,
+        "sql-planner-test",
+        "Run focused SQL parser, binder, and logical planner tests",
+        .{ .filters = &antfly_tests_build.SQLPlannerTestFilters.focused, .simple_runner = true },
+    );
+    sql_planner_tests.tests.stack_size = 64 * 1024 * 1024;
+
     const release_blocker_regression_tests = b.addTest(.{
         .root_module = db_test_mod,
         .filters = antfly_tests_build.compileFiltersWithAnchors(
@@ -2120,15 +2196,18 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .sanitize_thread = sanitize_thread,
         });
-        mod.addImport("antfly-zig", lib_mod);
-        mod.addImport("antfly-client", antfly_client_pkg_mod);
-        mod.addImport("httpx", httpx_mod);
-        mod.addImport("antfly_vellum", vellum_mod);
-        mod.addImport("raft_engine", raft_engine_mod);
+        if (!linked_runtime_libraries) {
+            mod.addImport("antfly-zig", lib_mod);
+            mod.addImport("antfly-client", antfly_client_pkg_mod);
+            mod.addImport("httpx", httpx_mod);
+            mod.addImport("antfly_vellum", vellum_mod);
+            mod.addImport("raft_engine", raft_engine_mod);
+            mod.addImport("handlebars", handlebars_mod);
+        }
         mod.addImport("structlog", structlog_mod);
         mod.addImport("antfly_platform", platform_mod);
-        mod.addImport("handlebars", handlebars_mod);
-        mod.addOptions("build_options", build_options);
+        mod.addImport("build_options", build_options_mod);
+        mod.addImport("linked_runtime_options", linked_runtime_options_mod);
         break :blk mod;
     } else blk: {
         const inference_cli_mod = b.createModule(.{
@@ -2150,7 +2229,8 @@ pub fn build(b: *std.Build) void {
         mod.addImport("inference_cli", inference_cli_mod);
         mod.addImport("antfly_platform", platform_mod);
         mod.addImport("structlog", structlog_mod);
-        mod.addOptions("build_options", build_options);
+        mod.addImport("build_options", build_options_mod);
+        mod.addImport("linked_runtime_options", linked_runtime_options_mod);
         break :blk mod;
     };
 
@@ -2163,6 +2243,75 @@ pub fn build(b: *std.Build) void {
         .name = "antfly",
         .root_module = antfly_main_mod,
     });
+    if (linked_runtime_libraries) {
+        const runtime_units: []const RuntimeLibraryUnit = if (coalesced_application_runtime)
+            &.{ .application, .inference, .cli }
+        else
+            &.{ .api_kernel, .distributed, .inference, .cli };
+        for (runtime_units) |unit| {
+            const unit_options = b.addOptions();
+            unit_options.addOption(RuntimeLibraryUnit, "unit", unit);
+
+            const role_mod = b.createModule(.{
+                .root_source_file = b.path(if (unit == .cli)
+                    "pkg/antfly/src/cli_root.zig"
+                else
+                    "pkg/antfly/src/runtime_artifact_lib.zig"),
+                .target = target,
+                .optimize = optimize,
+                .sanitize_thread = sanitize_thread,
+                .pic = true,
+            });
+            var role_imports = antfly_imports;
+            role_imports.standalone_runtime_options = linked_standalone_runtime_options_mod;
+            role_imports.configure(b, role_mod, false, link_libc);
+            role_mod.addImport("antfly-zig", role_mod);
+            role_mod.addImport("antfly-client", antfly_client_pkg_mod);
+            role_mod.addOptions("runtime_library_options", unit_options);
+            const role_usermgr_storage_mod = b.createModule(.{
+                .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
+                .target = target,
+                .optimize = optimize,
+            });
+            role_usermgr_storage_mod.addImport("antfly_root", role_mod);
+            role_usermgr_storage_mod.addImport("antfly_platform", platform_mod);
+            role_mod.addImport("usermgr_storage", role_usermgr_storage_mod);
+
+            if (strip) {
+                var role_visited = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
+                defer role_visited.deinit();
+                setStripRecursively(role_mod, &role_visited);
+            }
+
+            const role_artifact = b.addLibrary(.{
+                .name = switch (unit) {
+                    .application => "antfly-runtime-application",
+                    .api_kernel => "antfly-runtime-api_kernel",
+                    .distributed => "antfly-runtime-distributed",
+                    .inference => "antfly-runtime-inference",
+                    .cli => "antfly-runtime-cli",
+                },
+                .root_module = role_mod,
+                .linkage = .static,
+                .max_rss = switch (unit) {
+                    .application => 18 * 1024 * 1024 * 1024,
+                    .api_kernel => 6 * 1024 * 1024 * 1024,
+                    .distributed => 10 * 1024 * 1024 * 1024,
+                    .inference => 6 * 1024 * 1024 * 1024,
+                    .cli => 2 * 1024 * 1024 * 1024,
+                },
+            });
+            if (unit == .application or unit == .distributed or runtime_analysis_sections) {
+                role_artifact.link_function_sections = true;
+                role_artifact.link_data_sections = true;
+            }
+            if (unit == .distributed) {
+                capi_steps.capi_lib.root_module.linkLibrary(role_artifact);
+                capi_steps.lite_capi_lib.root_module.linkLibrary(role_artifact);
+            }
+            antfly_main.root_module.linkLibrary(role_artifact);
+        }
+    }
     const graph_metric_maintenance_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/cmd_graph_metric_maintenance_test_root.zig"),
         .target = target,
@@ -2198,7 +2347,7 @@ pub fn build(b: *std.Build) void {
     const run_graph_metric_operations_command_tests = b.addRunArtifact(graph_metric_operations_command_tests);
     const cli_test_step = b.step("cli-test", "Run Antfly command-line tests");
     cli_test_step.dependOn(&run_antfly_main_tests.step);
-    cli_test_step.dependOn(&run_lite_cli_tests.step);
+    cli_test_step.dependOn(&main_capture_tests.lite_cmd.step);
     cli_test_step.dependOn(&run_graph_metric_operations_command_tests.step);
     unit_test_step.dependOn(&run_graph_metric_operations_command_tests.step);
 
@@ -2253,7 +2402,6 @@ pub fn build(b: *std.Build) void {
         .lite_local_inference_runtime = lite_local_inference_runtime,
         .capi_steps = capi_steps,
         .run_antfly_main_tests = run_antfly_main_tests,
-        .run_lite_cli_tests = run_lite_cli_tests,
         .run_lite_cmd_tests = main_capture_tests.lite_cmd,
         .run_lite_native_tests = run_lite_native_tests,
         .run_antfly_embedded_pkg_tests = run_antfly_embedded_pkg_tests,

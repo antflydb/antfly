@@ -20,7 +20,7 @@ const http_common = @import("../raft/transport/http_common.zig");
 const http_route_helpers = @import("http_route_helpers.zig");
 const metadata_api = @import("../metadata/api.zig");
 const query_api = @import("query.zig");
-const raft_mod = @import("../raft/mod.zig");
+const raft_mod = @import("../raft/domain.zig");
 const routes = @import("http_routes.zig");
 const table_reads = @import("table_reads.zig");
 

@@ -23,12 +23,12 @@ const scraping = @import("antfly_scraping");
 const common_secrets = @import("../../common/secrets.zig");
 const fs_paths = @import("../../common/fs_paths.zig");
 const metadata_admin = @import("../../metadata/admin.zig");
-const metadata_mod = @import("../../metadata/mod.zig");
+const metadata_mod = @import("../../metadata/domain.zig");
 const metadata_api = @import("../../metadata/api.zig");
 const metadata_table_manager = @import("../../metadata/table_manager.zig");
 const metadata_table_provisioner = @import("../../metadata/table_provisioner.zig");
 const metadata_transition_state = @import("../../metadata/transition_state.zig");
-const raft_mod = @import("../../raft/mod.zig");
+const raft_mod = @import("../../raft/domain.zig");
 const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
 const backup_restore = @import("../../raft/storage/backup_restore.zig");
 const raft_reconciler = @import("../../raft/reconciler.zig");
@@ -989,6 +989,7 @@ pub const ProvisionedTableWriteSource = struct {
     dirty_write_tables_mutex: std.atomic.Mutex = .unlocked,
     dirty_write_table_count: std.atomic.Value(u32) = .init(0),
     dirty_write_tables: std.StringHashMapUnmanaged(void) = .empty,
+    graph_metric_maintenance_cursor: usize = 0,
     startup_catch_up_active: std.atomic.Value(bool) = .init(false),
     startup_catch_up_backoff_mutex: std.atomic.Mutex = .unlocked,
     startup_catch_up_backoff_epoch: std.atomic.Value(u64) = .init(1),
@@ -4705,6 +4706,68 @@ pub const ProvisionedTableWriteSource = struct {
         progressed: bool = false,
         group_id: ?u64 = null,
     };
+
+    pub const GraphMetricMaintenanceRoundResult = struct {
+        progressed: bool = false,
+        group_id: ?u64 = null,
+    };
+
+    fn graphMetricMaintenanceGroupOwned(self: *const ProvisionedTableWriteSource, group_id: u64) bool {
+        const leadership = self.promotion_leadership_source orelse return true;
+        return leadership.isLocalLeader(group_id);
+    }
+
+    /// Runs one bounded graph-metric scheduler quantum against a resident
+    /// writable shard. The data-node control loop owns cadence and HA gating;
+    /// this layer keeps cache lifetime and Raft leadership checks adjacent to
+    /// the DB lease.
+    pub fn runGraphMetricMaintenanceRoundBestEffort(
+        self: *ProvisionedTableWriteSource,
+    ) !GraphMetricMaintenanceRoundResult {
+        if (!self.local_db_mutex.tryLock()) return .{};
+        var leased = blk: {
+            defer self.local_db_mutex.unlock();
+            const cache = self.write_cache orelse return .{};
+            if (cache.entries.items.len == 0) return .{};
+
+            const start = self.graph_metric_maintenance_cursor % cache.entries.items.len;
+            var offset: usize = 0;
+            while (offset < cache.entries.items.len) : (offset += 1) {
+                const index = (start + offset) % cache.entries.items.len;
+                const entry = cache.entries.items[index];
+                if (entry.lsm_root_generation != self.visibleRootGeneration(entry.group_id)) continue;
+                if (entry.bulk_ingest_session_open or entry.auto_bulk_ingest_session_open) continue;
+                if (!self.graphMetricMaintenanceGroupOwned(entry.group_id)) continue;
+                const candidate = cache.snapshotLeaseLocked(
+                    entry.group_id,
+                    entry.lsm_root_generation,
+                    entry.table_name,
+                ) orelse continue;
+                self.graph_metric_maintenance_cursor = (index + 1) % cache.entries.items.len;
+                break :blk candidate;
+            }
+            return .{};
+        };
+        defer {
+            const release_alloc = if (leased.cache) |cache| cache.alloc else std.heap.page_allocator;
+            leased.deinit(release_alloc);
+        }
+
+        const entry = leased.entry orelse return .{};
+        if (!self.graphMetricMaintenanceGroupOwned(entry.group_id)) return .{};
+        const result = try leased.db.runGraphMetricPlannedMaintenanceForIdle(.{
+            .worker_id = "data-node",
+            .max_rounds = 1,
+            .max_metrics_per_round = 1,
+            .max_pages_per_round = 1,
+        });
+        const progressed = result.durableProgressed();
+        if (progressed) self.notifyLocalChange(entry.table_name, .runtime_status);
+        return .{
+            .progressed = progressed,
+            .group_id = entry.group_id,
+        };
+    }
 
     pub fn runLsmMaintenanceRound(self: *ProvisionedTableWriteSource) !bool {
         return (try self.runLsmMaintenanceRoundDetailed()).progressed;
@@ -32723,6 +32786,7 @@ test "provisioned table write source maintenance probes are best effort when loc
     try std.testing.expectEqual(@as(u64, 0), source.lsmMaintenanceScoreBestEffort());
     try std.testing.expect(source.hasActiveBulkIngestSession());
     try std.testing.expect(!try source.runLsmMaintenanceRoundBestEffort());
+    try std.testing.expect(!(try source.runGraphMetricMaintenanceRoundBestEffort()).progressed);
 }
 
 test "provisioned native backup restore repeats through shared read and write owners" {

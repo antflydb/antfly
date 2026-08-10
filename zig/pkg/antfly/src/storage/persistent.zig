@@ -38,11 +38,13 @@
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
 const backend_adapter = @import("backend_adapter.zig");
 const backend_erased = @import("backend_erased.zig");
 const backend_types = @import("backend_types.zig");
-const supports_main_lmdb = builtin.os.tag != .freestanding;
+const supports_main_lmdb = builtin.is_test or
+    (builtin.os.tag != .freestanding and build_options.lmdb_enabled);
 const lmdb = if (supports_main_lmdb) @import("lmdb.zig") else struct {
     pub const CommitBackend = enum {
         sync,
@@ -2276,7 +2278,14 @@ pub const PersistentIndex = struct {
             errdefer sink_impl.deinit();
             var sink = sink_impl.sink();
             try build_fn(ctx, &sink);
-            data = .fromOwnedHeap(try sink_impl.finishOwned());
+            const owned = try sink_impl.finishOwned();
+            if (self.segment_files) |*store| {
+                defer self.alloc.free(owned);
+                data = try store.publish(seg_id, owned);
+                delete_file_on_error = true;
+            } else {
+                data = .fromOwnedHeap(owned);
+            }
         }
 
         var key_range = try extractSegmentKeyRange(staging_alloc, data.?.bytes());

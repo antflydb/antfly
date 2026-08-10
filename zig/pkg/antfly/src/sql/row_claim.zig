@@ -13,7 +13,9 @@
 // limitations.
 
 const ast = @import("ast.zig");
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = struct {
+    pub const types = @import("../storage/db/types.zig");
+};
 const generated_parser = @import("generated_parser.zig");
 const grammar = @import("grammar.zig");
 const std = @import("std");

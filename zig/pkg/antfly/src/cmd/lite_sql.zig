@@ -71,22 +71,42 @@ pub const Session = struct {
     }
 };
 
+const RunOptions = struct {
+    path: []const u8,
+    command: ?[]const u8 = null,
+    file_path: ?[]const u8 = null,
+    catalog: cli.CatalogFlags,
+};
+
 pub fn runFromArgs(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
     const path = args.next() orelse cli.fatal("database path is required", .{});
-    try requireAflitePath(path);
+    return runWithOptions(allocator, io, try parseRunOptions(args, path, false));
+}
+
+pub fn runFromSqlArgs(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
+    return runWithOptions(allocator, io, try parseRunOptions(args, null, true));
+}
+
+fn parseRunOptions(args: *std.process.Args.Iterator, initial_path: ?[]const u8, sql_command_form: bool) !RunOptions {
+    var path = initial_path;
+    if (path) |value| try requireAflitePath(value);
 
     var command: ?[]const u8 = null;
     var file_path: ?[]const u8 = null;
     var catalog = cli.CatalogFlags.defaultsFromEnv();
     while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--command")) {
+        if (sql_command_form and std.mem.eql(u8, arg, "--lite")) {
+            if (path != null) cli.fatal("--lite may only be specified once", .{});
+            path = args.next() orelse cli.fatal("--lite requires a .aflite path", .{});
+            try requireAflitePath(path.?);
+        } else if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--command")) {
             command = args.next() orelse cli.fatal("{s} requires a SQL statement", .{arg});
         } else if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--file")) {
             file_path = args.next() orelse cli.fatal("{s} requires a path", .{arg});
         } else if (cli.parseCatalogFlag(&catalog, arg, args)) {
             continue;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            printUsage();
+            if (sql_command_form) printSqlUsage() else printUsage();
             std.process.exit(0);
         } else {
             cli.fatal("unknown lite sql option: {s}", .{arg});
@@ -97,24 +117,33 @@ pub fn runFromArgs(allocator: Allocator, io: std.Io, args: *std.process.Args.Ite
         cli.fatal("use only one of -c/--command or -f/--file", .{});
     }
 
-    var session = try Session.init(allocator, catalog);
+    return .{
+        .path = path orelse cli.fatal("--lite requires a .aflite path", .{}),
+        .command = command,
+        .file_path = file_path,
+        .catalog = catalog,
+    };
+}
+
+fn runWithOptions(allocator: Allocator, io: std.Io, options: RunOptions) !void {
+    var session = try Session.init(allocator, options.catalog);
     defer session.deinit(allocator);
 
-    if (command) |sql| {
-        if (!try executeSqlText(allocator, io, path, &session, sql, true)) return error.SqlCommandFailed;
+    if (options.command) |sql| {
+        if (!try executeSqlText(allocator, io, options.path, &session, sql, true)) return error.SqlCommandFailed;
         return;
     }
 
-    if (file_path) |sql_path| {
+    if (options.file_path) |sql_path| {
         const sql = cli.readFileAlloc(io, allocator, sql_path, max_sql_file_bytes) catch |err| {
             cli.fatal("reading SQL file {s}: {}", .{ sql_path, err });
         };
         defer allocator.free(sql);
-        if (!try executeSqlText(allocator, io, path, &session, sql, true)) return error.SqlCommandFailed;
+        if (!try executeSqlText(allocator, io, options.path, &session, sql, true)) return error.SqlCommandFailed;
         return;
     }
 
-    return repl(allocator, io, path, &session);
+    return repl(allocator, io, options.path, &session);
 }
 
 pub fn executeSqlText(
@@ -1043,6 +1072,27 @@ fn printUsage() void {
         \\a semicolon. Use \q or .quit to exit.
         \\
     , .{});
+}
+
+fn printSqlUsage() void {
+    std.debug.print(
+        \\usage: antfly sql --lite <db.aflite> [-c <sql> | -f <path>] [--database <name>] [--namespace <name>]
+        \\
+        \\Without -c or -f, starts a small psql-style REPL. End statements with
+        \\a semicolon. Use \q or .quit to exit.
+        \\
+    , .{});
+}
+
+test "sql command form extracts lite path without consuming options early" {
+    var argv = [_][*:0]const u8{ "--database", "analytics", "--lite", "local.aflite", "-c", "SELECT 1;" };
+    var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+
+    const options = try parseRunOptions(&args, null, true);
+
+    try std.testing.expectEqualStrings("local.aflite", options.path);
+    try std.testing.expectEqualStrings("SELECT 1;", options.command.?);
+    try std.testing.expectEqualStrings("analytics", options.catalog.database.?);
 }
 
 test "lite sql statement splitter ignores quoted semicolons" {

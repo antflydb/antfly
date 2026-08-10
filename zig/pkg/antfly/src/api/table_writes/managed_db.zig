@@ -17,7 +17,7 @@ const scraping = @import("antfly_scraping");
 
 const common_secrets = @import("../../common/secrets.zig");
 const metadata_api = @import("../../metadata/api.zig");
-const metadata_mod = @import("../../metadata/mod.zig");
+const metadata_mod = @import("../../metadata/domain.zig");
 const metadata_table_provisioner = @import("../../metadata/table_provisioner.zig");
 const asset_producer_mod = @import("../../storage/db/enrichment/asset_producer.zig");
 const document_extraction_mod = @import("../../storage/db/enrichment/document_extraction.zig");

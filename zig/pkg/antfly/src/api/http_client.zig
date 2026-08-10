@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const cluster = @import("cluster.zig");
-const metadata_mod = @import("../metadata/mod.zig");
+const metadata_mod = @import("../metadata/domain.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
 const db_api = @import("../storage/db/mod.zig");
 const db_mod = @import("../storage/db/mod.zig");
@@ -4171,7 +4171,7 @@ test "api http client round-trips public transaction commit route" {
     const metadata_api = @import("../metadata/api.zig");
     const table_reads = @import("table_reads.zig");
     const table_writes = @import("table_writes.zig");
-    const raft_mod = @import("../raft/mod.zig");
+    const raft_mod = @import("../raft/domain.zig");
 
     const alloc = std.testing.allocator;
     const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-http-client-txn");
@@ -4270,7 +4270,7 @@ test "api http client round-trips long-lived public transaction session routes" 
     const metadata_api = @import("../metadata/api.zig");
     const table_reads = @import("table_reads.zig");
     const table_writes = @import("table_writes.zig");
-    const raft_mod = @import("../raft/mod.zig");
+    const raft_mod = @import("../raft/domain.zig");
 
     const alloc = std.testing.allocator;
     const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-http-client-session-txn");

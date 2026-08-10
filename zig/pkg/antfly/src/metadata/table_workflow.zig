@@ -359,11 +359,11 @@ fn validateSplitIntentDocIdentity(current: metadata_reconciler.CurrentMetadataSt
         if (!currentHasDocIdentityTelemetry(current)) return;
         return error.DocIdentityNamespaceMismatch;
     };
-    if (!runtimeDocIdentityHasFacts(source.doc_identity)) return;
     if (source.doc_identity_reassignment_active) return error.DocIdentityNamespaceMismatch;
     if (source.doc_identity_namespace_conflict) return error.DocIdentityNamespaceMismatch;
     if (source.doc_identity.rebuild_required) return error.DocIdentityNamespaceMismatch;
     if (source.doc_identity.ordinal_capacity_exhausted) return error.DocIdentityNamespaceMismatch;
+    if (!runtimeDocIdentityHasFacts(source.doc_identity)) return;
 }
 
 fn validateMergeIntentDocIdentity(current: metadata_reconciler.CurrentMetadataState, intent: table_manager.MergeIntent) !void {
@@ -603,10 +603,17 @@ test "table workflow doc identity lifecycle handles mixed-version transition sta
     }, true);
     try std.testing.expect(normalized.allow_doc_identity_reassignment);
 
-    try std.testing.expectError(error.DocIdentityNamespaceMismatch, validateSplitIntentDocIdentity(.{ .merged_group_statuses = &.{} }, .{
+    try validateSplitIntentDocIdentity(.{ .merged_group_statuses = &.{} }, .{
         .transition_id = 12,
         .table_id = 10,
         .source_group_id = 101,
+        .destination_group_id = 103,
+        .split_key = "doc:m",
+    });
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, validateSplitIntentDocIdentity(.{ .merged_group_statuses = &.{old_left} }, .{
+        .transition_id = 12,
+        .table_id = 10,
+        .source_group_id = 102,
         .destination_group_id = 103,
         .split_key = "doc:m",
     }));

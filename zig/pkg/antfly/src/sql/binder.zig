@@ -18,7 +18,9 @@ const metadata_api = @import("../metadata/api.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = struct {
+    pub const types = @import("../storage/db/types.zig");
+};
 const ddl_plan = @import("ddl_plan.zig");
 const runtime_schema = @import("../storage/schema.zig");
 const schema_api = @import("../schema/mod.zig");

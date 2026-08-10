@@ -16,10 +16,10 @@ const std = @import("std");
 
 const graph_query_mod = @import("../../graph/query.zig");
 const metadata_api = @import("../../metadata/api.zig");
-const metadata_mod = @import("../../metadata/mod.zig");
+const metadata_mod = @import("../../metadata/domain.zig");
 const metadata_table_manager = @import("../../metadata/table_manager.zig");
 const metadata_transition_state = @import("../../metadata/transition_state.zig");
-const raft_mod = @import("../../raft/mod.zig");
+const raft_mod = @import("../../raft/domain.zig");
 const raft_reconciler = @import("../../raft/reconciler.zig");
 const db_mod = @import("../../storage/db/mod.zig");
 const platform_time = @import("antfly_platform").time;

@@ -2356,8 +2356,7 @@ pub fn jsonValuesNotDistinct(actual: std.json.Value, expected: std.json.Value) ?
 }
 
 pub fn jsonValuesNotDistinctWithCollation(actual: std.json.Value, expected: std.json.Value, collation: ?[]const u8) ?bool {
-    const comparison = compareJsonScalarsWithCollation(actual, expected, collation) orelse return null;
-    return comparison == .eq;
+    return relational_collation.jsonValuesNotDistinctWithCollation(actual, expected, collation);
 }
 
 pub fn compareJsonScalars(actual: std.json.Value, expected: std.json.Value) ?ScalarComparison {

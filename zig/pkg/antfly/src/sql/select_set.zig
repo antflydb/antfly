@@ -15,13 +15,15 @@
 const std = @import("std");
 
 const ast = @import("ast.zig");
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = struct {
+    pub const types = @import("../storage/db/types.zig");
+};
 const expr_disjoint = @import("expr/disjoint.zig");
 const expr_equal = @import("expr/equal.zig");
 const expr_limits = @import("expr/limits.zig");
 const expr_type = @import("expr/type.zig");
 const plan_mod = @import("plan.zig");
-const relational_rows_executor = @import("../storage/db/relational_rows.zig");
+const relational_collation = @import("../storage/db/relational_collation.zig");
 const runtime_schema = @import("../storage/schema.zig");
 
 const cloneExpressionConditionAlloc = plan_mod.cloneExpressionConditionAlloc;
@@ -458,7 +460,7 @@ fn inPredicateValuesContainJsonLiteralProof(
 
     for (parsed.value.array.items) |value| {
         if (!jsonValueIsSafeDisjointProofScalar(value)) return .unknown;
-        const not_distinct = relational_rows_executor.jsonValuesNotDistinctWithCollation(value, wanted.value, predicate.collation) orelse return .unknown;
+        const not_distinct = relational_collation.jsonValuesNotDistinctWithCollation(value, wanted.value, predicate.collation) orelse return .unknown;
         if (not_distinct) return .contains;
     }
     return .does_not_contain;

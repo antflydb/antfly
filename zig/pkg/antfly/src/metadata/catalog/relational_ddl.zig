@@ -17,6 +17,7 @@ const std = @import("std");
 const catalog_jobs = @import("jobs.zig");
 const catalog_resources = @import("resources.zig");
 const extension_domain = @import("../../extensions/mod.zig");
+const extension_sql_adapter = @import("../../extensions/sql_adapter.zig");
 const metadata_api = @import("snapshot.zig");
 const metadata_table_manager = @import("../table_manager.zig");
 const metadata_table_workflow = @import("../table_workflow.zig");
@@ -182,7 +183,7 @@ fn applyExtensionLogicalPlanWithSessionAlloc(
     session: catalog_resources.SqlCatalogSession,
 ) !table_ddl.AppliedRelationalSqlDdlRecord {
     _ = session;
-    return try extension_domain.sql_adapter.executeRelationalSqlExtensionPlanOnService(svc, alloc, plan);
+    return try extension_sql_adapter.executeRelationalSqlExtensionPlanOnService(svc, alloc, plan);
 }
 
 pub fn applyAuthorizationLogicalPlanWithSessionAlloc(

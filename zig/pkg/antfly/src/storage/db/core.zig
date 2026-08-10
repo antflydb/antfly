@@ -1041,7 +1041,7 @@ pub const DBCore = struct {
     }
 
     pub fn splitRightStoreToDir(self: *DBCore, split_lower: []const u8, dest_dir: []const u8) !bool {
-        return self.store.splitRightToDir(split_lower, dest_dir) catch |err| switch (err) {
+        return self.store.splitRightToDir(split_lower, dest_dir) catch |err| switch (@as(anyerror, err)) {
             error.Incompatible => false,
             error.Unsupported => false,
             else => return err,
@@ -1049,7 +1049,7 @@ pub const DBCore = struct {
     }
 
     pub fn rewriteLeftStoreInPlace(self: *DBCore, split_lower: []const u8) !bool {
-        return self.store.rewriteLeftInPlace(split_lower) catch |err| switch (err) {
+        return self.store.rewriteLeftInPlace(split_lower) catch |err| switch (@as(anyerror, err)) {
             error.Incompatible => false,
             error.Unsupported => false,
             else => return err,

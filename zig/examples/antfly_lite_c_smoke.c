@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 static antfly_slice slice_from_cstr(const char *value) {
     antfly_slice slice;
@@ -58,12 +59,31 @@ static int fail_with_buffer(const char *message, antfly_buffer *buffer) {
     return 1;
 }
 
+static int smoke_path(char *out, size_t capacity, const char *label) {
+    const int written = snprintf(
+        out,
+        capacity,
+        "/tmp/antfly-lite-c-smoke-%ld-%s.aflite",
+        (long)getpid(),
+        label
+    );
+    return written < 0 || (size_t)written >= capacity;
+}
+
 int main(void) {
-    const char *path = "/tmp/antfly-lite-c-smoke.aflite";
-    const char *restored_path = "/tmp/antfly-lite-c-smoke-restored.aflite";
-    const char *snapshot_path = "/tmp/antfly-lite-c-smoke-snapshot.aflite";
-    const char *missing_path = "/tmp/antfly-lite-c-smoke-missing.aflite";
-    const char *bad_path = "/tmp/antfly-lite-c-smoke-bad.aflite";
+    char path[160];
+    char restored_path[160];
+    char snapshot_path[160];
+    char missing_path[160];
+    char bad_path[160];
+    if (smoke_path(path, sizeof(path), "primary") ||
+        smoke_path(restored_path, sizeof(restored_path), "restored") ||
+        smoke_path(snapshot_path, sizeof(snapshot_path), "snapshot") ||
+        smoke_path(missing_path, sizeof(missing_path), "missing") ||
+        smoke_path(bad_path, sizeof(bad_path), "bad")) {
+        fprintf(stderr, "failed to construct C API smoke-test paths\n");
+        return 1;
+    }
     (void)remove(path);
     (void)remove(restored_path);
     (void)remove(snapshot_path);

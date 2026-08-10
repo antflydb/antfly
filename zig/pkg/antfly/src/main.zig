@@ -14,12 +14,12 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
-const antfly = @import("antfly-zig");
 const structlog = @import("structlog");
-const cmd = @import("cmd/mod.zig");
-const httpx = @import("httpx");
-const antfly_client = @import("antfly-client");
 const platform = @import("antfly_platform");
+const build_options = @import("build_options");
+const linked_runtime_options = @import("linked_runtime_options");
+const cmd = if (linked_runtime_options.enabled) struct {} else @import("cmd/mod.zig");
+const httpx = if (linked_runtime_options.enabled) struct {} else @import("httpx");
 
 const antfly_cloud_binary = "antfly-cloud";
 
@@ -29,7 +29,8 @@ pub const std_options: std.Options = .{
 
 pub fn main(init: std.process.Init) void {
     mainImpl(init) catch |err| {
-        const message = switch (err) {
+        const any_err: anyerror = err;
+        const message = switch (any_err) {
             error.FileNotFound => "required file was not found; check the configured path",
             error.AddressInUse => "listen address is already in use",
             error.InvalidCharacter, error.InvalidArguments => "invalid command-line value; run with --help",
@@ -62,14 +63,25 @@ fn mainImpl(init: std.process.Init) !void {
     }
 
     // Server-side subcommands
-    if (std.mem.eql(u8, subcommand, "data")) return try cmd.data.runFromIterator(runtimeInit(init), argv0, &args);
-    if (std.mem.eql(u8, subcommand, "graph-metric-maintenance")) return try cmd.graph_metric_maintenance.runFromIterator(runtimeInit(init), argv0, &args);
-    if (std.mem.eql(u8, subcommand, "metadata")) return try cmd.metadata.runFromIterator(runtimeInit(init), argv0, &args);
-    if (std.mem.eql(u8, subcommand, "standalone")) return try cmd.standalone.runFromIterator(runtimeInit(init), argv0, &args);
-    if (std.mem.eql(u8, subcommand, "inference")) return try cmd.inference.runFromIterator(runtimeInit(init), argv0, &args);
-    if (std.mem.eql(u8, subcommand, "serverless")) return try cmd.serverless.runFromIterator(runtimeInit(init), argv0, &args);
-    if (std.mem.eql(u8, subcommand, "lite")) return try cmd.lite.runFromIterator(runtimeInit(init), argv0, &args);
-    if (std.mem.eql(u8, subcommand, "ha")) return try cmd.ha.runFromIterator(runtimeInit(init), argv0, &args);
+    if (comptime linked_runtime_options.enabled) {
+        if (std.mem.eql(u8, subcommand, "data")) return runLinkedRuntime(.data, subcommand, init, &args);
+        if (std.mem.eql(u8, subcommand, "__graph-metric-maintenance")) return runLinkedRuntime(.graph_metric_maintenance, subcommand, init, &args);
+        if (std.mem.eql(u8, subcommand, "metadata")) return runLinkedRuntime(.metadata, subcommand, init, &args);
+        if (std.mem.eql(u8, subcommand, "standalone")) return runLinkedRuntime(.standalone, subcommand, init, &args);
+        if (std.mem.eql(u8, subcommand, "inference")) return runLinkedRuntime(.inference, subcommand, init, &args);
+        if (std.mem.eql(u8, subcommand, "serverless")) return runLinkedRuntime(.serverless, subcommand, init, &args);
+        if (std.mem.eql(u8, subcommand, "lite")) return runLinkedRuntime(.standalone, subcommand, init, &args);
+        if (std.mem.eql(u8, subcommand, "ha")) return runLinkedRuntime(.ha, subcommand, init, &args);
+    } else {
+        if (std.mem.eql(u8, subcommand, "data")) return try cmd.data.runFromIterator(runtimeInit(init), argv0, &args);
+        if (std.mem.eql(u8, subcommand, "__graph-metric-maintenance")) return try cmd.graph_metric_maintenance.runFromIterator(runtimeInit(init), argv0, &args);
+        if (std.mem.eql(u8, subcommand, "metadata")) return try cmd.metadata.runFromIterator(runtimeInit(init), argv0, &args);
+        if (std.mem.eql(u8, subcommand, "standalone")) return try cmd.standalone.runFromIterator(runtimeInit(init), argv0, &args);
+        if (std.mem.eql(u8, subcommand, "inference")) return try cmd.inference.runFromIterator(runtimeInit(init), argv0, &args);
+        if (std.mem.eql(u8, subcommand, "serverless")) return try cmd.serverless.runFromIterator(runtimeInit(init), argv0, &args);
+        if (std.mem.eql(u8, subcommand, "lite")) return try cmd.lite.runFromIterator(runtimeInit(init), argv0, &args);
+        if (std.mem.eql(u8, subcommand, "ha")) return try cmd.ha.runFromIterator(runtimeInit(init), argv0, &args);
+    }
 
     if (std.mem.eql(u8, subcommand, "cloud")) {
         const code = try runAntflyCloud(init.gpa, init.io, &args);
@@ -86,6 +98,12 @@ fn mainImpl(init: std.process.Init) !void {
     };
     for (cli_commands) |cli_cmd| {
         if (std.mem.eql(u8, subcommand, cli_cmd)) {
+            if (comptime linked_runtime_options.enabled) {
+                if (std.mem.eql(u8, subcommand, "sql") and sqlLiteRequested(&args))
+                    return runLinkedRuntime(.standalone, subcommand, init, &args);
+            }
+            if (comptime linked_runtime_options.enabled)
+                return runLinkedRuntime(.cli, subcommand, init, &args);
             if (cliHelpRequested(&args)) {
                 cmd.cli.printCommandUsage(cli_cmd);
                 return;
@@ -102,6 +120,44 @@ fn mainImpl(init: std.process.Init) !void {
     return error.InvalidArguments;
 }
 
+const LinkedRuntimeRole = enum { cli, data, graph_metric_maintenance, ha, inference, metadata, serverless, standalone };
+
+extern fn antfly_runtime_cli(context: *const runtime_bridge.Context) callconv(.c) c_int;
+extern fn antfly_runtime_data(context: *const runtime_bridge.Context) callconv(.c) c_int;
+extern fn antfly_runtime_graph_metric_maintenance(context: *const runtime_bridge.Context) callconv(.c) c_int;
+extern fn antfly_runtime_ha(context: *const runtime_bridge.Context) callconv(.c) c_int;
+extern fn antfly_runtime_inference(context: *const runtime_bridge.Context) callconv(.c) c_int;
+extern fn antfly_runtime_metadata(context: *const runtime_bridge.Context) callconv(.c) c_int;
+extern fn antfly_runtime_serverless(context: *const runtime_bridge.Context) callconv(.c) c_int;
+extern fn antfly_runtime_standalone(context: *const runtime_bridge.Context) callconv(.c) c_int;
+
+const runtime_bridge = @import("runtime_bridge.zig");
+
+fn runLinkedRuntime(
+    comptime role: LinkedRuntimeRole,
+    command: []const u8,
+    init: std.process.Init,
+    args: *std.process.Args.Iterator,
+) void {
+    const context = runtime_bridge.Context{
+        .init = @ptrCast(&init),
+        .args = @ptrCast(args),
+        .command_ptr = command.ptr,
+        .command_len = command.len,
+    };
+    const code = switch (role) {
+        .cli => antfly_runtime_cli(&context),
+        .data => antfly_runtime_data(&context),
+        .graph_metric_maintenance => antfly_runtime_graph_metric_maintenance(&context),
+        .ha => antfly_runtime_ha(&context),
+        .inference => antfly_runtime_inference(&context),
+        .metadata => antfly_runtime_metadata(&context),
+        .serverless => antfly_runtime_serverless(&context),
+        .standalone => antfly_runtime_standalone(&context),
+    };
+    if (code != 0) std.process.exit(@intCast(code));
+}
+
 fn cliHelpRequested(args: *std.process.Args.Iterator) bool {
     var probe = args.*;
     var first = true;
@@ -109,6 +165,28 @@ fn cliHelpRequested(args: *std.process.Args.Iterator) bool {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) return true;
         if (first and std.mem.eql(u8, arg, "help")) return true;
         first = false;
+    }
+    return false;
+}
+
+fn sqlLiteRequested(args: *std.process.Args.Iterator) bool {
+    var probe = args.*;
+    while (probe.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--lite")) return true;
+        if (sqlOptionConsumesValue(arg)) _ = probe.next();
+    }
+    return false;
+}
+
+fn sqlOptionConsumesValue(arg: []const u8) bool {
+    const options = [_][]const u8{
+        "-c",            "--command",         "-f",            "--file",
+        "-d",            "--database",        "-n",            "--namespace",
+        "--host",        "--port",            "--pgwire-host", "--pgwire-port",
+        "--pgwire-user", "--pgwire-password",
+    };
+    for (options) |option| {
+        if (std.mem.eql(u8, arg, option)) return true;
     }
     return false;
 }
@@ -205,7 +283,6 @@ fn printUsage(argv0: []const u8) void {
         \\
         \\server subcommands:
         \\  data
-        \\  graph-metric-maintenance
         \\  metadata
         \\  standalone
         \\  inference
@@ -237,7 +314,7 @@ fn printUsage(argv0: []const u8) void {
 }
 
 fn printVersion() void {
-    std.debug.print("antfly {s} (zig runtime)\n", .{antfly.build_options.antfly_version});
+    std.debug.print("antfly {s} (zig runtime)\n", .{build_options.antfly_version});
 }
 
 fn runtimeInit(init: std.process.Init) std.process.Init {
@@ -271,6 +348,18 @@ test "client help is recognized before command execution" {
     var value_argv = [_][*:0]const u8{ "--key", "help" };
     var value_args = std.process.Args.Iterator.init(.{ .vector = value_argv[0..] });
     try std.testing.expect(!cliHelpRequested(&value_args));
+}
+
+test "SQL Lite routing probe skips option values without consuming arguments" {
+    var argv = [_][*:0]const u8{ "--database", "analytics", "--lite", "local.aflite" };
+    var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+
+    try std.testing.expect(sqlLiteRequested(&args));
+    try std.testing.expectEqualStrings("--database", args.next().?);
+
+    var command_argv = [_][*:0]const u8{ "-c", "--lite" };
+    var command_args = std.process.Args.Iterator.init(.{ .vector = command_argv[0..] });
+    try std.testing.expect(!sqlLiteRequested(&command_args));
 }
 
 test "cloud shim argv starts with antfly-cloud and preserves args" {

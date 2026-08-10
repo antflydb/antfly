@@ -18,7 +18,13 @@ const binder = @import("binder.zig");
 const catalog_resources = @import("catalog_resources.zig");
 const sql_statement_kind = @import("statement_kind.zig");
 const corpus = @import("corpus.zig");
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = struct {
+    pub const DB = @import("../storage/db/db.zig").DB;
+    pub const document_mapper = @import("../storage/db/document_mapper.zig");
+    pub const document_write = @import("../storage/db/document_write.zig");
+    pub const relational_store = @import("../storage/db/relational_store.zig");
+    pub const types = @import("../storage/db/types.zig");
+};
 const ddl_plan = @import("ddl_plan.zig");
 const document_plan = @import("document_plan.zig");
 const document_sql_corpus = @import("document_sql_corpus.zig");

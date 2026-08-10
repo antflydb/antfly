@@ -15,7 +15,8 @@
 const std = @import("std");
 const antfly_client = @import("antfly-client");
 const platform = @import("antfly_platform");
-const lite_sql = @import("../lite_sql.zig");
+const linked_runtime_options = @import("linked_runtime_options");
+const lite_sql = if (linked_runtime_options.enabled) struct {} else @import("../lite_sql.zig");
 const cli = @import("mod.zig");
 
 const max_sql_file_bytes = 64 * 1024 * 1024;
@@ -58,28 +59,33 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antf
     }
 
     if (opts.lite_path) |path| {
-        var session = try lite_sql.Session.init(allocator, opts.catalog);
-        defer session.deinit(allocator);
+        if (comptime linked_runtime_options.enabled) {
+            // The thin dispatcher sends this form to the storage-owning Lite runtime.
+            return error.InvalidArguments;
+        } else {
+            var session = try lite_sql.Session.init(allocator, opts.catalog);
+            defer session.deinit(allocator);
 
-        if (opts.command) |sql| {
-            if (!try lite_sql.executeSqlText(allocator, io, path, &session, sql, true)) {
-                return error.SqlCommandFailed;
+            if (opts.command) |sql| {
+                if (!try lite_sql.executeSqlText(allocator, io, path, &session, sql, true)) {
+                    return error.SqlCommandFailed;
+                }
+                return;
             }
-            return;
-        }
 
-        if (opts.file_path) |sql_path| {
-            const sql = cli.readFileAlloc(io, allocator, sql_path, lite_sql.max_sql_file_bytes) catch |err| {
-                cli.fatal("reading SQL file {s}: {}", .{ sql_path, err });
-            };
-            defer allocator.free(sql);
-            if (!try lite_sql.executeSqlText(allocator, io, path, &session, sql, true)) {
-                return error.SqlCommandFailed;
+            if (opts.file_path) |sql_path| {
+                const sql = cli.readFileAlloc(io, allocator, sql_path, lite_sql.max_sql_file_bytes) catch |err| {
+                    cli.fatal("reading SQL file {s}: {}", .{ sql_path, err });
+                };
+                defer allocator.free(sql);
+                if (!try lite_sql.executeSqlText(allocator, io, path, &session, sql, true)) {
+                    return error.SqlCommandFailed;
+                }
+                return;
             }
-            return;
-        }
 
-        return lite_sql.repl(allocator, io, path, &session);
+            return lite_sql.repl(allocator, io, path, &session);
+        }
     }
 
     if (opts.pgwire_port) |port| {
@@ -875,7 +881,7 @@ fn pgwireCommandCount(tag: []const u8) u64 {
 }
 
 test "sql cli statement splitter ignores quoted semicolons" {
-    try std.testing.expectEqual(@as(?usize, 40), firstStatementEnd("select ';' as semi, \"x;y\" from docs;"));
+    try std.testing.expectEqual(@as(?usize, 35), firstStatementEnd("select ';' as semi, \"x;y\" from docs;"));
     try std.testing.expectEqual(@as(?usize, 22), firstStatementEnd("select $$a;b$$ as body;"));
     try std.testing.expectEqual(@as(?usize, null), firstStatementEnd("select 'unterminated;"));
 }

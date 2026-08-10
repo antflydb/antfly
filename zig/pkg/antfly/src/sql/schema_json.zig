@@ -15,11 +15,13 @@
 const std = @import("std");
 
 const binder = @import("binder.zig");
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = struct {
+    pub const types = @import("../storage/db/types.zig");
+};
 const ddl_plan = @import("ddl_plan.zig");
 const expr_type = @import("expr/type.zig");
 const json_helpers = @import("../common/json_helpers.zig");
-const relational_rows = @import("relational_rows.zig");
+const scalar_subquery_default = @import("scalar_subquery_default.zig");
 const runtime_schema = @import("../storage/schema.zig");
 const schema_api = @import("../schema/mod.zig");
 
@@ -172,7 +174,7 @@ pub fn schemaJsonDefaultValueAlloc(alloc: std.mem.Allocator, value: runtime_sche
             }
         },
         .scalar_subquery => {
-            relational_rows.validateScalarSubqueryDefaultPayloadAlloc(alloc, value.value_json) catch return error.InvalidSqlCatalog;
+            scalar_subquery_default.validatePayloadAlloc(alloc, value.value_json) catch return error.InvalidSqlCatalog;
             var parsed = std.json.parseFromSlice(std.json.Value, alloc, value.value_json, .{}) catch return error.InvalidSqlCatalog;
             defer parsed.deinit();
             if (parsed.value != .object) return error.InvalidSqlCatalog;

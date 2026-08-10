@@ -15,13 +15,13 @@
 const std = @import("std");
 
 const db_mod = @import("../../storage/db/mod.zig");
-const metadata_mod = @import("../../metadata/mod.zig");
+const metadata_mod = @import("../../metadata/domain.zig");
 const catalog_resources = @import("../catalog_resources.zig");
 const table_catalog = @import("../../metadata/catalog/routing.zig");
 const query_api = @import("../query.zig");
 const document_sql_runtime = @import("../../sql/document_runtime.zig");
 const sql_document = @import("../../sql/document.zig");
-const raft_mod = @import("../../raft/mod.zig");
+const raft_mod = @import("../../raft/domain.zig");
 const core = @import("core.zig");
 const cache = @import("cache.zig");
 const remote_wire = @import("remote_wire.zig");

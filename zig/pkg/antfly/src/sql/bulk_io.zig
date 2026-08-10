@@ -14,7 +14,9 @@
 
 const std = @import("std");
 
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = struct {
+    pub const types = @import("../storage/db/types.zig");
+};
 const ddl_plan = @import("ddl_plan.zig");
 const relational_rows = @import("relational_rows.zig");
 const runtime_schema = @import("../storage/schema.zig");

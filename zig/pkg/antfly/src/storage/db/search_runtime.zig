@@ -60,6 +60,7 @@ const db_query_search = @import("query/search_exec.zig");
 const dense_exact = @import("dense_exact.zig");
 const distributed_stats_mod = @import("../../search/distributed_stats.zig");
 const graph_metric_runtime_mod = @import("maintenance/graph_metric_runtime.zig");
+const lease_mod = @import("lease.zig");
 const text_merge_runtime_mod = @import("maintenance/text_merge_runtime.zig");
 const sparse_compaction_runtime_mod = @import("maintenance/sparse_compaction_runtime.zig");
 const hbc_mod = @import("../hbc_adapter.zig");
@@ -5992,11 +5993,15 @@ pub fn Impl(comptime DB: type) type {
             defer if (preserve_lease) runtime.deinitPreserveLease() else runtime.deinit();
 
             if (parsed.value.action == .release) {
-                runtime.ownership.releaseHeldLease();
+                const released = try runtime.ownership.releaseHeldLease();
+                var current_lease = try runtime.ownership.loadLease(alloc);
+                defer if (current_lease) |*lease| lease_mod.deinitRecord(alloc, lease);
                 var runtime_stats = runtime.stats();
                 runtime_stats.shutdown = true;
                 return try std.json.Stringify.valueAlloc(alloc, .{
-                    .released = true,
+                    .released = released,
+                    .lease_owner_id_hash = if (current_lease) |lease| graph_metric_runtime_mod.identityHash(lease.owner_id) else 0,
+                    .lease_expires_at_ms = if (current_lease) |lease| lease.expires_at_ms else 0,
                     .stats = runtime_stats,
                 }, .{ .emit_null_optional_fields = false });
             }

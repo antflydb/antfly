@@ -12,7 +12,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const metadata = @import("../metadata/mod.zig");
+const metadata = @import("../metadata/domain.zig");
 
 pub const host = @import("host.zig");
 pub const metadata_apply = @import("metadata_apply.zig");

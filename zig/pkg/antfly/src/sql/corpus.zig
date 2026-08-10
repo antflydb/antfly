@@ -17,7 +17,9 @@ const sql_adapter = @This();
 
 const binder = @import("binder.zig");
 const sql_statement_kind = @import("statement_kind.zig");
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = struct {
+    pub const types = @import("../storage/db/types.zig");
+};
 const diagnostics = @import("diagnostics.zig");
 const document_plan = @import("document_plan.zig");
 const document_sql_corpus = @import("document_sql_corpus.zig");

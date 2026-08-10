@@ -15,7 +15,9 @@
 const std = @import("std");
 
 const corpus = @import("corpus.zig");
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = struct {
+    pub const types = @import("../storage/db/types.zig");
+};
 const diagnostics = @import("diagnostics.zig");
 const document_plan = @import("document_plan.zig");
 const expr_aggregate = @import("expr/aggregate.zig");

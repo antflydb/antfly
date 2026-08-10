@@ -15,8 +15,9 @@
 const std = @import("std");
 
 const ast = @import("ast.zig");
-const sql_statement_kind = @import("statement_kind.zig");
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = struct {
+    pub const types = @import("../storage/db/types.zig");
+};
 const ddl_plan = @import("ddl_plan.zig");
 const expr_type = @import("expr/type.zig");
 const generated_parser = @import("generated_parser.zig");

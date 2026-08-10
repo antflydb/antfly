@@ -1,0 +1,171 @@
+// Copyright 2026 Antfly, Inc.
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
+//! Metadata domain and control-plane types without the command runtime entry.
+
+pub const storage = @import("storage/mod.zig");
+pub const catalog = @import("catalog/mod.zig");
+pub const catalog_lookup = catalog.lookup;
+pub const catalog_source = catalog.source;
+pub const api = @import("api.zig");
+pub const authority = @import("authority.zig");
+pub const incarnation = @import("incarnation.zig");
+pub const admin = @import("admin.zig");
+pub const http_routes = @import("http_routes.zig");
+pub const http_server = @import("http_server.zig");
+pub const http_client = @import("http_client.zig");
+pub const state = @import("state.zig");
+pub const table_manager = @import("table_manager.zig");
+pub const table_provisioner = @import("table_provisioner.zig");
+pub const shard_db_adapter = @import("shard_db_adapter.zig");
+pub const store_observer = @import("store_observer.zig");
+pub const reconcile_lease = @import("reconcile_lease.zig");
+pub const reallocation_request = @import("reallocation_request.zig");
+pub const reconciler = @import("reconciler.zig");
+pub const control_loop = @import("control_loop.zig");
+pub const transition_state = @import("transition_state.zig");
+pub const transition_actions = @import("transition_actions.zig");
+pub const transition_controller = @import("transition_controller.zig");
+pub const transition_driver = @import("transition_driver.zig");
+
+pub const RaftApplyStore = storage.RaftApplyStore;
+pub const RaftApplyStoreConfig = storage.RaftApplyStoreConfig;
+pub const AppliedMetadataBatch = storage.AppliedMetadataBatch;
+pub const TransitionCommand = storage.TransitionCommand;
+pub const encodeTransitionCommand = storage.encodeTransitionCommand;
+pub const decodeTransitionCommand = storage.decodeTransitionCommand;
+pub const AdminSnapshot = catalog.snapshot.AdminSnapshot;
+pub const MetadataStatus = catalog.snapshot.MetadataStatus;
+pub const MetadataClusterIncarnation = incarnation.MetadataClusterIncarnation;
+pub const captureAdminSnapshot = catalog.snapshot.captureSnapshot;
+pub const freeAdminSnapshot = catalog.snapshot.freeSnapshot;
+pub const ActiveTransitionCounts = admin.ActiveTransitionCounts;
+pub const ActiveTransitions = admin.ActiveTransitions;
+pub const findAdminTable = admin.findTable;
+pub const findAdminRange = admin.findRange;
+pub const findAdminStore = admin.findStore;
+pub const countActiveAdminTransitions = admin.countActiveTransitions;
+pub const listAdminTableRanges = admin.listTableRanges;
+pub const listAdminGroupPlacement = admin.listGroupPlacement;
+pub const listAdminActiveTransitions = admin.listActiveTransitions;
+pub const freeAdminRangeRefs = admin.freeRangeRefs;
+pub const freeAdminPlacementRefs = admin.freePlacementRefs;
+pub const freeAdminActiveTransitions = admin.freeActiveTransitions;
+pub const CapturedCurrentState = state.CapturedCurrentState;
+pub const MetadataState = state.MetadataState;
+pub const DatabaseRecord = table_manager.DatabaseRecord;
+pub const NamespaceRecord = table_manager.NamespaceRecord;
+pub const TablespaceRecord = table_manager.TablespaceRecord;
+pub const SequenceRecord = table_manager.SequenceRecord;
+pub const SequenceCompareAndSwapRequest = table_manager.SequenceCompareAndSwapRequest;
+pub const deriveSequenceId = table_manager.deriveSequenceId;
+pub const sequenceInitialLastValueFromOptionsJson = table_manager.sequenceInitialLastValueFromOptionsJson;
+pub const TableRecord = table_manager.TableRecord;
+pub const TableCatalogBatchUpdateWithSchemaRewriteJobsRequest = table_manager.TableCatalogBatchUpdateWithSchemaRewriteJobsRequest;
+pub const TableCatalogDropWithSchemaRewriteJobsRequest = table_manager.TableCatalogDropWithSchemaRewriteJobsRequest;
+pub const PlacementClass = table_manager.PlacementClass;
+pub const RangeRecord = table_manager.RangeRecord;
+pub const ForeignKeyReferenceRangeRecord = table_manager.ForeignKeyReferenceRangeRecord;
+pub const ForeignKeyReferenceRangeSelector = table_manager.ForeignKeyReferenceRangeSelector;
+pub const ForeignKeyReferenceRangeSplitRequest = table_manager.ForeignKeyReferenceRangeSplitRequest;
+pub const ForeignKeyReferenceRangeMergeRequest = table_manager.ForeignKeyReferenceRangeMergeRequest;
+pub const UniqueConstraintRangeRecord = table_manager.UniqueConstraintRangeRecord;
+pub const UniqueConstraintRangeSelector = table_manager.UniqueConstraintRangeSelector;
+pub const UniqueConstraintRangeSplitRequest = table_manager.UniqueConstraintRangeSplitRequest;
+pub const UniqueConstraintRangeMergeRequest = table_manager.UniqueConstraintRangeMergeRequest;
+pub const SecondaryIndexRebuildRangeRecord = table_manager.SecondaryIndexRebuildRangeRecord;
+pub const SecondaryIndexRebuildRangeSelector = table_manager.SecondaryIndexRebuildRangeSelector;
+pub const SecondaryIndexRebuildRangeBeginRequest = table_manager.SecondaryIndexRebuildRangeBeginRequest;
+pub const SecondaryIndexRebuildRangeFinishRequest = table_manager.SecondaryIndexRebuildRangeFinishRequest;
+pub const SecondaryIndexRebuildRangeInvalidateRequest = table_manager.SecondaryIndexRebuildRangeInvalidateRequest;
+pub const SchemaRewriteRename = table_manager.SchemaRewriteRename;
+pub const SchemaRewriteJobRecord = table_manager.SchemaRewriteJobRecord;
+pub const SchemaRewriteJobBeginRequest = table_manager.SchemaRewriteJobBeginRequest;
+pub const SchemaRewriteJobFinishRequest = table_manager.SchemaRewriteJobFinishRequest;
+pub const SchemaRewriteJobInvalidateRequest = table_manager.SchemaRewriteJobInvalidateRequest;
+pub const TableCatalogUpdateWithSchemaRewriteJobsRequest = table_manager.TableCatalogUpdateWithSchemaRewriteJobsRequest;
+pub const TableEmptyingJobRecord = table_manager.TableEmptyingJobRecord;
+pub const TableEmptyingJobBeginRequest = table_manager.TableEmptyingJobBeginRequest;
+pub const TableEmptyingJobFinishRequest = table_manager.TableEmptyingJobFinishRequest;
+pub const TableEmptyingJobInvalidateRequest = table_manager.TableEmptyingJobInvalidateRequest;
+pub const TableEmptyingBarrierPromotion = table_manager.TableEmptyingBarrierPromotion;
+pub const TableEmptyingBarrierPromotionRequest = table_manager.TableEmptyingBarrierPromotionRequest;
+pub const stableTableEmptyingJobId = table_manager.stableTableEmptyingJobId;
+pub const SecondaryIndexReadyPromotionRequest = table_manager.SecondaryIndexReadyPromotionRequest;
+pub const TableSchemaCompareAndSwapRequest = table_manager.TableSchemaCompareAndSwapRequest;
+pub const RestoreIntentIdentity = table_manager.RestoreIntentIdentity;
+pub const NodeRecord = table_manager.NodeRecord;
+pub const StoreRecord = table_manager.StoreRecord;
+pub const GroupStatusReport = table_manager.GroupStatusReport;
+pub const StoreStatusReport = table_manager.StoreStatusReport;
+pub const RuntimeGroupStatusReport = table_manager.RuntimeGroupStatusReport;
+pub const RuntimeEnrichmentStatusReport = table_manager.RuntimeEnrichmentStatusReport;
+pub const RuntimeDocIdentityStatusReport = table_manager.RuntimeDocIdentityStatusReport;
+pub const RuntimeDocSetPlanningStatusReport = table_manager.RuntimeDocSetPlanningStatusReport;
+pub const RuntimeIndexStatusReport = table_manager.RuntimeIndexStatusReport;
+pub const SchemaProgressRecord = table_manager.SchemaProgressRecord;
+pub const RestoreProgressRecord = table_manager.RestoreProgressRecord;
+pub const ReplicationSourceStatusRecord = table_manager.ReplicationSourceStatusRecord;
+pub const ShuffleJoinLeaseRecord = table_manager.ShuffleJoinLeaseRecord;
+pub const StoreObservation = store_observer.StoreObservation;
+pub const PlacementStatusTag = store_observer.PlacementStatusTag;
+pub const PlacementStatus = store_observer.PlacementStatus;
+pub const ReconcileLeaseRecord = reconcile_lease.ReconcileLeaseRecord;
+pub const ReconcileLeaseState = reconcile_lease.State;
+pub const ReconcileLeaseStats = reconcile_lease.Stats;
+pub const ReallocationRequestRecord = reallocation_request.ReallocationRequestRecord;
+pub const isValidReallocationRequest = reallocation_request.isValid;
+pub const applyStoreObservation = store_observer.applyObservation;
+pub const applyStoreObservations = store_observer.applyObservations;
+pub const classifyStore = store_observer.classifyStore;
+pub const SplitIntent = table_manager.SplitIntent;
+pub const MergeIntent = table_manager.MergeIntent;
+pub const TableManager = table_manager.TableManager;
+pub const TableProvisionSummary = table_provisioner.ProvisionSummary;
+pub const ReconcileReplicaRootOptions = table_provisioner.ReconcileReplicaRootOptions;
+pub const ShardDbAdapter = shard_db_adapter.ShardDbAdapter;
+pub const FallbackLocalShardDbAdapter = shard_db_adapter.FallbackLocalShardDbAdapter;
+pub const groupDbPathFromReplicaRoot = table_provisioner.groupDbPathFromReplicaRoot;
+pub const reconcileReplicaRootTables = table_provisioner.reconcileReplicaRoot;
+pub const reconcileReplicaRootTablesWithOptions = table_provisioner.reconcileReplicaRootWithOptions;
+pub const parsePlacementClass = table_manager.parsePlacementClass;
+pub const placementRoleCompatible = table_manager.placementRoleCompatible;
+pub const TransitionKind = transition_state.TransitionKind;
+pub const TransitionPhase = transition_state.TransitionPhase;
+pub const TransitionTableContract = transition_state.TransitionTableContract;
+pub const SplitTransitionRecord = transition_state.SplitTransitionRecord;
+pub const MergeTransitionRecord = transition_state.MergeTransitionRecord;
+pub const SplitObservation = transition_state.SplitObservation;
+pub const MergeObservation = transition_state.MergeObservation;
+pub const TransitionRecord = transition_state.TransitionRecord;
+pub const TransitionObservation = transition_state.TransitionObservation;
+pub const SplitRuntimeObservation = reconciler.SplitRuntimeObservation;
+pub const MergeRuntimeObservation = reconciler.MergeRuntimeObservation;
+pub const CurrentMetadataState = reconciler.CurrentMetadataState;
+pub const PlannedSplitStep = reconciler.PlannedSplitStep;
+pub const PlannedMergeStep = reconciler.PlannedMergeStep;
+pub const ReconciliationPlan = reconciler.ReconciliationPlan;
+pub const Reconciler = reconciler.Reconciler;
+pub const ReconcileSummary = control_loop.ReconcileSummary;
+pub const MetadataControlLoop = control_loop.MetadataControlLoop;
+pub const TransitionAction = transition_actions.TransitionAction;
+pub const TransitionDecision = transition_actions.TransitionDecision;
+pub const SplitExecutionStateTag = transition_controller.SplitExecutionStateTag;
+pub const MergeExecutionStateTag = transition_controller.MergeExecutionStateTag;
+pub const SplitExecutionState = transition_controller.SplitExecutionState;
+pub const MergeExecutionState = transition_controller.MergeExecutionState;
+pub const TransitionController = transition_controller.TransitionController;
+pub const MetadataTransitionRuntime = transition_driver.TransitionRuntime;
+pub const TransitionStepResult = transition_driver.StepResult;
+pub const TransitionDriver = transition_driver.TransitionDriver;

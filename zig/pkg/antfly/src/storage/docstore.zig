@@ -20,6 +20,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const Allocator = std.mem.Allocator;
 const AtomicU64 = platform.atomic.Value(u64);
@@ -32,7 +33,8 @@ const internal_keys = @import("internal_keys.zig");
 const lsm_backend = @import("lsm_backend.zig");
 const mem_backend = @import("mem_backend.zig");
 const platform_time = @import("antfly_platform").time;
-const supports_lmdb = builtin.os.tag != .freestanding;
+const supports_lmdb = builtin.is_test or
+    (builtin.os.tag != .freestanding and build_options.lmdb_enabled);
 const backend_lmdb_adapter = if (supports_lmdb) @import("backend_lmdb_adapter.zig") else struct {
     pub const Cursor = struct {
         pub fn init(_: anytype) @This() {

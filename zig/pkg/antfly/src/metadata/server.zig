@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
-const metadata_mod = @import("mod.zig");
+const metadata_mod = @import("domain.zig");
 const metadata_authority = @import("authority.zig");
 const service = @import("service.zig");
 const transition_state = @import("transition_state.zig");

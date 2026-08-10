@@ -16,7 +16,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 const fs_paths = @import("../common/fs_paths.zig");
 const common_secrets = @import("../common/secrets.zig");
-const metadata_mod = @import("mod.zig");
+const metadata_mod = @import("domain.zig");
 const extension_domain = @import("../extensions/mod.zig");
 const metadata_api = @import("api.zig");
 const raft_engine = @import("raft_engine");
@@ -3977,7 +3977,7 @@ pub const MetadataService = struct {
 
         var local = std.ArrayListUnmanaged(raft_reconciler.PlacementIntent).empty;
         defer {
-            for (local.items) |intent| if (intent.peer_node_ids.len > 0) self.alloc.free(intent.peer_node_ids);
+            for (local.items) |intent| raft_reconciler.freeIntentOwned(self.alloc, intent);
             local.deinit(self.alloc);
         }
 

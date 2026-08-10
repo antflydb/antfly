@@ -35,7 +35,7 @@ const json_helpers = @import("../../common/json_helpers.zig");
 const catalog_resources = @import("resources.zig");
 const sql_adapter = @import("../../sql/mod.zig");
 const sql_schema_mutation = @import("../../sql/schema_mutation.zig");
-const table_reads = @import("../../api/table_reads.zig");
+const table_reads = @import("../../api/table_read_source.zig");
 const coverage_policy_mod = @import("../../api/coverage_policy.zig");
 
 pub const default_full_text_index_name = full_text_indexes.default_full_text_index_name;
@@ -8981,6 +8981,7 @@ test "metadata.schema update sql ddl applies relational catalog changes through 
     try std.testing.expectEqualStrings("tenant_id", concat_rewrite.expression.operands[0].field);
     try std.testing.expectEqualStrings("\":\"", concat_rewrite.expression.operands[1].value_json);
     try std.testing.expectEqualStrings("status", concat_rewrite.expression.operands[2].field);
+    try std.testing.expect(std.mem.indexOf(u8, generated.table.schema_json, "\"version\":2") != null);
 
     var default_backfill = try applyRelationalSqlDdlToTableRecordAlloc(
         std.testing.allocator,
@@ -9039,7 +9040,7 @@ test "metadata.schema update sql ddl applies relational catalog changes through 
     try std.testing.expectEqual(sql_adapter.AppliedDdlWorkAction.rebuild, indexed.work_items[0].action);
     try std.testing.expectEqual(sql_adapter.AppliedDdlWorkAction.validate, indexed.work_items[1].action);
     try std.testing.expect(std.mem.indexOf(u8, indexed.table.schema_json, "\"users_tenant_email_key\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, indexed.table.schema_json, "\"version\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, indexed.table.schema_json, "\"version\":3") != null);
 
     var trigger = try applyRelationalSqlDdlToTableRecordAlloc(
         std.testing.allocator,

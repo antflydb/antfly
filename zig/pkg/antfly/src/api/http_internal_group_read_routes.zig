@@ -1073,7 +1073,7 @@ test "internal group read routes handle text stats errors" {
             _: []const u8,
             _: []const u8,
             _: @import("../storage/db/mod.zig").types.LookupOptions,
-            _: @import("../raft/mod.zig").ReadConsistency,
+            _: @import("../raft/domain.zig").ReadConsistency,
         ) !?table_reads.LookupResponse {
             return null;
         }
@@ -1085,7 +1085,7 @@ test "internal group read routes handle text stats errors" {
             _: []const u8,
             _: []const u8,
             _: @import("../storage/db/mod.zig").types.ScanOptions,
-            _: @import("../raft/mod.zig").ReadConsistency,
+            _: @import("../raft/domain.zig").ReadConsistency,
         ) !?table_reads.ScanResponse {
             return null;
         }
@@ -1095,7 +1095,7 @@ test "internal group read routes handle text stats errors" {
             _: std.mem.Allocator,
             _: []const u8,
             _: @import("../storage/db/mod.zig").types.SearchRequest,
-            _: @import("../raft/mod.zig").ReadConsistency,
+            _: @import("../raft/domain.zig").ReadConsistency,
         ) !?@import("query.zig").QueryResponse {
             return null;
         }
@@ -1156,7 +1156,7 @@ test "internal group read routes map doc identity mismatch to conflict" {
             _: []const u8,
             _: []const u8,
             _: db_mod.types.LookupOptions,
-            _: @import("../raft/mod.zig").ReadConsistency,
+            _: @import("../raft/domain.zig").ReadConsistency,
         ) !?table_reads.LookupResponse {
             return null;
         }
@@ -1168,7 +1168,7 @@ test "internal group read routes map doc identity mismatch to conflict" {
             _: []const u8,
             _: []const u8,
             _: db_mod.types.ScanOptions,
-            _: @import("../raft/mod.zig").ReadConsistency,
+            _: @import("../raft/domain.zig").ReadConsistency,
         ) !?table_reads.ScanResponse {
             return null;
         }
@@ -1178,7 +1178,7 @@ test "internal group read routes map doc identity mismatch to conflict" {
             _: std.mem.Allocator,
             _: []const u8,
             _: db_mod.types.SearchRequest,
-            _: @import("../raft/mod.zig").ReadConsistency,
+            _: @import("../raft/domain.zig").ReadConsistency,
         ) !?query_api.QueryResponse {
             return null;
         }
@@ -1189,7 +1189,7 @@ test "internal group read routes map doc identity mismatch to conflict" {
             group_id: u64,
             table_name: []const u8,
             _: db_mod.types.SearchRequest,
-            _: @import("../raft/mod.zig").ReadConsistency,
+            _: @import("../raft/domain.zig").ReadConsistency,
         ) !?query_api.QueryResponse {
             try std.testing.expectEqual(@as(u64, 7), group_id);
             try std.testing.expectEqualStrings("docs", table_name);
@@ -1242,7 +1242,7 @@ test "internal group read routes expose relational rows source group local" {
             _: []const u8,
             _: []const u8,
             _: db_mod.types.LookupOptions,
-            _: @import("../raft/mod.zig").ReadConsistency,
+            _: @import("../raft/domain.zig").ReadConsistency,
         ) !?table_reads.LookupResponse {
             return null;
         }
@@ -1254,7 +1254,7 @@ test "internal group read routes expose relational rows source group local" {
             _: []const u8,
             _: []const u8,
             _: db_mod.types.ScanOptions,
-            _: @import("../raft/mod.zig").ReadConsistency,
+            _: @import("../raft/domain.zig").ReadConsistency,
         ) !?table_reads.ScanResponse {
             return null;
         }
@@ -1264,7 +1264,7 @@ test "internal group read routes expose relational rows source group local" {
             _: std.mem.Allocator,
             _: []const u8,
             _: db_mod.types.SearchRequest,
-            _: @import("../raft/mod.zig").ReadConsistency,
+            _: @import("../raft/domain.zig").ReadConsistency,
         ) !?query_api.QueryResponse {
             return null;
         }
@@ -1279,7 +1279,7 @@ test "internal group read routes expose relational rows source group local" {
             req_inner: db_mod.types.RelationalRowsQueryRequest,
             doc_key_range: db_mod.types.RelationalRowsDocKeyRange,
             system_time: ?table_reads.RelationalRowsSourceGroupSystemTime,
-            consistency: @import("../raft/mod.zig").ReadConsistency,
+            consistency: @import("../raft/domain.zig").ReadConsistency,
         ) !?db_mod.types.RelationalRowsQueryResult {
             try std.testing.expectEqual(@as(u64, 7), group_id);
             try std.testing.expectEqualStrings("docs", table_name);
@@ -1298,7 +1298,7 @@ test "internal group read routes expose relational rows source group local" {
             try std.testing.expect(req_inner.select_all);
             try std.testing.expect(doc_key_range.start.len > 0);
             try std.testing.expectEqualStrings("z", doc_key_range.end);
-            try std.testing.expectEqual(@import("../raft/mod.zig").ReadConsistency.read_index, consistency);
+            try std.testing.expectEqual(@import("../raft/domain.zig").ReadConsistency.read_index, consistency);
 
             const fallback_reason: db_mod.types.RelationalRowsQueryResult.FallbackReason = switch (doc_key_range.start[0]) {
                 'a' => .ordered_tuple_predicate_not_proven,
@@ -1559,7 +1559,7 @@ test "internal group vector worker rejects unsupported identity generation" {
             _: []const u8,
             _: []const u8,
             _: db_mod.types.LookupOptions,
-            _: @import("../raft/mod.zig").ReadConsistency,
+            _: @import("../raft/domain.zig").ReadConsistency,
         ) !?table_reads.LookupResponse {
             return null;
         }
@@ -1571,7 +1571,7 @@ test "internal group vector worker rejects unsupported identity generation" {
             _: []const u8,
             _: []const u8,
             _: db_mod.types.ScanOptions,
-            _: @import("../raft/mod.zig").ReadConsistency,
+            _: @import("../raft/domain.zig").ReadConsistency,
         ) !?table_reads.ScanResponse {
             return null;
         }
@@ -1581,7 +1581,7 @@ test "internal group vector worker rejects unsupported identity generation" {
             _: std.mem.Allocator,
             _: []const u8,
             _: db_mod.types.SearchRequest,
-            _: @import("../raft/mod.zig").ReadConsistency,
+            _: @import("../raft/domain.zig").ReadConsistency,
         ) !?query_api.QueryResponse {
             return null;
         }
@@ -1592,7 +1592,7 @@ test "internal group vector worker rejects unsupported identity generation" {
             group_id: u64,
             table_name: []const u8,
             req: db_mod.types.SearchRequest,
-            _: @import("../raft/mod.zig").ReadConsistency,
+            _: @import("../raft/domain.zig").ReadConsistency,
         ) !?query_api.QueryResponse {
             try std.testing.expectEqual(@as(u64, 7), group_id);
             try std.testing.expectEqualStrings("docs", table_name);
@@ -1646,7 +1646,7 @@ test "internal group graph expand rejects unsupported identity generation" {
             _: []const u8,
             _: []const u8,
             _: db_mod.types.LookupOptions,
-            _: @import("../raft/mod.zig").ReadConsistency,
+            _: @import("../raft/domain.zig").ReadConsistency,
         ) !?table_reads.LookupResponse {
             return null;
         }
@@ -1658,7 +1658,7 @@ test "internal group graph expand rejects unsupported identity generation" {
             _: []const u8,
             _: []const u8,
             _: db_mod.types.ScanOptions,
-            _: @import("../raft/mod.zig").ReadConsistency,
+            _: @import("../raft/domain.zig").ReadConsistency,
         ) !?table_reads.ScanResponse {
             return null;
         }
@@ -1668,7 +1668,7 @@ test "internal group graph expand rejects unsupported identity generation" {
             _: std.mem.Allocator,
             _: []const u8,
             _: db_mod.types.SearchRequest,
-            _: @import("../raft/mod.zig").ReadConsistency,
+            _: @import("../raft/domain.zig").ReadConsistency,
         ) !?query_api.QueryResponse {
             return null;
         }
@@ -1679,7 +1679,7 @@ test "internal group graph expand rejects unsupported identity generation" {
             group_id: u64,
             table_name: []const u8,
             req: distributed_graph.GraphExpandRequest,
-            _: @import("../raft/mod.zig").ReadConsistency,
+            _: @import("../raft/domain.zig").ReadConsistency,
         ) !?distributed_graph.GraphExpandResponse {
             try std.testing.expectEqual(@as(u64, 7), group_id);
             try std.testing.expectEqualStrings("docs", table_name);
@@ -1741,7 +1741,7 @@ test "internal group read routes handle query preflight" {
             _: []const u8,
             _: []const u8,
             _: @import("../storage/db/mod.zig").types.LookupOptions,
-            _: @import("../raft/mod.zig").ReadConsistency,
+            _: @import("../raft/domain.zig").ReadConsistency,
         ) !?table_reads.LookupResponse {
             return null;
         }
@@ -1753,7 +1753,7 @@ test "internal group read routes handle query preflight" {
             _: []const u8,
             _: []const u8,
             _: @import("../storage/db/mod.zig").types.ScanOptions,
-            _: @import("../raft/mod.zig").ReadConsistency,
+            _: @import("../raft/domain.zig").ReadConsistency,
         ) !?table_reads.ScanResponse {
             return null;
         }
@@ -1763,7 +1763,7 @@ test "internal group read routes handle query preflight" {
             _: std.mem.Allocator,
             _: []const u8,
             _: @import("../storage/db/mod.zig").types.SearchRequest,
-            _: @import("../raft/mod.zig").ReadConsistency,
+            _: @import("../raft/domain.zig").ReadConsistency,
         ) !?@import("query.zig").QueryResponse {
             return null;
         }
@@ -1774,7 +1774,7 @@ test "internal group read routes handle query preflight" {
             _: u64,
             _: []const u8,
             _: @import("../storage/db/mod.zig").types.SearchRequest,
-            _: @import("../raft/mod.zig").ReadConsistency,
+            _: @import("../raft/domain.zig").ReadConsistency,
             _: u32,
         ) !?@import("../storage/db/mod.zig").RuntimePreflightSummary {
             const result_refs = try alloc_inner.alloc([]const u8, 1);
@@ -1866,15 +1866,15 @@ test "internal group document algebraic aggregate route preserves typed errors" 
             };
         }
 
-        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: @import("../raft/mod.zig").ReadConsistency) !?table_reads.LookupResponse {
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: @import("../raft/domain.zig").ReadConsistency) !?table_reads.LookupResponse {
             return error.UnexpectedLookup;
         }
 
-        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: @import("../raft/mod.zig").ReadConsistency) !?table_reads.ScanResponse {
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: @import("../raft/domain.zig").ReadConsistency) !?table_reads.ScanResponse {
             return error.UnexpectedScan;
         }
 
-        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: @import("../raft/mod.zig").ReadConsistency) !?query_api.QueryResponse {
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: @import("../raft/domain.zig").ReadConsistency) !?query_api.QueryResponse {
             return error.UnexpectedQuery;
         }
 
@@ -1884,14 +1884,14 @@ test "internal group document algebraic aggregate route preserves typed errors" 
             group_id: u64,
             table_name: []const u8,
             req: document_sql_runtime.AlgebraicAggregateRequest,
-            consistency: @import("../raft/mod.zig").ReadConsistency,
+            consistency: @import("../raft/domain.zig").ReadConsistency,
         ) !?document_sql_runtime.AlgebraicAggregateResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqual(@as(u64, 7), group_id);
             try std.testing.expectEqualStrings("docs", table_name);
             try std.testing.expectEqualStrings("amount_alg", req.index_name);
             try std.testing.expectEqualStrings("avg_by_status", req.materialization_name);
-            try std.testing.expectEqual(@import("../raft/mod.zig").ReadConsistency.read_index, consistency);
+            try std.testing.expectEqual(@import("../raft/domain.zig").ReadConsistency.read_index, consistency);
             switch (self.mode) {
                 .unavailable => return error.DocumentSqlIndexUnavailable,
                 .invalid => return error.InvalidQueryRequest,

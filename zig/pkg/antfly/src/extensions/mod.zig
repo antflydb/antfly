@@ -16,13 +16,7 @@ const std = @import("std");
 const schema_mod = @import("../schema/mod.zig");
 const runtime_schema = @import("../storage/schema.zig");
 
-pub const lifecycle = @import("lifecycle.zig");
-pub const sql_adapter = @import("sql_adapter.zig");
 pub const wasmtime_runtime = @import("wasmtime_runtime.zig");
-
-test {
-    _ = sql_adapter;
-}
 
 pub const manifest_api_version_v1 = "extensions/v1";
 pub const package_manifest_filename = "extension.json";

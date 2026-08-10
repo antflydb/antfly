@@ -16,7 +16,7 @@ const std = @import("std");
 
 const db_mod = @import("../../storage/db/mod.zig");
 const storage_schema = @import("../../storage/schema.zig");
-const raft_mod = @import("../../raft/mod.zig");
+const raft_mod = @import("../../raft/domain.zig");
 const catalog_resources = @import("../catalog_resources.zig");
 const document_sql_runtime = @import("../../sql/document_runtime.zig");
 const distributed_graph = @import("../distributed_graph.zig");

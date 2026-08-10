@@ -14,7 +14,10 @@
 
 const std = @import("std");
 
-const db_mod = @import("../../storage/db/mod.zig");
+const db_mod = struct {
+    pub const DB = @import("../../storage/db/db.zig").DB;
+    pub const types = @import("../../storage/db/types.zig");
+};
 const expr_equal = @import("equal.zig");
 const expr_text = @import("text.zig");
 const expr_type = @import("type.zig");

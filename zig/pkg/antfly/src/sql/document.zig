@@ -14,7 +14,10 @@
 
 const std = @import("std");
 
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = struct {
+    pub const DB = @import("../storage/db/db.zig").DB;
+    pub const algebraic = @import("../storage/db/algebraic/mod.zig");
+};
 const document_plan = @import("document_plan.zig");
 const document_runtime = @import("document_runtime.zig");
 

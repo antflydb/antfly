@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const storage_schema = @import("../storage/schema.zig");
-const relational_rows = @import("../sql/relational_rows.zig");
+const scalar_subquery_default = @import("../sql/scalar_subquery_default.zig");
 const impl = @import("table_schema_impl.zig");
 
 pub const ParsedTableSchema = impl.TableSchema;
@@ -853,7 +853,7 @@ fn cloneRelationalDefaultValue(
         .scalar_subquery => .scalar_subquery,
     };
     if (kind == .scalar_subquery) {
-        try relational_rows.validateScalarSubqueryDefaultPayloadAlloc(alloc, value.value_json);
+        try scalar_subquery_default.validatePayloadAlloc(alloc, value.value_json);
     }
     return .{
         .kind = kind,

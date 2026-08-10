@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const antfly = @import("../root.zig");
+const antfly = @import("runtime_root.zig");
 const fs_paths = @import("../common/fs_paths.zig");
 const group_ids = @import("../common/group_ids.zig");
 const build_options = @import("build_options");

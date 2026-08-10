@@ -115,11 +115,17 @@ pub const State = struct {
         self.has_lease = !self.lease_owned;
     }
 
-    pub fn releaseHeldLease(self: *State) void {
-        if (self.lease_owned) {
-            _ = self.lease.release(self.owner_id) catch false;
-        }
+    pub fn releaseHeldLease(self: *State) !bool {
+        const released = if (self.lease_owned)
+            try self.lease.release(self.owner_id)
+        else
+            false;
         self.has_lease = !self.lease_owned;
+        return released;
+    }
+
+    pub fn loadLease(self: *State, alloc: Allocator) !?lease_mod.LeaseRecord {
+        return try self.lease.load(alloc);
     }
 
     pub fn stats(self: *const State) Stats {

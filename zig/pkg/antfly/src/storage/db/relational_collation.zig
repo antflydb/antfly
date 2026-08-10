@@ -60,6 +60,26 @@ pub fn compareTextForOrdering(lhs: []const u8, rhs: []const u8, collation: ?[]co
     return textComparisonFromOrder(std.mem.order(u8, lhs, rhs));
 }
 
+pub fn jsonValuesNotDistinctWithCollation(lhs: std.json.Value, rhs: std.json.Value, collation: ?[]const u8) ?bool {
+    if (jsonNumberAsF64(lhs)) |left| {
+        const right = jsonNumberAsF64(rhs) orelse return null;
+        return left == right;
+    }
+    if (lhs == .string and rhs == .string) return textEqual(lhs.string, rhs.string, collation);
+    if (lhs == .bool and rhs == .bool) return lhs.bool == rhs.bool;
+    if (lhs == .null and rhs == .null) return true;
+    return null;
+}
+
+fn jsonNumberAsF64(value: std.json.Value) ?f64 {
+    return switch (value) {
+        .integer => |integer| @floatFromInt(integer),
+        .float => |float| float,
+        .number_string => |number| std.fmt.parseFloat(f64, number) catch null,
+        else => null,
+    };
+}
+
 fn textComparisonFromOrder(order: std.math.Order) TextComparison {
     return switch (order) {
         .lt => .lt,
@@ -78,4 +98,7 @@ test "relational collation centralizes scalar equality and stable ordering" {
     try std.testing.expect(!textEqual("Alpha", "alpha", "C"));
     try std.testing.expectEqual(TextComparison.eq, compareTextForScalar("Alpha", "alpha", "ci"));
     try std.testing.expectEqual(TextComparison.lt, compareTextForOrdering("Alpha", "alpha", "ci"));
+    try std.testing.expectEqual(true, jsonValuesNotDistinctWithCollation(.{ .string = "Alpha" }, .{ .string = "alpha" }, "ci"));
+    try std.testing.expectEqual(true, jsonValuesNotDistinctWithCollation(.{ .integer = 42 }, .{ .float = 42.0 }, null));
+    try std.testing.expectEqual(null, jsonValuesNotDistinctWithCollation(.{ .integer = 42 }, .{ .string = "42" }, null));
 }

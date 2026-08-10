@@ -19,7 +19,7 @@ const reallocation_request = @import("reallocation_request.zig");
 const metadata_store_observer = @import("store_observer.zig");
 const metadata_table_manager = @import("table_manager.zig");
 const transition_state = @import("transition_state.zig");
-const data = @import("../data/mod.zig");
+const data = @import("../data/domain.zig");
 
 pub const CandidatePlacementInfo = struct {
     node_id: u64,

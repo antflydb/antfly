@@ -16,7 +16,9 @@ const std = @import("std");
 const binder = @import("binder.zig");
 const catalog_resources = @import("catalog_resources.zig");
 const sql_statement_kind = @import("statement_kind.zig");
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = struct {
+    pub const types = @import("../storage/db/types.zig");
+};
 const expr_condition = @import("expr/condition.zig");
 const expr_build = @import("expr/build.zig");
 const expr_type = @import("expr/type.zig");
@@ -33,7 +35,7 @@ const expr_row_parse = @import("expr/row_parse.zig");
 const plan_mod = @import("plan.zig");
 const parser = @import("parser.zig");
 const parser_context = @import("parser_context.zig");
-const relational_rows = @import("relational_rows.zig");
+const scalar_subquery_default = @import("scalar_subquery_default.zig");
 const runtime_schema = @import("../storage/schema.zig");
 const schema_api = @import("../schema/mod.zig");
 const token_mod = @import("token.zig");
@@ -19525,7 +19527,7 @@ fn generatedDdlScalarSubqueryDefaultValueAlloc(
     defer alloc.free(query_json);
     const wrapped = try std.fmt.allocPrint(alloc, "{{\"query\":{s}}}", .{query_json});
     errdefer alloc.free(wrapped);
-    try relational_rows.validateScalarSubqueryDefaultPayloadAlloc(alloc, wrapped);
+    try scalar_subquery_default.validatePayloadAlloc(alloc, wrapped);
     return .{ .kind = .scalar_subquery, .value_json = wrapped };
 }
 

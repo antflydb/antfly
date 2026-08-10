@@ -17,7 +17,9 @@ const std = @import("std");
 const binder = @import("binder.zig");
 const catalog_resources = @import("catalog_resources.zig");
 const sql_statement_kind = @import("statement_kind.zig");
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = struct {
+    pub const types = @import("../storage/db/types.zig");
+};
 const generated_parser = @import("generated_parser.zig");
 const generated_read_validate = @import("generated_read_validate.zig");
 const lower_expr = @import("lower_expr.zig");

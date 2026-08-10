@@ -12,7 +12,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = struct {
+    pub const types = @import("../storage/db/types.zig");
+};
 
 pub const SelectOutputKind = enum {
     field,

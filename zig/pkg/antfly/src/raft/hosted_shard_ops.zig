@@ -17,7 +17,7 @@ const api_http_client = @import("../api/http_client.zig");
 const catalog_source = @import("../metadata/catalog/source.zig");
 const api_table_router = @import("../api/table_router.zig");
 const metadata_api = @import("../metadata/api.zig");
-const metadata_mod = @import("../metadata/mod.zig");
+const metadata_mod = @import("../metadata/domain.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
 const http_common = @import("transport/http_common.zig");
 const shard_ops = @import("shard_ops.zig");
@@ -696,7 +696,7 @@ test "hosted shard operation adapter uses local shard ops when preferred leader 
         }
 
         fn observeMerge(_: *anyopaque, _: u64, record: metadata_transition_state.MergeTransitionRecord) !metadata_transition_state.MergeObservation {
-            const status = @import("../data/mod.zig").MergeTransitionStatus{
+            const status = @import("../data/domain.zig").MergeTransitionStatus{
                 .phase = .replay_deltas,
                 .donor_group_id = record.donor_group_id,
                 .receiver_group_id = record.receiver_group_id,

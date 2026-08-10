@@ -16,7 +16,9 @@ const std = @import("std");
 
 const binder = @import("binder.zig");
 const catalog_resources = @import("catalog_resources.zig");
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = struct {
+    pub const types = @import("../storage/db/types.zig");
+};
 const ddl_plan = @import("ddl_plan.zig");
 const expr_type = @import("expr/type.zig");
 const fingerprint = @import("fingerprint.zig");

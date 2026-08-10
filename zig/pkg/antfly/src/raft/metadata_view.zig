@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const metadata = @import("../metadata/mod.zig");
+const metadata = @import("../metadata/domain.zig");
 const peer_resolver = @import("peer_resolver.zig");
 const reconciler = @import("reconciler.zig");
 
