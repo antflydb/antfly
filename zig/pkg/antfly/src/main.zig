@@ -20,6 +20,8 @@ const cmd = @import("cmd/mod.zig");
 const httpx = @import("httpx");
 const antfly_client = @import("antfly-client");
 const platform = @import("antfly_platform");
+const linked_runtime_options = @import("linked_runtime_options");
+const runtime_bridge = @import("runtime_bridge.zig");
 
 const antfly_cloud_binary = "antfly-cloud";
 
@@ -62,10 +64,17 @@ fn mainImpl(init: std.process.Init) !void {
     }
 
     // Server-side subcommands
-    if (std.mem.eql(u8, subcommand, "data")) return try cmd.data.runFromIterator(runtimeInit(init), argv0, &args);
-    if (std.mem.eql(u8, subcommand, "metadata")) return try cmd.metadata.runFromIterator(runtimeInit(init), argv0, &args);
-    if (std.mem.eql(u8, subcommand, "standalone")) return try cmd.standalone.runFromIterator(runtimeInit(init), argv0, &args);
-    if (std.mem.eql(u8, subcommand, "inference")) return try cmd.inference.runFromIterator(runtimeInit(init), argv0, &args);
+    if (comptime linked_runtime_options.enabled) {
+        if (std.mem.eql(u8, subcommand, "data")) return runLinkedRuntime(.data, init, &args);
+        if (std.mem.eql(u8, subcommand, "inference")) return runLinkedRuntime(.inference, init, &args);
+        if (std.mem.eql(u8, subcommand, "metadata")) return runLinkedRuntime(.metadata, init, &args);
+        if (std.mem.eql(u8, subcommand, "standalone")) return runLinkedRuntime(.standalone, init, &args);
+    } else {
+        if (std.mem.eql(u8, subcommand, "data")) return try cmd.data.runFromIterator(runtimeInit(init), argv0, &args);
+        if (std.mem.eql(u8, subcommand, "inference")) return try cmd.inference.runFromIterator(runtimeInit(init), argv0, &args);
+        if (std.mem.eql(u8, subcommand, "metadata")) return try cmd.metadata.runFromIterator(runtimeInit(init), argv0, &args);
+        if (std.mem.eql(u8, subcommand, "standalone")) return try cmd.standalone.runFromIterator(runtimeInit(init), argv0, &args);
+    }
     if (std.mem.eql(u8, subcommand, "serverless")) return try cmd.serverless.runFromIterator(runtimeInit(init), argv0, &args);
     if (std.mem.eql(u8, subcommand, "lite")) return try cmd.lite.runFromIterator(runtimeInit(init), argv0, &args);
     if (std.mem.eql(u8, subcommand, "ha")) return try cmd.ha.runFromIterator(runtimeInit(init), argv0, &args);
@@ -98,6 +107,27 @@ fn mainImpl(init: std.process.Init) !void {
     std.debug.print("unknown subcommand: {s}\n", .{subcommand});
     printUsage(argv0);
     return error.InvalidArguments;
+}
+
+const LinkedRuntimeRole = enum { data, inference, metadata, standalone };
+
+extern fn antfly_runtime_data(context: *const runtime_bridge.Context) callconv(.c) c_int;
+extern fn antfly_runtime_inference(context: *const runtime_bridge.Context) callconv(.c) c_int;
+extern fn antfly_runtime_metadata(context: *const runtime_bridge.Context) callconv(.c) c_int;
+extern fn antfly_runtime_standalone(context: *const runtime_bridge.Context) callconv(.c) c_int;
+
+fn runLinkedRuntime(comptime role: LinkedRuntimeRole, init: std.process.Init, args: *std.process.Args.Iterator) void {
+    const context = runtime_bridge.Context{
+        .init = @ptrCast(&init),
+        .args = @ptrCast(args),
+    };
+    const code = switch (role) {
+        .data => antfly_runtime_data(&context),
+        .inference => antfly_runtime_inference(&context),
+        .metadata => antfly_runtime_metadata(&context),
+        .standalone => antfly_runtime_standalone(&context),
+    };
+    if (code != 0) std.process.exit(@intCast(code));
 }
 
 fn cliHelpRequested(args: *std.process.Args.Iterator) bool {

@@ -12,30 +12,33 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-//! Focused executable entry point for measuring and packaging server runtimes.
+//! One independently code-generated server runtime, linked into the final
+//! Antfly executable through a narrow C ABI entry point.
 
 const builtin = @import("builtin");
 const std = @import("std");
 const platform = @import("antfly_platform");
+const bridge = @import("runtime_bridge.zig");
 const role_options = @import("runtime_artifact_options");
-const structlog = @import("structlog");
 
-const data_runtime = @import("data/runtime.zig");
-const inference_runtime = @import("inference_runtime/runtime.zig");
-const metadata_runtime = @import("metadata/runtime.zig");
-const standalone_runtime = @import("standalone/runtime.zig");
+const runtime = switch (role_options.role) {
+    .data => @import("data/runtime.zig"),
+    .inference => @import("inference_runtime/runtime.zig"),
+    .metadata => @import("metadata/runtime.zig"),
+    .standalone => @import("standalone/runtime.zig"),
+};
 
 // The user-manager storage adapter deliberately imports these through the
 // compilation root so it shares their exact Zig type identity.
 pub const lsm_backend = @import("storage/lsm_backend/mod.zig");
 pub const storage_backend_erased = @import("storage/backend_erased.zig");
 
-pub const std_options: std.Options = .{
-    .logFn = structlog.logFn,
-};
+fn runtimeEntry(context: *const bridge.Context) callconv(.c) c_int {
+    const init: *const std.process.Init = @ptrCast(@alignCast(context.init));
+    const args: *std.process.Args.Iterator = @ptrCast(@alignCast(context.args));
+    const argv0 = "antfly " ++ @tagName(role_options.role);
 
-pub fn main(init: std.process.Init) void {
-    mainImpl(init) catch |err| {
+    runtime.runFromIterator(runtimeInit(init.*), argv0, args) catch |err| {
         const message = switch (err) {
             error.FileNotFound => "required file was not found; check the configured path",
             error.AddressInUse => "listen address is already in use",
@@ -43,25 +46,13 @@ pub fn main(init: std.process.Init) void {
             else => "startup failed; see the preceding diagnostic for details",
         };
         std.debug.print("antfly {s}: {s}\n", .{ @tagName(role_options.role), message });
-        std.process.exit(1);
+        return 1;
     };
+    return 0;
 }
 
-fn mainImpl(init: std.process.Init) !void {
-    structlog.init(.{ .formatter = .json, .level = .info });
-
-    var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);
-    defer args.deinit();
-    _ = args.next();
-
-    const argv0 = "antfly " ++ @tagName(role_options.role);
-    const runtime_init = runtimeInit(init);
-    return switch (role_options.role) {
-        .data => data_runtime.runFromIterator(runtime_init, argv0, &args),
-        .inference => inference_runtime.runFromIterator(runtime_init, argv0, &args),
-        .metadata => metadata_runtime.runFromIterator(runtime_init, argv0, &args),
-        .standalone => standalone_runtime.runFromIterator(runtime_init, argv0, &args),
-    };
+comptime {
+    @export(&runtimeEntry, .{ .name = "antfly_runtime_" ++ @tagName(role_options.role) });
 }
 
 fn runtimeInit(init: std.process.Init) std.process.Init {
