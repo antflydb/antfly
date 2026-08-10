@@ -17,7 +17,6 @@
 const std = @import("std");
 const client = @import("client_runtime.zig");
 const ha = @import("cmd/ha.zig");
-const lite = @import("cmd/lite.zig");
 const serverless = @import("cmd/serverless.zig");
 
 pub fn runFromIterator(
@@ -26,7 +25,6 @@ pub fn runFromIterator(
     args: *std.process.Args.Iterator,
 ) !void {
     if (std.mem.eql(u8, command, "ha")) return ha.runFromIterator(init, "antfly", args);
-    if (std.mem.eql(u8, command, "lite")) return lite.runFromIterator(init, "antfly", args);
     if (std.mem.eql(u8, command, "serverless")) return serverless.runFromIterator(init, "antfly", args);
     return client.runFromIterator(init, command, args);
 }

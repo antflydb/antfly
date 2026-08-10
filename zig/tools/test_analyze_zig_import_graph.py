@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 
 import importlib.util
+import io
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 
 
@@ -61,6 +63,30 @@ class ImportGraphTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "escapes"):
             graph.resolve_source("../outside.zig")
+
+    def test_codegen_boundary_accepts_focused_cli(self):
+        self.write("cli_runtime.zig", 'const client = @import("client.zig");\n')
+        self.write("client.zig", "pub const value = 1;\n")
+        self.write("standalone/runtime.zig", "pub const value = 2;\n")
+        self.write("inference_runtime/runtime.zig", "pub const value = 3;\n")
+        graph = analyzer.ImportGraph(self.root)
+
+        self.assertTrue(analyzer.check_codegen_boundary(graph))
+
+    def test_codegen_boundary_rejects_transitive_runtime_import(self):
+        self.write("cli_runtime.zig", 'const command = @import("cmd/lite.zig");\n')
+        self.write("cmd/lite.zig", 'const runtime = @import("../standalone/runtime.zig");\n')
+        self.write("standalone/runtime.zig", "pub const value = 2;\n")
+        self.write("inference_runtime/runtime.zig", "pub const value = 3;\n")
+        graph = analyzer.ImportGraph(self.root)
+
+        diagnostics = io.StringIO()
+        with redirect_stderr(diagnostics):
+            self.assertFalse(analyzer.check_codegen_boundary(graph))
+        self.assertIn(
+            "cli_runtime.zig -> cmd/lite.zig -> standalone/runtime.zig",
+            diagnostics.getvalue(),
+        )
 
 
 if __name__ == "__main__":

@@ -25,8 +25,6 @@ pub const metadata = @import("metadata/mod.zig");
 pub const public_api = @import("api/mod.zig");
 pub const raft = @import("raft/mod.zig");
 pub const serverless = @import("serverless/mod.zig");
-pub const standalone = @import("standalone/mod.zig");
-pub const inference_runtime = @import("inference_runtime/runtime.zig");
 
 pub const ha = @import("storage/ha/mod.zig");
 pub const db = @import("storage/db/mod.zig");
