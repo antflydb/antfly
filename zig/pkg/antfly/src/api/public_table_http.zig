@@ -85,6 +85,7 @@ pub const TableApi = struct {
         DocIdentityUnavailable,
         ReadRequiresPrimary,
         ReadUnavailable,
+        StorageReadTemporarilyUnavailable,
         IndexRebuilding,
         ModelNotFound,
         UnsupportedExactSort,
@@ -108,6 +109,7 @@ pub const TableApi = struct {
         DocIdentityUnavailable,
         ReadRequiresPrimary,
         ReadUnavailable,
+        StorageReadTemporarilyUnavailable,
         ModelNotFound,
         InternalFailure,
     };
@@ -197,6 +199,7 @@ pub const TableApi = struct {
         DocIdentityUnavailable,
         ReadRequiresPrimary,
         ReadUnavailable,
+        StorageReadTemporarilyUnavailable,
         InternalFailure,
     };
 
@@ -206,6 +209,7 @@ pub const TableApi = struct {
         DocIdentityUnavailable,
         ReadRequiresPrimary,
         ReadUnavailable,
+        StorageReadTemporarilyUnavailable,
         InternalFailure,
     };
 
@@ -521,6 +525,18 @@ pub const OwnedResponse = struct {
     }
 };
 
+pub const storage_read_temporarily_unavailable_body = "{\"code\":\"storage_read_temporarily_unavailable\",\"message\":\"storage read temporarily unavailable\",\"retryable\":true}";
+pub const storage_read_temporarily_unavailable_retry_after_seconds: u32 = 1;
+
+pub fn storageReadTemporarilyUnavailableOwnedResponse(alloc: std.mem.Allocator) !OwnedResponse {
+    return .{
+        .status = 503,
+        .body = try alloc.dupe(u8, storage_read_temporarily_unavailable_body),
+        .json = true,
+        .retry_after_seconds = storage_read_temporarily_unavailable_retry_after_seconds,
+    };
+}
+
 pub fn isNonRetryableTableStorageReadError(err: anyerror) bool {
     return switch (err) {
         error.InvalidManifest,
@@ -710,6 +726,10 @@ pub fn handleTableQueryRequest(
                 std.log.warn("public table query standby unavailable table={s} err={}", .{ table_name, err });
                 return .{ .status = 503, .body = try alloc.dupe(u8, "standby read unavailable") };
             },
+            error.StorageReadTemporarilyUnavailable => {
+                std.log.warn("public table query storage temporarily unavailable table={s}", .{table_name});
+                return try storageReadTemporarilyUnavailableOwnedResponse(alloc);
+            },
             error.IndexRebuilding => {
                 std.log.info("public table query index rebuilding table={s}", .{table_name});
                 return .{
@@ -828,6 +848,7 @@ pub fn handleTableQueryView(
         error.DocIdentityUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "doc identity unavailable") },
         error.ReadRequiresPrimary => return .{ .status = 503, .body = try alloc.dupe(u8, "read requires primary") },
         error.ReadUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "standby read unavailable") },
+        error.StorageReadTemporarilyUnavailable => return try storageReadTemporarilyUnavailableOwnedResponse(alloc),
         error.ModelNotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "{\"error\":\"MODEL_NOT_FOUND\",\"message\":\"model not found\"}") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "query failed") },
     };
@@ -1121,6 +1142,7 @@ pub fn handleDocumentArtifactManifest(
         error.DocIdentityUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "doc identity unavailable") },
         error.ReadRequiresPrimary => return .{ .status = 503, .body = try alloc.dupe(u8, "read requires primary") },
         error.ReadUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "standby read unavailable") },
+        error.StorageReadTemporarilyUnavailable => return try storageReadTemporarilyUnavailableOwnedResponse(alloc),
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "artifact manifest lookup failed") },
     };
     defer manifest.deinit(alloc);
@@ -1229,6 +1251,7 @@ pub fn handleDocumentArtifactManifests(
         error.DocIdentityUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "doc identity unavailable") },
         error.ReadRequiresPrimary => return .{ .status = 503, .body = try alloc.dupe(u8, "read requires primary") },
         error.ReadUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "standby read unavailable") },
+        error.StorageReadTemporarilyUnavailable => return try storageReadTemporarilyUnavailableOwnedResponse(alloc),
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "artifact manifest list failed") },
     };
     defer list.deinit(alloc);
@@ -2202,6 +2225,7 @@ test "public table query handler preserves retryable failure status" {
         .{ .err = error.EmbedTransientFailure, .status = 503, .body = "query embedding temporarily unavailable" },
         .{ .err = error.EmbedUpstreamFailure, .status = 502, .body = "query embedding provider failed" },
         .{ .err = error.IndexRebuilding, .status = 503, .body = "{\"code\":\"index_rebuilding\",\"message\":\"required index is rebuilding\",\"retryable\":true}", .json = true },
+        .{ .err = error.StorageReadTemporarilyUnavailable, .status = 503, .body = "{\"code\":\"storage_read_temporarily_unavailable\",\"message\":\"storage read temporarily unavailable\",\"retryable\":true}", .json = true },
         .{ .err = error.InvalidManifest, .status = 500, .body = "{\"code\":\"table_storage_unreadable\",\"error\":\"InvalidManifest\",\"message\":\"table storage unreadable\",\"retryable\":false}", .json = true },
         .{ .err = error.CorruptInput, .status = 500, .body = "{\"code\":\"table_storage_unreadable\",\"error\":\"CorruptInput\",\"message\":\"table storage unreadable\",\"retryable\":false}", .json = true },
     };
@@ -2215,6 +2239,10 @@ test "public table query handler preserves retryable failure status" {
         try std.testing.expectEqual(tc.status, resp.status);
         try std.testing.expectEqualStrings(tc.body, resp.body);
         try std.testing.expectEqual(tc.json, resp.json);
+        try std.testing.expectEqual(
+            if (tc.err == error.StorageReadTemporarilyUnavailable) @as(?u32, 1) else null,
+            resp.retry_after_seconds,
+        );
     }
 }
 
@@ -3288,9 +3316,11 @@ test "public table restore handler reports confirmed durability" {
 
 test "public document artifact manifest handlers map HA read gate errors" {
     const Backend = struct {
-        fn iface() TableApi {
+        storage_unavailable: bool = false,
+
+        fn iface(self: *@This()) TableApi {
             return .{
-                .ptr = undefined,
+                .ptr = self,
                 .vtable = &.{
                     .execute_table_batch = unsupportedBatch,
                     .execute_table_query_request = unsupportedQueryRequest,
@@ -3308,24 +3338,30 @@ test "public document artifact manifest handlers map HA read gate errors" {
         }
 
         fn executeDocumentArtifactManifest(
-            _: *anyopaque,
+            ptr: *anyopaque,
             _: std.mem.Allocator,
             _: []const u8,
             _: []const u8,
             _: []const u8,
         ) TableApi.ExecuteDocumentArtifactManifestError!db_mod.types.DocumentArtifactManifest {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.storage_unavailable) return error.StorageReadTemporarilyUnavailable;
             return error.ReadUnavailable;
         }
 
         fn executeDocumentArtifactManifests(
-            _: *anyopaque,
+            ptr: *anyopaque,
             _: std.mem.Allocator,
             _: []const u8,
             _: []const u8,
         ) TableApi.ExecuteDocumentArtifactManifestsError!db_mod.types.DocumentArtifactManifestList {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.storage_unavailable) return error.StorageReadTemporarilyUnavailable;
             return error.ReadRequiresPrimary;
         }
     };
+
+    var backend = Backend{};
 
     var manifest_resp = try handleDocumentArtifactManifest(
         std.testing.allocator,
@@ -3333,7 +3369,7 @@ test "public document artifact manifest handlers map HA read gate errors" {
         "doc:a",
         "document_units_v1",
         .{},
-        Backend.iface(),
+        backend.iface(),
     );
     defer manifest_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 503), manifest_resp.status);
@@ -3344,11 +3380,41 @@ test "public document artifact manifest handlers map HA read gate errors" {
         "docs",
         "doc:a",
         .{},
-        Backend.iface(),
+        backend.iface(),
     );
     defer list_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 503), list_resp.status);
     try std.testing.expectEqualStrings("read requires primary", list_resp.body);
+
+    backend.storage_unavailable = true;
+    var storage_resp = try handleDocumentArtifactManifest(
+        std.testing.allocator,
+        "docs",
+        "doc:a",
+        "document_units_v1",
+        .{},
+        backend.iface(),
+    );
+    defer storage_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 503), storage_resp.status);
+    try std.testing.expect(storage_resp.json);
+    try std.testing.expectEqual(@as(?u32, 1), storage_resp.retry_after_seconds);
+    try std.testing.expectEqualStrings(
+        "{\"code\":\"storage_read_temporarily_unavailable\",\"message\":\"storage read temporarily unavailable\",\"retryable\":true}",
+        storage_resp.body,
+    );
+
+    var storage_list_resp = try handleDocumentArtifactManifests(
+        std.testing.allocator,
+        "docs",
+        "doc:a",
+        .{},
+        backend.iface(),
+    );
+    defer storage_list_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 503), storage_list_resp.status);
+    try std.testing.expect(storage_list_resp.json);
+    try std.testing.expectEqual(@as(?u32, 1), storage_list_resp.retry_after_seconds);
 }
 
 test "public document artifact manifest handler returns summary and raw state" {

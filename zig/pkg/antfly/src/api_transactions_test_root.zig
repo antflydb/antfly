@@ -12,8 +12,10 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const distributed_txn = @import("api/distributed_txn.zig");
 const transactions = @import("api/transactions.zig");
 
 test {
+    _ = distributed_txn;
     _ = transactions;
 }

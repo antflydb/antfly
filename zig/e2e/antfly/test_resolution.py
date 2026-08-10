@@ -101,7 +101,7 @@ DOCUMENTS_INDEXES = {
 
 
 @pytest.fixture(scope="function")
-def resolution_cluster():
+def resolution_cluster(request: pytest.FixtureRequest):
     binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
     if not Path(binary).exists():
         pytest.skip(f"Antfly binary not found: {binary} (set ANTFLY_BIN)")
@@ -116,7 +116,11 @@ def resolution_cluster():
     try:
         yield cluster
     finally:
-        cluster.stop(timeout_s=AUTOGRAPH_E2E_TEARDOWN_TIMEOUT_S)
+        report = getattr(request.node, "rep_call", None)
+        cluster.stop(
+            timeout_s=AUTOGRAPH_E2E_TEARDOWN_TIMEOUT_S,
+            test_failed=bool(report and report.failed),
+        )
 
 
 class _Api:
