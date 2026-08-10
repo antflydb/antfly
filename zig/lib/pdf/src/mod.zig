@@ -109,6 +109,7 @@ fn renderParsedPagePngEffectiveAlloc(alloc: Allocator, parsed: *reader.Reader, p
 }
 
 fn renderParsedPagePngNativeAlloc(alloc: Allocator, parsed: *reader.Reader, page_number: usize, dpi: u16, max_pixels: u64) ![]u8 {
+    const reader_alloc = parsed.allocator();
     if (page_number == 0) return error.InvalidPageNumber;
     if (dpi < minimum_direct_render_dpi or dpi > 600) return error.InvalidRenderDpi;
     const page_count = try parsed.pageCount();
@@ -120,7 +121,7 @@ fn renderParsedPagePngNativeAlloc(alloc: Allocator, parsed: *reader.Reader, page
     const preflight_height = @max(1.0, unscaled_box.max_y - unscaled_box.min_y) * scale;
     if (preflight_width * preflight_height > @as(f64, @floatFromInt(max_pixels))) return error.RenderedPageTooLarge;
     var render_runs = try parsed.extractPageRenderRunsAlloc(page_number);
-    defer render_runs.deinit(alloc);
+    defer render_runs.deinit(reader_alloc);
     scalePageRenderRuns(&render_runs, scale);
     const page_box = render_runs.page_box;
     const page_width = @max(1.0, page_box.max_x - page_box.min_x);
@@ -134,10 +135,10 @@ fn renderParsedPagePngNativeAlloc(alloc: Allocator, parsed: *reader.Reader, page
     var text_pattern_runs: []reader.PatternRun = &.{};
     var text_shape_runs: []reader.ShapeRun = &.{};
     defer {
-        for (text_pattern_runs) |*run| run.deinit(alloc);
-        if (text_pattern_runs.len > 0) alloc.free(text_pattern_runs);
-        for (text_shape_runs) |*run| run.deinit(alloc);
-        if (text_shape_runs.len > 0) alloc.free(text_shape_runs);
+        for (text_pattern_runs) |*run| run.deinit(reader_alloc);
+        if (text_pattern_runs.len > 0) reader_alloc.free(text_pattern_runs);
+        for (text_shape_runs) |*run| run.deinit(reader_alloc);
+        if (text_shape_runs.len > 0) reader_alloc.free(text_shape_runs);
     }
     var plain_runs = std.ArrayList(reader.TextRun).empty;
     defer plain_runs.deinit(alloc);
@@ -792,6 +793,21 @@ test "native backend renders embedded fixture pdf first page png" {
     const backend = Backend.native();
     const png = try backend.renderFirstPagePng(alloc, fixture);
     defer alloc.free(png);
+    try std.testing.expectEqualSlices(u8, &.{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' }, png[0..8]);
+}
+
+test "parsed rendering releases reader-owned runs with the reader allocator" {
+    const fixture = @embedFile("../testdata/simple_text_fixture.pdf");
+
+    var reader_gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer std.debug.assert(reader_gpa.deinit() == .ok);
+    var output_gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer std.debug.assert(output_gpa.deinit() == .ok);
+
+    var parsed = try reader.Reader.init(reader_gpa.allocator(), fixture);
+    defer parsed.deinit();
+    const png = try renderParsedPagePngAlloc(output_gpa.allocator(), &parsed, 1, 150, 40_000_000);
+    defer output_gpa.allocator().free(png);
     try std.testing.expectEqualSlices(u8, &.{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' }, png[0..8]);
 }
 

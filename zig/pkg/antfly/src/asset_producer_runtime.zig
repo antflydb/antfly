@@ -295,6 +295,9 @@ pub const Runtime = struct {
         for (requests) |request| {
             if (request.producer_type != .reader) return error.BatchIncompatible;
             if (!std.mem.eql(u8, request.config_json, requests[0].config_json)) return error.BatchIncompatible;
+            // Never collapse external and internally generated media into one
+            // request: trust is intentionally carried at the request boundary.
+            if (request.inline_media_trusted != requests[0].inline_media_trusted) return error.BatchIncompatible;
         }
 
         var cfg_parsed = try std.json.parseFromSlice(readers.Config, alloc, requests[0].config_json, .{
@@ -347,6 +350,7 @@ pub const Runtime = struct {
                 .images = chunk_images,
                 .prompt = shared_prompt,
                 .max_tokens = cfg_parsed.value.max_tokens,
+                .inline_content_trust = if (requests[0].inline_media_trusted) .trusted_internal else .untrusted,
                 .source_fingerprint = requests[0].source_fingerprint,
             });
             if (chunk_results.len != chunk_images.len) {
@@ -422,6 +426,7 @@ pub const Runtime = struct {
             .images = source.images,
             .prompt = source.prompt orelse cfg_parsed.value.prompt,
             .max_tokens = cfg_parsed.value.max_tokens,
+            .inline_content_trust = if (request.inline_media_trusted) .trusted_internal else .untrusted,
             .source_fingerprint = request.source_fingerprint,
         });
         defer {
@@ -1355,6 +1360,7 @@ test "asset producer runtime routes antfly reader without url to local provider"
             try std.testing.expectEqual(@as(usize, 1), request.images.len);
             try std.testing.expectEqualStrings("data:image/png;base64,aaa", request.images[0]);
             try std.testing.expectEqualStrings("extract", request.prompt.?);
+            try std.testing.expectEqual(readers.InlineContentTrust.untrusted, request.inline_content_trust);
 
             const out = try a.alloc(readers.Result, 1);
             out[0] = .{ .text = try a.dupe(u8, "local read text") };
@@ -1415,6 +1421,7 @@ test "asset producer runtime batches compatible antfly reader requests" {
             try std.testing.expectEqualStrings("data:image/png;base64,aaa", request.images[0]);
             try std.testing.expectEqualStrings("data:image/png;base64,bbb", request.images[1]);
             try std.testing.expect(request.prompt == null);
+            try std.testing.expectEqual(readers.InlineContentTrust.trusted_internal, request.inline_content_trust);
 
             const out = try a.alloc(readers.Result, 2);
             out[0] = .{ .text = try a.dupe(u8, "first") };
@@ -1435,12 +1442,14 @@ test "asset producer runtime batches compatible antfly reader requests" {
             .config_json = "{\"provider\":\"antfly\",\"model\":\"local-reader\"}",
             .source_text = "data:image/png;base64,aaa",
             .content_type = "text/plain",
+            .inline_media_trusted = true,
         },
         .{
             .producer_type = .reader,
             .config_json = "{\"provider\":\"antfly\",\"model\":\"local-reader\"}",
             .source_text = "data:image/png;base64,bbb",
             .content_type = "text/plain",
+            .inline_media_trusted = true,
         },
     });
     defer {

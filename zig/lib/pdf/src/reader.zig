@@ -1349,6 +1349,13 @@ pub const Reader = struct {
 
     const max_recursive_pdf_objects: usize = 100_000;
 
+    /// Allocator that owns objects returned by the Reader extraction APIs.
+    /// Callers that use a distinct allocator for downstream rendering must
+    /// release Reader-owned runs with this allocator.
+    pub fn allocator(self: *const Reader) Allocator {
+        return self.alloc;
+    }
+
     const TraversalGuard = struct {
         visited: std.AutoHashMapUnmanaged(u64, void) = .empty,
         nodes: usize = 0,

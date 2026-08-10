@@ -77,10 +77,18 @@ pub const Config = struct {
     }
 };
 
+pub const InlineContentTrust = enum {
+    untrusted,
+    trusted_internal,
+};
+
 pub const Request = struct {
     images: []const []const u8,
     prompt: ?[]const u8 = null,
     max_tokens: ?i64 = null,
+    /// Trust applies only to inline `data:` image content. Network locations
+    /// always retain the configured download policy.
+    inline_content_trust: InlineContentTrust = .untrusted,
     /// Stable source fingerprint for opt-in inference profiling. Remote reader
     /// providers deliberately do not serialize this internal-only value.
     source_fingerprint: ?[]const u8 = null,

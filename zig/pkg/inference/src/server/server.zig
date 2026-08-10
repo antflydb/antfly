@@ -2321,7 +2321,11 @@ pub const Node = struct {
         const batch_byte_cap = readBatchMaxBytes();
         var batch_bytes: usize = 0;
         for (request.images, 0..) |image_url, i| {
-            var item = try downloadReadBatchContent(self, allocator, image_url, batch_byte_cap, batch_bytes, .trusted_internal);
+            const inline_content_trust: InlineContentTrust = switch (request.inline_content_trust) {
+                .untrusted => .untrusted,
+                .trusted_internal => .trusted_internal,
+            };
+            var item = try downloadReadBatchContent(self, allocator, image_url, batch_byte_cap, batch_bytes, inline_content_trust);
             errdefer item.deinit(allocator);
             batch_bytes = try addReadBatchDownloadedBytes(batch_bytes, item, batch_byte_cap);
             downloaded[i] = item;

@@ -74,6 +74,9 @@ pub const Request = struct {
     source_text: []const u8,
     source_parts_json: ?[]const u8 = null,
     content_type: []const u8 = "",
+    /// Only producers that generated the inline media themselves may set this
+    /// value. User-authored fields and URLs remain untrusted by default.
+    inline_media_trusted: bool = false,
     /// Stable source fingerprint for opt-in producer/inference profiling.
     source_fingerprint: ?[]const u8 = null,
 };

@@ -4059,7 +4059,10 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
     defer if (owned_pdf_session) |*session| session.deinit();
     var pdf_session = pdf_session_override;
     if (pdf_session == null and kind == .ocr and std.mem.eql(u8, route_type, "pdf")) {
-        owned_pdf_session = try document_extraction_mod.PdfRenderSession.initWithDecodeLimits(alloc, source_bytes, config.pdf_decode_limits);
+        // The Reader owns decoded image resources and render runs in addition
+        // to the final PNG. Keep the whole render session on the working-set
+        // allocator so adversarial PDFs cannot allocate around admission.
+        owned_pdf_session = try document_extraction_mod.PdfRenderSession.initWithDecodeLimits(working_alloc, source_bytes, config.pdf_decode_limits);
         pdf_session = &owned_pdf_session.?;
     }
     for (units, 0..) |unit, idx| {
@@ -4109,6 +4112,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
             .source_text = if (rendered != null) "" else source_url,
             .source_parts_json = parts_json,
             .content_type = "text/plain",
+            .inline_media_trusted = rendered != null,
             .source_fingerprint = source_fingerprint,
         };
         const request_bytes = runtimeGeneratedTextRequestBytes(request);
@@ -4366,6 +4370,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextUnit(
         .source_text = if (rendered != null) "" else source_url,
         .source_parts_json = parts_json,
         .content_type = "text/plain",
+        .inline_media_trusted = rendered != null,
     });
     errdefer runtime.alloc.free(produced);
     try applyRuntimeGeneratedUnitText(runtime.alloc, unit, produced, method, "completed", kind, config.ocr_quality, if (kind == .ocr) document_extraction_mod.effectiveOcrPrompt(config) else "");
@@ -4896,7 +4901,6 @@ const RuntimeDocumentExtractionCollectContext = struct {
     pending_generated_units: std.ArrayListUnmanaged(document_extraction_mod.Unit) = .empty,
     pending_generated_kind: ?RuntimeGeneratedUnitTextKind = null,
     pending_generated_bytes: usize = 0,
-    pdf_render_session: ?document_extraction_mod.PdfRenderSession = null,
     resolved_char_cursor: usize = 0,
 
     fn sink(self: *@This()) document_extraction_mod.UnitSink {
@@ -4909,7 +4913,6 @@ const RuntimeDocumentExtractionCollectContext = struct {
     }
 
     fn deinit(self: *@This(), alloc: Allocator) void {
-        if (self.pdf_render_session) |*session| session.deinit();
         self.info.deinit(alloc);
         self.clearPendingGeneratedUnits(alloc);
         self.pending_generated_units.deinit(alloc);
@@ -4962,9 +4965,6 @@ const RuntimeDocumentExtractionCollectContext = struct {
         if (self.pending_generated_units.items.len == 0) return;
         const producer = self.runtime.config.asset_producer orelse return error.MissingAssetProducer;
         const kind = self.pending_generated_kind orelse return error.InvalidAssetProducerResponse;
-        if (self.pdf_render_session == null and kind == .ocr and std.mem.eql(u8, self.info.route_type, "pdf")) {
-            self.pdf_render_session = try document_extraction_mod.PdfRenderSession.initWithDecodeLimits(self.runtime.alloc, self.source_bytes, self.config.pdf_decode_limits);
-        }
         try completeRuntimeDocumentExtractionGeneratedTextBatch(
             self.runtime,
             self.runtime.alloc,
@@ -4977,7 +4977,7 @@ const RuntimeDocumentExtractionCollectContext = struct {
             self.info.content_type,
             self.pending_generated_units.items,
             kind,
-            if (self.pdf_render_session) |*session| session else null,
+            null,
         );
         for (self.pending_generated_units.items) |*unit| {
             unit.char_start = std.math.cast(u32, self.resolved_char_cursor) orelse return error.DocumentExtractionOffsetOverflow;
