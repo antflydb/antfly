@@ -140,6 +140,61 @@ pub fn validateInlineSourceSize(remote_content: ?*const scraping.RemoteContentCo
     if (try inlineDataUriSourceTooLarge(remote_content, source_text)) return error.StreamTooLong;
 }
 
+/// HTTP statuses that are safe to retry without changing the request. Non-
+/// success 3xx/4xx responses are permanent except for standardized timeout,
+/// early-data, and throttling codes.
+pub fn remoteHttpStatusIsTransient(status: u16) bool {
+    return status == 408 or status == 425 or status == 429 or (status >= 500 and status <= 599);
+}
+
+/// Configuration, policy, and input errors cannot be repaired by retrying the
+/// same remote fetch. Unknown transport/backend errors remain retryable so new
+/// downloader errors cannot silently park documents without using the worker
+/// retry budget.
+pub fn remoteContentErrorIsPermanent(err: anyerror) bool {
+    return switch (err) {
+        error.InvalidUri,
+        error.UnexpectedCharacter,
+        error.InvalidFormat,
+        error.InvalidPort,
+        error.InvalidHostName,
+        error.UnsupportedUrlScheme,
+        error.InvalidDataUri,
+        error.InvalidBase64,
+        error.StreamTooLong,
+        error.MissingS3Credentials,
+        error.MissingAccessKeyId,
+        error.MissingSecretAccessKey,
+        error.InvalidS3Url,
+        error.MissingEndpoint,
+        error.InvalidHost,
+        error.HostNotAllowed,
+        error.PrivateIpBlocked,
+        error.PathNotAllowed,
+        error.UnsupportedRemoteContentCredential,
+        => true,
+        else => false,
+    };
+}
+
+test "remote fetch classification retries only transient failures" {
+    try std.testing.expect(remoteHttpStatusIsTransient(408));
+    try std.testing.expect(remoteHttpStatusIsTransient(425));
+    try std.testing.expect(remoteHttpStatusIsTransient(429));
+    try std.testing.expect(remoteHttpStatusIsTransient(500));
+    try std.testing.expect(remoteHttpStatusIsTransient(503));
+    try std.testing.expect(!remoteHttpStatusIsTransient(301));
+    try std.testing.expect(!remoteHttpStatusIsTransient(400));
+    try std.testing.expect(!remoteHttpStatusIsTransient(404));
+    try std.testing.expect(!remoteHttpStatusIsTransient(700));
+
+    try std.testing.expect(remoteContentErrorIsPermanent(error.HostNotAllowed));
+    try std.testing.expect(remoteContentErrorIsPermanent(error.StreamTooLong));
+    try std.testing.expect(remoteContentErrorIsPermanent(error.InvalidFormat));
+    try std.testing.expect(!remoteContentErrorIsPermanent(error.ConnectionResetByPeer));
+    try std.testing.expect(!remoteContentErrorIsPermanent(error.TimedOut));
+}
+
 pub const default_ocr_model = "antflydb/Florence-2-base";
 pub const default_ocr_config_json =
     \\{"provider":"antfly","model":"antflydb/Florence-2-base"}
@@ -164,7 +219,11 @@ pub const PdfRenderSession = struct {
     parsed: pdf.reader.Reader,
 
     pub fn init(alloc: Allocator, pdf_bytes: []const u8) !PdfRenderSession {
-        return .{ .parsed = try pdf.reader.Reader.init(alloc, pdf_bytes) };
+        return try initWithDecodeLimits(alloc, pdf_bytes, .{});
+    }
+
+    pub fn initWithDecodeLimits(alloc: Allocator, pdf_bytes: []const u8, decode_limits: pdf.reader.DecodeLimits) !PdfRenderSession {
+        return .{ .parsed = try pdf.reader.Reader.initWithDecodeLimits(alloc, pdf_bytes, decode_limits) };
     }
 
     pub fn deinit(self: *PdfRenderSession) void {
@@ -336,6 +395,9 @@ pub const Config = struct {
     transcription_config_json: []const u8 = "",
     route_preset: RoutePreset = .mixed_files,
     routes: []Route = &.{},
+    /// Runtime-owned safety policy. This is deliberately not parsed from the
+    /// producer JSON, so a document cannot raise the node's decode budget.
+    pdf_decode_limits: pdf.reader.DecodeLimits = .{},
 
     pub fn deinit(self: *Config, alloc: Allocator) void {
         if (self.filename.len > 0) alloc.free(@constCast(self.filename));
@@ -1055,13 +1117,13 @@ pub fn extractDownloadedAlloc(
     const content_type = if (config.content_type.len > 0) config.content_type else downloaded.content_type;
     for (config.routes) |route| {
         if (!routeMatches(route.match, content_type, config.filename, source_url, downloaded.data)) continue;
-        return try extractWithRouteAlloc(alloc, downloaded.data, content_type, route, config.html_strip_tags, config.ocr_mode, config.ocr_quality);
+        return try extractWithRouteAlloc(alloc, downloaded.data, content_type, route, config.html_strip_tags, config.ocr_mode, config.ocr_quality, config.pdf_decode_limits);
     }
     if (config.route_preset == .explicit_only) {
         return try unsupportedResultAlloc(alloc, content_type, "no_configured_route_matched");
     }
     if (isPdfContent(content_type, config.filename, source_url, downloaded.data)) {
-        return try extractPdfAlloc(alloc, downloaded.data, content_type, config.ocr_mode, config.ocr_quality);
+        return try extractPdfAlloc(alloc, downloaded.data, content_type, config.ocr_mode, config.ocr_quality, config.pdf_decode_limits);
     }
     if (isHtmlContent(content_type, config.filename, source_url, downloaded.data)) {
         return try extractSingleTextUnitAlloc(alloc, downloaded.data, content_type, "article:000001", "article", "html_text", config.html_strip_tags);
@@ -1103,14 +1165,14 @@ pub fn extractDownloadedStreaming(
     const content_type = if (config.content_type.len > 0) config.content_type else downloaded.content_type;
     for (config.routes) |route| {
         if (!routeMatches(route.match, content_type, config.filename, source_url, downloaded.data)) continue;
-        return try extractWithRouteStreaming(alloc, downloaded.data, content_type, route, config.html_strip_tags, config.ocr_mode, config.ocr_quality, sink);
+        return try extractWithRouteStreaming(alloc, downloaded.data, content_type, route, config.html_strip_tags, config.ocr_mode, config.ocr_quality, config.pdf_decode_limits, sink);
     }
     if (config.route_preset == .explicit_only) {
         try streamUnsupportedResult(sink, content_type, "no_configured_route_matched");
         return;
     }
     if (isPdfContent(content_type, config.filename, source_url, downloaded.data)) {
-        return try extractPdfStreaming(alloc, downloaded.data, content_type, config.ocr_mode, config.ocr_quality, sink);
+        return try extractPdfStreaming(alloc, downloaded.data, content_type, config.ocr_mode, config.ocr_quality, config.pdf_decode_limits, sink);
     }
     if (isHtmlContent(content_type, config.filename, source_url, downloaded.data)) {
         return try extractSingleTextUnitStreaming(alloc, downloaded.data, content_type, "article:000001", "article", "html_text", config.html_strip_tags, sink);
@@ -1150,10 +1212,11 @@ fn extractWithRouteStreaming(
     html_strip_tags: bool,
     ocr_mode: OcrMode,
     ocr_quality: OcrQualityConfig,
+    pdf_decode_limits: pdf.reader.DecodeLimits,
     sink: UnitSink,
 ) !void {
     switch (route.extractor_type) {
-        .pdf => return try extractPdfStreaming(alloc, bytes, content_type, ocr_mode, ocr_quality, sink),
+        .pdf => return try extractPdfStreaming(alloc, bytes, content_type, ocr_mode, ocr_quality, pdf_decode_limits, sink),
         .html => return try extractSingleConfiguredUnitStreaming(alloc, bytes, content_type, route.unit, "article", "html_text", html_strip_tags, sink),
         .text => return try extractSingleConfiguredUnitStreaming(alloc, bytes, content_type, route.unit, "document", "text", false, sink),
         .email => return try streamBufferedExtraction(alloc, try extractEmailAlloc(alloc, bytes, content_type, if (route.unit.len > 0) route.unit else "email"), sink),
@@ -1253,9 +1316,10 @@ fn extractWithRouteAlloc(
     html_strip_tags: bool,
     ocr_mode: OcrMode,
     ocr_quality: OcrQualityConfig,
+    pdf_decode_limits: pdf.reader.DecodeLimits,
 ) !Result {
     return switch (route.extractor_type) {
-        .pdf => try extractPdfAlloc(alloc, bytes, content_type, ocr_mode, ocr_quality),
+        .pdf => try extractPdfAlloc(alloc, bytes, content_type, ocr_mode, ocr_quality, pdf_decode_limits),
         .html => try extractSingleConfiguredUnitAlloc(alloc, bytes, content_type, route.unit, "article", "html_text", html_strip_tags),
         .text => try extractSingleConfiguredUnitAlloc(alloc, bytes, content_type, route.unit, "document", "text", false),
         .email => try extractEmailAlloc(alloc, bytes, content_type, if (route.unit.len > 0) route.unit else "email"),
@@ -1311,6 +1375,13 @@ const PdfPageTextCandidate = struct {
 
 fn extractPdfPageTextBestEffort(alloc: Allocator, parsed: *pdf.reader.Reader, page_num: usize) !PdfPageTextCandidate {
     var analysis = parsed.extractPageTextAnalysisAlloc(page_num) catch |err| {
+        switch (err) {
+            error.OutOfMemory,
+            error.DecodedStreamTooLarge,
+            error.PdfDecodeWorkingSetTooLarge,
+            => return err,
+            else => {},
+        }
         var empty_analysis = pdf.reader.PageTextAnalysis{
             .text = try alloc.dupe(u8, ""),
             .runs = try alloc.alloc(pdf.reader.TextRun, 0),
@@ -1331,8 +1402,17 @@ fn extractPdfPageTextBestEffort(alloc: Allocator, parsed: *pdf.reader.Reader, pa
     };
 }
 
-fn extractPdfAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8, ocr_mode: OcrMode, quality_config: OcrQualityConfig) !Result {
-    var parsed = try pdf.reader.Reader.init(alloc, bytes);
+pub fn resolvesToPdf(config: Config, source_url: []const u8, content_type: []const u8, bytes: []const u8) bool {
+    for (config.routes) |route| {
+        if (!routeMatches(route.match, content_type, config.filename, source_url, bytes)) continue;
+        return route.extractor_type == .pdf;
+    }
+    if (config.route_preset == .explicit_only) return false;
+    return isPdfContent(content_type, config.filename, source_url, bytes);
+}
+
+fn extractPdfAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8, ocr_mode: OcrMode, quality_config: OcrQualityConfig, decode_limits: pdf.reader.DecodeLimits) !Result {
+    var parsed = try pdf.reader.Reader.initWithDecodeLimits(alloc, bytes, decode_limits);
     defer parsed.deinit();
 
     const page_count = try parsed.pageCount();
@@ -1411,8 +1491,8 @@ fn extractPdfAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8
     };
 }
 
-fn extractPdfStreaming(alloc: Allocator, bytes: []const u8, content_type: []const u8, ocr_mode: OcrMode, quality_config: OcrQualityConfig, sink: UnitSink) !void {
-    var parsed = try pdf.reader.Reader.init(alloc, bytes);
+fn extractPdfStreaming(alloc: Allocator, bytes: []const u8, content_type: []const u8, ocr_mode: OcrMode, quality_config: OcrQualityConfig, decode_limits: pdf.reader.DecodeLimits, sink: UnitSink) !void {
+    var parsed = try pdf.reader.Reader.initWithDecodeLimits(alloc, bytes, decode_limits);
     defer parsed.deinit();
 
     const page_count = try parsed.pageCount();

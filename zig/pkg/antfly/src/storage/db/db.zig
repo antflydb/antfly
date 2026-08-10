@@ -25646,26 +25646,47 @@ fn computeDocumentExtractionAssetRequestDerived(
     ) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => {
-            try appendDocumentExtractionFailureManifest(alloc, db, request.doc_key, artifact_name, source_url, manifest_key, state_key, existing_state, from_generation, to_generation, @errorName(err), "remote content download failed", artifact_writes, artifact_delete_keys);
+            if (!document_extraction_mod.remoteContentErrorIsPermanent(err)) return err;
+            try appendDocumentExtractionFailureManifest(alloc, db, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, @errorName(err), "remote content download failed", artifact_writes);
             return;
         },
     };
     const downloaded = switch (fetched) {
         .ok => |content| content,
         .http_error => |http_error| {
+            if (document_extraction_mod.remoteHttpStatusIsTransient(http_error.status))
+                return error.RemoteDocumentFetchFailed;
             const message = try std.fmt.allocPrint(alloc, "{s}: HTTP {d}", .{ http_error.message, http_error.status });
             defer alloc.free(message);
-            try appendDocumentExtractionFailureManifest(alloc, db, request.doc_key, artifact_name, source_url, manifest_key, state_key, existing_state, from_generation, to_generation, "RemoteDocumentFetchFailed", message, artifact_writes, artifact_delete_keys);
+            try appendDocumentExtractionFailureManifest(alloc, db, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, "RemoteDocumentFetchFailed", message, artifact_writes);
             return;
         },
     };
     var downloaded_mut = downloaded;
     defer downloaded_mut.deinit(alloc);
 
+    var pdf_decode_reservation: ?resource_manager_mod.Reservation = null;
+    defer if (pdf_decode_reservation) |*reservation| reservation.release();
+    if (document_extraction_mod.resolvesToPdf(config, source_url, if (config.content_type.len > 0) config.content_type else downloaded_mut.content_type, downloaded_mut.data)) {
+        if (db.core.index_manager.resource_manager) |manager| {
+            const stats = manager.sliceStats(.document_extraction_working_set);
+            const downloaded_bytes: u64 = @intCast(downloaded_mut.data.len);
+            const decode_budget = if (stats.hard_limit_bytes == 0)
+                @as(u64, @intCast(config.pdf_decode_limits.max_working_set_bytes))
+            else
+                @min(@as(u64, @intCast(config.pdf_decode_limits.max_working_set_bytes)), stats.hard_limit_bytes -| downloaded_bytes);
+            if (decode_budget == 0) return error.DocumentExtractionWorkingSetTooLarge;
+            const reservation_bytes = std.math.add(u64, downloaded_bytes, decode_budget) catch return error.DocumentExtractionWorkingSetTooLarge;
+            pdf_decode_reservation = try manager.reserve(.document_extraction_working_set, reservation_bytes);
+            config.pdf_decode_limits.max_working_set_bytes = @intCast(decode_budget);
+            config.pdf_decode_limits.max_decoded_stream_bytes = @min(config.pdf_decode_limits.max_decoded_stream_bytes, config.pdf_decode_limits.max_working_set_bytes);
+        }
+    }
+
     var extraction = document_extraction_mod.extractDownloadedAlloc(alloc, downloaded_mut, source_url, config) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => {
-            try appendDocumentExtractionFailureManifest(alloc, db, request.doc_key, artifact_name, source_url, manifest_key, state_key, existing_state, from_generation, to_generation, @errorName(err), "document extraction failed", artifact_writes, artifact_delete_keys);
+            try appendDocumentExtractionFailureManifest(alloc, db, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, @errorName(err), "document extraction failed", artifact_writes);
             return;
         },
     };
@@ -27794,6 +27815,9 @@ fn documentExtractionFailureManifestPayloadAlloc(
     doc_key: []const u8,
     artifact_name: []const u8,
     source_url: []const u8,
+    unit_keys: []const []const u8,
+    chunk_keys: []const []const u8,
+    previous_child_ranges: []const types.DocumentArtifactChildRange,
     from_generation: u64,
     to_generation: u64,
     error_code: []const u8,
@@ -27812,10 +27836,12 @@ fn documentExtractionFailureManifestPayloadAlloc(
     try appendJsonFieldString(alloc, &out, &first, "source_fingerprint", "");
     try appendJsonFieldString(alloc, &out, &first, "content_type", "");
     try appendJsonFieldString(alloc, &out, &first, "route_type", "error");
-    try appendJsonFieldUsize(alloc, &out, &first, "unit_count", 0);
-    try appendJsonFieldUsize(alloc, &out, &first, "chunk_count", 0);
+    try appendJsonFieldUsize(alloc, &out, &first, "unit_count", unit_keys.len);
+    try appendJsonFieldUsize(alloc, &out, &first, "chunk_count", chunk_keys.len);
     try appendJsonFieldName(alloc, &out, &first, "child_ranges");
-    try out.appendSlice(alloc, "[]");
+    try out.append(alloc, '[');
+    try appendDocumentExtractionRangeDescriptors(alloc, &out, artifact_name, unit_keys, chunk_keys, &.{}, previous_child_ranges);
+    try out.append(alloc, ']');
     try appendJsonFieldName(alloc, &out, &first, "merge_plan");
     try out.append(alloc, '{');
     var merge_first = true;
@@ -27844,25 +27870,18 @@ fn appendDocumentExtractionFailureManifest(
     artifact_name: []const u8,
     source_url: []const u8,
     manifest_key: []const u8,
-    state_key: []const u8,
     existing_state: ?[]const u8,
+    previous_child_ranges: []const types.DocumentArtifactChildRange,
     from_generation: u64,
     to_generation: u64,
     error_code: []const u8,
     error_message: []const u8,
     artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
-    artifact_delete_keys: *std.ArrayListUnmanaged([]const u8),
 ) !void {
+    var previous_state = DocumentExtractionPreviousState{};
+    defer previous_state.deinit(alloc);
     if (existing_state != null) {
-        var previous_state = try loadDocumentExtractionPreviousState(alloc, db, doc_key, artifact_name, existing_state);
-        defer previous_state.deinit(alloc);
-        for (previous_state.unit_keys) |previous_key| {
-            try artifact_delete_keys.append(alloc, try alloc.dupe(u8, previous_key));
-        }
-        for (previous_state.chunk_keys) |previous_key| {
-            try artifact_delete_keys.append(alloc, try alloc.dupe(u8, previous_key));
-        }
-        try artifact_delete_keys.append(alloc, try alloc.dupe(u8, state_key));
+        previous_state = try loadDocumentExtractionPreviousState(alloc, db, doc_key, artifact_name, existing_state);
     }
 
     const manifest = try documentExtractionFailureManifestPayloadAlloc(
@@ -27870,6 +27889,9 @@ fn appendDocumentExtractionFailureManifest(
         doc_key,
         artifact_name,
         source_url,
+        previous_state.unit_keys,
+        previous_state.chunk_keys,
+        previous_child_ranges,
         from_generation,
         to_generation,
         error_code,
@@ -27880,6 +27902,35 @@ fn appendDocumentExtractionFailureManifest(
         .key = try alloc.dupe(u8, manifest_key),
         .value = try alloc.dupe(u8, manifest),
     });
+    // Preserve the last known-good state and child artifacts. The failure
+    // manifest makes the source stale and repairable without creating a search
+    // outage or losing the prior key set needed for a correct future diff.
+}
+
+test "db document extraction failure manifest preserves prior artifacts" {
+    const alloc = std.testing.allocator;
+    const unit_keys = [_][]const u8{"unit:1"};
+    const chunk_keys = [_][]const u8{"chunk:1"};
+    const manifest = try documentExtractionFailureManifestPayloadAlloc(
+        alloc,
+        "doc:1",
+        "document_units_v1",
+        "https://example.test/document.pdf",
+        &unit_keys,
+        &chunk_keys,
+        &.{},
+        4,
+        5,
+        "RemoteDocumentFetchFailed",
+        "remote content download failed",
+    );
+    defer alloc.free(manifest);
+
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"unit_count\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"chunk_count\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"start_key\":\"unit:1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"start_key\":\"chunk:1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"last_error\":{\"code\":\"RemoteDocumentFetchFailed\"") != null);
 }
 
 fn extractAssetSourceValue(

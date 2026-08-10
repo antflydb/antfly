@@ -19,6 +19,88 @@ const image_lib = @import("antfly_image");
 const font_lib = @import("antfly_font");
 
 const Allocator = std.mem.Allocator;
+
+pub const default_max_decoded_stream_bytes: usize = 64 * 1024 * 1024;
+pub const default_max_decode_working_set_bytes: usize = 96 * 1024 * 1024;
+
+/// Bounds both the final output of one PDF stream and the cumulative live
+/// allocations used while applying its filter chain. The working-set limit is
+/// intentionally separate: chained filters and predictors retain their input
+/// until the next output has been produced.
+pub const DecodeLimits = struct {
+    max_decoded_stream_bytes: usize = default_max_decoded_stream_bytes,
+    max_working_set_bytes: usize = default_max_decode_working_set_bytes,
+
+    fn validate(self: DecodeLimits) !void {
+        if (self.max_decoded_stream_bytes == 0 or self.max_working_set_bytes == 0)
+            return error.InvalidPdfDecodeLimits;
+    }
+};
+
+const DecodeBudgetAllocator = struct {
+    backing: Allocator,
+    live_bytes: usize,
+    max_live_bytes: usize,
+    limit_exceeded: bool = false,
+
+    fn init(backing: Allocator, initial_live_bytes: usize, max_live_bytes: usize) DecodeBudgetAllocator {
+        return .{
+            .backing = backing,
+            .live_bytes = initial_live_bytes,
+            .max_live_bytes = max_live_bytes,
+        };
+    }
+
+    fn allocator(self: *DecodeBudgetAllocator) Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            },
+        };
+    }
+
+    fn permitsGrowth(self: *DecodeBudgetAllocator, additional_bytes: usize) bool {
+        if (additional_bytes <= self.max_live_bytes -| self.live_bytes) return true;
+        self.limit_exceeded = true;
+        return false;
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *DecodeBudgetAllocator = @ptrCast(@alignCast(ctx));
+        if (!self.permitsGrowth(len)) return null;
+        const ptr = self.backing.rawAlloc(len, alignment, ret_addr) orelse return null;
+        self.live_bytes += len;
+        return ptr;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *DecodeBudgetAllocator = @ptrCast(@alignCast(ctx));
+        const growth = new_len -| memory.len;
+        if (growth > 0 and !self.permitsGrowth(growth)) return false;
+        if (!self.backing.rawResize(memory, alignment, new_len, ret_addr)) return false;
+        self.live_bytes = self.live_bytes -| memory.len +| new_len;
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *DecodeBudgetAllocator = @ptrCast(@alignCast(ctx));
+        const growth = new_len -| memory.len;
+        if (growth > 0 and !self.permitsGrowth(growth)) return null;
+        const ptr = self.backing.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
+        self.live_bytes = self.live_bytes -| memory.len +| new_len;
+        return ptr;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *DecodeBudgetAllocator = @ptrCast(@alignCast(ctx));
+        self.backing.rawFree(memory, alignment, ret_addr);
+        self.live_bytes -|= memory.len;
+    }
+};
 const max_trailing_pdf_bytes: usize = 4096;
 
 pub const XrefEntry = struct {
@@ -1255,6 +1337,7 @@ fn objectEncryptionKey(file_key: [16]u8, ptr: syntax.ObjRef, method: EncryptionC
 pub const Reader = struct {
     alloc: Allocator,
     bytes: []const u8,
+    decode_limits: DecodeLimits,
     version_minor: u8,
     startxref_offset: usize,
     xref_entries: []XrefEntry,
@@ -1287,6 +1370,11 @@ pub const Reader = struct {
     };
 
     pub fn init(alloc: Allocator, bytes: []const u8) !Reader {
+        return try initWithDecodeLimits(alloc, bytes, .{});
+    }
+
+    pub fn initWithDecodeLimits(alloc: Allocator, bytes: []const u8, decode_limits: DecodeLimits) !Reader {
+        try decode_limits.validate();
         if (bytes.len < 10) return error.InvalidPdfHeader;
         // ISO 32000 permits the header to appear anywhere in the first 1024
         // bytes. In practice scanners and download gateways sometimes prefix
@@ -1318,7 +1406,7 @@ pub const Reader = struct {
         var trailer: ?syntax.Object = null;
         errdefer if (trailer) |*value| value.deinit(alloc);
 
-        try parseXrefTable(alloc, bytes, startxref_offset, &entries, &trailer);
+        try parseXrefTable(alloc, bytes, startxref_offset, &entries, &trailer, decode_limits);
         if (trailer == null) return error.MissingTrailer;
 
         const xref_entries = try entries.toOwnedSlice(alloc);
@@ -1342,6 +1430,7 @@ pub const Reader = struct {
         var reader: Reader = .{
             .alloc = alloc,
             .bytes = bytes,
+            .decode_limits = decode_limits,
             .version_minor = minor - '0',
             .startxref_offset = startxref_offset,
             .xref_entries = xref_entries,
@@ -1517,9 +1606,11 @@ pub const Reader = struct {
         if (obj.* != .stream) return error.NotAStream;
         const stream_value = obj.stream;
         if (self.decrypted_streams.get(stream_value.data_offset)) |decrypted| {
+            if (decrypted.len > self.decode_limits.max_working_set_bytes) return error.PdfDecodeWorkingSetTooLarge;
             return try self.alloc.dupe(u8, decrypted);
         }
         const data_length = try self.resolvedStreamDataLength(obj);
+        if (data_length > self.decode_limits.max_working_set_bytes) return error.PdfDecodeWorkingSetTooLarge;
         const end = std.math.add(usize, stream_value.data_offset, data_length) catch return error.InvalidObjectOffset;
         if (end > self.bytes.len) return error.InvalidObjectOffset;
         return try self.alloc.dupe(u8, self.bytes[stream_value.data_offset..end]);
@@ -1542,8 +1633,7 @@ pub const Reader = struct {
     pub fn readDecodedStreamData(self: *const Reader, obj: *const syntax.Object) ![]u8 {
         if (obj.* != .stream) return error.NotAStream;
         const raw = try self.readRawStreamData(obj);
-        defer self.alloc.free(raw);
-        return try decodeStreamFiltersAlloc(self.alloc, raw, obj.get("Filter"), obj.get("DecodeParms"));
+        return try decodeStreamFiltersOwnedAlloc(self.alloc, raw, obj.get("Filter"), obj.get("DecodeParms"), self.decode_limits);
     }
 
     pub fn pageCount(self: *Reader) !usize {
@@ -3273,13 +3363,13 @@ pub const Reader = struct {
         }
         if (!image_mask and streamHasFilter(obj.get("Filter"), "DCTDecode")) {
             const raw = try self.readRawStreamData(obj);
-            defer self.alloc.free(raw);
-            const encoded = try decodeStreamFiltersBeforeAlloc(
+            const encoded = try decodeStreamFiltersBeforeOwnedAlloc(
                 self.alloc,
                 raw,
-                obj.get("Filter"),
+                obj.get("Filter").?,
                 obj.get("DecodeParms"),
                 "DCTDecode",
+                self.decode_limits,
             );
             defer self.alloc.free(encoded);
             const jpeg_decoded = try image_lib.jpeg.decodeRgba(self.alloc, encoded);
@@ -4317,10 +4407,11 @@ fn parseXrefTable(
     offset: usize,
     entries: *std.ArrayList(XrefEntry),
     trailer_out: *?syntax.Object,
+    decode_limits: DecodeLimits,
 ) anyerror!void {
     var visited: std.AutoHashMapUnmanaged(usize, void) = .empty;
     defer visited.deinit(alloc);
-    return try parseXrefTableGuarded(alloc, bytes, offset, entries, trailer_out, &visited);
+    return try parseXrefTableGuarded(alloc, bytes, offset, entries, trailer_out, &visited, decode_limits);
 }
 
 fn parseXrefTableGuarded(
@@ -4330,6 +4421,7 @@ fn parseXrefTableGuarded(
     entries: *std.ArrayList(XrefEntry),
     trailer_out: *?syntax.Object,
     visited: *std.AutoHashMapUnmanaged(usize, void),
+    decode_limits: DecodeLimits,
 ) anyerror!void {
     if (offset >= bytes.len) return error.InvalidStartXref;
     const visit = try visited.getOrPut(alloc, offset);
@@ -4338,7 +4430,7 @@ fn parseXrefTableGuarded(
     var cursor = offset;
     skipPdfWs(bytes, &cursor);
     if (!std.mem.startsWith(u8, bytes[cursor..], "xref")) {
-        return try parseXrefStream(alloc, bytes, cursor, entries, trailer_out, visited);
+        return try parseXrefStream(alloc, bytes, cursor, entries, trailer_out, visited, decode_limits);
     }
     cursor += "xref".len;
 
@@ -4372,7 +4464,7 @@ fn parseXrefTableGuarded(
     }
     if (trailer.get("Prev")) |prev_value| {
         if (prev_value.asInteger()) |prev| {
-            if (prev >= 0) try parseXrefTableGuarded(alloc, bytes, @intCast(prev), entries, trailer_out, visited);
+            if (prev >= 0) try parseXrefTableGuarded(alloc, bytes, @intCast(prev), entries, trailer_out, visited, decode_limits);
         }
     }
 }
@@ -4384,6 +4476,7 @@ fn parseXrefStream(
     entries: *std.ArrayList(XrefEntry),
     trailer_out: *?syntax.Object,
     visited: *std.AutoHashMapUnmanaged(usize, void),
+    decode_limits: DecodeLimits,
 ) anyerror!void {
     if (offset >= bytes.len) return error.InvalidStartXref;
 
@@ -4407,7 +4500,7 @@ fn parseXrefStream(
         trailer_out.* = try trailer.clone(alloc);
     }
 
-    const decoded = try decodeStreamDataAlloc(alloc, bytes, xref_stream);
+    const decoded = try decodeStreamDataAlloc(alloc, bytes, xref_stream, decode_limits);
     defer alloc.free(decoded);
 
     const widths = try parseXrefWidths(xref_stream.get("W") orelse return error.MalformedXrefStream);
@@ -4415,7 +4508,7 @@ fn parseXrefStream(
 
     if (trailer.get("Prev")) |prev_value| {
         if (prev_value.asInteger()) |prev| {
-            if (prev >= 0) try parseXrefTableGuarded(alloc, bytes, @intCast(prev), entries, trailer_out, visited);
+            if (prev >= 0) try parseXrefTableGuarded(alloc, bytes, @intCast(prev), entries, trailer_out, visited, decode_limits);
         }
     }
 }
@@ -4518,13 +4611,13 @@ fn cloneStreamHeaderAsDict(alloc: Allocator, obj: *const syntax.Object) !syntax.
     return .{ .dict = out };
 }
 
-fn decodeStreamDataAlloc(alloc: Allocator, bytes: []const u8, obj: *const syntax.Object) ![]u8 {
+fn decodeStreamDataAlloc(alloc: Allocator, bytes: []const u8, obj: *const syntax.Object, decode_limits: DecodeLimits) ![]u8 {
     if (obj.* != .stream) return error.NotAStream;
     const stream_value = obj.stream;
     const end = stream_value.data_offset + stream_value.data_length;
     if (end > bytes.len) return error.InvalidObjectOffset;
     const raw = bytes[stream_value.data_offset..end];
-    return try decodeStreamFiltersAlloc(alloc, raw, obj.get("Filter"), obj.get("DecodeParms"));
+    return try decodeStreamFiltersAlloc(alloc, raw, obj.get("Filter"), obj.get("DecodeParms"), decode_limits);
 }
 
 fn streamHasFilter(filter_obj: ?*const syntax.Object, name: []const u8) bool {
@@ -4762,20 +4855,60 @@ fn decodeStreamFiltersAlloc(
     raw: []const u8,
     filter_obj: ?*const syntax.Object,
     decode_parms_obj: ?*const syntax.Object,
+    decode_limits: DecodeLimits,
 ) ![]u8 {
-    if (filter_obj == null) {
-        // Some allocators reuse a sentinel for zero-length allocations. Avoid
-        // passing the same sentinel as both source and destination to dupe.
-        if (raw.len == 0) return try alloc.alloc(u8, 0);
-        return try alloc.dupe(u8, raw);
+    try decode_limits.validate();
+    if (raw.len > decode_limits.max_working_set_bytes) return error.PdfDecodeWorkingSetTooLarge;
+    const owned = if (raw.len == 0) try alloc.alloc(u8, 0) else try alloc.dupe(u8, raw);
+    return try decodeStreamFiltersOwnedAlloc(alloc, owned, filter_obj, decode_parms_obj, decode_limits);
+}
+
+fn decodeStreamFiltersOwnedAlloc(
+    alloc: Allocator,
+    raw: []u8,
+    filter_obj: ?*const syntax.Object,
+    decode_parms_obj: ?*const syntax.Object,
+    decode_limits: DecodeLimits,
+) ![]u8 {
+    decode_limits.validate() catch |err| {
+        alloc.free(raw);
+        return err;
+    };
+    if (raw.len > decode_limits.max_working_set_bytes) {
+        alloc.free(raw);
+        return error.PdfDecodeWorkingSetTooLarge;
     }
 
-    var current = try alloc.dupe(u8, raw);
+    var budget = DecodeBudgetAllocator.init(alloc, raw.len, decode_limits.max_working_set_bytes);
+    const decode_alloc = budget.allocator();
+    return decodeStreamFiltersOwnedBudgetAlloc(
+        decode_alloc,
+        raw,
+        filter_obj,
+        decode_parms_obj,
+        decode_limits.max_decoded_stream_bytes,
+    ) catch |err| {
+        if (err == error.OutOfMemory and budget.limit_exceeded)
+            return error.PdfDecodeWorkingSetTooLarge;
+        return err;
+    };
+}
+
+fn decodeStreamFiltersOwnedBudgetAlloc(
+    alloc: Allocator,
+    raw: []u8,
+    filter_obj: ?*const syntax.Object,
+    decode_parms_obj: ?*const syntax.Object,
+    max_decoded_stream_bytes: usize,
+) ![]u8 {
+    if (filter_obj == null) return raw;
+
+    var current = raw;
     errdefer alloc.free(current);
 
     switch (filter_obj.?.*) {
         .name => |name| {
-            const next = try applyStreamFilterAlloc(alloc, current, name, decode_parms_obj);
+            const next = try applyStreamFilterAlloc(alloc, current, name, decode_parms_obj, max_decoded_stream_bytes);
             alloc.free(current);
             return next;
         },
@@ -4790,7 +4923,7 @@ fn decodeStreamFiltersAlloc(
                     }
                 else
                     null;
-                const next = try applyStreamFilterAlloc(alloc, current, name, param);
+                const next = try applyStreamFilterAlloc(alloc, current, name, param, max_decoded_stream_bytes);
                 alloc.free(current);
                 current = next;
             }
@@ -4806,9 +4939,56 @@ fn decodeStreamFiltersBeforeAlloc(
     filter_obj: ?*const syntax.Object,
     decode_parms_obj: ?*const syntax.Object,
     stop_filter: []const u8,
+    decode_limits: DecodeLimits,
 ) ![]u8 {
+    try decode_limits.validate();
+    if (raw.len > decode_limits.max_working_set_bytes) return error.PdfDecodeWorkingSetTooLarge;
     const filter = filter_obj orelse return error.UnsupportedStreamFilter;
-    var current = try alloc.dupe(u8, raw);
+    const owned = if (raw.len == 0) try alloc.alloc(u8, 0) else try alloc.dupe(u8, raw);
+    return try decodeStreamFiltersBeforeOwnedAlloc(alloc, owned, filter, decode_parms_obj, stop_filter, decode_limits);
+}
+
+fn decodeStreamFiltersBeforeOwnedAlloc(
+    alloc: Allocator,
+    raw: []u8,
+    filter: *const syntax.Object,
+    decode_parms_obj: ?*const syntax.Object,
+    stop_filter: []const u8,
+    decode_limits: DecodeLimits,
+) ![]u8 {
+    decode_limits.validate() catch |err| {
+        alloc.free(raw);
+        return err;
+    };
+    if (raw.len > decode_limits.max_working_set_bytes) {
+        alloc.free(raw);
+        return error.PdfDecodeWorkingSetTooLarge;
+    }
+    var budget = DecodeBudgetAllocator.init(alloc, raw.len, decode_limits.max_working_set_bytes);
+    const decode_alloc = budget.allocator();
+    return decodeStreamFiltersBeforeOwnedBudgetAlloc(
+        decode_alloc,
+        raw,
+        filter,
+        decode_parms_obj,
+        stop_filter,
+        decode_limits.max_decoded_stream_bytes,
+    ) catch |err| {
+        if (err == error.OutOfMemory and budget.limit_exceeded)
+            return error.PdfDecodeWorkingSetTooLarge;
+        return err;
+    };
+}
+
+fn decodeStreamFiltersBeforeOwnedBudgetAlloc(
+    alloc: Allocator,
+    raw: []u8,
+    filter: *const syntax.Object,
+    decode_parms_obj: ?*const syntax.Object,
+    stop_filter: []const u8,
+    max_decoded_stream_bytes: usize,
+) ![]u8 {
+    var current = raw;
     errdefer alloc.free(current);
 
     switch (filter.*) {
@@ -4831,7 +5011,7 @@ fn decodeStreamFiltersBeforeAlloc(
                     }
                 else
                     null;
-                const next = try applyStreamFilterAlloc(alloc, current, name, param);
+                const next = try applyStreamFilterAlloc(alloc, current, name, param, max_decoded_stream_bytes);
                 alloc.free(current);
                 current = next;
             }
@@ -4846,8 +5026,8 @@ fn applyStreamFilterAlloc(
     input: []const u8,
     name: []const u8,
     param: ?*const syntax.Object,
+    max_decoded_stream_bytes: usize,
 ) ![]u8 {
-    const max_decoded_stream_bytes: usize = 256 * 1024 * 1024;
     if (std.mem.eql(u8, name, "FlateDecode")) {
         var in: std.Io.Reader = .fixed(input);
         var flate_buffer: [std.compress.flate.max_window_len]u8 = undefined;
@@ -9197,7 +9377,7 @@ test "xref parser rejects a cyclic Prev chain" {
 
     try std.testing.expectError(
         error.CyclicXref,
-        parseXrefTable(alloc, bytes, 0, &entries, &trailer),
+        parseXrefTable(alloc, bytes, 0, &entries, &trailer, .{}),
     );
 }
 
@@ -9495,6 +9675,27 @@ test "stream decoders enforce the decoded byte budget before growth" {
 
     const run_length = &.{ 2, 'A', 'B', 'C', 254, 'Z', 128 };
     try std.testing.expectError(error.DecodedStreamTooLarge, runLengthDecodeAlloc(alloc, run_length, 5));
+}
+
+test "stream filter chains enforce cumulative live allocation budget" {
+    const alloc = std.testing.allocator;
+    const run_length = &.{ 2, 'A', 'B', 'C', 254, 'Z', 128 };
+    var filter = syntax.Object{ .name = @constCast("RunLengthDecode") };
+
+    try std.testing.expectError(
+        error.PdfDecodeWorkingSetTooLarge,
+        decodeStreamFiltersAlloc(alloc, run_length, &filter, null, .{
+            .max_decoded_stream_bytes = 64,
+            .max_working_set_bytes = run_length.len + 5,
+        }),
+    );
+
+    const decoded = try decodeStreamFiltersAlloc(alloc, run_length, &filter, null, .{
+        .max_decoded_stream_bytes = 64,
+        .max_working_set_bytes = 256,
+    });
+    defer alloc.free(decoded);
+    try std.testing.expectEqualStrings("ABCZZZ", decoded);
 }
 
 test "predictor dimensions reject overflow and oversized rows before allocation" {
@@ -9953,7 +10154,7 @@ test "xref trailer is deinitialized once when recursive Prev parsing fails" {
 
     try std.testing.expectError(
         error.ExpectedTrailerDict,
-        parseXrefTable(alloc, bytes, invalid_previous.len, &entries, &trailer),
+        parseXrefTable(alloc, bytes, invalid_previous.len, &entries, &trailer, .{}),
     );
 }
 
@@ -10014,7 +10215,7 @@ test "stream filter prefix decoding stops before DCT data" {
     var filter_obj: syntax.Object = .{ .array = filters };
     defer filter_obj.deinit(alloc);
 
-    const result = try decodeStreamFiltersBeforeAlloc(alloc, compressed.items, &filter_obj, null, "DCTDecode");
+    const result = try decodeStreamFiltersBeforeAlloc(alloc, compressed.items, &filter_obj, null, "DCTDecode", .{});
     defer alloc.free(result);
     try std.testing.expectEqualStrings(encoded, result);
 }

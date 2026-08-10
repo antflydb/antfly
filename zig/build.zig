@@ -3981,6 +3981,11 @@ pub fn build(b: *std.Build) void {
             "storage.db.db.test.db replay applies dense embeddings from artifact payloads",
             "storage.db.db.test.db split cutover",
             "storage.db.db.test.db merge-style cutover",
+            "remote fetch classification retries only transient failures",
+            "remote HTTP failures consume retry budget before terminal coverage",
+            "document extraction reserves PDF decoder peak memory atomically",
+            "enrichment runtime document extraction manifest uses v2 range and merge shape",
+            "db document extraction failure manifest preserves prior artifacts",
         },
     });
     const run_lib_db_enrichment_tests = addFilteredTestRunArtifact(b, lib_db_enrichment_tests);

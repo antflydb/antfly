@@ -567,6 +567,7 @@ const EnrichmentErrorDisposition = enum {
 };
 
 fn enrichmentErrorDisposition(err: anyerror) EnrichmentErrorDisposition {
+    if (document_extraction_mod.remoteContentErrorIsPermanent(err)) return .terminal_request;
     return switch (err) {
         error.OutOfMemory,
         error.InvalidDenseArtifactTargetCounter,
@@ -600,6 +601,9 @@ fn enrichmentErrorDisposition(err: anyerror) EnrichmentErrorDisposition {
         error.ZipEncryptionUnsupported,
         error.ZipNoEndRecord,
         error.ZipTruncated,
+        error.DecodedStreamTooLarge,
+        error.PdfDecodeWorkingSetTooLarge,
+        error.InvalidPdfDecodeLimits,
         => .terminal_request,
 
         // New provider, transport, and decoder errors must not silently drop
@@ -742,6 +746,17 @@ fn shouldYieldRequestError(runtime: *EnrichmentRuntime, err: anyerror) bool {
     };
 }
 
+fn shouldYieldRemoteHttpFailure(runtime: *EnrichmentRuntime, status: u16) bool {
+    return remoteHttpFailureNeedsRetry(
+        status,
+        shouldYieldRequestError(runtime, error.RemoteDocumentFetchFailed),
+    );
+}
+
+fn remoteHttpFailureNeedsRetry(status: u16, retry_budget_allows: bool) bool {
+    return document_extraction_mod.remoteHttpStatusIsTransient(status) and retry_budget_allows;
+}
+
 fn workerRetryDelayMs(consecutive_retry_count: u32) u64 {
     // Six doublings already exceed the cap; bounding the shift also keeps
     // user-supplied retry budgets from overflowing before the min is applied.
@@ -771,6 +786,13 @@ test "enrichment worker attempt budget includes the current request" {
     try std.testing.expectEqual(@as(u32, 2), requestPriorAttempts(41, 41, 2));
     try std.testing.expectEqual(@as(u32, 0), requestPriorAttempts(42, 41, 2));
     try std.testing.expectEqual(@as(u32, 0), requestPriorAttempts(0, 41, 2));
+}
+
+test "remote HTTP failures consume retry budget before terminal coverage" {
+    try std.testing.expect(remoteHttpFailureNeedsRetry(503, true));
+    try std.testing.expect(remoteHttpFailureNeedsRetry(429, true));
+    try std.testing.expect(!remoteHttpFailureNeedsRetry(503, false));
+    try std.testing.expect(!remoteHttpFailureNeedsRetry(404, true));
 }
 
 test "enrichment worker retry delay is exponential and capped" {
@@ -3197,33 +3219,33 @@ fn processDocumentExtractionAsset(
         runtime.config.secret_store,
         source_url,
         if (config.credentials.len > 0) config.credentials else null,
-    ) catch |err| switch (err) {
-        std.mem.Allocator.Error.OutOfMemory => return err,
-        else => {
-            try writeDocumentExtractionFailureManifest(
-                runtime,
-                request.doc_key,
-                artifact_name,
-                source_url,
-                metadata_fingerprint orelse "",
-                config.content_type,
-                @errorName(err),
-                "remote content download failed",
-                "remote_content_download",
-                manifest_key,
-                state_key,
-                previous_child_ranges,
-                existing_state,
-                from_generation,
-                window,
-            );
-            try recordIsolatedRequestError(runtime, window, request, err);
-            return;
-        },
+    ) catch |err| {
+        if (shouldYieldRequestError(runtime, err)) return err;
+        try writeDocumentExtractionFailureManifest(
+            runtime,
+            request.doc_key,
+            artifact_name,
+            source_url,
+            metadata_fingerprint orelse "",
+            config.content_type,
+            @errorName(err),
+            "remote content download failed",
+            "remote_content_download",
+            manifest_key,
+            previous_child_ranges,
+            existing_state,
+            from_generation,
+            window,
+        );
+        try recordIsolatedRequestError(runtime, window, request, err);
+        return;
     };
     const downloaded = switch (fetched) {
         .ok => |content| content,
         .http_error => |http_error| {
+            if (shouldYieldRemoteHttpFailure(runtime, http_error.status)) {
+                return error.RemoteDocumentFetchFailed;
+            }
             const message = try std.fmt.allocPrint(runtime.alloc, "{s}: HTTP {d}", .{ http_error.message, http_error.status });
             defer runtime.alloc.free(message);
             try writeDocumentExtractionFailureManifest(
@@ -3237,7 +3259,6 @@ fn processDocumentExtractionAsset(
                 message,
                 "remote_content_http",
                 manifest_key,
-                state_key,
                 previous_child_ranges,
                 existing_state,
                 from_generation,
@@ -3252,6 +3273,11 @@ fn processDocumentExtractionAsset(
     var resource_tracker = RuntimeDocumentExtractionResourceTracker.init(runtime);
     defer resource_tracker.deinit();
     try resource_tracker.setDownloadedBytes(downloaded_mut.data.len);
+    if (document_extraction_mod.resolvesToPdf(config, source_url, if (config.content_type.len > 0) config.content_type else downloaded_mut.content_type, downloaded_mut.data)) {
+        const decode_budget = try resource_tracker.reservePdfDecodeWorkingSet(config.pdf_decode_limits.max_working_set_bytes);
+        config.pdf_decode_limits.max_working_set_bytes = decode_budget;
+        config.pdf_decode_limits.max_decoded_stream_bytes = @min(config.pdf_decode_limits.max_decoded_stream_bytes, decode_budget);
+    }
 
     const byte_source_fingerprint = if (metadata_fingerprint == null)
         try documentExtractionFingerprintAlloc(runtime.alloc, source_url, config_json, config.content_type, config.filename, downloaded_mut.content_type, downloaded_mut.data)
@@ -3309,7 +3335,6 @@ fn processDocumentExtractionAsset(
             "document extraction failed",
             documentExtractionFailureStage(err, "document_extraction"),
             manifest_key,
-            state_key,
             previous_child_ranges,
             existing_state,
             from_generation,
@@ -3490,7 +3515,6 @@ fn processDocumentExtractionAsset(
             "document extraction materialization failed",
             documentExtractionFailureStage(err, "document_materialization"),
             manifest_key,
-            state_key,
             previous_child_ranges,
             existing_state,
             from_generation,
@@ -3584,6 +3608,7 @@ fn documentExtractionFailureStage(err: anyerror, fallback: []const u8) []const u
         error.UnsupportedStreamFilter,
         error.UnsupportedPredictor,
         error.DecodedStreamTooLarge,
+        error.PdfDecodeWorkingSetTooLarge,
         => "pdf_stream_decode",
         error.UnsupportedPdfRendering,
         error.RenderedPageTooLarge,
@@ -3622,7 +3647,6 @@ fn writeDocumentExtractionFailureManifest(
     error_message: []const u8,
     error_stage: []const u8,
     manifest_key: []const u8,
-    state_key: []const u8,
     previous_child_ranges: []const types.DocumentArtifactChildRange,
     existing_state: ?[]const u8,
     from_generation: u64,
@@ -3649,9 +3673,9 @@ fn writeDocumentExtractionFailureManifest(
         source_fingerprint,
         failed_extraction,
         &.{},
-        &.{},
-        &.{},
-        &.{},
+        previous_state.unit_keys,
+        previous_state.unit_descriptors,
+        previous_state.chunk_keys,
         previous_child_ranges,
         previous_state.unit_keys,
         previous_state.unit_descriptors,
@@ -3673,11 +3697,6 @@ fn writeDocumentExtractionFailureManifest(
         }
         writes.deinit(runtime.alloc);
     }
-    var deletes = std.ArrayListUnmanaged([]const u8).empty;
-    defer {
-        for (deletes.items) |key| runtime.alloc.free(@constCast(key));
-        deletes.deinit(runtime.alloc);
-    }
 
     try writes.append(runtime.alloc, .{
         .key = try runtime.alloc.dupe(u8, manifest_key),
@@ -3685,19 +3704,11 @@ fn writeDocumentExtractionFailureManifest(
     });
     try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, manifest_key);
 
-    try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, state_key));
-    for (previous_state.unit_keys) |previous_key| {
-        try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, previous_key));
-        try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
-        try appendUniqueDupeKey(runtime.alloc, &window.deleted_keys, previous_key);
-    }
-    for (previous_state.chunk_keys) |previous_key| {
-        try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, previous_key));
-        try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
-        try appendUniqueDupeKey(runtime.alloc, &window.deleted_keys, previous_key);
-    }
-
-    try storePutBatchWithRetry(runtime, writes.items, deletes.items);
+    // Keep the last successfully materialized state and child artifacts. The
+    // failed manifest and repair ledger make the source stale/observable, while
+    // retaining searchable data and enough prior state for a later repair to
+    // diff and remove obsolete children correctly.
+    try storePutBatchWithRetry(runtime, writes.items, &.{});
     recordArtifactBytes(runtime, .asset, manifest.len);
 }
 
@@ -3820,7 +3831,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatch(
     defer if (owned_pdf_session) |*session| session.deinit();
     var pdf_session = pdf_session_override;
     if (pdf_session == null and kind == .ocr and std.mem.eql(u8, route_type, "pdf")) {
-        owned_pdf_session = try document_extraction_mod.PdfRenderSession.init(alloc, source_bytes);
+        owned_pdf_session = try document_extraction_mod.PdfRenderSession.initWithDecodeLimits(alloc, source_bytes, config.pdf_decode_limits);
         pdf_session = &owned_pdf_session.?;
     }
     for (units, 0..) |unit, idx| {
@@ -4098,7 +4109,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextUnit(
     unit.ocr_attempted = kind == .ocr;
     const rendered = if (kind == .ocr and std.mem.eql(u8, route_type, "pdf")) blk: {
         unit.ocr_render_dpi = config.ocr_render_dpi;
-        var rendered_page = document_extraction_mod.PdfRenderSession.init(runtime.alloc, source_bytes) catch |err| {
+        var rendered_page = document_extraction_mod.PdfRenderSession.initWithDecodeLimits(runtime.alloc, source_bytes, config.pdf_decode_limits) catch |err| {
             try setRuntimeGeneratedUnitFailureStage(runtime.alloc, unit, kind, "render");
             return err;
         };
@@ -4714,7 +4725,7 @@ const RuntimeDocumentExtractionCollectContext = struct {
         const producer = self.runtime.config.asset_producer orelse return error.MissingAssetProducer;
         const kind = self.pending_generated_kind orelse return error.InvalidAssetProducerResponse;
         if (self.pdf_render_session == null and kind == .ocr and std.mem.eql(u8, self.info.route_type, "pdf")) {
-            self.pdf_render_session = try document_extraction_mod.PdfRenderSession.init(self.runtime.alloc, self.source_bytes);
+            self.pdf_render_session = try document_extraction_mod.PdfRenderSession.initWithDecodeLimits(self.runtime.alloc, self.source_bytes, self.config.pdf_decode_limits);
         }
         try completeRuntimeDocumentExtractionGeneratedTextBatch(
             self.runtime,
@@ -4767,6 +4778,7 @@ const RuntimeDocumentExtractionResourceTracker = struct {
     manager: ?*resource_manager_mod.ResourceManager,
     current_bytes: u64 = 0,
     downloaded_bytes: usize = 0,
+    pdf_decode_reservation_bytes: u64 = 0,
 
     fn init(runtime: *EnrichmentRuntime) @This() {
         return .{ .manager = runtime.config.resource_manager orelse runtime.index_manager.resource_manager };
@@ -4775,6 +4787,21 @@ const RuntimeDocumentExtractionResourceTracker = struct {
     fn setDownloadedBytes(self: *@This(), bytes: usize) !void {
         self.downloaded_bytes = bytes;
         try self.setBytes(bytes);
+    }
+
+    fn reservePdfDecodeWorkingSet(self: *@This(), requested_bytes: usize) !usize {
+        const manager = self.manager orelse return requested_bytes;
+        const stats = manager.sliceStats(.document_extraction_working_set);
+        const own_available = if (stats.hard_limit_bytes == 0)
+            @as(u64, @intCast(requested_bytes))
+        else
+            stats.hard_limit_bytes -| self.current_bytes;
+        const reserved = @min(@as(u64, @intCast(requested_bytes)), own_available);
+        if (reserved == 0) return error.DocumentExtractionWorkingSetTooLarge;
+        const next = std.math.add(u64, self.current_bytes, reserved) catch return error.ResourceBudgetExceeded;
+        try self.setAccountedBytes(next);
+        self.pdf_decode_reservation_bytes = reserved;
+        return std.math.cast(usize, reserved) orelse return error.DocumentExtractionWorkingSetTooLarge;
     }
 
     fn updateWorkingSet(
@@ -4808,8 +4835,13 @@ const RuntimeDocumentExtractionResourceTracker = struct {
     }
 
     fn setBytes(self: *@This(), bytes: usize) !void {
+        const actual = std.math.cast(u64, bytes) orelse return error.ResourceBudgetExceeded;
+        const next = std.math.add(u64, actual, self.pdf_decode_reservation_bytes) catch return error.ResourceBudgetExceeded;
+        return try self.setAccountedBytes(next);
+    }
+
+    fn setAccountedBytes(self: *@This(), next: u64) !void {
         const manager = self.manager orelse return;
-        const next = std.math.cast(u64, bytes) orelse return error.ResourceBudgetExceeded;
         const stats = manager.sliceStats(.document_extraction_working_set);
         if (stats.hard_limit_bytes > 0 and next > stats.hard_limit_bytes) {
             return error.DocumentExtractionWorkingSetTooLarge;
@@ -4819,7 +4851,8 @@ const RuntimeDocumentExtractionResourceTracker = struct {
 
     fn observeBytes(self: *@This(), bytes: usize) void {
         const manager = self.manager orelse return;
-        const next = std.math.cast(u64, bytes) orelse std.math.maxInt(u64);
+        const actual = std.math.cast(u64, bytes) orelse std.math.maxInt(u64);
+        const next = std.math.add(u64, actual, self.pdf_decode_reservation_bytes) catch std.math.maxInt(u64);
         manager.observeUsage(.document_extraction_working_set, &self.current_bytes, next);
     }
 
@@ -4848,6 +4881,24 @@ test "document extraction working set accounts generated unit cache bytes" {
 
     try tracker.updateWorkingSet(40, 0, &.{}, &window);
     try std.testing.expectError(error.DocumentExtractionWorkingSetTooLarge, tracker.updateWorkingSet(40, 60, &.{}, &window));
+}
+
+test "document extraction reserves PDF decoder peak memory atomically" {
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{
+        .soft_limit_bytes = 0,
+        .hard_limit_bytes = 100,
+    };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    var tracker = RuntimeDocumentExtractionResourceTracker{ .manager = &manager };
+    defer tracker.deinit();
+
+    try tracker.setDownloadedBytes(10);
+    try std.testing.expectEqual(@as(usize, 60), try tracker.reservePdfDecodeWorkingSet(60));
+    try std.testing.expectEqual(@as(u64, 70), manager.sliceStats(.document_extraction_working_set).used_bytes);
+    try tracker.setBytes(40);
+    try std.testing.expectEqual(@as(u64, 100), manager.sliceStats(.document_extraction_working_set).used_bytes);
+    try std.testing.expectError(error.DocumentExtractionWorkingSetTooLarge, tracker.setBytes(41));
 }
 
 fn addUsizeSaturating(a: usize, b: usize) usize {
@@ -8826,7 +8877,13 @@ fn documentExtractionManifestPayloadAlloc(
         if (value.stage) |stage| try appendJsonFieldString(alloc, &out, &error_first, "stage", stage);
         try out.append(alloc, '}');
     }
-    try appendJsonFieldUsize(alloc, &out, &first, "unit_count", if (unit_text_lengths.len > 0) unit_text_lengths.len else extraction.units.len);
+    const unit_count = if (unit_text_lengths.len > 0)
+        unit_text_lengths.len
+    else if (extraction.units.len > 0)
+        extraction.units.len
+    else
+        unit_keys.len;
+    try appendJsonFieldUsize(alloc, &out, &first, "unit_count", unit_count);
     try appendJsonFieldUsize(alloc, &out, &first, "chunk_count", chunk_keys.len);
     try appendJsonFieldUsize(alloc, &out, &first, "ocr_attempted_count", extraction.ocr_attempted_count);
     try appendJsonFieldUsize(alloc, &out, &first, "ocr_selected_count", extraction.ocr_selected_count);
@@ -11377,9 +11434,9 @@ test "enrichment runtime document extraction manifest uses v2 range and merge sh
         "source-fingerprint",
         failed_extraction,
         &.{},
-        &.{},
-        &.{},
-        &.{},
+        &previous_unit_keys,
+        &previous_descriptors,
+        &previous_chunk_keys,
         &.{},
         &previous_unit_keys,
         &previous_descriptors,
@@ -11394,8 +11451,8 @@ test "enrichment runtime document extraction manifest uses v2 range and merge sh
     defer alloc.free(failed);
     try std.testing.expect(std.mem.indexOf(u8, failed, "\"generation\":6") != null);
     try std.testing.expect(std.mem.indexOf(u8, failed, "\"last_error\":{\"code\":\"InvalidPdf\",\"message\":\"document extraction failed\"}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, failed, "\"unit_count\":0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, failed, "\"chunk_count\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, failed, "\"unit_count\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, failed, "\"chunk_count\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, failed, "\"child_count\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, failed, "\"route_status\":\"remote_committed\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, failed, "\"status\":\"failed\"") != null);
