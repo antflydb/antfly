@@ -2658,6 +2658,69 @@ for the experimental distributed build in one change. Until that selection
 makes the physical `RaftApplyStore` unreachable, do not measure or claim a
 distributed graph reduction.
 
+### Phase 4k: opaque data-Raft projection and local-transition owner
+
+ABI versions 21 and 22 complete the data-Raft ownership prerequisite. The
+compiled kernel now owns the physical apply/projection store and every DB
+operation used by local split and merge coordination. Distributed control
+retains Raft orchestration, metadata policy, retry scheduling, transition
+admission, and deterministic two-group ordering, but it no longer needs to
+reopen a DB already resident in the opaque process owner.
+
+The boundary remains coarse:
+
+- one committed Raft batch, snapshot phase, or bounded projection page crosses
+  the data-apply ABI;
+- one bounded reconciliation call copies authoritative resident DB state into
+  the apply projection without exposing either owner;
+- one synchronous local split/merge phase borrows the source/donor and
+  destination/receiver handles, executes the existing coordinator entirely in
+  the storage unit, and returns only scalar transition facts; and
+- immutable table, schema, index, and source/target identity contracts are
+  borrowed for the call. No DB, backend store, record, or LMDB primitive
+  crosses the boundary.
+
+Pre-bootstrap destinations are opened from the transition's pinned contract,
+not from a fresh catalog lookup. This is required because the destination
+range is intentionally absent from the catalog before bootstrap. Owner
+acquisition remains globally ordered by group ID, while ABI argument order
+preserves source/destination and donor/receiver roles. Merge identity
+reassignment is performed inside the kernel against the resident receiver.
+
+Focused validation with normal build concurrency passed:
+
+- the cross-archive DataServer suite: 16/16, including complete local split and
+  merge fallbacks and zero leaks;
+- the opaque owner suite: 8/8 with zero leaks;
+- the provisioned owner-source suite: 6/6 with zero leaks;
+- complete linked native Debug builds with the experiment enabled and
+  disabled, production LSM-only mode, and LMDB compatibility enabled; and
+- all three graph boundary gates plus 15/15 analyzer tests.
+
+A fresh-cache native Debug compiler capture compared this complete slice with
+the immediately preceding projection baseline:
+
+| Unit | Baseline | Candidate | Repository Zig files | Declarations |
+|---|---:|---:|---:|---:|
+| Distributed | 77.330 s | 75.980 s | 719 -> 719 | 42,183 -> 41,980 |
+| Storage kernel | 51.582 s | 50.882 s | 429 -> 434 | 28,904 -> 29,081 |
+| API kernel | 29.152 s | 28.871 s | 326 -> 326 | unchanged |
+
+The distributed file graph and its 1,069,802 repository source lines were
+identical. The small time deltas are local noise, while the five files added to
+the storage unit are the coordinator implementation now owned there. Therefore
+this checkpoint does **not** justify a cold ARM64 Linux musl `ReleaseFast`
+build or claim a compiler-time improvement.
+
+Decision: **keep as the completion of the data-Raft/split-merge ownership
+prerequisite, with no compiler claim**. It removes the resident-owner conflict
+that made the atomic physical-source cut behaviorally impossible. The next
+measurement-worthy experiment remains checklist item 7 above: select a
+control-only distributed composition in one compile-time switch so the legacy
+physical caches, resource owner, local vtables, DB opens, maintenance, and
+generation-transition implementations become unreachable together. Do not
+measure another individual lifecycle callback.
+
 ## Holistic target architecture
 
 The current candidate baseline is the four-unit topology above with serverless

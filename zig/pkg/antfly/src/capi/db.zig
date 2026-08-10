@@ -43,6 +43,7 @@ const distributed_graph = antfly.public_api.distributed_graph;
 const runtime_status = antfly.public_api.runtime_status;
 const shard_state_store = antfly.data_snapshot;
 const data_raft_apply = antfly.data_raft_apply;
+const data_raft_projection_wire = antfly.data_raft_projection_wire;
 const backups_api = antfly.public_api.backups;
 const backup_restore = antfly.raft.storage.backup_restore;
 const Allocator = std.mem.Allocator;
@@ -2054,6 +2055,249 @@ pub fn dataApplyStoreLatest(
     return .ok;
 }
 
+pub fn dataApplyStoreLatestForTransition(
+    store_ptr: ?*anyopaque,
+    request: *const kernel_owner_abi.DataApplyGroupRequest,
+    out_result: *kernel_owner_abi.DataApplyLatestResult,
+) callconv(.c) kernel_owner_abi.Status {
+    out_result.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asDataApplyStore(store_ptr) orelse return .invalid_argument;
+    const latest = handle.store.latestBatchForTransition(request.group_id) catch |err|
+        return storageOwnerStatusFromError(err);
+    out_result.* = dataApplyLatestResult(latest);
+    return .ok;
+}
+
+pub fn dataApplyStoreProjection(
+    store_ptr: ?*anyopaque,
+    request: *const kernel_owner_abi.DataApplyProjectionRequest,
+    out_result: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_result.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request.expected.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asDataApplyStore(store_ptr) orelse return .invalid_argument;
+    const alloc = handle.alloc;
+    const encoded = switch (request.kind) {
+        .observe_split_control => blk: {
+            var observation = handle.store.observeSplitControl(alloc, request.group_id) catch |err|
+                return storageOwnerStatusFromError(err);
+            defer observation.deinit(alloc);
+            break :blk data_raft_projection_wire.encodeSplitControlAlloc(alloc, observation) catch |err|
+                return storageOwnerStatusFromError(err);
+        },
+        .current_range => blk: {
+            const byte_range = handle.store.currentRange(alloc, request.group_id) catch |err|
+                return storageOwnerStatusFromError(err);
+            defer {
+                if (byte_range.start.len > 0) alloc.free(@constCast(byte_range.start));
+                if (byte_range.end.len > 0) alloc.free(@constCast(byte_range.end));
+            }
+            break :blk data_raft_projection_wire.encodeRangeAlloc(alloc, byte_range) catch |err|
+                return storageOwnerStatusFromError(err);
+        },
+        .group_state_page => blk: {
+            const max_entries = std.math.cast(usize, request.max_entries) orelse return .invalid_argument;
+            const max_bytes = std.math.cast(usize, request.max_bytes) orelse return .invalid_argument;
+            if (max_entries == 0 or max_bytes == 0) return .invalid_argument;
+            var page = handle.store.groupStatePageInRange(
+                alloc,
+                request.group_id,
+                .{ .start = request.range_start.slice(), .end = request.range_end.slice() },
+                if (request.after_key.len == 0) null else request.after_key.slice(),
+                max_entries,
+                max_bytes,
+            ) catch |err| return storageOwnerStatusFromError(err);
+            defer page.deinit(alloc);
+            break :blk data_raft_projection_wire.encodeGroupStatePageAlloc(alloc, page) catch |err|
+                return storageOwnerStatusFromError(err);
+        },
+        .split_deltas_page => blk: {
+            const max_entries = std.math.cast(usize, request.max_entries) orelse return .invalid_argument;
+            const max_bytes = std.math.cast(usize, request.max_bytes) orelse return .invalid_argument;
+            if (max_entries == 0 or max_bytes == 0) return .invalid_argument;
+            const deltas = handle.store.listSplitDeltasPage(
+                alloc,
+                request.group_id,
+                request.after_sequence,
+                request.through_sequence,
+                max_entries,
+                max_bytes,
+            ) catch |err| return storageOwnerStatusFromError(err);
+            defer antfly.shard.freeDeltas(alloc, deltas);
+            break :blk data_raft_projection_wire.encodeSplitDeltasAlloc(alloc, deltas) catch |err|
+                return storageOwnerStatusFromError(err);
+        },
+        .capture_verified_handoff_metadata => blk: {
+            const expected = (dataApplyExpectedBatch(request.expected) catch return .invalid_argument) orelse
+                return .invalid_argument;
+            const root_incarnation = std.mem.readInt(u128, &request.root_incarnation_le, .little);
+            const handoff = handle.store.captureVerifiedSplitHandoffMetadataAtRootIncarnation(
+                alloc,
+                request.group_id,
+                expected,
+                root_incarnation,
+            ) catch |err| return storageOwnerStatusFromError(err);
+            const value = handoff orelse return .not_found;
+            defer antfly.data_snapshot.freeHandoffMetadata(alloc, value);
+            break :blk data_raft_projection_wire.encodeHandoffMetadataAlloc(alloc, value) catch |err|
+                return storageOwnerStatusFromError(err);
+        },
+    };
+    out_result.* = .{
+        .ptr = if (encoded.len == 0) null else encoded.ptr,
+        .len = @intCast(encoded.len),
+    };
+    return .ok;
+}
+
+pub fn dataApplyStoreReconcileOwner(
+    store_ptr: ?*anyopaque,
+    owner_ptr: ?*anyopaque,
+    request: *const kernel_owner_abi.DataApplyReconcileRequest,
+    out_result: *kernel_owner_abi.DataApplyReconcileResult,
+) callconv(.c) kernel_owner_abi.Status {
+    out_result.* = .{};
+    if (request.version != kernel_owner_abi.abi_version or
+        request.expected.version != kernel_owner_abi.abi_version)
+        return .invalid_abi;
+    const apply_handle = asDataApplyStore(store_ptr) orelse return .invalid_argument;
+    const owner = asHandle(owner_ptr) orelse return .invalid_argument;
+    if (owner.storage_owner_group_id != request.group_id) return .invalid_argument;
+    const max_entries = std.math.cast(usize, request.max_page_entries) orelse return .invalid_argument;
+    const max_bytes = std.math.cast(usize, request.max_page_bytes) orelse return .invalid_argument;
+    if (max_entries == 0 or max_bytes == 0) return .invalid_argument;
+    if (request.capture_handoff > 1) return .invalid_argument;
+    const capture_handoff = request.capture_handoff != 0;
+    const expected = dataApplyExpectedBatch(request.expected) catch return .invalid_argument;
+    if (capture_handoff and expected == null) return .invalid_argument;
+    if (owner.db.hasTopologySensitiveTransactions() catch |err| return storageOwnerStatusFromError(err))
+        return .busy;
+    const root_incarnation = owner.db.durableRootIncarnation() catch |err|
+        return storageOwnerStatusFromError(err);
+    const alloc = apply_handle.alloc;
+
+    if (capture_handoff) {
+        const handoff = apply_handle.store.captureVerifiedSplitHandoffMetadataAtRootIncarnation(
+            alloc,
+            request.group_id,
+            expected.?,
+            root_incarnation,
+        ) catch |err| return storageOwnerStatusFromError(err);
+        if (handoff) |value| {
+            defer antfly.data_snapshot.freeHandoffMetadata(alloc, value);
+            const encoded = data_raft_projection_wire.encodeHandoffMetadataAlloc(alloc, value) catch |err|
+                return storageOwnerStatusFromError(err);
+            out_result.* = .{
+                .state = .handoff,
+                .handoff_metadata = .{
+                    .ptr = if (encoded.len == 0) null else encoded.ptr,
+                    .len = @intCast(encoded.len),
+                },
+            };
+            return .ok;
+        }
+    }
+
+    const active_split = apply_handle.store.currentSplitState(alloc, request.group_id) catch |err|
+        return storageOwnerStatusFromError(err);
+    defer if (active_split) |state| antfly.data_snapshot.freeSplitState(alloc, state);
+    var projected_range: ?data_raft_apply.AppliedDataRange = null;
+    defer if (projected_range) |range| {
+        if (range.start.len > 0) alloc.free(@constCast(range.start));
+        if (range.end.len > 0) alloc.free(@constCast(range.end));
+    };
+    const byte_range = if (active_split) |state| blk: {
+        const current = apply_handle.store.currentRange(alloc, request.group_id) catch |err|
+            return storageOwnerStatusFromError(err);
+        projected_range = current;
+        break :blk data_raft_apply.AppliedDataRange{
+            .start = current.start,
+            .end = state.original_range_end,
+        };
+    } else owner.db.getRange();
+
+    if (expected) |watermark| {
+        const reconciled = apply_handle.store.reconcileGroupSnapshotFromAuthoritativeStoreAtRootIncarnation(
+            alloc,
+            request.group_id,
+            watermark,
+            root_incarnation,
+            byte_range,
+            owner.db.core.store,
+            max_entries,
+            max_bytes,
+        ) catch |err| return storageOwnerStatusFromError(err);
+        if (!reconciled) {
+            out_result.state = .advanced;
+            return .ok;
+        }
+        if (!capture_handoff) {
+            out_result.state = .reconciled;
+            return .ok;
+        }
+        const handoff = apply_handle.store.captureVerifiedSplitHandoffMetadataAtRootIncarnation(
+            alloc,
+            request.group_id,
+            watermark,
+            root_incarnation,
+        ) catch |err| return storageOwnerStatusFromError(err);
+        const value = handoff orelse {
+            out_result.state = .advanced;
+            return .ok;
+        };
+        defer antfly.data_snapshot.freeHandoffMetadata(alloc, value);
+        const encoded = data_raft_projection_wire.encodeHandoffMetadataAlloc(alloc, value) catch |err|
+            return storageOwnerStatusFromError(err);
+        out_result.* = .{
+            .state = .handoff,
+            .handoff_metadata = .{
+                .ptr = if (encoded.len == 0) null else encoded.ptr,
+                .len = @intCast(encoded.len),
+            },
+        };
+        return .ok;
+    }
+    const seeded = apply_handle.store.seedGroupSnapshotFromAuthoritativeStoreIfAbsent(
+        alloc,
+        request.group_id,
+        root_incarnation,
+        byte_range,
+        owner.db.core.store,
+        max_entries,
+        max_bytes,
+    ) catch |err| return storageOwnerStatusFromError(err);
+    out_result.state = if (seeded) .reconciled else .advanced;
+    return .ok;
+}
+
+fn dataApplyLatestResult(latest: ?data_raft_apply.AppliedDataBatch) kernel_owner_abi.DataApplyLatestResult {
+    const value = latest orelse return .{};
+    return .{
+        .present = 1,
+        .commit_index = value.commit_index,
+        .entry_count = @intCast(value.entry_count),
+        .normal_entry_count = @intCast(value.normal_entry_count),
+        .admin_entry_count = @intCast(value.admin_entry_count),
+        .last_entry_term = value.last_entry_term,
+        .last_entry_index = value.last_entry_index,
+    };
+}
+
+fn dataApplyExpectedBatch(value: kernel_owner_abi.DataApplyLatestResult) !?data_raft_apply.AppliedDataBatch {
+    if (value.present == 0) return null;
+    if (value.present != 1) return error.InvalidArgument;
+    return .{
+        .commit_index = value.commit_index,
+        .entry_count = std.math.cast(usize, value.entry_count) orelse return error.InvalidArgument,
+        .normal_entry_count = std.math.cast(usize, value.normal_entry_count) orelse return error.InvalidArgument,
+        .admin_entry_count = std.math.cast(usize, value.admin_entry_count) orelse return error.InvalidArgument,
+        .last_entry_term = value.last_entry_term,
+        .last_entry_index = value.last_entry_index,
+    };
+}
+
 pub fn dataApplyStoreRetainGroups(
     store_ptr: ?*anyopaque,
     request: *const kernel_owner_abi.DataApplyGroupsRequest,
@@ -2108,6 +2352,313 @@ pub fn dataApplyStoreDestroyGroupTransition(transition_ptr: ?*anyopaque) callcon
     if (handle.active) handle.transition.abort();
     handle.transition.deinit();
     std.heap.c_allocator.destroy(handle);
+}
+
+fn releaseBorrowedTransitionOwner(_: *anyopaque) void {}
+
+fn validateLocalTransitionOwner(
+    handle: *const Handle,
+    group_id: u64,
+    table_name: []const u8,
+    table_id: u64,
+    shard_id: u64,
+    range_id: u64,
+    allow_same_table_identity: bool,
+) !void {
+    if (handle.storage_owner_group_id != group_id or
+        !std.mem.eql(u8, handle.storage_owner_table_name orelse return error.InvalidArgument, table_name) or
+        handle.storage_owner_path == null)
+    {
+        return error.InvalidArgument;
+    }
+    const identity = handle.db.core.identity_namespace;
+    if (identity.table_id != table_id) return error.DocIdentityNamespaceMismatch;
+    if (!allow_same_table_identity and
+        (identity.shard_id != shard_id or identity.range_id != range_id))
+    {
+        return error.DocIdentityNamespaceMismatch;
+    }
+}
+
+fn localTransitionIdentity(
+    request: *const kernel_owner_abi.LocalTransitionRequest,
+    target: bool,
+) db_mod.DocIdentityNamespace {
+    return .{
+        .table_id = request.table_id,
+        .shard_id = if (target) request.target_identity_shard_id else request.source_identity_shard_id,
+        .range_id = if (target) request.target_identity_range_id else request.source_identity_range_id,
+    };
+}
+
+fn localTransitionSplitResult(status: anytype) kernel_owner_abi.LocalTransitionResult {
+    return .{
+        .kind = .split,
+        .phase = @enumFromInt(@intFromEnum(status.phase)),
+        .has_source_split_phase = @intFromBool(status.source_split_phase != null),
+        .source_split_phase = if (status.source_split_phase) |phase| @intFromEnum(phase) else 0,
+        .bootstrapped = @intFromBool(status.bootstrapped),
+        .replay_required = @intFromBool(status.replay_required),
+        .replay_caught_up = @intFromBool(status.replay_caught_up),
+        .cutover_ready = @intFromBool(status.cutover_ready),
+        .peer_ready_for_reads = @intFromBool(status.destination_ready_for_reads),
+        .primary_delta_sequence = status.source_delta_sequence,
+        .secondary_delta_sequence = status.dest_delta_sequence,
+    };
+}
+
+fn localTransitionMergeResult(status: anytype) kernel_owner_abi.LocalTransitionResult {
+    return .{
+        .kind = .merge,
+        .phase = @enumFromInt(@intFromEnum(status.phase)),
+        .bootstrapped = @intFromBool(status.bootstrapped),
+        .replay_required = @intFromBool(status.replay_required),
+        .replay_caught_up = @intFromBool(status.replay_caught_up),
+        .cutover_ready = @intFromBool(status.cutover_ready),
+        .peer_ready_for_reads = @intFromBool(status.receiver_ready_for_reads),
+        .receiver_accepts_donor_range = @intFromBool(status.receiver_accepts_donor_range),
+        .allow_doc_identity_reassignment = @intFromBool(status.allow_doc_identity_reassignment),
+        .primary_group_id = status.donor_group_id,
+        .secondary_group_id = status.receiver_group_id,
+        .primary_delta_sequence = status.donor_delta_sequence,
+        .secondary_delta_sequence = status.receiver_delta_sequence,
+        .receiver_identity_table_id = status.receiver_identity_reassignment_namespace_table_id,
+        .receiver_identity_shard_id = status.receiver_identity_reassignment_namespace_shard_id,
+        .receiver_identity_range_id = status.receiver_identity_reassignment_namespace_range_id,
+    };
+}
+
+/// Execute one complete local transition phase against two resident opaque DB
+/// owners. No database, backend, or per-record representation crosses the ABI.
+pub fn storageOwnerLocalTransition(
+    primary_owner_ptr: ?*anyopaque,
+    secondary_owner_ptr: ?*anyopaque,
+    apply_store_ptr: ?*anyopaque,
+    request: *const kernel_owner_abi.LocalTransitionRequest,
+    out_result: *kernel_owner_abi.LocalTransitionResult,
+) callconv(.c) kernel_owner_abi.Status {
+    out_result.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request.transition_id == 0 or request.primary_group_id == 0 or
+        request.secondary_group_id == 0 or request.primary_group_id == request.secondary_group_id or
+        request.table_id == 0 or request.table_name.slice().len == 0 or
+        request.indexes_json.slice().len == 0 or request.allow_doc_identity_reassignment > 1 or
+        request.has_source_range_end > 1)
+    {
+        return .invalid_argument;
+    }
+    const primary = asHandle(primary_owner_ptr) orelse return .invalid_argument;
+    const secondary = asHandle(secondary_owner_ptr) orelse return .invalid_argument;
+    const table_name = request.table_name.slice();
+    const is_merge = switch (request.action) {
+        .observe_merge,
+        .accept_merge_receiver,
+        .catch_up_merge_receiver,
+        .finalize_merge,
+        .rollback_merge,
+        => true,
+        else => false,
+    };
+    validateLocalTransitionOwner(
+        primary,
+        request.primary_group_id,
+        table_name,
+        request.table_id,
+        request.source_identity_shard_id,
+        request.source_identity_range_id,
+        false,
+    ) catch |err| return storageOwnerStatusFromError(err);
+    validateLocalTransitionOwner(
+        secondary,
+        request.secondary_group_id,
+        table_name,
+        request.table_id,
+        request.target_identity_shard_id,
+        request.target_identity_range_id,
+        is_merge and request.allow_doc_identity_reassignment != 0,
+    ) catch |err| return storageOwnerStatusFromError(err);
+    if ((primary.db.hasTopologySensitiveTransactions() catch |err|
+        return storageOwnerStatusFromError(err)) or
+        (secondary.db.hasTopologySensitiveTransactions() catch |err|
+            return storageOwnerStatusFromError(err)))
+    {
+        return .busy;
+    }
+    const primary_path = primary.storage_owner_path.?;
+    const secondary_path = secondary.storage_owner_path.?;
+    const apply_store = if (apply_store_ptr != null)
+        &(asDataApplyStore(apply_store_ptr) orelse return .invalid_argument).store
+    else
+        null;
+    const alloc = std.heap.c_allocator;
+
+    switch (request.action) {
+        .observe_split,
+        .prepare_split_source,
+        .start_split_source,
+        .bootstrap_split_destination,
+        .catch_up_split_destination,
+        .finalize_split_source,
+        .rollback_split,
+        => {
+            if (request.attempt_epoch == 0 or request.allow_doc_identity_reassignment != 0)
+                return .invalid_argument;
+            var runtime = raft_mod.SplitCoordinatorRuntime.init(alloc, .{
+                .transition_id = request.transition_id,
+                .attempt_epoch = request.attempt_epoch,
+                .source_root_dir = primary_path,
+                .dest_root_dir = secondary_path,
+                .source_group_id = request.primary_group_id,
+                .dest_group_id = request.secondary_group_id,
+                .source_store = apply_store,
+                .source_lease = .{
+                    .db = &primary.db,
+                    .ctx = primary,
+                    .release_fn = releaseBorrowedTransitionOwner,
+                },
+                .dest = .{
+                    .root_dir = secondary_path,
+                    .db = .{ .identity_namespace = localTransitionIdentity(request, true) },
+                },
+                .dest_lease = .{
+                    .db = &secondary.db,
+                    .ctx = secondary,
+                    .release_fn = releaseBorrowedTransitionOwner,
+                },
+            }) catch |err| return storageOwnerStatusFromError(err);
+            defer runtime.deinit();
+            const transition = runtime.runtime();
+            switch (request.action) {
+                .observe_split => {
+                    const status = transition.observeStatus(
+                        request.transition_id,
+                        request.attempt_epoch,
+                        request.primary_group_id,
+                        request.secondary_group_id,
+                    ) catch |err| return storageOwnerStatusFromError(err);
+                    out_result.* = localTransitionSplitResult(status);
+                },
+                .prepare_split_source => _ = transition.prepareSource(
+                    request.transition_id,
+                    request.attempt_epoch,
+                    request.primary_group_id,
+                    request.secondary_group_id,
+                    request.split_key.slice(),
+                    if (request.has_source_range_end != 0) request.source_range_end.slice() else null,
+                ) catch |err| return storageOwnerStatusFromError(err),
+                .start_split_source => _ = transition.startSource(
+                    request.transition_id,
+                    request.attempt_epoch,
+                    request.primary_group_id,
+                    request.secondary_group_id,
+                ) catch |err| return storageOwnerStatusFromError(err),
+                .bootstrap_split_destination => _ = transition.bootstrapDestination(
+                    request.transition_id,
+                    request.attempt_epoch,
+                    request.primary_group_id,
+                    request.secondary_group_id,
+                ) catch |err| return storageOwnerStatusFromError(err),
+                .catch_up_split_destination => _ = transition.catchUpDestination(
+                    request.transition_id,
+                    request.attempt_epoch,
+                    request.primary_group_id,
+                    request.secondary_group_id,
+                ) catch |err| return storageOwnerStatusFromError(err),
+                .finalize_split_source => _ = transition.finalizeSource(
+                    request.transition_id,
+                    request.attempt_epoch,
+                    request.primary_group_id,
+                    request.secondary_group_id,
+                ) catch |err| return storageOwnerStatusFromError(err),
+                .rollback_split => _ = transition.rollbackSource(
+                    request.transition_id,
+                    request.attempt_epoch,
+                    request.primary_group_id,
+                    request.secondary_group_id,
+                ) catch |err| return storageOwnerStatusFromError(err),
+                else => unreachable,
+            }
+        },
+        .observe_merge,
+        .accept_merge_receiver,
+        .catch_up_merge_receiver,
+        .finalize_merge,
+        .rollback_merge,
+        => {
+            var runtime = raft_mod.MergeCoordinatorRuntime.init(alloc, .{
+                .donor_root_dir = primary_path,
+                .receiver_root_dir = secondary_path,
+                .donor_group_id = request.primary_group_id,
+                .receiver_group_id = request.secondary_group_id,
+                .donor_store = apply_store,
+                .donor_lease = .{
+                    .db = &primary.db,
+                    .ctx = primary,
+                    .release_fn = releaseBorrowedTransitionOwner,
+                },
+                .receiver = .{
+                    .root_dir = secondary_path,
+                    .db = .{
+                        .identity_namespace = localTransitionIdentity(request, true),
+                        .prefer_existing_identity_namespace = true,
+                    },
+                },
+                .receiver_lease = .{
+                    .db = &secondary.db,
+                    .ctx = secondary,
+                    .release_fn = releaseBorrowedTransitionOwner,
+                },
+                .receiver_identity_reassignment_namespace = localTransitionIdentity(request, true),
+            }) catch |err| return storageOwnerStatusFromError(err);
+            defer runtime.deinit();
+            const transition = runtime.runtime();
+            switch (request.action) {
+                .observe_merge => {
+                    const status = transition.observeStatus(
+                        request.primary_group_id,
+                        request.secondary_group_id,
+                    ) catch |err| return storageOwnerStatusFromError(err);
+                    out_result.* = localTransitionMergeResult(status);
+                },
+                .accept_merge_receiver => {
+                    if (request.allow_doc_identity_reassignment != 0) transition.recordDocIdentityReassignment(
+                        request.primary_group_id,
+                        request.secondary_group_id,
+                    ) catch |err| return storageOwnerStatusFromError(err);
+                    transition.acceptReceiver(
+                        request.primary_group_id,
+                        request.secondary_group_id,
+                    ) catch |err| return storageOwnerStatusFromError(err);
+                },
+                .catch_up_merge_receiver => {
+                    if (request.allow_doc_identity_reassignment != 0) transition.recordDocIdentityReassignment(
+                        request.primary_group_id,
+                        request.secondary_group_id,
+                    ) catch |err| return storageOwnerStatusFromError(err);
+                    _ = transition.catchUpReceiver(
+                        request.primary_group_id,
+                        request.secondary_group_id,
+                    ) catch |err| return storageOwnerStatusFromError(err);
+                },
+                .finalize_merge => {
+                    if (request.allow_doc_identity_reassignment != 0) transition.recordDocIdentityReassignment(
+                        request.primary_group_id,
+                        request.secondary_group_id,
+                    ) catch |err| return storageOwnerStatusFromError(err);
+                    _ = transition.finalizeMerge(
+                        request.primary_group_id,
+                        request.secondary_group_id,
+                    ) catch |err| return storageOwnerStatusFromError(err);
+                },
+                .rollback_merge => _ = transition.rollbackMerge(
+                    request.primary_group_id,
+                    request.secondary_group_id,
+                ) catch |err| return storageOwnerStatusFromError(err),
+                else => unreachable,
+            }
+        },
+    }
+    return .ok;
 }
 
 pub fn storageOwnerOpen(

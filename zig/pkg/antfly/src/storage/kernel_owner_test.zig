@@ -630,10 +630,13 @@ test "opaque storage context enforces owner lifetime and shares process storage 
 test "opaque data raft apply owner preserves batch snapshot and placement lifecycle" {
     const source_root = "/tmp/antfly-storage-kernel-data-apply-source";
     const restored_root = "/tmp/antfly-storage-kernel-data-apply-restored";
+    const authoritative_root = "/tmp/antfly-storage-kernel-data-apply-authoritative";
     cleanup(source_root);
     cleanup(restored_root);
+    cleanup(authoritative_root);
     defer cleanup(source_root);
     defer cleanup(restored_root);
+    defer cleanup(authoritative_root);
 
     var context = client.Context{};
     try context.ensure();
@@ -671,6 +674,55 @@ test "opaque data raft apply owner preserves batch snapshot and placement lifecy
     try std.testing.expectEqual(@as(u64, 9), latest.commit_index);
     try std.testing.expectEqual(@as(u64, 9), latest.last_entry_index);
     try std.testing.expectEqual(@as(usize, 1), latest.normal_entry_count);
+    const transition_latest = (try source.latestBatchForTransition(81)) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(latest, transition_latest);
+    var empty_observation = try source.observeSplitControl(std.testing.allocator, 81);
+    defer empty_observation.deinit(std.testing.allocator);
+    try std.testing.expect(empty_observation.state == null);
+    try std.testing.expectEqual(@as(u64, 0), empty_observation.delta_sequence);
+
+    var authoritative = try client.Owner.open(.{
+        .context = context.handle,
+        .path = .fromSlice(authoritative_root),
+        .table_name = .fromSlice("docs"),
+        .group_id = 81,
+    });
+    defer authoritative.deinit();
+    var authoritative_batch = try authoritative.batchJson(
+        "docs",
+        "{\"inserts\":{\"doc:a\":{\"title\":\"alpha\"},\"doc:b\":{\"title\":\"beta\"}},\"sync_level\":\"write\"}",
+    );
+    authoritative_batch.deinit();
+    var reconcile = try source.reconcileAuthoritativeOwner(
+        std.testing.allocator,
+        authoritative.handle,
+        81,
+        latest,
+        false,
+        1,
+        1024 * 1024,
+    );
+    defer reconcile.deinit(std.testing.allocator);
+    try std.testing.expect(reconcile == .reconciled);
+    var projection_range = try source.currentRange(std.testing.allocator, 81);
+    defer projection_range.deinit(std.testing.allocator);
+    var projection_page = try source.groupStatePageInRange(
+        std.testing.allocator,
+        81,
+        .{ .start = projection_range.start, .end = projection_range.end },
+        null,
+        8,
+        1024 * 1024,
+    );
+    defer projection_page.deinit(std.testing.allocator);
+    try std.testing.expect(projection_page.entries.len > 0);
+    var invalid_projection: abi.OwnedBytes = .{};
+    try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_data_apply_store_projection(
+        source.handle,
+        &.{ .version = abi.abi_version + 1 },
+        &invalid_projection,
+    ));
+    try std.testing.expectEqual(@as(u64, 0), invalid_projection.len);
 
     var placement = try source.beginActiveGroupTransition(&.{81});
     placement.commit();

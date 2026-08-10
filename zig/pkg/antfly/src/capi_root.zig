@@ -19,6 +19,8 @@
 pub const aggregation = @import("search/aggregation.zig");
 pub const backup_codec = @import("storage/backup_codec.zig");
 pub const data_snapshot = @import("data/storage/shard_state_store.zig");
+pub const data_raft_apply = @import("data/storage/raft_apply_store.zig");
+pub const data_raft_projection_wire = @import("storage/data_raft_projection_wire.zig");
 pub const db = @import("storage/db/mod.zig");
 pub const geo = @import("search/geo.zig");
 pub const graph = @import("graph/graph.zig");

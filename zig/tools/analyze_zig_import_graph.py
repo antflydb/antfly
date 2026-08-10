@@ -72,6 +72,7 @@ API_KERNEL_CONTRACTS = (
     "api/table_read_source.zig",
     "api/table_write_source.zig",
     "storage/data_raft_apply_client.zig",
+    "storage/data_raft_projection_wire.zig",
 )
 API_KERNEL_IMPLEMENTATIONS = (
     "api/table_reads.zig",

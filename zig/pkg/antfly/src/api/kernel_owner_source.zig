@@ -21,6 +21,7 @@ const platform_sync = @import("antfly_platform").sync;
 const platform_time = @import("antfly_platform").time;
 const abi = @import("kernel_owner_abi");
 const client = @import("../storage/kernel_owner_client.zig");
+const data_apply_client = @import("../storage/data_raft_apply_client.zig");
 const descriptor_contract = @import("../storage/kernel_owner_descriptor.zig");
 const backend_types = @import("../storage/backend_types.zig");
 const db_types = @import("../storage/db/types.zig");
@@ -51,6 +52,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     group_visible_root_generation: ?table_reads.GroupVisibleRootGenerationSource = null,
     transaction_recovery_source: ?*table_writes.ProvisionedTableWriteSource = null,
     context: client.Context = .{},
+    owns_context: bool = true,
     mutex: std.atomic.Mutex = .unlocked,
     entries: std.ArrayListUnmanaged(*Entry) = .empty,
     owner_cache_hits: std.atomic.Value(u64) = .init(0),
@@ -152,6 +154,17 @@ pub const ProvisionedKernelOwnerSource = struct {
         return self;
     }
 
+    pub fn withStorageContextHandle(
+        self: *ProvisionedKernelOwnerSource,
+        handle: ?*anyopaque,
+    ) *ProvisionedKernelOwnerSource {
+        std.debug.assert(self.entries.items.len == 0);
+        std.debug.assert(self.context.handle == null);
+        self.context.handle = handle;
+        self.owns_context = false;
+        return self;
+    }
+
     /// Call only after every attached read/write source has drained. Owner
     /// closure is deliberately centralized here so one live DB serves both
     /// operation families for its full group lifecycle.
@@ -166,7 +179,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         }
         self.entries.deinit(self.alloc);
         self.entries = .empty;
-        self.context.deinit();
+        if (self.owns_context) self.context.deinit();
     }
 
     pub fn readSource(self: *ProvisionedKernelOwnerSource) table_read_source.TableReadSource {
@@ -263,6 +276,125 @@ pub const ProvisionedKernelOwnerSource = struct {
 
     pub fn contextMetrics(self: *ProvisionedKernelOwnerSource) !abi.ContextMetricsResult {
         return try self.context.metrics();
+    }
+
+    pub fn storageContextHandle(self: *ProvisionedKernelOwnerSource) !?*anyopaque {
+        try self.context.ensure();
+        return self.context.handle;
+    }
+
+    /// Run one bounded projection reconciliation while borrowing the same
+    /// resident physical owner used by table reads and writes.
+    pub fn reconcileDataRaftProjection(
+        self: *ProvisionedKernelOwnerSource,
+        apply_store: *data_apply_client.RaftApplyStore,
+        work_alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        expected: ?data_apply_client.AppliedDataBatch,
+        capture_handoff: bool,
+        max_page_entries: usize,
+        max_page_bytes: usize,
+    ) !data_apply_client.RaftApplyStore.ReconcileResult {
+        var lease = try self.acquire(group_id, table_name);
+        defer lease.deinit();
+        return try apply_store.reconcileAuthoritativeOwner(
+            work_alloc,
+            lease.owner().handle,
+            group_id,
+            expected,
+            capture_handoff,
+            max_page_entries,
+            max_page_bytes,
+        );
+    }
+
+    /// Borrow both resident group owners for one complete local split/merge
+    /// phase. Acquisition is globally ordered so inverse group pairs cannot
+    /// deadlock, while argument order remains source/destination or
+    /// donor/receiver at the compiled ABI.
+    pub fn runLocalTransition(
+        self: *ProvisionedKernelOwnerSource,
+        apply_store: ?*data_apply_client.RaftApplyStore,
+        primary_group_id: u64,
+        secondary_group_id: u64,
+        table_name: []const u8,
+        request: client.LocalTransitionRequest,
+    ) !client.LocalTransitionResult {
+        if (primary_group_id == secondary_group_id or
+            request.primary_group_id != primary_group_id or
+            request.secondary_group_id != secondary_group_id or
+            !std.mem.eql(u8, request.table_name.slice(), table_name))
+        {
+            return error.InvalidTransitionRequest;
+        }
+
+        var primary_lease: ?Lease = null;
+        defer if (primary_lease) |*lease| lease.deinit();
+        var secondary_lease: ?Lease = null;
+        defer if (secondary_lease) |*lease| lease.deinit();
+        const primary_path = try std.fmt.allocPrint(self.alloc, "{s}/group-{d}/table-db", .{
+            self.replica_root_dir,
+            primary_group_id,
+        });
+        defer self.alloc.free(primary_path);
+        const secondary_path = try std.fmt.allocPrint(self.alloc, "{s}/group-{d}/table-db", .{
+            self.replica_root_dir,
+            secondary_group_id,
+        });
+        defer self.alloc.free(secondary_path);
+        const primary_descriptor: descriptor_contract.Descriptor = .{
+            .lsm_root_generation = self.visibleRootGeneration(primary_group_id),
+            .identity = .{
+                .table_id = request.table_id,
+                .shard_id = request.source_identity_shard_id,
+                .range_id = request.source_identity_range_id,
+            },
+            .schema_json = request.schema_json.slice(),
+            .indexes_json = request.indexes_json.slice(),
+        };
+        const secondary_descriptor: descriptor_contract.Descriptor = .{
+            .lsm_root_generation = self.visibleRootGeneration(secondary_group_id),
+            .identity = .{
+                .table_id = request.table_id,
+                .shard_id = request.target_identity_shard_id,
+                .range_id = request.target_identity_range_id,
+            },
+            .schema_json = request.schema_json.slice(),
+            .indexes_json = request.indexes_json.slice(),
+        };
+        if (primary_group_id < secondary_group_id) {
+            primary_lease = try self.acquireDescriptor(
+                primary_group_id,
+                table_name,
+                primary_path,
+                primary_descriptor,
+            );
+            secondary_lease = try self.acquireDescriptor(
+                secondary_group_id,
+                table_name,
+                secondary_path,
+                secondary_descriptor,
+            );
+        } else {
+            secondary_lease = try self.acquireDescriptor(
+                secondary_group_id,
+                table_name,
+                secondary_path,
+                secondary_descriptor,
+            );
+            primary_lease = try self.acquireDescriptor(
+                primary_group_id,
+                table_name,
+                primary_path,
+                primary_descriptor,
+            );
+        }
+        return try primary_lease.?.owner().localTransition(
+            secondary_lease.?.owner(),
+            if (apply_store) |store| store.handle else null,
+            request,
+        );
     }
 
     pub fn retireAll(self: *ProvisionedKernelOwnerSource) usize {

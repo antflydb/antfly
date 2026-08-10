@@ -14,10 +14,12 @@
 
 const std = @import("std");
 const raft_engine = @import("raft_engine");
+const build_options = @import("build_options");
 const backups_api = @import("../api/backups.zig");
 const common_config = @import("../common/config.zig");
 const catalog = @import("catalog.zig");
 const data_storage = @import("../data/storage/mod.zig");
+const data_apply_client = @import("../storage/data_raft_apply_client.zig");
 const host_mod = @import("host.zig");
 const leader_runtime = @import("leader_runtime.zig");
 const metadata_table_provisioner = @import("../metadata/table_provisioner.zig");
@@ -29,6 +31,11 @@ const storage = @import("storage/mod.zig");
 const backup_restore = @import("storage/backup_restore.zig");
 const background_runtime = @import("../storage/background_runtime.zig");
 const resource_manager = @import("../storage/resource_manager.zig");
+const storage_kernel_experiment = if (@hasDecl(build_options, "storage_kernel_experiment"))
+    @field(build_options, "storage_kernel_experiment")
+else
+    false;
+pub const DataApplyStore = if (storage_kernel_experiment) data_apply_client.RaftApplyStore else data_storage.RaftApplyStore;
 
 pub const ManagedHostConfig = struct {
     host: host_mod.HostConfig,
@@ -43,6 +50,7 @@ pub const ManagedHostDeps = struct {
     data_snapshot_builder: ?state_machine.SnapshotBuilder = null,
     leader_observer: ?leader_runtime.LeaderObserver = null,
     read_state_observer: ?state_machine.ReadStateObserver = null,
+    data_apply_storage_context: ?*anyopaque = null,
 };
 
 pub const ManagedHttpHostConfig = struct {
@@ -59,6 +67,7 @@ pub const ManagedHttpHostDeps = struct {
     data_snapshot_builder: ?state_machine.SnapshotBuilder = null,
     leader_observer: ?leader_runtime.LeaderObserver = null,
     read_state_observer: ?state_machine.ReadStateObserver = null,
+    data_apply_storage_context: ?*anyopaque = null,
 };
 
 pub const ManagedSyncResult = struct {
@@ -75,7 +84,7 @@ pub const ManagedHost = struct {
     owned_file_replica_provider: ?*storage.PersistentReplicaProvider = null,
     owned_wal_replica_provider: ?*storage.WalReplicaProvider = null,
     owned_metadata_store: ?*metadata_storage.RaftApplyStore = null,
-    owned_data_store: ?*data_storage.RaftApplyStore = null,
+    owned_data_store: ?*DataApplyStore = null,
     owned_metadata_state_machine: ?*state_machine.MetadataStateMachine = null,
     owned_data_state_machine: ?*state_machine.DataStateMachine = null,
     owned_routed_state_machine: ?*state_machine.RoutedStateMachine = null,
@@ -100,6 +109,7 @@ pub const ManagedHost = struct {
             deps.metadata_snapshot_builder,
             deps.data_snapshot_builder,
             deps.read_state_observer,
+            deps.data_apply_storage_context,
         );
         errdefer prepared_deps.deinit(alloc);
 
@@ -298,7 +308,7 @@ pub const ManagedHttpHost = struct {
     owned_file_replica_provider: ?*storage.PersistentReplicaProvider = null,
     owned_wal_replica_provider: ?*storage.WalReplicaProvider = null,
     owned_metadata_store: ?*metadata_storage.RaftApplyStore = null,
-    owned_data_store: ?*data_storage.RaftApplyStore = null,
+    owned_data_store: ?*DataApplyStore = null,
     owned_metadata_state_machine: ?*state_machine.MetadataStateMachine = null,
     owned_data_state_machine: ?*state_machine.DataStateMachine = null,
     owned_routed_state_machine: ?*state_machine.RoutedStateMachine = null,
@@ -323,6 +333,7 @@ pub const ManagedHttpHost = struct {
             deps.metadata_snapshot_builder,
             deps.data_snapshot_builder,
             deps.read_state_observer,
+            deps.data_apply_storage_context,
         );
         errdefer prepared_deps.deinit(alloc);
 
@@ -436,6 +447,7 @@ pub const ManagedHttpHost = struct {
     }
 
     pub fn attachDataApplyStoreResourceManager(self: *ManagedHttpHost, manager: *resource_manager.ResourceManager) !void {
+        if (comptime storage_kernel_experiment) return;
         const store = self.owned_data_store orelse return;
         try store.attachResourceManager(manager);
     }
@@ -448,7 +460,7 @@ pub const ManagedHttpHost = struct {
     pub fn beginDataApplyGroupTransition(
         self: *ManagedHttpHost,
         group_ids: []const u64,
-    ) !?data_storage.RaftApplyStore.ActiveGroupTransition {
+    ) !?DataApplyStore.ActiveGroupTransition {
         const store = self.owned_data_store orelse return null;
         return try store.beginActiveGroupTransition(group_ids);
     }
@@ -543,6 +555,101 @@ pub const ManagedHttpHost = struct {
     }
 };
 
+const DataApplySnapshotBuilder = struct {
+    store: *data_apply_client.RaftApplyStore,
+
+    fn builder(self: @This()) state_machine.SnapshotBuilder {
+        return .{
+            .ptr = self.store,
+            .vtable = &.{
+                .build_snapshot = buildSnapshot,
+                .prepare_snapshot = prepareSnapshot,
+                .install_snapshot = installSnapshot,
+                .apply_batch = applyBatch,
+            },
+        };
+    }
+
+    fn buildSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64) ![]u8 {
+        const store: *data_apply_client.RaftApplyStore = @ptrCast(@alignCast(ptr));
+        return try store.buildSnapshot(alloc, group_id);
+    }
+
+    fn prepareSnapshot(
+        ptr: *anyopaque,
+        group_id: u64,
+        applied_index: u64,
+    ) !?raft_engine.runtime.storage_iface.SnapshotSource {
+        const store: *data_apply_client.RaftApplyStore = @ptrCast(@alignCast(ptr));
+        var prepared = (try store.prepareSnapshot(group_id, applied_index)) orelse return null;
+        errdefer prepared.deinit();
+        const source = try std.heap.page_allocator.create(DataApplyPreparedSnapshotSource);
+        source.* = .{ .prepared = prepared };
+        return source.source();
+    }
+
+    fn installSnapshot(
+        ptr: *anyopaque,
+        _: std.mem.Allocator,
+        group_id: u64,
+        commit_index: u64,
+        snapshot: []const u8,
+    ) !void {
+        const store: *data_apply_client.RaftApplyStore = @ptrCast(@alignCast(ptr));
+        try store.installSnapshot(group_id, commit_index, snapshot);
+    }
+
+    fn applyBatch(ptr: *anyopaque, batch: state_machine.ApplyBatch) !void {
+        const store: *data_apply_client.RaftApplyStore = @ptrCast(@alignCast(ptr));
+        try store.applyBatch(batch.group_id, batch.commit_index, batch.entries_bytes);
+    }
+};
+
+const DataApplyPreparedSnapshotSource = struct {
+    prepared: data_apply_client.RaftApplyStore.PreparedSnapshot,
+
+    fn source(self: *@This()) raft_engine.runtime.storage_iface.SnapshotSource {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .materialize = materialize,
+                .cancel = cancel,
+                .deinit = deinit,
+            },
+        };
+    }
+
+    fn materialize(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+    ) !raft_engine.runtime.storage_iface.SnapshotMaterialization {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        var file = try self.prepared.materializeFile(alloc);
+        errdefer file.deinit(alloc);
+        const artifact = try storage.file_snapshot_artifact.FileSnapshotArtifact.create(
+            alloc,
+            std.Options.debug_io,
+            file.path,
+            file.size,
+        );
+        // The artifact duplicated the path and now owns deletion of the file.
+        alloc.free(file.path);
+        file = undefined;
+        return .{ .artifact = artifact };
+    }
+
+    fn cancel(ptr: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.prepared.cancel();
+    }
+
+    fn deinit(ptr: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.prepared.deinit();
+        std.heap.page_allocator.destroy(self);
+    }
+};
+
 const PreparedHostDeps = struct {
     host: host_mod.HostDeps,
     owned_backup_restore_bootstrapper: ?*ReplicaBackupRestoreBootstrapper = null,
@@ -550,7 +657,7 @@ const PreparedHostDeps = struct {
     owned_file_replica_provider: ?*storage.PersistentReplicaProvider = null,
     owned_wal_replica_provider: ?*storage.WalReplicaProvider = null,
     owned_metadata_store: ?*metadata_storage.RaftApplyStore = null,
-    owned_data_store: ?*data_storage.RaftApplyStore = null,
+    owned_data_store: ?*DataApplyStore = null,
     owned_metadata_state_machine: ?*state_machine.MetadataStateMachine = null,
     owned_data_state_machine: ?*state_machine.DataStateMachine = null,
     owned_routed_state_machine: ?*state_machine.RoutedStateMachine = null,
@@ -641,6 +748,7 @@ fn prepareHostDeps(
     metadata_snapshot_builder: ?state_machine.SnapshotBuilder,
     data_snapshot_builder: ?state_machine.SnapshotBuilder,
     read_state_observer: ?state_machine.ReadStateObserver,
+    data_apply_storage_context: ?*anyopaque,
 ) !PreparedHostDeps {
     var prepared = PreparedHostDeps{ .host = base };
     var effective_metadata_builder = metadata_snapshot_builder;
@@ -680,15 +788,25 @@ fn prepareHostDeps(
             effective_metadata_builder = owned_store.snapshotBuilder();
         }
         if (effective_data_builder == null) {
-            const owned_store = try alloc.create(data_storage.RaftApplyStore);
+            const owned_store = try alloc.create(DataApplyStore);
             errdefer alloc.destroy(owned_store);
-            owned_store.* = try data_storage.RaftApplyStore.init(alloc, .{
-                .root_dir = replica_root_dir,
-                .no_sync = replica_apply_store_no_sync,
-                .backend_runtime = backend_runtime,
-            });
+            owned_store.* = if (comptime storage_kernel_experiment)
+                try data_apply_client.RaftApplyStore.init(alloc, .{
+                    .root_dir = replica_root_dir,
+                    .no_sync = replica_apply_store_no_sync,
+                    .context = data_apply_storage_context,
+                })
+            else
+                try data_storage.RaftApplyStore.init(alloc, .{
+                    .root_dir = replica_root_dir,
+                    .no_sync = replica_apply_store_no_sync,
+                    .backend_runtime = backend_runtime,
+                });
             prepared.owned_data_store = owned_store;
-            effective_data_builder = owned_store.snapshotBuilder();
+            effective_data_builder = if (comptime storage_kernel_experiment)
+                (DataApplySnapshotBuilder{ .store = owned_store }).builder()
+            else
+                owned_store.snapshotBuilder();
         }
 
         const base_factory = prepared.host.descriptor_factory orelse return error.MissingReplicaDescriptorFactory;

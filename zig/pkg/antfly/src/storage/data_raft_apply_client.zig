@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const abi = @import("kernel_owner_abi");
+pub const projection_wire = @import("data_raft_projection_wire.zig");
 
 pub const RaftApplyStoreConfig = struct {
     root_dir: []const u8,
@@ -108,6 +109,190 @@ pub const RaftApplyStore = struct {
         };
     }
 
+    pub fn latestBatchForTransition(self: *RaftApplyStore, group_id: u64) !?AppliedDataBatch {
+        var result: abi.DataApplyLatestResult = .{};
+        try statusToError(abi.antfly_data_apply_store_latest_for_transition(self.handle, &.{
+            .group_id = group_id,
+        }, &result));
+        return try decodeLatest(result);
+    }
+
+    pub fn observeSplitControl(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+    ) !projection_wire.SplitControlObservation {
+        var response = try self.projection(.{ .kind = .observe_split_control, .group_id = group_id });
+        defer abi.antfly_storage_owner_buffer_destroy(&response);
+        return try projection_wire.decodeSplitControlAlloc(alloc, response.slice());
+    }
+
+    pub fn currentSplitState(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+    ) !?projection_wire.SplitState {
+        var observation = try self.observeSplitControl(alloc, group_id);
+        defer observation.deinit(alloc);
+        const state = observation.state;
+        observation.state = null;
+        return state;
+    }
+
+    pub fn currentSplitDeltaSequence(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+    ) !u64 {
+        var observation = try self.observeSplitControl(alloc, group_id);
+        defer observation.deinit(alloc);
+        return observation.delta_sequence;
+    }
+
+    pub fn currentSplitAcknowledgement(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+    ) !?projection_wire.SplitAcknowledgement {
+        var observation = try self.observeSplitControl(alloc, group_id);
+        defer observation.deinit(alloc);
+        return observation.acknowledgement;
+    }
+
+    pub fn currentRange(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+    ) !projection_wire.ByteRange {
+        var response = try self.projection(.{ .kind = .current_range, .group_id = group_id });
+        defer abi.antfly_storage_owner_buffer_destroy(&response);
+        return try projection_wire.decodeRangeAlloc(alloc, response.slice());
+    }
+
+    pub fn groupStatePageInRange(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        byte_range: anytype,
+        after_key: ?[]const u8,
+        max_entries: usize,
+        max_bytes: usize,
+    ) !projection_wire.GroupStatePage {
+        var response = try self.projection(.{
+            .kind = .group_state_page,
+            .group_id = group_id,
+            .max_entries = @intCast(max_entries),
+            .max_bytes = @intCast(max_bytes),
+            .range_start = .fromSlice(byte_range.start),
+            .range_end = .fromSlice(byte_range.end),
+            .after_key = .fromSlice(after_key orelse ""),
+        });
+        defer abi.antfly_storage_owner_buffer_destroy(&response);
+        return try projection_wire.decodeGroupStatePageAlloc(alloc, response.slice());
+    }
+
+    pub fn listSplitDeltasPage(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        after_sequence: u64,
+        through_sequence: u64,
+        max_entries: usize,
+        max_bytes: usize,
+    ) !projection_wire.SplitDeltas {
+        var response = try self.projection(.{
+            .kind = .split_deltas_page,
+            .group_id = group_id,
+            .after_sequence = after_sequence,
+            .through_sequence = through_sequence,
+            .max_entries = @intCast(max_entries),
+            .max_bytes = @intCast(max_bytes),
+        });
+        defer abi.antfly_storage_owner_buffer_destroy(&response);
+        return try projection_wire.decodeSplitDeltasAlloc(alloc, response.slice());
+    }
+
+    pub fn captureVerifiedSplitHandoffMetadataAtRootIncarnation(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        expected: AppliedDataBatch,
+        root_incarnation: u128,
+    ) !?projection_wire.SplitHandoffMetadata {
+        var request = abi.DataApplyProjectionRequest{
+            .kind = .capture_verified_handoff_metadata,
+            .group_id = group_id,
+            .expected = encodeLatest(expected),
+        };
+        std.mem.writeInt(u128, &request.root_incarnation_le, root_incarnation, .little);
+        var response = self.projection(request) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        defer abi.antfly_storage_owner_buffer_destroy(&response);
+        return try projection_wire.decodeHandoffMetadataAlloc(alloc, response.slice());
+    }
+
+    pub const ReconcileResult = union(enum) {
+        advanced,
+        reconciled,
+        handoff: projection_wire.SplitHandoffMetadata,
+
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            switch (self.*) {
+                .handoff => |*value| value.deinit(alloc),
+                else => {},
+            }
+            self.* = undefined;
+        }
+    };
+
+    /// Reconciles against an opaque resident table owner. The owner handle is
+    /// borrowed only for this synchronous, page-bounded kernel operation.
+    pub fn reconcileAuthoritativeOwner(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        owner_handle: ?*anyopaque,
+        group_id: u64,
+        expected: ?AppliedDataBatch,
+        capture_handoff: bool,
+        max_page_entries: usize,
+        max_page_bytes: usize,
+    ) !ReconcileResult {
+        var result: abi.DataApplyReconcileResult = .{};
+        try statusToError(abi.antfly_data_apply_store_reconcile_owner(
+            self.handle,
+            owner_handle,
+            &.{
+                .capture_handoff = @intFromBool(capture_handoff),
+                .group_id = group_id,
+                .max_page_entries = @intCast(max_page_entries),
+                .max_page_bytes = @intCast(max_page_bytes),
+                .expected = if (expected) |value| encodeLatest(value) else .{},
+            },
+            &result,
+        ));
+        defer abi.antfly_storage_owner_buffer_destroy(&result.handoff_metadata);
+        if (result.version != abi.abi_version) return error.InvalidAbiVersion;
+        return switch (result.state) {
+            .advanced => .advanced,
+            .reconciled => .reconciled,
+            .handoff => .{ .handoff = try projection_wire.decodeHandoffMetadataAlloc(
+                alloc,
+                result.handoff_metadata.slice(),
+            ) },
+        };
+    }
+
+    fn projection(
+        self: *RaftApplyStore,
+        request: abi.DataApplyProjectionRequest,
+    ) !abi.OwnedBytes {
+        var result: abi.OwnedBytes = .{};
+        try statusToError(abi.antfly_data_apply_store_projection(self.handle, &request, &result));
+        return result;
+    }
+
     pub fn retainActiveGroups(self: *RaftApplyStore, group_ids: []const u64) !void {
         const request = groupsRequest(group_ids);
         try statusToError(abi.antfly_data_apply_store_retain_groups(self.handle, &request));
@@ -186,6 +371,31 @@ pub const RaftApplyStore = struct {
         }
     };
 };
+
+fn decodeLatest(result: abi.DataApplyLatestResult) !?AppliedDataBatch {
+    if (result.version != abi.abi_version) return error.InvalidAbiVersion;
+    if (result.present == 0) return null;
+    return .{
+        .commit_index = result.commit_index,
+        .entry_count = std.math.cast(usize, result.entry_count) orelse return error.InvalidArgument,
+        .normal_entry_count = std.math.cast(usize, result.normal_entry_count) orelse return error.InvalidArgument,
+        .admin_entry_count = std.math.cast(usize, result.admin_entry_count) orelse return error.InvalidArgument,
+        .last_entry_term = result.last_entry_term,
+        .last_entry_index = result.last_entry_index,
+    };
+}
+
+fn encodeLatest(value: AppliedDataBatch) abi.DataApplyLatestResult {
+    return .{
+        .present = 1,
+        .commit_index = value.commit_index,
+        .entry_count = @intCast(value.entry_count),
+        .normal_entry_count = @intCast(value.normal_entry_count),
+        .admin_entry_count = @intCast(value.admin_entry_count),
+        .last_entry_term = value.last_entry_term,
+        .last_entry_index = value.last_entry_index,
+    };
+}
 
 fn groupsRequest(group_ids: []const u64) abi.DataApplyGroupsRequest {
     return .{

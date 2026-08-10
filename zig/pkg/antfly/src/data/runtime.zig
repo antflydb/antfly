@@ -51,6 +51,8 @@ fn publishRuntimeStatusRefreshForTest(
 const backend_runtime_mod = @import("../storage/background_runtime.zig");
 const lsm_backend_mod = @import("../storage/lsm_backend.zig");
 const resource_manager_mod = @import("../storage/resource_manager.zig");
+const kernel_owner_client = @import("../storage/kernel_owner_client.zig");
+const data_apply_client = @import("../storage/data_raft_apply_client.zig");
 const index_manager_mod = @import("../storage/db/catalog/index_manager.zig");
 const change_journal_mod = @import("../storage/db/derived/change_journal.zig");
 const doc_identity = @import("../storage/db/doc_identity.zig");
@@ -66,6 +68,30 @@ const storage_kernel_experiment = if (@hasDecl(build_options, "storage_kernel_ex
     @field(build_options, "storage_kernel_experiment")
 else
     false;
+const StorageKernelContext = if (storage_kernel_experiment)
+    kernel_owner_client.Context
+else
+    struct {
+        handle: ?*anyopaque = null,
+
+        fn deinit(self: *@This()) void {
+            self.* = .{};
+        }
+    };
+const DataRaftApplyStore = if (storage_kernel_experiment) data_apply_client.RaftApplyStore else antfly.data.RaftApplyStore;
+const DataRaftAppliedBatch = if (storage_kernel_experiment) data_apply_client.AppliedDataBatch else antfly.data.AppliedDataBatch;
+const DataRaftSplitState = if (storage_kernel_experiment)
+    data_apply_client.projection_wire.SplitState
+else
+    antfly.data.storage.shard_state_store.AppliedSplitState;
+const DataRaftSplitTerminal = if (storage_kernel_experiment)
+    data_apply_client.projection_wire.SplitTerminal
+else
+    antfly.data.storage.shard_state_store.AppliedSplitTerminal;
+const DataRaftHandoffMetadata = if (storage_kernel_experiment)
+    data_apply_client.projection_wire.SplitHandoffMetadata
+else
+    antfly.data.storage.raft_apply_store.SplitHandoffMetadata;
 
 const health_metrics = antfly.common.health_server;
 const setup_io_thread_stack_size = 1 * 1024 * 1024;
@@ -367,8 +393,8 @@ fn decodeSplitDeltaDocumentKeyAlloc(alloc: std.mem.Allocator, internal_key: []co
 const ReplicatedSplitTransitionPlan = enum { propose, idempotent };
 
 fn planReplicatedSplitTransition(
-    state: ?antfly.data.storage.shard_state_store.AppliedSplitState,
-    terminal: ?antfly.data.storage.shard_state_store.AppliedSplitTerminal,
+    state: ?DataRaftSplitState,
+    terminal: ?DataRaftSplitTerminal,
     transition_id: u64,
     attempt_epoch: u64,
     destination_group_id: u64,
@@ -378,7 +404,7 @@ fn planReplicatedSplitTransition(
     if (terminal) |completed| {
         if (attempt_epoch < completed.attempt_epoch) return .idempotent;
         if (attempt_epoch == completed.attempt_epoch) {
-            try antfly.data.storage.shard_state_store.validateSplitTerminalIdentity(completed, transition_id, attempt_epoch, destination_group_id, split_key);
+            try validateSplitTerminalIdentity(completed, transition_id, attempt_epoch, destination_group_id, split_key);
             return switch (kind) {
                 .prepare, .start => .idempotent,
                 .finalize => if (completed.outcome == .finalized) .idempotent else error.ConflictingSplitTransition,
@@ -397,24 +423,24 @@ fn planReplicatedSplitTransition(
             .none => return .propose,
             .rolling_back => return error.SplitInProgress,
             .prepare, .splitting, .finalizing => {
-                try antfly.data.storage.shard_state_store.validateSplitIdentity(current, transition_id, attempt_epoch, destination_group_id, split_key);
+                try validateSplitIdentity(current, transition_id, attempt_epoch, destination_group_id, split_key);
                 return .idempotent;
             },
         },
         .start => switch (current.phase) {
             .prepare => {
-                try antfly.data.storage.shard_state_store.validateSplitIdentity(current, transition_id, attempt_epoch, destination_group_id, split_key);
+                try validateSplitIdentity(current, transition_id, attempt_epoch, destination_group_id, split_key);
                 return .propose;
             },
             .splitting, .finalizing => {
-                try antfly.data.storage.shard_state_store.validateSplitIdentity(current, transition_id, attempt_epoch, destination_group_id, split_key);
+                try validateSplitIdentity(current, transition_id, attempt_epoch, destination_group_id, split_key);
                 return .idempotent;
             },
             .none, .rolling_back => return error.SplitInProgress,
         },
         .finalize => switch (current.phase) {
             .splitting, .finalizing => {
-                try antfly.data.storage.shard_state_store.validateSplitIdentity(current, transition_id, attempt_epoch, destination_group_id, split_key);
+                try validateSplitIdentity(current, transition_id, attempt_epoch, destination_group_id, split_key);
                 return .propose;
             },
             .none => return .idempotent,
@@ -422,7 +448,7 @@ fn planReplicatedSplitTransition(
         },
         .rollback => switch (current.phase) {
             .prepare, .splitting, .finalizing, .rolling_back => {
-                try antfly.data.storage.shard_state_store.validateSplitIdentity(current, transition_id, attempt_epoch, destination_group_id, split_key);
+                try validateSplitIdentity(current, transition_id, attempt_epoch, destination_group_id, split_key);
                 return .propose;
             },
             .none => return .idempotent,
@@ -431,27 +457,75 @@ fn planReplicatedSplitTransition(
 }
 
 fn validateReplicatedSplitTransfer(
-    state: antfly.data.storage.shard_state_store.AppliedSplitState,
+    state: DataRaftSplitState,
     transition_id: u64,
     attempt_epoch: u64,
     destination_group_id: u64,
 ) !void {
-    try antfly.data.storage.shard_state_store.validateSplitIdentity(state, transition_id, attempt_epoch, destination_group_id, null);
+    try validateSplitIdentity(state, transition_id, attempt_epoch, destination_group_id, null);
     if (state.phase != .splitting and state.phase != .finalizing) return error.SplitInProgress;
 }
 
 fn validateReplicatedSplitObservation(
-    state: antfly.data.storage.shard_state_store.AppliedSplitState,
+    state: DataRaftSplitState,
     transition_id: u64,
     attempt_epoch: u64,
     destination_group_id: u64,
 ) !void {
     if (state.phase == .none) return;
-    try antfly.data.storage.shard_state_store.validateSplitIdentity(state, transition_id, attempt_epoch, destination_group_id, null);
+    try validateSplitIdentity(state, transition_id, attempt_epoch, destination_group_id, null);
+}
+
+fn freeDataRaftHandoffMetadata(alloc: std.mem.Allocator, handoff: DataRaftHandoffMetadata) void {
+    if (comptime storage_kernel_experiment) {
+        var owned = handoff;
+        owned.deinit(alloc);
+    } else {
+        antfly.data.storage.shard_state_store.freeHandoffMetadata(alloc, handoff);
+    }
+}
+
+fn freeDataRaftSplitState(alloc: std.mem.Allocator, state: DataRaftSplitState) void {
+    if (comptime storage_kernel_experiment) {
+        var owned = state;
+        owned.deinit(alloc);
+    } else {
+        antfly.data.storage.shard_state_store.freeSplitState(alloc, state);
+    }
+}
+
+fn validateSplitIdentity(
+    state: DataRaftSplitState,
+    transition_id: u64,
+    attempt_epoch: u64,
+    destination_group_id: u64,
+    split_key: ?[]const u8,
+) !void {
+    if (state.transition_id != transition_id or state.attempt_epoch != attempt_epoch or
+        state.new_shard_id != destination_group_id)
+        return error.ConflictingSplitTransition;
+    if (split_key) |expected| {
+        if (!std.mem.eql(u8, state.split_key, expected)) return error.ConflictingSplitTransition;
+    }
+}
+
+fn validateSplitTerminalIdentity(
+    terminal: DataRaftSplitTerminal,
+    transition_id: u64,
+    attempt_epoch: u64,
+    destination_group_id: u64,
+    split_key: ?[]const u8,
+) !void {
+    if (terminal.transition_id != transition_id or terminal.attempt_epoch != attempt_epoch or
+        terminal.destination_group_id != destination_group_id)
+        return error.ConflictingSplitTransition;
+    if (split_key) |expected| {
+        if (!std.mem.eql(u8, terminal.split_key, expected)) return error.ConflictingSplitTransition;
+    }
 }
 
 fn replicatedSplitStatusWithoutActiveState(
-    terminal: ?antfly.data.storage.shard_state_store.AppliedSplitTerminal,
+    terminal: ?DataRaftSplitTerminal,
     transition_id: u64,
     attempt_epoch: u64,
     destination_group_id: u64,
@@ -460,7 +534,7 @@ fn replicatedSplitStatusWithoutActiveState(
     if (terminal) |completed| {
         if (attempt_epoch < completed.attempt_epoch) return error.StaleSplitAttempt;
         if (attempt_epoch == completed.attempt_epoch) {
-            try antfly.data.storage.shard_state_store.validateSplitTerminalIdentity(
+            try validateSplitTerminalIdentity(
                 completed,
                 transition_id,
                 attempt_epoch,
@@ -3736,7 +3810,7 @@ pub const DataServer = struct {
     const SplitProjectionReconcileResult = union(enum) {
         advanced,
         reconciled,
-        handoff: antfly.data.storage.raft_apply_store.SplitHandoffMetadata,
+        handoff: DataRaftHandoffMetadata,
     };
 
     alloc: std.mem.Allocator,
@@ -3912,6 +3986,7 @@ pub const DataServer = struct {
     /// It is initialized only for the compiled-storage experiment and destroyed
     /// after all attached sources and Raft apply work have drained.
     kernel_owner_source: ?*antfly.public_api.ProvisionedKernelOwnerSource = null,
+    storage_kernel_context: ?StorageKernelContext = null,
     read_source: antfly.public_api.ProvisionedTableReadSource,
     write_source: antfly.public_api.ProvisionedTableWriteSource,
     /// Long-lived backing for the cross-shard entity-resolution candidate
@@ -4238,6 +4313,10 @@ pub const DataServer = struct {
         );
         _ = owner_source.withGroupVisibleRootGeneration(self.provisioned_storage.groupVisibleRootGenerationSource());
         _ = owner_source.withTransactionRecoverySource(&self.write_source);
+        if (comptime storage_kernel_experiment) {
+            if (self.storage_kernel_context) |context|
+                _ = owner_source.withStorageContextHandle(context.handle);
+        }
         _ = self.read_source.withLocalReadSource(owner_source.readSource());
         self.read_source.resident_db = null;
         _ = self.write_source.withLocalWriteSource(owner_source.writeSource());
@@ -5195,6 +5274,7 @@ pub const DataServer = struct {
                 owner_source.deinit();
                 self.alloc.destroy(owner_source);
             }
+            if (self.storage_kernel_context) |*context| context.deinit();
         }
         if (self.data_raft_store) |store| {
             store.deinit();
@@ -5228,6 +5308,7 @@ pub const DataServer = struct {
         self.data_raft_factory = null;
         self.data_raft_apply = null;
         self.kernel_owner_source = null;
+        self.storage_kernel_context = null;
         self.data_raft_store = null;
         self.data_raft_base_uri = null;
         self.remote_metadata = null;
@@ -6943,6 +7024,180 @@ pub const DataServer = struct {
         return try fallback.adapter().schemaIndexReady(alloc, table_name, group_id, schema_version, read_schema_version);
     }
 
+    fn kernelLocalTransitionRequest(
+        action: kernel_owner_client.LocalTransitionAction,
+        transition_id: u64,
+        attempt_epoch: u64,
+        primary_group_id: u64,
+        secondary_group_id: u64,
+        allow_doc_identity_reassignment: bool,
+        split_key: []const u8,
+        source_range_end: ?[]const u8,
+        table_contract: antfly.metadata.TransitionTableContract,
+    ) kernel_owner_client.LocalTransitionRequest {
+        return .{
+            .action = action,
+            .transition_id = transition_id,
+            .attempt_epoch = attempt_epoch,
+            .primary_group_id = primary_group_id,
+            .secondary_group_id = secondary_group_id,
+            .table_id = table_contract.table_id,
+            .source_identity_shard_id = table_contract.source_identity.shard_id,
+            .source_identity_range_id = table_contract.source_identity.range_id,
+            .target_identity_shard_id = table_contract.target_identity.shard_id,
+            .target_identity_range_id = table_contract.target_identity.range_id,
+            .allow_doc_identity_reassignment = @intFromBool(allow_doc_identity_reassignment),
+            .has_source_range_end = @intFromBool(source_range_end != null),
+            .table_name = .fromSlice(table_contract.table_name),
+            .schema_json = .fromSlice(table_contract.schema_json),
+            .indexes_json = .fromSlice(table_contract.indexes_json),
+            .split_key = .fromSlice(split_key),
+            .source_range_end = .fromSlice(source_range_end orelse ""),
+        };
+    }
+
+    fn kernelTransitionBool(value: u8) !bool {
+        return switch (value) {
+            0 => false,
+            1 => true,
+            else => error.InvalidStorageKernelTransitionResult,
+        };
+    }
+
+    fn splitStatusFromKernel(
+        result: kernel_owner_client.LocalTransitionResult,
+    ) !antfly.data.SplitTransitionStatus {
+        if (result.kind != .split) return error.InvalidStorageKernelTransitionResult;
+        const source_split_phase: ?antfly.shard.SplitPhase = if (try kernelTransitionBool(result.has_source_split_phase))
+            switch (result.source_split_phase) {
+                0 => .none,
+                1 => .prepare,
+                2 => .splitting,
+                3 => .finalizing,
+                4 => .rolling_back,
+                else => return error.InvalidStorageKernelTransitionResult,
+            }
+        else
+            null;
+        return .{
+            .phase = switch (result.phase) {
+                .prepare => .prepare,
+                .bootstrap_peer => .bootstrap_peer,
+                .replay_deltas => .replay_deltas,
+                .cutover_ready => .cutover_ready,
+                .finalized => .finalized,
+                .rolling_back => .rolling_back,
+                .rolled_back => .rolled_back,
+            },
+            .source_split_phase = source_split_phase,
+            .bootstrapped = try kernelTransitionBool(result.bootstrapped),
+            .replay_required = try kernelTransitionBool(result.replay_required),
+            .replay_caught_up = try kernelTransitionBool(result.replay_caught_up),
+            .cutover_ready = try kernelTransitionBool(result.cutover_ready),
+            .destination_ready_for_reads = try kernelTransitionBool(result.peer_ready_for_reads),
+            .source_delta_sequence = result.primary_delta_sequence,
+            .dest_delta_sequence = result.secondary_delta_sequence,
+        };
+    }
+
+    fn mergeStatusFromKernel(
+        result: kernel_owner_client.LocalTransitionResult,
+    ) !antfly.data.MergeTransitionStatus {
+        if (result.kind != .merge) return error.InvalidStorageKernelTransitionResult;
+        return .{
+            .phase = switch (result.phase) {
+                .prepare => .prepare,
+                .bootstrap_peer => .bootstrap_peer,
+                .replay_deltas => .replay_deltas,
+                .cutover_ready => .cutover_ready,
+                .finalized => .finalized,
+                .rolling_back => .rolling_back,
+                .rolled_back => .rolled_back,
+            },
+            .donor_group_id = result.primary_group_id,
+            .receiver_group_id = result.secondary_group_id,
+            .receiver_accepts_donor_range = try kernelTransitionBool(result.receiver_accepts_donor_range),
+            .bootstrapped = try kernelTransitionBool(result.bootstrapped),
+            .replay_required = try kernelTransitionBool(result.replay_required),
+            .replay_caught_up = try kernelTransitionBool(result.replay_caught_up),
+            .cutover_ready = try kernelTransitionBool(result.cutover_ready),
+            .receiver_ready_for_reads = try kernelTransitionBool(result.peer_ready_for_reads),
+            .donor_delta_sequence = result.primary_delta_sequence,
+            .receiver_delta_sequence = result.secondary_delta_sequence,
+            .allow_doc_identity_reassignment = try kernelTransitionBool(result.allow_doc_identity_reassignment),
+            .receiver_identity_reassignment_namespace_table_id = result.receiver_identity_table_id,
+            .receiver_identity_reassignment_namespace_shard_id = result.receiver_identity_shard_id,
+            .receiver_identity_reassignment_namespace_range_id = result.receiver_identity_range_id,
+        };
+    }
+
+    fn runKernelLocalTransition(
+        self: *DataServer,
+        request: kernel_owner_client.LocalTransitionRequest,
+        table_contract: antfly.metadata.TransitionTableContract,
+    ) !kernel_owner_client.LocalTransitionResult {
+        if (comptime !storage_kernel_experiment) unreachable;
+        const primary_group_id = request.primary_group_id;
+        const secondary_group_id = request.secondary_group_id;
+        const source_root_dir = try antfly.metadata.groupDbPathFromReplicaRoot(
+            self.alloc,
+            self.write_source.replica_root_dir,
+            primary_group_id,
+        );
+        defer self.alloc.free(source_root_dir);
+        try self.ensureSplitSourceApplyStoreSeeded(
+            source_root_dir,
+            primary_group_id,
+            table_contract,
+        );
+
+        const owner_source = try self.ensureKernelOwnerSource();
+        const live_source = self.liveRuntimeWriteSource();
+        const first_group_id = @min(primary_group_id, secondary_group_id);
+        const second_group_id = @max(primary_group_id, secondary_group_id);
+        var first_activity = live_source.beginGroupTransitionActivity(
+            table_contract.table_name,
+            first_group_id,
+        );
+        defer first_activity.deinit();
+        var second_activity = live_source.beginGroupTransitionActivity(
+            table_contract.table_name,
+            second_group_id,
+        );
+        defer second_activity.deinit();
+        var fallback_first_activity: ?@TypeOf(first_activity) = null;
+        defer if (fallback_first_activity) |*activity| activity.deinit();
+        var fallback_second_activity: ?@TypeOf(second_activity) = null;
+        defer if (fallback_second_activity) |*activity| activity.deinit();
+        if (live_source != &self.write_source) {
+            fallback_first_activity = self.write_source.beginGroupTransitionActivity(
+                table_contract.table_name,
+                first_group_id,
+            );
+            fallback_second_activity = self.write_source.beginGroupTransitionActivity(
+                table_contract.table_name,
+                second_group_id,
+            );
+        }
+        try live_source.finishManagedWriterAutoBulkForTransition(primary_group_id, table_contract.table_name);
+        try live_source.finishManagedWriterAutoBulkForTransition(secondary_group_id, table_contract.table_name);
+        if (live_source != &self.write_source) {
+            try self.write_source.finishManagedWriterAutoBulkForTransition(primary_group_id, table_contract.table_name);
+            try self.write_source.finishManagedWriterAutoBulkForTransition(secondary_group_id, table_contract.table_name);
+        }
+        first_activity.allowReads();
+        second_activity.allowReads();
+        if (fallback_first_activity) |*activity| activity.allowReads();
+        if (fallback_second_activity) |*activity| activity.allowReads();
+        return try owner_source.runLocalTransition(
+            self.localTransitionApplyStore(),
+            primary_group_id,
+            secondary_group_id,
+            table_contract.table_name,
+            request,
+        );
+    }
+
     fn localObserveSplit(ptr: *anyopaque, _: u64, record: antfly.metadata.SplitTransitionRecord) !antfly.metadata.transition_state.SplitObservation {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         try record.table_contract.validateForSplit();
@@ -6956,6 +7211,20 @@ pub const DataServer = struct {
         }
         lockAtomic(&self.local_transition_mutex);
         defer self.local_transition_mutex.unlock();
+        if (comptime storage_kernel_experiment) {
+            const result = try self.runKernelLocalTransition(kernelLocalTransitionRequest(
+                .observe_split,
+                record.transition_id,
+                record.attempt_epoch,
+                record.source_group_id,
+                record.destination_group_id,
+                false,
+                "",
+                null,
+                record.table_contract,
+            ), record.table_contract);
+            return .{ .status = try splitStatusFromKernel(result) };
+        }
         return .{ .status = try self.observeLocalSplit(
             record.transition_id,
             record.attempt_epoch,
@@ -7034,6 +7303,21 @@ pub const DataServer = struct {
         if (self.local_transition_runtime) |runtime| return try runtime.shardOperationAdapter().observeMerge(record);
         self.lockLocalTransition();
         defer self.unlockLocalTransition();
+        if (comptime storage_kernel_experiment) {
+            const result = try self.runKernelLocalTransition(kernelLocalTransitionRequest(
+                .observe_merge,
+                record.transition_id,
+                0,
+                record.donor_group_id,
+                record.receiver_group_id,
+                record.allow_doc_identity_reassignment,
+                "",
+                null,
+                record.table_contract,
+            ), record.table_contract);
+            const status = try mergeStatusFromKernel(result);
+            return .{ .donor = status, .receiver = status };
+        }
         var runtime = try self.initLocalMergeRuntime(
             record.donor_group_id,
             record.receiver_group_id,
@@ -7059,9 +7343,23 @@ pub const DataServer = struct {
         } else {
             self.lockLocalTransition();
             defer self.unlockLocalTransition();
-            var runtime = try self.initLocalSplitRuntime(op.transition_id, op.attempt_epoch, op.source_group_id, op.destination_group_id, op.table_contract);
-            defer runtime.deinit();
-            _ = try runtime.runtime().prepareSource(op.transition_id, op.attempt_epoch, op.source_group_id, op.destination_group_id, op.split_key, op.source_range_end);
+            if (comptime storage_kernel_experiment) {
+                _ = try self.runKernelLocalTransition(kernelLocalTransitionRequest(
+                    .prepare_split_source,
+                    op.transition_id,
+                    op.attempt_epoch,
+                    op.source_group_id,
+                    op.destination_group_id,
+                    false,
+                    op.split_key,
+                    op.source_range_end,
+                    op.table_contract,
+                ), op.table_contract);
+            } else {
+                var runtime = try self.initLocalSplitRuntime(op.transition_id, op.attempt_epoch, op.source_group_id, op.destination_group_id, op.table_contract);
+                defer runtime.deinit();
+                _ = try runtime.runtime().prepareSource(op.transition_id, op.attempt_epoch, op.source_group_id, op.destination_group_id, op.split_key, op.source_range_end);
+            }
         }
         self.invalidateLocalGroupStatusCache();
     }
@@ -7080,9 +7378,23 @@ pub const DataServer = struct {
         } else {
             self.lockLocalTransition();
             defer self.unlockLocalTransition();
-            var runtime = try self.initLocalSplitRuntime(op.transition_id, op.attempt_epoch, op.source_group_id, op.destination_group_id, op.table_contract);
-            defer runtime.deinit();
-            _ = try runtime.runtime().startSource(op.transition_id, op.attempt_epoch, op.source_group_id, op.destination_group_id);
+            if (comptime storage_kernel_experiment) {
+                _ = try self.runKernelLocalTransition(kernelLocalTransitionRequest(
+                    .start_split_source,
+                    op.transition_id,
+                    op.attempt_epoch,
+                    op.source_group_id,
+                    op.destination_group_id,
+                    false,
+                    "",
+                    null,
+                    op.table_contract,
+                ), op.table_contract);
+            } else {
+                var runtime = try self.initLocalSplitRuntime(op.transition_id, op.attempt_epoch, op.source_group_id, op.destination_group_id, op.table_contract);
+                defer runtime.deinit();
+                _ = try runtime.runtime().startSource(op.transition_id, op.attempt_epoch, op.source_group_id, op.destination_group_id);
+            }
         }
         self.invalidateLocalGroupStatusCache();
     }
@@ -7099,9 +7411,23 @@ pub const DataServer = struct {
         } else {
             self.lockLocalTransition();
             defer self.unlockLocalTransition();
-            var runtime = try self.initLocalSplitRuntime(op.transition_id, op.attempt_epoch, op.source_group_id, op.destination_group_id, op.table_contract);
-            defer runtime.deinit();
-            _ = try runtime.runtime().bootstrapDestination(op.transition_id, op.attempt_epoch, op.source_group_id, op.destination_group_id);
+            if (comptime storage_kernel_experiment) {
+                _ = try self.runKernelLocalTransition(kernelLocalTransitionRequest(
+                    .bootstrap_split_destination,
+                    op.transition_id,
+                    op.attempt_epoch,
+                    op.source_group_id,
+                    op.destination_group_id,
+                    false,
+                    "",
+                    null,
+                    op.table_contract,
+                ), op.table_contract);
+            } else {
+                var runtime = try self.initLocalSplitRuntime(op.transition_id, op.attempt_epoch, op.source_group_id, op.destination_group_id, op.table_contract);
+                defer runtime.deinit();
+                _ = try runtime.runtime().bootstrapDestination(op.transition_id, op.attempt_epoch, op.source_group_id, op.destination_group_id);
+            }
         }
         self.invalidateLocalGroupStatusCache();
     }
@@ -7118,9 +7444,23 @@ pub const DataServer = struct {
         } else {
             self.lockLocalTransition();
             defer self.unlockLocalTransition();
-            var runtime = try self.initLocalSplitRuntime(op.transition_id, op.attempt_epoch, op.source_group_id, op.destination_group_id, op.table_contract);
-            defer runtime.deinit();
-            _ = try runtime.runtime().catchUpDestination(op.transition_id, op.attempt_epoch, op.source_group_id, op.destination_group_id);
+            if (comptime storage_kernel_experiment) {
+                _ = try self.runKernelLocalTransition(kernelLocalTransitionRequest(
+                    .catch_up_split_destination,
+                    op.transition_id,
+                    op.attempt_epoch,
+                    op.source_group_id,
+                    op.destination_group_id,
+                    false,
+                    "",
+                    null,
+                    op.table_contract,
+                ), op.table_contract);
+            } else {
+                var runtime = try self.initLocalSplitRuntime(op.transition_id, op.attempt_epoch, op.source_group_id, op.destination_group_id, op.table_contract);
+                defer runtime.deinit();
+                _ = try runtime.runtime().catchUpDestination(op.transition_id, op.attempt_epoch, op.source_group_id, op.destination_group_id);
+            }
         }
         self.invalidateLocalGroupStatusCache();
     }
@@ -7320,7 +7660,7 @@ pub const DataServer = struct {
             source_group_id,
             table_contract,
         );
-        defer antfly.data.storage.shard_state_store.freeHandoffMetadata(work_alloc, handoff);
+        defer freeDataRaftHandoffMetadata(work_alloc, handoff);
         try self.requireReplicatedTransitionActionActive(source_group_id);
         try validateReplicatedSplitTransfer(handoff.split_state, transition_id, attempt_epoch, destination_group_id);
         std.log.info("split bootstrap captured transition_id={} source_group_id={} destination_group_id={} watermark={}", .{
@@ -7346,7 +7686,7 @@ pub const DataServer = struct {
             destination_group_id,
             table_contract.table_name,
             replication,
-            handoff.byte_range,
+            .{ .start = handoff.byte_range.start, .end = handoff.byte_range.end },
             handoff.base_delta_sequence,
             .destination_begin,
             true,
@@ -7390,7 +7730,7 @@ pub const DataServer = struct {
             destination_group_id,
             table_contract.table_name,
             replication,
-            handoff.byte_range,
+            .{ .start = handoff.byte_range.start, .end = handoff.byte_range.end },
             handoff.base_delta_sequence,
             .destination_complete,
             false,
@@ -7485,7 +7825,7 @@ pub const DataServer = struct {
         try self.requireReplicatedTransitionActionActive(source_group_id);
         const source_store = self.localTransitionApplyStore() orelse return error.MissingSplitSourceStore;
         const source_state = (try source_store.currentSplitState(self.alloc, source_group_id)) orelse return error.SplitInProgress;
-        defer antfly.data.storage.shard_state_store.freeSplitState(self.alloc, source_state);
+        defer freeDataRaftSplitState(self.alloc, source_state);
         try validateReplicatedSplitTransfer(source_state, transition_id, attempt_epoch, destination_group_id);
         const replication = try self.splitReplicationContext(
             transition_id,
@@ -7501,7 +7841,7 @@ pub const DataServer = struct {
         var refresh_destination_route = true;
         var cursor = after_seq;
         while (cursor < source_seq) {
-            const deltas = try source_store.listSplitDeltasPage(
+            var deltas = try source_store.listSplitDeltasPage(
                 work_alloc,
                 source_group_id,
                 cursor,
@@ -7509,9 +7849,13 @@ pub const DataServer = struct {
                 64,
                 2 * 1024 * 1024,
             );
-            defer antfly.shard.freeDeltas(work_alloc, deltas);
-            if (deltas.len == 0) return error.SplitReplicationSequenceGap;
-            for (deltas) |delta| {
+            defer if (storage_kernel_experiment)
+                deltas.deinit(work_alloc)
+            else
+                antfly.shard.freeDeltas(work_alloc, deltas);
+            const delta_items = if (storage_kernel_experiment) deltas.items else deltas;
+            if (delta_items.len == 0) return error.SplitReplicationSequenceGap;
+            for (delta_items) |delta| {
                 try self.requireReplicatedTransitionActionActive(source_group_id);
                 var writes = std.ArrayListUnmanaged(antfly.db.types.BatchWrite).empty;
                 defer writes.deinit(work_alloc);
@@ -7546,7 +7890,7 @@ pub const DataServer = struct {
                 }, refresh_destination_route);
                 refresh_destination_route = false;
             }
-            const page_last = deltas[deltas.len - 1].sequence;
+            const page_last = delta_items[delta_items.len - 1].sequence;
             try self.replicateSplitSourceAcknowledgement(
                 source_group_id,
                 destination_group_id,
@@ -7684,9 +8028,23 @@ pub const DataServer = struct {
         } else {
             self.lockLocalTransition();
             defer self.unlockLocalTransition();
-            var runtime = try self.initLocalSplitRuntime(op.transition_id, op.attempt_epoch, op.source_group_id, op.destination_group_id, op.table_contract);
-            defer runtime.deinit();
-            _ = try runtime.runtime().finalizeSource(op.transition_id, op.attempt_epoch, op.source_group_id, op.destination_group_id);
+            if (comptime storage_kernel_experiment) {
+                _ = try self.runKernelLocalTransition(kernelLocalTransitionRequest(
+                    .finalize_split_source,
+                    op.transition_id,
+                    op.attempt_epoch,
+                    op.source_group_id,
+                    op.destination_group_id,
+                    false,
+                    "",
+                    null,
+                    op.table_contract,
+                ), op.table_contract);
+            } else {
+                var runtime = try self.initLocalSplitRuntime(op.transition_id, op.attempt_epoch, op.source_group_id, op.destination_group_id, op.table_contract);
+                defer runtime.deinit();
+                _ = try runtime.runtime().finalizeSource(op.transition_id, op.attempt_epoch, op.source_group_id, op.destination_group_id);
+            }
         }
         self.invalidateLocalGroupStatusCache();
     }
@@ -7705,9 +8063,23 @@ pub const DataServer = struct {
         } else {
             self.lockLocalTransition();
             defer self.unlockLocalTransition();
-            var runtime = try self.initLocalSplitRuntime(op.transition_id, op.attempt_epoch, op.source_group_id, op.destination_group_id, op.table_contract);
-            defer runtime.deinit();
-            _ = try runtime.runtime().rollbackSource(op.transition_id, op.attempt_epoch, op.source_group_id, op.destination_group_id);
+            if (comptime storage_kernel_experiment) {
+                _ = try self.runKernelLocalTransition(kernelLocalTransitionRequest(
+                    .rollback_split,
+                    op.transition_id,
+                    op.attempt_epoch,
+                    op.source_group_id,
+                    op.destination_group_id,
+                    false,
+                    "",
+                    null,
+                    op.table_contract,
+                ), op.table_contract);
+            } else {
+                var runtime = try self.initLocalSplitRuntime(op.transition_id, op.attempt_epoch, op.source_group_id, op.destination_group_id, op.table_contract);
+                defer runtime.deinit();
+                _ = try runtime.runtime().rollbackSource(op.transition_id, op.attempt_epoch, op.source_group_id, op.destination_group_id);
+            }
         }
         self.invalidateLocalGroupStatusCache();
     }
@@ -7762,7 +8134,7 @@ pub const DataServer = struct {
             .dest_root_dir = dest_root_dir,
             .source_group_id = source_group_id,
             .dest_group_id = destination_group_id,
-            .source_store = self.localTransitionApplyStore(),
+            .source_store = if (comptime storage_kernel_experiment) null else self.localTransitionApplyStore(),
             .source_lease = owned_source_lease,
             .dest = .{ .root_dir = dest_root_dir, .db = dest_db_options },
             .dest_lease = owned_dest_lease,
@@ -7805,7 +8177,7 @@ pub const DataServer = struct {
             .source_group_id = source_group_id,
             .dest_group_id = destination_group_id,
             .source = .{ .root_dir = source_root_dir },
-            .source_store = self.localTransitionApplyStore(),
+            .source_store = if (comptime storage_kernel_experiment) null else self.localTransitionApplyStore(),
             .dest = .{
                 .root_dir = destination_root_dir,
                 .db = .{ .identity_namespace = destination_namespace },
@@ -7837,7 +8209,7 @@ pub const DataServer = struct {
                     .source_group_id = source_group_id,
                     .dest_group_id = destination_group_id,
                     .source = .{ .root_dir = source_root_dir },
-                    .source_store = self.localTransitionApplyStore(),
+                    .source_store = if (comptime storage_kernel_experiment) null else self.localTransitionApplyStore(),
                     .dest = .{
                         .root_dir = source_root_dir,
                         .db = .{ .identity_namespace = source_namespace },
@@ -7868,7 +8240,7 @@ pub const DataServer = struct {
         else
             false;
         return antfly.data.storage.range_transition.deriveSplitStatus(
-            observation.state.?.phase,
+            @as(antfly.shard.SplitPhase, @enumFromInt(@intFromEnum(observation.state.?.phase))),
             bootstrapped,
             observation.delta_sequence,
             if (bootstrapped) observation.acknowledgement.?.delta_sequence else 0,
@@ -7947,7 +8319,7 @@ pub const DataServer = struct {
             .receiver_root_dir = receiver_root_dir,
             .donor_group_id = donor_group_id,
             .receiver_group_id = receiver_group_id,
-            .donor_store = self.localTransitionApplyStore(),
+            .donor_store = if (comptime storage_kernel_experiment) null else self.localTransitionApplyStore(),
             .donor_lease = owned_donor_lease,
             .receiver = .{ .root_dir = receiver_root_dir, .db = receiver_db_options },
             .receiver_lease = owned_receiver_lease,
@@ -8047,7 +8419,13 @@ pub const DataServer = struct {
                 table_contract,
             );
         }
-        var source_store = try antfly.data.RaftApplyStore.init(self.alloc, .{ .root_dir = source_root_dir });
+        var source_store = if (comptime storage_kernel_experiment)
+            try data_apply_client.RaftApplyStore.init(self.alloc, .{
+                .root_dir = source_root_dir,
+                .context = if (self.storage_kernel_context) |context| context.handle else null,
+            })
+        else
+            try antfly.data.RaftApplyStore.init(self.alloc, .{ .root_dir = source_root_dir });
         defer source_store.deinit();
         try self.ensureSplitSourceApplyStoreSeededInto(
             &source_store,
@@ -8056,14 +8434,14 @@ pub const DataServer = struct {
         );
     }
 
-    fn localTransitionApplyStore(self: *DataServer) ?*antfly.data.RaftApplyStore {
+    fn localTransitionApplyStore(self: *DataServer) ?*DataRaftApplyStore {
         const raft = self.data_raft orelse return null;
         return raft.host.owned_data_store;
     }
 
     fn ensureSplitSourceApplyStoreSeededInto(
         self: *DataServer,
-        source_store: *antfly.data.RaftApplyStore,
+        source_store: *DataRaftApplyStore,
         source_group_id: u64,
         table_contract: antfly.metadata.TransitionTableContract,
     ) !void {
@@ -8081,7 +8459,7 @@ pub const DataServer = struct {
 
     fn reconcileSplitSourceApplyStoreDocuments(
         self: *DataServer,
-        source_store: *antfly.data.RaftApplyStore,
+        source_store: *DataRaftApplyStore,
         source_group_id: u64,
         table_contract: antfly.metadata.TransitionTableContract,
     ) !void {
@@ -8118,10 +8496,10 @@ pub const DataServer = struct {
     fn captureReconciledSplitSourceHandoff(
         self: *DataServer,
         work_alloc: std.mem.Allocator,
-        source_store: *antfly.data.RaftApplyStore,
+        source_store: *DataRaftApplyStore,
         source_group_id: u64,
         table_contract: antfly.metadata.TransitionTableContract,
-    ) !antfly.data.storage.raft_apply_store.SplitHandoffMetadata {
+    ) !DataRaftHandoffMetadata {
         const max_reconcile_attempts: usize = 4;
         for (0..max_reconcile_attempts) |_| {
             const watermark = (try source_store.latestBatchForTransition(source_group_id)) orelse
@@ -8149,9 +8527,9 @@ pub const DataServer = struct {
     fn reconcileSplitSourceApplyStoreFromAuthoritativeDb(
         self: *DataServer,
         work_alloc: std.mem.Allocator,
-        source_store: *antfly.data.RaftApplyStore,
+        source_store: *DataRaftApplyStore,
         source_group_id: u64,
-        watermark: ?antfly.data.AppliedDataBatch,
+        watermark: ?DataRaftAppliedBatch,
         capture_handoff: bool,
         table_contract: antfly.metadata.TransitionTableContract,
     ) !SplitProjectionReconcileResult {
@@ -8171,6 +8549,24 @@ pub const DataServer = struct {
         }
         transition_activity.allowReads();
         if (fallback_transition_activity) |*activity| activity.allowReads();
+        if (comptime storage_kernel_experiment) {
+            const owner_source = try self.ensureKernelOwnerSource();
+            const reconciled = try owner_source.reconcileDataRaftProjection(
+                source_store,
+                work_alloc,
+                source_group_id,
+                table_name,
+                watermark,
+                capture_handoff,
+                256,
+                2 * 1024 * 1024,
+            );
+            return switch (reconciled) {
+                .advanced => .advanced,
+                .reconciled => .reconciled,
+                .handoff => |handoff| .{ .handoff = handoff },
+            };
+        }
         var result: SplitProjectionReconcileResult = undefined;
         transition_activity.withWriter(
             self.alloc,
@@ -8200,9 +8596,9 @@ pub const DataServer = struct {
     fn reconcileSplitSourceApplyStoreWithScopedDb(
         db: *antfly.db.DB,
         work_alloc: std.mem.Allocator,
-        source_store: *antfly.data.RaftApplyStore,
+        source_store: *DataRaftApplyStore,
         source_group_id: u64,
-        watermark: ?antfly.data.AppliedDataBatch,
+        watermark: ?DataRaftAppliedBatch,
         capture_handoff: bool,
         result: *SplitProjectionReconcileResult,
     ) !void {
@@ -8218,10 +8614,10 @@ pub const DataServer = struct {
 
     fn reconcileSplitSourceApplyStoreFromDb(
         work_alloc: std.mem.Allocator,
-        source_store: *antfly.data.RaftApplyStore,
+        source_store: *DataRaftApplyStore,
         source_group_id: u64,
         db: *antfly.db.DB,
-        watermark: ?antfly.data.AppliedDataBatch,
+        watermark: ?DataRaftAppliedBatch,
         capture_handoff: bool,
     ) !SplitProjectionReconcileResult {
         if (try db.hasTopologySensitiveTransactions()) return error.TransactionTopologyBusy;
@@ -8237,7 +8633,7 @@ pub const DataServer = struct {
         }
 
         const active_split = try source_store.currentSplitState(work_alloc, source_group_id);
-        defer if (active_split) |state| antfly.data.storage.shard_state_store.freeSplitState(work_alloc, state);
+        defer if (active_split) |state| freeDataRaftSplitState(work_alloc, state);
         var projected_range: ?antfly.db.types.ByteRange = null;
         defer if (projected_range) |range| range_state_mod.freeRange(work_alloc, range);
 
@@ -8294,18 +8690,32 @@ pub const DataServer = struct {
         } else {
             self.lockLocalTransition();
             defer self.unlockLocalTransition();
-            var runtime = try self.initLocalMergeRuntime(
-                op.donor_group_id,
-                op.receiver_group_id,
-                op.allow_doc_identity_reassignment,
-                op.table_contract,
-            );
-            defer runtime.deinit();
-            const merge = runtime.runtime();
-            if (op.allow_doc_identity_reassignment) {
-                try merge.recordDocIdentityReassignment(op.donor_group_id, op.receiver_group_id);
+            if (comptime storage_kernel_experiment) {
+                _ = try self.runKernelLocalTransition(kernelLocalTransitionRequest(
+                    .accept_merge_receiver,
+                    op.transition_id,
+                    0,
+                    op.donor_group_id,
+                    op.receiver_group_id,
+                    op.allow_doc_identity_reassignment,
+                    "",
+                    null,
+                    op.table_contract,
+                ), op.table_contract);
+            } else {
+                var runtime = try self.initLocalMergeRuntime(
+                    op.donor_group_id,
+                    op.receiver_group_id,
+                    op.allow_doc_identity_reassignment,
+                    op.table_contract,
+                );
+                defer runtime.deinit();
+                const merge = runtime.runtime();
+                if (op.allow_doc_identity_reassignment) {
+                    try merge.recordDocIdentityReassignment(op.donor_group_id, op.receiver_group_id);
+                }
+                try merge.acceptReceiver(op.donor_group_id, op.receiver_group_id);
             }
-            try merge.acceptReceiver(op.donor_group_id, op.receiver_group_id);
         }
         self.invalidateLocalGroupStatusCache();
     }
@@ -8320,18 +8730,32 @@ pub const DataServer = struct {
         } else {
             self.lockLocalTransition();
             defer self.unlockLocalTransition();
-            var runtime = try self.initLocalMergeRuntime(
-                op.donor_group_id,
-                op.receiver_group_id,
-                op.allow_doc_identity_reassignment,
-                op.table_contract,
-            );
-            defer runtime.deinit();
-            const merge = runtime.runtime();
-            if (op.allow_doc_identity_reassignment) {
-                try merge.recordDocIdentityReassignment(op.donor_group_id, op.receiver_group_id);
+            if (comptime storage_kernel_experiment) {
+                _ = try self.runKernelLocalTransition(kernelLocalTransitionRequest(
+                    .catch_up_merge_receiver,
+                    op.transition_id,
+                    0,
+                    op.donor_group_id,
+                    op.receiver_group_id,
+                    op.allow_doc_identity_reassignment,
+                    "",
+                    null,
+                    op.table_contract,
+                ), op.table_contract);
+            } else {
+                var runtime = try self.initLocalMergeRuntime(
+                    op.donor_group_id,
+                    op.receiver_group_id,
+                    op.allow_doc_identity_reassignment,
+                    op.table_contract,
+                );
+                defer runtime.deinit();
+                const merge = runtime.runtime();
+                if (op.allow_doc_identity_reassignment) {
+                    try merge.recordDocIdentityReassignment(op.donor_group_id, op.receiver_group_id);
+                }
+                _ = try merge.catchUpReceiver(op.donor_group_id, op.receiver_group_id);
             }
-            _ = try merge.catchUpReceiver(op.donor_group_id, op.receiver_group_id);
         }
         self.invalidateLocalGroupStatusCache();
     }
@@ -8346,18 +8770,32 @@ pub const DataServer = struct {
         } else {
             self.lockLocalTransition();
             defer self.unlockLocalTransition();
-            var runtime = try self.initLocalMergeRuntime(
-                op.donor_group_id,
-                op.receiver_group_id,
-                op.allow_doc_identity_reassignment,
-                op.table_contract,
-            );
-            defer runtime.deinit();
-            const merge = runtime.runtime();
-            if (op.allow_doc_identity_reassignment) {
-                try merge.recordDocIdentityReassignment(op.donor_group_id, op.receiver_group_id);
+            if (comptime storage_kernel_experiment) {
+                _ = try self.runKernelLocalTransition(kernelLocalTransitionRequest(
+                    .finalize_merge,
+                    op.transition_id,
+                    0,
+                    op.donor_group_id,
+                    op.receiver_group_id,
+                    op.allow_doc_identity_reassignment,
+                    "",
+                    null,
+                    op.table_contract,
+                ), op.table_contract);
+            } else {
+                var runtime = try self.initLocalMergeRuntime(
+                    op.donor_group_id,
+                    op.receiver_group_id,
+                    op.allow_doc_identity_reassignment,
+                    op.table_contract,
+                );
+                defer runtime.deinit();
+                const merge = runtime.runtime();
+                if (op.allow_doc_identity_reassignment) {
+                    try merge.recordDocIdentityReassignment(op.donor_group_id, op.receiver_group_id);
+                }
+                _ = try merge.finalizeMerge(op.donor_group_id, op.receiver_group_id);
             }
-            _ = try merge.finalizeMerge(op.donor_group_id, op.receiver_group_id);
         }
         self.invalidateLocalGroupStatusCache();
     }
@@ -8372,14 +8810,28 @@ pub const DataServer = struct {
         } else {
             self.lockLocalTransition();
             defer self.unlockLocalTransition();
-            var runtime = try self.initLocalMergeRuntime(
-                op.donor_group_id,
-                op.receiver_group_id,
-                op.allow_doc_identity_reassignment,
-                op.table_contract,
-            );
-            defer runtime.deinit();
-            _ = try runtime.runtime().rollbackMerge(op.donor_group_id, op.receiver_group_id);
+            if (comptime storage_kernel_experiment) {
+                _ = try self.runKernelLocalTransition(kernelLocalTransitionRequest(
+                    .rollback_merge,
+                    op.transition_id,
+                    0,
+                    op.donor_group_id,
+                    op.receiver_group_id,
+                    op.allow_doc_identity_reassignment,
+                    "",
+                    null,
+                    op.table_contract,
+                ), op.table_contract);
+            } else {
+                var runtime = try self.initLocalMergeRuntime(
+                    op.donor_group_id,
+                    op.receiver_group_id,
+                    op.allow_doc_identity_reassignment,
+                    op.table_contract,
+                );
+                defer runtime.deinit();
+                _ = try runtime.runtime().rollbackMerge(op.donor_group_id, op.receiver_group_id);
+            }
         }
         self.invalidateLocalGroupStatusCache();
     }
@@ -12246,6 +12698,14 @@ pub const DataServer = struct {
         }
         const api_io_impl = backend_runtime.?.apiIoImpl() orelse return error.HttpRuntimeUnavailable;
 
+        var storage_kernel_context: ?StorageKernelContext = null;
+        errdefer if (storage_kernel_context) |*context| context.deinit();
+        if (comptime storage_kernel_experiment) {
+            var context = kernel_owner_client.Context{};
+            try context.ensure();
+            storage_kernel_context = context;
+        }
+
         const remote_metadata = try alloc.create(RemoteMetadataSource);
         errdefer alloc.destroy(remote_metadata);
         remote_metadata.* = try RemoteMetadataSource.init(alloc, metadata_api_urls, api_io_impl);
@@ -12325,6 +12785,7 @@ pub const DataServer = struct {
                                 },
                             },
                         },
+                        .data_apply_storage_context = if (storage_kernel_context) |context| context.handle else null,
                     }, .{}, .{
                         .transition_runtime = null,
                     });
@@ -12346,6 +12807,7 @@ pub const DataServer = struct {
             .group_membership_source = cfg.group_membership_source orelse if (data_raft) |raft| GroupMembershipSource.fromManagedHttpHostService(raft) else null,
             .local_transition_runtime = if (data_raft) |raft| raft.local_transition_runtime else null,
             .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+            .storage_kernel_context = storage_kernel_context,
             .read_source = antfly.public_api.ProvisionedTableReadSource.init(
                 cfg.replica_root_dir,
                 remote_metadata.catalogSource(),
@@ -12368,6 +12830,7 @@ pub const DataServer = struct {
             .listener_cfg = publicApiListenerConfig(cfg.bind_host, cfg.bind_port),
         };
         owned_backend_runtime = null;
+        storage_kernel_context = null;
         return server;
     }
 };
@@ -17037,6 +17500,13 @@ test "data runtime local split fallback preserves source identity namespace" {
         .table_contract = FakeCatalog.table_contract,
     } });
 
+    // The compiled-kernel architecture intentionally keeps group owners
+    // resident. Drain them before this white-box durability inspection opens
+    // the physical DB directly outside the owner ABI.
+    if (comptime storage_kernel_experiment) {
+        _ = server.kernel_owner_source.?.retireTable("docs");
+    }
+
     var dest = try antfly.db.DB.open(alloc, destination_db_path, .{
         .identity_namespace = source_namespace,
         .start_index_workers = false,
@@ -17133,8 +17603,56 @@ test "data runtime split apply store seeding reuses cached source writer" {
         fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
     };
 
+    if (comptime storage_kernel_experiment) {
+        var storage_context = kernel_owner_client.Context{};
+        try storage_context.ensure();
+        const storage_context_handle = storage_context.handle;
+        var server: DataServer = .{
+            .alloc = alloc,
+            .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+            .read_source = antfly.public_api.ProvisionedTableReadSource.init(
+                replica_root_dir,
+                FakeCatalog.iface(),
+                antfly.raft.read_gate.noopReadableLeaseRequester(),
+            ),
+            .write_source = antfly.public_api.ProvisionedTableWriteSource.init(replica_root_dir, FakeCatalog.iface()),
+            .status_source = undefined,
+            .api_server_cfg = undefined,
+            .query_async_limit = .limited(8),
+            .listener_cfg = undefined,
+            .storage_kernel_context = storage_context,
+        };
+        defer server.deinit();
+        _ = try server.ensureKernelOwnerSource();
+
+        var source_store = try data_apply_client.RaftApplyStore.init(alloc, .{
+            .root_dir = source_db_path,
+            .context = storage_context_handle,
+        });
+        defer source_store.deinit();
+        try server.ensureSplitSourceApplyStoreSeededInto(
+            &source_store,
+            180,
+            table_contract,
+        );
+
+        var projection_range = try source_store.currentRange(alloc, 180);
+        defer projection_range.deinit(alloc);
+        var projection_page = try source_store.groupStatePageInRange(
+            alloc,
+            180,
+            projection_range,
+            null,
+            8,
+            1024 * 1024,
+        );
+        defer projection_page.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), projection_page.entries.len);
+        try std.testing.expectEqualStrings("doc:t", projection_page.entries[0].key);
+        return;
+    }
+
     var write_cache = antfly.public_api.table_writes.ProvisionedTableWriteCache.init(alloc);
-    defer write_cache.deinit();
     var server: DataServer = .{
         .alloc = alloc,
         .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
@@ -17151,6 +17669,9 @@ test "data runtime split apply store seeding reuses cached source writer" {
     };
     server.write_source.write_cache = &write_cache;
     defer server.deinit();
+    // The externally supplied cache may retain a DB using the server's
+    // background runtime. Drain it before the server joins that runtime.
+    defer write_cache.deinit();
 
     var held: ?antfly.public_api.ProvisionedTableWriteCache.CachedDb =
         (try server.write_source.leaseCachedGroupWriter(alloc, 180, "docs")) orelse return error.TestUnexpectedResult;
@@ -17374,6 +17895,12 @@ test "data runtime local merge fallback uses its durable table contract" {
         .allow_doc_identity_reassignment = true,
         .table_contract = table_contract,
     } });
+
+    // See the split test above: raw DB inspection is test-only and must first
+    // drain the process-resident opaque owners.
+    if (comptime storage_kernel_experiment) {
+        _ = server.kernel_owner_source.?.retireTable("docs");
+    }
 
     var reopened = try antfly.db.DB.open(alloc, receiver_db_path, .{
         .identity_namespace = target_namespace,

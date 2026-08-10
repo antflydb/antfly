@@ -15,7 +15,7 @@
 //! Versioned internal ABI for the storage kernel's live DB owner. Keep this
 //! module free of storage and distributed-runtime imports.
 
-pub const abi_version: u32 = 20;
+pub const abi_version: u32 = 22;
 
 pub const BorrowedBytes = extern struct {
     ptr: ?[*]const u8 = null,
@@ -190,6 +190,139 @@ pub const DataApplyLatestResult = extern struct {
     admin_entry_count: u64 = 0,
     last_entry_term: u64 = 0,
     last_entry_index: u64 = 0,
+};
+
+pub const DataApplyProjectionKind = enum(u32) {
+    observe_split_control = 0,
+    current_range = 1,
+    group_state_page = 2,
+    split_deltas_page = 3,
+    capture_verified_handoff_metadata = 4,
+};
+
+/// One bounded projection read. Fields unused by `kind` must remain zero.
+/// Variable-sized results use the versioned binary projection-wire contract.
+pub const DataApplyProjectionRequest = extern struct {
+    version: u32 = abi_version,
+    kind: DataApplyProjectionKind = .observe_split_control,
+    group_id: u64 = 0,
+    after_sequence: u64 = 0,
+    through_sequence: u64 = 0,
+    max_entries: u64 = 0,
+    max_bytes: u64 = 0,
+    expected: DataApplyLatestResult = .{},
+    root_incarnation_le: [16]u8 = @splat(0),
+    range_start: BorrowedBytes = .{},
+    range_end: BorrowedBytes = .{},
+    after_key: BorrowedBytes = .{},
+};
+
+pub const DataApplyReconcileState = enum(u32) {
+    advanced = 0,
+    reconciled = 1,
+    handoff = 2,
+};
+
+/// Reconcile one authoritative resident table owner into its data-Raft
+/// projection. Both physical owners stay inside the compiled kernel.
+pub const DataApplyReconcileRequest = extern struct {
+    version: u32 = abi_version,
+    capture_handoff: u8 = 0,
+    _reserved0: [3]u8 = @splat(0),
+    group_id: u64 = 0,
+    max_page_entries: u64 = 0,
+    max_page_bytes: u64 = 0,
+    expected: DataApplyLatestResult = .{},
+};
+
+pub const DataApplyReconcileResult = extern struct {
+    version: u32 = abi_version,
+    state: DataApplyReconcileState = .advanced,
+    handoff_metadata: OwnedBytes = .{},
+};
+
+/// One complete local range-transition phase. The distributed runtime owns
+/// admission, ordering, and metadata decisions; the compiled storage kernel
+/// owns every physical DB and data-Raft projection operation for the phase.
+pub const LocalTransitionAction = enum(u32) {
+    observe_split = 0,
+    prepare_split_source = 1,
+    start_split_source = 2,
+    bootstrap_split_destination = 3,
+    catch_up_split_destination = 4,
+    finalize_split_source = 5,
+    rollback_split = 6,
+    observe_merge = 7,
+    accept_merge_receiver = 8,
+    catch_up_merge_receiver = 9,
+    finalize_merge = 10,
+    rollback_merge = 11,
+};
+
+pub const LocalTransitionPhase = enum(u32) {
+    prepare = 0,
+    bootstrap_peer = 1,
+    replay_deltas = 2,
+    cutover_ready = 3,
+    finalized = 4,
+    rolling_back = 5,
+    rolled_back = 6,
+};
+
+pub const LocalTransitionResultKind = enum(u32) {
+    none = 0,
+    split = 1,
+    merge = 2,
+};
+
+/// Complete immutable table and identity contract for one synchronous phase.
+/// `primary_owner` is the split source or merge donor; `secondary_owner` is
+/// the split destination or merge receiver.
+pub const LocalTransitionRequest = extern struct {
+    version: u32 = abi_version,
+    action: LocalTransitionAction = .observe_split,
+    transition_id: u64 = 0,
+    attempt_epoch: u64 = 0,
+    primary_group_id: u64 = 0,
+    secondary_group_id: u64 = 0,
+    table_id: u64 = 0,
+    source_identity_shard_id: u64 = 0,
+    source_identity_range_id: u64 = 0,
+    target_identity_shard_id: u64 = 0,
+    target_identity_range_id: u64 = 0,
+    allow_doc_identity_reassignment: u8 = 0,
+    has_source_range_end: u8 = 0,
+    _reserved0: [6]u8 = @splat(0),
+    table_name: BorrowedBytes = .{},
+    schema_json: BorrowedBytes = .{},
+    indexes_json: BorrowedBytes = .{},
+    split_key: BorrowedBytes = .{},
+    source_range_end: BorrowedBytes = .{},
+};
+
+/// Scalar transition observation. Variable-size state remains kernel-owned;
+/// the control plane receives only the facts needed by its state machine.
+pub const LocalTransitionResult = extern struct {
+    version: u32 = abi_version,
+    kind: LocalTransitionResultKind = .none,
+    phase: LocalTransitionPhase = .prepare,
+    has_source_split_phase: u8 = 0,
+    source_split_phase: u8 = 0,
+    bootstrapped: u8 = 0,
+    replay_required: u8 = 0,
+    replay_caught_up: u8 = 0,
+    cutover_ready: u8 = 0,
+    peer_ready_for_reads: u8 = 0,
+    receiver_accepts_donor_range: u8 = 0,
+    allow_doc_identity_reassignment: u8 = 0,
+    _reserved0: [6]u8 = @splat(0),
+    primary_group_id: u64 = 0,
+    secondary_group_id: u64 = 0,
+    primary_delta_sequence: u64 = 0,
+    secondary_delta_sequence: u64 = 0,
+    receiver_identity_table_id: u64 = 0,
+    receiver_identity_shard_id: u64 = 0,
+    receiver_identity_range_id: u64 = 0,
 };
 
 pub const TransactionRecoveryResolveFn = *const fn (
@@ -597,6 +730,25 @@ pub extern fn antfly_data_apply_store_latest(
     out_result: *DataApplyLatestResult,
 ) callconv(.c) Status;
 
+pub extern fn antfly_data_apply_store_latest_for_transition(
+    store: ?*anyopaque,
+    request: *const DataApplyGroupRequest,
+    out_result: *DataApplyLatestResult,
+) callconv(.c) Status;
+
+pub extern fn antfly_data_apply_store_projection(
+    store: ?*anyopaque,
+    request: *const DataApplyProjectionRequest,
+    out_result: *OwnedBytes,
+) callconv(.c) Status;
+
+pub extern fn antfly_data_apply_store_reconcile_owner(
+    store: ?*anyopaque,
+    owner: ?*anyopaque,
+    request: *const DataApplyReconcileRequest,
+    out_result: *DataApplyReconcileResult,
+) callconv(.c) Status;
+
 pub extern fn antfly_data_apply_store_retain_groups(
     store: ?*anyopaque,
     request: *const DataApplyGroupsRequest,
@@ -619,6 +771,14 @@ pub extern fn antfly_data_apply_store_abort_group_transition(
 pub extern fn antfly_data_apply_store_destroy_group_transition(
     transition: ?*anyopaque,
 ) callconv(.c) void;
+
+pub extern fn antfly_storage_owner_local_transition(
+    primary_owner: ?*anyopaque,
+    secondary_owner: ?*anyopaque,
+    apply_store: ?*anyopaque,
+    request: *const LocalTransitionRequest,
+    out_result: *LocalTransitionResult,
+) callconv(.c) Status;
 
 pub extern fn antfly_storage_owner_open(
     request: *const OpenRequest,

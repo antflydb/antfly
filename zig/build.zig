@@ -8833,6 +8833,10 @@ pub fn build(b: *std.Build) void {
                 const data_runtime_owner_tests = b.addTest(.{
                     .root_module = data_runtime_owner_test_mod,
                     .filters = &.{
+                        "data server registered data raft uses wal state backend by default",
+                        "data runtime local split fallback preserves source identity namespace",
+                        "data runtime split apply store seeding reuses cached source writer",
+                        "data runtime local merge fallback uses its durable table contract",
                         "data runtime provisioned cache warmup populates runtime status without pinning db caches",
                         "data server applies routed HA replication records through standby write gate",
                     },

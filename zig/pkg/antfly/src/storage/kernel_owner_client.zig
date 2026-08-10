@@ -18,6 +18,12 @@
 const std = @import("std");
 const abi = @import("kernel_owner_abi");
 
+pub const LocalTransitionAction = abi.LocalTransitionAction;
+pub const LocalTransitionPhase = abi.LocalTransitionPhase;
+pub const LocalTransitionResultKind = abi.LocalTransitionResultKind;
+pub const LocalTransitionRequest = abi.LocalTransitionRequest;
+pub const LocalTransitionResult = abi.LocalTransitionResult;
+
 pub const Context = struct {
     handle: ?*anyopaque = null,
 
@@ -80,6 +86,27 @@ pub const Owner = struct {
         var handle: ?*anyopaque = null;
         try statusToError(abi.antfly_storage_owner_open(&request, &handle));
         return .{ .handle = handle orelse return error.StorageKernelFailure };
+    }
+
+    /// Runs one complete local split/merge phase while both opaque owners are
+    /// borrowed by the caller. `apply_store` is optional; a null handle asks
+    /// the provider to open the phase-local projection store itself.
+    pub fn localTransition(
+        self: *Owner,
+        secondary: *Owner,
+        apply_store: ?*anyopaque,
+        request: abi.LocalTransitionRequest,
+    ) !abi.LocalTransitionResult {
+        var result: abi.LocalTransitionResult = .{};
+        try statusToError(abi.antfly_storage_owner_local_transition(
+            self.handle,
+            secondary.handle,
+            apply_store,
+            &request,
+            &result,
+        ));
+        if (result.version != abi.abi_version) return error.InvalidAbiVersion;
+        return result;
     }
 
     pub fn deinit(self: *Owner) void {
