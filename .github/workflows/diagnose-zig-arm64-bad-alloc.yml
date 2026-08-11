@@ -67,11 +67,13 @@ jobs:
           # admit the measured 9GiB distributed-control consumer and 10.25GiB
           # PIC storage kernel as the initial 19.25GiB group. This fits the
           # unchanged 20,000MiB cap. With product composition moved out of the
-          # kernel, inference starts when storage finishes and overlaps the
-          # distributed tail; the remote CLI starts after distributed. Explicit
-          # build dependencies keep Zig's randomized traversal from admitting
-          # either downstream unit ahead of the two critical units. The pod
-          # reserve covers runner state, linker work, page cache, and drift.
+          # kernel, inference starts when distributed finishes and overlaps the
+          # storage tail at an 18.25GiB claim. The short enrichment and remote
+          # CLI units also wait for distributed; max_rss admission holds them
+          # until capacity remains. Explicit build dependencies keep Zig's
+          # randomized traversal from admitting downstream units ahead of the
+          # two initial critical units. The pod reserve covers runner state,
+          # linker work, page cache, and drift.
           cd zig
           runner_root="$(dirname "$(dirname "$RUNNER_TEMP")")"
           node_bin="$runner_root/externals/node24/bin/node"
@@ -156,6 +158,10 @@ jobs:
             "$RUNNER_TEMP/linked-runtime-reports/distributed.json" 30 &
           distributed_report_pid=$!
           "$node_bin" tools/capture_zig_time_report.mjs \
+            ws://127.0.0.1:19125/ antfly-runtime-enrichment_compute \
+            "$RUNNER_TEMP/linked-runtime-reports/enrichment.json" 5 &
+          enrichment_report_pid=$!
+          "$node_bin" tools/capture_zig_time_report.mjs \
             ws://127.0.0.1:19125/ antfly-runtime-inference \
             "$RUNNER_TEMP/linked-runtime-reports/inference.json" 30 &
           inference_report_pid=$!
@@ -168,6 +174,7 @@ jobs:
           for report_pid in \
             "$storage_report_pid" \
             "$distributed_report_pid" \
+            "$enrichment_report_pid" \
             "$inference_report_pid" \
             "$cli_report_pid"; do
             wait "$report_pid" || report_status=$?
@@ -206,7 +213,8 @@ jobs:
 
           storage_object="$(find "$RUNNER_TEMP/linked-runtime-cache/local" -type f -name 'libantfly-storage-kernel_zcu.o' -print -quit)"
           distributed_object="$(find "$RUNNER_TEMP/linked-runtime-cache/local" -type f -name 'libantfly-runtime-distributed_zcu.o' -print -quit)"
-          if [ -z "$storage_object" ] || [ -z "$distributed_object" ]; then
+          enrichment_object="$(find "$RUNNER_TEMP/linked-runtime-cache/local" -type f -name 'libantfly-runtime-enrichment_compute_zcu.o' -print -quit)"
+          if [ -z "$storage_object" ] || [ -z "$distributed_object" ] || [ -z "$enrichment_object" ]; then
             echo "Zig runtime objects were not found for emitted-overlap analysis" >&2
             exit 1
           fi
@@ -214,10 +222,12 @@ jobs:
           python3 tools/analyze_zig_import_graph.py \
             --time-report "storage=$RUNNER_TEMP/linked-runtime-reports/storage.json" \
             --time-report "distributed=$RUNNER_TEMP/linked-runtime-reports/distributed.json" \
+            --time-report "enrichment=$RUNNER_TEMP/linked-runtime-reports/enrichment.json" \
             --time-report "inference=$RUNNER_TEMP/linked-runtime-reports/inference.json" \
             --time-report "cli=$RUNNER_TEMP/linked-runtime-reports/cli.json" \
             --object "storage=$storage_object" \
             --object "distributed=$distributed_object" \
+            --object "enrichment=$enrichment_object" \
             --top-groups 30 \
             --json | tee "$RUNNER_TEMP/linked-runtime-reports/summary.json"
 
@@ -236,7 +246,7 @@ jobs:
           grep -Eq 'Machine:.*AArch64' "$RUNNER_TEMP/linked-runtime.elf-header"
           grep -Eq 'Machine:.*AArch64' "$RUNNER_TEMP/lite-capi.elf-header"
           grep -Eq 'GLOBAL.*antfly_db_open$' "$RUNNER_TEMP/lite-capi.symbols"
-          if grep -Eq 'GLOBAL.*antfly_(runtime_|api_kernel_|standalone_inference_|storage_kernel_link_anchor|storage_context_|storage_owner_|storage_snapshot_|storage_restore_|data_apply_store_)' "$RUNNER_TEMP/lite-capi.symbols"; then
+          if grep -Eq 'GLOBAL.*antfly_(runtime_|api_kernel_|enrichment_|standalone_inference_|storage_kernel_link_anchor|storage_context_|storage_owner_|storage_snapshot_|storage_restore_|data_apply_store_)' "$RUNNER_TEMP/lite-capi.symbols"; then
             echo "private executable ABI leaked from libantfly.so" >&2
             exit 1
           fi
