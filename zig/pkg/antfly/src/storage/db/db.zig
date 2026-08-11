@@ -84016,11 +84016,12 @@ test "db restore repair does not complete before regenerated chunk embeddings ar
         );
     }
 
-    try DB.markRestorePrimaryRestoredForPath(
+    try DB.markRestorePrimaryRestoredForPathWithArtifact(
         alloc,
         std.mem.span(restore_path),
         "snap1",
         "file:///tmp/backups",
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "snapshots/snap1",
         7001,
     );

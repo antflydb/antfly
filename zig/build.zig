@@ -1186,7 +1186,6 @@ pub fn build(b: *std.Build) void {
     const with_tla = b.option(bool, "with_tla", "Enable TLA+ trace instrumentation (ndjson event logging)") orelse false;
     const link_libc = b.option(bool, "link-libc", "Link Antfly runtime modules against libc") orelse true;
     const sanitize_thread = b.option(bool, "sanitize-thread", "Enable ThreadSanitizer for the Antfly runtime") orelse false;
-    const include_ha_tests_in_aggregates = b.option(bool, "ha-tests", "Include hot-standby HA suites in aggregate test steps") orelse true;
     const edition = b.option(BuildEdition, "edition", "Build edition: full or inference") orelse .full;
     const antfly_bin_name = b.option([]const u8, "antfly-bin-name", "Installed filename for the top-level Antfly CLI") orelse "antfly";
     if (antfly_bin_name.len == 0 or std.mem.indexOfAny(u8, antfly_bin_name, "/\\") != null) {
@@ -6230,9 +6229,7 @@ pub fn build(b: *std.Build) void {
 
     var unit_progress_tail: ?*std.Build.Step = null;
     unit_progress_tail = chainLabeledRunStep(b, run_unit_progress_root_tests, "lib-root-test", unit_progress_tail);
-    if (include_ha_tests_in_aggregates) {
-        unit_progress_tail = chainLabeledRun(b, ha_tests, "ha-test", unit_progress_tail);
-    }
+    unit_progress_tail = chainLabeledRun(b, ha_tests, "ha-test", unit_progress_tail);
     unit_progress_tail = chainLabeledRun(b, lib_template_tests, "lib-template-test", unit_progress_tail);
     unit_test_progress_step.dependOn(unit_progress_tail.?);
 
