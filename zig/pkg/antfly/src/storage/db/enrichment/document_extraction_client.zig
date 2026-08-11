@@ -213,19 +213,18 @@ pub fn extractDownloadedStreamingWithFailure(
         .on_begin = Context.onBegin,
         .on_units_json = Context.onUnitsJson,
     }, &failure);
-    out_failure.* = failure;
-    context.error_relay.finish(status) catch |err| {
-        // Callback failures belong to the consumer and retain their exact Zig
-        // identity through CallbackErrorRelay. Do not mislabel the provider's
-        // unwind sentinel as the originating failure.
-        if (context.error_relay.exact_error != null) out_failure.* = .{};
-        if (status == .internal and failure.error_name_len != 0) {
-            std.log.err("enrichment compute failed operation={d} provider_error={s} hash={x}", .{
-                failure.operation,
-                failure.errorName(),
-                failure.error_name_hash,
-            });
-        }
+    // Callback failures originate in this consumer. Preserve their exact Zig
+    // identity and do not confuse the provider's unwind sentinel with a
+    // provider failure envelope.
+    if (context.error_relay.exact_error) |err| return err;
+    try acceptProviderFailure(
+        status,
+        failure,
+        .validate_extract_response,
+        out_failure,
+    );
+    error_identity.statusToError(status) catch |err| {
+        if (status == .internal) logProviderFailure("enrichment compute", failure);
         return err;
     };
     try sink.on_end(sink.ptr);
@@ -290,15 +289,66 @@ pub fn renderPdfPagePngAllocWithFailure(
         .pdf_bytes = .fromSlice(pdf_bytes),
         .page_number = @intCast(page_number),
     }, &provider_png, &failure);
-    out_failure.* = failure;
+    try acceptProviderFailure(
+        status,
+        failure,
+        .validate_render_response,
+        out_failure,
+    );
     error_identity.statusToError(status) catch |err| {
-        if (status == .internal and failure.error_name_len != 0) {
-            std.log.err("enrichment PDF render failed provider_error={s} hash={x}", .{
-                failure.errorName(),
-                failure.error_name_hash,
-            });
-        }
+        if (status == .internal) logProviderFailure("enrichment PDF render", failure);
         return err;
     };
     return try alloc.dupe(u8, provider_png.slice());
+}
+
+pub fn acceptProviderFailure(
+    status: abi.Status,
+    failure: abi.FailureIdentity,
+    validation_operation: abi.EnrichmentOperation,
+    out_failure: *abi.FailureIdentity,
+) !void {
+    error_identity.validateFailureEnvelope(status, &failure, abi.abi_version) catch |err| {
+        std.log.err(
+            "enrichment returned inconsistent failure identity status={s} identity_status={s} identity_boundary={s} identity_version={d} operation={d} identity_error={s} identity_hash={x}",
+            .{
+                @tagName(status),
+                @tagName(failure.status),
+                @tagName(failure.boundary),
+                failure.boundary_version,
+                failure.operation,
+                failure.boundedErrorName(),
+                failure.error_name_hash,
+            },
+        );
+        out_failure.* = error_identity.failureFromError(
+            err,
+            .storage_owner,
+            abi.abi_version,
+            @intFromEnum(validation_operation),
+        );
+        return err;
+    };
+    if (status != .ok and failure.boundary != .enrichment_compute) {
+        std.log.err("enrichment returned failure from unexpected boundary={s}", .{@tagName(failure.boundary)});
+        out_failure.* = error_identity.failureFromError(
+            error.InvalidBoundaryFailureIdentity,
+            .storage_owner,
+            abi.abi_version,
+            @intFromEnum(validation_operation),
+        );
+        return error.InvalidBoundaryFailureIdentity;
+    }
+    out_failure.* = failure;
+}
+
+fn logProviderFailure(label: []const u8, failure: abi.FailureIdentity) void {
+    if (failure.error_name_len == 0) return;
+    std.log.err("{s} failed boundary={s} operation={d} provider_error={s} hash={x}", .{
+        label,
+        @tagName(failure.boundary),
+        failure.operation,
+        failure.errorName(),
+        failure.error_name_hash,
+    });
 }

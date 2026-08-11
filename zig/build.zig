@@ -75,6 +75,10 @@ const RuntimeLibraryUnit = enum {
     // durability, manifests, and index ownership and calls this unit once per
     // bounded extraction operation.
     enrichment_compute,
+    // Complete DB-local query execution over a borrowed opaque DB handle.
+    // Storage retains DB/index lifecycle and all writes; no posting, candidate,
+    // or stored-document callback crosses this boundary.
+    local_query,
     inference,
     // Short remote/client unit. Its compile-step gate below keeps it from
     // competing with the initial API plus application memory group.
@@ -602,6 +606,7 @@ const AntflyRootImports = struct {
     standalone_runtime_options: *std.Build.Step.Options,
     kernel_owner_abi: *std.Build.Module,
     kernel_error_identity: *std.Build.Module,
+    local_query_client: *std.Build.Module,
 
     const import_table = [_]struct { name: []const u8, field: []const u8 }{
         .{ .name = "lmdb_engine", .field = "lmdb_engine" },
@@ -669,6 +674,7 @@ const AntflyRootImports = struct {
         .{ .name = "structlog", .field = "structlog" },
         .{ .name = "kernel_owner_abi", .field = "kernel_owner_abi" },
         .{ .name = "kernel_error_identity", .field = "kernel_error_identity" },
+        .{ .name = "local_query_client", .field = "local_query_client" },
     };
 
     fn configure(self: @This(), b: *std.Build, mod: *std.Build.Module, include_lmdb_c: bool, link_libc: bool) void {
@@ -1778,6 +1784,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     kernel_error_identity_mod.addImport("kernel_owner_abi", kernel_owner_abi_mod);
+    const local_query_client_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/storage/local_query_client.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    local_query_client_mod.addImport("kernel_owner_abi", kernel_owner_abi_mod);
+    local_query_client_mod.addImport("kernel_error_identity", kernel_error_identity_mod);
 
     const hf_tokenizer_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -1899,6 +1912,7 @@ pub fn build(b: *std.Build) void {
         .standalone_runtime_options = standalone_runtime_options,
         .kernel_owner_abi = kernel_owner_abi_mod,
         .kernel_error_identity = kernel_error_identity_mod,
+        .local_query_client = local_query_client_mod,
     };
 
     // Library module
@@ -2383,6 +2397,10 @@ pub fn build(b: *std.Build) void {
     capi_mod.addImport("structlog", structlog_mod);
     capi_mod.addImport("kernel_owner_abi", kernel_owner_abi_mod);
     capi_mod.addImport("kernel_error_identity", kernel_error_identity_mod);
+    capi_mod.addImport("local_query_client", local_query_client_mod);
+    const capi_build_options = b.addOptions();
+    capi_build_options.addOption(bool, "storage_kernel_experiment", storage_kernel_experiment);
+    capi_mod.addOptions("capi_build_options", capi_build_options);
 
     // Unlinked and focused CAPI builds compile the storage ABI as a standalone
     // PIC object. Linked release builds instead include the same exports in the
@@ -5352,6 +5370,8 @@ pub fn build(b: *std.Build) void {
     const api_table_reads_docid_tests = b.addTest(.{
         .root_module = api_table_reads_docid_test_mod,
         .filters = &.{
+            "storage-kernel search result preserves sort and hierarchy identity",
+            "storage-kernel query request encodes singleton vector index identity",
             "aggregation completeness requires exact total relation",
             "api http client forwards internal query controls and maps remote timeout",
             "api http client preserves remote storage read contention",
@@ -8078,6 +8098,11 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseFast,
     });
     capi_bench_mod.addImport("antfly-zig", lib_mod);
+    capi_bench_mod.addImport("antfly_storage_root", lib_mod);
+    capi_bench_mod.addImport("kernel_owner_abi", kernel_owner_abi_mod);
+    capi_bench_mod.addImport("kernel_error_identity", kernel_error_identity_mod);
+    capi_bench_mod.addImport("local_query_client", local_query_client_mod);
+    capi_bench_mod.addOptions("capi_build_options", capi_build_options);
     dense_stack_bench_mod.addImport("antfly_capi", capi_bench_mod);
 
     const dense_stack_bench = b.addExecutable(.{
@@ -8841,6 +8866,7 @@ pub fn build(b: *std.Build) void {
         var inference_runtime_artifact: ?*std.Build.Step.Compile = null;
         var storage_runtime_artifact: ?*std.Build.Step.Compile = null;
         var enrichment_compute_artifact: ?*std.Build.Step.Compile = null;
+        var local_query_artifact: ?*std.Build.Step.Compile = null;
         var storage_owner_tests: ?*std.Build.Step.Compile = null;
         var storage_provisioned_owner_tests: ?*std.Build.Step.Compile = null;
         var storage_data_runtime_owner_tests: ?*std.Build.Step.Compile = null;
@@ -8851,7 +8877,8 @@ pub fn build(b: *std.Build) void {
                 unit != .cli_pic_probe and unit != .control_api_probe and
                 (unit != .api_kernel or !storage_kernel_experiment) and
                 (unit != .storage_kernel or storage_kernel_experiment) and
-                (unit != .enrichment_compute or storage_kernel_experiment);
+                (unit != .enrichment_compute or storage_kernel_experiment) and
+                (unit != .local_query or storage_kernel_experiment);
             const owns_storage_kernel = unit == .storage_kernel or unit == .data_pic_probe or
                 unit == .storage_runtime_pic_probe or unit == .application_pic_probe or
                 (unit == .distributed and !storage_kernel_experiment);
@@ -8864,15 +8891,16 @@ pub fn build(b: *std.Build) void {
                 .target = target,
                 .optimize = optimize,
                 .sanitize_thread = sanitize_thread,
-                .pic = if (owns_storage_kernel or unit == .enrichment_compute) true else null,
+                .pic = if (owns_storage_kernel or unit == .enrichment_compute or unit == .local_query) true else null,
             });
             antfly_imports.configureStorageSources(
                 b,
                 role_mod,
                 false,
                 link_libc,
-                storage_kernel_experiment and !owns_storage_kernel,
+                storage_kernel_experiment and !owns_storage_kernel and unit != .local_query,
             );
+            role_mod.addOptions("capi_build_options", capi_build_options);
             role_mod.addImport("antfly-client", antfly_client_pkg_mod);
             if (owns_storage_kernel) role_mod.addImport("antfly_storage_root", role_mod);
             role_mod.addOptions("runtime_library_options", unit_options);
@@ -8901,6 +8929,7 @@ pub fn build(b: *std.Build) void {
                         "antfly-runtime-distributed"
                     else
                         "antfly-storage-kernel",
+                    .local_query => "antfly-runtime-local_query",
                     else => b.fmt("antfly-runtime-{s}", .{@tagName(unit)}),
                 },
                 .root_module = role_mod,
@@ -8927,6 +8956,7 @@ pub fn build(b: *std.Build) void {
                     .control_api_probe => 11 * 1024 * 1024 * 1024,
                     .distributed => @as(usize, if (storage_kernel_experiment) 9 else 11) * 1024 * 1024 * 1024,
                     .enrichment_compute => 4 * 1024 * 1024 * 1024,
+                    .local_query => 8 * 1024 * 1024 * 1024,
                     .inference => 8 * 1024 * 1024 * 1024,
                 },
             });
@@ -8958,6 +8988,15 @@ pub fn build(b: *std.Build) void {
                     // launch group. This small unit overlaps the tail after
                     // distributed without delaying either critical root.
                     role_artifact.step.dependOn(&application_runtime_artifact.?.step);
+                },
+                .local_query => {
+                    if (unit_enabled) {
+                        local_query_artifact = role_artifact;
+                        // Do not add a third LLVM-heavy compiler to the initial
+                        // storage+distributed wave. It becomes eligible after
+                        // the storage owner that supplies its borrowed DB handles.
+                        role_artifact.step.dependOn(&storage_runtime_artifact.?.step);
+                    }
                 },
                 .inference => {
                     inference_runtime_artifact = role_artifact;
@@ -9029,6 +9068,7 @@ pub fn build(b: *std.Build) void {
                 });
                 owner_test_mod.addImport("kernel_owner_abi", kernel_owner_abi_mod);
                 owner_test_mod.addImport("kernel_error_identity", kernel_error_identity_mod);
+                owner_test_mod.addImport("local_query_client", local_query_client_mod);
                 owner_test_mod.addImport("antfly_platform", platform_mod);
                 owner_test_mod.addImport("raft_engine", raft_engine_mod);
                 const owner_tests = b.addTest(.{
@@ -9175,7 +9215,8 @@ pub fn build(b: *std.Build) void {
                 );
                 metadata_runtime_owner_test_step.dependOn(&run_metadata_runtime_owner_tests.step);
             }
-            if (owns_storage_kernel or unit == .control_api_probe or
+            if (owns_storage_kernel or unit == .enrichment_compute or unit == .local_query or
+                unit == .control_api_probe or
                 (storage_kernel_experiment and unit == .distributed))
             {
                 // The executable and C ABI libraries share this one optimized
@@ -9196,7 +9237,7 @@ pub fn build(b: *std.Build) void {
             // available. Storage and enrichment are PIC because the
             // executable and C ABI libraries share both archives; all three
             // consumers reuse the same analyzed and optimized graphs.
-            if (unit_enabled and (owns_storage_kernel or unit == .enrichment_compute)) {
+            if (unit_enabled and (owns_storage_kernel or unit == .enrichment_compute or unit == .local_query)) {
                 capi_link_mod.linkLibrary(role_artifact);
                 lite_capi_link_mod.linkLibrary(role_artifact);
             }
@@ -9225,8 +9266,14 @@ pub fn build(b: *std.Build) void {
             tests.root_module.linkLibrary(api_runtime_artifact.?);
             tests.root_module.linkLibrary(inference_runtime_artifact.?);
             tests.root_module.linkLibrary(enrichment_compute_artifact.?);
+            tests.root_module.linkLibrary(local_query_artifact.?);
         }
         if (storage_kernel_experiment) {
+            // The focused CAPI test root owns its DB directly rather than
+            // linking the storage-owner archive, but its experimental query
+            // and enrichment calls still cross the same provider archives.
+            capi_tests.root_module.linkLibrary(enrichment_compute_artifact.?);
+            capi_tests.root_module.linkLibrary(local_query_artifact.?);
             const enrichment_test_mod = b.createModule(.{
                 .root_source_file = b.path("pkg/antfly/src/enrichment_compute_test_root.zig"),
                 .target = target,

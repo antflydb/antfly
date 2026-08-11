@@ -15,7 +15,7 @@
 //! Versioned internal ABI for the storage kernel's live DB owner. Keep this
 //! module free of storage and distributed-runtime imports.
 
-pub const abi_version: u32 = 31;
+pub const abi_version: u32 = 33;
 
 pub const BorrowedBytes = extern struct {
     ptr: ?[*]const u8 = null,
@@ -316,6 +316,8 @@ pub const Status = enum(u32) {
     zip_encryption_unsupported = 163,
     zip_no_end_record = 164,
     zip_truncated = 165,
+    invalid_boundary_failure_identity = 166,
+    invalid_boundary_query_response = 167,
     internal = 255,
 };
 
@@ -327,8 +329,19 @@ pub const Status = enum(u32) {
 /// public ABI.  Consumers must branch only on `status`.
 pub const failure_error_name_capacity: usize = 127;
 
+/// Stable identity of the boundary where a failure originated. Wrappers must
+/// forward a valid inner identity unchanged, so this remains the provider that
+/// actually failed rather than the outermost ABI traversed by the error.
+pub const FailureBoundary = enum(u32) {
+    none = 0,
+    storage_owner = 1,
+    enrichment_compute = 2,
+    local_query = 3,
+};
+
 pub const FailureIdentity = extern struct {
     status: Status = .ok,
+    boundary: FailureBoundary = .none,
     boundary_version: u32 = abi_version,
     operation: u32 = 0,
     error_name_len: u8 = 0,
@@ -340,6 +353,12 @@ pub const FailureIdentity = extern struct {
 
     pub fn errorName(self: *const FailureIdentity) []const u8 {
         return self.error_name[0..self.error_name_len];
+    }
+
+    /// Safe for logging an untrusted envelope before validation. Control-flow
+    /// consumers should use `errorName` only after validation succeeds.
+    pub fn boundedErrorName(self: *const FailureIdentity) []const u8 {
+        return self.error_name[0..@min(self.error_name_len, failure_error_name_capacity)];
     }
 };
 
@@ -371,6 +390,103 @@ pub const EnrichmentRenderPdfRequest = extern struct {
     _reserved0: u32 = 0,
     pdf_bytes: BorrowedBytes = .{},
     page_number: u64 = 1,
+};
+
+/// Stable stages for failures originating in the enrichment compute unit.
+pub const EnrichmentOperation = enum(u32) {
+    extract_stream = 1,
+    render_pdf_page = 2,
+    validate_extract_response = 3,
+    validate_render_response = 4,
+};
+
+/// Selects the existing query wire dialect. Distributed/local-owner calls use
+/// the resolved internal representation; public C API and Lite calls retain
+/// public validation and translation inside the query provider.
+pub const LocalQueryDialect = enum(u32) {
+    internal = 0,
+    public = 1,
+};
+
+/// Complete operation families owned by the compiled local-query unit. New
+/// values are append-only. The storage owner remains responsible for handle
+/// lifetime and admission; parsing, physical execution, and response encoding
+/// stay together on the provider side.
+pub const LocalQueryKind = enum(u32) {
+    search = 0,
+    graph_expand = 1,
+    graph_hydrate = 2,
+    graph_edges = 3,
+    text_stats = 4,
+    algebraic_partials = 5,
+    preflight = 6,
+};
+
+/// Stable diagnostic identities for the stages of one local-query call. These
+/// values are ABI data: append new operations, never renumber existing ones.
+/// Control flow continues to use `FailureIdentity.status`; `operation` tells
+/// operators which side and stage produced that exact status.
+pub const LocalQueryOperation = enum(u32) {
+    validate_request = 1,
+    parse_internal_request = 2,
+    parse_public_request = 3,
+    execute_internal_query = 4,
+    execute_public_query = 5,
+    encode_internal_response = 6,
+    encode_public_response = 7,
+    validate_provider_response = 8,
+    text_stats = 9,
+    algebraic_partials = 10,
+    parse_graph_expand = 11,
+    execute_graph_expand = 12,
+    encode_graph_expand = 13,
+    parse_graph_hydrate = 14,
+    execute_graph_hydrate = 15,
+    encode_graph_hydrate = 16,
+    parse_graph_edges = 17,
+    execute_graph_edges = 18,
+    encode_graph_edges = 19,
+    parse_aggregation = 20,
+    execute_aggregation = 21,
+    encode_aggregation = 22,
+    preflight = 23,
+};
+
+pub const LocalQueryReturnMode = enum(u32) {
+    parent = 0,
+    chunk = 1,
+    parent_with_chunks = 2,
+};
+
+/// Scalar execution details that are not losslessly represented by the
+/// existing public/distributed JSON envelope. They are applied only when
+/// `enabled` is set, after parsing and before DB execution.
+pub const LocalQueryExecutionOptions = extern struct {
+    enabled: u8 = 0,
+    include_stored: u8 = 1,
+    _reserved0: [2]u8 = @splat(0),
+    return_mode: LocalQueryReturnMode = .parent,
+    max_chunks_per_parent: u32 = 0,
+    dense_k: u32 = 0,
+    sparse_k: u32 = 0,
+};
+
+/// One complete local query against a DB owned by the storage archive. The DB
+/// and cancellation token are opaque borrowed handles valid only for this
+/// synchronous call. No posting, candidate, stored document, or index handle
+/// crosses the compiled boundary.
+pub const LocalQueryRequest = extern struct {
+    version: u32 = abi_version,
+    dialect: LocalQueryDialect = .internal,
+    kind: LocalQueryKind = .search,
+    has_execution_deadline: u8 = 0,
+    _reserved0: [3]u8 = @splat(0),
+    db: ?*anyopaque = null,
+    table_name: BorrowedBytes = .{},
+    request_json: BorrowedBytes = .{},
+    execution_options: LocalQueryExecutionOptions = .{},
+    cancellation_flag: ?*const anyopaque = null,
+    execution_deadline_ns: u64 = 0,
 };
 
 /// Process-scoped physical-storage owner. The handle owns shared caches and
@@ -1580,6 +1696,7 @@ pub extern fn antfly_storage_owner_query_json(
     owner: ?*anyopaque,
     request: *const JsonOperationRequest,
     out_response: *OwnedBytes,
+    out_failure: *FailureIdentity,
 ) callconv(.c) Status;
 
 pub extern fn antfly_storage_owner_lookup_json(
@@ -1598,18 +1715,21 @@ pub extern fn antfly_storage_owner_preflight_json(
     owner: ?*anyopaque,
     request: *const JsonOperationRequest,
     out_response: *OwnedBytes,
+    out_failure: *FailureIdentity,
 ) callconv(.c) Status;
 
 pub extern fn antfly_storage_owner_text_stats_json(
     owner: ?*anyopaque,
     request: *const JsonOperationRequest,
     out_response: *OwnedBytes,
+    out_failure: *FailureIdentity,
 ) callconv(.c) Status;
 
 pub extern fn antfly_storage_owner_algebraic_partials_json(
     owner: ?*anyopaque,
     request: *const JsonOperationRequest,
     out_response: *OwnedBytes,
+    out_failure: *FailureIdentity,
 ) callconv(.c) Status;
 
 /// Computes one complete aggregation fold over already-merged query hits.
@@ -1618,24 +1738,28 @@ pub extern fn antfly_storage_owner_algebraic_partials_json(
 pub extern fn antfly_storage_aggregate_json(
     request: *const AggregationRequest,
     out_response: *OwnedBytes,
+    out_failure: *FailureIdentity,
 ) callconv(.c) Status;
 
 pub extern fn antfly_storage_owner_graph_expand_json(
     owner: ?*anyopaque,
     request: *const ControlledJsonOperationRequest,
     out_response: *OwnedBytes,
+    out_failure: *FailureIdentity,
 ) callconv(.c) Status;
 
 pub extern fn antfly_storage_owner_graph_hydrate_json(
     owner: ?*anyopaque,
     request: *const ControlledJsonOperationRequest,
     out_response: *OwnedBytes,
+    out_failure: *FailureIdentity,
 ) callconv(.c) Status;
 
 pub extern fn antfly_storage_owner_graph_edges_json(
     owner: ?*anyopaque,
     request: *const ControlledJsonOperationRequest,
     out_response: *OwnedBytes,
+    out_failure: *FailureIdentity,
 ) callconv(.c) Status;
 
 pub extern fn antfly_storage_owner_document_artifact_manifest_json(
@@ -1747,3 +1871,11 @@ pub extern fn antfly_enrichment_render_pdf_page_png(
 ) callconv(.c) Status;
 
 pub extern fn antfly_enrichment_buffer_destroy(buffer: *OwnedBytes) callconv(.c) void;
+
+pub extern fn antfly_local_query_execute(
+    request: *const LocalQueryRequest,
+    out_response: *OwnedBytes,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
+
+pub extern fn antfly_local_query_buffer_destroy(buffer: *OwnedBytes) callconv(.c) void;

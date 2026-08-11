@@ -14602,6 +14602,8 @@ fn encodeScanRequest(
 
 fn encodeQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest) ![]u8 {
     if (searchRequestHasUnserializableResolvedDocFilter(req)) return error.UnsupportedQueryRequest;
+    if (req.dense != null and req.dense_queries.len > 0) return error.UnsupportedQueryRequest;
+    if (req.sparse != null and req.sparse_queries.len > 0) return error.UnsupportedQueryRequest;
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
     try out.append(alloc, '{');
@@ -14621,6 +14623,12 @@ fn encodeQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest)
     }
     if (req.profile) {
         try appendJsonFieldBool(alloc, &out, &first, "profile", true);
+    }
+    if (req.index_name) |index_name| {
+        if (req.full_text != null or req.dense != null or req.sparse != null) {
+            const index_names = [_][]const u8{index_name};
+            try appendJsonFieldNames(alloc, &out, &first, "indexes", &index_names);
+        }
     }
     if (req.filter_prefix.len > 0) {
         try appendJsonFieldString(alloc, &out, &first, "filter_prefix", req.filter_prefix);
@@ -14674,8 +14682,20 @@ fn encodeQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest)
             .intersection => "intersection",
         });
     }
-    if (req.dense_queries.len > 0 or req.sparse_queries.len > 0) {
-        try appendEmbeddingsField(alloc, &out, &first, req.dense_queries, req.sparse_queries);
+    var singleton_dense: [1]db_mod.types.NamedDenseQuery = undefined;
+    const dense_queries = if (req.dense) |query| blk: {
+        const index_name = req.index_name orelse return error.UnsupportedQueryRequest;
+        singleton_dense[0] = .{ .name = index_name, .index_name = index_name, .query = query };
+        break :blk singleton_dense[0..];
+    } else req.dense_queries;
+    var singleton_sparse: [1]db_mod.types.NamedSparseQuery = undefined;
+    const sparse_queries = if (req.sparse) |query| blk: {
+        const index_name = req.index_name orelse return error.UnsupportedQueryRequest;
+        singleton_sparse[0] = .{ .name = index_name, .index_name = index_name, .query = query };
+        break :blk singleton_sparse[0..];
+    } else req.sparse_queries;
+    if (dense_queries.len > 0 or sparse_queries.len > 0) {
+        try appendEmbeddingsField(alloc, &out, &first, dense_queries, sparse_queries);
     }
     if (req.full_text) |full_text| {
         try appendTextQueryField(alloc, &out, &first, "full_text_search", full_text);
@@ -15752,12 +15772,7 @@ fn parseRemoteSearchResult(alloc: std.mem.Allocator, body: []const u8) !db_mod.t
         alloc.free(hits);
     }
     for (hits_value, 0..) |item, i| {
-        hits[i] = .{
-            .id = try alloc.dupe(u8, item._id),
-            .score = item._score,
-            .index_scores = try parseRemoteIndexScoresAlloc(alloc, item._index_scores),
-            .stored_data = if (item._source) |value| try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})}) else null,
-        };
+        hits[i] = try parseRemoteSearchHit(alloc, item);
         initialized += 1;
     }
 
@@ -15777,6 +15792,176 @@ fn parseRemoteSearchResult(alloc: std.mem.Allocator, body: []const u8) !db_mod.t
 
 pub fn parseStorageKernelSearchResult(alloc: std.mem.Allocator, body: []const u8) !db_mod.types.SearchResult {
     return try parseRemoteSearchResult(alloc, body);
+}
+
+fn parseRemoteSearchHit(
+    alloc: std.mem.Allocator,
+    item: metadata_openapi.QueryHit,
+) !db_mod.types.SearchHit {
+    var hit = db_mod.types.SearchHit{
+        .id = try alloc.dupe(u8, item._id),
+        .score = item._score,
+    };
+    errdefer hit.deinit(alloc);
+    hit.index_scores = try parseRemoteIndexScoresAlloc(alloc, item._index_scores);
+    hit.sort_values = if (item._sort) |values|
+        try db_mod.types.cloneJsonValues(alloc, values)
+    else
+        &.{};
+    hit.stored_data = if (item._source) |value|
+        try stringifyRemoteJsonValue(alloc, value)
+    else
+        null;
+    if (item.hierarchy) |hierarchy| try parseRemoteHitHierarchy(alloc, &hit, hierarchy);
+    return hit;
+}
+
+fn parseRemoteHitHierarchy(
+    alloc: std.mem.Allocator,
+    hit: *db_mod.types.SearchHit,
+    hierarchy: std.json.Value,
+) !void {
+    if (hierarchy != .object) return error.InvalidQueryRequest;
+    const object = hierarchy.object;
+    const parent_doc_key = jsonStringField(object, "parent_doc_key") orelse hit.id;
+    if (object.get("artifact")) |artifact_value| {
+        hit.artifact_ref = try parseRemoteArtifactRef(alloc, parent_doc_key, artifact_value);
+    }
+    if (object.get("ancestors")) |ancestors| {
+        if (ancestors != .object) return error.InvalidQueryRequest;
+        hit.ancestor_source_data = try parseRemoteAncestorDocument(alloc, ancestors.object, "source");
+        hit.ancestor_unit_data = try parseRemoteAncestorDocument(alloc, ancestors.object, "unit");
+    }
+    const chunks_value = object.get("chunks") orelse return;
+    if (chunks_value != .array) return error.InvalidQueryRequest;
+    if (chunks_value.array.items.len == 0) return;
+    const chunks = try alloc.alloc(db_mod.types.ChunkHit, chunks_value.array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (chunks[0..initialized]) |*chunk| chunk.deinit(alloc);
+        alloc.free(chunks);
+    }
+    for (chunks_value.array.items, 0..) |chunk_value, i| {
+        chunks[i] = try parseRemoteChunkHit(alloc, chunk_value);
+        initialized += 1;
+    }
+    hit.chunk_hits = chunks;
+}
+
+fn parseRemoteChunkHit(alloc: std.mem.Allocator, value: std.json.Value) !db_mod.types.ChunkHit {
+    if (value != .object) return error.InvalidQueryRequest;
+    const object = value.object;
+    const id = jsonStringField(object, "_id") orelse return error.InvalidQueryRequest;
+    var hit = db_mod.types.ChunkHit{
+        .id = try alloc.dupe(u8, id),
+        .score = try optionalJsonF32(object.get("_score")),
+    };
+    errdefer hit.deinit(alloc);
+    hit.stored_data = if (object.get("_source")) |source|
+        try stringifyRemoteJsonValue(alloc, source)
+    else
+        null;
+    if (object.get("hierarchy")) |hierarchy| {
+        if (hierarchy != .object) return error.InvalidQueryRequest;
+        const parent_doc_key = jsonStringField(hierarchy.object, "parent_doc_key") orelse id;
+        if (hierarchy.object.get("artifact")) |artifact_value| {
+            hit.artifact_ref = try parseRemoteArtifactRef(alloc, parent_doc_key, artifact_value);
+        }
+        if (hierarchy.object.get("ancestors")) |ancestors| {
+            if (ancestors != .object) return error.InvalidQueryRequest;
+            hit.ancestor_source_data = try parseRemoteAncestorDocument(alloc, ancestors.object, "source");
+            hit.ancestor_unit_data = try parseRemoteAncestorDocument(alloc, ancestors.object, "unit");
+        }
+    }
+    return hit;
+}
+
+fn parseRemoteArtifactRef(
+    alloc: std.mem.Allocator,
+    document_id: []const u8,
+    value: std.json.Value,
+) !db_mod.types.ArtifactRef {
+    if (value != .object) return error.InvalidQueryRequest;
+    const object = value.object;
+    var artifact_ref: db_mod.types.ArtifactRef = initial: {
+        const owned_document_id = try alloc.dupe(u8, document_id);
+        errdefer alloc.free(owned_document_id);
+        const owned_name = try alloc.dupe(u8, jsonStringField(object, "name") orelse return error.InvalidQueryRequest);
+        errdefer alloc.free(owned_name);
+        const owned_unit_id = if (jsonStringField(object, "unit_id")) |unit_id| try alloc.dupe(u8, unit_id) else null;
+        errdefer if (owned_unit_id) |unit_id| alloc.free(unit_id);
+        break :initial .{
+            .document_id = owned_document_id,
+            .name = owned_name,
+            .kind = try parseRemoteArtifactKind(jsonStringField(object, "kind") orelse return error.InvalidQueryRequest),
+            .chunk_id = try optionalJsonU32(object.get("chunk_id")),
+            .unit_id = owned_unit_id,
+        };
+    };
+    errdefer artifact_ref.deinit(alloc);
+    if (object.get("source")) |source_value| {
+        if (source_value != .object) return error.InvalidQueryRequest;
+        const source = source_value.object;
+        artifact_ref.source = source_ref: {
+            const source_name = try alloc.dupe(u8, jsonStringField(source, "name") orelse return error.InvalidQueryRequest);
+            errdefer alloc.free(source_name);
+            const source_unit_id = if (jsonStringField(source, "unit_id")) |unit_id| try alloc.dupe(u8, unit_id) else null;
+            errdefer if (source_unit_id) |unit_id| alloc.free(unit_id);
+            break :source_ref .{
+                .name = source_name,
+                .kind = try parseRemoteArtifactKind(jsonStringField(source, "kind") orelse return error.InvalidQueryRequest),
+                .chunk_id = try optionalJsonU32(source.get("chunk_id")),
+                .unit_id = source_unit_id,
+            };
+        };
+    }
+    return artifact_ref;
+}
+
+fn parseRemoteArtifactKind(value: []const u8) !db_mod.types.ArtifactKind {
+    if (std.mem.eql(u8, value, "chunk")) return .chunk;
+    if (std.mem.eql(u8, value, "asset")) return .asset;
+    if (std.mem.eql(u8, value, "embedding")) return .embedding;
+    return error.InvalidQueryRequest;
+}
+
+fn parseRemoteAncestorDocument(
+    alloc: std.mem.Allocator,
+    ancestors: std.json.ObjectMap,
+    name: []const u8,
+) !?[]u8 {
+    const ancestor = ancestors.get(name) orelse return null;
+    if (ancestor != .object) return error.InvalidQueryRequest;
+    const document = ancestor.object.get("document") orelse return null;
+    return try stringifyRemoteJsonValue(alloc, document);
+}
+
+fn stringifyRemoteJsonValue(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
+}
+
+fn jsonStringField(object: std.json.ObjectMap, name: []const u8) ?[]const u8 {
+    const value = object.get(name) orelse return null;
+    return if (value == .string) value.string else null;
+}
+
+fn optionalJsonU32(value: ?std.json.Value) !?u32 {
+    const actual = value orelse return null;
+    if (actual != .integer or actual.integer < 0 or actual.integer > std.math.maxInt(u32))
+        return error.InvalidQueryRequest;
+    return @intCast(actual.integer);
+}
+
+fn optionalJsonF32(value: ?std.json.Value) !?f32 {
+    const actual = value orelse return null;
+    const number: f64 = switch (actual) {
+        .float => |number| number,
+        .integer => |number| @floatFromInt(number),
+        .number_string => |number| std.fmt.parseFloat(f64, number) catch return error.InvalidQueryRequest,
+        else => return error.InvalidQueryRequest,
+    };
+    if (!std.math.isFinite(number)) return error.InvalidQueryRequest;
+    return @floatCast(number);
 }
 
 fn parseRemoteIndexScoresAlloc(
@@ -15834,6 +16019,30 @@ test "parseRemoteSearchResult preserves fused index scores" {
     try std.testing.expectEqual(@as(f64, 0.75), result.hits[0].index_scores[0].score);
     try std.testing.expectEqualStrings("semantic_idx", result.hits[0].index_scores[1].index_name);
     try std.testing.expectEqual(@as(f64, 0.25), result.hits[0].index_scores[1].score);
+}
+
+test "storage-kernel search result preserves sort and hierarchy identity" {
+    const alloc = std.testing.allocator;
+    var result = try parseStorageKernelSearchResult(alloc,
+        \\{"responses":[{"hits":{"total":{"value":1,"relation":"exact"},"hits":[{"_id":"doc:a","_score":0.8,"_sort":[42,"doc:a"],"_source":{"title":"source"},"hierarchy":{"level":"source","parent_doc_key":"doc:a","ancestors":{"source":{"id":"doc:a","document":{"title":"source"}}},"chunks":[{"_id":"chunk:a:1","_score":0.7,"_source":{"text":"alpha"},"hierarchy":{"level":"chunk","parent_doc_key":"doc:a","parent_unit_id":"page:1","artifact":{"name":"chunks","kind":"chunk","chunk_id":1,"unit_id":"page:1","source":{"name":"pages","kind":"asset","unit_id":"page:1"}},"ancestors":{"unit":{"id":"page:1","document":{"page":1}}}}}]}}],"max_score":0.8},"took":1,"status":200,"table":"docs"}]}
+    );
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), result.hits[0].sort_values.len);
+    try std.testing.expectEqual(@as(i64, 42), result.hits[0].sort_values[0].integer);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].sort_values[1].string);
+    try std.testing.expectEqualStrings("{\"title\":\"source\"}", result.hits[0].ancestor_source_data.?);
+    try std.testing.expectEqual(@as(usize, 1), result.hits[0].chunk_hits.len);
+    const chunk = result.hits[0].chunk_hits[0];
+    try std.testing.expectEqualStrings("chunk:a:1", chunk.id);
+    try std.testing.expectEqualStrings("{\"text\":\"alpha\"}", chunk.stored_data.?);
+    try std.testing.expectEqualStrings("{\"page\":1}", chunk.ancestor_unit_data.?);
+    try std.testing.expectEqualStrings("doc:a", chunk.artifact_ref.?.document_id);
+    try std.testing.expectEqualStrings("chunks", chunk.artifact_ref.?.name);
+    try std.testing.expectEqual(db_mod.types.ArtifactKind.chunk, chunk.artifact_ref.?.kind);
+    try std.testing.expectEqualStrings("page:1", chunk.artifact_ref.?.unit_id.?);
+    try std.testing.expectEqualStrings("pages", chunk.artifact_ref.?.source.?.name);
+    try std.testing.expectEqualStrings("page:1", chunk.artifact_ref.?.source.?.unit_id.?);
 }
 
 fn parseRemoteGraphResults(
@@ -19072,6 +19281,29 @@ test "encode query request round-trips composed bleve full_text queries" {
     var parsed_fuzzy = try parseJsonTestBody(std.json.Value, alloc, fuzzy);
     defer parsed_fuzzy.deinit();
     try std.testing.expectEqual(@as(i64, 1), parsed_fuzzy.value.object.get("full_text_search").?.object.get("fuzziness").?.integer);
+}
+
+test "storage-kernel query request encodes singleton vector index identity" {
+    const alloc = std.testing.allocator;
+    const encoded = try encodeStorageKernelQueryRequest(alloc, .{
+        .index_name = "dense_idx",
+        .dense = .{ .vector = &.{ 1, 0, 0 }, .k = 7 },
+        .limit = 3,
+    });
+    defer alloc.free(encoded);
+
+    var parsed_json = try parseJsonTestBody(std.json.Value, alloc, encoded);
+    defer parsed_json.deinit();
+    const indexes = parsed_json.value.object.get("indexes") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("dense_idx", indexes.array.items[0].string);
+    const embeddings = parsed_json.value.object.get("embeddings") orelse return error.TestExpectedEqual;
+    try std.testing.expect(embeddings.object.get("dense_idx") != null);
+
+    var parsed = try query_api.parseQueryRequest(alloc, null, "docs", encoded);
+    defer parsed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), parsed.req.dense_queries.len);
+    try std.testing.expectEqualStrings("dense_idx", parsed.req.dense_queries[0].index_name);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 0, 0 }, parsed.req.dense_queries[0].query.vector);
 }
 
 test "encode query request round-trips all public phrase geo and ip queries" {

@@ -151,17 +151,17 @@ pub fn extractStream(
     out_failure: *abi.FailureIdentity,
 ) callconv(.c) abi.Status {
     out_failure.* = .{};
-    if (request.version != abi.abi_version) return .invalid_abi;
-    if (request.on_begin == null or request.on_units_json == null) return .invalid_argument;
+    if (request.version != abi.abi_version)
+        return fail(error.InvalidAbiVersion, .extract_stream, out_failure);
+    if (request.on_begin == null or request.on_units_json == null)
+        return fail(error.InvalidArgument, .extract_stream, out_failure);
     const alloc = std.heap.c_allocator;
     var config = extraction.parseConfig(alloc, request.config_json.slice()) catch |err| {
-        out_failure.* = error_identity.failureFromError(err, abi.abi_version, 1);
-        return out_failure.status;
+        return fail(err, .extract_stream, out_failure);
     };
     defer config.deinit(alloc);
     extraction.applySourceMetadataFromJson(alloc, &config, request.raw_document_json.slice()) catch |err| {
-        out_failure.* = error_identity.failureFromError(err, abi.abi_version, 1);
-        return out_failure.status;
+        return fail(err, .extract_stream, out_failure);
     };
     var stream = Stream{ .alloc = alloc, .request = request };
     defer stream.deinit();
@@ -169,8 +169,7 @@ pub fn extractStream(
         .data = request.downloaded.slice(),
         .content_type = request.downloaded_content_type.slice(),
     }, request.source_url.slice(), config, stream.sink()) catch |err| {
-        out_failure.* = error_identity.failureFromError(err, abi.abi_version, 1);
-        return out_failure.status;
+        return fail(err, .extract_stream, out_failure);
     };
     return .ok;
 }
@@ -182,14 +181,29 @@ pub fn renderPdfPagePng(
 ) callconv(.c) abi.Status {
     out_png.* = .{};
     out_failure.* = .{};
-    if (request.version != abi.abi_version) return .invalid_abi;
-    const page_number = std.math.cast(usize, request.page_number) orelse return .invalid_argument;
+    if (request.version != abi.abi_version)
+        return fail(error.InvalidAbiVersion, .render_pdf_page, out_failure);
+    const page_number = std.math.cast(usize, request.page_number) orelse
+        return fail(error.InvalidArgument, .render_pdf_page, out_failure);
     const png = extraction.renderPdfPagePngAlloc(std.heap.c_allocator, request.pdf_bytes.slice(), page_number) catch |err| {
-        out_failure.* = error_identity.failureFromError(err, abi.abi_version, 2);
-        return out_failure.status;
+        return fail(err, .render_pdf_page, out_failure);
     };
     out_png.* = .{ .ptr = png.ptr, .len = @intCast(png.len) };
     return .ok;
+}
+
+fn fail(
+    err: anyerror,
+    operation: abi.EnrichmentOperation,
+    out_failure: *abi.FailureIdentity,
+) abi.Status {
+    out_failure.* = error_identity.failureFromError(
+        err,
+        .enrichment_compute,
+        abi.abi_version,
+        @intFromEnum(operation),
+    );
+    return out_failure.status;
 }
 
 pub fn bufferDestroy(buffer: *abi.OwnedBytes) callconv(.c) void {

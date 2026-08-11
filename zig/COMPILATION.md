@@ -41,7 +41,9 @@ do not satisfy the main goal.
 - Allocation ownership, cancellation, deadlines, and error translation must be
   explicit at every compiled ABI boundary. Declared errors keep their stable
   semantic identities; adapters must not collapse them into broad status
-  classes.
+  classes. Every migrated operation carries a validated failure envelope with
+  its originating boundary and operation stage, and nested wrappers forward a
+  valid inner envelope unchanged.
 
 ## Goal loop
 
@@ -58,7 +60,9 @@ Repeat this loop until the main goal and exit criteria are satisfied:
    the small C API surface, exact behavior/error/cancellation ownership, and
    provider-to-consumer error identity. Model call failure, item outcome, and
    callback failure as independent channels; do not let one overwrite or
-   normalize another.
+   normalize another. A wrapper may originate a new failure identity only for
+   work it performed itself or for a malformed inner envelope; it must never
+   relabel a valid nested failure as its own.
 4. Validate the affected behavior in both experiment-enabled and legacy
    configurations, then run graph gates, ABI tests, artifact/symbol audits, and
    a genuinely cold ARM64 `ReleaseFast` comparison.
@@ -3392,12 +3396,34 @@ compiler-assigned Zig errors are a stable ABI.
 ### Phase 4r: boundary identity hardening
 
 Before adding another physical split, the shared ABI now defines one reusable
-`FailureIdentity`: a stable semantic `Status`, boundary version, operation ID,
-bounded readable provider error name, truncation bit, and stable hash of the
-complete name. Declared errors still round trip through the exhaustive
-bidirectional registry. An undeclared defect remains `internal` for control
-flow, but no longer becomes operationally indistinguishable from every other
-provider defect in diagnostics.
+`FailureIdentity`: a stable semantic `Status`, stable originating
+`FailureBoundary`, boundary version, operation ID, bounded readable provider
+error name, truncation bit, and stable hash of the complete name. Declared
+errors still round trip through the exhaustive bidirectional registry. An
+undeclared defect remains `internal` for control flow, but no longer becomes
+operationally indistinguishable from every other provider defect in
+diagnostics.
+
+ABI 32 makes nested propagation explicit. Every provider returns a canonical
+envelope on both success and failure, and every consumer validates the status,
+version, origin, operation, name/hash pair, truncation marker, reserved bytes,
+and zero padding before trusting it. A valid inner envelope is forwarded
+unchanged through an outer provider: a local-query failure therefore remains
+`local_query` after crossing the storage-owner ABI. An outer wrapper creates a
+new identity only for an error it originated. If it detects malformed provider
+data, it logs the raw untrusted envelope and emits a new registered
+`invalid_boundary_failure_identity` failure at its own validation stage; it
+never forwards malformed bytes or silently substitutes the inner status.
+
+These rules preserve two different meanings without conflating them. Stable
+registered statuses are the executable control-flow contract and map back to
+the exact declared Zig error. Arbitrary undeclared Zig errors cannot safely be
+reconstructed from compiler-assigned values across a C ABI, so `internal`
+remains the control-flow status while the exact original name, full-name hash,
+origin, and stage remain available for diagnostics and durable failure
+evidence. The public C API may still deliberately translate this internal
+contract into its documented coarser `ErrorCode`; that is an explicit product
+boundary, not accidental loss inside the compiled architecture.
 
 The audit also removed an existing context-dependent identity translation:
 write-admission backpressure previously crossed as generic `busy` and the
@@ -3441,7 +3467,8 @@ implementations remain compile-time fallbacks for tests and for the disabled
 experiment, rather than runtime fallbacks that could emit a second production
 copy.
 
-ABI 31 applies the Phase 4q/4r identity contract without exceptions:
+ABI 31 introduced the Phase 4q/4r identity contract for this boundary; ABI 32
+adds the stable `enrichment_compute` origin and canonical consumer validation:
 
 - expected extraction/config/archive failures have distinct registered
   statuses and map back to the original Zig error;
@@ -3532,15 +3559,180 @@ and emitted-object ranking to select the next coarse source cut; separately
 measure a schedule that avoids contending two LLVM-heavy units before accepting
 any concurrency-policy change.
 
+### Phase 4t: compiled local-query island
+
+The next representative cut gives one separately compiled PIC unit a borrowed
+opaque `DB` for the duration of one complete local operation. Storage retains
+DB/index lifecycle, admission, writes, snapshots, restore, and maintenance.
+The provider owns request parsing, local planning/search, result shaping, and
+wire encoding. No posting, candidate, stored-document, index, or backend handle
+crosses the ABI. Distributed routing and consistency admission remain outside.
+
+The first slice moved internal/public search used by the provisioned owner,
+Lite, and C API. A genuinely cold Apple-Silicon cross-build to ARM64 Linux musl
+`ReleaseFast` produced:
+
+| Unit | Compiler time | LLVM emission | Repository graph | Declarations |
+|---|---:|---:|---:|---:|
+| Storage kernel | 307.033 s | 300.697 s | 590 files / 918,757 lines | 33,438 |
+| Distributed/API control | 234.038 s | 228.535 s | 542 files / 763,635 lines | 28,523 |
+| Local query | 53.399 s | 52.017 s | 204 files / 409,930 lines | 9,486 |
+
+On the same host, the prior combined distributed/storage control was 358.589 s,
+350.840 s LLVM, 643 files, 1,024,169 lines, and 40,313 declarations. The storage
+candidate therefore removed 51.556 s (14.4%), 53 loaded files, 105,412 source
+lines, and 6,875 declarations from that critical unit. The local-query island
+itself remained a small 53.4-second unit and the build retained normal
+concurrency.
+
+The first linked artifacts exposed the next acceptance issue. After enabling
+function/data sections on the new PIC unit, the stripped static executable was
+65,001,944 B and `libantfly.so` was 19,932,656 B, versus the preceding
+61,366,960 B and 17,877,808 B checkpoint. Section GC changed only a few
+kilobytes, proving the C API was reaching the added implementation rather than
+accidentally retaining one monolithic object. Emitted-object analysis found
+4,014,762 duplicate allocatable bytes across storage, distributed, and local
+query. The leading duplicate implementation families were local search,
+query-contract lowering, algebraic planning, DB search support, and graph
+execution.
+
+The attempted broadening moved text statistics, algebraic partials, graph
+expand/hydrate/edges, and the complete aggregation fold into the same provider.
+A second cold build rejected it:
+
+| Unit | Search-only | Broadened | Change |
+|---|---:|---:|---:|
+| Storage kernel | 307.033 s / 33,438 decls | 315.894 s / 33,141 decls | +8.861 s / -297 decls |
+| Distributed/API control | 234.038 s | 240.534 s | +6.496 s |
+| Local query | 53.399 s / 9,486 decls | 78.785 s / 10,633 decls | +25.386 s / +1,147 decls |
+
+The broadened executable grew to 65,885,368 B and `libantfly.so` to
+20,427,296 B. Only 8,122 loaded source lines left storage. Those operation
+exports were not the roots retaining the large implementations, so the change
+increased aggregate LLVM work and artifact size without improving the critical
+unit.
+
+A follow-up capability probe tested whether the generic `Engine.search`
+function pointer was the hidden root. Moving it to a separate typed query
+vtable produced an identical 590-file graph, increased declarations from
+33,438 to 33,446, and changed cold storage time only from 307.033 to 302.983
+seconds. Removing the pointer entirely produced a byte-for-byte identical
+optimized storage object, proving that the unused vtable was already lazy and
+not the retention edge. Both API variants were reverted.
+
+A unit-scoped compile-error trace then identified the first real production
+edge precisely: `storageOwnerGraphExpandJson` ->
+`executeStorageKernelGraphExpand` -> `DB.search`. This explains why moving only
+the ordinary query route could not remove `search_exec`, and why the partial
+graph broadening above duplicated work: public CAPI graph/search operations
+still retained the storage copy. A future retry must migrate the complete set
+of storage-owner and public-CAPI query roots atomically, or it is not a valid
+deduplication experiment.
+
+Interim decision: **revert the broadening and continue revising the search-only cut**.
+Do not add another library. Text statistics, algebraic partials, graph
+operations, and aggregation remain in storage until a future ownership change
+can remove their actual roots rather than duplicate them. Their newly added
+failure envelopes are retained independently because they fix semantic ABI
+behavior without moving implementation or adding a compiler unit. The
+search-only boundary remains opt-in and unaccepted until the C API returns to
+its established size envelope or a subsequent cut proves the growth is the
+necessary cost of one reused implementation.
+
+ABI 32 introduced one failure rule for the original search slice and the
+audited storage operations. The envelope contains stable semantic status,
+originating boundary, ABI version, append-only operation stage, exact bounded
+Zig error name, truncation marker, and full-name hash. Storage wrappers forward
+valid nested `local_query` failures unchanged; operations that still execute in
+storage retain `storage_owner` as their true origin rather than claiming to
+have crossed the local-query provider.
+Malformed envelopes become a new `invalid_boundary_failure_identity` at the
+consumer validation stage after the raw bytes are logged. Call-level failure,
+per-item outcome, callback failure, cancellation state, and partial progress
+remain independent channels. Focused tests exercise a nested search parse
+failure plus algebraic, graph, and aggregation failures and assert each true
+origin and stage at the boundary it actually crossed.
+
+The atomic retry followed the compiler trace rather than merely broadening the
+public surface. It moved graph expand/hydrate/edges, text statistics, algebraic
+partials, and query preflight together because each was an actual storage root
+of `DB.search` or `searchComposed`. Aggregation remains in storage because it is
+not such a root. A second compile-error trace found the less obvious remaining
+path: `storageOwnerPreflightJson` -> `DB.preflightSearchRequest` -> planning
+statistics -> `searchLocked` -> `searchComposed`. After moving that complete
+preflight operation, both sentinels stopped firing and the storage object
+emitted zero bytes for `storage.db.query.search_exec`.
+
+ABI 33 extends the local-query operation family without weakening the Phase
+4r contract. Each new operation returns the same canonical `FailureIdentity`.
+The storage wrapper validates it and forwards a valid nested `local_query`
+identity byte-for-byte; only errors produced by the wrapper itself receive a
+new `storage_owner` identity. Malformed envelopes become the registered
+`InvalidBoundaryFailureIdentity` protocol failure rather than inheriting either
+the inner or outer status. The 92-test owner suite verifies malformed search,
+graph, text-statistics, algebraic, and preflight requests retain matching
+status, original boundary/version, exact operation stage, bounded name, and
+full-name hash. The 11 CAPI tests and seven enrichment-boundary tests pass as
+well, with zero leaks. The experiment-disabled linked Debug executable also
+builds successfully.
+
+A genuinely cold Apple-Silicon cross-build to ARM64 Linux musl `ReleaseFast`
+with normal concurrency produced:
+
+| Unit | Search-only | Atomic query/preflight | Change |
+|---|---:|---:|---:|
+| Storage kernel | 307.033 s / 300.697 s LLVM | 278.304 s / 272.404 s LLVM | -28.729 s / -28.293 s |
+| Distributed/API control | 234.038 s / 228.535 s LLVM | 232.290 s / 226.702 s LLVM | -1.748 s / -1.833 s |
+| Local query | 53.399 s / 52.017 s LLVM | 61.716 s / 60.022 s LLVM | +8.317 s / +8.005 s |
+
+Storage fell from 590 repository files / 918,757 lines / 33,438 declarations
+to 580 files / 905,892 lines / 31,440 declarations. The local-query island grew
+from 204 files / 409,930 lines / 9,486 declarations to 215 files / 460,659
+lines / 10,297 declarations, but remains far below the 278-second critical
+unit. Its scheduling edge follows storage to avoid admitting a third compiler
+into the initial storage/distributed wave, so their measured compiler chain is
+340.020 seconds while local query overlaps later work. The other isolated
+units completed at 222.862 seconds for inference, 38.107 seconds for CLI, and
+17.349 seconds for enrichment. The build finished all 43 steps without
+`bad_alloc`; reported unit peaks were 4 GiB for storage, 3 GiB for distributed,
+5 GiB for inference, and 2 GiB for local query.
+
+The optimized storage object is 28,538,760 B and the local-query object is
+6,324,152 B. Conservative emitted overlap across storage, distributed,
+local-query, and enrichment is 3,552,673 B, below the search-only experiment's
+4,014,762 B even though the latter did not include enrichment. The stripped
+static executable shrank from 65,001,944 B to 63,312,104 B. `libantfly.so`
+grew from 19,932,656 B to 20,495,368 B because its public search root reaches
+the shared provider object; this is 19.55 MiB and remains below the explicit
+20 MiB retained-code gate. Splitting search and controlled operations into two
+exported functions did not permit section GC across the shared compiled object
+and made the library 480 bytes larger, so that micro-experiment was reverted.
+Dynamic-symbol inspection exposes `antfly_db_open` and none of the private
+runtime, local-query, storage-owner, snapshot, restore, or data-apply ABI.
+
+Decision: **keep the atomic query/preflight migration as the current
+candidate**. It is the first local-query revision that removes the physical
+search implementation from storage, lowers the local cold critical unit below
+350 seconds, reduces aggregate emitted overlap, and shrinks the executable.
+The provider consumes the same coarse JSON operation wires that these paths
+already parsed and encoded; it adds no per-document, candidate, index, or
+backend ABI crossing. It remains opt-in until the normal Linux runner confirms
+ReleaseFast reliability, time/RSS, archive shape, and representative runtime
+behavior. Do not raise runner cost or enable the experiment by default based
+only on the local result.
+
 ## Holistic target architecture
 
-The current candidate is the opt-in four-unit source-selected topology above.
-Unlike the rejected source-only coalescing probes, it gives the distributed/API
-unit only control sources and gives the storage unit the one physical
-implementation. Both units exceed 380 seconds on the normal Linux runner; the
-storage unit is the 530-second compiler critical path. It is not yet the
-production baseline because the Linux time gate failed and has not yet been
-reduced by a substantial physical-source cut.
+The current candidate is the opt-in six-unit source-selected topology above:
+storage, distributed/API control, local query, enrichment compute, inference,
+and remote CLI. Unlike the rejected source-only coalescing probes, it gives the
+distributed/API unit only control sources, removes composed local-query
+execution from storage, and keeps compute-heavy inference/enrichment isolated.
+The local cold storage-plus-local-query chain is now 340.020 seconds, below the
+350-second preferred gate. It is not yet the production baseline because the
+normal Linux runner has measured only the earlier topology, where storage and
+distributed still exceeded 380 seconds under contention; the new cut requires
+its own runner evidence.
 
 The reopened target is a modular monolith with one compiled physical-storage
 owner and separately compiled control consumers:
@@ -3609,6 +3801,11 @@ before becoming the production architecture:
 - Each expected failure has one stable status identity in the shared
   bidirectional registry. Do not merge distinct failures into `busy`,
   `cancelled`, `invalid_argument`, or `internal` merely to shorten an adapter.
+- Every migrated operation also returns one canonical `FailureIdentity` whose
+  origin and append-only operation stage identify where the failure happened.
+  Consumers validate the whole envelope. Nested wrappers forward a valid inner
+  identity unchanged and originate a new one only for their own work or for a
+  detected protocol defect.
 - Operation state (`pending`, `partial`, continuation position, retryability,
   lifecycle phase, or cancellation observation) is carried by typed fields or
   tagged outcomes. It is not encoded by borrowing an error status.
@@ -3620,7 +3817,10 @@ before becoming the production architecture:
   not domain-error identities.
 - `internal` is reserved for defects not declared by the operation contract;
   its diagnostic payload retains the provider error name, full-name hash, and
-  boundary version, but consumers may not branch on that payload.
+  originating boundary, operation stage, and boundary version, but consumers
+  may not branch on that payload. Malformed diagnostic payloads are logged as
+  untrusted evidence and replaced by a registered protocol-failure identity;
+  they are never forwarded as if valid.
   Provider/client tests must prove representative declared errors and callback
   errors round trip with their original Zig error identity.
 - Calls represent complete operations: one group query, one batch, one
@@ -3860,6 +4060,8 @@ node zig/tools/capture_zig_time_report.mjs \
   ws://127.0.0.1:19125/ antfly-storage-kernel reports/storage.json 30
 node zig/tools/capture_zig_time_report.mjs \
   ws://127.0.0.1:19125/ antfly-runtime-api_kernel reports/api.json 30
+node zig/tools/capture_zig_time_report.mjs \
+  ws://127.0.0.1:19125/ antfly-runtime-local_query reports/local-query.json 30
 node zig/tools/capture_zig_time_report.mjs \
   ws://127.0.0.1:19125/ antfly-runtime-inference reports/inference.json 30
 node zig/tools/capture_zig_time_report.mjs \

@@ -171,7 +171,9 @@ pub const VersionedResponse = struct {
 
 pub fn aggregate(request: AggregationRequest) !Response {
     var response: Response = .{};
-    try statusToError(abi.antfly_storage_aggregate_json(&request, &response.buffer));
+    var failure: abi.FailureIdentity = .{};
+    const status = abi.antfly_storage_aggregate_json(&request, &response.buffer, &failure);
+    try acceptStorageOwnerFailure(status, failure, "storage-owner aggregation");
     return response;
 }
 
@@ -407,14 +409,37 @@ pub const Owner = struct {
 
     pub fn queryJson(self: *Owner, table_name: []const u8, request_json: []const u8) !Response {
         var response: Response = .{};
-        try statusToError(abi.antfly_storage_owner_query_json(
+        var failure: abi.FailureIdentity = .{};
+        const status = abi.antfly_storage_owner_query_json(
             self.handle,
             &.{
                 .table_name = .fromSlice(table_name),
                 .request_json = .fromSlice(request_json),
             },
             &response.buffer,
-        ));
+            &failure,
+        );
+        error_identity.validateFailureEnvelope(status, &failure, abi.abi_version) catch |err| {
+            std.log.err(
+                "storage-owner query returned inconsistent failure identity status={s} identity_status={s} identity_boundary={s} identity_version={d} operation={d}",
+                .{ @tagName(status), @tagName(failure.status), @tagName(failure.boundary), failure.boundary_version, failure.operation },
+            );
+            return err;
+        };
+        if (status != .ok and failure.boundary != .storage_owner and failure.boundary != .local_query) {
+            std.log.err("storage-owner query returned failure from unexpected boundary={s}", .{@tagName(failure.boundary)});
+            return error.InvalidBoundaryFailureIdentity;
+        }
+        statusToError(status) catch |err| {
+            if (status == .internal) {
+                std.log.err("storage-owner query failed provider_error={s} hash={x} operation={d}", .{
+                    failure.errorName(),
+                    failure.error_name_hash,
+                    failure.operation,
+                });
+            }
+            return err;
+        };
         return response;
     }
 
@@ -446,40 +471,49 @@ pub const Owner = struct {
 
     pub fn preflightJson(self: *Owner, table_name: []const u8, request_json: []const u8) !Response {
         var response: Response = .{};
-        try statusToError(abi.antfly_storage_owner_preflight_json(
+        var failure: abi.FailureIdentity = .{};
+        const status = abi.antfly_storage_owner_preflight_json(
             self.handle,
             &.{
                 .table_name = .fromSlice(table_name),
                 .request_json = .fromSlice(request_json),
             },
             &response.buffer,
-        ));
+            &failure,
+        );
+        try acceptStorageOwnerFailure(status, failure, "storage-owner preflight");
         return response;
     }
 
     pub fn textStatsJson(self: *Owner, table_name: []const u8, request_json: []const u8) !Response {
         var response: Response = .{};
-        try statusToError(abi.antfly_storage_owner_text_stats_json(
+        var failure: abi.FailureIdentity = .{};
+        const status = abi.antfly_storage_owner_text_stats_json(
             self.handle,
             &.{
                 .table_name = .fromSlice(table_name),
                 .request_json = .fromSlice(request_json),
             },
             &response.buffer,
-        ));
+            &failure,
+        );
+        try acceptStorageOwnerFailure(status, failure, "storage-owner text stats");
         return response;
     }
 
     pub fn algebraicPartialsJson(self: *Owner, table_name: []const u8, request_json: []const u8) !Response {
         var response: Response = .{};
-        try statusToError(abi.antfly_storage_owner_algebraic_partials_json(
+        var failure: abi.FailureIdentity = .{};
+        const status = abi.antfly_storage_owner_algebraic_partials_json(
             self.handle,
             &.{
                 .table_name = .fromSlice(table_name),
                 .request_json = .fromSlice(request_json),
             },
             &response.buffer,
-        ));
+            &failure,
+        );
+        try acceptStorageOwnerFailure(status, failure, "storage-owner algebraic partials");
         return response;
     }
 
@@ -491,12 +525,15 @@ pub const Owner = struct {
         cancellation_flag: ?*const anyopaque,
     ) !Response {
         var response: Response = .{};
+        var failure: abi.FailureIdentity = .{};
         const request = controlledRequest(table_name, request_json, execution_deadline_ns, cancellation_flag);
-        try statusToError(abi.antfly_storage_owner_graph_expand_json(
+        const status = abi.antfly_storage_owner_graph_expand_json(
             self.handle,
             &request,
             &response.buffer,
-        ));
+            &failure,
+        );
+        try acceptStorageOwnerFailure(status, failure, "storage-owner graph expand");
         return response;
     }
 
@@ -508,12 +545,15 @@ pub const Owner = struct {
         cancellation_flag: ?*const anyopaque,
     ) !Response {
         var response: Response = .{};
+        var failure: abi.FailureIdentity = .{};
         const request = controlledRequest(table_name, request_json, execution_deadline_ns, cancellation_flag);
-        try statusToError(abi.antfly_storage_owner_graph_hydrate_json(
+        const status = abi.antfly_storage_owner_graph_hydrate_json(
             self.handle,
             &request,
             &response.buffer,
-        ));
+            &failure,
+        );
+        try acceptStorageOwnerFailure(status, failure, "storage-owner graph hydrate");
         return response;
     }
 
@@ -525,12 +565,15 @@ pub const Owner = struct {
         cancellation_flag: ?*const anyopaque,
     ) !Response {
         var response: Response = .{};
+        var failure: abi.FailureIdentity = .{};
         const request = controlledRequest(table_name, request_json, execution_deadline_ns, cancellation_flag);
-        try statusToError(abi.antfly_storage_owner_graph_edges_json(
+        const status = abi.antfly_storage_owner_graph_edges_json(
             self.handle,
             &request,
             &response.buffer,
-        ));
+            &failure,
+        );
+        try acceptStorageOwnerFailure(status, failure, "storage-owner graph edges");
         return response;
     }
 
@@ -740,6 +783,45 @@ fn controlledRequest(
         .execution_deadline_ns = execution_deadline_ns orelse 0,
         .has_execution_deadline = @intFromBool(execution_deadline_ns != null),
         .cancellation_flag = cancellation_flag,
+    };
+}
+
+fn acceptStorageOwnerFailure(
+    status: abi.Status,
+    failure: abi.FailureIdentity,
+    label: []const u8,
+) !void {
+    error_identity.validateFailureEnvelope(status, &failure, abi.abi_version) catch |err| {
+        std.log.err(
+            "{s} returned inconsistent failure identity status={s} identity_status={s} boundary={s} version={d} operation={d} error={s} hash={x}",
+            .{
+                label,
+                @tagName(status),
+                @tagName(failure.status),
+                @tagName(failure.boundary),
+                failure.boundary_version,
+                failure.operation,
+                failure.boundedErrorName(),
+                failure.error_name_hash,
+            },
+        );
+        return err;
+    };
+    if (status != .ok and failure.boundary != .storage_owner and failure.boundary != .local_query) {
+        std.log.err("{s} returned failure from unexpected boundary={s}", .{ label, @tagName(failure.boundary) });
+        return error.InvalidBoundaryFailureIdentity;
+    }
+    statusToError(status) catch |err| {
+        if (status == .internal and failure.error_name_len != 0) {
+            std.log.err("{s} failed boundary={s} operation={d} provider_error={s} hash={x}", .{
+                label,
+                @tagName(failure.boundary),
+                failure.operation,
+                failure.errorName(),
+                failure.error_name_hash,
+            });
+        }
+        return err;
     };
 }
 

@@ -18,6 +18,8 @@ const antfly_client = @import("antfly-client");
 const cli = @import("cli/mod.zig");
 const httpx = @import("httpx");
 const runtime_bridge = @import("../runtime_bridge.zig");
+const kernel_owner_abi = @import("kernel_owner_abi");
+const local_query_client = @import("local_query_client");
 const standalone_runtime = if (antfly.build_options.storage_kernel_experiment)
     struct {}
 else
@@ -1110,6 +1112,20 @@ fn scanJson(allocator: Allocator, db: *db_mod.DB, body: []const u8) ![]u8 {
 }
 
 fn searchJson(allocator: Allocator, db: *db_mod.DB, body: []const u8) ![]u8 {
+    if (comptime antfly.build_options.storage_kernel_experiment) {
+        var failure: kernel_owner_abi.FailureIdentity = .{};
+        return try local_query_client.executeJsonAlloc(
+            allocator,
+            @ptrCast(db),
+            "docs",
+            body,
+            .public,
+            .{},
+            null,
+            &failure,
+        );
+    }
+
     var owned = try query_api.parsePublicQueryRequest(
         allocator,
         null,

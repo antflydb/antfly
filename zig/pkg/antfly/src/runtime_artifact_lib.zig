@@ -48,6 +48,10 @@ const enrichment_compute_exports = if (unit_options.unit == .enrichment_compute)
     @import("storage/enrichment_compute_provider.zig")
 else
     struct {};
+const local_query_exports = if (unit_options.unit == .local_query)
+    @import("storage/local_query_provider.zig")
+else
+    struct {};
 
 const cli_runtime = if (unit_options.unit == .cli or unit_options.unit == .control_probe or
     unit_options.unit == .cli_pic_probe)
@@ -487,6 +491,10 @@ comptime {
             exportInternal(&enrichment_compute_exports.extractStream, "antfly_enrichment_extract_stream");
             exportInternal(&enrichment_compute_exports.renderPdfPagePng, "antfly_enrichment_render_pdf_page_png");
             exportInternal(&enrichment_compute_exports.bufferDestroy, "antfly_enrichment_buffer_destroy");
+        },
+        .local_query => {
+            exportInternal(&local_query_exports.execute, "antfly_local_query_execute");
+            exportInternal(&local_query_exports.bufferDestroy, "antfly_local_query_buffer_destroy");
         },
         .inference => {
             exportInternal(&inferenceEntry, "antfly_runtime_inference");

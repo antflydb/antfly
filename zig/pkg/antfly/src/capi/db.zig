@@ -19,6 +19,8 @@ const capi = @import("types.zig");
 const search_wire = @import("search_wire.zig");
 const kernel_owner_abi = @import("kernel_owner_abi");
 const kernel_error_identity = @import("kernel_error_identity");
+const local_query_client = @import("local_query_client");
+const capi_build_options = @import("capi_build_options");
 const kernel_wal_owner = antfly.kernel_wal_owner;
 
 pub const storageWalOpen = kernel_wal_owner.open;
@@ -470,6 +472,43 @@ fn currentIdentityReadGenerationForHandle(handle: *Handle, requested: ?u64) !u64
 
 fn stampSearchRequestIdentityGeneration(handle: *Handle, req: *db_mod.types.SearchRequest) !void {
     req.identity_read_generation = try currentIdentityReadGenerationForHandle(handle, req.identity_read_generation);
+}
+
+fn executeLocalSearch(handle: *Handle, req: db_mod.types.SearchRequest) !db_mod.types.SearchResult {
+    if (comptime capi_build_options.storage_kernel_experiment) {
+        const request_json = try table_reads_api.encodeStorageKernelQueryRequest(handle.alloc, req);
+        defer handle.alloc.free(request_json);
+        var failure: kernel_owner_abi.FailureIdentity = .{};
+        const response_json = try local_query_client.executeJsonAlloc(
+            handle.alloc,
+            @ptrCast(&handle.db),
+            "docs",
+            request_json,
+            .internal,
+            .{
+                .enabled = 1,
+                .include_stored = @intFromBool(req.include_stored),
+                .return_mode = switch (req.return_mode) {
+                    .parent => .parent,
+                    .chunk => .chunk,
+                    .parent_with_chunks => .parent_with_chunks,
+                },
+                .max_chunks_per_parent = req.max_chunks_per_parent,
+                .dense_k = if (req.dense) |query| query.k else 0,
+                .sparse_k = if (req.sparse) |query| query.k else 0,
+            },
+            if (req.cancellation) |cancellation| @ptrCast(cancellation) else null,
+            &failure,
+        );
+        defer handle.alloc.free(response_json);
+        var result = table_reads_api.parseStorageKernelSearchResult(handle.alloc, response_json) catch |err| {
+            std.log.err("local query returned an invalid response wire error={s}", .{@errorName(err)});
+            return error.InvalidBoundaryQueryResponse;
+        };
+        result.identity_read_generation = req.identity_read_generation;
+        return result;
+    }
+    return try handle.db.search(handle.alloc, req);
 }
 
 const ReadableLeaseHookFn = *const fn (
@@ -4512,11 +4551,16 @@ pub fn storageOwnerQueryJson(
     owner: ?*anyopaque,
     request: *const kernel_owner_abi.JsonOperationRequest,
     out_response: *kernel_owner_abi.OwnedBytes,
+    out_failure: *kernel_owner_abi.FailureIdentity,
 ) callconv(.c) kernel_owner_abi.Status {
     out_response.* = .{};
-    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
-    const handle = asHandle(owner) orelse return .invalid_argument;
-    const table_name = storageOwnerOperationTableName(handle, request) orelse return .invalid_argument;
+    out_failure.* = .{};
+    if (request.version != kernel_owner_abi.abi_version)
+        return storageOwnerQueryFailure(error.InvalidAbiVersion, .validate_request, out_failure);
+    const handle = asHandle(owner) orelse
+        return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
+    const table_name = storageOwnerOperationTableName(handle, request) orelse
+        return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
     var response: capi.Buffer = .{};
     const request_slice: capi.Slice = .{
         .ptr = request.request_json.ptr,
@@ -4527,6 +4571,7 @@ pub fn storageOwnerQueryJson(
         table_name,
         request_slice,
         &response,
+        out_failure,
     );
     if (status != .ok) return status;
     out_response.* = .{
@@ -4613,73 +4658,112 @@ pub fn storageOwnerPreflightJson(
     owner: ?*anyopaque,
     request: *const kernel_owner_abi.JsonOperationRequest,
     out_response: *kernel_owner_abi.OwnedBytes,
+    out_failure: *kernel_owner_abi.FailureIdentity,
 ) callconv(.c) kernel_owner_abi.Status {
     out_response.* = .{};
-    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
-    const handle = asHandle(owner) orelse return .invalid_argument;
-    const table_name = storageOwnerOperationTableName(handle, request) orelse return .invalid_argument;
-    const response = table_reads_api.executeStorageKernelPreflight(
-        handle.alloc,
-        &handle.db,
+    out_failure.* = .{};
+    if (request.version != kernel_owner_abi.abi_version)
+        return storageOwnerQueryFailure(error.InvalidAbiVersion, .validate_request, out_failure);
+    const handle = asHandle(owner) orelse
+        return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
+    const table_name = storageOwnerOperationTableName(handle, request) orelse
+        return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
+    return executeStorageOwnerCompiledQueryOperation(
+        handle,
         table_name,
         request.request_json.slice(),
-    ) catch |err| return storageOwnerStatusFromError(err);
-    out_response.* = .{
-        .ptr = response.ptr,
-        .len = @intCast(response.len),
-    };
-    return .ok;
+        .preflight,
+        .preflight,
+        out_response,
+        out_failure,
+    );
 }
 
 pub fn storageOwnerTextStatsJson(
     owner: ?*anyopaque,
     request: *const kernel_owner_abi.JsonOperationRequest,
     out_response: *kernel_owner_abi.OwnedBytes,
+    out_failure: *kernel_owner_abi.FailureIdentity,
 ) callconv(.c) kernel_owner_abi.Status {
     out_response.* = .{};
-    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
-    const handle = asHandle(owner) orelse return .invalid_argument;
-    const table_name = storageOwnerOperationTableName(handle, request) orelse return .invalid_argument;
-    const response = table_reads_api.executeStorageKernelTextStats(
-        handle.alloc,
-        &handle.db,
+    out_failure.* = .{};
+    if (request.version != kernel_owner_abi.abi_version)
+        return storageOwnerQueryFailure(error.InvalidAbiVersion, .validate_request, out_failure);
+    const handle = asHandle(owner) orelse
+        return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
+    const table_name = storageOwnerOperationTableName(handle, request) orelse
+        return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
+    return executeStorageOwnerCompiledQueryOperation(
+        handle,
         table_name,
         request.request_json.slice(),
-    ) catch |err| return storageOwnerStatusFromError(err);
-    out_response.* = .{
-        .ptr = response.ptr,
-        .len = @intCast(response.len),
-    };
-    return .ok;
+        .text_stats,
+        .text_stats,
+        out_response,
+        out_failure,
+    );
 }
 
 pub fn storageOwnerAlgebraicPartialsJson(
     owner: ?*anyopaque,
     request: *const kernel_owner_abi.JsonOperationRequest,
     out_response: *kernel_owner_abi.OwnedBytes,
+    out_failure: *kernel_owner_abi.FailureIdentity,
 ) callconv(.c) kernel_owner_abi.Status {
     out_response.* = .{};
-    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
-    const handle = asHandle(owner) orelse return .invalid_argument;
-    _ = storageOwnerOperationTableName(handle, request) orelse return .invalid_argument;
-    const response = table_reads_api.executeStorageKernelAlgebraicPartials(
-        handle.alloc,
-        &handle.db,
+    out_failure.* = .{};
+    if (request.version != kernel_owner_abi.abi_version)
+        return storageOwnerQueryFailure(error.InvalidAbiVersion, .validate_request, out_failure);
+    const handle = asHandle(owner) orelse
+        return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
+    const table_name = storageOwnerOperationTableName(handle, request) orelse
+        return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
+    return executeStorageOwnerCompiledQueryOperation(
+        handle,
+        table_name,
         request.request_json.slice(),
-    ) catch |err| return storageOwnerStatusFromError(err);
-    out_response.* = .{
-        .ptr = response.ptr,
-        .len = @intCast(response.len),
+        .algebraic_partials,
+        .algebraic_partials,
+        out_response,
+        out_failure,
+    );
+}
+
+fn executeStorageOwnerCompiledQueryOperation(
+    handle: *Handle,
+    table_name: []const u8,
+    request_json: []const u8,
+    kind: kernel_owner_abi.LocalQueryKind,
+    outer_operation: kernel_owner_abi.LocalQueryOperation,
+    out_response: *kernel_owner_abi.OwnedBytes,
+    out_failure: *kernel_owner_abi.FailureIdentity,
+) kernel_owner_abi.Status {
+    const response = local_query_client.executeControlledJsonAlloc(
+        std.heap.c_allocator,
+        kind,
+        @ptrCast(&handle.db),
+        table_name,
+        request_json,
+        null,
+        null,
+        out_failure,
+    ) catch |err| {
+        if (out_failure.status != .ok) return out_failure.status;
+        return storageOwnerQueryFailure(err, outer_operation, out_failure);
     };
+    out_response.* = .{ .ptr = response.ptr, .len = @intCast(response.len) };
     return .ok;
 }
 
 pub fn storageAggregateJson(
     request: *const kernel_owner_abi.AggregationRequest,
     out_response: *kernel_owner_abi.OwnedBytes,
+    out_failure: *kernel_owner_abi.FailureIdentity,
 ) callconv(.c) kernel_owner_abi.Status {
     out_response.* = .{};
-    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    out_failure.* = .{};
+    if (request.version != kernel_owner_abi.abi_version)
+        return storageOwnerQueryFailure(error.InvalidAbiVersion, .parse_aggregation, out_failure);
 
     var arena_impl = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer arena_impl.deinit();
@@ -4689,23 +4773,25 @@ pub fn storageAggregateJson(
         arena,
         request.context_json.slice(),
         .{},
-    ) catch return .invalid_argument;
+    ) catch |err| return storageOwnerQueryFailure(err, .parse_aggregation, out_failure);
 
     const requests = query_api.parseAggregationRequestsJson(
         std.heap.c_allocator,
         request.aggregations_json.slice(),
-    ) catch |err| return storageOwnerStatusFromError(err);
+    ) catch |err| return storageOwnerQueryFailure(err, .parse_aggregation, out_failure);
     defer query_api.freeAggregationRequests(std.heap.c_allocator, requests);
 
-    if (request.hit_count > std.math.maxInt(usize)) return .invalid_argument;
+    if (request.hit_count > std.math.maxInt(usize))
+        return storageOwnerQueryFailure(error.InvalidArgument, .parse_aggregation, out_failure);
     const hit_count: usize = @intCast(request.hit_count);
     const borrowed_hits = if (hit_count == 0)
         @as([]const kernel_owner_abi.AggregationHit, &.{})
     else if (request.hits) |ptr|
         ptr[0..hit_count]
     else
-        return .invalid_argument;
-    const hits = arena.alloc(db_mod.types.SearchHit, hit_count) catch return .out_of_memory;
+        return storageOwnerQueryFailure(error.InvalidArgument, .parse_aggregation, out_failure);
+    const hits = arena.alloc(db_mod.types.SearchHit, hit_count) catch |err|
+        return storageOwnerQueryFailure(err, .execute_aggregation, out_failure);
     for (borrowed_hits, 0..) |hit, i| hits[i] = .{
         .id = @constCast(""),
         .stored_data = if (hit.stored_data.len == 0) null else @constCast(hit.stored_data.slice()),
@@ -4724,83 +4810,118 @@ pub fn storageAggregateJson(
             .distributed_text_stats = wire.distributed_text_stats,
             .distributed_background_text_stats = wire.distributed_background_text_stats,
         },
-    ) catch |err| return storageOwnerStatusFromError(err);
+    ) catch |err| return storageOwnerQueryFailure(err, .execute_aggregation, out_failure);
     defer aggregations_mod.deinitResults(std.heap.c_allocator, aggregation_results);
 
     const response = std.json.Stringify.valueAlloc(
         std.heap.c_allocator,
         aggregation_results,
         .{},
-    ) catch return .out_of_memory;
+    ) catch |err| return storageOwnerQueryFailure(err, .encode_aggregation, out_failure);
     out_response.* = .{ .ptr = response.ptr, .len = @intCast(response.len) };
     return .ok;
-}
-
-fn applyStorageOwnerGraphControls(
-    request: *const kernel_owner_abi.ControlledJsonOperationRequest,
-    graph_request: anytype,
-) void {
-    graph_request.execution_deadline_ns = if (request.has_execution_deadline != 0) request.execution_deadline_ns else null;
-    graph_request.timeout_ms = null;
-    graph_request.cancellation = if (request.cancellation_flag) |flag|
-        @ptrCast(@alignCast(flag))
-    else
-        null;
 }
 
 pub fn storageOwnerGraphExpandJson(
     owner: ?*anyopaque,
     request: *const kernel_owner_abi.ControlledJsonOperationRequest,
     out_response: *kernel_owner_abi.OwnedBytes,
+    out_failure: *kernel_owner_abi.FailureIdentity,
 ) callconv(.c) kernel_owner_abi.Status {
     out_response.* = .{};
-    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
-    const handle = asHandle(owner) orelse return .invalid_argument;
-    const table_name = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
-    var parsed = distributed_graph.parseGraphExpandRequest(handle.alloc, request.request_json.slice()) catch return .invalid_query;
-    defer parsed.deinit(handle.alloc);
-    applyStorageOwnerGraphControls(request, &parsed);
-    var result = table_reads_api.executeStorageKernelGraphExpand(handle.alloc, &handle.db, table_name, parsed) catch |err| return storageOwnerStatusFromError(err);
-    defer result.deinit(handle.alloc);
-    const response = distributed_graph.encodeGraphExpandResponse(handle.alloc, result) catch |err| return storageOwnerStatusFromError(err);
-    out_response.* = .{ .ptr = response.ptr, .len = @intCast(response.len) };
-    return .ok;
+    out_failure.* = .{};
+    if (request.version != kernel_owner_abi.abi_version)
+        return storageOwnerQueryFailure(error.InvalidAbiVersion, .validate_request, out_failure);
+    const handle = asHandle(owner) orelse
+        return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
+    const table_name = storageOwnerTableName(handle, request.table_name) orelse
+        return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
+    return executeStorageOwnerCompiledGraph(
+        handle,
+        table_name,
+        request,
+        .graph_expand,
+        .encode_graph_expand,
+        out_response,
+        out_failure,
+    );
 }
 
 pub fn storageOwnerGraphHydrateJson(
     owner: ?*anyopaque,
     request: *const kernel_owner_abi.ControlledJsonOperationRequest,
     out_response: *kernel_owner_abi.OwnedBytes,
+    out_failure: *kernel_owner_abi.FailureIdentity,
 ) callconv(.c) kernel_owner_abi.Status {
     out_response.* = .{};
-    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
-    const handle = asHandle(owner) orelse return .invalid_argument;
-    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
-    var parsed = distributed_graph.parseGraphHydrateRequest(handle.alloc, request.request_json.slice()) catch return .invalid_query;
-    defer parsed.deinit(handle.alloc);
-    applyStorageOwnerGraphControls(request, &parsed);
-    var result = table_reads_api.executeStorageKernelGraphHydrate(handle.alloc, &handle.db, parsed) catch |err| return storageOwnerStatusFromError(err);
-    defer result.deinit(handle.alloc);
-    const response = distributed_graph.encodeGraphHydrateResponse(handle.alloc, result) catch |err| return storageOwnerStatusFromError(err);
-    out_response.* = .{ .ptr = response.ptr, .len = @intCast(response.len) };
-    return .ok;
+    out_failure.* = .{};
+    if (request.version != kernel_owner_abi.abi_version)
+        return storageOwnerQueryFailure(error.InvalidAbiVersion, .validate_request, out_failure);
+    const handle = asHandle(owner) orelse
+        return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
+    const table_name = storageOwnerTableName(handle, request.table_name) orelse
+        return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
+    return executeStorageOwnerCompiledGraph(
+        handle,
+        table_name,
+        request,
+        .graph_hydrate,
+        .encode_graph_hydrate,
+        out_response,
+        out_failure,
+    );
 }
 
 pub fn storageOwnerGraphEdgesJson(
     owner: ?*anyopaque,
     request: *const kernel_owner_abi.ControlledJsonOperationRequest,
     out_response: *kernel_owner_abi.OwnedBytes,
+    out_failure: *kernel_owner_abi.FailureIdentity,
 ) callconv(.c) kernel_owner_abi.Status {
     out_response.* = .{};
-    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
-    const handle = asHandle(owner) orelse return .invalid_argument;
-    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
-    var parsed = distributed_graph.parseGraphEdgesRequest(handle.alloc, request.request_json.slice()) catch return .invalid_query;
-    defer parsed.deinit(handle.alloc);
-    applyStorageOwnerGraphControls(request, &parsed);
-    var result = table_reads_api.executeStorageKernelGraphEdges(handle.alloc, &handle.db, parsed) catch |err| return storageOwnerStatusFromError(err);
-    defer result.deinit(handle.alloc);
-    const response = distributed_graph.encodeGraphEdgesResponse(handle.alloc, result) catch |err| return storageOwnerStatusFromError(err);
+    out_failure.* = .{};
+    if (request.version != kernel_owner_abi.abi_version)
+        return storageOwnerQueryFailure(error.InvalidAbiVersion, .validate_request, out_failure);
+    const handle = asHandle(owner) orelse
+        return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
+    const table_name = storageOwnerTableName(handle, request.table_name) orelse
+        return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
+    return executeStorageOwnerCompiledGraph(
+        handle,
+        table_name,
+        request,
+        .graph_edges,
+        .encode_graph_edges,
+        out_response,
+        out_failure,
+    );
+}
+
+fn executeStorageOwnerCompiledGraph(
+    handle: *Handle,
+    table_name: []const u8,
+    request: *const kernel_owner_abi.ControlledJsonOperationRequest,
+    kind: kernel_owner_abi.LocalQueryKind,
+    outer_operation: kernel_owner_abi.LocalQueryOperation,
+    out_response: *kernel_owner_abi.OwnedBytes,
+    out_failure: *kernel_owner_abi.FailureIdentity,
+) kernel_owner_abi.Status {
+    const response = local_query_client.executeControlledJsonAlloc(
+        std.heap.c_allocator,
+        kind,
+        @ptrCast(&handle.db),
+        table_name,
+        request.request_json.slice(),
+        if (request.has_execution_deadline != 0) request.execution_deadline_ns else null,
+        request.cancellation_flag,
+        out_failure,
+    ) catch |err| {
+        // A valid nested provider failure retains its local-query origin and
+        // operation. Only consumer-side allocation/protocol work receives a
+        // new storage-owner identity.
+        if (out_failure.status != .ok) return out_failure.status;
+        return storageOwnerQueryFailure(err, outer_operation, out_failure);
+    };
     out_response.* = .{ .ptr = response.ptr, .len = @intCast(response.len) };
     return .ok;
 }
@@ -6564,7 +6685,7 @@ fn searchDenseOwnedProfiled(
     };
 
     const fallback_start = monotonicNowNs();
-    var result = try handle.db.search(handle.alloc, req);
+    var result = try executeLocalSearch(handle, req);
     defer result.deinit();
     const fallback_end = monotonicNowNs();
 
@@ -6705,7 +6826,7 @@ fn searchTextOwned(
     };
 
     try handle.prepareSearchRequest(req);
-    var result = try handle.db.search(handle.alloc, req);
+    var result = try executeLocalSearch(handle, req);
     defer result.deinit();
 
     const ids = try handle.alloc.alloc([]const u8, result.hits.len);
@@ -7475,7 +7596,32 @@ fn searchStorageKernelQueryJson(
     table_name: []const u8,
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
+    out_failure: *kernel_owner_abi.FailureIdentity,
 ) kernel_owner_abi.Status {
+    out_failure.* = .{};
+    if (comptime capi_build_options.storage_kernel_experiment) {
+        handle.prepareSearchRequest(.{}) catch |err|
+            return storageOwnerQueryFailure(err, .execute_internal_query, out_failure);
+        const response = local_query_client.executeJsonAlloc(
+            std.heap.c_allocator,
+            @ptrCast(&handle.db),
+            table_name,
+            request_json.bytes(),
+            .internal,
+            .{},
+            null,
+            out_failure,
+        ) catch |err| {
+            // A valid provider failure already carries the exact envelope.
+            // Consumer-side allocation/protocol failures originate in this
+            // outer operation and receive their own identity.
+            if (out_failure.status != .ok) return out_failure.status;
+            return storageOwnerQueryFailure(err, .encode_internal_response, out_failure);
+        };
+        out_buf.* = .{ .ptr = response.ptr, .len = response.len };
+        return .ok;
+    }
+
     // The distributed adapter sends the same resolved/internal query dialect
     // used by remote group routes. It must not be reparsed as a public request:
     // fields such as `_filter_query_json` are deliberately internal.
@@ -7484,15 +7630,16 @@ fn searchStorageKernelQueryJson(
         null,
         table_name,
         request_json.bytes(),
-    ) catch |err| return storageOwnerStatusFromError(err);
+    ) catch |err| return storageOwnerQueryFailure(err, .parse_internal_request, out_failure);
     defer owned.deinit(handle.alloc);
 
     stampSearchRequestIdentityGeneration(handle, &owned.req) catch |err|
-        return storageOwnerStatusFromError(err);
-    handle.prepareSearchRequest(owned.req) catch |err| return storageOwnerStatusFromError(err);
+        return storageOwnerQueryFailure(err, .execute_internal_query, out_failure);
+    handle.prepareSearchRequest(owned.req) catch |err|
+        return storageOwnerQueryFailure(err, .execute_internal_query, out_failure);
 
     var result = handle.db.search(handle.alloc, owned.req) catch |err|
-        return storageOwnerStatusFromError(err);
+        return storageOwnerQueryFailure(err, .execute_internal_query, out_failure);
     defer result.deinit();
 
     var response = query_api.encodeQueryResponses(
@@ -7501,11 +7648,26 @@ fn searchStorageKernelQueryJson(
         owned.req,
         .{},
         result,
-    ) catch |err| return storageOwnerStatusFromError(err);
+    ) catch |err| return storageOwnerQueryFailure(err, .encode_internal_response, out_failure);
     defer response.deinit(handle.alloc);
 
-    out_buf.* = dupBytes(response.json) catch |err| return storageOwnerStatusFromError(err);
+    out_buf.* = dupBytes(response.json) catch |err|
+        return storageOwnerQueryFailure(err, .encode_internal_response, out_failure);
     return .ok;
+}
+
+fn storageOwnerQueryFailure(
+    err: anyerror,
+    operation: kernel_owner_abi.LocalQueryOperation,
+    out_failure: *kernel_owner_abi.FailureIdentity,
+) kernel_owner_abi.Status {
+    out_failure.* = kernel_error_identity.failureFromError(
+        err,
+        .storage_owner,
+        kernel_owner_abi.abi_version,
+        @intFromEnum(operation),
+    );
+    return out_failure.status;
 }
 
 fn searchPublicQueryJson(
@@ -7514,6 +7676,23 @@ fn searchPublicQueryJson(
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
+    if (comptime capi_build_options.storage_kernel_experiment) {
+        handle.prepareSearchRequest(.{}) catch |err| return capi.mapError(err);
+        var failure: kernel_owner_abi.FailureIdentity = .{};
+        const response = local_query_client.executeJsonAlloc(
+            std.heap.c_allocator,
+            @ptrCast(&handle.db),
+            table_name,
+            request_json.bytes(),
+            .public,
+            .{},
+            null,
+            &failure,
+        ) catch |err| return capi.mapError(err);
+        out_buf.* = .{ .ptr = response.ptr, .len = response.len };
+        return .ok;
+    }
+
     var owned = query_api.parsePublicQueryRequest(
         handle.alloc,
         null,
@@ -7636,7 +7815,7 @@ pub export fn antfly_db_search_json(
 
     stampSearchRequestIdentityGeneration(handle, &req) catch |err| return capi.mapError(err);
     handle.prepareSearchRequest(req) catch |err| return capi.mapError(err);
-    var result = handle.db.search(handle.alloc, req) catch |err| return capi.mapError(err);
+    var result = executeLocalSearch(handle, req) catch |err| return capi.mapError(err);
     defer result.deinit();
 
     var aggregation_results: []JsonSearchAggregationResult = &.{};
@@ -7653,7 +7832,7 @@ pub export fn antfly_db_search_json(
             agg_req.offset = 0;
             agg_req.limit = if (result.total_hits == 0) 1 else result.total_hits;
             agg_req.include_stored = true;
-            full_result = handle.db.search(handle.alloc, agg_req) catch |err| return capi.mapError(err);
+            full_result = executeLocalSearch(handle, agg_req) catch |err| return capi.mapError(err);
             agg_source_is_full = true;
         }
         const source = if (full_result) |*value| value else &result;
@@ -8018,7 +8197,7 @@ pub export fn antfly_db_search_hits_json(
 
     stampSearchRequestIdentityGeneration(handle, &req) catch |err| return capi.mapError(err);
     handle.prepareSearchRequest(req) catch |err| return capi.mapError(err);
-    var result = handle.db.search(handle.alloc, req) catch |err| return capi.mapError(err);
+    var result = executeLocalSearch(handle, req) catch |err| return capi.mapError(err);
     defer result.deinit();
     if (result.graph_results.len > 0) return .invalid_argument;
 

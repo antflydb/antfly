@@ -162,6 +162,10 @@ jobs:
             "$RUNNER_TEMP/linked-runtime-reports/enrichment.json" 5 &
           enrichment_report_pid=$!
           "$node_bin" tools/capture_zig_time_report.mjs \
+            ws://127.0.0.1:19125/ antfly-runtime-local_query \
+            "$RUNNER_TEMP/linked-runtime-reports/local-query.json" 30 &
+          local_query_report_pid=$!
+          "$node_bin" tools/capture_zig_time_report.mjs \
             ws://127.0.0.1:19125/ antfly-runtime-inference \
             "$RUNNER_TEMP/linked-runtime-reports/inference.json" 30 &
           inference_report_pid=$!
@@ -175,6 +179,7 @@ jobs:
             "$storage_report_pid" \
             "$distributed_report_pid" \
             "$enrichment_report_pid" \
+            "$local_query_report_pid" \
             "$inference_report_pid" \
             "$cli_report_pid"; do
             wait "$report_pid" || report_status=$?
@@ -214,7 +219,8 @@ jobs:
           storage_object="$(find "$RUNNER_TEMP/linked-runtime-cache/local" -type f -name 'libantfly-storage-kernel_zcu.o' -print -quit)"
           distributed_object="$(find "$RUNNER_TEMP/linked-runtime-cache/local" -type f -name 'libantfly-runtime-distributed_zcu.o' -print -quit)"
           enrichment_object="$(find "$RUNNER_TEMP/linked-runtime-cache/local" -type f -name 'libantfly-runtime-enrichment_compute_zcu.o' -print -quit)"
-          if [ -z "$storage_object" ] || [ -z "$distributed_object" ] || [ -z "$enrichment_object" ]; then
+          local_query_object="$(find "$RUNNER_TEMP/linked-runtime-cache/local" -type f -name 'libantfly-runtime-local_query_zcu.o' -print -quit)"
+          if [ -z "$storage_object" ] || [ -z "$distributed_object" ] || [ -z "$enrichment_object" ] || [ -z "$local_query_object" ]; then
             echo "Zig runtime objects were not found for emitted-overlap analysis" >&2
             exit 1
           fi
@@ -223,11 +229,13 @@ jobs:
             --time-report "storage=$RUNNER_TEMP/linked-runtime-reports/storage.json" \
             --time-report "distributed=$RUNNER_TEMP/linked-runtime-reports/distributed.json" \
             --time-report "enrichment=$RUNNER_TEMP/linked-runtime-reports/enrichment.json" \
+            --time-report "local_query=$RUNNER_TEMP/linked-runtime-reports/local-query.json" \
             --time-report "inference=$RUNNER_TEMP/linked-runtime-reports/inference.json" \
             --time-report "cli=$RUNNER_TEMP/linked-runtime-reports/cli.json" \
             --object "storage=$storage_object" \
             --object "distributed=$distributed_object" \
             --object "enrichment=$enrichment_object" \
+            --object "local_query=$local_query_object" \
             --top-groups 30 \
             --json | tee "$RUNNER_TEMP/linked-runtime-reports/summary.json"
 

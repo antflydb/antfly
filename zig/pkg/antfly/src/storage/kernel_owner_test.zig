@@ -14,10 +14,50 @@
 
 const std = @import("std");
 const abi = @import("kernel_owner_abi");
+const error_identity = @import("kernel_error_identity");
+const local_query_client = @import("local_query_client");
 const client = @import("kernel_owner_client.zig");
 const wal_client = @import("kernel_wal_client.zig");
 const data_apply_client = @import("data_raft_apply_client.zig");
 const metadata_apply_client = @import("metadata_raft_apply_client.zig");
+
+test "local query identity relay preserves origin and attributes protocol defects to consumer" {
+    const failure = error_identity.failureFromError(
+        error.InvalidQueryRequest,
+        .local_query,
+        abi.abi_version,
+        @intFromEnum(abi.LocalQueryOperation.parse_internal_request),
+    );
+    var forwarded: abi.FailureIdentity = .{};
+    try local_query_client.acceptProviderFailure(
+        failure.status,
+        failure,
+        .validate_provider_response,
+        &forwarded,
+    );
+    try std.testing.expectEqualDeep(failure, forwarded);
+
+    var malformed = failure;
+    malformed.operation = 0;
+    var replacement: abi.FailureIdentity = .{};
+    try std.testing.expectError(
+        error.InvalidBoundaryFailureIdentity,
+        local_query_client.acceptProviderFailure(
+            malformed.status,
+            malformed,
+            .validate_provider_response,
+            &replacement,
+        ),
+    );
+    try std.testing.expectEqual(abi.Status.invalid_boundary_failure_identity, replacement.status);
+    try std.testing.expectEqual(abi.FailureBoundary.storage_owner, replacement.boundary);
+    try std.testing.expectEqual(abi.abi_version, replacement.boundary_version);
+    try std.testing.expectEqual(
+        @intFromEnum(abi.LocalQueryOperation.validate_provider_response),
+        replacement.operation,
+    );
+    try std.testing.expectEqualStrings("InvalidBoundaryFailureIdentity", replacement.errorName());
+}
 
 fn cleanup(path: []const u8) void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -329,6 +369,131 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     ;
     try std.testing.expectError(error.InvalidArgument, owner.queryJson("articles", query_json));
     try std.testing.expectError(error.InvalidQueryRequest, owner.queryJson("docs", "{"));
+
+    // The nested distributed -> storage-owner -> local-query path must retain
+    // both the semantic status and its originating stage, not merely rethrow a
+    // broad failure after the inner provider unwinds.
+    var invalid_query_response: abi.OwnedBytes = .{};
+    var invalid_query_failure: abi.FailureIdentity = .{};
+    const invalid_query_status = abi.antfly_storage_owner_query_json(
+        owner.handle,
+        &.{
+            .table_name = .fromSlice("docs"),
+            .request_json = .fromSlice("{"),
+        },
+        &invalid_query_response,
+        &invalid_query_failure,
+    );
+    try std.testing.expectEqual(abi.Status.invalid_query, invalid_query_status);
+    try std.testing.expectEqual(invalid_query_status, invalid_query_failure.status);
+    try std.testing.expectEqual(abi.FailureBoundary.local_query, invalid_query_failure.boundary);
+    try std.testing.expectEqual(abi.abi_version, invalid_query_failure.boundary_version);
+    try std.testing.expectEqual(
+        @intFromEnum(abi.LocalQueryOperation.parse_internal_request),
+        invalid_query_failure.operation,
+    );
+    try std.testing.expectEqualStrings("InvalidQueryRequest", invalid_query_failure.errorName());
+    try std.testing.expect(invalid_query_failure.error_name_hash != 0);
+    try std.testing.expectEqual(@as(usize, 0), invalid_query_response.len);
+
+    var invalid_abi_response: abi.OwnedBytes = .{};
+    var invalid_abi_failure: abi.FailureIdentity = .{};
+    var invalid_abi_request = abi.LocalQueryRequest{};
+    invalid_abi_request.version = abi.abi_version - 1;
+    const invalid_abi_status = abi.antfly_local_query_execute(
+        &invalid_abi_request,
+        &invalid_abi_response,
+        &invalid_abi_failure,
+    );
+    try std.testing.expectEqual(abi.Status.invalid_abi, invalid_abi_status);
+    try std.testing.expectEqual(invalid_abi_status, invalid_abi_failure.status);
+    try std.testing.expectEqual(abi.FailureBoundary.local_query, invalid_abi_failure.boundary);
+    try std.testing.expectEqual(
+        @intFromEnum(abi.LocalQueryOperation.validate_request),
+        invalid_abi_failure.operation,
+    );
+    try std.testing.expectEqualStrings("InvalidAbiVersion", invalid_abi_failure.errorName());
+
+    // Every operation family crossing the storage-owner boundary carries the
+    // same complete envelope even when it remains in the storage unit.
+    var operation_response: abi.OwnedBytes = .{};
+    defer abi.antfly_storage_owner_buffer_destroy(&operation_response);
+    var operation_failure: abi.FailureIdentity = .{};
+    const invalid_algebraic_status = abi.antfly_storage_owner_algebraic_partials_json(
+        owner.handle,
+        &.{ .table_name = .fromSlice("docs"), .request_json = .fromSlice("{") },
+        &operation_response,
+        &operation_failure,
+    );
+    try std.testing.expect(invalid_algebraic_status != .ok);
+    try std.testing.expectEqual(invalid_algebraic_status, operation_failure.status);
+    try std.testing.expectEqual(abi.FailureBoundary.local_query, operation_failure.boundary);
+    try std.testing.expectEqual(abi.abi_version, operation_failure.boundary_version);
+    try std.testing.expectEqual(
+        @intFromEnum(abi.LocalQueryOperation.algebraic_partials),
+        operation_failure.operation,
+    );
+    try std.testing.expect(operation_failure.error_name_hash != 0);
+
+    const invalid_text_stats_status = abi.antfly_storage_owner_text_stats_json(
+        owner.handle,
+        &.{ .table_name = .fromSlice("docs"), .request_json = .fromSlice("{") },
+        &operation_response,
+        &operation_failure,
+    );
+    try std.testing.expect(invalid_text_stats_status != .ok);
+    try std.testing.expectEqual(invalid_text_stats_status, operation_failure.status);
+    try std.testing.expectEqual(abi.FailureBoundary.local_query, operation_failure.boundary);
+    try std.testing.expectEqual(abi.abi_version, operation_failure.boundary_version);
+    try std.testing.expectEqual(
+        @intFromEnum(abi.LocalQueryOperation.text_stats),
+        operation_failure.operation,
+    );
+    try std.testing.expect(operation_failure.error_name_hash != 0);
+
+    const invalid_preflight_status = abi.antfly_storage_owner_preflight_json(
+        owner.handle,
+        &.{ .table_name = .fromSlice("docs"), .request_json = .fromSlice("{") },
+        &operation_response,
+        &operation_failure,
+    );
+    try std.testing.expect(invalid_preflight_status != .ok);
+    try std.testing.expectEqual(invalid_preflight_status, operation_failure.status);
+    try std.testing.expectEqual(abi.FailureBoundary.local_query, operation_failure.boundary);
+    try std.testing.expectEqual(abi.abi_version, operation_failure.boundary_version);
+    try std.testing.expectEqual(
+        @intFromEnum(abi.LocalQueryOperation.preflight),
+        operation_failure.operation,
+    );
+    try std.testing.expect(operation_failure.error_name_hash != 0);
+
+    const invalid_graph_status = abi.antfly_storage_owner_graph_expand_json(
+        owner.handle,
+        &.{ .table_name = .fromSlice("docs"), .request_json = .fromSlice("{") },
+        &operation_response,
+        &operation_failure,
+    );
+    try std.testing.expect(invalid_graph_status != .ok);
+    try std.testing.expectEqual(invalid_graph_status, operation_failure.status);
+    try std.testing.expectEqual(abi.FailureBoundary.local_query, operation_failure.boundary);
+    try std.testing.expectEqual(abi.abi_version, operation_failure.boundary_version);
+    try std.testing.expectEqual(
+        @intFromEnum(abi.LocalQueryOperation.parse_graph_expand),
+        operation_failure.operation,
+    );
+    try std.testing.expect(operation_failure.error_name_hash != 0);
+
+    const invalid_aggregation_status = abi.antfly_storage_aggregate_json(
+        &.{ .context_json = .fromSlice("{"), .aggregations_json = .fromSlice("[]") },
+        &operation_response,
+        &operation_failure,
+    );
+    try std.testing.expect(invalid_aggregation_status != .ok);
+    try std.testing.expectEqual(abi.FailureBoundary.storage_owner, operation_failure.boundary);
+    try std.testing.expectEqual(
+        @intFromEnum(abi.LocalQueryOperation.parse_aggregation),
+        operation_failure.operation,
+    );
 
     var query_response = try owner.queryJson("docs", query_json);
     defer query_response.deinit();
@@ -717,27 +882,30 @@ test "opaque storage owner validates ABI and destruction is idempotent" {
         abi.antfly_storage_owner_replicated_batch_json(null, &invalid_operation, &response),
     );
     try std.testing.expectEqual(@as(u64, 0), response.len);
+    var query_failure: abi.FailureIdentity = .{};
     try std.testing.expectEqual(
         abi.Status.invalid_abi,
-        abi.antfly_storage_owner_preflight_json(null, &invalid_operation, &response),
+        abi.antfly_storage_owner_preflight_json(null, &invalid_operation, &response, &query_failure),
     );
+    try std.testing.expectEqual(abi.FailureBoundary.storage_owner, query_failure.boundary);
     try std.testing.expectEqual(@as(u64, 0), response.len);
     try std.testing.expectEqual(
         abi.Status.invalid_abi,
-        abi.antfly_storage_owner_text_stats_json(null, &invalid_operation, &response),
+        abi.antfly_storage_owner_text_stats_json(null, &invalid_operation, &response, &query_failure),
     );
+    try std.testing.expectEqual(abi.FailureBoundary.storage_owner, query_failure.boundary);
     try std.testing.expectEqual(@as(u64, 0), response.len);
     try std.testing.expectEqual(
         abi.Status.invalid_abi,
-        abi.antfly_storage_owner_algebraic_partials_json(null, &invalid_operation, &response),
+        abi.antfly_storage_owner_algebraic_partials_json(null, &invalid_operation, &response, &query_failure),
     );
     try std.testing.expectEqual(@as(u64, 0), response.len);
     const invalid_controlled = abi.ControlledJsonOperationRequest{ .version = abi.abi_version + 1 };
-    try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_graph_expand_json(null, &invalid_controlled, &response));
+    try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_graph_expand_json(null, &invalid_controlled, &response, &query_failure));
     try std.testing.expectEqual(@as(u64, 0), response.len);
-    try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_graph_hydrate_json(null, &invalid_controlled, &response));
+    try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_graph_hydrate_json(null, &invalid_controlled, &response, &query_failure));
     try std.testing.expectEqual(@as(u64, 0), response.len);
-    try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_graph_edges_json(null, &invalid_controlled, &response));
+    try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_graph_edges_json(null, &invalid_controlled, &response, &query_failure));
     try std.testing.expectEqual(@as(u64, 0), response.len);
     try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_document_artifact_manifest_json(null, &invalid_operation, &response));
     try std.testing.expectEqual(@as(u64, 0), response.len);

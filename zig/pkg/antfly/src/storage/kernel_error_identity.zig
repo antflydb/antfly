@@ -171,6 +171,8 @@ const mappings = [_]Mapping{
     .{ .status = .zip_encryption_unsupported, .err = error.ZipEncryptionUnsupported },
     .{ .status = .zip_no_end_record, .err = error.ZipNoEndRecord },
     .{ .status = .zip_truncated, .err = error.ZipTruncated },
+    .{ .status = .invalid_boundary_failure_identity, .err = error.InvalidBoundaryFailureIdentity },
+    .{ .status = .invalid_boundary_query_response, .err = error.InvalidBoundaryQueryResponse },
     .{ .status = .active_node_finalize_rejected, .err = error.ActiveNodeFinalizeRejected },
     .{ .status = .applied_snapshot_index_mismatch, .err = error.AppliedSnapshotIndexMismatch },
     .{ .status = .invalid_committed_entries_encoding, .err = error.InvalidCommittedEntriesEncoding },
@@ -220,9 +222,15 @@ pub fn statusToError(status: abi.Status) !void {
 /// Build the wire identity for a provider error. Declared errors retain their
 /// stable semantic status; undeclared defects retain their bounded diagnostic
 /// name while deliberately using `.internal` for control flow.
-pub fn failureFromError(err: anyerror, boundary_version: u32, operation: u32) abi.FailureIdentity {
+pub fn failureFromError(
+    err: anyerror,
+    boundary: abi.FailureBoundary,
+    boundary_version: u32,
+    operation: u32,
+) abi.FailureIdentity {
     var result = abi.FailureIdentity{
         .status = statusFromError(err),
+        .boundary = boundary,
         .boundary_version = boundary_version,
         .operation = operation,
     };
@@ -233,6 +241,53 @@ pub fn failureFromError(err: anyerror, boundary_version: u32, operation: u32) ab
     result.error_name_truncated = @intFromBool(name.len > len);
     result.error_name_hash = stableErrorNameHash(name);
     return result;
+}
+
+/// Verify that the provider's control-flow status and diagnostic envelope
+/// describe the same failure. Keep the returned envelope intact when this
+/// reports a protocol defect so logs can show both conflicting identities.
+pub fn validateFailureEnvelope(
+    status: abi.Status,
+    failure: *const abi.FailureIdentity,
+    expected_boundary_version: u32,
+) !void {
+    const zero_name: [abi.failure_error_name_capacity]u8 = @splat(0);
+    if (status == .ok) {
+        if (failure.status != .ok or
+            failure.boundary != .none or
+            failure.boundary_version != expected_boundary_version or
+            failure.operation != 0 or
+            failure.error_name_len != 0 or
+            failure.error_name_truncated != 0 or
+            failure.error_name_hash != 0 or
+            !std.mem.eql(u8, &failure._reserved0, &@as([2]u8, @splat(0))) or
+            !std.mem.eql(u8, &failure.error_name, &zero_name))
+        {
+            return error.InvalidBoundaryFailureIdentity;
+        }
+        return;
+    }
+    if (failure.status != status or
+        failure.boundary == .none or
+        failure.boundary_version != expected_boundary_version or
+        failure.operation == 0 or
+        failure.error_name_len == 0 or
+        failure.error_name_len > abi.failure_error_name_capacity or
+        failure.error_name_hash == 0 or
+        failure.error_name_truncated > 1 or
+        !std.mem.eql(u8, &failure._reserved0, &@as([2]u8, @splat(0))) or
+        (failure.error_name_truncated != 0 and
+            failure.error_name_len != abi.failure_error_name_capacity) or
+        (failure.error_name_truncated == 0 and
+            stableErrorNameHash(failure.errorName()) != failure.error_name_hash) or
+        !std.mem.eql(
+            u8,
+            failure.error_name[failure.error_name_len..],
+            zero_name[failure.error_name_len..],
+        ))
+    {
+        return error.InvalidBoundaryFailureIdentity;
+    }
 }
 
 fn stableErrorNameHash(name: []const u8) u64 {
@@ -294,8 +349,9 @@ pub fn validateForTest() !void {
         }
     }
 
-    const declared = failureFromError(error.HAReadOnlyStandby, 7, 41);
+    const declared = failureFromError(error.HAReadOnlyStandby, .storage_owner, 7, 41);
     try std.testing.expectEqual(abi.Status.ha_read_only_standby, declared.status);
+    try std.testing.expectEqual(abi.FailureBoundary.storage_owner, declared.boundary);
     try std.testing.expectEqual(@as(u32, 7), declared.boundary_version);
     try std.testing.expectEqual(@as(u32, 41), declared.operation);
     try std.testing.expectEqualStrings("HAReadOnlyStandby", declared.errorName());
@@ -303,10 +359,49 @@ pub fn validateForTest() !void {
     try std.testing.expect(declared.error_name_hash != 0);
     try std.testing.expectError(error.HAReadOnlyStandby, statusToError(declared.status));
 
-    const defect = failureFromError(error.UnregisteredProviderDefect, 8, 42);
+    const defect = failureFromError(error.UnregisteredProviderDefect, .local_query, 8, 42);
     try std.testing.expectEqual(abi.Status.internal, defect.status);
     try std.testing.expectEqualStrings("UnregisteredProviderDefect", defect.errorName());
     try std.testing.expectError(error.StorageKernelFailure, statusToError(defect.status));
+
+    try validateFailureEnvelope(declared.status, &declared, 7);
+    try validateFailureEnvelope(defect.status, &defect, 8);
+    const success: abi.FailureIdentity = .{};
+    try validateFailureEnvelope(.ok, &success, abi.abi_version);
+    var mismatched = declared;
+    mismatched.status = .busy;
+    try std.testing.expectError(
+        error.InvalidBoundaryFailureIdentity,
+        validateFailureEnvelope(.ha_read_only_standby, &mismatched, 7),
+    );
+    try std.testing.expectError(
+        error.InvalidBoundaryFailureIdentity,
+        validateFailureEnvelope(.ok, &declared, 7),
+    );
+    var corrupted_hash = declared;
+    corrupted_hash.error_name_hash +%= 1;
+    try std.testing.expectError(
+        error.InvalidBoundaryFailureIdentity,
+        validateFailureEnvelope(.ha_read_only_standby, &corrupted_hash, 7),
+    );
+    var noncanonical_success: abi.FailureIdentity = .{};
+    noncanonical_success.error_name[0] = 'x';
+    try std.testing.expectError(
+        error.InvalidBoundaryFailureIdentity,
+        validateFailureEnvelope(.ok, &noncanonical_success, abi.abi_version),
+    );
+    var noncanonical_failure = declared;
+    noncanonical_failure.error_name[noncanonical_failure.error_name_len] = 'x';
+    try std.testing.expectError(
+        error.InvalidBoundaryFailureIdentity,
+        validateFailureEnvelope(.ha_read_only_standby, &noncanonical_failure, 7),
+    );
+    var oversized_name = declared;
+    oversized_name.error_name_len = abi.failure_error_name_capacity + 1;
+    try std.testing.expectError(
+        error.InvalidBoundaryFailureIdentity,
+        validateFailureEnvelope(.ha_read_only_standby, &oversized_name, 7),
+    );
 
     var relay = CallbackErrorRelay{};
     try std.testing.expectEqual(

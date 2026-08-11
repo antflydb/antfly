@@ -18,11 +18,50 @@ const std = @import("std");
 const client = @import("storage/db/enrichment/document_extraction_client.zig");
 const extraction = @import("storage/db/enrichment/document_extraction.zig");
 const abi = @import("kernel_owner_abi");
+const error_identity = @import("kernel_error_identity");
 
 const Downloaded = struct {
     data: []const u8,
     content_type: []const u8,
 };
+
+test "enrichment compute boundary identity relay preserves origin and attributes protocol defects to consumer" {
+    const failure = error_identity.failureFromError(
+        error.InvalidPdfHeader,
+        .enrichment_compute,
+        abi.abi_version,
+        @intFromEnum(abi.EnrichmentOperation.render_pdf_page),
+    );
+    var forwarded: abi.FailureIdentity = .{};
+    try client.acceptProviderFailure(
+        failure.status,
+        failure,
+        .validate_render_response,
+        &forwarded,
+    );
+    try std.testing.expectEqualDeep(failure, forwarded);
+
+    var malformed = failure;
+    malformed.operation = 0;
+    var replacement: abi.FailureIdentity = .{};
+    try std.testing.expectError(
+        error.InvalidBoundaryFailureIdentity,
+        client.acceptProviderFailure(
+            malformed.status,
+            malformed,
+            .validate_render_response,
+            &replacement,
+        ),
+    );
+    try std.testing.expectEqual(abi.Status.invalid_boundary_failure_identity, replacement.status);
+    try std.testing.expectEqual(abi.FailureBoundary.storage_owner, replacement.boundary);
+    try std.testing.expectEqual(abi.abi_version, replacement.boundary_version);
+    try std.testing.expectEqual(
+        @intFromEnum(abi.EnrichmentOperation.validate_render_response),
+        replacement.operation,
+    );
+    try std.testing.expectEqualStrings("InvalidBoundaryFailureIdentity", replacement.errorName());
+}
 
 test "enrichment compute boundary returns an owned extraction result" {
     const alloc = std.testing.allocator;
@@ -82,9 +121,27 @@ test "enrichment compute boundary preserves semantic provider error identity" {
         &failure,
     ));
     try std.testing.expectEqual(abi.Status.invalid_document_extraction_config, failure.status);
+    try std.testing.expectEqual(abi.FailureBoundary.enrichment_compute, failure.boundary);
     try std.testing.expectEqualStrings("InvalidDocumentExtractionConfig", failure.errorName());
     try std.testing.expectEqual(abi.abi_version, failure.boundary_version);
     try std.testing.expectEqual(@as(u32, 1), failure.operation);
+}
+
+test "enrichment compute boundary preflight failures carry a complete identity" {
+    var request = abi.EnrichmentExtractRequest{};
+    request.version = abi.abi_version - 1;
+    var failure: abi.FailureIdentity = .{};
+    const status = abi.antfly_enrichment_extract_stream(&request, &failure);
+    try std.testing.expectEqual(abi.Status.invalid_abi, status);
+    try std.testing.expectEqual(status, failure.status);
+    try std.testing.expectEqual(abi.FailureBoundary.enrichment_compute, failure.boundary);
+    try std.testing.expectEqual(abi.abi_version, failure.boundary_version);
+    try std.testing.expectEqual(
+        @intFromEnum(abi.EnrichmentOperation.extract_stream),
+        failure.operation,
+    );
+    try std.testing.expectEqualStrings("InvalidAbiVersion", failure.errorName());
+    try std.testing.expect(failure.error_name_hash != 0);
 }
 
 test "enrichment compute boundary retains undeclared provider diagnostic identity" {
@@ -98,6 +155,7 @@ test "enrichment compute boundary retains undeclared provider diagnostic identit
         &failure,
     ));
     try std.testing.expectEqual(abi.Status.internal, failure.status);
+    try std.testing.expectEqual(abi.FailureBoundary.enrichment_compute, failure.boundary);
     try std.testing.expect(failure.error_name_len > 0);
     try std.testing.expect(failure.error_name_hash != 0);
     try std.testing.expectEqual(abi.abi_version, failure.boundary_version);
@@ -135,5 +193,6 @@ test "enrichment compute boundary returns the exact consumer callback error" {
         &failure,
     ));
     try std.testing.expectEqual(abi.Status.ok, failure.status);
+    try std.testing.expectEqual(abi.FailureBoundary.none, failure.boundary);
     try std.testing.expectEqual(@as(u8, 0), failure.error_name_len);
 }
