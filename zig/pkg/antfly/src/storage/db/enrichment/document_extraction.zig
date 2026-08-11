@@ -15,6 +15,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
+const readers = @import("antfly_readers");
 // The PDF package has a dedicated test artifact. Keeping it out of the already
 // large Antfly unit-test root prevents the Zig compiler and test process from
 // approaching the 15 GiB CI runner limit. Production builds and the PDF/OCR
@@ -188,6 +189,7 @@ pub fn remoteContentErrorIsPermanent(err: anyerror) bool {
         error.PathNotAllowed,
         error.PeerAddressVerificationUnavailable,
         error.UnsupportedRemoteContentCredential,
+        error.CredentialDestinationNotAllowed,
         => true,
         else => false,
     };
@@ -837,6 +839,7 @@ pub fn parseConfig(alloc: Allocator, raw: []const u8) !Config {
     config.ocr_enabled = configured_ocr_fallback orelse false;
     config.ocr_pdf_fallback_enabled = configured_ocr_fallback orelse true;
     config.ocr_config_json = try parseOptionalProducerConfigJsonAlloc(alloc, object, "ocr", &config.ocr_enabled);
+    if (config.ocr_config_json.len > 0) try validateReaderConfigJson(alloc, config.ocr_config_json);
     if (has_explicit_ocr_config) config.ocr_pdf_fallback_enabled = config.ocr_enabled;
     try parseOcrOptions(alloc, object, &config);
     config.transcription_enabled = (try boolField(object, "transcribe_audio")) orelse false;
@@ -1004,6 +1007,20 @@ fn parseOptionalProducerConfigJsonAlloc(
         },
         else => return error.InvalidDocumentExtractionConfig,
     }
+}
+
+fn validateReaderConfigJson(alloc: Allocator, raw: []const u8) !void {
+    var parsed = std.json.parseFromSlice(readers.Config, alloc, raw, .{
+        .allocate = .alloc_always,
+        // Provider-owned options remain forward-compatible; the fields known
+        // to the active reader contract, especially its provider enum and
+        // scalar types, must still be valid at table admission.
+        .ignore_unknown_fields = true,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidDocumentExtractionConfig,
+    };
+    defer parsed.deinit();
 }
 
 fn parseRoutesAlloc(alloc: Allocator, object: std.json.ObjectMap) ![]Route {
@@ -3713,6 +3730,12 @@ test "generated text provider config is validated while parsing extraction confi
     const alloc = std.testing.allocator;
     try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(alloc,
         \\{"ocr":{"enabled":true,"config":{"model":"missing-provider"}}}
+    ));
+    try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(alloc,
+        \\{"ocr":{"enabled":true,"config":{"provider":"antfyl","model":"reader"}}}
+    ));
+    try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(alloc,
+        \\{"ocr":{"enabled":true,"config":{"provider":"antfly","max_tokens":"many"}}}
     ));
     try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(alloc,
         \\{"ocr":{"enabled":true,"config":"not-an-object"}}

@@ -374,6 +374,8 @@ fn validateRemoteContentConfig(config: *const config_mod.Config) !void {
             {
                 return error.InvalidRemoteContentConfig;
             }
+            if (parsed.user != null or parsed.password != null or parsed.query != null or parsed.fragment != null)
+                return error.InvalidRemoteContentConfig;
         }
         var header_it = credential.headers.iterator();
         while (header_it.next()) |header| {
