@@ -29,6 +29,10 @@ const table_reads = @import("../api/table_reads.zig");
 const table_writes = @import("../api/table_writes.zig");
 const shard_state_store = @import("../data/storage/shard_state_store.zig");
 
+test "bulk callback ABI retains exact consumer error identity" {
+    try kernel_owner_source.ProvisionedKernelOwnerSource.validateBulkCallbackIdentityForTest();
+}
+
 fn cleanup(path: []const u8) void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();

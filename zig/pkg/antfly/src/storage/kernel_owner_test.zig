@@ -766,6 +766,10 @@ test "opaque storage owner validates ABI and destruction is idempotent" {
     try std.testing.expectError(error.IdentityReadGenerationChanged, client.statusToError(.identity_read_generation_changed));
     try std.testing.expectError(error.Timeout, client.statusToError(.timeout));
     try std.testing.expectError(error.Cancelled, client.statusToError(.cancelled));
+    try std.testing.expectError(
+        error.DenseRepairBackpressure,
+        client.statusToError(.dense_repair_backpressure),
+    );
 
     var empty: abi.OwnedBytes = .{};
     abi.antfly_storage_owner_buffer_destroy(&empty);

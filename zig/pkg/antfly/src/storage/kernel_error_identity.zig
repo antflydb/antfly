@@ -152,6 +152,7 @@ const mappings = [_]Mapping{
     .{ .status = .durable_file_sync_unsupported, .err = error.DurableFileSyncUnsupported },
     .{ .status = .unsupported_platform, .err = error.UnsupportedPlatform },
     .{ .status = .unsupported_evented_io_runtime, .err = error.UnsupportedEventedIoRuntime },
+    .{ .status = .dense_repair_backpressure, .err = error.DenseRepairBackpressure },
     .{ .status = .active_node_finalize_rejected, .err = error.ActiveNodeFinalizeRejected },
     .{ .status = .applied_snapshot_index_mismatch, .err = error.AppliedSnapshotIndexMismatch },
     .{ .status = .invalid_committed_entries_encoding, .err = error.InvalidCommittedEntriesEncoding },
@@ -198,6 +199,50 @@ pub fn statusToError(status: abi.Status) !void {
     return error.StorageKernelFailure;
 }
 
+/// Build the wire identity for a provider error. Declared errors retain their
+/// stable semantic status; undeclared defects retain their bounded diagnostic
+/// name while deliberately using `.internal` for control flow.
+pub fn failureFromError(err: anyerror, boundary_version: u32, operation: u32) abi.FailureIdentity {
+    var result = abi.FailureIdentity{
+        .status = statusFromError(err),
+        .boundary_version = boundary_version,
+        .operation = operation,
+    };
+    const name = @errorName(err);
+    const len = @min(name.len, abi.failure_error_name_capacity);
+    @memcpy(result.error_name[0..len], name[0..len]);
+    result.error_name_len = @intCast(len);
+    result.error_name_truncated = @intFromBool(name.len > len);
+    result.error_name_hash = stableErrorNameHash(name);
+    return result;
+}
+
+fn stableErrorNameHash(name: []const u8) u64 {
+    var hash: u64 = 14_695_981_039_346_656_037;
+    for (name) |byte| {
+        hash ^= byte;
+        hash *%= 1_099_511_628_211;
+    }
+    return hash;
+}
+
+/// Consumer-owned relay for callbacks invoked across a provider boundary.
+/// The ABI sees only a protocol sentinel so it can unwind; the originating
+/// consumer receives the exact error value after the provider returns.
+pub const CallbackErrorRelay = struct {
+    exact_error: ?anyerror = null,
+
+    pub fn capture(self: *CallbackErrorRelay, err: anyerror) abi.Status {
+        if (self.exact_error == null) self.exact_error = err;
+        return .storage_kernel_callback_failed;
+    }
+
+    pub fn finish(self: *const CallbackErrorRelay, provider_status: abi.Status) !void {
+        if (self.exact_error) |err| return err;
+        return statusToError(provider_status);
+    }
+};
+
 fn hasRegisteredIdentity(status: abi.Status) bool {
     inline for (mappings) |mapping| {
         if (status == mapping.status) return true;
@@ -230,6 +275,29 @@ pub fn validateForTest() !void {
             try std.testing.expect(lhs.err != rhs.err);
         }
     }
+
+    const declared = failureFromError(error.HAReadOnlyStandby, 7, 41);
+    try std.testing.expectEqual(abi.Status.ha_read_only_standby, declared.status);
+    try std.testing.expectEqual(@as(u32, 7), declared.boundary_version);
+    try std.testing.expectEqual(@as(u32, 41), declared.operation);
+    try std.testing.expectEqualStrings("HAReadOnlyStandby", declared.errorName());
+    try std.testing.expectEqual(@as(u8, 0), declared.error_name_truncated);
+    try std.testing.expect(declared.error_name_hash != 0);
+    try std.testing.expectError(error.HAReadOnlyStandby, statusToError(declared.status));
+
+    const defect = failureFromError(error.UnregisteredProviderDefect, 8, 42);
+    try std.testing.expectEqual(abi.Status.internal, defect.status);
+    try std.testing.expectEqualStrings("UnregisteredProviderDefect", defect.errorName());
+    try std.testing.expectError(error.StorageKernelFailure, statusToError(defect.status));
+
+    var relay = CallbackErrorRelay{};
+    try std.testing.expectEqual(
+        abi.Status.storage_kernel_callback_failed,
+        relay.capture(error.CallbackReadOnly),
+    );
+    _ = relay.capture(error.LaterCallbackFailure);
+    try std.testing.expectError(error.CallbackReadOnly, relay.finish(.storage_kernel_callback_failed));
+    try std.testing.expectError(error.CallbackReadOnly, relay.finish(.ha_read_only_standby));
 }
 
 test "registered storage-kernel errors are unique and round trip without losing identity" {

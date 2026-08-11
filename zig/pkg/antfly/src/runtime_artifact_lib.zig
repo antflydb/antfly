@@ -152,7 +152,9 @@ fn runtimeEntry(
             error.InvalidCharacter, error.InvalidArguments => "invalid command-line value; run with --help",
             else => "startup failed; see the preceding diagnostic for details",
         };
-        std.debug.print("antfly {s}: {s}\n", .{ role_name, message });
+        // The process-level ABI intentionally returns only success/failure,
+        // but diagnostics must retain the exact originating Zig error name.
+        std.debug.print("antfly {s}: {s} err={s}\n", .{ role_name, message, @errorName(err) });
         return 1;
     };
     return 0;

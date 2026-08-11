@@ -9075,7 +9075,10 @@ pub fn build(b: *std.Build) void {
                 );
                 const provisioned_owner_tests = b.addTest(.{
                     .root_module = provisioned_owner_test_mod,
-                    .filters = &.{"provisioned batch lookup scan and query share one opaque live storage owner"},
+                    .filters = &.{
+                        "provisioned batch lookup scan and query share one opaque live storage owner",
+                        "bulk callback ABI retains exact consumer error identity",
+                    },
                     .test_runner = .{
                         .path = b.path("pkg/antfly/src/test_runner.zig"),
                         .mode = .simple,

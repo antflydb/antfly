@@ -244,11 +244,9 @@ pub const Owner = struct {
     }
 
     pub fn preflightWriteAdmission(self: *Owner, table_name: []const u8) !void {
-        const status = abi.antfly_storage_owner_preflight_write_admission(self.handle, &.{
+        try statusToError(abi.antfly_storage_owner_preflight_write_admission(self.handle, &.{
             .table_name = .fromSlice(table_name),
-        });
-        if (status == .busy) return error.DenseRepairBackpressure;
-        try statusToError(status);
+        }));
     }
 
     pub fn findMedianKey(self: *Owner, table_name: []const u8) !?Response {
@@ -268,7 +266,15 @@ pub const Owner = struct {
     }
 
     pub fn finishBulkIngest(self: *Owner, request: *const abi.BulkFinishRequest) !void {
-        try statusToError(abi.antfly_storage_owner_bulk_finish(self.handle, request));
+        try statusToError(self.finishBulkIngestStatus(request));
+    }
+
+    /// Raw status is exposed only for a synchronous consumer adapter that owns
+    /// callback error state. It must inspect that state before translating the
+    /// provider status so the unwind sentinel cannot replace the exact
+    /// callback-originated error.
+    pub fn finishBulkIngestStatus(self: *Owner, request: *const abi.BulkFinishRequest) abi.Status {
+        return abi.antfly_storage_owner_bulk_finish(self.handle, request);
     }
 
     pub fn abortBulkIngest(self: *Owner, table_name: []const u8) !void {

@@ -3749,7 +3749,7 @@ pub fn storageOwnerPreflightWriteAdmission(
     if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
     const handle = asHandle(owner) orelse return .invalid_argument;
     _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
-    return if (handle.db.denseRepairWriteBackpressured()) .busy else .ok;
+    return if (handle.db.denseRepairWriteBackpressured()) .dense_repair_backpressure else .ok;
 }
 
 pub fn storageOwnerFindMedianKey(

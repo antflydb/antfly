@@ -15,7 +15,7 @@
 //! Versioned internal ABI for the storage kernel's live DB owner. Keep this
 //! module free of storage and distributed-runtime imports.
 
-pub const abi_version: u32 = 29;
+pub const abi_version: u32 = 30;
 
 pub const BorrowedBytes = extern struct {
     ptr: ?[*]const u8 = null,
@@ -297,7 +297,32 @@ pub const Status = enum(u32) {
     durable_file_sync_unsupported = 144,
     unsupported_platform = 145,
     unsupported_evented_io_runtime = 146,
+    dense_repair_backpressure = 147,
     internal = 255,
+};
+
+/// Lossless failure metadata for compiled operation and per-item boundaries.
+///
+/// `status` is the stable semantic identity used for control flow.  The
+/// bounded name is diagnostic evidence: it preserves an undeclared provider
+/// error without turning compiler-assigned Zig error values or strings into a
+/// public ABI.  Consumers must branch only on `status`.
+pub const failure_error_name_capacity: usize = 127;
+
+pub const FailureIdentity = extern struct {
+    status: Status = .ok,
+    boundary_version: u32 = abi_version,
+    operation: u32 = 0,
+    error_name_len: u8 = 0,
+    error_name_truncated: u8 = 0,
+    _reserved0: [2]u8 = @splat(0),
+    /// Stable FNV-1a hash of the complete (possibly longer) provider name.
+    error_name_hash: u64 = 0,
+    error_name: [failure_error_name_capacity]u8 = @splat(0),
+
+    pub fn errorName(self: *const FailureIdentity) []const u8 {
+        return self.error_name[0..self.error_name_len];
+    }
 };
 
 /// Process-scoped physical-storage owner. The handle owns shared caches and

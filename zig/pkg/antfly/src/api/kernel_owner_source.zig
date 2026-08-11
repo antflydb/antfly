@@ -2037,6 +2037,7 @@ pub const ProvisionedKernelOwnerSource = struct {
 
     const BulkFinishCallbacks = struct {
         options: backend_types.BulkIngestFinishOptions,
+        error_relay: kernel_error_identity.CallbackErrorRelay = .{},
 
         fn progress(
             ctx: ?*anyopaque,
@@ -2060,10 +2061,39 @@ pub const ProvisionedKernelOwnerSource = struct {
 
         fn admission(ctx: ?*anyopaque) callconv(.c) abi.Status {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
-            self.options.checkAdmission() catch |err| return kernel_error_identity.statusFromError(err);
+            self.options.checkAdmission() catch |err| return self.error_relay.capture(err);
             return .ok;
         }
     };
+
+    pub fn validateBulkCallbackIdentityForTest() !void {
+        const Admission = struct {
+            fn fail(_: *anyopaque) !void {
+                return error.TestBulkAdmissionIdentity;
+            }
+        };
+        var admission_context: u8 = 0;
+        var callbacks = BulkFinishCallbacks{ .options = .{
+            .admission_ctx = &admission_context,
+            .admission_fn = Admission.fail,
+        } };
+        const callback_status = BulkFinishCallbacks.admission(&callbacks);
+
+        // Model the real provider adapter: callback status becomes a Zig
+        // error inside storage, then becomes a status again at the exported
+        // operation boundary. The consumer relay must still win.
+        const provider_status = blk: {
+            kernel_error_identity.statusToError(callback_status) catch |err| {
+                break :blk kernel_error_identity.statusFromError(err);
+            };
+            break :blk abi.Status.ok;
+        };
+        try std.testing.expectEqual(abi.Status.storage_kernel_callback_failed, provider_status);
+        try std.testing.expectError(
+            error.TestBulkAdmissionIdentity,
+            callbacks.error_relay.finish(provider_status),
+        );
+    }
 
     fn finishBulkIngestGroupLocal(
         ptr: *anyopaque,
@@ -2102,7 +2132,8 @@ pub const ProvisionedKernelOwnerSource = struct {
             else
                 null,
         };
-        try lease.owner().finishBulkIngest(&request);
+        const status = lease.owner().finishBulkIngestStatus(&request);
+        try callbacks.error_relay.finish(status);
         lease.entry.bulk_ingest_active.store(false, .release);
         return {};
     }

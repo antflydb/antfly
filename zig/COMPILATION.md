@@ -1,6 +1,6 @@
 # Antfly Zig compilation architecture
 
-Last updated: 2026-08-10
+Last updated: 2026-08-11
 
 ## Main goal
 
@@ -56,7 +56,9 @@ Repeat this loop until the main goal and exit criteria are satisfied:
 3. Implement the boundary behind the storage-kernel experiment. Preserve one
    static executable, embedded standalone inference, normal build concurrency,
    the small C API surface, exact behavior/error/cancellation ownership, and
-   provider-to-consumer error identity.
+   provider-to-consumer error identity. Model call failure, item outcome, and
+   callback failure as independent channels; do not let one overwrite or
+   normalize another.
 4. Validate the affected behavior in both experiment-enabled and legacy
    configurations, then run graph gates, ABI tests, artifact/symbol audits, and
    a genuinely cold ARM64 `ReleaseFast` comparison.
@@ -3368,6 +3370,57 @@ shapes remain defects. This experiment is worth implementing only as a complete
 bounded-window operation; the 24-second decoder-only adapter and direct-store
 callback variants are not candidates.
 
+Callbacks form a third identity domain, independent of both response domains.
+When consumer code invoked by a provider callback returns an error, the
+consumer adapter records that exact Zig error in call-scoped state and returns
+only a callback-failed protocol sentinel to unwind the provider. After the
+provider returns, the consumer rethrows the recorded error. The sentinel must
+never escape as the apparent operation failure, and a provider failure must
+never overwrite a callback error that already occurred.
+
+An undeclared provider error is a contract defect rather than a new implicit
+public status. It maps to `internal` for control flow, but the result also
+carries bounded diagnostic identity (the original provider error name, a
+stable hash of the complete name, and the operation/boundary version) for logs
+and failure-ledger evidence. Consumers do not branch on this diagnostic
+payload. If the error is expected and actionable, the next ABI revision must
+assign it a stable registered status and add the bidirectional round-trip test.
+This retains operational identity without pretending arbitrary
+compiler-assigned Zig errors are a stable ABI.
+
+### Phase 4r: boundary identity hardening
+
+Before adding another physical split, the shared ABI now defines one reusable
+`FailureIdentity`: a stable semantic `Status`, boundary version, operation ID,
+bounded readable provider error name, truncation bit, and stable hash of the
+complete name. Declared errors still round trip through the exhaustive
+bidirectional registry. An undeclared defect remains `internal` for control
+flow, but no longer becomes operationally indistinguishable from every other
+provider defect in diagnostics.
+
+The audit also removed an existing context-dependent identity translation:
+write-admission backpressure previously crossed as generic `busy` and the
+client guessed `DenseRepairBackpressure` from the operation being called. ABI
+30 assigns `dense_repair_backpressure` its own registered status, so
+`StorageBusy` and `DenseRepairBackpressure` remain distinct in both directions.
+
+The first synchronous reverse-callback adapter uses a consumer-owned
+`CallbackErrorRelay`. Bulk-finish admission stores the exact `anyerror`,
+returns `storage_kernel_callback_failed` only to unwind the storage provider,
+receives the raw provider status, and rethrows the stored error before ordinary
+status translation. The test models the complete callback-status -> provider
+error -> exported-status round trip with an error that is intentionally absent
+from the shared registry. A second registry canary proves that a different
+provider status cannot overwrite the first callback failure. Process-level
+runtime entry points also print the exact originating error name even though
+their deliberate external contract remains a success/failure exit code.
+
+This is a bounded prerequisite rather than a compiler-graph experiment. It
+adds no implementation import to a consumer unit and changes no existing
+exported function signature. Every new coarse operation must use this shape
+for call failures and use the same semantic identity inside per-item tagged
+outcomes; it must not introduce a boundary-specific broad error mapper.
+
 ## Holistic target architecture
 
 The current candidate is the opt-in four-unit source-selected topology above.
@@ -3445,9 +3498,20 @@ before becoming the production architecture:
 - Each expected failure has one stable status identity in the shared
   bidirectional registry. Do not merge distinct failures into `busy`,
   `cancelled`, `invalid_argument`, or `internal` merely to shorten an adapter.
+- Operation state (`pending`, `partial`, continuation position, retryability,
+  lifecycle phase, or cancellation observation) is carried by typed fields or
+  tagged outcomes. It is not encoded by borrowing an error status.
+- Batched operations have separate call-level and per-item result channels. A
+  successful call can contain exact item failures; an item failure must not be
+  promoted to a generic call failure or hidden by an overall `ok`.
+- A callback-originated error is stored in consumer-owned call state and
+  rethrown exactly after the provider unwinds. Callback protocol sentinels are
+  not domain-error identities.
 - `internal` is reserved for defects not declared by the operation contract;
-  provider/client tests must prove representative declared errors round trip
-  with their original Zig error identity.
+  its diagnostic payload retains the provider error name, full-name hash, and
+  boundary version, but consumers may not branch on that payload.
+  Provider/client tests must prove representative declared errors and callback
+  errors round trip with their original Zig error identity.
 - Calls represent complete operations: one group query, one batch, one
   transaction phase, one restore publication, or one maintenance request.
 - Do not cross the ABI per document, posting, edge, LMDB operation, or vector
