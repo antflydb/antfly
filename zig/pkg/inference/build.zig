@@ -1492,10 +1492,10 @@ pub fn build(b: *std.Build) void {
         quant_kernel_local_check_step.dependOn(&run_quant_kernel_metal_renderer_tests.step);
         quant_kernel_metal_local_check_step.dependOn(&run_quant_kernel_metal_renderer_tests.step);
     }
-    const run_quant_kernel_cuda_microbench_tests = b.addRunArtifact(tests);
-    run_quant_kernel_cuda_microbench_tests.addArg("--test-filter");
-    run_quant_kernel_cuda_microbench_tests.addArg("cuda microbench");
-    if (targetRunsOnBuildHost(b, target)) {
+    if (enable_cuda and targetRunsOnBuildHost(b, target)) {
+        const run_quant_kernel_cuda_microbench_tests = b.addRunArtifact(tests);
+        run_quant_kernel_cuda_microbench_tests.addArg("--test-filter");
+        run_quant_kernel_cuda_microbench_tests.addArg("cuda microbench");
         quant_kernel_local_check_step.dependOn(&run_quant_kernel_cuda_microbench_tests.step);
     }
     const test_step = b.step("test", "Run unit tests");
