@@ -675,9 +675,27 @@ const AntflyRootImports = struct {
     };
 
     fn configure(self: @This(), b: *std.Build, mod: *std.Build.Module, include_lmdb_c: bool, link_libc: bool) void {
+        self.configureRuntime(b, mod, include_lmdb_c, link_libc, true);
+    }
+
+    /// Install the production runtime imports while keeping the heavyweight
+    /// inference server graph out of compilation units that only exchange its
+    /// language-neutral bridge types. Supporting inference API, chunking,
+    /// extraction, and audio modules remain available because distributed
+    /// server roles genuinely use them.
+    fn configureRuntime(
+        self: @This(),
+        b: *std.Build,
+        mod: *std.Build.Module,
+        include_lmdb_c: bool,
+        link_libc: bool,
+        include_inference_server: bool,
+    ) void {
         mod.addOptions("build_options", self.build_options);
         inline for (import_table) |entry| {
-            mod.addImport(entry.name, @field(self, entry.field));
+            if (include_inference_server or !std.mem.eql(u8, entry.name, "inference_server")) {
+                mod.addImport(entry.name, @field(self, entry.field));
+            }
         }
         mod.addImport("antfly_platform", self.platform);
         if (link_libc and !self.platform_link_libc) {
@@ -2330,6 +2348,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = link_libc,
         .strip = strip,
     });
+    addMacosSdkPaths(b, libantfly_link_mod, target);
     const libantfly = b.addLibrary(.{
         .linkage = .dynamic,
         .name = "antfly",
@@ -8832,16 +8851,25 @@ pub fn build(b: *std.Build) void {
         mod.addOptions("build_options", build_options);
         break :blk mod;
     };
+    addMacosSdkPaths(b, antfly_main_mod, target);
 
     const antfly_main = b.addExecutable(.{
         .name = "antfly",
         .root_module = antfly_main_mod,
     });
 
+    var runtime_library_artifacts: [std.meta.fields(RuntimeLibraryUnit).len]?*std.Build.Step.Compile = @splat(null);
     inline for (std.meta.tags(RuntimeLibraryUnit)) |unit| {
         // The C API reuses the distributed PIC archive independently of the
-        // executable edition. Other runtime units exist only in the full graph.
-        if (edition == .full or unit == .distributed) {
+        // executable edition. Focused artifacts also reuse their owning units
+        // instead of recompiling a role's implementation in an executable.
+        const focused_role_needs_unit = if (runtime_artifact_role) |role| switch (role) {
+            .cli => unit == .cli or unit == .distributed,
+            .data, .metadata => unit == .api_kernel or unit == .distributed,
+            .inference => unit == .inference,
+            .standalone => unit != .cli,
+        } else false;
+        if (edition == .full or unit == .distributed or focused_role_needs_unit) {
             const unit_options = b.addOptions();
             unit_options.addOption(RuntimeLibraryUnit, "unit", unit);
 
@@ -8852,7 +8880,14 @@ pub fn build(b: *std.Build) void {
                 .sanitize_thread = sanitize_thread,
                 .pic = if (unit == .distributed) true else null,
             });
-            production_antfly_imports.configure(b, role_mod, false, link_libc);
+            production_antfly_imports.configureRuntime(
+                b,
+                role_mod,
+                false,
+                link_libc,
+                unit == .inference,
+            );
+            addMacosSdkPaths(b, role_mod, target);
             role_mod.addImport("antfly-client", antfly_client_pkg_mod);
             if (unit == .distributed) role_mod.addImport("antfly_storage_root", role_mod);
             role_mod.addOptions("runtime_library_options", unit_options);
@@ -8888,6 +8923,7 @@ pub fn build(b: *std.Build) void {
                     .cli => 2 * 1024 * 1024 * 1024,
                 },
             });
+            runtime_library_artifacts[@intFromEnum(unit)] = role_artifact;
             if (unit == .distributed) {
                 // The executable and C ABI libraries share this one optimized
                 // PIC object. Give the final links enough section granularity
@@ -8923,23 +8959,35 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .sanitize_thread = sanitize_thread,
         });
-        production_antfly_imports.configure(b, role_mod, false, link_libc);
-        role_mod.addImport("antfly-client", antfly_client_pkg_mod);
+        role_mod.addImport("structlog", structlog_mod);
+        role_mod.link_libc = link_libc;
+        addMacosSdkPaths(b, role_mod, target);
         role_mod.addOptions("runtime_artifact_options", role_options);
-        const role_usermgr_storage_mod = b.createModule(.{
-            .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
-            .target = target,
-            .optimize = optimize,
-        });
-        role_usermgr_storage_mod.addImport("antfly_root", role_mod);
-        role_usermgr_storage_mod.addImport("antfly_platform", platform_mod);
-        role_mod.addImport("usermgr_storage", role_usermgr_storage_mod);
 
         const role_name = @tagName(role);
         const role_exe = b.addExecutable(.{
             .name = b.fmt("antfly-{s}", .{role_name}),
             .root_module = role_mod,
         });
+        role_exe.link_gc_sections = true;
+        switch (role) {
+            .cli => {
+                role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.cli)].?);
+                role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.distributed)].?);
+            },
+            .data, .metadata => {
+                role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.api_kernel)].?);
+                role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.distributed)].?);
+            },
+            .inference => {
+                role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.inference)].?);
+            },
+            .standalone => {
+                role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.api_kernel)].?);
+                role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.distributed)].?);
+                role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.inference)].?);
+            },
+        }
         if (strip) {
             var visited = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
             defer visited.deinit();

@@ -137,6 +137,8 @@ pub const Detail = enum(c_int) {
     table_block_checksum_mismatch,
     value_too_long,
     unsupported_platform,
+    // Append-only: numeric Detail values are part of the stable C ABI.
+    unsupported_transform_operation,
 };
 
 pub const Status = extern struct {
@@ -219,6 +221,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.MethodNotAllowed => status(.unsupported, .method_not_allowed),
         error.Unsupported => status(.unsupported, .unsupported),
         error.UnsupportedOperation => status(.unsupported, .unsupported_operation),
+        error.UnsupportedTransformOperation => status(.invalid_argument, .unsupported_transform_operation),
         error.UnsupportedQueryRequest => status(.unsupported, .unsupported_query_request),
         error.UnsupportedFilterQueryRequest => status(.unsupported, .unsupported_filter_query_request),
         error.UnsupportedExclusionQueryRequest => status(.unsupported, .unsupported_exclusion_query_request),
@@ -393,6 +396,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .table_block_checksum_mismatch => "TableBlockChecksumMismatch",
         .value_too_long => "ValueTooLong",
         .unsupported_platform => "UnsupportedPlatform",
+        .unsupported_transform_operation => "UnsupportedTransformOperation",
     };
 }
 
@@ -404,6 +408,7 @@ test "stable status preserves public boundary semantics" {
     try std.testing.expectEqual(error.ResourceRequestTooLarge, errorFromStatus(statusFromError(error.ResourceRequestTooLarge)));
     try std.testing.expectEqual(error.ResourceTemporarilyUnavailable, errorFromStatus(statusFromError(error.ResourceTemporarilyUnavailable)));
     try std.testing.expectEqual(error.UnsupportedPlatform, errorFromStatus(statusFromError(error.UnsupportedPlatform)));
+    try std.testing.expectEqual(error.UnsupportedTransformOperation, errorFromStatus(statusFromError(error.UnsupportedTransformOperation)));
     try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(statusFromError(error.UnitPrivateError)));
 }
 

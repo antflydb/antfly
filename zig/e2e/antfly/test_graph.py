@@ -689,6 +689,90 @@ def test_serverless_graph_pattern_two_hop_and_documents(serverless_api):
     assert match["path"][1]["target"] == "doc-c"
 
 
+def test_multi_batch_graph_push_preserves_boundary_error_and_existing_edges(backup_api):
+    table_name = f"graph_transform_boundary_{time.time_ns()}"
+    _create_stateful_table(backup_api, table_name, num_shards=1)
+    assert (
+        _create_index(
+            backup_api,
+            table_name,
+            "graph_idx",
+            {
+                "name": "graph_idx",
+                "type": "graph",
+                "edge_types": [{"name": "knows"}],
+            },
+        )
+        == {}
+    )
+    seeded = _batch_write_stateful(
+        backup_api,
+        table_name,
+        inserts={
+            "doc-a": {
+                "title": "alpha",
+                "_edges": {"graph_idx": {"knows": [{"target": "doc-b", "weight": 1.0}]}},
+            },
+            "doc-b": {"title": "beta"},
+            "doc-c": {"title": "gamma"},
+        },
+        sync_level="full_index",
+    )
+    assert seeded["inserted"] == 3
+
+    # Transaction intents cannot yet carry projected graph deltas. The
+    # distributed unit must preserve this exact storage-domain error across the
+    # stable runtime ABI so the public handler rejects the request as 400.
+    response = backup_api._request(
+        "POST",
+        "/batch",
+        {
+            "tables": {
+                table_name: {
+                    "transforms": [
+                        {
+                            "key": "doc-a",
+                            "operations": [
+                                {"op": "$set", "path": "title", "value": "must-not-commit"},
+                                {
+                                    "op": "$push",
+                                    "path": "$._edges.graph_idx.knows",
+                                    "value": {"target": "doc-c", "weight": 2.0},
+                                },
+                            ],
+                        }
+                    ],
+                    "sync_level": "full_index",
+                }
+            },
+            "sync_level": "full_index",
+        },
+    )
+    assert response.status_code == 400, response.text
+    assert backup_api.lookup_key(table_name, "doc-a")["title"] == "alpha"
+
+    neighbors_payload = {
+        "graph_searches": {
+            "neighbors": {
+                "type": "neighbors",
+                "index_name": "graph_idx",
+                "start_nodes": {"keys": ["doc-a"]},
+                "params": {"edge_types": ["knows"], "direction": "out"},
+            }
+        },
+        "limit": 10,
+    }
+    neighbor_result = _wait_for_graph_result(
+        backup_api,
+        table_name,
+        neighbors_payload,
+        "neighbors",
+        lambda result: result.get("total") == 1,
+    )
+    assert neighbor_result is not None
+    assert [node["key"] for node in neighbor_result["nodes"]] == ["doc-b"]
+
+
 def test_stateful_graph_field_edges_extract_and_update(backup_api):
     table_name = f"graph_field_edges_{time.time_ns()}"
 
