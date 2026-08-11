@@ -380,6 +380,10 @@ fn singleBackendPreference(backend: backends_mod.BackendType) []const backends_m
 var active_node: ?*Node = null;
 var active_models_dir: ?[]const u8 = null;
 
+fn generationKvSlidingTrimForced() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_KV_SLIDING_TRIM", false);
+}
+
 fn embedTimingEnabled() bool {
     return platform.env.getenvBoolDefault("TERMITE_EMBED_TIMING", false);
 }
@@ -1869,7 +1873,9 @@ pub const Node = struct {
     fn countPromptTokens(
         allocator: std.mem.Allocator,
         model: *model_manager_mod.LoadedModel,
+        gpt_config: gpt_model_mod.Config,
         messages: []const generation.Message,
+        max_tokens: i32,
     ) !usize {
         const prompt = if (model.chat_tmpl) |ct|
             try ct.apply(allocator, messages, true)
@@ -1877,11 +1883,19 @@ pub const Node = struct {
             try generation.formatMessages(allocator, messages);
         defer allocator.free(prompt);
 
-        var encoded = try generation.encodePromptForGeneration(
+        const media_allowance = generation.nativeGenerationMediaTokenAllowance(messages, gpt_config);
+        const prompt_token_limit = try generation.nativeGenerationPromptTokenLimit(
+            gpt_config,
+            null,
+            @intCast(@max(max_tokens, 1)),
+            0,
+            media_allowance,
+        );
+        var encoded = try generation.encodeNativeGenerationPrompt(
             model.getTokenizer(),
             allocator,
             prompt,
-            2048,
+            prompt_token_limit,
             model.manifest.add_bos_token,
             model.manifest.bos_token,
         );
@@ -1890,7 +1904,7 @@ pub const Node = struct {
         var prompt_tokens: usize = 0;
         while (prompt_tokens < encoded.attention_mask.len and encoded.attention_mask[prompt_tokens] != 0) : (prompt_tokens += 1) {}
         if (prompt_tokens == 0) return error.EmptyPrompt;
-        return prompt_tokens;
+        return std.math.add(usize, prompt_tokens, media_allowance) catch error.PromptTooLong;
     }
 
     fn generateMessagesDirectMaxTokens(
@@ -1945,7 +1959,7 @@ pub const Node = struct {
             runtime.tier.memory.defaultLimitsForBackend(budget_backend_class),
         ));
         var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
-        const prompt_tokens = try countPromptTokens(allocator, model, messages);
+        const prompt_tokens = try countPromptTokens(allocator, model, gpt_config, messages, max_tokens);
         const resource_estimate = try runtime.tier.memory.estimateGptGeneration(
             backend_kind,
             kv_dtype,
@@ -1985,32 +1999,9 @@ pub const Node = struct {
         };
         defer cb.deinit();
 
-        const sliding_window_size: ?u32 = if (gpt_config.position_encoding == .absolute)
-            null
-        else if (gpt_config.sliding_window > 0)
-            gpt_config.sliding_window
-        else if (gpt_config.max_position_embeddings > 0)
-            gpt_config.max_position_embeddings
-        else
-            null;
-        const pool_id = try kv_manager.addPool(.{
-            .backend = backend_kind,
-            .dtype = kv_dtype,
-            .page_size_tokens = 16,
-            .num_layers_packed = @intCast(gpt_config.num_hidden_layers),
-            .num_kv_heads = gpt_config.maxKvHeads(),
-            .head_dim = gpt_config.maxHeadDim(),
-            .sliding_window_size = sliding_window_size,
-        });
-        var kv_storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, .{
-            .backend = backend_kind,
-            .dtype = kv_dtype,
-            .page_size_tokens = 16,
-            .num_layers_packed = @intCast(gpt_config.num_hidden_layers),
-            .num_kv_heads = gpt_config.maxKvHeads(),
-            .head_dim = gpt_config.maxHeadDim(),
-            .sliding_window_size = sliding_window_size,
-        });
+        const kv_pool_config = generation.kvPoolConfig(backend_kind, kv_dtype, gpt_config, generationKvSlidingTrimForced());
+        const pool_id = try kv_manager.addPool(kv_pool_config);
+        var kv_storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, kv_pool_config);
         defer kv_storage.deinit();
         try cb.provisionKvDeviceWriteHook(&kv_storage);
         var decode_state = generation.NativeDecodeState.initPaged(allocator, &kv_manager, pool_id, model.shared_moe_cache);
@@ -2763,7 +2754,10 @@ pub const Node = struct {
         self: *Node,
         allocator: std.mem.Allocator,
         model: *model_manager_mod.LoadedModel,
+        gpt_config: gpt_model_mod.Config,
         messages: []const generation.Message,
+        max_tokens: i32,
+        speculative_bonus_tokens: usize,
     ) !usize {
         _ = self;
         const prompt = if (model.chat_tmpl) |ct|
@@ -2771,18 +2765,26 @@ pub const Node = struct {
         else
             try generation.formatMessages(allocator, messages);
         defer allocator.free(prompt);
-        var encoded = try generation.encodePromptForGeneration(
+        const media_allowance = generation.nativeGenerationMediaTokenAllowance(messages, gpt_config);
+        const prompt_token_limit = try generation.nativeGenerationPromptTokenLimit(
+            gpt_config,
+            null,
+            @intCast(@max(max_tokens, 1)),
+            speculative_bonus_tokens,
+            media_allowance,
+        );
+        var encoded = try generation.encodeNativeGenerationPrompt(
             model.getTokenizer(),
             allocator,
             prompt,
-            2048,
+            prompt_token_limit,
             model.manifest.add_bos_token,
             model.manifest.bos_token,
         );
         defer encoded.deinit();
         var count: usize = 0;
         while (count < encoded.attention_mask.len and encoded.attention_mask[count] != 0) : (count += 1) {}
-        return count;
+        return std.math.add(usize, count, media_allowance) catch error.PromptTooLong;
     }
 
     fn memoryBudgetExceededMessage(
@@ -3761,22 +3763,6 @@ pub const Node = struct {
         const model = model_handle.get();
         model.lockNativeGeneration();
         defer model.unlockNativeGeneration();
-        const prompt_bytes = self.estimateGeneratePromptBytes(messages.items);
-        const prompt_tokens = self.estimateNativePromptTokens(ctx.allocator, model, messages.items) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "TOKENIZE_FAILED", .message = @errorName(err) });
-        var native_generate_lease: ?runtime.scheduler.native_generate.Lease = null;
-        defer if (native_generate_lease) |lease| {
-            if (model.native_generate_coordinator) |coordinator| coordinator.release(lease);
-        };
-        if (model.native_generate_coordinator) |coordinator| {
-            native_generate_lease = try coordinator.acquire(.{
-                .requested_units = queue_units,
-                .prompt_bytes = prompt_bytes,
-                .max_tokens = configured_max_tokens,
-            });
-            config.prefill_chunk_size = native_generate_lease.?.prefill_chunk_size;
-        }
-
         const gpt_config = session_factory.getGptConfig(model.session) orelse {
             // The session is not a decoder at all, which in practice means the
             // architecture was never recognized and the model fell through to the
@@ -3795,6 +3781,36 @@ pub const Node = struct {
                 ),
             });
         };
+        const prompt_bytes = self.estimateGeneratePromptBytes(messages.items);
+        const prompt_tokens = self.estimateNativePromptTokens(
+            ctx.allocator,
+            model,
+            gpt_config,
+            messages.items,
+            configured_max_tokens,
+            if (config.speculation_requested and config.speculation_policy != .off and config.speculative_k > 0) 1 else 0,
+        ) catch |err| {
+            if (err == error.PromptTooLong) {
+                return ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = "prompt exceeds the model context window after reserving output tokens",
+                });
+            }
+            return ctx.status(500).json(.{ .@"error" = "TOKENIZE_FAILED", .message = @errorName(err) });
+        };
+        var native_generate_lease: ?runtime.scheduler.native_generate.Lease = null;
+        defer if (native_generate_lease) |lease| {
+            if (model.native_generate_coordinator) |coordinator| coordinator.release(lease);
+        };
+        if (model.native_generate_coordinator) |coordinator| {
+            native_generate_lease = try coordinator.acquire(.{
+                .requested_units = queue_units,
+                .prompt_bytes = prompt_bytes,
+                .max_tokens = configured_max_tokens,
+            });
+            config.prefill_chunk_size = native_generate_lease.?.prefill_chunk_size;
+        }
+
         const backend_kind: runtime.kv.pool.BackendKind = switch (model.session.backend()) {
             .native => .native,
             .metal => .metal,
@@ -4040,23 +4056,7 @@ pub const Node = struct {
             return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
         };
         defer cb.deinit();
-        const sliding_window_size: ?u32 = if (gpt_config.position_encoding == .absolute)
-            null
-        else if (gpt_config.sliding_window > 0)
-            gpt_config.sliding_window
-        else if (gpt_config.max_position_embeddings > 0)
-            gpt_config.max_position_embeddings
-        else
-            null;
-        const pool_config: runtime.kv.pool.KvPoolConfig = .{
-            .backend = backend_kind,
-            .dtype = kv_dtype,
-            .page_size_tokens = 16,
-            .num_layers_packed = @intCast(gpt_config.num_hidden_layers),
-            .num_kv_heads = gpt_config.maxKvHeads(),
-            .head_dim = gpt_config.maxHeadDim(),
-            .sliding_window_size = sliding_window_size,
-        };
+        const pool_config = generation.kvPoolConfig(backend_kind, kv_dtype, gpt_config, generationKvSlidingTrimForced());
 
         var prompt_cache: ?*runtime.kv.prompt_cache.PromptPrefixCache = null;
         var active_kv_manager: *runtime.kv.manager.KvManager = &kv_manager;
@@ -4135,21 +4135,13 @@ pub const Node = struct {
         if (draft_cb != null) {
             if (draft_gpt_config) |draft_cfg| {
                 draft_kv_manager = runtime.kv.manager.KvManager.init(ctx.allocator);
-                const draft_sliding_window_size: ?u32 = if (draft_cfg.position_encoding == .absolute)
-                    null
-                else if (draft_cfg.sliding_window > 0)
-                    @intCast(draft_cfg.sliding_window)
-                else
-                    null;
-                const draft_pool_id = draft_kv_manager.?.addPool(.{
-                    .backend = draft_backend_kind.?,
-                    .dtype = draft_kv_dtype.?,
-                    .page_size_tokens = 16,
-                    .num_layers_packed = @intCast(draft_cfg.num_hidden_layers),
-                    .num_kv_heads = draft_cfg.maxKvHeads(),
-                    .head_dim = draft_cfg.maxHeadDim(),
-                    .sliding_window_size = draft_sliding_window_size,
-                }) catch |err|
+                const draft_pool_config = generation.kvPoolConfig(
+                    draft_backend_kind.?,
+                    draft_kv_dtype.?,
+                    draft_cfg,
+                    generationKvSlidingTrimForced(),
+                );
+                const draft_pool_id = draft_kv_manager.?.addPool(draft_pool_config) catch |err|
                     return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
                 draft_decode_state = generation.NativeDecodeState.initPaged(ctx.allocator, &draft_kv_manager.?, draft_pool_id, null);
             }
@@ -4861,8 +4853,22 @@ pub const Node = struct {
                         pending[idx] = false;
                         continue;
                     };
-                    prompt_tokens[pos] = self.estimateNativePromptTokens(ctx.allocator, model, owned_messages[idx].messages) catch |err| {
-                        results[idx].@"error" = .{ .code = "TOKENIZE_FAILED", .message = @errorName(err), .retryable = false };
+                    prompt_tokens[pos] = self.estimateNativePromptTokens(
+                        ctx.allocator,
+                        model,
+                        gpt_config,
+                        owned_messages[idx].messages,
+                        configs[pos].max_tokens,
+                        if (configs[pos].speculation_requested and configs[pos].speculation_policy != .off and configs[pos].speculative_k > 0) 1 else 0,
+                    ) catch |err| {
+                        results[idx].@"error" = if (err == error.PromptTooLong)
+                            .{
+                                .code = "INVALID_REQUEST",
+                                .message = "prompt exceeds the model context window after reserving output tokens",
+                                .retryable = false,
+                            }
+                        else
+                            .{ .code = "TOKENIZE_FAILED", .message = @errorName(err), .retryable = false };
                         pending[idx] = false;
                         continue;
                     };
@@ -4994,23 +5000,8 @@ pub const Node = struct {
 
                 var kv_manager = runtime.kv.manager.KvManager.init(ctx.allocator);
                 defer kv_manager.deinit();
-                const sliding_window_size: ?u32 = if (gpt_config.position_encoding == .absolute)
-                    null
-                else if (gpt_config.sliding_window > 0)
-                    gpt_config.sliding_window
-                else if (gpt_config.max_position_embeddings > 0)
-                    gpt_config.max_position_embeddings
-                else
-                    null;
-                const pool_id = kv_manager.addPool(.{
-                    .backend = backend_kind,
-                    .dtype = kv_dtype,
-                    .page_size_tokens = 16,
-                    .num_layers_packed = @intCast(gpt_config.num_hidden_layers),
-                    .num_kv_heads = gpt_config.maxKvHeads(),
-                    .head_dim = gpt_config.maxHeadDim(),
-                    .sliding_window_size = sliding_window_size,
-                }) catch |err| {
+                const kv_pool_config = generation.kvPoolConfig(backend_kind, kv_dtype, gpt_config, generationKvSlidingTrimForced());
+                const pool_id = kv_manager.addPool(kv_pool_config) catch |err| {
                     for (group_indices.items) |idx| {
                         if (!pending[idx]) continue;
                         results[idx].@"error" = .{ .code = "BACKEND_ERROR", .message = @errorName(err), .retryable = true };
@@ -5018,15 +5009,7 @@ pub const Node = struct {
                     }
                     continue;
                 };
-                var kv_storage = runtime.kv.storage_runtime.KvStorageRuntime.init(ctx.allocator, .{
-                    .backend = backend_kind,
-                    .dtype = kv_dtype,
-                    .page_size_tokens = 16,
-                    .num_layers_packed = @intCast(gpt_config.num_hidden_layers),
-                    .num_kv_heads = gpt_config.maxKvHeads(),
-                    .head_dim = gpt_config.maxHeadDim(),
-                    .sliding_window_size = sliding_window_size,
-                }) catch |err| {
+                var kv_storage = runtime.kv.storage_runtime.KvStorageRuntime.init(ctx.allocator, kv_pool_config) catch |err| {
                     for (group_indices.items) |idx| {
                         if (!pending[idx]) continue;
                         results[idx].@"error" = .{ .code = "BACKEND_ERROR", .message = @errorName(err), .retryable = true };

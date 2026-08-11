@@ -560,6 +560,8 @@ pub const KvCacheView = struct {
     logical_block_count: usize,
     tail_tokens: u16,
     position_offset: usize = 0,
+    max_inflight_tokens: usize = 0,
+    allow_swa_ring: bool = false,
     logical_blocks: ?[]const runtime.kv.block.KvBlockId = null,
     kv_storage: ?*runtime.kv.storage_runtime.KvStorageRuntime = null,
 };

@@ -7657,6 +7657,8 @@ pub const RawRuntimeMemoryStats = extern struct {
     deberta_attention_gemm_calls: u64 = 0,
     deberta_attention_gemm_fallbacks: u64 = 0,
     paged_attention_1x_calls: u64 = 0,
+    decode_gqa_split_calls: u64 = 0,
+    decode_gqa_split_fallback_calls: u64 = 0,
     compute_encoder_count: u64 = 0,
     blit_encoder_count: u64 = 0,
     last_frame_compute_encoder_count: u64 = 0,
@@ -7785,6 +7787,16 @@ pub extern fn termite_metal_decode_runtime_end_planned_compute_scope(runtime: ?*
 pub extern fn termite_metal_decode_runtime_push_planned_compute_barrier_suppression(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_pop_planned_compute_barrier_suppression(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_frame_cb_count(runtime: ?*RawMetalDecodeRuntime) u64;
+pub extern fn termite_metal_decode_gqa_split_policy_probe(
+    q_len: usize,
+    kv_tokens: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    sliding_window: usize,
+    split_count_out: *c_uint,
+    scratch_bytes_out: *usize,
+) c_int;
 pub extern fn termite_metal_decode_runtime_last_frame_gpu_nanos(runtime: ?*RawMetalDecodeRuntime) u64;
 pub extern fn termite_metal_decode_runtime_memory_snapshot(
     runtime: ?*RawMetalDecodeRuntime,
@@ -10844,6 +10856,14 @@ pub extern fn termite_metal_decode_runtime_reset_attention_span_slot(
     runtime: ?*RawMetalDecodeRuntime,
     slot: usize,
 ) c_int;
+pub extern fn termite_metal_decode_runtime_acquire_paged_kv_slot(
+    runtime: ?*RawMetalDecodeRuntime,
+    slot_out: *usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_release_paged_kv_slot(
+    runtime: ?*RawMetalDecodeRuntime,
+    slot: usize,
+) c_int;
 pub extern fn termite_metal_decode_runtime_reserve_attention_span_slot_buffers(
     runtime: ?*RawMetalDecodeRuntime,
     slot: usize,
@@ -10853,9 +10873,13 @@ pub extern fn termite_metal_decode_runtime_reserve_attention_span_slot_buffers(
     v_row_stride: usize,
 ) c_int;
 
-/// Mirror of the C-side `TERMITE_METAL_ATTENTION_SPAN_SLOT_CAPACITY` used to
-/// bound slot indices on the Zig side. Keep in sync with metal_kernels.m.
-pub const attention_span_slot_capacity: usize = 256;
+/// Mirrors the C-side attention-span namespaces. Legacy/direct attention owns
+/// the lower 256 slots; device-paged KV hooks lease from the upper 256 so a
+/// retained prompt prefix cannot be overwritten by an intervening request.
+pub const legacy_attention_span_slot_capacity: usize = 256;
+pub const paged_kv_slot_capacity: usize = 256;
+pub const paged_kv_slot_base: usize = legacy_attention_span_slot_capacity;
+pub const attention_span_slot_capacity: usize = legacy_attention_span_slot_capacity + paged_kv_slot_capacity;
 pub extern fn termite_metal_decode_runtime_attention_span(
     runtime: ?*RawMetalDecodeRuntime,
     format: u32,
@@ -27159,7 +27183,9 @@ test "metal native paged attention f16 single row uses 1x kernel across pages" {
     if (termite_metal_decode_runtime_ready(runtime) == 0) return error.SkipZigTest;
 
     const q_len: usize = 1;
-    const kv_tokens: usize = 640;
+    // Stay just below the split-GQA production threshold so this test keeps
+    // exercising the legacy paged-1x route it is named for.
+    const kv_tokens: usize = 511;
     const num_heads: usize = 8;
     const num_kv_heads: usize = 2;
     const head_dim: usize = 256;
@@ -29372,4 +29398,63 @@ test "metal native graph planner reserves gated ffn scratch up front" {
     try std.testing.expectEqual(snapshot.graph_plan_count, reused_snapshot.graph_plan_count);
     try std.testing.expectEqual(snapshot.graph_plan_slots, reused_snapshot.graph_plan_slots);
     try std.testing.expectEqual(snapshot.graph_plan_allocations, reused_snapshot.graph_plan_allocations);
+}
+
+test "Metal Gemma4 split GQA policy covers long-context E2B and E4B shapes" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+
+    const cases = [_]struct {
+        q_len: usize,
+        kv_tokens: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        sliding_window: usize,
+        expected_splits: c_uint,
+        expected_scratch: usize,
+    }{
+        .{ .q_len = 1, .kv_tokens = 512, .num_kv_heads = 1, .head_dim = 512, .sliding_window = 0, .expected_splits = 16, .expected_scratch = 263_168 },
+        .{ .q_len = 1, .kv_tokens = 2003, .num_kv_heads = 2, .head_dim = 512, .sliding_window = 0, .expected_splits = 32, .expected_scratch = 526_336 },
+        .{ .q_len = 2, .kv_tokens = 4096, .num_kv_heads = 1, .head_dim = 256, .sliding_window = 512, .expected_splits = 32, .expected_scratch = 528_384 },
+    };
+    for (cases) |case| {
+        var split_count: c_uint = 0;
+        var scratch_bytes: usize = 0;
+        try std.testing.expectEqual(@as(c_int, 1), termite_metal_decode_gqa_split_policy_probe(
+            case.q_len,
+            case.kv_tokens,
+            8,
+            case.num_kv_heads,
+            case.head_dim,
+            case.sliding_window,
+            &split_count,
+            &scratch_bytes,
+        ));
+        try std.testing.expectEqual(case.expected_splits, split_count);
+        try std.testing.expectEqual(case.expected_scratch, scratch_bytes);
+    }
+
+    var split_count: c_uint = 99;
+    var scratch_bytes: usize = 99;
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_gqa_split_policy_probe(
+        1,
+        511,
+        8,
+        1,
+        512,
+        0,
+        &split_count,
+        &scratch_bytes,
+    ));
+    try std.testing.expectEqual(@as(c_uint, 0), split_count);
+    try std.testing.expectEqual(@as(usize, 0), scratch_bytes);
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_gqa_split_policy_probe(
+        1,
+        512,
+        8,
+        1,
+        384,
+        0,
+        &split_count,
+        &scratch_bytes,
+    ));
 }

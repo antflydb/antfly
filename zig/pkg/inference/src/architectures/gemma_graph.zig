@@ -610,13 +610,7 @@ fn buildLayerRopeTables(
 } {
     const rope_active_dim = config.layerRopeActiveDim(layer);
     if (rope_active_dim == 0) return error.InvalidRopeDim;
-    const rope_dim = config.layerRopeDim(layer);
-    var theta = config.layerRopeTheta(layer);
-    if (config.rope_dim_override > 0 and config.usesGemmaSlidingAttention() and !config.layerUsesSlidingAttention(layer) and rope_active_dim < rope_dim) {
-        const freq_dim: f32 = @floatFromInt(rope_dim);
-        const active_dim: f32 = @floatFromInt(rope_active_dim);
-        theta = std.math.pow(f32, theta, active_dim / freq_dim);
-    }
+    const theta = config.layerRopeEffectiveTheta(layer);
 
     const table = try buildRopeCosSin(bld.graph.allocator, seq_len, rope_active_dim, theta);
     defer bld.graph.allocator.free(table.cos);

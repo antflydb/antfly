@@ -2463,14 +2463,7 @@ fn initRuntimeParityDecodeState(
     errdefer kv_manager.deinit();
     const backend_kind = try kvBackendKindFromOps(cb.kind());
     const kv_dtype = session_factory.recommendedKvDTypeForSession(model.session, backend_kind);
-    const sliding_window_size: ?u32 = if (cfg.position_encoding == .absolute)
-        null
-    else if (cfg.sliding_window > 0)
-        cfg.sliding_window
-    else if (cfg.max_position_embeddings > 0)
-        cfg.max_position_embeddings
-    else
-        null;
+    const sliding_window_size = cfg.kvPoolSlidingWindowSize(false);
     const pool_config = runtime.kv.pool.KvPoolConfig{
         .backend = backend_kind,
         .dtype = kv_dtype,

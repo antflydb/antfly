@@ -322,6 +322,38 @@ pub const Config = struct {
         return false;
     }
 
+    pub fn hasMixedSlidingAndGlobalAttentionLayers(self: Config) bool {
+        const layer_count: usize = @intCast(self.num_hidden_layers);
+        var has_sliding = false;
+        var has_global = false;
+        for (0..layer_count) |layer| {
+            if (self.layerUsesSlidingAttention(layer)) {
+                has_sliding = true;
+            } else {
+                has_global = true;
+            }
+            if (has_sliding and has_global) return true;
+        }
+        return false;
+    }
+
+    pub fn supportsSplitSwaGlobalKvRing(self: Config) bool {
+        return self.family == .gemma and
+            self.hasPle() and
+            self.sliding_window > 0 and
+            self.hasMixedSlidingAndGlobalAttentionLayers();
+    }
+
+    /// Retention window for a layer-packed KV pool. Mixed global/sliding
+    /// attention keeps full history unless the lower-memory override is forced.
+    pub fn kvPoolSlidingWindowSize(self: Config, force_sliding_trim: bool) ?u32 {
+        if (self.position_encoding == .absolute) return null;
+        if (self.sliding_window > 0 and self.hasMixedSlidingAndGlobalAttentionLayers() and !force_sliding_trim) return null;
+        if (self.sliding_window > 0) return self.sliding_window;
+        if (self.max_position_embeddings > 0) return self.max_position_embeddings;
+        return null;
+    }
+
     pub fn layerRopeTheta(self: Config, layer_index: usize) f32 {
         if (self.family == .deepseek_v4 and
             self.deepseekV4AttentionKind(layer_index) != .sliding_attention and
@@ -378,6 +410,25 @@ pub const Config = struct {
             return self.effectiveHeadDimForLayer(layer_index);
         }
         return self.layerRopeDim(layer_index);
+    }
+
+    /// Backend-facing RoPE base for the active rotary width.
+    ///
+    /// Gemma 4 can define a smaller active prefix over a wider frequency
+    /// domain. Folding that domain into theta preserves the same frequencies
+    /// for backends whose RoPE contract is expressed in active dimensions.
+    pub fn layerRopeEffectiveTheta(self: Config, layer_index: usize) f32 {
+        const base_theta = self.layerRopeTheta(layer_index);
+        const active_dim = self.layerRopeActiveDim(layer_index);
+        const frequency_dim = self.layerRopeFrequencyDim(layer_index);
+        if (active_dim > 0 and active_dim < frequency_dim) {
+            return std.math.pow(
+                f32,
+                base_theta,
+                @as(f32, @floatFromInt(active_dim)) / @as(f32, @floatFromInt(frequency_dim)),
+            );
+        }
+        return base_theta;
     }
 
     pub fn layerUsesSharedTail(self: Config, layer_index: usize) bool {
@@ -2976,6 +3027,63 @@ test "gemma4 rope_dim_override only limits active rotary lanes" {
 
     try std.testing.expectEqual(@as(u32, 128), config.layerRopeDim(4));
     try std.testing.expectEqual(@as(u32, 64), config.layerRopeActiveDim(4));
+}
+
+test "gemma4 effective theta preserves the wider frequency domain" {
+    const config = Config{
+        .family = .gemma,
+        .sliding_window = 512,
+        .sliding_window_pattern = 5,
+        .attention_head_dim = 256,
+        .global_head_dim = 512,
+        .rope_theta = 1_000_000.0,
+        .rope_partial_factor = 1.0,
+        .rope_dim_override = 128,
+    };
+
+    try std.testing.expectEqual(@as(f32, 10_000.0), config.layerRopeEffectiveTheta(0));
+
+    const active_dim = config.layerRopeActiveDim(4);
+    const frequency_dim = config.layerRopeFrequencyDim(4);
+    const effective_theta = config.layerRopeEffectiveTheta(4);
+    try std.testing.expectEqual(@as(u32, 128), active_dim);
+    try std.testing.expectEqual(@as(u32, 512), frequency_dim);
+
+    for ([_]u32{ 0, 2, 32, 62, 126 }) |lane| {
+        const effective_denominator = std.math.pow(
+            f32,
+            effective_theta,
+            @as(f32, @floatFromInt(lane)) / @as(f32, @floatFromInt(active_dim)),
+        );
+        const full_denominator = std.math.pow(
+            f32,
+            config.rope_theta,
+            @as(f32, @floatFromInt(lane)) / @as(f32, @floatFromInt(frequency_dim)),
+        );
+        try std.testing.expectApproxEqRel(full_denominator, effective_denominator, 2e-6);
+    }
+}
+
+test "KV pool retains full history only for genuinely mixed attention" {
+    const mixed_gemma = Config{
+        .family = .gemma,
+        .num_hidden_layers = 6,
+        .sliding_window = 512,
+        .sliding_window_pattern = 6,
+        .position_encoding = .rope,
+    };
+    try std.testing.expect(mixed_gemma.hasMixedSlidingAndGlobalAttentionLayers());
+    try std.testing.expectEqual(@as(?u32, null), mixed_gemma.kvPoolSlidingWindowSize(false));
+    try std.testing.expectEqual(@as(?u32, 512), mixed_gemma.kvPoolSlidingWindowSize(true));
+
+    const mistral = Config{
+        .family = .mistral,
+        .num_hidden_layers = 32,
+        .sliding_window = 4096,
+        .position_encoding = .rope,
+    };
+    try std.testing.expect(!mistral.hasMixedSlidingAndGlobalAttentionLayers());
+    try std.testing.expectEqual(@as(?u32, 4096), mistral.kvPoolSlidingWindowSize(false));
 }
 
 fn appendLe(comptime T: type, allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), value: T) !void {

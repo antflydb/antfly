@@ -96,6 +96,25 @@ pub fn messagesHaveAudio(messages: []const Message) bool {
     return false;
 }
 
+/// Extra positions introduced when model-declared image placeholders expand.
+/// Audio expansion is measured after projection because its token count varies
+/// with the clip and projector metadata.
+pub fn nativeGenerationMediaTokenAllowance(messages: []const Message, config: gpt_mod.Config) usize {
+    if (config.mm_tokens_per_image == 0) return 0;
+    var image_count: usize = 0;
+    for (messages) |message| {
+        if (message.content_parts) |parts| {
+            for (parts) |part| switch (part) {
+                .image => image_count +|= 1,
+                else => {},
+            };
+        } else if (message.image_bytes) |images| {
+            image_count +|= images.len;
+        }
+    }
+    return image_count *| (@as(usize, config.mm_tokens_per_image) + 1);
+}
+
 pub fn userFacingErrorMessage(err: anyerror) []const u8 {
     return switch (err) {
         error.AudioInputTooLong => "audio input is too long for the Gemma4 direct audio projector; trim the clip or raise clip.audio.max_tokens in the projector metadata",
@@ -184,6 +203,23 @@ pub const GenerationConfig = struct {
     /// EOS token. Defaults to production stop-on-EOS behavior.
     ignore_eos: bool = false,
 };
+
+pub fn kvPoolConfig(
+    backend: runtime.kv.pool.BackendKind,
+    dtype: runtime.kv.pool.KvDType,
+    config: gpt_mod.Config,
+    force_sliding_trim: bool,
+) runtime.kv.pool.KvPoolConfig {
+    return .{
+        .backend = backend,
+        .dtype = dtype,
+        .page_size_tokens = 16,
+        .num_layers_packed = @intCast(config.num_hidden_layers),
+        .num_kv_heads = config.maxKvHeads(),
+        .head_dim = config.maxHeadDim(),
+        .sliding_window_size = config.kvPoolSlidingWindowSize(force_sliding_trim),
+    };
+}
 
 /// Parsed chat template for rendering messages via Jinja2.
 pub const ChatTemplate = struct {
@@ -673,6 +709,8 @@ pub const KvView = struct {
     tail_tokens: u16,
     token_count: usize,
     position_offset: usize,
+    max_inflight_tokens: usize = 0,
+    allow_swa_ring: bool = false,
     logical_blocks: ?[]const runtime.kv.block.KvBlockId = null,
     kv_storage: ?*runtime.kv.storage_runtime.KvStorageRuntime = null,
 };
@@ -1161,6 +1199,21 @@ fn gemma4MtpActiveMaterializeEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_ACTIVE_MATERIALIZE", true);
 }
 
+fn gemma4MtpActiveMaterializeSupported(
+    kind: ops.BackendKind,
+    config: gpt_mod.Config,
+    total_seq_len: usize,
+) bool {
+    // Without a whole-model generated route, the Metal active frame can hand
+    // a mixed SWA/global model back to generic attention after device-only KV
+    // has been written. Past the local window that fallback cannot reconstruct
+    // the complete KV span. Use the existing hidden-only materialization path,
+    // which owns the full one-token forward, for long-context MTP instead.
+    return !(kind == .metal and
+        config.supportsSplitSwaGlobalKvRing() and
+        total_seq_len > @as(usize, config.sliding_window));
+}
+
 fn gemma4MtpAcceptBonusDefault(kind: ops.BackendKind) bool {
     return kind != .metal;
 }
@@ -1377,6 +1430,18 @@ fn shouldUseCudaPrefillGreedyToken(
         config.grammar == null;
 }
 
+fn shouldCaptureMetalGemmaMtpPrefillHidden(
+    backend_kind: ops.BackendKind,
+    config: *const gpt_mod.Config,
+    capture_last_hidden: bool,
+) bool {
+    return capture_last_hidden and
+        backend_kind == .metal and
+        config.family == .gemma and
+        config.hasPle() and
+        !config.gemma4_mtp_assistant;
+}
+
 fn coalescedPrefillChunkSizeForFirstToken(
     backend_kind: ops.BackendKind,
     max_tokens: usize,
@@ -1463,6 +1528,8 @@ pub const NativeDecodeState = struct {
     gemma4_layer_spec_cache: gpt_arch.Gemma4LayerSpecCache = .{},
     deepseek_v4_compressed_cache: ?gpt_arch.DeepSeekV4CompressedCache = null,
     force_full_recompute: bool = false,
+    kv_max_inflight_tokens: usize = 0,
+    allow_swa_ring: bool = false,
 
     pub fn initContiguous(allocator: std.mem.Allocator) NativeDecodeState {
         return .{
@@ -1502,8 +1569,30 @@ pub const NativeDecodeState = struct {
 
     pub fn configureForGptConfig(self: *NativeDecodeState, config: gpt_mod.Config) void {
         self.force_full_recompute = false;
+        if (self.total_tokens == 0) self.kv_max_inflight_tokens = 0;
+        self.allow_swa_ring = config.supportsSplitSwaGlobalKvRing();
         if (config.family != .gemma) self.gemma4_layer_spec_cache.reset();
         if (!requiresDeepSeekV4CompressedCache(config)) self.clearDeepSeekV4CompressedCache();
+    }
+
+    fn configureKvMaxInflightTokens(self: *NativeDecodeState, token_count: usize, request_allows_ring: bool) void {
+        if (token_count == 0 or self.total_tokens != 0) {
+            self.allow_swa_ring = false;
+            self.kv_max_inflight_tokens = 0;
+            if (self.kv_view) |*view| {
+                view.max_inflight_tokens = 0;
+                view.allow_swa_ring = false;
+            }
+            return;
+        }
+        // Ring page ids are absolute from sequence position zero. A pool that
+        // front-trims its logical block table would make them view-relative.
+        self.allow_swa_ring = self.allow_swa_ring and request_allows_ring and self.kvSlidingWindowTokens() == null;
+        self.kv_max_inflight_tokens = if (self.allow_swa_ring) token_count else 0;
+        if (self.kv_view) |*view| {
+            view.max_inflight_tokens = self.kv_max_inflight_tokens;
+            view.allow_swa_ring = self.allow_swa_ring;
+        }
     }
 
     pub fn requiresFullRecompute(self: *const NativeDecodeState) bool {
@@ -1631,6 +1720,8 @@ pub const NativeDecodeState = struct {
             .tail_tokens = tail_tokens,
             .token_count = token_count,
             .position_offset = position_offset,
+            .max_inflight_tokens = self.kv_max_inflight_tokens,
+            .allow_swa_ring = self.allow_swa_ring,
             .logical_blocks = self.kv_block_ids.items,
             .kv_storage = self.kv_storage,
         };
@@ -1959,6 +2050,8 @@ pub const NativeDecodeState = struct {
                     .logical_block_count = view.logical_block_count,
                     .tail_tokens = view.tail_tokens,
                     .position_offset = view.position_offset,
+                    .max_inflight_tokens = view.max_inflight_tokens,
+                    .allow_swa_ring = view.allow_swa_ring,
                     .logical_blocks = view.logical_blocks,
                     .kv_storage = view.kv_storage,
                 }
@@ -2108,6 +2201,8 @@ pub fn buildOwnedBatchDecodeContext(
                 .logical_block_count = ctx.kv_cache.?.logical_block_count,
                 .tail_tokens = ctx.kv_cache.?.tail_tokens,
                 .position_offset = ctx.kv_cache.?.position_offset,
+                .max_inflight_tokens = ctx.kv_cache.?.max_inflight_tokens,
+                .allow_swa_ring = ctx.kv_cache.?.allow_swa_ring,
                 .logical_blocks = ctx.kv_cache.?.logical_blocks,
                 .kv_storage = ctx.kv_cache.?.kv_storage,
             },
@@ -2485,19 +2580,6 @@ pub const NativeGenerationPipeline = struct {
         }
         const formatted_prompt_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
 
-        // Tokenize
-        var encoded = try encodePromptForGeneration(self.tokenizer, allocator, prompt, 2048, self.add_bos_token, self.bos_token);
-        const encoded_prompt_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
-        defer encoded.deinit();
-
-        var actual_prompt_tokens: usize = 0;
-        while (actual_prompt_tokens < encoded.attention_mask.len and encoded.attention_mask[actual_prompt_tokens] != 0) : (actual_prompt_tokens += 1) {}
-        if (actual_prompt_tokens == 0) return error.EmptyPrompt;
-        debugGenerationStage(
-            "encoded prompt chars={d} actual_prompt_tokens={d}",
-            .{ prompt.len, actual_prompt_tokens },
-        );
-
         const has_images = messagesHaveImages(messages);
         const has_audio = messagesHaveAudio(messages);
         const requested_max_tokens: usize = @intCast(@max(config.max_tokens, 1));
@@ -2549,6 +2631,41 @@ pub const NativeGenerationPipeline = struct {
         if ((has_images or has_audio) and use_speculative) return error.MultimodalSpeculativeDecodingNotSupported;
         if (use_speculative and self.speculativeUsesDeepSeekV4CompressedCache()) return error.DeepSeekV4CompressedSpeculativeDecodingNotSupported;
 
+        const relevant_draft_config = if (use_speculative) self.draft_gpt_config else null;
+        const speculative_bonus_tokens: usize = if (use_speculative and config.speculative_k > 0) 1 else 0;
+        const expanded_prompt_token_limit = try nativeGenerationPromptTokenLimit(
+            self.gpt_config,
+            relevant_draft_config,
+            requested_max_tokens,
+            speculative_bonus_tokens,
+            0,
+        );
+        const text_prompt_token_limit = try nativeGenerationPromptTokenLimit(
+            self.gpt_config,
+            relevant_draft_config,
+            requested_max_tokens,
+            speculative_bonus_tokens,
+            nativeGenerationMediaTokenAllowance(messages, self.gpt_config),
+        );
+        var encoded = try encodeNativeGenerationPrompt(
+            self.tokenizer,
+            allocator,
+            prompt,
+            text_prompt_token_limit,
+            self.add_bos_token,
+            self.bos_token,
+        );
+        const encoded_prompt_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
+        defer encoded.deinit();
+
+        var actual_prompt_tokens: usize = 0;
+        while (actual_prompt_tokens < encoded.attention_mask.len and encoded.attention_mask[actual_prompt_tokens] != 0) : (actual_prompt_tokens += 1) {}
+        if (actual_prompt_tokens == 0) return error.EmptyPrompt;
+        debugGenerationStage(
+            "encoded prompt chars={d} actual_prompt_tokens={d}",
+            .{ prompt.len, actual_prompt_tokens },
+        );
+
         var prepared_multimodal_prompt: ?gemma3_mm.PreparedPrompt = null;
         defer if (prepared_multimodal_prompt) |*prepared| prepared.deinit(&self.cb);
 
@@ -2568,7 +2685,14 @@ pub const NativeGenerationPipeline = struct {
                     const model_dir = self.model_dir orelse return error.MissingModelDirForMultimodal;
                     const expanded_prompt = try gemma3_mm.expandPromptText(allocator, prompt, self.gpt_config, images.len);
                     defer allocator.free(expanded_prompt);
-                    var expanded_encoded = try encodePromptForGeneration(self.tokenizer, allocator, expanded_prompt, 4096, self.add_bos_token, self.bos_token);
+                    var expanded_encoded = try encodeNativeGenerationPrompt(
+                        self.tokenizer,
+                        allocator,
+                        expanded_prompt,
+                        expanded_prompt_token_limit,
+                        self.add_bos_token,
+                        self.bos_token,
+                    );
                     defer expanded_encoded.deinit();
                     var expanded_prompt_tokens: usize = 0;
                     while (expanded_prompt_tokens < expanded_encoded.attention_mask.len and expanded_encoded.attention_mask[expanded_prompt_tokens] != 0) : (expanded_prompt_tokens += 1) {}
@@ -2602,8 +2726,14 @@ pub const NativeGenerationPipeline = struct {
                         if (projected_audio) |*projected| projected.tokens_per_audio else &.{},
                     );
                     defer allocator.free(expanded_prompt);
-                    const max_expanded_tokens = @max(@as(usize, 4096), expanded_prompt.len);
-                    var expanded_encoded = try encodePromptForGeneration(self.tokenizer, allocator, expanded_prompt, max_expanded_tokens, self.add_bos_token, self.bos_token);
+                    var expanded_encoded = try encodeNativeGenerationPrompt(
+                        self.tokenizer,
+                        allocator,
+                        expanded_prompt,
+                        expanded_prompt_token_limit,
+                        self.add_bos_token,
+                        self.bos_token,
+                    );
                     defer expanded_encoded.deinit();
                     var expanded_prompt_tokens: usize = 0;
                     while (expanded_prompt_tokens < expanded_encoded.attention_mask.len and expanded_encoded.attention_mask[expanded_prompt_tokens] != 0) : (expanded_prompt_tokens += 1) {}
@@ -2626,13 +2756,12 @@ pub const NativeGenerationPipeline = struct {
                 if (self.gpt_config.family == .qwen3_5) {
                     debugGenerationStage("qwen3.5 multimodal load preprocessor", .{});
                     const prep_cfg = try qwen2vl_mm.loadPreprocessorConfig(allocator, model_dir);
-                    const max_expanded_tokens = @max(@as(usize, 4096), prompt.len + images.len * 3);
-                    debugGenerationStage("qwen3.5 multimodal encode prompt max_tokens={d}", .{max_expanded_tokens});
+                    debugGenerationStage("qwen3.5 multimodal encode prompt max_tokens={d}", .{expanded_prompt_token_limit});
                     var qwen_encoded = try encodeQwenPromptWithImagePlaceholders(
                         self.tokenizer,
                         allocator,
                         prompt,
-                        max_expanded_tokens,
+                        expanded_prompt_token_limit,
                         self.add_bos_token,
                         self.bos_token,
                         self.gpt_config,
@@ -2662,7 +2791,14 @@ pub const NativeGenerationPipeline = struct {
                 } else {
                     const expanded_prompt = try gemma3_mm.expandPromptText(allocator, prompt, self.gpt_config, images.len);
                     defer allocator.free(expanded_prompt);
-                    var expanded_encoded = try encodePromptForGeneration(self.tokenizer, allocator, expanded_prompt, 4096, self.add_bos_token, self.bos_token);
+                    var expanded_encoded = try encodeNativeGenerationPrompt(
+                        self.tokenizer,
+                        allocator,
+                        expanded_prompt,
+                        expanded_prompt_token_limit,
+                        self.add_bos_token,
+                        self.bos_token,
+                    );
                     defer expanded_encoded.deinit();
                     var expanded_prompt_tokens: usize = 0;
                     while (expanded_prompt_tokens < expanded_encoded.attention_mask.len and expanded_encoded.attention_mask[expanded_prompt_tokens] != 0) : (expanded_prompt_tokens += 1) {}
@@ -3453,6 +3589,25 @@ pub const NativeGenerationPipeline = struct {
         last_hidden_rows: usize = 0,
     };
 
+    /// Prepared decoder tails expose the input to final RMSNorm. Gemma4 MTP's
+    /// `.final` activation contract is the post-norm row used by verification.
+    fn capturePreparedTailPostNormHidden(
+        cb: *const ComputeBackend,
+        capture: bool,
+        pre_norm_hidden: ops.CT,
+        final_norm_slot: usize,
+        hidden_size: usize,
+        eps: f32,
+    ) !?ops.CT {
+        if (!capture) return null;
+        return cb.decoderRuntimeApplyRmsNorm(&.{
+            .slot = final_norm_slot,
+            .input = pre_norm_hidden,
+            .hidden_size = hidden_size,
+            .eps = eps,
+        });
+    }
+
     fn tryCudaPreparedTailPrefillGreedy(
         self: *NativeGenerationPipeline,
         input_ids: []const i64,
@@ -3493,14 +3648,21 @@ pub const NativeGenerationPipeline = struct {
             greedy.token_tensor = null;
         }
 
-        const last_hidden = if (capture_last_hidden) blk: {
-            owns_hidden = false;
-            break :blk tail.final_hidden;
-        } else blk: {
+        const last_hidden = try capturePreparedTailPostNormHidden(
+            &self.cb,
+            capture_last_hidden,
+            tail.final_hidden,
+            tail.final_norm_slot,
+            self.gpt_config.hidden_size,
+            self.gpt_config.norm_eps,
+        );
+        if (capture_last_hidden and last_hidden == null) {
             self.cb.free(tail.final_hidden);
             owns_hidden = false;
-            break :blk null;
-        };
+            return null;
+        }
+        self.cb.free(tail.final_hidden);
+        owns_hidden = false;
         debugGenerationStage(
             "executePrefill prepared_tail_greedy token={d} capture_hidden={}",
             .{ greedy.token_id, capture_last_hidden },
@@ -3538,6 +3700,11 @@ pub const NativeGenerationPipeline = struct {
             self.gpt_config.suppressTokenIds().len > 0,
             enableCudaPrefillGreedyToken(),
         );
+        const capture_metal_mtp_prefill_hidden = shouldCaptureMetalGemmaMtpPrefillHidden(
+            self.cb.kind(),
+            &self.gpt_config,
+            capture_last_hidden,
+        );
         debugGenerationStage(
             "executePrefill enter seq_len={d} prefilled={d} query_len={d} paged={} scheduler={} compiled_whole_model={} prefill_greedy={}",
             .{
@@ -3564,6 +3731,13 @@ pub const NativeGenerationPipeline = struct {
 
         if (self.compiled_partition_backend != null and self.compiled_attachment_target == .whole_model and self.graph_cache != null) {
             if (prefilled_tokens != 0) return error.UnsupportedShape;
+            const max_speculative_rows = @min(@as(usize, @intCast(config.speculative_k)), 16) + 1;
+            decode_state.configureKvMaxInflightTokens(
+                @max(seq_len, max_speculative_rows),
+                self.cb.kind() == .metal and
+                    !config.prompt_cache_enabled and
+                    config.cache_compaction_ratio == null,
+            );
             debugGenerationStage("executePrefill whole-model fast path seq_len={d}", .{seq_len});
             const decode_context = try decode_runtime.preparePrefill(seq_len, seq_len);
             if (allow_resident_greedy_token) {
@@ -3623,6 +3797,12 @@ pub const NativeGenerationPipeline = struct {
                 );
                 current_chunk_size = coalesced_chunk_size;
             }
+            // The generic executor may fall back to contiguous KV
+            // materialization on any unsupported Metal attention layer. A
+            // cyclic SWA ring cannot satisfy that fallback, so keep the ring
+            // exclusive to whole-model executors whose attention path
+            // consumes the paged table directly.
+            decode_state.configureKvMaxInflightTokens(0, false);
             var processed: usize = 0;
             while (processed < query_len) {
                 const scheduler_chunk = if (self.scheduler_lease) |lease| lease.prefill_chunk_size else current_chunk_size;
@@ -3638,7 +3818,9 @@ pub const NativeGenerationPipeline = struct {
                 if (self.scheduler) |scheduler| {
                     if (self.scheduler_lease) |lease| {
                         if (self.io) |io| {
-                            if (!(total_chunk_end == seq_len and use_cuda_prefill_greedy_token)) {
+                            if (!(total_chunk_end == seq_len and
+                                (use_cuda_prefill_greedy_token or capture_metal_mtp_prefill_hidden)))
+                            {
                                 prefill_last_logits = self.runScheduledPrefillBatch(scheduler, lease, io, decode_state, chunk, total_chunk_end, chunk.len, total_chunk_end == seq_len) catch |err| {
                                     if (err == error.MemoryBudgetExceeded and chunk_size > 1) {
                                         current_chunk_size = @max(chunk_size / 2, 1);
@@ -3693,6 +3875,52 @@ pub const NativeGenerationPipeline = struct {
                     debugGenerationStage(
                         "executePrefill captured greedy token={d}",
                         .{prefill_greedy_token.?},
+                    );
+                } else if (total_chunk_end == seq_len and capture_metal_mtp_prefill_hidden) {
+                    const target_hidden = self.forwardHiddenDevice(
+                        chunk,
+                        1,
+                        total_chunk_end,
+                        &decode_context,
+                    ) catch |err| {
+                        if (err == error.MemoryBudgetExceeded and chunk_size > 1) {
+                            current_chunk_size = @max(chunk_size / 2, 1);
+                            continue;
+                        }
+                        return err;
+                    };
+                    var keep_target_hidden = false;
+                    defer {
+                        if (!keep_target_hidden) self.cb.free(target_hidden.hidden);
+                        if (target_hidden.pre_norm_hidden) |pre_norm| self.cb.free(pre_norm);
+                    }
+                    if (target_hidden.rows == 0) return error.InvalidTensorShape;
+                    const last_hidden = try self.cb.sliceRows2D(
+                        allocator,
+                        target_hidden.hidden,
+                        target_hidden.rows - 1,
+                        1,
+                        self.gpt_config.hidden_size,
+                    );
+                    defer self.cb.free(last_hidden);
+                    const lm_w = try gpt_arch.getLmHeadWeight(&self.cb, self.gpt_config);
+                    defer self.cb.free(lm_w);
+                    const last_logits_device = try self.cb.linearNoBias(
+                        last_hidden,
+                        lm_w,
+                        1,
+                        self.gpt_config.hidden_size,
+                        self.gpt_config.vocab_size,
+                    );
+                    defer self.cb.free(last_logits_device);
+                    prefill_last_logits = try self.cb.toFloat32(last_logits_device, allocator);
+                    gpt_arch.applyFinalLogitSoftcapInPlace(self.gpt_config, prefill_last_logits.?);
+                    prefill_last_hidden = target_hidden.hidden;
+                    prefill_last_hidden_rows = target_hidden.rows;
+                    keep_target_hidden = true;
+                    debugGenerationStage(
+                        "executePrefill captured final logits and MTP hidden vocab_size={d}",
+                        .{self.gpt_config.vocab_size},
                     );
                 } else {
                     const logits = self.forwardAllLogits(chunk, 1, total_chunk_end, &decode_context) catch |err| {
@@ -7240,6 +7468,7 @@ pub const NativeGenerationPipeline = struct {
         if (!gemma4MtpActiveMaterializeEnabled()) return null;
         if (hidden_source != .final) return null;
         if (self.cb.kind() != .metal) return null;
+        if (!gemma4MtpActiveMaterializeSupported(self.cb.kind(), self.gpt_config, total_seq_len)) return null;
         if (total_seq_len == 0 or token_ids.len < total_seq_len) return error.InvalidTensorShape;
         var result = (try decoder_gated_runtime.forwardGreedyTokenAndFinalHidden(
             &self.cb,
@@ -8017,6 +8246,61 @@ pub fn encodePromptForGeneration(
     );
 }
 
+/// Maximum text tokens that can be admitted without exceeding either model's
+/// context after generation and known multimodal expansion.
+pub fn nativeGenerationPromptTokenLimit(
+    target_config: gpt_mod.Config,
+    draft_config: ?gpt_mod.Config,
+    requested_output_tokens: usize,
+    speculative_bonus_tokens: usize,
+    media_token_allowance: usize,
+) !usize {
+    var context_tokens: usize = @intCast(target_config.max_position_embeddings);
+    if (draft_config) |draft| {
+        context_tokens = @min(context_tokens, @as(usize, @intCast(draft.max_position_embeddings)));
+    }
+    const output_tokens = std.math.add(
+        usize,
+        @max(requested_output_tokens, 1),
+        speculative_bonus_tokens,
+    ) catch return error.PromptTooLong;
+    const reserved_tokens = std.math.add(
+        usize,
+        output_tokens,
+        media_token_allowance,
+    ) catch return error.PromptTooLong;
+    if (context_tokens <= reserved_tokens) return error.PromptTooLong;
+    return context_tokens - reserved_tokens;
+}
+
+/// Encode one native-generation prompt without silently dropping tokens at the
+/// model boundary. The extra slot distinguishes an exact fit from overflow.
+pub fn encodeNativeGenerationPrompt(
+    tokenizer: tokenizer_mod.Tokenizer,
+    allocator: std.mem.Allocator,
+    prompt: []const u8,
+    prompt_token_limit: usize,
+    add_bos_token: bool,
+    bos_token: []const u8,
+) !tokenizer_mod.EncodeResult {
+    if (prompt_token_limit == 0) return error.PromptTooLong;
+    const detection_limit = std.math.add(usize, prompt_token_limit, 1) catch prompt_token_limit;
+    var encoded = try encodePromptForGeneration(
+        tokenizer,
+        allocator,
+        prompt,
+        detection_limit,
+        add_bos_token,
+        bos_token,
+    );
+    errdefer encoded.deinit();
+
+    var token_count: usize = 0;
+    while (token_count < encoded.attention_mask.len and encoded.attention_mask[token_count] != 0) : (token_count += 1) {}
+    if (token_count > prompt_token_limit) return error.PromptTooLong;
+    return encoded;
+}
+
 fn shouldAddBosToken(prompt: []const u8, add_bos_token: bool, bos_token: []const u8) bool {
     if (!add_bos_token) return false;
     if (bos_token.len == 0) return true;
@@ -8084,7 +8368,7 @@ fn appendQwenPromptTextTokens(
     if (text.len == 0 and !add_bos_token) return;
     if (out.items.len >= max_length) return error.PromptTooLong;
     const remaining = max_length - out.items.len;
-    var encoded = try encodePromptForGeneration(tokenizer, allocator, text, remaining, add_bos_token, bos_token);
+    var encoded = try encodeNativeGenerationPrompt(tokenizer, allocator, text, remaining, add_bos_token, bos_token);
     defer encoded.deinit();
     var token_count: usize = 0;
     while (token_count < encoded.attention_mask.len and encoded.attention_mask[token_count] != 0) : (token_count += 1) {}
@@ -8111,6 +8395,42 @@ test "shouldAddBosToken skips duplicate literal bos prefix" {
     try std.testing.expect(!shouldAddBosToken("<bos><start_of_turn>user\nHello", true, "<bos>"));
 }
 
+test "native generation prompt limit reserves output media and draft context" {
+    const target = gpt_mod.Config{ .max_position_embeddings = 8192 };
+    const draft = gpt_mod.Config{ .max_position_embeddings = 4096 };
+    try std.testing.expectEqual(
+        @as(usize, 3775),
+        try nativeGenerationPromptTokenLimit(target, draft, 64, 1, 256),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 8128),
+        try nativeGenerationPromptTokenLimit(target, null, 64, 0, 0),
+    );
+    try std.testing.expectError(
+        error.PromptTooLong,
+        nativeGenerationPromptTokenLimit(.{ .max_position_embeddings = 64 }, null, 64, 0, 0),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try nativeGenerationPromptTokenLimit(.{ .max_position_embeddings = 65 }, null, 64, 0, 0),
+    );
+    try std.testing.expectError(
+        error.PromptTooLong,
+        nativeGenerationPromptTokenLimit(.{ .max_position_embeddings = 65 }, null, 64, 1, 0),
+    );
+    try std.testing.expectError(
+        error.PromptTooLong,
+        nativeGenerationPromptTokenLimit(target, null, std.math.maxInt(usize), 1, 0),
+    );
+
+    const images = [_][]const u8{ "a", "b" };
+    const messages = [_]Message{.{ .role = "user", .content = "describe", .image_bytes = &images }};
+    try std.testing.expectEqual(
+        @as(usize, 514),
+        nativeGenerationMediaTokenAllowance(&messages, .{ .mm_tokens_per_image = 256 }),
+    );
+}
+
 test "encodePromptForGeneration does not duplicate literal bos prefix" {
     const allocator = std.testing.allocator;
     const tokenizer_json =
@@ -8135,6 +8455,11 @@ test "encodePromptForGeneration does not duplicate literal bos prefix" {
     try std.testing.expectEqual(@as(i32, 2), encoded.ids[0]);
     try std.testing.expectEqual(@as(i32, 3), encoded.ids[1]);
     try std.testing.expectEqual(@as(i32, 0), encoded.attention_mask[2]);
+
+    try std.testing.expectError(
+        error.PromptTooLong,
+        encodeNativeGenerationPrompt(tok.tokenizer(), allocator, "<bos>Hello", 1, true, "<bos>"),
+    );
 }
 
 test "grammar prompt opens Gemma4 public final channel" {
@@ -9255,6 +9580,19 @@ test "cuda prefill greedy token path is pure greedy only" {
     try std.testing.expect(!shouldUseCudaPrefillGreedyToken(.cuda, grammar, true, false, true));
 }
 
+test "Metal MTP hidden capture is limited to PLE Gemma targets" {
+    var target = gpt_mod.Config{ .family = .gemma, .ple_hidden_size = 256 };
+    try std.testing.expect(shouldCaptureMetalGemmaMtpPrefillHidden(.metal, &target, true));
+    try std.testing.expect(!shouldCaptureMetalGemmaMtpPrefillHidden(.metal, &target, false));
+    try std.testing.expect(!shouldCaptureMetalGemmaMtpPrefillHidden(.cuda, &target, true));
+
+    target.gemma4_mtp_assistant = true;
+    try std.testing.expect(!shouldCaptureMetalGemmaMtpPrefillHidden(.metal, &target, true));
+
+    const llama = gpt_mod.Config{ .family = .llama, .ple_hidden_size = 256 };
+    try std.testing.expect(!shouldCaptureMetalGemmaMtpPrefillHidden(.metal, &llama, true));
+}
+
 test "cuda prefill first token coalesces only short eligible prompts" {
     try std.testing.expectEqual(@as(usize, 2), coalescedPrefillChunkSizeForFirstToken(.cuda, 1, false, true, 2, 1, 8));
     try std.testing.expectEqual(@as(usize, 1), coalescedPrefillChunkSizeForFirstToken(.cuda, 1, false, true, 16, 1, 8));
@@ -9332,6 +9670,30 @@ test "native decode state reports retained kv window offsets after trim" {
     try std.testing.expectEqual(@as(usize, 4), ctx.kv_sequence_len);
     try std.testing.expectEqual(@as(usize, 2), ctx.kv_position_offset);
     try std.testing.expectEqual(@as(usize, 2), ctx.kv_cache.?.position_offset);
+}
+
+test "native decode state can disable an initialized SWA ring policy" {
+    const allocator = std.testing.allocator;
+    var manager = runtime.kv.manager.KvManager.init(allocator);
+    defer manager.deinit();
+
+    const pool_id = try manager.addPool(.{
+        .backend = .metal,
+        .dtype = .f16,
+        .page_size_tokens = 16,
+        .num_kv_heads = 4,
+        .head_dim = 256,
+    });
+    var state = NativeDecodeState.initPaged(allocator, &manager, pool_id, null);
+    defer state.deinit();
+
+    state.allow_swa_ring = true;
+    state.configureKvMaxInflightTokens(512, true);
+    try std.testing.expect(state.allow_swa_ring);
+
+    state.configureKvMaxInflightTokens(0, false);
+    try std.testing.expect(!state.allow_swa_ring);
+    try std.testing.expectEqual(@as(usize, 0), state.kv_max_inflight_tokens);
 }
 
 test "owned batch decode context captures per-item kv bindings" {
@@ -9534,6 +9896,22 @@ test "Gemma4 MTP bonus default is conservative on Metal" {
 
 test "Gemma4 MTP active materialization is default" {
     try std.testing.expectEqual(true, gemma4MtpActiveMaterializeEnabled());
+}
+
+test "Gemma4 MTP long-context Metal materialization owns the full forward" {
+    const mixed = gpt_mod.Config{
+        .family = .gemma,
+        .num_hidden_layers = 6,
+        .ple_hidden_size = 256,
+        .sliding_window = 512,
+    };
+    try std.testing.expect(gemma4MtpActiveMaterializeSupported(.metal, mixed, 512));
+    try std.testing.expect(!gemma4MtpActiveMaterializeSupported(.metal, mixed, 513));
+    try std.testing.expect(gemma4MtpActiveMaterializeSupported(.cuda, mixed, 513));
+
+    var all_sliding = mixed;
+    all_sliding.num_hidden_layers = 5;
+    try std.testing.expect(gemma4MtpActiveMaterializeSupported(.metal, all_sliding, 513));
 }
 
 test "Gemma4 MTP cached first choice requires multi draft" {

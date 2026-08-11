@@ -493,6 +493,8 @@ pub const DecodeContext = struct {
         logical_block_count: usize,
         tail_tokens: u16,
         position_offset: usize = 0,
+        max_inflight_tokens: usize = 0,
+        allow_swa_ring: bool = false,
         logical_blocks: ?[]const runtime.kv.block.KvBlockId = null,
         kv_storage: ?*runtime.kv.storage_runtime.KvStorageRuntime = null,
     };
@@ -4885,13 +4887,10 @@ fn decoderBlock(
             config.layerRopeActiveDim(layer)
         else
             0;
-        const block_rope_theta = if (block_rope_active_dim != 0) theta_blk: {
-            const base_theta = config.layerRopeTheta(layer);
-            const freq_dim: f32 = @floatFromInt(config.layerRopeFrequencyDim(layer));
-            const active_dim: f32 = @floatFromInt(block_rope_active_dim);
-            if (active_dim < freq_dim) break :theta_blk std.math.pow(f32, base_theta, active_dim / freq_dim);
-            break :theta_blk base_theta;
-        } else 10000.0;
+        const block_rope_theta = if (block_rope_active_dim != 0)
+            config.layerRopeEffectiveTheta(layer)
+        else
+            10000.0;
         const block_started_at = monotonicNowNs();
         debug_timing_stats.gated_block_attempts += 1;
         debug_timing_stats.gated_block_input_attempts += 1;
@@ -5207,13 +5206,7 @@ fn decoderBlock(
     var fused_k_rope: ?CT = null;
     if (!shares_kv and config.family == .gemma and config.position_encoding == .rope and batch == 1) fused_blk: {
         const rope_dim = config.layerRopeActiveDim(layer);
-        const rope_theta = blk: {
-            const base_theta = config.layerRopeTheta(layer);
-            const freq_dim: f32 = @floatFromInt(config.layerRopeFrequencyDim(layer));
-            const active_dim: f32 = @floatFromInt(rope_dim);
-            if (active_dim < freq_dim) break :blk std.math.pow(f32, base_theta, active_dim / freq_dim);
-            break :blk base_theta;
-        };
+        const rope_theta = config.layerRopeEffectiveTheta(layer);
         const offset = positionOffset(seq_len, total, decode_context);
         const consecutive_pairs = config.rope_layout == .consecutive_pairs;
         const q_scale = if (config.global_head_dim != 0) @sqrt(@as(f32, @floatFromInt(head_dim))) else 1.0;
@@ -7198,19 +7191,7 @@ fn applyAttentionWithSink(
     }
     const rope_dim: usize = config.layerRopeActiveDim(layer);
     const rope_consecutive_pairs = config.rope_layout == .consecutive_pairs;
-    // When rope_dim_override is active (from rope_freqs.weight), the frequency formula
-    // in the backend uses rope_dim (active_dim). We adjust theta so that:
-    //   1/theta'^(2j/active_dim) == 1/theta^(2j/freq_dim)
-    // which gives theta' = theta^(active_dim/freq_dim).
-    const rope_theta = blk: {
-        const base_theta = config.layerRopeTheta(layer);
-        const freq_dim: f32 = @floatFromInt(config.layerRopeFrequencyDim(layer));
-        const active_dim: f32 = @floatFromInt(rope_dim);
-        if (active_dim < freq_dim) {
-            break :blk std.math.pow(f32, base_theta, active_dim / freq_dim);
-        }
-        break :blk base_theta;
-    };
+    const rope_theta = config.layerRopeEffectiveTheta(layer);
 
     // Mixed batch: per-item RoPE with different position offsets.
     const is_mixed = if (decode_context) |dc| dc.isMixedBatch() else false;
@@ -7485,15 +7466,7 @@ pub fn applyAttentionResidual(
     if (config.position_encoding == .rope) {
         const rope_dim: usize = config.layerRopeActiveDim(layer);
         const rope_consecutive_pairs = config.rope_layout == .consecutive_pairs;
-        const rope_theta = blk: {
-            const base_theta = config.layerRopeTheta(layer);
-            const freq_dim: f32 = @floatFromInt(config.layerRopeFrequencyDim(layer));
-            const active_dim: f32 = @floatFromInt(rope_dim);
-            if (active_dim < freq_dim) {
-                break :blk std.math.pow(f32, base_theta, active_dim / freq_dim);
-            }
-            break :blk base_theta;
-        };
+        const rope_theta = config.layerRopeEffectiveTheta(layer);
         const position_offset = positionOffset(seq_len, attention.query_sequence_len, decode_context);
         const rope_started_at = monotonicNowNs();
         const Q_rope = if (config.global_head_dim != 0) blk: {
@@ -7691,6 +7664,8 @@ fn attentionContext(seq_len: usize, decode_context: ?*const DecodeContext) ops.A
                 .logical_block_count = kv.logical_block_count,
                 .tail_tokens = kv.tail_tokens,
                 .position_offset = kv.position_offset,
+                .max_inflight_tokens = kv.max_inflight_tokens,
+                .allow_swa_ring = kv.allow_swa_ring,
                 .logical_blocks = kv.logical_blocks,
                 .kv_storage = kv.kv_storage,
             }

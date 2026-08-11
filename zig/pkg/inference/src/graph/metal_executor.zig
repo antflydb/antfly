@@ -669,6 +669,14 @@ fn printRuntimeDebugTimingStats(metal_stats: model_runtime.RuntimeDebugTimingSta
         },
     );
     std.debug.print(
+        "metal_attention_dispatch: paged_1x={d} decode_gqa_split={d} decode_gqa_split_fallback={d}\n",
+        .{
+            provider_stats.metal_runtime_paged_attention_1x_calls,
+            provider_stats.metal_runtime_decode_gqa_split_calls,
+            provider_stats.metal_runtime_decode_gqa_split_fallback_calls,
+        },
+    );
+    std.debug.print(
         "metal_q4_0_dispatch: linear_reduce={d} linear_reduce_in_f16={d} linear_reduce_out_f16={d} linear_reduce_in_f16_out_f16={d} linear_reduce_sumsq={d} pair_act_reduce={d} pair_act_reduce_out_f16={d} pair_act_rms_scale_reduce_out_f16={d} activation_rhs_reduce={d} activation_rhs_reduce_out_f16={d} rms_norm_add_sumsq={d} pair_reduce={d} pair={d}\n",
         .{
             provider_stats.metal_runtime_q4_0_linear_reduce,
@@ -835,19 +843,58 @@ const DecoderRuntimeSpanState = struct {
     kv_position_offset: usize,
 };
 
+fn executorUsesLazyDeviceKvReserve(config: gpt_mod.Config) bool {
+    if (config.family != .gemma or !config.hasPle()) return false;
+    const mixed_width = config.hasGlobalAttentionLayers() and
+        (config.maxKvHeads() != config.effectiveKVHeads() or
+            config.maxHeadDim() != config.headDim());
+    return mixed_width or config.num_kv_shared_layers > 0;
+}
+
+fn executorContractKvCacheView(kv_view: generation.KvView) contracts.KvCacheView {
+    return .{
+        .sequence_id = kv_view.sequence_id,
+        .pool_id = kv_view.pool_id,
+        .logical_block_count = kv_view.logical_block_count,
+        .tail_tokens = kv_view.tail_tokens,
+        .position_offset = kv_view.position_offset,
+        .max_inflight_tokens = kv_view.max_inflight_tokens,
+        .allow_swa_ring = kv_view.allow_swa_ring,
+        .logical_blocks = kv_view.logical_blocks,
+        .kv_storage = kv_view.kv_storage,
+    };
+}
+
+fn executorDecodeKvCacheView(kv_view: generation.KvView) gpt_arch.DecodeContext.KvCacheView {
+    return .{
+        .sequence_id = kv_view.sequence_id,
+        .pool_id = kv_view.pool_id,
+        .logical_block_count = kv_view.logical_block_count,
+        .tail_tokens = kv_view.tail_tokens,
+        .position_offset = kv_view.position_offset,
+        .max_inflight_tokens = kv_view.max_inflight_tokens,
+        .allow_swa_ring = kv_view.allow_swa_ring,
+        .logical_blocks = kv_view.logical_blocks,
+        .kv_storage = kv_view.kv_storage,
+    };
+}
+
 const ExecutorKvMetadataLayer = struct {
     allocator: std.mem.Allocator,
     pool_id: runtime.kv.block.KvPoolId,
+    lazy_device_reserve: bool,
     sequence_id: ?runtime.kv.manager.SequenceId = null,
     total_token_count: usize = 0,
     position_offset: usize = 0,
     tail_tokens: u16 = 0,
     kv_view: ?generation.KvView = null,
     compacted: bool = false,
+    max_inflight_tokens: usize = 0,
+    allow_swa_ring: bool = false,
     logical_blocks: std.ArrayListUnmanaged(runtime.kv.block.KvBlockId) = .empty,
 
-    fn init(allocator: std.mem.Allocator, pool_id: runtime.kv.block.KvPoolId) ExecutorKvMetadataLayer {
-        return .{ .allocator = allocator, .pool_id = pool_id };
+    fn init(allocator: std.mem.Allocator, pool_id: runtime.kv.block.KvPoolId, lazy_device_reserve: bool) ExecutorKvMetadataLayer {
+        return .{ .allocator = allocator, .pool_id = pool_id, .lazy_device_reserve = lazy_device_reserve };
     }
 
     fn deinit(self: *ExecutorKvMetadataLayer, storage: *runtime.kv.storage_runtime.KvStorageRuntime) void {
@@ -863,7 +910,22 @@ const ExecutorKvMetadataLayer = struct {
         self.tail_tokens = 0;
         self.kv_view = null;
         self.compacted = false;
+        self.max_inflight_tokens = 0;
+        self.allow_swa_ring = false;
         self.logical_blocks.clearRetainingCapacity();
+    }
+
+    fn configureKvPolicy(self: *ExecutorKvMetadataLayer, max_inflight_tokens: usize, allow_swa_ring: bool) !void {
+        const enabled = allow_swa_ring and max_inflight_tokens > 0;
+        const normalized_max = if (enabled) max_inflight_tokens else 0;
+        if (self.sequence_id != null or self.total_token_count != 0) {
+            if (self.max_inflight_tokens != normalized_max or self.allow_swa_ring != enabled) {
+                return error.InvalidPagedKvState;
+            }
+            return;
+        }
+        self.max_inflight_tokens = normalized_max;
+        self.allow_swa_ring = enabled;
     }
 
     fn tokenCount(self: *const ExecutorKvMetadataLayer, storage: *const runtime.kv.storage_runtime.KvStorageRuntime) usize {
@@ -890,6 +952,8 @@ const ExecutorKvMetadataLayer = struct {
             .tail_tokens = self.tail_tokens,
             .token_count = retained_tokens,
             .position_offset = self.position_offset,
+            .max_inflight_tokens = self.max_inflight_tokens,
+            .allow_swa_ring = self.allow_swa_ring,
             .logical_blocks = self.logical_blocks.items,
             .kv_storage = storage,
         };
@@ -908,7 +972,10 @@ const ExecutorKvMetadataLayer = struct {
     }
 
     fn reserveDeviceCapacity(self: *ExecutorKvMetadataLayer, storage: *runtime.kv.storage_runtime.KvStorageRuntime) !void {
-        if (disableDeviceKvReserveRequested()) return;
+        // The generic eager reserve does not know whether a layer is local or
+        // global. Let the first layer write establish that slot's ring geometry
+        // when split SWA/global caching is enabled.
+        if (self.lazy_device_reserve or self.allow_swa_ring or disableDeviceKvReserveRequested()) return;
         const sequence_id = self.sequence_id orelse return;
         const pool = storage.getPool(self.pool_id) orelse return error.InvalidPoolId;
         const retained_tokens = self.tokenCount(storage);
@@ -921,6 +988,9 @@ const ExecutorKvMetadataLayer = struct {
                 self.position_offset,
                 pool.config.num_kv_heads,
                 pool.config.head_dim,
+                0,
+                0,
+                false,
             ) catch |err| switch (err) {
                 error.DeviceWriteUnsupported,
                 error.DeviceWriteFormatUnsupported,
@@ -945,6 +1015,8 @@ const ExecutorKvMetadataLayer = struct {
         self.position_offset = 0;
         self.tail_tokens = 0;
         self.compacted = false;
+        self.max_inflight_tokens = 0;
+        self.allow_swa_ring = false;
         self.logical_blocks.clearRetainingCapacity();
         self.kv_view = null;
     }
@@ -1155,14 +1227,7 @@ const RuntimeContext = struct {
             .metal => false,
             else => false,
         };
-        const sliding_window_size: ?u32 = if (gpt_config.position_encoding == .absolute)
-            null
-        else if (gpt_config.sliding_window > 0)
-            gpt_config.sliding_window
-        else if (gpt_config.max_position_embeddings > 0)
-            gpt_config.max_position_embeddings
-        else
-            null;
+        const sliding_window_size = executorKvSlidingWindowSize(gpt_config);
 
         var kv_storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, .{
             .backend = .metal,
@@ -1193,7 +1258,7 @@ const RuntimeContext = struct {
             .pool_id = pool_id,
             .moe_runtime = runtime.moe.runtime.MoeRuntime.init(allocator, shared_moe_cache),
             .shared_moe_cache = shared_moe_cache,
-            .kv_metadata = ExecutorKvMetadataLayer.init(allocator, pool_id),
+            .kv_metadata = ExecutorKvMetadataLayer.init(allocator, pool_id, executorUsesLazyDeviceKvReserve(gpt_config)),
             .mirrored_token_count = 0,
             .mirrored_kv_view = null,
             .mirrored_kv_compacted = false,
@@ -1404,7 +1469,7 @@ const RuntimeContext = struct {
         };
         defer compacted.deinit();
 
-        var replacement = ExecutorKvMetadataLayer.init(self.allocator, self.pool_id);
+        var replacement = ExecutorKvMetadataLayer.init(self.allocator, self.pool_id, self.kv_metadata.lazy_device_reserve);
         replacement.sequence_id = try self.kv_storage.attachSequence(self.pool_id);
         errdefer replacement.releaseOwnedSequence(&self.kv_storage) catch {};
         replacement.total_token_count = self.kv_metadata.total_token_count;
@@ -1484,15 +1549,14 @@ const RuntimeContext = struct {
     }
 
     fn kvCacheView(_: *const RuntimeContext, kv_view: generation.KvView) contracts.KvCacheView {
-        return .{
-            .sequence_id = kv_view.sequence_id,
-            .pool_id = kv_view.pool_id,
-            .logical_block_count = kv_view.logical_block_count,
-            .tail_tokens = kv_view.tail_tokens,
-            .position_offset = kv_view.position_offset,
-            .logical_blocks = kv_view.logical_blocks,
-            .kv_storage = kv_view.kv_storage,
-        };
+        return executorContractKvCacheView(kv_view);
+    }
+
+    fn configureKvPolicy(self: *RuntimeContext, max_inflight_tokens: usize, allow_swa_ring: bool) !void {
+        try self.kv_metadata.configureKvPolicy(
+            max_inflight_tokens,
+            allow_swa_ring and self.gpt_config.supportsSplitSwaGlobalKvRing(),
+        );
     }
 
     fn validateDecodePosition(self: *const RuntimeContext, position: usize) !void {
@@ -1558,15 +1622,7 @@ const RuntimeContext = struct {
                 .kv_storage = &self.kv_storage,
                 .moe_runtime = &self.moe_runtime,
                 .kv_cache = if (kv_view) |view|
-                    .{
-                        .sequence_id = view.sequence_id,
-                        .pool_id = view.pool_id,
-                        .logical_block_count = view.logical_block_count,
-                        .tail_tokens = view.tail_tokens,
-                        .position_offset = view.position_offset,
-                        .logical_blocks = view.logical_blocks,
-                        .kv_storage = view.kv_storage,
-                    }
+                    executorDecodeKvCacheView(view)
                 else
                     null,
             };
@@ -1831,6 +1887,10 @@ const RuntimeContext = struct {
     }
 };
 
+fn executorKvSlidingWindowSize(config: gpt_mod.Config) ?u32 {
+    return config.kvPoolSlidingWindowSize(false);
+}
+
 const runtime_vtable = model_runtime.ModelRuntime.VTable{
     .capabilities = runtimeCapabilities,
     .prepare = runtimePrepare,
@@ -2053,6 +2113,7 @@ fn runtimePrefill(
     if (request.input_ids.len == 0 or request.query_seq_len == 0) return error.EmptyPrompt;
     if (request.input_ids.len != request.query_seq_len) return error.UnsupportedShape;
     if (request.query_seq_len > request.seq_len) return error.UnsupportedShape;
+    try runtime_ctx.configureKvPolicy(request.max_inflight_tokens, request.allow_swa_ring);
 
     timing_stats.prefill_calls += 1;
     const prepare_started_at = monotonicNowNs();

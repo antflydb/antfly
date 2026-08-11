@@ -427,18 +427,29 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     else
         try generation.formatMessages(allocator, &messages);
     defer allocator.free(rendered_prompt);
-    var prompt_encoded = try generation.encodePromptForGeneration(
+    const prompt_media_allowance = generation.nativeGenerationMediaTokenAllowance(&messages, gpt_config);
+    const prompt_token_limit = try generation.nativeGenerationPromptTokenLimit(
+        gpt_config,
+        if (draft_model != null and opts.speculation_policy != .off) draft_gpt_config else null,
+        @intCast(@max(opts.max_tokens, 1)),
+        if (draft_model != null and opts.speculation_policy != .off and opts.speculative_k > 0) 1 else 0,
+        prompt_media_allowance,
+    );
+    var prompt_encoded = try generation.encodeNativeGenerationPrompt(
         tokenizer,
         allocator,
         rendered_prompt,
-        2048,
+        prompt_token_limit,
         !opts.no_bos and model.manifest.add_bos_token,
         model.manifest.bos_token,
     );
     const encoded_prompt_at = std.Io.Timestamp.now(io, .awake);
     defer prompt_encoded.deinit();
-    const prompt_tokens = countPromptTokens(prompt_encoded.attention_mask) +
-        opts.image_count * (@as(usize, gpt_config.mm_tokens_per_image) + 1);
+    const prompt_tokens = std.math.add(
+        usize,
+        countPromptTokens(prompt_encoded.attention_mask),
+        prompt_media_allowance,
+    ) catch return error.PromptTooLong;
 
     if (artifact_backend != null and effective_draft_model == null and !route_onnx_whole_model_graph and opts.max_tokens == 1 and opts.image_count == 0 and opts.audio_count == 0) {
         if (try tryRunArtifactForPromptShape(
@@ -671,24 +682,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         null;
     defer if (draft_cb) |*backend| backend.deinit();
 
-    const sliding_window_size: ?u32 = if (gpt_config.position_encoding == .absolute)
-        null
-    else if (gpt_config.sliding_window > 0 and gpt_config.hasGlobalAttentionLayers() and !kvSlidingTrimForced())
-        // Mixed attention (iSWA-style models like Gemma): global layers need
-        // the full KV history, and the pool packs every layer's KV into
-        // shared blocks, so window-trimming the pool silently truncates the
-        // global layers' context. Retain everything; sliding-window layers
-        // still apply their exact window inside the attention kernels, so
-        // their compute stays bounded — only KV memory grows with context.
-        // ANTFLY_INFERENCE_KV_SLIDING_TRIM=1 restores the old
-        // trim-to-window behavior (lower memory, truncated global context).
-        null
-    else if (gpt_config.sliding_window > 0)
-        gpt_config.sliding_window
-    else if (gpt_config.max_position_embeddings > 0)
-        gpt_config.max_position_embeddings
-    else
-        null;
+    const sliding_window_size = gpt_config.kvPoolSlidingWindowSize(kvSlidingTrimForced());
 
     const pool_id = try kv_manager.addPool(.{
         .backend = backend_kind,
@@ -742,14 +736,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     if (draft_model != null) {
         if (draft_gpt_config) |draft_cfg| {
             draft_kv_manager = runtime.kv.manager.KvManager.init(allocator);
-            const draft_sliding_window_size: ?u32 = if (draft_cfg.position_encoding == .absolute)
-                null
-            else if (draft_cfg.sliding_window > 0)
-                draft_cfg.sliding_window
-            else if (draft_cfg.max_position_embeddings > 0)
-                draft_cfg.max_position_embeddings
-            else
-                null;
+            const draft_sliding_window_size = draft_cfg.kvPoolSlidingWindowSize(kvSlidingTrimForced());
             const draft_pool_id = try draft_kv_manager.?.addPool(.{
                 .backend = draft_backend_kind.?,
                 .dtype = draft_kv_dtype.?,
@@ -4084,6 +4071,16 @@ fn liveWholeModelExecutorRequested(opts: *const Options) bool {
     };
 }
 
+fn liveWholeModelSupportsSplitSwaRing(gpt_config: gpt_mod.Config) bool {
+    return gpt_config.supportsSplitSwaGlobalKvRing();
+}
+
+fn liveWholeModelAllowsSplitSwaRing(gpt_config: gpt_mod.Config, config: generation.GenerationConfig) bool {
+    return liveWholeModelSupportsSplitSwaRing(gpt_config) and
+        !config.prompt_cache_enabled and
+        config.cache_compaction_ratio == null;
+}
+
 fn runLiveWholeModelExecutorReuseProbe(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -4108,6 +4105,7 @@ fn runLiveWholeModelExecutorReuseProbe(
     var processed: usize = 0;
     var output_accum: ?graph_mod.model_runtime.ModelOutput = null;
     errdefer if (output_accum) |*owned| owned.deinit(allocator);
+    const allow_swa_ring = liveWholeModelSupportsSplitSwaRing(gpt_config);
     while (processed < prompt_ids.len) {
         const chunk_end = @min(prompt_ids.len, processed + @max(prefill_chunk_size, 1));
         if (output_accum) |*owned| owned.deinit(allocator);
@@ -4116,6 +4114,8 @@ fn runLiveWholeModelExecutorReuseProbe(
             .seq_len = chunk_end,
             .query_seq_len = chunk_end - processed,
             .attention_mode = .paged_prefill,
+            .max_inflight_tokens = if (allow_swa_ring) @max(prefill_chunk_size, 1) else 0,
+            .allow_swa_ring = allow_swa_ring,
             .force_host_logits = forcePrefillHostLogits(),
             .prefer_greedy_token = prefillGreedyTokenEnabled() and chunk_end == prompt_ids.len,
         });
@@ -4252,6 +4252,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
     const prefer_prefill_greedy_token = prefillGreedyTokenEnabled() and use_greedy_decode;
     var prefill_chunk_size = if (config.prefill_chunk_size > 0) config.prefill_chunk_size else prompt_ids.len;
     prefill_chunk_size = @max(@min(prefill_chunk_size, prompt_ids.len), 1);
+    const allow_swa_ring = liveWholeModelAllowsSplitSwaRing(gpt_config, config);
     const prefill_started_at = std.Io.Timestamp.now(io, .awake);
     var output = blk: {
         var processed: usize = 0;
@@ -4266,6 +4267,8 @@ fn tryRunLiveWholeModelExecutorGenerate(
                 .seq_len = chunk_end,
                 .query_seq_len = chunk_end - processed,
                 .attention_mode = .paged_prefill,
+                .max_inflight_tokens = if (allow_swa_ring) prefill_chunk_size else 0,
+                .allow_swa_ring = allow_swa_ring,
                 .force_host_logits = forcePrefillHostLogits(),
                 .prefer_greedy_token = prefer_prefill_greedy_token and chunk_end == prompt_ids.len,
             }) catch |err| {
@@ -4775,24 +4778,7 @@ fn runOnnxWholeModelGraphGenerate(
     const created_backend_at = std.Io.Timestamp.now(io, .awake);
     defer cb.deinit();
 
-    const sliding_window_size: ?u32 = if (gpt_config.position_encoding == .absolute)
-        null
-    else if (gpt_config.sliding_window > 0 and gpt_config.hasGlobalAttentionLayers() and !kvSlidingTrimForced())
-        // Mixed attention (iSWA-style models like Gemma): global layers need
-        // the full KV history, and the pool packs every layer's KV into
-        // shared blocks, so window-trimming the pool silently truncates the
-        // global layers' context. Retain everything; sliding-window layers
-        // still apply their exact window inside the attention kernels, so
-        // their compute stays bounded — only KV memory grows with context.
-        // ANTFLY_INFERENCE_KV_SLIDING_TRIM=1 restores the old
-        // trim-to-window behavior (lower memory, truncated global context).
-        null
-    else if (gpt_config.sliding_window > 0)
-        gpt_config.sliding_window
-    else if (gpt_config.max_position_embeddings > 0)
-        gpt_config.max_position_embeddings
-    else
-        null;
+    const sliding_window_size = gpt_config.kvPoolSlidingWindowSize(kvSlidingTrimForced());
     const pool_id = try kv_manager.addPool(.{
         .backend = backend_kind,
         .dtype = kv_dtype,

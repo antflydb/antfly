@@ -17,6 +17,7 @@ const builtin = @import("builtin");
 const platform = @import("antfly_platform");
 const planner = @import("planner.zig");
 const kv_pool = @import("../kv/pool.zig");
+const storage_runtime = @import("../kv/storage_runtime.zig");
 const gpt_mod = @import("../../models/gpt.zig");
 
 const macos = if (builtin.os.tag == .macos) struct {
@@ -2011,6 +2012,18 @@ fn clampBytes(value: usize, min_value: usize, max_value: usize) usize {
     return @min(@max(value, min_value), max_value);
 }
 
+fn geometricTokenCapacityChecked(tokens: usize) !usize {
+    const aligned = try alignForwardChecked(@max(tokens, 1), 16);
+    const growth = try std.math.add(usize, aligned / 2, aligned % 2);
+    return alignForwardChecked(try std.math.add(usize, aligned, growth), 16);
+}
+
+fn generationMaxInflightTokens(prefill_chunk_size: usize) usize {
+    // Generation accepts speculative_k through 16 and writes the proposal
+    // rows plus the verification row into the same live KV span.
+    return @max(@max(prefill_chunk_size, 1), 17);
+}
+
 pub fn estimateGptGeneration(
     backend: kv_pool.BackendKind,
     kv_dtype: kv_pool.KvDType,
@@ -2028,34 +2041,50 @@ pub fn estimateGptGeneration(
     }
     const total_tokens = std.math.add(usize, prompt_tokens, max_tokens) catch
         return error.ResourceLimitExceeded;
-    const retained_tokens = blk: {
-        if (config.position_encoding != .absolute and config.sliding_window > 0) {
-            break :blk @min(total_tokens, @as(usize, @intCast(config.sliding_window)));
-        }
-        if (config.position_encoding != .absolute and config.max_position_embeddings > 0) {
-            break :blk @min(total_tokens, @as(usize, @intCast(config.max_position_embeddings)));
-        }
-        break :blk total_tokens;
-    };
+    const retained_tokens = if (config.kvPoolSlidingWindowSize(false)) |window|
+        @min(total_tokens, @as(usize, @intCast(window)))
+    else
+        total_tokens;
     const page_aligned_tokens = alignForwardChecked(@max(retained_tokens, 1), 16) catch
         return error.ResourceLimitExceeded;
-    const max_kv_heads = config.maxKvHeads();
-    const max_head_dim = try estimateMaxHeadDim(config);
-    if (max_kv_heads == 0 or max_head_dim == 0) return error.InvalidModelConfig;
-    const kv_pair_bytes = kv_dtype.bytesForTokenPairChecked(max_kv_heads, max_head_dim) catch
+    const metal_capacity_tokens = geometricTokenCapacityChecked(total_tokens) catch
         return error.ResourceLimitExceeded;
-    const token_layers = std.math.mul(
-        usize,
-        page_aligned_tokens,
-        @as(usize, config.num_hidden_layers),
-    ) catch return error.ResourceLimitExceeded;
-    const kv_bytes = std.math.mul(usize, token_layers, kv_pair_bytes) catch
-        return error.ResourceLimitExceeded;
+    const split_gemma_kv = backend == .metal and
+        config.usesGemmaSlidingAttention() and
+        config.hasGlobalAttentionLayers();
+    var kv_bytes: usize = 0;
+    for (0..@as(usize, @intCast(config.num_hidden_layers))) |layer| {
+        if (config.layerSharesKv(layer)) continue;
+        var layer_capacity_tokens = if (backend == .metal) metal_capacity_tokens else page_aligned_tokens;
+        if (split_gemma_kv and config.layerUsesSlidingAttention(layer)) {
+            const ring_pages = storage_runtime.swaRingPageCount(
+                16,
+                config.sliding_window,
+                generationMaxInflightTokens(prefill_chunk_size),
+                true,
+            ) catch return error.ResourceLimitExceeded;
+            const ring_tokens = std.math.mul(usize, ring_pages, 16) catch
+                return error.ResourceLimitExceeded;
+            layer_capacity_tokens = @max(layer_capacity_tokens, ring_tokens);
+        }
+        const kv_heads = config.effectiveKVHeadsForLayer(layer);
+        const head_dim = if (config.family == .deepseek_v4)
+            try estimateMaxHeadDim(config)
+        else
+            config.effectiveHeadDimForLayer(layer);
+        if (kv_heads == 0 or head_dim == 0) return error.InvalidModelConfig;
+        const kv_pair_bytes = kv_dtype.bytesForTokenPairChecked(kv_heads, head_dim) catch
+            return error.ResourceLimitExceeded;
+        const layer_bytes = std.math.mul(usize, layer_capacity_tokens, kv_pair_bytes) catch
+            return error.ResourceLimitExceeded;
+        kv_bytes = std.math.add(usize, kv_bytes, layer_bytes) catch
+            return error.ResourceLimitExceeded;
+    }
 
     const scratch_rows = @max(prefill_chunk_size, 1);
     const hidden = @as(usize, @intCast(config.hidden_size));
     const heads = @as(usize, @intCast(config.num_attention_heads));
-    const head_dim = @as(usize, @intCast(config.headDim()));
+    const head_dim = @as(usize, try estimateMaxHeadDim(config));
     const vocab = @as(usize, @intCast(config.vocab_size));
     const attention_width = std.math.mul(usize, heads, head_dim) catch
         return error.ResourceLimitExceeded;
@@ -2910,17 +2939,67 @@ test "gpt generation estimate accounts for sliding window and page alignment" {
 
     const estimate = try estimateGptGeneration(.metal, .f16, cfg, 100, 10, 64);
     try std.testing.expectEqual(@as(usize, 110), estimate.retained_tokens);
-    try std.testing.expectEqual(@as(usize, 112), estimate.kv_bytes / (32 * 8 * 128 * 2 * 2));
+    try std.testing.expectEqual(@as(usize, 176), estimate.kv_bytes / (32 * 8 * 128 * 2 * 2));
     try std.testing.expectEqual(ResidencyTier.backend, estimate.kv_tier);
     try std.testing.expect(estimate.scratch_bytes > 0);
 
     // int8: bytesForTokenRow(8, 128) = 1024 + 8*4 = 1056
     const est_int8 = try estimateGptGeneration(.metal, .int8, cfg, 100, 10, 64);
-    try std.testing.expectEqual(@as(usize, 112 * 32 * 1056 * 2), est_int8.kv_bytes);
+    try std.testing.expectEqual(@as(usize, 176 * 32 * 1056 * 2), est_int8.kv_bytes);
 
     // int4: bytesForTokenRow(8, 128) = ceil(1024/32)*18 = 32*18 = 576
     const est_int4 = try estimateGptGeneration(.metal, .int4, cfg, 100, 10, 64);
-    try std.testing.expectEqual(@as(usize, 112 * 32 * 576 * 2), est_int4.kv_bytes);
+    try std.testing.expectEqual(@as(usize, 176 * 32 * 576 * 2), est_int4.kv_bytes);
+}
+
+test "generation ring estimate covers the maximum speculative verification span" {
+    try std.testing.expectEqual(@as(usize, 17), generationMaxInflightTokens(1));
+    try std.testing.expectEqual(@as(usize, 17), generationMaxInflightTokens(16));
+    try std.testing.expectEqual(@as(usize, 128), generationMaxInflightTokens(128));
+}
+
+test "gpt generation estimate keeps mixed Gemma global history" {
+    const cfg = gpt_mod.Config{
+        .family = .gemma,
+        .hidden_size = 2560,
+        .num_hidden_layers = 42,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 2,
+        .attention_head_dim = 256,
+        .global_head_dim = 512,
+        .vocab_size = 262144,
+        .sliding_window = 512,
+        .sliding_window_pattern = 6,
+        .num_kv_shared_layers = 18,
+        .position_encoding = .rope,
+    };
+
+    const estimate = try estimateGptGeneration(.metal, .f16, cfg, 2000, 100, 512);
+    try std.testing.expectEqual(@as(usize, 2100), estimate.retained_tokens);
+    // The 24 donor layers budget geometric Metal growth. Shared tail layers
+    // do not own KV storage.
+    try std.testing.expectEqual(@as(usize, 181_665_792), estimate.kv_bytes);
+    try std.testing.expectEqual(@as(usize, 76_546_048), estimate.scratch_bytes);
+}
+
+test "gpt generation estimate covers a sliding ring larger than global growth" {
+    const cfg = gpt_mod.Config{
+        .family = .gemma,
+        .hidden_size = 2560,
+        .num_hidden_layers = 2,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 2,
+        .attention_head_dim = 256,
+        .global_head_dim = 512,
+        .vocab_size = 1,
+        .sliding_window = 512,
+        .sliding_window_pattern = 2,
+        .position_encoding = .rope,
+    };
+
+    const estimate = try estimateGptGeneration(.metal, .f16, cfg, 16, 1, 16);
+    // Local ring: 34 pages = 544 tokens. Global growth: 32 -> 48 tokens.
+    try std.testing.expectEqual(@as(usize, 1_310_720), estimate.kv_bytes);
 }
 
 test "gpt generation estimate rejects malformed and overflowing inputs" {
