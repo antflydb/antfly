@@ -4799,7 +4799,7 @@ fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator
             const attention_mask = inputs[1].asInt64();
 
             if (self.task == .classifier) {
-                const hidden_ct = try deberta_arch.forwardCt(&cb, allocator, cfg, input_ids, attention_mask, batch, seq_len);
+                const hidden_ct = try deberta_arch.forwardCt(&cb, allocator, cfg, input_ids, attention_mask, batch, seq_len, false);
                 defer cb.free(hidden_ct);
 
                 const logits = try runDebertaSequenceClassifierCt(&cb, allocator, cfg, hidden_ct, batch, seq_len);
@@ -5237,18 +5237,32 @@ fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator
                 return result;
             }
 
-            const hidden = try deberta_arch.forwardCt(&cb, allocator, cfg, input_ids, attention_mask, batch, seq_len);
+            // The GLiNER span head and DeBERTa encoder run encoder-shaped
+            // quantized GEMMs. Bounded f16 mirrors avoid per-row quantized
+            // setup while leaving other model sessions unchanged.
+            cb.preferEagerQuantMirrors(true);
+            const hidden = try deberta_arch.forwardCt(&cb, allocator, cfg, input_ids, attention_mask, batch, seq_len, true);
             defer cb.free(hidden);
 
             // Eager head path -- keeps the encoder/head boundary on the
             // backend (CT) so we skip the toFloat32 + fromFloat32Shape
-            // round-trip the legacy []f32-typed APIs do.
+            // round-trip the legacy []f32-typed APIs do. One Metal frame
+            // amortizes command-buffer commits across the resident head.
+            var head_frame_active = false;
+            if (cb.kind() == .metal and !cb.decoderRuntimeHasActiveFrame()) {
+                head_frame_active = cb.decoderRuntimeBeginFrame() catch false;
+            }
+            errdefer if (head_frame_active) cb.decoderRuntimeCancelFrame() catch {};
             const head_result = try gliner_head.forwardCtWithLabelMarkers(&cb, allocator, hidden, input_ids, words_mask, span_idx, batch, seq_len, cfg.hidden_size, .{
                 .classification = cfg.classification_token_id,
                 .entity = cfg.entity_token_id,
                 .relation = cfg.relation_token_id,
             });
             defer cb.free(head_result.logits);
+            if (head_frame_active) {
+                try cb.decoderRuntimeSubmitAndWaitFrame();
+                head_frame_active = false;
+            }
 
             const logits_f32 = if (head_result.num_labels == 0)
                 try allocator.alloc(f32, 0)

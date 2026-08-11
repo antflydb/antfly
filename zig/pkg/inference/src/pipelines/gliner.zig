@@ -29,6 +29,7 @@
 const std = @import("std");
 const platform = @import("antfly_platform");
 const backends = @import("../backends/backends.zig");
+const session_mod = @import("../backends/session.zig");
 const Tokenizer = @import("inference_tokenizer").Tokenizer;
 const Tensor = backends.Tensor;
 const runtime = @import("../runtime/root.zig");
@@ -85,6 +86,21 @@ pub const GlinerPipeline = struct {
     session: backends.Session,
     tok: Tokenizer,
     config: GlinerConfig,
+    /// Optional caller-owned guard for backend state shared by pipelines made
+    /// from the same loaded model. Preparation and decoding stay parallel;
+    /// only stateful session execution is serialized.
+    execution_lock: ?*std.atomic.Mutex = null,
+
+    fn lockedSessionRun(
+        self: *GlinerPipeline,
+        permit: *session_mod.RunPermit,
+        inputs: []const Tensor,
+        alloc: std.mem.Allocator,
+    ) ![]Tensor {
+        if (self.execution_lock) |mutex| platform.sync.lockYielding(mutex);
+        defer if (self.execution_lock) |mutex| mutex.unlock();
+        return permit.run(inputs, alloc);
+    }
 
     pub fn usesDistributedGpuHosted(self: *const GlinerPipeline) bool {
         return self.config.distributed.enabled and
@@ -177,13 +193,10 @@ pub const GlinerPipeline = struct {
         const relation_threshold = if (self.config.relation_threshold > 0) self.config.relation_threshold else self.config.threshold;
         const active_texts = try alloc.alloc([]const u8, rows_with_entities);
         defer alloc.free(active_texts);
-        const active_indices = try alloc.alloc(usize, rows_with_entities);
-        defer alloc.free(active_indices);
         var active_len: usize = 0;
         for (all_entities, 0..) |entities, i| {
             if (entities.len < 2) continue;
             active_texts[active_len] = texts[i];
-            active_indices[active_len] = i;
             active_len += 1;
         }
 
@@ -196,14 +209,23 @@ pub const GlinerPipeline = struct {
             alloc.free(relation_heads);
         }
 
-        for (all_entities, 0..) |entities, i| {
-            if (entities.len >= 2) continue;
-            all_relations[i] = try alloc.alloc(Relation, 0);
+        var active_index: usize = 0;
+        for (all_entities, 0..) |entities, row_index| {
+            if (entities.len < 2) {
+                all_relations[row_index] = try alloc.alloc(Relation, 0);
+                initialized_relations += 1;
+                continue;
+            }
+
+            all_relations[row_index] = try self.matchRelations(entities, relation_heads[active_index]);
+            active_index += 1;
             initialized_relations += 1;
-        }
-        for (active_indices[0..active_len], 0..) |row_index, active_index| {
-            all_relations[row_index] = try self.matchRelations(all_entities[row_index], relation_heads[active_index]);
-            initialized_relations += 1;
+            all_entities[row_index] = try includeRelationEndpoints(
+                alloc,
+                all_entities[row_index],
+                all_relations[row_index],
+                use_entity_labels,
+            );
         }
 
         return .{
@@ -256,6 +278,16 @@ pub const GlinerPipeline = struct {
         return rows[0];
     }
 
+    const PreparedGlinerSchema = struct {
+        ids: []i32,
+        positions: []i64,
+
+        fn deinit(self: *PreparedGlinerSchema, alloc: std.mem.Allocator) void {
+            alloc.free(self.ids);
+            alloc.free(self.positions);
+        }
+    };
+
     const PreparedGlinerInput = struct {
         text: []const u8,
         input_ids: []i64,
@@ -285,6 +317,63 @@ pub const GlinerPipeline = struct {
         word_major_logits,
         label_major_scores,
     };
+
+    const BatchOutputLayout = struct {
+        num_words: usize,
+        max_width: usize,
+        num_labels: usize,
+        row_stride: usize,
+    };
+
+    fn validateBatchOutputLayout(
+        output_shape: []const i64,
+        logits_len: usize,
+        batch: usize,
+        expected_num_words: usize,
+        expected_max_width: usize,
+        requested_labels: usize,
+    ) !BatchOutputLayout {
+        if (output_shape.len != 3 and output_shape.len != 4) return error.UnexpectedOutputShape;
+        const output_batch = nonNegativeDim(output_shape[0]) catch return error.UnexpectedOutputShape;
+        if (output_batch != batch) return error.UnexpectedOutputShape;
+
+        var num_words = expected_num_words;
+        var max_width = expected_max_width;
+        const output_labels: usize = if (output_shape.len == 4) labels: {
+            num_words = nonNegativeDim(output_shape[1]) catch return error.UnexpectedOutputShape;
+            max_width = nonNegativeDim(output_shape[2]) catch return error.UnexpectedOutputShape;
+            break :labels nonNegativeDim(output_shape[3]) catch return error.UnexpectedOutputShape;
+        } else labels: {
+            const output_spans = nonNegativeDim(output_shape[1]) catch return error.UnexpectedOutputShape;
+            const expected_spans = std.math.mul(usize, expected_num_words, expected_max_width) catch
+                return error.UnexpectedOutputShape;
+            if (output_spans != expected_spans) return error.UnexpectedOutputShape;
+            break :labels nonNegativeDim(output_shape[2]) catch return error.UnexpectedOutputShape;
+        };
+        if (num_words == 0 or
+            max_width == 0 or
+            num_words != expected_num_words or
+            max_width != expected_max_width or
+            output_labels != requested_labels)
+        {
+            return error.UnexpectedOutputShape;
+        }
+
+        const row_stride = std.math.mul(
+            usize,
+            std.math.mul(usize, num_words, max_width) catch return error.UnexpectedOutputShape,
+            output_labels,
+        ) catch return error.UnexpectedOutputShape;
+        const expected_logits = std.math.mul(usize, batch, row_stride) catch return error.UnexpectedOutputShape;
+        if (logits_len != expected_logits) return error.UnexpectedOutputShape;
+
+        return .{
+            .num_words = num_words,
+            .max_width = max_width,
+            .num_labels = requested_labels,
+            .row_stride = row_stride,
+        };
+    }
 
     fn recognizeWithLabelTokenBatch(
         self: *GlinerPipeline,
@@ -318,6 +407,9 @@ pub const GlinerPipeline = struct {
         }
         if (texts.len == 0) return results;
 
+        var schema = try self.prepareGlinerSchema(labels, label_token);
+        defer schema.deinit(alloc);
+
         var prepared = try alloc.alloc(PreparedGlinerInput, texts.len);
         var prepared_len: usize = 0;
         errdefer {
@@ -329,7 +421,7 @@ pub const GlinerPipeline = struct {
         var max_num_words: usize = 0;
         const prepare_start_ns = glinerProfileStart(profile_enabled);
         for (texts, 0..) |text, i| {
-            prepared[i] = try self.prepareGlinerInput(text, labels, label_token);
+            prepared[i] = try self.prepareGlinerInputWithSchema(text, schema);
             prepared_len += 1;
             max_seq_len = @max(max_seq_len, prepared[i].input_ids.len);
             max_num_words = @max(max_num_words, prepared[i].actual_num_words);
@@ -375,21 +467,14 @@ pub const GlinerPipeline = struct {
         }
 
         const batch = texts.len;
-        const batch_num_spans = std.math.mul(usize, max_num_words, max_width) catch
-            return error.ResourceLimitExceeded;
-        const token_elements = std.math.mul(usize, batch, max_seq_len) catch
-            return error.ResourceLimitExceeded;
-        const span_elements = std.math.mul(
-            usize,
-            std.math.mul(usize, batch, batch_num_spans) catch
-                return error.ResourceLimitExceeded,
-            2,
-        ) catch return error.ResourceLimitExceeded;
+        const batch_num_spans = try checkedSizeMul(max_num_words, max_width);
+        const batch_rows = try checkedSizeMul(batch, max_seq_len);
+        const span_values = try checkedSizeMul(try checkedSizeMul(batch, batch_num_spans), 2);
         const input_elements = std.math.add(
             usize,
-            std.math.mul(usize, token_elements, 3) catch
+            std.math.mul(usize, batch_rows, 3) catch
                 return error.ResourceLimitExceeded,
-            span_elements,
+            span_values,
         ) catch return error.ResourceLimitExceeded;
         const input_bytes = std.math.mul(usize, input_elements, @sizeOf(i64)) catch
             return error.ResourceLimitExceeded;
@@ -401,13 +486,13 @@ pub const GlinerPipeline = struct {
         });
         defer run_permit.deinit();
         const pack_start_ns = glinerProfileStart(profile_enabled);
-        const input_ids_buf = try alloc.alloc(i64, batch * max_seq_len);
+        const input_ids_buf = try alloc.alloc(i64, batch_rows);
         defer alloc.free(input_ids_buf);
-        const attention_mask_buf = try alloc.alloc(i64, batch * max_seq_len);
+        const attention_mask_buf = try alloc.alloc(i64, batch_rows);
         defer alloc.free(attention_mask_buf);
-        const words_mask_buf = try alloc.alloc(i64, batch * max_seq_len);
+        const words_mask_buf = try alloc.alloc(i64, batch_rows);
         defer alloc.free(words_mask_buf);
-        const span_idx_buf = try alloc.alloc(i64, batch * batch_num_spans * 2);
+        const span_idx_buf = try alloc.alloc(i64, span_values);
         defer alloc.free(span_idx_buf);
         @memset(input_ids_buf, 0);
         @memset(attention_mask_buf, 0);
@@ -431,7 +516,7 @@ pub const GlinerPipeline = struct {
             }
         }
 
-        const shape_2d = [_]i64{ @intCast(batch), @intCast(max_seq_len) };
+        const shape_2d = [_]i64{ try sizeToI64(batch), try sizeToI64(max_seq_len) };
         var input_ids_tensor = try Tensor.initInt64(alloc, "input_ids", &shape_2d, input_ids_buf);
         defer input_ids_tensor.deinit();
         var attention_mask_tensor = try Tensor.initInt64(alloc, "attention_mask", &shape_2d, attention_mask_buf);
@@ -439,13 +524,13 @@ pub const GlinerPipeline = struct {
         var words_mask_tensor = try Tensor.initInt64(alloc, "words_mask", &shape_2d, words_mask_buf);
         defer words_mask_tensor.deinit();
 
-        const span_shape = [_]i64{ @intCast(batch), @intCast(batch_num_spans), 2 };
+        const span_shape = [_]i64{ try sizeToI64(batch), try sizeToI64(batch_num_spans), 2 };
         var span_idx_tensor = try Tensor.initInt64(alloc, "span_idx", &span_shape, span_idx_buf);
         defer span_idx_tensor.deinit();
         const pack_ms = glinerProfileElapsedMs(pack_start_ns);
 
         const session_start_ns = glinerProfileStart(profile_enabled);
-        const outputs = try run_permit.run(&.{
+        const outputs = try self.lockedSessionRun(&run_permit, &.{
             input_ids_tensor,
             attention_mask_tensor,
             words_mask_tensor,
@@ -462,32 +547,26 @@ pub const GlinerPipeline = struct {
         const logits = output.asFloat32();
         const output_shape = output.shape;
 
-        var num_labels_dim: usize = labels.len;
-        var output_num_words: usize = max_num_words;
-        var output_max_width: usize = max_width;
-        var row_stride: usize = batch_num_spans * num_labels_dim;
-        if (output_shape.len >= 4) {
-            output_num_words = @intCast(output_shape[1]);
-            output_max_width = @intCast(output_shape[2]);
-            num_labels_dim = @intCast(output_shape[3]);
-            row_stride = output_num_words * output_max_width * num_labels_dim;
-        } else if (output_shape.len == 3) {
-            row_stride = @as(usize, @intCast(output_shape[1])) * @as(usize, @intCast(output_shape[2]));
-            num_labels_dim = @intCast(output_shape[2]);
-        }
-        if (num_labels_dim > labels.len) num_labels_dim = labels.len;
+        const output_layout = try validateBatchOutputLayout(
+            output_shape,
+            logits.len,
+            batch,
+            max_num_words,
+            max_width,
+            labels.len,
+        );
 
         const decode_start_ns = glinerProfileStart(profile_enabled);
         for (prepared[0..prepared_len], 0..) |row, i| {
-            const row_start = @min(i * row_stride, logits.len);
-            const row_end = @min(row_start + row_stride, logits.len);
+            const row_start = try checkedSizeMul(i, output_layout.row_stride);
+            const row_end = try checkedSizeAdd(row_start, output_layout.row_stride);
             results[i] = try self.decodeEntitiesFromLogits(
                 row,
                 labels,
                 logits[row_start..row_end],
-                output_num_words,
-                output_max_width,
-                num_labels_dim,
+                output_layout.num_words,
+                output_layout.max_width,
+                output_layout.num_labels,
                 threshold,
                 flat_ner,
                 .word_major_logits,
@@ -609,7 +688,7 @@ pub const GlinerPipeline = struct {
         var span_idx_tensor = try Tensor.initInt64(alloc, "span_idx", &span_shape, row.span_idx);
         defer span_idx_tensor.deinit();
 
-        const outputs = try run_permit.run(&.{
+        const outputs = try self.lockedSessionRun(&run_permit, &.{
             input_ids_tensor,
             attention_mask_tensor,
             text_positions_tensor,
@@ -628,10 +707,21 @@ pub const GlinerPipeline = struct {
         if (output_shape.len != 4 and output_shape.len != 3) return error.UnexpectedOutputShape;
 
         const dim_offset: usize = if (output_shape.len == 4) 1 else 0;
-        var num_labels_dim: usize = @intCast(output_shape[dim_offset]);
-        if (num_labels_dim > labels.len) num_labels_dim = labels.len;
-        const output_num_words: usize = @intCast(output_shape[dim_offset + 1]);
-        const output_max_width: usize = @intCast(output_shape[dim_offset + 2]);
+        if (output_shape.len == 4 and (nonNegativeDim(output_shape[0]) catch return error.UnexpectedOutputShape) != 1) {
+            return error.UnexpectedOutputShape;
+        }
+        const output_labels = nonNegativeDim(output_shape[dim_offset]) catch return error.UnexpectedOutputShape;
+        const output_num_words = nonNegativeDim(output_shape[dim_offset + 1]) catch return error.UnexpectedOutputShape;
+        const output_max_width = nonNegativeDim(output_shape[dim_offset + 2]) catch return error.UnexpectedOutputShape;
+        if (output_labels < labels.len or output_num_words == 0 or output_max_width == 0) {
+            return error.UnexpectedOutputShape;
+        }
+        const expected_scores = std.math.mul(
+            usize,
+            std.math.mul(usize, output_labels, output_num_words) catch return error.UnexpectedOutputShape,
+            output_max_width,
+        ) catch return error.UnexpectedOutputShape;
+        if (scores.len != expected_scores) return error.UnexpectedOutputShape;
 
         return self.decodeEntitiesFromLogits(
             row,
@@ -639,7 +729,7 @@ pub const GlinerPipeline = struct {
             scores,
             output_num_words,
             output_max_width,
-            num_labels_dim,
+            labels.len,
             threshold,
             flat_ner,
             .label_major_scores,
@@ -652,11 +742,53 @@ pub const GlinerPipeline = struct {
         labels: []const []const u8,
         label_token: i32,
     ) !PreparedGlinerInput {
+        var schema = try self.prepareGlinerSchema(labels, label_token);
+        defer schema.deinit(self.allocator);
+        return self.prepareGlinerInputWithSchema(text, schema);
+    }
+
+    fn prepareGlinerSchema(
+        self: *GlinerPipeline,
+        labels: []const []const u8,
+        label_token: i32,
+    ) !PreparedGlinerSchema {
+        const alloc = self.allocator;
+        var schema_ids = std.ArrayListUnmanaged(i32).empty;
+        errdefer schema_ids.deinit(alloc);
+        var schema_positions = std.ArrayListUnmanaged(i64).empty;
+        errdefer schema_positions.deinit(alloc);
+
+        try self.tok.encodeInto(alloc, "(", &schema_ids);
+        try schema_positions.append(alloc, @intCast(schema_ids.items.len));
+        try schema_ids.append(alloc, self.config.token_p);
+        try self.tok.encodeInto(alloc, "entities", &schema_ids);
+        try self.tok.encodeInto(alloc, "(", &schema_ids);
+
+        for (labels) |label| {
+            try schema_positions.append(alloc, @intCast(schema_ids.items.len));
+            try schema_ids.append(alloc, label_token);
+            try self.tok.encodeInto(alloc, label, &schema_ids);
+        }
+
+        try self.tok.encodeInto(alloc, ")", &schema_ids);
+        try self.tok.encodeInto(alloc, ")", &schema_ids);
+        try schema_ids.append(alloc, self.config.token_sep_text);
+
+        const ids = try schema_ids.toOwnedSlice(alloc);
+        errdefer alloc.free(ids);
+        const positions = try schema_positions.toOwnedSlice(alloc);
+        return .{ .ids = ids, .positions = positions };
+    }
+
+    fn prepareGlinerInputWithSchema(
+        self: *GlinerPipeline,
+        text: []const u8,
+        schema: PreparedGlinerSchema,
+    ) !PreparedGlinerInput {
         const alloc = self.allocator;
         const max_width: usize = self.config.max_width;
         const max_len: usize = self.config.max_length;
 
-        // Split text into words with character offsets
         var words = std.ArrayListUnmanaged([]const u8).empty;
         defer words.deinit(alloc);
         var word_starts = std.ArrayListUnmanaged(usize).empty;
@@ -666,87 +798,39 @@ pub const GlinerPipeline = struct {
 
         try splitIntoWords(alloc, text, &words, &word_starts, &word_ends);
         const num_words = words.items.len;
+        const schema_len = schema.ids.len;
 
-        // Build schema tokens: ( [P] entities ( [E] label1 [E] label2 ... ) ) [SEP_TEXT]
-        // Special tokens [P], [E], [SEP_TEXT] use their dedicated token IDs.
-        // Regular text parts are tokenized normally.
-        var schema_ids = std.ArrayListUnmanaged(i32).empty;
-        defer schema_ids.deinit(alloc);
-        var schema_positions = std.ArrayListUnmanaged(i64).empty;
-        errdefer schema_positions.deinit(alloc);
-
-        // "("
-        {
-            const ids = try self.tok.encode(alloc, "(");
-            defer alloc.free(ids);
-            try schema_ids.appendSlice(alloc, ids);
-        }
-        // [P]
-        try schema_positions.append(alloc, @intCast(schema_ids.items.len));
-        try schema_ids.append(alloc, self.config.token_p);
-        // "entities"
-        {
-            const ids = try self.tok.encode(alloc, "entities");
-            defer alloc.free(ids);
-            try schema_ids.appendSlice(alloc, ids);
-        }
-        // "("
-        {
-            const ids = try self.tok.encode(alloc, "(");
-            defer alloc.free(ids);
-            try schema_ids.appendSlice(alloc, ids);
-        }
-
-        for (labels) |label| {
-            // [E] special token
-            try schema_positions.append(alloc, @intCast(schema_ids.items.len));
-            try schema_ids.append(alloc, label_token);
-
-            // Label text (tokenized normally)
-            const lbl_ids = try self.tok.encode(alloc, label);
-            defer alloc.free(lbl_ids);
-            try schema_ids.appendSlice(alloc, lbl_ids);
-        }
-
-        // ")"
-        {
-            const ids = try self.tok.encode(alloc, ")");
-            defer alloc.free(ids);
-            try schema_ids.appendSlice(alloc, ids);
-        }
-        // ")"
-        {
-            const ids = try self.tok.encode(alloc, ")");
-            defer alloc.free(ids);
-            try schema_ids.appendSlice(alloc, ids);
-        }
-        // [SEP_TEXT] special token
-        try schema_ids.append(alloc, self.config.token_sep_text);
-
-        const schema_len = schema_ids.items.len;
-
-        // Tokenize each word individually (lowercased), tracking sub-token count per word
-        var text_ids = std.ArrayListUnmanaged(i32).empty;
-        defer text_ids.deinit(alloc);
-        var word_token_counts = try alloc.alloc(usize, num_words);
-        defer alloc.free(word_token_counts);
+        const TokenRange = struct { offset: usize, len: usize };
+        var unique_word_ids = std.ArrayListUnmanaged(i32).empty;
+        defer unique_word_ids.deinit(alloc);
+        var word_cache = std.HashMapUnmanaged([]const u8, TokenRange, AsciiCaselessStringContext, 80).empty;
+        defer word_cache.deinit(alloc);
+        var lowercase = std.ArrayListUnmanaged(u8).empty;
+        defer lowercase.deinit(alloc);
+        const word_token_ranges = try alloc.alloc(TokenRange, num_words);
+        defer alloc.free(word_token_ranges);
+        var text_token_count: usize = 0;
 
         for (words.items, 0..) |word, wi| {
-            const lower = try toLower(alloc, word);
-            defer alloc.free(lower);
-
-            const ids = try self.tok.encode(alloc, lower);
-            defer alloc.free(ids);
-
-            word_token_counts[wi] = ids.len;
-            try text_ids.appendSlice(alloc, ids);
+            const token_range = word_cache.get(word) orelse blk: {
+                lowercase.clearRetainingCapacity();
+                try lowercase.ensureUnusedCapacity(alloc, word.len);
+                for (word) |c| lowercase.appendAssumeCapacity(std.ascii.toLower(c));
+                const offset = unique_word_ids.items.len;
+                try self.tok.encodeInto(alloc, lowercase.items, &unique_word_ids);
+                const range = TokenRange{ .offset = offset, .len = unique_word_ids.items.len - offset };
+                try word_cache.put(alloc, word, range);
+                break :blk range;
+            };
+            word_token_ranges[wi] = token_range;
+            text_token_count = std.math.add(usize, text_token_count, token_range.len) catch
+                return error.ResourceLimitExceeded;
         }
 
-        // Total sequence length (clamp to max_len)
-        var seq_len = schema_len + text_ids.items.len;
+        var seq_len = std.math.add(usize, schema_len, text_token_count) catch
+            return error.ResourceLimitExceeded;
         if (seq_len > max_len) seq_len = max_len;
 
-        // Build input tensors
         const input_ids_buf = try alloc.alloc(i64, seq_len);
         errdefer alloc.free(input_ids_buf);
         const attention_mask_buf = try alloc.alloc(i64, seq_len);
@@ -759,36 +843,35 @@ pub const GlinerPipeline = struct {
         var text_positions = std.ArrayListUnmanaged(i64).empty;
         errdefer text_positions.deinit(alloc);
 
-        // Fill schema tokens
         for (0..@min(schema_len, seq_len)) |j| {
-            input_ids_buf[j] = @intCast(schema_ids.items[j]);
+            input_ids_buf[j] = @intCast(schema.ids[j]);
             attention_mask_buf[j] = 1;
-            words_mask_buf[j] = 0; // schema tokens get 0
+            words_mask_buf[j] = 0;
         }
 
-        // Fill text tokens with word IDs (1-indexed)
         var pos = schema_len;
         var actual_num_words: usize = 0;
-        var token_offset: usize = 0;
         for (0..num_words) |wi| {
-            const count = word_token_counts[wi];
-            if (pos + count > seq_len) break;
+            const token_range = word_token_ranges[wi];
+            const count = token_range.len;
+            if (pos > seq_len or count > seq_len - pos) break;
 
             try text_positions.append(alloc, @intCast(pos));
             for (0..count) |ti| {
                 if (pos >= seq_len) break;
-                input_ids_buf[pos] = @intCast(text_ids.items[token_offset + ti]);
+                input_ids_buf[pos] = @intCast(unique_word_ids.items[token_range.offset + ti]);
                 attention_mask_buf[pos] = 1;
-                words_mask_buf[pos] = @intCast(wi + 1); // 1-indexed word ID
+                words_mask_buf[pos] = @intCast(wi + 1);
                 pos += 1;
             }
-            token_offset += count;
             actual_num_words = wi + 1;
         }
 
-        // Build span indices: all word-level spans up to max_width
-        const num_spans = actual_num_words * max_width;
-        const span_idx_buf = try alloc.alloc(i64, num_spans * 2);
+        const num_spans = std.math.mul(usize, actual_num_words, max_width) catch
+            return error.ResourceLimitExceeded;
+        const span_values = std.math.mul(usize, num_spans, 2) catch
+            return error.ResourceLimitExceeded;
+        const span_idx_buf = try alloc.alloc(i64, span_values);
         errdefer alloc.free(span_idx_buf);
 
         for (0..actual_num_words) |w| {
@@ -811,7 +894,7 @@ pub const GlinerPipeline = struct {
         errdefer alloc.free(word_ends_owned);
         const text_positions_owned = try text_positions.toOwnedSlice(alloc);
         errdefer alloc.free(text_positions_owned);
-        const schema_positions_owned = try schema_positions.toOwnedSlice(alloc);
+        const schema_positions_owned = try alloc.dupe(i64, schema.positions);
 
         return .{
             .text = text,
@@ -982,9 +1065,14 @@ pub const GlinerPipeline = struct {
             alloc.free(relation_heads);
         }
 
+        const relations = try self.matchRelations(entities, relation_heads);
+        errdefer {
+            for (relations) |*relation| relation.deinit(alloc);
+            alloc.free(relations);
+        }
         return .{
-            .entities = entities,
-            .relations = try self.matchRelations(entities, relation_heads),
+            .entities = try includeRelationEndpoints(alloc, entities, relations, entity_labels),
+            .relations = relations,
         };
     }
 
@@ -1049,7 +1137,11 @@ pub const GlinerPipeline = struct {
 
         try splitIntoWords(alloc, text, &words, &word_starts, &word_ends);
         const num_words = words.items.len;
-        if (num_words == 0) return try alloc.alloc(f32, 0);
+        if (num_words == 0) {
+            const scores = try alloc.alloc(f32, labels.len);
+            @memset(scores, 0);
+            return scores;
+        }
 
         var schema_ids = std.ArrayListUnmanaged(i32).empty;
         defer schema_ids.deinit(alloc);
@@ -1203,7 +1295,7 @@ pub const GlinerPipeline = struct {
         var span_idx_tensor = try Tensor.initInt64(alloc, "span_idx", &span_shape, span_idx_buf);
         defer span_idx_tensor.deinit();
 
-        const outputs = try run_permit.run(&.{
+        const outputs = try self.lockedSessionRun(&run_permit, &.{
             input_ids_tensor,
             attention_mask_tensor,
             words_mask_tensor,
@@ -1220,15 +1312,15 @@ pub const GlinerPipeline = struct {
         const logits = output.asFloat32();
         const output_shape = output.shape;
 
-        var num_labels_dim: usize = labels.len;
-        if (output_shape.len >= 4) {
-            num_labels_dim = @intCast(output_shape[3]);
-        } else if (output_shape.len == 3) {
-            num_labels_dim = @intCast(output_shape[2]);
-        }
-        if (num_labels_dim > labels.len) num_labels_dim = labels.len;
-
-        return scoreLabelsFromLogits(alloc, logits, num_labels_dim);
+        const output_layout = try validateBatchOutputLayout(
+            output_shape,
+            logits.len,
+            1,
+            actual_num_words,
+            max_width,
+            labels.len,
+        );
+        return scoreLabelsFromLogits(alloc, logits, output_layout.num_labels);
     }
 
     pub fn supportsClassification(self: *const GlinerPipeline) bool {
@@ -1425,6 +1517,65 @@ fn duplicateEntity(alloc: std.mem.Allocator, entity: Entity) !Entity {
     };
 }
 
+fn includeRelationEndpoints(
+    alloc: std.mem.Allocator,
+    entities: []Entity,
+    relations: []const Relation,
+    stable_labels: []const []const u8,
+) ![]Entity {
+    if (relations.len == 0) return entities;
+
+    var out = std.ArrayListUnmanaged(Entity).empty;
+    var borrowed_count: usize = 0;
+    errdefer {
+        for (out.items[borrowed_count..]) |entity| alloc.free(entity.text);
+        out.deinit(alloc);
+    }
+    try out.appendSlice(alloc, entities);
+    borrowed_count = entities.len;
+
+    for (relations) |relation| {
+        const endpoints = [_]Entity{ relation.head, relation.tail };
+        for (endpoints) |endpoint| {
+            if (containsEntity(out.items, endpoint)) continue;
+
+            const stable_label = findStableLabel(stable_labels, endpoint.label) orelse
+                return error.InvalidRelationEndpointLabel;
+            const text = try alloc.dupe(u8, endpoint.text);
+            out.append(alloc, .{
+                .text = text,
+                .label = stable_label,
+                .start = endpoint.start,
+                .end = endpoint.end,
+                .score = endpoint.score,
+            }) catch |err| {
+                alloc.free(text);
+                return err;
+            };
+        }
+    }
+
+    const reconciled = try out.toOwnedSlice(alloc);
+    alloc.free(entities);
+    return reconciled;
+}
+
+fn containsEntity(entities: []const Entity, needle: Entity) bool {
+    for (entities) |entity| {
+        if (entity.start == needle.start and entity.end == needle.end and
+            std.mem.eql(u8, entity.label, needle.label) and
+            std.mem.eql(u8, entity.text, needle.text)) return true;
+    }
+    return false;
+}
+
+fn findStableLabel(labels: []const []const u8, wanted: []const u8) ?[]const u8 {
+    for (labels) |label| {
+        if (std.mem.eql(u8, label, wanted)) return label;
+    }
+    return null;
+}
+
 fn charDistance(start1: usize, end1: usize, start2: usize, end2: usize) usize {
     if (end1 <= start2) return start2 - end1;
     return start1 - end2;
@@ -1587,6 +1738,39 @@ fn toLower(alloc: std.mem.Allocator, s: []const u8) ![]u8 {
     return buf;
 }
 
+const AsciiCaselessStringContext = struct {
+    pub fn hash(_: @This(), value: []const u8) u64 {
+        var hash_value: u64 = 14695981039346656037;
+        for (value) |c| {
+            hash_value ^= std.ascii.toLower(c);
+            hash_value *%= 1099511628211;
+        }
+        return hash_value;
+    }
+
+    pub fn eql(_: @This(), a: []const u8, b: []const u8) bool {
+        return std.ascii.eqlIgnoreCase(a, b);
+    }
+};
+
+fn checkedSizeMul(a: usize, b: usize) !usize {
+    return std.math.mul(usize, a, b) catch error.ResourceLimitExceeded;
+}
+
+fn checkedSizeAdd(a: usize, b: usize) !usize {
+    return std.math.add(usize, a, b) catch error.ResourceLimitExceeded;
+}
+
+fn sizeToI64(value: usize) !i64 {
+    if (value > std.math.maxInt(i64)) return error.ResourceLimitExceeded;
+    return @intCast(value);
+}
+
+fn nonNegativeDim(value: i64) !usize {
+    if (value < 0) return error.UnexpectedOutputShape;
+    return @intCast(value);
+}
+
 test "scoreLabelsFromLogits returns sigmoid of max logit per label" {
     const alloc = std.testing.allocator;
     const logits = [_]f32{
@@ -1600,6 +1784,43 @@ test "scoreLabelsFromLogits returns sigmoid of max logit per label" {
 
     try std.testing.expectApproxEqAbs(sigmoid(0.7), scores[0], 1e-6);
     try std.testing.expectApproxEqAbs(sigmoid(1.2), scores[1], 1e-6);
+}
+
+test "gliner batch output validation rejects incomplete backend results" {
+    const layout = try GlinerPipeline.validateBatchOutputLayout(&.{ 2, 3, 4, 3 }, 72, 2, 3, 4, 3);
+    try std.testing.expectEqual(@as(usize, 3), layout.num_words);
+    try std.testing.expectEqual(@as(usize, 4), layout.max_width);
+    try std.testing.expectEqual(@as(usize, 3), layout.num_labels);
+    try std.testing.expectEqual(@as(usize, 36), layout.row_stride);
+
+    try std.testing.expectError(
+        error.UnexpectedOutputShape,
+        GlinerPipeline.validateBatchOutputLayout(&.{ 1, 3, 4, 3 }, 36, 2, 3, 4, 3),
+    );
+    try std.testing.expectError(
+        error.UnexpectedOutputShape,
+        GlinerPipeline.validateBatchOutputLayout(&.{ 2, 3, 4, 3 }, 71, 2, 3, 4, 3),
+    );
+    try std.testing.expectError(
+        error.UnexpectedOutputShape,
+        GlinerPipeline.validateBatchOutputLayout(&.{ 2, 3, 4, 2 }, 48, 2, 3, 4, 3),
+    );
+    try std.testing.expectError(
+        error.UnexpectedOutputShape,
+        GlinerPipeline.validateBatchOutputLayout(&.{ 2, 2, 4, 3 }, 48, 2, 3, 4, 3),
+    );
+}
+
+test "gliner whitespace classification returns one zero score per label" {
+    var pipeline = GlinerPipeline{
+        .allocator = std.testing.allocator,
+        .session = undefined,
+        .tok = undefined,
+        .config = .{ .token_p = 1, .token_e = 2, .token_sep_text = 3 },
+    };
+    const scores = try pipeline.scoreLabels(" \t\n", &.{ "person", "organization" });
+    defer std.testing.allocator.free(scores);
+    try std.testing.expectEqualSlices(f32, &.{ 0, 0 }, scores);
 }
 
 test "gliner splitIntoWords separates punctuation like Python processor" {
@@ -1777,6 +1998,65 @@ test "gliner relation matching preserves synthetic head label for unmatched head
     try std.testing.expectEqualStrings("person", relations[0].owned_head_label.?);
     try std.testing.expectEqualStrings("Acme", relations[0].tail.text);
     try std.testing.expectEqualStrings("works_for", relations[0].label);
+}
+
+test "gliner relation results include synthetic endpoint entities" {
+    const allocator = std.testing.allocator;
+    const labels = [_][]const u8{ "person", "organization" };
+
+    const entities = try allocator.alloc(Entity, 2);
+    var initialized_entities: usize = 0;
+    errdefer {
+        for (entities[0..initialized_entities]) |entity| allocator.free(entity.text);
+        allocator.free(entities);
+    }
+    entities[0] = .{
+        .text = try allocator.dupe(u8, "John"),
+        .label = labels[0],
+        .start = 0,
+        .end = 4,
+        .score = 0.91,
+    };
+    initialized_entities += 1;
+    entities[1] = .{
+        .text = try allocator.dupe(u8, "Acme"),
+        .label = labels[1],
+        .start = 15,
+        .end = 19,
+        .score = 0.88,
+    };
+    initialized_entities += 1;
+
+    const relations = [_]Relation{.{
+        .head = .{
+            .text = "employee",
+            .label = "person",
+            .start = 6,
+            .end = 14,
+            .score = 0.71,
+        },
+        .tail = .{
+            .text = "Acme",
+            .label = "organization",
+            .start = 15,
+            .end = 19,
+            .score = 0.88,
+        },
+        .label = "works_for",
+        .score = 0.71,
+    }};
+
+    const reconciled = try includeRelationEndpoints(allocator, entities, &relations, &labels);
+    defer {
+        for (reconciled) |entity| allocator.free(entity.text);
+        allocator.free(reconciled);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), reconciled.len);
+    try std.testing.expect(containsEntity(reconciled, relations[0].head));
+    try std.testing.expect(containsEntity(reconciled, relations[0].tail));
+    try std.testing.expectEqualStrings("employee", reconciled[2].text);
+    try std.testing.expectEqualStrings("person", reconciled[2].label);
 }
 
 test "gliner relation matching skips exact head span with mismatched entity label" {
