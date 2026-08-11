@@ -394,7 +394,7 @@ fn resolveRemoteContentFetchOptions(
         };
     }
     if (isUriScheme(parsed, "http") or isUriScheme(parsed, "https")) {
-        const credential = selectHttpCredential(cfg, url, credential_name);
+        const credential = try selectHttpCredential(cfg, parsed, credential_name);
         return .{
             .security = effectiveRemoteContentSecurity(cfg, if (credential) |creds| creds.security else null),
             .http_headers = if (credential) |creds| try resolveHttpHeaders(alloc, secret_store, creds) else null,
@@ -452,17 +452,66 @@ fn selectS3Credential(
 
 fn selectHttpCredential(
     cfg: *const scraping.RemoteContentConfig,
-    url: []const u8,
+    parsed: std.Uri,
     credential_name: ?[]const u8,
-) ?*const scraping.HTTPCredentialConfig {
-    if (credential_name) |name| return cfg.getHttp(name);
+) !?*const scraping.HTTPCredentialConfig {
+    if (credential_name) |name| {
+        const credential = cfg.getHttp(name) orelse return error.UnsupportedRemoteContentCredential;
+        if (!httpCredentialAllowsDestination(cfg, credential, parsed))
+            return error.CredentialDestinationNotAllowed;
+        return credential;
+    }
     var it = cfg.http.iterator();
     while (it.next()) |entry| {
         const credential = entry.value_ptr;
         const base_url = credential.base_url orelse continue;
-        if (std.mem.startsWith(u8, url, base_url)) return credential;
+        if (httpUrlMatchesBase(parsed, base_url)) return credential;
     }
     return null;
+}
+
+/// Credentials are capabilities and must be bound to a destination before
+/// their headers are resolved. An explicit name may use either its canonical
+/// base URL or an explicit effective host allowlist; the default SSRF policy
+/// alone is intentionally insufficient because it permits arbitrary public
+/// hosts.
+fn httpCredentialAllowsDestination(
+    cfg: *const scraping.RemoteContentConfig,
+    credential: *const scraping.HTTPCredentialConfig,
+    parsed: std.Uri,
+) bool {
+    if (credential.base_url) |base_url| return httpUrlMatchesBase(parsed, base_url);
+    const effective = effectiveRemoteContentSecurity(cfg, credential.security);
+    const allowed_hosts = effective.allowed_hosts orelse return false;
+    const host = (parsed.host orelse return false).percent_encoded;
+    for (allowed_hosts) |allowed| {
+        if (std.ascii.eqlIgnoreCase(host, allowed)) return true;
+    }
+    return false;
+}
+
+fn httpUrlMatchesBase(target: std.Uri, base_url: []const u8) bool {
+    const base = std.Uri.parse(base_url) catch return false;
+    const target_host = target.host orelse return false;
+    const base_host = base.host orelse return false;
+    if (!std.ascii.eqlIgnoreCase(target.scheme, base.scheme) or
+        !std.ascii.eqlIgnoreCase(target_host.percent_encoded, base_host.percent_encoded) or
+        effectiveUriPort(target) != effectiveUriPort(base))
+    {
+        return false;
+    }
+
+    const base_path = base.path.percent_encoded;
+    const target_path = target.path.percent_encoded;
+    if (base_path.len == 0 or std.mem.eql(u8, base_path, "/")) return true;
+    if (std.mem.eql(u8, target_path, base_path)) return true;
+    if (!std.mem.startsWith(u8, target_path, base_path)) return false;
+    return std.mem.endsWith(u8, base_path, "/") or
+        (target_path.len > base_path.len and target_path[base_path.len] == '/');
+}
+
+fn effectiveUriPort(uri: std.Uri) u16 {
+    return uri.port orelse if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) 443 else 80;
 }
 
 fn resolveS3Credential(
@@ -727,6 +776,76 @@ test "template remote applies remote content security to http urls" {
 
     try std.testing.expectEqual(@as(?bool, false), resolved.security.block_private_ips);
     try std.testing.expectEqual(@as(?u64, default_remote_fetch_max_download_size_bytes), resolved.security.max_download_size_bytes);
+}
+
+test "template remote binds named HTTP credentials to their configured destination" {
+    const alloc = std.testing.allocator;
+
+    var cfg = scraping.RemoteContentConfig{};
+    defer cfg.deinit(alloc);
+    var credential = scraping.HTTPCredentialConfig{
+        .base_url = try alloc.dupe(u8, "https://api.example.com/v1"),
+    };
+    errdefer credential.deinit(alloc);
+    try credential.headers.put(
+        alloc,
+        try alloc.dupe(u8, "Authorization"),
+        try alloc.dupe(u8, "Bearer secret"),
+    );
+    try cfg.http.put(alloc, try alloc.dupe(u8, "documents"), credential);
+
+    try std.testing.expectError(
+        error.CredentialDestinationNotAllowed,
+        resolveRemoteContentFetchOptions(alloc, &cfg, null, "https://attacker.example/v1/document", "documents"),
+    );
+    try std.testing.expectError(
+        error.CredentialDestinationNotAllowed,
+        resolveRemoteContentFetchOptions(alloc, &cfg, null, "https://api.example.com.evil.test/v1/document", "documents"),
+    );
+
+    var resolved = try resolveRemoteContentFetchOptions(
+        alloc,
+        &cfg,
+        null,
+        "https://api.example.com/v1/document",
+        "documents",
+    );
+    defer resolved.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), resolved.http_headers.?.len);
+    try std.testing.expectEqualStrings("Bearer secret", resolved.http_headers.?[0].value);
+}
+
+test "template remote requires an allowlist for unbased named HTTP credentials" {
+    const alloc = std.testing.allocator;
+
+    var cfg = scraping.RemoteContentConfig{};
+    defer cfg.deinit(alloc);
+    var credential = scraping.HTTPCredentialConfig{};
+    errdefer credential.deinit(alloc);
+    try credential.headers.put(
+        alloc,
+        try alloc.dupe(u8, "Authorization"),
+        try alloc.dupe(u8, "Bearer secret"),
+    );
+    try cfg.http.put(alloc, try alloc.dupe(u8, "documents"), credential);
+
+    try std.testing.expectError(
+        error.CredentialDestinationNotAllowed,
+        resolveRemoteContentFetchOptions(alloc, &cfg, null, "https://api.example.com/document", "documents"),
+    );
+
+    const allowed_hosts = try alloc.alloc([]u8, 1);
+    allowed_hosts[0] = try alloc.dupe(u8, "api.example.com");
+    cfg.http.getPtr("documents").?.security = .{ .allowed_hosts = allowed_hosts };
+    var resolved = try resolveRemoteContentFetchOptions(
+        alloc,
+        &cfg,
+        null,
+        "https://api.example.com/document",
+        "documents",
+    );
+    defer resolved.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), resolved.http_headers.?.len);
 }
 
 test "template remote preserves PDF content type across a multi-megabyte download" {

@@ -3597,15 +3597,15 @@ fn processDocumentExtractionAsset(
     if (existing_state != null) {
         for (previous_state.unit_keys) |previous_key| {
             if (runtimeContainsConstKey(desired_unit_keys.items, previous_key)) continue;
-            try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, previous_key));
-            try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
-            try appendUniqueDupeKey(runtime.alloc, &window.deleted_keys, previous_key);
+            try appendUniqueOwnedRuntimeKey([]const u8, &resource_tracker, runtime.alloc, &deletes, previous_key);
+            try appendUniqueOwnedRuntimeKey([]u8, &resource_tracker, runtime.alloc, &window.changed_artifact_keys, previous_key);
+            try appendUniqueOwnedRuntimeKey([]u8, &resource_tracker, runtime.alloc, &window.deleted_keys, previous_key);
         }
         for (previous_state.chunk_keys) |previous_key| {
             if (runtimeContainsConstKey(desired_chunk_keys.items, previous_key)) continue;
-            try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, previous_key));
-            try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
-            try appendUniqueDupeKey(runtime.alloc, &window.deleted_keys, previous_key);
+            try appendUniqueOwnedRuntimeKey([]const u8, &resource_tracker, runtime.alloc, &deletes, previous_key);
+            try appendUniqueOwnedRuntimeKey([]u8, &resource_tracker, runtime.alloc, &window.changed_artifact_keys, previous_key);
+            try appendUniqueOwnedRuntimeKey([]u8, &resource_tracker, runtime.alloc, &window.deleted_keys, previous_key);
         }
     }
 
@@ -5131,13 +5131,15 @@ const RuntimeDocumentExtractionResourceTracker = struct {
         self: *@This(),
         unit_bytes: usize,
         generated_cache_bytes: usize,
-        writes: []const KVPair,
+        writes: *const std.ArrayListUnmanaged(KVPair),
+        deletes: *const std.ArrayListUnmanaged([]const u8),
         window: *const GeneratedReplayWindow,
     ) !void {
         var total = self.locallyAccountedDownloadedBytes();
         total = addUsizeSaturating(total, unit_bytes);
         total = addUsizeSaturating(total, generated_cache_bytes);
-        total = addUsizeSaturating(total, runtimeDocumentExtractionWriteBytes(writes));
+        total = addUsizeSaturating(total, runtimeDocumentExtractionWriteWorkingSetBytes(writes));
+        total = addUsizeSaturating(total, runtimeDocumentExtractionDeleteWorkingSetBytes(deletes));
         total = addUsizeSaturating(total, runtimeDocumentExtractionWindowBytes(window));
         try self.setBytes(total);
     }
@@ -5158,21 +5160,6 @@ const RuntimeDocumentExtractionResourceTracker = struct {
         }
         const next = std.math.add(u64, self.current_bytes, additional) catch return error.DocumentExtractionWorkingSetTooLarge;
         try self.setAccountedBytes(next);
-    }
-
-    fn observeWorkingSet(
-        self: *@This(),
-        unit_bytes: usize,
-        generated_cache_bytes: usize,
-        writes: []const KVPair,
-        window: *const GeneratedReplayWindow,
-    ) void {
-        var total = self.locallyAccountedDownloadedBytes();
-        total = addUsizeSaturating(total, unit_bytes);
-        total = addUsizeSaturating(total, generated_cache_bytes);
-        total = addUsizeSaturating(total, runtimeDocumentExtractionWriteBytes(writes));
-        total = addUsizeSaturating(total, runtimeDocumentExtractionWindowBytes(window));
-        self.observeBytes(total);
     }
 
     fn setBytes(self: *@This(), bytes: usize) !void {
@@ -5197,13 +5184,6 @@ const RuntimeDocumentExtractionResourceTracker = struct {
         try manager.adjustUsage(.document_extraction_working_set, &self.current_bytes, next);
     }
 
-    fn observeBytes(self: *@This(), bytes: usize) void {
-        const manager = self.manager orelse return;
-        const actual = std.math.cast(u64, bytes) orelse std.math.maxInt(u64);
-        const next = std.math.add(u64, actual, self.pdf_decode_reservation_bytes) catch std.math.maxInt(u64);
-        manager.observeUsage(.document_extraction_working_set, &self.current_bytes, next);
-    }
-
     fn deinit(self: *@This()) void {
         if (self.manager) |manager| {
             manager.observeUsage(.document_extraction_working_set, &self.current_bytes, 0);
@@ -5226,9 +5206,11 @@ test "document extraction working set accounts generated unit cache bytes" {
 
     var window = GeneratedReplayWindow{ .alloc = std.testing.allocator };
     defer window.deinit();
+    var writes = std.ArrayListUnmanaged(KVPair).empty;
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
 
-    try tracker.updateWorkingSet(40, 0, &.{}, &window);
-    try std.testing.expectError(error.DocumentExtractionWorkingSetTooLarge, tracker.updateWorkingSet(40, 60, &.{}, &window));
+    try tracker.updateWorkingSet(40, 0, &writes, &deletes, &window);
+    try std.testing.expectError(error.DocumentExtractionWorkingSetTooLarge, tracker.updateWorkingSet(40, 60, &writes, &deletes, &window));
 }
 
 test "budgeted document download composes with materialization accounting" {
@@ -5254,10 +5236,34 @@ test "budgeted document download composes with materialization accounting" {
     tracker.setExternallyAccountedDownloadedBytes(body.len);
     var window = GeneratedReplayWindow{ .alloc = std.testing.allocator };
     defer window.deinit();
+    var writes = std.ArrayListUnmanaged(KVPair).empty;
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
 
-    try tracker.updateWorkingSet(20, 0, &.{}, &window);
+    try tracker.updateWorkingSet(20, 0, &writes, &deletes, &window);
     try std.testing.expectEqual(@as(u64, 60), manager.sliceStats(.document_extraction_working_set).used_bytes);
     try std.testing.expectError(error.DocumentExtractionWorkingSetTooLarge, tracker.reserveAdditional(41));
+}
+
+test "document replay payloads are admitted before persistent allocation" {
+    const alloc = std.testing.allocator;
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{
+        .soft_limit_bytes = 0,
+        .hard_limit_bytes = 1024,
+    };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    var tracker = RuntimeDocumentExtractionResourceTracker{ .manager = &manager };
+    defer tracker.deinit();
+    var window = GeneratedReplayWindow{ .alloc = alloc };
+    defer window.deinit();
+
+    const oversized = try alloc.alloc(u8, 2048);
+    defer alloc.free(oversized);
+    try std.testing.expectError(
+        error.DocumentExtractionWorkingSetTooLarge,
+        appendRuntimeReplayDocument(&tracker, alloc, &window, "unit", oversized, &.{"text"}),
+    );
+    try std.testing.expectEqual(@as(usize, 0), window.documents.items.len);
 }
 
 test "document extraction reserves PDF decoder peak memory atomically" {
@@ -5339,22 +5345,36 @@ fn addUsizeSaturating(a: usize, b: usize) usize {
 }
 
 fn runtimeDocumentExtractionWriteBytes(writes: []const KVPair) usize {
-    var total: usize = writes.len *| @sizeOf(KVPair);
+    var total: usize = 0;
     for (writes) |write| total = addUsizeSaturating(total, addUsizeSaturating(write.key.len, write.value.len));
     return total;
 }
 
+fn runtimeDocumentExtractionWriteWorkingSetBytes(writes: *const std.ArrayListUnmanaged(KVPair)) usize {
+    return addUsizeSaturating(
+        writes.capacity *| @sizeOf(KVPair),
+        runtimeDocumentExtractionWriteBytes(writes.items),
+    );
+}
+
+fn runtimeDocumentExtractionDeleteWorkingSetBytes(deletes: *const std.ArrayListUnmanaged([]const u8)) usize {
+    var total = deletes.capacity *| @sizeOf([]const u8);
+    for (deletes.items) |key| total = addUsizeSaturating(total, key.len);
+    return total;
+}
+
 fn runtimeDocumentExtractionWindowBytes(window: *const GeneratedReplayWindow) usize {
-    var total: usize = window.documents.items.len *| @sizeOf(derived_types.DerivedDocument);
-    total = addUsizeSaturating(total, window.deleted_keys.items.len *| @sizeOf([]const u8));
-    total = addUsizeSaturating(total, window.artifact_delete_keys.items.len *| @sizeOf([]const u8));
-    total = addUsizeSaturating(total, window.changed_artifact_keys.items.len *| @sizeOf([]const u8));
-    total = addUsizeSaturating(total, window.dense_embeddings.items.len *| @sizeOf(derived_types.DerivedDenseEmbeddingWrite));
-    total = addUsizeSaturating(total, window.sparse_embeddings.items.len *| @sizeOf(derived_types.DerivedSparseEmbeddingWrite));
-    total = addUsizeSaturating(total, window.coverage_transitions.items.len *| @sizeOf(CoverageOutcomeTransition));
+    var total: usize = window.documents.capacity *| @sizeOf(derived_types.DerivedDocument);
+    total = addUsizeSaturating(total, window.deleted_keys.capacity *| @sizeOf([]const u8));
+    total = addUsizeSaturating(total, window.artifact_delete_keys.capacity *| @sizeOf([]const u8));
+    total = addUsizeSaturating(total, window.changed_artifact_keys.capacity *| @sizeOf([]const u8));
+    total = addUsizeSaturating(total, window.dense_embeddings.capacity *| @sizeOf(derived_types.DerivedDenseEmbeddingWrite));
+    total = addUsizeSaturating(total, window.sparse_embeddings.capacity *| @sizeOf(derived_types.DerivedSparseEmbeddingWrite));
+    total = addUsizeSaturating(total, window.coverage_transitions.capacity *| @sizeOf(CoverageOutcomeTransition));
     for (window.documents.items) |doc| {
         total = addUsizeSaturating(total, doc.key.len);
         if (doc.cleaned_value) |value| total = addUsizeSaturating(total, value.len);
+        total = addUsizeSaturating(total, doc.targets.len *| @sizeOf(derived_types.DerivedTargetRef));
         for (doc.targets) |target| total = addUsizeSaturating(total, target.index_name.len);
     }
     for (window.deleted_keys.items) |key| total = addUsizeSaturating(total, key.len);
@@ -5374,6 +5394,17 @@ fn runtimeDocumentExtractionWindowBytes(window: *const GeneratedReplayWindow) us
         total = addUsizeSaturating(total, embedding.values.len * @sizeOf(f32));
         if (embedding.artifact_key) |key| total = addUsizeSaturating(total, key.len);
     }
+    for (window.coverage_transitions.items) |transition| {
+        total = addUsizeSaturating(total, transition.index_name.len);
+        total = addUsizeSaturating(total, transition.marker_key.len);
+        for (transition.counter_keys) |key| total = addUsizeSaturating(total, key.len);
+        total = addUsizeSaturating(total, transition.failure_guards.capacity *| @sizeOf(FailureIdentity));
+        for (transition.failure_guards.items) |failure| {
+            total = addUsizeSaturating(total, failure.artifact_name.len);
+            total = addUsizeSaturating(total, failure.source_artifact_name.len);
+            total = addUsizeSaturating(total, failure.doc_key.len);
+        }
+    }
     return total;
 }
 
@@ -5388,16 +5419,100 @@ fn clearRuntimeKVBatch(runtime: *EnrichmentRuntime, writes: *std.ArrayListUnmana
 }
 
 fn appendOwnedRuntimeKVPair(
+    resource_tracker: *RuntimeDocumentExtractionResourceTracker,
     alloc: Allocator,
     writes: *std.ArrayListUnmanaged(KVPair),
     key: []const u8,
     value: []const u8,
 ) !void {
+    try ensureRuntimeListAppendCapacity(KVPair, resource_tracker, alloc, writes);
+    try resource_tracker.reserveAdditional(addUsizeSaturating(key.len, value.len));
     const owned_key = try alloc.dupe(u8, key);
     errdefer alloc.free(owned_key);
     const owned_value = try alloc.dupe(u8, value);
     errdefer alloc.free(owned_value);
-    try writes.append(alloc, .{ .key = owned_key, .value = owned_value });
+    writes.appendAssumeCapacity(.{ .key = owned_key, .value = owned_value });
+}
+
+fn ensureRuntimeListAppendCapacity(
+    comptime T: type,
+    resource_tracker: *RuntimeDocumentExtractionResourceTracker,
+    alloc: Allocator,
+    list: *std.ArrayListUnmanaged(T),
+) !void {
+    if (list.items.len < list.capacity) return;
+    const next_capacity = if (list.capacity < 8)
+        @as(usize, 8)
+    else
+        std.math.mul(usize, list.capacity, 2) catch return error.DocumentExtractionWorkingSetTooLarge;
+    const growth_items = next_capacity - list.capacity;
+    const growth_bytes = std.math.mul(usize, growth_items, @sizeOf(T)) catch
+        return error.DocumentExtractionWorkingSetTooLarge;
+    try resource_tracker.reserveAdditional(growth_bytes);
+    try list.ensureTotalCapacityPrecise(alloc, next_capacity);
+}
+
+fn appendUniqueOwnedRuntimeKey(
+    comptime T: type,
+    resource_tracker: *RuntimeDocumentExtractionResourceTracker,
+    alloc: Allocator,
+    keys: *std.ArrayListUnmanaged(T),
+    key: []const u8,
+) !void {
+    for (keys.items) |existing| {
+        if (std.mem.eql(u8, existing, key)) return;
+    }
+    try ensureRuntimeListAppendCapacity(T, resource_tracker, alloc, keys);
+    try resource_tracker.reserveAdditional(key.len);
+    const owned = try alloc.dupe(u8, key);
+    keys.appendAssumeCapacity(owned);
+}
+
+fn appendRuntimeReplayDocument(
+    resource_tracker: *RuntimeDocumentExtractionResourceTracker,
+    alloc: Allocator,
+    window: *GeneratedReplayWindow,
+    key: []const u8,
+    payload: []const u8,
+    text_indexes: []const []const u8,
+) !void {
+    try ensureRuntimeListAppendCapacity(
+        derived_types.DerivedDocument,
+        resource_tracker,
+        alloc,
+        &window.documents,
+    );
+    var owned_bytes = addUsizeSaturating(key.len, payload.len);
+    owned_bytes = addUsizeSaturating(
+        owned_bytes,
+        text_indexes.len *| @sizeOf(derived_types.DerivedTargetRef),
+    );
+    for (text_indexes) |index_name| owned_bytes = addUsizeSaturating(owned_bytes, index_name.len);
+    try resource_tracker.reserveAdditional(owned_bytes);
+
+    const targets = try alloc.alloc(derived_types.DerivedTargetRef, text_indexes.len);
+    var targets_initialized: usize = 0;
+    errdefer {
+        for (targets[0..targets_initialized]) |target| alloc.free(@constCast(target.index_name));
+        alloc.free(targets);
+    }
+    for (text_indexes, 0..) |index_name, i| {
+        targets[i] = .{
+            .kind = .full_text,
+            .index_name = try alloc.dupe(u8, index_name),
+        };
+        targets_initialized += 1;
+    }
+    const owned_key = try alloc.dupe(u8, key);
+    errdefer alloc.free(owned_key);
+    const owned_payload = try alloc.dupe(u8, payload);
+    errdefer alloc.free(owned_payload);
+    window.documents.appendAssumeCapacity(.{
+        .key = owned_key,
+        .action = .upsert,
+        .cleaned_value = owned_payload,
+        .targets = targets,
+    });
 }
 
 fn flushRuntimeKVBatchAndClear(
@@ -5447,11 +5562,14 @@ const RuntimeDocumentExtractionMaterializeContext = struct {
     fn onBegin(_: *anyopaque, _: document_extraction_mod.StreamInfo) anyerror!void {}
 
     fn accountWorkingSet(self: *@This(), unit_bytes: usize, generated_cache_bytes: usize) !void {
-        if (self.mode == .store_artifacts) {
-            try self.resource_tracker.updateWorkingSet(unit_bytes, generated_cache_bytes, self.writes.items, self.window);
-        } else {
-            self.resource_tracker.observeWorkingSet(unit_bytes, generated_cache_bytes, self.writes.items, self.window);
-        }
+        try self.resource_tracker.updateWorkingSet(unit_bytes, generated_cache_bytes, self.writes, self.deletes, self.window);
+    }
+
+    fn accountAndFlushReplay(self: *@This(), unit_bytes: usize, generated_cache_bytes: usize) !void {
+        if (self.mode != .publish_replay) return;
+        try self.accountWorkingSet(unit_bytes, generated_cache_bytes);
+        try flushGeneratedReplayWindowIfNeeded(self.runtime, self.window, self.max_window_items);
+        try self.accountWorkingSet(unit_bytes, generated_cache_bytes);
     }
 
     fn onUnit(ptr: *anyopaque, unit: *document_extraction_mod.Unit) anyerror!void {
@@ -5492,8 +5610,7 @@ const RuntimeDocumentExtractionMaterializeContext = struct {
         defer working_alloc.free(payload);
 
         if (self.mode == .store_artifacts) {
-            try self.resource_tracker.reserveAdditional(addUsizeSaturating(@sizeOf(KVPair), addUsizeSaturating(unit_key.len, payload.len)));
-            try appendOwnedRuntimeKVPair(self.runtime.alloc, self.writes, unit_key, payload);
+            try appendOwnedRuntimeKVPair(self.resource_tracker, self.runtime.alloc, self.writes, unit_key, payload);
             try self.accountWorkingSet(unit_working_bytes, generated_cache_bytes);
             if (self.writes.items.len >= runtime_document_extraction_flush_write_count or
                 runtimeDocumentExtractionWriteBytes(self.writes.items) >= runtime_document_extraction_flush_write_bytes)
@@ -5502,28 +5619,26 @@ const RuntimeDocumentExtractionMaterializeContext = struct {
                 try self.accountWorkingSet(unit_working_bytes, generated_cache_bytes);
             }
         } else {
-            try appendUniqueDupeKey(self.runtime.alloc, &self.window.changed_artifact_keys, unit_key);
+            try appendUniqueOwnedRuntimeKey(
+                []u8,
+                self.resource_tracker,
+                self.runtime.alloc,
+                &self.window.changed_artifact_keys,
+                unit_key,
+            );
         }
 
         if (self.mode == .publish_replay and self.text_indexes.len > 0) {
-            var targets = try self.runtime.alloc.alloc(derived_types.DerivedTargetRef, self.text_indexes.len);
-            errdefer {
-                for (targets) |target| self.runtime.alloc.free(@constCast(target.index_name));
-                self.runtime.alloc.free(targets);
-            }
-            for (self.text_indexes, 0..) |index_name, i| {
-                targets[i] = .{
-                    .kind = .full_text,
-                    .index_name = try self.runtime.alloc.dupe(u8, index_name),
-                };
-            }
-            try self.window.documents.append(self.runtime.alloc, .{
-                .key = try self.runtime.alloc.dupe(u8, unit_key),
-                .action = .upsert,
-                .cleaned_value = try self.runtime.alloc.dupe(u8, payload),
-                .targets = targets,
-            });
+            try appendRuntimeReplayDocument(
+                self.resource_tracker,
+                self.runtime.alloc,
+                self.window,
+                unit_key,
+                payload,
+                self.text_indexes,
+            );
         }
+        try self.accountAndFlushReplay(unit_working_bytes, generated_cache_bytes);
 
         try appendRuntimeDocumentUnitChunkWrites(self, working_alloc, unit_key, unit.*, unit_working_bytes, generated_cache_bytes);
         self.unit_index += 1;
@@ -5535,9 +5650,7 @@ const RuntimeDocumentExtractionMaterializeContext = struct {
             try flushRuntimeKVBatchAndClear(self.runtime, self.writes, self.deletes);
             try self.accountWorkingSet(unit_working_bytes, generated_cache_bytes);
         }
-        if (self.mode == .publish_replay) {
-            try flushGeneratedReplayWindowIfNeeded(self.runtime, self.window, self.max_window_items);
-        }
+        try self.accountAndFlushReplay(unit_working_bytes, generated_cache_bytes);
         try self.accountWorkingSet(unit_working_bytes, generated_cache_bytes);
     }
 
@@ -5583,32 +5696,29 @@ fn appendRuntimeDocumentUnitChunkWrites(
             const chunk_route = documentExtractionRangeRoute(context.previous_child_ranges, chunk_range_id, "chunk", "derived_chunks");
             const payload = try buildDocumentUnitChunkPayloadAlloc(scratch, context.doc_key, unit_key, entry.name, context.artifact_name, entry.source_field, unit, chunk, true, chunk_route);
             if (context.mode == .store_artifacts) {
-                try context.resource_tracker.reserveAdditional(addUsizeSaturating(@sizeOf(KVPair), addUsizeSaturating(chunk_key.len, payload.len)));
-                try appendOwnedRuntimeKVPair(context.runtime.alloc, context.writes, chunk_key, payload);
+                try appendOwnedRuntimeKVPair(context.resource_tracker, context.runtime.alloc, context.writes, chunk_key, payload);
             } else {
-                try appendUniqueDupeKey(context.runtime.alloc, &context.window.changed_artifact_keys, chunk_key);
+                try appendUniqueOwnedRuntimeKey(
+                    []u8,
+                    context.resource_tracker,
+                    context.runtime.alloc,
+                    &context.window.changed_artifact_keys,
+                    chunk_key,
+                );
             }
 
             if (context.mode == .publish_replay and text_indexes.len > 0) {
-                var targets = try context.runtime.alloc.alloc(derived_types.DerivedTargetRef, text_indexes.len);
-                errdefer {
-                    for (targets) |target| context.runtime.alloc.free(@constCast(target.index_name));
-                    context.runtime.alloc.free(targets);
-                }
-                for (text_indexes, 0..) |index_name, i| {
-                    targets[i] = .{
-                        .kind = .full_text,
-                        .index_name = try context.runtime.alloc.dupe(u8, index_name),
-                    };
-                }
-                try context.window.documents.append(context.runtime.alloc, .{
-                    .key = try context.runtime.alloc.dupe(u8, chunk_key),
-                    .action = .upsert,
-                    .cleaned_value = try context.runtime.alloc.dupe(u8, payload),
-                    .targets = targets,
-                });
+                try appendRuntimeReplayDocument(
+                    context.resource_tracker,
+                    context.runtime.alloc,
+                    context.window,
+                    chunk_key,
+                    payload,
+                    text_indexes,
+                );
             }
 
+            try context.accountAndFlushReplay(unit_working_bytes, generated_cache_bytes);
             try context.accountWorkingSet(unit_working_bytes, generated_cache_bytes);
             if (context.mode == .store_artifacts and (context.writes.items.len >= runtime_document_extraction_flush_write_count or
                 runtimeDocumentExtractionWriteBytes(context.writes.items) >= runtime_document_extraction_flush_write_bytes))

@@ -3999,6 +3999,7 @@ pub fn build(b: *std.Build) void {
             "PDF decoder credit and OCR transient allocations compose without double charging",
             "reserved PDF working set is bounded without duplicate resource charges",
             "budgeted document download composes with materialization accounting",
+            "document replay payloads are admitted before persistent allocation",
             "document extraction generated OCR bypasses unsupported native batch",
             "generated text provider config is validated while parsing extraction config",
             "public enrichment validation rejects invalid execution and producer config",

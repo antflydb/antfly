@@ -169,60 +169,30 @@ fn renderParsedPagePngNativeAlloc(alloc: Allocator, parsed: *reader.Reader, page
         all_shape_runs.deinit(alloc);
     }
     for (shape_runs) |run| {
-        try all_shape_runs.append(alloc, .{
-            .paint_order = run.paint_order,
-            .blend_mode = run.blend_mode,
-            .group_id = run.group_id,
-            .group_parent_id = run.group_parent_id,
-            .group_isolated = run.group_isolated,
-            .group_knockout = run.group_knockout,
-            .kind = run.kind,
-            .fill_rule = run.fill_rule,
-            .line_cap = run.line_cap,
-            .line_join = run.line_join,
-            .miter_limit = run.miter_limit,
-            .dash_array = if (run.dash_array) |dash| try alloc.dupe(f64, dash) else null,
-            .dash_phase = run.dash_phase,
-            .color = run.color,
-            .stroke_width = run.stroke_width,
-            .closed = run.closed,
-            .clip_box = run.clip_box,
-            .clip_points = if (run.clip_points) |pts| try alloc.dupe([2]f64, pts) else null,
-            .clip_fill_rule = run.clip_fill_rule,
-            .points = try alloc.dupe([2]f64, run.points),
-        });
+        var cloned = try dupShapeRunAlloc(alloc, run);
+        errdefer cloned.deinit(alloc);
+        try all_shape_runs.append(alloc, cloned);
     }
     for (text_shape_runs) |run| {
-        try all_shape_runs.append(alloc, .{
-            .paint_order = run.paint_order,
-            .blend_mode = run.blend_mode,
-            .group_id = run.group_id,
-            .group_parent_id = run.group_parent_id,
-            .group_isolated = run.group_isolated,
-            .group_knockout = run.group_knockout,
-            .kind = run.kind,
-            .fill_rule = run.fill_rule,
-            .line_cap = run.line_cap,
-            .line_join = run.line_join,
-            .miter_limit = run.miter_limit,
-            .dash_array = if (run.dash_array) |dash| try alloc.dupe(f64, dash) else null,
-            .dash_phase = run.dash_phase,
-            .color = run.color,
-            .stroke_width = run.stroke_width,
-            .closed = run.closed,
-            .clip_box = run.clip_box,
-            .clip_points = if (run.clip_points) |pts| try alloc.dupe([2]f64, pts) else null,
-            .clip_fill_rule = run.clip_fill_rule,
-            .points = try alloc.dupe([2]f64, run.points),
-        });
+        var cloned = try dupShapeRunAlloc(alloc, run);
+        errdefer cloned.deinit(alloc);
+        try all_shape_runs.append(alloc, cloned);
     }
     var all_pattern_runs = std.ArrayList(reader.PatternRun).empty;
     defer {
         for (all_pattern_runs.items) |*run| run.deinit(alloc);
         all_pattern_runs.deinit(alloc);
     }
-    for (pattern_runs) |run| try all_pattern_runs.append(alloc, try dupPatternRunAlloc(alloc, run));
-    for (text_pattern_runs) |run| try all_pattern_runs.append(alloc, try dupPatternRunAlloc(alloc, run));
+    for (pattern_runs) |run| {
+        var cloned = try dupPatternRunAlloc(alloc, run);
+        errdefer cloned.deinit(alloc);
+        try all_pattern_runs.append(alloc, cloned);
+    }
+    for (text_pattern_runs) |run| {
+        var cloned = try dupPatternRunAlloc(alloc, run);
+        errdefer cloned.deinit(alloc);
+        try all_pattern_runs.append(alloc, cloned);
+    }
     std.mem.sort(reader.TextRun, plain_runs.items, {}, struct {
         fn lessThan(_: void, a: reader.TextRun, b: reader.TextRun) bool {
             return a.paint_order < b.paint_order;
@@ -401,204 +371,222 @@ fn scalePageRenderRuns(runs: *reader.PageRenderRuns, scale: f64) void {
     scaleShapeRuns(runs.shape_runs, scale);
 }
 
+fn dupTextRunAlloc(alloc: Allocator, run: reader.TextRun) !reader.TextRun {
+    var out = run;
+    out.text = &.{};
+    out.raw_text = null;
+    out.fill_pattern_name = null;
+    out.stroke_pattern_name = null;
+    out.clip_points = null;
+    errdefer out.deinit(alloc);
+
+    out.text = try alloc.dupe(u8, run.text);
+    if (run.raw_text) |raw| out.raw_text = try alloc.dupe(u8, raw);
+    if (run.fill_pattern_name) |name| out.fill_pattern_name = try alloc.dupe(u8, name);
+    if (run.stroke_pattern_name) |name| out.stroke_pattern_name = try alloc.dupe(u8, name);
+    if (run.clip_points) |points| out.clip_points = try alloc.dupe([2]f64, points);
+    return out;
+}
+
+fn dupImageRunAlloc(alloc: Allocator, run: reader.ImageRun) !reader.ImageRun {
+    var out = run;
+    out.rgba = &.{};
+    out.clip_points = null;
+    errdefer out.deinit(alloc);
+
+    out.rgba = try alloc.dupe(u8, run.rgba);
+    if (run.clip_points) |points| out.clip_points = try alloc.dupe([2]f64, points);
+    return out;
+}
+
+fn dupShadingRunAlloc(alloc: Allocator, run: reader.ShadingRun) !reader.ShadingRun {
+    var out = run;
+    out.clip_points = null;
+    errdefer out.deinit(alloc);
+
+    if (run.clip_points) |points| out.clip_points = try alloc.dupe([2]f64, points);
+    return out;
+}
+
+fn dupShapeRunAlloc(alloc: Allocator, run: reader.ShapeRun) !reader.ShapeRun {
+    var out = run;
+    out.dash_array = null;
+    out.clip_points = null;
+    out.points = &.{};
+    errdefer out.deinit(alloc);
+
+    if (run.dash_array) |dash| out.dash_array = try alloc.dupe(f64, dash);
+    if (run.clip_points) |points| out.clip_points = try alloc.dupe([2]f64, points);
+    out.points = try alloc.dupe([2]f64, run.points);
+    return out;
+}
+
 fn dupPatternRunAlloc(alloc: Allocator, run: reader.PatternRun) !reader.PatternRun {
-    var out = reader.PatternRun{
-        .kind = run.kind,
-        .mode = run.mode,
-        .paint_order = run.paint_order,
-        .blend_mode = run.blend_mode,
-        .group_id = run.group_id,
-        .group_parent_id = run.group_parent_id,
-        .group_isolated = run.group_isolated,
-        .group_knockout = run.group_knockout,
-        .fill_rule = run.fill_rule,
-        .line_cap = run.line_cap,
-        .line_join = run.line_join,
-        .miter_limit = run.miter_limit,
-        .dash_array = if (run.dash_array) |dash| try alloc.dupe(f64, dash) else null,
-        .dash_phase = run.dash_phase,
-        .stroke_width = run.stroke_width,
-        .closed = run.closed,
-        .clip_box = run.clip_box,
-        .clip_points = if (run.clip_points) |clip| try alloc.dupe([2]f64, clip) else null,
-        .clip_fill_rule = run.clip_fill_rule,
-        .points = try alloc.dupe([2]f64, run.points),
-        .pattern_matrix = run.pattern_matrix,
-        .pattern_bbox = run.pattern_bbox,
-        .pattern_x_step = run.pattern_x_step,
-        .pattern_y_step = run.pattern_y_step,
-        .base_color = run.base_color,
-        .shading = null,
-        .tile_text_runs = &.{},
-        .tile_image_runs = &.{},
-        .tile_shading_runs = &.{},
-        .tile_pattern_runs = &.{},
-        .tile_shape_runs = &.{},
-    };
-    if (run.shading) |shading| {
-        out.shading = .{
-            .kind = shading.kind,
-            .paint_order = shading.paint_order,
-            .blend_mode = shading.blend_mode,
-            .group_id = shading.group_id,
-            .group_parent_id = shading.group_parent_id,
-            .group_isolated = shading.group_isolated,
-            .group_knockout = shading.group_knockout,
-            .clip_box = shading.clip_box,
-            .clip_points = if (shading.clip_points) |clip| try alloc.dupe([2]f64, clip) else null,
-            .clip_fill_rule = shading.clip_fill_rule,
-            .x0 = shading.x0,
-            .y0 = shading.y0,
-            .r0 = shading.r0,
-            .x1 = shading.x1,
-            .y1 = shading.y1,
-            .r1 = shading.r1,
-            .c0 = shading.c0,
-            .c1 = shading.c1,
-            .extend_start = shading.extend_start,
-            .extend_end = shading.extend_end,
-        };
-    }
+    var out = run;
+    out.dash_array = null;
+    out.clip_points = null;
+    out.points = &.{};
+    out.shading = null;
+    out.tile_text_runs = &.{};
+    out.tile_image_runs = &.{};
+    out.tile_shading_runs = &.{};
+    out.tile_pattern_runs = &.{};
+    out.tile_shape_runs = &.{};
+    errdefer out.deinit(alloc);
+
+    if (run.dash_array) |dash| out.dash_array = try alloc.dupe(f64, dash);
+    if (run.clip_points) |points| out.clip_points = try alloc.dupe([2]f64, points);
+    out.points = try alloc.dupe([2]f64, run.points);
+    if (run.shading) |shading| out.shading = try dupShadingRunAlloc(alloc, shading);
+
     if (run.tile_text_runs.len > 0) {
-        var list = std.ArrayList(reader.TextRun).empty;
+        var list = try std.ArrayList(reader.TextRun).initCapacity(alloc, run.tile_text_runs.len);
         defer list.deinit(alloc);
-        for (run.tile_text_runs) |text| {
-            try list.append(alloc, .{
-                .text = try alloc.dupe(u8, text.text),
-                .raw_text = if (text.raw_text) |raw| try alloc.dupe(u8, raw) else null,
-                .font_index = text.font_index,
-                .vectorizable = text.vectorizable,
-                .x = text.x,
-                .y = text.y,
-                .font_size = text.font_size,
-                .a = text.a,
-                .b = text.b,
-                .c = text.c,
-                .d = text.d,
-                .alpha = text.alpha,
-                .stroke_alpha = text.stroke_alpha,
-                .render_mode = text.render_mode,
-                .fill_color = text.fill_color,
-                .stroke_color = text.stroke_color,
-                .stroke_width = text.stroke_width,
-                .horizontal_scale = text.horizontal_scale,
-                .char_spacing = text.char_spacing,
-                .word_spacing = text.word_spacing,
-                .advance_width = text.advance_width,
-                .ascent = text.ascent,
-                .descent = text.descent,
-                .paint_order = text.paint_order,
-                .blend_mode = text.blend_mode,
-                .group_id = text.group_id,
-                .group_parent_id = text.group_parent_id,
-                .group_isolated = text.group_isolated,
-                .group_knockout = text.group_knockout,
-                .fill_pattern_name = text.fill_pattern_name,
-                .stroke_pattern_name = text.stroke_pattern_name,
-                .clip_box = text.clip_box,
-                .clip_points = if (text.clip_points) |clip| try alloc.dupe([2]f64, clip) else null,
-                .clip_fill_rule = text.clip_fill_rule,
-            });
+        errdefer for (list.items) |*item| item.deinit(alloc);
+        for (run.tile_text_runs) |item| {
+            var cloned = try dupTextRunAlloc(alloc, item);
+            errdefer cloned.deinit(alloc);
+            list.appendAssumeCapacity(cloned);
         }
         out.tile_text_runs = try list.toOwnedSlice(alloc);
     }
     if (run.tile_image_runs.len > 0) {
-        var list = std.ArrayList(reader.ImageRun).empty;
+        var list = try std.ArrayList(reader.ImageRun).initCapacity(alloc, run.tile_image_runs.len);
         defer list.deinit(alloc);
-        for (run.tile_image_runs) |image_run| {
-            try list.append(alloc, .{
-                .rgba = try alloc.dupe(u8, image_run.rgba),
-                .width = image_run.width,
-                .height = image_run.height,
-                .alpha = image_run.alpha,
-                .paint_order = image_run.paint_order,
-                .blend_mode = image_run.blend_mode,
-                .group_id = image_run.group_id,
-                .group_parent_id = image_run.group_parent_id,
-                .group_isolated = image_run.group_isolated,
-                .group_knockout = image_run.group_knockout,
-                .clip_box = image_run.clip_box,
-                .clip_points = if (image_run.clip_points) |clip| try alloc.dupe([2]f64, clip) else null,
-                .clip_fill_rule = image_run.clip_fill_rule,
-                .a = image_run.a,
-                .b = image_run.b,
-                .c = image_run.c,
-                .d = image_run.d,
-                .e = image_run.e,
-                .f = image_run.f,
-                .x = image_run.x,
-                .y = image_run.y,
-                .draw_width = image_run.draw_width,
-                .draw_height = image_run.draw_height,
-            });
+        errdefer for (list.items) |*item| item.deinit(alloc);
+        for (run.tile_image_runs) |item| {
+            var cloned = try dupImageRunAlloc(alloc, item);
+            errdefer cloned.deinit(alloc);
+            list.appendAssumeCapacity(cloned);
         }
         out.tile_image_runs = try list.toOwnedSlice(alloc);
     }
     if (run.tile_shading_runs.len > 0) {
-        var list = std.ArrayList(reader.ShadingRun).empty;
+        var list = try std.ArrayList(reader.ShadingRun).initCapacity(alloc, run.tile_shading_runs.len);
         defer list.deinit(alloc);
-        for (run.tile_shading_runs) |shading| {
-            try list.append(alloc, .{
-                .kind = shading.kind,
-                .paint_order = shading.paint_order,
-                .blend_mode = shading.blend_mode,
-                .group_id = shading.group_id,
-                .group_parent_id = shading.group_parent_id,
-                .group_isolated = shading.group_isolated,
-                .group_knockout = shading.group_knockout,
-                .clip_box = shading.clip_box,
-                .clip_points = if (shading.clip_points) |clip| try alloc.dupe([2]f64, clip) else null,
-                .clip_fill_rule = shading.clip_fill_rule,
-                .x0 = shading.x0,
-                .y0 = shading.y0,
-                .r0 = shading.r0,
-                .x1 = shading.x1,
-                .y1 = shading.y1,
-                .r1 = shading.r1,
-                .c0 = shading.c0,
-                .c1 = shading.c1,
-                .extend_start = shading.extend_start,
-                .extend_end = shading.extend_end,
-            });
+        errdefer for (list.items) |*item| item.deinit(alloc);
+        for (run.tile_shading_runs) |item| {
+            var cloned = try dupShadingRunAlloc(alloc, item);
+            errdefer cloned.deinit(alloc);
+            list.appendAssumeCapacity(cloned);
         }
         out.tile_shading_runs = try list.toOwnedSlice(alloc);
     }
     if (run.tile_pattern_runs.len > 0) {
-        var list = std.ArrayList(reader.PatternRun).empty;
+        var list = try std.ArrayList(reader.PatternRun).initCapacity(alloc, run.tile_pattern_runs.len);
         defer list.deinit(alloc);
-        for (run.tile_pattern_runs) |pattern_run| try list.append(alloc, try dupPatternRunAlloc(alloc, pattern_run));
+        errdefer for (list.items) |*item| item.deinit(alloc);
+        for (run.tile_pattern_runs) |item| {
+            var cloned = try dupPatternRunAlloc(alloc, item);
+            errdefer cloned.deinit(alloc);
+            list.appendAssumeCapacity(cloned);
+        }
         out.tile_pattern_runs = try list.toOwnedSlice(alloc);
     }
     if (run.tile_shape_runs.len > 0) {
-        var list = std.ArrayList(reader.ShapeRun).empty;
+        var list = try std.ArrayList(reader.ShapeRun).initCapacity(alloc, run.tile_shape_runs.len);
         defer list.deinit(alloc);
-        for (run.tile_shape_runs) |shape| {
-            try list.append(alloc, .{
-                .kind = shape.kind,
-                .paint_order = shape.paint_order,
-                .blend_mode = shape.blend_mode,
-                .group_id = shape.group_id,
-                .group_parent_id = shape.group_parent_id,
-                .group_isolated = shape.group_isolated,
-                .group_knockout = shape.group_knockout,
-                .fill_rule = shape.fill_rule,
-                .line_cap = shape.line_cap,
-                .line_join = shape.line_join,
-                .miter_limit = shape.miter_limit,
-                .dash_array = if (shape.dash_array) |dash| try alloc.dupe(f64, dash) else null,
-                .dash_phase = shape.dash_phase,
-                .color = shape.color,
-                .stroke_width = shape.stroke_width,
-                .closed = shape.closed,
-                .clip_box = shape.clip_box,
-                .clip_points = if (shape.clip_points) |clip| try alloc.dupe([2]f64, clip) else null,
-                .clip_fill_rule = shape.clip_fill_rule,
-                .points = try alloc.dupe([2]f64, shape.points),
-            });
+        errdefer for (list.items) |*item| item.deinit(alloc);
+        for (run.tile_shape_runs) |item| {
+            var cloned = try dupShapeRunAlloc(alloc, item);
+            errdefer cloned.deinit(alloc);
+            list.appendAssumeCapacity(cloned);
         }
         out.tile_shape_runs = try list.toOwnedSlice(alloc);
     }
     return out;
+}
+
+test "PDF render pattern cloning is allocation-failure safe" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            var pattern_dash = [_]f64{ 1, 2 };
+            var pattern_clip = [_][2]f64{ .{ 0, 0 }, .{ 8, 8 } };
+            var pattern_points = [_][2]f64{ .{ 0, 0 }, .{ 8, 0 }, .{ 8, 8 }, .{ 0, 8 } };
+            var text_clip = [_][2]f64{ .{ 1, 1 }, .{ 2, 2 } };
+            var tile_text = [_]reader.TextRun{.{
+                .text = "visible",
+                .raw_text = "raw",
+                .x = 1,
+                .y = 2,
+                .font_size = 12,
+                .fill_pattern_name = "fill-pattern",
+                .stroke_pattern_name = "stroke-pattern",
+                .clip_points = &text_clip,
+            }};
+            var rgba = [_]u8{ 0, 64, 128, 255 };
+            var image_clip = [_][2]f64{ .{ 2, 2 }, .{ 3, 3 } };
+            var tile_images = [_]reader.ImageRun{.{
+                .rgba = &rgba,
+                .width = 1,
+                .height = 1,
+                .clip_points = &image_clip,
+                .a = 1,
+                .b = 0,
+                .c = 0,
+                .d = 1,
+                .e = 0,
+                .f = 0,
+                .x = 0,
+                .y = 0,
+                .draw_width = 1,
+                .draw_height = 1,
+            }};
+            var shading_clip = [_][2]f64{ .{ 3, 3 }, .{ 4, 4 } };
+            var tile_shadings = [_]reader.ShadingRun{.{
+                .kind = .axial,
+                .clip_points = &shading_clip,
+                .x0 = 0,
+                .y0 = 0,
+                .x1 = 8,
+                .y1 = 8,
+                .c0 = .{ 0, 0, 0, 255 },
+                .c1 = .{ 255, 255, 255, 255 },
+            }};
+            var shape_dash = [_]f64{ 3, 4 };
+            var shape_clip = [_][2]f64{ .{ 4, 4 }, .{ 5, 5 } };
+            var shape_points = [_][2]f64{ .{ 0, 0 }, .{ 4, 4 } };
+            var tile_shapes = [_]reader.ShapeRun{.{
+                .kind = .stroke,
+                .dash_array = &shape_dash,
+                .color = .{ 0, 0, 0, 255 },
+                .stroke_width = 1,
+                .closed = false,
+                .clip_points = &shape_clip,
+                .points = &shape_points,
+            }};
+            var nested_points = [_][2]f64{ .{ 0, 0 }, .{ 2, 2 } };
+            var nested_patterns = [_]reader.PatternRun{.{
+                .kind = .fill,
+                .points = &nested_points,
+                .pattern_bbox = .{ .min_x = 0, .min_y = 0, .max_x = 2, .max_y = 2 },
+                .pattern_x_step = 2,
+                .pattern_y_step = 2,
+            }};
+            const source = reader.PatternRun{
+                .kind = .fill,
+                .dash_array = &pattern_dash,
+                .clip_points = &pattern_clip,
+                .points = &pattern_points,
+                .pattern_bbox = .{ .min_x = 0, .min_y = 0, .max_x = 8, .max_y = 8 },
+                .pattern_x_step = 8,
+                .pattern_y_step = 8,
+                .shading = tile_shadings[0],
+                .tile_text_runs = &tile_text,
+                .tile_image_runs = &tile_images,
+                .tile_shading_runs = &tile_shadings,
+                .tile_pattern_runs = &nested_patterns,
+                .tile_shape_runs = &tile_shapes,
+            };
+
+            var cloned = try dupPatternRunAlloc(alloc, source);
+            defer cloned.deinit(alloc);
+            try std.testing.expectEqualStrings("fill-pattern", cloned.tile_text_runs[0].fill_pattern_name.?);
+            try std.testing.expect(cloned.tile_text_runs[0].fill_pattern_name.?.ptr != source.tile_text_runs[0].fill_pattern_name.?.ptr);
+        }
+    };
+
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 fn encryptType1EexecAlloc(alloc: Allocator, plain: []const u8) ![]u8 {
