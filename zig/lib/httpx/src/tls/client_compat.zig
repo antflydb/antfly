@@ -21,11 +21,11 @@
 //! Zig 0.16 TLS client compatibility copy.
 //!
 //! Derived from Zig 0.16.0 `std.crypto.tls.Client` under the Zig contributors'
-//! MIT license above. The only protocol change accepts an optional TLS 1.3
-//! initial-handshake CertificateRequest and sends an empty client Certificate
-//! message, as required when bearer authentication is used without a client
-//! certificate. Remove this copy after upstream Zig provides the same behavior
-//! and Antfly's minimum Zig revision includes it.
+//! MIT license above. The only protocol change accepts an optional TLS 1.2 or
+//! TLS 1.3 initial-handshake CertificateRequest and sends an empty client
+//! Certificate message, as required when bearer authentication is used without
+//! a client certificate. Remove this copy after upstream Zig provides the same
+//! behavior and Antfly's minimum Zig revision includes it.
 
 const builtin = @import("builtin");
 const native_endian = builtin.cpu.arch.endian();
@@ -630,19 +630,46 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                         handshake_state = .certificate;
                     },
                     .certificate_request => {
-                        if (tls_version != .tls_1_3) return error.TlsUnexpectedMessage;
-                        if (cipher_state != .handshake) return error.TlsUnexpectedMessage;
-                        if (handshake_state != .certificate) return error.TlsUnexpectedMessage;
                         if (server_requested_client_certificate) return error.TlsUnexpectedMessage;
+                        switch (tls_version) {
+                            .tls_1_3 => {
+                                if (cipher_state != .handshake) return error.TlsUnexpectedMessage;
+                                if (handshake_state != .certificate) return error.TlsUnexpectedMessage;
+                            },
+                            .tls_1_2 => {
+                                if (cipher_state != .cleartext) return error.TlsUnexpectedMessage;
+                                if (handshake_state != .server_hello_done) return error.TlsUnexpectedMessage;
+                            },
+                            else => return error.TlsUnexpectedMessage,
+                        }
                         switch (handshake_cipher) {
                             inline else => |*p| p.transcript_hash.update(wrapped_handshake),
                         }
-                        try hsd.ensure(1);
-                        const request_context_len = hsd.decode(u8);
-                        if (request_context_len != 0) return error.TlsIllegalParameter;
-                        try hsd.ensure(2);
-                        const extensions_len = hsd.decode(u16);
-                        _ = try hsd.sub(extensions_len);
+                        switch (tls_version) {
+                            .tls_1_3 => {
+                                try hsd.ensure(1);
+                                const request_context_len = hsd.decode(u8);
+                                if (request_context_len != 0) return error.TlsIllegalParameter;
+                                try hsd.ensure(2);
+                                const extensions_len = hsd.decode(u16);
+                                _ = try hsd.sub(extensions_len);
+                            },
+                            .tls_1_2 => {
+                                try hsd.ensure(1);
+                                const certificate_types_len = hsd.decode(u8);
+                                if (certificate_types_len == 0) return error.TlsIllegalParameter;
+                                _ = try hsd.sub(certificate_types_len);
+                                try hsd.ensure(2);
+                                const signature_algorithms_len = hsd.decode(u16);
+                                if (signature_algorithms_len == 0 or signature_algorithms_len % 2 != 0)
+                                    return error.TlsIllegalParameter;
+                                _ = try hsd.sub(signature_algorithms_len);
+                                try hsd.ensure(2);
+                                const certificate_authorities_len = hsd.decode(u16);
+                                _ = try hsd.sub(certificate_authorities_len);
+                            },
+                            else => unreachable,
+                        }
                         if (!hsd.eof()) return error.TlsDecodeError;
                         server_requested_client_certificate = true;
                     },
@@ -790,6 +817,12 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                             .{@intFromEnum(tls.HandshakeType.client_key_exchange)} ++
                             int(u24, @intCast(public_key_bytes.len + 1)) ++ // handshake message length
                             .{@as(u8, @intCast(public_key_bytes.len))}; // public key length
+                        const client_empty_certificate_msg = .{@intFromEnum(tls.ContentType.handshake)} ++
+                            int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_2)) ++
+                            int(u16, 7) ++ // record length
+                            .{@intFromEnum(tls.HandshakeType.certificate)} ++
+                            int(u24, 3) ++ // handshake message length
+                            int(u24, 0); // empty certificate_list
                         const client_change_cipher_spec_msg = .{@intFromEnum(tls.ContentType.change_cipher_spec)} ++
                             int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_2)) ++
                             array(u16, tls.ChangeCipherSpecType, .{.change_cipher_spec});
@@ -798,6 +831,9 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                             inline else => |*p| {
                                 const P = @TypeOf(p.*).A;
                                 p.transcript_hash.update(wrapped_handshake);
+                                if (server_requested_client_certificate) {
+                                    p.transcript_hash.update(client_empty_certificate_msg[tls.record_header_len..]);
+                                }
                                 p.transcript_hash.update(client_key_exchange_prefix[tls.record_header_len..]);
                                 p.transcript_hash.update(public_key_bytes);
                                 const master_secret = hmacExpandLabel(P.Hmac, pre_master_secret, &.{
@@ -853,13 +889,24 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                     nonce,
                                     pv.app_cipher.client_write_key,
                                 );
-                                var all_msgs_vec: [4][]const u8 = .{
-                                    &client_key_exchange_prefix,
-                                    public_key_bytes,
-                                    &client_change_cipher_spec_msg,
-                                    &client_verify_msg,
-                                };
-                                try output.writeVecAll(&all_msgs_vec);
+                                if (server_requested_client_certificate) {
+                                    var all_msgs_vec: [5][]const u8 = .{
+                                        &client_empty_certificate_msg,
+                                        &client_key_exchange_prefix,
+                                        public_key_bytes,
+                                        &client_change_cipher_spec_msg,
+                                        &client_verify_msg,
+                                    };
+                                    try output.writeVecAll(&all_msgs_vec);
+                                } else {
+                                    var all_msgs_vec: [4][]const u8 = .{
+                                        &client_key_exchange_prefix,
+                                        public_key_bytes,
+                                        &client_change_cipher_spec_msg,
+                                        &client_verify_msg,
+                                    };
+                                    try output.writeVecAll(&all_msgs_vec);
+                                }
                                 try output.flush();
                             },
                         }

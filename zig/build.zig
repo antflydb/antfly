@@ -6124,6 +6124,7 @@ pub fn build(b: *std.Build) void {
             "runtime lease watchdog prefers a DNS-verified Kubernetes API host and retains the injected port",
             "Lease executor rejects unscoped request shapes",
             "Lease executor accepts optional CertificateRequest with projected CA and verified hostname",
+            "Lease executor accepts TLS 1.2 optional CertificateRequest",
             "Lease executor rejects optional CertificateRequest hostname mismatch",
         },
         .test_runner = .{

@@ -36,7 +36,7 @@ if [ "${status:-0}" -ne 1 ]; then
     exit 1
 fi
 
-expected_diff=d9a8ca0b8ef32ce29e3590fe532778ea36416761d46d5433257cbbb81a82e6b9
+expected_diff=b66fe1e58e6007fc33e058742795e69b6531c61c8c4c789a3e8e97b4380cdfd8
 actual_diff=$(hash_file "$diff_file")
 if [ "$actual_diff" != "$expected_diff" ]; then
     echo "Zig TLS compatibility patch drift: expected $expected_diff, found $actual_diff" >&2

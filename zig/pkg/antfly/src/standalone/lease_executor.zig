@@ -127,6 +127,8 @@ const optional_client_auth_server =
     \\listener.listen(1)
     \\pathlib.Path(port_file).write_text(str(listener.getsockname()[1]))
     \\ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    \\if len(sys.argv) > 4 and sys.argv[4] == 'tls12':
+    \\    ctx.maximum_version = ssl.TLSVersion.TLSv1_2
     \\ctx.load_cert_chain(certfile=cert, keyfile=key)
     \\ctx.load_verify_locations(cafile=cert)
     \\ctx.verify_mode = ssl.CERT_OPTIONAL
@@ -153,6 +155,7 @@ fn spawnOptionalClientAuthServer(
     alloc: std.mem.Allocator,
     io: std.Io,
     tmp: *std.testing.TmpDir,
+    force_tls_1_2: bool,
 ) !struct { child: std.process.Child, cert_path: []u8, port: u16 } {
     try tmp.dir.writeFile(io, .{ .sub_path = "cert.pem", .data = @embedFile("testdata/optional-client-auth.crt") });
     try tmp.dir.writeFile(io, .{ .sub_path = "key.pem", .data = @embedFile("testdata/optional-client-auth.key") });
@@ -163,7 +166,10 @@ fn spawnOptionalClientAuthServer(
     errdefer alloc.free(cert_path);
 
     var child = std.process.spawn(io, .{
-        .argv = &.{ "python3", "server.py", "cert.pem", "key.pem", "port.txt" },
+        .argv = if (force_tls_1_2)
+            &.{ "python3", "server.py", "cert.pem", "key.pem", "port.txt", "tls12" }
+        else
+            &.{ "python3", "server.py", "cert.pem", "key.pem", "port.txt" },
         .cwd = .{ .dir = tmp.dir },
         .stdin = .ignore,
         .stdout = .ignore,
@@ -199,7 +205,32 @@ test "Lease executor accepts optional CertificateRequest with projected CA and v
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var server = try spawnOptionalClientAuthServer(alloc, io, &tmp);
+    var server = try spawnOptionalClientAuthServer(alloc, io, &tmp, false);
+    defer {
+        server.child.kill(io);
+        alloc.free(server.cert_path);
+    }
+    const uri = try std.fmt.allocPrint(alloc, "https://localhost:{d}/lease", .{server.port});
+    defer alloc.free(uri);
+    var executor = try LeaseExecutor.init(alloc, io, server.cert_path, 4096);
+    defer executor.deinit();
+    var response = try executor.executor().execute(alloc, .{
+        .method = .GET,
+        .uri = uri,
+        .authorization = "Bearer test-token",
+        .timeout_ms = 3000,
+    });
+    defer response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), response.status);
+    try std.testing.expectEqualStrings("{\"ok\":true}", response.body);
+}
+
+test "Lease executor accepts TLS 1.2 optional CertificateRequest" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var server = try spawnOptionalClientAuthServer(alloc, io, &tmp, true);
     defer {
         server.child.kill(io);
         alloc.free(server.cert_path);
@@ -224,7 +255,7 @@ test "Lease executor rejects optional CertificateRequest hostname mismatch" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var server = try spawnOptionalClientAuthServer(alloc, io, &tmp);
+    var server = try spawnOptionalClientAuthServer(alloc, io, &tmp, false);
     defer {
         server.child.kill(io);
         alloc.free(server.cert_path);
