@@ -597,6 +597,7 @@ const AntflyRootImports = struct {
     filesystem_capacity_source_file: std.Build.LazyPath,
     standalone_runtime_options: *std.Build.Step.Options,
     kernel_owner_abi: *std.Build.Module,
+    kernel_error_identity: *std.Build.Module,
 
     const import_table = [_]struct { name: []const u8, field: []const u8 }{
         .{ .name = "lmdb_engine", .field = "lmdb_engine" },
@@ -663,6 +664,7 @@ const AntflyRootImports = struct {
         .{ .name = "prometheus", .field = "prometheus" },
         .{ .name = "structlog", .field = "structlog" },
         .{ .name = "kernel_owner_abi", .field = "kernel_owner_abi" },
+        .{ .name = "kernel_error_identity", .field = "kernel_error_identity" },
     };
 
     fn configure(self: @This(), b: *std.Build, mod: *std.Build.Module, include_lmdb_c: bool, link_libc: bool) void {
@@ -1766,6 +1768,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const kernel_error_identity_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/storage/kernel_error_identity.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    kernel_error_identity_mod.addImport("kernel_owner_abi", kernel_owner_abi_mod);
 
     const hf_tokenizer_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -1886,6 +1894,7 @@ pub fn build(b: *std.Build) void {
         .filesystem_capacity_source_file = b.path("lib/platform/src/filesystem_capacity.c"),
         .standalone_runtime_options = standalone_runtime_options,
         .kernel_owner_abi = kernel_owner_abi_mod,
+        .kernel_error_identity = kernel_error_identity_mod,
     };
 
     // Library module
@@ -2369,6 +2378,7 @@ pub fn build(b: *std.Build) void {
     capi_mod.addImport("antfly_storage_root", capi_root_mod);
     capi_mod.addImport("structlog", structlog_mod);
     capi_mod.addImport("kernel_owner_abi", kernel_owner_abi_mod);
+    capi_mod.addImport("kernel_error_identity", kernel_error_identity_mod);
 
     // Unlinked and focused CAPI builds compile the storage ABI as a standalone
     // PIC object. Linked release builds instead include the same exports in the
@@ -2511,6 +2521,7 @@ pub fn build(b: *std.Build) void {
     const capi_default_filters = [_][]const u8{
         "capi lite opens exports imports checks and vacuums aflite",
         "capi zero buffer helper wipes bytes before free",
+        "storage-owner reverse callbacks preserve semantic error identity",
         "capi lite exposes hosted and status-only profiles",
         "capi lite open options validate and configure ttl cleanup",
         "capi execute graph queries honors identity read generation",
@@ -8825,6 +8836,7 @@ pub fn build(b: *std.Build) void {
         var storage_owner_tests: ?*std.Build.Step.Compile = null;
         var storage_provisioned_owner_tests: ?*std.Build.Step.Compile = null;
         var storage_data_runtime_owner_tests: ?*std.Build.Step.Compile = null;
+        var storage_metadata_runtime_owner_tests: ?*std.Build.Step.Compile = null;
         inline for (std.meta.tags(RuntimeLibraryUnit)) |unit| {
             const unit_enabled = unit != .data_pic_probe and unit != .storage_runtime_pic_probe and
                 unit != .application_pic_probe and unit != .control_probe and
@@ -8992,12 +9004,15 @@ pub fn build(b: *std.Build) void {
             }
             if (unit == .storage_kernel and storage_kernel_experiment) {
                 const owner_test_mod = b.createModule(.{
-                    .root_source_file = b.path("pkg/antfly/src/storage/kernel_owner_test.zig"),
+                    .root_source_file = b.path("pkg/antfly/src/storage_kernel_owner_test_root.zig"),
                     .target = target,
                     .optimize = optimize,
                     .link_libc = true,
                 });
                 owner_test_mod.addImport("kernel_owner_abi", kernel_owner_abi_mod);
+                owner_test_mod.addImport("kernel_error_identity", kernel_error_identity_mod);
+                owner_test_mod.addImport("antfly_platform", platform_mod);
+                owner_test_mod.addImport("raft_engine", raft_engine_mod);
                 const owner_tests = b.addTest(.{
                     .root_module = owner_test_mod,
                     .test_runner = .{
@@ -9079,14 +9094,42 @@ pub fn build(b: *std.Build) void {
                     "Run DataServer process-owner composition tests across static archives",
                 );
                 data_runtime_owner_test_step.dependOn(&run_data_runtime_owner_tests.step);
+
+                const metadata_runtime_owner_test_mod = b.createModule(.{
+                    .root_source_file = b.path("pkg/antfly/src/metadata_core_test_root.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .link_libc = true,
+                });
+                antfly_imports.configureStorageSources(b, metadata_runtime_owner_test_mod, true, true, true);
+                const metadata_runtime_owner_tests = b.addTest(.{
+                    .root_module = metadata_runtime_owner_test_mod,
+                    .filters = &.{"metadata runtime preserves projected tables across restart"},
+                    .test_runner = .{
+                        .path = b.path("pkg/antfly/src/test_runner.zig"),
+                        .mode = .simple,
+                    },
+                });
+                metadata_runtime_owner_tests.root_module.linkLibrary(role_artifact);
+                storage_metadata_runtime_owner_tests = metadata_runtime_owner_tests;
+                const run_metadata_runtime_owner_tests = b.addRunArtifact(metadata_runtime_owner_tests);
+                const metadata_runtime_owner_test_step = b.step(
+                    "storage-kernel-metadata-runtime-test",
+                    "Run metadata projection persistence through the opaque storage kernel",
+                );
+                metadata_runtime_owner_test_step.dependOn(&run_metadata_runtime_owner_tests.step);
             }
-            if (owns_storage_kernel or unit == .control_api_probe) {
+            if (owns_storage_kernel or unit == .control_api_probe or
+                (storage_kernel_experiment and unit == .distributed))
+            {
                 // The executable and C ABI libraries share this one optimized
                 // PIC object. Give the final links enough section granularity
                 // to retain only the C ABI roots in the shared libraries while
-                // the executable retains the runtime entry points as well.
-                // The excluded control/API probe uses the same granularity so
-                // the graph analyzer can attribute remaining cross-unit code.
+                // the executable retains the runtime entry points as well. The
+                // excluded control/API probe and experimental distributed unit
+                // use the same granularity so the graph analyzer can attribute
+                // remaining cross-unit code and the final executable can drop
+                // unused composition helpers after the ownership move.
                 role_artifact.link_function_sections = true;
                 role_artifact.link_data_sections = true;
             }
@@ -9120,6 +9163,7 @@ pub fn build(b: *std.Build) void {
             storage_owner_tests,
             storage_provisioned_owner_tests,
             storage_data_runtime_owner_tests,
+            storage_metadata_runtime_owner_tests,
         }) |maybe_tests| {
             const tests = maybe_tests orelse continue;
             tests.root_module.linkLibrary(api_runtime_artifact.?);

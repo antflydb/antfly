@@ -66,6 +66,11 @@ const distributed_graph = @import("distributed_graph.zig");
 const runtime_status = @import("runtime_status.zig");
 const table_read_source = @import("table_read_source.zig");
 const storage_kernel_experiment = control_only_storage_sources;
+const kernel_owner_client = if (control_only_storage_sources)
+    @import("../storage/kernel_owner_client.zig")
+else
+    struct {};
+const aggregation_contract = @import("../storage/db/aggregations_contract.zig");
 
 fn publishRuntimeStatusGroupForTest(
     cache: *runtime_status.TableRuntimeSnapshotCache,
@@ -10724,6 +10729,10 @@ fn applyAggregationResults(
     meta: *query_api.QueryResponseMeta,
 ) !void {
     if (req.aggregations_json.len == 0) return;
+    if (comptime control_only_storage_sources) {
+        meta.aggregation_results = try computeAggregationResultsThroughKernel(alloc, req, result, ctx);
+        return;
+    }
     const requests = try query_api.parseAggregationRequestsJson(alloc, req.aggregations_json);
     defer query_api.freeAggregationRequests(alloc, requests);
     var aggregation_ctx = ctx;
@@ -10742,6 +10751,50 @@ fn applyAggregationResults(
         try db_mod.aggregations.cloneSearchAggregationResultLabelsDeep(alloc, aggregation);
     }
     meta.aggregation_results = aggregation_results;
+}
+
+fn computeAggregationResultsThroughKernel(
+    alloc: std.mem.Allocator,
+    req: db_mod.types.SearchRequest,
+    result: db_mod.types.SearchResult,
+    ctx: db_mod.aggregations.Context,
+) ![]db_mod.aggregations.SearchAggregationResult {
+    const hits = try alloc.alloc(kernel_owner_client.AggregationHit, result.hits.len);
+    defer if (hits.len > 0) alloc.free(hits);
+    for (result.hits, 0..) |hit, i| hits[i] = .{
+        .stored_data = .fromSlice(hit.stored_data orelse ""),
+    };
+
+    const context_json = try std.json.Stringify.valueAlloc(alloc, aggregation_contract.ComputeContextWire{
+        .text_analysis = if (ctx.text_analysis) |value| value.* else null,
+        .distributed_text_stats = ctx.distributed_text_stats,
+        .distributed_background_text_stats = ctx.distributed_background_text_stats,
+    }, .{});
+    defer alloc.free(context_json);
+
+    var response = try kernel_owner_client.aggregate(.{
+        .total_hits = result.total_hits,
+        .aggregations_json = .fromSlice(req.aggregations_json),
+        .context_json = .fromSlice(context_json),
+        .hits = if (hits.len == 0) null else hits.ptr,
+        .hit_count = @intCast(hits.len),
+    });
+    defer response.deinit();
+    const results = std.json.parseFromSliceLeaky(
+        []db_mod.aggregations.SearchAggregationResult,
+        alloc,
+        response.bytes(),
+        .{},
+    ) catch return error.StorageKernelFailure;
+    for (results) |*aggregation| markAggregationLabelsOwned(aggregation);
+    return results;
+}
+
+fn markAggregationLabelsOwned(result: *db_mod.aggregations.SearchAggregationResult) void {
+    result.owns_labels = true;
+    for (result.buckets) |*bucket| {
+        for (bucket.aggregations) |*child| markAggregationLabelsOwned(child);
+    }
 }
 
 fn requestWithResultIdentityGeneration(

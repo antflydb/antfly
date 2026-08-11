@@ -23,8 +23,13 @@ const fs_paths = @import("../common/fs_paths.zig");
 const platform_time = @import("antfly_platform").time;
 const platform = @import("antfly_platform");
 const inference_bridge = @import("inference_bridge.zig");
+const kernel_owner_client = @import("../storage/kernel_owner_client.zig");
+const storage_source_options = @import("storage_source_options");
 const standalone_runtime_options = @import("standalone_runtime_options");
 const inline_inference_codegen = !standalone_runtime_options.linked_inference;
+const storage_kernel_experiment = storage_source_options.control_only;
+const LegacyLiteHandle = if (storage_kernel_experiment) struct {} else antfly.lite.backend.Handle;
+const LegacyAuthBackend = if (storage_kernel_experiment) struct {} else antfly.lsm_backend.BackendHandle;
 const inference_host = if (inline_inference_codegen) @import("inference_host.zig") else struct {};
 
 const AntflyApiHandler = antfly.public_api.httpx_handler.AntflyApiHandler;
@@ -685,6 +690,44 @@ const LocalStandaloneMetadata = struct {
             .range_id = ranges[0].range_id,
         };
         try verifyAdoptedLiteIdentity(self.alloc, backend, namespace, target_identity);
+
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.findTableByNameLocked("default") != null) return;
+        var mutation = try self.beginCatalogMutationLocked();
+        defer mutation.deinit(self);
+        try self.manager.upsertTable(table);
+        for (ranges) |range| try self.manager.upsertRange(range);
+        self.epoch +|= 1;
+        try mutation.commit(self);
+    }
+
+    fn adoptEmbeddedLiteRootFromKernelIfNeeded(
+        self: *LocalStandaloneMetadata,
+        context: *kernel_owner_client.Context,
+    ) !void {
+        const existing = try self.manager.listTables(self.alloc);
+        defer self.manager.freeTables(self.alloc, existing);
+        if (existing.len != 0) return;
+        const probe = try context.liteAdoptionProbe();
+        if (probe.is_embedded_artifact == 0 and probe.embedded_root_has_user_documents == 0) return;
+
+        const table = try deriveStandaloneTableRecord(.lite, "default", .{});
+        const ranges = try antfly.public_api.tables.deriveInitialRanges(self.alloc, table);
+        defer {
+            for (ranges) |record| antfly.metadata.table_manager.freeRange(self.alloc, record);
+            self.alloc.free(ranges);
+        }
+        if (ranges.len != 1) return error.InvalidCreateTableRequest;
+        const namespace = try std.fmt.allocPrint(self.alloc, "group-{d}/table-db", .{ranges[0].group_id});
+        defer self.alloc.free(namespace);
+
+        try context.liteAdoptAndVerify(.{
+            .namespace = .fromSlice(namespace),
+            .identity_table_id = table.table_id,
+            .identity_shard_id = ranges[0].group_id,
+            .identity_range_id = ranges[0].range_id,
+        });
 
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
@@ -1367,19 +1410,42 @@ pub fn runFromIterator(
     try ensureParent(setup_io.io(), resolved.secret_store_path);
     try ensureDirPath(setup_io.io(), resolved.auth_store_root_dir);
 
+    const auth_enabled = resolveAuthEnabled(cli, if (loaded_config) |*cfg| cfg else null);
+    var storage_kernel_context = kernel_owner_client.Context{};
+    if (comptime storage_kernel_experiment) {
+        try storage_kernel_context.ensureWith(.{
+            .storage_kind = if (lite_path != null) .lite else .directory,
+            .no_sync = @intFromBool(!lite_fsync),
+            .storage_path = .fromSlice(lite_path orelse ""),
+            .auth_storage_path = .fromSlice(if (auth_enabled) resolved.auth_store_root_dir else ""),
+        });
+    }
+    defer if (storage_kernel_experiment) storage_kernel_context.deinit();
+
     var node_backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
     defer node_backend_runtime.deinit();
-    var lite_backend: ?antfly.lite.backend.Handle = if (lite_path) |path|
-        try antfly.lite.backend.Handle.openOrCreate(alloc, path, .{ .no_sync = !lite_fsync })
-    else
-        null;
-    defer if (lite_backend) |*backend| backend.deinit();
-    if (lite_backend) |*backend| {
-        node_backend_runtime.ptr().db_open_configurator = backend.dbOpenConfigurator();
+    var lite_backend: ?LegacyLiteHandle = null;
+    if (comptime !storage_kernel_experiment) {
+        if (lite_path) |path| lite_backend = try antfly.lite.backend.Handle.openOrCreate(
+            alloc,
+            path,
+            .{ .no_sync = !lite_fsync },
+        );
+    }
+    defer if (comptime !storage_kernel_experiment) if (lite_backend) |*backend| backend.deinit();
+    if (comptime !storage_kernel_experiment) {
+        if (lite_backend) |*backend| {
+            node_backend_runtime.ptr().db_open_configurator = backend.dbOpenConfigurator();
+        }
     }
     var storage_maintenance = try antfly.storage_maintenance.Coordinator.init(
         alloc,
-        if (lite_backend) |*backend| backend.maintenanceSource() else antfly.storage_maintenance.localSource,
+        if (comptime storage_kernel_experiment)
+            storage_kernel_context.maintenanceSource()
+        else if (lite_backend) |*backend|
+            backend.maintenanceSource()
+        else
+            antfly.storage_maintenance.localSource,
         node_backend_runtime.ptr(),
     );
     defer storage_maintenance.deinit();
@@ -1437,19 +1503,43 @@ pub fn runFromIterator(
         secret_store_initialized = true;
     }
 
-    const auth_enabled = resolveAuthEnabled(cli, if (loaded_config) |*cfg| cfg else null);
-    var auth_backend: ?antfly.lsm_backend.BackendHandle = null;
+    var auth_backend: ?LegacyAuthBackend = null;
     var auth_runtime: ?antfly.storage_backend_erased.NamespaceStore = null;
+    var kernel_auth_users_store: ?antfly.storage_backend_erased.Store = null;
+    var kernel_auth_casbin_store: ?antfly.storage_backend_erased.Store = null;
+    var kernel_auth_users_runtime: ?antfly.storage_backend_erased.NamespaceStore = null;
+    var kernel_auth_casbin_runtime: ?antfly.storage_backend_erased.NamespaceStore = null;
     var auth_user_store: ?antfly.usermgr.StorageUserStore = null;
     var auth_casbin_store: ?antfly.usermgr.StorageCasbinAdapter = null;
     var user_manager: ?antfly.usermgr.UserManager = null;
     if (auth_enabled) {
-        auth_backend = try antfly.lsm_backend.BackendHandle.open(alloc, resolved.auth_store_root_dir, .{});
-        errdefer if (auth_backend) |*backend| backend.close();
-        auth_runtime = try auth_backend.?.backend.runtimeNamespaceStore(alloc);
-        errdefer if (auth_runtime) |*runtime| runtime.deinit();
-        auth_user_store = antfly.usermgr.StorageUserStore.init(alloc, auth_runtime.?);
-        auth_casbin_store = antfly.usermgr.StorageCasbinAdapter.init(alloc, auth_runtime.?);
+        if (comptime storage_kernel_experiment) {
+            kernel_auth_users_store = try storage_kernel_context.systemStore(alloc, "system/auth-users");
+            errdefer kernel_auth_users_store.?.deinit();
+            kernel_auth_casbin_store = try storage_kernel_context.systemStore(alloc, "system/auth-casbin");
+            errdefer kernel_auth_casbin_store.?.deinit();
+            kernel_auth_users_runtime = try kernel_owner_client.singleNamespaceStore(
+                alloc,
+                &kernel_auth_users_store.?,
+                "usermgr_users",
+            );
+            errdefer kernel_auth_users_runtime.?.deinit();
+            kernel_auth_casbin_runtime = try kernel_owner_client.singleNamespaceStore(
+                alloc,
+                &kernel_auth_casbin_store.?,
+                "usermgr_casbin",
+            );
+            errdefer kernel_auth_casbin_runtime.?.deinit();
+            auth_user_store = antfly.usermgr.StorageUserStore.init(alloc, kernel_auth_users_runtime.?);
+            auth_casbin_store = antfly.usermgr.StorageCasbinAdapter.init(alloc, kernel_auth_casbin_runtime.?);
+        } else {
+            auth_backend = try antfly.lsm_backend.BackendHandle.open(alloc, resolved.auth_store_root_dir, .{});
+            errdefer if (auth_backend) |*backend| backend.close();
+            auth_runtime = try auth_backend.?.backend.runtimeNamespaceStore(alloc);
+            errdefer if (auth_runtime) |*runtime| runtime.deinit();
+            auth_user_store = antfly.usermgr.StorageUserStore.init(alloc, auth_runtime.?);
+            auth_casbin_store = antfly.usermgr.StorageCasbinAdapter.init(alloc, auth_runtime.?);
+        }
         user_manager = try antfly.usermgr.UserManager.init(
             alloc,
             auth_user_store.?.iface(),
@@ -1461,9 +1551,13 @@ pub fn runFromIterator(
         // clustered startup before raft listeners are running.
         try antfly.usermgr.ensureDefaultAdminUser(&user_manager.?);
     }
-    defer if (user_manager) |*manager| manager.deinit();
+    defer if (comptime !storage_kernel_experiment) if (auth_backend) |*backend| backend.close();
     defer if (auth_runtime) |*runtime| runtime.deinit();
-    defer if (auth_backend) |*backend| backend.close();
+    defer if (kernel_auth_users_store) |*store| store.deinit();
+    defer if (kernel_auth_casbin_store) |*store| store.deinit();
+    defer if (kernel_auth_users_runtime) |*runtime| runtime.deinit();
+    defer if (kernel_auth_casbin_runtime) |*runtime| runtime.deinit();
+    defer if (user_manager) |*manager| manager.deinit();
 
     const public_listener = resolvePublicListener(cli);
     const local_node_id = cli.local_node_id orelse 1;
@@ -1474,6 +1568,15 @@ pub fn runFromIterator(
     );
     defer alloc.free(public_api_url);
 
+    var kernel_catalog_store: ?antfly.storage_backend_erased.Store = null;
+    if (comptime storage_kernel_experiment) {
+        if (lite_path != null) kernel_catalog_store = try storage_kernel_context.systemStore(
+            alloc,
+            "system/metadata",
+        );
+    }
+    defer if (kernel_catalog_store) |*store| store.deinit();
+
     var local_metadata = LocalStandaloneMetadata.init(
         alloc,
         local_node_id,
@@ -1482,24 +1585,55 @@ pub fn runFromIterator(
         resolved.replica_root_dir,
         resolved.local_metadata_catalog_path,
         node_backend_runtime.ptr(),
-        if (lite_backend) |*backend| try backend.runtimeStoreForNamespace("system/metadata") else null,
+        if (comptime storage_kernel_experiment)
+            if (kernel_catalog_store) |*store| store else null
+        else if (lite_backend) |*backend|
+            try backend.runtimeStoreForNamespace("system/metadata")
+        else
+            null,
         storage_engine,
     ) catch |err| {
         std.log.err("standalone startup failed step=local_metadata_init err={}", .{err});
         return err;
     };
     defer local_metadata.deinit();
-    if (lite_backend) |*backend| {
-        try local_metadata.adoptEmbeddedLiteRootIfNeeded(backend);
-        // Mark only after embedded adoption and metadata publication succeed.
-        // Offline root-only backup must reject every standalone artifact, not
-        // merely artifacts that originated in the embedded profile.
-        try backend.markStandaloneArtifact();
+    if (lite_path != null) {
+        if (comptime storage_kernel_experiment) {
+            try local_metadata.adoptEmbeddedLiteRootFromKernelIfNeeded(&storage_kernel_context);
+            try storage_kernel_context.liteMarkStandalone();
+        } else if (lite_backend) |*backend| {
+            try local_metadata.adoptEmbeddedLiteRootIfNeeded(backend);
+            // Mark only after embedded adoption and metadata publication
+            // succeed. Offline root-only backup must reject every standalone
+            // artifact, not merely artifacts from the embedded profile.
+            try backend.markStandaloneArtifact();
+        }
     }
     // API transaction sessions are engine state, not a sidecar. Keeping them
     // in a reserved Lite namespace makes a copied/reopened .aflite file a
     // complete database and preserves staged multi-request transactions.
-    var lite_session_store = if (lite_backend) |*backend|
+    var kernel_session_backend: ?antfly.storage_backend_erased.Store = null;
+    var kernel_restore_job_backend: ?antfly.storage_backend_erased.Store = null;
+    if (comptime storage_kernel_experiment) {
+        if (lite_path != null) {
+            kernel_session_backend = try storage_kernel_context.systemStore(
+                alloc,
+                "system/api-transaction-sessions",
+            );
+            kernel_restore_job_backend = try storage_kernel_context.systemStore(
+                alloc,
+                "system/api-restore-jobs",
+            );
+        }
+    }
+    defer if (kernel_session_backend) |*store| store.deinit();
+    defer if (kernel_restore_job_backend) |*store| store.deinit();
+    var lite_session_store = if (comptime storage_kernel_experiment)
+        if (kernel_session_backend) |*store|
+            antfly.public_api.transactions.DurableSessionStore.initRuntime(alloc, store)
+        else
+            null
+    else if (lite_backend) |*backend|
         antfly.public_api.transactions.DurableSessionStore.initRuntime(
             alloc,
             try backend.runtimeStoreForNamespace("system/api-transaction-sessions"),
@@ -1551,6 +1685,7 @@ pub fn runFromIterator(
         .replica_root_dir = resolved.replica_root_dir,
         .replica_catalog_path = resolved.replica_catalog_path,
         .snapshot_root_dir = resolved.snapshot_root_dir,
+        .storage_kernel_context_handle = if (storage_kernel_experiment) storage_kernel_context.handle else null,
         .store_registration = .{
             .node_id = local_node_id,
             .store_id = 1,
@@ -1646,8 +1781,12 @@ pub fn runFromIterator(
     try data_server.initApiServer();
     local_metadata.local_schema_progress_provider = localSchemaProgressProvider(&data_server);
     const api_server = &data_server.http_server.?;
-    if (lite_backend) |*backend| {
-        try api_server.attachRestoreJobRuntimeStore(try backend.runtimeStoreForNamespace("system/api-restore-jobs"));
+    if (comptime storage_kernel_experiment) {
+        if (kernel_restore_job_backend) |*store| try api_server.attachRestoreJobRuntimeStore(store);
+    } else if (lite_backend) |*backend| {
+        try api_server.attachRestoreJobRuntimeStore(
+            try backend.runtimeStoreForNamespace("system/api-restore-jobs"),
+        );
     }
     // Recovery is a startup concern: enqueue durable work before the listener is
     // marked ready instead of waiting for an unrelated request to arrive.

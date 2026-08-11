@@ -52,7 +52,7 @@ else
         pub const types = @import("../storage/db/types.zig");
         pub const RuntimePreflightSummary = @import("../storage/db/runtime_preflight.zig").RuntimePreflightSummary;
         pub const background_runtime = @import("../storage/background_runtime.zig");
-        pub const aggregations = @import("../storage/db/aggregations.zig");
+        pub const aggregations = @import("../storage/db/aggregations_contract.zig");
         pub const SortRejectionDiagnostic = db_query_search.SortRejectionDiagnostic;
 
         pub const resetLastSortRejectionDiagnostic = db_query_search.resetLastSortRejectionDiagnostic;

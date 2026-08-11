@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+pub const contract = @import("aggregations_contract.zig");
 const types = @import("types.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
 const derived_types = @import("derived/derived_types.zig");
@@ -31,109 +32,19 @@ const doc_identity = @import("doc_identity.zig");
 const doc_set = @import("doc_set.zig");
 const roaring = @import("../../encoding/roaring.zig");
 
-pub const max_aggregation_source_hits: usize = 100_000;
+pub const max_aggregation_source_hits = contract.max_aggregation_source_hits;
 const max_significant_terms_candidates: usize = 4096;
 const min_significant_terms_candidates: usize = 256;
 const significant_terms_candidate_multiplier: usize = 8;
 const max_significant_terms_memberships: usize = 1_000_000;
 
-pub const NumericRangeRequest = struct {
-    name: []const u8 = "",
-    start: ?f64 = null,
-    end: ?f64 = null,
-};
-
-pub const DateRangeRequest = struct {
-    name: []const u8 = "",
-    start: ?[]const u8 = null,
-    end: ?[]const u8 = null,
-};
-
-pub const DistanceRangeRequest = struct {
-    name: []const u8 = "",
-    from: ?f64 = null,
-    to: ?f64 = null,
-};
-
-pub const SearchAggregationRequest = struct {
-    name: []const u8,
-    type: []const u8,
-    field: []const u8,
-    fields: []const []const u8 = &.{},
-    size: i64 = 0,
-    interval: f64 = 0,
-    calendar_interval: []const u8 = "",
-    fixed_interval: []const u8 = "",
-    min_doc_count: i64 = 0,
-    significance_algorithm: []const u8 = "",
-    background_query: ?BackgroundQuery = null,
-    bucket_path: []const u8 = "",
-    sort_order: []const u8 = "",
-    from: i64 = 0,
-    window: i64 = 0,
-    gap_policy: []const u8 = "",
-    term_prefix: []const u8 = "",
-    term_pattern: []const u8 = "",
-    ranges: []const NumericRangeRequest = &.{},
-    date_ranges: []const DateRangeRequest = &.{},
-    distance_ranges: []const DistanceRangeRequest = &.{},
-    center_lat: f64 = 0,
-    center_lon: f64 = 0,
-    distance_unit: []const u8 = "",
-    geohash_precision: u8 = 0,
-    algebraic_join: ?algebraic_mod.ir.JoinRef = null,
-    aggregations: []const SearchAggregationRequest = &.{},
-};
-
-pub const BackgroundQuery = union(enum) {
-    match_all: void,
-    match: struct {
-        field: []const u8,
-        text: []const u8,
-    },
-    term: struct {
-        field: []const u8,
-        term: []const u8,
-    },
-};
-
-pub const SearchAggregationBucket = struct {
-    key_json: []const u8,
-    count: i64,
-    score: ?f64 = null,
-    bg_count: ?i64 = null,
-    aggregations: []SearchAggregationResult = &.{},
-
-    pub fn deinit(self: *SearchAggregationBucket, alloc: Allocator) void {
-        alloc.free(self.key_json);
-        for (self.aggregations) |*agg| agg.deinit(alloc);
-        if (self.aggregations.len > 0) alloc.free(self.aggregations);
-        self.* = undefined;
-    }
-};
-
-pub const SearchAggregationResult = struct {
-    name: []const u8,
-    field: []const u8,
-    type: []const u8,
-    owns_labels: bool = false,
-    value_json: ?[]const u8 = null,
-    metadata_json: ?[]const u8 = null,
-    buckets: []SearchAggregationBucket = &.{},
-
-    pub fn deinit(self: *SearchAggregationResult, alloc: Allocator) void {
-        if (self.owns_labels) {
-            if (self.name.len > 0) alloc.free(self.name);
-            if (self.field.len > 0) alloc.free(self.field);
-            if (self.type.len > 0) alloc.free(self.type);
-        }
-        if (self.value_json) |value_json| alloc.free(value_json);
-        if (self.metadata_json) |metadata_json| alloc.free(metadata_json);
-        for (self.buckets) |*bucket| bucket.deinit(alloc);
-        if (self.buckets.len > 0) alloc.free(self.buckets);
-        self.* = undefined;
-    }
-};
+pub const NumericRangeRequest = contract.NumericRangeRequest;
+pub const DateRangeRequest = contract.DateRangeRequest;
+pub const DistanceRangeRequest = contract.DistanceRangeRequest;
+pub const SearchAggregationRequest = contract.SearchAggregationRequest;
+pub const BackgroundQuery = contract.BackgroundQuery;
+pub const SearchAggregationBucket = contract.SearchAggregationBucket;
+pub const SearchAggregationResult = contract.SearchAggregationResult;
 
 pub const DistributedBackgroundTextStats = background_text_stats.DistributedBackgroundTextStats;
 

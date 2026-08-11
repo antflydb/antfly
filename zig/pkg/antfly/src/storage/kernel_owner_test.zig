@@ -16,11 +16,129 @@ const std = @import("std");
 const abi = @import("kernel_owner_abi");
 const client = @import("kernel_owner_client.zig");
 const data_apply_client = @import("data_raft_apply_client.zig");
+const metadata_apply_client = @import("metadata_raft_apply_client.zig");
 
 fn cleanup(path: []const u8) void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+}
+
+test "coarse aggregation ABI preserves results and semantic error identities" {
+    const hit_bodies = [_][]const u8{
+        "{\"category\":\"alpha\",\"price\":10}",
+        "{\"category\":\"alpha\",\"price\":20}",
+        "{\"category\":\"beta\",\"price\":30}",
+    };
+    var hits: [hit_bodies.len]client.AggregationHit = undefined;
+    for (hit_bodies, 0..) |body, i| hits[i] = .{ .stored_data = .fromSlice(body) };
+
+    const base = client.AggregationRequest{
+        .total_hits = hit_bodies.len,
+        .context_json = .fromSlice("{}"),
+        .hits = &hits,
+        .hit_count = hits.len,
+    };
+    var response = try client.aggregate(.{
+        .total_hits = base.total_hits,
+        .aggregations_json = .fromSlice("{\"by_category\":{\"type\":\"terms\",\"field\":\"category\",\"size\":10}}"),
+        .context_json = base.context_json,
+        .hits = base.hits,
+        .hit_count = base.hit_count,
+    });
+    defer response.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, response.bytes(), "by_category") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.bytes(), "alpha") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.bytes(), "beta") != null);
+
+    try std.testing.expectError(error.InvalidAggregation, client.aggregate(.{
+        .total_hits = base.total_hits,
+        .aggregations_json = .fromSlice("{\"bad\":{\"type\":\"histogram\",\"field\":\"price\",\"interval\":0}}"),
+        .context_json = base.context_json,
+        .hits = base.hits,
+        .hit_count = base.hit_count,
+    }));
+    try std.testing.expectError(error.UnsupportedAggregation, client.aggregate(.{
+        .total_hits = base.total_hits,
+        .aggregations_json = .fromSlice("{\"unsupported_without_text_context\":{\"type\":\"significant_terms\",\"field\":\"category\",\"size\":10}}"),
+        .context_json = base.context_json,
+        .hits = base.hits,
+        .hit_count = base.hit_count,
+    }));
+}
+
+test "opaque storage context owns Lite system namespaces auth and table owners" {
+    const root = "/tmp/antfly-storage-kernel-context-lite";
+    const lite_path = root ++ "/standalone.aflite";
+    const auth_path = root ++ "/auth";
+    cleanup(root);
+    defer cleanup(root);
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    try std.Io.Dir.cwd().createDirPath(io_impl.io(), root);
+
+    var context = client.Context{};
+    try context.ensureWith(.{
+        .storage_kind = .lite,
+        .storage_path = .fromSlice(lite_path),
+        .auth_storage_path = .fromSlice(auth_path),
+    });
+
+    var catalog = try context.systemStore(std.testing.allocator, "system/metadata");
+    var write = try catalog.beginWrite();
+    try write.put("catalog", "{\"epoch\":2}");
+    try write.commit();
+    var read = try catalog.beginRead();
+    try std.testing.expectEqualStrings("{\"epoch\":2}", try read.get("catalog"));
+    read.abort();
+
+    var auth_users = try context.systemStore(std.testing.allocator, "system/auth-users");
+    var users = try client.singleNamespaceStore(
+        std.testing.allocator,
+        &auth_users,
+        "usermgr_users",
+    );
+    var auth_write = try users.beginWrite();
+    try auth_write.put(.{ .name = "usermgr_users" }, "userpass:admin", "hash");
+    try auth_write.commit();
+    var auth_read = try users.beginRead();
+    var auth_cursor = try auth_read.openCursor(.{ .name = "usermgr_users" });
+    const first = (try auth_cursor.first()).?;
+    try std.testing.expectEqualStrings("userpass:admin", first.key);
+    try std.testing.expectEqualStrings("hash", first.value);
+    auth_cursor.close();
+    auth_read.abort();
+
+    var owner = try client.Owner.open(.{
+        .context = context.handle,
+        .path = .fromSlice("group-7001/table-db"),
+        .table_name = .fromSlice("docs"),
+        .group_id = 7001,
+        .has_identity_namespace = 1,
+        .identity_table_id = 7,
+        .identity_shard_id = 7001,
+        .identity_range_id = 7001,
+    });
+    var response = try owner.batchJson(
+        "docs",
+        "{\"inserts\":{\"doc:a\":{\"title\":\"alpha\"}},\"sync_level\":\"full_index\"}",
+    );
+    try std.testing.expect(std.mem.indexOf(u8, response.bytes(), "\"inserted\":1") != null);
+    response.deinit();
+    try std.testing.expectEqual(
+        abi.Status.busy,
+        abi.antfly_storage_context_destroy(context.handle),
+    );
+
+    const maintenance_status = context.maintenanceSource().status();
+    try std.testing.expectEqualStrings("lite", maintenance_status.engine);
+    try std.testing.expect(maintenance_status.maintenance.check);
+
+    owner.deinit();
+    users.deinit();
+    auth_users.deinit();
+    catalog.deinit();
+    context.deinit();
 }
 
 test "opaque storage owner performs coarse batch and query on one live DB" {
@@ -44,7 +162,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     defer owner.deinit();
 
     var duplicate_owner: ?*anyopaque = null;
-    try std.testing.expectEqual(abi.Status.busy, abi.antfly_storage_owner_open(&.{
+    try std.testing.expectEqual(abi.Status.lsm_root_writer_already_open, abi.antfly_storage_owner_open(&.{
         .path = .fromSlice(path),
         .table_name = .fromSlice("docs"),
         .has_identity_namespace = 1,
@@ -85,6 +203,8 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     );
     defer replicated_response.deinit();
     try std.testing.expect(std.mem.indexOf(u8, replicated_response.bytes(), "\"inserted\":1") != null);
+    try std.testing.expectError(error.InvalidBatchRequest, owner.batchJson("docs", "{"));
+    try std.testing.expectError(error.InvalidBatchRequest, owner.replicatedBatchJson("docs", "{"));
     try owner.waitForSync("docs", .full_index);
     try owner.applyHAReplicationRecord("docs", .{
         .record_kind = 0x0012,
@@ -121,6 +241,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
         \\{"query":{"match_all":{}},"limit":10}
     ;
     try std.testing.expectError(error.InvalidArgument, owner.queryJson("articles", query_json));
+    try std.testing.expectError(error.InvalidQueryRequest, owner.queryJson("docs", "{"));
 
     var query_response = try owner.queryJson("docs", query_json);
     defer query_response.deinit();
@@ -282,7 +403,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
             return 1;
         }
     };
-    try std.testing.expectError(error.Cancelled, owner.artifactOperationJson(
+    try std.testing.expectError(error.Canceled, owner.artifactOperationJson(
         "docs",
         .repair_issues,
         "{\"artifact_kind\":\"embedding\",\"limit\":10}",
@@ -800,7 +921,7 @@ test "opaque data raft apply owner preserves batch snapshot and placement lifecy
     var cancelled = (try source.prepareSnapshot(81, 9)) orelse return error.TestExpectedEqual;
     defer cancelled.deinit();
     cancelled.cancel();
-    try std.testing.expectError(error.Cancelled, cancelled.materializeFile(std.testing.allocator));
+    try std.testing.expectError(error.SnapshotBuildCancelled, cancelled.materializeFile(std.testing.allocator));
 
     const snapshot = try source.buildSnapshot(std.testing.allocator, 81);
     defer std.testing.allocator.free(snapshot);
@@ -817,4 +938,38 @@ test "opaque data raft apply owner preserves batch snapshot and placement lifecy
     try std.testing.expectEqual(latest.last_entry_index, restored_latest.last_entry_index);
 
     try std.testing.expectEqual(abi.Status.busy, abi.antfly_storage_context_destroy(context.handle));
+}
+
+test "opaque metadata apply owner preserves semantic error identity" {
+    const path = "/tmp/antfly-storage-kernel-metadata-errors";
+    cleanup(path);
+    defer cleanup(path);
+
+    var store = try metadata_apply_client.RaftApplyStore.init(std.testing.allocator, .{
+        .root_dir = path,
+        .no_sync = true,
+    });
+    defer store.deinit();
+    const snapshots = store.snapshotBuilder();
+
+    try std.testing.expectError(
+        error.InvalidMetadataSnapshot,
+        snapshots.installSnapshot(std.testing.allocator, 91, 7, "not-a-metadata-snapshot"),
+    );
+
+    // The concrete store deliberately preserves the committed watermark even
+    // when a batch has no projectable metadata commands. That gives this
+    // cross-archive test a real provider-side index mismatch to round-trip.
+    try snapshots.applyBatch(.{
+        .group_id = 91,
+        .commit_index = 7,
+        .entries_bytes = "not-projectable-entries",
+    });
+    const latest = (try store.latestBatch(91)) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, 7), latest.commit_index);
+    try std.testing.expectEqualStrings("not-projectable-entries", latest.entries_bytes);
+    try std.testing.expectError(
+        error.AppliedSnapshotIndexMismatch,
+        snapshots.prepareSnapshot(91, 8),
+    );
 }

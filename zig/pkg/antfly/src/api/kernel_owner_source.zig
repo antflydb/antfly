@@ -20,6 +20,7 @@ const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
 const platform_time = @import("antfly_platform").time;
 const abi = @import("kernel_owner_abi");
+const kernel_error_identity = @import("kernel_error_identity");
 const client = @import("../storage/kernel_owner_client.zig");
 const data_apply_client = @import("../storage/data_raft_apply_client.zig");
 const descriptor_contract = @import("../storage/kernel_owner_descriptor.zig");
@@ -1162,13 +1163,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     }
 
     fn transactionRecoveryStatus(err: anyerror) abi.Status {
-        return switch (err) {
-            error.TxnNotFound => .transaction_not_found,
-            error.Timeout => .timeout,
-            error.Canceled, error.Cancelled => .cancelled,
-            error.WouldBlock, error.StorageBusy, error.ResourceBudgetExceeded => .busy,
-            else => .internal,
-        };
+        return kernel_error_identity.statusFromError(err);
     }
 
     fn transactionRecoveryResolve(
@@ -1631,25 +1626,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     }
 
     fn documentChildRangeDispatchStatusFromError(err: anyerror) abi.Status {
-        return switch (err) {
-            error.InvalidArgument, error.InvalidArguments => .invalid_argument,
-            error.NotFound, error.FileNotFound, error.TableNotFound => .not_found,
-            error.VersionConflict => .version_conflict,
-            error.IntentConflict, error.DecisionConflict => .intent_conflict,
-            error.TxnNotFound => .transaction_not_found,
-            error.LsmRootWriterAlreadyOpen, error.GenerationTransitionActive, error.WouldBlock => .busy,
-            error.ReadOnly => .read_only,
-            error.OutOfMemory => .out_of_memory,
-            error.Corrupted => .corrupted,
-            error.DocIdentityNamespaceMismatch => .identity_namespace_mismatch,
-            error.InvalidQueryRequest => .invalid_query,
-            error.UnsupportedQueryRequest => .unsupported_query,
-            error.IndexNotFound => .index_not_found,
-            error.IdentityReadGenerationChanged => .identity_read_generation_changed,
-            error.Timeout, error.TableVisibilityTimeout => .timeout,
-            error.Canceled, error.Cancelled => .cancelled,
-            else => .internal,
-        };
+        return kernel_error_identity.statusFromError(err);
     }
 
     fn executeArtifactOperation(
@@ -2083,13 +2060,7 @@ pub const ProvisionedKernelOwnerSource = struct {
 
         fn admission(ctx: ?*anyopaque) callconv(.c) abi.Status {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
-            self.options.checkAdmission() catch |err| return switch (err) {
-                error.WouldBlock, error.StorageBusy, error.ResourceBudgetExceeded => .busy,
-                error.Timeout => .timeout,
-                error.Canceled, error.Cancelled => .cancelled,
-                error.HAReadOnlyStandby => .read_only,
-                else => .internal,
-            };
+            self.options.checkAdmission() catch |err| return kernel_error_identity.statusFromError(err);
             return .ok;
         }
     };

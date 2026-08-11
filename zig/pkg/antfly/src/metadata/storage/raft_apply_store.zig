@@ -29,11 +29,9 @@ const raft_reconciler = @import("../../raft/reconciler.zig");
 const raft_storage_mod = @import("../../raft/storage/mod.zig");
 const wal_replica_state_mod = @import("../../raft/storage/wal_replica_state.zig");
 const raft_state_machine = @import("../../raft/state_machine/mod.zig");
+const apply_contract = @import("raft_apply_contract.zig");
 
-pub const AppliedMetadataBatch = struct {
-    commit_index: u64,
-    entries_bytes: []const u8,
-};
+pub const AppliedMetadataBatch = apply_contract.AppliedMetadataBatch;
 
 pub const ExtensionMemberKey = struct {
     extension_name: []const u8,
@@ -57,14 +55,7 @@ pub const ExtensionLifecycleDelta = struct {
     remove_extension_dependencies: []const ExtensionDependencyKey = &.{},
 };
 
-pub const TableTransitionFence = struct {
-    generation: u64 = 0,
-    active_count: u32 = 0,
-
-    pub fn active(self: @This()) bool {
-        return self.active_count != 0;
-    }
-};
+pub const TableTransitionFence = apply_contract.TableTransitionFence;
 
 pub const TransitionCommand = union(enum) {
     initialize_metadata_incarnation: metadata_incarnation.MetadataClusterIncarnation,
@@ -803,63 +794,11 @@ pub const RaftApplyStoreConfig = struct {
     flush_threshold: usize = 64,
 };
 
-pub const ProjectionSignalKind = enum {
-    table,
-    range,
-    store,
-    placement_intent,
-    reconcile_lease,
-    shuffle_join_lease,
-    split_transition,
-    merge_transition,
-    schema_progress,
-    restore_progress,
-    restore_job,
-    replication_source_status,
-};
-
-pub const ProjectionSignal = struct {
-    kind: ProjectionSignalKind,
-    metadata_group_id: u64,
-    table_name: ?[]const u8 = null,
-    table_id: u64 = 0,
-    group_id: u64 = 0,
-    store_id: u64 = 0,
-    node_id: u64 = 0,
-};
-
-pub const ProjectionListener = struct {
-    ptr: *anyopaque,
-    vtable: *const VTable,
-
-    pub const VTable = struct {
-        on_projection_signal: *const fn (ptr: *anyopaque, signal: ProjectionSignal) void,
-    };
-
-    pub fn onProjectionSignal(self: ProjectionListener, signal: ProjectionSignal) void {
-        self.vtable.on_projection_signal(self.ptr, signal);
-    }
-};
-
-pub const CommittedKeySignal = struct {
-    metadata_group_id: u64,
-    key: []const u8,
-};
-
-pub const CommittedKeyListener = struct {
-    ptr: *anyopaque,
-    vtable: *const VTable,
-
-    pub const VTable = struct {
-        matches_key: *const fn (ptr: *anyopaque, signal: CommittedKeySignal) bool,
-        on_committed_key: *const fn (ptr: *anyopaque, signal: CommittedKeySignal) void,
-    };
-
-    pub fn onCommittedKey(self: CommittedKeyListener, signal: CommittedKeySignal) void {
-        if (!self.vtable.matches_key(self.ptr, signal)) return;
-        self.vtable.on_committed_key(self.ptr, signal);
-    }
-};
+pub const ProjectionSignalKind = apply_contract.ProjectionSignalKind;
+pub const ProjectionSignal = apply_contract.ProjectionSignal;
+pub const ProjectionListener = apply_contract.ProjectionListener;
+pub const CommittedKeySignal = apply_contract.CommittedKeySignal;
+pub const CommittedKeyListener = apply_contract.CommittedKeyListener;
 
 pub const CommittedTransitionDelta = union(enum) {
     upsert_split: metadata.SplitTransitionRecord,

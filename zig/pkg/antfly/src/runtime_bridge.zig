@@ -23,3 +23,31 @@ pub const Context = extern struct {
     command_ptr: [*]const u8,
     command_len: usize,
 };
+
+pub const BorrowedBytes = extern struct {
+    ptr: ?[*]const u8 = null,
+    len: usize = 0,
+
+    pub fn fromSlice(value: []const u8) BorrowedBytes {
+        return .{ .ptr = value.ptr, .len = value.len };
+    }
+
+    pub fn slice(self: BorrowedBytes) []const u8 {
+        if (self.len == 0) return "";
+        return self.ptr.?[0..self.len];
+    }
+};
+
+/// Reverse link used only when physical Lite administration is compiled in
+/// the storage kernel but `lite serve` must enter the distributed standalone
+/// composition unit. Every slice is borrowed for the duration of the call.
+pub const LiteServeContext = extern struct {
+    init: *const anyopaque,
+    path: BorrowedBytes,
+    host: BorrowedBytes,
+    extra_args: ?[*]const BorrowedBytes = null,
+    extra_args_len: usize = 0,
+    port: u16,
+    fsync: u8,
+    _reserved0: [5]u8 = @splat(0),
+};

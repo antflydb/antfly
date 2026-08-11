@@ -38,41 +38,7 @@ const shard_db_adapter_mod = @import("shard_db_adapter.zig");
 const doc_identity = @import("../storage/db/doc_identity.zig");
 const restore_state_contract = @import("../storage/restore_state_contract.zig");
 
-pub const ProvisionSummary = struct {
-    groups_considered: usize = 0,
-    dbs_opened: usize = 0,
-    indexes_added: usize = 0,
-    indexes_removed: usize = 0,
-    indexes_pending: usize = 0,
-    enrichments_added: usize = 0,
-    enrichments_updated: usize = 0,
-    enrichments_removed: usize = 0,
-    resolvers_added: usize = 0,
-    resolvers_updated: usize = 0,
-    resolvers_removed: usize = 0,
-
-    pub fn merge(self: *@This(), other: @This()) void {
-        self.groups_considered += other.groups_considered;
-        self.dbs_opened += other.dbs_opened;
-        self.indexes_added += other.indexes_added;
-        self.indexes_removed += other.indexes_removed;
-        self.indexes_pending += other.indexes_pending;
-        self.enrichments_added += other.enrichments_added;
-        self.enrichments_updated += other.enrichments_updated;
-        self.enrichments_removed += other.enrichments_removed;
-        self.resolvers_added += other.resolvers_added;
-        self.resolvers_updated += other.resolvers_updated;
-        self.resolvers_removed += other.resolvers_removed;
-    }
-
-    pub fn indexManagerCatalogChanged(self: @This()) bool {
-        return self.indexes_added > 0 or
-            self.indexes_removed > 0 or
-            self.resolvers_added > 0 or
-            self.resolvers_updated > 0 or
-            self.resolvers_removed > 0;
-    }
-};
+pub const ProvisionSummary = @import("provision_contract.zig").ProvisionSummary;
 
 pub const ReconcileReplicaRootOptions = struct {
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,

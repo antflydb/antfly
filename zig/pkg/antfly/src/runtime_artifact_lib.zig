@@ -62,11 +62,11 @@ const metadata_runtime = if (unit_options.unit == .distributed or unit_options.u
     @import("metadata/runtime.zig")
 else
     struct {};
-// Serverless owns local orchestration, but provisioned physical operations use
-// the selected opaque storage source in the kernel experiment. Keep it with
-// distributed/API control so the kernel does not re-import that control graph.
-const serverless_runtime = if (unit_options.unit == .distributed or
-    unit_options.unit == .application_pic_probe)
+// Serverless is a complete local-query implementation over published
+// artifacts. Keep that physical execution with the storage kernel; only the
+// legacy compile-once topology roots it in distributed.
+const serverless_runtime = if ((unit_options.unit == .distributed and !unit_options.storage_kernel_experiment) or
+    unit_options.unit == .storage_kernel or unit_options.unit == .application_pic_probe)
     @import("cmd/serverless.zig")
 else
     struct {};
@@ -80,10 +80,11 @@ const standalone_runtime = if (unit_options.unit == .distributed or
     @import("standalone/runtime.zig")
 else
     struct {};
-// Lite's non-server commands share types with standalone, while `lite serve`
-// directly enters that runtime. Co-locating them preserves one control-side
-// type identity; physical storage remains behind the linked kernel boundary.
-const lite_runtime = if (unit_options.unit == .distributed or
+// Lite administration opens and rewrites the physical container directly, so
+// it belongs beside the DB/local-query implementation. `lite serve` remains a
+// separate linked entry point in the same final executable.
+const lite_runtime = if ((unit_options.unit == .distributed and !unit_options.storage_kernel_experiment) or
+    unit_options.unit == .storage_kernel or
     unit_options.unit == .storage_runtime_pic_probe or
     unit_options.unit == .application_pic_probe)
     @import("cmd/lite.zig")
@@ -112,6 +113,9 @@ pub const graph_query = @import("graph/query.zig");
 pub const hbc = @import("storage/hbc_adapter.zig");
 pub const lite = @import("storage/lite/mod.zig");
 pub const lsm_backend = @import("storage/lsm_backend/mod.zig");
+pub const metadata_raft_apply = @import("metadata/storage/raft_apply_store.zig");
+pub const metadata_table_manager = @import("metadata/table_manager.zig");
+pub const metadata_table_provisioner = @import("metadata/table_provisioner.zig");
 pub const paths = @import("graph/paths.zig");
 pub const platform_clock = @import("antfly_platform").clock;
 pub const platform_sync = @import("antfly_platform").sync;
@@ -124,6 +128,7 @@ pub const raft_catalog = @import("raft/catalog.zig");
 pub const shard = @import("storage/shard.zig");
 pub const storage_backend = @import("storage/backend_types.zig");
 pub const storage_backend_erased = @import("storage/backend_erased.zig");
+pub const storage_maintenance = @import("storage/maintenance.zig");
 pub const transactions = @import("storage/transactions.zig");
 pub const traversal = @import("graph/traversal.zig");
 
@@ -181,9 +186,12 @@ fn runInference(init: std.process.Init, _: []const u8, args: *std.process.Args.I
     return inference_runtime.runFromIterator(init, "antfly", args);
 }
 
-fn runStandalone(init: std.process.Init, command: []const u8, args: *std.process.Args.Iterator) !void {
-    if (std.mem.eql(u8, command, "lite")) return lite_runtime.runFromIterator(init, "antfly", args);
+fn runStandalone(init: std.process.Init, _: []const u8, args: *std.process.Args.Iterator) !void {
     return standalone_runtime.runFromIterator(init, "antfly", args);
+}
+
+fn runLite(init: std.process.Init, _: []const u8, args: *std.process.Args.Iterator) !void {
+    return lite_runtime.runFromIterator(init, "antfly", args);
 }
 
 fn cliEntry(context: *const bridge.Context) callconv(.c) c_int {
@@ -212,6 +220,32 @@ fn inferenceEntry(context: *const bridge.Context) callconv(.c) c_int {
 
 fn standaloneEntry(context: *const bridge.Context) callconv(.c) c_int {
     return runtimeEntry(context, "standalone", runStandalone);
+}
+
+fn liteEntry(context: *const bridge.Context) callconv(.c) c_int {
+    return runtimeEntry(context, "lite", runLite);
+}
+
+fn standaloneLiteEntry(context: *const bridge.LiteServeContext) callconv(.c) c_int {
+    const init: *const std.process.Init = @ptrCast(@alignCast(context.init));
+    const extra_args = init.gpa.alloc([]const u8, context.extra_args_len) catch return 1;
+    defer init.gpa.free(extra_args);
+    if (context.extra_args_len > 0) {
+        const encoded = context.extra_args.?[0..context.extra_args_len];
+        for (encoded, 0..) |arg, i| extra_args[i] = arg.slice();
+    }
+    standalone_runtime.runLite(
+        runtimeInit(init.*),
+        context.path.slice(),
+        context.host.slice(),
+        context.port,
+        context.fsync != 0,
+        extra_args,
+    ) catch |err| {
+        std.debug.print("antfly lite serve: startup failed err={s}\n", .{@errorName(err)});
+        return 1;
+    };
+    return 0;
 }
 
 fn exportInternal(comptime function: anytype, comptime name: []const u8) void {
@@ -256,9 +290,12 @@ comptime {
             exportInternal(&haEntry, "antfly_runtime_ha");
             exportInternal(&metadataEntry, "antfly_runtime_metadata");
             if (unit_options.storage_kernel_experiment) exportApiKernel();
-            exportInternal(&serverlessEntry, "antfly_runtime_serverless");
             exportInternal(&standaloneEntry, "antfly_runtime_standalone");
+            if (unit_options.storage_kernel_experiment)
+                exportInternal(&standaloneLiteEntry, "antfly_runtime_standalone_lite");
             if (!unit_options.storage_kernel_experiment) {
+                exportInternal(&liteEntry, "antfly_runtime_lite");
+                exportInternal(&serverlessEntry, "antfly_runtime_serverless");
                 exportInternal(&restore_staging_exports.create, "antfly_restore_staging_create");
                 exportInternal(&restore_staging_exports.destroy, "antfly_restore_staging_destroy");
                 // The legacy compile-once archive owns both sides of the
@@ -321,11 +358,48 @@ comptime {
             // control unit and reaches these implementations through opaque
             // owner and restore-staging entry points.
             _ = storage_kernel_exports;
+            exportInternal(&liteEntry, "antfly_runtime_lite");
+            exportInternal(&serverlessEntry, "antfly_runtime_serverless");
             exportInternal(&restore_staging_exports.create, "antfly_restore_staging_create");
             exportInternal(&restore_staging_exports.destroy, "antfly_restore_staging_destroy");
             exportInternal(&storage_kernel_exports.storageOwnerContextCreate, "antfly_storage_context_create");
             exportInternal(&storage_kernel_exports.storageOwnerContextDestroy, "antfly_storage_context_destroy");
             exportInternal(&storage_kernel_exports.storageOwnerContextMetrics, "antfly_storage_context_metrics");
+            exportInternal(&storage_kernel_exports.storageContextSystemStoreOpen, "antfly_storage_context_system_store_open");
+            exportInternal(&storage_kernel_exports.storageSystemStoreClose, "antfly_storage_system_store_close");
+            exportInternal(&storage_kernel_exports.storageSystemStoreSync, "antfly_storage_system_store_sync");
+            exportInternal(&storage_kernel_exports.storageSystemStoreBeginRead, "antfly_storage_system_store_begin_read");
+            exportInternal(&storage_kernel_exports.storageSystemStoreBeginCurrentScan, "antfly_storage_system_store_begin_current_scan");
+            exportInternal(&storage_kernel_exports.storageSystemStoreBeginWrite, "antfly_storage_system_store_begin_write");
+            exportInternal(&storage_kernel_exports.storageSystemReadGet, "antfly_storage_system_read_get");
+            exportInternal(&storage_kernel_exports.storageSystemReadOpenCursor, "antfly_storage_system_read_open_cursor");
+            exportInternal(&storage_kernel_exports.storageSystemReadAbort, "antfly_storage_system_read_abort");
+            exportInternal(&storage_kernel_exports.storageSystemCurrentScanOpenCursor, "antfly_storage_system_current_scan_open_cursor");
+            exportInternal(&storage_kernel_exports.storageSystemCurrentScanAbort, "antfly_storage_system_current_scan_abort");
+            exportInternal(&storage_kernel_exports.storageSystemWriteGet, "antfly_storage_system_write_get");
+            exportInternal(&storage_kernel_exports.storageSystemWritePut, "antfly_storage_system_write_put");
+            exportInternal(&storage_kernel_exports.storageSystemWriteDelete, "antfly_storage_system_write_delete");
+            exportInternal(&storage_kernel_exports.storageSystemWriteCommit, "antfly_storage_system_write_commit");
+            exportInternal(&storage_kernel_exports.storageSystemWriteAbort, "antfly_storage_system_write_abort");
+            exportInternal(&storage_kernel_exports.storageSystemCursorMove, "antfly_storage_system_cursor_move");
+            exportInternal(&storage_kernel_exports.storageSystemCursorClose, "antfly_storage_system_cursor_close");
+            exportInternal(&storage_kernel_exports.storageContextLiteAdoptionProbe, "antfly_storage_context_lite_adoption_probe");
+            exportInternal(&storage_kernel_exports.storageContextLiteAdoptAndVerify, "antfly_storage_context_lite_adopt_and_verify");
+            exportInternal(&storage_kernel_exports.storageContextLiteMarkStandalone, "antfly_storage_context_lite_mark_standalone");
+            exportInternal(&storage_kernel_exports.storageContextMaintenanceStatus, "antfly_storage_context_maintenance_status");
+            exportInternal(&storage_kernel_exports.storageContextMaintenanceRun, "antfly_storage_context_maintenance_run");
+            exportInternal(&storage_kernel_exports.metadataApplyStoreOpen, "antfly_metadata_apply_store_open");
+            exportInternal(&storage_kernel_exports.metadataApplyStoreClose, "antfly_metadata_apply_store_close");
+            exportInternal(&storage_kernel_exports.metadataApplyStoreApplyBatch, "antfly_metadata_apply_store_apply_batch");
+            exportInternal(&storage_kernel_exports.metadataApplyStoreBuildSnapshot, "antfly_metadata_apply_store_build_snapshot");
+            exportInternal(&storage_kernel_exports.metadataApplyStoreInstallSnapshot, "antfly_metadata_apply_store_install_snapshot");
+            exportInternal(&storage_kernel_exports.metadataApplyStorePrepareSnapshot, "antfly_metadata_apply_store_prepare_snapshot");
+            exportInternal(&storage_kernel_exports.metadataApplyPreparedSnapshotMaterialize, "antfly_metadata_apply_prepared_snapshot_materialize");
+            exportInternal(&storage_kernel_exports.metadataApplyPreparedSnapshotCancel, "antfly_metadata_apply_prepared_snapshot_cancel");
+            exportInternal(&storage_kernel_exports.metadataApplyPreparedSnapshotDestroy, "antfly_metadata_apply_prepared_snapshot_destroy");
+            exportInternal(&storage_kernel_exports.metadataApplyStoreProjection, "antfly_metadata_apply_store_projection");
+            exportInternal(&storage_kernel_exports.metadataApplyStoreAddListeners, "antfly_metadata_apply_store_add_listeners");
+            exportInternal(&storage_kernel_exports.metadataReconcileReplicaRoot, "antfly_metadata_reconcile_replica_root");
             exportInternal(&storage_kernel_exports.dataApplyStoreOpen, "antfly_data_apply_store_open");
             exportInternal(&storage_kernel_exports.dataApplyStoreClose, "antfly_data_apply_store_close");
             exportInternal(&storage_kernel_exports.dataApplyStoreApplyBatch, "antfly_data_apply_store_apply_batch");
@@ -376,6 +450,7 @@ comptime {
             exportInternal(&storage_kernel_exports.storageOwnerPreflightJson, "antfly_storage_owner_preflight_json");
             exportInternal(&storage_kernel_exports.storageOwnerTextStatsJson, "antfly_storage_owner_text_stats_json");
             exportInternal(&storage_kernel_exports.storageOwnerAlgebraicPartialsJson, "antfly_storage_owner_algebraic_partials_json");
+            exportInternal(&storage_kernel_exports.storageAggregateJson, "antfly_storage_aggregate_json");
             exportInternal(&storage_kernel_exports.storageOwnerGraphExpandJson, "antfly_storage_owner_graph_expand_json");
             exportInternal(&storage_kernel_exports.storageOwnerGraphHydrateJson, "antfly_storage_owner_graph_hydrate_json");
             exportInternal(&storage_kernel_exports.storageOwnerGraphEdgesJson, "antfly_storage_owner_graph_edges_json");

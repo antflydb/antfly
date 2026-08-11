@@ -102,6 +102,7 @@ else
             self.* = .{};
         }
     };
+const LegacyAuthBackend = if (storage_kernel_experiment) struct {} else antfly.lsm_backend.BackendHandle;
 const DataRaftApplyStore = if (storage_kernel_experiment) data_apply_client.RaftApplyStore else antfly.data.RaftApplyStore;
 const DataRaftAppliedBatch = if (storage_kernel_experiment) data_apply_client.AppliedDataBatch else antfly.data.AppliedDataBatch;
 const DataRaftSplitState = if (storage_kernel_experiment)
@@ -2714,6 +2715,9 @@ pub const DataServerConfig = struct {
     index_repair_max_convergence_rounds: u32 = 32,
     index_repair_max_activation_pause_ms: u64 = 250,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
+    /// Borrowed process-scoped storage kernel. The caller must keep it alive
+    /// until `DataServer.deinit` has closed every resident owner.
+    storage_kernel_context_handle: ?*anyopaque = null,
     api_server_cfg: antfly.public_api.http_server.ApiHttpServerConfig = .{},
     ha: DataServerHAConfig = .{},
 };
@@ -4011,6 +4015,7 @@ pub const DataServer = struct {
     /// after all attached sources and Raft apply work have drained.
     kernel_owner_source: ?*antfly.public_api.ProvisionedKernelOwnerSource = null,
     storage_kernel_context: ?StorageKernelContext = null,
+    borrowed_storage_kernel_context: ?*anyopaque = null,
     read_source: antfly.public_api.ProvisionedTableReadSource,
     write_source: antfly.public_api.ProvisionedTableWriteSource,
     /// Long-lived backing for the cross-shard entity-resolution candidate
@@ -4247,6 +4252,7 @@ pub const DataServer = struct {
             .ha_primary_sync_wait = haPrimarySyncWaitFromConfig(cfg.ha.primary_sync_wait),
             .query_async_limit = cfg.query_async_limit,
             .backend_runtime = cfg.backend_runtime,
+            .borrowed_storage_kernel_context = cfg.storage_kernel_context_handle,
             .listener_cfg = publicApiListenerConfig(cfg.bind_host, cfg.bind_port),
         };
     }
@@ -4338,8 +4344,8 @@ pub const DataServer = struct {
         _ = owner_source.withGroupVisibleRootGeneration(self.provisioned_storage.groupVisibleRootGenerationSource());
         _ = owner_source.withTransactionRecoverySource(self.write_source.transactionRecoverySource());
         if (comptime storage_kernel_experiment) {
-            if (self.storage_kernel_context) |context|
-                _ = owner_source.withStorageContextHandle(context.handle);
+            if (self.storageKernelContextHandle()) |handle|
+                _ = owner_source.withStorageContextHandle(handle);
         }
         _ = self.read_source.withLocalReadSource(owner_source.readSource());
         self.read_source.resident_db = null;
@@ -4349,6 +4355,11 @@ pub const DataServer = struct {
         if (self.data_raft_apply) |apply_sm| apply_sm.attachKernelOwnerSource(owner_source);
         self.kernel_owner_source = owner_source;
         return owner_source;
+    }
+
+    fn storageKernelContextHandle(self: *const DataServer) ?*anyopaque {
+        return self.borrowed_storage_kernel_context orelse
+            if (self.storage_kernel_context) |context| context.handle else null;
     }
 
     fn storageOwnerLsmCacheStatsBestEffort(self: *DataServer) lsm_backend_mod.CacheStats {
@@ -5333,6 +5344,7 @@ pub const DataServer = struct {
         self.data_raft_apply = null;
         self.kernel_owner_source = null;
         self.storage_kernel_context = null;
+        self.borrowed_storage_kernel_context = null;
         self.data_raft_store = null;
         self.data_raft_base_uri = null;
         self.remote_metadata = null;
@@ -8491,7 +8503,7 @@ pub const DataServer = struct {
         var source_store = if (comptime storage_kernel_experiment)
             try data_apply_client.RaftApplyStore.init(self.alloc, .{
                 .root_dir = source_root_dir,
-                .context = if (self.storage_kernel_context) |context| context.handle else null,
+                .context = self.storageKernelContextHandle(),
             })
         else
             try antfly.data.RaftApplyStore.init(self.alloc, .{ .root_dir = source_root_dir });
@@ -12764,9 +12776,11 @@ pub const DataServer = struct {
         var storage_kernel_context: ?StorageKernelContext = null;
         errdefer if (storage_kernel_context) |*context| context.deinit();
         if (comptime storage_kernel_experiment) {
-            var context = kernel_owner_client.Context{};
-            try context.ensure();
-            storage_kernel_context = context;
+            if (cfg.storage_kernel_context_handle == null) {
+                var context = kernel_owner_client.Context{};
+                try context.ensure();
+                storage_kernel_context = context;
+            }
         }
 
         const remote_metadata = try alloc.create(RemoteMetadataSource);
@@ -15759,18 +15773,45 @@ pub fn runFromIterator(
     );
     defer active_audio_runtime.deinit();
 
-    var auth_backend: ?antfly.lsm_backend.BackendHandle = null;
+    var process_storage_kernel_context: ?StorageKernelContext = null;
+    if (comptime storage_kernel_experiment) {
+        var context = kernel_owner_client.Context{};
+        try context.ensureWith(.{
+            .auth_storage_path = .fromSlice(if (auth_enabled) resolved.auth_store_root_dir else ""),
+        });
+        process_storage_kernel_context = context;
+    }
+    defer if (process_storage_kernel_context) |*context| context.deinit();
+
+    var auth_backend: ?LegacyAuthBackend = null;
     var auth_runtime: ?antfly.storage_backend_erased.NamespaceStore = null;
+    var kernel_auth_users_store: ?antfly.storage_backend_erased.Store = null;
+    var kernel_auth_casbin_store: ?antfly.storage_backend_erased.Store = null;
+    var kernel_auth_users_runtime: ?antfly.storage_backend_erased.NamespaceStore = null;
+    var kernel_auth_casbin_runtime: ?antfly.storage_backend_erased.NamespaceStore = null;
     var auth_user_store: ?antfly.usermgr.StorageUserStore = null;
     var auth_casbin_store: ?antfly.usermgr.StorageCasbinAdapter = null;
     var user_manager: ?antfly.usermgr.UserManager = null;
     if (auth_enabled) {
-        auth_backend = try antfly.lsm_backend.BackendHandle.open(alloc, resolved.auth_store_root_dir, .{});
-        errdefer if (auth_backend) |*backend| backend.close();
-        auth_runtime = try auth_backend.?.backend.runtimeNamespaceStore(alloc);
-        errdefer if (auth_runtime) |*runtime| runtime.deinit();
-        auth_user_store = antfly.usermgr.StorageUserStore.init(alloc, auth_runtime.?);
-        auth_casbin_store = antfly.usermgr.StorageCasbinAdapter.init(alloc, auth_runtime.?);
+        if (comptime storage_kernel_experiment) {
+            kernel_auth_users_store = try process_storage_kernel_context.?.systemStore(alloc, "system/auth-users");
+            errdefer kernel_auth_users_store.?.deinit();
+            kernel_auth_casbin_store = try process_storage_kernel_context.?.systemStore(alloc, "system/auth-casbin");
+            errdefer kernel_auth_casbin_store.?.deinit();
+            kernel_auth_users_runtime = try kernel_owner_client.singleNamespaceStore(alloc, &kernel_auth_users_store.?, "usermgr_users");
+            errdefer kernel_auth_users_runtime.?.deinit();
+            kernel_auth_casbin_runtime = try kernel_owner_client.singleNamespaceStore(alloc, &kernel_auth_casbin_store.?, "usermgr_casbin");
+            errdefer kernel_auth_casbin_runtime.?.deinit();
+            auth_user_store = antfly.usermgr.StorageUserStore.init(alloc, kernel_auth_users_runtime.?);
+            auth_casbin_store = antfly.usermgr.StorageCasbinAdapter.init(alloc, kernel_auth_casbin_runtime.?);
+        } else {
+            auth_backend = try antfly.lsm_backend.BackendHandle.open(alloc, resolved.auth_store_root_dir, .{});
+            errdefer if (auth_backend) |*backend| backend.close();
+            auth_runtime = try auth_backend.?.backend.runtimeNamespaceStore(alloc);
+            errdefer if (auth_runtime) |*runtime| runtime.deinit();
+            auth_user_store = antfly.usermgr.StorageUserStore.init(alloc, auth_runtime.?);
+            auth_casbin_store = antfly.usermgr.StorageCasbinAdapter.init(alloc, auth_runtime.?);
+        }
         user_manager = try antfly.usermgr.UserManager.init(
             alloc,
             auth_user_store.?.iface(),
@@ -15782,9 +15823,13 @@ pub fn runFromIterator(
         // clustered startup before raft listeners are running.
         try antfly.usermgr.ensureDefaultAdminUser(&user_manager.?);
     }
-    defer if (user_manager) |*manager| manager.deinit();
+    defer if (comptime !storage_kernel_experiment) if (auth_backend) |*backend| backend.close();
     defer if (auth_runtime) |*runtime| runtime.deinit();
-    defer if (auth_backend) |*backend| backend.close();
+    defer if (kernel_auth_users_store) |*store| store.deinit();
+    defer if (kernel_auth_casbin_store) |*store| store.deinit();
+    defer if (kernel_auth_users_runtime) |*runtime| runtime.deinit();
+    defer if (kernel_auth_casbin_runtime) |*runtime| runtime.deinit();
+    defer if (user_manager) |*manager| manager.deinit();
 
     const trusted_principal_issuer = try resolveTrustedPrincipalIssuer(
         alloc,
@@ -15800,6 +15845,7 @@ pub fn runFromIterator(
         .replica_root_dir = resolved.replica_root_dir,
         .replica_catalog_path = resolved.replica_catalog_path,
         .snapshot_root_dir = resolved.snapshot_root_dir,
+        .storage_kernel_context_handle = if (process_storage_kernel_context) |context| context.handle else null,
         .store_registration = if (cli.node_id != null and cli.store_id != null) .{
             .node_id = cli.node_id.?,
             .store_id = cli.store_id.?,

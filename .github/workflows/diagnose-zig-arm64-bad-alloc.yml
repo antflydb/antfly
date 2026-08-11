@@ -204,11 +204,20 @@ jobs:
             exit 1
           fi
 
+          storage_object="$(find "$RUNNER_TEMP/linked-runtime-cache/local" -type f -name 'libantfly-storage-kernel_zcu.o' -print -quit)"
+          distributed_object="$(find "$RUNNER_TEMP/linked-runtime-cache/local" -type f -name 'libantfly-runtime-distributed_zcu.o' -print -quit)"
+          if [ -z "$storage_object" ] || [ -z "$distributed_object" ]; then
+            echo "Zig runtime objects were not found for emitted-overlap analysis" >&2
+            exit 1
+          fi
+
           python3 tools/analyze_zig_import_graph.py \
             --time-report "storage=$RUNNER_TEMP/linked-runtime-reports/storage.json" \
             --time-report "distributed=$RUNNER_TEMP/linked-runtime-reports/distributed.json" \
             --time-report "inference=$RUNNER_TEMP/linked-runtime-reports/inference.json" \
             --time-report "cli=$RUNNER_TEMP/linked-runtime-reports/cli.json" \
+            --object "storage=$storage_object" \
+            --object "distributed=$distributed_object" \
             --top-groups 30 \
             --json | tee "$RUNNER_TEMP/linked-runtime-reports/summary.json"
 

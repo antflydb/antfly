@@ -26,8 +26,8 @@ const ha_primary = @import("../ha/primary.zig");
 const platform_time = @import("antfly_platform").time;
 
 pub const types = @import("types.zig");
-pub const aggregations = @import("aggregations.zig");
-pub const algebraic = @import("algebraic/mod.zig");
+pub const aggregations = @import("aggregations_contract.zig");
+pub const algebraic = @import("algebraic/control_root.zig");
 pub const doc_filter_wire = @import("doc_filter_wire.zig");
 pub const background_runtime = @import("../background_runtime.zig");
 pub const query_metrics = @import("query_metrics.zig");

@@ -15,7 +15,7 @@
 //! Versioned internal ABI for the storage kernel's live DB owner. Keep this
 //! module free of storage and distributed-runtime imports.
 
-pub const abi_version: u32 = 25;
+pub const abi_version: u32 = 28;
 
 pub const BorrowedBytes = extern struct {
     ptr: ?[*]const u8 = null,
@@ -83,6 +83,94 @@ pub const Status = enum(u32) {
     backup_integrity = 20,
     unsupported_backup_migration = 21,
     restore_identity_namespace_mismatch = 22,
+    invalid_aggregation = 23,
+    unsupported_aggregation = 24,
+    query_candidate_budget_exceeded = 25,
+    invalid_index_config = 26,
+    algebraic_planner_scan_too_large = 27,
+    algebraic_result_bucket_limit = 28,
+    invalid_algebraic_tensor_expr = 29,
+    invalid_algebraic_tensor_row = 30,
+    invalid_arguments = 31,
+    file_not_found = 32,
+    decision_conflict = 33,
+    lsm_root_writer_already_open = 34,
+    generation_transition_active = 35,
+    would_block = 36,
+    table_visibility_timeout = 37,
+    canceled = 38,
+    snapshot_build_cancelled = 39,
+    backup_integrity_missing = 40,
+    backup_artifact_missing = 41,
+    backup_artifact_format_mismatch = 42,
+    backup_artifact_integrity_mismatch = 43,
+    active_node_finalize_rejected = 44,
+    applied_snapshot_index_mismatch = 45,
+    invalid_committed_entries_encoding = 46,
+    invalid_metadata_apply_batch = 47,
+    invalid_metadata_incarnation = 48,
+    invalid_metadata_record = 49,
+    invalid_metadata_snapshot = 50,
+    invalid_metadata_transition_encoding = 51,
+    invalid_replication_cutover_intent = 52,
+    invalid_restore_intent_identity = 53,
+    invalid_restore_job_record = 54,
+    invalid_restore_progress_record = 55,
+    invalid_split_admission = 56,
+    invalid_table_definition_replacement = 57,
+    invalid_table_id = 58,
+    invalid_table_transition_fence = 59,
+    metadata_snapshot_too_large = 60,
+    missing_metadata_batch = 61,
+    missing_metadata_snapshot_source = 62,
+    no_space_left = 63,
+    reserved_group_id = 64,
+    table_transition_count_exhausted = 65,
+    table_transition_generation_exhausted = 66,
+    unexpected_metadata_snapshot_artifact = 67,
+    invalid_backup_artifact_path = 68,
+    backup_artifact_too_large = 69,
+    unsupported_backup_artifact = 70,
+    file_busy = 71,
+    ha_read_only_standby = 72,
+    path_already_exists = 73,
+    snapshot_too_large = 74,
+    truncated_native_header = 75,
+    unsupported_native_format_version = 76,
+    missing_participant_resolver = 77,
+    missing_replicated_recovery_hooks = 78,
+    storage_kernel_callback_failed = 79,
+    storage_kernel_recovery_callback_failed = 80,
+    provider_internal = 81,
+    resource_budget_exceeded = 82,
+    table_not_found = 83,
+    conflicting_enrichment_config = 84,
+    invalid_table_index_metadata = 85,
+    invalid_table_schema = 86,
+    invalid_create_table_request = 87,
+    unsupported_create_table_request = 88,
+    storage_kernel_owner_unavailable = 89,
+    invalid_batch_request = 90,
+    unsupported_batch_request_encoding = 91,
+    value_too_long = 92,
+    invalid_filter_query_request = 93,
+    invalid_exclusion_query_request = 94,
+    unsupported_filter_query_request = 95,
+    unsupported_exclusion_query_request = 96,
+    invalid_native_snapshot_path = 97,
+    invalid_native_magic = 98,
+    invalid_native_header_size = 99,
+    native_header_checksum_mismatch = 100,
+    invalid_native_page_size = 101,
+    invalid_native_checkpoint = 102,
+    truncated_native_file = 103,
+    end_of_stream = 104,
+    truncated = 105,
+    invalid_magic = 106,
+    header_crc_mismatch = 107,
+    unsupported_version = 108,
+    block_crc_mismatch = 109,
+    writer_locked = 110,
     internal = 255,
 };
 
@@ -90,9 +178,103 @@ pub const Status = enum(u32) {
 /// admission state; individual table/group owners borrow it for their full
 /// lifetime. A null context in `OpenRequest` retains the standalone ABI path
 /// used by focused C API callers and compatibility tests.
+pub const ContextStorageKind = enum(u32) {
+    directory = 0,
+    lite = 1,
+};
+
 pub const ContextRequest = extern struct {
     version: u32 = abi_version,
+    storage_kind: ContextStorageKind = .directory,
+    no_sync: u8 = 0,
+    _reserved0: [7]u8 = @splat(0),
+    storage_path: BorrowedBytes = .{},
+    auth_storage_path: BorrowedBytes = .{},
+};
+
+/// One low-volume engine namespace used by control-plane metadata or durable
+/// API sessions. User documents never cross this transaction ABI.
+pub const SystemStoreOpenRequest = extern struct {
+    version: u32 = abi_version,
     _reserved0: u32 = 0,
+    namespace: BorrowedBytes = .{},
+};
+
+pub const SystemEntryResult = extern struct {
+    key: BorrowedBytes = .{},
+    value: BorrowedBytes = .{},
+    present: u8 = 0,
+    _reserved0: [7]u8 = @splat(0),
+};
+
+pub const SystemCursorSeek = enum(u32) {
+    first = 0,
+    last = 1,
+    next = 2,
+    previous = 3,
+    at_or_after = 4,
+    at_or_before = 5,
+};
+
+pub const LiteAdoptionRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved0: u32 = 0,
+    namespace: BorrowedBytes = .{},
+    identity_table_id: u64 = 0,
+    identity_shard_id: u64 = 0,
+    identity_range_id: u64 = 0,
+};
+
+pub const LiteAdoptionProbeResult = extern struct {
+    version: u32 = abi_version,
+    is_embedded_artifact: u8 = 0,
+    embedded_root_has_user_documents: u8 = 0,
+    _reserved0: [2]u8 = @splat(0),
+};
+
+pub const ContextMaintenanceOperation = enum(u32) {
+    check = 0,
+    compact = 1,
+    vacuum = 2,
+};
+
+pub const ContextMaintenanceStatus = extern struct {
+    version: u32 = abi_version,
+    check: u8 = 0,
+    compact: u8 = 0,
+    vacuum: u8 = 0,
+    online: u8 = 0,
+    asynchronous: u8 = 1,
+    has_fsync: u8 = 0,
+    fsync: u8 = 0,
+    _reserved0: u8 = 0,
+    engine: BorrowedBytes = .{},
+    format: BorrowedBytes = .{},
+};
+
+pub const ContextMaintenanceRequest = extern struct {
+    version: u32 = abi_version,
+    operation: ContextMaintenanceOperation = .check,
+    cancel_token: ?*const anyopaque = null,
+};
+
+pub const ContextMaintenanceResult = extern struct {
+    version: u32 = abi_version,
+    has_valid: u8 = 0,
+    valid: u8 = 0,
+    _reserved0: [2]u8 = @splat(0),
+    /// Static machine-readable issue identifier owned by the kernel.
+    issue: BorrowedBytes = .{},
+    file_size: u64 = 0,
+    valid_prefix_size: u64 = 0,
+    reclaimable_bytes: u64 = 0,
+    before_size: u64 = 0,
+    after_size: u64 = 0,
+    reclaimed_bytes: u64 = 0,
+    live_file_count: u64 = 0,
+    live_bytes: u64 = 0,
+    present_mask: u16 = 0,
+    _reserved1: [6]u8 = @splat(0),
 };
 
 pub const ContextCacheKindStats = extern struct {
@@ -129,6 +311,157 @@ pub const DataApplyOpenRequest = extern struct {
     _reserved0: u16 = 0,
     context: ?*anyopaque = null,
     root_dir: BorrowedBytes = .{},
+};
+
+/// Process-owned metadata-Raft apply/projection store. Projection requests are
+/// complete control-plane reads (one list/get/stats operation), never backend
+/// cursor or record-level calls.
+pub const MetadataApplyOpenRequest = extern struct {
+    version: u32 = abi_version,
+    no_sync: u8 = 0,
+    read_only: u8 = 0,
+    _reserved0: u16 = 0,
+    context: ?*anyopaque = null,
+    root_dir: BorrowedBytes = .{},
+};
+
+pub const MetadataApplyBatchRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved0: u32 = 0,
+    group_id: u64 = 0,
+    commit_index: u64 = 0,
+    entries: BorrowedBytes = .{},
+};
+
+pub const MetadataApplyGroupRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved0: u32 = 0,
+    group_id: u64 = 0,
+};
+
+pub const MetadataApplySnapshotRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved0: u32 = 0,
+    group_id: u64 = 0,
+    commit_index: u64 = 0,
+    snapshot: BorrowedBytes = .{},
+};
+
+pub const MetadataApplyPrepareSnapshotRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved0: u32 = 0,
+    group_id: u64 = 0,
+    applied_index: u64 = 0,
+};
+
+pub const MetadataProjectionKind = enum(u32) {
+    latest_batch = 0,
+    metadata_incarnation = 1,
+    split_transitions = 2,
+    placement_intents = 3,
+    local_placement_intents = 4,
+    nodes = 5,
+    stores = 6,
+    merge_transitions = 7,
+    tables = 8,
+    table = 9,
+    table_transition_fence = 10,
+    schema_progress = 11,
+    restore_progress = 12,
+    replication_source_statuses = 13,
+    replication_source_status = 14,
+    extension_packages = 15,
+    installed_extensions = 16,
+    extension_members = 17,
+    extension_dependencies = 18,
+    shuffle_join_leases = 19,
+    ranges = 20,
+    reconcile_lease = 21,
+    reallocation_request = 22,
+    shuffle_join_lease = 23,
+    restore_job_rows = 24,
+    restore_job_value = 25,
+    maintenance_stats = 26,
+};
+
+pub const MetadataProjectionRequest = extern struct {
+    version: u32 = abi_version,
+    kind: MetadataProjectionKind = .latest_batch,
+    group_id: u64 = 0,
+    arg0: u64 = 0,
+    arg1: u64 = 0,
+    key: BorrowedBytes = .{},
+};
+
+pub const MetadataProjectionSignalKind = enum(u32) {
+    table = 0,
+    range = 1,
+    store = 2,
+    placement_intent = 3,
+    reconcile_lease = 4,
+    shuffle_join_lease = 5,
+    split_transition = 6,
+    merge_transition = 7,
+    schema_progress = 8,
+    restore_progress = 9,
+    restore_job = 10,
+    replication_source_status = 11,
+};
+
+pub const MetadataProjectionSignal = extern struct {
+    kind: MetadataProjectionSignalKind = .table,
+    _reserved0: u32 = 0,
+    metadata_group_id: u64 = 0,
+    table_name: BorrowedBytes = .{},
+    table_id: u64 = 0,
+    group_id: u64 = 0,
+    store_id: u64 = 0,
+    node_id: u64 = 0,
+};
+
+pub const MetadataProjectionSignalFn = *const fn (
+    context: ?*anyopaque,
+    signal: *const MetadataProjectionSignal,
+) callconv(.c) void;
+
+pub const MetadataCommittedKeySignalFn = *const fn (
+    context: ?*anyopaque,
+    metadata_group_id: u64,
+    key: BorrowedBytes,
+) callconv(.c) void;
+
+pub const MetadataListenerRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved0: u32 = 0,
+    context: ?*anyopaque = null,
+    projection_fn: ?MetadataProjectionSignalFn = null,
+    committed_key_fn: ?MetadataCommittedKeySignalFn = null,
+};
+
+/// One complete local replica-root provisioning round. The JSON envelope owns
+/// the hosted group IDs plus projected table/range records; all physical DB,
+/// restore, schema, index, enrichment, and resolver work remains in the kernel.
+pub const MetadataReplicaRootReconcileRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved0: u32 = 0,
+    context: ?*anyopaque = null,
+    replica_root_dir: BorrowedBytes = .{},
+    metadata_group_id: u64 = 0,
+    request_json: BorrowedBytes = .{},
+};
+
+pub const MetadataProvisionSummary = extern struct {
+    groups_considered: u64 = 0,
+    dbs_opened: u64 = 0,
+    indexes_added: u64 = 0,
+    indexes_removed: u64 = 0,
+    indexes_pending: u64 = 0,
+    enrichments_added: u64 = 0,
+    enrichments_updated: u64 = 0,
+    enrichments_removed: u64 = 0,
+    resolvers_added: u64 = 0,
+    resolvers_updated: u64 = 0,
+    resolvers_removed: u64 = 0,
 };
 
 pub const DataApplyBatchRequest = extern struct {
@@ -388,6 +721,23 @@ pub const JsonOperationRequest = extern struct {
     _reserved0: u32 = 0,
     table_name: BorrowedBytes = .{},
     request_json: BorrowedBytes = .{},
+};
+
+/// One already-merged hit borrowed for a synchronous coarse aggregation
+/// operation. The kernel reads `stored_data` only for the duration of the call.
+pub const AggregationHit = extern struct {
+    stored_data: BorrowedBytes = .{},
+};
+
+/// Complete aggregation fold input. Expected semantic failures are returned
+/// as distinct `Status` values; `internal` is reserved for unexpected defects.
+pub const AggregationRequest = extern struct {
+    version: u32 = abi_version,
+    total_hits: u32 = 0,
+    aggregations_json: BorrowedBytes = .{},
+    context_json: BorrowedBytes = .{},
+    hits: ?[*]const AggregationHit = null,
+    hit_count: u64 = 0,
 };
 
 /// Synchronous coarse dispatch of one generated document-artifact child range.
@@ -721,6 +1071,97 @@ pub extern fn antfly_storage_context_metrics(
     out_result: *ContextMetricsResult,
 ) callconv(.c) Status;
 
+pub extern fn antfly_storage_context_system_store_open(
+    context: ?*anyopaque,
+    request: *const SystemStoreOpenRequest,
+    out_store: *?*anyopaque,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_system_store_close(store: ?*anyopaque) callconv(.c) void;
+pub extern fn antfly_storage_system_store_sync(store: ?*anyopaque, force: u8) callconv(.c) Status;
+pub extern fn antfly_storage_system_store_begin_read(store: ?*anyopaque, out_txn: *?*anyopaque) callconv(.c) Status;
+pub extern fn antfly_storage_system_store_begin_current_scan(store: ?*anyopaque, out_txn: *?*anyopaque) callconv(.c) Status;
+pub extern fn antfly_storage_system_store_begin_write(store: ?*anyopaque, out_txn: *?*anyopaque) callconv(.c) Status;
+pub extern fn antfly_storage_system_read_get(txn: ?*anyopaque, key: BorrowedBytes, out_value: *BorrowedBytes) callconv(.c) Status;
+pub extern fn antfly_storage_system_read_open_cursor(txn: ?*anyopaque, out_cursor: *?*anyopaque) callconv(.c) Status;
+pub extern fn antfly_storage_system_read_abort(txn: ?*anyopaque) callconv(.c) void;
+pub extern fn antfly_storage_system_current_scan_open_cursor(txn: ?*anyopaque, out_cursor: *?*anyopaque) callconv(.c) Status;
+pub extern fn antfly_storage_system_current_scan_abort(txn: ?*anyopaque) callconv(.c) void;
+pub extern fn antfly_storage_system_write_get(txn: ?*anyopaque, key: BorrowedBytes, out_value: *BorrowedBytes) callconv(.c) Status;
+pub extern fn antfly_storage_system_write_put(txn: ?*anyopaque, key: BorrowedBytes, value: BorrowedBytes) callconv(.c) Status;
+pub extern fn antfly_storage_system_write_delete(txn: ?*anyopaque, key: BorrowedBytes) callconv(.c) Status;
+pub extern fn antfly_storage_system_write_commit(txn: ?*anyopaque) callconv(.c) Status;
+pub extern fn antfly_storage_system_write_abort(txn: ?*anyopaque) callconv(.c) void;
+pub extern fn antfly_storage_system_cursor_move(
+    cursor: ?*anyopaque,
+    operation: SystemCursorSeek,
+    key: BorrowedBytes,
+    out_entry: *SystemEntryResult,
+) callconv(.c) Status;
+pub extern fn antfly_storage_system_cursor_close(cursor: ?*anyopaque) callconv(.c) void;
+
+pub extern fn antfly_storage_context_lite_adoption_probe(
+    context: ?*anyopaque,
+    out_result: *LiteAdoptionProbeResult,
+) callconv(.c) Status;
+pub extern fn antfly_storage_context_lite_adopt_and_verify(
+    context: ?*anyopaque,
+    request: *const LiteAdoptionRequest,
+) callconv(.c) Status;
+pub extern fn antfly_storage_context_lite_mark_standalone(context: ?*anyopaque) callconv(.c) Status;
+pub extern fn antfly_storage_context_maintenance_status(
+    context: ?*anyopaque,
+    out_result: *ContextMaintenanceStatus,
+) callconv(.c) Status;
+pub extern fn antfly_storage_context_maintenance_run(
+    context: ?*anyopaque,
+    request: *const ContextMaintenanceRequest,
+    out_result: *ContextMaintenanceResult,
+) callconv(.c) Status;
+
+pub extern fn antfly_metadata_apply_store_open(
+    request: *const MetadataApplyOpenRequest,
+    out_store: *?*anyopaque,
+) callconv(.c) Status;
+pub extern fn antfly_metadata_apply_store_close(store: ?*anyopaque) callconv(.c) void;
+pub extern fn antfly_metadata_apply_store_apply_batch(
+    store: ?*anyopaque,
+    request: *const MetadataApplyBatchRequest,
+) callconv(.c) Status;
+pub extern fn antfly_metadata_apply_store_build_snapshot(
+    store: ?*anyopaque,
+    request: *const MetadataApplyGroupRequest,
+    out_snapshot: *OwnedBytes,
+) callconv(.c) Status;
+pub extern fn antfly_metadata_apply_store_install_snapshot(
+    store: ?*anyopaque,
+    request: *const MetadataApplySnapshotRequest,
+) callconv(.c) Status;
+pub extern fn antfly_metadata_apply_store_prepare_snapshot(
+    store: ?*anyopaque,
+    request: *const MetadataApplyPrepareSnapshotRequest,
+    out_prepared: *?*anyopaque,
+) callconv(.c) Status;
+pub extern fn antfly_metadata_apply_prepared_snapshot_materialize(
+    prepared: ?*anyopaque,
+    out_snapshot: *OwnedBytes,
+) callconv(.c) Status;
+pub extern fn antfly_metadata_apply_prepared_snapshot_cancel(prepared: ?*anyopaque) callconv(.c) Status;
+pub extern fn antfly_metadata_apply_prepared_snapshot_destroy(prepared: ?*anyopaque) callconv(.c) void;
+pub extern fn antfly_metadata_apply_store_projection(
+    store: ?*anyopaque,
+    request: *const MetadataProjectionRequest,
+    out_json: *OwnedBytes,
+) callconv(.c) Status;
+pub extern fn antfly_metadata_apply_store_add_listeners(
+    store: ?*anyopaque,
+    request: *const MetadataListenerRequest,
+) callconv(.c) Status;
+pub extern fn antfly_metadata_reconcile_replica_root(
+    request: *const MetadataReplicaRootReconcileRequest,
+    out_summary: *MetadataProvisionSummary,
+) callconv(.c) Status;
+
 pub extern fn antfly_data_apply_store_open(
     request: *const DataApplyOpenRequest,
     out_store: *?*anyopaque,
@@ -969,6 +1410,14 @@ pub extern fn antfly_storage_owner_text_stats_json(
 pub extern fn antfly_storage_owner_algebraic_partials_json(
     owner: ?*anyopaque,
     request: *const JsonOperationRequest,
+    out_response: *OwnedBytes,
+) callconv(.c) Status;
+
+/// Computes one complete aggregation fold over already-merged query hits.
+/// This remains a single coarse call: the descriptor array and document bytes
+/// are borrowed, while the comparatively small context and result are JSON.
+pub extern fn antfly_storage_aggregate_json(
+    request: *const AggregationRequest,
     out_response: *OwnedBytes,
 ) callconv(.c) Status;
 

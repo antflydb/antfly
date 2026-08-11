@@ -17,8 +17,14 @@ const antfly = @import("../cli_root.zig");
 const antfly_client = @import("antfly-client");
 const cli = @import("cli/mod.zig");
 const httpx = @import("httpx");
-const standalone_runtime = @import("../standalone/runtime.zig");
+const runtime_bridge = @import("../runtime_bridge.zig");
+const standalone_runtime = if (antfly.build_options.storage_kernel_experiment)
+    struct {}
+else
+    @import("../standalone/runtime.zig");
 const fs_paths = antfly.common.fs_paths;
+
+extern fn antfly_runtime_standalone_lite(context: *const runtime_bridge.LiteServeContext) callconv(.c) c_int;
 
 const Allocator = std.mem.Allocator;
 const max_json_file_bytes: usize = 64 * 1024 * 1024;
@@ -966,6 +972,22 @@ fn serve(init: std.process.Init, args: *std.process.Args.Iterator) !void {
 fn serveWithOptions(init: std.process.Init, opts: ServeOptions) !void {
     try requireAflitePath(opts.path);
     const listen = try parseLiteListenAddress(opts.addr);
+    if (comptime antfly.build_options.storage_kernel_experiment) {
+        const extra_args = try init.gpa.alloc(runtime_bridge.BorrowedBytes, opts.standalone_args.items.len);
+        defer init.gpa.free(extra_args);
+        for (opts.standalone_args.items, 0..) |arg, i| extra_args[i] = .fromSlice(arg);
+        const code = antfly_runtime_standalone_lite(&.{
+            .init = @ptrCast(&init),
+            .path = .fromSlice(opts.path),
+            .host = .fromSlice(listen.host),
+            .extra_args = if (extra_args.len == 0) null else extra_args.ptr,
+            .extra_args_len = extra_args.len,
+            .port = listen.port,
+            .fsync = @intFromBool(opts.fsync),
+        });
+        if (code != 0) return error.LinkedStandaloneStartupFailed;
+        return;
+    }
     return try standalone_runtime.runLite(init, opts.path, listen.host, listen.port, opts.fsync, opts.standalone_args.items);
 }
 

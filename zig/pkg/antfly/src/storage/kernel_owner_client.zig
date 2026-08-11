@@ -17,20 +17,30 @@
 
 const std = @import("std");
 const abi = @import("kernel_owner_abi");
+const error_identity = @import("kernel_error_identity");
+const maintenance = @import("maintenance.zig");
+const system_store_client = @import("kernel_system_store_client.zig");
 
 pub const LocalTransitionAction = abi.LocalTransitionAction;
 pub const LocalTransitionPhase = abi.LocalTransitionPhase;
 pub const LocalTransitionResultKind = abi.LocalTransitionResultKind;
 pub const LocalTransitionRequest = abi.LocalTransitionRequest;
 pub const LocalTransitionResult = abi.LocalTransitionResult;
+pub const AggregationHit = abi.AggregationHit;
+pub const AggregationRequest = abi.AggregationRequest;
+pub const singleNamespaceStore = system_store_client.singleNamespaceStore;
 
 pub const Context = struct {
     handle: ?*anyopaque = null,
 
     pub fn ensure(self: *Context) !void {
+        return try self.ensureWith(.{});
+    }
+
+    pub fn ensureWith(self: *Context, request: abi.ContextRequest) !void {
         if (self.handle != null) return;
         var handle: ?*anyopaque = null;
-        try statusToError(abi.antfly_storage_context_create(&.{}, &handle));
+        try statusToError(abi.antfly_storage_context_create(&request, &handle));
         self.handle = handle orelse return error.StorageKernelFailure;
     }
 
@@ -46,6 +56,86 @@ pub const Context = struct {
         try statusToError(abi.antfly_storage_context_metrics(self.handle, &result));
         if (result.version != abi.abi_version) return error.InvalidAbiVersion;
         return result;
+    }
+
+    pub fn systemStore(
+        self: *Context,
+        allocator: std.mem.Allocator,
+        namespace: []const u8,
+    ) !@import("backend_erased.zig").Store {
+        try self.ensure();
+        return try system_store_client.open(allocator, self.handle, namespace);
+    }
+
+    pub fn liteAdoptionProbe(self: *Context) !abi.LiteAdoptionProbeResult {
+        var result: abi.LiteAdoptionProbeResult = .{};
+        try statusToError(abi.antfly_storage_context_lite_adoption_probe(self.handle, &result));
+        if (result.version != abi.abi_version) return error.InvalidAbiVersion;
+        return result;
+    }
+
+    pub fn liteAdoptAndVerify(self: *Context, request: abi.LiteAdoptionRequest) !void {
+        try statusToError(abi.antfly_storage_context_lite_adopt_and_verify(self.handle, &request));
+    }
+
+    pub fn liteMarkStandalone(self: *Context) !void {
+        try statusToError(abi.antfly_storage_context_lite_mark_standalone(self.handle));
+    }
+
+    pub fn maintenanceSource(self: *Context) maintenance.Source {
+        return .{ .ptr = self, .vtable = &.{
+            .status = contextMaintenanceStatus,
+            .run = contextMaintenanceRun,
+        } };
+    }
+
+    fn contextMaintenanceStatus(ptr: *anyopaque) maintenance.Status {
+        const self: *Context = @ptrCast(@alignCast(ptr));
+        var result: abi.ContextMaintenanceStatus = .{};
+        statusToError(abi.antfly_storage_context_maintenance_status(self.handle, &result)) catch
+            return .{ .engine = "kernel", .maintenance = .{} };
+        return .{
+            .engine = result.engine.slice(),
+            .format = if (result.format.len == 0) null else result.format.slice(),
+            .fsync = if (result.has_fsync != 0) result.fsync != 0 else null,
+            .maintenance = .{
+                .check = result.check != 0,
+                .compact = result.compact != 0,
+                .vacuum = result.vacuum != 0,
+                .online = result.online != 0,
+                .asynchronous = result.asynchronous != 0,
+            },
+        };
+    }
+
+    fn contextMaintenanceRun(
+        ptr: *anyopaque,
+        operation: maintenance.Operation,
+        cancel: *const maintenance.CancelToken,
+    ) !maintenance.Result {
+        const self: *Context = @ptrCast(@alignCast(ptr));
+        var result: abi.ContextMaintenanceResult = .{};
+        try statusToError(abi.antfly_storage_context_maintenance_run(self.handle, &.{
+            .operation = switch (operation) {
+                .check => .check,
+                .compact => .compact,
+                .vacuum => .vacuum,
+            },
+            .cancel_token = cancel,
+        }, &result));
+        if (result.version != abi.abi_version) return error.InvalidAbiVersion;
+        return .{
+            .valid = if (result.has_valid != 0) result.valid != 0 else null,
+            .issue = if (result.issue.len == 0) null else result.issue.slice(),
+            .file_size = if (result.present_mask & (1 << 0) != 0) result.file_size else null,
+            .valid_prefix_size = if (result.present_mask & (1 << 1) != 0) result.valid_prefix_size else null,
+            .reclaimable_bytes = if (result.present_mask & (1 << 2) != 0) result.reclaimable_bytes else null,
+            .before_size = if (result.present_mask & (1 << 3) != 0) result.before_size else null,
+            .after_size = if (result.present_mask & (1 << 4) != 0) result.after_size else null,
+            .reclaimed_bytes = if (result.present_mask & (1 << 5) != 0) result.reclaimed_bytes else null,
+            .live_file_count = if (result.present_mask & (1 << 6) != 0) result.live_file_count else null,
+            .live_bytes = if (result.present_mask & (1 << 7) != 0) result.live_bytes else null,
+        };
     }
 };
 
@@ -78,6 +168,12 @@ pub const VersionedResponse = struct {
         self.* = undefined;
     }
 };
+
+pub fn aggregate(request: AggregationRequest) !Response {
+    var response: Response = .{};
+    try statusToError(abi.antfly_storage_aggregate_json(&request, &response.buffer));
+    return response;
+}
 
 pub const Owner = struct {
     handle: ?*anyopaque,
@@ -642,30 +738,16 @@ fn controlledRequest(
 }
 
 pub fn statusToError(status: abi.Status) !void {
-    return switch (status) {
-        .ok => {},
-        .invalid_abi => error.InvalidAbiVersion,
-        .invalid_argument => error.InvalidArgument,
-        .not_found => error.NotFound,
-        .busy => error.StorageBusy,
-        .version_conflict => error.VersionConflict,
-        .intent_conflict => error.IntentConflict,
-        .transaction_not_found => error.TxnNotFound,
-        .read_only => error.ReadOnly,
-        .out_of_memory => error.OutOfMemory,
-        .corrupted => error.Corrupted,
-        .identity_namespace_mismatch => error.DocIdentityNamespaceMismatch,
-        .invalid_query => error.InvalidQueryRequest,
-        .unsupported_query => error.UnsupportedQueryRequest,
-        .index_not_found => error.IndexNotFound,
-        .identity_read_generation_changed => error.IdentityReadGenerationChanged,
-        .timeout => error.Timeout,
-        .cancelled => error.Cancelled,
-        .restore_identity_mismatch => error.RestoreIdentityMismatch,
-        .invalid_backup => error.InvalidBackupRequest,
-        .backup_integrity => error.BackupArtifactIntegrityMismatch,
-        .unsupported_backup_migration => error.UnsupportedBackupMigrationState,
-        .restore_identity_namespace_mismatch => error.IdentityNamespaceMismatch,
-        .internal => error.StorageKernelFailure,
-    };
+    return error_identity.statusToError(status);
+}
+
+test "storage kernel aggregation statuses preserve error identity" {
+    try std.testing.expectError(error.InvalidAggregation, statusToError(.invalid_aggregation));
+    try std.testing.expectError(error.UnsupportedAggregation, statusToError(.unsupported_aggregation));
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, statusToError(.query_candidate_budget_exceeded));
+    try std.testing.expectError(error.InvalidIndexConfig, statusToError(.invalid_index_config));
+    try std.testing.expectError(error.AlgebraicPlannerScanTooLarge, statusToError(.algebraic_planner_scan_too_large));
+    try std.testing.expectError(error.AlgebraicResultBucketLimit, statusToError(.algebraic_result_bucket_limit));
+    try std.testing.expectError(error.InvalidAlgebraicTensorExpr, statusToError(.invalid_algebraic_tensor_expr));
+    try std.testing.expectError(error.InvalidAlgebraicTensorRow, statusToError(.invalid_algebraic_tensor_row));
 }

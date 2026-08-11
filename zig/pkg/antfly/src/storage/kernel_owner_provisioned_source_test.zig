@@ -963,7 +963,7 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
         .identity_range_id = 7001,
     };
     var duplicate: ?*anyopaque = null;
-    try std.testing.expectEqual(abi.Status.busy, abi.antfly_storage_owner_open(&open_request, &duplicate));
+    try std.testing.expectEqual(abi.Status.lsm_root_writer_already_open, abi.antfly_storage_owner_open(&open_request, &duplicate));
     try std.testing.expect(duplicate == null);
 
     try std.testing.expect((try write_source.source().dropTable(alloc, "articles", &.{7001})) != null);

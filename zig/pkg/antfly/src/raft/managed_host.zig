@@ -800,10 +800,17 @@ fn prepareHostDeps(
         if (effective_metadata_builder == null) {
             const owned_store = try alloc.create(metadata_storage.RaftApplyStore);
             errdefer alloc.destroy(owned_store);
-            owned_store.* = try metadata_storage.RaftApplyStore.init(alloc, .{
-                .root_dir = replica_root_dir,
-                .no_sync = replica_apply_store_no_sync,
-            });
+            owned_store.* = if (comptime storage_kernel_experiment)
+                try metadata_storage.RaftApplyStore.init(alloc, .{
+                    .root_dir = replica_root_dir,
+                    .no_sync = replica_apply_store_no_sync,
+                    .context = data_apply_storage_context,
+                })
+            else
+                try metadata_storage.RaftApplyStore.init(alloc, .{
+                    .root_dir = replica_root_dir,
+                    .no_sync = replica_apply_store_no_sync,
+                });
             prepared.owned_metadata_store = owned_store;
             effective_metadata_builder = owned_store.snapshotBuilder();
         }

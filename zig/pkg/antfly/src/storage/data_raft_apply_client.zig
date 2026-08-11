@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const abi = @import("kernel_owner_abi");
+const error_identity = @import("kernel_error_identity");
 pub const projection_wire = @import("data_raft_projection_wire.zig");
 
 pub const RaftApplyStoreConfig = struct {
@@ -405,16 +406,5 @@ fn groupsRequest(group_ids: []const u64) abi.DataApplyGroupsRequest {
 }
 
 fn statusToError(status: abi.Status) !void {
-    return switch (status) {
-        .ok => {},
-        .invalid_abi => error.InvalidAbiVersion,
-        .invalid_argument => error.InvalidArgument,
-        .not_found => error.NotFound,
-        .busy => error.StorageOwnerBusy,
-        .read_only => error.ReadOnly,
-        .out_of_memory => error.OutOfMemory,
-        .corrupted => error.Corrupted,
-        .cancelled => error.Cancelled,
-        else => error.StorageKernelFailure,
-    };
+    return error_identity.statusToError(status);
 }

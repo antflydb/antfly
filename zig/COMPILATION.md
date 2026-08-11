@@ -39,7 +39,9 @@ do not satisfy the main goal.
 - Runtime boundaries must be coarse enough that they do not introduce a call
   per record, posting, LMDB operation, or vector candidate.
 - Allocation ownership, cancellation, deadlines, and error translation must be
-  explicit at every compiled ABI boundary.
+  explicit at every compiled ABI boundary. Declared errors keep their stable
+  semantic identities; adapters must not collapse them into broad status
+  classes.
 
 ## Goal loop
 
@@ -53,7 +55,8 @@ Repeat this loop until the main goal and exit criteria are satisfied:
    what complete local operation moves behind it.
 3. Implement the boundary behind the storage-kernel experiment. Preserve one
    static executable, embedded standalone inference, normal build concurrency,
-   the small C API surface, and exact behavior/error/cancellation ownership.
+   the small C API surface, exact behavior/error/cancellation ownership, and
+   provider-to-consumer error identity.
 4. Validate the affected behavior in both experiment-enabled and legacy
    configurations, then run graph gates, ABI tests, artifact/symbol audits, and
    a genuinely cold ARM64 `ReleaseFast` comparison.
@@ -2929,14 +2932,49 @@ runner-cost change. The storage archive shrinks from 36,705,768 B to
 remains small, while the executable grows 5.70%, slightly above the approximate
 5% guardrail.
 
-Decision: **keep the composition placement as the next opt-in candidate, but
-do not enable it by default yet**. It materially makes the intended ownership
-boundary true and puts both local compiler units below 350 seconds, but the
-409.34-second local wall path and executable growth require fresh authoritative
-reports and a clean normal-runner measurement before acceptance. The next run
-must show whether the Linux distributed unit remains below 380 seconds and
-whether the storage/distributed overlap actually falls rather than merely
-moves.
+An emitted-object audit then supplied the decisive go/no-go evidence. Enabling
+per-source sections on the experimental distributed archive changed the final
+binary by only -28,768 B (to 68,967,728 B) while making its machine code
+attributable. Storage and distributed still emitted 182 of the same Antfly
+modules and 8,380,444 duplicate text bytes. The overlap includes the complete
+physical family that the boundary is meant to compile once:
+
+| Duplicated module | Duplicate text |
+|---|---:|
+| `storage.db.db` | 1,630,316 B |
+| `storage.db.algebraic.index` | 877,944 B |
+| `storage.db.catalog.index_manager` | 755,664 B |
+| `storage.db.query.search_exec` | 442,288 B |
+| `storage.db.enrichment.enrichment_runtime` | 435,420 B |
+| `storage.db.aggregations` | 397,748 B |
+
+Focused, sectioned ARM64 `ReleaseFast` root probes isolated the source of that
+failure:
+
+| Root | Compiler result | Duplicate text against storage | Important observation |
+|---|---:|---:|---|
+| Data + metadata + HA + API control | 209.21 s / 6 GiB | contract/merge overlap only | Does not emit DB core, index-manager, or enrichment-runtime implementations |
+| Serverless alone | 107.36 s / 3 GiB | 1,663,456 B | Primarily aggregation/algebraic local-query code |
+| Standalone + Lite alone | 229.06 s / 6 GiB | 8,191,824 B | Emits essentially the entire physical DB/index/LSM implementation |
+
+These probes used fresh local caches and the same populated global dependency
+cache; their role is root attribution, not a replacement for the cold timing
+gate. They prove that moving standalone/Lite source roots is not an opaque
+boundary: `standalone/runtime_root.zig` still imports physical DB, Lite, LSM,
+erased-backend, and maintenance implementations directly. Serverless is itself
+a local-query implementation and belongs with the kernel rather than in the
+control unit.
+
+Decision: **revise; do not accept the composition relocation as the ownership
+boundary**. Keep it only as opt-in scaffolding for the next slice. Put
+serverless local execution back in the kernel, retain data/metadata/HA/API as
+the already-small control island, and migrate standalone/Lite physical state
+to coarse opaque kernel handles before measuring the combined topology again.
+The experimental per-source sections stay enabled so CI can reject source-only
+relocations using emitted overlap rather than lexical reachability. The next
+candidate must eliminate the DB core, index manager, local query, enrichment,
+and LSM modules from the standalone/control object; a faster wall clock alone
+is insufficient.
 
 Artifact validation found one stripped static ARM64 executable, a 16,682,104 B
 `libantfly.so`, and one 36,705,768 B storage archive reused by both product
@@ -2972,6 +3010,169 @@ production/default decision remains **revise/pending** while compiler reports
 identify the next coarse slice and repeated cold builds prove the result. Do
 not enable the option by default, merge it, lower memory claims, or increase
 runner cost.
+
+### Phase 4m: coarse aggregation execution and lossless failure ABI
+
+The first accepted post-cut operation moves complete aggregation folding into
+the storage kernel. Distributed control still parses and merges the query, but
+passes the aggregation request, one borrowed descriptor array for all merged
+hit bodies, and a small JSON context through a single synchronous call. The
+result remains JSON because it is comparatively small and already matches the
+public response model. Document bodies are not copied into an intermediate
+JSON request and no per-hit or storage-engine callback crosses the boundary.
+
+The ABI status enum is part of the operation contract, not merely an
+ok/failure flag. Expected failures retain stable identities including
+`InvalidAggregation`, `UnsupportedAggregation`, candidate-budget exhaustion,
+invalid index configuration, algebraic planner/bucket limits, and malformed
+algebraic tensor expressions/rows. `internal` is reserved for unexpected
+defects. A linked owner test exercises a successful terms fold over borrowed
+hits and proves that invalid and unsupported aggregation errors make a full
+provider/client round trip without collapsing to a generic storage failure.
+
+ABI version 28 generalizes that rule across every compiled storage boundary.
+`storage/kernel_error_identity.zig` is the single bidirectional registry used
+by providers, clients, callback adapters, the data-Raft apply client, and the
+low-volume system-store adapter. A status is a stable semantic identity, not a
+severity class: for example `LsmRootWriterAlreadyOpen`, `WouldBlock`, and
+`StorageBusy`; `Canceled`, `Cancelled`, and `SnapshotBuildCancelled`; the four
+backup-integrity failures; and every expected metadata-apply validation or
+snapshot failure remain distinguishable. The registry has uniqueness,
+round-trip, and status-enum exhaustiveness tests: adding an ABI status without
+its inverse error mapping fails the owner suite. A provider error absent from
+the registry is an unexpected defect and is the only case converted to
+`internal` / `StorageKernelFailure`.
+
+New coarse operations must add their expected error vocabulary to this
+registry before exposing an ABI entry point, then test at least one real
+provider/client failure round trip. Protocol directives may still use a small
+intentional status vocabulary (for example an admission callback), but that
+normalization belongs to the protocol definition and must not be reused as a
+generic error mapper.
+
+The candidate passed 78 opaque-owner tests, 6 provisioned-source tests, 13
+cross-archive data-runtime tests, 43 standalone tests, and 10 CAPI tests with
+zero leaks. A populated-dependency ARM64 Linux musl `ReleaseFast` build then
+completed all 34 steps with normal concurrency:
+
+| Unit or artifact | Result |
+|---|---:|
+| Storage kernel | 4 m / 4 GiB MaxRSS |
+| Distributed/API control | 3 m / 3 GiB MaxRSS |
+| Inference | 3 m / 5 GiB MaxRSS |
+| Remote CLI | 32 s / 818 MiB MaxRSS |
+| Static stripped executable | 60,434,856 B |
+| `libantfly.so` | 16,612,744 B |
+
+The emitted-object comparison is the acceptance signal:
+
+| Metric | Before | Aggregation boundary | Change |
+|---|---:|---:|---:|
+| Storage/distributed duplicate text | 3,237,340 B | 2,281,040 B | -956,300 B (-29.5%) |
+| Distributed object | 29,236,520 B | 27,513,016 B | -1,723,504 B |
+| Storage object | 30,495,232 B | 30,570,064 B | +74,832 B |
+| `storage.db.algebraic.index` duplicate text | 376,068 B | 1,252 B | -374,816 B |
+
+`storage.db.aggregations` disappears from meaningful overlap. The tiny
+remaining algebraic-index attribution consists of shared contract helpers,
+not another physical index implementation. This is therefore a **keep**: it
+removes real LLVM work, keeps both changed critical units under 380 seconds on
+the local comparison, preserves artifact shape, and avoids a fine-grained ABI.
+The next measured duplicate is `api.query_contract` at 258,480 text bytes,
+followed by the LSM/runtime family.
+
+A follow-up control-only native-storage-pool selector was **rejected**. It
+replaced the descriptor pool embedded in the generic background executor while
+retaining the same scheduler behavior. All native suites and the full ARM64
+build passed, but duplicate text changed only from 2,281,040 B to 2,280,284 B
+and distributed shrank just 1,464 B. The LSM runtime, compaction, and recovery
+modules remained unchanged because other active control paths still instantiate
+that family. The selector was reverted rather than retaining an abstraction
+that did not remove LLVM work.
+
+### Phase 4n: metadata apply ownership and replica-root reconciliation
+
+The next ownership slice removes the metadata control runtime's physical
+Raft-apply store. A storage-free client now opens one opaque metadata-store
+handle and crosses the compiled boundary only for complete committed batches,
+snapshots, and bounded projection envelopes. Transactions, cursors, backend
+records, snapshot construction, and projection scans remain entirely in the
+storage kernel. Projection and committed-key listeners cross through small
+reverse callback records; they do not expose a storage handle.
+
+The metadata runtime also needs to reconcile the metadata replica root during
+startup. That path is one coarse operation rather than a table-by-table ABI:
+control sends one JSON envelope containing the hosted group IDs and the
+already-owned table/range snapshots, and the storage owner returns a fixed
+summary. This restores normal production startup behavior while keeping the
+provisioner and its physical DB graph out of distributed control. The request
+is intentionally low-frequency control-plane JSON; it is not a precedent for
+per-record storage calls.
+
+Two contract files keep type identity without restoring the implementation
+graph. `raft_apply_contract.zig` owns only applied-batch and listener records;
+`provision_contract.zig` owns the reconciliation summary. Both the concrete
+owner and opaque client alias those declarations. In particular, the client
+must not import the 10,000-line concrete apply-store merely to reproduce a Zig
+type.
+
+Failure identity is symmetric across this boundary. Every forward provider
+result and every failure-bearing reverse callback uses the shared ABI-28
+registry. Distinct admission and lifecycle results such as `WouldBlock`,
+`StorageBusy`, `ResourceBudgetExceeded`, `Canceled`, and `Cancelled` are not
+normalized into one callback failure. Real provider/client tests verify exact
+round trips for `InvalidMetadataSnapshot` and
+`AppliedSnapshotIndexMismatch`; the earlier aggregation tests continue to
+cover `InvalidAggregation` and `UnsupportedAggregation`. The audit also removed
+an older lossy hop through the small public-CAPI error enum from the internal
+query, batch, and replicated-batch entry points. Their full query/batch/native
+format error vocabulary is now registered, and real malformed operations
+round-trip as `InvalidQueryRequest` and `InvalidBatchRequest`. Notifications
+whose callback signatures cannot fail remain deliberately status-free.
+
+Native validation passed with zero leaks:
+
+- 88 opaque-owner tests, including the status-registry exhaustiveness canary;
+- 6 provisioned-source tests;
+- 13 cross-archive data-runtime tests;
+- 5 focused metadata-runtime restart/projection tests using the normal local
+  replica-root hook;
+- all 393 default metadata tests across the reconciler, apply store, planner,
+  service, provisioner, replication, state, and runtime shards;
+- 43 standalone runtime tests and 11 CAPI tests, including a reverse-callback
+  identity test;
+- all 15 analyzer tests; and
+- the runtime, codegen, and API boundary gates.
+
+A fresh Apple-Silicon cross-build to ARM64 Linux musl `ReleaseFast`, with new
+local and global caches and normal concurrency, completed without `bad_alloc`
+or OOM. It took 445.84 seconds locally; this Darwin cross-build is useful for
+artifact and reliability evidence but is not comparable to the normal Linux
+runner performance gate. The final lossless query/batch status adjustment was
+then rebuilt from that populated cache; the artifact sizes below are final,
+while a normal-runner cold build remains the authoritative timing check.
+
+| Metric | Phase 4m | Metadata boundary | Change |
+|---|---:|---:|---:|
+| Distributed object | 27,513,016 B | 27,172,752 B | -340,264 B |
+| Storage object | 30,570,064 B | 31,255,000 B | +684,936 B |
+| Conservative storage/distributed duplicate text | 2,281,040 B | 2,309,244 B | +28,204 B (+1.2%) |
+| Static stripped executable | 60,434,856 B | 60,663,400 B | +228,544 B (+0.4%) |
+| `libantfly.so` | 16,612,744 B | 16,614,968 B | +2,224 B (+0.01%) |
+
+The overlap increase is dominated by shared wire/contract attribution; the
+distributed object still loses physical metadata work. Production objects
+contain no `storage.lmdb` or `mdb_*` sections. The executable retains legacy
+LMDB configuration/metric strings for compatibility, which is not evidence
+that the LMDB engine is linked.
+
+Decision: **keep this slice behind the opt-in experiment, pending normal-runner
+measurement**. It makes metadata storage ownership real and reduces the
+distributed unit, but it is not independently an accepted performance win:
+the storage unit grows, and storage is currently the longer compiler unit. A
+normal-runner cold build must show that the critical path remains within the
+gate. If it regresses materially, revise the serialization/provider shape or
+revert this slice rather than enabling it by architectural preference alone.
 
 ## Holistic target architecture
 
@@ -3047,6 +3248,12 @@ before becoming the production architecture:
 - Results allocated by the kernel are destroyed by the kernel.
 - Status values use explicit enums or tagged result structures, not exported
   arbitrary Zig error sets.
+- Each expected failure has one stable status identity in the shared
+  bidirectional registry. Do not merge distinct failures into `busy`,
+  `cancelled`, `invalid_argument`, or `internal` merely to shorten an adapter.
+- `internal` is reserved for defects not declared by the operation contract;
+  provider/client tests must prove representative declared errors round trip
+  with their original Zig error identity.
 - Calls represent complete operations: one group query, one batch, one
   transaction phase, one restore publication, or one maintenance request.
 - Do not cross the ABI per document, posting, edge, LMDB operation, or vector
