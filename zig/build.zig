@@ -4541,6 +4541,7 @@ pub fn build(b: *std.Build) void {
         "distributed join applies auth row filter to right table filter query",
         "distributed join preserves native public filters when adding join predicates",
         "scan request errors map to stable client responses",
+        "httpx antfly reads map missing table errors to not found",
         "httpx antfly scan honors optional body and documented bad requests",
         "httpx multi batch route uses the batch commit hook and public response contract",
         "httpx stable transaction commit durably hands off recovery before acknowledgement",
