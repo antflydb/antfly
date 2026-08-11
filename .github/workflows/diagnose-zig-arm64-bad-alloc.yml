@@ -59,14 +59,16 @@ jobs:
           mkdir -p \
             "$RUNNER_TEMP/linked-runtime" \
             "$RUNNER_TEMP/linked-runtime-cache/local" \
-            "$RUNNER_TEMP/linked-runtime-cache/global"
+            "$RUNNER_TEMP/linked-runtime-cache/global" \
+            "$RUNNER_TEMP/linked-runtime-reports"
           # Keep 4000Mi of the ARC pod's 24000Mi request outside Zig's
           # scheduling budget. Step max_rss values are scheduling claims, not
           # a complete accounting of build-runner state and page cache. Claims
-          # admit the 11GiB distributed-control consumer and 8GiB PIC storage
-          # kernel as the initial 19GiB group. When distributed finishes,
-          # inference and the remote CLI can overlap the storage tail in another
-          # 19GiB group. Explicit build dependencies keep Zig's randomized
+          # admit the measured 9GiB distributed-control consumer and 10.25GiB
+          # PIC storage kernel as the initial 19.25GiB group. This fits the
+          # unchanged 20,000MiB cap. When distributed finishes, inference can
+          # overlap the storage tail; the remote CLI starts as soon as another
+          # 3GiB claim fits. Explicit build dependencies keep Zig's randomized
           # traversal from admitting either downstream unit ahead of the two
           # critical units. The pod reserve covers runner state, linker work,
           # page cache, and measurement drift.
@@ -89,7 +91,115 @@ jobs:
             --global-cache-dir "$RUNNER_TEMP/linked-runtime-cache/global" \
             --maxrss 20971520000 \
             --summary all \
-            2>&1 | tee "$RUNNER_TEMP/linked-runtime.log"
+            --time-report \
+            --webui=127.0.0.1:19125 \
+            >"$RUNNER_TEMP/linked-runtime.log" 2>&1 &
+          build_pid=$!
+
+          stop_webui_build() {
+            if ! kill -0 "$build_pid" 2>/dev/null; then
+              wait "$build_pid" || true
+              return
+            fi
+            # GNU time, the Zig launcher, and Zig's generated build runner form
+            # a short parent/child chain. --time-report intentionally leaves
+            # the deepest build-runner process waiting in the WebUI after the
+            # summary. Interrupt that idle process; its parents then reap it
+            # and GNU time writes the complete resource report.
+            webui_pid="$build_pid"
+            while true; do
+              child_pid="$(pgrep -P "$webui_pid" | head -n 1 || true)"
+              if [ -z "$child_pid" ]; then break; fi
+              webui_pid="$child_pid"
+            done
+            kill -INT "$webui_pid" 2>/dev/null || true
+            for _ in $(seq 1 30); do
+              if ! kill -0 "$build_pid" 2>/dev/null; then break; fi
+              sleep 1
+            done
+            if kill -0 "$build_pid" 2>/dev/null; then
+              kill -TERM "$webui_pid" 2>/dev/null || true
+              kill -TERM "$build_pid" 2>/dev/null || true
+            fi
+            wait "$build_pid" || true
+          }
+
+          webui_ready=false
+          for _ in $(seq 1 120); do
+            if ! kill -0 "$build_pid" 2>/dev/null; then break; fi
+            if curl --silent --fail http://127.0.0.1:19125/ >/dev/null; then
+              webui_ready=true
+              break
+            fi
+            sleep 1
+          done
+          if [ "$webui_ready" != true ]; then
+            stop_webui_build
+            cat "$RUNNER_TEMP/linked-runtime.log"
+            echo "Zig time-report web UI did not become ready" >&2
+            exit 1
+          fi
+
+          node tools/capture_zig_time_report.mjs \
+            ws://127.0.0.1:19125/ antfly-storage-kernel \
+            "$RUNNER_TEMP/linked-runtime-reports/storage.json" 30 &
+          storage_report_pid=$!
+          node tools/capture_zig_time_report.mjs \
+            ws://127.0.0.1:19125/ antfly-runtime-distributed \
+            "$RUNNER_TEMP/linked-runtime-reports/distributed.json" 30 &
+          distributed_report_pid=$!
+          node tools/capture_zig_time_report.mjs \
+            ws://127.0.0.1:19125/ antfly-runtime-inference \
+            "$RUNNER_TEMP/linked-runtime-reports/inference.json" 30 &
+          inference_report_pid=$!
+          node tools/capture_zig_time_report.mjs \
+            ws://127.0.0.1:19125/ antfly-runtime-cli \
+            "$RUNNER_TEMP/linked-runtime-reports/cli.json" 5 &
+          cli_report_pid=$!
+
+          report_status=0
+          for report_pid in \
+            "$storage_report_pid" \
+            "$distributed_report_pid" \
+            "$inference_report_pid" \
+            "$cli_report_pid"; do
+            wait "$report_pid" || report_status=$?
+          done
+
+          # A Zig 0.16 WebUI build does not exit after completing its steps; it
+          # waits for an interactive rebuild request. The full summary is the
+          # authoritative completion marker. Allow ample time for the thin
+          # final links after the last compiler report arrives, then stop only
+          # the idle WebUI child above.
+          build_complete=false
+          for _ in $(seq 1 600); do
+            if grep -q '^Build Summary:' "$RUNNER_TEMP/linked-runtime.log"; then
+              build_complete=true
+              break
+            fi
+            if ! kill -0 "$build_pid" 2>/dev/null; then break; fi
+            sleep 1
+          done
+          stop_webui_build
+          cat "$RUNNER_TEMP/linked-runtime.log"
+
+          if [ "$report_status" -ne 0 ]; then exit "$report_status"; fi
+          if [ "$build_complete" != true ]; then
+            echo "Zig time-report build did not reach a final summary" >&2
+            exit 1
+          fi
+          if ! grep -Eq '^Build Summary: [0-9]+/[0-9]+ steps succeeded$' "$RUNNER_TEMP/linked-runtime.log"; then
+            echo "Zig time-report build summary was not successful" >&2
+            exit 1
+          fi
+
+          python3 tools/analyze_zig_import_graph.py \
+            --time-report "storage=$RUNNER_TEMP/linked-runtime-reports/storage.json" \
+            --time-report "distributed=$RUNNER_TEMP/linked-runtime-reports/distributed.json" \
+            --time-report "inference=$RUNNER_TEMP/linked-runtime-reports/inference.json" \
+            --time-report "cli=$RUNNER_TEMP/linked-runtime-reports/cli.json" \
+            --top-groups 30 \
+            --json | tee "$RUNNER_TEMP/linked-runtime-reports/summary.json"
 
       - name: Verify ARM64 release artifacts
         run: |
@@ -132,6 +242,7 @@ jobs:
             ${{ runner.temp }}/linked-runtime
             ${{ runner.temp }}/linked-runtime.log
             ${{ runner.temp }}/linked-runtime.time
+            ${{ runner.temp }}/linked-runtime-reports
             ${{ runner.temp }}/linked-runtime.elf-header
             ${{ runner.temp }}/linked-runtime.size
             ${{ runner.temp }}/lite-capi.elf-header

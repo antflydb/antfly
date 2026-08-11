@@ -190,6 +190,7 @@ the same host, target, cache state, and report set.
 | Isolated local HA runtime | Application saved 5.344 s while a new HA unit cost 30.525 s and duplicated 75 files | Rejected; small role splitting increases aggregate LLVM work |
 | Experimental control-only provisioned write vtable | Application 366.523 s, 41,591 declarations, and only 703 KB less allocatable object data while adding a 216.358 s storage unit | Rejected; the vtable shell is small and direct runtime storage ownership remains |
 | Atomic control-only physical-source cut | Focused distributed control 236 s; full cold archive 509 s -> 458 s; storage 316 s / 4.03 GiB and distributed 233 s / 2.98 GiB; executable 71.79 MB -> 65.27 MB | Keep behind the experiment; production enablement remains pending repeated normal-runner proof |
+| First normal-runner physical-source cut | Storage 11 m / 10 GB, distributed 8 m / 8 GB, inference 7 m / 6 GB; complete archive 16:25.14; executable 65.27 MB; C API 16.68 MB | Reliable and structurally valid, but both critical units miss 380 s; revise using authoritative Linux time reports |
 
 The `/tmp` graph analysis was consolidated into
 `tools/analyze_zig_import_graph.py`. It reports lexical reachability, consumes
@@ -2828,7 +2829,41 @@ overlaps the tail of storage. This preserves normal parallel code generation
 without exceeding the existing claims. It is not evidence for lowering those
 claims before Linux measurements.
 
-Artifact validation found one stripped static ARM64 executable, a 16,682,120 B
+The first cold normal-runner measurement, GitHub Actions run `31437306380` at
+commit `c4bfc0742`, completed successfully on the unchanged
+`arc-antfly-publish` runner. It used the same ARM64 Linux musl `ReleaseFast`
+target, production LSM-only mode, normal compiler concurrency, 20 GB Zig
+scheduler budget, and 4 GB runner reserve:
+
+| Unit or artifact | Normal-runner result |
+|---|---:|
+| Storage kernel | 11 m, 10 GB MaxRSS |
+| Distributed/API control | 8 m, 8 GB MaxRSS |
+| Inference | 7 m, 6 GB MaxRSS |
+| Remote CLI | 1 m, 1 GB MaxRSS |
+| Thin final link | 12 s, 417 MB MaxRSS |
+| Complete archive build | 16:25.14, 9,811,980 KiB process-tree peak RSS |
+| Swap | zero |
+| Static stripped executable | 65,273,088 B |
+| `libantfly.so` | 16,682,104 B |
+
+This proves that the source-selected architecture avoids the original
+`bad_alloc` and preserves the artifact gates on the normal runner. It also
+invalidates the local timing acceptance: storage and distributed both exceed
+380 seconds, so the experiment is not ready to become the production default.
+The storage compiler actually peaked at 10,047,467,520 bytes, exceeding its
+provisional 8 GiB scheduling claim. Zig discarded and retried that completed
+step. The claim is therefore corrected to 10.25 GiB, about 9.5% above the
+measurement, while distributed is reduced from 11 GiB to 9 GiB using its
+measured 8 GB peak. Their 19.25 GiB initial group fits the unchanged 20,000 MiB
+scheduler budget; neither runner size nor CI cost is increased.
+
+The next normal-runner pass captures the authoritative Zig time report for
+all four compiler units and uploads their cross-unit overlap summary. That
+evidence, rather than the much faster local-host ratios, determines the next
+coarse ownership slice.
+
+Artifact validation found one stripped static ARM64 executable, a 16,682,104 B
 `libantfly.so`, and one 36,705,768 B storage archive reused by both product
 links. The storage archive contains no native `mdb_*`, `lmdb_backend`, or
 `backend_lmdb` symbol. The C API dynamic symbol table retains public
@@ -2854,22 +2889,24 @@ snapshot through a transient writer, rather than leaving the earlier synthetic
 placeholder. The corrected regression now asserts that authoritative source
 and also proves both physical write caches are empty afterward.
 
-Decision: **keep this increment behind the opt-in experiment**. It is the first
-candidate that makes the ownership architecture materially true and meets both
-local per-unit time gates while shrinking total wall time and artifacts. The
-production/default decision remains **revise/pending** until repeated cold
-builds on the normal Linux runner confirm reliability, time, RSS, symbols, and
-behavior. Do not enable the option by default, merge it, lower memory claims,
-or increase runner cost from this local result alone.
+Decision: **keep this increment behind the opt-in experiment and revise its
+unit composition**. It is the first candidate that makes the ownership
+architecture materially true, avoids `bad_alloc`, and shrinks the executable,
+but the authoritative Linux unit times fail the performance gate. The
+production/default decision remains **revise/pending** while compiler reports
+identify the next coarse slice and repeated cold builds prove the result. Do
+not enable the option by default, merge it, lower memory claims, or increase
+runner cost.
 
 ## Holistic target architecture
 
-The current local candidate is the opt-in four-unit source-selected topology
-above. Unlike the rejected source-only coalescing probes, it gives the
-distributed/API unit only control sources and gives the storage unit the one
-physical implementation. Both units are below the preferred 350-second local
-gate. It is not yet the production baseline because the normal Linux runner has
-not repeated the cold result.
+The current candidate is the opt-in four-unit source-selected topology above.
+Unlike the rejected source-only coalescing probes, it gives the distributed/API
+unit only control sources and gives the storage unit the one physical
+implementation. Both units are below the preferred 350-second local gate, but
+both exceed 380 seconds on the normal Linux runner. It is not yet the
+production baseline because the Linux time gate failed and the cold result has
+not been repeated.
 
 The reopened target is a modular monolith with one compiled physical-storage
 owner and separately compiled control consumers:
@@ -3123,10 +3160,10 @@ zig build \
 ```
 
 The atomic physical-source cut is complete in the opt-in data, metadata, HA,
-and API consumer unit, but the option remains off by default while repeated
-normal-runner proof is missing. Production must not enable it until the
-behavioral, compiler, memory, graph, artifact, and normal-runner gates above
-pass.
+and API consumer unit. One normal-runner archive has succeeded, but its storage
+and distributed units remain above the performance gate and repeated proof is
+still missing. Production must not enable it until the behavioral, compiler,
+memory, graph, artifact, and normal-runner gates above pass.
 
 Compatibility validation keeps the linked architecture but enables LMDB:
 
@@ -3176,9 +3213,14 @@ node zig/tools/capture_zig_time_report.mjs \
   ws://127.0.0.1:19125/ antfly-runtime-cli reports/cli.json 5
 ```
 
-The optional final argument is the minimum LLVM-emission duration in seconds.
+The first optional argument is the minimum LLVM-emission duration in seconds.
 It prevents an early build-script or sema-only report from being mistaken for
-the final optimized unit. The collector creates the output parent directory.
+the final optimized unit. A second optional argument bounds the wait in seconds
+and defaults to 1,200, so a missing step cannot hang CI. The collector creates
+the output parent directory. Zig 0.16 intentionally keeps a `--time-report`
+WebUI build runner alive after the final summary; after all reports and the
+successful `Build Summary` are present, interrupt that idle build-runner
+process rather than waiting for it to exit on its own.
 
 Use a new `--cache-dir` and `--global-cache-dir` for genuine cold-cache
 comparisons. Do not compare a cold candidate with a warm baseline.

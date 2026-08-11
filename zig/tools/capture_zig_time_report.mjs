@@ -25,16 +25,21 @@ const url = process.argv[2];
 const stepNeedle = process.argv[3];
 const outputPath = process.argv[4];
 const minLlvmSeconds = Number(process.argv[5] ?? "0");
+const timeoutSeconds = Number(process.argv[6] ?? "1200");
 if (!url || !stepNeedle || !outputPath) {
   throw new Error(
-    "usage: node capture_zig_time_report.mjs URL STEP_NEEDLE OUTPUT.json [MIN_LLVM_SECONDS]",
+    "usage: node capture_zig_time_report.mjs URL STEP_NEEDLE OUTPUT.json [MIN_LLVM_SECONDS] [TIMEOUT_SECONDS]",
   );
 }
 if (!Number.isFinite(minLlvmSeconds) || minLlvmSeconds < 0) {
   throw new Error("MIN_LLVM_SECONDS must be a non-negative number");
 }
+if (!Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0) {
+  throw new Error("TIMEOUT_SECONDS must be a positive number");
+}
 
 let stepNames = [];
+let captured = false;
 
 function u64(view, offset) {
   return Number(view.getBigUint64(offset, true));
@@ -137,6 +142,12 @@ function parseCompile(bytes) {
 
 const socket = new WebSocket(url);
 socket.binaryType = "arraybuffer";
+const timeout = setTimeout(() => {
+  console.error(
+    `timed out after ${timeoutSeconds}s waiting for compiler report matching ${stepNeedle}`,
+  );
+  process.exit(1);
+}, timeoutSeconds * 1000);
 socket.addEventListener("message", (event) => {
   const bytes = new Uint8Array(event.data);
   if (bytes[0] === 0) {
@@ -147,6 +158,8 @@ socket.addEventListener("message", (event) => {
   const report = parseCompile(bytes);
   if (!report.step_name.includes(stepNeedle)) return;
   if (report.stats.real_ns_llvm_emit < minLlvmSeconds * 1e9) return;
+  captured = true;
+  clearTimeout(timeout);
   mkdirSync(dirname(outputPath), { recursive: true });
   writeFileSync(outputPath, `${JSON.stringify(report, null, 2)}\n`);
   console.log(`captured ${report.step_name} to ${outputPath}`);
@@ -157,6 +170,16 @@ socket.addEventListener("message", (event) => {
   // of leaving CI and local measurement sessions attached indefinitely.
   process.exit(0);
 });
-socket.addEventListener("error", () => {
-  process.exitCode = 1;
+socket.addEventListener("error", (event) => {
+  console.error(`failed to capture compiler report matching ${stepNeedle}`, event);
+  process.exit(1);
+});
+socket.addEventListener("close", () => {
+  clearTimeout(timeout);
+  if (!captured) {
+    console.error(
+      `compiler report stream closed before a report matching ${stepNeedle} was captured`,
+    );
+    process.exitCode = 1;
+  }
 });
