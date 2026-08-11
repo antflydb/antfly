@@ -318,7 +318,7 @@ func TestE2E_ClusterBackupRestore(t *testing.T) {
 		BackupID: backupID, Location: location, Connection: "e2e-backups", RestoreMode: "fail_if_exists",
 	})
 	require.NoError(t, err, "Failed to restore from cluster backup")
-	t.Logf("Cluster restore triggered with status: %s", restoreResult.Status)
+	t.Logf("Cluster restore job %s accepted in phase %s", restoreResult.JobId, restoreResult.Phase)
 
 	// Step 9: Wait for tables to be ready
 	t.Log("Waiting for tables to be ready after restore...")

@@ -57,6 +57,9 @@ pub const SyncConfig = struct {
     /// Optional durable source-side acknowledgement used by distributed
     /// handoff, where the source leader need not host a destination replica.
     progress_db: ?*db_mod.DB = null,
+    /// Optional lease that keeps source writes and topology transition work
+    /// mutually exclusive for the lifetime of one transition action.
+    source_lease: ?BorrowedDestinationDb = null,
     dest_lease: ?BorrowedDestinationDb = null,
 };
 
@@ -153,6 +156,7 @@ pub const MergeConfig = struct {
     donor_store: ?*data_store.RaftApplyStore = null,
     receiver: DestinationConfig = .{ .root_dir = "" },
     receiver_db: ?*db_mod.DB = null,
+    donor_lease: ?BorrowedDestinationDb = null,
     receiver_lease: ?BorrowedDestinationDb = null,
     receiver_identity_reassignment_namespace: ?doc_identity.Namespace = null,
 };
@@ -500,10 +504,18 @@ pub const SyncCoordinator = struct {
     source: *data_store.RaftApplyStore,
     source_owned: bool,
     source_open: bool,
+    source_lease: ?BorrowedDestinationDb,
     dest: Destination,
     dest_open: bool,
 
     pub fn init(alloc: std.mem.Allocator, cfg: SyncConfig) !SyncCoordinator {
+        // Leases are consumed by init on both success and failure. Keep local
+        // ownership until each lease is transferred into its final owner.
+        var source_lease = cfg.source_lease;
+        errdefer if (source_lease) |lease| lease.release();
+        var dest_lease = cfg.dest_lease;
+        errdefer if (dest_lease) |lease| lease.release();
+
         const source_root_dir = try alloc.dupe(u8, cfg.source_root_dir);
         var source_root_dir_owned = true;
         errdefer if (source_root_dir_owned) alloc.free(source_root_dir);
@@ -534,12 +546,15 @@ pub const SyncCoordinator = struct {
         defer if (source_state) |state| shard_state_store.freeSplitState(alloc, state);
         if (source_state) |state| try validateActiveSplitDestination(state, cfg.transition_id, cfg.attempt_epoch, cfg.dest_group_id);
 
-        var dest = if (cfg.dest_lease) |lease|
+        var dest = if (dest_lease) |lease|
             try Destination.initBorrowed(alloc, dest_root_dir, lease)
         else
             try Destination.init(alloc, dest_cfg);
+        dest_lease = null;
         errdefer dest.deinit();
 
+        const owned_source_lease = source_lease;
+        source_lease = null;
         return .{
             .alloc = alloc,
             .transition_id = cfg.transition_id,
@@ -553,6 +568,7 @@ pub const SyncCoordinator = struct {
             .source = source,
             .source_owned = source_owned,
             .source_open = true,
+            .source_lease = owned_source_lease,
             .dest = dest,
             .dest_open = true,
         };
@@ -560,6 +576,7 @@ pub const SyncCoordinator = struct {
 
     pub fn deinit(self: *SyncCoordinator) void {
         if (self.dest_open) self.dest.deinit();
+        if (self.source_lease) |lease| lease.release();
         if (self.source_owned) {
             if (self.source_open) self.source.deinit();
             self.alloc.destroy(self.source);
@@ -860,6 +877,7 @@ pub const MergeCoordinator = struct {
     receiver_cfg: DestinationConfig,
     donor: *data_store.RaftApplyStore,
     donor_owned: bool,
+    donor_lease: ?BorrowedDestinationDb,
     receiver: Destination,
     receiver_accepts_donor_range: bool,
     receiver_base_range: db_types.ByteRange,
@@ -868,6 +886,13 @@ pub const MergeCoordinator = struct {
     receiver_identity_reassignment_namespace: ?doc_identity.Namespace,
 
     pub fn init(alloc: std.mem.Allocator, cfg: MergeConfig) !MergeCoordinator {
+        // As with split coordinators, init consumes borrowed leases on every
+        // return path so callers never need ambiguous partial-init cleanup.
+        var donor_lease = cfg.donor_lease;
+        errdefer if (donor_lease) |lease| lease.release();
+        var receiver_lease = cfg.receiver_lease;
+        errdefer if (receiver_lease) |lease| lease.release();
+
         const donor_root_dir = try alloc.dupe(u8, cfg.donor_root_dir);
         var donor_root_dir_owned = true;
         errdefer if (donor_root_dir_owned) alloc.free(donor_root_dir);
@@ -894,10 +919,11 @@ pub const MergeCoordinator = struct {
             donor.deinit();
             alloc.destroy(donor);
         };
-        var receiver = if (cfg.receiver_lease) |lease|
+        var receiver = if (receiver_lease) |lease|
             try Destination.initBorrowed(alloc, receiver_root_dir, lease)
         else
             try Destination.init(alloc, receiver_cfg);
+        receiver_lease = null;
         errdefer receiver.deinit();
 
         const persisted = try receiver.loadMergeState(alloc);
@@ -912,6 +938,8 @@ pub const MergeCoordinator = struct {
         };
         errdefer range_state.freeRange(alloc, base_range);
 
+        const owned_donor_lease = donor_lease;
+        donor_lease = null;
         return .{
             .alloc = alloc,
             .donor_root_dir = donor_root_dir,
@@ -922,6 +950,7 @@ pub const MergeCoordinator = struct {
             .receiver_cfg = receiver_cfg,
             .donor = donor,
             .donor_owned = donor_owned,
+            .donor_lease = owned_donor_lease,
             .receiver = receiver,
             .receiver_accepts_donor_range = if (persisted) |state|
                 state.phase == .accepting or state.phase == .finalized or state.phase == .rolling_back
@@ -939,6 +968,7 @@ pub const MergeCoordinator = struct {
 
     pub fn deinit(self: *MergeCoordinator) void {
         self.receiver.deinit();
+        if (self.donor_lease) |lease| lease.release();
         if (self.donor_owned) {
             self.donor.deinit();
             self.alloc.destroy(self.donor);

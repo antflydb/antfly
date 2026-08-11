@@ -29,9 +29,9 @@ Use product-area names for test files. Do not use migration labels like `*_parit
   - rejection of invalid tree-search requests without start nodes or seed hits
 - `test_transactions.py`
   - stateful public multi-shard single-table batch commit
-  - atomic multi-key balance transfer semantics
+  - multi-key balance update and conservation check
   - repeated multi-shard commit and post-commit recovery/health verification
-  - client-timeout multi-shard batch atomicity check
+  - client-timeout multi-shard batch partial-visibility check
   - stateful public atomic multi-table batch commit
   - mixed insert/delete across tables
   - abort on invalid table without partial writes

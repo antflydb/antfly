@@ -498,6 +498,22 @@ pub const AdmissionRequest = struct {
     amounts: AdmissionAmounts,
 };
 
+/// The exact transient constraint that rejected an admission. Callers that can
+/// reclaim resident resources use this to choose a victim that can actually
+/// relieve the failed budget instead of evicting by coarse byte-category
+/// overlap. Permanent `ResourceLimitExceeded` failures never report pressure.
+pub const AdmissionPressure = union(enum) {
+    shared_host,
+    shared_unified,
+    domain_host: BackendClass,
+    domain_backend: BackendClass,
+    domain_combined: BackendClass,
+    domain_kv: BackendClass,
+    domain_scratch: BackendClass,
+    external_budget,
+    live_host,
+};
+
 const backend_class_count = 2;
 
 fn backendClassIndex(backend_class: BackendClass) usize {
@@ -571,6 +587,31 @@ pub const AdmissionController = struct {
         emptyAdmissionAmountsByBackend(),
     shared_limits: SharedAdmissionLimits = .{},
     resource_budget: ?AdmissionResourceBudget = null,
+    /// Opt-in fault injection for live server regression tests. Production
+    /// callers leave this at zero, so normal admission behavior is unchanged.
+    forced_run_denials_for_testing: std.atomic.Value(usize) = .init(0),
+
+    pub fn configureForcedRunDenialsForTesting(
+        self: *AdmissionController,
+        count: usize,
+    ) void {
+        self.forced_run_denials_for_testing.store(count, .release);
+    }
+
+    pub fn consumeForcedRunDenialForTesting(
+        self: *AdmissionController,
+    ) bool {
+        var remaining = self.forced_run_denials_for_testing.load(.acquire);
+        while (remaining > 0) {
+            remaining = self.forced_run_denials_for_testing.cmpxchgWeak(
+                remaining,
+                remaining - 1,
+                .acq_rel,
+                .acquire,
+            ) orelse return true;
+        }
+        return false;
+    }
 
     pub fn configureSharedLimits(
         self: *AdmissionController,
@@ -599,13 +640,32 @@ pub const AdmissionController = struct {
         amounts: AdmissionAmounts,
         check_live_memory: bool,
     ) !AdmissionLease {
-        return self.tryAcquireRequests(
+        var ignored_pressure: ?AdmissionPressure = null;
+        return self.tryAcquireWithPressure(
+            backend_class,
+            limits,
+            amounts,
+            check_live_memory,
+            &ignored_pressure,
+        );
+    }
+
+    pub fn tryAcquireWithPressure(
+        self: *AdmissionController,
+        backend_class: BackendClass,
+        limits: Limits,
+        amounts: AdmissionAmounts,
+        check_live_memory: bool,
+        pressure: *?AdmissionPressure,
+    ) !AdmissionLease {
+        return self.tryAcquireRequestsWithPressure(
             &.{.{
                 .backend_class = backend_class,
                 .limits = limits,
                 .amounts = amounts,
             }},
             check_live_memory,
+            pressure,
         );
     }
 
@@ -618,6 +678,21 @@ pub const AdmissionController = struct {
         requests: []const AdmissionRequest,
         check_live_memory: bool,
     ) !AdmissionLease {
+        var ignored_pressure: ?AdmissionPressure = null;
+        return self.tryAcquireRequestsWithPressure(
+            requests,
+            check_live_memory,
+            &ignored_pressure,
+        );
+    }
+
+    pub fn tryAcquireRequestsWithPressure(
+        self: *AdmissionController,
+        requests: []const AdmissionRequest,
+        check_live_memory: bool,
+        pressure: *?AdmissionPressure,
+    ) !AdmissionLease {
+        pressure.* = null;
         var amounts_by_backend = emptyAdmissionAmountsByBackend();
         var limits_by_backend = [_]Limits{ .{}, .{} };
         var active_backends = [_]bool{ false, false };
@@ -662,13 +737,15 @@ pub const AdmissionController = struct {
             // CPU work and CUDA staging/cache allocations consume the same host
             // RAM. Enforce that physical domain before backend-local policies so
             // provisional cross-backend reservations cannot race past it.
-            try checkAdmissionLimit(
+            try checkAdmissionLimitWithPressure(
                 request_host,
                 next_global_host,
                 self.shared_limits.host_limit_bytes,
+                .shared_host,
+                pressure,
             );
             if (builtin.os.tag == .macos) {
-                try checkAdmissionLimit(
+                try checkAdmissionLimitWithPressure(
                     request_combined,
                     std.math.add(
                         usize,
@@ -676,6 +753,8 @@ pub const AdmissionController = struct {
                         next_global_backend,
                     ) catch return error.ResourceLimitExceeded,
                     self.shared_limits.unified_limit_bytes,
+                    .shared_unified,
+                    pressure,
                 );
             }
 
@@ -710,11 +789,42 @@ pub const AdmissionController = struct {
                 const next_scratch = domain_next.scratchTotalBytesChecked() catch
                     return error.ResourceLimitExceeded;
 
-                try checkAdmissionLimit(domain_request_host, next_host, limits.host_limit_bytes);
-                try checkAdmissionLimit(domain_request_backend, next_backend, limits.backend_limit_bytes);
-                try checkAdmissionLimit(domain_request_combined, next_combined, limits.combined_limit_bytes);
-                try checkAdmissionLimit(domain_request_kv, next_kv, limits.kv_limit_bytes);
-                try checkAdmissionLimit(domain_request_scratch, next_scratch, limits.scratch_limit_bytes);
+                const backend_class: BackendClass = @enumFromInt(index);
+                try checkAdmissionLimitWithPressure(
+                    domain_request_host,
+                    next_host,
+                    limits.host_limit_bytes,
+                    .{ .domain_host = backend_class },
+                    pressure,
+                );
+                try checkAdmissionLimitWithPressure(
+                    domain_request_backend,
+                    next_backend,
+                    limits.backend_limit_bytes,
+                    .{ .domain_backend = backend_class },
+                    pressure,
+                );
+                try checkAdmissionLimitWithPressure(
+                    domain_request_combined,
+                    next_combined,
+                    limits.combined_limit_bytes,
+                    .{ .domain_combined = backend_class },
+                    pressure,
+                );
+                try checkAdmissionLimitWithPressure(
+                    domain_request_kv,
+                    next_kv,
+                    limits.kv_limit_bytes,
+                    .{ .domain_kv = backend_class },
+                    pressure,
+                );
+                try checkAdmissionLimitWithPressure(
+                    domain_request_scratch,
+                    next_scratch,
+                    limits.scratch_limit_bytes,
+                    .{ .domain_scratch = backend_class },
+                    pressure,
+                );
                 next_by_backend[index] = domain_next;
             }
             self.admitted = next;
@@ -723,6 +833,8 @@ pub const AdmissionController = struct {
 
         if (self.resource_budget) |resource_budget| {
             resource_budget.try_reserve(resource_budget.context, amounts) catch |err| {
+                if (err == error.ResourceTemporarilyUnavailable)
+                    pressure.* = .external_budget;
                 self.releaseLocal(amounts_by_backend, amounts);
                 return err;
             };
@@ -739,6 +851,8 @@ pub const AdmissionController = struct {
                 return error.ResourceLimitExceeded;
             };
             live_reserved_bytes = self.tryReserveLiveCapacity(live_host_incremental) catch |err| {
+                if (err == error.ResourceTemporarilyUnavailable)
+                    pressure.* = .live_host;
                 self.release(amounts_by_backend, amounts);
                 return err;
             };
@@ -999,6 +1113,20 @@ fn checkAdmissionLimit(request: usize, next: usize, limit: usize) !void {
     if (limit == 0 or next <= limit) return;
     if (request > limit) return error.ResourceLimitExceeded;
     return error.ResourceTemporarilyUnavailable;
+}
+
+fn checkAdmissionLimitWithPressure(
+    request: usize,
+    next: usize,
+    limit: usize,
+    rejected_pressure: AdmissionPressure,
+    pressure: *?AdmissionPressure,
+) !void {
+    checkAdmissionLimit(request, next, limit) catch |err| {
+        if (err == error.ResourceTemporarilyUnavailable)
+            pressure.* = rejected_pressure;
+        return err;
+    };
 }
 
 fn checkLiveHostMemory(incremental_bytes: usize) !void {
@@ -2344,6 +2472,56 @@ test "shared admission accounts for concurrent leases and releases capacity" {
     var second = try controller.tryAcquire(.cpu, limits, .{ .host_kv_bytes = 50 }, false);
     defer second.release();
     try std.testing.expectEqual(@as(usize, 50), controller.snapshot().hostTotalBytes());
+}
+
+test "admission reports the exact transient pressure domain" {
+    var controller = AdmissionController{};
+    var scratch_lease = try controller.tryAcquire(
+        .cpu,
+        .{ .scratch_limit_bytes = 100 },
+        .{ .host_scratch_bytes = 70 },
+        false,
+    );
+    defer scratch_lease.release();
+
+    var pressure: ?AdmissionPressure = null;
+    try std.testing.expectError(
+        error.ResourceTemporarilyUnavailable,
+        controller.tryAcquireWithPressure(
+            .cpu,
+            .{ .scratch_limit_bytes = 100 },
+            .{ .host_scratch_bytes = 40 },
+            false,
+            &pressure,
+        ),
+    );
+    switch (pressure orelse return error.TestExpectedAdmissionPressure) {
+        .domain_scratch => |backend_class| try std.testing.expectEqual(BackendClass.cpu, backend_class),
+        else => return error.TestUnexpectedAdmissionPressure,
+    }
+
+    scratch_lease.release();
+    var backend_lease = try controller.tryAcquire(
+        .gpu,
+        .{ .backend_limit_bytes = 100 },
+        .{ .backend_weight_bytes = 70 },
+        false,
+    );
+    defer backend_lease.release();
+    try std.testing.expectError(
+        error.ResourceTemporarilyUnavailable,
+        controller.tryAcquireWithPressure(
+            .gpu,
+            .{ .backend_limit_bytes = 100 },
+            .{ .backend_weight_bytes = 40 },
+            false,
+            &pressure,
+        ),
+    );
+    switch (pressure orelse return error.TestExpectedAdmissionPressure) {
+        .domain_backend => |backend_class| try std.testing.expectEqual(BackendClass.gpu, backend_class),
+        else => return error.TestUnexpectedAdmissionPressure,
+    }
 }
 
 test "cpu and gpu admission enforce independent policy domains" {

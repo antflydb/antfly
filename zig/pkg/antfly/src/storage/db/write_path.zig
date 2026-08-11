@@ -303,6 +303,13 @@ pub const DocumentArtifactChildRangeDispatcher = struct {
     }
 };
 
+pub const TransactionResolution = struct {
+    txn_id: transactions_mod.TxnId,
+    status: transactions_mod.TxnStatus,
+    commit_version: u64,
+    expected_intent_revision: u64,
+};
+
 pub const BatchExecutionOptions = struct {
     validate_range_ownership: bool = true,
     store_batch_options: backend_types.BatchOptions = .{},
@@ -315,6 +322,7 @@ pub const BatchExecutionOptions = struct {
     bypass_ha_write_gate: bool = false,
     ha_applied_lsn_marker: ?u64 = null,
     suppress_derived_replay_append: bool = false,
+    transaction_resolution: ?TransactionResolution = null,
 };
 
 pub fn logBatchProfile(req: types.BatchRequest, profile: BatchProfile) void {
@@ -8122,7 +8130,7 @@ fn computeAssetRequestDerived(
     else
         null;
     defer if (state_value) |value| alloc.free(value);
-    if (state_key != null and state_value != null) {
+    if (!force_reprocess and state_key != null and state_value != null) {
         const existing_state = try db.core.getStoreValue(alloc, state_key.?);
         defer if (existing_state) |value| alloc.free(value);
         if (existing_state != null and std.mem.eql(u8, existing_state.?, state_value.?)) {
@@ -9981,11 +9989,8 @@ pub fn Impl(comptime DB: type) type {
         ) anyerror!bool {
             var cfg = (try self.getEnrichment(alloc, .asset, artifact_name)) orelse return false;
             defer cfg.deinit(alloc);
-            var producer_cfg = try asset_producer_mod.parseProducerConfig(alloc, cfg.producer_json);
-            defer producer_cfg.deinit(alloc);
-            if (producer_cfg.type != .document_extraction) return error.InvalidArgument;
 
-            const value = try self.get(alloc, doc_key) orelse return false;
+            const value = try self.get(alloc, doc_key) orelse return error.NotFound;
             defer alloc.free(value);
 
             const state_key = try assetStateKeyAlloc(alloc, doc_key, artifact_name);
@@ -10017,9 +10022,6 @@ pub fn Impl(comptime DB: type) type {
         ) anyerror!types.DocumentArtifactTableReprocessResult {
             var cfg = (try self.getEnrichment(alloc, .asset, artifact_name)) orelse return error.NotFound;
             defer cfg.deinit(alloc);
-            var producer_cfg = try asset_producer_mod.parseProducerConfig(alloc, cfg.producer_json);
-            defer producer_cfg.deinit(alloc);
-            if (producer_cfg.type != .document_extraction) return error.InvalidArgument;
 
             var effective_req = req;
             if (req.shard_cursors.len > 0) {
@@ -10714,6 +10716,26 @@ pub fn Impl(comptime DB: type) type {
             var apply_mutex_held = true;
             errdefer if (apply_mutex_held) self.core.unlockApply();
 
+            if (opts.transaction_resolution) |resolution| {
+                const intent_snapshot = try self.core.validateTransactionIntentSnapshot(
+                    resolution.txn_id,
+                    resolution.expected_intent_revision,
+                );
+                if (!intent_snapshot.has_intents) {
+                    const outcome = try self.core.resolveTransactionIntentsWithExtraBatch(
+                        resolution.txn_id,
+                        resolution.status,
+                        resolution.commit_version,
+                        .{ .expected_intent_revision = resolution.expected_intent_revision },
+                    );
+                    self.core.unlockApply();
+                    apply_mutex_held = false;
+                    if (!opts.bypass_ha_write_gate) try DB.WritePathCallbacks.flush_transaction_ha_outbox(self, resolution.txn_id);
+                    try DB.WritePathCallbacks.wait_for_resolved_transaction_sync(self, req.sync_level, outcome.replay_sequence);
+                    return;
+                }
+            }
+
             if (self.bulk_ingest_coalescer.active and !self.flushing_bulk_ingest_coalescer) {
                 if (self.bulk_ingest_coalescer.hasPending()) {
                     self.core.unlockApply();
@@ -10763,6 +10785,10 @@ pub fn Impl(comptime DB: type) type {
                 .write_mode = req.write_mode,
             };
             if (profile) |active_profile| DB.WritePathCallbacks.record_profile_ns(profile, &active_profile.merge_effective_req_ns, merge_effective_req_start_ns);
+
+            if (opts.transaction_resolution == null) {
+                try self.core.checkOrdinaryWriteConflicts(effective_ops.writes, effective_ops.deletes);
+            }
 
             try enforceRelationalForegroundBatchWriteGate(self, effective_req);
 
@@ -11542,6 +11568,29 @@ pub fn Impl(comptime DB: type) type {
             );
             try store_writes.appendSlice(self.alloc, opts.extra_store_writes);
             try delete_keys.appendSlice(self.alloc, identity_visibility_deletes.items);
+
+            var transaction_ha_batch_payload: ?[]const u8 = null;
+            var transaction_ha_replay_payload: ?[]const u8 = null;
+            if (opts.transaction_resolution) |resolution| if (!opts.bypass_ha_write_gate) {
+                if (self.ha_async_batch_mirror) |mirror| if (DB.WritePathCallbacks.ha_mirror_sync_enabled(mirror)) {
+                    const payload = try DB.WritePathCallbacks.encode_batch_mutation_request_alloc(self.alloc, effective_req);
+                    try owned_store_values.append(self.alloc, payload);
+                    const key_array = transactions_mod.makeTransactionHABatchOutboxKey(resolution.txn_id);
+                    const key = try self.alloc.dupe(u8, &key_array);
+                    try owned_store_keys.append(self.alloc, key);
+                    try store_writes.append(self.alloc, .{ .key = key, .value = payload });
+                    transaction_ha_batch_payload = payload;
+                };
+                if (self.ha_async_effect_mirror) |mirror| if (DB.WritePathCallbacks.ha_mirror_sync_enabled(mirror)) {
+                    const payload = try self.alloc.dupe(u8, replay_payload);
+                    try owned_store_values.append(self.alloc, payload);
+                    const key_array = transactions_mod.makeTransactionHAReplayOutboxKey(resolution.txn_id);
+                    const key = try self.alloc.dupe(u8, &key_array);
+                    try owned_store_keys.append(self.alloc, key);
+                    try store_writes.append(self.alloc, .{ .key = key, .value = payload });
+                    transaction_ha_replay_payload = payload;
+                };
+            };
             const replay_append: ?docstore_mod.DocStore.ReplayAppend = if (opts.suppress_derived_replay_append)
                 null
             else
@@ -11549,13 +11598,38 @@ pub fn Impl(comptime DB: type) type {
                     .sequence = sequence,
                     .payload = replay_payload,
                 };
-            try self.core.store.putBatchWithReplayWithOptions(
-                self.backend_runtime.io(),
-                store_writes.items,
-                delete_keys.items,
-                replay_append,
-                store_batch_options,
-            );
+            const transaction_applied = if (opts.transaction_resolution) |resolution| blk: {
+                const outcome = try self.core.resolveTransactionIntentsWithExtraBatch(
+                    resolution.txn_id,
+                    resolution.status,
+                    resolution.commit_version,
+                    .{
+                        .writes = store_writes.items,
+                        .deletes = delete_keys.items,
+                        .replay = if (replay_append) |entry| .{ .sequence = entry.sequence, .payload = entry.payload } else null,
+                        .expected_intent_revision = resolution.expected_intent_revision,
+                    },
+                );
+                if (outcome.applied) {
+                    if (replay_append) |entry| self.core.store.observeExternalReplayCommit(entry.sequence);
+                }
+                break :blk outcome;
+            } else blk: {
+                try self.core.store.putBatchWithReplayWithOptions(
+                    self.backend_runtime.io(),
+                    store_writes.items,
+                    delete_keys.items,
+                    replay_append,
+                    store_batch_options,
+                );
+                break :blk transactions_mod.ResolutionOutcome{ .applied = true, .replay_sequence = sequence };
+            };
+            if (!transaction_applied.applied) {
+                self.core.unlockApply();
+                apply_mutex_held = false;
+                try DB.WritePathCallbacks.wait_for_resolved_transaction_sync(self, effective_req.sync_level, transaction_applied.replay_sequence);
+                return;
+            }
             if (persisted_range != null) {
                 self.core.adoptPersistedRangeOwned(
                     persisted_range_start_owned.?,
@@ -11565,8 +11639,14 @@ pub fn Impl(comptime DB: type) type {
                 persisted_range_end_owned = null;
             }
             if (!opts.bypass_ha_write_gate) {
-                try DB.WritePathCallbacks.mirror_ha_batch_mutation_commit(self, effective_req);
-                try DB.WritePathCallbacks.mirror_ha_replay_payload_commit(self, replay_payload);
+                if (transaction_ha_batch_payload) |payload| {
+                    try DB.WritePathCallbacks.mirror_ha_encoded_batch_mutation_commit(self, payload);
+                    try self.core.clearTransactionHAOutbox(opts.transaction_resolution.?.txn_id, .batch);
+                } else try DB.WritePathCallbacks.mirror_ha_batch_mutation_commit(self, effective_req);
+                if (transaction_ha_replay_payload) |payload| {
+                    try DB.WritePathCallbacks.mirror_ha_replay_payload_commit(self, payload);
+                    try self.core.clearTransactionHAOutbox(opts.transaction_resolution.?.txn_id, .replay);
+                } else try DB.WritePathCallbacks.mirror_ha_replay_payload_commit(self, replay_payload);
             }
             if (pending_identity_visibility_summary) |summary| {
                 self.identity_visibility_summary_cache = summary;

@@ -359,6 +359,7 @@ pub fn collectGraphMutationsForArtifacts(
                             null,
                             options.repair.sequence,
                             .corrupt_artifact,
+                            options.repair.issue_mutex,
                         );
                         return error.ArtifactRepairRequired;
                     }
@@ -398,6 +399,7 @@ pub fn collectGraphMutationsForArtifacts(
 pub const GraphReplayRepairOptions = struct {
     enabled: bool = false,
     sequence: u64 = 0,
+    issue_mutex: ?*std.atomic.Mutex = null,
 };
 
 pub fn graphArtifactSourceConsumesRef(
@@ -638,7 +640,16 @@ pub fn materializeGraphSourceArtifactsForIndex(
                 error.OutOfMemory => return err,
                 else => {
                     if (options.repair.enabled) {
-                        try artifact_repair.recordArtifactRepairIssueForRefReplay(alloc, store, index_name, artifact_ref, artifact_key, options.repair.sequence, .corrupt_artifact);
+                        try artifact_repair.recordArtifactRepairIssueForRefReplay(
+                            alloc,
+                            store,
+                            index_name,
+                            artifact_ref,
+                            artifact_key,
+                            options.repair.sequence,
+                            .corrupt_artifact,
+                            options.repair.issue_mutex,
+                        );
                         return error.ArtifactRepairRequired;
                     }
                     return err;

@@ -114,22 +114,27 @@ pub fn graphHydrateSearchRequest(req: distributed_graph.GraphHydrateRequest) db_
     };
 }
 
-pub fn graphHydrateOnOpenDb(
-    alloc: std.mem.Allocator,
+fn prepareGraphSearchConsistency(
     reads: raft_mod.FeatureDBReads,
-    db: *db_mod.DB,
-    req: distributed_graph.GraphHydrateRequest,
+    req: db_mod.types.SearchRequest,
     consistency: raft_mod.ReadConsistency,
     fallback_to_stale_on_not_leader: bool,
-) !distributed_graph.GraphHydrateResponse {
-    const search_req = graphHydrateSearchRequest(req);
-    reads.reads.prepareSearchWithConsistency(reads.group_id, search_req, consistency) catch |err| switch (err) {
+) !void {
+    reads.reads.prepareSearchWithConsistency(reads.group_id, req, consistency) catch |err| switch (err) {
         error.NotLeader => {
             if (!fallback_to_stale_on_not_leader or consistency == .stale) return err;
-            try reads.reads.prepareSearchWithConsistency(reads.group_id, search_req, .stale);
+            try reads.reads.prepareSearchWithConsistency(reads.group_id, req, .stale);
         },
         else => return err,
     };
+}
+
+pub fn graphHydrateOnPreparedDb(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    req: distributed_graph.GraphHydrateRequest,
+    search_req: db_mod.types.SearchRequest,
+) !distributed_graph.GraphHydrateResponse {
     const hits = if (req.include_hits)
         try db.graphHydrateKeysForInternalRead(alloc, search_req, req.keys)
     else
@@ -141,14 +146,23 @@ pub fn graphHydrateOnOpenDb(
     return .{
         .hits = hits,
         .has_incoming = if (req.incoming_index_name.len > 0)
-            try db.graphHasIncomingEdgesForInternalRead(
-                alloc,
-                req.incoming_index_name,
-                req.keys,
-            )
+            try db.graphHasIncomingEdgesForInternalRead(alloc, req.incoming_index_name, req.keys)
         else
             @constCast((&[_]bool{})[0..]),
     };
+}
+
+pub fn graphHydrateOnOpenDb(
+    alloc: std.mem.Allocator,
+    reads: raft_mod.FeatureDBReads,
+    db: *db_mod.DB,
+    req: distributed_graph.GraphHydrateRequest,
+    consistency: raft_mod.ReadConsistency,
+    fallback_to_stale_on_not_leader: bool,
+) !distributed_graph.GraphHydrateResponse {
+    const search_req = graphHydrateSearchRequest(req);
+    try prepareGraphSearchConsistency(reads, search_req, consistency, fallback_to_stale_on_not_leader);
+    return try graphHydrateOnPreparedDb(alloc, db, req, search_req);
 }
 
 pub fn graphExpandWithSearch(

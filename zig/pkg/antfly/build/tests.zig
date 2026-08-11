@@ -304,6 +304,13 @@ pub const MetadataTestRun = struct {
     step: *std.Build.Step,
 };
 
+pub const metadata_production_shard_count = 7;
+
+pub const MetadataProductionTestStep = struct {
+    runs: [metadata_production_shard_count]MetadataTestRun,
+    step: *std.Build.Step,
+};
+
 pub const MetadataChaosTestSteps = struct {
     transition: *std.Build.Step,
     public: *std.Build.Step,
@@ -313,7 +320,7 @@ pub const MetadataChaosTestSteps = struct {
 };
 
 pub const MetadataTestSteps = struct {
-    root: MetadataTestRun,
+    root: MetadataProductionTestStep,
     table_workflow: MetadataTestRun,
     sim: MetadataTestRun,
     sim_core: MetadataTestRun,
@@ -706,6 +713,7 @@ pub const capi_default_filters = [_][]const u8{
 
 pub const release_scale_test_filters = [_][]const u8{
     "db dense default dynamic 0.2 percent numeric filter exact scores bounded candidates",
+    "one percent native filter routes through integrated dense search exactly",
     "db one real delete keeps filtered full text on complement path across restart",
     "db production ingest preserves high-frequency keyword recall across clean restarts",
 };
@@ -1729,6 +1737,7 @@ pub const APITestFilters = struct {
         "distributed txn coordinator routes unique constraint writes through owner ranges",
         "distributed txn coordinator routes ordered tuple unique conflicts through catalog index owners",
         "distributed txn coordinator routes unique owner handoff with row version proofs",
+        "distributed txn coordinator never restarts a transaction id on topology change",
         "distributed txn coordinator allows non-unique transforms on multi-range unique tables",
         "distributed txn coordinator allows single-range unique writes to use local enforcement",
         "distributed txn coordinator rejects non-primary foreign key parent writes without unique owner topology",
@@ -2041,7 +2050,7 @@ pub const APITestFilters = struct {
         "distributed txn coordinator externalizes deferred foreign key parent checks exactly",
         "distributed txn coordinator routes foreign key child writes through ref owners when configured",
         "distributed txn coordinator routes unique owner handoff with row version proofs",
-        "distributed txn coordinator retries once on topology change",
+        "distributed txn coordinator never restarts a transaction id on topology change",
         "distributed txn coordinator fails closed for transitional foreign key ref owner ranges",
         "distributed txn coordinator routes foreign key checks through unique owner ranges",
         "distributed txn coordinator routes cross-table foreign key checks through parent unique owner ranges",
@@ -2300,7 +2309,7 @@ pub const APITestFilters = struct {
         "distributed txn coordinator externalizes deferred foreign key parent checks exactly",
         "distributed txn coordinator routes foreign key child writes through ref owners when configured",
         "distributed txn coordinator routes unique owner handoff with row version proofs",
-        "distributed txn coordinator retries once on topology change",
+        "distributed txn coordinator never restarts a transaction id on topology change",
         "distributed txn coordinator fails closed for transitional foreign key ref owner ranges",
         "distributed txn coordinator routes foreign key checks through unique owner ranges",
         "distributed txn coordinator routes cross-table foreign key checks through parent unique owner ranges",
@@ -2753,6 +2762,50 @@ pub const DataTestFilters = struct {
 };
 
 pub const MetadataTestFilters = struct {
+    pub const production_shards = [_][]const []const u8{
+        &.{"metadata.reconciler."},
+        &.{
+            "metadata.service.",
+            "metadata.http_client.",
+            "metadata.http_routes.",
+            "metadata.http_server.",
+        },
+        &.{
+            "metadata.state.",
+            "metadata.runtime.",
+            "metadata.server.",
+            "metadata.api.",
+            "metadata.admin.",
+            "metadata.authority.",
+            "metadata.incarnation.",
+            "metadata.reconcile_lease.",
+            "metadata.store_observer.",
+        },
+        &.{
+            "metadata.placement_planner.",
+            "metadata.control_loop.",
+            "metadata.table_manager.",
+            "metadata.table_workflow.",
+            "metadata.transition_state.",
+            "metadata.transition_actions.",
+            "metadata.transition_controller.",
+            "metadata.transition_driver.",
+        },
+        &.{"metadata.table_provisioner."},
+        &.{"metadata.replication_backfill."},
+        &.{"metadata.storage."},
+    };
+
+    pub const production_shard_names = [_][]const u8{
+        "metadata-reconciler-tests",
+        "metadata-service-http-tests",
+        "metadata-core-tests",
+        "metadata-planning-transition-tests",
+        "metadata-table-provisioner-tests",
+        "metadata-replication-backfill-tests",
+        "metadata-storage-tests",
+    };
+
     pub const root = [_][]const u8{
         "metadata.mod.test.",
         "metadata.api.test.",
@@ -4084,20 +4137,57 @@ pub fn addMetadataTestSteps(
     b: *std.Build,
     root_module: *std.Build.Module,
     foreign_key_module: *std.Build.Module,
+    production_modules: [metadata_production_shard_count]*std.Build.Module,
 ) MetadataTestSteps {
-    const root = addMetadataTestRun(b, root_module, "metadata-test", "Run root-module and foreign-key metadata tests", &MetadataTestFilters.root, true);
+    const root_step = b.step("metadata-test", "Run production and foreign-key metadata tests in bounded shards");
+    var production_runs: [metadata_production_shard_count]MetadataTestRun = undefined;
+    for (
+        production_modules,
+        MetadataTestFilters.production_shards,
+        MetadataTestFilters.production_shard_names,
+        &production_runs,
+    ) |root, filters, name, *result| {
+        const tests = b.addTest(.{
+            .name = name,
+            .root_module = root,
+            .filters = filters,
+            .test_runner = .{
+                .path = b.path("pkg/antfly/src/test_runner.zig"),
+                .mode = .simple,
+            },
+        });
+        const focused_metadata = b.addRunArtifact(tests);
+        if (selectedRunTestFilter(b)) |filter| {
+            focused_metadata.addArgs(&.{ "--test-filter", filter, "--allow-empty-test-filter" });
+        }
+        root_step.dependOn(&focused_metadata.step);
+        result.* = .{
+            .tests = tests,
+            .run = focused_metadata,
+            .step = &focused_metadata.step,
+        };
+    }
+    const root = MetadataProductionTestStep{
+        .runs = production_runs,
+        .step = root_step,
+    };
     const foreign_key_tests = b.addTest(.{
         .root_module = foreign_key_module,
         .filters = &MetadataTestFilters.foreign_key,
     });
     const run_foreign_key_tests = b.addRunArtifact(foreign_key_tests);
-    root.step.dependOn(&run_foreign_key_tests.step);
+    root_step.dependOn(&run_foreign_key_tests.step);
     const table_workflow = addMetadataTestRunArtifact(b, root_module, &MetadataTestFilters.table_workflow, false);
     const service = addMetadataTestRunArtifact(b, root_module, &MetadataTestFilters.service, false);
     const logic = addMetadataTestRunArtifact(b, root_module, &MetadataTestFilters.logic, false);
-    root.step.dependOn(&table_workflow.run.step);
-    root.step.dependOn(&service.run.step);
-    root.step.dependOn(&logic.run.step);
+    if (selectedRunTestFilter(b) != null) {
+        table_workflow.run.addArg("--allow-empty-test-filter");
+        service.run.addArg("--allow-empty-test-filter");
+        logic.run.addArg("--allow-empty-test-filter");
+    }
+    root_step.dependOn(&table_workflow.run.step);
+    root_step.dependOn(&service.run.step);
+    root_step.dependOn(&logic.run.step);
 
     const sim = addMetadataTestRunArtifact(b, root_module, &MetadataTestFilters.sim, true);
     const sim_core = addMetadataTestRunArtifact(b, root_module, &MetadataTestFilters.sim_core, true);

@@ -22,20 +22,21 @@ pub const std_options: std.Options = .{
 };
 
 var log_err_count: usize = 0;
-var arg_buffer: [32768]u8 = undefined;
-const max_filters = 256;
-var test_filters: [max_filters][]const u8 = undefined;
-var test_filter_count: usize = 0;
-var skip_test_filters: [max_filters][]const u8 = undefined;
-var skip_test_filter_count: usize = 0;
+var test_filters: []const []const u8 = &.{};
+var skip_test_filters: []const []const u8 = &.{};
 
 pub fn main(init: std.process.Init.Minimal) void {
     @disableInstrumentation();
 
-    var fba = std.heap.FixedBufferAllocator.init(&arg_buffer);
-    const args = init.args.toSlice(fba.allocator()) catch |err| {
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const args = init.args.toSlice(arena) catch |err| {
         std.debug.panic("unable to parse command line args: {t}", .{err});
     };
+    var include_filters: std.ArrayList([]const u8) = .empty;
+    var exclude_filters: std.ArrayList([]const u8) = .empty;
+    var allow_empty_test_filter = false;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -44,17 +45,19 @@ pub fn main(init: std.process.Init.Minimal) void {
             testing.random_seed = std.fmt.parseUnsigned(u32, arg["--seed=".len..], 0) catch
                 @panic("unable to parse --seed command line argument");
         } else if (std.mem.startsWith(u8, arg, "--test-filter=")) {
-            appendFilter("--test-filter", &test_filters, &test_filter_count, arg["--test-filter=".len..]);
+            appendFilter(arena, "--test-filter", &include_filters, arg["--test-filter=".len..]);
         } else if (std.mem.eql(u8, arg, "--test-filter")) {
             i += 1;
             if (i >= args.len) @panic("missing value for --test-filter");
-            appendFilter("--test-filter", &test_filters, &test_filter_count, args[i]);
+            appendFilter(arena, "--test-filter", &include_filters, args[i]);
         } else if (std.mem.startsWith(u8, arg, "--skip-test-filter=")) {
-            appendFilter("--skip-test-filter", &skip_test_filters, &skip_test_filter_count, arg["--skip-test-filter=".len..]);
+            appendFilter(arena, "--skip-test-filter", &exclude_filters, arg["--skip-test-filter=".len..]);
         } else if (std.mem.eql(u8, arg, "--skip-test-filter")) {
             i += 1;
             if (i >= args.len) @panic("missing value for --skip-test-filter");
-            appendFilter("--skip-test-filter", &skip_test_filters, &skip_test_filter_count, args[i]);
+            appendFilter(arena, "--skip-test-filter", &exclude_filters, args[i]);
+        } else if (std.mem.eql(u8, arg, "--allow-empty-test-filter")) {
+            allow_empty_test_filter = true;
         } else if (std.mem.startsWith(u8, arg, "--cache-dir=")) {
             // Accepted for compatibility with the default test runner.
         } else if (std.mem.eql(u8, arg, "--listen=-")) {
@@ -63,6 +66,8 @@ pub fn main(init: std.process.Init.Minimal) void {
             std.debug.panic("unrecognized command line argument: {s}", .{arg});
         }
     }
+    test_filters = include_filters.items;
+    skip_test_filters = exclude_filters.items;
 
     const test_fns = builtin.test_functions;
     var ok_count: usize = 0;
@@ -70,23 +75,30 @@ pub fn main(init: std.process.Init.Minimal) void {
     var fail_count: usize = 0;
     var leak_count: usize = 0;
     var total_count: usize = 0;
-    var matched_filter_counts = [_]usize{0} ** max_filters;
+    const matched_filter_counts = arena.alloc(usize, test_filters.len) catch
+        @panic("out of memory while allocating test filter counters");
+    @memset(matched_filter_counts, 0);
 
     for (test_fns) |test_fn| {
-        recordMatchingIncludeFilters(test_fn.name, &matched_filter_counts);
+        recordMatchingIncludeFilters(test_fn.name, matched_filter_counts);
         if (matchesFilter(test_fn.name)) total_count += 1;
     }
 
     var missing_filter_count: usize = 0;
-    for (test_filters[0..test_filter_count], 0..) |filter, filter_index| {
+    for (test_filters, 0..) |filter, filter_index| {
         if (matched_filter_counts[filter_index] != 0) continue;
         missing_filter_count += 1;
-        std.debug.print("test filter matched no declared tests: {s}\n", .{filter});
+        if (!allow_empty_test_filter) {
+            std.debug.print("test filter matched no declared tests: {s}\n", .{filter});
+        }
     }
-    if (missing_filter_count != 0) {
+    if (missing_filter_count != 0 and !allow_empty_test_filter) {
         std.process.exit(1);
     }
     if (total_count == 0) {
+        if (allow_empty_test_filter) {
+            return;
+        }
         std.debug.print("test selection matched no runnable tests\n", .{});
         std.process.exit(1);
     }
@@ -98,6 +110,10 @@ pub fn main(init: std.process.Init.Minimal) void {
         if (!matchesFilter(test_fn.name)) continue;
         current_count += 1;
         const test_start_ns = if (trace_timings) platform.time.monotonicNs() else 0;
+        // Print attribution before initializing per-test I/O. If platform I/O
+        // setup itself terminates the process, CI still identifies the test
+        // boundary instead of reporting an anonymous signal.
+        std.debug.print("{d}/{d} {s}...", .{ current_count, total_count, test_fn.name });
         testing.allocator_instance = .{};
         testing.io_instance = .init(testing.allocator, .{
             .argv0 = .init(init.args),
@@ -105,8 +121,6 @@ pub fn main(init: std.process.Init.Minimal) void {
         });
         testing.environ = init.environ;
         testing.log_level = .warn;
-
-        std.debug.print("{d}/{d} {s}...", .{ current_count, total_count, test_fn.name });
 
         if (test_fn.func()) |_| {
             ok_count += 1;
@@ -155,9 +169,9 @@ pub fn main(init: std.process.Init.Minimal) void {
 }
 
 fn matchesFilter(name: []const u8) bool {
-    if (test_filter_count != 0) {
+    if (test_filters.len != 0) {
         var included = false;
-        for (test_filters[0..test_filter_count]) |filter| {
+        for (test_filters) |filter| {
             if (matchesSingleFilter(name, filter)) {
                 included = true;
                 break;
@@ -166,14 +180,14 @@ fn matchesFilter(name: []const u8) bool {
         if (!included) return false;
     }
 
-    for (skip_test_filters[0..skip_test_filter_count]) |filter| {
+    for (skip_test_filters) |filter| {
         if (matchesSingleFilter(name, filter)) return false;
     }
     return true;
 }
 
-fn recordMatchingIncludeFilters(name: []const u8, matched_filter_counts: *[max_filters]usize) void {
-    for (test_filters[0..test_filter_count], 0..) |filter, filter_index| {
+fn recordMatchingIncludeFilters(name: []const u8, matched_filter_counts: []usize) void {
+    for (test_filters, 0..) |filter, filter_index| {
         if (matchesSingleFilter(name, filter)) matched_filter_counts[filter_index] += 1;
     }
 }
@@ -187,19 +201,16 @@ fn matchesSingleFilter(name: []const u8, filter: []const u8) bool {
 }
 
 fn appendFilter(
+    allocator: std.mem.Allocator,
     kind: []const u8,
-    filters: *[max_filters][]const u8,
-    count: *usize,
+    filters: *std.ArrayList([]const u8),
     filter: []const u8,
 ) void {
     if (filter.len == 0) {
         std.debug.panic("missing value for {s}", .{kind});
     }
-    if (count.* >= max_filters) {
-        std.debug.panic("too many {s} arguments", .{kind});
-    }
-    filters[count.*] = filter;
-    count.* += 1;
+    filters.append(allocator, filter) catch
+        std.debug.panic("out of memory while appending {s}", .{kind});
 }
 
 fn declaredTestName(name: []const u8) []const u8 {

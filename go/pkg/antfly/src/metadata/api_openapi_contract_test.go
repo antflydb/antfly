@@ -40,6 +40,7 @@ func TestEmbeddedOpenAPITransformOperationsMatchGeneratedModel(t *testing.T) {
 		TransformOpTypeUNSET,
 		TransformOpTypeINC,
 		TransformOpTypePUSH,
+		TransformOpTypePULL,
 		TransformOpTypeADDTOSET,
 		TransformOpTypeMAX,
 	}

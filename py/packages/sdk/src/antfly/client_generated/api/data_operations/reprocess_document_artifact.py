@@ -81,10 +81,12 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
 ) -> Response[DocumentArtifactReprocessResponse | Error]:
-    """Reprocess a derived document artifact
+    """Reprocess a derived asset
 
      Invalidates the current artifact state and requests the producer to
-    rebuild the derived document hierarchy for the source document.
+    rebuild the derived asset for the source document. Copy, generator,
+    reader, transcriber, extractor, and document-extraction producers are
+    all supported.
 
     Args:
         table_name (str):
@@ -119,10 +121,12 @@ def sync(
     *,
     client: AuthenticatedClient,
 ) -> DocumentArtifactReprocessResponse | Error | None:
-    """Reprocess a derived document artifact
+    """Reprocess a derived asset
 
      Invalidates the current artifact state and requests the producer to
-    rebuild the derived document hierarchy for the source document.
+    rebuild the derived asset for the source document. Copy, generator,
+    reader, transcriber, extractor, and document-extraction producers are
+    all supported.
 
     Args:
         table_name (str):
@@ -152,10 +156,12 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient,
 ) -> Response[DocumentArtifactReprocessResponse | Error]:
-    """Reprocess a derived document artifact
+    """Reprocess a derived asset
 
      Invalidates the current artifact state and requests the producer to
-    rebuild the derived document hierarchy for the source document.
+    rebuild the derived asset for the source document. Copy, generator,
+    reader, transcriber, extractor, and document-extraction producers are
+    all supported.
 
     Args:
         table_name (str):
@@ -188,10 +194,12 @@ async def asyncio(
     *,
     client: AuthenticatedClient,
 ) -> DocumentArtifactReprocessResponse | Error | None:
-    """Reprocess a derived document artifact
+    """Reprocess a derived asset
 
      Invalidates the current artifact state and requests the producer to
-    rebuild the derived document hierarchy for the source document.
+    rebuild the derived asset for the source document. Copy, generator,
+    reader, transcriber, extractor, and document-extraction producers are
+    all supported.
 
     Args:
         table_name (str):

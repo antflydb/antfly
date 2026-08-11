@@ -17,6 +17,8 @@ const std = @import("std");
 const backups_api = @import("../backups.zig");
 const catalog_resources = @import("../catalog_resources.zig");
 const distributed_txn = @import("../distributed_txn.zig");
+const metadata_api = @import("../../metadata/api.zig");
+const metadata_transition_state = @import("../../metadata/transition_state.zig");
 const metadata_table_manager = @import("../../metadata/table_manager.zig");
 const platform_time = @import("antfly_platform").time;
 const backend_types = @import("../../storage/backend_types.zig");
@@ -25,7 +27,9 @@ const doc_identity = @import("../../storage/db/doc_identity.zig");
 const storage_schema = @import("../../storage/schema.zig");
 const relational_rows_api = @import("../../sql/relational_rows.zig");
 const runtime_status = @import("../runtime_status.zig");
+const table_catalog = @import("../../metadata/catalog/routing.zig");
 const tables_api = @import("../../metadata/catalog/table_ddl.zig");
+const raft_reconciler = @import("../../raft/reconciler.zig");
 const sql_adapter = @import("../../sql/mod.zig");
 const table_write_integrity_types = @import("integrity_types.zig");
 const table_write_schema_jobs = @import("schema_jobs.zig");
@@ -53,6 +57,8 @@ const TableEmptyingWorkerResult = table_write_schema_jobs.TableEmptyingWorkerRes
 const TableEmptyingWorkerPassResult = table_write_schema_jobs.TableEmptyingWorkerPassResult;
 
 pub const backend_current_root_generation: u64 = 0;
+pub const stateless_batch_max_attempts: u8 = 3;
+pub const stateless_batch_retry_base_ns: u64 = std.time.ns_per_ms;
 
 pub const StartupCatchUpMetadata = struct {
     pub const MetadataSource = enum { supplied, local_persisted };
@@ -117,6 +123,125 @@ pub fn freeRelationalIndexRepairJobRecord(alloc: std.mem.Allocator, record: Rela
 pub fn freeRelationalIndexRepairJobRecords(alloc: std.mem.Allocator, records: []RelationalIndexRepairJobRecord) void {
     for (records) |record| freeRelationalIndexRepairJobRecord(alloc, record);
     if (records.len > 0) alloc.free(records);
+}
+
+pub fn statelessBatchMayRetry(tables: []const distributed_txn.TableCommitRequest) bool {
+    for (tables) |table| {
+        if (table.predicates.len != 0) return false;
+    }
+    return true;
+}
+
+pub fn statelessBatchRetryDelayNs(attempt: u8) u64 {
+    return stateless_batch_retry_base_ns << @intCast(attempt);
+}
+
+test "stateless batch retries are bounded and exclude explicit OCC" {
+    const plain = [_]distributed_txn.TableCommitRequest{.{
+        .table_name = "docs",
+        .writes = &.{.{ .key = "doc:a", .value = "{}" }},
+    }};
+    try std.testing.expect(statelessBatchMayRetry(&plain));
+
+    const predicated = [_]distributed_txn.TableCommitRequest{.{
+        .table_name = "docs",
+        .predicates = &.{.{ .key = "doc:a", .expected_version = 7 }},
+    }};
+    try std.testing.expect(!statelessBatchMayRetry(&predicated));
+    try std.testing.expectEqual(std.time.ns_per_ms, statelessBatchRetryDelayNs(0));
+    try std.testing.expectEqual(2 * std.time.ns_per_ms, statelessBatchRetryDelayNs(1));
+    try std.testing.expectEqual(@as(u8, 3), stateless_batch_max_attempts);
+}
+
+test "provisioned stateless batch retries definite aborts to the production bound" {
+    const ProvisionedTableWriteSource = @import("sources.zig").ProvisionedTableWriteSource;
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+    const Batcher = struct {
+        failures_remaining: u8,
+        attempts: u8 = 0,
+
+        fn batchGroup(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: u64,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+        ) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.attempts += 1;
+            if (self.failures_remaining > 0) {
+                self.failures_remaining -= 1;
+                return error.IntentConflict;
+            }
+        }
+
+        fn batchGroupLocal(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: u64,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+        ) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    var source = ProvisionedTableWriteSource.init("unused", Catalog.iface());
+    defer source.deinit();
+    var batcher = Batcher{ .failures_remaining = 2 };
+    _ = source.withRaftBatcher(.{
+        .ptr = &batcher,
+        .vtable = &.{
+            .batch_group = Batcher.batchGroup,
+            .batch_group_local = Batcher.batchGroupLocal,
+        },
+    });
+    const tables = [_]distributed_txn.TableCommitRequest{.{
+        .table_name = "docs",
+        .writes = &.{.{ .key = "doc:a", .value = "{}" }},
+    }};
+
+    const committed = (try source.source().commitBatch(std.testing.allocator, &tables, .write)).?;
+    try std.testing.expect(committed == .committed);
+    try std.testing.expectEqual(stateless_batch_max_attempts, batcher.attempts);
+
+    batcher = .{ .failures_remaining = stateless_batch_max_attempts };
+    const exhausted = (try source.source().commitBatch(std.testing.allocator, &tables, .write)).?;
+    try std.testing.expect(exhausted == .conflict);
+    try std.testing.expectEqual(stateless_batch_max_attempts, batcher.attempts);
 }
 
 pub fn boundConflict(table: distributed_txn.TableCommitRequest, err: anyerror) distributed_txn.CommitConflict {
@@ -411,6 +536,12 @@ pub const TableWriteSource = struct {
             tables: []const distributed_txn.TableCommitRequest,
             sync_level: db_mod.types.SyncLevel,
         ) anyerror!?distributed_txn.CommitOutcome = null,
+        commit_batch: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            tables: []const distributed_txn.TableCommitRequest,
+            sync_level: db_mod.types.SyncLevel,
+        ) anyerror!?distributed_txn.CommitOutcome = null,
         commit_transaction_with_id: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -419,6 +550,13 @@ pub const TableWriteSource = struct {
             tables: []const distributed_txn.TableCommitRequest,
             sync_level: db_mod.types.SyncLevel,
         ) anyerror!?distributed_txn.CommitOutcome = null,
+        acknowledge_transaction_commit: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            txn_id: db_mod.types.TxnId,
+            coordinator_group_id: u64,
+            coordinator_table_name: []const u8,
+        ) anyerror!?void = null,
         batch: *const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -559,6 +697,7 @@ pub const TableWriteSource = struct {
             txn_id: db_mod.types.TxnId,
             begin_timestamp: u64,
             topology_epoch: u64,
+            retain_terminal: bool,
             participants: []const []const u8,
         ) anyerror!?void = null,
         txn_prepare_group_local: ?*const fn (
@@ -578,6 +717,8 @@ pub const TableWriteSource = struct {
             txn_id: db_mod.types.TxnId,
             status: db_mod.types.TxnStatus,
             commit_version: u64,
+            topology_epoch: u64,
+            sync_level: db_mod.types.SyncLevel,
         ) anyerror!?void = null,
         txn_status_group_local: ?*const fn (
             ptr: *anyopaque,
@@ -586,6 +727,14 @@ pub const TableWriteSource = struct {
             table_name: []const u8,
             txn_id: db_mod.types.TxnId,
         ) anyerror!?db_mod.types.TxnStatus = null,
+        txn_acknowledge_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            txn_id: db_mod.types.TxnId,
+            participant: []const u8,
+        ) anyerror!?void = null,
         corrupt_embedding_artifact: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -1575,6 +1724,16 @@ pub const TableWriteSource = struct {
         return try fn_ptr(self.ptr, alloc, tables, sync_level);
     }
 
+    pub fn commitBatch(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+    ) !?distributed_txn.CommitOutcome {
+        const fn_ptr = self.vtable.commit_batch orelse self.vtable.commit_transaction orelse return null;
+        return try fn_ptr(self.ptr, alloc, tables, sync_level);
+    }
+
     pub fn commitTransactionWithId(
         self: TableWriteSource,
         alloc: std.mem.Allocator,
@@ -1585,6 +1744,17 @@ pub const TableWriteSource = struct {
     ) !?distributed_txn.CommitOutcome {
         const fn_ptr = self.vtable.commit_transaction_with_id orelse return null;
         return try fn_ptr(self.ptr, alloc, txn_id, begin_timestamp, tables, sync_level);
+    }
+
+    pub fn acknowledgeTransactionCommit(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+        coordinator_group_id: u64,
+        coordinator_table_name: []const u8,
+    ) !?void {
+        const fn_ptr = self.vtable.acknowledge_transaction_commit orelse return null;
+        return try fn_ptr(self.ptr, alloc, txn_id, coordinator_group_id, coordinator_table_name);
     }
 
     pub fn batchGroupLocal(
@@ -1606,10 +1776,11 @@ pub const TableWriteSource = struct {
         txn_id: db_mod.types.TxnId,
         begin_timestamp: u64,
         topology_epoch: u64,
+        retain_terminal: bool,
         participants: []const []const u8,
     ) !?void {
         const fn_ptr = self.vtable.txn_begin_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, txn_id, begin_timestamp, topology_epoch, participants);
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, txn_id, begin_timestamp, topology_epoch, retain_terminal, participants);
     }
 
     pub fn txnPrepareGroupLocal(
@@ -1633,9 +1804,11 @@ pub const TableWriteSource = struct {
         txn_id: db_mod.types.TxnId,
         status: db_mod.types.TxnStatus,
         commit_version: u64,
+        topology_epoch: u64,
+        sync_level: db_mod.types.SyncLevel,
     ) !?void {
         const fn_ptr = self.vtable.txn_resolve_group_local orelse return null;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, txn_id, status, commit_version);
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level);
     }
 
     pub fn txnStatusGroupLocal(
@@ -1647,6 +1820,18 @@ pub const TableWriteSource = struct {
     ) !?db_mod.types.TxnStatus {
         const fn_ptr = self.vtable.txn_status_group_local orelse return null;
         return try fn_ptr(self.ptr, alloc, group_id, table_name, txn_id);
+    }
+
+    pub fn txnAcknowledgeGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_mod.types.TxnId,
+        participant: []const u8,
+    ) !?void {
+        const fn_ptr = self.vtable.txn_acknowledge_group_local orelse return null;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, txn_id, participant);
     }
 
     pub fn corruptEmbeddingArtifact(

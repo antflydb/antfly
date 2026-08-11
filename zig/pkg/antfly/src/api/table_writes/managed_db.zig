@@ -62,6 +62,7 @@ pub const ManagedDbOpenOptions = struct {
     ha_async_metadata_mirror: ?db_mod.HAAsyncMetadataMirror = null,
     staged_generation: ?*const db_mod.generation_lifecycle.StagedGeneration = null,
     identity_validation: StartupCatchUpMetadata.IdentityValidation = .exact,
+    transaction_recovery: db_mod.transaction_runtime.Config = .{},
 };
 
 pub const ManagedDbEnrichmentSet = struct {
@@ -1190,6 +1191,16 @@ fn transactionWritesToBatchWrites(
     return try out.toOwnedSlice(alloc);
 }
 
+pub fn transactionWritesAsBatchWrites(
+    writes: []const db_mod.types.TransactionWrite,
+) []const db_mod.types.BatchWrite {
+    comptime {
+        std.debug.assert(@sizeOf(db_mod.types.TransactionWrite) == @sizeOf(db_mod.types.BatchWrite));
+        std.debug.assert(@alignOf(db_mod.types.TransactionWrite) == @alignOf(db_mod.types.BatchWrite));
+    }
+    return @ptrCast(writes);
+}
+
 pub fn validateTableBatchAgainstLocalSchema(
     alloc: std.mem.Allocator,
     db: *db_mod.DB,
@@ -2022,6 +2033,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                 .ha_async_effect_mirror = open_options.ha_async_effect_mirror,
                 .ha_async_batch_mirror = open_options.ha_async_batch_mirror,
                 .ha_async_metadata_mirror = open_options.ha_async_metadata_mirror,
+                .transaction_recovery = open_options.transaction_recovery,
             };
             return switch (open_mode) {
                 .default => if (enrichment_cfg != null)
@@ -2041,6 +2053,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                         .ha_async_effect_mirror = open_options.ha_async_effect_mirror,
                         .ha_async_batch_mirror = open_options.ha_async_batch_mirror,
                         .ha_async_metadata_mirror = open_options.ha_async_metadata_mirror,
+                        .transaction_recovery = open_options.transaction_recovery,
                     }),
                 .default_async, .writer_no_replay => if (enrichment_cfg != null)
                     try db_mod.DB.open(allocator, db_path, .{
@@ -2058,6 +2071,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                         .ha_async_effect_mirror = open_options.ha_async_effect_mirror,
                         .ha_async_batch_mirror = open_options.ha_async_batch_mirror,
                         .ha_async_metadata_mirror = open_options.ha_async_metadata_mirror,
+                        .transaction_recovery = open_options.transaction_recovery,
                         .open_mode = .writer_no_replay,
                         .index_open_parallelism = 1,
                     })
@@ -2076,6 +2090,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                         .ha_async_effect_mirror = open_options.ha_async_effect_mirror,
                         .ha_async_batch_mirror = open_options.ha_async_batch_mirror,
                         .ha_async_metadata_mirror = open_options.ha_async_metadata_mirror,
+                        .transaction_recovery = open_options.transaction_recovery,
                         .open_mode = .writer_no_replay,
                         .index_open_parallelism = 1,
                     }),

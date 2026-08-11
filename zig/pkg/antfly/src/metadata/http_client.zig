@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const platform_time = @import("antfly_platform").time;
 const extension_domain = @import("../extensions/mod.zig");
 const metadata_api = @import("api.zig");
 const metadata_reconciler = @import("reconciler.zig");
@@ -26,6 +27,14 @@ const routes = @import("http_routes.zig");
 const max_transport_retries: usize = 1;
 const max_metadata_not_leader_retries: usize = 2;
 const default_request_timeout_ms: u32 = 5_000;
+
+/// One monotonic budget shared by every transport and not-leader retry in a
+/// logical metadata operation. The cancellation pointer is borrowed only by
+/// synchronous request execution.
+pub const RequestBudget = struct {
+    deadline_ns: u64,
+    cancellation: ?*const http_common.RequestCancellation = null,
+};
 
 fn isUriUnreserved(ch: u8) bool {
     return (ch >= 'A' and ch <= 'Z') or
@@ -70,11 +79,27 @@ pub const MetadataHttpClient = struct {
     }
 
     pub fn fetchHead(self: *MetadataHttpClient, base_uri: []const u8) !metadata_api.MetadataHead {
-        return try self.getJsonValue(metadata_api.MetadataHead, base_uri, routes.Routes.head);
+        return try self.fetchHeadWithBudget(base_uri, null);
+    }
+
+    pub fn fetchHeadWithBudget(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        budget: ?RequestBudget,
+    ) !metadata_api.MetadataHead {
+        return try self.getJsonValueWithBudget(metadata_api.MetadataHead, base_uri, routes.Routes.head, budget);
     }
 
     pub fn fetchSnapshot(self: *MetadataHttpClient, base_uri: []const u8) !std.json.Parsed(metadata_api.AdminSnapshot) {
-        return try self.getJson(metadata_api.AdminSnapshot, base_uri, routes.Routes.admin_snapshot);
+        return try self.fetchSnapshotWithBudget(base_uri, null);
+    }
+
+    pub fn fetchSnapshotWithBudget(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        budget: ?RequestBudget,
+    ) !std.json.Parsed(metadata_api.AdminSnapshot) {
+        return try self.getJsonWithBudget(metadata_api.AdminSnapshot, base_uri, routes.Routes.admin_snapshot, budget);
     }
 
     pub fn validateCatalogPublication(
@@ -506,28 +531,48 @@ pub const MetadataHttpClient = struct {
     }
 
     fn getJson(self: *MetadataHttpClient, comptime T: type, base_uri: []const u8, path: []const u8) !std.json.Parsed(T) {
+        return try self.getJsonWithBudget(T, base_uri, path, null);
+    }
+
+    fn getJsonWithBudget(
+        self: *MetadataHttpClient,
+        comptime T: type,
+        base_uri: []const u8,
+        path: []const u8,
+        budget: ?RequestBudget,
+    ) !std.json.Parsed(T) {
         const uri = try join(self.alloc, base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executeWithRetry(.{
+        var resp = try self.executeWithRetryBudget(.{
             .method = .GET,
             .uri = uri,
             .timeout_ms = default_request_timeout_ms,
-        });
+        }, budget);
         defer resp.deinit(self.alloc);
         try mapStatus(resp.status, null, null, null);
         return try parseJson(T, self.alloc, resp.body);
     }
 
     fn getJsonValue(self: *MetadataHttpClient, comptime T: type, base_uri: []const u8, path: []const u8) !T {
+        return try self.getJsonValueWithBudget(T, base_uri, path, null);
+    }
+
+    fn getJsonValueWithBudget(
+        self: *MetadataHttpClient,
+        comptime T: type,
+        base_uri: []const u8,
+        path: []const u8,
+        budget: ?RequestBudget,
+    ) !T {
         const uri = try join(self.alloc, base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executeWithRetry(.{
+        var resp = try self.executeWithRetryBudget(.{
             .method = .GET,
             .uri = uri,
             .timeout_ms = default_request_timeout_ms,
-        });
+        }, budget);
         defer resp.deinit(self.alloc);
         try mapStatus(resp.status, null, null, null);
         return try std.json.parseFromSliceLeaky(T, self.alloc, resp.body, .{ .ignore_unknown_fields = true });
@@ -609,10 +654,19 @@ pub const MetadataHttpClient = struct {
     }
 
     fn executeWithRetry(self: *MetadataHttpClient, req: http_common.HttpRequest) !http_common.HttpResponse {
+        return try self.executeWithRetryBudget(req, null);
+    }
+
+    fn executeWithRetryBudget(
+        self: *MetadataHttpClient,
+        req: http_common.HttpRequest,
+        budget: ?RequestBudget,
+    ) !http_common.HttpResponse {
         var transport_attempt: usize = 0;
         var not_leader_attempt: usize = 0;
         while (true) {
-            var resp = self.executor.execute(self.alloc, req) catch |err| switch (err) {
+            const controlled_req = try applyRequestBudget(req, budget);
+            var resp = self.executor.execute(self.alloc, controlled_req) catch |err| switch (err) {
                 error.HttpConnectionClosing,
                 error.ConnectionResetByPeer,
                 error.ConnectionRefused,
@@ -658,6 +712,26 @@ pub const MetadataHttpClient = struct {
         return error.UnexpectedHttpStatus;
     }
 };
+
+fn applyRequestBudget(req: http_common.HttpRequest, budget: ?RequestBudget) !http_common.HttpRequest {
+    const value = budget orelse return req;
+    const cancellation = value.cancellation orelse req.cancellation;
+    if (cancellation) |signal| {
+        if (signal.isCancelled()) return error.Cancelled;
+    }
+    const now_ns = platform_time.monotonicNs();
+    if (now_ns >= value.deadline_ns) return error.Timeout;
+    const remaining_ns = value.deadline_ns - now_ns;
+    const remaining_ms = (remaining_ns +| (std.time.ns_per_ms - 1)) / std.time.ns_per_ms;
+    const bounded_ms: u32 = @intCast(@min(remaining_ms, std.math.maxInt(u32)));
+    var controlled = req;
+    controlled.timeout_ms = if (req.timeout_ms) |request_timeout_ms|
+        @min(request_timeout_ms, bounded_ms)
+    else
+        bounded_ms;
+    controlled.cancellation = cancellation;
+    return controlled;
+}
 
 fn join(alloc: std.mem.Allocator, base_uri: []const u8, path: []const u8) ![]u8 {
     return try raft_routes.Routes.join(alloc, base_uri, path);
@@ -777,6 +851,62 @@ test "metadata http client retries bounded timeout on fetch status" {
     const status = try client.fetchStatus("http://127.0.0.1:9000");
     try std.testing.expectEqual(@as(u64, 88), status.metadata_group_id);
     try std.testing.expectEqual(@as(usize, 2), timeout_executor.attempts);
+}
+
+test "metadata http client shares deadline and cancellation across retries" {
+    const BudgetExecutor = struct {
+        attempts: usize = 0,
+        prior_timeout_ms: u32 = std.math.maxInt(u32),
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(req.cancellation != null);
+            const timeout_ms = req.timeout_ms.?;
+            try std.testing.expect(timeout_ms > 0 and timeout_ms <= 250);
+            try std.testing.expect(timeout_ms <= self.prior_timeout_ms);
+            self.prior_timeout_ms = timeout_ms;
+            self.attempts += 1;
+            if (self.attempts == 1) return error.HttpConnectionClosing;
+            return .{
+                .status = 200,
+                .content_type = try alloc.dupe(u8, "application/json"),
+                .body = try alloc.dupe(u8,
+                    \\{"metadata_group_id":91,"metadata_incarnation":"11111111111111111111111111111111","metadata_epoch":4}
+                ),
+            };
+        }
+    };
+
+    var cancellation = http_common.RequestCancellation{};
+    var executor = BudgetExecutor{};
+    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+    const head = try client.fetchHeadWithBudget("http://127.0.0.1:9000", .{
+        .deadline_ns = platform_time.monotonicNs() + 250 * std.time.ns_per_ms,
+        .cancellation = &cancellation,
+    });
+    try std.testing.expectEqual(@as(u64, 91), head.metadata_group_id);
+    try std.testing.expectEqual(@as(usize, 2), executor.attempts);
+
+    cancellation.cancel();
+    try std.testing.expectError(error.Cancelled, client.fetchHeadWithBudget("http://127.0.0.1:9000", .{
+        .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s,
+        .cancellation = &cancellation,
+    }));
+    try std.testing.expectEqual(@as(usize, 2), executor.attempts);
+
+    var active_cancellation = http_common.RequestCancellation{};
+    try std.testing.expectError(error.Timeout, client.fetchHeadWithBudget("http://127.0.0.1:9000", .{
+        .deadline_ns = platform_time.monotonicNs(),
+        .cancellation = &active_cancellation,
+    }));
+    try std.testing.expectEqual(@as(usize, 2), executor.attempts);
 }
 
 test "metadata http client retries explicit metadata not leader response" {

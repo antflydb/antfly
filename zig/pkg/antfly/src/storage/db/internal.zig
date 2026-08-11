@@ -941,6 +941,7 @@ pub fn AsyncContext(comptime DB: type) type {
         index_manager: *index_manager_mod.IndexManager,
         apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
         repair_replay_mutex: ?*std.atomic.Mutex = null,
+        artifact_repair_issue_mutex: std.atomic.Mutex = .unlocked,
         repair_sequence: u64 = 0,
         repair_issue_counter: ?*AtomicU64 = null,
         allow_graph_materialization: bool = true,

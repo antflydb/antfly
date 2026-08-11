@@ -149,10 +149,9 @@ func CreateTestConfig(t *testing.T, baseDir string, id types.ID) *common.Config 
 		DefaultShardsPerTable: 1,
 		HealthPort:            GetFreePort(t),
 		Storage: common.StorageConfig{
+			Engine: common.StorageEngineLocal,
 			Local: common.LocalStorageConfig{
-				BaseDir:  baseDir,
-				Data:     common.StorageBackendLocal,
-				Metadata: common.StorageBackendLocal,
+				BaseDir: baseDir,
 			},
 		},
 		Metadata: common.MetadataInfo{

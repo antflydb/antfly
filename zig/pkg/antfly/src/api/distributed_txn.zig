@@ -35,6 +35,7 @@ pub const TxnBeginRequest = struct {
     txn_id: db_mod.types.TxnId,
     begin_timestamp: u64,
     topology_epoch: u64 = 0,
+    retain_terminal: bool = false,
     participants: []const []const u8,
 };
 
@@ -48,10 +49,20 @@ pub const TxnResolveRequest = struct {
     txn_id: db_mod.types.TxnId,
     status: db_mod.types.TxnStatus,
     commit_version: u64,
+    /// Non-zero only during the initial commit-resolution pass. Participant
+    /// recovery and aborts must remain possible after a topology transition
+    /// has already published.
+    topology_epoch: u64 = 0,
+    sync_level: db_mod.types.SyncLevel = .propose,
 };
 
 pub const TxnStatusResponse = struct {
     status: db_mod.types.TxnStatus,
+};
+
+pub const TxnAcknowledgeRequest = struct {
+    txn_id: db_mod.types.TxnId,
+    participant: []const u8,
 };
 
 pub const ForeignKeyRefChildrenRequest = struct {
@@ -173,6 +184,13 @@ pub const ParticipantWorker = struct {
             table_name: []const u8,
             txn_id: db_mod.types.TxnId,
         ) anyerror!db_mod.types.TxnStatus,
+        acknowledge_group: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            req: TxnAcknowledgeRequest,
+        ) anyerror!void = null,
         lookup_group: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -210,6 +228,11 @@ pub const ParticipantWorker = struct {
 
     pub fn statusGroup(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId) !db_mod.types.TxnStatus {
         return try self.vtable.status_group(self.ptr, alloc, group_id, table_name, txn_id);
+    }
+
+    pub fn acknowledgeGroup(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeRequest) !void {
+        const acknowledge = self.vtable.acknowledge_group orelse return;
+        try acknowledge(self.ptr, alloc, group_id, table_name, req);
     }
 
     pub fn lookupGroup(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, key: []const u8) !?table_reads.LookupResponse {
@@ -255,6 +278,7 @@ pub const RecoveryResolver = struct {
     interval_ms: u64 = 10,
     cutoff_ns: u64 = 5 * std.time.ns_per_min,
     clock: platform_clock.Clock = platform_clock.Clock.real(),
+    local_participant: ?[]const u8 = null,
 
     pub fn config(self: *const RecoveryResolver) db_mod.transaction_runtime.Config {
         return .{
@@ -266,6 +290,7 @@ pub const RecoveryResolver = struct {
             .clock = self.clock,
             .resolver_ctx = @constCast(self),
             .resolve_participant_fn = resolve,
+            .local_participant = self.local_participant,
         };
     }
 
@@ -315,6 +340,7 @@ pub const HostedParticipantWorker = struct {
                 .prepare_group = prepareGroup,
                 .resolve_group = resolveGroup,
                 .status_group = statusGroup,
+                .acknowledge_group = acknowledgeGroup,
                 .lookup_group = lookupGroup,
                 .foreign_key_ref_children_group = foreignKeyRefChildrenGroup,
                 .foreign_key_ref_children_page_group = foreignKeyRefChildrenPageGroup,
@@ -327,7 +353,7 @@ pub const HostedParticipantWorker = struct {
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader)) orelse return error.UnknownGroup;
         defer route.deinit(alloc);
         switch (route) {
-            .local => _ = (try self.writes.txnBeginGroupLocal(alloc, group_id, table_name, req.txn_id, req.begin_timestamp, req.topology_epoch, req.participants)) orelse return error.UnknownGroup,
+            .local => _ = (try self.writes.txnBeginGroupLocal(alloc, group_id, table_name, req.txn_id, req.begin_timestamp, req.topology_epoch, req.retain_terminal, req.participants)) orelse return error.UnknownGroup,
             .remote => |remote| {
                 var client = http_client_mod.ApiHttpClient.init(alloc, self.executor);
                 const body = try encodeTxnBeginRequest(alloc, req);
@@ -359,7 +385,7 @@ pub const HostedParticipantWorker = struct {
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader)) orelse return error.UnknownGroup;
         defer route.deinit(alloc);
         switch (route) {
-            .local => _ = (try self.writes.txnResolveGroupLocal(alloc, group_id, table_name, req.txn_id, req.status, req.commit_version)) orelse return error.UnknownGroup,
+            .local => _ = (try self.writes.txnResolveGroupLocal(alloc, group_id, table_name, req.txn_id, req.status, req.commit_version, req.topology_epoch, req.sync_level)) orelse return error.UnknownGroup,
             .remote => |remote| {
                 var client = http_client_mod.ApiHttpClient.init(alloc, self.executor);
                 const body = try encodeTxnResolveRequest(alloc, req);
@@ -386,6 +412,22 @@ pub const HostedParticipantWorker = struct {
                 break :blk parsed.status;
             },
         };
+    }
+
+    fn acknowledgeGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeRequest) !void {
+        const self: *HostedParticipantWorker = @ptrCast(@alignCast(ptr));
+        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader)) orelse return error.UnknownGroup;
+        defer route.deinit(alloc);
+        switch (route) {
+            .local => _ = (try self.writes.txnAcknowledgeGroupLocal(alloc, group_id, table_name, req.txn_id, req.participant)) orelse return error.UnknownGroup,
+            .remote => |remote| {
+                var client = http_client_mod.ApiHttpClient.init(alloc, self.executor);
+                const body = try encodeTxnAcknowledgeRequest(alloc, req);
+                defer alloc.free(body);
+                var response = try client.fetchGroupTxnAcknowledge(remote.base_uri, group_id, table_name, body);
+                response.deinit(alloc);
+            },
+        }
     }
 
     fn lookupGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, key: []const u8) !?table_reads.LookupResponse {
@@ -474,6 +516,7 @@ pub const LocalTableWriteParticipantWorker = struct {
                 .prepare_group = prepareGroup,
                 .resolve_group = resolveGroup,
                 .status_group = statusGroup,
+                .acknowledge_group = acknowledgeGroup,
                 .lookup_group = lookupGroup,
                 .foreign_key_ref_children_group = foreignKeyRefChildrenGroup,
                 .foreign_key_ref_children_page_group = foreignKeyRefChildrenPageGroup,
@@ -483,7 +526,7 @@ pub const LocalTableWriteParticipantWorker = struct {
 
     fn beginGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnBeginRequest) !void {
         const self: *LocalTableWriteParticipantWorker = @ptrCast(@alignCast(ptr));
-        _ = (try self.writes.txnBeginGroupLocal(alloc, group_id, table_name, req.txn_id, req.begin_timestamp, req.topology_epoch, req.participants)) orelse return error.UnknownGroup;
+        _ = (try self.writes.txnBeginGroupLocal(alloc, group_id, table_name, req.txn_id, req.begin_timestamp, req.topology_epoch, req.retain_terminal, req.participants)) orelse return error.UnknownGroup;
     }
 
     fn prepareGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnPrepareRequest) !void {
@@ -493,12 +536,17 @@ pub const LocalTableWriteParticipantWorker = struct {
 
     fn resolveGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest) !void {
         const self: *LocalTableWriteParticipantWorker = @ptrCast(@alignCast(ptr));
-        _ = (try self.writes.txnResolveGroupLocal(alloc, group_id, table_name, req.txn_id, req.status, req.commit_version)) orelse return error.UnknownGroup;
+        _ = (try self.writes.txnResolveGroupLocal(alloc, group_id, table_name, req.txn_id, req.status, req.commit_version, req.topology_epoch, req.sync_level)) orelse return error.UnknownGroup;
     }
 
     fn statusGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId) !db_mod.types.TxnStatus {
         const self: *LocalTableWriteParticipantWorker = @ptrCast(@alignCast(ptr));
         return (try self.writes.txnStatusGroupLocal(alloc, group_id, table_name, txn_id)) orelse error.UnknownGroup;
+    }
+
+    fn acknowledgeGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeRequest) !void {
+        const self: *LocalTableWriteParticipantWorker = @ptrCast(@alignCast(ptr));
+        _ = (try self.writes.txnAcknowledgeGroupLocal(alloc, group_id, table_name, req.txn_id, req.participant)) orelse return error.UnknownGroup;
     }
 
     fn lookupGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, key: []const u8) !?table_reads.LookupResponse {
@@ -525,7 +573,58 @@ pub const LocalTableWriteParticipantWorker = struct {
 
 pub const ExecuteResult = struct {
     participant_count: usize,
+    /// Stable sessions persist their terminal result before acknowledging the
+    /// coordinator itself. These coordinates identify that durable decision
+    /// record without recomputing it from mutable table routing.
+    coordinator_group_id: ?u64 = null,
+    coordinator_table_name: ?[]const u8 = null,
+    /// The commit decision is durable, but at least one participant still
+    /// needs phase-two delivery by foreground retry or recovery.
+    propagation_pending: bool = false,
+    /// Participant writes are durable, but the requested visibility barrier
+    /// was not reached before the response was produced.
+    visibility_pending: bool = false,
 };
+
+pub const ExecuteOptions = struct {
+    /// Preserve the terminal coordinator decision for an externally supplied
+    /// transaction ID's retry window.
+    retain_terminal: bool = false,
+    /// Only callers with an externally reusable transaction ID can safely
+    /// surface a post-decision error. An ephemeral caller would retry under a
+    /// new ID and reapply non-idempotent transforms.
+    report_post_commit_failure: bool = true,
+    /// Optional process-owned executor for independent participant RPCs. The
+    /// coordinator decision remains ordered, while follower admission,
+    /// prepare, and phase-two delivery use bounded concurrent windows.
+    fanout_io: ?std.Io = null,
+    max_parallel_participants: usize = 8,
+};
+
+const ParticipantFanoutSlot = struct {
+    err: ?anyerror = null,
+    acknowledgement_err: ?anyerror = null,
+    /// Begin failures other than a definite routing miss may have applied
+    /// before their response failed and therefore require an abort delivery.
+    may_have_transaction_state: bool = false,
+    propagation_pending: bool = false,
+
+    fn reset(self: *ParticipantFanoutSlot) void {
+        self.* = .{};
+    }
+};
+
+fn fanoutWidth(options: ExecuteOptions, participant_count: usize) usize {
+    if (options.fanout_io == null or participant_count <= 1) return 1;
+    return @min(@max(options.max_parallel_participants, 1), participant_count);
+}
+
+fn awaitFanout(group: *std.Io.Group, io: std.Io) void {
+    // Group.await only reports cancellation after every submitted task has
+    // finished. Transaction coordination is not itself cancelable once a
+    // participant RPC has started, so consume that signal after joining.
+    group.await(io) catch {};
+}
 
 pub fn executeCrossGroup(
     alloc: std.mem.Allocator,
@@ -538,131 +637,30 @@ pub fn executeCrossGroup(
     req: db_mod.types.TransactionIntentRequest,
     trace_writer: ?tracing.AntflyTraceWriter,
 ) !ExecuteResult {
-    const topology_epoch = try table_catalog.topologyEpoch(alloc, catalog, table_name);
-    var participants = std.ArrayListUnmanaged(ParticipantTxn).empty;
-    defer {
-        for (participants.items) |*participant| participant.deinit(alloc);
-        participants.deinit(alloc);
-    }
-    const constraint_timing_overrides = [_]TableForeignKeyConstraintTimingOverrides{.{
+    const tables = [_]TableCommitRequest{.{
         .table_name = table_name,
-        .overrides = req.foreign_key_constraint_timing_overrides,
+        .writes = req.writes,
+        .deletes = req.deletes,
+        .transforms = req.transforms,
+        .predicates = req.predicates,
+        .foreign_key_constraint_timing_overrides = req.foreign_key_constraint_timing_overrides,
     }};
-
-    try rejectUnsupportedDistributedForeignKeyTransforms(alloc, catalog, table_name, req.transforms);
-
-    for (req.writes) |write| {
-        const group_id = (try table_catalog.resolveGroupForKeyPinned(alloc, catalog, table_name, write.key, topology_epoch)) orelse return error.UnknownGroup;
-        const participant = try ensureParticipantTxn(alloc, &participants, table_name, group_id, topology_epoch);
-        try participant.writes.append(alloc, write);
-    }
-    for (req.deletes) |key| {
-        const group_id = (try table_catalog.resolveGroupForKeyPinned(alloc, catalog, table_name, key, topology_epoch)) orelse return error.UnknownGroup;
-        const participant = try ensureParticipantTxn(alloc, &participants, table_name, group_id, topology_epoch);
-        try participant.deletes.append(alloc, key);
-    }
-    for (req.predicates) |predicate| {
-        const group_id = (try table_catalog.resolveGroupForKeyPinned(alloc, catalog, table_name, predicate.key, topology_epoch)) orelse return error.UnknownGroup;
-        const participant = try ensureParticipantTxn(alloc, &participants, table_name, group_id, topology_epoch);
-        try participant.predicates.append(alloc, predicate);
-    }
-    for (req.transforms) |transform| {
-        const group_id = (try table_catalog.resolveGroupForKeyPinned(alloc, catalog, table_name, transform.key, topology_epoch)) orelse return error.UnknownGroup;
-        const participant = try ensureParticipantTxn(alloc, &participants, table_name, group_id, topology_epoch);
-        try participant.transforms.append(alloc, transform);
-    }
-    try addForeignKeyParentParticipants(alloc, catalog, worker, &participants, table_name, req.writes, req.transforms, req.predicates, &constraint_timing_overrides);
-    try addForeignKeyTransformParticipants(alloc, catalog, worker, &participants, table_name, req.writes, req.deletes, req.transforms, req.predicates, &constraint_timing_overrides);
-    try addForeignKeyChildDeleteParticipants(alloc, catalog, worker, &participants, table_name, req.deletes, req.transforms, req.predicates);
-    try addForeignKeyParentUpdateParticipants(alloc, catalog, worker, &participants, table_name, req.writes, req.deletes, req.transforms, req.predicates, &constraint_timing_overrides);
-    try addForeignKeyParentDeleteParticipants(
+    const outcome = try executeMultiTableCommit(
         alloc,
         catalog,
         worker,
-        &participants,
-        table_name,
-        req.writes,
-        &.{},
-        req.deletes,
-        req.predicates,
-        &constraint_timing_overrides,
-        0,
-        foreign_key_action_default_cascade_max_depth,
+        txn_id,
+        begin_timestamp,
+        commit_version,
+        &tables,
+        .propose,
+        trace_writer,
     );
-    try addUniqueConstraintOwnerParticipants(alloc, catalog, worker, &participants, table_name, req.writes, req.deletes, req.transforms, req.predicates);
-    try applyForeignKeyConstraintTimingOverridesToParticipants(alloc, &participants, &constraint_timing_overrides);
-
-    var participant_ids = std.ArrayListUnmanaged([]const u8).empty;
-    defer {
-        for (participant_ids.items) |participant_id| alloc.free(@constCast(participant_id));
-        participant_ids.deinit(alloc);
-    }
-    try participant_ids.ensureTotalCapacity(alloc, participants.items.len);
-    for (participants.items) |participant| {
-        const participant_id = try participantIdForGroup(alloc, participant.table_name, participant.group_id);
-        participant_ids.appendAssumeCapacity(participant_id);
-    }
-
-    var begun = std.ArrayListUnmanaged(ParticipantRef).empty;
-    defer begun.deinit(alloc);
-
-    errdefer {
-        if (trace_writer) |tw| {
-            tw.traceEvent(&.{ .name = "AbortTransaction", .txn_id = txn_id, .shard_id = "" });
-        }
-        abortBegunRefs(alloc, worker, txn_id, commit_version, begun.items) catch {};
-    }
-
-    for (participants.items) |participant| {
-        try worker.beginGroup(alloc, participant.group_id, participant.table_name, .{
-            .txn_id = txn_id,
-            .begin_timestamp = begin_timestamp,
-            .topology_epoch = participant.topology_epoch,
-            .participants = participant_ids.items,
-        });
-        try begun.append(alloc, .{ .table_name = participant.table_name, .group_id = participant.group_id });
-    }
-
-    for (participants.items) |participant| {
-        try worker.prepareGroup(alloc, participant.group_id, participant.table_name, .{
-            .txn_id = txn_id,
-            .topology_epoch = participant.topology_epoch,
-            .req = .{
-                .writes = participant.writes.items,
-                .deletes = participant.deletes.items,
-                .transforms = participant.transforms.items,
-                .predicates = participant.predicates.items,
-                .foreign_key_parent_checks = participant.foreign_key_parent_checks.items,
-                .foreign_key_parent_delete_checks = participant.foreign_key_parent_delete_checks.items,
-                .foreign_key_conflict_checks = participant.foreign_key_conflict_checks.items,
-                .foreign_key_set_null_children = participant.foreign_key_set_null_children.items,
-                .foreign_key_cascade_children = participant.foreign_key_cascade_children.items,
-                .foreign_key_action_schedules = participant.foreign_key_action_schedules.items,
-                .foreign_key_ref_writes = participant.foreign_key_ref_writes.items,
-                .foreign_key_ref_deletes = participant.foreign_key_ref_deletes.items,
-                .foreign_key_externalized_parent_checks = participant.foreign_key_externalized_parent_checks.items,
-                .unique_constraint_writes = participant.unique_constraint_writes.items,
-                .unique_constraint_deletes = participant.unique_constraint_deletes.items,
-                .foreign_key_constraint_timing_overrides = participant.foreign_key_constraint_timing_overrides.items,
-            },
-        });
-    }
-
-    for (participants.items) |participant| {
-        try worker.resolveGroup(alloc, participant.group_id, participant.table_name, .{
-            .txn_id = txn_id,
-            .status = .committed,
-            .commit_version = commit_version,
-        });
-    }
-
-    if (trace_writer) |tw| {
-        tw.traceEvent(&.{ .name = "CommitTransaction", .txn_id = txn_id, .shard_id = "", .timestamp = commit_version });
-    }
-
-    return .{ .participant_count = participants.items.len };
+    return switch (outcome) {
+        .committed => |committed| .{ .participant_count = committed.participant_count },
+        .conflict => error.IntentConflict,
+    };
 }
-
 pub fn executeMultiTableCommit(
     alloc: std.mem.Allocator,
     catalog: table_catalog.CatalogSource,
@@ -671,16 +669,36 @@ pub fn executeMultiTableCommit(
     begin_timestamp: u64,
     commit_version: u64,
     tables: []const TableCommitRequest,
+    sync_level: db_mod.types.SyncLevel,
     trace_writer: ?tracing.AntflyTraceWriter,
 ) !CommitOutcome {
-    var attempt: usize = 0;
-    while (attempt < 2) : (attempt += 1) {
-        return executeMultiTableCommitOnce(alloc, catalog, worker, txn_id, begin_timestamp, commit_version, tables, attempt > 0, trace_writer) catch |err| switch (err) {
-            error.TopologyChanged, error.UnknownGroup => if (attempt == 0) continue else return err,
-            else => return err,
-        };
-    }
-    unreachable;
+    return executeMultiTableCommitWithOptions(
+        alloc,
+        catalog,
+        worker,
+        txn_id,
+        begin_timestamp,
+        commit_version,
+        tables,
+        sync_level,
+        trace_writer,
+        .{},
+    );
+}
+
+pub fn executeMultiTableCommitWithOptions(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    worker: ParticipantWorker,
+    txn_id: db_mod.types.TxnId,
+    begin_timestamp: u64,
+    commit_version: u64,
+    tables: []const TableCommitRequest,
+    sync_level: db_mod.types.SyncLevel,
+    trace_writer: ?tracing.AntflyTraceWriter,
+    options: ExecuteOptions,
+) !CommitOutcome {
+    return executeMultiTableCommitOnce(alloc, catalog, worker, txn_id, begin_timestamp, commit_version, tables, sync_level, trace_writer, options);
 }
 
 pub fn executeForeignKeyActionPage(
@@ -1021,8 +1039,9 @@ fn executeMultiTableCommitOnce(
     begin_timestamp: u64,
     commit_version: u64,
     tables: []const TableCommitRequest,
-    surface_unavailable_conflict: bool,
+    sync_level: db_mod.types.SyncLevel,
     trace_writer: ?tracing.AntflyTraceWriter,
+    options: ExecuteOptions,
 ) !CommitOutcome {
     var participants = std.ArrayListUnmanaged(ParticipantTxn).empty;
     defer {
@@ -1039,28 +1058,29 @@ fn executeMultiTableCommitOnce(
     }
 
     for (tables) |table| {
-        const topology_epoch = try table_catalog.topologyEpoch(alloc, catalog, table.table_name);
-        if (topology_epoch == 0) return error.TableNotFound;
+        var routing = (try table_catalog.transactionRoutingSnapshot(alloc, catalog, table.table_name)) orelse return error.TableNotFound;
+        defer routing.deinit(alloc);
+        const topology_epoch = routing.topology_epoch;
 
         try rejectUnsupportedDistributedForeignKeyTransforms(alloc, catalog, table.table_name, table.transforms);
 
         for (table.writes) |write| {
-            const group_id = (try table_catalog.resolveGroupForKeyPinned(alloc, catalog, table.table_name, write.key, topology_epoch)) orelse return error.UnknownGroup;
+            const group_id = routing.resolveGroupForKey(write.key) orelse return error.UnknownGroup;
             const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
             try participant.writes.append(alloc, write);
         }
         for (table.deletes) |key| {
-            const group_id = (try table_catalog.resolveGroupForKeyPinned(alloc, catalog, table.table_name, key, topology_epoch)) orelse return error.UnknownGroup;
+            const group_id = routing.resolveGroupForKey(key) orelse return error.UnknownGroup;
             const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
             try participant.deletes.append(alloc, key);
         }
         for (table.predicates) |predicate| {
-            const group_id = (try table_catalog.resolveGroupForKeyPinned(alloc, catalog, table.table_name, predicate.key, topology_epoch)) orelse return error.UnknownGroup;
+            const group_id = routing.resolveGroupForKey(predicate.key) orelse return error.UnknownGroup;
             const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
             try participant.predicates.append(alloc, predicate);
         }
         for (table.transforms) |transform| {
-            const group_id = (try table_catalog.resolveGroupForKeyPinned(alloc, catalog, table.table_name, transform.key, topology_epoch)) orelse return error.UnknownGroup;
+            const group_id = routing.resolveGroupForKey(transform.key) orelse return error.UnknownGroup;
             const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
             try participant.transforms.append(alloc, transform);
         }
@@ -1086,94 +1106,227 @@ fn executeMultiTableCommitOnce(
     }
     try applyForeignKeyConstraintTimingOverridesToParticipants(alloc, &participants, constraint_timing_overrides);
 
-    var participant_ids = std.ArrayListUnmanaged([]const u8).empty;
+    const participant_ids = try alloc.alloc([]const u8, participants.items.len);
+    var participant_ids_initialized: usize = 0;
     defer {
-        for (participant_ids.items) |participant_id| alloc.free(@constCast(participant_id));
-        participant_ids.deinit(alloc);
+        for (participant_ids[0..participant_ids_initialized]) |participant_id| alloc.free(@constCast(participant_id));
+        alloc.free(participant_ids);
     }
-    try participant_ids.ensureTotalCapacity(alloc, participants.items.len);
-    for (participants.items) |participant| {
-        const participant_id = try participantIdForGroup(alloc, participant.table_name, participant.group_id);
-        participant_ids.appendAssumeCapacity(participant_id);
+    for (participants.items, 0..) |participant, i| {
+        participant_ids[i] = try participantIdForGroup(alloc, participant.table_name, participant.group_id);
+        participant_ids_initialized += 1;
     }
 
-    var begun = std.ArrayListUnmanaged(ParticipantRef).empty;
-    defer begun.deinit(alloc);
+    // Allocate every coordination slot before contacting a participant. No
+    // allocator failure may be introduced after the commit decision becomes
+    // durable, where returning an ordinary server error would invite an unsafe
+    // stateless retry.
+    const fanout_slots = try alloc.alloc(ParticipantFanoutSlot, participants.items.len);
+    defer alloc.free(fanout_slots);
+    for (fanout_slots) |*slot| slot.reset();
 
+    var begun_count: usize = 0;
+    var abort_on_error = true;
+    var resume_committed = false;
     errdefer {
-        if (trace_writer) |tw| {
-            tw.traceEvent(&.{ .name = "AbortTransaction", .txn_id = txn_id, .shard_id = "" });
+        if (abort_on_error) {
+            if (trace_writer) |tw| {
+                tw.traceEvent(&.{ .name = "AbortTransaction", .txn_id = txn_id, .shard_id = "" });
+            }
+            if (begun_count > 0) abortParticipants(
+                alloc,
+                worker,
+                txn_id,
+                commit_version,
+                participants.items,
+                participant_ids,
+                begun_count,
+            ) catch {};
         }
-        abortBegunRefs(alloc, worker, txn_id, commit_version, begun.items) catch {};
     }
 
-    for (participants.items) |participant| {
+    if (participants.items.len > 0) coordinator_begin: {
+        const participant = participants.items[0];
         worker.beginGroup(alloc, participant.group_id, participant.table_name, .{
             .txn_id = txn_id,
             .begin_timestamp = begin_timestamp,
             .topology_epoch = participant.topology_epoch,
-            .participants = participant_ids.items,
+            .retain_terminal = options.retain_terminal,
+            .participants = participant_ids,
         }) catch |err| switch (err) {
             error.UnknownGroup => {
-                if (surface_unavailable_conflict) {
-                    return .{ .conflict = try participantUnavailableConflict(alloc, participant, .begin) };
-                }
-                return err;
+                abort_on_error = false;
+                return .{ .conflict = try participantUnavailableConflict(alloc, participant, .begin) };
             },
-            else => return err,
+            error.DecisionConflict => {
+                // A stable transaction ID may be retried after the coordinator
+                // durably committed but before the client observed success.
+                // Resume commit-only propagation instead of treating that
+                // terminal record as a failed fresh begin.
+                const status = worker.statusGroup(
+                    alloc,
+                    participant.group_id,
+                    participant.table_name,
+                    txn_id,
+                ) catch return error.CommitDecisionUnknown;
+                switch (status) {
+                    .committed => {
+                        resume_committed = true;
+                        abort_on_error = false;
+                        break :coordinator_begin;
+                    },
+                    .aborted => {
+                        abort_on_error = false;
+                        return .{ .conflict = try participantDecisionConflict(alloc, participant, .begin) };
+                    },
+                    .pending => {},
+                }
+                abort_on_error = false;
+                try abortParticipants(
+                    alloc,
+                    worker,
+                    txn_id,
+                    commit_version,
+                    participants.items,
+                    participant_ids,
+                    1,
+                );
+                return error.TransactionBeginFailed;
+            },
+            else => {
+                // The failed call may have applied before its response failed,
+                // so include it in abort delivery. Participants after it were
+                // never contacted and can be acknowledged without an RPC.
+                abort_on_error = false;
+                try abortParticipants(
+                    alloc,
+                    worker,
+                    txn_id,
+                    commit_version,
+                    participants.items,
+                    participant_ids,
+                    1,
+                );
+                std.log.warn("transaction begin failed table={s} group_id={} err={s}", .{
+                    participant.table_name, participant.group_id, @errorName(err),
+                });
+                return error.TransactionBeginFailed;
+            },
         };
-        try begun.append(alloc, .{ .table_name = participant.table_name, .group_id = participant.group_id });
+        begun_count = 1;
     }
 
-    for (participants.items) |participant| {
-        worker.prepareGroup(alloc, participant.group_id, participant.table_name, .{
-            .txn_id = txn_id,
-            .topology_epoch = participant.topology_epoch,
-            .req = .{
-                .writes = participant.writes.items,
-                .deletes = participant.deletes.items,
-                .transforms = participant.transforms.items,
-                .predicates = participant.predicates.items,
-                .foreign_key_parent_checks = participant.foreign_key_parent_checks.items,
-                .foreign_key_parent_delete_checks = participant.foreign_key_parent_delete_checks.items,
-                .foreign_key_conflict_checks = participant.foreign_key_conflict_checks.items,
-                .foreign_key_set_null_children = participant.foreign_key_set_null_children.items,
-                .foreign_key_cascade_children = participant.foreign_key_cascade_children.items,
-                .foreign_key_action_schedules = participant.foreign_key_action_schedules.items,
-                .foreign_key_ref_writes = participant.foreign_key_ref_writes.items,
-                .foreign_key_ref_deletes = participant.foreign_key_ref_deletes.items,
-                .foreign_key_externalized_parent_checks = participant.foreign_key_externalized_parent_checks.items,
-                .unique_constraint_writes = participant.unique_constraint_writes.items,
-                .unique_constraint_deletes = participant.unique_constraint_deletes.items,
-                .foreign_key_constraint_timing_overrides = participant.foreign_key_constraint_timing_overrides.items,
-            },
-        }) catch |err| switch (err) {
-            error.IntentConflict, error.VersionConflict => {
-                if (trace_writer) |tw| {
-                    tw.traceEvent(&.{ .name = "AbortTransaction", .txn_id = txn_id, .shard_id = "" });
-                }
-                try abortBegunRefs(alloc, worker, txn_id, commit_version, begun.items);
-                return .{ .conflict = try participantConflict(alloc, participant) };
-            },
-            error.UnknownGroup => {
-                if (surface_unavailable_conflict) {
+    if (!resume_committed and participants.items.len > 1) {
+        runBeginFanout(
+            worker,
+            txn_id,
+            begin_timestamp,
+            participants.items,
+            participant_ids,
+            fanout_slots,
+            options,
+        );
+        if (firstFanoutError(fanout_slots[1..])) |failure_offset| {
+            const participant_index = failure_offset + 1;
+            const failure = fanout_slots[participant_index].err.?;
+            if (failure != error.UnknownGroup) {
+                const participant = participants.items[participant_index];
+                std.log.warn("transaction begin failed table={s} group_id={} err={s}", .{
+                    participant.table_name, participant.group_id, @errorName(failure),
+                });
+            }
+            abort_on_error = false;
+            try abortParticipantsWithContactMask(
+                alloc,
+                worker,
+                txn_id,
+                commit_version,
+                participants.items,
+                participant_ids,
+                fanout_slots,
+            );
+            return switch (failure) {
+                error.UnknownGroup => .{ .conflict = try participantUnavailableConflict(alloc, participants.items[participant_index], .begin) },
+                else => error.TransactionBeginFailed,
+            };
+        }
+        begun_count = participants.items.len;
+    }
+
+    if (!resume_committed) {
+        runPrepareFanout(worker, txn_id, participants.items, fanout_slots, options);
+        if (firstFanoutError(fanout_slots)) |participant_index| {
+            const participant = participants.items[participant_index];
+            const err = fanout_slots[participant_index].err.?;
+            switch (err) {
+                error.IntentConflict, error.VersionConflict => {
                     if (trace_writer) |tw| {
                         tw.traceEvent(&.{ .name = "AbortTransaction", .txn_id = txn_id, .shard_id = "" });
                     }
-                    try abortBegunRefs(alloc, worker, txn_id, commit_version, begun.items);
+                    abort_on_error = false;
+                    try abortParticipants(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len);
+                    return .{ .conflict = try participantConflict(alloc, participant) };
+                },
+                error.UnknownGroup => {
+                    abort_on_error = false;
+                    try abortParticipants(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len);
                     return .{ .conflict = try participantUnavailableConflict(alloc, participant, .prepare) };
-                }
-                return err;
-            },
-            else => return err,
-        };
+                },
+                else => {
+                    abort_on_error = false;
+                    try abortParticipants(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len);
+                    return err;
+                },
+            }
+        }
     }
 
-    for (participants.items) |participant| {
+    // Preparing can overlap metadata publication. Recheck both transition
+    // admission and the exact range epoch before the coordinator participant
+    // records the irreversible commit decision.
+    if (!resume_committed) {
+        for (participants.items, 0..) |participant, i| {
+            var already_checked = false;
+            for (participants.items[0..i]) |prior| {
+                if (std.mem.eql(u8, prior.table_name, participant.table_name)) {
+                    already_checked = true;
+                    break;
+                }
+            }
+            if (already_checked) continue;
+            table_catalog.validateTransactionTopologyEpoch(alloc, catalog, participant.table_name, participant.topology_epoch) catch |err| {
+                abort_on_error = false;
+                try abortParticipants(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len);
+                return err;
+            };
+        }
+    }
+
+    // Visibility and propagation can both remain pending (for example, when
+    // the coordinator's write becomes durable but its visibility barrier
+    // fails and a follower was only proposed). Track them independently so a
+    // later phase-two outcome cannot hide an earlier recovery obligation.
+    var visibility_pending = false;
+    var propagation_pending = false;
+    var propagation_failed = false;
+    if (participants.items.len > 0) {
+        const participant = participants.items[0];
+        const coordinator_sync_level: db_mod.types.SyncLevel = if (sync_level == .propose) .write else sync_level;
         worker.resolveGroup(alloc, participant.group_id, participant.table_name, .{
             .txn_id = txn_id,
             .status = .committed,
             .commit_version = commit_version,
+            // Fence every first-pass resolution against the topology pinned at
+            // admission. Recovery deliberately uses epoch zero: a durable
+            // commit decision must remain resolvable after a topology change.
+            .topology_epoch = if (!resume_committed) participant.topology_epoch else 0,
+            // The first participant is the transaction decision record. It must
+            // be committed and applied before any other participant can learn a
+            // commit decision, even when the public request selected the faster
+            // proposal-only acknowledgement level. Later participants retain
+            // the caller's requested visibility contract and are recoverable
+            // from the durable coordinator decision.
+            .sync_level = coordinator_sync_level,
         }) catch |err| switch (err) {
             error.DecisionConflict => {
                 if (trace_writer) |tw| {
@@ -1185,6 +1338,8 @@ fn executeMultiTableCommitOnce(
                         .reason = "participant decision conflict",
                     });
                 }
+                abort_on_error = false;
+                try abortParticipants(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len);
                 return .{ .conflict = try participantDecisionConflict(alloc, participant, .resolve) };
             },
             error.TxnNotFound, error.InvalidTxnRecord => {
@@ -1197,27 +1352,135 @@ fn executeMultiTableCommitOnce(
                         .reason = "participant transaction state missing",
                     });
                 }
+                // The decision participant has no durable transaction record,
+                // so no commit decision exists yet.
+                abort_on_error = false;
+                try abortParticipants(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len);
                 return .{ .conflict = try participantTornStateConflict(alloc, participant, .resolve) };
             },
-            error.UnknownGroup => {
-                if (surface_unavailable_conflict) {
-                    if (trace_writer) |tw| {
-                        tw.traceEvent(&.{ .name = "AbortTransaction", .txn_id = txn_id, .shard_id = "" });
-                    }
-                    try abortBegunRefs(alloc, worker, txn_id, commit_version, begun.items);
-                    return .{ .conflict = try participantUnavailableConflict(alloc, participant, .resolve) };
+            else => {
+                // A resolve can report an error after its local atomic commit
+                // (for example while mirroring or waiting for an index). Read
+                // the participant record before deciding whether abort is
+                // still legal.
+                const durable_status = resolveCoordinatorDecisionAfterFailure(
+                    alloc,
+                    worker,
+                    participant,
+                    txn_id,
+                    commit_version,
+                    coordinator_sync_level,
+                    err,
+                ) catch |status_err| {
+                    // The outcome is uncertain. Recovery will consult the
+                    // participant record; aborting here could contradict a
+                    // commit that already became durable.
+                    abort_on_error = false;
+                    std.log.warn("transaction commit decision remains unknown table={s} group_id={} err={s}", .{
+                        participant.table_name, participant.group_id, @errorName(status_err),
+                    });
+                    return error.CommitDecisionUnknown;
+                };
+                switch (durable_status) {
+                    .committed => {
+                        abort_on_error = false;
+                        // The decision is durable, but the requested sync or
+                        // visibility barrier did not complete. Preserve that
+                        // failure while finishing best-effort propagation.
+                        std.log.warn("transaction commit visibility barrier failed table={s} group_id={} err={s}", .{
+                            participant.table_name, participant.group_id, @errorName(err),
+                        });
+                        visibility_pending = true;
+                    },
+                    .pending => {
+                        abort_on_error = false;
+                        try abortParticipants(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len);
+                        return err;
+                    },
+                    .aborted => {
+                        abort_on_error = false;
+                        try abortParticipants(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len);
+                        return .{ .conflict = try participantDecisionConflict(alloc, participant, .resolve) };
+                    },
                 }
-                return err;
             },
-            else => return err,
         };
+        // The first participant is the durable transaction decision. Once it
+        // commits, all remaining retries are commit-only and must never enter
+        // the abort cleanup path.
+        abort_on_error = false;
+    }
+
+    runResolveFollowerFanout(
+        worker,
+        txn_id,
+        commit_version,
+        participants.items,
+        participant_ids,
+        sync_level,
+        resume_committed,
+        fanout_slots,
+        options,
+    );
+    const follower_start: usize = @min(fanout_slots.len, 1);
+    for (fanout_slots[follower_start..], follower_start..) |slot, participant_index| {
+        if (slot.err) |err| {
+            const participant = participants.items[participant_index];
+            if (trace_writer) |tw| {
+                tw.traceEvent(&.{
+                    .name = if (err == error.DecisionConflict) "ResolveDecisionConflict" else "ResolveParticipantFailure",
+                    .txn_id = txn_id,
+                    .shard_id = "",
+                    .timestamp = commit_version,
+                    .reason = @errorName(err),
+                });
+            }
+            std.log.warn("transaction commit propagation failed table={s} group_id={} err={s}", .{
+                participant.table_name,
+                participant.group_id,
+                @errorName(err),
+            });
+            propagation_failed = true;
+        }
+        if (slot.acknowledgement_err) |err| {
+            const participant = participants.items[participant_index];
+            std.log.warn("transaction participant acknowledgement deferred table={s} group_id={} err={s}", .{
+                participant.table_name,
+                participant.group_id,
+                @errorName(err),
+            });
+        }
+        propagation_pending = propagation_pending or slot.propagation_pending;
     }
 
     if (trace_writer) |tw| {
         tw.traceEvent(&.{ .name = "CommitTransaction", .txn_id = txn_id, .shard_id = "", .timestamp = commit_version });
     }
 
-    return .{ .committed = .{ .participant_count = participants.items.len } };
+    var result: ExecuteResult = .{
+        .participant_count = participants.items.len,
+        .coordinator_group_id = if (participants.items.len > 0) participants.items[0].group_id else null,
+        .coordinator_table_name = if (participants.items.len > 0) participants.items[0].table_name else null,
+    };
+    if (options.report_post_commit_failure) {
+        // A definite participant failure is more actionable than a failed
+        // visibility barrier. Otherwise preserve the direct visibility error
+        // ahead of proposal-only propagation that recovery will make durable.
+        // Callers requesting structured outcomes receive every pending flag.
+        if (propagation_failed) return error.CommitPropagationIncomplete;
+        if (visibility_pending) return error.CommitVisibilityNotSatisfied;
+        if (propagation_pending) return error.CommitPropagationIncomplete;
+    }
+    result.visibility_pending = visibility_pending;
+    result.propagation_pending = propagation_pending;
+    if (visibility_pending) {
+        std.log.warn("transaction commit acknowledged with deferred visibility txn_id={x}", .{txn_id});
+    }
+    if (propagation_pending) {
+        std.log.warn("transaction commit acknowledged with deferred propagation txn_id={x}", .{txn_id});
+    }
+
+    return .{ .committed = result };
 }
 
 pub fn explainRoutedForeignKeyParentDelete(
@@ -1576,8 +1839,71 @@ fn routeForeignKeyRefOwnerChildActionPage(
     }
 }
 
+const max_coordinator_resolution_attempts: usize = 3;
+
+/// Resolve an ambiguous coordinator submission without changing transaction
+/// identity. Status is probed after every failed submission; retries are
+/// idempotent and occur only on this failure path, keeping the normal commit
+/// path at one Raft round trip.
+fn resolveCoordinatorDecisionAfterFailure(
+    alloc: std.mem.Allocator,
+    worker: ParticipantWorker,
+    participant: ParticipantTxn,
+    txn_id: db_mod.types.TxnId,
+    commit_version: u64,
+    sync_level: db_mod.types.SyncLevel,
+    initial_resolve_error: anyerror,
+) !db_mod.types.TxnStatus {
+    var attempts: usize = 1;
+    var last_resolve_error = initial_resolve_error;
+    while (true) {
+        const status = worker.statusGroup(
+            alloc,
+            participant.group_id,
+            participant.table_name,
+            txn_id,
+        ) catch |status_err| {
+            if (attempts >= max_coordinator_resolution_attempts) {
+                std.log.warn("transaction commit decision probe exhausted table={s} group_id={} attempts={} resolve_err={s} status_err={s}", .{
+                    participant.table_name,
+                    participant.group_id,
+                    attempts,
+                    @errorName(last_resolve_error),
+                    @errorName(status_err),
+                });
+                return error.CommitDecisionUnknown;
+            }
+            attempts += 1;
+            worker.resolveGroup(alloc, participant.group_id, participant.table_name, .{
+                .txn_id = txn_id,
+                .status = .committed,
+                .commit_version = commit_version,
+                .topology_epoch = participant.topology_epoch,
+                .sync_level = sync_level,
+            }) catch |retry_err| {
+                last_resolve_error = retry_err;
+                continue;
+            };
+            return .committed;
+        };
+
+        if (status != .pending or attempts >= max_coordinator_resolution_attempts) return status;
+        attempts += 1;
+        worker.resolveGroup(alloc, participant.group_id, participant.table_name, .{
+            .txn_id = txn_id,
+            .status = .committed,
+            .commit_version = commit_version,
+            .topology_epoch = participant.topology_epoch,
+            .sync_level = sync_level,
+        }) catch |retry_err| {
+            last_resolve_error = retry_err;
+            continue;
+        };
+        return .committed;
+    }
+}
 const ParticipantTxn = struct {
-    table_name: []u8,
+    table_name: []const u8,
     group_id: u64,
     topology_epoch: u64,
     writes: std.ArrayListUnmanaged(db_mod.types.TransactionWrite) = .empty,
@@ -1708,6 +2034,405 @@ fn freeUniqueConstraintMutationFields(alloc: std.mem.Allocator, mutation: db_mod
     if (mutation.temporal_end) |value| alloc.free(@constCast(value));
 }
 
+const BeginFanoutTask = struct {
+    fn run(
+        worker: ParticipantWorker,
+        participant: *const ParticipantTxn,
+        participant_ids: []const []const u8,
+        txn_id: db_mod.types.TxnId,
+        begin_timestamp: u64,
+        retain_terminal: bool,
+        slot: *ParticipantFanoutSlot,
+    ) void {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        worker.beginGroup(arena.allocator(), participant.group_id, participant.table_name, .{
+            .txn_id = txn_id,
+            .begin_timestamp = begin_timestamp,
+            .topology_epoch = participant.topology_epoch,
+            .retain_terminal = retain_terminal,
+            .participants = participant_ids,
+        }) catch |err| {
+            slot.err = err;
+            slot.may_have_transaction_state = err != error.UnknownGroup;
+            return;
+        };
+        slot.may_have_transaction_state = true;
+    }
+};
+
+fn runBeginFanout(
+    worker: ParticipantWorker,
+    txn_id: db_mod.types.TxnId,
+    begin_timestamp: u64,
+    participants: []const ParticipantTxn,
+    participant_ids: []const []const u8,
+    slots: []ParticipantFanoutSlot,
+    options: ExecuteOptions,
+) void {
+    std.debug.assert(participants.len == participant_ids.len and participants.len == slots.len);
+    for (slots) |*slot| slot.reset();
+    if (participants.len <= 1) return;
+    const width = fanoutWidth(options, participants.len - 1);
+    var start: usize = 1;
+    while (start < participants.len) : (start += width) {
+        const end = @min(start + width, participants.len);
+        if (options.fanout_io) |io| {
+            var group: std.Io.Group = .init;
+            for (start..end) |i| {
+                group.concurrent(io, BeginFanoutTask.run, .{
+                    worker,
+                    &participants[i],
+                    participant_ids,
+                    txn_id,
+                    begin_timestamp,
+                    options.retain_terminal,
+                    &slots[i],
+                }) catch BeginFanoutTask.run(
+                    worker,
+                    &participants[i],
+                    participant_ids,
+                    txn_id,
+                    begin_timestamp,
+                    options.retain_terminal,
+                    &slots[i],
+                );
+            }
+            awaitFanout(&group, io);
+        } else {
+            for (start..end) |i| BeginFanoutTask.run(
+                worker,
+                &participants[i],
+                participant_ids,
+                txn_id,
+                begin_timestamp,
+                options.retain_terminal,
+                &slots[i],
+            );
+        }
+        if (firstFanoutError(slots[start..end]) != null) break;
+    }
+}
+
+const PrepareFanoutTask = struct {
+    fn run(
+        worker: ParticipantWorker,
+        participant: *const ParticipantTxn,
+        txn_id: db_mod.types.TxnId,
+        slot: *ParticipantFanoutSlot,
+    ) void {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        worker.prepareGroup(arena.allocator(), participant.group_id, participant.table_name, .{
+            .txn_id = txn_id,
+            .topology_epoch = participant.topology_epoch,
+            .req = .{
+                .writes = participant.writes.items,
+                .deletes = participant.deletes.items,
+                .transforms = participant.transforms.items,
+                .predicates = participant.predicates.items,
+                .foreign_key_parent_checks = participant.foreign_key_parent_checks.items,
+                .foreign_key_parent_delete_checks = participant.foreign_key_parent_delete_checks.items,
+                .foreign_key_conflict_checks = participant.foreign_key_conflict_checks.items,
+                .foreign_key_set_null_children = participant.foreign_key_set_null_children.items,
+                .foreign_key_cascade_children = participant.foreign_key_cascade_children.items,
+                .foreign_key_action_schedules = participant.foreign_key_action_schedules.items,
+                .foreign_key_ref_writes = participant.foreign_key_ref_writes.items,
+                .foreign_key_ref_deletes = participant.foreign_key_ref_deletes.items,
+                .foreign_key_externalized_parent_checks = participant.foreign_key_externalized_parent_checks.items,
+                .unique_constraint_writes = participant.unique_constraint_writes.items,
+                .unique_constraint_deletes = participant.unique_constraint_deletes.items,
+                .foreign_key_constraint_timing_overrides = participant.foreign_key_constraint_timing_overrides.items,
+            },
+        }) catch |err| {
+            slot.err = err;
+        };
+    }
+};
+
+fn runPrepareFanout(
+    worker: ParticipantWorker,
+    txn_id: db_mod.types.TxnId,
+    participants: []const ParticipantTxn,
+    slots: []ParticipantFanoutSlot,
+    options: ExecuteOptions,
+) void {
+    std.debug.assert(participants.len == slots.len);
+    for (slots) |*slot| slot.reset();
+    const width = fanoutWidth(options, participants.len);
+    var start: usize = 0;
+    while (start < participants.len) : (start += width) {
+        const end = @min(start + width, participants.len);
+        if (options.fanout_io) |io| {
+            var group: std.Io.Group = .init;
+            for (start..end) |i| {
+                group.concurrent(io, PrepareFanoutTask.run, .{ worker, &participants[i], txn_id, &slots[i] }) catch
+                    PrepareFanoutTask.run(worker, &participants[i], txn_id, &slots[i]);
+            }
+            awaitFanout(&group, io);
+        } else {
+            for (start..end) |i| PrepareFanoutTask.run(worker, &participants[i], txn_id, &slots[i]);
+        }
+        if (firstFanoutError(slots[start..end]) != null) break;
+    }
+}
+
+const ResolveFollowerFanoutTask = struct {
+    fn run(
+        worker: ParticipantWorker,
+        coordinator: *const ParticipantTxn,
+        participant: *const ParticipantTxn,
+        participant_id: []const u8,
+        txn_id: db_mod.types.TxnId,
+        commit_version: u64,
+        sync_level: db_mod.types.SyncLevel,
+        resume_committed: bool,
+        slot: *ParticipantFanoutSlot,
+    ) void {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        worker.resolveGroup(arena.allocator(), participant.group_id, participant.table_name, .{
+            .txn_id = txn_id,
+            .status = .committed,
+            .commit_version = commit_version,
+            .topology_epoch = if (resume_committed) 0 else participant.topology_epoch,
+            .sync_level = sync_level,
+        }) catch |err| {
+            slot.err = err;
+            slot.propagation_pending = true;
+            return;
+        };
+        if (sync_level == .propose) {
+            // Proposal acceptance can be lost on leadership change. Retain the
+            // coordinator enlistment until recovery delivers at write level.
+            slot.propagation_pending = true;
+            return;
+        }
+        worker.acknowledgeGroup(arena.allocator(), coordinator.group_id, coordinator.table_name, .{
+            .txn_id = txn_id,
+            .participant = participant_id,
+        }) catch |err| {
+            slot.acknowledgement_err = err;
+            slot.propagation_pending = true;
+        };
+    }
+};
+
+fn runResolveFollowerFanout(
+    worker: ParticipantWorker,
+    txn_id: db_mod.types.TxnId,
+    commit_version: u64,
+    participants: []const ParticipantTxn,
+    participant_ids: []const []const u8,
+    sync_level: db_mod.types.SyncLevel,
+    resume_committed: bool,
+    slots: []ParticipantFanoutSlot,
+    options: ExecuteOptions,
+) void {
+    std.debug.assert(participants.len == participant_ids.len and participants.len == slots.len);
+    for (slots) |*slot| slot.reset();
+    if (participants.len <= 1) return;
+    const width = fanoutWidth(options, participants.len - 1);
+    var start: usize = 1;
+    while (start < participants.len) : (start += width) {
+        const end = @min(start + width, participants.len);
+        if (options.fanout_io) |io| {
+            var group: std.Io.Group = .init;
+            for (start..end) |i| {
+                group.concurrent(io, ResolveFollowerFanoutTask.run, .{
+                    worker,
+                    &participants[0],
+                    &participants[i],
+                    participant_ids[i],
+                    txn_id,
+                    commit_version,
+                    sync_level,
+                    resume_committed,
+                    &slots[i],
+                }) catch ResolveFollowerFanoutTask.run(
+                    worker,
+                    &participants[0],
+                    &participants[i],
+                    participant_ids[i],
+                    txn_id,
+                    commit_version,
+                    sync_level,
+                    resume_committed,
+                    &slots[i],
+                );
+            }
+            awaitFanout(&group, io);
+        } else {
+            for (start..end) |i| ResolveFollowerFanoutTask.run(
+                worker,
+                &participants[0],
+                &participants[i],
+                participant_ids[i],
+                txn_id,
+                commit_version,
+                sync_level,
+                resume_committed,
+                &slots[i],
+            );
+        }
+    }
+}
+
+fn firstFanoutError(slots: []const ParticipantFanoutSlot) ?usize {
+    for (slots, 0..) |slot, i| if (slot.err != null) return i;
+    return null;
+}
+
+test "distributed txn retries an ambiguous coordinator decision under the same id" {
+    const Recorder = struct {
+        resolve_calls: usize = 0,
+        status_calls: usize = 0,
+
+        fn worker(self: *@This()) ParticipantWorker {
+            return .{ .ptr = self, .vtable = &.{
+                .begin_group = begin,
+                .prepare_group = prepare,
+                .resolve_group = resolve,
+                .status_group = status,
+            } };
+        }
+
+        fn begin(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnBeginRequest) !void {}
+        fn prepare(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnPrepareRequest) !void {}
+        fn resolve(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, req: TxnResolveRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.resolve_calls += 1;
+            try std.testing.expectEqual(db_mod.types.TxnStatus.committed, req.status);
+            try std.testing.expectEqual(@as(u64, 10_001), req.commit_version);
+            try std.testing.expectEqual(db_mod.types.SyncLevel.write, req.sync_level);
+        }
+        fn status(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.status_calls += 1;
+            return error.InjectedStatusFailure;
+        }
+    };
+
+    var recorder = Recorder{};
+    const txn_id = try parseTxnIdHex("00112233445566778899aabbccddeeff");
+    const status = try resolveCoordinatorDecisionAfterFailure(
+        std.testing.allocator,
+        recorder.worker(),
+        .{ .table_name = "docs", .group_id = 7001, .topology_epoch = 9 },
+        txn_id,
+        10_001,
+        // Every ambiguous coordinator retry must preserve the durable barrier
+        // selected for the original decision submission.
+        .write,
+        error.InjectedResolveFailure,
+    );
+    try std.testing.expectEqual(db_mod.types.TxnStatus.committed, status);
+    try std.testing.expectEqual(@as(usize, 1), recorder.status_calls);
+    try std.testing.expectEqual(@as(usize, 1), recorder.resolve_calls);
+}
+
+test "distributed txn bounds unresolved coordinator decision retries" {
+    const Recorder = struct {
+        resolve_calls: usize = 0,
+        status_calls: usize = 0,
+
+        fn worker(self: *@This()) ParticipantWorker {
+            return .{ .ptr = self, .vtable = &.{
+                .begin_group = begin,
+                .prepare_group = prepare,
+                .resolve_group = resolve,
+                .status_group = status,
+            } };
+        }
+
+        fn begin(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnBeginRequest) !void {}
+        fn prepare(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnPrepareRequest) !void {}
+        fn resolve(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnResolveRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.resolve_calls += 1;
+            return error.InjectedResolveFailure;
+        }
+        fn status(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.status_calls += 1;
+            return error.InjectedStatusFailure;
+        }
+    };
+
+    var recorder = Recorder{};
+    const txn_id = try parseTxnIdHex("ffeeddccbbaa99887766554433221100");
+    try std.testing.expectError(error.CommitDecisionUnknown, resolveCoordinatorDecisionAfterFailure(
+        std.testing.allocator,
+        recorder.worker(),
+        .{ .table_name = "docs", .group_id = 7001, .topology_epoch = 9 },
+        txn_id,
+        10_001,
+        .write,
+        error.InjectedResolveFailure,
+    ));
+    try std.testing.expectEqual(max_coordinator_resolution_attempts, recorder.status_calls);
+    try std.testing.expectEqual(max_coordinator_resolution_attempts - 1, recorder.resolve_calls);
+}
+
+test "distributed txn participant fanout is bounded and concurrent" {
+    const Recorder = struct {
+        active: std.atomic.Value(usize) = .init(0),
+        peak: std.atomic.Value(usize) = .init(0),
+        calls: std.atomic.Value(usize) = .init(0),
+
+        fn worker(self: *@This()) ParticipantWorker {
+            return .{ .ptr = self, .vtable = &.{
+                .begin_group = begin,
+                .prepare_group = prepare,
+                .resolve_group = resolve,
+                .status_group = status,
+            } };
+        }
+
+        fn updatePeak(self: *@This(), current: usize) void {
+            var observed = self.peak.load(.monotonic);
+            while (current > observed) {
+                observed = self.peak.cmpxchgWeak(observed, current, .monotonic, .monotonic) orelse return;
+            }
+        }
+
+        fn begin(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnBeginRequest) !void {}
+        fn prepare(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnPrepareRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const current = self.active.fetchAdd(1, .acq_rel) + 1;
+            self.updatePeak(current);
+            _ = self.calls.fetchAdd(1, .monotonic);
+            sleepNs(10 * std.time.ns_per_ms);
+            _ = self.active.fetchSub(1, .acq_rel);
+        }
+        fn resolve(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnResolveRequest) !void {}
+        fn status(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
+            return .pending;
+        }
+    };
+
+    var recorder = Recorder{};
+    const participants = [_]ParticipantTxn{
+        .{ .table_name = "docs", .group_id = 7001, .topology_epoch = 1 },
+        .{ .table_name = "docs", .group_id = 7002, .topology_epoch = 1 },
+        .{ .table_name = "docs", .group_id = 7003, .topology_epoch = 1 },
+        .{ .table_name = "docs", .group_id = 7004, .topology_epoch = 1 },
+    };
+    var slots: [participants.len]ParticipantFanoutSlot = undefined;
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(4) });
+    defer io_impl.deinit();
+
+    runPrepareFanout(
+        recorder.worker(),
+        try parseTxnIdHex("00112233445566778899aabbccddeeff"),
+        &participants,
+        &slots,
+        .{ .fanout_io = io_impl.io(), .max_parallel_participants = 2 },
+    );
+    try std.testing.expectEqual(@as(usize, participants.len), recorder.calls.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 2), recorder.peak.load(.acquire));
+    try std.testing.expect(firstFanoutError(&slots) == null);
+}
 fn ensureParticipantTxn(
     alloc: std.mem.Allocator,
     grouped: *std.ArrayListUnmanaged(ParticipantTxn),
@@ -4027,6 +4752,10 @@ pub fn resolveParticipant(
         .txn_id = txn_id,
         .status = status,
         .commit_version = commit_version,
+        // Recovery acknowledges this participant immediately after the call.
+        // It therefore requires a committed/applied decision, not mere Raft
+        // proposal acceptance.
+        .sync_level = .write,
     });
 }
 
@@ -4063,6 +4792,8 @@ pub fn encodeTxnBeginRequest(alloc: std.mem.Allocator, req: TxnBeginRequest) ![]
     const epoch = try std.fmt.allocPrint(alloc, "{d}", .{req.topology_epoch});
     defer alloc.free(epoch);
     try out.appendSlice(alloc, epoch);
+    try out.appendSlice(alloc, ",\"retain_terminal\":");
+    try out.appendSlice(alloc, if (req.retain_terminal) "true" else "false");
     try out.appendSlice(alloc, ",\"participants\":[");
     for (req.participants, 0..) |participant, i| {
         if (i > 0) try out.append(alloc, ',');
@@ -4468,14 +5199,23 @@ pub fn encodeTxnResolveRequest(alloc: std.mem.Allocator, req: TxnResolveRequest)
     };
     return try std.fmt.allocPrint(
         alloc,
-        "{{\"txn_id\":\"{s}\",\"status\":\"{s}\",\"commit_version\":{d}}}",
-        .{ &txn_hex, status_text, req.commit_version },
+        "{{\"txn_id\":\"{s}\",\"status\":\"{s}\",\"commit_version\":{d},\"topology_epoch\":{d},\"sync_level\":\"{s}\"}}",
+        .{ &txn_hex, status_text, req.commit_version, req.topology_epoch, @tagName(req.sync_level) },
     );
 }
 
 pub fn encodeTxnStatusRequest(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) ![]u8 {
     const txn_hex = encodeTxnIdHex(txn_id);
     return try std.fmt.allocPrint(alloc, "{{\"txn_id\":\"{s}\"}}", .{&txn_hex});
+}
+
+pub fn encodeTxnAcknowledgeRequest(alloc: std.mem.Allocator, req: TxnAcknowledgeRequest) ![]u8 {
+    const txn_hex = encodeTxnIdHex(req.txn_id);
+    return try std.fmt.allocPrint(
+        alloc,
+        "{{\"txn_id\":\"{s}\",\"participant\":{f}}}",
+        .{ &txn_hex, std.json.fmt(req.participant, .{}) },
+    );
 }
 
 pub fn encodeTxnStatusResponse(alloc: std.mem.Allocator, response: TxnStatusResponse) ![]u8 {
@@ -4558,21 +5298,35 @@ pub fn parseTxnBeginRequest(alloc: std.mem.Allocator, body: []const u8) !TxnBegi
         else => return error.InvalidTxnRequest,
     };
     const txn_id = try parseTxnIdHex(requireString(obj, "txn_id"));
-    const begin_timestamp = requireInteger(obj, "begin_timestamp");
+    const begin_timestamp = try requireU64(obj, "begin_timestamp");
     const participants_value = obj.get("participants") orelse return error.InvalidTxnRequest;
     const participants = switch (participants_value) {
         .array => |arr| arr,
         else => return error.InvalidTxnRequest,
     };
-    var out = try alloc.alloc([]const u8, participants.items.len);
-    errdefer alloc.free(out);
+    const out = try alloc.alloc([]const u8, participants.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |participant| alloc.free(@constCast(participant));
+        if (out.len > 0) alloc.free(out);
+    }
     for (participants.items, 0..) |item, i| {
         out[i] = try alloc.dupe(u8, switch (item) {
             .string => |s| s,
             else => return error.InvalidTxnRequest,
         });
+        initialized += 1;
     }
-    return .{ .txn_id = txn_id, .begin_timestamp = begin_timestamp, .topology_epoch = requireInteger(obj, "topology_epoch"), .participants = out };
+    return .{
+        .txn_id = txn_id,
+        .begin_timestamp = begin_timestamp,
+        .topology_epoch = try optionalU64(obj, "topology_epoch"),
+        .retain_terminal = if (obj.get("retain_terminal")) |value| switch (value) {
+            .bool => |flag| flag,
+            else => return error.InvalidTxnRequest,
+        } else false,
+        .participants = out,
+    };
 }
 
 pub fn freeTxnBeginRequest(alloc: std.mem.Allocator, req: *TxnBeginRequest) void {
@@ -4590,13 +5344,13 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
     };
     const txn_id = try parseTxnIdHex(requireString(obj, "txn_id"));
     const writes = try parseTxnWrites(alloc, obj.get("writes") orelse return error.InvalidTxnRequest);
-    errdefer if (writes.len > 0) alloc.free(writes);
+    errdefer freeTxnWrites(alloc, writes);
     const deletes = try parseTxnDeletes(alloc, obj.get("deletes") orelse return error.InvalidTxnRequest);
-    errdefer if (deletes.len > 0) alloc.free(deletes);
+    errdefer freeTxnDeletes(alloc, deletes);
     const transforms = try parseTxnTransforms(alloc, obj.get("transforms") orelse return error.InvalidTxnRequest);
     errdefer freeTxnTransforms(alloc, transforms);
     const predicates = try parseTxnPredicates(alloc, obj.get("predicates") orelse return error.InvalidTxnRequest);
-    errdefer if (predicates.len > 0) alloc.free(predicates);
+    errdefer freeTxnPredicates(alloc, predicates);
     const foreign_key_parent_checks = if (obj.get("foreign_key_parent_checks")) |checks_value|
         try parseTxnForeignKeyParentChecks(alloc, checks_value)
     else
@@ -4659,7 +5413,7 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
     errdefer freeTxnUniqueConstraintMutations(alloc, unique_constraint_deletes);
     return .{
         .txn_id = txn_id,
-        .topology_epoch = requireInteger(obj, "topology_epoch"),
+        .topology_epoch = try optionalU64(obj, "topology_epoch"),
         .req = .{
             .writes = writes,
             .deletes = deletes,
@@ -4682,16 +5436,10 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
 }
 
 pub fn freeTxnPrepareRequest(alloc: std.mem.Allocator, req: *TxnPrepareRequest) void {
-    for (req.req.writes) |write| {
-        alloc.free(@constCast(write.key));
-        alloc.free(@constCast(write.value));
-    }
-    if (req.req.writes.len > 0) alloc.free(req.req.writes);
-    for (req.req.deletes) |key| alloc.free(@constCast(key));
-    if (req.req.deletes.len > 0) alloc.free(req.req.deletes);
+    freeTxnWrites(alloc, req.req.writes);
+    freeTxnDeletes(alloc, req.req.deletes);
     freeTxnTransforms(alloc, req.req.transforms);
-    for (req.req.predicates) |predicate| alloc.free(@constCast(predicate.key));
-    if (req.req.predicates.len > 0) alloc.free(req.req.predicates);
+    freeTxnPredicates(alloc, req.req.predicates);
     freeTxnForeignKeyParentChecks(alloc, req.req.foreign_key_parent_checks);
     freeTxnForeignKeyParentDeleteChecks(alloc, req.req.foreign_key_parent_delete_checks);
     freeTxnForeignKeyConflictChecks(alloc, req.req.foreign_key_conflict_checks);
@@ -4717,7 +5465,12 @@ pub fn parseTxnResolveRequest(alloc: std.mem.Allocator, body: []const u8) !TxnRe
     return .{
         .txn_id = try parseTxnIdHex(requireString(obj, "txn_id")),
         .status = parseTxnStatus(requireString(obj, "status")) orelse return error.InvalidTxnRequest,
-        .commit_version = requireInteger(obj, "commit_version"),
+        .commit_version = try requireU64(obj, "commit_version"),
+        .topology_epoch = try optionalU64(obj, "topology_epoch"),
+        .sync_level = if (obj.get("sync_level")) |value| db_mod.types.parsePublicSyncLevelText(switch (value) {
+            .string => |text| text,
+            else => return error.InvalidTxnRequest,
+        }) orelse return error.InvalidTxnRequest else .propose,
     };
 }
 
@@ -4858,6 +5611,26 @@ pub fn parseTxnStatusRequest(alloc: std.mem.Allocator, body: []const u8) !db_mod
     return try parseTxnIdHex(requireString(obj, "txn_id"));
 }
 
+pub fn parseTxnAcknowledgeRequest(alloc: std.mem.Allocator, body: []const u8) !TxnAcknowledgeRequest {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const obj = switch (parsed.value) {
+        .object => |obj| obj,
+        else => return error.InvalidTxnRequest,
+    };
+    const participant = requireString(obj, "participant");
+    if (participant.len == 0 or parseParticipantRef(participant) == null) return error.InvalidTxnRequest;
+    return .{
+        .txn_id = try parseTxnIdHex(requireString(obj, "txn_id")),
+        .participant = try alloc.dupe(u8, participant),
+    };
+}
+
+pub fn freeTxnAcknowledgeRequest(alloc: std.mem.Allocator, req: *TxnAcknowledgeRequest) void {
+    alloc.free(@constCast(req.participant));
+    req.* = undefined;
+}
+
 pub fn parseTxnStatusResponse(alloc: std.mem.Allocator, body: []const u8) !TxnStatusResponse {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
@@ -4873,21 +5646,39 @@ fn parseTxnWrites(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod.typ
         .array => |arr| arr,
         else => return error.InvalidTxnRequest,
     };
-    var out = try alloc.alloc(db_mod.types.TransactionWrite, arr.items.len);
+    const out = try alloc.alloc(db_mod.types.TransactionWrite, arr.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |write| {
+            alloc.free(@constCast(write.key));
+            alloc.free(@constCast(write.value));
+        }
+        if (out.len > 0) alloc.free(out);
+    }
     for (arr.items, 0..) |item, i| {
         const obj = switch (item) {
             .object => |obj| obj,
             else => return error.InvalidTxnRequest,
         };
+        const key = try parseTxnBinaryKeyAlloc(alloc, obj);
+        errdefer alloc.free(key);
+        const raw_value = obj.get("value") orelse return error.InvalidTxnRequest;
+        const encoded_value = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(raw_value, .{})});
         out[i] = .{
-            .key = try parseTxnBinaryKeyAlloc(alloc, obj),
-            .value = blk: {
-                const raw_value = obj.get("value") orelse return error.InvalidTxnRequest;
-                break :blk try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(raw_value, .{})});
-            },
+            .key = key,
+            .value = encoded_value,
         };
+        initialized += 1;
     }
     return out;
+}
+
+fn freeTxnWrites(alloc: std.mem.Allocator, writes: []const db_mod.types.TransactionWrite) void {
+    for (writes) |write| {
+        alloc.free(@constCast(write.key));
+        alloc.free(@constCast(write.value));
+    }
+    if (writes.len > 0) alloc.free(@constCast(writes));
 }
 
 fn parseTxnDeletes(alloc: std.mem.Allocator, value: std.json.Value) ![]const []const u8 {
@@ -4895,14 +5686,25 @@ fn parseTxnDeletes(alloc: std.mem.Allocator, value: std.json.Value) ![]const []c
         .array => |arr| arr,
         else => return error.InvalidTxnRequest,
     };
-    var out = try alloc.alloc([]const u8, arr.items.len);
+    const out = try alloc.alloc([]const u8, arr.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |key| alloc.free(@constCast(key));
+        if (out.len > 0) alloc.free(out);
+    }
     for (arr.items, 0..) |item, i| {
         out[i] = try alloc.dupe(u8, switch (item) {
             .string => |s| s,
             else => return error.InvalidTxnRequest,
         });
+        initialized += 1;
     }
     return out;
+}
+
+fn freeTxnDeletes(alloc: std.mem.Allocator, deletes: []const []const u8) void {
+    for (deletes) |key| alloc.free(@constCast(key));
+    if (deletes.len > 0) alloc.free(@constCast(deletes));
 }
 
 fn parseTxnTransforms(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod.types.DocumentTransform {
@@ -4963,14 +5765,15 @@ fn parseTxnTransforms(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod
                 .operations = ops[i .. i + 1],
             }) catch return error.InvalidTxnRequest;
         }
+        const upsert = if (obj.get("upsert")) |upsert_value| switch (upsert_value) {
+            .bool => |flag| flag,
+            .null => false,
+            else => return error.InvalidTxnRequest,
+        } else false;
         out[initialized] = .{
             .key = try alloc.dupe(u8, key),
             .operations = ops,
-            .upsert = if (obj.get("upsert")) |upsert_value| switch (upsert_value) {
-                .bool => |flag| flag,
-                .null => false,
-                else => return error.InvalidTxnRequest,
-            } else false,
+            .upsert = upsert,
         };
         initialized += 1;
     }
@@ -5004,16 +5807,23 @@ fn parseTxnPredicates(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod
         .array => |arr| arr,
         else => return error.InvalidTxnRequest,
     };
-    var out = try alloc.alloc(db_mod.types.TransactionVersionPredicate, arr.items.len);
+    const out = try alloc.alloc(db_mod.types.TransactionVersionPredicate, arr.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |predicate| alloc.free(@constCast(predicate.key));
+        if (out.len > 0) alloc.free(out);
+    }
     for (arr.items, 0..) |item, i| {
         const obj = switch (item) {
             .object => |obj| obj,
             else => return error.InvalidTxnRequest,
         };
+        const expected_version = try requireU64(obj, "expected_version");
         out[i] = .{
             .key = try parseTxnBinaryKeyAlloc(alloc, obj),
-            .expected_version = requireInteger(obj, "expected_version"),
+            .expected_version = expected_version,
         };
+        initialized += 1;
     }
     return out;
 }
@@ -5790,6 +6600,10 @@ fn freeTxnUniqueConstraintMutations(alloc: std.mem.Allocator, mutations: []const
     if (mutations.len > 0) alloc.free(@constCast(mutations));
 }
 
+fn freeTxnPredicates(alloc: std.mem.Allocator, predicates: []const db_mod.types.TransactionVersionPredicate) void {
+    for (predicates) |predicate| alloc.free(@constCast(predicate.key));
+    if (predicates.len > 0) alloc.free(@constCast(predicates));
+}
 fn requireString(obj: std.json.ObjectMap, key: []const u8) []const u8 {
     const value = obj.get(key) orelse return "";
     return switch (value) {
@@ -6139,11 +6953,181 @@ fn requireInteger(obj: std.json.ObjectMap, key: []const u8) u64 {
     };
 }
 
+test "transaction request parsers release owned prefixes after malformed input" {
+    const alloc = std.testing.allocator;
+    const malformed_begin_requests = [_][]const u8{
+        \\{"txn_id":"00112233445566778899aabbccddeeff","begin_timestamp":1,"topology_epoch":2,"participants":["table2:4:docs:group:7",7]}
+        ,
+        \\{"txn_id":"00112233445566778899aabbccddeeff","begin_timestamp":1,"topology_epoch":2,"retain_terminal":"invalid","participants":["table2:4:docs:group:7"]}
+        ,
+    };
+    for (malformed_begin_requests) |body| {
+        try std.testing.expectError(error.InvalidTxnRequest, parseTxnBeginRequest(alloc, body));
+    }
+
+    const malformed_prepare_requests = [_][]const u8{
+        \\{"txn_id":"00112233445566778899aabbccddeeff","topology_epoch":2,"writes":[{"key":"doc:a","value":{"title":"alpha"}},{"key":"doc:b"}],"deletes":[],"transforms":[],"predicates":[]}
+        ,
+        \\{"txn_id":"00112233445566778899aabbccddeeff","topology_epoch":2,"writes":[{"key":"doc:a","value":{"title":"alpha"}}],"deletes":["doc:b",7],"transforms":[],"predicates":[]}
+        ,
+        \\{"txn_id":"00112233445566778899aabbccddeeff","topology_epoch":2,"writes":[{"key":"doc:a","value":{"title":"alpha"}}],"deletes":["doc:b"],"transforms":[{"key":"doc:c","operations":[{"op":"$set","path":"status","value":"ready"}],"upsert":"invalid"}],"predicates":[]}
+        ,
+        \\{"txn_id":"00112233445566778899aabbccddeeff","topology_epoch":2,"writes":[{"key":"doc:a","value":{"title":"alpha"}}],"deletes":["doc:b"],"transforms":[{"key":"doc:c","operations":[{"op":"$set","path":"status","value":"ready"}],"upsert":true}],"predicates":[{"key":"doc:d","expected_version":1},7]}
+        ,
+    };
+    for (malformed_prepare_requests) |body| {
+        try std.testing.expectError(error.InvalidTxnRequest, parseTxnPrepareRequest(alloc, body));
+    }
+}
+test "transaction request parsers reject invalid unsigned integers and accept legacy epochs" {
+    const alloc = std.testing.allocator;
+    const malformed_begin_requests = [_][]const u8{
+        \\{"txn_id":"00112233445566778899aabbccddeeff","topology_epoch":2,"participants":[]}
+        ,
+        \\{"txn_id":"00112233445566778899aabbccddeeff","begin_timestamp":"1","topology_epoch":2,"participants":[]}
+        ,
+        \\{"txn_id":"00112233445566778899aabbccddeeff","begin_timestamp":-1,"topology_epoch":2,"participants":[]}
+        ,
+        \\{"txn_id":"00112233445566778899aabbccddeeff","begin_timestamp":1,"topology_epoch":-1,"participants":[]}
+        ,
+    };
+    for (malformed_begin_requests) |body| {
+        try std.testing.expectError(error.InvalidTxnRequest, parseTxnBeginRequest(alloc, body));
+    }
+
+    const malformed_prepare_requests = [_][]const u8{
+        \\{"txn_id":"00112233445566778899aabbccddeeff","topology_epoch":"2","writes":[],"deletes":[],"transforms":[],"predicates":[]}
+        ,
+        \\{"txn_id":"00112233445566778899aabbccddeeff","topology_epoch":-1,"writes":[],"deletes":[],"transforms":[],"predicates":[]}
+        ,
+        \\{"txn_id":"00112233445566778899aabbccddeeff","writes":[],"deletes":[],"transforms":[],"predicates":[{"key":"doc:a"}]}
+        ,
+        \\{"txn_id":"00112233445566778899aabbccddeeff","writes":[],"deletes":[],"transforms":[],"predicates":[{"key":"doc:a","expected_version":"1"}]}
+        ,
+        \\{"txn_id":"00112233445566778899aabbccddeeff","writes":[],"deletes":[],"transforms":[],"predicates":[{"key":"doc:a","expected_version":-1}]}
+        ,
+    };
+    for (malformed_prepare_requests) |body| {
+        try std.testing.expectError(error.InvalidTxnRequest, parseTxnPrepareRequest(alloc, body));
+    }
+
+    const malformed_resolve_requests = [_][]const u8{
+        \\{"txn_id":"00112233445566778899aabbccddeeff","status":"committed"}
+        ,
+        \\{"txn_id":"00112233445566778899aabbccddeeff","status":"committed","commit_version":"1"}
+        ,
+        \\{"txn_id":"00112233445566778899aabbccddeeff","status":"committed","commit_version":-1}
+        ,
+        \\{"txn_id":"00112233445566778899aabbccddeeff","status":"committed","commit_version":1,"topology_epoch":"2"}
+        ,
+        \\{"txn_id":"00112233445566778899aabbccddeeff","status":"committed","commit_version":1,"topology_epoch":-1}
+        ,
+    };
+    for (malformed_resolve_requests) |body| {
+        try std.testing.expectError(error.InvalidTxnRequest, parseTxnResolveRequest(alloc, body));
+    }
+
+    var legacy_begin = try parseTxnBeginRequest(
+        alloc,
+        \\{"txn_id":"00112233445566778899aabbccddeeff","begin_timestamp":1,"participants":[]}
+        ,
+    );
+    defer freeTxnBeginRequest(alloc, &legacy_begin);
+    try std.testing.expectEqual(@as(u64, 0), legacy_begin.topology_epoch);
+
+    var legacy_prepare = try parseTxnPrepareRequest(
+        alloc,
+        \\{"txn_id":"00112233445566778899aabbccddeeff","writes":[],"deletes":[],"transforms":[],"predicates":[]}
+        ,
+    );
+    defer freeTxnPrepareRequest(alloc, &legacy_prepare);
+    try std.testing.expectEqual(@as(u64, 0), legacy_prepare.topology_epoch);
+
+    var max_begin = try parseTxnBeginRequest(
+        alloc,
+        \\{"txn_id":"00112233445566778899aabbccddeeff","begin_timestamp":18446744073709551615,"topology_epoch":18446744073709551615,"participants":[]}
+        ,
+    );
+    defer freeTxnBeginRequest(alloc, &max_begin);
+    try std.testing.expectEqual(std.math.maxInt(u64), max_begin.begin_timestamp);
+    try std.testing.expectEqual(std.math.maxInt(u64), max_begin.topology_epoch);
+
+    var max_prepare = try parseTxnPrepareRequest(
+        alloc,
+        \\{"txn_id":"00112233445566778899aabbccddeeff","topology_epoch":18446744073709551615,"writes":[],"deletes":[],"transforms":[],"predicates":[{"key":"doc:a","expected_version":18446744073709551615}]}
+        ,
+    );
+    defer freeTxnPrepareRequest(alloc, &max_prepare);
+    try std.testing.expectEqual(std.math.maxInt(u64), max_prepare.topology_epoch);
+    try std.testing.expectEqual(std.math.maxInt(u64), max_prepare.req.predicates[0].expected_version);
+
+    const max_resolve = try parseTxnResolveRequest(
+        alloc,
+        \\{"txn_id":"00112233445566778899aabbccddeeff","status":"committed","commit_version":18446744073709551615,"topology_epoch":18446744073709551615}
+        ,
+    );
+    try std.testing.expectEqual(std.math.maxInt(u64), max_resolve.commit_version);
+    try std.testing.expectEqual(std.math.maxInt(u64), max_resolve.topology_epoch);
+}
+
+fn parseU64(value: std.json.Value) !u64 {
+    return switch (value) {
+        .integer => |integer| if (integer >= 0) @intCast(integer) else error.InvalidTxnRequest,
+        .number_string => |text| std.fmt.parseUnsigned(u64, text, 10) catch error.InvalidTxnRequest,
+        else => error.InvalidTxnRequest,
+    };
+}
+
+fn requireU64(obj: std.json.ObjectMap, key: []const u8) !u64 {
+    return try parseU64(obj.get(key) orelse return error.InvalidTxnRequest);
+}
+
+fn optionalU64(obj: std.json.ObjectMap, key: []const u8) !u64 {
+    return try parseU64(obj.get(key) orelse return 0);
+}
+
 fn parseTxnStatus(text: []const u8) ?db_mod.types.TxnStatus {
     if (std.mem.eql(u8, text, "pending")) return .pending;
     if (std.mem.eql(u8, text, "committed")) return .committed;
     if (std.mem.eql(u8, text, "aborted")) return .aborted;
     return null;
+}
+
+test "txn resolve codec preserves sync level and accepts legacy requests" {
+    const alloc = std.testing.allocator;
+    const txn_id = try parseTxnIdHex("00112233445566778899aabbccddeeff");
+    const encoded = try encodeTxnResolveRequest(alloc, .{
+        .txn_id = txn_id,
+        .status = .committed,
+        .commit_version = 42,
+        .topology_epoch = 7,
+        .sync_level = .full_index,
+    });
+    defer alloc.free(encoded);
+    const decoded = try parseTxnResolveRequest(alloc, encoded);
+    try std.testing.expectEqual(@as(u64, 7), decoded.topology_epoch);
+    try std.testing.expectEqual(db_mod.types.SyncLevel.full_index, decoded.sync_level);
+
+    const legacy = try parseTxnResolveRequest(
+        alloc,
+        "{\"txn_id\":\"00112233445566778899aabbccddeeff\",\"status\":\"committed\",\"commit_version\":42}",
+    );
+    try std.testing.expectEqual(@as(u64, 0), legacy.topology_epoch);
+    try std.testing.expectEqual(db_mod.types.SyncLevel.propose, legacy.sync_level);
+}
+
+test "txn acknowledgement codec preserves participant identity" {
+    const alloc = std.testing.allocator;
+    const txn_id = try parseTxnIdHex("00112233445566778899aabbccddeeff");
+    const encoded = try encodeTxnAcknowledgeRequest(alloc, .{
+        .txn_id = txn_id,
+        .participant = "table2:00000004:docs:7002",
+    });
+    defer alloc.free(encoded);
+    var decoded = try parseTxnAcknowledgeRequest(alloc, encoded);
+    defer freeTxnAcknowledgeRequest(alloc, &decoded);
+    try std.testing.expectEqualSlices(u8, &txn_id, &decoded.txn_id);
+    try std.testing.expectEqualStrings("table2:00000004:docs:7002", decoded.participant);
 }
 
 fn abortBegunRefs(
@@ -6160,6 +7144,217 @@ fn abortBegunRefs(
             .commit_version = timestamp,
         }) catch {};
     }
+}
+
+fn abortParticipants(
+    alloc: std.mem.Allocator,
+    worker: ParticipantWorker,
+    txn_id: db_mod.types.TxnId,
+    timestamp: u64,
+    participants: []const ParticipantTxn,
+    participant_ids: []const []const u8,
+    attempted_count: usize,
+) !void {
+    if (participants.len == 0) return;
+    std.debug.assert(participant_ids.len == participants.len);
+    std.debug.assert(attempted_count > 0 and attempted_count <= participants.len);
+
+    // The first participant is the coordinator. Do not report an aborted
+    // transaction until its abort decision is durable; otherwise a prepared
+    // transaction can be stranded forever while the client is told it lost.
+    const coordinator = participants[0];
+    worker.resolveGroup(alloc, coordinator.group_id, coordinator.table_name, .{
+        .txn_id = txn_id,
+        .status = .aborted,
+        .commit_version = timestamp,
+        // An abort is a transaction decision just like a commit. Do not tell
+        // the client it lost until the coordinator decision is committed and
+        // applied; follower delivery remains recoverable from that record.
+        .sync_level = .write,
+    }) catch {
+        const status = worker.statusGroup(
+            alloc,
+            coordinator.group_id,
+            coordinator.table_name,
+            txn_id,
+        ) catch return error.AbortDecisionNotDurable;
+        if (status != .aborted) return error.AbortDecisionNotDurable;
+    };
+
+    // Once the coordinator decision is durable, follower delivery is
+    // idempotent recovery work and must not contradict that decision.
+    for (participants[1..], 1..) |participant, participant_index| {
+        if (participant_index < attempted_count) {
+            worker.resolveGroup(alloc, participant.group_id, participant.table_name, .{
+                .txn_id = txn_id,
+                .status = .aborted,
+                .commit_version = timestamp,
+                // An acknowledgement removes the participant from durable
+                // recovery, so phase two must be committed/applied first.
+                .sync_level = .write,
+            }) catch |err| {
+                // Continue notifying later participants. The durable
+                // coordinator record remains authoritative and recovery will
+                // retry any unavailable attempted participant.
+                std.log.warn("transaction abort delivery failed table={s} group_id={} err={s}", .{
+                    participant.table_name,
+                    participant.group_id,
+                    @errorName(err),
+                });
+                continue;
+            };
+        }
+        // Participants beyond attempted_count were never contacted. They have
+        // no transaction state or intents and are safe to acknowledge directly
+        // after the coordinator's abort decision is durable.
+        worker.acknowledgeGroup(alloc, coordinator.group_id, coordinator.table_name, .{
+            .txn_id = txn_id,
+            .participant = participant_ids[participant_index],
+        }) catch |err| {
+            std.log.warn("transaction abort acknowledgement deferred table={s} group_id={} err={s}", .{
+                participant.table_name,
+                participant.group_id,
+                @errorName(err),
+            });
+        };
+    }
+}
+
+fn abortParticipantsWithContactMask(
+    alloc: std.mem.Allocator,
+    worker: ParticipantWorker,
+    txn_id: db_mod.types.TxnId,
+    timestamp: u64,
+    participants: []const ParticipantTxn,
+    participant_ids: []const []const u8,
+    slots: []const ParticipantFanoutSlot,
+) !void {
+    if (participants.len == 0) return;
+    std.debug.assert(participant_ids.len == participants.len and slots.len == participants.len);
+
+    const coordinator = participants[0];
+    worker.resolveGroup(alloc, coordinator.group_id, coordinator.table_name, .{
+        .txn_id = txn_id,
+        .status = .aborted,
+        .commit_version = timestamp,
+        .sync_level = .write,
+    }) catch {
+        const status = worker.statusGroup(alloc, coordinator.group_id, coordinator.table_name, txn_id) catch
+            return error.AbortDecisionNotDurable;
+        if (status != .aborted) return error.AbortDecisionNotDurable;
+    };
+
+    for (participants[1..], 1..) |participant, participant_index| {
+        if (slots[participant_index].may_have_transaction_state) {
+            worker.resolveGroup(alloc, participant.group_id, participant.table_name, .{
+                .txn_id = txn_id,
+                .status = .aborted,
+                .commit_version = timestamp,
+                .sync_level = .write,
+            }) catch |err| {
+                // An explicitly missing record proves the failed begin did not
+                // create participant state. Other failures remain enlisted so
+                // durable coordinator recovery can redeliver the abort.
+                if (err != error.TxnNotFound) {
+                    std.log.warn("transaction abort delivery failed table={s} group_id={} err={s}", .{
+                        participant.table_name,
+                        participant.group_id,
+                        @errorName(err),
+                    });
+                    continue;
+                }
+            };
+        }
+        worker.acknowledgeGroup(alloc, coordinator.group_id, coordinator.table_name, .{
+            .txn_id = txn_id,
+            .participant = participant_ids[participant_index],
+        }) catch |err| {
+            std.log.warn("transaction abort acknowledgement deferred table={s} group_id={} err={s}", .{
+                participant.table_name,
+                participant.group_id,
+                @errorName(err),
+            });
+        };
+    }
+}
+
+test "distributed txn abort durably resolves attempted participants and acknowledges untouched participants" {
+    const participants = [_]ParticipantTxn{
+        .{ .table_name = "docs", .group_id = 7001, .topology_epoch = 1 },
+        .{ .table_name = "docs", .group_id = 7002, .topology_epoch = 1 },
+        .{ .table_name = "docs", .group_id = 7003, .topology_epoch = 1 },
+    };
+    const participant_ids = [_][]const u8{
+        "table2:00000004:docs:7001",
+        "table2:00000004:docs:7002",
+        "table2:00000004:docs:7003",
+    };
+    const txn_id = try parseTxnIdHex("abcdefabcdefabcdefabcdefabcdefab");
+
+    const Recorder = struct {
+        resolved_groups: [3]u64 = undefined,
+        resolved_count: usize = 0,
+        acknowledgements: [2][]const u8 = undefined,
+        acknowledgement_count: usize = 0,
+
+        fn worker(self: *@This()) ParticipantWorker {
+            return .{ .ptr = self, .vtable = &.{
+                .begin_group = begin,
+                .prepare_group = prepare,
+                .resolve_group = resolve,
+                .status_group = status,
+                .acknowledge_group = acknowledge,
+            } };
+        }
+
+        fn begin(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnBeginRequest) !void {}
+        fn prepare(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnPrepareRequest) !void {}
+        fn status(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
+            return .pending;
+        }
+        fn resolve(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, _: []const u8, req: TxnResolveRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(db_mod.types.TxnStatus.aborted, req.status);
+            try std.testing.expectEqual(db_mod.types.SyncLevel.write, req.sync_level);
+            self.resolved_groups[self.resolved_count] = group_id;
+            self.resolved_count += 1;
+        }
+        fn acknowledge(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, _: []const u8, req: TxnAcknowledgeRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(u64, 7001), group_id);
+            self.acknowledgements[self.acknowledgement_count] = req.participant;
+            self.acknowledgement_count += 1;
+        }
+    };
+
+    var partial = Recorder{};
+    try abortParticipants(
+        std.testing.allocator,
+        partial.worker(),
+        txn_id,
+        10_001,
+        &participants,
+        &participant_ids,
+        1,
+    );
+    try std.testing.expectEqual(@as(usize, 1), partial.resolved_count);
+    try std.testing.expectEqual(@as(u64, 7001), partial.resolved_groups[0]);
+    try std.testing.expectEqual(@as(usize, 2), partial.acknowledgement_count);
+    try std.testing.expectEqualStrings(participant_ids[1], partial.acknowledgements[0]);
+    try std.testing.expectEqualStrings(participant_ids[2], partial.acknowledgements[1]);
+
+    var fully_begun = Recorder{};
+    try abortParticipants(
+        std.testing.allocator,
+        fully_begun.worker(),
+        txn_id,
+        10_001,
+        &participants,
+        &participant_ids,
+        participants.len,
+    );
+    try std.testing.expectEqual(@as(usize, 3), fully_begun.resolved_count);
+    try std.testing.expectEqual(@as(usize, 2), fully_begun.acknowledgement_count);
 }
 
 fn ownedParticipantConflict(
@@ -6196,7 +7391,6 @@ fn participantConflict(alloc: std.mem.Allocator, participant: ParticipantTxn) !C
     }
     return try ownedParticipantConflict(alloc, participant, "", "transaction conflict", .prepare);
 }
-
 fn participantUnavailableConflict(alloc: std.mem.Allocator, participant: ParticipantTxn, phase: ParticipantPhase) !CommitConflict {
     return try ownedParticipantConflict(alloc, participant, "", "participant unavailable", phase);
 }
@@ -6245,12 +7439,18 @@ test "distributed txn coordinator groups by range and commits all participants" 
     const Recorder = struct {
         begins: std.ArrayListUnmanaged(u64) = .empty,
         prepares: std.ArrayListUnmanaged(u64) = .empty,
-        resolves: std.ArrayListUnmanaged(struct { group_id: u64, status: db_mod.types.TxnStatus }) = .empty,
+        resolves: std.ArrayListUnmanaged(struct {
+            group_id: u64,
+            status: db_mod.types.TxnStatus,
+            sync_level: db_mod.types.SyncLevel,
+        }) = .empty,
+        acknowledgements: std.ArrayListUnmanaged(u64) = .empty,
 
         fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             self.begins.deinit(alloc);
             self.prepares.deinit(alloc);
             self.resolves.deinit(alloc);
+            self.acknowledgements.deinit(alloc);
         }
 
         fn worker(self: *@This()) ParticipantWorker {
@@ -6261,6 +7461,7 @@ test "distributed txn coordinator groups by range and commits all participants" 
                     .prepare_group = prepare,
                     .resolve_group = resolve,
                     .status_group = status,
+                    .acknowledge_group = acknowledge,
                 },
             };
         }
@@ -6279,26 +7480,38 @@ test "distributed txn coordinator groups by range and commits all participants" 
 
         fn resolve(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, _: []const u8, req: TxnResolveRequest) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            try self.resolves.append(std.testing.allocator, .{ .group_id = group_id, .status = req.status });
+            try std.testing.expect(req.topology_epoch != 0);
+            try self.resolves.append(std.testing.allocator, .{
+                .group_id = group_id,
+                .status = req.status,
+                .sync_level = req.sync_level,
+            });
         }
 
         fn status(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
             return .pending;
+        }
+
+        fn acknowledge(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, _: []const u8, req: TxnAcknowledgeRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(u64, 7001), group_id);
+            try std.testing.expectEqualStrings("table2:00000004:docs:7002", req.participant);
+            try self.acknowledgements.append(std.testing.allocator, group_id);
         }
     };
 
     var recorder = Recorder{};
     defer recorder.deinit(std.testing.allocator);
     const txn_id = try parseTxnIdHex("00112233445566778899aabbccddeeff");
-    const result = try executeCrossGroup(
+    const outcome = try executeMultiTableCommitWithOptions(
         std.testing.allocator,
         FakeCatalog.iface(),
         recorder.worker(),
-        "docs",
         txn_id,
         10_000,
         10_001,
-        .{
+        &.{.{
+            .table_name = "docs",
             .writes = &.{
                 .{ .key = "doc:a", .value = "{\"title\":\"a\"}" },
                 .{ .key = "doc:z", .value = "{\"title\":\"z\"}" },
@@ -6307,14 +7520,159 @@ test "distributed txn coordinator groups by range and commits all participants" 
                 .{ .key = "doc:a", .expected_version = 1 },
                 .{ .key = "doc:z", .expected_version = 2 },
             },
-        },
+        }},
+        .propose,
         null,
+        .{ .report_post_commit_failure = false },
     );
+    const result = switch (outcome) {
+        .committed => |committed| committed,
+        .conflict => return error.TestUnexpectedResult,
+    };
     try std.testing.expectEqual(@as(usize, 2), result.participant_count);
+    try std.testing.expect(result.propagation_pending);
     try std.testing.expectEqual(@as(usize, 2), recorder.begins.items.len);
     try std.testing.expectEqual(@as(usize, 2), recorder.prepares.items.len);
     try std.testing.expectEqual(@as(usize, 2), recorder.resolves.items.len);
+    try std.testing.expectEqual(@as(usize, 0), recorder.acknowledgements.items.len);
     for (recorder.resolves.items) |resolved| try std.testing.expectEqual(db_mod.types.TxnStatus.committed, resolved.status);
+    try std.testing.expectEqual(db_mod.types.SyncLevel.write, recorder.resolves.items[0].sync_level);
+    try std.testing.expectEqual(db_mod.types.SyncLevel.propose, recorder.resolves.items[1].sync_level);
+
+    const durable_txn_id = try parseTxnIdHex("10112233445566778899aabbccddeeff");
+    const durable_outcome = try executeMultiTableCommit(
+        std.testing.allocator,
+        FakeCatalog.iface(),
+        recorder.worker(),
+        durable_txn_id,
+        20_000,
+        20_001,
+        &.{.{
+            .table_name = "docs",
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"a\"}" },
+                .{ .key = "doc:z", .value = "{\"title\":\"z\"}" },
+            },
+        }},
+        .write,
+        null,
+    );
+    try std.testing.expect(durable_outcome == .committed);
+    try std.testing.expect(!durable_outcome.committed.propagation_pending);
+    try std.testing.expectEqual(@as(usize, 1), recorder.acknowledgements.items.len);
+    try std.testing.expectEqual(@as(usize, 4), recorder.resolves.items.len);
+    try std.testing.expectEqual(db_mod.types.SyncLevel.write, recorder.resolves.items[2].sync_level);
+    try std.testing.expectEqual(db_mod.types.SyncLevel.write, recorder.resolves.items[3].sync_level);
+}
+
+test "stable distributed transaction retry resumes a durable commit decision" {
+    const FakeCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !@import("../metadata/api.zig").AdminSnapshot {
+            const metadata_table_manager = @import("../metadata/table_manager.zig");
+            const raft_reconciler = @import("../raft/reconciler.zig");
+            const metadata_transition_state = @import("../metadata/transition_state.zig");
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{ .table_id = 7, .name = "docs", .placement_role = "data" }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = "doc:m" },
+                    .{ .group_id = 7002, .table_id = 7, .start_key = "doc:m", .end_key = null },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *@import("../metadata/api.zig").AdminSnapshot) void {}
+    };
+
+    const Recorder = struct {
+        begin_calls: usize = 0,
+        prepare_calls: usize = 0,
+        resolve_calls: usize = 0,
+        status_calls: usize = 0,
+
+        fn worker(self: *@This()) ParticipantWorker {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .begin_group = begin,
+                    .prepare_group = prepare,
+                    .resolve_group = resolve,
+                    .status_group = status,
+                },
+            };
+        }
+
+        fn begin(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, req: TxnBeginRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.begin_calls += 1;
+            try std.testing.expect(req.retain_terminal);
+            return error.DecisionConflict;
+        }
+
+        fn prepare(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnPrepareRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.prepare_calls += 1;
+        }
+
+        fn resolve(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, req: TxnResolveRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.resolve_calls += 1;
+            try std.testing.expectEqual(db_mod.types.TxnStatus.committed, req.status);
+            try std.testing.expectEqual(@as(u64, 0), req.topology_epoch);
+        }
+
+        fn status(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.status_calls += 1;
+            return .committed;
+        }
+    };
+
+    var recorder = Recorder{};
+    const txn_id = try parseTxnIdHex("0123456789abcdeffedcba9876543210");
+    const outcome = try executeMultiTableCommitWithOptions(
+        std.testing.allocator,
+        FakeCatalog.iface(),
+        recorder.worker(),
+        txn_id,
+        10_000,
+        10_001,
+        &.{.{
+            .table_name = "docs",
+            .transforms = &.{
+                .{
+                    .key = "doc:a",
+                    .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }},
+                },
+                .{
+                    .key = "doc:z",
+                    .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }},
+                },
+            },
+        }},
+        .write,
+        null,
+        .{ .retain_terminal = true },
+    );
+    try std.testing.expect(outcome == .committed);
+    try std.testing.expectEqual(@as(usize, 1), recorder.begin_calls);
+    try std.testing.expectEqual(@as(usize, 1), recorder.status_calls);
+    try std.testing.expectEqual(@as(usize, 0), recorder.prepare_calls);
+    try std.testing.expectEqual(@as(usize, 2), recorder.resolve_calls);
 }
 
 test "distributed txn coordinator registers foreign key parent participants" {
@@ -6426,6 +7784,7 @@ test "distributed txn coordinator registers foreign key parent participants" {
             .table_name = "docs",
             .writes = &.{.{ .key = "doc:a-order", .value = "{\"customer_id\":\"cust:z-customer\"}" }},
         }},
+        .propose,
         null,
     );
     try std.testing.expectEqual(@as(usize, 2), result.committed.participant_count);
@@ -6552,6 +7911,7 @@ test "distributed txn coordinator externalizes deferred foreign key parent check
             .table_name = "docs",
             .writes = &.{.{ .key = "doc:a-order", .value = "{\"customer_id\":\"cust:z-customer\"}" }},
         }},
+        .propose,
         null,
     );
     try std.testing.expectEqual(@as(usize, 2), result.committed.participant_count);
@@ -6578,6 +7938,7 @@ test "distributed txn coordinator externalizes deferred foreign key parent check
                 .timing = .immediate,
             }},
         }},
+        .propose,
         null,
     );
     try std.testing.expectEqual(@as(usize, 2), immediate_result.committed.participant_count);
@@ -6644,6 +8005,7 @@ test "distributed txn coordinator externalizes deferred foreign key parent check
                 .timing = .deferred,
             }},
         }},
+        .propose,
         null,
     );
     try std.testing.expectEqual(@as(usize, 2), deferred_override_result.committed.participant_count);
@@ -6900,6 +8262,7 @@ test "distributed txn coordinator routes foreign key child writes through ref ow
             .table_name = "docs",
             .writes = &.{.{ .key = "doc:a-order", .value = "{\"customer_id\":\"cust:z-customer\"}" }},
         }},
+        .propose,
         null,
     );
     try std.testing.expectEqual(@as(usize, 3), unversioned_result.committed.participant_count);
@@ -6920,6 +8283,7 @@ test "distributed txn coordinator routes foreign key child writes through ref ow
             .table_name = "docs",
             .deletes = &.{"doc:a-order"},
         }},
+        .propose,
         null,
     ));
     try std.testing.expect(!delete_recorder.prepared_child);
@@ -6940,6 +8304,7 @@ test "distributed txn coordinator routes foreign key child writes through ref ow
             .writes = &.{.{ .key = "doc:a-order", .value = "{\"customer_id\":\"cust:z-customer\"}" }},
             .predicates = &.{.{ .key = "doc:a-order", .expected_version = 0 }},
         }},
+        .propose,
         null,
     );
     try std.testing.expectEqual(@as(usize, 3), result.committed.participant_count);
@@ -7044,6 +8409,7 @@ test "distributed txn coordinator fails closed for transitional foreign key ref 
             .writes = &.{.{ .key = "doc:a-order", .value = "{\"customer_id\":\"cust:z-customer\"}" }},
             .predicates = &.{.{ .key = "doc:a-order", .expected_version = 0 }},
         }},
+        .propose,
         null,
     ));
     try std.testing.expectEqual(@as(usize, 0), recorder.begin_calls);
@@ -7191,6 +8557,7 @@ test "distributed txn coordinator routes old and new foreign key refs with versi
             .writes = &.{.{ .key = "doc:a-order", .value = "{\"customer_id\":\"cust:new\"}" }},
             .predicates = &.{.{ .key = "doc:a-order", .expected_version = 7 }},
         }},
+        .propose,
         null,
     );
     try std.testing.expectEqual(@as(usize, 3), update_result.committed.participant_count);
@@ -7212,6 +8579,7 @@ test "distributed txn coordinator routes old and new foreign key refs with versi
             .deletes = &.{"doc:a-order"},
             .predicates = &.{.{ .key = "doc:a-order", .expected_version = 7 }},
         }},
+        .propose,
         null,
     );
     try std.testing.expectEqual(@as(usize, 2), delete_result.committed.participant_count);
@@ -7436,6 +8804,7 @@ test "distributed txn coordinator routes unique-touching transforms with row pro
                 .upsert = true,
             }},
         }},
+        .propose,
         null,
     );
     try std.testing.expectEqual(@as(usize, 2), upsert_result.committed.participant_count);
@@ -8372,6 +9741,7 @@ test "distributed txn coordinator allows single-range unique writes to use local
             .table_name = "users",
             .writes = &.{.{ .key = "user:a", .value = "{\"email\":\"ada@example.test\"}" }},
         }},
+        .propose,
         null,
     );
     try std.testing.expectEqual(@as(usize, 1), result.committed.participant_count);
@@ -8466,6 +9836,7 @@ test "distributed txn coordinator rejects non-primary foreign key parent writes 
             .table_name = "docs",
             .writes = &.{.{ .key = "doc:a-order", .value = "{\"ref_email\":\"ada@example.test\"}" }},
         }},
+        .propose,
         null,
     ));
     try std.testing.expectEqual(@as(usize, 0), recorder.begin_calls);
@@ -8555,6 +9926,7 @@ test "distributed txn coordinator rejects partial match full composite foreign k
             .table_name = "docs",
             .writes = &.{.{ .key = "doc:partial", .value = "{\"tenant_id\":\"tenant:1\"}" }},
         }},
+        .propose,
         null,
     ));
     try std.testing.expectEqual(@as(usize, 0), recorder.begin_calls);
@@ -8677,6 +10049,7 @@ test "distributed txn coordinator routes foreign key checks through unique owner
             .writes = &.{.{ .key = "doc:a-order", .value = "{\"ref_email\":\"ada@example.test\"}" }},
             .predicates = &.{.{ .key = "doc:a-order", .expected_version = 0 }},
         }},
+        .propose,
         null,
     );
     try std.testing.expectEqual(@as(usize, 2), result.committed.participant_count);
@@ -8805,6 +10178,7 @@ test "distributed txn coordinator routes cross-table foreign key checks through 
             .writes = &.{.{ .key = "order:a", .value = "{\"customer_email\":\"ada@example.test\"}" }},
             .predicates = &.{.{ .key = "order:a", .expected_version = 0 }},
         }},
+        .propose,
         null,
     );
     try std.testing.expectEqual(@as(usize, 2), result.committed.participant_count);
@@ -8966,6 +10340,7 @@ test "distributed txn coordinator routes unique foreign key parent updates throu
             .writes = &.{.{ .key = "customer:ada", .value = "{\"email\":\"grace@example.test\",\"name\":\"Ada\"}" }},
             .predicates = &.{.{ .key = "customer:ada", .expected_version = 5 }},
         }},
+        .propose,
         null,
     );
     try std.testing.expectEqual(@as(usize, 3), result.committed.participant_count);
@@ -9132,6 +10507,7 @@ test "distributed txn coordinator schedules mutating unique foreign key parent u
             .writes = &.{.{ .key = "customer:ada", .value = "{\"email\":\"grace@example.test\",\"name\":\"Ada\"}" }},
             .predicates = &.{.{ .key = "customer:ada", .expected_version = 5 }},
         }},
+        .propose,
         null,
     );
     try std.testing.expectEqual(@as(usize, 3), result.committed.participant_count);
@@ -9270,6 +10646,7 @@ test "distributed txn coordinator routes cross-table composite foreign key check
             .writes = &.{.{ .key = "order:a", .value = "{\"customer_region\":\"us-east\",\"customer_email\":\"ada@example.test\"}" }},
             .predicates = &.{.{ .key = "order:a", .expected_version = 0 }},
         }},
+        .propose,
         null,
     );
     try std.testing.expectEqual(@as(usize, 2), result.committed.participant_count);
@@ -9397,6 +10774,7 @@ test "distributed txn coordinator routes cross-table composite foreign key check
             .writes = &.{.{ .key = "order:a", .value = "{\"customer_region\":\"us-east\",\"customer_email\":\"ada@example.test\"}" }},
             .predicates = &.{.{ .key = "order:a", .expected_version = 0 }},
         }},
+        .propose,
         null,
     );
     try std.testing.expectEqual(@as(usize, 2), result.committed.participant_count);
@@ -9546,6 +10924,7 @@ test "distributed txn coordinator routes unique foreign key parent deletes throu
             .table_name = "docs",
             .deletes = &.{"user:parent"},
         }},
+        .propose,
         null,
     );
     try std.testing.expectEqual(@as(usize, 3), unversioned_result.committed.participant_count);
@@ -9565,6 +10944,7 @@ test "distributed txn coordinator routes unique foreign key parent deletes throu
             .deletes = &.{"user:parent"},
             .predicates = &.{.{ .key = "user:parent", .expected_version = 5 }},
         }},
+        .propose,
         null,
     );
     try std.testing.expectEqual(@as(usize, 3), result.committed.participant_count);
@@ -9735,6 +11115,7 @@ test "distributed txn coordinator routes cross-table unique foreign key parent d
             .table_name = "customers",
             .deletes = &.{"customer:ada"},
         }},
+        .propose,
         null,
     );
     try std.testing.expectEqual(@as(usize, 3), unversioned_result.committed.participant_count);
@@ -9754,6 +11135,7 @@ test "distributed txn coordinator routes cross-table unique foreign key parent d
             .deletes = &.{"customer:ada"},
             .predicates = &.{.{ .key = "customer:ada", .expected_version = 8 }},
         }},
+        .propose,
         null,
     );
     try std.testing.expectEqual(@as(usize, 3), result.committed.participant_count);
@@ -10188,6 +11570,7 @@ fn runUniqueForeignKeyParentDeleteActionRoutingTest(comptime action: enum { set_
             .deletes = &.{"user:parent"},
             .predicates = &.{.{ .key = "user:parent", .expected_version = 5 }},
         }},
+        .propose,
         null,
     );
     try std.testing.expectEqual(@as(usize, 4), result.committed.participant_count);
@@ -10428,6 +11811,7 @@ test "distributed txn coordinator routes foreign key reference transforms with f
                 .operations = set_customer[0..],
             }},
         }},
+        .propose,
         null,
     );
     try std.testing.expectEqual(@as(usize, 3), unversioned_outcome.committed.participant_count);
@@ -10649,6 +12033,7 @@ test "distributed txn coordinator allows non-reference transforms on foreign key
                 .operations = update_status[0..],
             }},
         }},
+        .propose,
         null,
     );
     try std.testing.expectEqual(@as(usize, 1), outcome.committed.participant_count);
@@ -10745,6 +12130,7 @@ test "distributed txn coordinator fails closed without foreign key ref owner par
             .table_name = "customers",
             .deletes = &.{"cust:z-customer"},
         }},
+        .propose,
         null,
     ));
     try std.testing.expectEqual(@as(usize, 0), recorder.begin_calls);
@@ -10855,6 +12241,7 @@ test "distributed txn coordinator routes foreign key parent deletes through ref 
             .table_name = "customers",
             .deletes = &.{"cust:z-customer"},
         }},
+        .propose,
         null,
     );
     try std.testing.expectEqual(@as(usize, 2), result.committed.participant_count);
@@ -10969,6 +12356,7 @@ test "distributed txn coordinator routes deferred foreign key parent deletes thr
             .table_name = "customers",
             .deletes = &.{"cust:z-customer"},
         }},
+        .propose,
         null,
     );
     try std.testing.expectEqual(@as(usize, 2), result.committed.participant_count);
@@ -11071,6 +12459,7 @@ test "distributed txn coordinator fails closed for transitional foreign key ref 
             .table_name = "customers",
             .deletes = &.{"cust:z-customer"},
         }},
+        .propose,
         null,
     ));
     try std.testing.expectEqual(@as(usize, 0), recorder.begin_calls);
@@ -11165,6 +12554,7 @@ test "distributed txn coordinator ignores unrelated foreign key child tables for
             .table_name = "customers",
             .deletes = &.{"cust:z-customer"},
         }},
+        .propose,
         null,
     );
     try std.testing.expectEqual(@as(usize, 1), result.committed.participant_count);
@@ -11351,6 +12741,7 @@ test "distributed txn coordinator routes distributed foreign key set-null action
             .table_name = "customers",
             .deletes = &.{"cust:z-customer"},
         }},
+        .propose,
         null,
     );
     try std.testing.expectEqual(@as(usize, 2), result.committed.participant_count);
@@ -12553,7 +13944,7 @@ test "distributed txn relational identity workload mixes owner topology churn an
         .predicates = &.{.{ .key = "order:a", .expected_version = 0 }},
     };
 
-    const active_write = try executeMultiTableCommit(std.testing.allocator, catalog.iface(), recorder.worker(), try parseTxnIdHex("11111111222222223333333344444441"), 10_000, 10_001, &.{write_order}, null);
+    const active_write = try executeMultiTableCommit(std.testing.allocator, catalog.iface(), recorder.worker(), try parseTxnIdHex("11111111222222223333333344444441"), 10_000, 10_001, &.{write_order}, .propose, null);
     try std.testing.expect(active_write == .committed);
     try std.testing.expect(recorder.parent_checks >= 2);
     try std.testing.expect(recorder.externalized_checks >= 2);
@@ -12562,23 +13953,23 @@ test "distributed txn relational identity workload mixes owner topology churn an
 
     catalog.configure(.fk_ref_splitting);
     recorder.reset();
-    try std.testing.expectError(error.UnknownGroup, executeMultiTableCommit(std.testing.allocator, catalog.iface(), recorder.worker(), try parseTxnIdHex("11111111222222223333333344444442"), 10_010, 10_011, &.{write_order}, null));
+    try std.testing.expectError(error.UnknownGroup, executeMultiTableCommit(std.testing.allocator, catalog.iface(), recorder.worker(), try parseTxnIdHex("11111111222222223333333344444442"), 10_010, 10_011, &.{write_order}, .propose, null));
     try std.testing.expectEqual(@as(usize, 0), recorder.begin_calls);
 
     catalog.configure(.fk_ref_split_active);
     recorder.reset();
-    const split_write = try executeMultiTableCommit(std.testing.allocator, catalog.iface(), recorder.worker(), try parseTxnIdHex("11111111222222223333333344444443"), 10_020, 10_021, &.{write_order}, null);
+    const split_write = try executeMultiTableCommit(std.testing.allocator, catalog.iface(), recorder.worker(), try parseTxnIdHex("11111111222222223333333344444443"), 10_020, 10_021, &.{write_order}, .propose, null);
     try std.testing.expect(split_write == .committed);
     try std.testing.expect(recorder.ref_writes >= 2);
 
     catalog.configure(.unique_splitting);
     recorder.reset();
-    try std.testing.expectError(error.UnknownGroup, executeMultiTableCommit(std.testing.allocator, catalog.iface(), recorder.worker(), try parseTxnIdHex("11111111222222223333333344444444"), 10_030, 10_031, &.{write_order}, null));
+    try std.testing.expectError(error.UnknownGroup, executeMultiTableCommit(std.testing.allocator, catalog.iface(), recorder.worker(), try parseTxnIdHex("11111111222222223333333344444444"), 10_030, 10_031, &.{write_order}, .propose, null));
     try std.testing.expectEqual(@as(usize, 0), recorder.begin_calls);
 
     catalog.configure(.unique_split_active);
     recorder.reset();
-    const unique_split_write = try executeMultiTableCommit(std.testing.allocator, catalog.iface(), recorder.worker(), try parseTxnIdHex("11111111222222223333333344444445"), 10_040, 10_041, &.{write_order}, null);
+    const unique_split_write = try executeMultiTableCommit(std.testing.allocator, catalog.iface(), recorder.worker(), try parseTxnIdHex("11111111222222223333333344444445"), 10_040, 10_041, &.{write_order}, .propose, null);
     try std.testing.expect(unique_split_write == .committed);
     try std.testing.expect(recorder.parent_checks >= 2);
     try std.testing.expect(recorder.ref_writes >= 2);
@@ -12757,6 +14148,7 @@ test "distributed txn coordinator routes distributed foreign key cascade actions
             .table_name = "customers",
             .deletes = &.{"cust:z-customer"},
         }},
+        .propose,
         null,
     );
     try std.testing.expectEqual(@as(usize, 2), result.committed.participant_count);
@@ -12852,6 +14244,7 @@ test "distributed txn coordinator rejects distributed foreign key cascade action
             .table_name = "customers",
             .deletes = &.{"cust:z-customer"},
         }},
+        .propose,
         null,
     ));
     try std.testing.expectEqual(@as(usize, 0), recorder.begin_calls);
@@ -12891,6 +14284,7 @@ test "distributed txn coordinator aborts begun participants on prepare failure" 
     };
 
     const Recorder = struct {
+        fail_begin: bool = false,
         resolves: std.ArrayListUnmanaged(db_mod.types.TxnStatus) = .empty,
 
         fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
@@ -12909,10 +14303,14 @@ test "distributed txn coordinator aborts begun participants on prepare failure" 
             };
         }
 
-        fn begin(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnBeginRequest) !void {}
+        fn begin(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, _: []const u8, _: TxnBeginRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.fail_begin and group_id == 7002) return error.InjectedBeginFailure;
+        }
 
-        fn prepare(_: *anyopaque, _: std.mem.Allocator, group_id: u64, _: []const u8, _: TxnPrepareRequest) !void {
-            if (group_id == 7002) return error.IntentConflict;
+        fn prepare(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, _: []const u8, _: TxnPrepareRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!self.fail_begin and group_id == 7002) return error.IntentConflict;
         }
 
         fn resolve(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, req: TxnResolveRequest) !void {
@@ -12946,9 +14344,30 @@ test "distributed txn coordinator aborts begun participants on prepare failure" 
     ));
     try std.testing.expectEqual(@as(usize, 2), recorder.resolves.items.len);
     for (recorder.resolves.items) |status| try std.testing.expectEqual(db_mod.types.TxnStatus.aborted, status);
+
+    recorder.resolves.clearRetainingCapacity();
+    recorder.fail_begin = true;
+    try std.testing.expectError(error.TransactionBeginFailed, executeCrossGroup(
+        std.testing.allocator,
+        FakeCatalog.iface(),
+        recorder.worker(),
+        "docs",
+        txn_id,
+        10_000,
+        10_001,
+        .{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"a\"}" },
+                .{ .key = "doc:z", .value = "{\"title\":\"z\"}" },
+            },
+        },
+        null,
+    ));
+    try std.testing.expectEqual(@as(usize, 2), recorder.resolves.items.len);
+    for (recorder.resolves.items) |status| try std.testing.expectEqual(db_mod.types.TxnStatus.aborted, status);
 }
 
-test "distributed txn coordinator retries once on topology change" {
+test "distributed txn coordinator never restarts a transaction id on topology change" {
     const FakeCatalog = struct {
         call_count: usize = 0,
 
@@ -12971,7 +14390,9 @@ test "distributed txn coordinator retries once on topology change" {
             return .{
                 .status = .{ .metadata_group_id = 1, .metrics = .{} },
                 .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{ .table_id = 7, .name = "docs", .placement_role = "data" }})[0..]),
-                .ranges = if (self.call_count <= 2)
+                // Transaction admission now checks active transitions before
+                // pinning and resolving the range epoch.
+                .ranges = if (self.call_count <= 3)
                     @constCast((&[_]metadata_table_manager.RangeRecord{
                         .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = "doc:m" },
                         .{ .group_id = 7002, .table_id = 7, .start_key = "doc:m", .end_key = null },
@@ -12993,6 +14414,7 @@ test "distributed txn coordinator retries once on topology change" {
 
     const Recorder = struct {
         prepare_calls: usize = 0,
+        resolved_sync_level: db_mod.types.SyncLevel = .propose,
 
         fn worker(self: *@This()) ParticipantWorker {
             return .{
@@ -13017,7 +14439,10 @@ test "distributed txn coordinator retries once on topology change" {
             }
         }
 
-        fn resolve(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnResolveRequest) !void {}
+        fn resolve(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, req: TxnResolveRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.resolved_sync_level = req.sync_level;
+        }
 
         fn status(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
             return .pending;
@@ -13027,7 +14452,7 @@ test "distributed txn coordinator retries once on topology change" {
     var catalog = FakeCatalog{};
     var recorder = Recorder{};
     const txn_id = try parseTxnIdHex("11112222333344445555666677778888");
-    const outcome = try executeMultiTableCommit(
+    try std.testing.expectError(error.TopologyChanged, executeMultiTableCommit(
         std.testing.allocator,
         catalog.iface(),
         recorder.worker(),
@@ -13038,13 +14463,16 @@ test "distributed txn coordinator retries once on topology change" {
             .table_name = "docs",
             .writes = &.{.{ .key = "doc:z", .value = "{\"title\":\"z\"}" }},
         }},
+        .full_index,
         null,
-    );
-    try std.testing.expect(outcome == .committed);
-    try std.testing.expectEqual(@as(usize, 2), recorder.prepare_calls);
+    ));
+    try std.testing.expectEqual(@as(usize, 1), recorder.prepare_calls);
+    // Abort decisions must be durable before the coordinator reports the
+    // prepare failure; an earlier participant may already have begun.
+    try std.testing.expectEqual(db_mod.types.SyncLevel.write, recorder.resolved_sync_level);
 }
 
-test "distributed txn coordinator stops after single topology retry" {
+test "distributed txn coordinator returns topology failure without retry" {
     const FakeCatalog = struct {
         fn iface() table_catalog.CatalogSource {
             return .{
@@ -13111,11 +14539,12 @@ test "distributed txn coordinator stops after single topology retry" {
             .table_name = "docs",
             .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"a\"}" }},
         }},
+        .propose,
         null,
     ));
 }
 
-test "distributed txn coordinator surfaces participant group on repeated unknown-group failure" {
+test "distributed txn coordinator returns unknown group without restarting the transaction" {
     const FakeCatalog = struct {
         fn iface() table_catalog.CatalogSource {
             return .{
@@ -13188,6 +14617,7 @@ test "distributed txn coordinator surfaces participant group on repeated unknown
             .table_name = "docs",
             .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"a\"}" }},
         }},
+        .propose,
         null,
     );
     defer outcome.deinit(std.testing.allocator);
@@ -13196,7 +14626,186 @@ test "distributed txn coordinator surfaces participant group on repeated unknown
     try std.testing.expectEqualStrings("docs", outcome.conflict.table_name);
     try std.testing.expectEqual(@as(?u64, 7001), outcome.conflict.group_id);
     try std.testing.expectEqual(.begin, outcome.conflict.phase.?);
-    try std.testing.expectEqual(@as(usize, 2), recorder.begin_calls);
+    try std.testing.expectEqual(@as(usize, 1), recorder.begin_calls);
+}
+
+test "distributed txn coordinator never aborts after durable commit decision" {
+    const FakeCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{ .ptr = undefined, .vtable = &.{
+                .admin_snapshot = adminSnapshot,
+                .free_admin_snapshot = freeAdminSnapshot,
+            } };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !@import("../metadata/api.zig").AdminSnapshot {
+            const metadata_table_manager = @import("../metadata/table_manager.zig");
+            const raft_reconciler = @import("../raft/reconciler.zig");
+            const metadata_transition_state = @import("../metadata/transition_state.zig");
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{ .table_id = 7, .name = "docs", .placement_role = "data" }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = "doc:m" },
+                    .{ .group_id = 7002, .table_id = 7, .start_key = "doc:m", .end_key = null },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *@import("../metadata/api.zig").AdminSnapshot) void {}
+    };
+
+    const Recorder = struct {
+        first_committed: bool = false,
+        abort_calls: usize = 0,
+        second_conflict: bool = false,
+        retry_ambiguous_coordinator: bool = false,
+        coordinator_resolve_calls: usize = 0,
+        coordinator_retry_sync_level: ?db_mod.types.SyncLevel = null,
+
+        fn worker(self: *@This()) ParticipantWorker {
+            return .{ .ptr = self, .vtable = &.{
+                .begin_group = begin,
+                .prepare_group = prepare,
+                .resolve_group = resolve,
+                .status_group = status,
+            } };
+        }
+
+        fn begin(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnBeginRequest) !void {}
+        fn prepare(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnPrepareRequest) !void {}
+        fn resolve(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, _: []const u8, req: TxnResolveRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (req.status == .aborted) {
+                self.abort_calls += 1;
+                return;
+            }
+            if (group_id == 7001) {
+                self.coordinator_resolve_calls += 1;
+                if (self.retry_ambiguous_coordinator) {
+                    if (self.coordinator_resolve_calls == 1) return error.InjectedPostCommitAckFailure;
+                    self.coordinator_retry_sync_level = req.sync_level;
+                    self.first_committed = true;
+                    return;
+                }
+                self.first_committed = true;
+                return error.InjectedPostCommitAckFailure;
+            }
+            if (self.second_conflict) return error.DecisionConflict;
+        }
+        fn status(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (group_id == 7001 and self.retry_ambiguous_coordinator) return .pending;
+            if (group_id == 7001 and self.first_committed) return .committed;
+            return .pending;
+        }
+    };
+
+    var recorder = Recorder{};
+    const txn_id = try parseTxnIdHex("1234567890abcdef1234567890abcdef");
+    try std.testing.expectError(error.CommitVisibilityNotSatisfied, executeMultiTableCommit(
+        std.testing.allocator,
+        FakeCatalog.iface(),
+        recorder.worker(),
+        txn_id,
+        10_000,
+        10_001,
+        &.{.{
+            .table_name = "docs",
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"a\"}" },
+                .{ .key = "doc:z", .value = "{\"title\":\"z\"}" },
+            },
+        }},
+        .propose,
+        null,
+    ));
+    try std.testing.expect(recorder.first_committed);
+    try std.testing.expectEqual(@as(usize, 0), recorder.abort_calls);
+
+    // A contradictory/missing follower after the coordinator decision is a
+    // committed transaction with incomplete propagation, never an abort.
+    recorder = .{ .second_conflict = true };
+    const second_txn_id = try parseTxnIdHex("abcdef1234567890abcdef1234567890");
+    try std.testing.expectError(error.CommitPropagationIncomplete, executeMultiTableCommit(
+        std.testing.allocator,
+        FakeCatalog.iface(),
+        recorder.worker(),
+        second_txn_id,
+        20_000,
+        20_001,
+        &.{.{
+            .table_name = "docs",
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"a\"}" },
+                .{ .key = "doc:z", .value = "{\"title\":\"z\"}" },
+            },
+        }},
+        .propose,
+        null,
+    ));
+    try std.testing.expect(recorder.first_committed);
+    try std.testing.expectEqual(@as(usize, 0), recorder.abort_calls);
+
+    // Callers using an ephemeral server-generated ID must not receive a
+    // retryable failure after the decision is durable: a retry would use a new
+    // ID and could apply transforms twice.
+    recorder = .{ .second_conflict = true };
+    const ephemeral_txn_id = try parseTxnIdHex("00112233445566778899aabbccddeeff");
+    const ephemeral = try executeMultiTableCommitWithOptions(
+        std.testing.allocator,
+        FakeCatalog.iface(),
+        recorder.worker(),
+        ephemeral_txn_id,
+        30_000,
+        30_001,
+        &.{.{
+            .table_name = "docs",
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"a\"}" },
+                .{ .key = "doc:z", .value = "{\"title\":\"z\"}" },
+            },
+        }},
+        .propose,
+        null,
+        .{ .report_post_commit_failure = false },
+    );
+    try std.testing.expect(ephemeral == .committed);
+    try std.testing.expect(ephemeral.committed.propagation_pending);
+    try std.testing.expect(ephemeral.committed.visibility_pending);
+    try std.testing.expect(recorder.first_committed);
+    try std.testing.expectEqual(@as(usize, 0), recorder.abort_calls);
+
+    // An ambiguous proposal-only coordinator submission is retried under the
+    // effective write barrier. Treating proposal acceptance as committed here
+    // could let a follower commit after leadership loss discards the decision.
+    recorder = .{ .retry_ambiguous_coordinator = true };
+    const ambiguous_txn_id = try parseTxnIdHex("fedcba0987654321fedcba0987654321");
+    const ambiguous = try executeMultiTableCommitWithOptions(
+        std.testing.allocator,
+        FakeCatalog.iface(),
+        recorder.worker(),
+        ambiguous_txn_id,
+        40_000,
+        40_001,
+        &.{.{
+            .table_name = "docs",
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"a\"}" },
+                .{ .key = "doc:z", .value = "{\"title\":\"z\"}" },
+            },
+        }},
+        .propose,
+        null,
+        .{ .report_post_commit_failure = false },
+    );
+    try std.testing.expect(ambiguous == .committed);
+    try std.testing.expectEqual(@as(?db_mod.types.SyncLevel, .write), recorder.coordinator_retry_sync_level);
+    try std.testing.expectEqual(@as(usize, 0), recorder.abort_calls);
 }
 
 test "distributed txn coordinator surfaces resolve decision conflicts deterministically" {
@@ -13235,6 +14844,7 @@ test "distributed txn coordinator surfaces resolve decision conflicts determinis
         begin_calls: usize = 0,
         prepare_calls: usize = 0,
         resolve_calls: usize = 0,
+        abort_calls: usize = 0,
 
         fn worker(self: *@This()) ParticipantWorker {
             return .{
@@ -13260,10 +14870,13 @@ test "distributed txn coordinator surfaces resolve decision conflicts determinis
 
         fn resolve(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.resolve_calls += 1;
             try std.testing.expectEqual(@as(u64, 7001), group_id);
             try std.testing.expectEqualStrings("docs", table_name);
-            try std.testing.expectEqual(db_mod.types.TxnStatus.committed, req.status);
+            if (req.status == .aborted) {
+                self.abort_calls += 1;
+                return;
+            }
+            self.resolve_calls += 1;
             return error.DecisionConflict;
         }
 
@@ -13285,6 +14898,7 @@ test "distributed txn coordinator surfaces resolve decision conflicts determinis
             .table_name = "docs",
             .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"a\"}" }},
         }},
+        .propose,
         null,
     );
     defer outcome.deinit(std.testing.allocator);
@@ -13296,6 +14910,7 @@ test "distributed txn coordinator surfaces resolve decision conflicts determinis
     try std.testing.expectEqual(@as(usize, 1), recorder.begin_calls);
     try std.testing.expectEqual(@as(usize, 1), recorder.prepare_calls);
     try std.testing.expectEqual(@as(usize, 1), recorder.resolve_calls);
+    try std.testing.expectEqual(@as(usize, 1), recorder.abort_calls);
 }
 
 test "db transaction recovery runtime resolves table-group participants through distributed txn resolver" {
@@ -13334,6 +14949,7 @@ test "db transaction recovery runtime resolves table-group participants through 
         fn resolve(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqual(db_mod.types.SyncLevel.write, req.sync_level);
             self.calls += 1;
             self.last_group_id = group_id;
             self.last_status = req.status;
@@ -13571,6 +15187,7 @@ test "db one-shot transaction recovery resolves table-group participants through
             try std.testing.expectEqualStrings("docs", table_name);
             try std.testing.expectEqual(@as(u64, 88), group_id);
             try std.testing.expectEqual(db_mod.types.TxnStatus.committed, req.status);
+            try std.testing.expectEqual(db_mod.types.SyncLevel.write, req.sync_level);
             self.calls += 1;
         }
     };

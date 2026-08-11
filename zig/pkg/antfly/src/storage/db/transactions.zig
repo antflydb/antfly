@@ -17,6 +17,7 @@ const builtin = @import("builtin");
 const platform = @import("antfly_platform");
 
 const db_internal = @import("internal.zig");
+const change_journal_mod = @import("derived/change_journal.zig");
 const doc_identity = @import("doc_identity.zig");
 const docstore_mod = @import("../docstore.zig");
 const internal_keys = @import("../internal_keys.zig");
@@ -35,6 +36,14 @@ const Allocator = std.mem.Allocator;
 const row_claim_intent_key_prefix = relational_store_mod.row_claim_intent_key_prefix;
 
 const TestHelpers = if (builtin.is_test) @import("test_support.zig") else struct {};
+
+fn tempPath(buf: []u8) [*:0]const u8 {
+    return TestHelpers.tempPath(buf);
+}
+
+fn cleanupTempDir(path: [*:0]const u8) void {
+    TestHelpers.cleanupTempDir(path);
+}
 
 pub fn Impl(comptime DB: type) type {
     return struct {
@@ -60,7 +69,70 @@ pub fn Impl(comptime DB: type) type {
             return try self.core.beginTransactionWithParticipants(txn_id, timestamp_ns, participants);
         }
 
+        pub fn beginTransactionWithIdAndParticipantsCreatedAt(
+            self: *DB,
+            txn_id: transactions_mod.TxnId,
+            timestamp_ns: u64,
+            created_at_ns: u64,
+            participants: []const []const u8,
+        ) !transactions_mod.TxnId {
+            lockApply(self);
+            defer self.core.unlockApply();
+            return try self.core.beginTransactionWithParticipantsCreatedAt(txn_id, timestamp_ns, created_at_ns, participants);
+        }
+
+        pub fn beginTransactionWithIdAndParticipantsCreatedAtAndRole(
+            self: *DB,
+            txn_id: transactions_mod.TxnId,
+            timestamp_ns: u64,
+            created_at_ns: u64,
+            participants: []const []const u8,
+            coordinator: bool,
+        ) !transactions_mod.TxnId {
+            return try beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(
+                self,
+                txn_id,
+                timestamp_ns,
+                created_at_ns,
+                participants,
+                coordinator,
+                false,
+            );
+        }
+
+        pub fn beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(
+            self: *DB,
+            txn_id: transactions_mod.TxnId,
+            timestamp_ns: u64,
+            created_at_ns: u64,
+            participants: []const []const u8,
+            coordinator: bool,
+            retain_terminal: bool,
+        ) !transactions_mod.TxnId {
+            lockApply(self);
+            defer self.core.unlockApply();
+            return try self.core.beginTransactionWithParticipantsCreatedAtRoleAndRetention(
+                txn_id,
+                timestamp_ns,
+                created_at_ns,
+                participants,
+                coordinator,
+                retain_terminal,
+            );
+        }
+
         pub fn writeIntents(
+            self: *DB,
+            txn_id: transactions_mod.TxnId,
+            intents: []const transactions_mod.WriteIntent,
+            predicates: []const transactions_mod.VersionPredicate,
+        ) !void {
+            lockApply(self);
+            defer self.core.unlockApply();
+            try writeIntentsLocked(self, txn_id, intents, predicates);
+        }
+
+        fn writeIntentsLocked(
             self: *DB,
             txn_id: transactions_mod.TxnId,
             intents: []const transactions_mod.WriteIntent,
@@ -97,13 +169,18 @@ pub fn Impl(comptime DB: type) type {
                 try identity_upsert_keys.append(self.alloc, intent.key);
             }
 
-            lockApply(self);
-            defer self.core.unlockApply();
             try failIfIdentityOrdinalExhaustedForNewUpserts(self, identity_upsert_keys.items);
             try self.core.writeIntents(txn_id, effective_intents, predicates);
         }
 
         pub fn writeTransaction(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest) !void {
+            // Transform expansion is a read-modify-write operation. Hold the same
+            // apply fence used by ordinary batches from the source read through
+            // predicate validation and durable intent installation; otherwise a
+            // concurrent write can be lost between transform expansion and prepare.
+            lockApply(self);
+            defer self.core.unlockApply();
+
             var effective_ops = try self.coalesceKeyValueRequest(types.TransactionWrite, req.writes, req.deletes, req.transforms);
             defer effective_ops.deinit(self.alloc);
             // Transaction intents currently carry primary rows only. Reject
@@ -225,14 +302,14 @@ pub fn Impl(comptime DB: type) type {
                 effective_ops.deletes,
                 txn_id,
                 monotonicTimeNs(),
-                false,
+                true,
             );
             _ = try reclaimExpiredRowClaimIntentsForIdentityRewrites(
                 self,
                 req.relational_identity_rewrites,
                 txn_id,
                 monotonicTimeNs(),
-                false,
+                true,
             );
             try applyForeignKeyParentDeleteActions(
                 self,
@@ -310,7 +387,7 @@ pub fn Impl(comptime DB: type) type {
                 effective_ops.deletes,
             );
 
-            try self.writeIntents(txn_id, intents.items, predicates.items);
+            try writeIntentsLocked(self, txn_id, intents.items, predicates.items);
         }
 
         fn appendPreparedRelationalRowMutationIntents(
@@ -722,13 +799,16 @@ pub fn Impl(comptime DB: type) type {
         // resolveTransactionTransforms, removePendingTransactionWrite, and freeTransactionWritesOwned
         // request coalescing is consolidated into coalesceKeyValueRequest above
 
-        pub fn commitTransaction(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64) !void {
-            try self.resolveTransactionIntents(txn_id, .committed, timestamp_ns);
-        }
-
-        pub fn resolveTransactionIntents(self: *DB, txn_id: transactions_mod.TxnId, status: transactions_mod.TxnStatus, commit_version: u64) !void {
+        fn resolveRelationalTransactionIntentsWithSyncLevel(
+            self: *DB,
+            txn_id: transactions_mod.TxnId,
+            status: transactions_mod.TxnStatus,
+            commit_version: u64,
+            sync_level: types.SyncLevel,
+        ) !void {
             lockApply(self);
-            defer self.core.unlockApply();
+            var apply_mutex_held = true;
+            defer if (apply_mutex_held) self.core.unlockApply();
 
             var raw_identity_upserts = std.ArrayListUnmanaged([]const u8).empty;
             defer {
@@ -745,8 +825,9 @@ pub fn Impl(comptime DB: type) type {
             var identity_deletes = std.ArrayListUnmanaged([]const u8).empty;
             defer identity_deletes.deinit(self.alloc);
             var identity_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+            var identity_writes_borrowed_start: ?usize = null;
             defer {
-                for (identity_writes.items) |item| {
+                for (identity_writes.items[0 .. identity_writes_borrowed_start orelse identity_writes.items.len]) |item| {
                     self.alloc.free(@constCast(item.key));
                     self.alloc.free(@constCast(item.value));
                 }
@@ -758,17 +839,18 @@ pub fn Impl(comptime DB: type) type {
                 identity_visibility_deletes.deinit(self.alloc);
             }
             var relational_extra_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
-            defer {
-                for (relational_extra_writes.items) |item| {
-                    self.alloc.free(@constCast(item.key));
-                    self.alloc.free(@constCast(item.value));
-                }
-                relational_extra_writes.deinit(self.alloc);
-            }
+            defer relational_extra_writes.deinit(self.alloc);
             var relational_extra_deletes = std.ArrayListUnmanaged([]const u8).empty;
+            defer relational_extra_deletes.deinit(self.alloc);
+            var relational_extra_owned_keys = std.ArrayListUnmanaged([]u8).empty;
             defer {
-                for (relational_extra_deletes.items) |key| self.alloc.free(@constCast(key));
-                relational_extra_deletes.deinit(self.alloc);
+                for (relational_extra_owned_keys.items) |key| self.alloc.free(key);
+                relational_extra_owned_keys.deinit(self.alloc);
+            }
+            var relational_extra_owned_values = std.ArrayListUnmanaged([]u8).empty;
+            defer {
+                for (relational_extra_owned_values.items) |value| self.alloc.free(value);
+                relational_extra_owned_values.deinit(self.alloc);
             }
             var relational_skip_intent_keys = std.ArrayListUnmanaged([]const u8).empty;
             defer {
@@ -809,12 +891,15 @@ pub fn Impl(comptime DB: type) type {
                         const metadata_value = try self.alloc.dupe(u8, value);
                         var metadata_value_owned = true;
                         errdefer if (metadata_value_owned) self.alloc.free(metadata_value);
-                        try relational_extra_writes.append(self.alloc, .{ .key = metadata_key, .value = metadata_value });
+                        try relational_extra_owned_keys.append(self.alloc, metadata_key);
                         metadata_key_owned = false;
+                        try relational_extra_owned_values.append(self.alloc, metadata_value);
                         metadata_value_owned = false;
+                        try relational_extra_writes.append(self.alloc, .{ .key = metadata_key, .value = metadata_value });
                     } else {
-                        try relational_extra_deletes.append(self.alloc, metadata_key);
+                        try relational_extra_owned_keys.append(self.alloc, metadata_key);
                         metadata_key_owned = false;
+                        try relational_extra_deletes.append(self.alloc, metadata_key);
                     }
                 }
                 const identity_live_before = (try doc_identity.fastStatsFromStore(self.core.store)).live_ordinals;
@@ -877,16 +962,6 @@ pub fn Impl(comptime DB: type) type {
                         if (isMetadataKey(mutation.key) or internal_keys.isInternalPhysicalTableDataKey(mutation.key)) continue;
                         if (isRelationalIdentityRewriteEndpoint(relational_identity_rewrites, mutation.key)) continue;
                         if (mutation.value == null) try relational_intent_delete_keys.append(self.alloc, mutation.key);
-                    }
-                    var relational_extra_owned_keys = std.ArrayListUnmanaged([]u8).empty;
-                    defer {
-                        for (relational_extra_owned_keys.items) |key| self.alloc.free(key);
-                        relational_extra_owned_keys.deinit(self.alloc);
-                    }
-                    var relational_extra_owned_values = std.ArrayListUnmanaged([]u8).empty;
-                    defer {
-                        for (relational_extra_owned_values.items) |value| self.alloc.free(value);
-                        relational_extra_owned_values.deinit(self.alloc);
                     }
                     var relational_participant = relational_store_mod.WriteParticipant.initWithColumnIndexPolicy(
                         self.alloc,
@@ -1053,20 +1128,21 @@ pub fn Impl(comptime DB: type) type {
                             );
                         }
                     }
-                    relational_extra_owned_keys.clearRetainingCapacity();
-                    relational_extra_owned_values.clearRetainingCapacity();
                 }
             }
 
             const pending_identity_visibility_summary = try doc_identity.visibilitySummaryFromWrites(identity_writes.items);
+            identity_writes_borrowed_start = identity_writes.items.len;
             try identity_writes.appendSlice(self.alloc, relational_extra_writes.items);
             relational_extra_writes.clearRetainingCapacity();
             try relational_extra_deletes.ensureUnusedCapacity(self.alloc, identity_visibility_deletes.items.len);
+            try relational_extra_owned_keys.ensureUnusedCapacity(self.alloc, identity_visibility_deletes.items.len);
             for (identity_visibility_deletes.items) |key| {
                 relational_extra_deletes.appendAssumeCapacity(key);
+                relational_extra_owned_keys.appendAssumeCapacity(key);
             }
             identity_visibility_deletes.items.len = 0;
-            try self.core.resolveTransactionIntentsWithExtraBatch(txn_id, status, commit_version, .{
+            const outcome = try self.core.resolveTransactionIntentsWithExtraBatch(txn_id, status, commit_version, .{
                 .writes = identity_writes.items,
                 .deletes = relational_extra_deletes.items,
                 .skip_intent_keys = relational_skip_intent_keys.items,
@@ -1076,6 +1152,103 @@ pub fn Impl(comptime DB: type) type {
                 self.clearLiveDocSetCache();
                 self.clearNonVisibleDocSetCache();
             }
+            self.core.unlockApply();
+            apply_mutex_held = false;
+            try DB.WritePathCallbacks.flush_transaction_ha_outbox(self, txn_id);
+            try DB.WritePathCallbacks.wait_for_resolved_transaction_sync(self, sync_level, outcome.replay_sequence);
+        }
+
+        fn intentBatchRequiresSpecializedResolution(intents: transactions_mod.IntentBatch) bool {
+            for (intents.writes) |write| {
+                if (isMetadataKey(write.key) or internal_keys.isInternalPhysicalTableDataKey(write.key)) return true;
+            }
+            for (intents.deletes) |key| {
+                if (isMetadataKey(key) or internal_keys.isInternalPhysicalTableDataKey(key)) return true;
+            }
+            return false;
+        }
+
+        pub fn commitTransaction(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64) !void {
+            try self.resolveTransactionIntents(txn_id, .committed, timestamp_ns);
+        }
+
+        pub fn resolveTransactionIntents(self: *DB, txn_id: transactions_mod.TxnId, status: transactions_mod.TxnStatus, commit_version: u64) !void {
+            try self.resolveTransactionIntentsWithSyncLevel(txn_id, status, commit_version, .propose);
+        }
+
+        pub fn resolveTransactionIntentsWithSyncLevel(
+            self: *DB,
+            txn_id: transactions_mod.TxnId,
+            status: transactions_mod.TxnStatus,
+            commit_version: u64,
+            sync_level: types.SyncLevel,
+        ) !void {
+            if (status != .committed) {
+                lockApply(self);
+                defer self.core.unlockApply();
+                _ = self.core.resolveTransactionIntentsWithExtraBatch(txn_id, status, commit_version, .{}) catch |err| switch (err) {
+                    // An abort decision for a participant that was declared but
+                    // never enlisted is already satisfied. Treat it as an
+                    // idempotent no-op so coordinator recovery can acknowledge it.
+                    transactions_mod.TxnError.TxnNotFound => return,
+                    else => return err,
+                };
+                return;
+            }
+
+            var attempts: usize = 0;
+            while (attempts < 8) : (attempts += 1) {
+                var intents = try self.core.collectTransactionIntentBatch(self.alloc, txn_id);
+                defer intents.deinit(self.alloc);
+                if (relationalColumnsForStore(self) != null or intentBatchRequiresSpecializedResolution(intents)) {
+                    return try resolveRelationalTransactionIntentsWithSyncLevel(
+                        self,
+                        txn_id,
+                        status,
+                        commit_version,
+                        sync_level,
+                    );
+                }
+                if (intents.writes.len == 0 and intents.deletes.len == 0) {
+                    lockApply(self);
+                    const outcome = self.core.resolveTransactionIntentsWithExtraBatch(
+                        txn_id,
+                        status,
+                        commit_version,
+                        .{ .expected_intent_revision = intents.revision },
+                    ) catch |err| {
+                        self.core.unlockApply();
+                        if (err == error.IntentSnapshotChanged) continue;
+                        return err;
+                    };
+                    self.core.unlockApply();
+                    try DB.WritePathCallbacks.flush_transaction_ha_outbox(self, txn_id);
+                    try DB.WritePathCallbacks.wait_for_resolved_transaction_sync(self, sync_level, outcome.replay_sequence);
+                    return;
+                }
+
+                const writes = try self.alloc.alloc(types.BatchWrite, intents.writes.len);
+                defer self.alloc.free(writes);
+                for (intents.writes, 0..) |write, i| writes[i] = .{ .key = write.key, .value = write.value };
+                DB.WritePathCallbacks.batch_internal(self, .{
+                    .writes = writes,
+                    .deletes = intents.deletes,
+                    .timestamp_ns = commit_version,
+                    .sync_level = sync_level,
+                }, null, .{
+                    .transaction_resolution = .{
+                        .txn_id = txn_id,
+                        .status = status,
+                        .commit_version = commit_version,
+                        .expected_intent_revision = intents.revision,
+                    },
+                }) catch |err| {
+                    if (err == error.IntentSnapshotChanged) continue;
+                    return err;
+                };
+                return;
+            }
+            return error.TransactionPrepareContention;
         }
 
         fn appendOrderedTupleUniqueConflictSkipKeys(
@@ -1105,6 +1278,14 @@ pub fn Impl(comptime DB: type) type {
             return try self.core.getCommitVersion(txn_id);
         }
 
+        pub fn transactionDefersCoordinatorAcknowledgement(self: *DB, txn_id: transactions_mod.TxnId) !bool {
+            return try self.core.transactionDefersCoordinatorAcknowledgement(txn_id);
+        }
+
+        pub fn hasTopologySensitiveTransactions(self: *DB) !bool {
+            return try self.core.hasTopologySensitiveTransactions();
+        }
+
         pub fn markTransactionParticipantResolved(self: *DB, txn_id: transactions_mod.TxnId, participant: []const u8) !void {
             lockApply(self);
             defer self.core.unlockApply();
@@ -1119,10 +1300,41 @@ pub fn Impl(comptime DB: type) type {
             return try self.core.getUnresolvedTransactionParticipants(alloc, txn_id);
         }
 
-        pub fn recoverTransactions(self: *DB, cutoff_timestamp: u64, resolution_timestamp: u64) !transactions_mod.RecoveryStats {
+        pub fn cleanupTransactionMetadataIfEligible(
+            self: *DB,
+            txn_id: transactions_mod.TxnId,
+            cutoff_timestamp: u64,
+            retained_cutoff_timestamp: u64,
+        ) !bool {
             lockApply(self);
             defer self.core.unlockApply();
-            return try self.core.recoverTransactions(cutoff_timestamp, resolution_timestamp);
+            return try self.core.cleanupTransactionMetadataIfEligible(txn_id, cutoff_timestamp, retained_cutoff_timestamp);
+        }
+
+        pub fn recoverTransactions(self: *DB, cutoff_timestamp: u64, resolution_timestamp: u64) !transactions_mod.RecoveryStats {
+            const resolved_finalized = try self.resolveFinalizedTransactionIntentsForRecovery(resolution_timestamp);
+            lockApply(self);
+            defer self.core.unlockApply();
+            var recovery_stats = try self.core.recoverTransactions(cutoff_timestamp, resolution_timestamp);
+            recovery_stats.resolved_finalized += resolved_finalized;
+            return recovery_stats;
+        }
+
+        pub fn resolveFinalizedTransactionIntentsForRecovery(self: *DB, resolution_timestamp: u64) !u64 {
+            const txns = try self.core.listTransactions(self.alloc);
+            defer self.alloc.free(txns);
+            var resolved_finalized: u64 = 0;
+            for (txns) |txn| {
+                if (txn.status == .pending or
+                    (!(try self.core.transactionHasIntents(txn.txn_id)) and !(try self.core.transactionHasHAOutbox(txn.txn_id)))) continue;
+                const resolve_version = if (txn.status == .committed and txn.commit_version != 0)
+                    txn.commit_version
+                else
+                    resolution_timestamp;
+                try self.resolveTransactionIntentsWithSyncLevel(txn.txn_id, txn.status, resolve_version, .propose);
+                resolved_finalized += 1;
+            }
+            return resolved_finalized;
         }
 
         fn lockApply(self: *DB) void {
@@ -1358,7 +1570,9 @@ test "db transactions local lifecycle exposes committed and deleted documents" {
 
     const begin_ts: u64 = 1_700_000_000_000_000_000;
     const commit_ts: u64 = begin_ts + 1;
+    try std.testing.expect(!try db.hasTopologySensitiveTransactions());
     const txn_id = try db.beginTransaction(begin_ts);
+    try std.testing.expect(try db.hasTopologySensitiveTransactions());
     try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try db.getTransactionStatus(txn_id));
 
     try db.writeIntents(txn_id, &.{
@@ -1366,6 +1580,7 @@ test "db transactions local lifecycle exposes committed and deleted documents" {
     }, &.{});
 
     try db.commitTransaction(txn_id, commit_ts);
+    try std.testing.expect(!try db.hasTopologySensitiveTransactions());
     try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try db.getTransactionStatus(txn_id));
     try std.testing.expectEqual(commit_ts, try db.getCommitVersion(txn_id));
     try std.testing.expectEqual(@as(?u64, 1), try range_cardinality.load(alloc, db.core.store));
@@ -1385,10 +1600,12 @@ test "db transactions local lifecycle exposes committed and deleted documents" {
     }
 
     const delete_txn = try db.beginTransaction(commit_ts + 1);
+    try std.testing.expect(try db.hasTopologySensitiveTransactions());
     try db.writeIntents(delete_txn, &.{
         .{ .key = "doc:txn", .value = null },
     }, &.{});
     try db.commitTransaction(delete_txn, commit_ts + 2);
+    try std.testing.expect(!try db.hasTopologySensitiveTransactions());
     try std.testing.expect((try db.get(alloc, "doc:txn")) == null);
     try std.testing.expectEqual(@as(?u64, 0), try range_cardinality.load(alloc, db.core.store));
 
@@ -1957,6 +2174,38 @@ test "db transactions resolve transforms against pending same-transaction writes
         .float => |value| try std.testing.expectEqual(@as(f64, 5), value),
         else => return error.TestExpectedEqual,
     }
+}
+
+test "db transaction intents fence ordinary batch transforms" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "doc:counter", .value = "{\"count\":0}" }} });
+
+    const txn_id = try db.beginTransaction(10_000);
+    try db.writeTransaction(txn_id, .{ .transforms = &.{.{
+        .key = "doc:counter",
+        .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }},
+    }} });
+
+    try std.testing.expectError(error.IntentConflict, db.batch(.{ .transforms = &.{.{
+        .key = "doc:counter",
+        .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }},
+    }} }));
+
+    try db.commitTransaction(txn_id, 10_001);
+    try db.batch(.{ .transforms = &.{.{
+        .key = "doc:counter",
+        .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }},
+    }} });
+    const raw = (try db.get(alloc, "doc:counter")) orelse return error.TestExpectedEqual;
+    defer alloc.free(raw);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"count\":2") != null);
 }
 
 test "db transactions relational transforms read base rows and honor abort" {
@@ -2533,6 +2782,132 @@ test "db transactions explicit resolveTransactionIntents applies participant-sty
     try std.testing.expectEqualStrings("{\"title\":\"replicated\"}", raw);
 }
 
+test "db transaction repeated committed resolve cannot overwrite a newer write" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+
+    const txn_id = try db.beginTransaction(12_000);
+    try db.writeTransaction(txn_id, .{
+        .writes = &.{.{ .key = "doc:fenced", .value = "{\"title\":\"transaction\"}" }},
+    });
+    try db.resolveTransactionIntents(txn_id, .committed, 15_000);
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:fenced", .value = "{\"title\":\"newer\"}" }},
+        .timestamp_ns = 16_000,
+    });
+
+    try db.resolveTransactionIntents(txn_id, .committed, 15_000);
+    const raw = (try db.get(alloc, "doc:fenced")) orelse return error.TestExpectedEqual;
+    defer alloc.free(raw);
+    try std.testing.expectEqualStrings("{\"title\":\"newer\"}", raw);
+    try std.testing.expectEqual(@as(u64, 16_000), try db.getTimestamp(alloc, "doc:fenced"));
+    try std.testing.expectEqual(@as(u64, 2), db.core.store.lastReplaySequence(0));
+}
+
+test "db transaction committed transform appends derived replay from final value" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "doc:transform", .value = "{\"count\":1}" }} });
+
+    const txn_id = try db.beginTransaction(12_000);
+    try db.writeTransaction(txn_id, .{
+        .transforms = &.{.{
+            .key = "doc:transform",
+            .operations = &.{.{ .op = .inc, .path = "count", .value_json = "2" }},
+        }},
+    });
+    try db.resolveTransactionIntents(txn_id, .committed, 15_000);
+
+    const raw = (try db.get(alloc, "doc:transform")) orelse return error.TestExpectedEqual;
+    defer alloc.free(raw);
+    try std.testing.expectEqualStrings("{\"count\":3}", raw);
+
+    const entries = try db.core.store.iterateReplayFrom(alloc, 2);
+    defer {
+        for (entries) |*entry| entry.deinit(alloc);
+        alloc.free(entries);
+    }
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    var record = try change_journal_mod.decodeRecord(alloc, entries[0].payload);
+    defer record.deinit();
+    try std.testing.expectEqual(@as(usize, 1), record.record.changed_doc_keys.len);
+    try std.testing.expectEqualStrings("doc:transform", record.record.changed_doc_keys[0]);
+}
+
+test "db transaction committed transform reaches full text visibility" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    try db.addIndex(.{ .name = "ft_txn", .kind = .full_text, .config_json = "{}" });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:transform-index", .value = "{\"title\":\"alpha\"}" }},
+        .sync_level = .full_index,
+    });
+
+    const txn_id = try db.beginTransaction(12_000);
+    try db.writeTransaction(txn_id, .{
+        .transforms = &.{.{
+            .key = "doc:transform-index",
+            .operations = &.{.{ .op = .set, .path = "title", .value_json = "\"omega\"" }},
+        }},
+    });
+    try db.resolveTransactionIntentsWithSyncLevel(txn_id, .committed, 15_000, .full_index);
+
+    var result = try db.search(alloc, .{
+        .index_name = "ft_txn",
+        .query = .{ .match = .{ .field = "_all", .text = "omega" } },
+        .limit = 10,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("doc:transform-index", result.hits[0].id);
+}
+
+test "db transaction idempotent resolve honors stronger sync level" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    try db.addIndex(.{ .name = "ft_txn_retry", .kind = .full_text, .config_json = "{}" });
+
+    const txn_id = try db.beginTransaction(12_000);
+    try db.writeTransaction(txn_id, .{
+        .writes = &.{.{ .key = "doc:sync-retry", .value = "{\"title\":\"durable replay\"}" }},
+    });
+    try db.resolveTransactionIntentsWithSyncLevel(txn_id, .committed, 15_000, .propose);
+    try db.resolveTransactionIntentsWithSyncLevel(txn_id, .committed, 15_000, .full_index);
+
+    var result = try db.search(alloc, .{
+        .index_name = "ft_txn_retry",
+        .query = .{ .match = .{ .field = "_all", .text = "durable" } },
+        .limit = 10,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("doc:sync-retry", result.hits[0].id);
+}
+
 test "db transactions recoverTransactions auto-aborts stale pending intents" {
     const DB = @import("mod.zig").DB;
     const alloc = std.testing.allocator;
@@ -2723,6 +3098,50 @@ test "db transactions recovery resolves committed mutation source row claims aft
     }
 }
 
+test "db participant recovery callbacks run outside the apply lock" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const txn_id = try db.beginTransactionWithParticipants(1_000, &.{"remote"});
+    try db.writeTransaction(txn_id, .{
+        .writes = &.{.{ .key = "doc:reentrant-recovery", .value = "{\"title\":\"value\"}" }},
+    });
+    try db.resolveTransactionIntents(txn_id, .committed, 2_000);
+
+    const ReentrantResolver = struct {
+        db: *DB,
+        calls: usize = 0,
+
+        fn resolve(ctx: *anyopaque, resolved_txn_id: transactions_mod.TxnId, participant: []const u8, _: transactions_mod.TxnStatus, _: u64) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            try std.testing.expectEqualStrings("remote", participant);
+            // This acquires the DB apply lock. It would deadlock if recovery
+            // still held that lock while invoking participant callbacks.
+            try self.db.markTransactionParticipantResolved(resolved_txn_id, participant);
+            self.calls += 1;
+        }
+    };
+    var resolver = ReentrantResolver{ .db = &db };
+    const stats = try db.runTransactionRecoveryOnce(.{
+        .enabled = true,
+        .lease_owned = true,
+        .resolver_ctx = &resolver,
+        .resolve_participant_fn = ReentrantResolver.resolve,
+        .cutoff_ns = 1,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), resolver.calls);
+    try std.testing.expectEqual(@as(u64, 1), stats.notification_successes);
+    try std.testing.expectError(transactions_mod.TxnError.TxnNotFound, db.getTransactionStatus(txn_id));
+}
+
 test "db transactions recovery runtime resolves participants and unblocks cleanup" {
     const DB = @import("mod.zig").DB;
     const alloc = std.testing.allocator;
@@ -2802,81 +3221,6 @@ test "db transactions recovery runtime resolves participants and unblocks cleanu
     if (!stats_ready) return error.TransactionRecoveryStatsTimeout;
     try std.testing.expectError(transactions_mod.TxnError.TxnNotFound, db.getTransactionStatus(txn_id));
     if (!resolver_called) return error.TransactionRecoveryResolverTimeout;
-}
-
-test "db transactions recovery runtime appends identity rows for committed orphaned intents" {
-    const DB = @import("mod.zig").DB;
-    const alloc = std.testing.allocator;
-
-    var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
-    defer TestHelpers.cleanupTempDir(path);
-
-    const txn_id = blk: {
-        var setup_db = try DB.open(alloc, std.mem.span(path), .{});
-        defer setup_db.close();
-
-        const txn_id = try setup_db.beginTransaction(1_000);
-        try setup_db.writeTransaction(txn_id, .{
-            .writes = &.{.{ .key = "doc:recovered_orphan", .value = "{\"title\":\"recovered\"}" }},
-        });
-
-        const record_key = blk_key: {
-            const prefix = "\x00\x00__txn_records__:";
-            var key: [prefix.len + @sizeOf(transactions_mod.TxnId)]u8 = undefined;
-            @memcpy(key[0..prefix.len], prefix);
-            @memcpy(key[prefix.len..], &txn_id);
-            break :blk_key key;
-        };
-        var record_value: [33]u8 = undefined;
-        record_value[0] = @intFromEnum(transactions_mod.TxnStatus.committed);
-        std.mem.writeInt(u64, record_value[1..9], 1_000, .little);
-        std.mem.writeInt(u64, record_value[9..17], 2_000, .little);
-        std.mem.writeInt(u64, record_value[17..25], 1_000, .little);
-        std.mem.writeInt(u64, record_value[25..33], 2_000, .little);
-        try setup_db.core.store.put(record_key[0..], record_value[0..]);
-        break :blk txn_id;
-    };
-
-    const TxnResolverRecorder = TestHelpers.TxnResolverRecorder;
-    var recorder = TxnResolverRecorder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
-        .transaction_recovery = .{
-            .enabled = true,
-            .interval_ms = 10,
-            .cutoff_ns = 1,
-            .resolver_ctx = &recorder,
-            .resolve_participant_fn = TxnResolverRecorder.resolve,
-        },
-    });
-    defer db.close();
-
-    var cleaned = false;
-    var attempts: usize = 0;
-    while (attempts < 500) : (attempts += 1) {
-        const status = db.getTransactionStatus(txn_id);
-        if (status) |_| {} else |err| {
-            if (err == transactions_mod.TxnError.TxnNotFound) {
-                cleaned = true;
-                break;
-            }
-            return err;
-        }
-        platform.time.sleepMs(10);
-    }
-    if (!cleaned) return error.TransactionRecoveryCleanupTimeout;
-
-    const raw = (try db.get(alloc, "doc:recovered_orphan")) orelse return error.TestExpectedEqual;
-    defer alloc.free(raw);
-    try std.testing.expectEqualStrings("{\"title\":\"recovered\"}", raw);
-    try std.testing.expectEqual(@as(?u64, 1), try range_cardinality.load(alloc, db.core.store));
-
-    const stats = try db.diagnosticStats(alloc);
-    defer types.freeDBStats(alloc, stats);
-    try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.state_rows);
-    try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.live_ordinals);
-    try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.primary_docs_missing_ordinals);
-    try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.primary_docs_missing_identity_state);
 }
 
 test "db transactions relational recovery resolves orphaned intents into base rows" {
@@ -3043,6 +3387,92 @@ test "db transactions one-shot relational recovery resolves orphaned intents int
     const primary_key = try internal_keys.documentKeyAlloc(alloc, "row:one_shot_recovered");
     defer alloc.free(primary_key);
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, primary_key));
+}
+
+test "db transaction recovery runtime rebuilds all derived effects for committed orphaned intents" {
+    const DB = @import("mod.zig").DB;
+    const TxnResolverRecorder = TestHelpers.TxnResolverRecorder;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const txn_id = blk: {
+        var setup_db = try DB.open(alloc, std.mem.span(path), .{});
+        defer setup_db.close();
+        try setup_db.addIndex(.{ .name = "ft_recovered_txn", .kind = .full_text, .config_json = "{}" });
+
+        const txn_id = try setup_db.beginTransaction(1_000);
+        try setup_db.writeTransaction(txn_id, .{
+            .writes = &.{.{ .key = "doc:recovered_orphan", .value = "{\"title\":\"recovered\"}" }},
+        });
+
+        const record_key = blk_key: {
+            const prefix = "\x00\x00__txn_records__:";
+            var key: [prefix.len + @sizeOf(transactions_mod.TxnId)]u8 = undefined;
+            @memcpy(key[0..prefix.len], prefix);
+            @memcpy(key[prefix.len..], &txn_id);
+            break :blk_key key;
+        };
+        var record_value: [33]u8 = undefined;
+        record_value[0] = @intFromEnum(transactions_mod.TxnStatus.committed);
+        std.mem.writeInt(u64, record_value[1..9], 1_000, .little);
+        std.mem.writeInt(u64, record_value[9..17], 2_000, .little);
+        std.mem.writeInt(u64, record_value[17..25], 1_000, .little);
+        std.mem.writeInt(u64, record_value[25..33], 2_000, .little);
+        try setup_db.core.store.put(record_key[0..], record_value[0..]);
+        break :blk txn_id;
+    };
+
+    var recorder = TxnResolverRecorder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .transaction_recovery = .{
+            .enabled = true,
+            .interval_ms = 10,
+            .cutoff_ns = 1,
+            .resolver_ctx = &recorder,
+            .resolve_participant_fn = TxnResolverRecorder.resolve,
+        },
+    });
+    defer db.close();
+
+    var cleaned = false;
+    var attempts: usize = 0;
+    while (attempts < 500) : (attempts += 1) {
+        const status = db.getTransactionStatus(txn_id);
+        if (status) |_| {} else |err| {
+            if (err == transactions_mod.TxnError.TxnNotFound) {
+                cleaned = true;
+                break;
+            }
+            return err;
+        }
+        db_internal.sleepPollInterval();
+    }
+    if (!cleaned) return error.TransactionRecoveryCleanupTimeout;
+
+    const raw = (try db.get(alloc, "doc:recovered_orphan")) orelse return error.TestExpectedEqual;
+    defer alloc.free(raw);
+    try std.testing.expectEqualStrings("{\"title\":\"recovered\"}", raw);
+    try std.testing.expectEqual(@as(?u64, 1), try range_cardinality.load(alloc, db.core.store));
+
+    const stats = try db.diagnosticStats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.state_rows);
+    try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.live_ordinals);
+    try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.primary_docs_missing_ordinals);
+    try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.primary_docs_missing_identity_state);
+
+    try db.waitForCurrentSyncLevel(.full_index);
+    var result = try db.search(alloc, .{
+        .index_name = "ft_recovered_txn",
+        .query = .{ .match = .{ .field = "_all", .text = "recovered" } },
+        .limit = 10,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("doc:recovered_orphan", result.hits[0].id);
 }
 
 test "db transactions batch enforces optimistic version predicates" {

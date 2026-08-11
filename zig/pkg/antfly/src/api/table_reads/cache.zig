@@ -220,7 +220,7 @@ pub const ProvisionedTableReadCache = struct {
         while (true) {
             // Reload every attempt because a stale-epoch retry can mean the
             // table identity changed while the previous open was in flight.
-            const identity_namespace = try loadTableIdentityNamespaceForGroup(self.alloc, catalog, table_name, group_id);
+            const identity_namespace = try requireTableIdentityNamespaceForGroup(self.alloc, catalog, table_name, group_id);
             self.mutex.lockUncancelable(io);
             if (self.hasExclusiveTableAccessLocked(table_name) or self.hasExclusiveGroupAccessLocked(group_id)) {
                 self.mutex.unlock(io);
@@ -859,7 +859,7 @@ pub fn openProvisionedQueryDbForTableWithRuntime(
         lsm_root_generation,
         null,
         .{ .backend_runtime = backend_runtime },
-        try loadTableIdentityNamespaceForGroup(alloc, catalog, table_name, group_id),
+        try requireTableIdentityNamespaceForGroup(alloc, catalog, table_name, group_id),
     );
 }
 
@@ -1045,6 +1045,15 @@ pub fn loadTableIdentityNamespaceForGroup(
     return null;
 }
 
+pub fn requireTableIdentityNamespaceForGroup(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+    group_id: u64,
+) !db_mod.DocIdentityNamespace {
+    return (try loadTableIdentityNamespaceForGroup(alloc, catalog, table_name, group_id)) orelse error.TableNotFound;
+}
+
 pub fn validateProvisionedDbIdentityNamespace(
     alloc: std.mem.Allocator,
     catalog: table_catalog.CatalogSource,
@@ -1052,7 +1061,7 @@ pub fn validateProvisionedDbIdentityNamespace(
     group_id: u64,
     db: *const db_mod.DB,
 ) !void {
-    const expected = (try loadTableIdentityNamespaceForGroup(alloc, catalog, table_name, group_id)) orelse return;
+    const expected = try requireTableIdentityNamespaceForGroup(alloc, catalog, table_name, group_id);
     try validateOpenedProvisionedDbIdentityNamespace(db, expected);
 }
 
@@ -1381,7 +1390,17 @@ test "provisioned read cache keys entries by identity namespace" {
     defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
     const CatalogState = struct {
-        range_id: u64,
+        ranges: [1]metadata_table_manager.RangeRecord,
+
+        fn init(range_id: u64) @This() {
+            return .{ .ranges = .{.{
+                .group_id = 7001,
+                .table_id = 7,
+                .range_id = range_id,
+                .start_key = "",
+                .end_key = null,
+            }} };
+        }
 
         fn iface(self: *@This()) table_catalog.CatalogSource {
             return .{
@@ -1407,13 +1426,7 @@ test "provisioned read cache keys entries by identity namespace" {
                     .replication_sources_json = "[]",
                     .placement_role = "data",
                 }})[0..]),
-                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
-                    .group_id = 7001,
-                    .table_id = 7,
-                    .range_id = self.range_id,
-                    .start_key = "",
-                    .end_key = null,
-                }})[0..]),
+                .ranges = self.ranges[0..],
                 .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
                 .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
                 .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
@@ -1424,7 +1437,7 @@ test "provisioned read cache keys entries by identity namespace" {
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
     };
 
-    var catalog_state = CatalogState{ .range_id = 7101 };
+    var catalog_state = CatalogState.init(7101);
     var cache = ProvisionedTableReadCache.init(alloc);
     defer cache.deinit();
 
@@ -1433,7 +1446,7 @@ test "provisioned read cache keys entries by identity namespace" {
     try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len);
     try std.testing.expectEqual(@as(u64, 7101), lease1.db.core.identity_namespace.range_id);
 
-    catalog_state.range_id = 7102;
+    catalog_state.ranges[0].range_id = 7102;
     try std.testing.expect(cache.getIfPresent(7001, 1, .{
         .table_id = 7,
         .shard_id = 7001,
@@ -1456,7 +1469,17 @@ test "provisioned read cache invalidates repeated ownership moves with pinned le
     defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
     const CatalogState = struct {
-        range_id: u64,
+        ranges: [1]metadata_table_manager.RangeRecord,
+
+        fn init(range_id: u64) @This() {
+            return .{ .ranges = .{.{
+                .group_id = 7001,
+                .table_id = 7,
+                .range_id = range_id,
+                .start_key = "",
+                .end_key = null,
+            }} };
+        }
 
         fn iface(self: *@This()) table_catalog.CatalogSource {
             return .{
@@ -1482,13 +1505,7 @@ test "provisioned read cache invalidates repeated ownership moves with pinned le
                     .replication_sources_json = "[]",
                     .placement_role = "data",
                 }})[0..]),
-                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
-                    .group_id = 7001,
-                    .table_id = 7,
-                    .range_id = self.range_id,
-                    .start_key = "",
-                    .end_key = null,
-                }})[0..]),
+                .ranges = self.ranges[0..],
                 .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
                 .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
                 .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
@@ -1499,7 +1516,7 @@ test "provisioned read cache invalidates repeated ownership moves with pinned le
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
     };
 
-    var catalog_state = CatalogState{ .range_id = 7201 };
+    var catalog_state = CatalogState.init(7201);
     var cache = ProvisionedTableReadCache.init(alloc);
     defer cache.deinit();
 
@@ -1513,7 +1530,7 @@ test "provisioned read cache invalidates repeated ownership moves with pinned le
     try std.testing.expectEqual(@as(usize, 1), cache.retired_entries.items.len);
     try std.testing.expect(cache.getIfPresent(7001, 1, .{ .table_id = 7, .shard_id = 7001, .range_id = 7201 }, "docs") == null);
 
-    catalog_state.range_id = 7202;
+    catalog_state.ranges[0].range_id = 7202;
     var second = try cache.getOrOpen(path, catalog_state.iface(), 7001, 1, "docs");
     defer second.release();
     try std.testing.expectEqual(@as(u64, 7202), second.db.core.identity_namespace.range_id);
@@ -1524,7 +1541,7 @@ test "provisioned read cache invalidates repeated ownership moves with pinned le
     try std.testing.expectEqual(@as(usize, 0), cache.entries.items.len);
     try std.testing.expectEqual(@as(usize, 2), cache.retired_entries.items.len);
 
-    catalog_state.range_id = 7203;
+    catalog_state.ranges[0].range_id = 7203;
     var third = try cache.getOrOpen(path, catalog_state.iface(), 7001, 1, "docs");
     defer third.release();
     try std.testing.expectEqual(@as(u64, 7203), third.db.core.identity_namespace.range_id);

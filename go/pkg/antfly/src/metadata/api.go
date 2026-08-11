@@ -413,7 +413,7 @@ func (w wrapper) QueryNamespaceTable(rw http.ResponseWriter, r *http.Request, da
 }
 
 func (w wrapper) RestoreNamespaceTable(rw http.ResponseWriter, r *http.Request, databaseName string, namespaceName string, tableName string) {
-	w.TableApi.RestoreTable(rw, r, tableName)
+	w.TableApi.RestoreTable(rw, r, tableName, RestoreTableParams{})
 }
 
 func (w wrapper) RowsBatchNamespaceTable(rw http.ResponseWriter, r *http.Request, databaseName string, namespaceName string, tableName string) {

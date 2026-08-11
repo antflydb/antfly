@@ -33,6 +33,7 @@ pub const NamedResultSet = struct {
     name: []const u8,
     hits: []const types.SearchHit,
     total_hits: u32,
+    total_hits_relation: types.TotalHitsRelation = .exact,
     resolved_doc_set: ?*const doc_set.ResolvedDocSet = null,
     resolved_doc_set_complete: bool = false,
 };
@@ -670,6 +671,7 @@ pub fn cloneNamedSetAsResult(alloc: Allocator, set: NamedResultSet, include_stor
         .alloc = alloc,
         .hits = hits,
         .total_hits = set.total_hits,
+        .total_hits_relation = set.total_hits_relation,
         .graph_results = &.{},
     };
 }
@@ -779,8 +781,19 @@ pub fn fuseNamedSets(
         .alloc = alloc,
         .hits = hits,
         .total_hits = @intCast(pruned.len),
+        .total_hits_relation = fusedTotalHitsRelation(named_sets),
         .graph_results = &.{},
     };
+}
+
+fn fusedTotalHitsRelation(named_sets: []const NamedResultSet) types.TotalHitsRelation {
+    for (named_sets) |set| {
+        // Fusion only sees each source's returned window. Even when a source
+        // knows its exact total, the union cannot be exact until that entire
+        // source is present and can be deduplicated against the other legs.
+        if (set.total_hits_relation != .exact or set.hits.len != set.total_hits) return .gte;
+    }
+    return .exact;
 }
 
 const OrdinalFusionEntry = struct {
@@ -4724,6 +4737,7 @@ test "db query result shape cloneNamedSetAsResult preserves hit ordinals" {
         .name = "dense",
         .hits = &source_hits,
         .total_hits = 1,
+        .total_hits_relation = .gte,
     };
 
     var without_stored = try cloneNamedSetAsResult(alloc, set, false);
@@ -4732,6 +4746,7 @@ test "db query result shape cloneNamedSetAsResult preserves hit ordinals" {
     try std.testing.expectEqualStrings("doc:a", without_stored.hits[0].id);
     try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 11), without_stored.hits[0].doc_ordinal);
     try std.testing.expect(without_stored.hits[0].stored_data == null);
+    try std.testing.expectEqual(types.TotalHitsRelation.gte, without_stored.total_hits_relation);
 
     var with_stored = try cloneNamedSetAsResult(alloc, set, true);
     defer with_stored.deinit();
@@ -4872,6 +4887,57 @@ test "db query result shape fuseNamedSets preserves source hit ordinals" {
     try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 11), result.hits[0].doc_ordinal);
     try std.testing.expectEqualStrings("doc:b", result.hits[1].id);
     try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 12), result.hits[1].doc_ordinal);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, result.total_hits_relation);
+}
+
+test "fuseNamedSets reports a lower bound while any source window is truncated" {
+    const alloc = std.testing.allocator;
+
+    const left_hits = [_]types.SearchHit{
+        .{ .id = @constCast("doc:a"), .score = 1.0 },
+        .{ .id = @constCast("doc:b"), .score = 0.5 },
+    };
+    const right_hits = [_]types.SearchHit{
+        .{ .id = @constCast("doc:b"), .score = 1.0 },
+        .{ .id = @constCast("doc:c"), .score = 0.5 },
+    };
+    const named_sets = [_]NamedResultSet{
+        .{
+            .name = "$full_text_results",
+            .hits = &left_hits,
+            .total_hits = 3,
+            .total_hits_relation = .exact,
+        },
+        .{
+            .name = "dense_idx",
+            .hits = &right_hits,
+            .total_hits = right_hits.len,
+            .total_hits_relation = .exact,
+        },
+    };
+
+    const Harness = struct {
+        fn loadProjectedDocument(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: []const u8,
+        ) anyerror!?[]u8 {
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    var result = try fuseNamedSets(alloc, .{
+        .limit = 3,
+        .include_stored = false,
+    }, &named_sets, .{
+        .ctx = null,
+        .load_projected_document = Harness.loadProjectedDocument,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 3), result.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.gte, result.total_hits_relation);
 }
 
 test "db query result shape fuseNamedSets deduplicates aliases by ordinal when complete" {

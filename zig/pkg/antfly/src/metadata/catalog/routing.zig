@@ -235,6 +235,29 @@ pub fn resolveTableDocKeyRanges(
     return try plans.toOwnedSlice(alloc);
 }
 
+pub const RoutedGroupSnapshot = struct {
+    group_id: ?u64,
+    topology_epoch: u64,
+};
+
+pub fn routedGroupSnapshot(
+    alloc: std.mem.Allocator,
+    catalog: CatalogSource,
+    table_name: []const u8,
+    key: []const u8,
+) !RoutedGroupSnapshot {
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const table = metadata_catalog_lookup.findTableByName(&snapshot, table_name) orelse return .{ .group_id = null, .topology_epoch = 0 };
+    const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
+    defer metadata_admin.freeRangeRefs(alloc, ranges);
+    sortRangeRefs(ranges);
+    return .{
+        .group_id = resolveGroupForKeyFromRanges(ranges, key),
+        .topology_epoch = topologyEpochFromSortedRanges(table.*, ranges),
+    };
+}
+
 pub fn resolveGroupForKeyFromRanges(
     ranges: []const *const metadata_table_manager.RangeRecord,
     key: []const u8,
@@ -248,6 +271,46 @@ pub fn resolveGroupForKeyFromRanges(
 /// Whether a table with this name currently exists in the catalog. Used by
 /// cross-table graph hydration to fail closed (skip) rather than error when a
 /// node references a dropped table.
+pub const TransactionRoutingSnapshot = struct {
+    catalog: CatalogSource,
+    snapshot: metadata_api.AdminSnapshot,
+    ranges: []const *const metadata_table_manager.RangeRecord,
+    topology_epoch: u64,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        metadata_admin.freeRangeRefs(alloc, self.ranges);
+        self.catalog.freeAdminSnapshot(&self.snapshot);
+        self.* = undefined;
+    }
+
+    pub fn resolveGroupForKey(self: *const @This(), key: []const u8) ?u64 {
+        return resolveGroupForKeyFromRanges(self.ranges, key);
+    }
+};
+
+pub fn transactionRoutingSnapshot(
+    alloc: std.mem.Allocator,
+    catalog: CatalogSource,
+    table_name: []const u8,
+) !?TransactionRoutingSnapshot {
+    var snapshot = try catalog.adminSnapshot();
+    errdefer catalog.freeAdminSnapshot(&snapshot);
+    const table = metadata_catalog_lookup.findTableByName(&snapshot, table_name) orelse return null;
+    try validateTransactionTopologyStableSnapshot(&snapshot, table.*);
+
+    const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
+    errdefer metadata_admin.freeRangeRefs(alloc, ranges);
+    if (ranges.len == 0) return null;
+    sortRangeRefs(ranges);
+
+    return .{
+        .catalog = catalog,
+        .snapshot = snapshot,
+        .ranges = ranges,
+        .topology_epoch = topologyEpochFromSortedRanges(table.*, ranges),
+    };
+}
+
 pub fn tableExists(
     catalog: CatalogSource,
     table_name: []const u8,
@@ -265,10 +328,7 @@ pub fn topologyEpoch(
     var snapshot = try catalog.adminSnapshot();
     defer catalog.freeAdminSnapshot(&snapshot);
     const table = metadata_catalog_lookup.findTableByName(&snapshot, table_name) orelse return 0;
-    const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
-    defer metadata_admin.freeRangeRefs(alloc, ranges);
-
-    return tableTopologyEpochFromRanges(table.*, ranges);
+    return try topologyEpochFromSnapshot(alloc, &snapshot, table.*);
 }
 
 pub fn tableTopologyEpochFromRanges(
@@ -305,6 +365,64 @@ pub fn tableSchemaJsonAlloc(
     return try alloc.dupe(u8, table.schema_json);
 }
 
+fn topologyEpochFromSnapshot(
+    alloc: std.mem.Allocator,
+    snapshot: *const metadata_api.AdminSnapshot,
+    table: metadata_table_manager.TableRecord,
+) !u64 {
+    const ranges = try metadata_admin.listTableRanges(alloc, snapshot, table.table_id);
+    defer metadata_admin.freeRangeRefs(alloc, ranges);
+
+    sortRangeRefs(ranges);
+    return topologyEpochFromSortedRanges(table, ranges);
+}
+
+fn topologyEpochFromSortedRanges(
+    table: metadata_table_manager.TableRecord,
+    ranges: []const *const metadata_table_manager.RangeRecord,
+) u64 {
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update(table.name);
+    hasher.update(std.mem.asBytes(&table.table_id));
+    hasher.update(std.mem.asBytes(&@as(u64, @intCast(ranges.len))));
+    for (ranges) |range| {
+        hasher.update(std.mem.asBytes(&range.group_id));
+        hasher.update(range.start_key);
+        if (range.end_key) |end_key| {
+            hasher.update(&[_]u8{1});
+            hasher.update(end_key);
+        } else {
+            hasher.update(&[_]u8{0});
+        }
+    }
+    return hasher.final();
+}
+
+pub fn transactionTopologyEpoch(
+    alloc: std.mem.Allocator,
+    catalog: CatalogSource,
+    table_name: []const u8,
+) !u64 {
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const table = metadata_catalog_lookup.findTableByName(&snapshot, table_name) orelse return 0;
+    try validateTransactionTopologyStableSnapshot(&snapshot, table.*);
+    return try topologyEpochFromSnapshot(alloc, &snapshot, table.*);
+}
+
+pub fn validateTransactionTopologyEpoch(
+    alloc: std.mem.Allocator,
+    catalog: CatalogSource,
+    table_name: []const u8,
+    expected_epoch: u64,
+) !void {
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const table = metadata_catalog_lookup.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+    try validateTransactionTopologyStableSnapshot(&snapshot, table.*);
+    if (expected_epoch != 0 and (try topologyEpochFromSnapshot(alloc, &snapshot, table.*)) != expected_epoch) return error.TopologyChanged;
+}
+
 pub fn validateTopologyEpoch(
     alloc: std.mem.Allocator,
     catalog: CatalogSource,
@@ -333,6 +451,98 @@ pub fn validateGroupTopologyEpoch(
     if (foreignKeyRefTopologyEpochMatchesGroup(&snapshot, table.*, group_id, expected_epoch)) return;
     if (uniqueConstraintTopologyEpochMatchesGroup(&snapshot, table.*, group_id, expected_epoch)) return;
     return error.TopologyChanged;
+}
+
+pub fn validatePinnedTopologyEpoch(
+    alloc: std.mem.Allocator,
+    catalog: CatalogSource,
+    table_name: []const u8,
+    expected_epoch: u64,
+) !void {
+    const actual_epoch = try topologyEpoch(alloc, catalog, table_name);
+    if (actual_epoch != expected_epoch) return error.TopologyChanged;
+}
+
+pub fn groupTopologyEpoch(
+    alloc: std.mem.Allocator,
+    catalog: CatalogSource,
+    table_name: []const u8,
+    group_id: u64,
+) !u64 {
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const table = metadata_catalog_lookup.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+    const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
+    defer metadata_admin.freeRangeRefs(alloc, ranges);
+    sortRangeRefs(ranges);
+    for (ranges) |range| {
+        if (range.group_id == group_id) return topologyEpochFromSortedRanges(table.*, ranges);
+    }
+    return error.TopologyChanged;
+}
+
+pub fn validatePinnedGroupTopology(
+    alloc: std.mem.Allocator,
+    catalog: CatalogSource,
+    table_name: []const u8,
+    group_id: u64,
+    expected_epoch: u64,
+) !void {
+    if (try groupTopologyEpoch(alloc, catalog, table_name, group_id) != expected_epoch)
+        return error.TopologyChanged;
+}
+
+pub fn validateTransactionTopologyStable(
+    catalog: CatalogSource,
+    table_name: []const u8,
+) !void {
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const table = metadata_catalog_lookup.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+    return validateTransactionTopologyStableSnapshot(&snapshot, table.*);
+}
+
+fn validateTransactionTopologyStableSnapshot(
+    snapshot: *const metadata_api.AdminSnapshot,
+    table: metadata_table_manager.TableRecord,
+) !void {
+    for (snapshot.split_transitions) |transition| {
+        if (!transitionPhaseActive(transition.phase)) continue;
+        if (transition.table_contract.table_id == table.table_id or
+            std.mem.eql(u8, transition.table_contract.table_name, table.name))
+        {
+            return error.TopologyChanged;
+        }
+        if (transition.table_contract.table_id == 0 and
+            (rangeGroupBelongsToTable(snapshot.ranges, table.table_id, transition.source_group_id) or
+                rangeGroupBelongsToTable(snapshot.ranges, table.table_id, transition.destination_group_id)))
+        {
+            return error.TopologyChanged;
+        }
+    }
+    for (snapshot.merge_transitions) |transition| {
+        if (!transitionPhaseActive(transition.phase)) continue;
+        if (transition.table_contract.table_id == table.table_id or
+            std.mem.eql(u8, transition.table_contract.table_name, table.name))
+        {
+            return error.TopologyChanged;
+        }
+        if (transition.table_contract.table_id == 0 and
+            (rangeGroupBelongsToTable(snapshot.ranges, table.table_id, transition.donor_group_id) or
+                rangeGroupBelongsToTable(snapshot.ranges, table.table_id, transition.receiver_group_id)))
+        {
+            return error.TopologyChanged;
+        }
+    }
+}
+
+fn transitionPhaseActive(phase: metadata_transition_state.TransitionPhase) bool {
+    return phase != .finalized and phase != .rolled_back;
+}
+
+fn rangeGroupBelongsToTable(ranges: []const metadata_table_manager.RangeRecord, table_id: u64, group_id: u64) bool {
+    for (ranges) |range| if (range.table_id == table_id and range.group_id == group_id) return true;
+    return false;
 }
 
 pub fn validateDocIdentityReadyForTable(
@@ -432,6 +642,40 @@ pub fn resolveGroupsForSpan(
         try groups.append(alloc, range.group_id);
     }
     return try groups.toOwnedSlice(alloc);
+}
+
+pub const RoutedSpanSnapshot = struct {
+    group_ids: []u64,
+    topology_epoch: u64,
+};
+
+pub fn routedSpanSnapshot(
+    alloc: std.mem.Allocator,
+    catalog: CatalogSource,
+    table_name: []const u8,
+    from_key: []const u8,
+    to_key: []const u8,
+) !RoutedSpanSnapshot {
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const table = metadata_catalog_lookup.findTableByName(&snapshot, table_name) orelse return .{
+        .group_ids = try alloc.alloc(u64, 0),
+        .topology_epoch = 0,
+    };
+    const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
+    defer metadata_admin.freeRangeRefs(alloc, ranges);
+
+    sortRangeRefs(ranges);
+    var groups = std.ArrayListUnmanaged(u64).empty;
+    defer groups.deinit(alloc);
+    for (ranges) |range| {
+        if (!rangeOverlapsSpan(range.*, from_key, to_key)) continue;
+        try groups.append(alloc, range.group_id);
+    }
+    return .{
+        .group_ids = try groups.toOwnedSlice(alloc),
+        .topology_epoch = topologyEpochFromSortedRanges(table.*, ranges),
+    };
 }
 
 pub fn resolveGroupsForSpanEventually(
@@ -642,6 +886,43 @@ fn findMergedGroupStatus(statuses: []const metadata_reconciler.MergedGroupStatus
         if (status.group_id == group_id) return status;
     }
     return null;
+}
+
+test "transaction topology fence rejects active split transitions" {
+    const Source = struct {
+        fn snapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{.{
+                    .transition_id = 9,
+                    .attempt_epoch = 1,
+                    .source_group_id = 7001,
+                    .destination_group_id = 7002,
+                    .table_contract = .{ .table_id = 7, .table_name = "docs" },
+                }})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+        fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+    const source: CatalogSource = .{ .ptr = undefined, .vtable = &.{
+        .admin_snapshot = Source.snapshot,
+        .free_admin_snapshot = Source.free,
+    } };
+    try std.testing.expectError(error.TopologyChanged, validateTransactionTopologyStable(source, "docs"));
 }
 
 fn findRangeForTableGroup(

@@ -27,7 +27,10 @@ class TableRepairRunResult:
         in_progress (int): Number of selected repair records or indexes skipped because another repair pass already owns
             them.
         indexes_rebuilt (int): Number of indexes rebuilt by this pass when target is index.
-        indexes_degraded (int): Number of selected indexes that were already degraded or quarantined before repair.
+        indexes_degraded_before (int): Number of selected indexes that were degraded or quarantined when this repair
+            pass began.
+        indexes_degraded_after (int): Number of selected indexes that remain degraded or quarantined when this repair
+            pass returns.
         controls_applied (int): Number of existing index repairs that accepted the requested control.
         limit (int): Effective repair limit.
         has_more (bool): Whether another repair scan page is available via next_cursor.
@@ -47,7 +50,8 @@ class TableRepairRunResult:
     unresolved: int
     in_progress: int
     indexes_rebuilt: int
-    indexes_degraded: int
+    indexes_degraded_before: int
+    indexes_degraded_after: int
     controls_applied: int
     limit: int
     has_more: bool
@@ -76,7 +80,9 @@ class TableRepairRunResult:
 
         indexes_rebuilt = self.indexes_rebuilt
 
-        indexes_degraded = self.indexes_degraded
+        indexes_degraded_before = self.indexes_degraded_before
+
+        indexes_degraded_after = self.indexes_degraded_after
 
         controls_applied = self.controls_applied
 
@@ -106,7 +112,8 @@ class TableRepairRunResult:
                 "unresolved": unresolved,
                 "in_progress": in_progress,
                 "indexes_rebuilt": indexes_rebuilt,
-                "indexes_degraded": indexes_degraded,
+                "indexes_degraded_before": indexes_degraded_before,
+                "indexes_degraded_after": indexes_degraded_after,
                 "controls_applied": controls_applied,
                 "limit": limit,
                 "has_more": has_more,
@@ -141,7 +148,9 @@ class TableRepairRunResult:
 
         indexes_rebuilt = d.pop("indexes_rebuilt")
 
-        indexes_degraded = d.pop("indexes_degraded")
+        indexes_degraded_before = d.pop("indexes_degraded_before")
+
+        indexes_degraded_after = d.pop("indexes_degraded_after")
 
         controls_applied = d.pop("controls_applied")
 
@@ -171,7 +180,8 @@ class TableRepairRunResult:
             unresolved=unresolved,
             in_progress=in_progress,
             indexes_rebuilt=indexes_rebuilt,
-            indexes_degraded=indexes_degraded,
+            indexes_degraded_before=indexes_degraded_before,
+            indexes_degraded_after=indexes_degraded_after,
             controls_applied=controls_applied,
             limit=limit,
             has_more=has_more,

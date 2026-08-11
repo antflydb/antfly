@@ -1141,22 +1141,14 @@ test "public api smoke e2e creates table inserts and queries documents" {
     defer svc.freeProjectedTables(std.testing.allocator, finalized_tables);
     const finalized_ranges = try svc.listProjectedRanges(std.testing.allocator);
     defer svc.freeProjectedRanges(std.testing.allocator, finalized_ranges);
-    const finalized_range_ptrs = try std.testing.allocator.alloc(*const metadata_table_manager.RangeRecord, finalized_ranges.len);
-    defer std.testing.allocator.free(finalized_range_ptrs);
-    for (finalized_ranges, 0..) |*range, index| finalized_range_ptrs[index] = range;
-    platform.sync.lockYielding(provisioned_write_source.localDbMutex());
-    _ = provisioned_write_source.reconcileReplicaRootTablesWithWriteCacheLocked(
+    _ = try provisioned_write_source.reconcileReplicaRootTablesWithWriteCache(
         std.testing.allocator,
         group_ids.main_metadata_group_id,
         &.{group_id},
         finalized_tables,
-        finalized_range_ptrs,
+        finalized_ranges,
         null,
-    ) catch |err| {
-        provisioned_write_source.localDbMutex().unlock();
-        return err;
-    };
-    provisioned_write_source.localDbMutex().unlock();
+    );
 
     const committed_placements = try svc.listProjectedPlacementIntents(std.testing.allocator);
     defer svc.freeProjectedPlacementIntents(std.testing.allocator, committed_placements);

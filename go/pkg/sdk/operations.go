@@ -253,6 +253,14 @@ func (c *AntflyClient) BatchWithOptions(ctx context.Context, tableName string, r
 		}
 	}
 
+	if result.Status == "" {
+		if resp.StatusCode == http.StatusAccepted {
+			result.Status = "committed_pending"
+		} else {
+			result.Status = "committed"
+		}
+	}
+
 	return &result, nil
 }
 
@@ -872,13 +880,17 @@ func (c *AntflyClient) RetrievalAgent(ctx context.Context, req RetrievalAgentReq
 	return result, nil
 }
 
-// MultiBatch performs a cross-table batch operation atomically.
+// MultiBatch performs a cross-table batch operation atomically. Transaction
+// conflicts return a result with Status "aborted" and a populated Conflict;
+// they are outcomes, not transport errors.
 func (c *AntflyClient) MultiBatch(ctx context.Context, request MultiBatchRequest) (*MultiBatchResult, error) {
 	return c.MultiBatchWithOptions(ctx, request, WriteOptions{})
 }
 
 // MultiBatchWithOptions performs a cross-table batch operation atomically with
-// request and response size bounds.
+// request and response size bounds. Transaction conflicts return a result with
+// Status "aborted" and a populated Conflict; they are outcomes, not transport
+// errors.
 func (c *AntflyClient) MultiBatchWithOptions(ctx context.Context, request MultiBatchRequest, opts WriteOptions) (*MultiBatchResult, error) {
 	opts = normalizeWriteOptions(opts)
 	batchBody, err := boundedJSONBody(request, opts.MaxRequestBytes)
@@ -892,7 +904,7 @@ func (c *AntflyClient) MultiBatchWithOptions(ctx context.Context, request MultiB
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode >= 300 {
+	if resp.StatusCode >= 300 && resp.StatusCode != http.StatusConflict {
 		return nil, fmt.Errorf("multi-batch failed: %w", readErrorResponse(resp))
 	}
 
@@ -908,6 +920,19 @@ func (c *AntflyClient) MultiBatchWithOptions(ctx context.Context, request MultiB
 	if len(respBody) > 0 {
 		if err := json.Unmarshal(respBody, &result); err != nil {
 			return nil, fmt.Errorf("parsing multi-batch result: %w", err)
+		}
+	}
+	if resp.StatusCode == http.StatusConflict {
+		if result.Status != "aborted" {
+			return nil, fmt.Errorf("parsing multi-batch conflict: unexpected status %q", result.Status)
+		}
+		return &result, nil
+	}
+	if result.Status == "" {
+		if resp.StatusCode == http.StatusAccepted {
+			result.Status = "committed_pending"
+		} else {
+			result.Status = "committed"
 		}
 	}
 
@@ -1035,8 +1060,9 @@ func (tx *Transaction) CommitWithOptions(ctx context.Context, writes map[string]
 		return nil, fmt.Errorf("commit transaction response exceeded %d bytes", opts.MaxResponseBytes)
 	}
 
-	// Both 200 (committed) and 409 (conflict/aborted) return TransactionCommitResponse
-	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusConflict {
+	// 200 is fully visible, 202 is durably committed with post-commit work
+	// pending, and 409 is conflict/aborted. All carry the same response shape.
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusAccepted || resp.StatusCode == http.StatusConflict {
 		var result TransactionCommitResult
 		if err := json.Unmarshal(respBody, &result); err != nil {
 			return nil, fmt.Errorf("parsing commit result: %w", err)

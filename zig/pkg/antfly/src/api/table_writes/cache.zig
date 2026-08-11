@@ -2368,6 +2368,32 @@ pub const ProvisionedTableWriteCache = struct {
         return null;
     }
 
+    pub fn snapshotLeaseOrAdoptSeededForReconcileLocked(
+        self: *ProvisionedTableWriteCache,
+        group_id: u64,
+        lsm_root_generation: u64,
+        table_name: []const u8,
+    ) ?CachedDb {
+        if (self.snapshotLeaseLocked(group_id, lsm_root_generation, table_name)) |cached| return cached;
+        for (self.entries.items) |entry| {
+            if (entry.group_id != group_id) continue;
+            if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
+            if (!self.entryHAWriteGateCurrent(entry)) continue;
+            if (entry.auto_bulk_ingest_finishing) return null;
+            const allow_active_generation_adoption = entry.allow_active_generation_adoption;
+            if (!self.adoptSeededEntryGenerationLocked(entry, lsm_root_generation)) continue;
+            entry.allow_generation_adoption = true;
+            entry.allow_active_generation_adoption = allow_active_generation_adoption;
+            return self.leaseEntryLocked(entry);
+        }
+        return null;
+    }
+
+    pub fn markReconciledEntryAdoptableLocked(entry: *Entry) void {
+        entry.allow_generation_adoption = true;
+        entry.allow_active_generation_adoption = true;
+    }
+
     pub fn snapshotGroupLeaseOrAdoptSeededLocked(
         self: *ProvisionedTableWriteCache,
         group_id: u64,

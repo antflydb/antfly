@@ -655,11 +655,11 @@ pub const DeleteArtifactEnrichmentPathParams = struct {
     artifact_name: []const u8,
 };
 
-/// Reprocess a derived document artifact across a table range
+/// Reprocess a derived asset across a table range
 pub const ReprocessDocumentArtifactRangePathParams = struct {
     /// Name of the table
     table_name: []const u8,
-    /// Name of the derived document artifact.
+    /// Name of the derived asset enrichment.
     artifact_name: []const u8,
 };
 
@@ -672,7 +672,7 @@ pub fn parseReprocessDocumentArtifactRangeBody(allocator: std.mem.Allocator, bod
 pub const StartDocumentArtifactReprocessJobPathParams = struct {
     /// Name of the table
     table_name: []const u8,
-    /// Name of the derived document artifact.
+    /// Name of the derived asset enrichment.
     artifact_name: []const u8,
 };
 
@@ -787,7 +787,7 @@ pub const GetDocumentArtifactManifestParams = struct {
     detail: ?[]const u8 = null,
 };
 
-/// Reprocess a derived document artifact
+/// Reprocess a derived asset
 pub const ReprocessDocumentArtifactPathParams = struct {
     /// Name of the table
     table_name: []const u8,

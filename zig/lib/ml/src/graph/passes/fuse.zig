@@ -1851,6 +1851,7 @@ fn isLastDimSlice(graph: *const Graph, slice_id: NodeId, x_id: NodeId, start: i6
         .slice => |a| a,
         else => return false,
     };
+    if (attrs.runtime_starts or attrs.runtime_limits) return false;
     if (s.inputs[0] != x_id) return false;
     const x_shape = graph.node(x_id).output_shape;
     if (attrs.num_axes != x_shape.rank()) return false;
@@ -2429,6 +2430,7 @@ fn fuseSliceChain(allocator: std.mem.Allocator, work: *Graph, reachable: []const
             .slice => |a| a,
             else => continue,
         };
+        if (outer_attrs.runtime_starts or outer_attrs.runtime_limits) continue;
         const inner_id = outer.inputs[0];
         if (inner_id == null_node or inner_id >= count) continue;
         const inner = work.node(inner_id);
@@ -2436,6 +2438,7 @@ fn fuseSliceChain(allocator: std.mem.Allocator, work: *Graph, reachable: []const
             .slice => |a| a,
             else => continue,
         };
+        if (inner_attrs.runtime_starts or inner_attrs.runtime_limits) continue;
         if (outer_attrs.num_axes != inner_attrs.num_axes) continue;
 
         const out_shape = outer.output_shape;
@@ -2500,6 +2503,7 @@ fn fuseSliceOfConcat(allocator: std.mem.Allocator, work: *Graph, reachable: []co
             .slice => |a| a,
             else => continue,
         };
+        if (slice_attrs.runtime_starts or slice_attrs.runtime_limits) continue;
         const concat_id = slice_node.inputs[0];
         if (concat_id == null_node or concat_id >= count) continue;
         const concat_node = work.node(concat_id);
@@ -5135,6 +5139,44 @@ test "fuse collapses slice(slice(x))" {
     const out_attrs = result.graph.node(out_id).op.slice;
     try std.testing.expectEqual(@as(i64, 2), out_attrs.starts[1]);
     try std.testing.expectEqual(@as(i64, 5), out_attrs.limits[1]);
+}
+
+test "fuse preserves runtime-bound slice chains" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    const x = try b.parameter("x", Shape.init(.f32, &.{ 4, 8 }));
+    const starts = try b.tensorConst(&.{0}, Shape.init(.i64, &.{1}));
+    const limits = try b.parameter("limits", Shape.init(.i64, &.{1}));
+    var attrs: node_mod.SliceAttrs = .{};
+    attrs.num_axes = 2;
+    attrs.limits[0] = 4;
+    attrs.limits[1] = 6;
+    attrs.bound_axes[0] = 1;
+    attrs.num_bound_axes = 1;
+    attrs.runtime_limits = true;
+    const inner = try g.addNode(.{
+        .op = .{ .slice = attrs },
+        .output_shape = Shape.init(.f32, &.{ 4, 6 }),
+        .inputs = .{ x, starts, limits, null_node },
+        .num_inputs = 3,
+    });
+    const outer = try b.sliceLastDim(inner, 1, 4);
+    try g.markOutput(outer);
+
+    var result = try fuse(allocator, &g);
+    defer result.deinit();
+
+    var slice_count: usize = 0;
+    for (result.graph.nodes.items) |node| {
+        if (std.meta.activeTag(node.op) == .slice) slice_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), slice_count);
+    const output = result.graph.node(result.graph.outputs.items[0]);
+    try std.testing.expectEqual(@as(std.meta.Tag(node_mod.OpCode), .slice), std.meta.activeTag(result.graph.node(output.inputs[0]).op));
+    try std.testing.expect(result.graph.node(output.inputs[0]).op.slice.runtime_limits);
 }
 
 test "fuse collapses strided slice(slice(x))" {

@@ -6311,26 +6311,20 @@ test "metadata replication live snapshot and later streaming insert through runn
     };
     const source_table = try std.fmt.allocPrint(alloc, "antfly_zig_metadata_cdc_live_{d}", .{suffix});
     defer alloc.free(source_table);
-    const slot_name = try std.fmt.allocPrint(alloc, "antfly_zig_metadata_cdc_live_slot_{d}", .{suffix});
+    // Keep the unique portion inside the 26-byte prefix retained by
+    // exactCutoverPhysicalResourceName. Putting the suffix after a long static
+    // prefix made every run share the same cleanup prefix once PostgreSQL's
+    // 63-byte identifier limit truncated the configured name.
+    const slot_name = try std.fmt.allocPrint(alloc, "afls_{x:0>16}", .{suffix});
     defer alloc.free(slot_name);
-    const publication_name = try std.fmt.allocPrint(alloc, "antfly_zig_metadata_cdc_live_pub_{d}", .{suffix});
+    const publication_name = try std.fmt.allocPrint(alloc, "aflp_{x:0>16}", .{suffix});
     defer alloc.free(publication_name);
 
-    const drop_publication_sql = try std.fmt.allocPrint(alloc, "drop publication if exists {s}", .{publication_name});
-    defer alloc.free(drop_publication_sql);
-    const drop_slot_sql = try std.fmt.allocPrint(
-        alloc,
-        "select pg_drop_replication_slot('{s}') from pg_replication_slots where slot_name = '{s}' and not active",
-        .{ slot_name, slot_name },
-    );
-    defer alloc.free(drop_slot_sql);
+    try cleanupTestExactCutoverResources(alloc, dsn, slot_name, publication_name);
+    defer cleanupTestExactCutoverResources(alloc, dsn, slot_name, publication_name) catch {};
     const drop_table_sql = try std.fmt.allocPrint(alloc, "drop table if exists {s}", .{source_table});
     defer alloc.free(drop_table_sql);
-    defer {
-        execPsqlCommand(alloc, dsn, drop_publication_sql) catch {};
-        execPsqlCommand(alloc, dsn, drop_slot_sql) catch {};
-        execPsqlCommand(alloc, dsn, drop_table_sql) catch {};
-    }
+    defer execPsqlCommand(alloc, dsn, drop_table_sql) catch {};
 
     const create_table_sql = try std.fmt.allocPrint(
         alloc,
@@ -6443,14 +6437,6 @@ test "metadata replication live snapshot and later streaming insert through runn
         status_sink.latest(),
     );
     defer metadata_table_manager.freeReplicationSourceStatus(alloc, snapshot_status);
-    const drop_physical_slot_sql = try std.fmt.allocPrint(
-        alloc,
-        "select pg_drop_replication_slot('{s}') from pg_replication_slots where slot_name = '{s}' and not active",
-        .{ snapshot_status.slot_name, snapshot_status.slot_name },
-    );
-    defer alloc.free(drop_physical_slot_sql);
-    defer execPsqlCommand(alloc, dsn, drop_physical_slot_sql) catch {};
-
     var user_one = (try db.lookup(alloc, "user-1", .{})).?;
     defer user_one.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, user_one.json, "\"Alice\"") != null);
@@ -6615,26 +6601,16 @@ test "metadata http service live snapshot and later streaming insert through hos
     };
     const source_table = try std.fmt.allocPrint(alloc, "antfly_zig_metadata_cdc_hosted_{d}", .{suffix});
     defer alloc.free(source_table);
-    const slot_name = try std.fmt.allocPrint(alloc, "antfly_zig_metadata_cdc_hosted_slot_{d}", .{suffix});
+    const slot_name = try std.fmt.allocPrint(alloc, "afhs_{x:0>16}", .{suffix});
     defer alloc.free(slot_name);
-    const publication_name = try std.fmt.allocPrint(alloc, "antfly_zig_metadata_cdc_hosted_pub_{d}", .{suffix});
+    const publication_name = try std.fmt.allocPrint(alloc, "afhp_{x:0>16}", .{suffix});
     defer alloc.free(publication_name);
 
-    const drop_publication_sql = try std.fmt.allocPrint(alloc, "drop publication if exists {s}", .{publication_name});
-    defer alloc.free(drop_publication_sql);
-    const drop_slot_sql = try std.fmt.allocPrint(
-        alloc,
-        "select pg_drop_replication_slot('{s}') from pg_replication_slots where slot_name = '{s}' and not active",
-        .{ slot_name, slot_name },
-    );
-    defer alloc.free(drop_slot_sql);
+    try cleanupTestExactCutoverResources(alloc, dsn, slot_name, publication_name);
+    defer cleanupTestExactCutoverResources(alloc, dsn, slot_name, publication_name) catch {};
     const drop_table_sql = try std.fmt.allocPrint(alloc, "drop table if exists {s}", .{source_table});
     defer alloc.free(drop_table_sql);
-    defer {
-        execPsqlCommand(alloc, dsn, drop_publication_sql) catch {};
-        execPsqlCommand(alloc, dsn, drop_slot_sql) catch {};
-        execPsqlCommand(alloc, dsn, drop_table_sql) catch {};
-    }
+    defer execPsqlCommand(alloc, dsn, drop_table_sql) catch {};
 
     const create_table_sql = try std.fmt.allocPrint(
         alloc,
@@ -6749,6 +6725,50 @@ fn testPgDsnAlloc(alloc: Allocator) ![]u8 {
         return try alloc.dupe(u8, std.mem.span(value_z));
     }
     return try alloc.dupe(u8, "postgres://localhost:5432/postgres?sslmode=disable");
+}
+
+fn cleanupTestExactCutoverResources(
+    alloc: Allocator,
+    dsn: []const u8,
+    configured_slot_name: []const u8,
+    configured_publication_name: []const u8,
+) !void {
+    // These names are interpolated only after validating the restricted test
+    // identifier alphabet. Production paths quote provider identifiers in the
+    // PostgreSQL adapter; this helper intentionally remains test-only.
+    if (configured_slot_name.len == 0 or configured_publication_name.len == 0) {
+        return error.InvalidTestPostgresIdentifier;
+    }
+    for (configured_slot_name) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '_') return error.InvalidTestPostgresIdentifier;
+    }
+    for (configured_publication_name) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '_') return error.InvalidTestPostgresIdentifier;
+    }
+
+    const resource_prefix_len = postgres_identifier_max_len - exact_cutover_resource_suffix_len;
+    const slot_prefix = configured_slot_name[0..@min(configured_slot_name.len, resource_prefix_len)];
+    const publication_prefix = configured_publication_name[0..@min(configured_publication_name.len, resource_prefix_len)];
+    const drop_slots_sql = try std.fmt.allocPrint(
+        alloc,
+        "select pg_drop_replication_slot(slot_name) from pg_replication_slots " ++
+            "where not active and (slot_name = '{s}' or starts_with(slot_name, '{s}_af_'))",
+        .{ configured_slot_name, slot_prefix },
+    );
+    defer alloc.free(drop_slots_sql);
+    try execPsqlCommand(alloc, dsn, drop_slots_sql);
+
+    const drop_publications_sql = try std.fmt.allocPrint(
+        alloc,
+        "do $antfly$ declare resource_name text; begin " ++
+            "for resource_name in select pubname from pg_publication " ++
+            "where pubname = '{s}' or starts_with(pubname, '{s}_af_') loop " ++
+            "execute format('drop publication if exists %I', resource_name); " ++
+            "end loop; end $antfly$",
+        .{ configured_publication_name, publication_prefix },
+    );
+    defer alloc.free(drop_publications_sql);
+    try execPsqlCommand(alloc, dsn, drop_publications_sql);
 }
 
 fn execPsqlCommand(alloc: Allocator, dsn: []const u8, sql_text: []const u8) !void {

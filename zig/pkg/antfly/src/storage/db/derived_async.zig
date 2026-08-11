@@ -37,6 +37,7 @@ const index_repair_state = @import("derived/index_repair_state.zig");
 const doc_identity = @import("doc_identity.zig");
 const docstore_mod = @import("../docstore.zig");
 const enrichment_artifact_codec = @import("enrichment/artifact_codec.zig");
+const enrichment_types = @import("enrichment/enrichment_types.zig");
 const embedder_mod = @import("enrichment/embedder.zig");
 const enrichment_runtime_mod = @import("enrichment/enrichment_runtime.zig");
 const enrichment_state = @import("enrichment/enrichment_state.zig");
@@ -72,6 +73,10 @@ const readEnvUsize = db_internal.readEnvUsize;
 const readEnvU64 = db_internal.readEnvU64;
 
 const TestHelpers = if (builtin.is_test) @import("test_support.zig") else struct {};
+const artifactRepairIssueKeyForIssueAlloc = artifact_repair.artifactRepairIssueKeyForIssueAlloc;
+const bytesToHexAlloc = artifact_repair.bytesToHexAlloc;
+const loadArtifactRepairIssueFromStoreByKey = artifact_repair.loadArtifactRepairIssueFromStoreByKey;
+const lockAtomicWithBackoff = db_internal.lockAtomicWithBackoff;
 
 test "db derived async external dense bulk waiter owns admission across catch-up handoff" {
     const DB = @import("mod.zig").DB;
@@ -142,7 +147,7 @@ const DerivedCoverageDocOutcome = struct {
     outcome: DerivedCoverageOutcome,
 };
 
-fn loadDerivedCoverageOutcomeCounterFromStore(
+pub fn loadDerivedCoverageOutcomeCounterFromStore(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
     index_name: []const u8,
@@ -201,7 +206,7 @@ fn derivedCoverageOutcomeCounterValueForStore(
         try scanDerivedCoverageOutcomeFromStore(alloc, store, index_name, generation, outcome);
 }
 
-fn setDerivedCoverageOutcomes(
+pub fn setDerivedCoverageOutcomes(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
     index_manager: *index_manager_mod.IndexManager,
@@ -2499,6 +2504,113 @@ pub fn Impl(comptime DB: type) type {
             return sequence;
         }
 
+        fn enrichmentFailureArtifactKeyAlloc(
+            alloc: Allocator,
+            kind: enrichment_types.GeneratedEnrichmentKind,
+            doc_key: []const u8,
+            artifact_name: []const u8,
+            source_artifact_name: []const u8,
+        ) ![]u8 {
+            return switch (kind) {
+                .dense_embedding, .sparse_embedding => if (source_artifact_name.len > 0)
+                    // A chunked request owns a set of derived embedding keys. Leave the
+                    // singular artifact key absent so its durable identity is the
+                    // complete request tuple rather than a fabricated document key.
+                    try alloc.alloc(u8, 0)
+                else
+                    try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, doc_key, artifact_name),
+                .asset => try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", artifact_name),
+                .chunk_text => try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "chunk", artifact_name),
+            };
+        }
+
+        pub fn recordEnrichmentRequestFailure(ctx_ptr: *anyopaque, failure: enrichment_runtime_mod.RequestFailure) !void {
+            const ctx: *EnrichmentAppendContext = @ptrCast(@alignCast(ctx_ptr));
+            const async_ctx = ctx.async_context orelse return;
+            const artifact_kind: types.ArtifactRepairKind = switch (failure.kind) {
+                .dense_embedding, .sparse_embedding => .embedding,
+                .asset => .asset,
+                .chunk_text => .chunk,
+            };
+            const artifact_key = try enrichmentFailureArtifactKeyAlloc(
+                ctx.alloc,
+                failure.kind,
+                failure.doc_key,
+                failure.artifact_name,
+                failure.source_artifact_name,
+            );
+            defer ctx.alloc.free(artifact_key);
+
+            try DB.ArtifactRepairCallbacks.record_artifact_repair_issue_context_detailed(
+                async_ctx,
+                artifact_kind,
+                failure.index_name,
+                failure.doc_key,
+                "",
+                "",
+                failure.source_artifact_name,
+                failure.artifact_name,
+                artifact_key,
+                null,
+                failure.sequence,
+                .enrichment_failed,
+                failure.attempts,
+                failure.error_name,
+            );
+        }
+
+        pub fn enrichmentRequestFailurePending(
+            ctx_ptr: *anyopaque,
+            failure: enrichment_runtime_mod.FailureIdentity,
+            index_name: []const u8,
+        ) !bool {
+            const ctx: *EnrichmentAppendContext = @ptrCast(@alignCast(ctx_ptr));
+            const artifact_kind: types.ArtifactRepairKind = switch (failure.kind) {
+                .dense_embedding, .sparse_embedding => .embedding,
+                .asset => .asset,
+                .chunk_text => .chunk,
+            };
+            const artifact_key = try enrichmentFailureArtifactKeyAlloc(
+                ctx.alloc,
+                failure.kind,
+                failure.doc_key,
+                failure.artifact_name,
+                failure.source_artifact_name,
+            );
+            defer ctx.alloc.free(artifact_key);
+            const artifact_key_hex = if (artifact_key.len > 0)
+                try bytesToHexAlloc(ctx.alloc, artifact_key)
+            else
+                try ctx.alloc.dupe(u8, "");
+            defer ctx.alloc.free(artifact_key_hex);
+
+            const issue_key = try artifactRepairIssueKeyForIssueAlloc(ctx.alloc, .{
+                .artifact_kind = artifact_kind,
+                .index_name = index_name,
+                .doc_key = failure.doc_key,
+                .source_artifact_name = failure.source_artifact_name,
+                .artifact_name = failure.artifact_name,
+                .artifact_key = artifact_key_hex,
+            });
+            defer ctx.alloc.free(issue_key);
+            const loaded = (try loadArtifactRepairIssueFromStoreByKey(ctx.alloc, ctx.store, issue_key)) orelse return false;
+            var issue = loaded;
+            defer issue.deinit(ctx.alloc);
+            return issue.reason == .enrichment_failed and issue.sequence >= failure.sequence;
+        }
+
+        pub fn lockEnrichmentFailurePendingFence(ctx_ptr: *anyopaque) void {
+            const ctx: *EnrichmentAppendContext = @ptrCast(@alignCast(ctx_ptr));
+            const async_ctx = ctx.async_context orelse return;
+            lockAtomicWithBackoff(&async_ctx.artifact_repair_issue_mutex);
+        }
+
+        pub fn unlockEnrichmentFailurePendingFence(ctx_ptr: *anyopaque) void {
+            const ctx: *EnrichmentAppendContext = @ptrCast(@alignCast(ctx_ptr));
+            const async_ctx = ctx.async_context orelse return;
+            async_ctx.artifact_repair_issue_mutex.unlock();
+        }
+
         pub fn appendGeneratedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.DerivedBatch, artifact_delete_keys: []const []const u8) !u64 {
             if (artifact_delete_keys.len == 0) return appendDerivedBatchFromEnrichment(ctx_ptr, batch);
 
@@ -2600,7 +2712,7 @@ pub fn Impl(comptime DB: type) type {
         }
 
         pub fn markPrecomputedEnrichmentAppliedForSyncContext(ctx: *const BatchExecutionContext, sync_level: types.SyncLevel, sequence: u64) !void {
-            if (sync_level != .enrichments or sequence == 0) return;
+            if ((sync_level != .enrichments and sync_level != .full_index) or sequence == 0) return;
             const runtime = ctx.enrichment_runtime orelse return;
             const runtime_stats = runtime.stats();
             if (runtime_stats.applied_sequence >= sequence -| 1 or
@@ -2773,6 +2885,9 @@ pub fn Impl(comptime DB: type) type {
             sequence: u64,
             reason: types.ArtifactRepairReason,
         ) !void {
+            const mutable_ctx = @constCast(ctx);
+            lockAtomicWithBackoff(&mutable_ctx.artifact_repair_issue_mutex);
+            defer mutable_ctx.artifact_repair_issue_mutex.unlock();
             try artifact_repair.recordEmbeddingArtifactRepairIssueForReplay(
                 ctx.alloc,
                 ctx.store,
@@ -3218,6 +3333,7 @@ pub fn Impl(comptime DB: type) type {
                                 .repair = .{
                                     .enabled = true,
                                     .sequence = batch.sequence,
+                                    .issue_mutex = &@constCast(ctx).artifact_repair_issue_mutex,
                                 },
                             },
                         )
@@ -3240,6 +3356,7 @@ pub fn Impl(comptime DB: type) type {
                             .repair = .{
                                 .enabled = true,
                                 .sequence = batch.sequence,
+                                .issue_mutex = &@constCast(ctx).artifact_repair_issue_mutex,
                             },
                         });
                         defer graph_mutations.deinit();
@@ -4329,6 +4446,10 @@ pub fn Impl(comptime DB: type) type {
         fn runEnrichmentUntilContext(ctx: *const BatchExecutionContext, sequence: u64) !void {
             if (sequence == 0) return;
             if (ctx.enrichment_runtime) |runtime| {
+                if (!runtime.isStarted()) {
+                    try runtime.catchUpUntil(sequence);
+                    return;
+                }
                 runtime.notifySequence(sequence);
                 try runtime.waitForApplied(sequence);
             }
@@ -4346,13 +4467,8 @@ pub fn Impl(comptime DB: type) type {
         fn runMaintenanceUntilContext(ctx: *const BatchExecutionContext, sequence: u64, sync_targets: ManagedSyncTargets) !void {
             var stable_target = sequence;
             while (true) {
-                try runEnrichmentUntilContext(ctx, stable_target);
-                const enriched_target = currentReplayTargetSequenceContext(ctx);
-                if (enriched_target > stable_target) {
-                    stable_target = enriched_target;
-                    continue;
-                }
                 try runDerivedUntilContext(ctx, stable_target);
+                try runEnrichmentUntilContext(ctx, stable_target);
 
                 const next_target = currentReplayTargetSequenceContext(ctx);
                 if (next_target <= stable_target) {
@@ -4367,13 +4483,8 @@ pub fn Impl(comptime DB: type) type {
             if (index_names.len == 0) return;
             var stable_target = sequence;
             while (true) {
-                try runEnrichmentUntilContext(ctx, stable_target);
-                const enriched_target = currentReplayTargetSequenceContext(ctx);
-                if (enriched_target > stable_target) {
-                    stable_target = enriched_target;
-                    continue;
-                }
                 try runDerivedUntilTargetsContext(ctx, stable_target, index_names);
+                try runEnrichmentUntilContext(ctx, stable_target);
 
                 const next_target = currentReplayTargetSequenceContext(ctx);
                 if (next_target <= stable_target) {

@@ -519,12 +519,14 @@ pub const ArtifactRepairReason = enum {
     missing_artifact,
     corrupt_artifact,
     unreadable_artifact,
+    enrichment_failed,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .missing_artifact => "missing_artifact",
             .corrupt_artifact => "corrupt_artifact",
             .unreadable_artifact => "unreadable_artifact",
+            .enrichment_failed => "enrichment_failed",
         };
         try jw.write(s);
     }
@@ -538,6 +540,7 @@ pub const ArtifactRepairReason = enum {
             .{ "missing_artifact", .missing_artifact },
             .{ "corrupt_artifact", .corrupt_artifact },
             .{ "unreadable_artifact", .unreadable_artifact },
+            .{ "enrichment_failed", .enrichment_failed },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -639,7 +642,35 @@ pub const BatchRequest = struct {
     sync_level: ?SyncLevel = null,
 };
 
+/// Durable commit and visibility/participant recovery state.
+pub const BatchResponseStatus = enum {
+    committed,
+    committed_pending,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .committed => "committed",
+            .committed_pending => "committed_pending",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "committed", .committed },
+            .{ "committed_pending", .committed_pending },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const BatchResponse = struct {
+    /// Durable commit and visibility/participant recovery state.
+    status: ?BatchResponseStatus = null,
     /// Number of documents successfully inserted
     inserted: ?i64 = null,
     /// Number of documents successfully deleted
@@ -2486,8 +2517,39 @@ pub const MultiBatchRequest = struct {
     sync_level: ?SyncLevel = null,
 };
 
+/// Durable commit and visibility/propagation state.
+pub const MultiBatchResponseStatus = enum {
+    committed,
+    committed_visibility_pending,
+    committed_recovery_pending,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .committed => "committed",
+            .committed_visibility_pending => "committed_visibility_pending",
+            .committed_recovery_pending => "committed_recovery_pending",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "committed", .committed },
+            .{ "committed_visibility_pending", .committed_visibility_pending },
+            .{ "committed_recovery_pending", .committed_recovery_pending },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Response for a cross-table batch operation. Contains per-table results.
 pub const MultiBatchResponse = struct {
+    /// Durable commit and visibility/propagation state.
+    status: ?MultiBatchResponseStatus = null,
     /// Per-table batch results
     tables: ?std.json.ArrayHashMap(BatchResponse) = null,
 };
@@ -6524,6 +6586,10 @@ pub const TableRepairIssue = struct {
     /// Derived replay sequence that observed the issue.
     sequence: i64,
     reason: ArtifactRepairReason,
+    /// Number of enrichment generation attempts made before this issue was parked.
+    generation_attempts: i64,
+    /// Stable source-generation error code that caused this issue to be parked.
+    generation_error: ?[]const u8 = null,
     /// Number of repair attempts made for this issue.
     attempts: i64,
     /// Monotonic timestamp when this issue was first recorded.
@@ -6702,8 +6768,10 @@ pub const TableRepairRunResult = struct {
     in_progress: i64,
     /// Number of indexes rebuilt by this pass when target is index.
     indexes_rebuilt: i64,
-    /// Number of selected indexes that were already degraded or quarantined before repair.
-    indexes_degraded: i64,
+    /// Number of selected indexes that were degraded or quarantined when this repair pass began.
+    indexes_degraded_before: i64,
+    /// Number of selected indexes that remain degraded or quarantined when this repair pass returns.
+    indexes_degraded_after: i64,
     /// Number of existing index repairs that accepted the requested control.
     controls_applied: i64,
     /// Effective repair limit.
@@ -6858,14 +6926,18 @@ pub const TransactionCommitRequest = struct {
     sync_level: ?SyncLevel = null,
 };
 
-/// Whether the transaction was committed or aborted due to a conflict
+/// Durable transaction outcome. Pending committed states mean the commit decision is durable while its requested visibility barrier or participant recovery is still completing.
 pub const TransactionCommitResponseStatus = enum {
     committed,
+    committed_visibility_pending,
+    committed_recovery_pending,
     aborted,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .committed => "committed",
+            .committed_visibility_pending => "committed_visibility_pending",
+            .committed_recovery_pending => "committed_recovery_pending",
             .aborted => "aborted",
         };
         try jw.write(s);
@@ -6878,6 +6950,8 @@ pub const TransactionCommitResponseStatus = enum {
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "committed", .committed },
+            .{ "committed_visibility_pending", .committed_visibility_pending },
+            .{ "committed_recovery_pending", .committed_recovery_pending },
             .{ "aborted", .aborted },
         });
         return map.get(s) orelse error.UnexpectedToken;
@@ -6886,12 +6960,148 @@ pub const TransactionCommitResponseStatus = enum {
 
 /// Result of an OCC transaction commit attempt.
 pub const TransactionCommitResponse = struct {
-    /// Whether the transaction was committed or aborted due to a conflict
+    /// Durable transaction outcome. Pending committed states mean the commit decision is durable while its requested visibility barrier or participant recovery is still completing.
     status: TransactionCommitResponseStatus,
     /// Details about the conflict that caused an abort (only present when status is "aborted")
-    conflict: ?std.json.Value = null,
-    /// Per-table batch results (only present when status is "committed")
+    conflict: ?TransactionConflict = null,
+    /// Per-table batch results (present for every committed status)
     tables: ?std.json.ArrayHashMap(BatchResponse) = null,
+};
+
+/// Stable machine-readable conflict classification.
+pub const TransactionConflictKind = enum {
+    version_conflict,
+    intent_conflict,
+    topology_changed,
+    participant_unavailable,
+    doc_identity_unavailable,
+    session_lease_lost,
+    transaction_conflict,
+    torn_state,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .version_conflict => "version_conflict",
+            .intent_conflict => "intent_conflict",
+            .topology_changed => "topology_changed",
+            .participant_unavailable => "participant_unavailable",
+            .doc_identity_unavailable => "doc_identity_unavailable",
+            .session_lease_lost => "session_lease_lost",
+            .transaction_conflict => "transaction_conflict",
+            .torn_state => "torn_state",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "version_conflict", .version_conflict },
+            .{ "intent_conflict", .intent_conflict },
+            .{ "topology_changed", .topology_changed },
+            .{ "participant_unavailable", .participant_unavailable },
+            .{ "doc_identity_unavailable", .doc_identity_unavailable },
+            .{ "session_lease_lost", .session_lease_lost },
+            .{ "transaction_conflict", .transaction_conflict },
+            .{ "torn_state", .torn_state },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Component whose state should be refreshed before retrying.
+pub const TransactionConflictRetryScope = enum {
+    topology,
+    participant,
+    doc_identity,
+    session,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .topology => "topology",
+            .participant => "participant",
+            .doc_identity => "doc_identity",
+            .session => "session",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "topology", .topology },
+            .{ "participant", .participant },
+            .{ "doc_identity", .doc_identity },
+            .{ "session", .session },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Structured details for an aborted transaction attempt.
+pub const TransactionConflict = struct {
+    /// Table where the conflict was detected.
+    table: []const u8,
+    /// Document key associated with the conflict, when applicable.
+    key: []const u8,
+    /// Human-readable conflict description.
+    message: []const u8,
+    /// Stable machine-readable conflict classification.
+    kind: TransactionConflictKind,
+    /// Whether retrying the transaction may succeed without changing its writes.
+    retryable: bool,
+    /// Minimum suggested delay before retrying a retryable conflict.
+    retry_after_ms: ?i64 = null,
+    /// Component whose state should be refreshed before retrying.
+    retry_scope: ?TransactionConflictRetryScope = null,
+    /// Version required by the transaction predicate.
+    expected_version: ?i64 = null,
+    /// Version observed while validating the transaction predicate.
+    current_version: ?i64 = null,
+    participant: ?TransactionConflictParticipant = null,
+};
+
+/// 2PC participant phase that reported the conflict.
+pub const TransactionConflictParticipantPhase = enum {
+    begin,
+    prepare,
+    resolve,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .begin => "begin",
+            .prepare => "prepare",
+            .resolve => "resolve",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "begin", .begin },
+            .{ "prepare", .prepare },
+            .{ "resolve", .resolve },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Participant location and 2PC phase where the conflict occurred.
+pub const TransactionConflictParticipant = struct {
+    /// Raft group that reported the conflict.
+    group_id: ?i64 = null,
+    /// 2PC participant phase that reported the conflict.
+    phase: ?TransactionConflictParticipantPhase = null,
 };
 
 /// A key that was read as part of an OCC transaction, along with the version observed at read time. Used to detect conflicts at commit time.
@@ -6915,14 +7125,18 @@ pub const TransactionSessionCleanupResponse = struct {
     cutoff_ns: ?i64 = null,
 };
 
-/// Whether the transaction was committed or aborted due to a conflict
+/// Durable transaction outcome. Pending committed states mean the commit decision is durable while its requested visibility barrier or participant recovery is still completing.
 pub const TransactionSessionCommitResponseStatus = enum {
     committed,
+    committed_visibility_pending,
+    committed_recovery_pending,
     aborted,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .committed => "committed",
+            .committed_visibility_pending => "committed_visibility_pending",
+            .committed_recovery_pending => "committed_recovery_pending",
             .aborted => "aborted",
         };
         try jw.write(s);
@@ -6935,6 +7149,8 @@ pub const TransactionSessionCommitResponseStatus = enum {
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "committed", .committed },
+            .{ "committed_visibility_pending", .committed_visibility_pending },
+            .{ "committed_recovery_pending", .committed_recovery_pending },
             .{ "aborted", .aborted },
         });
         return map.get(s) orelse error.UnexpectedToken;
@@ -6942,11 +7158,11 @@ pub const TransactionSessionCommitResponseStatus = enum {
 };
 
 pub const TransactionSessionCommitResponse = struct {
-    /// Whether the transaction was committed or aborted due to a conflict
+    /// Durable transaction outcome. Pending committed states mean the commit decision is durable while its requested visibility barrier or participant recovery is still completing.
     status: TransactionSessionCommitResponseStatus,
     /// Details about the conflict that caused an abort (only present when status is "aborted")
-    conflict: ?std.json.Value = null,
-    /// Per-table batch results (only present when status is "committed")
+    conflict: ?TransactionConflict = null,
+    /// Per-table batch results (present for every committed status)
     tables: ?std.json.ArrayHashMap(BatchResponse) = null,
     transaction_id: []const u8,
 };

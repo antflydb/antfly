@@ -22,6 +22,7 @@ import signal
 import subprocess
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -408,30 +409,48 @@ class MultiMetadataBackupCluster:
         parts.append(f"[data]\n{_read_log_tail(self.data_log_path)}")
         return "\n".join(parts)
 
-    def metadata_statuses(self) -> list[dict | None]:
-        statuses: list[dict | None] = []
-        for url in self.metadata_admin_urls:
+    def metadata_statuses(self, *, request_timeout_s: float = 1.0) -> list[dict | None]:
+        def fetch(url: str) -> dict | None:
             try:
-                response = requests.get(f"{url}/metadata/v1/status", timeout=5)
-                statuses.append(_check_response(response))
+                response = requests.get(
+                    f"{url}/metadata/v1/status", timeout=request_timeout_s
+                )
+                return _check_response(response)
             except (AssertionError, requests.RequestException, ValueError):
-                statuses.append(None)
-        return statuses
+                return None
+
+        # A serial probe makes one unavailable node consume the complete
+        # election-observation window before healthy peers are considered.
+        # Keep one bounded request per node and preserve configured ordering.
+        with ThreadPoolExecutor(max_workers=len(self.metadata_admin_urls)) as executor:
+            return list(executor.map(fetch, self.metadata_admin_urls))
+
+    def metadata_leader_index_once(self, *, request_timeout_s: float) -> int | None:
+        statuses = self.metadata_statuses(request_timeout_s=request_timeout_s)
+        leader_ids = {
+            int(status["metadata_raft_leader_id"])
+            for status in statuses
+            if status and status.get("metadata_raft_leader_id") is not None
+        }
+        if len(leader_ids) != 1:
+            return None
+        leader_id = leader_ids.pop()
+        if leader_id < 1 or leader_id > len(self.metadata_admin_urls):
+            return None
+        leader_status = statuses[leader_id - 1]
+        if not leader_status:
+            return None
+        if leader_status.get("metadata_raft_role") != "leader":
+            return None
+        if int(leader_status.get("metadata_raft_local_node_id", 0)) != leader_id:
+            return None
+        return leader_id - 1
 
     def metadata_leader_index(self, *, timeout_s: float) -> int | None:
         def current_leader() -> int | None:
-            statuses = self.metadata_statuses()
-            leader_ids = {
-                int(status["metadata_raft_leader_id"])
-                for status in statuses
-                if status and status.get("metadata_raft_leader_id") is not None
-            }
-            if len(leader_ids) != 1:
-                return None
-            leader_id = leader_ids.pop()
-            if leader_id < 1 or leader_id > len(self.metadata_admin_urls):
-                return None
-            return leader_id - 1
+            return self.metadata_leader_index_once(
+                request_timeout_s=min(1.0, max(0.05, timeout_s))
+            )
 
         return wait_until(current_leader, timeout_s=timeout_s, interval_s=0.25)
 
@@ -447,7 +466,9 @@ class MultiMetadataBackupCluster:
 
         def current_stable_leader() -> int | None:
             nonlocal last_leader, observed
-            leader_index = self.metadata_leader_index(timeout_s=interval_s)
+            leader_index = self.metadata_leader_index_once(
+                request_timeout_s=min(1.0, max(0.05, interval_s))
+            )
             if leader_index is None:
                 last_leader = None
                 observed = 0

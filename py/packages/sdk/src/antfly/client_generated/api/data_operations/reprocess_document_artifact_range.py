@@ -94,9 +94,9 @@ def sync_detailed(
     client: AuthenticatedClient,
     body: DocumentArtifactTableReprocessRequest | Unset = UNSET,
 ) -> Response[DocumentArtifactTableReprocessResponse | Error]:
-    """Reprocess a derived document artifact across a table range
+    """Reprocess a derived asset across a table range
 
-     Runs a bounded operational repair pass for a derived document artifact
+     Runs a bounded operational repair pass for any asset producer type
     across source rows in key order. Use `next_key` from the response as
     the next request's `from_key` for simple single-cursor continuation.
     Distributed repair controllers should persist `shard_cursors` from the
@@ -137,9 +137,9 @@ def sync(
     client: AuthenticatedClient,
     body: DocumentArtifactTableReprocessRequest | Unset = UNSET,
 ) -> DocumentArtifactTableReprocessResponse | Error | None:
-    """Reprocess a derived document artifact across a table range
+    """Reprocess a derived asset across a table range
 
-     Runs a bounded operational repair pass for a derived document artifact
+     Runs a bounded operational repair pass for any asset producer type
     across source rows in key order. Use `next_key` from the response as
     the next request's `from_key` for simple single-cursor continuation.
     Distributed repair controllers should persist `shard_cursors` from the
@@ -175,9 +175,9 @@ async def asyncio_detailed(
     client: AuthenticatedClient,
     body: DocumentArtifactTableReprocessRequest | Unset = UNSET,
 ) -> Response[DocumentArtifactTableReprocessResponse | Error]:
-    """Reprocess a derived document artifact across a table range
+    """Reprocess a derived asset across a table range
 
-     Runs a bounded operational repair pass for a derived document artifact
+     Runs a bounded operational repair pass for any asset producer type
     across source rows in key order. Use `next_key` from the response as
     the next request's `from_key` for simple single-cursor continuation.
     Distributed repair controllers should persist `shard_cursors` from the
@@ -216,9 +216,9 @@ async def asyncio(
     client: AuthenticatedClient,
     body: DocumentArtifactTableReprocessRequest | Unset = UNSET,
 ) -> DocumentArtifactTableReprocessResponse | Error | None:
-    """Reprocess a derived document artifact across a table range
+    """Reprocess a derived asset across a table range
 
-     Runs a bounded operational repair pass for a derived document artifact
+     Runs a bounded operational repair pass for any asset producer type
     across source rows in key order. Use `next_key` from the response as
     the next request's `from_key` for simple single-cursor continuation.
     Distributed repair controllers should persist `shard_cursors` from the

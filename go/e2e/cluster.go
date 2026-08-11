@@ -199,10 +199,9 @@ func (c *TestCluster) startMetadataNode(ctx context.Context, logger *zap.Logger,
 		DefaultShardsPerTable: uint64(cfg.NumShards),         //nolint:gosec // G115: bounded value, cannot overflow in practice
 		HealthPort:            GetFreePort(c.T),
 		Storage: common.StorageConfig{
+			Engine: common.StorageEngineLocal,
 			Local: common.LocalStorageConfig{
-				BaseDir:  c.DataDir,
-				Data:     common.StorageBackendLocal,
-				Metadata: common.StorageBackendLocal,
+				BaseDir: c.DataDir,
 			},
 		},
 		Metadata: common.MetadataInfo{

@@ -41,7 +41,7 @@ class AlgebraicIndexStats:
             backfill_active (bool | Unset): Whether the sidecar is actively rebuilding, replaying, or catching up.
             backfill_progress (float | Unset): Backfill progress as a ratio from 0.0 to 1.0
             backfill_items_processed (int | Unset): Number of documents processed during current backfill
-            backfill_state (str | Unset): Operational readiness state such as ready, running, retrying, or failed.
+            backfill_state (str | Unset): Operational readiness state such as ready, running, retrying, degraded, or failed.
             doc_count (int | Unset): Number of documents visible to the sidecar.
             term_count (int | Unset):
             replay_applied_sequence (int | Unset):

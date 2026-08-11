@@ -46,6 +46,7 @@ const promotion_runtime_mod = @import("promotion_runtime.zig");
 const resolver_lib = @import("antfly_resolver");
 const types = @import("types.zig");
 const aggregations_mod = @import("aggregations.zig");
+const ha_effects_mod = @import("../ha/effects.zig");
 const ha_replication_record_mod = @import("../ha/replication_record.zig");
 const derived_types = @import("derived/derived_types.zig");
 const index_repair_state = @import("derived/index_repair_state.zig");
@@ -258,6 +259,10 @@ pub const DB = struct {
         pub const can_advance_derived_to_target_async = derived_async_impl.canAdvanceDerivedToTargetAsync;
         pub const append_derived_batch_from_enrichment = derived_async_impl.appendDerivedBatchFromEnrichment;
         pub const append_generated_batch_from_enrichment = derived_async_impl.appendGeneratedBatchFromEnrichment;
+        pub const record_enrichment_request_failure = derived_async_impl.recordEnrichmentRequestFailure;
+        pub const enrichment_request_failure_pending = derived_async_impl.enrichmentRequestFailurePending;
+        pub const lock_enrichment_failure_pending_fence = derived_async_impl.lockEnrichmentFailurePendingFence;
+        pub const unlock_enrichment_failure_pending_fence = derived_async_impl.unlockEnrichmentFailurePendingFence;
         pub const notify_derived_executor_sequence = derived_async_impl.notifyDerivedExecutorSequence;
         pub const delete_expired_documents_from_candidates = write_path_impl.deleteExpiredDocumentsFromCandidates;
         pub const notify_async_context_visibility_hook = internal_impl.notifyAsyncContextVisibilityHook;
@@ -291,6 +296,7 @@ pub const DB = struct {
     pub const hasQueryVisibilityHook = internal_impl.hasQueryVisibilityHook;
     pub const notifyQueryVisibilityHook = internal_impl.notifyQueryVisibilityHook;
     pub const DerivedAsyncCallbacks = struct {
+        pub const set_derived_coverage_outcomes = derived_async.setDerivedCoverageOutcomes;
         pub const dense_catch_up_finish_options = denseCatchUpFinishOptions;
         pub const enforce_ha_write_gate_optional = ha_replication.enforceWriteGateOptional;
         pub const mirror_ha_replay_payload_best_effort_context = ha_replication.mirrorReplayPayloadBestEffort;
@@ -326,8 +332,19 @@ pub const DB = struct {
         pub const log_derived_worker_profile = derived_async.logDerivedWorkerProfile;
     };
     pub const ArtifactRepairCallbacks = struct {
+        pub const ArtifactRepairIssueRevision = artifact_repair_impl.ArtifactRepairIssueRevision;
+        pub const ArtifactRepairCompletionDisposition = artifact_repair_impl.ArtifactRepairCompletionDisposition;
+        pub const artifact_repair_completion_key_for_issue_alloc = artifact_repair_impl.artifactRepairCompletionKeyForIssueAlloc;
+        pub const artifact_repair_completion_snapshot = artifact_repair_impl.artifactRepairCompletionSnapshot;
+        pub const bytes_to_hex_alloc = artifact_repair.bytesToHexAlloc;
+        pub const clear_artifact_repair_issue = artifact_repair_impl.clearArtifactRepairIssue;
+        pub const clear_artifact_repair_issue_if_current = artifact_repair_impl.clearArtifactRepairIssueIfCurrent;
+        pub const complete_artifact_repair_issue_if_current = artifact_repair_impl.completeArtifactRepairIssueIfCurrent;
+        pub const record_artifact_repair_issue_context_detailed = artifact_repair_impl.recordArtifactRepairIssueContextDetailed;
         pub const delete_dense_artifact_counter_metadata_context = derived_async_impl.deleteDenseArtifactCounterMetadataContext;
         pub const managed_admission_visibility_summary = schema_runtime_impl.managedAdmissionVisibilitySummary;
+        pub const managed_index_applied_sequence = lifecycle_impl.managedIndexAppliedSequence;
+        pub const projection_stats_target_sequence = lifecycle_impl.projectionStatsTargetSequence;
         pub const refresh_index_repair_availability_for_index = artifact_repair_impl.refreshIndexRepairAvailabilityForIndex;
         pub const repair_capacity_observation = artifact_repair_impl.repairCapacityObservation;
         pub const repair_working_set_plan = artifact_repair_impl.repairWorkingSetPlan;
@@ -404,7 +421,12 @@ pub const DB = struct {
         pub const encode_change_record_payload = derived_async_impl.encodeChangeRecordPayloadForDB;
         pub const encode_change_record_payload_context = derived_async_impl.encodeChangeRecordPayload;
         pub const mirror_ha_batch_mutation_commit = ha_replication_impl.mirrorDBBatchMutationCommit;
+        pub const mirror_ha_encoded_batch_mutation_commit = ha_replication_impl.mirrorHAEncodedBatchMutationCommit;
         pub const mirror_ha_replay_payload_commit = ha_replication_impl.mirrorDBReplayPayloadCommit;
+        pub const flush_transaction_ha_outbox = ha_replication_impl.flushTransactionHAOutbox;
+        pub const ha_mirror_sync_enabled = ha_replication.haMirrorSyncEnabled;
+        pub const encode_batch_mutation_request_alloc = ha_effects_mod.encodeBatchMutationRequestAlloc;
+        pub const wait_for_resolved_transaction_sync = lifecycle_impl.waitForResolvedTransactionSync;
         pub const mirror_ha_replay_payload_best_effort = ha_replication_impl.mirrorDBReplayPayloadBestEffort;
         pub const mirror_ha_replay_payload_best_effort_context = ha_replication.mirrorReplayPayloadBestEffort;
         pub const begin_external_dense_bulk_session_tracked_wait = derived_async_impl.beginExternalDenseBulkSessionTrackedWait;
@@ -534,6 +556,10 @@ pub const DB = struct {
     pub fn runTransactionRecoveryOnce(self: *DB, config: transaction_runtime_mod.Config) !types.TransactionRecoveryStats {
         try ha_replication_impl.enforceDurableMutationGate(self);
         return try lifecycle_impl.runTransactionRecoveryOnce(self, config);
+    }
+
+    pub fn ensureTransactionRecoveryRuntime(self: *DB, config: transaction_runtime_mod.Config) !void {
+        return lifecycle_impl.ensureTransactionRecoveryRuntime(self, config);
     }
 
     pub fn beginBulkIngestSession(self: *DB) !void {
@@ -1913,6 +1939,57 @@ pub const DB = struct {
         return try db_transactions_impl.beginTransactionWithIdAndParticipants(self, txn_id, timestamp_ns, participants);
     }
 
+    pub fn beginTransactionWithIdAndParticipantsCreatedAt(
+        self: *DB,
+        txn_id: transactions_mod.TxnId,
+        timestamp_ns: u64,
+        created_at_ns: u64,
+        participants: []const []const u8,
+    ) !transactions_mod.TxnId {
+        try ha_replication_impl.enforceDurableMutationGate(self);
+        return try db_transactions_impl.beginTransactionWithIdAndParticipantsCreatedAt(self, txn_id, timestamp_ns, created_at_ns, participants);
+    }
+
+    pub fn beginTransactionWithIdAndParticipantsCreatedAtAndRole(
+        self: *DB,
+        txn_id: transactions_mod.TxnId,
+        timestamp_ns: u64,
+        created_at_ns: u64,
+        participants: []const []const u8,
+        coordinator: bool,
+    ) !transactions_mod.TxnId {
+        try ha_replication_impl.enforceDurableMutationGate(self);
+        return try db_transactions_impl.beginTransactionWithIdAndParticipantsCreatedAtAndRole(
+            self,
+            txn_id,
+            timestamp_ns,
+            created_at_ns,
+            participants,
+            coordinator,
+        );
+    }
+
+    pub fn beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(
+        self: *DB,
+        txn_id: transactions_mod.TxnId,
+        timestamp_ns: u64,
+        created_at_ns: u64,
+        participants: []const []const u8,
+        coordinator: bool,
+        retain_terminal: bool,
+    ) !transactions_mod.TxnId {
+        try ha_replication_impl.enforceDurableMutationGate(self);
+        return try db_transactions_impl.beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(
+            self,
+            txn_id,
+            timestamp_ns,
+            created_at_ns,
+            participants,
+            coordinator,
+            retain_terminal,
+        );
+    }
+
     pub fn writeIntents(
         self: *DB,
         txn_id: transactions_mod.TxnId,
@@ -1948,6 +2025,17 @@ pub const DB = struct {
         return try db_transactions_impl.resolveTransactionIntents(self, txn_id, status, commit_version);
     }
 
+    pub fn resolveTransactionIntentsWithSyncLevel(
+        self: *DB,
+        txn_id: transactions_mod.TxnId,
+        status: transactions_mod.TxnStatus,
+        commit_version: u64,
+        sync_level: types.SyncLevel,
+    ) !void {
+        try ha_replication_impl.enforceDurableMutationGate(self);
+        return try db_transactions_impl.resolveTransactionIntentsWithSyncLevel(self, txn_id, status, commit_version, sync_level);
+    }
+
     pub fn abortTransaction(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64) !void {
         try ha_replication_impl.enforceDurableMutationGate(self);
         return try db_transactions_impl.abortTransaction(self, txn_id, timestamp_ns);
@@ -1961,9 +2049,27 @@ pub const DB = struct {
         return try db_transactions_impl.getCommitVersion(self, txn_id);
     }
 
+    pub fn transactionDefersCoordinatorAcknowledgement(self: *DB, txn_id: transactions_mod.TxnId) !bool {
+        return try db_transactions_impl.transactionDefersCoordinatorAcknowledgement(self, txn_id);
+    }
+
+    pub fn hasTopologySensitiveTransactions(self: *DB) !bool {
+        return try db_transactions_impl.hasTopologySensitiveTransactions(self);
+    }
+
     pub fn markTransactionParticipantResolved(self: *DB, txn_id: transactions_mod.TxnId, participant: []const u8) !void {
         try ha_replication_impl.enforceDurableMutationGate(self);
         return try db_transactions_impl.markTransactionParticipantResolved(self, txn_id, participant);
+    }
+
+    pub fn cleanupTransactionMetadataIfEligible(
+        self: *DB,
+        txn_id: transactions_mod.TxnId,
+        cutoff_timestamp: u64,
+        retained_cutoff_timestamp: u64,
+    ) !bool {
+        try ha_replication_impl.enforceDurableMutationGate(self);
+        return try db_transactions_impl.cleanupTransactionMetadataIfEligible(self, txn_id, cutoff_timestamp, retained_cutoff_timestamp);
     }
 
     pub fn getTransactionParticipants(self: *DB, alloc: Allocator, txn_id: transactions_mod.TxnId) ![][]u8 {
@@ -1977,6 +2083,10 @@ pub const DB = struct {
     pub fn recoverTransactions(self: *DB, cutoff_timestamp: u64, resolution_timestamp: u64) !transactions_mod.RecoveryStats {
         try ha_replication_impl.enforceDurableMutationGate(self);
         return try db_transactions_impl.recoverTransactions(self, cutoff_timestamp, resolution_timestamp);
+    }
+
+    pub fn resolveFinalizedTransactionIntentsForRecovery(self: *DB, resolution_timestamp: u64) !u64 {
+        return try db_transactions_impl.resolveFinalizedTransactionIntentsForRecovery(self, resolution_timestamp);
     }
 
     pub fn getEdges(

@@ -1011,6 +1011,25 @@ pub fn build(b: *std.Build) void {
     });
     antfly_imports.configure(b, lib_test_mod, true, true);
 
+    const metadata_unit_test_root_paths = [_][]const u8{
+        "pkg/antfly/src/metadata_reconciler_test_root.zig",
+        "pkg/antfly/src/metadata_service_http_test_root.zig",
+        "pkg/antfly/src/metadata_core_test_root.zig",
+        "pkg/antfly/src/metadata_planning_transition_test_root.zig",
+        "pkg/antfly/src/metadata_table_provisioner_test_root.zig",
+        "pkg/antfly/src/metadata_replication_backfill_test_root.zig",
+        "pkg/antfly/src/metadata_storage_test_root.zig",
+    };
+    var metadata_unit_test_mods: [metadata_unit_test_root_paths.len]*std.Build.Module = undefined;
+    for (metadata_unit_test_root_paths, &metadata_unit_test_mods) |root_path, *test_mod| {
+        test_mod.* = b.createModule(.{
+            .root_source_file = b.path(root_path),
+            .target = target,
+            .optimize = optimize,
+        });
+        antfly_imports.configure(b, test_mod.*, true, true);
+    }
+
     const raft_sim_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/raft_sim_test_root.zig"),
         .target = target,
@@ -1629,8 +1648,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     antfly_imports.configure(b, metadata_fk_test_mod, true, true);
-    const metadata_tests = antfly_tests_build.addMetadataTestSteps(b, lib_test_mod, metadata_fk_test_mod);
-    const metadata_root_tests = metadata_tests.root.tests;
+    const metadata_tests = antfly_tests_build.addMetadataTestSteps(b, lib_test_mod, metadata_fk_test_mod, metadata_unit_test_mods);
+    const unit_metadata = metadata_tests.root.step;
     const run_lib_metadata_sim_smoke_tests = metadata_tests.sim_smoke.run;
     const run_lib_metadata_vopr_tests = metadata_tests.vopr.run;
     const run_lib_metadata_vopr_chaos_tests = metadata_tests.vopr_chaos.run;
@@ -1892,7 +1911,8 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&lib_db_module_tests.result_shape.step);
     unit_test_step.dependOn(&run_serverless_tests.step);
     unit_test_step.dependOn(&run_lib_data_storage_tests.step);
-    unit_test_step.dependOn(metadata_tests.root.step);
+    unit_test_step.dependOn(unit_metadata);
+    unit_test_step.dependOn(&root_module_tests.run.step);
     antfly_tests_build.dependOnAPITableUnitTestRuns(unit_test_step, api_table_tests);
     unit_test_step.dependOn(&api_table_tests.provisioned_query_visibility_unit.step);
     unit_test_step.dependOn(&api_table_tests.api_table_writes_production_regression_unit.step);
@@ -1935,7 +1955,9 @@ pub fn build(b: *std.Build) void {
         unit_progress_tail = chainLabeledRun(b, storage_tests.ha.tests, "ha-test", unit_progress_tail);
     }
     unit_progress_tail = chainLabeledRunStep(b, lib_db_test.run, antfly_tests_build.db_root_step_name, unit_progress_tail);
-    unit_progress_tail = chainLabeledRun(b, metadata_root_tests, "metadata-test", unit_progress_tail);
+    for (metadata_tests.root.runs, antfly_tests_build.MetadataTestFilters.production_shard_names) |metadata_run, shard_name| {
+        unit_progress_tail = chainLabeledRun(b, metadata_run.tests, shard_name, unit_progress_tail);
+    }
     unit_progress_tail = chainLabeledRun(b, raft_unit_tests, "raft-test", unit_progress_tail);
     unit_progress_tail = chainLabeledRun(b, raft_transport_tests, "raft.transport", unit_progress_tail);
     unit_progress_tail = chainLabeledRun(b, serverless_tests, "serverless-test", unit_progress_tail);
@@ -2134,7 +2156,6 @@ pub fn build(b: *std.Build) void {
         &standalone_module_tests.httpx.run.step,
         &standalone_module_tests.api_json_helpers.run.step,
         &run_antfly_client_pkg_tests.step,
-        &root_module_tests.run.step,
         metadata_tests.root.step,
         &run_lib_storage_tests.step,
         &run_lsm_backend_tests.step,

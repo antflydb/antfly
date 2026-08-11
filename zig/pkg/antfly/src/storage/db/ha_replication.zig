@@ -24,6 +24,7 @@ const ha_session_mod = @import("../ha/session.zig");
 const ha_standby_mod = @import("../ha/standby.zig");
 const ha_write_gate_mod = @import("../ha/write_gate.zig");
 const change_journal_mod = @import("derived/change_journal.zig");
+const db_internal = @import("internal.zig");
 const doc_identity = @import("doc_identity.zig");
 const internal_keys = @import("../internal_keys.zig");
 const ha_replication_record_mod = @import("../ha/replication_record.zig");
@@ -37,6 +38,14 @@ const types = @import("types.zig");
 const Allocator = std.mem.Allocator;
 
 const TestHelpers = if (builtin.is_test) @import("test_support.zig") else struct {};
+
+fn tempPath(buf: []u8) [*:0]const u8 {
+    return TestHelpers.tempPath(buf);
+}
+
+fn cleanupTempDir(path: [*:0]const u8) void {
+    TestHelpers.cleanupTempDir(path);
+}
 
 pub const AsyncEffectMirror = ha_types.AsyncEffectMirror;
 pub const AsyncBatchMirror = ha_types.AsyncBatchMirror;
@@ -687,6 +696,75 @@ test "storage.ha db primary progress sync wait returns would block without repor
     try std.testing.expectEqual(@intFromEnum(ha_commit_gate_mod.Action.wait_for_standby), gate_action.load(.acquire));
     const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(u64, 0), slot.received_lsn);
+}
+
+test "db transaction HA retry drains durable mirror outbox" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+    var db_path_buf: [256]u8 = undefined;
+    const db_path = tempPath(&db_path_buf);
+    defer cleanupTempDir(db_path);
+    var ha_log_path_buf: [256]u8 = undefined;
+    const ha_log_path = tempPath(&ha_log_path_buf);
+    defer cleanupTempDir(ha_log_path);
+    var ha_slots_path_buf: [256]u8 = undefined;
+    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    defer cleanupTempDir(ha_slots_path);
+
+    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
+        .cluster_id = 263,
+        .shard_id = 4,
+        .table_id = 10,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer primary.close();
+    try primary.createSlot("standby-a", 0);
+    const AckOnRetry = struct {
+        calls: usize = 0,
+        fn wait(ctx: *anyopaque, active_primary: *ha_primary_mod.Primary, target_lsn: u64, _: ha_primary_mod.SyncPolicy) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            if (self.calls == 1) return error.InjectedMirrorWaitFailure;
+            try active_primary.standbyStatusUpdate("standby-a", 1, target_lsn, target_lsn);
+        }
+    };
+    var ack = AckOnRetry{};
+    const standby_names = [_][]const u8{"standby-a"};
+    var db = try DB.open(alloc, std.mem.span(db_path), .{
+        .ha_async_batch_mirror = .{
+            .primary = &primary,
+            .sync_policy = .{
+                .mode = .remote_write,
+                .standby_names = &standby_names,
+                .failure_policy = .block,
+            },
+            .sync_wait_ctx = &ack,
+            .sync_wait_fn = AckOnRetry.wait,
+        },
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    const txn_id = try db.beginTransaction(20_000);
+    try db.writeTransaction(txn_id, .{ .writes = &.{.{
+        .key = "doc:ha-txn",
+        .value = "{\"title\":\"committed\"}",
+    }} });
+    try std.testing.expectError(error.InjectedMirrorWaitFailure, db.commitTransaction(txn_id, 20_001));
+    try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try db.getTransactionStatus(txn_id));
+    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
+
+    const configured_mirror = db.ha_async_batch_mirror;
+    db.ha_async_batch_mirror = null;
+    try std.testing.expectError(error.HAMirrorUnavailable, db.commitTransaction(txn_id, 20_001));
+    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
+    db.ha_async_batch_mirror = configured_mirror;
+
+    try db.commitTransaction(txn_id, 20_001);
+    try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
+    try db.commitTransaction(txn_id, 20_001);
+    try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
 }
 
 test "storage.ha db primary progress sync wait survives primary restart before ack" {
@@ -1916,9 +1994,49 @@ pub fn Impl(comptime DB: type) type {
             try mirrorBatchMutationCommit(self.alloc, resources.log_mutex, resources.identity_namespace, self.ha_async_batch_mirror, request);
         }
 
+        pub fn mirrorHAEncodedBatchMutationCommit(self: *DB, payload: []const u8) !void {
+            var ctx = self.batchContext();
+            try mirrorHAEncodedBatchMutationCommitContext(&ctx, payload);
+        }
+
         pub fn mirrorDBReplayPayloadCommit(self: *DB, payload: []const u8) !void {
             const resources = self.core.batchExecutionResources();
             try mirrorReplayPayloadCommit(resources.log_mutex, resources.identity_namespace, self.ha_async_effect_mirror, payload);
+        }
+
+        pub fn flushTransactionHAOutbox(self: *DB, txn_id: transactions_mod.TxnId) !void {
+            var outbox = try self.core.loadTransactionHAOutbox(self.alloc, txn_id);
+            defer outbox.deinit(self.alloc);
+            if (outbox.batch_payload == null and outbox.replay_payload == null) return;
+
+            // An outbox entry is a durable synchronous-replication obligation. Do
+            // not silently discard it if a restart temporarily removes or
+            // downgrades the corresponding mirror configuration.
+            if (outbox.batch_payload != null) {
+                const mirror = self.ha_async_batch_mirror orelse return error.HAMirrorUnavailable;
+                if (!haMirrorSyncEnabled(mirror)) return error.HAMirrorUnavailable;
+            }
+            if (outbox.replay_payload != null) {
+                const mirror = self.ha_async_effect_mirror orelse return error.HAMirrorUnavailable;
+                if (!haMirrorSyncEnabled(mirror)) return error.HAMirrorUnavailable;
+            }
+            try Self.enforceDBWriteGate(self);
+            const ctx = self.batchContext();
+            if (outbox.batch_payload != null) try preflightMirrorSyncCommit(ctx.log_mutex, ctx.ha_async_batch_mirror);
+            if (outbox.replay_payload != null) try preflightMirrorSyncCommit(ctx.log_mutex, ctx.ha_async_effect_mirror);
+
+            if (outbox.batch_payload) |payload| {
+                try Self.mirrorHAEncodedBatchMutationCommit(self, payload);
+                self.core.lockApply();
+                defer self.core.unlockApply();
+                try self.core.clearTransactionHAOutbox(txn_id, .batch);
+            }
+            if (outbox.replay_payload) |payload| {
+                try Self.mirrorDBReplayPayloadCommit(self, payload);
+                self.core.lockApply();
+                defer self.core.unlockApply();
+                try self.core.clearTransactionHAOutbox(txn_id, .replay);
+            }
         }
 
         pub fn mirrorDBSchemaMetadataCommit(self: *DB, table_schema: schema_mod.TableSchema) !void {
@@ -2040,6 +2158,10 @@ pub fn Impl(comptime DB: type) type {
     };
 }
 
+pub fn haMirrorSyncEnabled(mirror: ha_types.AsyncEffectMirror) bool {
+    return mirror.sync_policy.mode != .async;
+}
+
 pub fn enforceWriteGateOptional(gate: ?WriteGate) !void {
     const configured = gate orelse return;
     try configured.check();
@@ -2128,6 +2250,25 @@ pub fn mirrorBatchMutationCommit(alloc: Allocator, log_mutex: *std.atomic.Mutex,
         break :blk lsn;
     };
     try evaluateMirrorCommitGate(configured, lsn);
+}
+
+fn mirrorHAEncodedBatchMutationCommitContext(ctx: anytype, payload: []const u8) !void {
+    const mirror = ctx.ha_async_batch_mirror orelse return;
+    const lsn = blk: {
+        db_internal.lockAtomicWithBackoff(ctx.log_mutex);
+        defer ctx.log_mutex.*.unlock();
+        const lsn = ha_effects_mod.appendEncodedBatchMutationRequest(mirror.primary, payload, .{
+            .shard_id = ctx.identity_namespace.shard_id,
+            .table_id = ctx.identity_namespace.table_id,
+        }) catch |err| {
+            noteMirrorFailure(mirror, "batch mutation", err);
+            if (haMirrorSyncEnabled(mirror)) return err;
+            return;
+        };
+        if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
+        break :blk lsn;
+    };
+    try evaluateMirrorCommitGate(mirror, lsn);
 }
 
 pub fn mirrorSchemaMetadataBestEffort(alloc: Allocator, log_mutex: *std.atomic.Mutex, identity_namespace: doc_identity.Namespace, mirror: ?AsyncMetadataMirror, table_schema: schema_mod.TableSchema) void {

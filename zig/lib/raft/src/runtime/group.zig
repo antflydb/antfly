@@ -85,7 +85,12 @@ pub const Group = struct {
     }
 
     pub fn propose(self: *Group, data: []const u8) !void {
-        return try self.raw_node.propose(data);
+        var accepted_index: ?core.types.Index = null;
+        return try self.proposeWithReceipt(data, &accepted_index);
+    }
+
+    pub fn proposeWithReceipt(self: *Group, data: []const u8, accepted_index: *?core.types.Index) !void {
+        return try self.raw_node.proposeWithReceipt(data, accepted_index);
     }
 
     pub fn readIndex(self: *Group, request_ctx: []const u8) !void {

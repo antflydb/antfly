@@ -16,7 +16,9 @@ package sdk
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -144,23 +146,33 @@ func TestStoreClientBackup_FileLocationDoesNotTruncateStreamSource(t *testing.T)
 			require.NoError(t, err)
 			stat, err := body.Stat()
 			require.NoError(t, err)
+			headers := make(http.Header)
+			headers.Set(common.BackupArtifactNameHeader, backupFileName)
+			headers.Set(common.BackupArtifactSizeHeader, fmt.Sprint(len(expected)))
+			headers.Set(
+				common.BackupArtifactSHA256Header,
+				fmt.Sprintf("%x", sha256.Sum256(expected)),
+			)
 			return &http.Response{
 				StatusCode:    http.StatusOK,
 				Body:          body,
-				Header:        make(http.Header),
+				Header:        headers,
 				ContentLength: stat.Size(),
 			}, nil
 		}),
 	}
 
 	sc := NewStoreClient(httpClient, types.ID(1), "http://store.test")
-	require.NoError(t, sc.Backup(
+	_, err := sc.Backup(
 		context.Background(),
 		shardID,
-		"file://"+backupDir,
-		backupID,
-		common.BackupFormatPortable,
-	))
+		common.BackupConfig{
+			BackupID: backupID,
+			Location: "file://" + backupDir,
+			Format:   common.BackupFormatPortable,
+		},
+	)
+	require.ErrorIs(t, err, common.ErrBackupAlreadyExists)
 
 	actual, err := os.ReadFile(backupPath)
 	require.NoError(t, err)

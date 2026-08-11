@@ -650,6 +650,16 @@ pub fn freeDBIndexStatsItem(alloc: Allocator, item: types.DBIndexStats) void {
 
 pub fn Impl(comptime DB: type) type {
     return struct {
+        fn resolveRecoveredLocalTransaction(
+            ctx: *anyopaque,
+            txn_id: transactions_mod.TxnId,
+            status: transactions_mod.TxnStatus,
+            commit_version: u64,
+        ) anyerror!void {
+            const db: *DB = @ptrCast(@alignCast(ctx));
+            try db.resolveTransactionIntentsWithSyncLevel(txn_id, status, commit_version, .propose);
+        }
+
         const Self = @This();
         const test_quarantine_publication_fence_entered = DB.ArtifactRepairCallbacks.test_quarantine_publication_fence_entered;
 
@@ -1088,9 +1098,78 @@ pub fn Impl(comptime DB: type) type {
         }
 
         pub fn runTransactionRecoveryOnce(self: *DB, config: transaction_runtime_mod.Config) !types.TransactionRecoveryStats {
+            if (!config.enabled) return .{};
+            if (config.replicated_metadata) {
+                return try transaction_runtime_mod.recoverOnce(
+                    self.alloc,
+                    self.core.batchExecutionResources().store,
+                    config,
+                );
+            }
+            const resolve_participant = config.resolve_participant_fn orelse return error.MissingParticipantResolver;
+            const resolver_ctx = config.resolver_ctx orelse return error.MissingParticipantResolver;
+            const now_ns = config.clock.nowRealtimeNs();
+            const resolved_finalized = try self.resolveFinalizedTransactionIntentsForRecovery(now_ns);
+
+            var recovery_stats: types.TransactionRecoveryStats = .{
+                .enabled = true,
+                .lease_owned = config.lease_owned,
+                .runs = 1,
+                .resolved_finalized = resolved_finalized,
+                .last_run_ns = now_ns,
+            };
+
+            // Notification may perform network I/O or route back to this DB. Keep
+            // it entirely outside the apply lock and acknowledge each successful
+            // delivery with a separate short, idempotent locked update.
+            const txns = try self.core.listTransactions(self.alloc);
+            defer self.alloc.free(txns);
+            for (txns) |txn| {
+                if (txn.status == .pending) continue;
+                const unresolved = self.core.getUnresolvedTransactionParticipants(self.alloc, txn.txn_id) catch |err| switch (err) {
+                    transactions_mod.TxnError.TxnNotFound => continue,
+                    else => return err,
+                };
+                defer transactions_mod.freeParticipantList(self.alloc, unresolved);
+                for (unresolved) |participant| {
+                    recovery_stats.notification_attempts += 1;
+                    if (config.local_participant) |local| {
+                        if (std.mem.eql(u8, local, participant)) {
+                            self.markTransactionParticipantResolved(txn.txn_id, participant) catch |err| switch (err) {
+                                transactions_mod.TxnError.TxnNotFound => {},
+                                else => return err,
+                            };
+                            recovery_stats.notification_successes += 1;
+                            continue;
+                        }
+                    }
+                    resolve_participant(resolver_ctx, txn.txn_id, participant, txn.status, txn.commit_version) catch {
+                        recovery_stats.notification_failures += 1;
+                        continue;
+                    };
+                    self.markTransactionParticipantResolved(txn.txn_id, participant) catch |err| switch (err) {
+                        transactions_mod.TxnError.TxnNotFound => {},
+                        else => return err,
+                    };
+                    recovery_stats.notification_successes += 1;
+                }
+            }
+
+            // Serialize presumed-abort and metadata cleanup with prepare/resolve,
+            // but do not hold the lock across participant callbacks above.
             self.core.lockApply();
-            defer self.core.unlockApply();
-            return try self.core.runTransactionRecoveryOnce(self.alloc, config);
+            const local_stats = self.core.recoverTransactions(now_ns -| config.cutoff_ns, now_ns) catch |err| {
+                self.core.unlockApply();
+                return err;
+            };
+            self.core.unlockApply();
+            recovery_stats.scanned_records = local_stats.scanned_records;
+            recovery_stats.auto_aborted = local_stats.auto_aborted;
+            recovery_stats.resolved_finalized += local_stats.resolved_finalized;
+            recovery_stats.cleaned_records = local_stats.cleaned_records;
+            recovery_stats.kept_recent_pending = local_stats.kept_recent_pending;
+            recovery_stats.deferred_unresolved = local_stats.deferred_unresolved;
+            return recovery_stats;
         }
 
         pub fn recordStartupOpenStats(self: *DB, profile: anytype) void {
@@ -1356,6 +1435,14 @@ pub fn Impl(comptime DB: type) type {
                 self.core.batchExecutionResources().apply_mutex,
                 append_ctx,
                 DB.LifecycleCallbacks.append_generated_batch_from_enrichment,
+                append_ctx,
+                DB.LifecycleCallbacks.record_enrichment_request_failure,
+                DB.LifecycleCallbacks.enrichment_request_failure_pending,
+                .{
+                    .ptr = append_ctx,
+                    .lock_fn = DB.LifecycleCallbacks.lock_enrichment_failure_pending_fence,
+                    .unlock_fn = DB.LifecycleCallbacks.unlock_enrichment_failure_pending_fence,
+                },
                 self.executor,
                 DB.LifecycleCallbacks.notify_derived_executor_sequence,
                 self.backend_runtime,
@@ -1719,12 +1806,30 @@ pub fn Impl(comptime DB: type) type {
                 self.async_context.enrichment_desired_running.store(true, .release);
             }
             if (self.ttl_runtime) |runtime| try runtime.start();
-            if (self.transaction_runtime) |runtime| try runtime.start();
+            if (self.transaction_runtime) |runtime| {
+                runtime.config.local_resolution_ctx = self;
+                runtime.config.resolve_local_fn = resolveRecoveredLocalTransaction;
+                try runtime.start();
+            }
             if (self.text_merge_runtime) |runtime| try runtime.start();
             if (self.sparse_compaction_runtime) |runtime| try runtime.start();
             if (self.graph_metric_runtime) |runtime| try runtime.start();
             self.startArtifactRepairMetadataWorkerIfNeeded();
             self.startQuarantineRetryWorkerIfNeeded();
+        }
+
+        pub fn ensureTransactionRecoveryRuntime(self: *DB, cfg: transaction_runtime_mod.Config) !void {
+            if (!cfg.enabled or self.transaction_runtime != null) return;
+            self.core.lockApply();
+            defer self.core.unlockApply();
+            if (self.transaction_runtime != null) return;
+            try Self.initOptionalTransactionRuntime(self, cfg);
+            if (self.optional_runtime_workers_enabled) {
+                const runtime = self.transaction_runtime.?;
+                runtime.config.local_resolution_ctx = self;
+                runtime.config.resolve_local_fn = resolveRecoveredLocalTransaction;
+                try runtime.start();
+            }
         }
 
         pub fn hasConfiguredResolvers(self: *const DB) bool {
@@ -2312,6 +2417,8 @@ pub fn Impl(comptime DB: type) type {
                 .error_count = status.error_count,
                 .retryable_error_count = status.retryable_error_count,
                 .fatal_error_count = status.fatal_error_count,
+                .consecutive_retry_count = status.consecutive_retry_count,
+                .next_retry_at_ms = status.next_retry_at_ms,
                 .retrying = status.retrying,
                 .worker_failed = status.worker_failed,
                 .skipped_source_count = status.skipped_source_count,
@@ -2320,12 +2427,13 @@ pub fn Impl(comptime DB: type) type {
 
         const ReplayDrainOptions = struct {
             truncate_replay: bool = true,
+            wait_for_enrichment_retries: bool = false,
         };
 
         fn runDerivedUntilWithOptions(
             self: *DB,
             sequence: u64,
-            truncate_replay: bool,
+            options: ReplayDrainOptions,
         ) !void {
             if (sequence == 0) return;
             if (!self.executor.hasWorkers()) {
@@ -2333,7 +2441,7 @@ pub fn Impl(comptime DB: type) type {
                     self,
                     null,
                     null,
-                    truncate_replay,
+                    options.truncate_replay,
                 );
                 return;
             }
@@ -2342,7 +2450,7 @@ pub fn Impl(comptime DB: type) type {
         }
 
         pub fn runDerivedUntil(self: *DB, sequence: u64) !void {
-            try Self.runDerivedUntilWithOptions(self, sequence, true);
+            try Self.runDerivedUntilWithOptions(self, sequence, .{});
         }
 
         pub fn runDerivedUntilTargets(self: *DB, sequence: u64, index_names: []const []const u8) !void {
@@ -2364,8 +2472,22 @@ pub fn Impl(comptime DB: type) type {
             }
         }
 
+        fn runEnrichmentUntilForDrain(self: *DB, sequence: u64, options: ReplayDrainOptions) !void {
+            while (true) {
+                self.runEnrichmentUntil(sequence) catch |err| switch (err) {
+                    error.EnrichmentRetryInProgress => {
+                        if (!options.wait_for_enrichment_retries) return err;
+                        db_internal.sleepNs(25 * std.time.ns_per_ms);
+                        continue;
+                    },
+                    else => return err,
+                };
+                return;
+            }
+        }
+
         pub fn markPrecomputedEnrichmentAppliedForSync(self: *DB, sync_level: types.SyncLevel, sequence: u64) !void {
-            if (sync_level != .enrichments or sequence == 0) return;
+            if ((sync_level != .enrichments and sync_level != .full_index) or sequence == 0) return;
             const runtime = self.enrichment_runtime orelse return;
             const runtime_stats = runtime.stats();
             if (runtime_stats.applied_sequence >= sequence -| 1 or
@@ -2388,21 +2510,16 @@ pub fn Impl(comptime DB: type) type {
             self: *DB,
             sequence: u64,
             sync_targets: ManagedSyncTargets,
-            truncate_replay: bool,
+            options: ReplayDrainOptions,
         ) !void {
             var stable_target = sequence;
             while (true) {
-                try Self.runEnrichmentUntil(self, stable_target);
-                const enriched_target = self.core.nextDerivedSequence();
-                if (enriched_target > stable_target) {
-                    stable_target = enriched_target;
-                    continue;
-                }
                 try Self.runDerivedUntilWithOptions(
                     self,
                     stable_target,
-                    truncate_replay,
+                    options,
                 );
+                try Self.runEnrichmentUntilForDrain(self, stable_target, options);
 
                 const next_target = self.core.nextDerivedSequence();
                 if (next_target <= stable_target) {
@@ -2419,7 +2536,7 @@ pub fn Impl(comptime DB: type) type {
                 self,
                 sequence,
                 sync_targets,
-                true,
+                .{},
             );
         }
 
@@ -2427,13 +2544,8 @@ pub fn Impl(comptime DB: type) type {
             if (index_names.len == 0) return;
             var stable_target = sequence;
             while (true) {
-                try Self.runEnrichmentUntil(self, stable_target);
-                const enriched_target = self.core.nextDerivedSequence();
-                if (enriched_target > stable_target) {
-                    stable_target = enriched_target;
-                    continue;
-                }
                 try Self.runDerivedUntilTargets(self, stable_target, index_names);
+                try Self.runEnrichmentUntil(self, stable_target);
 
                 const next_target = self.core.nextDerivedSequence();
                 if (next_target <= stable_target) {
@@ -2461,6 +2573,26 @@ pub fn Impl(comptime DB: type) type {
                 db_internal.notifyExecutorForSyncLevelWithDenseBulkDeferral(self.async_context, self.executor, sync_level, sequence, sync_targets);
             }
             try DB.LifecycleCallbacks.wait_for_sync_level(self, sync_level, sequence, sync_targets);
+        }
+
+        pub fn waitForResolvedTransactionSync(self: *DB, sync_level: types.SyncLevel, sequence: u64) !void {
+            if (sequence == 0 or sync_level == .propose or sync_level == .write) {
+                try self.executor.failIfUnhealthy();
+                return;
+            }
+            try self.executor.failIfUnhealthy();
+            try Self.markPrecomputedEnrichmentAppliedForSync(self, sync_level, sequence);
+            var sync_targets = try Self.currentManagedSyncTargets(self, sync_level);
+            defer sync_targets.deinit(self.alloc);
+            if (self.executor.hasWorkers()) {
+                db_internal.notifyExecutorForSyncLevelWithDenseBulkDeferral(self.async_context, self.executor, sync_level, sequence, sync_targets);
+            }
+            if (self.enrichment_runtime) |runtime| runtime.notifySequence(sequence);
+            Self.notifyResolverReplayRuntimes(self, sequence);
+            try DB.LifecycleCallbacks.wait_for_sync_level(self, sync_level, sequence, sync_targets);
+            if (sync_level == .full_index and self.text_merge_runtime == null) {
+                try Self.drainScheduledTextMerges(self);
+            }
         }
 
         pub fn currentManagedSyncTargets(self: *DB, sync_level: types.SyncLevel) !ManagedSyncTargets {
@@ -2570,7 +2702,7 @@ pub fn Impl(comptime DB: type) type {
 
         fn drainReplayStagesUntilStableWithOptions(
             self: *DB,
-            truncate_replay: bool,
+            options: ReplayDrainOptions,
         ) !void {
             var rounds: usize = 0;
             while (rounds < run_until_idle_max_replay_rounds) : (rounds += 1) {
@@ -2581,7 +2713,7 @@ pub fn Impl(comptime DB: type) type {
                     self,
                     Self.currentMaintenanceTargetSequence(self),
                     .{},
-                    truncate_replay,
+                    options,
                 );
                 const drained_sequence = self.core.nextDerivedSequence();
 
@@ -2604,7 +2736,7 @@ pub fn Impl(comptime DB: type) type {
                         self,
                         Self.currentMaintenanceTargetSequence(self),
                         .{},
-                        truncate_replay,
+                        options,
                     );
                     if (Self.resolverReplayBlockedAfterRunnableDrain(self)) return;
                 }
@@ -2623,11 +2755,14 @@ pub fn Impl(comptime DB: type) type {
         }
 
         fn drainReplayStagesUntilStable(self: *DB) !void {
-            try Self.drainReplayStagesUntilStableWithOptions(self, true);
+            try Self.drainReplayStagesUntilStableWithOptions(self, .{ .wait_for_enrichment_retries = true });
         }
 
         pub fn drainReplayStagesUntilStableWithoutTruncation(self: *DB) !void {
-            try Self.drainReplayStagesUntilStableWithOptions(self, false);
+            try Self.drainReplayStagesUntilStableWithOptions(self, .{
+                .truncate_replay = false,
+                .wait_for_enrichment_retries = true,
+            });
         }
 
         pub fn snapshotForeignKeyStats(self: *DB) types.ForeignKeyStats {
@@ -3886,7 +4021,7 @@ pub fn Impl(comptime DB: type) type {
             };
         }
 
-        fn managedIndexAppliedSequence(self: *DB, alloc: Allocator, index_name: []const u8) !u64 {
+        pub fn managedIndexAppliedSequence(self: *DB, alloc: Allocator, index_name: []const u8) !u64 {
             var applied_sequence = try self.core.loadAppliedSequence(alloc, index_name);
             if (self.executor.appliedSequence(index_name)) |live_applied| {
                 applied_sequence = @max(applied_sequence, live_applied);
@@ -3925,7 +4060,7 @@ pub fn Impl(comptime DB: type) type {
             );
         }
 
-        fn projectionStatsTargetSequence(self: *DB, alloc: Allocator, cfg: types.IndexConfig, applied_sequence: u64) !u64 {
+        pub fn projectionStatsTargetSequence(self: *DB, alloc: Allocator, cfg: types.IndexConfig, applied_sequence: u64) !u64 {
             return try Self.managedIndexReplayTargetSequence(
                 self,
                 alloc,

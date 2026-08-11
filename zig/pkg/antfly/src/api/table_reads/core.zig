@@ -375,6 +375,13 @@ pub const ResidentDbLease = struct {
 };
 
 pub const ResidentDbSource = struct {
+    pub const LeaseOptions = struct {
+        // Query and lookup entry points already hold a table read-admission
+        // lease. Reacquiring it here can deadlock behind an exclusive apply
+        // waiter that is waiting for the outer lease to drain.
+        read_activity_held: bool = false,
+    };
+
     ptr: *anyopaque,
     lease_group: *const fn (
         ptr: *anyopaque,
@@ -382,7 +389,15 @@ pub const ResidentDbSource = struct {
         table_name: []const u8,
         group_id: u64,
         lsm_root_generation: u64,
+        options: LeaseOptions,
     ) anyerror!?ResidentDbLease,
+    prepare_group_for_read_retry: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        group_id: u64,
+        lsm_root_generation: u64,
+    ) anyerror!void = null,
 
     pub fn leaseGroup(
         self: ResidentDbSource,
@@ -390,8 +405,24 @@ pub const ResidentDbSource = struct {
         table_name: []const u8,
         group_id: u64,
         lsm_root_generation: u64,
+        options: LeaseOptions,
     ) !?ResidentDbLease {
-        return try self.lease_group(self.ptr, alloc, table_name, group_id, lsm_root_generation);
+        return try self.lease_group(self.ptr, alloc, table_name, group_id, lsm_root_generation, options);
+    }
+
+    /// Complete a resident writer publication without holding table read
+    /// admission. Callers must rerun routing, consistency, and admission after
+    /// this returns; the prepared resident is only a progress guarantee, not a
+    /// lease that may be used directly.
+    pub fn prepareGroupForReadRetry(
+        self: ResidentDbSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        group_id: u64,
+        lsm_root_generation: u64,
+    ) !void {
+        const prepare = self.prepare_group_for_read_retry orelse return error.StorageReadTemporarilyUnavailable;
+        return try prepare(self.ptr, alloc, table_name, group_id, lsm_root_generation);
     }
 };
 
