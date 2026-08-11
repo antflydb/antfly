@@ -1039,6 +1039,7 @@ pub const APITestFilters = struct {
 
     pub const auth = [_][]const u8{
         "api http server requires auth on public routes when enabled",
+        "api http server document scan requires table read permission",
         "api http server dispatches HA admin and internal executors",
         "api http server protects HA admin routes while exempting HA internal routes",
         "api http server forbids non-admin secret access when auth is enabled",
