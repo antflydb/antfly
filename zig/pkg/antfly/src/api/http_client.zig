@@ -4069,7 +4069,7 @@ test "api http client maps group txn resolve decision conflicts" {
             return error.UnsupportedOperation;
         }
 
-        fn resolveGroup(_: *anyopaque, _: std.mem.Allocator, group_id: u64, table_name: []const u8, _: db_mod.types.TxnId, _: db_mod.types.TxnStatus, _: u64, _: db_mod.types.SyncLevel) anyerror!?void {
+        fn resolveGroup(_: *anyopaque, _: std.mem.Allocator, group_id: u64, table_name: []const u8, _: db_mod.types.TxnId, _: db_mod.types.TxnStatus, _: u64, _: u64, _: db_mod.types.SyncLevel) anyerror!?void {
             try std.testing.expectEqual(@as(u64, 7001), group_id);
             try std.testing.expectEqualStrings("docs", table_name);
             return error.DecisionConflict;

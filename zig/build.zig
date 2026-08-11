@@ -1759,6 +1759,7 @@ pub fn build(b: *std.Build) void {
     const inference_server_mod = inference_graph.inference_mod;
     const standalone_runtime_options = b.addOptions();
     standalone_runtime_options.addOption(bool, "linked_inference", linked_runtime_libraries);
+    standalone_runtime_options.addOption(bool, "linked_runtime_boundaries", linked_runtime_libraries);
     const kernel_owner_abi_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/storage/kernel_owner_abi.zig"),
         .target = target,
@@ -8727,9 +8728,9 @@ pub fn build(b: *std.Build) void {
     const recall_harness_step = b.step("recall-harness", "Run Zig recall suites against exported vector datasets");
     recall_harness_step.dependOn(&run_recall_harness.step);
 
+    const linked_runtime_options = b.addOptions();
+    linked_runtime_options.addOption(bool, "enabled", linked_runtime_libraries);
     const antfly_main_mod = if (edition == .full) blk: {
-        const linked_runtime_options = b.addOptions();
-        linked_runtime_options.addOption(bool, "enabled", linked_runtime_libraries);
         const mod = b.createModule(.{
             .root_source_file = b.path("pkg/antfly/src/main.zig"),
             .target = target,
@@ -8777,6 +8778,38 @@ pub fn build(b: *std.Build) void {
         mod.addOptions("build_options", build_options);
         break :blk mod;
     };
+
+    // The non-linked executable deliberately excludes the LMDB C backend so
+    // production artifacts remain LSM-only. Testing main.zig as a root also
+    // discovers tests in its relative storage imports, including the LMDB
+    // differential simulator. Give that test compile its own module with the
+    // bundled C backend rather than adding LMDB to the production module.
+    const antfly_main_test_mod = if (edition == .full) blk: {
+        const mod = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly/src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .sanitize_thread = sanitize_thread,
+        });
+        mod.addImport("antfly-client", antfly_client_pkg_mod);
+        if (linked_runtime_libraries) {
+            mod.addImport("structlog", structlog_mod);
+            mod.addImport("antfly_platform", platform_mod);
+            mod.addOptions("build_options", build_options);
+        } else {
+            antfly_imports.configure(b, mod, true, true);
+            const main_test_usermgr_storage_mod = b.createModule(.{
+                .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
+                .target = target,
+                .optimize = optimize,
+            });
+            main_test_usermgr_storage_mod.addImport("antfly_root", mod);
+            main_test_usermgr_storage_mod.addImport("antfly_platform", platform_mod);
+            mod.addImport("usermgr_storage", main_test_usermgr_storage_mod);
+        }
+        mod.addOptions("linked_runtime_options", linked_runtime_options);
+        break :blk mod;
+    } else antfly_main_mod;
 
     const antfly_main = b.addExecutable(.{
         .name = "antfly",
@@ -8856,24 +8889,31 @@ pub fn build(b: *std.Build) void {
                     // so the build runner never discards completed work.
                     .api_kernel => 7 * 1024 * 1024 * 1024,
                     .cli => 3 * 1024 * 1024 * 1024,
-                    .storage_kernel => 8 * 1024 * 1024 * 1024,
+                    // The first normal-runner physical-source build peaked at
+                    // 10,047,467,520 bytes, so 8 GiB caused Zig to discard and
+                    // retry the completed compiler step. A 10.25 GiB claim
+                    // leaves about 9.5% measured headroom. Paired with the
+                    // 9 GiB distributed claim, it remains below the workflow's
+                    // unchanged 20,000 MiB scheduler budget.
+                    .storage_kernel => (10 * 1024 + 256) * 1024 * 1024,
                     .data_pic_probe => 11 * 1024 * 1024 * 1024,
                     .storage_runtime_pic_probe => 11 * 1024 * 1024 * 1024,
                     .application_pic_probe => 11 * 1024 * 1024 * 1024,
                     .control_probe => 8 * 1024 * 1024 * 1024,
                     .cli_pic_probe => 8 * 1024 * 1024 * 1024,
                     .control_api_probe => 11 * 1024 * 1024 * 1024,
-                    .distributed => 11 * 1024 * 1024 * 1024,
+                    .distributed => @as(usize, if (storage_kernel_experiment) 9 else 11) * 1024 * 1024 * 1024,
                     .inference => 8 * 1024 * 1024 * 1024,
                 },
             });
             // Zig 0.16 intentionally randomizes dependency traversal, so enum
             // order cannot define a reliable bounded-RSS launch group. These
-            // two edges deterministically preserve the useful overlap:
-            //
-            //   API (7 GiB) + application/storage (11 GiB)
-            //   application/storage + inference (8 GiB), after API
-            //   inference + CLI (3 GiB), after application/storage
+            // two edges deterministically preserve useful overlap. The
+            // default topology schedules API (7 GiB) with combined
+            // application/storage (11 GiB), then inference (8 GiB) with the
+            // latter after API. The physical-source experiment initially
+            // schedules storage (10.25 GiB) with distributed/API control
+            // (9 GiB), then admits inference after distributed finishes.
             //
             // This is still concurrent code generation; it only prevents a
             // short or later unit from consuming the claim needed by a
@@ -9043,16 +9083,19 @@ pub fn build(b: *std.Build) void {
             }
             // Zig's build runner uses these claims to run as many LLVM codegen
             // steps concurrently as fit in available RAM. The explicit gates
-            // above make API and the application/storage archive the initial
-            // 18 GiB group, then overlap inference and CLI with the opposite
-            // long path as claims become available. The application archive
-            // is PIC because the executable and C ABI libraries share it; all
-            // three consumers reuse the same analyzed and optimized graph.
+            // above establish the initial groups described above, then overlap
+            // inference and CLI with the opposite long path as claims become
+            // available. The storage-owning archive is PIC because the
+            // executable and C ABI libraries share it; all three consumers
+            // reuse the same analyzed and optimized graph.
             if (unit_enabled and owns_storage_kernel) {
                 capi_link_mod.linkLibrary(role_artifact);
                 lite_capi_link_mod.linkLibrary(role_artifact);
             }
-            if (unit_enabled) antfly_main.root_module.linkLibrary(role_artifact);
+            if (unit_enabled) {
+                antfly_main.root_module.linkLibrary(role_artifact);
+                antfly_main_test_mod.linkLibrary(role_artifact);
+            }
             if (strip) {
                 var visited = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
                 defer visited.deinit();
@@ -9118,7 +9161,7 @@ pub fn build(b: *std.Build) void {
         setStripRecursively(capi_mod, &visited);
     }
     const antfly_main_tests = b.addTest(.{
-        .root_module = antfly_main_mod,
+        .root_module = antfly_main_test_mod,
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,

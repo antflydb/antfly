@@ -17,6 +17,7 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
+const runtime_options = @import("standalone_runtime_options");
 const abi = @import("kernel_abi.zig");
 const server_mod = @import("http_server.zig");
 const handler_mod = @import("httpx_handler.zig");
@@ -62,8 +63,10 @@ fn callError(status: c_int, error_code: ErrorInt) !void {
     return error.ApiKernelOperationFailed;
 }
 
-pub const ApiHttpServer = if (builtin.is_test) server_mod.ApiHttpServer else OpaqueApiHttpServer;
-pub const HttpxHandler = if (builtin.is_test) handler_mod.AntflyApiHandler else OpaqueHttpxHandler;
+const use_opaque_boundary = !builtin.is_test and runtime_options.linked_runtime_boundaries;
+
+pub const ApiHttpServer = if (use_opaque_boundary) OpaqueApiHttpServer else server_mod.ApiHttpServer;
+pub const HttpxHandler = if (use_opaque_boundary) OpaqueHttpxHandler else handler_mod.AntflyApiHandler;
 
 const OpaqueApiHttpServer = struct {
     opaque_handle: *anyopaque,
@@ -250,7 +253,7 @@ const OpaqueHttpxHandler = struct {
 };
 
 pub fn createHandler(server: *ApiHttpServer) !HttpxHandler {
-    if (comptime builtin.is_test) return .{ .api_server = server };
+    if (comptime !use_opaque_boundary) return .{ .api_server = server };
     var handle: ?*anyopaque = null;
     var error_code: ErrorInt = 0;
     const status = antfly_api_kernel_handler_create(&.{
@@ -263,7 +266,7 @@ pub fn createHandler(server: *ApiHttpServer) !HttpxHandler {
 }
 
 pub fn handlerStats(handler: *const HttpxHandler) HandlerStats {
-    if (comptime builtin.is_test) {
+    if (comptime !use_opaque_boundary) {
         const query = handler.query_admission.stats();
         const query_body = handler.query_body_admission.stats();
         const runtime = handler.runtimeStats();
@@ -286,11 +289,11 @@ pub fn handlerStats(handler: *const HttpxHandler) HandlerStats {
 }
 
 pub fn deinitHandler(handler: *HttpxHandler) void {
-    if (comptime builtin.is_test) handler.deinitRuntime() else handler.deinit();
+    if (comptime !use_opaque_boundary) handler.deinitRuntime() else handler.deinit();
 }
 
 pub fn setAntflyProvider(server: *ApiHttpServer, provider: ?managed_embedder.AntflyProvider) void {
-    if (comptime builtin.is_test)
+    if (comptime !use_opaque_boundary)
         server.antfly_provider = provider
     else
         server.setAntflyProvider(provider);

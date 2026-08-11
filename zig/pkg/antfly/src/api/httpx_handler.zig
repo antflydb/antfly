@@ -187,6 +187,14 @@ pub const AntflyApiHandler = struct {
         self.peer_observer = null;
     }
 
+    pub fn registerRoutes(self: *AntflyApiHandler, server: *httpx.Server) !void {
+        const public_router = metadata_openapi.server.ServerRouter(AntflyApiHandler).init(self);
+        var public_prefixed = PrefixedServer("/db/v1", httpx.Server){ .inner = server };
+        try public_router.register(&public_prefixed);
+        const usermgr_router = usermgr_openapi.server.ServerRouter(AntflyApiHandler).init(self);
+        try usermgr_router.register(server);
+    }
+
     // ---------------------------------------------------------------
     // Response conversion: http_common.HttpResponse -> httpx.Response
     // ---------------------------------------------------------------

@@ -4091,7 +4091,7 @@ pub fn storageOwnerRestoreStateJson(
     var state = (db_mod.DB.readRestoreStateForPath(handle.alloc, path) catch |err|
         return storageOwnerStatusFromError(err)) orelse return .not_found;
     defer state.deinit(handle.alloc);
-    const wire = @import("../storage/restore_state_contract.zig").State{
+    const wire = antfly.restore_state_contract.State{
         .backup_id = state.backup_id,
         .location = state.location,
         .artifact_sha256 = state.artifact_sha256,

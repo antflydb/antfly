@@ -587,7 +587,7 @@ const LocalGenerateMessages = struct {
     owned_slices: std.ArrayListUnmanaged([]const []const u8) = .empty,
     owned_parts: std.ArrayListUnmanaged([]inference.pipelines.GenerationMessage.ContentPart) = .empty,
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         for (self.owned_texts.items) |text| alloc.free(text);
         self.owned_texts.deinit(alloc);
         for (self.owned_media.items) |media| alloc.free(media);

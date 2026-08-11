@@ -1109,7 +1109,7 @@ test "postgres source runtime delegates replication polling through executor" {
         last_publication_name: ?[]u8 = null,
         prepare_calls: usize = 0,
 
-        fn query(_: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: sql.PreparedQuery, _: ?u64) !foreign_source.QueryResult {
+        fn query(_: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: sql.PreparedQuery, _: ?u64, _: ?*const std.atomic.Value(bool)) !foreign_source.QueryResult {
             var owned = prepared;
             defer owned.deinit(inner_alloc);
             return .{ .rows = try inner_alloc.alloc(std.json.Value, 0), .total = 0 };
@@ -1202,7 +1202,7 @@ test "postgres source runtime delegates replication prepare through executor" {
         last_publication_name: ?[]u8 = null,
         prepare_calls: usize = 0,
 
-        fn query(_: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: sql.PreparedQuery, _: ?u64) !foreign_source.QueryResult {
+        fn query(_: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: sql.PreparedQuery, _: ?u64, _: ?*const std.atomic.Value(bool)) !foreign_source.QueryResult {
             var owned = prepared;
             defer owned.deinit(inner_alloc);
             return .{ .rows = try inner_alloc.alloc(std.json.Value, 0), .total = 0 };
@@ -1294,7 +1294,7 @@ test "postgres source runtime delegates consistent snapshot queries through exec
             }
         };
 
-        fn query(_: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: sql.PreparedQuery, _: ?u64) !foreign_source.QueryResult {
+        fn query(_: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: sql.PreparedQuery, _: ?u64, _: ?*const std.atomic.Value(bool)) !foreign_source.QueryResult {
             var owned = prepared;
             defer owned.deinit(inner_alloc);
             return .{ .rows = try inner_alloc.alloc(std.json.Value, 0), .total = 0 };
@@ -1400,7 +1400,7 @@ test "postgres source runtime delegates prepared replication snapshot through ex
             }
         };
 
-        fn query(_: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: sql.PreparedQuery, _: ?u64) !foreign_source.QueryResult {
+        fn query(_: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: sql.PreparedQuery, _: ?u64, _: ?*const std.atomic.Value(bool)) !foreign_source.QueryResult {
             var owned = prepared;
             defer owned.deinit(inner_alloc);
             return .{ .rows = try inner_alloc.alloc(std.json.Value, 0), .total = 0 };
@@ -1708,7 +1708,7 @@ test "postgres source runtime builds select queries through executor" {
         last_args: []sql.ParameterValue = &.{},
         last_deadline_ns: ?u64 = null,
 
-        fn query(ptr: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: sql.PreparedQuery, execution_deadline_ns: ?u64) !foreign_source.QueryResult {
+        fn query(ptr: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: sql.PreparedQuery, execution_deadline_ns: ?u64, _: ?*const std.atomic.Value(bool)) !foreign_source.QueryResult {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.last_sql) |value| inner_alloc.free(value);
             for (self.last_args) |*arg| arg.deinit(inner_alloc);
@@ -1906,7 +1906,7 @@ test "postgres source runtime translates filter_query_json and validates fields"
         last_sql: ?[]u8 = null,
         last_args: []sql.ParameterValue = &.{},
 
-        fn query(ptr: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: sql.PreparedQuery, _: ?u64) !foreign_source.QueryResult {
+        fn query(ptr: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: sql.PreparedQuery, _: ?u64, _: ?*const std.atomic.Value(bool)) !foreign_source.QueryResult {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.last_sql) |value| inner_alloc.free(value);
             for (self.last_args) |*arg| arg.deinit(inner_alloc);
@@ -2012,7 +2012,7 @@ test "postgres source runtime discovers columns when config omits them" {
         discover_count: usize = 0,
         last_sql: ?[]u8 = null,
 
-        fn query(ptr: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: sql.PreparedQuery, _: ?u64) !foreign_source.QueryResult {
+        fn query(ptr: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: sql.PreparedQuery, _: ?u64, _: ?*const std.atomic.Value(bool)) !foreign_source.QueryResult {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.last_sql) |value| inner_alloc.free(value);
             self.last_sql = try inner_alloc.dupe(u8, prepared.sql_text);
@@ -2090,7 +2090,7 @@ test "postgres source runtime refreshes stale discovered columns once" {
         refresh_count: usize = 0,
         last_sql: ?[]u8 = null,
 
-        fn query(ptr: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: sql.PreparedQuery, _: ?u64) !foreign_source.QueryResult {
+        fn query(ptr: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: sql.PreparedQuery, _: ?u64, _: ?*const std.atomic.Value(bool)) !foreign_source.QueryResult {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.last_sql) |value| inner_alloc.free(value);
             self.last_sql = try inner_alloc.dupe(u8, prepared.sql_text);
@@ -2196,7 +2196,7 @@ test "postgres source runtime batches simple aggregations into one query" {
         last_sql: ?[]u8 = null,
         last_args: []sql.ParameterValue = &.{},
 
-        fn query(ptr: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: sql.PreparedQuery, _: ?u64) !foreign_source.QueryResult {
+        fn query(ptr: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: sql.PreparedQuery, _: ?u64, _: ?*const std.atomic.Value(bool)) !foreign_source.QueryResult {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.last_sql) |value| inner_alloc.free(value);
             for (self.last_args) |*arg| arg.deinit(inner_alloc);
@@ -2308,7 +2308,7 @@ test "postgres source runtime executes stats and terms aggregations with transla
             self.args_list.deinit(inner_alloc);
         }
 
-        fn query(ptr: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: sql.PreparedQuery, _: ?u64) !foreign_source.QueryResult {
+        fn query(ptr: *anyopaque, inner_alloc: Allocator, _: []const u8, prepared: sql.PreparedQuery, _: ?u64, _: ?*const std.atomic.Value(bool)) !foreign_source.QueryResult {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.sql_texts.append(inner_alloc, try inner_alloc.dupe(u8, prepared.sql_text));
             try self.args_list.append(inner_alloc, try cloneArgsAlloc(inner_alloc, prepared.args));

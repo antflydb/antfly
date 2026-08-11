@@ -117,6 +117,7 @@ pub const platform_clock = @import("antfly_platform").clock;
 pub const platform_sync = @import("antfly_platform").sync;
 pub const platform_time = @import("antfly_platform").time;
 pub const portable_backup = @import("storage/portable_backup.zig");
+pub const restore_state_contract = @import("storage/restore_state_contract.zig");
 pub const public_api = @import("api/mod.zig");
 pub const raft = @import("raft/mod.zig");
 pub const raft_catalog = @import("raft/catalog.zig");

@@ -19,8 +19,6 @@ const httpx = @import("httpx");
 const antfly = @import("runtime_root.zig");
 const group_ids = @import("../common/group_ids.zig");
 const threaded_io_limits = @import("../common/threaded_io_limits.zig");
-const metadata_openapi = @import("antfly_metadata_openapi");
-const usermgr_openapi = @import("antfly_usermgr_openapi");
 const fs_paths = @import("../common/fs_paths.zig");
 const platform_time = @import("antfly_platform").time;
 const platform = @import("antfly_platform");
@@ -1927,15 +1925,7 @@ fn serveUnifiedInner(
     }
 
     // Register antfly public API routes under /db/v1
-    if (comptime builtin.is_test) {
-        const public_router = metadata_openapi.server.ServerRouter(AntflyApiHandler).init(handler);
-        var public_prefixed = PrefixedServer("/db/v1", httpx.Server){ .inner = &server };
-        try public_router.register(&public_prefixed);
-        const usermgr_router = usermgr_openapi.server.ServerRouter(AntflyApiHandler).init(handler);
-        try usermgr_router.register(&server);
-    } else {
-        try handler.registerRoutes(&server);
-    }
+    try handler.registerRoutes(&server);
 
     // Health/ready at root level
     try server.get("/healthz", healthzHandler);
@@ -2011,28 +2001,6 @@ fn publicHttpServerConfig(bind_host: []const u8, bind_port: u16) httpx.ServerCon
         // The standalone listener lease supplies exclusivity while preserving
         // restart-safe address reuse for connections in TIME_WAIT.
         .reuse_address = true,
-    };
-}
-
-fn PrefixedServer(comptime prefix: []const u8, comptime Inner: type) type {
-    return struct {
-        inner: *Inner,
-
-        pub fn post(self: *const @This(), comptime path: []const u8, handler_fn: httpx.Handler) !void {
-            try self.inner.post(prefix ++ path, handler_fn);
-        }
-
-        pub fn get(self: *const @This(), comptime path: []const u8, handler_fn: httpx.Handler) !void {
-            try self.inner.get(prefix ++ path, handler_fn);
-        }
-
-        pub fn put(self: *const @This(), comptime path: []const u8, handler_fn: httpx.Handler) !void {
-            try self.inner.put(prefix ++ path, handler_fn);
-        }
-
-        pub fn delete(self: *const @This(), comptime path: []const u8, handler_fn: httpx.Handler) !void {
-            try self.inner.delete(prefix ++ path, handler_fn);
-        }
     };
 }
 

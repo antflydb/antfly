@@ -18066,6 +18066,7 @@ test "api http plain public query preserves outer absolute request deadline" {
         null,
         outer_deadline_ns,
         .{ .domain = .internal, .value = "test" },
+        null,
     );
     defer response.deinit(alloc);
     try std.testing.expectEqualStrings("{\"hits\":[],\"total\":0}", response.json);
@@ -26572,9 +26573,9 @@ test "api http server enforces session adoption timeout when configured" {
     var durable = transactions_api.DurableSessionStore.init(alloc, &session_store);
     const lease_store = transactions_api.SessionLeaseStore.init(alloc, &session_store);
 
-    var registry = transactions_api.SessionRegistry.initWithLeaseTtl(alloc, &durable, lease_store, std.time.ns_per_s);
-    defer registry.deinit();
-    const session = try registry.begin(.{ .sync_level = .write }, 7);
+    var registry = transactions_api.SessionRegistry.initWithLeaseTtl(&durable, lease_store, std.time.ns_per_s);
+    defer registry.deinit(alloc);
+    const session = try registry.begin(alloc, .{ .sync_level = .write }, 7);
 
     const FakeSource = struct {
         fn iface(_: *@This()) StatusSource {

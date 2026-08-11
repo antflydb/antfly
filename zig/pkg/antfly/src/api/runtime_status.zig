@@ -3010,6 +3010,7 @@ test "table runtime snapshot cache preserves previous snapshots when replace pre
 
             publishRefreshForTest(&cache, refresh) catch |err| switch (err) {
                 error.OutOfMemory => {},
+                else => return err,
             };
 
             var docs = (try cache.snapshot(alloc, "docs")).?;
