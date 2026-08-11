@@ -53,11 +53,25 @@ fn mainImpl(init: std.process.Init) anyerror!void {
         args.next() orelse return error.InvalidArguments
     else
         @tagName(role_options.role);
+    var argument_views: std.ArrayListUnmanaged(bridge.Bytes) = .empty;
+    defer argument_views.deinit(init.gpa);
+    while (args.next()) |arg| try argument_views.append(init.gpa, .init(arg));
+
+    const environment_names = init.environ_map.keys();
+    const environment_values = init.environ_map.values();
+    std.debug.assert(environment_names.len == environment_values.len);
+    const environment = try init.gpa.alloc(bridge.EnvironmentEntry, environment_names.len);
+    defer init.gpa.free(environment);
+    for (environment, environment_names, environment_values) |*entry, name, value| {
+        entry.* = .{ .name = .init(name), .value = .init(value) };
+    }
+
     const context = bridge.Context{
-        .init = @ptrCast(&init),
-        .args = @ptrCast(&args),
-        .command_ptr = command.ptr,
-        .command_len = command.len,
+        .command = .init(command),
+        .arguments_ptr = if (argument_views.items.len == 0) null else argument_views.items.ptr,
+        .arguments_len = argument_views.items.len,
+        .environment_ptr = if (environment.len == 0) null else environment.ptr,
+        .environment_len = environment.len,
     };
     const code = switch (role_options.role) {
         .cli => antfly_runtime_cli(&context),

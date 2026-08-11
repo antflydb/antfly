@@ -573,7 +573,12 @@ jobs:
 
       - name: Run corpus-scale release regressions
         working-directory: zig
-        run: taskset -c ${{ steps.cpus.outputs.list }} zig build release-scale-test -j${{ steps.cpus.outputs.build_jobs }}
+        run: >-
+          taskset -c ${{ steps.cpus.outputs.list }}
+          python3 tools/run_bounded_zig_build.py --zig zig -- build
+          release-scale-test
+          --build-runner ${{ steps.cpus.outputs.build_runner }}
+          --maxrss ${{ steps.cpus.outputs.max_rss }}
 
       - name: Set up Java for TLA+
         uses: actions/setup-java@v5
@@ -589,15 +594,30 @@ jobs:
 
       - name: Run Zig simulation tests
         working-directory: zig
-        run: taskset -c ${{ steps.cpus.outputs.list }} zig build sim-test
+        run: >-
+          taskset -c ${{ steps.cpus.outputs.list }}
+          python3 tools/run_bounded_zig_build.py --zig zig -- build
+          sim-test
+          --build-runner ${{ steps.cpus.outputs.build_runner }}
+          --maxrss ${{ steps.cpus.outputs.max_rss }}
 
       - name: Run Zig integration tests
         working-directory: zig
-        run: taskset -c ${{ steps.cpus.outputs.list }} zig build integration-test
+        run: >-
+          taskset -c ${{ steps.cpus.outputs.list }}
+          python3 tools/run_bounded_zig_build.py --zig zig -- build
+          integration-test
+          --build-runner ${{ steps.cpus.outputs.build_runner }}
+          --maxrss ${{ steps.cpus.outputs.max_rss }}
 
       - name: Run Zig recall tests
         working-directory: zig
-        run: taskset -c ${{ steps.cpus.outputs.list }} zig build recall-test
+        run: >-
+          taskset -c ${{ steps.cpus.outputs.list }}
+          python3 tools/run_bounded_zig_build.py --zig zig -- build
+          recall-test
+          --build-runner ${{ steps.cpus.outputs.build_runner }}
+          --maxrss ${{ steps.cpus.outputs.max_rss }}
 
       - name: Run Zig recall harness sweep
         working-directory: zig
@@ -618,13 +638,23 @@ jobs:
           )
           for dataset in "${datasets[@]}"; do
             echo "::group::recall-harness ${dataset}"
-            taskset -c ${{ steps.cpus.outputs.list }} zig build recall-harness -- --dataset-dir testdata/vectorsets --dataset "${dataset}"
+            taskset -c ${{ steps.cpus.outputs.list }} \
+              python3 tools/run_bounded_zig_build.py --zig zig -- build \
+              recall-harness \
+              --build-runner ${{ steps.cpus.outputs.build_runner }} \
+              --maxrss ${{ steps.cpus.outputs.max_rss }} \
+              -- --dataset-dir testdata/vectorsets --dataset "${dataset}"
             echo "::endgroup::"
           done
 
       - name: Run Zig chaos tests
         working-directory: zig
-        run: taskset -c ${{ steps.cpus.outputs.list }} zig build chaos-test ${ZIG_BUILD_FLAGS}
+        run: >-
+          taskset -c ${{ steps.cpus.outputs.list }}
+          python3 tools/run_bounded_zig_build.py --zig zig -- build
+          chaos-test ${ZIG_BUILD_FLAGS}
+          --build-runner ${{ steps.cpus.outputs.build_runner }}
+          --maxrss ${{ steps.cpus.outputs.max_rss }}
 
   zig-base:
     name: zig-base

@@ -139,6 +139,28 @@ pub const Detail = enum(c_int) {
     unsupported_platform,
     // Append-only: numeric Detail values are part of the stable C ABI.
     unsupported_transform_operation,
+    ha_read_requires_primary,
+    ha_read_wait_for_apply,
+    ha_read_wait_for_metadata,
+    persistent_descriptor_admission_exhausted,
+    invalid_graph_edges,
+    invalid_table_index_metadata,
+    transaction_begin_failed,
+    abort_decision_not_durable,
+    commit_visibility_not_satisfied,
+    leader_unavailable,
+    raft_batch_write_outcome_unknown,
+    raft_batch_write_partial_outcome,
+    enrichment_retry_in_progress,
+    resource_budget_exceeded,
+    text_merge_backpressure_timeout,
+    text_merge_backpressure_unavailable,
+    text_merge_runtime_shutdown,
+    background_owner_closing,
+    invalid_enrichment_config,
+    restore_identity_mismatch,
+    table_read_churn,
+    unsupported_multi_range_table,
 };
 
 pub const Status = extern struct {
@@ -191,7 +213,11 @@ pub fn statusFromError(err: anyerror) Status {
         error.WriteUnavailable => status(.unavailable, .write_unavailable),
         error.ReadUnavailable => status(.unavailable, .read_unavailable),
         error.ReadRequiresPrimary => status(.unavailable, .read_requires_primary),
+        error.HAReadRequiresPrimary => status(.unavailable, .ha_read_requires_primary),
+        error.HAReadWaitForApply => status(.retryable, .ha_read_wait_for_apply),
+        error.HAReadWaitForMetadata => status(.retryable, .ha_read_wait_for_metadata),
         error.StorageReadTemporarilyUnavailable => status(.retryable, .storage_read_temporarily_unavailable),
+        error.PersistentDescriptorAdmissionExhausted => status(.retryable, .persistent_descriptor_admission_exhausted),
         error.ResourceRequestTooLarge => status(.invalid_argument, .resource_request_too_large),
         error.ResourceTemporarilyUnavailable => status(.retryable, .resource_temporarily_unavailable),
         error.RestoreJobPersistenceUnavailable => status(.unavailable, .restore_job_persistence_unavailable),
@@ -200,14 +226,20 @@ pub fn statusFromError(err: anyerror) Status {
         error.OutcomeUnknown => status(.retryable, .outcome_unknown),
         error.CommitPropagationIncomplete => status(.retryable, .commit_propagation_incomplete),
         error.CommitDecisionUnknown => status(.retryable, .commit_decision_unknown),
+        error.CommitVisibilityNotSatisfied => status(.retryable, .commit_visibility_not_satisfied),
+        error.TransactionBeginFailed => status(.unavailable, .transaction_begin_failed),
+        error.AbortDecisionNotDurable => status(.unavailable, .abort_decision_not_durable),
         error.CommittedPending => status(.retryable, .committed_pending),
         error.WriteOutcomeUnknown => status(.retryable, .write_outcome_unknown),
+        error.RaftBatchWriteOutcomeUnknown => status(.retryable, .raft_batch_write_outcome_unknown),
+        error.RaftBatchWritePartialOutcome => status(.retryable, .raft_batch_write_partial_outcome),
         error.DocIdentityUnavailable => status(.retryable, .doc_identity_unavailable),
         error.HAReadOnlyStandby => status(.unavailable, .ha_read_only_standby),
         error.HAPromotedStandbyRequiresPrimaryOpen => status(.unavailable, .ha_promoted_standby_requires_primary_open),
         error.HAFencedPrimary => status(.conflict, .ha_fenced_primary),
         error.InternalFailure => status(.internal, .internal_failure),
         error.NotLeader => status(.retryable, .not_leader),
+        error.LeaderUnavailable => status(.unavailable, .leader_unavailable),
         error.TopologyChanged => status(.retryable, .topology_changed),
         error.IdentityReadGenerationChanged => status(.conflict, .identity_read_generation_changed),
         error.DocIdentityNamespaceMismatch => status(.conflict, .doc_identity_namespace_mismatch),
@@ -222,6 +254,9 @@ pub fn statusFromError(err: anyerror) Status {
         error.Unsupported => status(.unsupported, .unsupported),
         error.UnsupportedOperation => status(.unsupported, .unsupported_operation),
         error.UnsupportedTransformOperation => status(.invalid_argument, .unsupported_transform_operation),
+        error.InvalidGraphEdges => status(.invalid_argument, .invalid_graph_edges),
+        error.InvalidTableIndexMetadata => status(.invalid_argument, .invalid_table_index_metadata),
+        error.InvalidEnrichmentConfig => status(.invalid_argument, .invalid_enrichment_config),
         error.UnsupportedQueryRequest => status(.unsupported, .unsupported_query_request),
         error.UnsupportedFilterQueryRequest => status(.unsupported, .unsupported_filter_query_request),
         error.UnsupportedExclusionQueryRequest => status(.unsupported, .unsupported_exclusion_query_request),
@@ -265,6 +300,15 @@ pub fn statusFromError(err: anyerror) Status {
         error.CorruptRestoreJobStore => status(.corrupt, .corrupt_restore_job_store),
         error.TableBlockChecksumMismatch => status(.corrupt, .table_block_checksum_mismatch),
         error.ValueTooLong => status(.invalid_argument, .value_too_long),
+        error.EnrichmentRetryInProgress => status(.retryable, .enrichment_retry_in_progress),
+        error.ResourceBudgetExceeded => status(.retryable, .resource_budget_exceeded),
+        error.TextMergeBackpressureTimeout => status(.retryable, .text_merge_backpressure_timeout),
+        error.TextMergeBackpressureUnavailable => status(.retryable, .text_merge_backpressure_unavailable),
+        error.TextMergeRuntimeShutdown => status(.unavailable, .text_merge_runtime_shutdown),
+        error.BackgroundOwnerClosing => status(.unavailable, .background_owner_closing),
+        error.RestoreIdentityMismatch => status(.conflict, .restore_identity_mismatch),
+        error.TableReadChurn => status(.retryable, .table_read_churn),
+        error.UnsupportedMultiRangeTable => status(.unsupported, .unsupported_multi_range_table),
         else => status(.internal, .none),
     };
 }
@@ -397,6 +441,28 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .value_too_long => "ValueTooLong",
         .unsupported_platform => "UnsupportedPlatform",
         .unsupported_transform_operation => "UnsupportedTransformOperation",
+        .ha_read_requires_primary => "HAReadRequiresPrimary",
+        .ha_read_wait_for_apply => "HAReadWaitForApply",
+        .ha_read_wait_for_metadata => "HAReadWaitForMetadata",
+        .persistent_descriptor_admission_exhausted => "PersistentDescriptorAdmissionExhausted",
+        .invalid_graph_edges => "InvalidGraphEdges",
+        .invalid_table_index_metadata => "InvalidTableIndexMetadata",
+        .transaction_begin_failed => "TransactionBeginFailed",
+        .abort_decision_not_durable => "AbortDecisionNotDurable",
+        .commit_visibility_not_satisfied => "CommitVisibilityNotSatisfied",
+        .leader_unavailable => "LeaderUnavailable",
+        .raft_batch_write_outcome_unknown => "RaftBatchWriteOutcomeUnknown",
+        .raft_batch_write_partial_outcome => "RaftBatchWritePartialOutcome",
+        .enrichment_retry_in_progress => "EnrichmentRetryInProgress",
+        .resource_budget_exceeded => "ResourceBudgetExceeded",
+        .text_merge_backpressure_timeout => "TextMergeBackpressureTimeout",
+        .text_merge_backpressure_unavailable => "TextMergeBackpressureUnavailable",
+        .text_merge_runtime_shutdown => "TextMergeRuntimeShutdown",
+        .background_owner_closing => "BackgroundOwnerClosing",
+        .invalid_enrichment_config => "InvalidEnrichmentConfig",
+        .restore_identity_mismatch => "RestoreIdentityMismatch",
+        .table_read_churn => "TableReadChurn",
+        .unsupported_multi_range_table => "UnsupportedMultiRangeTable",
     };
 }
 
@@ -409,6 +475,11 @@ test "stable status preserves public boundary semantics" {
     try std.testing.expectEqual(error.ResourceTemporarilyUnavailable, errorFromStatus(statusFromError(error.ResourceTemporarilyUnavailable)));
     try std.testing.expectEqual(error.UnsupportedPlatform, errorFromStatus(statusFromError(error.UnsupportedPlatform)));
     try std.testing.expectEqual(error.UnsupportedTransformOperation, errorFromStatus(statusFromError(error.UnsupportedTransformOperation)));
+    try std.testing.expectEqual(error.HAReadRequiresPrimary, errorFromStatus(statusFromError(error.HAReadRequiresPrimary)));
+    try std.testing.expectEqual(error.PersistentDescriptorAdmissionExhausted, errorFromStatus(statusFromError(error.PersistentDescriptorAdmissionExhausted)));
+    try std.testing.expectEqual(error.CommitVisibilityNotSatisfied, errorFromStatus(statusFromError(error.CommitVisibilityNotSatisfied)));
+    try std.testing.expectEqual(error.AbortDecisionNotDurable, errorFromStatus(statusFromError(error.AbortDecisionNotDurable)));
+    try std.testing.expectEqual(error.LeaderUnavailable, errorFromStatus(statusFromError(error.LeaderUnavailable)));
     try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(statusFromError(error.UnitPrivateError)));
 }
 

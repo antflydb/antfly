@@ -157,23 +157,15 @@ zig_install_args=(
   --global-cache-dir "$cache_root/global"
 )
 
-zig_lib_dir="$(zig env | sed -n 's/^[[:space:]]*\.lib_dir = "\(.*\)",$/\1/p')"
-if [ -z "$zig_lib_dir" ] || [ ! -f "$zig_lib_dir/compiler/build_runner.zig" ]; then
-  echo "unable to locate Zig 0.16 build_runner.zig from 'zig env'" >&2
-  exit 1
-fi
-patched_build_runner="$work_root/zig-build-runner-maxrss.zig"
-python3 "$repo_root/zig/tools/patch_zig_0_16_build_runner_maxrss.py" \
-  "$zig_lib_dir/compiler/build_runner.zig" \
-  "$patched_build_runner"
-max_rss="$(python3 "$repo_root/zig/tools/run_bounded_zig_build.py" --print-max-rss)"
-zig_install_args+=(
-  --build-runner "$patched_build_runner"
-  --maxrss "$max_rss"
-)
-
 run_zig_build_steps() {
-  local -a command=(zig build)
+  local -a command=(
+    python3
+    "$repo_root/zig/tools/run_bounded_zig_build.py"
+    --zig
+    zig
+    --
+    build
+  )
 
   if [ -n "$jobs" ]; then
     command+=("-j$jobs")

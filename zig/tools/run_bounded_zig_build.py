@@ -17,6 +17,12 @@ from patch_zig_0_16_build_runner_maxrss import patch_build_runner
 
 
 DEFAULT_MEMORY_FRACTION = 4 / 5
+# Keep enough aggregate headroom for the build runner, linker, filesystem
+# cache, and unrelated job processes even on large shared hosts. This ceiling
+# is deliberately above the largest measured compilation unit (distributed,
+# about 11 GiB), while preventing the distributed, API, inference, and CLI
+# claims from all being admitted together.
+DEFAULT_SCHEDULER_CEILING = 16 * 1024 * 1024 * 1024
 MAX_RSS_ENV = "ANTFLY_ZIG_MAX_RSS"
 CGROUP_MEMORY_LIMITS = (
     Path("/sys/fs/cgroup/memory.max"),
@@ -40,7 +46,8 @@ def detect_max_rss() -> int:
             raise RuntimeError(f"{MAX_RSS_ENV} must be a positive byte count")
         return parsed
 
-    return int(detect_memory_limit() * DEFAULT_MEMORY_FRACTION)
+    detected_budget = int(detect_memory_limit() * DEFAULT_MEMORY_FRACTION)
+    return min(detected_budget, DEFAULT_SCHEDULER_CEILING)
 
 
 def detect_memory_limit() -> int:

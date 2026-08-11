@@ -12,10 +12,8 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const builtin = @import("builtin");
 const std = @import("std");
 const structlog = @import("structlog");
-const platform = @import("antfly_platform");
 const build_options = @import("build_options");
 const runtime_bridge = @import("runtime_bridge.zig");
 
@@ -110,12 +108,26 @@ fn runRuntimeUnit(
     command: []const u8,
     init: std.process.Init,
     args: *std.process.Args.Iterator,
-) void {
+) !void {
+    var argument_views: std.ArrayListUnmanaged(runtime_bridge.Bytes) = .empty;
+    defer argument_views.deinit(init.gpa);
+    while (args.next()) |arg| try argument_views.append(init.gpa, .init(arg));
+
+    const environment_names = init.environ_map.keys();
+    const environment_values = init.environ_map.values();
+    std.debug.assert(environment_names.len == environment_values.len);
+    const environment = try init.gpa.alloc(runtime_bridge.EnvironmentEntry, environment_names.len);
+    defer init.gpa.free(environment);
+    for (environment, environment_names, environment_values) |*entry, name, value| {
+        entry.* = .{ .name = .init(name), .value = .init(value) };
+    }
+
     const context = runtime_bridge.Context{
-        .init = @ptrCast(&init),
-        .args = @ptrCast(args),
-        .command_ptr = command.ptr,
-        .command_len = command.len,
+        .command = .init(command),
+        .arguments_ptr = if (argument_views.items.len == 0) null else argument_views.items.ptr,
+        .arguments_len = argument_views.items.len,
+        .environment_ptr = if (environment.len == 0) null else environment.ptr,
+        .environment_len = environment.len,
     };
     const code = switch (role) {
         .cli => antfly_runtime_cli(&context),
@@ -213,22 +225,6 @@ fn printUsage(argv0: []const u8) void {
 
 fn printVersion() void {
     std.debug.print("antfly {s} (zig runtime)\n", .{build_options.antfly_version});
-}
-
-fn runtimeInit(init: std.process.Init) std.process.Init {
-    return .{
-        .minimal = init.minimal,
-        .arena = init.arena,
-        .gpa = runtimeAllocator(init),
-        .io = init.io,
-        .environ_map = init.environ_map,
-        .preopens = init.preopens,
-    };
-}
-
-fn runtimeAllocator(init: std.process.Init) std.mem.Allocator {
-    const fallback = if (!builtin.single_threaded) std.heap.smp_allocator else init.gpa;
-    return platform.allocator.processAllocator(fallback);
 }
 
 test "main cmd compiles" {

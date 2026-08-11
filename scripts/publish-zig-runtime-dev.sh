@@ -125,7 +125,7 @@ mkdir -p "$cache_dir"
 echo "Building $arch Zig runtime artifact for $zig_target"
 (
   cd "$repo_root/zig"
-  zig build \
+  python3 tools/run_bounded_zig_build.py --zig zig -- build \
     antfly \
     -Dtarget="$zig_target" \
     -Doptimize=ReleaseFast \

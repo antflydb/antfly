@@ -37,6 +37,18 @@ class BoundedZigBuildTest(unittest.TestCase):
             ):
                 self.assertEqual(8_000, launcher.detect_max_rss())
 
+    def test_large_host_cannot_admit_every_runtime_unit_together(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with mock.patch.object(
+                launcher,
+                "detect_memory_limit",
+                return_value=64 * 1024 * 1024 * 1024,
+            ):
+                self.assertEqual(
+                    launcher.DEFAULT_SCHEDULER_CEILING,
+                    launcher.detect_max_rss(),
+                )
+
     def test_command_adds_missing_scheduler_options(self):
         command = launcher.build_command(
             "zig",
