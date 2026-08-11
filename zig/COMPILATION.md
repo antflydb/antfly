@@ -251,8 +251,8 @@ The opt-in experiment now selects a different four-unit composition:
 
 ```text
 antfly executable
-├── antfly-runtime-distributed  # API plus data/metadata/HA control consumers
-├── antfly-storage-kernel       # physical storage, serverless, standalone/Lite, CAPI
+├── antfly-runtime-distributed  # API/distributed control plus product composition
+├── antfly-storage-kernel       # physical storage/local query, restore, CAPI
 ├── antfly-runtime-inference    # inference plus standalone inference host
 └── antfly-runtime-cli          # remote/client commands only
 ```
@@ -2871,6 +2871,73 @@ workflow now invokes the Node 24 binary bundled with the Actions runner and
 fails collector setup immediately; this run neither accepts nor rejects the
 architecture.
 
+The corrected capture, run `31450058350` at commit `a018af4b2`, completed on
+the normal runner and produced all four authoritative reports. The WebUI
+instrumentation build took 18:17.56 wall time and 10,561,540 KiB process-tree
+peak RSS with zero swap. Its compiler reports were:
+
+| Unit | Total | LLVM emission | Repository files / lines | Declarations |
+|---|---:|---:|---:|---:|
+| Storage | 689.361 s | 675.627 s (98.0%) | 714 / 1,057,526 | 39,624 |
+| Distributed/API | 501.152 s | 489.937 s (97.8%) | 557 / 848,638 | 31,464 |
+| Inference | 487.309 s | 438.081 s (89.9%) | 524 / 579,553 | 24,966 |
+| Remote CLI | 68.494 s | 65.435 s (95.5%) | 53 / 39,003 | 5,804 |
+
+Across the four reports there were 1,848 repository-file instances but only
+1,203 unique files, leaving 645 duplicate analysis/codegen instances. More
+importantly, storage and distributed shared 503 files and 778,101 source lines,
+or 90.3% of the smaller distributed graph. Storage alone still analyzed 51 API
+files and 201,656 API lines; distributed still analyzed 121 storage files and
+246,556 storage lines. The largest aggregate duplicated groups were storage
+(119 duplicate instances / 245,781 duplicate lines), API (49 / 200,378), and
+HTTPX (72 / 61,823).
+
+This rejects the claim that the first source-selected artifact was already a
+storage-only kernel. Its explicit ownership of standalone, Lite, and serverless
+composition re-imported most data/API/control code, while the distributed
+consumer retained the corresponding control-side storage contracts. The next
+coarse experiment therefore moves those product orchestration roots to the
+distributed control unit and leaves physical storage, local-query execution,
+restore staging, and CAPI exports in the kernel.
+
+That placement compiles without adding a new fine-grained ABI: the existing
+control-only provisioned-storage selection already routes its physical
+operations through the opaque owner interface. Linked native Debug, all graph
+gates, 8 opaque-owner tests, 6 provisioned-source tests, 13 cross-archive data
+runtime tests, and 10 CAPI tests pass with zero leaks.
+
+Two clean local ARM64 Linux musl `ReleaseFast` builds measured the composition
+move and then corrected its deterministic scheduling edge:
+
+| Metric | Source-selected placement | Composition moved, old gate | Composition moved, storage gate |
+|---|---:|---:|---:|
+| Complete build | 458 s | 541.61 s | 409.34 s |
+| Storage kernel | 316 s / 4.03 GiB | 3 m / 6 GiB | 3 m / 6 GiB |
+| Distributed/API/composition | 233 s / 2.98 GiB | 5 m / 9 GiB | 5 m / 7 GiB |
+| Inference | 202 s / 3.34 GiB | 3 m / 5 GiB | 3 m / 5 GiB |
+| Remote CLI | 33 s / 0.74 GiB | 31 s / 1 GiB | 30 s / 1 GiB |
+| Static executable | 65,273,152 B | not retained | 68,996,496 B |
+| `libantfly.so` | 16,682,104 B | not retained | 16,553,032 B |
+
+The first moved build waited for the newly longer distributed unit before
+starting inference. The corrected graph instead admits inference when the now
+shorter storage unit releases its claim, overlapping inference with the tail
+of distributed under the same 20,000 MiB scheduler cap and normal compiler
+concurrency. That removes 132.27 seconds of avoidable wall time without a
+runner-cost change. The storage archive shrinks from 36,705,768 B to
+26,022,134 B and distributed grows from 23,861,542 B to 37,985,820 B. The CAPI
+remains small, while the executable grows 5.70%, slightly above the approximate
+5% guardrail.
+
+Decision: **keep the composition placement as the next opt-in candidate, but
+do not enable it by default yet**. It materially makes the intended ownership
+boundary true and puts both local compiler units below 350 seconds, but the
+409.34-second local wall path and executable growth require fresh authoritative
+reports and a clean normal-runner measurement before acceptance. The next run
+must show whether the Linux distributed unit remains below 380 seconds and
+whether the storage/distributed overlap actually falls rather than merely
+moves.
+
 Artifact validation found one stripped static ARM64 executable, a 16,682,104 B
 `libantfly.so`, and one 36,705,768 B storage archive reused by both product
 links. The storage archive contains no native `mdb_*`, `lmdb_backend`, or
@@ -2923,21 +2990,23 @@ owner and separately compiled control consumers:
 thin linked main
 ├── API protocol and distributed-control consumer islands
 │   ├── HTTP/auth/public translation, routing, topology, fanout and merge
+│   ├── serverless orchestration plus standalone/Lite product composition
 │   └── opaque storage handles plus coarse request/result/callback ABIs
 ├── provisioned storage/local-query kernel (PIC, sectioned, compiled once)
-│   ├── DB/LSM/index ownership, serverless, and complete group-local queries
+│   ├── DB/LSM/index ownership and complete group-local query execution
 │   ├── writes, transaction participants, snapshots, restore and maintenance
 │   └── public C API exports reused by the shared libraries
 └── inference island
     └── model lifecycle plus the linked standalone inference host
 ```
 
-The candidate grouping keeps remote CLI separate; co-generates API with the
-data, metadata, and HA control consumers; and keeps serverless local execution,
-standalone/Lite, restore, physical storage, and the C API in the storage unit.
-Further regrouping is a measured decision, not a prerequisite for normal-runner
-validation. Standalone remains a product composition mode and always links the
-separately compiled inference host.
+The current candidate grouping keeps remote CLI separate; co-generates API,
+serverless orchestration, standalone/Lite composition, and the data, metadata,
+and HA control consumers; and keeps restore staging, physical storage/local
+query execution, and the C API in the storage unit. Standalone remains a
+product composition mode and always links the separately compiled inference
+host. Fresh Linux reports determine whether this placement is accepted or
+revised again.
 
 The kernel is not a per-backend wrapper and not an internal RPC service. It is
 one static PIC artifact linked into the executable and the C API libraries.
@@ -2953,7 +3022,7 @@ compiled ABI between control consumers and physical storage ownership.
 | Layer | Owns | Must not own |
 |---|---|---|
 | API protocol | HTTP, auth, public validation, request translation | Provisioned DB ownership, raft application |
-| Serverless | Published artifact lifecycle and serverless-local query execution | Provisioned table/shard ownership or cluster Raft |
+| Serverless | Published artifact lifecycle and serverless request orchestration | Provisioned table/shard ownership, physical query execution, or cluster Raft |
 | Distributed control | Table routing, topology, leadership, fanout, distributed merge, transaction coordination | Local storage implementation details |
 | Provisioned storage | Table and shard handles, local physical query execution, batches, transaction participant state, snapshots, restore publication, maintenance | HTTP, auth, cluster routing, remote topology |
 | Inference | Model lifecycle and inference execution | Table/storage ownership |

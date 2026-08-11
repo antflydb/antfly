@@ -62,29 +62,29 @@ const metadata_runtime = if (unit_options.unit == .distributed or unit_options.u
     @import("metadata/runtime.zig")
 else
     struct {};
-// Serverless owns a complete local query/maintenance runtime. Co-generate it
-// with the application/storage owner so API protocol handling does not emit a
-// second copy of physical query and storage implementation.
-const serverless_runtime = if ((unit_options.unit == .distributed and !unit_options.storage_kernel_experiment) or
-    unit_options.unit == .storage_kernel or unit_options.unit == .application_pic_probe)
+// Serverless owns local orchestration, but provisioned physical operations use
+// the selected opaque storage source in the kernel experiment. Keep it with
+// distributed/API control so the kernel does not re-import that control graph.
+const serverless_runtime = if (unit_options.unit == .distributed or
+    unit_options.unit == .application_pic_probe)
     @import("cmd/serverless.zig")
 else
     struct {};
 const inference_runtime = if (unit_options.unit == .inference) @import("inference_runtime/runtime.zig") else struct {};
-// Standalone adds about 35 seconds when co-generated with the server roles but
-// costs 6 minutes and 8 GiB as a separate ARM64 Linux unit. Keep it co-located
-// until the shared storage kernel removes that duplicated LLVM work.
-const standalone_runtime = if ((unit_options.unit == .distributed and !unit_options.storage_kernel_experiment) or
-    unit_options.unit == .storage_kernel or unit_options.unit == .storage_runtime_pic_probe or
+// Standalone adds little when co-generated with the server roles but costs a
+// large independent ARM64 Linux unit. It is product composition, so keep it
+// with distributed control while storage and inference remain linked islands.
+const standalone_runtime = if (unit_options.unit == .distributed or
+    unit_options.unit == .storage_runtime_pic_probe or
     unit_options.unit == .application_pic_probe)
     @import("standalone/runtime.zig")
 else
     struct {};
-// Lite's non-server commands share storage types with standalone, while
-// `lite serve` directly enters that runtime. Co-locating Lite and the server
-// roles gives them one storage type identity and one LLVM unit.
-const lite_runtime = if ((unit_options.unit == .distributed and !unit_options.storage_kernel_experiment) or
-    unit_options.unit == .storage_kernel or unit_options.unit == .storage_runtime_pic_probe or
+// Lite's non-server commands share types with standalone, while `lite serve`
+// directly enters that runtime. Co-locating them preserves one control-side
+// type identity; physical storage remains behind the linked kernel boundary.
+const lite_runtime = if (unit_options.unit == .distributed or
+    unit_options.unit == .storage_runtime_pic_probe or
     unit_options.unit == .application_pic_probe)
     @import("cmd/lite.zig")
 else
@@ -256,9 +256,9 @@ comptime {
             exportInternal(&haEntry, "antfly_runtime_ha");
             exportInternal(&metadataEntry, "antfly_runtime_metadata");
             if (unit_options.storage_kernel_experiment) exportApiKernel();
+            exportInternal(&serverlessEntry, "antfly_runtime_serverless");
+            exportInternal(&standaloneEntry, "antfly_runtime_standalone");
             if (!unit_options.storage_kernel_experiment) {
-                exportInternal(&serverlessEntry, "antfly_runtime_serverless");
-                exportInternal(&standaloneEntry, "antfly_runtime_standalone");
                 exportInternal(&restore_staging_exports.create, "antfly_restore_staging_create");
                 exportInternal(&restore_staging_exports.destroy, "antfly_restore_staging_destroy");
                 // The legacy compile-once archive owns both sides of the
@@ -316,12 +316,11 @@ comptime {
             exportInternal(&cliEntry, "antfly_runtime_cli");
         },
         .storage_kernel => {
-            // Storage-owning product runtimes share the same physical DB and
-            // local-query compilation as the C API. Distributed data and
-            // metadata retain only control sources and opaque owner clients.
+            // The kernel owns physical DB and local-query compilation plus
+            // the C API. Product-mode orchestration stays in the distributed
+            // control unit and reaches these implementations through opaque
+            // owner and restore-staging entry points.
             _ = storage_kernel_exports;
-            exportInternal(&serverlessEntry, "antfly_runtime_serverless");
-            exportInternal(&standaloneEntry, "antfly_runtime_standalone");
             exportInternal(&restore_staging_exports.create, "antfly_restore_staging_create");
             exportInternal(&restore_staging_exports.destroy, "antfly_restore_staging_destroy");
             exportInternal(&storage_kernel_exports.storageOwnerContextCreate, "antfly_storage_context_create");

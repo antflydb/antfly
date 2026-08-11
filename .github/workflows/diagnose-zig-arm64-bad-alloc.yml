@@ -66,12 +66,12 @@ jobs:
           # a complete accounting of build-runner state and page cache. Claims
           # admit the measured 9GiB distributed-control consumer and 10.25GiB
           # PIC storage kernel as the initial 19.25GiB group. This fits the
-          # unchanged 20,000MiB cap. When distributed finishes, inference can
-          # overlap the storage tail; the remote CLI starts as soon as another
-          # 3GiB claim fits. Explicit build dependencies keep Zig's randomized
-          # traversal from admitting either downstream unit ahead of the two
-          # critical units. The pod reserve covers runner state, linker work,
-          # page cache, and measurement drift.
+          # unchanged 20,000MiB cap. With product composition moved out of the
+          # kernel, inference starts when storage finishes and overlaps the
+          # distributed tail; the remote CLI starts after distributed. Explicit
+          # build dependencies keep Zig's randomized traversal from admitting
+          # either downstream unit ahead of the two critical units. The pod
+          # reserve covers runner state, linker work, page cache, and drift.
           cd zig
           runner_root="$(dirname "$(dirname "$RUNNER_TEMP")")"
           node_bin="$runner_root/externals/node24/bin/node"

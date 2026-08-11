@@ -67,8 +67,9 @@ const RuntimeLibraryUnit = enum {
     // Measurement-only control island combining the public API kernel with
     // data, metadata, and HA control over the opaque storage-owner ABI.
     control_api_probe,
-    // Application/storage unit: data, metadata, standalone/Lite, local HA,
-    // restore staging, and the shared CAPI implementation.
+    // Distributed/API control plus serverless and standalone/Lite composition.
+    // Under the storage-kernel experiment, physical storage and restore
+    // staging live in the separate storage unit.
     distributed,
     inference,
     // Short remote/client unit. Its compile-step gate below keeps it from
@@ -8820,6 +8821,7 @@ pub fn build(b: *std.Build) void {
         var api_runtime_artifact: ?*std.Build.Step.Compile = null;
         var application_runtime_artifact: ?*std.Build.Step.Compile = null;
         var inference_runtime_artifact: ?*std.Build.Step.Compile = null;
+        var storage_runtime_artifact: ?*std.Build.Step.Compile = null;
         var storage_owner_tests: ?*std.Build.Step.Compile = null;
         var storage_provisioned_owner_tests: ?*std.Build.Step.Compile = null;
         var storage_data_runtime_owner_tests: ?*std.Build.Step.Compile = null;
@@ -8911,9 +8913,10 @@ pub fn build(b: *std.Build) void {
             // two edges deterministically preserve useful overlap. The
             // default topology schedules API (7 GiB) with combined
             // application/storage (11 GiB), then inference (8 GiB) with the
-            // latter after API. The physical-source experiment initially
-            // schedules storage (10.25 GiB) with distributed/API control
-            // (9 GiB), then admits inference after distributed finishes.
+            // latter after API. The physical-source experiment schedules
+            // storage (10.25 GiB) with distributed/API/composition (9 GiB),
+            // then admits inference when the shorter storage unit finishes so
+            // it overlaps the tail of distributed without exceeding 20 GiB.
             //
             // This is still concurrent code generation; it only prevents a
             // short or later unit from consuming the claim needed by a
@@ -8928,9 +8931,15 @@ pub fn build(b: *std.Build) void {
                 },
                 .inference => {
                     inference_runtime_artifact = role_artifact;
-                    role_artifact.step.dependOn(&api_runtime_artifact.?.step);
+                    role_artifact.step.dependOn(if (storage_kernel_experiment)
+                        &storage_runtime_artifact.?.step
+                    else
+                        &api_runtime_artifact.?.step);
                 },
                 .cli => role_artifact.step.dependOn(&application_runtime_artifact.?.step),
+                .storage_kernel => if (storage_kernel_experiment) {
+                    storage_runtime_artifact = role_artifact;
+                },
                 else => {},
             }
             if (unit == .data_pic_probe) {
