@@ -41,6 +41,10 @@ pub const Config = struct {
     /// clients normally use the transport defaults; health probes set this so
     /// an unreachable endpoint cannot monopolize an API worker.
     request_timeout_ms: ?u64 = null,
+    /// Optional policy evaluated against the exact resolved endpoint address
+    /// immediately before connect. The policy and its context are borrowed for
+    /// the lifetime of the client.
+    address_filter: ?httpx.AddressFilter = null,
     /// Optional borrowed application runtime. When absent, the client owns a
     /// threaded fallback for standalone library use.
     io: ?std.Io = null,
@@ -165,7 +169,12 @@ const HttpxTransport = struct {
     io_impl: ?*std.Io.Threaded,
     client: httpx.Client,
 
-    fn init(alloc: Allocator, request_timeout_ms: ?u64, shared_io: ?std.Io) !HttpxTransport {
+    fn init(
+        alloc: Allocator,
+        request_timeout_ms: ?u64,
+        shared_io: ?std.Io,
+        address_filter: ?httpx.AddressFilter,
+    ) !HttpxTransport {
         const io_impl: ?*std.Io.Threaded = if (shared_io == null) blk: {
             const owned = try alloc.create(std.Io.Threaded);
             owned.* = std.Io.Threaded.init(alloc, .{});
@@ -175,7 +184,7 @@ const HttpxTransport = struct {
             owned.deinit();
             alloc.destroy(owned);
         };
-        const client_config: httpx.ClientConfig = if (request_timeout_ms) |timeout_ms| .{
+        var client_config: httpx.ClientConfig = if (request_timeout_ms) |timeout_ms| .{
             .timeouts = .{
                 .connect_ms = timeout_ms,
                 .read_ms = timeout_ms,
@@ -185,6 +194,11 @@ const HttpxTransport = struct {
                 .request_ms = timeout_ms,
             },
         } else .{};
+        // S3 authorization is scoped to one exact authority and path. Never
+        // replay it through redirects or ambient cookie state.
+        client_config.redirect_policy = .noFollow();
+        client_config.cookies_enabled = false;
+        client_config.address_filter = address_filter;
         return .{
             .alloc = alloc,
             .io_impl = io_impl,
@@ -330,11 +344,13 @@ test "s3 http transport borrows a shared io runtime" {
     const alloc = std.testing.allocator;
     var shared = std.Io.Threaded.init(alloc, .{});
     defer shared.deinit();
-    var transport = try HttpxTransport.init(alloc, null, shared.io());
+    var transport = try HttpxTransport.init(alloc, null, shared.io(), null);
     defer transport.deinit();
     try std.testing.expect(transport.io_impl == null);
+    try std.testing.expect(!transport.client.config.redirect_policy.follow_redirects);
+    try std.testing.expect(!transport.client.config.cookies_enabled);
 
-    var fallback = try HttpxTransport.init(alloc, null, null);
+    var fallback = try HttpxTransport.init(alloc, null, null, null);
     defer fallback.deinit();
     try std.testing.expect(fallback.io_impl != null);
     try std.testing.expect(fallback.client.io.userdata == @as(?*anyopaque, @ptrCast(fallback.io_impl.?)));
@@ -372,7 +388,7 @@ pub const Client = struct {
     pub fn init(alloc: Allocator, cfg: Config) !Client {
         const transport = try alloc.create(HttpxTransport);
         errdefer alloc.destroy(transport);
-        transport.* = try HttpxTransport.init(alloc, cfg.request_timeout_ms, cfg.io);
+        transport.* = try HttpxTransport.init(alloc, cfg.request_timeout_ms, cfg.io, cfg.address_filter);
         return .{
             .alloc = alloc,
             .cfg = cfg,

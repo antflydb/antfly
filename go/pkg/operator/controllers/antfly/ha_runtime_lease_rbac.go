@@ -8,7 +8,10 @@ import (
 	antflyv1 "github.com/antflydb/antfly/go/pkg/operator/api/antfly/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8sruntime "k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
@@ -26,6 +29,9 @@ func (r *AntflyClusterReconciler) reconcileHARuntimeLeaseRBAC(ctx context.Contex
 	}
 	configured := strings.TrimSpace(cluster.Spec.ServiceAccountName)
 	if !haRuntimeLeaseWatchdogEnabled(cluster) {
+		if err := r.cleanupHARuntimeLeaseRBAC(ctx, cluster, true); err != nil {
+			return "", err
+		}
 		return configured, nil
 	}
 	serviceAccountName := configured
@@ -39,6 +45,8 @@ func (r *AntflyClusterReconciler) reconcileHARuntimeLeaseRBAC(ctx context.Contex
 		}); err != nil {
 			return "", fmt.Errorf("reconcile HA runtime ServiceAccount: %w", err)
 		}
+	} else if err := r.cleanupGeneratedHARuntimeServiceAccount(ctx, cluster); err != nil {
+		return "", err
 	}
 
 	roleName := cluster.Name + haRuntimeLeaseRBACSuffix
@@ -72,6 +80,67 @@ func (r *AntflyClusterReconciler) reconcileHARuntimeLeaseRBAC(ctx context.Contex
 		return "", fmt.Errorf("reconcile HA runtime Lease RoleBinding: %w", err)
 	}
 	return serviceAccountName, nil
+}
+
+// cleanupHARuntimeLeaseRBAC removes only resources owned by this cluster. A
+// resource with the conventional name but different ownership is never
+// adopted or deleted. RoleBinding is removed first so access is revoked before
+// the Role and generated identity disappear.
+func (r *AntflyClusterReconciler) cleanupHARuntimeLeaseRBAC(ctx context.Context, cluster *antflyv1.AntflyCluster, removeGeneratedServiceAccount bool) error {
+	roleName := cluster.Name + haRuntimeLeaseRBACSuffix
+	objects := []struct {
+		object client.Object
+		kind   string
+	}{
+		{object: &rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: roleName, Namespace: cluster.Namespace}}, kind: "RoleBinding"},
+		{object: &rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: roleName, Namespace: cluster.Namespace}}, kind: "Role"},
+	}
+	for _, item := range objects {
+		if err := r.deleteHAOwnedObject(ctx, cluster, item.object); err != nil {
+			return fmt.Errorf("cleanup HA runtime Lease %s: %w", item.kind, err)
+		}
+	}
+	if removeGeneratedServiceAccount {
+		return r.cleanupGeneratedHARuntimeServiceAccount(ctx, cluster)
+	}
+	return nil
+}
+
+func (r *AntflyClusterReconciler) cleanupGeneratedHARuntimeServiceAccount(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
+	serviceAccount := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{
+		Name: cluster.Name + "-ha-runtime", Namespace: cluster.Namespace,
+	}}
+	if err := r.deleteHAOwnedObject(ctx, cluster, serviceAccount); err != nil {
+		return fmt.Errorf("cleanup generated HA runtime ServiceAccount: %w", err)
+	}
+	return nil
+}
+
+func (r *AntflyClusterReconciler) deleteHAOwnedObject(ctx context.Context, cluster *antflyv1.AntflyCluster, object client.Object) error {
+	// Some focused reconcilers intentionally install only the API groups they
+	// exercise. Such a client cannot contain this object kind, so cleanup is a
+	// no-op rather than turning an unrelated reconciliation into a hard failure.
+	if _, _, err := r.Scheme.ObjectKinds(object); err != nil {
+		if k8sruntime.IsNotRegisteredError(err) {
+			return nil
+		}
+		return err
+	}
+	key := client.ObjectKeyFromObject(object)
+	if err := r.Get(ctx, key, object); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	owner := metav1.GetControllerOf(object)
+	if owner == nil || owner.UID != cluster.UID {
+		return nil
+	}
+	if err := r.Delete(ctx, object); err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
+	return nil
 }
 
 func haRuntimeLeaseEnv(cluster *antflyv1.AntflyCluster) []corev1.EnvVar {
@@ -111,10 +180,18 @@ func haRuntimeLeaseMaxFenceLatencyMS(cluster *antflyv1.AntflyCluster) (int32, bo
 }
 
 func haRuntimeLeaseWatchdogEnabled(cluster *antflyv1.AntflyCluster) bool {
-	if cluster == nil || cluster.Spec.HighAvailability == nil || cluster.Spec.HighAvailability.Runtime == nil ||
-		cluster.Spec.HighAvailability.Runtime.FencingLease == nil {
+	if cluster == nil || cluster.Spec.HighAvailability == nil {
 		return false
 	}
-	lease := cluster.Spec.HighAvailability.Runtime.FencingLease
+	ha := cluster.Spec.HighAvailability
+	if ha.Mode == "" || ha.Mode == antflyv1.HAModeDisabled ||
+		ha.AutomaticFailover == nil || !ha.AutomaticFailover.Enabled ||
+		!haAutomaticFailoverExecutionEnabled(ha) ||
+		ha.AutomaticFailover.FencingAuthority != antflyv1.HAFencingAuthorityKubernetesLease ||
+		ha.Runtime == nil || ha.Runtime.Role != antflyv1.HARuntimeRolePrimary ||
+		ha.Runtime.FencingLease == nil {
+		return false
+	}
+	lease := ha.Runtime.FencingLease
 	return strings.TrimSpace(lease.Name) != "" && strings.TrimSpace(lease.TopologyID) != ""
 }

@@ -3664,9 +3664,12 @@ pub fn testLocalAdmissionOverloadNormalization() !void {
     try std.testing.expectError(error.ResourceLimitExceeded, embedWithEntryParts(std.testing.allocator, multimodal_entry, &media_parts, 3));
 
     local.failure = error.TestUnexpectedResult;
-    try std.testing.expectError(error.TestUnexpectedResult, managed.embedQuery(std.testing.allocator, "dense_idx", "query"));
-    try std.testing.expectError(error.TestUnexpectedResult, embedSparseWithEntry(std.testing.allocator, sparse_entry, "query"));
-    try std.testing.expectError(error.TestUnexpectedResult, embedWithEntryParts(std.testing.allocator, multimodal_entry, &media_parts, 3));
+    // Unit-private Zig errors are intentionally not transported between
+    // independently generated runtime archives. Unknown outcomes fail closed
+    // at the stable boundary instead of relying on compilation-local error IDs.
+    try std.testing.expectError(error.RuntimeBoundaryFailure, managed.embedQuery(std.testing.allocator, "dense_idx", "query"));
+    try std.testing.expectError(error.RuntimeBoundaryFailure, embedSparseWithEntry(std.testing.allocator, sparse_entry, "query"));
+    try std.testing.expectError(error.RuntimeBoundaryFailure, embedWithEntryParts(std.testing.allocator, multimodal_entry, &media_parts, 3));
 }
 
 test "managed embedder routes antfly without api_url to local provider" {

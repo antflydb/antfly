@@ -147,19 +147,10 @@ func haFencingLeaseRenewalRequeueAfter(cluster *antflyv1.AntflyCluster) time.Dur
 }
 
 func haKubernetesLeaseRenewalEnabled(cluster *antflyv1.AntflyCluster) bool {
-	if cluster == nil {
-		return false
-	}
-	ha := cluster.Spec.HighAvailability
-	return ha != nil &&
-		ha.Mode != "" &&
-		ha.Mode != antflyv1.HAModeDisabled &&
-		ha.AutomaticFailover != nil &&
-		ha.AutomaticFailover.Enabled &&
-		haAutomaticFailoverExecutionEnabled(ha) &&
-		ha.AutomaticFailover.FencingAuthority == antflyv1.HAFencingAuthorityKubernetesLease &&
-		ha.Runtime != nil && ha.Runtime.Role == antflyv1.HARuntimeRolePrimary &&
-		haRuntimeLeaseWatchdogEnabled(cluster)
+	// Renewal, pod watchdog configuration, and least-privilege RBAC must be
+	// controlled by exactly the same ownership predicate. Divergence here can
+	// make a healthy primary fence itself after the operator stops renewing.
+	return haRuntimeLeaseWatchdogEnabled(cluster)
 }
 
 type haPlannedAction struct {

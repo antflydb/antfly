@@ -37,10 +37,27 @@ pub fn encodeRgba(alloc: Allocator, width: u32, height: u32, rgba: []const u8) !
     if (rgba.len != expected) return error.InvalidRgbaSize;
 
     const row_bytes = @as(usize, width) * 4;
-    const scanline_len = row_bytes + 1;
-    const raw_len = scanline_len * @as(usize, height);
-    const deflate_block_count = if (raw_len == 0) 1 else (raw_len + 65_534) / 65_535;
-    const zlib_len = 2 + deflate_block_count * 5 + raw_len + 4;
+    // The flate writer requires an initial output buffer (and grows it through
+    // Writer.Allocating as compressed bytes are emitted).
+    var compressed = try std.Io.Writer.Allocating.initCapacity(alloc, 16 * 1024);
+    defer compressed.deinit();
+    {
+        var history: [std.compress.flate.max_window_len]u8 = undefined;
+        var compressor = try std.compress.flate.Compress.init(
+            &compressed.writer,
+            history[0..],
+            .zlib,
+            .default,
+        );
+        for (0..height) |row| {
+            try compressor.writer.writeByte(0);
+            const offset = row * row_bytes;
+            try compressor.writer.writeAll(rgba[offset..][0..row_bytes]);
+        }
+        try compressor.finish();
+    }
+    const zlib = compressed.writer.buffered();
+    const zlib_len = zlib.len;
     if (zlib_len > std.math.maxInt(u32)) return error.PngEncodeFailed;
 
     const png_len = 8 + chunkTotalLen(13) + chunkTotalLen(zlib_len) + chunkTotalLen(0);
@@ -65,77 +82,14 @@ pub fn encodeRgba(alloc: Allocator, width: u32, height: u32, rgba: []const u8) !
     const idat_type_start = cursor;
     @memcpy(out[cursor .. cursor + 4], "IDAT");
     cursor += 4;
-    const idat_data_start = cursor;
-    out[cursor] = 0x78;
-    out[cursor + 1] = 0x01;
-    cursor += 2;
-
-    var adler = adler32FastInit();
-    var raw_offset: usize = 0;
-    var block_index: usize = 0;
-    while (block_index < deflate_block_count) : (block_index += 1) {
-        const remaining = raw_len - raw_offset;
-        const block_len: u16 = @intCast(@min(remaining, 65_535));
-        const final_block = block_index + 1 == deflate_block_count;
-        out[cursor] = if (final_block) 0x01 else 0x00;
-        out[cursor + 1] = @truncate(block_len);
-        out[cursor + 2] = @truncate(block_len >> 8);
-        const nlen: u16 = ~block_len;
-        out[cursor + 3] = @truncate(nlen);
-        out[cursor + 4] = @truncate(nlen >> 8);
-        cursor += 5;
-
-        const block = out[cursor .. cursor + block_len];
-        copyFilteredRgbaBlock(block, rgba, row_bytes, scanline_len, raw_offset);
-        adler = adler32FastUpdate(adler, block);
-        cursor += block_len;
-        raw_offset += block_len;
-    }
-
-    writeU32be(out[cursor .. cursor + 4], adler);
-    cursor += 4;
-    std.debug.assert(cursor - idat_data_start == zlib_len);
+    @memcpy(out[cursor .. cursor + zlib_len], zlib);
+    cursor += zlib_len;
     writeU32be(out[cursor .. cursor + 4], crc32Fast(out[idat_type_start..cursor]));
     cursor += 4;
 
     appendChunkToBuffer(out, &cursor, "IEND", &.{});
     std.debug.assert(cursor == out.len);
     return out;
-}
-
-fn copyFilteredRgbaBlock(
-    dest: []u8,
-    rgba: []const u8,
-    row_bytes: usize,
-    scanline_len: usize,
-    raw_start: usize,
-) void {
-    var row = raw_start / scanline_len;
-    var column = raw_start - row * scanline_len;
-    var out_offset: usize = 0;
-    while (out_offset < dest.len) {
-        if (column == 0) {
-            dest[out_offset] = 0;
-            out_offset += 1;
-            column = 1;
-            if (column == scanline_len) {
-                row += 1;
-                column = 0;
-            }
-            continue;
-        }
-
-        const row_offset = column - 1;
-        const copy_len = @min(dest.len - out_offset, row_bytes - row_offset);
-        const src_start = row * row_bytes + row_offset;
-        @memcpy(dest[out_offset .. out_offset + copy_len], rgba[src_start .. src_start + copy_len]);
-        out_offset += copy_len;
-        column += copy_len;
-        if (column == scanline_len) {
-            row += 1;
-            column = 0;
-        }
-    }
 }
 
 fn chunkTotalLen(data_len: usize) usize {
@@ -853,6 +807,24 @@ test "encode rgba writes png signature" {
     const png = try encodeRgba(alloc, 2, 2, &rgba);
     defer alloc.free(png);
     try std.testing.expectEqualSlices(u8, &.{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' }, png[0..8]);
+    const decoded = try decodeRgba(alloc, png);
+    defer alloc.free(decoded.rgba);
+    try std.testing.expectEqual(@as(u32, 2), decoded.width);
+    try std.testing.expectEqual(@as(u32, 2), decoded.height);
+    try std.testing.expectEqualSlices(u8, &rgba, decoded.rgba);
+}
+
+test "encode rgba compresses repetitive pages" {
+    const alloc = std.testing.allocator;
+    const rgba = try alloc.alloc(u8, 256 * 256 * 4);
+    defer alloc.free(rgba);
+    @memset(rgba, 0xff);
+    const png = try encodeRgba(alloc, 256, 256, rgba);
+    defer alloc.free(png);
+    try std.testing.expect(png.len < rgba.len / 16);
+    const decoded = try decodeRgba(alloc, png);
+    defer alloc.free(decoded.rgba);
+    try std.testing.expectEqualSlices(u8, rgba, decoded.rgba);
 }
 
 test "png crc32 fast path matches std crc32" {

@@ -83,6 +83,9 @@ pub const ClientConfig = struct {
     pool_max_connections: u32 = 20,
     pool_max_per_host: u32 = 5,
     max_cookies: usize = 1000,
+    /// Disable cookie persistence for credentialed or policy-constrained
+    /// transports where ambient state must not cross requests.
+    cookies_enabled: bool = true,
     /// Cache only addresses that have completed a TCP connection. A failed
     /// cached address is evicted before the next DNS lookup. Ignored when an
     /// explicit address filter is installed.
@@ -127,14 +130,14 @@ fn shouldSendConnectionClose(config: ClientConfig) bool {
 
 test "filtered HTTP1 connections advertise close when pools are bypassed" {
     const Policy = struct {
-        fn acceptAll(_: Address) bool {
+        fn acceptAll(_: ?*const anyopaque, _: Address) bool {
             return true;
         }
     };
 
-    try std.testing.expect(shouldSendConnectionClose(.{ .address_filter = Policy.acceptAll }));
+    try std.testing.expect(shouldSendConnectionClose(.{ .address_filter = .{ .acceptsFn = Policy.acceptAll } }));
     try std.testing.expect(!shouldSendConnectionClose(.{
-        .address_filter = Policy.acceptAll,
+        .address_filter = .{ .acceptsFn = Policy.acceptAll },
         .http2_enabled = true,
     }));
     try std.testing.expect(!shouldSendConnectionClose(.{}));
@@ -585,7 +588,7 @@ pub const Client = struct {
             try req.headers.set(HeaderName.ACCEPT_ENCODING, "gzip, deflate");
         }
 
-        try self.attachCookies(&req);
+        if (self.config.cookies_enabled) try self.attachCookies(&req);
 
         for (self.interceptors.items) |interceptor| {
             if (interceptor.request_fn) |f| {
@@ -596,7 +599,7 @@ pub const Client = struct {
         var response = try self.executeRequest(&req, reqOpts.timeout_ms, reqOpts.cancellation);
         errdefer response.deinit();
 
-        try self.storeCookies(&response);
+        if (self.config.cookies_enabled) try self.storeCookies(&response);
 
         for (self.interceptors.items) |interceptor| {
             if (interceptor.response_fn) |f| {
@@ -679,7 +682,7 @@ pub const Client = struct {
             try req.headers.set(HeaderName.ACCEPT_ENCODING, "gzip, deflate");
         }
 
-        try self.attachCookies(&req);
+        if (self.config.cookies_enabled) try self.attachCookies(&req);
 
         for (self.interceptors.items) |interceptor| {
             if (interceptor.request_fn) |f| {
@@ -690,7 +693,7 @@ pub const Client = struct {
         var response = try self.executeRequestToWriter(&req, reqOpts.timeout_ms, writer, progress_cb, progress_ctx, reqOpts.cancellation);
         errdefer response.deinit();
 
-        try self.storeCookies(&response);
+        if (self.config.cookies_enabled) try self.storeCookies(&response);
 
         for (self.interceptors.items) |interceptor| {
             if (interceptor.response_fn) |f| {

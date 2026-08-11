@@ -6,6 +6,8 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -72,5 +74,57 @@ func TestHARuntimeLeaseEnvBindsExactAuthorityAndPersistentSentinel(t *testing.T)
 	}
 	if !namespaceDownward {
 		t.Fatalf("namespace must use downward API: %#v", env)
+	}
+}
+
+func TestReconcileHARuntimeLeaseRBACCleansOwnedResourcesWhenFailoverIsDisabled(t *testing.T) {
+	ctx := context.Background()
+	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
+	cluster.Spec.ServiceAccountName = ""
+	reconciler := testHAReconciler(t, cluster)
+	if _, err := reconciler.reconcileHARuntimeLeaseRBAC(ctx, cluster); err != nil {
+		t.Fatalf("create HA runtime Lease RBAC: %v", err)
+	}
+
+	cluster.Spec.HighAvailability.AutomaticFailover.Enabled = false
+	if serviceAccountName, err := reconciler.reconcileHARuntimeLeaseRBAC(ctx, cluster); err != nil {
+		t.Fatalf("cleanup HA runtime Lease RBAC: %v", err)
+	} else if serviceAccountName != "" {
+		t.Fatalf("disabled runtime service account = %q", serviceAccountName)
+	}
+	if haRuntimeLeaseWatchdogEnabled(cluster) || haKubernetesLeaseRenewalEnabled(cluster) || len(haRuntimeLeaseEnv(cluster)) != 0 {
+		t.Fatal("disabled automatic failover must disable renewal, watchdog env, and RBAC together")
+	}
+
+	roleName := cluster.Name + haRuntimeLeaseRBACSuffix
+	for _, object := range []client.Object{
+		&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: roleName, Namespace: cluster.Namespace}},
+		&rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: roleName, Namespace: cluster.Namespace}},
+		&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: cluster.Name + "-ha-runtime", Namespace: cluster.Namespace}},
+	} {
+		if err := reconciler.Get(ctx, client.ObjectKeyFromObject(object), object); !apierrors.IsNotFound(err) {
+			t.Fatalf("expected %T to be deleted, got %v", object, err)
+		}
+	}
+}
+
+func TestReconcileHARuntimeLeaseRBACPreservesCustomServiceAccount(t *testing.T) {
+	ctx := context.Background()
+	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
+	custom := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "database-runtime", Namespace: cluster.Namespace}}
+	cluster.Spec.ServiceAccountName = custom.Name
+	reconciler := testHAReconciler(t, cluster, custom)
+
+	if serviceAccountName, err := reconciler.reconcileHARuntimeLeaseRBAC(ctx, cluster); err != nil {
+		t.Fatalf("create custom-account HA runtime Lease RBAC: %v", err)
+	} else if serviceAccountName != custom.Name {
+		t.Fatalf("service account = %q", serviceAccountName)
+	}
+	cluster.Spec.HighAvailability.AutomaticFailover.Enabled = false
+	if _, err := reconciler.reconcileHARuntimeLeaseRBAC(ctx, cluster); err != nil {
+		t.Fatalf("cleanup custom-account HA runtime Lease RBAC: %v", err)
+	}
+	if err := reconciler.Get(ctx, client.ObjectKeyFromObject(custom), &corev1.ServiceAccount{}); err != nil {
+		t.Fatalf("custom ServiceAccount was deleted: %v", err)
 	}
 }

@@ -20,8 +20,17 @@ const is_windows = builtin.os.tag == .windows;
 /// Network address type (std.Io.net.IpAddress).
 pub const Address = net.IpAddress;
 
-/// Optional policy applied to every resolved address before connecting.
-pub const AddressFilter = *const fn (Address) bool;
+/// Optional policy applied to every resolved address immediately before
+/// connecting. The borrowed context lets callers enforce deployment-specific
+/// network policy (for example configured NAT64 prefixes) without global state.
+pub const AddressFilter = struct {
+    context: ?*const anyopaque = null,
+    acceptsFn: *const fn (?*const anyopaque, Address) bool,
+
+    pub fn accepts(self: AddressFilter, address: Address) bool {
+        return self.acceptsFn(self.context, address);
+    }
+};
 
 const HostName = net.HostName;
 
@@ -36,8 +45,8 @@ pub fn resolveAddress(io: Io, host: []const u8, port: u16) !Address {
 /// SSRF checks to the address that is actually connected.
 pub fn resolveAddressFiltered(io: Io, host: []const u8, port: u16, filter: ?AddressFilter) !Address {
     if (Address.resolve(io, host, port)) |addr| {
-        if (filter) |accept| {
-            if (!accept(addr)) return error.AddressRejected;
+        if (filter) |policy| {
+            if (!policy.accepts(addr)) return error.AddressRejected;
         }
         return addr;
     } else |_| {}
@@ -59,8 +68,8 @@ pub fn resolveAddressFiltered(io: Io, host: []const u8, port: u16, filter: ?Addr
         switch (result) {
             .address => |address| {
                 saw_address = true;
-                if (filter) |accept| {
-                    if (!accept(address)) continue;
+                if (filter) |policy| {
+                    if (!policy.accepts(address)) continue;
                 }
                 return address;
             },
@@ -73,27 +82,27 @@ pub fn resolveAddressFiltered(io: Io, host: []const u8, port: u16, filter: ?Addr
 
 test "resolveAddressFiltered applies policy to literal and DNS results" {
     const Policy = struct {
-        fn rejectLoopback(address: Address) bool {
+        fn rejectLoopback(_: ?*const anyopaque, address: Address) bool {
             return switch (address) {
                 .ip4 => |ip4| ip4.bytes[0] != 127,
                 .ip6 => true,
             };
         }
 
-        fn rejectAll(_: Address) bool {
+        fn rejectAll(_: ?*const anyopaque, _: Address) bool {
             return false;
         }
     };
 
     try std.testing.expectError(
         error.AddressRejected,
-        resolveAddressFiltered(std.testing.io, "127.0.0.1", 80, Policy.rejectLoopback),
+        resolveAddressFiltered(std.testing.io, "127.0.0.1", 80, .{ .acceptsFn = Policy.rejectLoopback }),
     );
-    const accepted = try resolveAddressFiltered(std.testing.io, "8.8.8.8", 53, Policy.rejectLoopback);
+    const accepted = try resolveAddressFiltered(std.testing.io, "8.8.8.8", 53, .{ .acceptsFn = Policy.rejectLoopback });
     try std.testing.expectEqual(@as(u8, 8), accepted.ip4.bytes[0]);
     try std.testing.expectError(
         error.AddressRejected,
-        resolveAddressFiltered(std.testing.io, "localhost", 80, Policy.rejectAll),
+        resolveAddressFiltered(std.testing.io, "localhost", 80, .{ .acceptsFn = Policy.rejectAll }),
     );
 }
 

@@ -281,6 +281,10 @@ pub const Detail = enum(c_int) {
     unsupported_source_kind,
     update_path_not_found,
     user_exists,
+    // Generic admission outcomes used by runtime callbacks. Keep these
+    // append-only so independently generated archives retain wire stability.
+    queue_full,
+    resource_limit_exceeded,
 };
 
 pub const Status = extern struct {
@@ -474,6 +478,8 @@ pub fn statusFromError(err: anyerror) Status {
         error.ApiKeyNotFound => status(.not_found, .api_key_not_found),
         error.AuthRowFilterNoMatch => status(.forbidden, .auth_row_filter_no_match),
         error.BackupMaintenanceQueueFull => status(.retryable, .backup_maintenance_queue_full),
+        error.QueueFull => status(.retryable, .queue_full),
+        error.ResourceLimitExceeded => status(.unavailable, .resource_limit_exceeded),
         error.BackupMaintenanceUnavailable => status(.unavailable, .backup_maintenance_unavailable),
         error.ConnectionNotFound => status(.not_found, .connection_not_found),
         error.EmbedRequestFailed => status(.unavailable, .embed_request_failed),
@@ -823,6 +829,8 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .unsupported_source_kind => "UnsupportedSourceKind",
         .update_path_not_found => "UpdatePathNotFound",
         .user_exists => "UserExists",
+        .queue_full => "QueueFull",
+        .resource_limit_exceeded => "ResourceLimitExceeded",
     };
 }
 
@@ -833,6 +841,8 @@ test "stable status preserves public boundary semantics" {
     try std.testing.expectEqual(error.ExtensionOwnedObject, errorFromStatus(statusFromError(error.ExtensionOwnedObject)));
     try std.testing.expectEqual(error.ResourceRequestTooLarge, errorFromStatus(statusFromError(error.ResourceRequestTooLarge)));
     try std.testing.expectEqual(error.ResourceTemporarilyUnavailable, errorFromStatus(statusFromError(error.ResourceTemporarilyUnavailable)));
+    try std.testing.expectEqual(error.QueueFull, errorFromStatus(statusFromError(error.QueueFull)));
+    try std.testing.expectEqual(error.ResourceLimitExceeded, errorFromStatus(statusFromError(error.ResourceLimitExceeded)));
     try std.testing.expectEqual(error.UnsupportedPlatform, errorFromStatus(statusFromError(error.UnsupportedPlatform)));
     try std.testing.expectEqual(error.UnsupportedTransformOperation, errorFromStatus(statusFromError(error.UnsupportedTransformOperation)));
     try std.testing.expectEqual(error.HAReadRequiresPrimary, errorFromStatus(statusFromError(error.HAReadRequiresPrimary)));

@@ -214,7 +214,7 @@ fn roundF32PlaneToI32(dst: []i32, src: []const f32) void {
 
 fn applyReversibleMctOnEqualComponentGrid(state: *const codestream.State, planes: [][]i32) void {
     const coding_style = state.coding_style orelse return;
-    if (!coding_style.multiple_component_transform or planes.len != 3) return;
+    if (!coding_style.multiple_component_transform or planes.len < 3) return;
     const first_dims = tile.componentDimensions(
         state.header.width,
         state.header.height,
@@ -384,7 +384,7 @@ pub fn interleavePlanesU8(
     bits_per_component: u8,
     is_signed: bool,
 ) ![]u8 {
-    if (planes.len != 1 and planes.len != 3) return error.UnsupportedPlaneCount;
+    if (planes.len != 1 and planes.len != 3 and planes.len != 4) return error.UnsupportedPlaneCount;
     const plane_len = width * height;
     for (planes) |plane| {
         if (plane.len != plane_len) return error.InvalidPlaneLength;
@@ -648,7 +648,7 @@ fn assemblePlanesFromTier1ComponentWaveletsAtResolution(
         }
     }
 
-    if (default_coding_style.multiple_component_transform and component_count == 3) {
+    if (default_coding_style.multiple_component_transform and component_count >= 3) {
         if (irreversible[0] and irreversible[1] and irreversible[2]) {
             const all_same = comp_widths[0] == comp_widths[1] and comp_widths[1] == comp_widths[2] and
                 comp_heights[0] == comp_heights[1] and comp_heights[1] == comp_heights[2];
@@ -2159,4 +2159,15 @@ test "interleavePlanesU16 basic grayscale" {
     try std.testing.expectEqual(@as(u16, 0), result[0]);
     try std.testing.expectEqual(@as(u16, 512), result[1]);
     try std.testing.expectEqual(@as(u16, 1023), result[2]);
+}
+
+test "interleavePlanesU8 preserves four-component RGBA samples" {
+    const allocator = std.testing.allocator;
+    const red = [_]i32{ -128, 127 };
+    const green = [_]i32{ -64, 64 };
+    const blue = [_]i32{ 0, 1 };
+    const alpha = [_]i32{ 127, -128 };
+    const result = try interleavePlanesU8(allocator, &.{ &red, &green, &blue, &alpha }, 2, 1, 8, false);
+    defer allocator.free(result);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 64, 128, 255, 255, 192, 129, 0 }, result);
 }

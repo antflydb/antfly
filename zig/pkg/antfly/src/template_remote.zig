@@ -487,6 +487,8 @@ fn formatRemoteFetchErrorDirective(alloc: Allocator, err: anyerror) ![]const u8 
     return switch (err) {
         error.StreamTooLong => try template_mod.formatErrorDirective(alloc, 413, @errorName(err)),
         error.HttpCredentialNotFoundOrOutOfScope,
+        error.UnsupportedRemoteContentCredential,
+        error.CredentialDestinationNotAllowed,
         error.S3CredentialNotFoundOrOutOfScope,
         error.InvalidCredentialName,
         => try template_mod.formatErrorDirective(alloc, 403, @errorName(err)),
@@ -766,8 +768,7 @@ fn resolveRemoteContentFetchOptions(
         };
     }
     if (isUriScheme(parsed, "http") or isUriScheme(parsed, "https")) {
-        const credential = selectHttpCredential(cfg, url, credential_name);
-        if (credential_name != null and credential == null) return error.HttpCredentialNotFoundOrOutOfScope;
+        const credential = try selectHttpCredential(cfg, parsed, credential_name);
         return .{
             .security = effectiveRemoteContentSecurity(cfg, if (credential) |creds| creds.security else null),
             .http_headers = if (credential) |creds| try resolveHttpHeaders(alloc, secret_store, creds) else null,
@@ -792,6 +793,7 @@ fn applyContentSecurityOverride(
 ) void {
     if (override.allowed_hosts) |value| effective.allowed_hosts = value;
     if (override.block_private_ips) |value| effective.block_private_ips = value;
+    if (override.nat64_prefixes) |value| effective.nat64_prefixes = value;
     if (override.max_download_size_bytes) |value| effective.max_download_size_bytes = value;
     if (override.download_timeout_seconds) |value| effective.download_timeout_seconds = value;
     if (override.max_image_dimension) |value| effective.max_image_dimension = value;
@@ -870,16 +872,14 @@ fn s3CredentialScopeMatches(credential: *const scraping.S3CredentialConfig, buck
 
 fn selectHttpCredential(
     cfg: *const scraping.RemoteContentConfig,
-    url: []const u8,
+    parsed: std.Uri,
     credential_name: ?[]const u8,
-) ?*const scraping.HTTPCredentialConfig {
+) !?*const scraping.HTTPCredentialConfig {
     if (credential_name) |name| {
-        const credential = cfg.getHttp(name) orelse return null;
-        // A named credential is still selected by table-controlled input. Do
-        // not let an explicit name turn an unscoped secret into a bearer
-        // credential for an arbitrary request URL.
-        const base_url = credential.base_url orelse return null;
-        return if (httpCredentialScopeMatches(base_url, url)) credential else null;
+        const credential = cfg.getHttp(name) orelse return error.UnsupportedRemoteContentCredential;
+        if (!httpCredentialAllowsDestination(cfg, credential, parsed))
+            return error.CredentialDestinationNotAllowed;
+        return credential;
     }
     var selected: ?*const scraping.HTTPCredentialConfig = null;
     var selected_name: ?[]const u8 = null;
@@ -888,7 +888,7 @@ fn selectHttpCredential(
     while (it.next()) |entry| {
         const credential = entry.value_ptr;
         const base_url = credential.base_url orelse continue;
-        if (!httpCredentialScopeMatches(base_url, url)) continue;
+        if (!scraping.httpUrlMatchesBase(parsed, base_url)) continue;
         const scope_len = httpCredentialScopeLength(base_url) orelse continue;
         const prefer = selected == null or
             scope_len > selected_scope_len or
@@ -904,83 +904,42 @@ fn selectHttpCredential(
 
 fn httpCredentialScopeLength(base_url: []const u8) ?usize {
     const base = std.Uri.parse(base_url) catch return null;
-    if (!isHttpScheme(base.scheme)) return null;
+    if (!isUriScheme(base, "http") and !isUriScheme(base, "https")) return null;
     if (base.user != null or base.password != null or base.query != null or base.fragment != null) return null;
-    const path = httpScopePath(base.path);
-    if (!credentialScopePathIsSafe(path)) return null;
-    return path.len;
+    return if (base.path.percent_encoded.len == 0) 1 else base.path.percent_encoded.len;
 }
 
 fn httpCredentialScopeMatches(base_url: []const u8, url: []const u8) bool {
-    const base = std.Uri.parse(base_url) catch return false;
-    const target = std.Uri.parse(url) catch return false;
-
-    if (!isHttpScheme(base.scheme) or !isHttpScheme(target.scheme)) return false;
-    if (!std.ascii.eqlIgnoreCase(base.scheme, target.scheme)) return false;
-    // A credential scope is an origin and optional path, never userinfo, a
-    // query, or a fragment. Reject ambiguous configuration instead of turning
-    // it into a broader scope than the operator intended.
-    if (base.user != null or base.password != null or base.query != null or base.fragment != null) return false;
-    if (target.user != null or target.password != null) return false;
-
-    var base_host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
-    var target_host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
-    const base_host = (base.getHost(&base_host_buffer) catch return false).bytes;
-    const target_host = (target.getHost(&target_host_buffer) catch return false).bytes;
-    if (!std.ascii.eqlIgnoreCase(base_host, target_host)) return false;
-    if (effectiveHttpPort(base) != effectiveHttpPort(target)) return false;
-
-    const base_path = httpScopePath(base.path);
-    const target_path = httpScopePath(target.path);
-    if (!credentialScopePathIsSafe(base_path) or !credentialScopePathIsSafe(target_path)) return false;
-    if (std.mem.eql(u8, base_path, target_path)) return true;
-    if (!std.mem.startsWith(u8, target_path, base_path)) return false;
-    return base_path[base_path.len - 1] == '/' or target_path[base_path.len] == '/';
+    const parsed = std.Uri.parse(url) catch return false;
+    return scraping.httpUrlMatchesBase(parsed, base_url);
 }
 
-fn isHttpScheme(scheme: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(scheme, "http") or std.ascii.eqlIgnoreCase(scheme, "https");
+fn selectHttpCredentialForUrl(
+    cfg: *const scraping.RemoteContentConfig,
+    url: []const u8,
+    credential_name: ?[]const u8,
+) !?*const scraping.HTTPCredentialConfig {
+    return selectHttpCredential(cfg, try std.Uri.parse(url), credential_name);
 }
 
-fn effectiveHttpPort(uri: std.Uri) u16 {
-    return uri.port orelse if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) 443 else 80;
-}
-
-fn httpScopePath(component: std.Uri.Component) []const u8 {
-    const path = switch (component) {
-        .raw, .percent_encoded => |value| value,
-    };
-    return if (path.len == 0) "/" else path;
-}
-
-fn credentialScopePathIsSafe(path: []const u8) bool {
-    var segments = std.mem.splitScalar(u8, path, '/');
-    while (segments.next()) |segment| {
-        var decoded_len: usize = 0;
-        var dots_only = true;
-        var i: usize = 0;
-        while (i < segment.len) {
-            const decoded = if (segment[i] == '%') blk: {
-                if (i + 2 >= segment.len) return false;
-                const high = std.fmt.charToDigit(segment[i + 1], 16) catch return false;
-                const low = std.fmt.charToDigit(segment[i + 2], 16) catch return false;
-                i += 3;
-                break :blk (high << 4) | low;
-            } else blk: {
-                const value = segment[i];
-                i += 1;
-                break :blk value;
-            };
-            // Some HTTP stacks and origin servers normalize backslashes or
-            // encoded separators before routing. They cannot safely participate
-            // in a syntactic credential path scope.
-            if (decoded == '/' or decoded == '\\') return false;
-            dots_only = dots_only and decoded == '.';
-            decoded_len += 1;
-        }
-        if (dots_only and (decoded_len == 1 or decoded_len == 2)) return false;
+/// Credentials are capabilities and must be bound to a destination before
+/// their headers are resolved. An explicit name may use either its canonical
+/// base URL or an explicit effective host allowlist; the default SSRF policy
+/// alone is intentionally insufficient because it permits arbitrary public
+/// hosts.
+fn httpCredentialAllowsDestination(
+    cfg: *const scraping.RemoteContentConfig,
+    credential: *const scraping.HTTPCredentialConfig,
+    parsed: std.Uri,
+) bool {
+    if (credential.base_url) |base_url| return scraping.httpUrlMatchesBase(parsed, base_url);
+    const effective = effectiveRemoteContentSecurity(cfg, credential.security);
+    const allowed_hosts = effective.allowed_hosts orelse return false;
+    const host = (parsed.host orelse return false).percent_encoded;
+    for (allowed_hosts) |allowed| {
+        if (std.ascii.eqlIgnoreCase(host, allowed)) return true;
     }
-    return true;
+    return false;
 }
 
 fn resolveSelectedS3Credential(
@@ -1032,6 +991,7 @@ fn resolveHttpHeaders(
         headers[written] = .{
             .name = name,
             .value = value,
+            .credential_base_url = credential.base_url,
         };
         written += 1;
     }
@@ -1147,16 +1107,16 @@ test "explicit HTTP credentials remain inside their configured scope" {
         try cfg.http.put(alloc, name, .{ .base_url = base_url });
     }
 
-    try std.testing.expect(selectHttpCredential(
+    try std.testing.expect(try selectHttpCredentialForUrl(
         &cfg,
         "https://docs.internal.com/api/document",
         "internal",
     ) != null);
-    try std.testing.expect(selectHttpCredential(
+    try std.testing.expectError(error.CredentialDestinationNotAllowed, selectHttpCredentialForUrl(
         &cfg,
         "https://docs.internal.com.evil.test/api/document",
         "internal",
-    ) == null);
+    ));
 }
 
 test "explicit HTTP credentials without a base URL fail closed" {
@@ -1168,13 +1128,13 @@ test "explicit HTTP credentials without a base URL fail closed" {
     errdefer alloc.free(name);
     try cfg.http.put(alloc, name, .{});
 
-    try std.testing.expect(selectHttpCredential(
+    try std.testing.expectError(error.CredentialDestinationNotAllowed, selectHttpCredentialForUrl(
         &cfg,
         "https://attacker.example/collect",
         "unscoped",
-    ) == null);
+    ));
     try std.testing.expectError(
-        error.HttpCredentialNotFoundOrOutOfScope,
+        error.CredentialDestinationNotAllowed,
         resolveRemoteContentFetchOptions(
             alloc,
             &cfg,
@@ -1205,11 +1165,11 @@ test "explicit remote credentials fail closed when missing or outside scope" {
     );
 
     try std.testing.expectError(
-        error.HttpCredentialNotFoundOrOutOfScope,
+        error.UnsupportedRemoteContentCredential,
         resolveRemoteContentFetchOptions(alloc, &cfg, null, "https://docs.internal.test/api/doc", "missing"),
     );
     try std.testing.expectError(
-        error.HttpCredentialNotFoundOrOutOfScope,
+        error.CredentialDestinationNotAllowed,
         resolveRemoteContentFetchOptions(alloc, &cfg, null, "https://other.internal.test/api/doc", "internal"),
     );
     try std.testing.expectError(
@@ -1253,7 +1213,7 @@ test "automatic HTTP credential selection is longest-scope and deterministic" {
         .{ .base_url = try arena.dupe(u8, "https://docs.internal.test/api") },
     );
 
-    const selected = selectHttpCredential(&cfg, "https://docs.internal.test/api/v1/doc", null).?;
+    const selected = (try selectHttpCredentialForUrl(&cfg, "https://docs.internal.test/api/v1/doc", null)).?;
     try std.testing.expect(selected == cfg.getHttp("a-narrow").?);
 }
 
@@ -1627,6 +1587,77 @@ test "template remote applies remote content security to http urls" {
 
     try std.testing.expectEqual(@as(?bool, false), resolved.security.block_private_ips);
     try std.testing.expectEqual(@as(?u64, default_remote_fetch_max_download_size_bytes), resolved.security.max_download_size_bytes);
+}
+
+test "template remote binds named HTTP credentials to their configured destination" {
+    const alloc = std.testing.allocator;
+
+    var cfg = scraping.RemoteContentConfig{};
+    defer cfg.deinit(alloc);
+    var credential = scraping.HTTPCredentialConfig{
+        .base_url = try alloc.dupe(u8, "https://api.example.com/v1"),
+    };
+    errdefer credential.deinit(alloc);
+    try credential.headers.put(
+        alloc,
+        try alloc.dupe(u8, "Authorization"),
+        try alloc.dupe(u8, "Bearer secret"),
+    );
+    try cfg.http.put(alloc, try alloc.dupe(u8, "documents"), credential);
+
+    try std.testing.expectError(
+        error.CredentialDestinationNotAllowed,
+        resolveRemoteContentFetchOptions(alloc, &cfg, null, "https://attacker.example/v1/document", "documents"),
+    );
+    try std.testing.expectError(
+        error.CredentialDestinationNotAllowed,
+        resolveRemoteContentFetchOptions(alloc, &cfg, null, "https://api.example.com.evil.test/v1/document", "documents"),
+    );
+
+    var resolved = try resolveRemoteContentFetchOptions(
+        alloc,
+        &cfg,
+        null,
+        "https://api.example.com/v1/document",
+        "documents",
+    );
+    defer resolved.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), resolved.http_headers.?.len);
+    try std.testing.expectEqualStrings("Bearer secret", resolved.http_headers.?[0].value);
+    try std.testing.expectEqualStrings("https://api.example.com/v1", resolved.http_headers.?[0].credential_base_url.?);
+}
+
+test "template remote requires an allowlist for unbased named HTTP credentials" {
+    const alloc = std.testing.allocator;
+
+    var cfg = scraping.RemoteContentConfig{};
+    defer cfg.deinit(alloc);
+    var credential = scraping.HTTPCredentialConfig{};
+    errdefer credential.deinit(alloc);
+    try credential.headers.put(
+        alloc,
+        try alloc.dupe(u8, "Authorization"),
+        try alloc.dupe(u8, "Bearer secret"),
+    );
+    try cfg.http.put(alloc, try alloc.dupe(u8, "documents"), credential);
+
+    try std.testing.expectError(
+        error.CredentialDestinationNotAllowed,
+        resolveRemoteContentFetchOptions(alloc, &cfg, null, "https://api.example.com/document", "documents"),
+    );
+
+    const allowed_hosts = try alloc.alloc([]u8, 1);
+    allowed_hosts[0] = try alloc.dupe(u8, "api.example.com");
+    cfg.http.getPtr("documents").?.security = .{ .allowed_hosts = allowed_hosts };
+    var resolved = try resolveRemoteContentFetchOptions(
+        alloc,
+        &cfg,
+        null,
+        "https://api.example.com/document",
+        "documents",
+    );
+    defer resolved.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), resolved.http_headers.?.len);
 }
 
 test "template remote preserves PDF content type across a multi-megabyte download" {

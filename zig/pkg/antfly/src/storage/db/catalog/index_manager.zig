@@ -37,6 +37,7 @@ const resolver_catalog = @import("resolver_catalog.zig");
 pub const ResolverConfig = resolver_catalog.ResolverConfig;
 const enrichment_types = @import("../enrichment/enrichment_types.zig");
 const enrichment_artifact_codec = @import("../enrichment/artifact_codec.zig");
+const enrichment_config_validation = @import("../enrichment/config_validation.zig");
 const backfill_state_mod = @import("../backfill_state.zig");
 const db_config = @import("../config.zig");
 const persistent_mod = @import("../../persistent.zig");
@@ -10727,7 +10728,9 @@ pub const IndexManager = struct {
                     return error.InvalidEnrichmentConfig;
                 }
             },
-            .asset => {},
+            .asset => {
+                try enrichment_config_validation.validateAssetProducerConfig(self.alloc, cfg.producer_json);
+            },
         }
     }
 
@@ -20427,6 +20430,25 @@ test "shorthand chunk and embedding enrichment compatibility includes source_tem
         .source_artifact_name = "body_chunks",
         .expected_dims = 384,
     }));
+}
+
+test "asset registration validates document extraction OCR config" {
+    const alloc = std.testing.allocator;
+    var manager = try IndexManager.init(alloc, ".");
+    defer manager.deinit();
+
+    try std.testing.expectError(error.InvalidDocumentExtractionConfig, manager.validateEnrichmentConfig(.{
+        .name = "document_units",
+        .kind = .asset,
+        .source_field = "url",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"ocr\":{\"enabled\":true,\"render_dpi\":20,\"config\":{\"provider\":\"antfly\"}}}}",
+    }));
+    try manager.validateEnrichmentConfig(.{
+        .name = "document_units",
+        .kind = .asset,
+        .source_field = "url",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"ocr\":{\"enabled\":true,\"render_dpi\":150,\"config\":{\"provider\":\"antfly\"}}}}",
+    });
 }
 
 test "generated enrichment request identity includes source_template" {

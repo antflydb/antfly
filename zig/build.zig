@@ -566,6 +566,7 @@ const AntflyRootImports = struct {
     reranking_openapi: *std.Build.Module,
     extraction_openapi: *std.Build.Module,
     transcribing: *std.Build.Module,
+    reader_config: *std.Build.Module,
     readers: *std.Build.Module,
     extracting: *std.Build.Module,
     synthesizing: *std.Build.Module,
@@ -635,6 +636,7 @@ const AntflyRootImports = struct {
         .{ .name = "antfly_reranking_openapi", .field = "reranking_openapi" },
         .{ .name = "antfly_extraction_openapi", .field = "extraction_openapi" },
         .{ .name = "antfly_transcribing", .field = "transcribing" },
+        .{ .name = "antfly_reader_config", .field = "reader_config" },
         .{ .name = "antfly_readers", .field = "readers" },
         .{ .name = "antfly_extracting", .field = "extracting" },
         .{ .name = "antfly_synthesizing", .field = "synthesizing" },
@@ -1639,6 +1641,11 @@ pub fn build(b: *std.Build) void {
     });
     pdf_mod.addImport("antfly_image", image_mod);
     pdf_mod.addImport("antfly_font", font_mod);
+    if (target.result.os.tag == .macos) {
+        addMacosSdkPaths(b, pdf_mod, target);
+        pdf_mod.linkFramework("CoreFoundation", .{});
+        pdf_mod.linkFramework("CoreGraphics", .{});
+    }
     const wasm_image_mod = b.createModule(.{
         .root_source_file = b.path("lib/image/src/mod.zig"),
         .target = wasm_target,
@@ -1786,6 +1793,11 @@ pub fn build(b: *std.Build) void {
     transcribing_mod.addImport("inference_api", inference_api_mod);
     transcribing_mod.addImport("antfly_scraping", scraping_mod);
     transcribing_mod.addImport("antfly_google", google_mod);
+    const reader_config_mod = b.createModule(.{
+        .root_source_file = b.path("lib/readers/src/config.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const readers_mod = b.createModule(.{
         .root_source_file = b.path("lib/readers/src/mod.zig"),
         .target = target,
@@ -1794,6 +1806,7 @@ pub fn build(b: *std.Build) void {
     readers_mod.addImport("httpx", httpx_mod);
     readers_mod.addImport("inference_api", inference_api_mod);
     readers_mod.addImport("antfly_google", google_mod);
+    readers_mod.addImport("antfly_reader_config", reader_config_mod);
     inference_server_mod.addImport("antfly_readers", readers_mod);
     inference_server_mod.addImport("antfly_transcribing", transcribing_mod);
     inference_server_mod.addImport("antfly_extracting", extracting_mod);
@@ -1838,6 +1851,7 @@ pub fn build(b: *std.Build) void {
         .reranking_openapi = reranking_openapi_mod,
         .extraction_openapi = extraction_openapi_mod,
         .transcribing = transcribing_mod,
+        .reader_config = reader_config_mod,
         .readers = readers_mod,
         .extracting = extracting_mod,
         .synthesizing = synthesizing_mod,
@@ -2831,6 +2845,26 @@ pub fn build(b: *std.Build) void {
     const lib_image_test_step = b.step("lib-image-test", "Run shared image tests");
     lib_image_test_step.dependOn(&run_lib_image_tests.step);
 
+    const pdf_test_mod = b.createModule(.{
+        .root_source_file = b.path("lib/pdf/pdf_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    pdf_test_mod.addImport("antfly_image", image_mod);
+    pdf_test_mod.addImport("antfly_font", font_mod);
+    if (target.result.os.tag == .macos) {
+        addMacosSdkPaths(b, pdf_test_mod, target);
+        pdf_test_mod.linkFramework("CoreFoundation", .{});
+        pdf_test_mod.linkFramework("CoreGraphics", .{});
+    }
+    const lib_pdf_tests = b.addTest(.{
+        .root_module = pdf_test_mod,
+    });
+    lib_pdf_tests.root_module.link_libc = true;
+    const run_lib_pdf_tests = b.addRunArtifact(lib_pdf_tests);
+    const lib_pdf_test_step = b.step("lib-pdf-test", "Run shared PDF tests");
+    lib_pdf_test_step.dependOn(&run_lib_pdf_tests.step);
+
     const lib_image_bench_build_options = b.addOptions();
     const lib_image_spng_paths = detectSpngPaths(b, target);
     const lib_image_enable_spng = lib_image_spng_paths != null;
@@ -2886,6 +2920,11 @@ pub fn build(b: *std.Build) void {
     });
     pdf_bench_pdf_mod.addImport("antfly_image", pdf_bench_image_mod);
     pdf_bench_pdf_mod.addImport("antfly_font", pdf_bench_font_mod);
+    if (target.result.os.tag == .macos) {
+        addMacosSdkPaths(b, pdf_bench_pdf_mod, target);
+        pdf_bench_pdf_mod.linkFramework("CoreFoundation", .{});
+        pdf_bench_pdf_mod.linkFramework("CoreGraphics", .{});
+    }
     const pdf_bench_mod = b.createModule(.{
         .root_source_file = b.path("lib/pdf/src/pdf_bench.zig"),
         .target = target,
@@ -3330,6 +3369,9 @@ pub fn build(b: *std.Build) void {
         "create table raw parser merges default full text with quickstart embedding index",
         "create table raw parser accepts its canonical full text output",
         "table contract rejects unsupported index kinds before admission",
+        "table contract preserves artifact-backed public full text indexes",
+        "table contract rejects invalid inline artifact enrichments before admission",
+        "public enrichment validation rejects invalid execution and producer config",
         "provisioned primary lookup lease fails on identity namespace mismatch",
         "inference pull recognizes help before model resolution",
         "inference run recognizes help before server startup",
@@ -4080,6 +4122,21 @@ pub fn build(b: *std.Build) void {
             "storage.db.db.test.db replay applies dense embeddings from artifact payloads",
             "storage.db.db.test.db split cutover",
             "storage.db.db.test.db merge-style cutover",
+            "remote fetch classification retries only transient failures",
+            "remote HTTP failures consume retry budget before terminal coverage",
+            "enrichment retries unknown errors and isolates known permanent errors",
+            "document extraction reserves PDF decoder peak memory atomically",
+            "PDF decoder credit and OCR transient allocations compose without double charging",
+            "reserved PDF working set is bounded without duplicate resource charges",
+            "budgeted document download composes with materialization accounting",
+            "retained document collection allocations compose with the hard working-set cap",
+            "document replay payloads are admitted before persistent allocation",
+            "document extraction generated OCR bypasses unsupported native batch",
+            "OCR pending metadata construction is allocation-failure safe",
+            "generated text provider config is validated while parsing extraction config",
+            "public enrichment validation rejects invalid execution and producer config",
+            "enrichment runtime document extraction manifest uses v2 range and merge shape",
+            "db document extraction failure manifest preserves prior artifacts",
         },
     });
     const run_lib_db_enrichment_tests = addFilteredTestRunArtifact(b, lib_db_enrichment_tests);
@@ -6299,6 +6356,8 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_mcp_tests.step);
     unit_test_step.dependOn(&run_lib_a2a_tests.step);
     unit_test_step.dependOn(&run_lib_image_tests.step);
+    unit_test_step.dependOn(&run_lib_pdf_tests.step);
+    unit_test_step.dependOn(&run_lib_scraping_tests.step);
     unit_test_step.dependOn(&run_lib_audio_tests.step);
     unit_test_step.dependOn(&run_hf_tokenizer_tests.step);
     unit_test_step.dependOn(delegated_inference_steps.inference_test);
@@ -6636,6 +6695,7 @@ pub fn build(b: *std.Build) void {
     db_test_mod.addImport("inference_api", inference_api_mod);
     db_test_mod.addImport("antfly_reranking", reranking_mod);
     db_test_mod.addImport("antfly_scraping", scraping_mod);
+    db_test_mod.addImport("antfly_reader_config", reader_config_mod);
     db_test_mod.addImport("antfly_transcribing", transcribing_db_test_stub_mod);
     db_test_mod.addImport("httpx", httpx_mod);
     db_test_mod.addImport("antfly_pdf", pdf_mod);

@@ -146,17 +146,17 @@ test {
     _ = compare_generate;
     _ = run_options;
     _ = native_smoke;
-    _ = cuda_info;
-    _ = cuda_microbench;
-    _ = cuda_attention_diff;
-    _ = cuda_ffn_diff;
-    _ = cuda_nvrtc;
-    _ = metal_runtime;
     _ = native_compute.native;
     if (build_options.enable_metal) {
+        _ = metal_runtime;
         _ = native_compute.metal;
     }
     if (build_options.enable_cuda) {
+        _ = cuda_info;
+        _ = cuda_microbench;
+        _ = cuda_attention_diff;
+        _ = cuda_ffn_diff;
+        _ = cuda_nvrtc;
         _ = native_compute.cuda;
         _ = @import("ops/cuda/kernels.zig");
     }

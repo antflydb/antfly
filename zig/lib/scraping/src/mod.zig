@@ -47,6 +47,9 @@ pub const DownloadOutcome = union(enum) {
 pub const HTTPHeader = struct {
     name: []const u8,
     value: []const u8,
+    /// Capability boundary for credential-bearing headers. Redirects retain
+    /// credentials only while every hop stays under this canonical URL prefix.
+    credential_base_url: ?[]const u8 = null,
 };
 
 /// Execution context for one remote-content operation. For HTTP/S3,
@@ -62,6 +65,9 @@ pub const DownloadContext = struct {
 pub const ContentSecurityConfig = struct {
     allowed_hosts: ?[]const []u8 = null,
     block_private_ips: ?bool = null,
+    /// RFC 6052 network-specific prefixes used by the deployment's NAT64
+    /// translators. Embedded IPv4 destinations are classified before connect.
+    nat64_prefixes: ?[]const []u8 = null,
     max_download_size_bytes: ?u64 = null,
     download_timeout_seconds: ?u32 = null,
     max_image_dimension: ?u32 = null,
@@ -70,6 +76,7 @@ pub const ContentSecurityConfig = struct {
 
     pub fn deinit(self: *ContentSecurityConfig, alloc: std.mem.Allocator) void {
         if (self.allowed_hosts) |values| freeOwnedStringSlice(alloc, values);
+        if (self.nat64_prefixes) |values| freeOwnedStringSlice(alloc, values);
         if (self.allowed_paths) |values| freeOwnedStringSlice(alloc, values);
         if (self.user_agent) |value| alloc.free(value);
         self.* = undefined;
@@ -308,6 +315,10 @@ fn downloadContentOutcomeAllocImpl(
         return downloadHttpOutcomeAlloc(alloc, .{ .io = io_impl.io() }, uri, security, http_headers);
     }
     if (std.ascii.eqlIgnoreCase(parsed.scheme, "file")) {
+        if (parsed.host) |host| {
+            if (host.percent_encoded.len > 0 and !std.ascii.eqlIgnoreCase(host.percent_encoded, "localhost"))
+                return error.InvalidHost;
+        }
         const path_buf = try alloc.dupe(u8, parsed.path.percent_encoded);
         defer alloc.free(path_buf);
         const path = std.Uri.percentDecodeInPlace(path_buf);
@@ -323,6 +334,7 @@ fn downloadContentOutcomeAllocImpl(
 pub fn isEmptyContentSecurity(value: ContentSecurityConfig) bool {
     return value.allowed_hosts == null and
         value.block_private_ips == null and
+        value.nat64_prefixes == null and
         value.max_download_size_bytes == null and
         value.download_timeout_seconds == null and
         value.max_image_dimension == null and
@@ -444,69 +456,197 @@ fn downloadHttpOutcomeAlloc(
     http_headers: ?[]const HTTPHeader,
 ) !DownloadOutcome {
     try context.io.checkCancel();
-    const timeout_ms = effectiveDownloadTimeoutMs(context, security);
+    const ceiling = try DownloadCeiling.init(context, security);
     var client = httpx.Client.initWithConfig(alloc, context.io, httpClientConfig(security));
     defer client.deinit();
 
     var headers = std.ArrayListUnmanaged([2][]const u8).empty;
     defer headers.deinit(alloc);
+    var credential_base_url: ?[]const u8 = null;
     if (http_headers) |extra_headers| {
         for (extra_headers) |header| {
             if (header.name.len == 0) continue;
             try headers.append(alloc, .{ header.name, header.value });
+            if (header.credential_base_url) |base_url| {
+                if (credential_base_url) |existing| {
+                    if (!std.mem.eql(u8, existing, base_url)) return error.InvalidCredentialScope;
+                } else {
+                    credential_base_url = base_url;
+                }
+            }
         }
     }
 
-    var response = client.request(.GET, uri, httpRequestOptions(headers.items, timeout_ms)) catch |err| switch (err) {
-        error.AddressRejected => return error.PrivateIpBlocked,
-        error.ResponseTooLarge => return error.StreamTooLong,
-        else => return err,
-    };
-    defer response.deinit();
-    if (!response.ok()) {
-        return .{
-            .http_error = .{
-                .status = response.status.code,
-                .message = "remote fetch failed",
-                .downloaded_bytes = if (response.body) |body| @intCast(body.len) else 0,
-            },
+    var current_url = try alloc.dupe(u8, uri);
+    defer alloc.free(current_url);
+    var current_uri = try std.Uri.parse(current_url);
+    try validateHttpUri(current_uri);
+    try validateUrlSecurity(current_uri, security);
+    var send_credentials = credential_base_url == null or httpUrlMatchesBase(current_uri, credential_base_url.?);
+    const max_redirects: usize = 5;
+    var redirects: usize = 0;
+
+    while (true) {
+        var response = client.request(.GET, current_url, .{
+            .headers = if (send_credentials and headers.items.len > 0) headers.items else null,
+            .follow_redirects = false,
+            .timeout_ms = try ceiling.remainingTimeoutMs(),
+            .max_response_size = maxDownloadSize(security),
+        }) catch |err| switch (err) {
+            error.AddressRejected => return error.PrivateIpBlocked,
+            error.ResponseTooLarge => return error.StreamTooLong,
+            else => return err,
         };
-    }
+        defer response.deinit();
 
-    const mime = if (response.contentType()) |value|
-        trimMimeParameters(value)
-    else
-        "application/octet-stream";
-    const owned_mime = try alloc.dupe(u8, mime);
-    errdefer alloc.free(owned_mime);
-
-    const body = if (response.body) |data| blk: {
-        if (response.body_owned) {
-            response.body = null;
-            response.body_owned = false;
-            break :blk @constCast(data);
+        if (response.ok()) {
+            const mime = trimMimeParameters(response.contentType() orelse "application/octet-stream");
+            const owned_mime = try alloc.dupe(u8, mime);
+            errdefer alloc.free(owned_mime);
+            const body = try takeHttpResponseBodyAlloc(alloc, &response);
+            errdefer alloc.free(body);
+            try ceiling.check();
+            return .{ .ok = .{
+                .content_type = owned_mime,
+                .data = body,
+            } };
         }
-        break :blk try alloc.dupe(u8, data);
-    } else try alloc.alloc(u8, 0);
-    errdefer alloc.free(body);
 
-    return .{ .ok = .{
-        .content_type = owned_mime,
-        .data = body,
-    } };
+        if (isSupportedRedirect(response.status.code)) {
+            if (redirects >= max_redirects) return error.TooManyRedirects;
+            const location = response.location() orelse return error.InvalidRedirect;
+            const next_url = try resolveRedirectUrlAlloc(alloc, current_uri, location);
+            errdefer alloc.free(next_url);
+            const next_uri = try std.Uri.parse(next_url);
+            try validateHttpUri(next_uri);
+            try validateUrlSecurity(next_uri, security);
+            send_credentials = send_credentials and
+                sameOrigin(current_uri, next_uri) and
+                (credential_base_url == null or httpUrlMatchesBase(next_uri, credential_base_url.?));
+            alloc.free(current_url);
+            current_url = next_url;
+            current_uri = next_uri;
+            redirects += 1;
+            continue;
+        }
+
+        return .{ .http_error = .{
+            .status = response.status.code,
+            .message = "remote fetch failed",
+            .downloaded_bytes = if (response.body) |body| @intCast(body.len) else 0,
+        } };
+    }
 }
 
-fn httpRequestOptions(
-    headers: []const [2][]const u8,
-    timeout_ms: u64,
-) httpx.RequestOptions {
-    return .{
-        .headers = headers,
-        // Redirect targets must be parsed and revalidated before any follow-up;
-        // caller-supplied credential headers therefore never cross origins.
-        .follow_redirects = false,
-        .timeout_ms = timeout_ms,
+/// Transfers an httpx-owned response body when possible. The downloader and
+/// client share an allocator, so a successful response does not briefly use
+/// twice the configured response limit.
+fn takeHttpResponseBodyAlloc(alloc: Allocator, response: *httpx.Response) ![]u8 {
+    const body = response.body orelse return try alloc.alloc(u8, 0);
+    if (!response.body_owned) return try alloc.dupe(u8, body);
+    response.body = null;
+    response.body_owned = false;
+    return @constCast(body);
+}
+
+fn validateHttpUri(uri: std.Uri) !void {
+    if (!std.ascii.eqlIgnoreCase(uri.scheme, "http") and !std.ascii.eqlIgnoreCase(uri.scheme, "https"))
+        return error.UnsupportedUrlScheme;
+    if (uri.host == null) return error.InvalidHost;
+    if (uri.user != null or uri.password != null) return error.InvalidHost;
+}
+
+fn isSupportedRedirect(status: u16) bool {
+    return switch (status) {
+        301, 302, 303, 307, 308 => true,
+        else => false,
     };
+}
+
+fn effectiveHttpPort(uri: std.Uri) u16 {
+    return uri.port orelse if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) 443 else 80;
+}
+
+fn sameOrigin(lhs: std.Uri, rhs: std.Uri) bool {
+    const lhs_host = lhs.host orelse return false;
+    const rhs_host = rhs.host orelse return false;
+    return std.ascii.eqlIgnoreCase(lhs.scheme, rhs.scheme) and
+        std.ascii.eqlIgnoreCase(lhs_host.percent_encoded, rhs_host.percent_encoded) and
+        effectiveHttpPort(lhs) == effectiveHttpPort(rhs);
+}
+
+/// Matches a destination against a credential capability using canonical
+/// scheme, authority and path-segment boundaries.
+pub fn httpUrlMatchesBase(target: std.Uri, base_url: []const u8) bool {
+    const base = std.Uri.parse(base_url) catch return false;
+    const target_host = target.host orelse return false;
+    const base_host = base.host orelse return false;
+    if (base.user != null or base.password != null or base.query != null or base.fragment != null) return false;
+    if (target.user != null or target.password != null) return false;
+    if (!std.ascii.eqlIgnoreCase(target.scheme, base.scheme) or
+        !std.ascii.eqlIgnoreCase(target_host.percent_encoded, base_host.percent_encoded) or
+        effectiveHttpPort(target) != effectiveHttpPort(base)) return false;
+
+    const base_path = base.path.percent_encoded;
+    const target_path = target.path.percent_encoded;
+    if (!credentialPathIsCanonical(base_path) or !credentialPathIsCanonical(target_path)) return false;
+    if (base_path.len == 0 or std.mem.eql(u8, base_path, "/")) return true;
+    if (std.mem.eql(u8, target_path, base_path)) return true;
+    if (!std.mem.startsWith(u8, target_path, base_path)) return false;
+    return std.mem.endsWith(u8, base_path, "/") or
+        (target_path.len > base_path.len and target_path[base_path.len] == '/');
+}
+
+fn credentialPathIsCanonical(path: []const u8) bool {
+    var segment_start: usize = 0;
+    var i: usize = 0;
+    while (i <= path.len) : (i += 1) {
+        if (i != path.len and path[i] != '/') continue;
+        const segment = path[segment_start..i];
+        var decoded_len: usize = 0;
+        var only_dots = segment.len > 0;
+        var j: usize = 0;
+        while (j < segment.len) {
+            const byte = if (segment[j] == '%') blk: {
+                if (j + 2 >= segment.len) return false;
+                const high = std.fmt.charToDigit(segment[j + 1], 16) catch return false;
+                const low = std.fmt.charToDigit(segment[j + 2], 16) catch return false;
+                j += 3;
+                break :blk @as(u8, @intCast(high * 16 + low));
+            } else blk: {
+                const value = segment[j];
+                j += 1;
+                break :blk value;
+            };
+            if (byte == '/' or byte == '\\') return false;
+            decoded_len += 1;
+            only_dots = only_dots and byte == '.';
+        }
+        if (only_dots and (decoded_len == 1 or decoded_len == 2)) return false;
+        segment_start = i + 1;
+    }
+    return true;
+}
+
+fn formatUriAlloc(alloc: Allocator, uri: std.Uri) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try uri.format(&out.writer);
+    return try out.toOwnedSlice();
+}
+
+fn resolveRedirectUrlAlloc(alloc: Allocator, base: std.Uri, location: []const u8) ![]u8 {
+    const merged_path_capacity = std.math.add(usize, base.path.percent_encoded.len, location.len + 1) catch
+        return error.OutOfMemory;
+    const scratch_len = std.math.add(usize, location.len, merged_path_capacity) catch
+        return error.OutOfMemory;
+    const storage = try alloc.alloc(u8, scratch_len);
+    defer alloc.free(storage);
+    @memcpy(storage[0..location.len], location);
+    var remaining = storage;
+    var resolved = try std.Uri.resolveInPlace(base, location.len, &remaining);
+    resolved.fragment = null;
+    return try formatUriAlloc(alloc, resolved);
 }
 
 fn httpClientConfig(security: ?*const ContentSecurityConfig) httpx.ClientConfig {
@@ -515,9 +655,13 @@ fn httpClientConfig(security: ?*const ContentSecurityConfig) httpx.ClientConfig 
         .user_agent = if (security) |cfg| cfg.user_agent orelse "AntflyDB/1.0" else "AntflyDB/1.0",
         .max_response_size = maxDownloadSize(security),
         .keep_alive = false,
+        .cookies_enabled = false,
         .retry_policy = .noRetry(),
         .redirect_policy = .noFollow(),
-        .address_filter = if (block_private) allowGlobalAddress else null,
+        .address_filter = if (block_private) .{
+            .context = if (security) |cfg| @ptrCast(cfg) else null,
+            .acceptsFn = allowGlobalAddress,
+        } else null,
     };
 }
 
@@ -849,7 +993,7 @@ fn validateUrlSecurity(parsed: std.Uri, security: ?*const ContentSecurityConfig)
 
     // Reject dangerous literal spellings before network I/O. DNS names are
     // vetted and pinned by httpx's connection-time address filter.
-    if (cfg.block_private_ips orelse true and isNonGlobalHost(host)) return error.PrivateIpBlocked;
+    if (cfg.block_private_ips orelse true and isNonGlobalHostWithSecurity(host, cfg)) return error.PrivateIpBlocked;
 }
 
 fn validateOpenFilePathSecurity(
@@ -928,10 +1072,11 @@ fn hasComponentPrefix(path: []const u8, prefix: []const u8, separator: u8) bool 
     return path.len == prefix.len or prefix[prefix.len - 1] == separator or path[prefix.len] == separator;
 }
 
-fn allowGlobalAddress(address: std.Io.net.IpAddress) bool {
+fn allowGlobalAddress(context: ?*const anyopaque, address: std.Io.net.IpAddress) bool {
+    const security: ?*const ContentSecurityConfig = if (context) |ptr| @ptrCast(@alignCast(ptr)) else null;
     return switch (address) {
         .ip4 => |ip4| !isNonGlobalIpv4(ip4.bytes),
-        .ip6 => |ip6| ip6.interface.isNone() and !isNonGlobalIpv6(ip6.bytes),
+        .ip6 => |ip6| ip6.interface.isNone() and !isNonGlobalIpv6WithSecurity(ip6, security),
     };
 }
 
@@ -939,6 +1084,10 @@ fn allowGlobalAddress(address: std.Io.net.IpAddress) bool {
 /// reachable, not only RFC 1918 addresses. Hostnames are classified after DNS
 /// resolution by `allowGlobalAddress` at the connection boundary.
 fn isNonGlobalHost(host: []const u8) bool {
+    return isNonGlobalHostWithSecurity(host, null);
+}
+
+fn isNonGlobalHostWithSecurity(host: []const u8, security: ?*const ContentSecurityConfig) bool {
     var normalized = std.mem.trimEnd(u8, host, ".");
     if (normalized.len >= 2 and normalized[0] == '[' and normalized[normalized.len - 1] == ']') {
         normalized = normalized[1 .. normalized.len - 1];
@@ -958,7 +1107,7 @@ fn isNonGlobalHost(host: []const u8) bool {
             return isNonGlobalIpv4(ip4.bytes);
         },
         .ip6 => |ip6| {
-            return !ip6.interface.isNone() or isNonGlobalIpv6(ip6.bytes);
+            return !ip6.interface.isNone() or isNonGlobalIpv6WithSecurity(ip6, security);
         },
     };
 }
@@ -1003,6 +1152,93 @@ fn isNonGlobalIpv4(b: [4]u8) bool {
         (b[0] == 198 and b[1] == 51 and b[2] == 100) or
         (b[0] == 203 and b[1] == 0 and b[2] == 113) or
         b[0] >= 224;
+}
+
+const Nat64Prefix = struct {
+    bytes: [16]u8,
+    length: u8,
+};
+
+const Nat64Decode = union(enum) {
+    no_match,
+    malformed,
+    ipv4: [4]u8,
+};
+
+const well_known_nat64 = Nat64Prefix{
+    .bytes = .{ 0, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    .length = 96,
+};
+
+const local_use_nat64 = Nat64Prefix{
+    .bytes = .{ 0, 0x64, 0xff, 0x9b, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    .length = 48,
+};
+
+fn validNat64PrefixLength(length: u8) bool {
+    return switch (length) {
+        32, 40, 48, 56, 64, 96 => true,
+        else => false,
+    };
+}
+
+fn parseNat64Prefix(text: []const u8) !Nat64Prefix {
+    const slash = std.mem.lastIndexOfScalar(u8, text, '/') orelse return error.InvalidNat64Prefix;
+    if (slash == 0 or slash + 1 == text.len) return error.InvalidNat64Prefix;
+    const length = std.fmt.parseUnsigned(u8, text[slash + 1 ..], 10) catch return error.InvalidNat64Prefix;
+    if (!validNat64PrefixLength(length)) return error.InvalidNat64Prefix;
+    const address = std.Io.net.IpAddress.parse(text[0..slash], 0) catch return error.InvalidNat64Prefix;
+    const bytes = switch (address) {
+        .ip6 => |ip6| ip6.bytes,
+        .ip4 => return error.InvalidNat64Prefix,
+    };
+    const prefix_bytes = @as(usize, length) / 8;
+    if (!std.mem.allEqual(u8, bytes[prefix_bytes..], 0)) return error.InvalidNat64Prefix;
+    return .{ .bytes = bytes, .length = length };
+}
+
+pub fn validateNat64Prefixes(security: ContentSecurityConfig) !void {
+    if (security.nat64_prefixes) |prefixes| {
+        for (prefixes) |prefix| _ = try parseNat64Prefix(prefix);
+    }
+}
+
+fn decodeNat64(ip6: std.Io.net.Ip6Address, prefix: Nat64Prefix) Nat64Decode {
+    const b = ip6.bytes;
+    const prefix_bytes = @as(usize, prefix.length) / 8;
+    if (!std.mem.eql(u8, b[0..prefix_bytes], prefix.bytes[0..prefix_bytes])) return .no_match;
+    if (prefix.length == 96) return .{ .ipv4 = b[12..16].* };
+    if (b[8] != 0) return .malformed;
+    const decoded, const suffix_start = switch (prefix.length) {
+        32 => .{ b[4..8].*, @as(usize, 9) },
+        40 => .{ .{ b[5], b[6], b[7], b[9] }, @as(usize, 10) },
+        48 => .{ .{ b[6], b[7], b[9], b[10] }, @as(usize, 11) },
+        56 => .{ .{ b[7], b[9], b[10], b[11] }, @as(usize, 12) },
+        64 => .{ b[9..13].*, @as(usize, 13) },
+        else => return .malformed,
+    };
+    if (!std.mem.allEqual(u8, b[suffix_start..], 0)) return .malformed;
+    return .{ .ipv4 = decoded };
+}
+
+fn nat64NonGlobal(ip6: std.Io.net.Ip6Address, prefix: Nat64Prefix) ?bool {
+    return switch (decodeNat64(ip6, prefix)) {
+        .no_match => null,
+        .malformed => true,
+        .ipv4 => |bytes| isNonGlobalIpv4(bytes),
+    };
+}
+
+fn isNonGlobalIpv6WithSecurity(ip6: std.Io.net.Ip6Address, security: ?*const ContentSecurityConfig) bool {
+    if (nat64NonGlobal(ip6, well_known_nat64)) |non_global| return non_global;
+    if (nat64NonGlobal(ip6, local_use_nat64)) |non_global| return non_global;
+    if (security) |cfg| if (cfg.nat64_prefixes) |prefixes| {
+        for (prefixes) |text| {
+            const prefix = parseNat64Prefix(text) catch return true;
+            if (nat64NonGlobal(ip6, prefix)) |non_global| return non_global;
+        }
+    };
+    return isNonGlobalIpv6(ip6.bytes);
 }
 
 fn isNonGlobalIpv6(b: [16]u8) bool {
@@ -1079,15 +1315,6 @@ test "effective content security falls back when primary is empty" {
     try std.testing.expectEqual(@as(?bool, true), effective.block_private_ips);
 }
 
-test "HTTP downloads leave redirects unhandled for target revalidation" {
-    const headers = [_][2][]const u8{.{ "Authorization", "secret" }};
-    const options = httpRequestOptions(&headers, 1234);
-    try std.testing.expectEqual(@as(?bool, false), options.follow_redirects);
-    try std.testing.expectEqual(@as(?u64, 1234), options.timeout_ms);
-    try std.testing.expectEqual(@as(usize, 1), options.headers.?.len);
-    try std.testing.expectEqualStrings("Authorization", options.headers.?[0][0]);
-}
-
 test "HTTP client applies address response and redirect boundaries" {
     const security = ContentSecurityConfig{
         .block_private_ips = true,
@@ -1096,13 +1323,14 @@ test "HTTP client applies address response and redirect boundaries" {
     const config = httpClientConfig(&security);
     try std.testing.expect(config.address_filter != null);
     try std.testing.expect(!config.keep_alive);
+    try std.testing.expect(!config.cookies_enabled);
     try std.testing.expect(!config.redirect_policy.follow_redirects);
     try std.testing.expectEqual(@as(usize, 4), config.max_response_size);
 
     const global = try std.Io.net.IpAddress.parse("8.8.8.8", 443);
     const private = try std.Io.net.IpAddress.parse("127.0.0.1", 80);
-    try std.testing.expect(config.address_filter.?(global));
-    try std.testing.expect(!config.address_filter.?(private));
+    try std.testing.expect(config.address_filter.?.accepts(global));
+    try std.testing.expect(!config.address_filter.?.accepts(private));
 }
 
 test "download context timeout cannot lengthen configured deadline" {
@@ -1585,4 +1813,49 @@ test "content security defaults to blocking non-global literal hosts" {
     for (global) |host| {
         try std.testing.expect(!isNonGlobalHost(host));
     }
+}
+
+test "configured NAT64 prefixes classify the embedded IPv4 destination" {
+    const prefixes = [_][]u8{@constCast("2001:470:64::/96")};
+    const security = ContentSecurityConfig{ .nat64_prefixes = &prefixes };
+    try validateNat64Prefixes(security);
+
+    const private = try std.Io.net.IpAddress.parse("2001:470:64::a9fe:a9fe", 80);
+    const public = try std.Io.net.IpAddress.parse("2001:470:64::808:808", 80);
+    try std.testing.expect(!allowGlobalAddress(@ptrCast(&security), private));
+    try std.testing.expect(allowGlobalAddress(@ptrCast(&security), public));
+}
+
+test "NAT64 prefix validation rejects unsupported and non-canonical prefixes" {
+    const invalid_length = [_][]u8{@constCast("2001:470::/72")};
+    try std.testing.expectError(error.InvalidNat64Prefix, validateNat64Prefixes(.{ .nat64_prefixes = &invalid_length }));
+    const non_canonical = [_][]u8{@constCast("2001:470::1/96")};
+    try std.testing.expectError(error.InvalidNat64Prefix, validateNat64Prefixes(.{ .nat64_prefixes = &non_canonical }));
+}
+
+test "redirect resolution and credential capabilities are origin and path aware" {
+    const alloc = std.testing.allocator;
+    const base = try std.Uri.parse("https://cdn.example.com/a/b/document.pdf?old=1");
+    const relative = try resolveRedirectUrlAlloc(alloc, base, "../images/page.png?size=2#ignored");
+    defer alloc.free(relative);
+    try std.testing.expectEqualStrings("https://cdn.example.com/a/images/page.png?size=2", relative);
+
+    try std.testing.expect(httpUrlMatchesBase(try std.Uri.parse(relative), "https://cdn.example.com/a"));
+    try std.testing.expect(!httpUrlMatchesBase(try std.Uri.parse("https://cdn.example.com/admin"), "https://cdn.example.com/a"));
+    try std.testing.expect(!httpUrlMatchesBase(try std.Uri.parse("https://cdn.example.com/a/%2e%2e/admin"), "https://cdn.example.com/a"));
+    try std.testing.expect(!sameOrigin(base, try std.Uri.parse("https://assets.example.net/page.png")));
+}
+
+test "HTTP response body ownership transfers without a copy" {
+    const alloc = std.testing.allocator;
+    var response = httpx.Response.init(alloc, 200);
+    response.body = try alloc.dupe(u8, "owned-body");
+    response.body_owned = true;
+    defer response.deinit();
+
+    const original = response.body.?.ptr;
+    const taken = try takeHttpResponseBodyAlloc(alloc, &response);
+    defer alloc.free(taken);
+    try std.testing.expectEqual(original, taken.ptr);
+    try std.testing.expect(response.body == null);
 }

@@ -27,6 +27,13 @@ components:
           type: boolean
           description: "Reject loopback, private, link-local, carrier-grade NAT, reserved, and multicast destinations. Allowlisted DNS hostnames are resolved, every result is filtered by this policy, and the connection is pinned to a vetted address. Set false only as an explicit opt-out that permits private and special destinations."
           default: true
+        nat64_prefixes:
+          type: array
+          description: "RFC 6052 network-specific NAT64 prefixes used by this deployment. Resolved IPv6 addresses under these prefixes are decoded and checked against the private IPv4 policy. Prefix length must be 32, 40, 48, 56, 64, or 96."
+          items:
+            type: string
+          example:
+            - "2001:db8:64::/96"
         max_download_size_bytes:
           type: integer
           description: "Maximum size of downloaded content in bytes"

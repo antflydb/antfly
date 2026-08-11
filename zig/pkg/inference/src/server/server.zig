@@ -3862,7 +3862,11 @@ pub const Node = struct {
         var batch_bytes: usize = 0;
         var decoded_budget = ReadDecodedImageBudget.init(admission, effectiveRequestContentSecurity(self).max_image_dimension);
         for (request.images, 0..) |image_url, i| {
-            var item = try downloadReadBatchContent(self, allocator, image_url, batch_byte_cap, batch_bytes);
+            const inline_content_trust: InlineContentTrust = switch (request.inline_content_trust) {
+                .untrusted => .untrusted,
+                .trusted_internal => .trusted_internal,
+            };
+            var item = try downloadReadBatchContent(self, allocator, image_url, batch_byte_cap, batch_bytes, inline_content_trust);
             errdefer item.deinit(allocator);
             batch_bytes = try addReadBatchDownloadedBytes(batch_bytes, item, batch_byte_cap);
             try decoded_budget.addImage(item.data);
@@ -3889,6 +3893,7 @@ pub const Node = struct {
         const results = try reader.readBatch(image_datas, .{
             .prompt = normalizeReadPrompt(request.prompt),
             .max_tokens = max_tokens,
+            .source_fingerprint = request.source_fingerprint,
         });
         defer {
             for (results) |result| {
@@ -14121,11 +14126,11 @@ test "download helpers fail closed for null and explicit empty policies" {
         var node: Node = undefined;
         node.config = config;
         try std.testing.expectError(error.HostNotAllowed, downloadRemoteContent(&node, alloc, "https://example.com/a.png"));
-        try std.testing.expectError(error.HostNotAllowed, downloadReadBatchContent(&node, alloc, "https://example.com/a.png", 1024, 0));
+        try std.testing.expectError(error.HostNotAllowed, downloadReadBatchContent(&node, alloc, "https://example.com/a.png", 1024, 0, .untrusted));
         try std.testing.expectError(error.PathNotAllowed, downloadRemoteContent(&node, alloc, "s3://bucket/object.png"));
-        try std.testing.expectError(error.PathNotAllowed, downloadReadBatchContent(&node, alloc, "s3://bucket/object.png", 1024, 0));
+        try std.testing.expectError(error.PathNotAllowed, downloadReadBatchContent(&node, alloc, "s3://bucket/object.png", 1024, 0, .untrusted));
         try std.testing.expectError(error.PathNotAllowed, downloadRemoteContent(&node, alloc, file_uri));
-        try std.testing.expectError(error.PathNotAllowed, downloadReadBatchContent(&node, alloc, file_uri, 1024, 0));
+        try std.testing.expectError(error.PathNotAllowed, downloadReadBatchContent(&node, alloc, file_uri, 1024, 0, .untrusted));
     }
 }
 
@@ -16943,15 +16948,12 @@ fn downloadReadBatchContent(
     url: []const u8,
     max_bytes: usize,
     current_bytes: usize,
+    inline_content_trust: InlineContentTrust,
 ) !scraping.DownloadedContent {
     if (current_bytes >= max_bytes) return error.ReadBatchTooLarge;
     const remaining = max_bytes - current_bytes;
-    var bounded_security = effectiveRequestContentSecurity(self);
     const remaining_u64: u64 = @intCast(remaining);
-    bounded_security.max_download_size_bytes = if (bounded_security.max_download_size_bytes) |configured|
-        @min(configured, remaining_u64)
-    else
-        remaining_u64;
+    var bounded_security = boundedReadContentSecurity(self.config.content_security, url, remaining_u64, inline_content_trust);
     const s3_credentials = if (self.config.s3_credentials) |*cfg| cfg else null;
     return try scraping.downloadContentAlloc(alloc, url, &bounded_security, s3_credentials);
 }
@@ -16963,10 +16965,53 @@ fn downloadReadBatchContentForRequest(
     max_bytes: usize,
     current_bytes: usize,
 ) !scraping.DownloadedContent {
-    return downloadReadBatchContent(self, alloc, url, max_bytes, current_bytes) catch |err| {
+    return downloadReadBatchContent(self, alloc, url, max_bytes, current_bytes, .untrusted) catch |err| {
         if (err == error.ReadBatchTooLarge) return err;
         return normalizeRemoteContentRequestError(err);
     };
+}
+
+const InlineContentTrust = enum { untrusted, trusted_internal };
+
+fn boundedReadContentSecurity(
+    configured: ?scraping.ContentSecurityConfig,
+    url: []const u8,
+    remaining_bytes: u64,
+    inline_content_trust: InlineContentTrust,
+) scraping.ContentSecurityConfig {
+    var bounded = configured orelse scraping.ContentSecurityConfig{};
+    // Only the in-process enrichment bridge can assert trusted_internal.
+    // Public callers can also submit data URIs, so URL shape alone must never
+    // weaken the configured content policy.
+    if (inline_content_trust == .trusted_internal and std.mem.startsWith(u8, url, "data:")) {
+        bounded.max_download_size_bytes = remaining_bytes;
+    } else {
+        bounded.max_download_size_bytes = if (bounded.max_download_size_bytes) |limit|
+            @min(limit, remaining_bytes)
+        else
+            remaining_bytes;
+    }
+    return bounded;
+}
+
+test "read content caps internal data images by inference budget and preserves remote limits" {
+    const configured = scraping.ContentSecurityConfig{
+        .block_private_ips = true,
+        .max_download_size_bytes = 1024,
+        .max_image_dimension = 8192,
+    };
+    const inline_security = boundedReadContentSecurity(configured, "data:image/png;base64,AA==", 64 * 1024, .trusted_internal);
+    try std.testing.expectEqual(@as(?u64, 64 * 1024), inline_security.max_download_size_bytes);
+    try std.testing.expectEqual(@as(?bool, true), inline_security.block_private_ips);
+    try std.testing.expectEqual(@as(?u32, 8192), inline_security.max_image_dimension);
+
+    const public_inline = boundedReadContentSecurity(configured, "data:image/png;base64,AA==", 64 * 1024, .untrusted);
+    try std.testing.expectEqual(@as(?u64, 1024), public_inline.max_download_size_bytes);
+
+    const remote = boundedReadContentSecurity(configured, "https://example.com/page.png", 64 * 1024, .untrusted);
+    try std.testing.expectEqual(@as(?u64, 1024), remote.max_download_size_bytes);
+    const tighter_batch = boundedReadContentSecurity(configured, "https://example.com/page.png", 512, .untrusted);
+    try std.testing.expectEqual(@as(?u64, 512), tighter_batch.max_download_size_bytes);
 }
 
 fn readBatchMaxBytes() usize {
