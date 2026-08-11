@@ -455,9 +455,9 @@ pub fn ServerRouter(comptime Impl: type) type {
         fn getHASeedLifecycleReceipts(ctx: *httpx.Context) anyerror!httpx.Response {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
             const query_params = GetHASeedLifecycleReceiptsParams{
-                .kind = ctx.query("kind") orelse return ctx.status(400).json(.{ .@"error" = "missing_query_param", .message = "Missing required query parameter: kind" }),
-                .after = ctx.query("after"),
-                .limit = ctx.query("limit"),
+                .kind = (try ctx.queryDecoded("kind")) orelse return ctx.status(400).json(.{ .@"error" = "missing_query_param", .message = "Missing required query parameter: kind" }),
+                .after = try ctx.queryDecoded("after"),
+                .limit = try ctx.queryDecoded("limit"),
             };
             return impl.getHASeedLifecycleReceipts(ctx, query_params);
         }
