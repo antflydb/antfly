@@ -148,8 +148,18 @@ def build_command(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--zig", default="zig", help="Zig executable")
+    parser.add_argument(
+        "--print-max-rss",
+        action="store_true",
+        help="print the detected scheduler budget in bytes and exit",
+    )
     parser.add_argument("build_arguments", nargs=argparse.REMAINDER)
     args = parser.parse_args()
+    if args.print_max_rss:
+        if args.build_arguments:
+            parser.error("--print-max-rss does not accept build arguments")
+        print(detect_max_rss())
+        return 0
     build_arguments = args.build_arguments
     if build_arguments[:1] == ["--"]:
         build_arguments = build_arguments[1:]

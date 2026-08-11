@@ -42,7 +42,11 @@ extern fn antfly_api_kernel_set_ha_executor(context: *const CallContext) callcon
 extern fn antfly_api_kernel_executor(context: *const CallContext) callconv(.c) abi.Status;
 extern fn antfly_api_kernel_streaming_executor(context: *const CallContext) callconv(.c) abi.Status;
 extern fn antfly_api_kernel_attach_runtime_restore_store(context: *const CallContext) callconv(.c) abi.Status;
-extern fn antfly_api_kernel_attach_replicated_restore_store(context: *const CallContext) callconv(.c) abi.Status;
+extern fn antfly_api_kernel_attach_replicated_restore_store(
+    abi_version: u32,
+    handle: *anyopaque,
+    persistence: *const restore_jobs.ReplicatedPersistence,
+) callconv(.c) abi.Status;
 extern fn antfly_api_kernel_resume_restore_jobs(context: *const CallContext) callconv(.c) abi.Status;
 extern fn antfly_api_kernel_poll_restore_jobs(context: *const CallContext) callconv(.c) abi.Status;
 extern fn antfly_api_kernel_prepare_restore_leadership(context: *const CallContext) callconv(.c) abi.Status;
@@ -131,7 +135,7 @@ const OpaqueApiHttpServer = struct {
 
     pub fn attachReplicatedRestoreJobStore(self: *OpaqueApiHttpServer, persistence: restore_jobs.ReplicatedPersistence) !void {
         var input = persistence;
-        try callFallible(antfly_api_kernel_attach_replicated_restore_store, self.opaque_handle, &input, null);
+        try callError(antfly_api_kernel_attach_replicated_restore_store(abi.abi_version, self.opaque_handle, &input));
     }
 
     pub fn resumeRestoreJobsOnce(self: *OpaqueApiHttpServer) !void {

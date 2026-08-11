@@ -514,13 +514,13 @@ const MetadataAdminMux = struct {
 };
 
 fn metadataRestoreJobPersistence(svc: *service.MetadataHttpService) restore_jobs.ReplicatedPersistence {
-    return .{ .ptr = svc, .vtable = &.{
+    return restore_jobs.ReplicatedPersistence.fromLocal(svc, .{
         .load = metadataRestoreJobLoad,
         .get = metadataRestoreJobGet,
         .put = metadataRestoreJobPut,
         .delete = metadataRestoreJobDelete,
         .delete_many = metadataRestoreJobDeleteMany,
-    } };
+    });
 }
 
 fn metadataRestoreJobGet(ptr: *anyopaque, alloc: std.mem.Allocator, key: []const u8) !?[]u8 {

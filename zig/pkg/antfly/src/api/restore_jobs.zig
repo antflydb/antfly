@@ -7,7 +7,8 @@ const backend_erased = @import("../storage/backend_erased.zig");
 const mem_backend = @import("../storage/mem_backend.zig");
 const platform_sync = @import("antfly_platform").sync;
 const platform_time = @import("antfly_platform").time;
-const runtime_callback_abi = @import("../runtime_callback_abi.zig");
+const runtime_error_abi = @import("../runtime_error_abi.zig");
+const runtime_memory_abi = @import("../runtime_memory_abi.zig");
 
 const key_prefix = "\x00\x00__api_restore_jobs__:";
 const restore_job_retention_ms: u64 = 7 * 24 * 60 * 60 * 1000;
@@ -123,39 +124,219 @@ pub const OpenedStore = struct {
     }
 };
 
-pub const ReplicatedPersistence = struct {
+pub const ReplicatedPersistence = extern struct {
+    version: u32 = abi_version,
+    _reserved: u32 = 0,
     ptr: *anyopaque,
     vtable: *const VTable,
-    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
+
+    pub const abi_version: u32 = 1;
 
     pub const OwnedRow = struct { key: []u8, value: []u8 };
-    pub const VTable = struct {
+    pub const AbiRow = extern struct {
+        key: runtime_memory_abi.OwnedBytes = .{},
+        value: runtime_memory_abi.OwnedBytes = .{},
+    };
+    pub const AbiRows = extern struct {
+        ptr: ?[*]AbiRow = null,
+        len: usize = 0,
+    };
+    pub const VTable = extern struct {
+        load: *const fn (
+            ptr: *anyopaque,
+            alloc: *const runtime_memory_abi.Allocator,
+            out: *AbiRows,
+        ) callconv(.c) runtime_error_abi.Status,
+        get: *const fn (
+            ptr: *anyopaque,
+            alloc: *const runtime_memory_abi.Allocator,
+            key: runtime_memory_abi.Bytes,
+            out: *runtime_memory_abi.OptionalOwnedBytes,
+        ) callconv(.c) runtime_error_abi.Status,
+        put: *const fn (
+            ptr: *anyopaque,
+            key: runtime_memory_abi.Bytes,
+            value: runtime_memory_abi.Bytes,
+        ) callconv(.c) runtime_error_abi.Status,
+        delete: *const fn (
+            ptr: *anyopaque,
+            key: runtime_memory_abi.Bytes,
+        ) callconv(.c) runtime_error_abi.Status,
+        delete_many: *const fn (
+            ptr: *anyopaque,
+            alloc: *const runtime_memory_abi.Allocator,
+            keys: ?[*]const runtime_memory_abi.Bytes,
+            key_count: usize,
+        ) callconv(.c) runtime_error_abi.Status,
+    };
+    pub const LocalVTable = struct {
         load: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator) anyerror![]OwnedRow,
         get: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, key: []const u8) anyerror!?[]u8,
         put: *const fn (ptr: *anyopaque, key: []const u8, value: []const u8) anyerror!void,
         delete: *const fn (ptr: *anyopaque, key: []const u8) anyerror!void,
         delete_many: *const fn (ptr: *anyopaque, keys: []const []const u8) anyerror!void,
     };
-    const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
+
+    pub fn fromLocal(ptr: *anyopaque, comptime local: LocalVTable) ReplicatedPersistence {
+        return .{ .ptr = ptr, .vtable = &LocalAdapter(local).vtable };
+    }
+
+    fn LocalAdapter(comptime local: LocalVTable) type {
+        return struct {
+            const Self = @This();
+
+            const vtable: VTable = .{
+                .load = Self.load,
+                .get = Self.get,
+                .put = Self.put,
+                .delete = Self.delete,
+                .delete_many = Self.deleteMany,
+            };
+
+            fn fail(err: anyerror) runtime_error_abi.Status {
+                return runtime_error_abi.statusFromError(err);
+            }
+
+            fn load(
+                ptr: *anyopaque,
+                allocator: *const runtime_memory_abi.Allocator,
+                out: *AbiRows,
+            ) callconv(.c) runtime_error_abi.Status {
+                if (allocator.version != runtime_memory_abi.Allocator.abi_version)
+                    return fail(error.UnsupportedVersion);
+                const alloc = allocator.asStd();
+                const rows = local.load(ptr, alloc) catch |err| return fail(err);
+                const abi_rows = alloc.alloc(AbiRow, rows.len) catch |err| {
+                    freeRows(alloc, rows);
+                    return fail(err);
+                };
+                for (rows, 0..) |row, index| {
+                    abi_rows[index] = .{
+                        .key = .{ .ptr = row.key.ptr, .len = row.key.len },
+                        .value = .{ .ptr = row.value.ptr, .len = row.value.len },
+                    };
+                }
+                alloc.free(rows);
+                out.* = .{
+                    .ptr = if (abi_rows.len == 0) null else abi_rows.ptr,
+                    .len = abi_rows.len,
+                };
+                return .ok;
+            }
+
+            fn get(
+                ptr: *anyopaque,
+                allocator: *const runtime_memory_abi.Allocator,
+                key: runtime_memory_abi.Bytes,
+                out: *runtime_memory_abi.OptionalOwnedBytes,
+            ) callconv(.c) runtime_error_abi.Status {
+                if (allocator.version != runtime_memory_abi.Allocator.abi_version)
+                    return fail(error.UnsupportedVersion);
+                const value = local.get(ptr, allocator.asStd(), key.slice()) catch |err| return fail(err);
+                out.* = if (value) |bytes| .{
+                    .bytes = .{ .ptr = bytes.ptr, .len = bytes.len },
+                    .present = 1,
+                } else .{};
+                return .ok;
+            }
+
+            fn put(
+                ptr: *anyopaque,
+                key: runtime_memory_abi.Bytes,
+                value: runtime_memory_abi.Bytes,
+            ) callconv(.c) runtime_error_abi.Status {
+                local.put(ptr, key.slice(), value.slice()) catch |err| return fail(err);
+                return .ok;
+            }
+
+            fn delete(
+                ptr: *anyopaque,
+                key: runtime_memory_abi.Bytes,
+            ) callconv(.c) runtime_error_abi.Status {
+                local.delete(ptr, key.slice()) catch |err| return fail(err);
+                return .ok;
+            }
+
+            fn deleteMany(
+                ptr: *anyopaque,
+                allocator: *const runtime_memory_abi.Allocator,
+                keys_ptr: ?[*]const runtime_memory_abi.Bytes,
+                key_count: usize,
+            ) callconv(.c) runtime_error_abi.Status {
+                if (allocator.version != runtime_memory_abi.Allocator.abi_version)
+                    return fail(error.UnsupportedVersion);
+                const alloc = allocator.asStd();
+                const keys = alloc.alloc([]const u8, key_count) catch |err| return fail(err);
+                defer alloc.free(keys);
+                const abi_keys = if (key_count == 0) &.{} else keys_ptr.?[0..key_count];
+                for (abi_keys, 0..) |key, index| keys[index] = key.slice();
+                local.delete_many(ptr, keys) catch |err| return fail(err);
+                return .ok;
+            }
+        };
+    }
 
     pub fn load(self: ReplicatedPersistence, alloc: std.mem.Allocator) ![]OwnedRow {
-        return try BoundaryAbi.call("load", self.boundary_dispatch, self.vtable.load, .{ self.ptr, alloc });
+        try self.validateVersion();
+        var allocator = alloc;
+        var abi_allocator = runtime_memory_abi.Allocator.fromStd(&allocator);
+        var rows: AbiRows = .{};
+        try statusToError(self.vtable.load(self.ptr, &abi_allocator, &rows));
+        const abi_rows = if (rows.len == 0) &.{} else rows.ptr.?[0..rows.len];
+        defer if (rows.len != 0) alloc.free(abi_rows);
+        const out = alloc.alloc(OwnedRow, rows.len) catch |err| {
+            for (abi_rows) |row| {
+                alloc.free(row.key.slice());
+                alloc.free(row.value.slice());
+            }
+            return err;
+        };
+        for (abi_rows, 0..) |row, index| {
+            out[index] = .{ .key = row.key.slice(), .value = row.value.slice() };
+        }
+        return out;
     }
 
     pub fn get(self: ReplicatedPersistence, alloc: std.mem.Allocator, key: []const u8) !?[]u8 {
-        return try BoundaryAbi.call("get", self.boundary_dispatch, self.vtable.get, .{ self.ptr, alloc, key });
+        try self.validateVersion();
+        var allocator = alloc;
+        var abi_allocator = runtime_memory_abi.Allocator.fromStd(&allocator);
+        var out: runtime_memory_abi.OptionalOwnedBytes = .{};
+        try statusToError(self.vtable.get(self.ptr, &abi_allocator, .fromSlice(key), &out));
+        return if (out.present != 0) out.bytes.slice() else null;
     }
 
     pub fn put(self: ReplicatedPersistence, key: []const u8, value: []const u8) !void {
-        try BoundaryAbi.call("put", self.boundary_dispatch, self.vtable.put, .{ self.ptr, key, value });
+        try self.validateVersion();
+        try statusToError(self.vtable.put(self.ptr, .fromSlice(key), .fromSlice(value)));
     }
 
     pub fn delete(self: ReplicatedPersistence, key: []const u8) !void {
-        try BoundaryAbi.call("delete", self.boundary_dispatch, self.vtable.delete, .{ self.ptr, key });
+        try self.validateVersion();
+        try statusToError(self.vtable.delete(self.ptr, .fromSlice(key)));
     }
 
-    pub fn deleteMany(self: ReplicatedPersistence, keys: []const []const u8) !void {
-        try BoundaryAbi.call("delete_many", self.boundary_dispatch, self.vtable.delete_many, .{ self.ptr, keys });
+    pub fn deleteMany(self: ReplicatedPersistence, alloc: std.mem.Allocator, keys: []const []const u8) !void {
+        try self.validateVersion();
+        const abi_keys = try alloc.alloc(runtime_memory_abi.Bytes, keys.len);
+        defer alloc.free(abi_keys);
+        for (keys, 0..) |key, index| abi_keys[index] = .fromSlice(key);
+        var allocator = alloc;
+        var abi_allocator = runtime_memory_abi.Allocator.fromStd(&allocator);
+        try statusToError(self.vtable.delete_many(
+            self.ptr,
+            &abi_allocator,
+            if (abi_keys.len == 0) null else abi_keys.ptr,
+            abi_keys.len,
+        ));
+    }
+
+    fn statusToError(status: runtime_error_abi.Status) !void {
+        if (!status.isOk()) return runtime_error_abi.errorFromStatus(status);
+    }
+
+    fn validateVersion(self: ReplicatedPersistence) !void {
+        if (self.version != abi_version) return error.UnsupportedVersion;
     }
 
     pub fn freeRows(alloc: std.mem.Allocator, rows: []OwnedRow) void {
@@ -443,7 +624,7 @@ pub const Store = struct {
         var expired_offset: usize = 0;
         while (expired_offset < expired_keys.items.len) {
             const end = @min(expired_offset + restore_job_prune_batch_size, expired_keys.items.len);
-            try persistence.vtable.delete_many(persistence.ptr, expired_keys.items[expired_offset..end]);
+            try persistence.deleteMany(self.alloc, expired_keys.items[expired_offset..end]);
             expired_offset = end;
         }
         self.sortPendingLocked();
@@ -1431,7 +1612,7 @@ pub const Store = struct {
             };
             return txn.commit();
         }
-        if (self.replicated) |replicated| return replicated.deleteMany(keys);
+        if (self.replicated) |replicated| return replicated.deleteMany(self.alloc, keys);
         return error.RestoreJobPersistenceUnavailable;
     }
 
@@ -1743,6 +1924,7 @@ const TestReplicatedPersistence = struct {
     // 0 = open, 1 = pause the next point read after snapshotting, 2 = paused,
     // 3 = released. Tests use this to deterministically model a delayed read.
     get_gate: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+    fail_delete_many: bool = false,
 
     fn init(alloc: std.mem.Allocator) TestReplicatedPersistence {
         return .{ .alloc = alloc };
@@ -1758,13 +1940,13 @@ const TestReplicatedPersistence = struct {
     }
 
     fn persistence(self: *TestReplicatedPersistence) ReplicatedPersistence {
-        return .{ .ptr = self, .vtable = &.{
+        return ReplicatedPersistence.fromLocal(self, .{
             .load = load,
             .get = get,
             .put = put,
             .delete = delete,
             .delete_many = deleteMany,
-        } };
+        });
     }
 
     fn load(ptr: *anyopaque, alloc: std.mem.Allocator) ![]ReplicatedPersistence.OwnedRow {
@@ -1822,6 +2004,8 @@ const TestReplicatedPersistence = struct {
     }
 
     fn deleteMany(ptr: *anyopaque, keys: []const []const u8) !void {
+        const self: *TestReplicatedPersistence = @ptrCast(@alignCast(ptr));
+        if (self.fail_delete_many) return error.RestoreJobPersistenceUnavailable;
         for (keys) |key| try delete(ptr, key);
     }
 };
@@ -1831,6 +2015,12 @@ test "delayed replicated restore refresh cannot regress a running job" {
     defer persistence.deinit();
     var store = Store.initWithIo(std.testing.allocator, std.testing.io);
     defer store.deinit();
+    var incompatible = persistence.persistence();
+    incompatible.version += 1;
+    try std.testing.expectError(
+        error.UnsupportedVersion,
+        incompatible.load(std.testing.allocator),
+    );
     try store.attachReplicated(persistence.persistence());
 
     const queued = try store.start(std.testing.allocator, .{
@@ -2298,6 +2488,43 @@ test "replicated restore leadership rebuild preserves FIFO and recovers running 
     const recovered = try store.takePendingIds(std.testing.allocator, 3);
     defer std.testing.allocator.free(recovered);
     try std.testing.expectEqualSlices(u64, &created, recovered);
+}
+
+test "replicated restore expiry deletion preserves foreign boundary failure" {
+    var persistence = TestReplicatedPersistence.init(std.testing.allocator);
+    defer persistence.deinit();
+    persistence.fail_delete_many = true;
+    var store = Store.initWithIo(std.testing.allocator, std.testing.io);
+    defer store.deinit();
+    try store.attachReplicated(persistence.persistence());
+
+    const expired_key = try jobKey(std.testing.allocator, 999);
+    defer std.testing.allocator.free(expired_key);
+    const expired = try encode(std.testing.allocator, .{
+        .format_version = restore_job_format_version,
+        .job_id = 999,
+        .enqueue_sequence = 999,
+        .dispatch_sequence = 999,
+        .scope = .cluster,
+        .backup_id = "expired",
+        .location = "s3://archive/expired",
+        .connection = "archive-reader",
+        .phase = .succeeded,
+        .idempotency_namespace = "principal:admin:cluster",
+        .idempotency_key = "expired",
+        .request_fingerprint = "expired",
+        .created_at_ms = 0,
+        .updated_at_ms = 0,
+        .expires_at_ms = 0,
+    });
+    defer std.testing.allocator.free(expired);
+    try TestReplicatedPersistence.put(&persistence, expired_key, expired);
+
+    try std.testing.expectError(
+        error.RestoreJobPersistenceUnavailable,
+        store.prepareReplicatedLeadership(std.testing.allocator),
+    );
+    try std.testing.expect(persistence.rows.contains(expired_key));
 }
 
 test "restore requests without idempotency keys create independent opaque jobs" {

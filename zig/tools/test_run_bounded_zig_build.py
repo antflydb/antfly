@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import importlib.util
+import io
 import os
 import sys
 import unittest
@@ -116,6 +117,14 @@ class BoundedZigBuildTest(unittest.TestCase):
                 with mock.patch.object(launcher, "zig_version", return_value=(0, 16, 0)):
                     with self.assertRaisesRegex(RuntimeError, "unknown runner"):
                         launcher.prepare_build_runner("zig", Path("/tmp/patched.zig"))
+
+    def test_print_max_rss_uses_shared_host_aware_detection(self):
+        with mock.patch.object(sys, "argv", [str(SCRIPT), "--print-max-rss"]):
+            with mock.patch.object(launcher, "detect_max_rss", return_value=123_456):
+                output = io.StringIO()
+                with mock.patch("sys.stdout", output):
+                    self.assertEqual(0, launcher.main())
+        self.assertEqual("123456\n", output.getvalue())
 
 
 if __name__ == "__main__":

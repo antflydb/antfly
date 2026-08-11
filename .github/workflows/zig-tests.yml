@@ -285,6 +285,15 @@ jobs:
       - name: Check generated sources
         run: make zig-generated-check
 
+      - name: Test bounded-build tooling
+        working-directory: zig
+        run: >-
+          python3 -m unittest
+          tools/test_patch_zig_0_16_build_runner_maxrss.py
+          tools/test_run_bounded_zig_build.py
+          tools/test_analyze_zig_import_graph.py
+          tools/test_audit_storage_test_shards.py
+
       # ARC exposes the node CPU and memory totals instead of the pod limits.
       # Keep process affinity aligned with the CPU quota and give Zig's build
       # scheduler 80% of the cgroup memory budget. The patched 0.16 runner
@@ -296,11 +305,7 @@ jobs:
           jobs=$(nproc)
           if [ "$jobs" -gt 8 ]; then jobs=8; fi
           echo "list=0-$((jobs - 1))" >> "$GITHUB_OUTPUT"
-          memory_limit="$(cat /sys/fs/cgroup/memory.max 2>/dev/null || true)"
-          if ! [[ "$memory_limit" =~ ^[0-9]+$ ]]; then
-            memory_limit=$((15 * 1024 * 1024 * 1024))
-          fi
-          echo "max_rss=$((memory_limit * 4 / 5))" >> "$GITHUB_OUTPUT"
+          echo "max_rss=$(python3 zig/tools/run_bounded_zig_build.py --print-max-rss)" >> "$GITHUB_OUTPUT"
           zig_lib_dir="$(zig env | sed -n 's/^[[:space:]]*\.lib_dir = "\(.*\)",$/\1/p')"
           patched_runner="${RUNNER_TEMP}/zig-build-runner-maxrss.zig"
           python3 zig/tools/patch_zig_0_16_build_runner_maxrss.py \
@@ -524,6 +529,15 @@ jobs:
       - name: Check generated sources
         run: make zig-generated-check
 
+      - name: Test bounded-build tooling
+        working-directory: zig
+        run: >-
+          python3 -m unittest
+          tools/test_patch_zig_0_16_build_runner_maxrss.py
+          tools/test_run_bounded_zig_build.py
+          tools/test_analyze_zig_import_graph.py
+          tools/test_audit_storage_test_shards.py
+
       # Keep normal build-step parallelism while bounding aggregate compiler
       # memory to the pod's cgroup budget.
       - name: Configure bounded parallel heavy tests
@@ -532,11 +546,7 @@ jobs:
           jobs=$(nproc)
           if [ "$jobs" -gt 8 ]; then jobs=8; fi
           echo "list=0-$((jobs - 1))" >> "$GITHUB_OUTPUT"
-          memory_limit="$(cat /sys/fs/cgroup/memory.max 2>/dev/null || true)"
-          if ! [[ "$memory_limit" =~ ^[0-9]+$ ]]; then
-            memory_limit=$((15 * 1024 * 1024 * 1024))
-          fi
-          echo "max_rss=$((memory_limit * 4 / 5))" >> "$GITHUB_OUTPUT"
+          echo "max_rss=$(python3 zig/tools/run_bounded_zig_build.py --print-max-rss)" >> "$GITHUB_OUTPUT"
           zig_lib_dir="$(zig env | sed -n 's/^[[:space:]]*\.lib_dir = "\(.*\)",$/\1/p')"
           patched_runner="${RUNNER_TEMP}/zig-build-runner-maxrss.zig"
           python3 zig/tools/patch_zig_0_16_build_runner_maxrss.py \

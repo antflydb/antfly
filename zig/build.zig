@@ -2703,6 +2703,7 @@ pub fn build(b: *std.Build) void {
             "delayed restore contention yields FIFO capacity to unrelated jobs",
             "restore job runnable queue drains incrementally and preserves insertion order",
             "replicated restore leadership rebuild preserves FIFO and recovers running attempts",
+            "replicated restore expiry deletion preserves foreign boundary failure",
             "restore requests without idempotency keys create independent opaque jobs",
             "restore runtime store persists checkpoints and requeues interrupted work",
             "restore progress ordinals remain bounded at maximum table count",
@@ -6907,6 +6908,20 @@ pub fn build(b: *std.Build) void {
         "unit-storage-test",
         "Run the storage portion of the default unit-test target in bounded codegen shards",
     );
+    const unit_storage_shard_audit = b.addSystemCommand(&.{"python3"});
+    unit_storage_shard_audit.addFileArg(b.path("tools/audit_storage_test_shards.py"));
+    unit_storage_shard_audit.addArg("--root");
+    unit_storage_shard_audit.addDirectoryArg(b.path("pkg/antfly/src/storage"));
+    for (unit_storage_shard_filters) |shard_filters| {
+        for (shard_filters) |shard_filter| {
+            unit_storage_shard_audit.addArgs(&.{ "--filter", shard_filter });
+        }
+    }
+    const unit_storage_shard_audit_step = b.step(
+        "unit-storage-test-audit",
+        "Verify every test-bearing storage module belongs to a bounded codegen shard",
+    );
+    unit_storage_shard_audit_step.dependOn(&unit_storage_shard_audit.step);
     const storage_runtime_filter_is_default =
         lib_storage_runtime_filters.len == 1 and
         std.mem.eql(u8, lib_storage_runtime_filters[0], "storage.");
@@ -6929,6 +6944,7 @@ pub fn build(b: *std.Build) void {
             },
             .max_rss = shard_max_rss,
         });
+        unit_storage_tests.step.dependOn(&unit_storage_shard_audit.step);
         if (unit_storage_tail) |previous| unit_storage_tests.step.dependOn(previous);
         const run_unit_storage_tests = b.addRunArtifact(unit_storage_tests);
         addRuntimeTestFilters(b, run_unit_storage_tests, lib_storage_runtime_filters);

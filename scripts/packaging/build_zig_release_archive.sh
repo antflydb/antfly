@@ -166,9 +166,10 @@ patched_build_runner="$work_root/zig-build-runner-maxrss.zig"
 python3 "$repo_root/zig/tools/patch_zig_0_16_build_runner_maxrss.py" \
   "$zig_lib_dir/compiler/build_runner.zig" \
   "$patched_build_runner"
+max_rss="$(python3 "$repo_root/zig/tools/run_bounded_zig_build.py" --print-max-rss)"
 zig_install_args+=(
   --build-runner "$patched_build_runner"
-  --maxrss "${ANTFLY_ZIG_MAX_RSS:-20971520000}"
+  --maxrss "$max_rss"
 )
 
 run_zig_build_steps() {

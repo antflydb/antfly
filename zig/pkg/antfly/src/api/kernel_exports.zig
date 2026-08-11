@@ -150,9 +150,16 @@ pub fn attachRuntimeRestoreStore(context: *const CallContext) callconv(.c) abi.S
     return .ok;
 }
 
-pub fn attachReplicatedRestoreStore(context: *const CallContext) callconv(.c) abi.Status {
-    if (validateVersion(context.abi_version)) |failure| return failure;
-    serverState(context).server.attachReplicatedRestoreJobStore(input(restore_jobs.ReplicatedPersistence, context).*) catch |err|
+pub fn attachReplicatedRestoreStore(
+    abi_version: u32,
+    server_handle: *anyopaque,
+    persistence: *const restore_jobs.ReplicatedPersistence,
+) callconv(.c) abi.Status {
+    if (validateVersion(abi_version)) |failure| return failure;
+    if (persistence.version != restore_jobs.ReplicatedPersistence.abi_version)
+        return fail(error.UnsupportedVersion);
+    const state: *ServerState = @ptrCast(@alignCast(server_handle));
+    state.server.attachReplicatedRestoreJobStore(persistence.*) catch |err|
         return fail(err);
     return .ok;
 }
