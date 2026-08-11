@@ -2086,11 +2086,38 @@ test "transaction request parsers reject invalid unsigned integers and accept le
     );
     defer freeTxnPrepareRequest(alloc, &legacy_prepare);
     try std.testing.expectEqual(@as(u64, 0), legacy_prepare.topology_epoch);
+
+    var max_begin = try parseTxnBeginRequest(
+        alloc,
+        \\{"txn_id":"00112233445566778899aabbccddeeff","begin_timestamp":18446744073709551615,"topology_epoch":18446744073709551615,"participants":[]}
+        ,
+    );
+    defer freeTxnBeginRequest(alloc, &max_begin);
+    try std.testing.expectEqual(std.math.maxInt(u64), max_begin.begin_timestamp);
+    try std.testing.expectEqual(std.math.maxInt(u64), max_begin.topology_epoch);
+
+    var max_prepare = try parseTxnPrepareRequest(
+        alloc,
+        \\{"txn_id":"00112233445566778899aabbccddeeff","topology_epoch":18446744073709551615,"writes":[],"deletes":[],"transforms":[],"predicates":[{"key":"doc:a","expected_version":18446744073709551615}]}
+        ,
+    );
+    defer freeTxnPrepareRequest(alloc, &max_prepare);
+    try std.testing.expectEqual(std.math.maxInt(u64), max_prepare.topology_epoch);
+    try std.testing.expectEqual(std.math.maxInt(u64), max_prepare.req.predicates[0].expected_version);
+
+    const max_resolve = try parseTxnResolveRequest(
+        alloc,
+        \\{"txn_id":"00112233445566778899aabbccddeeff","status":"committed","commit_version":18446744073709551615,"topology_epoch":18446744073709551615}
+        ,
+    );
+    try std.testing.expectEqual(std.math.maxInt(u64), max_resolve.commit_version);
+    try std.testing.expectEqual(std.math.maxInt(u64), max_resolve.topology_epoch);
 }
 
 fn parseU64(value: std.json.Value) !u64 {
     return switch (value) {
         .integer => |integer| if (integer >= 0) @intCast(integer) else error.InvalidTxnRequest,
+        .number_string => |text| std.fmt.parseUnsigned(u64, text, 10) catch error.InvalidTxnRequest,
         else => error.InvalidTxnRequest,
     };
 }

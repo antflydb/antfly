@@ -98,6 +98,7 @@ test {
     _ = audio;
     _ = chunker;
     _ = pipelines;
+    _ = @import("pipelines/gliner.zig");
     _ = extractors;
     _ = server;
     _ = cache;
@@ -150,9 +151,9 @@ test {
     _ = cuda_attention_diff;
     _ = cuda_ffn_diff;
     _ = cuda_nvrtc;
+    _ = metal_runtime;
     _ = native_compute.native;
     if (build_options.enable_metal) {
-        _ = metal_runtime;
         _ = native_compute.metal;
     }
     if (build_options.enable_cuda) {

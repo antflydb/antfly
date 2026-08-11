@@ -2519,10 +2519,6 @@ pub const ComputeBackend = struct {
         return null;
     }
 
-    pub fn preferEagerQuantMirrors(self: *const ComputeBackend, enabled: bool) void {
-        if (self.vtable.preferEagerQuantMirrors) |op| op(self.ptr, enabled);
-    }
-
     pub fn glinerWordEmbeddings(self: *const ComputeBackend, hidden: CT, words_mask: []const i64, batch: usize, seq_len: usize, hidden_size: usize, num_words: usize) !?CT {
         if (self.vtable.glinerWordEmbeddings) |op| {
             return op(self.ptr, &.{
@@ -2535,6 +2531,12 @@ pub const ComputeBackend = struct {
             });
         }
         return null;
+    }
+
+    /// Prefer bounded dense mirrors for large-row eager quantized linears.
+    /// Backends that do not support this optimization ignore the hint.
+    pub fn preferEagerQuantMirrors(self: *const ComputeBackend, enabled: bool) void {
+        if (self.vtable.preferEagerQuantMirrors) |op| op(self.ptr, enabled);
     }
 
     pub fn glinerLabelGruCombined(self: *const ComputeBackend, label_embeddings: CT, num_labels: usize, hidden_size: usize) !?CT {

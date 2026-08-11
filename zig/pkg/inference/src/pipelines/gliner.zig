@@ -87,16 +87,18 @@ pub const GlinerPipeline = struct {
     tok: Tokenizer,
     config: GlinerConfig,
     /// Optional caller-owned guard for backend state shared by pipelines made
-    /// from the same loaded model (Metal frames and resident linear slots are
-    /// per-session state). Tokenization and postprocessing stay parallel;
-    /// only device/session execution is serialized.
+    /// from the same loaded model. Preparation and decoding stay parallel;
+    /// only stateful session execution is serialized.
     execution_lock: ?*std.atomic.Mutex = null,
 
-    fn lockedSessionRun(self: *GlinerPipeline, permit: *session_mod.RunPermit, inputs: []const Tensor, alloc: std.mem.Allocator) ![]Tensor {
-        if (self.execution_lock) |lock| {
-            platform.sync.lockYielding(lock);
-        }
-        defer if (self.execution_lock) |lock| lock.unlock();
+    fn lockedSessionRun(
+        self: *GlinerPipeline,
+        permit: *session_mod.RunPermit,
+        inputs: []const Tensor,
+        alloc: std.mem.Allocator,
+    ) ![]Tensor {
+        if (self.execution_lock) |mutex| platform.sync.lockYielding(mutex);
+        defer if (self.execution_lock) |mutex| mutex.unlock();
         return permit.run(inputs, alloc);
     }
 
@@ -856,7 +858,6 @@ pub const GlinerPipeline = struct {
 
         try splitIntoWords(alloc, text, &words, &word_starts, &word_ends);
         const num_words = words.items.len;
-
         const schema_len = schema.ids.len;
 
         // Tokenize each word individually (lowercased), tracking sub-token count per word
@@ -883,14 +884,15 @@ pub const GlinerPipeline = struct {
                 break :blk range;
             };
             word_token_ranges[wi] = token_range;
-            text_token_count = try std.math.add(usize, text_token_count, token_range.len);
+            text_token_count = std.math.add(usize, text_token_count, token_range.len) catch
+                return error.ResourceLimitExceeded;
         }
 
         // Total sequence length (clamp to max_len)
-        var seq_len = try std.math.add(usize, schema_len, text_token_count);
+        var seq_len = std.math.add(usize, schema_len, text_token_count) catch
+            return error.ResourceLimitExceeded;
         if (seq_len > max_len) seq_len = max_len;
 
-        // Build input tensors
         const input_ids_buf = try alloc.alloc(i64, seq_len);
         errdefer alloc.free(input_ids_buf);
         const attention_mask_buf = try alloc.alloc(i64, seq_len);
@@ -903,35 +905,35 @@ pub const GlinerPipeline = struct {
         var text_positions = std.ArrayListUnmanaged(i64).empty;
         errdefer text_positions.deinit(alloc);
 
-        // Fill schema tokens
         for (0..@min(schema_len, seq_len)) |j| {
             input_ids_buf[j] = @intCast(schema.ids[j]);
             attention_mask_buf[j] = 1;
-            words_mask_buf[j] = 0; // schema tokens get 0
+            words_mask_buf[j] = 0;
         }
 
-        // Fill text tokens with word IDs (1-indexed)
         var pos = schema_len;
         var actual_num_words: usize = 0;
         for (0..num_words) |wi| {
             const token_range = word_token_ranges[wi];
             const count = token_range.len;
-            if (pos + count > seq_len) break;
+            if (pos > seq_len or count > seq_len - pos) break;
 
             try text_positions.append(alloc, @intCast(pos));
             for (0..count) |ti| {
                 if (pos >= seq_len) break;
                 input_ids_buf[pos] = @intCast(unique_word_ids.items[token_range.offset + ti]);
                 attention_mask_buf[pos] = 1;
-                words_mask_buf[pos] = @intCast(wi + 1); // 1-indexed word ID
+                words_mask_buf[pos] = @intCast(wi + 1);
                 pos += 1;
             }
             actual_num_words = wi + 1;
         }
 
-        // Build span indices: all word-level spans up to max_width
-        const num_spans = actual_num_words * max_width;
-        const span_idx_buf = try alloc.alloc(i64, num_spans * 2);
+        const num_spans = std.math.mul(usize, actual_num_words, max_width) catch
+            return error.ResourceLimitExceeded;
+        const span_values = std.math.mul(usize, num_spans, 2) catch
+            return error.ResourceLimitExceeded;
+        const span_idx_buf = try alloc.alloc(i64, span_values);
         errdefer alloc.free(span_idx_buf);
 
         for (0..actual_num_words) |w| {
@@ -1814,20 +1816,20 @@ const AsciiCaselessStringContext = struct {
 };
 
 fn checkedSizeMul(a: usize, b: usize) !usize {
-    return std.math.mul(usize, a, b) catch error.InvalidShape;
+    return std.math.mul(usize, a, b) catch error.ResourceLimitExceeded;
 }
 
 fn checkedSizeAdd(a: usize, b: usize) !usize {
-    return std.math.add(usize, a, b) catch error.InvalidShape;
+    return std.math.add(usize, a, b) catch error.ResourceLimitExceeded;
 }
 
 fn sizeToI64(value: usize) !i64 {
-    if (value > std.math.maxInt(i64)) return error.InvalidShape;
+    if (value > std.math.maxInt(i64)) return error.ResourceLimitExceeded;
     return @intCast(value);
 }
 
 fn nonNegativeDim(value: i64) !usize {
-    if (value < 0) return error.InvalidShape;
+    if (value < 0) return error.UnexpectedOutputShape;
     return @intCast(value);
 }
 
@@ -1845,7 +1847,6 @@ fn cloneEntities(alloc: std.mem.Allocator, entities: []const Entity) ![]Entity {
     }
     return cloned;
 }
-
 test "scoreLabelsFromLogits returns sigmoid of max logit per label" {
     const alloc = std.testing.allocator;
     const logits = [_]f32{

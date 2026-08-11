@@ -6409,7 +6409,9 @@ pub const ApiHttpServer = struct {
                     error.HAReadWaitForMetadata,
                     error.ReadUnavailable,
                     => return try textResponse(self.alloc, 503, "standby read unavailable"),
-                    error.PersistentDescriptorAdmissionExhausted => return try textResponse(self.alloc, 503, "storage read temporarily unavailable"),
+                    error.PersistentDescriptorAdmissionExhausted,
+                    error.StorageReadTemporarilyUnavailable,
+                    => return try storageReadTemporarilyUnavailableResponse(self.alloc),
                     else => {
                         std.log.err("public table lookup failed table={s} key={s} err={}", .{ table_name, decoded_key, err });
                         return try textResponse(self.alloc, 500, "lookup failed");
@@ -6563,14 +6565,24 @@ pub const ApiHttpServer = struct {
                 };
                 defer scan_req.deinit(self.alloc);
 
-                var result = (try source.scan(
+                var result = (source.scan(
                     self.alloc,
                     table_name,
                     scan_req.from,
                     scan_req.to,
                     scan_req.opts,
                     .read_index,
-                )) orelse return try textResponse(self.alloc, 404, "not found");
+                ) catch |err| switch (err) {
+                    error.HAReadRequiresPrimary, error.ReadRequiresPrimary => return try textResponse(self.alloc, 503, "read requires primary"),
+                    error.HAReadWaitForApply,
+                    error.HAReadWaitForMetadata,
+                    error.ReadUnavailable,
+                    => return try textResponse(self.alloc, 503, "standby read unavailable"),
+                    error.PersistentDescriptorAdmissionExhausted,
+                    error.StorageReadTemporarilyUnavailable,
+                    => return try storageReadTemporarilyUnavailableResponse(self.alloc),
+                    else => return err,
+                }) orelse return try textResponse(self.alloc, 404, "not found");
                 defer result.deinit(self.alloc);
                 const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
                 defer if (row_filter_json) |value| self.alloc.free(value);
@@ -9062,8 +9074,10 @@ pub const ApiHttpServer = struct {
             error.HAReadWaitForApply,
             error.HAReadWaitForMetadata,
             error.ReadUnavailable,
-            error.PersistentDescriptorAdmissionExhausted,
             => return error.ReadUnavailable,
+            error.PersistentDescriptorAdmissionExhausted,
+            error.StorageReadTemporarilyUnavailable,
+            => return error.StorageReadTemporarilyUnavailable,
             error.ModelNotFound => return error.ModelNotFound,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
@@ -9133,7 +9147,10 @@ pub const ApiHttpServer = struct {
                 request_deadline_ns,
                 cancellation,
             ) catch |err| switch (err) {
-                error.DocIdentityNamespaceMismatch, error.IdentityReadGenerationChanged => {
+                error.DocIdentityNamespaceMismatch,
+                error.IdentityReadGenerationChanged,
+                error.StorageReadTemporarilyUnavailable,
+                => {
                     const now_ns = platform_time.monotonicNs();
                     if (retryDeadlineExpired(request_deadline_ns, now_ns)) return error.Timeout;
                     if (retry_timeout_ns == 0) return err;
@@ -9202,8 +9219,10 @@ pub const ApiHttpServer = struct {
                 error.HAReadWaitForApply,
                 error.HAReadWaitForMetadata,
                 error.ReadUnavailable,
-                error.PersistentDescriptorAdmissionExhausted,
                 => return error.ReadUnavailable,
+                error.PersistentDescriptorAdmissionExhausted,
+                error.StorageReadTemporarilyUnavailable,
+                => return error.StorageReadTemporarilyUnavailable,
                 error.Timeout => return error.Timeout,
                 error.Cancelled => return error.Cancelled,
                 error.InvalidManifest,
@@ -9247,8 +9266,10 @@ pub const ApiHttpServer = struct {
             error.HAReadWaitForApply,
             error.HAReadWaitForMetadata,
             error.ReadUnavailable,
-            error.PersistentDescriptorAdmissionExhausted,
             => return error.ReadUnavailable,
+            error.PersistentDescriptorAdmissionExhausted,
+            error.StorageReadTemporarilyUnavailable,
+            => return error.StorageReadTemporarilyUnavailable,
             error.Timeout => return error.Timeout,
             error.Cancelled => return error.Cancelled,
             error.InvalidManifest,
@@ -9320,8 +9341,10 @@ pub const ApiHttpServer = struct {
             error.HAReadWaitForApply,
             error.HAReadWaitForMetadata,
             error.ReadUnavailable,
-            error.PersistentDescriptorAdmissionExhausted,
             => return error.ReadUnavailable,
+            error.PersistentDescriptorAdmissionExhausted,
+            error.StorageReadTemporarilyUnavailable,
+            => return error.StorageReadTemporarilyUnavailable,
             error.Timeout => return error.Timeout,
             error.Cancelled => return error.Cancelled,
             error.InvalidManifest,
@@ -10371,6 +10394,7 @@ pub const ApiHttpServer = struct {
             error.HAReadWaitForMetadata,
             error.PersistentDescriptorAdmissionExhausted,
             => return error.ReadUnavailable,
+            error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
             error.InvalidArgument => return error.NotFound,
             else => {
                 std.log.err("public document artifact manifest lookup failed table={s} doc={s} artifact={s} err={}", .{ table_name, doc_key, artifact_name, err });
@@ -10394,6 +10418,7 @@ pub const ApiHttpServer = struct {
             error.HAReadWaitForMetadata,
             error.PersistentDescriptorAdmissionExhausted,
             => return error.ReadUnavailable,
+            error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
             error.InvalidArgument => return error.NotFound,
             else => {
                 std.log.err("public document artifact manifest list failed table={s} doc={s} err={}", .{ table_name, doc_key, err });
@@ -11367,7 +11392,9 @@ pub const ApiHttpServer = struct {
             error.HAReadWaitForMetadata,
             error.ReadUnavailable,
             => try textResponse(self.alloc, 503, "standby read unavailable"),
-            error.PersistentDescriptorAdmissionExhausted => try textResponse(self.alloc, 503, "storage read temporarily unavailable"),
+            error.PersistentDescriptorAdmissionExhausted,
+            error.StorageReadTemporarilyUnavailable,
+            => try storageReadTemporarilyUnavailableResponse(self.alloc),
             error.InvalidManifest,
             error.InvalidTableFile,
             error.TableBlockChecksumMismatch,
@@ -14623,6 +14650,7 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: http_commo
     };
     if (routes.Routes.matchTableLookup(path)) |lookup| return try tablePermission(alloc, lookup.table_name, .read);
     if (routes.Routes.matchTableQuery(path)) |query| return try tablePermission(alloc, query.table_name, .read);
+    if (routes.Routes.matchTableScan(path)) |scan| return try tablePermission(alloc, scan.table_name, .read);
     if (routes.Routes.matchTableDocumentArtifacts(path)) |artifact| return try tablePermission(alloc, artifact.table_name, switch (method) {
         .GET => .read,
         .POST, .PUT, .DELETE => return null,
@@ -14868,6 +14896,13 @@ test "document artifact routes declare read and admin permissions" {
 }
 
 test "required permissions decode table path resources" {
+    {
+        const required = (try requiredPermissionForRequest(std.testing.allocator, .POST, "/tables/docs%20table/documents")).?;
+        defer required.deinit(std.testing.allocator);
+        try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+        try std.testing.expectEqualStrings("docs table", required.resource);
+        try std.testing.expectEqual(usermgr.PermissionType.read, required.permission_type);
+    }
     {
         const required = (try requiredPermissionForRequest(std.testing.allocator, .GET, "/tables/docs%20table/artifacts")).?;
         defer required.deinit(std.testing.allocator);
@@ -15179,6 +15214,19 @@ fn indexRebuildingResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
         .message = "required index is rebuilding",
         .retryable = true,
     });
+}
+
+pub fn storageReadTemporarilyUnavailableResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
+    var response = try jsonBodyResponseWithStatus(alloc, 503, public_table_http.storage_read_temporarily_unavailable_body);
+    errdefer response.deinit(alloc);
+
+    response.headers = try alloc.alloc(http_common.Header, 1);
+    errdefer {
+        alloc.free(response.headers);
+        response.headers = &.{};
+    }
+    response.headers[0] = try ownedHeader(alloc, "Retry-After", "1");
+    return response;
 }
 
 fn unsupportedPublicQueryResponse(alloc: std.mem.Allocator, body: []const u8) !http_common.HttpResponse {
@@ -21199,6 +21247,93 @@ test "api http server requires auth on public routes when enabled" {
     try std.testing.expectEqual(@as(u16, 200), readyz.status);
 }
 
+test "api http server document scan requires table read permission" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/api-scan-auth", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:secret", .value = "{\"title\":\"classified\"}" },
+        },
+    });
+
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .status = status },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{
+                .metadata_group_id = 77,
+                .metrics = .{},
+                .projected_stores = 1,
+            };
+        }
+    };
+
+    var auth = try initTestAuthManager(alloc);
+    try bindTestAuthManager(alloc, &auth);
+    defer auth.manager.deinit();
+    defer auth.policy_store.deinit();
+    defer auth.store.deinit();
+
+    var other_table_permission = [_]usermgr.Permission{
+        try usermgr.Permission.initOwned(alloc, .table, "public", .read),
+    };
+    defer other_table_permission[0].deinit(alloc);
+    var other_table_reader = try auth.manager.createUser("other-reader", "reader", &other_table_permission);
+    defer other_table_reader.deinit(alloc);
+
+    var secrets_permission = [_]usermgr.Permission{
+        try usermgr.Permission.initOwned(alloc, .table, "secrets", .read),
+    };
+    defer secrets_permission[0].deinit(alloc);
+    var secrets_reader = try auth.manager.createUser("secrets-reader", "reader", &secrets_permission);
+    defer secrets_reader.deinit(alloc);
+
+    var read_source = table_reads.BoundTableReadSource.init("secrets", 1, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(alloc, .{
+        .auth_enabled = true,
+        .user_manager = &auth.manager,
+    }, source.iface(), read_source.source(), null);
+    defer server.deinit();
+
+    const other_reader_auth = try encodeBasicAuthorization(alloc, "other-reader", "reader");
+    defer alloc.free(other_reader_auth);
+    var forbidden = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/secrets/documents",
+        .authorization = other_reader_auth,
+        .body = "",
+    });
+    defer forbidden.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 403), forbidden.status);
+    try std.testing.expectEqualStrings("text/plain", forbidden.content_type.?);
+    try std.testing.expectEqualStrings("forbidden", forbidden.body);
+
+    const secrets_reader_auth = try encodeBasicAuthorization(alloc, "secrets-reader", "reader");
+    defer alloc.free(secrets_reader_auth);
+    var allowed = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/secrets/documents",
+        .authorization = secrets_reader_auth,
+        .body = "",
+    });
+    defer allowed.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), allowed.status);
+    try std.testing.expectEqualStrings("application/x-ndjson", allowed.content_type.?);
+    try std.testing.expect(std.mem.indexOf(u8, allowed.body, "\"_id\":\"doc:secret\"") != null);
+}
+
 test "api http server dispatches HA admin and internal executors" {
     const alloc = std.testing.allocator;
     const FakeSource = struct {
@@ -27076,6 +27211,7 @@ test "api http server preserves public query availability errors" {
         .{ .query_error = error.DocIdentityNamespaceMismatch, .status = 503, .body = "doc identity unavailable" },
         .{ .query_error = error.ReadUnavailable, .status = 503, .body = "standby read unavailable" },
         .{ .query_error = error.ReadRequiresPrimary, .status = 503, .body = "read requires primary" },
+        .{ .query_error = error.StorageReadTemporarilyUnavailable, .status = 503, .body = "{\"code\":\"storage_read_temporarily_unavailable\",\"message\":\"storage read temporarily unavailable\",\"retryable\":true}", .json = true },
         .{ .query_error = error.IndexRebuilding, .status = 503, .body = "{\"code\":\"index_rebuilding\",\"message\":\"required index is rebuilding\",\"retryable\":true}", .json = true },
         .{ .query_error = error.TableNotFound, .status = 404, .body = "not found" },
         .{ .query_error = error.InvalidManifest, .status = 500, .body = "{\"code\":\"table_storage_unreadable\",\"error\":\"InvalidManifest\",\"message\":\"table storage unreadable\",\"retryable\":false}", .json = true },
@@ -27093,6 +27229,10 @@ test "api http server preserves public query availability errors" {
         try std.testing.expectEqual(case.status, resp.status);
         try std.testing.expectEqualStrings(case.body, resp.body);
         try std.testing.expectEqualStrings(if (case.json) "application/json" else "text/plain", resp.content_type.?);
+        try std.testing.expectEqual(
+            case.query_error == error.StorageReadTemporarilyUnavailable,
+            resp.headers.len == 1 and std.ascii.eqlIgnoreCase(resp.headers[0].name, "Retry-After"),
+        );
 
         var multi_resp = try server.handlePublicTableMultiQuery("docs",
             \\{"query":{"match_all":{}}}
@@ -28228,7 +28368,6 @@ test "api http server create index waits for exact target config projection" {
     const alloc = std.testing.allocator;
 
     const FakeSource = struct {
-        projection_wait_calls: std.atomic.Value(u32) = .init(0),
         indexes_json: []const u8 = tables_api.default_indexes_json,
         owns_indexes_json: bool = false,
 
@@ -28240,7 +28379,6 @@ test "api http server create index waits for exact target config projection" {
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
                     .create_index = createIndex,
-                    .wait_table_projection = waitTableProjection,
                 },
             };
         }
@@ -28261,14 +28399,19 @@ test "api http server create index waits for exact target config projection" {
 
         fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            const tables = try std.testing.allocator.alloc(metadata_table_manager.TableRecord, 1);
+            errdefer std.testing.allocator.free(tables);
+            const indexes_json = try std.testing.allocator.dupe(u8, self.indexes_json);
+            errdefer std.testing.allocator.free(indexes_json);
+            tables[0] = .{
+                .table_id = 7,
+                .name = "docs",
+                .indexes_json = indexes_json,
+                .placement_role = "data",
+            };
             return .{
                 .status = .{ .metadata_group_id = 1, .metrics = .{} },
-                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
-                    .table_id = 7,
-                    .name = "docs",
-                    .indexes_json = self.indexes_json,
-                    .placement_role = "data",
-                }})[0..]),
+                .tables = tables,
                 .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
                     .group_id = 7001,
                     .table_id = 7,
@@ -28282,7 +28425,10 @@ test "api http server create index waits for exact target config projection" {
             };
         }
 
-        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn freeAdminSnapshot(_: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
+            std.testing.allocator.free(snapshot.tables[0].indexes_json);
+            std.testing.allocator.free(snapshot.tables);
+        }
 
         fn createIndex(ptr: *anyopaque, allocator: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -28294,15 +28440,6 @@ test "api http server create index waits for exact target config projection" {
             // equality with the pre-proposal snapshot.
             const concurrent = try indexes_api.addIndexToTableIndexesJson(allocator, next, "concurrent_text", "{\"type\":\"full_text\"}");
             self.replaceIndexesJson(allocator, concurrent, true);
-        }
-
-        fn waitTableProjection(ptr: *anyopaque, table_name: []const u8, schema_json: ?[]const u8, indexes_json: ?[]const u8) !void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expectEqualStrings("docs", table_name);
-            try std.testing.expect(schema_json == null);
-            try std.testing.expect(indexes_json != null);
-            try std.testing.expectEqualStrings(self.indexes_json, indexes_json.?);
-            _ = self.projection_wait_calls.fetchAdd(1, .monotonic);
         }
     };
 
@@ -28345,7 +28482,6 @@ test "api http server create index waits for exact target config projection" {
     });
     defer create_index_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 201), create_index_resp.status);
-    try std.testing.expectEqual(@as(u32, 0), source.projection_wait_calls.load(.monotonic));
 
     var first_lookup = (try indexes_api.lookupSingleIndexConfig(alloc, source.indexes_json, "embed_idx")).?;
     defer first_lookup.deinit();
@@ -28371,7 +28507,6 @@ test "api http server create index expands schema-derived algebraic config" {
             \\{"version":1,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"customer":{"type":"keyword"},"amount":{"type":"number"},"created_at":{"type":"datetime"}}}}}}
         ;
 
-        projection_wait_calls: std.atomic.Value(u32) = .init(0),
         indexes_json: []const u8 = tables_api.default_indexes_json,
         owns_indexes_json: bool = false,
 
@@ -28383,7 +28518,6 @@ test "api http server create index expands schema-derived algebraic config" {
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
                     .create_index = createIndex,
-                    .wait_table_projection = waitTableProjection,
                 },
             };
         }
@@ -28404,15 +28538,20 @@ test "api http server create index expands schema-derived algebraic config" {
 
         fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            const tables = try std.testing.allocator.alloc(metadata_table_manager.TableRecord, 1);
+            errdefer std.testing.allocator.free(tables);
+            const indexes_json = try std.testing.allocator.dupe(u8, self.indexes_json);
+            errdefer std.testing.allocator.free(indexes_json);
+            tables[0] = .{
+                .table_id = 7,
+                .name = "docs",
+                .schema_json = schema_json,
+                .indexes_json = indexes_json,
+                .placement_role = "data",
+            };
             return .{
                 .status = .{ .metadata_group_id = 1, .metrics = .{} },
-                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
-                    .table_id = 7,
-                    .name = "docs",
-                    .schema_json = schema_json,
-                    .indexes_json = self.indexes_json,
-                    .placement_role = "data",
-                }})[0..]),
+                .tables = tables,
                 .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
                     .group_id = 7001,
                     .table_id = 7,
@@ -28426,7 +28565,10 @@ test "api http server create index expands schema-derived algebraic config" {
             };
         }
 
-        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn freeAdminSnapshot(_: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
+            std.testing.allocator.free(snapshot.tables[0].indexes_json);
+            std.testing.allocator.free(snapshot.tables);
+        }
 
         fn createIndex(ptr: *anyopaque, allocator: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -28436,15 +28578,6 @@ test "api http server create index expands schema-derived algebraic config" {
             try std.testing.expect(std.mem.indexOf(u8, index_json, "\"measure_fields\"") != null);
             const next = try indexes_api.addIndexToTableIndexesJson(allocator, self.indexes_json, index_name, index_json);
             self.replaceIndexesJson(allocator, next, true);
-        }
-
-        fn waitTableProjection(ptr: *anyopaque, table_name: []const u8, schema_json_opt: ?[]const u8, indexes_json: ?[]const u8) !void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expectEqualStrings("docs", table_name);
-            try std.testing.expect(schema_json_opt == null);
-            try std.testing.expect(indexes_json != null);
-            try std.testing.expectEqualStrings(self.indexes_json, indexes_json.?);
-            _ = self.projection_wait_calls.fetchAdd(1, .monotonic);
         }
     };
 
@@ -28492,7 +28625,6 @@ test "api http server create index expands schema-derived algebraic config" {
     defer create_index_resp.deinit(alloc);
 
     try std.testing.expectEqual(@as(u16, 201), create_index_resp.status);
-    try std.testing.expectEqual(@as(u32, 1), source.projection_wait_calls.load(.monotonic));
     try std.testing.expect(std.mem.indexOf(u8, source.indexes_json, "\"derive_from_schema\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, source.indexes_json, "\"group_fields\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, source.indexes_json, "\"measure_fields\"") != null);

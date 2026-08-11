@@ -8738,7 +8738,10 @@ static void termite_metal_decode_runtime_memory_add_resources(
     }
 }
 
-static termite_metal_decode_runtime *termite_metal_active_encoder_runtime = NULL;
+// Encoder-frame routing is thread-local so independent model runtimes cannot
+// redirect each other's command encoders. Serving code additionally
+// serializes execution for each stateful model runtime.
+static _Thread_local termite_metal_decode_runtime *termite_metal_active_encoder_runtime = NULL;
 
 static bool termite_metal_trace_unscoped_compute_enabled(void) {
     const char *enabled = getenv("TERMITE_METAL_TRACE_UNSCOPED_COMPUTE");
@@ -10327,11 +10330,13 @@ static int termite_metal_decode_runtime_ensure_dense_qkv_packed_weight(
 ) {
     if (runtime == NULL || command_buffer == nil ||
         q_slot >= TERMITE_METAL_DENSE_QKV_PACK_CACHE_CAPACITY ||
-        k_slot >= TERMITE_METAL_DENSE_QKV_PACK_CACHE_CAPACITY ||
-        v_slot >= TERMITE_METAL_DENSE_QKV_PACK_CACHE_CAPACITY) return -1;
+        k_slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY ||
+        v_slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY) return -1;
     if (runtime->linear_weight_buffers[q_slot] == nil || runtime->linear_weight_buffers[k_slot] == nil || runtime->linear_weight_buffers[v_slot] == nil ||
         runtime->linear_bias_buffers[q_slot] == nil || runtime->linear_bias_buffers[k_slot] == nil || runtime->linear_bias_buffers[v_slot] == nil) return -1;
-    const size_t weight_element_bytes = runtime->linear_weight_dtypes[q_slot] == TERMITE_METAL_DENSE_LINEAR_DTYPE_F16
+    const uint8_t weight_dtype = runtime->linear_weight_dtypes[q_slot];
+    if (runtime->linear_weight_dtypes[k_slot] != weight_dtype || runtime->linear_weight_dtypes[v_slot] != weight_dtype) return -1;
+    const size_t weight_element_bytes = weight_dtype == TERMITE_METAL_DENSE_LINEAR_DTYPE_F16
         ? sizeof(uint16_t)
         : sizeof(float);
     size_t q_bytes = 0;
@@ -10437,8 +10442,11 @@ static int termite_metal_decode_runtime_ensure_dense_pair_packed_weight(
     size_t in_dim,
     size_t out_dim
 ) {
-    if (runtime == NULL || command_buffer == nil || a_slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY) return -1;
-    const size_t projection_bytes = out_dim * in_dim * sizeof(float);
+    if (runtime == NULL || command_buffer == nil || a_slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY || b_slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY) return -1;
+    const uint8_t weight_dtype = runtime->linear_weight_dtypes[a_slot];
+    if (runtime->linear_weight_dtypes[b_slot] != weight_dtype) return -1;
+    const size_t weight_element_bytes = weight_dtype == TERMITE_METAL_DENSE_LINEAR_DTYPE_F16 ? sizeof(uint16_t) : sizeof(float);
+    const size_t projection_bytes = out_dim * in_dim * weight_element_bytes;
     const size_t packed_bytes = projection_bytes * 2;
     const size_t bias_bytes = out_dim * sizeof(float);
     const size_t packed_bias_bytes = bias_bytes * 2;
@@ -25087,7 +25095,6 @@ int termite_metal_decode_runtime_prefer_linear_mps(
     runtime->linear_weight_dtypes[slot] = TERMITE_METAL_DENSE_LINEAR_DTYPE_F32_MPS;
     return 0;
 }
-
 int termite_metal_decode_runtime_prepare_linear_f16(
     termite_metal_decode_runtime *runtime,
     size_t slot,
@@ -25670,7 +25677,7 @@ int termite_metal_decode_runtime_apply_linear_multi_row_device(
         if ((termite_metal_dense_mps_linear_enabled() ||
              mps_weight_dtype == TERMITE_METAL_DENSE_LINEAR_DTYPE_F32_MPS ||
              mps_weight_dtype == TERMITE_METAL_DENSE_LINEAR_DTYPE_F16) &&
-            (mps_weight_dtype == TERMITE_METAL_DENSE_LINEAR_DTYPE_F32 ||
+             (mps_weight_dtype == TERMITE_METAL_DENSE_LINEAR_DTYPE_F32 ||
              mps_weight_dtype == TERMITE_METAL_DENSE_LINEAR_DTYPE_F32_MPS ||
              mps_weight_dtype == TERMITE_METAL_DENSE_LINEAR_DTYPE_F16) &&
             runtime->linear_weight_buffers[slot] != nil &&
@@ -25753,6 +25760,9 @@ int termite_metal_decode_runtime_apply_linear_multi_row_device(
                 return -12;
             }
         }
+        // F16 mirrors are MPS-only. Never reinterpret their storage through
+        // the float32 custom-kernel fallback.
+        if (runtime->linear_weight_dtypes[slot] == TERMITE_METAL_DENSE_LINEAR_DTYPE_F16) return -13;
         const bool frame_owned = (runtime->active_frame_cb == nil);
         id<MTLCommandBuffer> command_buffer = frame_owned
             ? termite_metal_new_command_buffer(runtime->queue, __func__)
@@ -29994,16 +30004,18 @@ int termite_metal_decode_runtime_apply_dense_linear_pair_slots_scratch_device(
     *b_output_handle = NULL;
     if (runtime->active_frame_cb == nil) return -2;
     if (runtime->dense_pair_split_bias_pipeline == nil) return -2;
-    const bool direct_packed_dense = termite_metal_direct_packed_dense_enabled();
-    if (runtime->active_planned_compute_encoder != nil && !direct_packed_dense) return -2;
     if (a_slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY || b_slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY) return -3;
     if (a_slot == b_slot) return -4;
     if (runtime->linear_slot_prepared[a_slot] == 0 || runtime->linear_slot_prepared[b_slot] == 0) return -5;
-    if (runtime->linear_weight_dtypes[a_slot] != TERMITE_METAL_DENSE_LINEAR_DTYPE_F32 ||
-        runtime->linear_weight_dtypes[b_slot] != TERMITE_METAL_DENSE_LINEAR_DTYPE_F32)
+    const uint8_t weight_dtype = runtime->linear_weight_dtypes[a_slot];
+    if ((weight_dtype != TERMITE_METAL_DENSE_LINEAR_DTYPE_F32 &&
+         weight_dtype != TERMITE_METAL_DENSE_LINEAR_DTYPE_F16) ||
+        runtime->linear_weight_dtypes[b_slot] != weight_dtype)
     {
         return -6;
     }
+    const bool direct_packed_dense = termite_metal_direct_packed_dense_enabled() && weight_dtype == TERMITE_METAL_DENSE_LINEAR_DTYPE_F32;
+    if (runtime->active_planned_compute_encoder != nil && !direct_packed_dense) return -2;
     if (runtime->linear_in_dims[a_slot] != in_dim || runtime->linear_in_dims[b_slot] != in_dim) return -7;
     if (runtime->linear_out_dims[a_slot] != out_dim || runtime->linear_out_dims[b_slot] != out_dim) return -8;
     if (rows == 0 || in_dim == 0 || out_dim == 0 || rows > UINT32_MAX || in_dim > UINT32_MAX || out_dim > UINT32_MAX) return -9;
@@ -30133,10 +30145,11 @@ int termite_metal_decode_runtime_apply_dense_linear_pair_slots_scratch_device(
                                                                                columns:in_dim
                                                                               rowBytes:in_dim * sizeof(float)
                                                                               dataType:MPSDataTypeFloat32];
+        const size_t weight_element_bytes = weight_dtype == TERMITE_METAL_DENSE_LINEAR_DTYPE_F16 ? sizeof(uint16_t) : sizeof(float);
         MPSMatrixDescriptor *right_desc = [MPSMatrixDescriptor matrixDescriptorWithRows:total_out_dim
                                                                                 columns:in_dim
-                                                                               rowBytes:in_dim * sizeof(float)
-                                                                               dataType:MPSDataTypeFloat32];
+                                                                               rowBytes:in_dim * weight_element_bytes
+                                                                               dataType:(weight_dtype == TERMITE_METAL_DENSE_LINEAR_DTYPE_F16 ? MPSDataTypeFloat16 : MPSDataTypeFloat32)];
         MPSMatrixDescriptor *result_desc = [MPSMatrixDescriptor matrixDescriptorWithRows:rows
                                                                                  columns:total_out_dim
                                                                                 rowBytes:total_out_dim * sizeof(float)

@@ -37105,6 +37105,89 @@ test "metal native decoder runtime bf16 multi-row linear matches identity projec
     }
 }
 
+test "metal native decoder runtime f16 MPS linear transitions from planned encoder" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const rows: usize = 3;
+    const hidden_size: usize = 128;
+    const slot: usize = 0;
+
+    const f16_one: u16 = @bitCast(@as(f16, 1.0));
+    const f16_weights = try allocator.alloc(u16, hidden_size * hidden_size);
+    defer allocator.free(f16_weights);
+    @memset(f16_weights, 0);
+    for (0..hidden_size) |i| f16_weights[i * hidden_size + i] = f16_one;
+    const f16_weight_bytes = std.mem.sliceAsBytes(f16_weights);
+
+    const bias = try allocator.alloc(f32, hidden_size);
+    defer allocator.free(bias);
+    @memset(bias, 0);
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_prepare_linear_f16(
+        runtime,
+        slot,
+        f16_weight_bytes.ptr,
+        f16_weight_bytes.len,
+        bias.ptr,
+        hidden_size,
+        hidden_size,
+    ));
+
+    const input_data = try allocator.alloc(f32, rows * hidden_size);
+    defer allocator.free(input_data);
+    for (input_data, 0..) |*value, i| {
+        const centered: i32 = @intCast(i % 29);
+        value.* = @as(f32, @floatFromInt(centered - 14)) * 0.125;
+    }
+    const shape = [_]i32{ @intCast(rows), @intCast(hidden_size) };
+    var input = try testDeviceTensorFromSlice(runtime, input_data, &shape);
+    defer input.deinit();
+    var scratch = try MetalTensor.deviceAllocate(runtime, input_data.len * @sizeOf(f32), .private, &shape);
+    defer scratch.deinit();
+    var output = try MetalTensor.deviceAllocate(runtime, input_data.len * @sizeOf(f32), .private, &shape);
+    defer output.deinit();
+
+    try beginFrame(runtime);
+    errdefer cancelFrame(runtime) catch {};
+    try beginPlannedComputeScope(runtime, @intFromEnum(ComputeSource.dense_linear), .ffn);
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_apply_add_device(
+        runtime,
+        input.deviceHandle(),
+        input.deviceByteOffset(),
+        input.deviceHandle(),
+        input.deviceByteOffset(),
+        input_data.len,
+        scratch.deviceHandle(),
+        scratch.deviceByteOffset(),
+    ));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_apply_linear_multi_row_device(
+        runtime,
+        slot,
+        input.deviceHandle(),
+        input.deviceByteOffset(),
+        rows,
+        hidden_size,
+        hidden_size,
+        output.deviceHandle(),
+        output.deviceByteOffset(),
+    ));
+    try endPlannedComputeScope(runtime);
+    try submitFrame(runtime);
+    try waitFrame(runtime);
+
+    const actual = try output.toHostSlice();
+    try std.testing.expectEqual(input_data.len, actual.len);
+    for (input_data, actual) |expected, got| {
+        try std.testing.expectApproxEqAbs(expected, got, 2e-3);
+    }
+}
+
 test "metal native decoder runtime activation scratch pool and hidden state" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!metalDeviceAvailable()) return error.SkipZigTest;

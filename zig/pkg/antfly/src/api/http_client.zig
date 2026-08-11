@@ -165,6 +165,7 @@ pub const RetrievalAgentResponse = struct {
 
 pub const BatchResponse = struct {
     owner_allocator: ?std.mem.Allocator = null,
+    status: u16,
     body: []u8,
 
     pub fn deinit(self: *BatchResponse, alloc: std.mem.Allocator) void {
@@ -335,6 +336,7 @@ pub const ApiHttpClient = struct {
         switch (resp.status) {
             200 => {},
             409 => return remoteGroupConflictError(resp.body),
+            503 => return remoteStorageReadUnavailableError(resp.body),
             else => return error.UnexpectedHttpStatus,
         }
         const version = for (resp.headers) |header| {
@@ -545,6 +547,7 @@ pub const ApiHttpClient = struct {
         switch (resp.status) {
             200 => {},
             409 => return remoteGroupConflictError(resp.body),
+            503 => return remoteStorageReadUnavailableError(resp.body),
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -643,6 +646,7 @@ pub const ApiHttpClient = struct {
             200 => {},
             408 => return error.Timeout,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return remoteStorageReadUnavailableError(resp.body),
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -707,6 +711,7 @@ pub const ApiHttpClient = struct {
             400 => return remotePreflightError(resp.body),
             404 => return remotePreflightError(resp.body),
             409 => return remotePreflightError(resp.body),
+            503 => return remoteStorageReadUnavailableError(resp.body),
             else => return error.UnexpectedHttpStatus,
         }
 
@@ -962,6 +967,7 @@ pub const ApiHttpClient = struct {
             200 => {},
             408 => return error.Timeout,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return remoteStorageReadUnavailableError(resp.body),
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -1010,6 +1016,7 @@ pub const ApiHttpClient = struct {
             200 => {},
             408 => return error.Timeout,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return remoteStorageReadUnavailableError(resp.body),
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -1138,6 +1145,7 @@ pub const ApiHttpClient = struct {
             408 => return error.Timeout,
             404 => return error.UnknownGroup,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return remoteStorageReadUnavailableError(resp.body),
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -1187,6 +1195,7 @@ pub const ApiHttpClient = struct {
             408 => return error.Timeout,
             404 => return error.UnknownGroup,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return remoteStorageReadUnavailableError(resp.body),
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -1236,6 +1245,7 @@ pub const ApiHttpClient = struct {
             408 => return error.Timeout,
             404 => return error.UnknownGroup,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return remoteStorageReadUnavailableError(resp.body),
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -1285,6 +1295,7 @@ pub const ApiHttpClient = struct {
             408 => return error.Timeout,
             404 => return error.UnknownGroup,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return remoteStorageReadUnavailableError(resp.body),
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -1312,11 +1323,12 @@ pub const ApiHttpClient = struct {
             .body = body,
         });
         defer resp.deinit(self.alloc);
-        if (resp.status != 201) {
-            std.debug.print("fetchBatch unexpected status={d} uri={s} body={s}\n", .{ resp.status, uri, resp.body });
-            return error.UnexpectedHttpStatus;
+        switch (resp.status) {
+            201, 202 => {},
+            else => return remotePublicBatchError(resp.status, resp.body),
         }
         return .{
+            .status = resp.status,
             .body = try self.alloc.dupe(u8, resp.body),
         };
     }
@@ -1734,6 +1746,7 @@ pub const ApiHttpClient = struct {
         }
         const response = BatchResponse{
             .owner_allocator = resp.owner_allocator orelse self.alloc,
+            .status = resp.status,
             .body = resp.body,
         };
         resp.body = &.{};
@@ -1775,6 +1788,7 @@ pub const ApiHttpClient = struct {
             200 => return .{ .body = try self.alloc.dupe(u8, resp.body) },
             404 => return error.NotFound,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return remoteStorageReadUnavailableError(resp.body),
             else => return error.UnexpectedHttpStatus,
         }
     }
@@ -1810,6 +1824,7 @@ pub const ApiHttpClient = struct {
             200 => return .{ .body = try self.alloc.dupe(u8, resp.body) },
             404 => return error.NotFound,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return remoteStorageReadUnavailableError(resp.body),
             else => return error.UnexpectedHttpStatus,
         }
     }
@@ -2114,6 +2129,7 @@ pub const ApiHttpClient = struct {
             200 => return .{},
             404 => return error.UnknownGroup,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.GroupLeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
     }
@@ -2147,6 +2163,7 @@ pub const ApiHttpClient = struct {
             200 => return .{},
             404 => return error.UnknownGroup,
             409 => return remoteGroupTxnPrepareConflictError(resp.body),
+            503 => return error.GroupLeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
     }
@@ -2199,6 +2216,7 @@ pub const ApiHttpClient = struct {
         switch (resp.status) {
             200 => {},
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.GroupLeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -2296,6 +2314,7 @@ pub const ApiHttpClient = struct {
             404 => return error.UnknownGroup,
             405 => return error.UnsupportedOperation,
             409 => return remoteGroupTxnResolveConflictError(resp.body),
+            503 => return error.GroupLeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
     }
@@ -2812,9 +2831,149 @@ fn remoteGroupConflictError(body: []const u8) anyerror {
     return error.UnexpectedHttpStatus;
 }
 
+fn remotePublicBatchError(status: u16, body: []const u8) anyerror {
+    const message = std.mem.trim(u8, body, " \t\r\n");
+    switch (status) {
+        409 => {
+            if (std.mem.eql(u8, message, "batch transaction conflicted")) return error.Conflict;
+            if (std.mem.eql(u8, message, "write outcome unknown")) return error.RaftBatchWriteOutcomeUnknown;
+            if (std.mem.eql(u8, message, "standby is read-only")) return error.HAReadOnlyStandby;
+            if (std.mem.eql(u8, message, "promoted standby requires primary open")) {
+                return error.HAPromotedStandbyRequiresPrimaryOpen;
+            }
+            if (std.mem.eql(u8, message, "fenced primary rejects writes")) return error.HAFencedPrimary;
+            return remoteGroupConflictError(message);
+        },
+        503 => {
+            if (std.mem.eql(u8, message, "write unavailable")) return error.LeaderUnavailable;
+            if (std.mem.eql(u8, message, "doc identity unavailable")) return error.DocIdentityUnavailable;
+            if (std.mem.eql(u8, message, "maintenance routes unavailable on query-only runtime")) {
+                return error.Unavailable;
+            }
+            return error.UnexpectedHttpStatus;
+        },
+        500 => {
+            if (std.mem.startsWith(u8, message, "transaction outcome is unknown")) {
+                return error.CommitDecisionUnknown;
+            }
+            return error.UnexpectedHttpStatus;
+        },
+        else => return error.UnexpectedHttpStatus,
+    }
+}
+
+test "api http client preserves public batch retry safety classifications" {
+    try std.testing.expectEqual(error.Conflict, remotePublicBatchError(409, "batch transaction conflicted"));
+    try std.testing.expectEqual(error.RaftBatchWriteOutcomeUnknown, remotePublicBatchError(409, "write outcome unknown"));
+    try std.testing.expectEqual(error.CommitDecisionUnknown, remotePublicBatchError(
+        500,
+        "transaction outcome is unknown; do not retry this stateless batch",
+    ));
+    try std.testing.expectEqual(error.LeaderUnavailable, remotePublicBatchError(503, "write unavailable"));
+    try std.testing.expectEqual(error.HAReadOnlyStandby, remotePublicBatchError(409, "standby is read-only"));
+}
+
+fn remoteStorageReadUnavailableError(body: []const u8) anyerror {
+    if (std.mem.eql(u8, body, "storage read temporarily unavailable")) {
+        return error.StorageReadTemporarilyUnavailable;
+    }
+    return error.UnexpectedHttpStatus;
+}
+
 test "api http client preserves remote transaction decision conflicts" {
     try std.testing.expectEqual(error.DecisionConflict, remoteGroupConflictError("decision conflict"));
     try std.testing.expectEqual(error.DecisionConflict, remoteGroupConflictError("DecisionConflict"));
+}
+
+test "api http client preserves remote storage read contention" {
+    try std.testing.expectEqual(
+        error.StorageReadTemporarilyUnavailable,
+        remoteStorageReadUnavailableError("storage read temporarily unavailable"),
+    );
+    try std.testing.expectEqual(
+        error.UnexpectedHttpStatus,
+        remoteStorageReadUnavailableError("group leader unavailable"),
+    );
+}
+
+test "api http client preserves storage read contention across group read endpoints" {
+    const UnavailableExecutor = struct {
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(_: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            return .{
+                .status = 503,
+                .body = try alloc.dupe(u8, "storage read temporarily unavailable"),
+            };
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var executor = UnavailableExecutor{};
+    var client = ApiHttpClient.init(alloc, executor.executor());
+    const base_uri = "http://127.0.0.1:1";
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, client.fetchGroupLookup(base_uri, 7, "docs", "doc:a", null));
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, client.fetchGroupDocumentArtifactManifest(base_uri, 7, "docs", "doc:a", "chunks"));
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, client.fetchGroupDocumentArtifactManifests(base_uri, 7, "docs", "doc:a"));
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, client.fetchGroupScan(base_uri, 7, "docs", null));
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, client.fetchGroupQuery(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, client.fetchGroupQueryPreflight(base_uri, 7, "docs", "{}", 0));
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, client.fetchGroupTextStats(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, client.fetchGroupAlgebraicPartials(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, client.fetchGroupGraphExpand(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, client.fetchGroupGraphHydrate(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, client.fetchGroupGraphEdges(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, client.fetchGroupVectorWorker(base_uri, 7, "docs", "{}"));
+}
+
+test "api http client accepts durable pending batch responses" {
+    const PendingExecutor = struct {
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(_: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, "/tables/docs/batch"));
+            return .{
+                .status = 202,
+                .body = try alloc.dupe(u8, "{\"status\":\"committed_pending\",\"inserted\":1,\"deleted\":0,\"transformed\":0}"),
+            };
+        }
+    };
+
+    var executor = PendingExecutor{};
+    var client = ApiHttpClient.init(std.testing.allocator, executor.executor());
+    var response = try client.fetchBatch("http://127.0.0.1:1", "docs", "{}");
+    defer response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 202), response.status);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "\"status\":\"committed_pending\"") != null);
+}
+
+test "api http client preserves retryable group transaction unavailability" {
+    const UnavailableExecutor = struct {
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(_: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            return .{
+                .status = 503,
+                .body = try alloc.dupe(u8, "group leader unavailable"),
+            };
+        }
+    };
+
+    var executor = UnavailableExecutor{};
+    var client = ApiHttpClient.init(std.testing.allocator, executor.executor());
+    const base_uri = "http://127.0.0.1:1";
+    try std.testing.expectError(error.GroupLeaderUnavailable, client.fetchGroupTxnBegin(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.GroupLeaderUnavailable, client.fetchGroupTxnPrepare(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.GroupLeaderUnavailable, client.fetchGroupTxnResolve(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.GroupLeaderUnavailable, client.fetchGroupTxnAcknowledge(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.GroupLeaderUnavailable, client.fetchGroupTxnStatus(base_uri, 7, "docs", "{}"));
 }
 
 fn isRetryableMetadataLeaderResponse(resp: http_common.HttpResponse) bool {

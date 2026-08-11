@@ -1230,8 +1230,10 @@ pub fn build(b: *std.Build) void {
     gliner2_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
     gliner2_bench_exe.root_module.addImport("antfly_platform", platform_mod);
     gliner2_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
-    // inference_internal already owns the Metal source and frameworks.
-    configureNativeTool(b, gliner2_bench_exe, target, enable_system_blas, blas_root, false);
+    // inference_internal already owns the native backend linkage, including
+    // metal_kernels.m. Linking it again at the executable root produces
+    // duplicate Metal symbols in these standalone benchmark tools.
+    gliner2_bench_exe.root_module.link_libc = true;
     configureOnnxRuntime(b, gliner2_bench_exe.root_module, enable_onnx, effective_onnx_root);
     const run_gliner2_bench = b.addRunArtifact(gliner2_bench_exe);
     if (b.args) |args| {
@@ -1258,8 +1260,7 @@ pub fn build(b: *std.Build) void {
     gliner2_e2e_bench_exe.root_module.addImport("protobuf", protobuf_mod);
     gliner2_e2e_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
     gliner2_e2e_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
-    // inference_internal already owns the Metal source and frameworks.
-    configureNativeTool(b, gliner2_e2e_bench_exe, target, enable_system_blas, blas_root, false);
+    gliner2_e2e_bench_exe.root_module.link_libc = true;
     configureOnnxRuntime(b, gliner2_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);
     const run_gliner2_e2e_bench = b.addRunArtifact(gliner2_e2e_bench_exe);
     if (b.args) |args| {
@@ -1370,8 +1371,7 @@ pub fn build(b: *std.Build) void {
     reranker_e2e_bench_exe.root_module.addImport("protobuf", protobuf_mod);
     reranker_e2e_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
     reranker_e2e_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
-    // inference_internal already owns the Metal source and frameworks.
-    configureNativeTool(b, reranker_e2e_bench_exe, target, enable_system_blas, blas_root, false);
+    reranker_e2e_bench_exe.root_module.link_libc = true;
     configureOnnxRuntime(b, reranker_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);
     const run_reranker_e2e_bench = b.addRunArtifact(reranker_e2e_bench_exe);
     if (b.args) |args| {

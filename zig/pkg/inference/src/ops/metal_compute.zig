@@ -10556,11 +10556,6 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return denseBuf(self.allocator, out, true, &out_shape);
     }
 
-    fn preferEagerQuantMirrorsOp(ctx: *anyopaque, enabled: bool) void {
-        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        self.eager_quant_mirrors_preferred = enabled;
-    }
-
     fn debertaEmbeddingsOp(ctx: *anyopaque, request: *const ops.DebertaEmbeddingsRequest) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const trace = traceGlinerStages();
@@ -10740,6 +10735,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return self.ctFromOwnedMetalTensor(tensor);
         }
         return null;
+    }
+
+    fn preferEagerQuantMirrorsOp(ctx: *anyopaque, enabled: bool) void {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        self.eager_quant_mirrors_preferred = enabled;
     }
 
     fn glinerLabelGruCombinedOp(ctx: *anyopaque, request: *const ops.GlinerLabelGruCombinedRequest) anyerror!?CT {

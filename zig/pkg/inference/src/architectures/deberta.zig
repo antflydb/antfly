@@ -103,7 +103,6 @@ fn metalSlotOpsEnabled() bool {
     if (platform.env.getenvBool("TERMITE_METAL_DISABLE_DEBERTA_SLOT_OPS")) return false;
     return true;
 }
-
 fn metalDebertaWeightMirrorMaxBytes() usize {
     const mb = platform.env.getenvUsize("TERMITE_METAL_DEBERTA_WEIGHT_MIRROR_MAX_MB") orelse 768;
     return std.math.mul(usize, mb, 1024 * 1024) catch std.math.maxInt(usize);
@@ -198,7 +197,6 @@ pub fn preplanMetalDebertaEncoderFrame(
     const heads: usize = @intCast(config.num_attention_heads);
     if (layer_count == 0 or batch == 0 or seq_len == 0 or H == 0 or I == 0 or heads == 0) return false;
     if (H % heads != 0) return false;
-
     const mirrors = debertaMirrorPreference(config, prefer_weight_mirrors);
 
     const layers = try allocator.alloc(ops.DebertaEncoderLayerSpec, layer_count);

@@ -226,7 +226,23 @@ pub const AntflyApiHandler = struct {
 
     fn respondOwnedApiResponse(ctx: *httpx.Context, resp: anytype) !httpx.Response {
         defer resp.deinit(ctx.allocator);
-        return respondApiResponseBody(ctx, resp.status, resp.body);
+        const Response = @TypeOf(resp.*);
+        _ = ctx.status(resp.status);
+        const is_json = if (@hasField(Response, "json")) resp.json else resp.status >= 200 and resp.status < 300;
+        if (is_json) {
+            try ctx.setHeader("content-type", "application/json");
+        } else {
+            try ctx.setHeader("content-type", "text/plain; charset=utf-8");
+        }
+        if (@hasField(Response, "retry_after_seconds")) {
+            if (resp.retry_after_seconds) |seconds| {
+                var retry_after_buf: [10]u8 = undefined;
+                const retry_after = try std.fmt.bufPrint(&retry_after_buf, "{d}", .{seconds});
+                try ctx.setHeader("Retry-After", retry_after);
+            }
+        }
+        _ = ctx.response.body(resp.body);
+        return ctx.response.build();
     }
 
     fn respondApiResponseBody(ctx: *httpx.Context, status: u16, body: []const u8) !httpx.Response {
@@ -2671,14 +2687,34 @@ pub const AntflyApiHandler = struct {
         };
         defer scan_req.deinit(alloc);
 
-        var result = (try source.scan(
+        var result = (source.scan(
             alloc,
             decoded_table_name,
             scan_req.from,
             scan_req.to,
             scan_req.opts,
             .read_index,
-        )) orelse {
+        ) catch |err| switch (err) {
+            error.TableNotFound => {
+                _ = ctx.status(404);
+                return ctx.text("not found");
+            },
+            error.HAReadRequiresPrimary, error.ReadRequiresPrimary => {
+                _ = ctx.status(503);
+                return ctx.text("read requires primary");
+            },
+            error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => {
+                _ = ctx.status(503);
+                return ctx.text("standby read unavailable");
+            },
+            error.PersistentDescriptorAdmissionExhausted,
+            error.StorageReadTemporarilyUnavailable,
+            => {
+                var response = try http_server_mod.storageReadTemporarilyUnavailableResponse(self.api_server.alloc);
+                return respondWithAllocator(ctx, &response, self.api_server.alloc);
+            },
+            else => return err,
+        }) orelse {
             _ = ctx.status(404);
             return ctx.text("not found");
         };
@@ -2721,6 +2757,10 @@ pub const AntflyApiHandler = struct {
         };
 
         var result = (source.lookup(alloc, decoded_table_name, decoded_key, lookup_opts.opts, consistency) catch |err| switch (err) {
+            error.TableNotFound => {
+                _ = ctx.status(404);
+                return ctx.text("not found");
+            },
             error.HAReadRequiresPrimary, error.ReadRequiresPrimary => {
                 _ = ctx.status(503);
                 return ctx.text("read requires primary");
@@ -2728,6 +2768,12 @@ pub const AntflyApiHandler = struct {
             error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => {
                 _ = ctx.status(503);
                 return ctx.text("standby read unavailable");
+            },
+            error.PersistentDescriptorAdmissionExhausted,
+            error.StorageReadTemporarilyUnavailable,
+            => {
+                var response = try http_server_mod.storageReadTemporarilyUnavailableResponse(self.api_server.alloc);
+                return respondWithAllocator(ctx, &response, self.api_server.alloc);
             },
             else => return err,
         }) orelse {
@@ -4380,6 +4426,23 @@ test "httpx internal request conversion preserves protocol headers" {
     try std.testing.expectEqualStrings("{}", converted.value.body);
 }
 
+test "httpx owned response preserves retryable JSON metadata" {
+    const alloc = std.testing.allocator;
+    var request = try httpx.Request.init(alloc, .GET, "http://127.0.0.1/db/v1/tables/docs/doc:a");
+    defer request.deinit();
+    var ctx = httpx.Context.init(alloc, undefined, &request);
+    defer ctx.deinit();
+
+    var owned = try public_table_http.storageReadTemporarilyUnavailableOwnedResponse(alloc);
+    var response = try AntflyApiHandler.respondOwnedApiResponse(&ctx, &owned);
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(u16, 503), response.status.code);
+    try std.testing.expectEqualStrings("application/json", response.headers.get("content-type").?);
+    try std.testing.expectEqualStrings("1", response.headers.get("Retry-After").?);
+    try std.testing.expectEqualStrings(public_table_http.storage_read_temporarily_unavailable_body, response.body.?);
+}
+
 test "httpx query admission rejects saturated queries without blocking control routes" {
     const alloc = std.testing.allocator;
     var source = AuthStatusSource{};
@@ -4801,6 +4864,80 @@ test "httpx antfly lookup route preserves projection and headers" {
     var parsed = try std.json.parseFromSlice(LookupResponse, alloc, resp.body.?, .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings("alpha", parsed.value.title);
+}
+
+test "httpx antfly reads map missing table errors to not found" {
+    const MissingTableReads = struct {
+        fn source() table_reads.TableReadSource {
+            return .{ .ptr = undefined, .vtable = &vtable };
+        }
+
+        const vtable = table_reads.TableReadSource.VTable{
+            .lookup = lookup,
+            .scan = scan,
+            .query = query,
+        };
+
+        fn lookup(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.LookupOptions,
+            _: raft_mod.ReadConsistency,
+        ) anyerror!?table_reads.LookupResponse {
+            return error.TableNotFound;
+        }
+
+        fn scan(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.ScanOptions,
+            _: raft_mod.ReadConsistency,
+        ) anyerror!?table_reads.ScanResponse {
+            return error.TableNotFound;
+        }
+
+        fn query(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.SearchRequest,
+            _: raft_mod.ReadConsistency,
+        ) anyerror!?query_api.QueryResponse {
+            return error.UnexpectedTestCall;
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var status_source = LookupStatusSource{};
+    var api_server = ApiHttpServer.init(alloc, .{}, status_source.iface(), MissingTableReads.source(), null);
+    var handler = AntflyApiHandler{ .api_server = &api_server };
+
+    var request = try httpx.Request.init(alloc, .GET, "http://127.0.0.1/db/v1/tables/docs/documents/doc:a");
+    defer request.deinit();
+    var ctx = httpx.Context.init(alloc, undefined, &request);
+    defer ctx.deinit();
+
+    var response = try handler.lookupKey(&ctx, "docs", "doc:a", .{});
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 404), response.status.code);
+    try std.testing.expectEqualStrings("text/plain; charset=utf-8", response.contentType().?);
+    try std.testing.expectEqualStrings("not found", response.body.?);
+
+    var scan_request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/tables/docs/documents");
+    defer scan_request.deinit();
+    var scan_ctx = httpx.Context.init(alloc, undefined, &scan_request);
+    defer scan_ctx.deinit();
+
+    var scan_response = try handler.scanKeys(&scan_ctx, "docs");
+    defer scan_response.deinit();
+    try std.testing.expectEqual(@as(u16, 404), scan_response.status.code);
+    try std.testing.expectEqualStrings("text/plain; charset=utf-8", scan_response.contentType().?);
+    try std.testing.expectEqualStrings("not found", scan_response.body.?);
 }
 
 test "httpx antfly scan honors optional body and documented bad requests" {

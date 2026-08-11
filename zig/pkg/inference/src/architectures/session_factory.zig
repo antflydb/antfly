@@ -6239,20 +6239,18 @@ fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator
                 return result;
             }
 
-            // The span head's quantized MLP weights run through the eager
-            // linear path at thousands of rows; dense f16 MPS mirrors are a
-            // measured win there. Scoped to GLiNER so other models' eager
-            // quantized linears keep their existing numerics and memory.
+            // The GLiNER span head and DeBERTa encoder run encoder-shaped
+            // quantized GEMMs. Bounded f16 mirrors avoid per-row quantized
+            // setup while leaving other model sessions unchanged.
             cb.preferEagerQuantMirrors(true);
             const hidden = try deberta_arch.forwardCt(&cb, allocator, cfg, input_ids, attention_mask, batch, seq_len, true);
             defer cb.free(hidden);
 
             // Eager head path -- keeps the encoder/head boundary on the
             // backend (CT) so we skip the toFloat32 + fromFloat32Shape
-            // round-trip the legacy []f32-typed APIs do. On Metal the head's
-            // gather/MLP/logits ops each pay a command-buffer commit+wait
-            // when no frame is open, so span the head with one frame; ops
-            // that read host memory (label GRU) drain it and reopen.
+            // round-trip the legacy []f32-typed APIs do. One Metal frame
+            // amortizes command-buffer commits across the resident head;
+            // host-reading ops such as the label GRU drain and reopen it.
             var head_frame_active = false;
             if (cb.kind() == .metal and !cb.decoderRuntimeHasActiveFrame()) {
                 head_frame_active = cb.decoderRuntimeBeginFrame() catch false;
