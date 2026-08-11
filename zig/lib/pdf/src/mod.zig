@@ -93,7 +93,20 @@ pub fn renderParsedPagePngAlloc(alloc: Allocator, parsed: *reader.Reader, page_n
 }
 
 fn renderParsedPagePngEffectiveAlloc(alloc: Allocator, parsed: *reader.Reader, page_number: usize, dpi: u16, max_pixels: u64) ![]u8 {
-    return renderParsedPagePngNativeAlloc(alloc, parsed, page_number, dpi, max_pixels) catch |err| switch (err) {
+    if (page_number == 0 or page_number > try parsed.pageCount()) return error.InvalidPageNumber;
+    const rotation = try normalizedPageRotation(try parsed.extractPageRotation(page_number));
+    return try renderParsedPagePngEffectiveWithRotationAlloc(alloc, parsed, page_number, dpi, max_pixels, rotation);
+}
+
+fn renderParsedPagePngEffectiveWithRotationAlloc(
+    alloc: Allocator,
+    parsed: *reader.Reader,
+    page_number: usize,
+    dpi: u16,
+    max_pixels: u64,
+    rotation: render.PageRotation,
+) ![]u8 {
+    return renderParsedPagePngNativeAlloc(alloc, parsed, page_number, dpi, max_pixels, rotation) catch |err| switch (err) {
         error.UnsupportedStreamFilter,
         error.UnsupportedNativeDecode,
         error.UnsupportedPdfRendering,
@@ -101,19 +114,23 @@ fn renderParsedPagePngEffectiveAlloc(alloc: Allocator, parsed: *reader.Reader, p
         error.MissingEndStream,
         error.UnexpectedEof,
         => if (builtin.os.tag == .macos)
-            try darwin_render.renderPagePngAlloc(alloc, parsed.sourceBytes(), page_number, dpi, max_pixels)
+            try darwin_render.renderPagePngAlloc(alloc, parsed.sourceBytes(), page_number, dpi, max_pixels, rotation)
         else
             return err,
         else => return err,
     };
 }
 
-fn renderParsedPagePngNativeAlloc(alloc: Allocator, parsed: *reader.Reader, page_number: usize, dpi: u16, max_pixels: u64) ![]u8 {
+fn renderParsedPagePngNativeAlloc(
+    alloc: Allocator,
+    parsed: *reader.Reader,
+    page_number: usize,
+    dpi: u16,
+    max_pixels: u64,
+    rotation: render.PageRotation,
+) ![]u8 {
     const reader_alloc = parsed.allocator();
-    if (page_number == 0) return error.InvalidPageNumber;
     if (dpi < minimum_direct_render_dpi or dpi > 600) return error.InvalidRenderDpi;
-    const page_count = try parsed.pageCount();
-    if (page_number > page_count) return error.InvalidPageNumber;
     // Reject oversized pages before decoding page images and font resources.
     const unscaled_box = try parsed.extractPageBox(page_number);
     const scale = @as(f64, @floatFromInt(dpi)) / 72.0;
@@ -208,7 +225,18 @@ fn renderParsedPagePngNativeAlloc(alloc: Allocator, parsed: *reader.Reader, page
             return a.paint_order < b.paint_order;
         }
     }.lessThan);
-    return try render.renderPageContentPngInBox(alloc, page_box, plain_runs.items, image_runs, shading_runs, all_pattern_runs.items, all_shape_runs.items);
+    return try render.renderPageContentPngInBoxRotated(alloc, page_box, plain_runs.items, image_runs, shading_runs, all_pattern_runs.items, all_shape_runs.items, rotation);
+}
+
+fn normalizedPageRotation(rotation: ?i32) !render.PageRotation {
+    const normalized = @mod(rotation orelse 0, 360);
+    return switch (normalized) {
+        0 => .none,
+        90 => .clockwise_90,
+        180 => .clockwise_180,
+        270 => .clockwise_270,
+        else => error.InvalidPageRotation,
+    };
 }
 
 /// Renders at the requested DPI when safe, reducing it only enough to satisfy
@@ -229,8 +257,12 @@ pub fn renderParsedPagePngAdaptiveAlloc(
     const page_count = try parsed.pageCount();
     if (page_number > page_count) return error.InvalidPageNumber;
     const box = try parsed.extractPageBox(page_number);
-    const page_width = @max(1.0, box.max_x - box.min_x);
-    const page_height = @max(1.0, box.max_y - box.min_y);
+    const rotation = try normalizedPageRotation(try parsed.extractPageRotation(page_number));
+    const unrotated_width = @max(1.0, box.max_x - box.min_x);
+    const unrotated_height = @max(1.0, box.max_y - box.min_y);
+    const swaps_dimensions = rotation == .clockwise_90 or rotation == .clockwise_270;
+    const page_width = if (swaps_dimensions) unrotated_height else unrotated_width;
+    const page_height = if (swaps_dimensions) unrotated_width else unrotated_height;
 
     var effective_dpi = requested_dpi;
     var width: u32 = 0;
@@ -252,7 +284,7 @@ pub fn renderParsedPagePngAdaptiveAlloc(
     }
 
     return .{
-        .png = try renderParsedPagePngEffectiveAlloc(alloc, parsed, page_number, effective_dpi, max_pixels),
+        .png = try renderParsedPagePngEffectiveWithRotationAlloc(alloc, parsed, page_number, effective_dpi, max_pixels, rotation),
         .requested_dpi = requested_dpi,
         .effective_dpi = effective_dpi,
         .width = width,
@@ -587,6 +619,72 @@ test "PDF render pattern cloning is allocation-failure safe" {
     };
 
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+fn buildRotatedTestPdfAlloc(alloc: Allocator, rotation: i32) ![]u8 {
+    const content = "0 0 10 10 re f\n";
+    const pages_object = try std.fmt.allocPrint(alloc, "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 20 30] /Rotate {d} >>\nendobj\n", .{rotation});
+    defer alloc.free(pages_object);
+    const content_object = try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ content.len, content });
+    defer alloc.free(content_object);
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        pages_object,
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>\nendobj\n",
+        content_object,
+    };
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(alloc);
+    try out.appendSlice(alloc, "%PDF-1.4\n");
+    var offsets: [objects.len]usize = undefined;
+    for (objects, 0..) |object, index| {
+        offsets[index] = out.items.len;
+        try out.appendSlice(alloc, object);
+    }
+    const xref_offset = out.items.len;
+    try out.appendSlice(alloc, "xref\n0 5\n0000000000 65535 f \n");
+    for (offsets) |offset| {
+        const entry = try std.fmt.allocPrint(alloc, "{d:0>10} 00000 n \n", .{offset});
+        defer alloc.free(entry);
+        try out.appendSlice(alloc, entry);
+    }
+    const trailer = try std.fmt.allocPrint(alloc, "trailer\n<< /Root 1 0 R /Size 5 >>\nstartxref\n{d}\n%%EOF\n", .{xref_offset});
+    defer alloc.free(trailer);
+    try out.appendSlice(alloc, trailer);
+    return try out.toOwnedSlice(alloc);
+}
+
+test "page rotation normalization accepts equivalent quarter turns" {
+    try std.testing.expectEqual(render.PageRotation.none, try normalizedPageRotation(null));
+    try std.testing.expectEqual(render.PageRotation.clockwise_90, try normalizedPageRotation(450));
+    try std.testing.expectEqual(render.PageRotation.clockwise_270, try normalizedPageRotation(-90));
+    try std.testing.expectError(error.InvalidPageRotation, normalizedPageRotation(45));
+}
+
+test "native and adaptive page rendering honor inherited rotation" {
+    const alloc = std.testing.allocator;
+    const fixture = try buildRotatedTestPdfAlloc(alloc, 90);
+    defer alloc.free(fixture);
+
+    const png = try renderPagePngAlloc(alloc, fixture, 1, 72, 40_000_000);
+    defer alloc.free(png);
+    const decoded = try @import("antfly_image").png.decodeRgba(alloc, png);
+    defer alloc.free(decoded.rgba);
+    try std.testing.expectEqual(@as(u32, 30), decoded.width);
+    try std.testing.expectEqual(@as(u32, 20), decoded.height);
+
+    var parsed = try reader.Reader.init(alloc, fixture);
+    defer parsed.deinit();
+    var adaptive = try renderParsedPagePngAdaptiveAlloc(alloc, &parsed, 1, 150, 40_000_000, 40);
+    defer adaptive.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 96), adaptive.effective_dpi);
+    try std.testing.expectEqual(@as(u32, 40), adaptive.width);
+    try std.testing.expectEqual(@as(u32, 27), adaptive.height);
+    const adaptive_decoded = try @import("antfly_image").png.decodeRgba(alloc, adaptive.png);
+    defer alloc.free(adaptive_decoded.rgba);
+    try std.testing.expectEqual(adaptive.width, adaptive_decoded.width);
+    try std.testing.expectEqual(adaptive.height, adaptive_decoded.height);
 }
 
 fn encryptType1EexecAlloc(alloc: Allocator, plain: []const u8) ![]u8 {
