@@ -88,6 +88,7 @@ pub const Producer = struct {
     pub const VTable = struct {
         produce: *const fn (ptr: *anyopaque, alloc: Allocator, request: Request) anyerror![]u8,
         produce_batch: ?*const fn (ptr: *anyopaque, alloc: Allocator, requests: []const Request) anyerror![][]u8 = null,
+        can_produce_batch: ?*const fn (ptr: *anyopaque, alloc: Allocator, requests: []const Request) anyerror!bool = null,
         deinit: ?*const fn (ptr: *anyopaque, alloc: Allocator) void = null,
     };
 
@@ -110,6 +111,17 @@ pub const Producer = struct {
             out[i] = try self.produce(alloc, request);
         }
         return out;
+    }
+
+    /// Reports whether produceBatch can execute the request set as one native
+    /// operation. A missing hook preserves the existing producer contract: a
+    /// provided batch function is assumed native, while the generic fallback is
+    /// explicitly sequential.
+    pub fn canProduceBatch(self: Producer, alloc: Allocator, requests: []const Request) !bool {
+        if (self.vtable.produce_batch == null) return false;
+        if (self.vtable.can_produce_batch) |can_produce_batch|
+            return try can_produce_batch(self.ptr, alloc, requests);
+        return true;
     }
 
     pub fn deinit(self: Producer, alloc: Allocator) void {

@@ -858,6 +858,7 @@ fn parseOcrOptions(alloc: Allocator, object: std.json.ObjectMap, config: *Config
     const value = object.get("ocr") orelse return;
     if (value != .object) return;
     const ocr = value.object;
+    try rejectUnknownFields(ocr, &.{ "enabled", "config", "mode", "render_dpi", "max_rendered_pixels", "max_rendered_dimension", "prompt", "quality" });
     if (ocr.get("mode")) |mode| {
         if (mode != .string) return error.InvalidDocumentExtractionConfig;
         config.ocr_mode = if (std.mem.eql(u8, mode.string, "auto"))
@@ -897,6 +898,7 @@ fn parseOcrOptions(alloc: Allocator, object: std.json.ObjectMap, config: *Config
     const quality_value = ocr.get("quality") orelse return;
     if (quality_value != .object) return error.InvalidDocumentExtractionConfig;
     const quality = quality_value.object;
+    try rejectUnknownFields(quality, &.{ "min_content_chars", "garbled_min_words", "garbled_sample_words", "max_single_char_word_ratio", "substantial_line_min_chars", "max_corrupted_line_ratio", "font_corruption_score_threshold", "max_replacement_char_ratio" });
     if (try intField(quality, "min_content_chars")) |v| {
         if (v < 0) return error.InvalidDocumentExtractionConfig;
         config.ocr_quality.min_content_chars = @intCast(v);
@@ -917,6 +919,15 @@ fn parseOcrOptions(alloc: Allocator, object: std.json.ObjectMap, config: *Config
     if (try floatField(quality, "max_corrupted_line_ratio")) |v| config.ocr_quality.max_corrupted_line_ratio = try ratio(v);
     if (try floatField(quality, "font_corruption_score_threshold")) |v| config.ocr_quality.font_corruption_score_threshold = try ratio(v);
     if (try floatField(quality, "max_replacement_char_ratio")) |v| config.ocr_quality.max_replacement_char_ratio = try ratio(v);
+}
+
+fn rejectUnknownFields(object: std.json.ObjectMap, allowed: []const []const u8) !void {
+    var it = object.iterator();
+    while (it.next()) |entry| {
+        for (allowed) |field| {
+            if (std.mem.eql(u8, entry.key_ptr.*, field)) break;
+        } else return error.InvalidDocumentExtractionConfig;
+    }
 }
 
 fn intField(object: std.json.ObjectMap, field: []const u8) !?i64 {
@@ -3717,6 +3728,12 @@ test "generated text provider config is validated while parsing extraction confi
     ));
     try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(alloc,
         \\{"ocr_fallback":"false"}
+    ));
+    try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(alloc,
+        \\{"ocr":{"enabled":true,"render_dp":150,"config":{"provider":"antfly"}}}
+    ));
+    try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(alloc,
+        \\{"ocr":{"enabled":true,"quality":{"min_content_char":50},"config":{"provider":"antfly"}}}
     ));
 }
 

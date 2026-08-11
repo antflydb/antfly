@@ -76,14 +76,14 @@ pub const Runtime = struct {
     pub fn producer(self: *Runtime) asset_producer.Producer {
         return .{
             .ptr = self,
-            .vtable = &.{ .produce = produce, .produce_batch = produceBatch },
+            .vtable = &.{ .produce = produce, .produce_batch = produceBatch, .can_produce_batch = canProduceBatch },
         };
     }
 
     pub fn ownedProducer(self: *Runtime) asset_producer.Producer {
         return .{
             .ptr = self,
-            .vtable = &.{ .produce = produce, .produce_batch = produceBatch, .deinit = deinitProducer },
+            .vtable = &.{ .produce = produce, .produce_batch = produceBatch, .can_produce_batch = canProduceBatch, .deinit = deinitProducer },
         };
     }
 
@@ -96,6 +96,90 @@ pub const Runtime = struct {
     fn produce(ptr: *anyopaque, alloc: Allocator, request: asset_producer.Request) ![]u8 {
         const self: *Runtime = @ptrCast(@alignCast(ptr));
         return try self.produceOne(alloc, request);
+    }
+
+    fn canProduceBatch(ptr: *anyopaque, alloc: Allocator, requests: []const asset_producer.Request) !bool {
+        const self: *Runtime = @ptrCast(@alignCast(ptr));
+        if (requests.len == 0) return true;
+        const first = requests[0];
+        for (requests) |request| {
+            if (request.producer_type != first.producer_type) return false;
+        }
+        return switch (first.producer_type) {
+            .copy => true,
+            .document_extraction => false,
+            .reader => try self.canReadBatch(alloc, requests),
+            .generator => try self.canGenerateBatch(alloc, requests),
+            // The transcriber interface accepts one audio input per call. Its
+            // produceBatch implementation is therefore a compatibility loop,
+            // not an atomic provider batch, and must be isolated by callers.
+            .transcriber => false,
+            .extractor => try self.canExtractBatch(alloc, requests),
+        };
+    }
+
+    fn requestsShareConfig(requests: []const asset_producer.Request) bool {
+        for (requests[1..]) |request| {
+            if (!std.mem.eql(u8, request.config_json, requests[0].config_json)) return false;
+        }
+        return true;
+    }
+
+    fn canReadBatch(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) !bool {
+        _ = self;
+        if (!requestsShareConfig(requests)) return false;
+        for (requests[1..]) |request| {
+            if (request.inline_media_trusted != requests[0].inline_media_trusted) return false;
+        }
+        var cfg = try std.json.parseFromSlice(readers.Config, alloc, requests[0].config_json, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+        });
+        defer cfg.deinit();
+        if (!readerSupportsPerImageBatch(cfg.value.provider)) return false;
+
+        var shared_prompt: ?[]const u8 = cfg.value.prompt;
+        for (requests, 0..) |request, i| {
+            var source = try parseReaderSource(alloc, request.source_text, request.source_parts_json);
+            defer source.deinit(alloc);
+            if (source.images.len == 0) return false;
+            const effective_prompt = source.prompt orelse cfg.value.prompt;
+            if (i == 0) {
+                shared_prompt = effective_prompt;
+            } else if (!optionalStringsEqual(shared_prompt, effective_prompt)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    fn canGenerateBatch(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) !bool {
+        _ = self;
+        if (!requestsShareConfig(requests)) return false;
+        for (requests) |request| {
+            if (request.source_parts_json) |parts| if (parts.len > 0) return false;
+        }
+        var parsed = try parseGeneratorProducerConfig(alloc, requests[0].config_json);
+        defer parsed.deinit(alloc);
+        const cfg = parsed.generator;
+        return cfg.provider == .antfly and
+            cfg.url.len > 0 and
+            cfg.api_key == null and
+            cfg.project_id == null and
+            cfg.location == null and
+            cfg.credentials_path == null and
+            cfg.tools_json == null and
+            cfg.tool_choice_json == null and
+            parsed.tool_output == .content;
+    }
+
+    fn canExtractBatch(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) !bool {
+        if (!requestsShareConfig(requests)) return false;
+        var cfg = try extracting.parseConfigFromSlice(alloc, requests[0].config_json);
+        defer cfg.deinit(alloc);
+        if (!isLocalExtractionProvider(cfg.provider, cfg.resolvedUrl())) return true;
+        const local = self.antfly_provider orelse return false;
+        return local.extract != null;
     }
 
     fn produceOne(self: *Runtime, alloc: Allocator, request: asset_producer.Request) ![]u8 {
@@ -1492,6 +1576,12 @@ test "asset producer runtime keeps prompt-level remote readers sequential" {
     );
     defer alloc.free(cfg_json);
 
+    const requests = [_]asset_producer.Request{
+        .{ .producer_type = .reader, .config_json = cfg_json, .source_text = "data:image/png;base64,aaa", .content_type = "text/plain" },
+        .{ .producer_type = .reader, .config_json = cfg_json, .source_text = "data:image/png;base64,bbb", .content_type = "text/plain" },
+    };
+    try std.testing.expect(!(try producer.canProduceBatch(alloc, &requests)));
+
     var results: ?[][]u8 = null;
     var run_err: ?anyerror = null;
     var group = std.Io.Group.init;
@@ -1662,7 +1752,7 @@ test "asset producer runtime batches compatible antfly transcriber requests" {
     var runtime = Runtime.initWithOptions(alloc, &client, .{ .antfly_provider = local.provider() });
     const producer = runtime.producer();
 
-    const results = try producer.produceBatch(alloc, &.{
+    const requests = [_]asset_producer.Request{
         .{
             .producer_type = .transcriber,
             .config_json = "{\"provider\":\"antfly\",\"model\":\"local-transcriber\",\"language_code\":\"en-US\"}",
@@ -1675,7 +1765,10 @@ test "asset producer runtime batches compatible antfly transcriber requests" {
             .source_text = "file:///tmp/b.wav",
             .content_type = "text/plain",
         },
-    });
+    };
+    try std.testing.expect(!(try producer.canProduceBatch(alloc, &requests)));
+
+    const results = try producer.produceBatch(alloc, &requests);
     defer {
         for (results) |result| alloc.free(result);
         alloc.free(results);

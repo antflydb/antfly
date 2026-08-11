@@ -756,6 +756,7 @@ fn enrichmentErrorDisposition(err: anyerror) EnrichmentErrorDisposition {
         error.InvalidDocumentExtractionConfig,
         error.InvalidEnrichmentConfig,
         error.InvalidEmbeddingResponse,
+        error.ReadRequestFailed,
         error.OcrPromptEcho,
         error.TrivialOcrOutput,
         error.UnsupportedEmbeddingProvider,
@@ -954,6 +955,7 @@ test "enrichment treats missing local model as retryable" {
 test "enrichment retries unknown errors and isolates known permanent errors" {
     try std.testing.expectEqual(EnrichmentErrorDisposition.retryable_request, enrichmentErrorDisposition(error.UnexpectedEndOfInput));
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.UnsupportedEmbeddingProvider));
+    try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.ReadRequestFailed));
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.OcrPromptEcho));
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.TrivialOcrOutput));
     try std.testing.expectEqual(EnrichmentErrorDisposition.fatal_worker, enrichmentErrorDisposition(error.OutOfMemory));
@@ -3260,6 +3262,13 @@ fn flushAssetProducerBatch(
     defer runtime.alloc.free(requests);
     for (items.items, 0..) |*item, idx| requests[idx] = item.asRequest();
 
+    const can_batch = producer.canProduceBatch(runtime.alloc, requests) catch |err| {
+        if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
+        return try flushAssetProducerBatchSequential(runtime, producer, items.items, window);
+    };
+    if (!can_batch)
+        return try flushAssetProducerBatchSequential(runtime, producer, items.items, window);
+
     var produced = producer.produceBatch(runtime.alloc, requests) catch |err| {
         if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
         // Batch execution is an optimization boundary, not a logical repair
@@ -3394,13 +3403,26 @@ fn processDocumentExtractionAsset(
         }
     }
 
+    var resource_tracker = RuntimeDocumentExtractionResourceTracker.init(runtime);
+    defer resource_tracker.deinit();
+    var download_budgeted: ?resource_manager_mod.BudgetedAllocator = if (resource_tracker.manager) |manager|
+        resource_manager_mod.BudgetedAllocator.init(manager, .document_extraction_working_set, runtime.alloc, 1)
+    else
+        null;
+    defer if (download_budgeted) |*allocator| allocator.deinit();
+    const download_alloc = if (download_budgeted) |*allocator| allocator.allocator() else runtime.alloc;
+
     const fetched = template_remote.downloadRemoteContentOutcomeAllocWithConfig(
-        runtime.alloc,
+        download_alloc,
         runtime.config.remote_content,
         runtime.config.secret_store,
         source_url,
         if (config.credentials.len > 0) config.credentials else null,
-    ) catch |err| {
+    ) catch |raw_err| {
+        const err: anyerror = if (raw_err == error.OutOfMemory and download_budgeted != null and download_budgeted.?.denied())
+            error.DocumentExtractionWorkingSetTooLarge
+        else
+            raw_err;
         if (shouldYieldRequestError(runtime, err)) return err;
         try writeDocumentExtractionFailureManifest(
             runtime,
@@ -3450,10 +3472,12 @@ fn processDocumentExtractionAsset(
         },
     };
     var downloaded_mut = downloaded;
-    defer downloaded_mut.deinit(runtime.alloc);
-    var resource_tracker = RuntimeDocumentExtractionResourceTracker.init(runtime);
-    defer resource_tracker.deinit();
-    try resource_tracker.setDownloadedBytes(downloaded_mut.data.len);
+    defer downloaded_mut.deinit(download_alloc);
+    if (download_budgeted != null) {
+        resource_tracker.setExternallyAccountedDownloadedBytes(downloaded_mut.data.len);
+    } else {
+        try resource_tracker.setDownloadedBytes(downloaded_mut.data.len);
+    }
     if (document_extraction_mod.resolvesToPdf(config, source_url, if (config.content_type.len > 0) config.content_type else downloaded_mut.content_type, downloaded_mut.data)) {
         const decode_budget = try resource_tracker.reservePdfDecodeWorkingSet(config.pdf_decode_limits.max_working_set_bytes);
         config.pdf_decode_limits.max_working_set_bytes = decode_budget;
@@ -4213,6 +4237,10 @@ fn flushRuntimeGeneratedTextBatch(
 ) !void {
     if (requests.len == 0) return;
     if (requests.len != unit_indices.len) return error.InvalidAssetProducerResponse;
+
+    if (!(try producer.canProduceBatch(alloc, requests))) {
+        return try flushRuntimeGeneratedTextBatchSequential(runtime, alloc, working_alloc, producer, requests, unit_indices, parts_values, units, method, kind, quality_config, ocr_prompt, source_fingerprint, "native_batch_unsupported");
+    }
 
     const started_ns = runtime.config.clock.nowRealtimeNs();
     const request_bytes = runtimeGeneratedTextBatchBytes(requests);
@@ -5033,7 +5061,7 @@ const RuntimeDocumentExtractionCollectContext = struct {
     fn collectUnit(self: *@This(), unit: document_extraction_mod.Unit, generated: bool) !void {
         const current_unit_bytes: usize = if (generated) 0 else runtimeDocumentExtractionUnitOwnedBytes(unit);
         try self.resource_tracker.setBytes(addUsizeSaturating(
-            addUsizeSaturating(self.resource_tracker.downloaded_bytes, self.generated_units.bytes),
+            addUsizeSaturating(self.resource_tracker.locallyAccountedDownloadedBytes(), self.generated_units.bytes),
             current_unit_bytes,
         ));
         try collectRuntimeDocumentExtractionDesiredKeysForUnit(self.runtime, self.doc_key, self.artifact_name, unit, self.desired_unit_keys, self.desired_unit_fingerprints, self.desired_chunk_keys);
@@ -5056,6 +5084,7 @@ const RuntimeDocumentExtractionResourceTracker = struct {
     manager: ?*resource_manager_mod.ResourceManager,
     current_bytes: u64 = 0,
     downloaded_bytes: usize = 0,
+    downloaded_bytes_externally_accounted: bool = false,
     pdf_decode_reservation_bytes: u64 = 0,
 
     fn init(runtime: *EnrichmentRuntime) @This() {
@@ -5067,13 +5096,29 @@ const RuntimeDocumentExtractionResourceTracker = struct {
         try self.setBytes(bytes);
     }
 
+    fn setExternallyAccountedDownloadedBytes(self: *@This(), bytes: usize) void {
+        self.downloaded_bytes = bytes;
+        self.downloaded_bytes_externally_accounted = true;
+    }
+
+    fn locallyAccountedDownloadedBytes(self: *const @This()) usize {
+        return if (self.downloaded_bytes_externally_accounted) 0 else self.downloaded_bytes;
+    }
+
+    fn externallyAccountedDownloadedBytes(self: *const @This()) u64 {
+        if (!self.downloaded_bytes_externally_accounted) return 0;
+        return std.math.cast(u64, self.downloaded_bytes) orelse std.math.maxInt(u64);
+    }
+
     fn reservePdfDecodeWorkingSet(self: *@This(), requested_bytes: usize) !usize {
         const manager = self.manager orelse return requested_bytes;
         const stats = manager.sliceStats(.document_extraction_working_set);
+        const operation_current = std.math.add(u64, self.current_bytes, self.externallyAccountedDownloadedBytes()) catch
+            return error.DocumentExtractionWorkingSetTooLarge;
         const own_available = if (stats.hard_limit_bytes == 0)
             @as(u64, @intCast(requested_bytes))
         else
-            stats.hard_limit_bytes -| self.current_bytes;
+            stats.hard_limit_bytes -| operation_current;
         const reserved = @min(@as(u64, @intCast(requested_bytes)), own_available);
         if (reserved == 0) return error.DocumentExtractionWorkingSetTooLarge;
         const next = std.math.add(u64, self.current_bytes, reserved) catch return error.ResourceBudgetExceeded;
@@ -5089,12 +5134,30 @@ const RuntimeDocumentExtractionResourceTracker = struct {
         writes: []const KVPair,
         window: *const GeneratedReplayWindow,
     ) !void {
-        var total = self.downloaded_bytes;
+        var total = self.locallyAccountedDownloadedBytes();
         total = addUsizeSaturating(total, unit_bytes);
         total = addUsizeSaturating(total, generated_cache_bytes);
         total = addUsizeSaturating(total, runtimeDocumentExtractionWriteBytes(writes));
         total = addUsizeSaturating(total, runtimeDocumentExtractionWindowBytes(window));
         try self.setBytes(total);
+    }
+
+    /// Reserves durable materialization bytes before they are allocated by the
+    /// runtime allocator. The next working-set update reconciles the
+    /// conservative reservation with exact live payload sizes.
+    fn reserveAdditional(self: *@This(), bytes: usize) !void {
+        const additional = std.math.cast(u64, bytes) orelse return error.DocumentExtractionWorkingSetTooLarge;
+        if (self.manager) |manager| {
+            const stats = manager.sliceStats(.document_extraction_working_set);
+            const operation_current = std.math.add(u64, self.current_bytes, self.externallyAccountedDownloadedBytes()) catch
+                return error.DocumentExtractionWorkingSetTooLarge;
+            const operation_next = std.math.add(u64, operation_current, additional) catch
+                return error.DocumentExtractionWorkingSetTooLarge;
+            if (stats.hard_limit_bytes > 0 and operation_next > stats.hard_limit_bytes)
+                return error.DocumentExtractionWorkingSetTooLarge;
+        }
+        const next = std.math.add(u64, self.current_bytes, additional) catch return error.DocumentExtractionWorkingSetTooLarge;
+        try self.setAccountedBytes(next);
     }
 
     fn observeWorkingSet(
@@ -5104,7 +5167,7 @@ const RuntimeDocumentExtractionResourceTracker = struct {
         writes: []const KVPair,
         window: *const GeneratedReplayWindow,
     ) void {
-        var total = self.downloaded_bytes;
+        var total = self.locallyAccountedDownloadedBytes();
         total = addUsizeSaturating(total, unit_bytes);
         total = addUsizeSaturating(total, generated_cache_bytes);
         total = addUsizeSaturating(total, runtimeDocumentExtractionWriteBytes(writes));
@@ -5115,6 +5178,13 @@ const RuntimeDocumentExtractionResourceTracker = struct {
     fn setBytes(self: *@This(), bytes: usize) !void {
         const actual = std.math.cast(u64, bytes) orelse return error.ResourceBudgetExceeded;
         const next = std.math.add(u64, actual, self.pdf_decode_reservation_bytes) catch return error.ResourceBudgetExceeded;
+        if (self.manager) |manager| {
+            const stats = manager.sliceStats(.document_extraction_working_set);
+            const operation_next = std.math.add(u64, next, self.externallyAccountedDownloadedBytes()) catch
+                return error.DocumentExtractionWorkingSetTooLarge;
+            if (stats.hard_limit_bytes > 0 and operation_next > stats.hard_limit_bytes)
+                return error.DocumentExtractionWorkingSetTooLarge;
+        }
         return try self.setAccountedBytes(next);
     }
 
@@ -5159,6 +5229,35 @@ test "document extraction working set accounts generated unit cache bytes" {
 
     try tracker.updateWorkingSet(40, 0, &.{}, &window);
     try std.testing.expectError(error.DocumentExtractionWorkingSetTooLarge, tracker.updateWorkingSet(40, 60, &.{}, &window));
+}
+
+test "budgeted document download composes with materialization accounting" {
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{
+        .soft_limit_bytes = 0,
+        .hard_limit_bytes = 100,
+    };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    var download_budgeted = resource_manager_mod.BudgetedAllocator.init(
+        &manager,
+        .document_extraction_working_set,
+        std.testing.allocator,
+        1,
+    );
+    defer download_budgeted.deinit();
+    const download_alloc = download_budgeted.allocator();
+    const body = try download_alloc.alloc(u8, 40);
+    defer download_alloc.free(body);
+
+    var tracker = RuntimeDocumentExtractionResourceTracker{ .manager = &manager };
+    defer tracker.deinit();
+    tracker.setExternallyAccountedDownloadedBytes(body.len);
+    var window = GeneratedReplayWindow{ .alloc = std.testing.allocator };
+    defer window.deinit();
+
+    try tracker.updateWorkingSet(20, 0, &.{}, &window);
+    try std.testing.expectEqual(@as(u64, 60), manager.sliceStats(.document_extraction_working_set).used_bytes);
+    try std.testing.expectError(error.DocumentExtractionWorkingSetTooLarge, tracker.reserveAdditional(41));
 }
 
 test "document extraction reserves PDF decoder peak memory atomically" {
@@ -5240,19 +5339,26 @@ fn addUsizeSaturating(a: usize, b: usize) usize {
 }
 
 fn runtimeDocumentExtractionWriteBytes(writes: []const KVPair) usize {
-    var total: usize = 0;
-    for (writes) |write| total += write.key.len + write.value.len;
+    var total: usize = writes.len *| @sizeOf(KVPair);
+    for (writes) |write| total = addUsizeSaturating(total, addUsizeSaturating(write.key.len, write.value.len));
     return total;
 }
 
 fn runtimeDocumentExtractionWindowBytes(window: *const GeneratedReplayWindow) usize {
-    var total: usize = 0;
+    var total: usize = window.documents.items.len *| @sizeOf(derived_types.DerivedDocument);
+    total = addUsizeSaturating(total, window.deleted_keys.items.len *| @sizeOf([]const u8));
+    total = addUsizeSaturating(total, window.artifact_delete_keys.items.len *| @sizeOf([]const u8));
+    total = addUsizeSaturating(total, window.changed_artifact_keys.items.len *| @sizeOf([]const u8));
+    total = addUsizeSaturating(total, window.dense_embeddings.items.len *| @sizeOf(derived_types.DerivedDenseEmbeddingWrite));
+    total = addUsizeSaturating(total, window.sparse_embeddings.items.len *| @sizeOf(derived_types.DerivedSparseEmbeddingWrite));
+    total = addUsizeSaturating(total, window.coverage_transitions.items.len *| @sizeOf(CoverageOutcomeTransition));
     for (window.documents.items) |doc| {
         total = addUsizeSaturating(total, doc.key.len);
         if (doc.cleaned_value) |value| total = addUsizeSaturating(total, value.len);
         for (doc.targets) |target| total = addUsizeSaturating(total, target.index_name.len);
     }
     for (window.deleted_keys.items) |key| total = addUsizeSaturating(total, key.len);
+    for (window.artifact_delete_keys.items) |key| total = addUsizeSaturating(total, key.len);
     for (window.changed_artifact_keys.items) |key| total = addUsizeSaturating(total, key.len);
     for (window.dense_embeddings.items) |embedding| {
         total = addUsizeSaturating(total, embedding.index_name.len);
@@ -5279,6 +5385,19 @@ fn clearRuntimeKVBatch(runtime: *EnrichmentRuntime, writes: *std.ArrayListUnmana
     writes.clearRetainingCapacity();
     for (deletes.items) |key| runtime.alloc.free(@constCast(key));
     deletes.clearRetainingCapacity();
+}
+
+fn appendOwnedRuntimeKVPair(
+    alloc: Allocator,
+    writes: *std.ArrayListUnmanaged(KVPair),
+    key: []const u8,
+    value: []const u8,
+) !void {
+    const owned_key = try alloc.dupe(u8, key);
+    errdefer alloc.free(owned_key);
+    const owned_value = try alloc.dupe(u8, value);
+    errdefer alloc.free(owned_value);
+    try writes.append(alloc, .{ .key = owned_key, .value = owned_value });
 }
 
 fn flushRuntimeKVBatchAndClear(
@@ -5337,6 +5456,22 @@ const RuntimeDocumentExtractionMaterializeContext = struct {
 
     fn onUnit(ptr: *anyopaque, unit: *document_extraction_mod.Unit) anyerror!void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        var budgeted: ?resource_manager_mod.BudgetedAllocator = if (self.resource_tracker.manager) |manager|
+            resource_manager_mod.BudgetedAllocator.init(manager, .document_extraction_working_set, self.runtime.alloc, 1)
+        else
+            null;
+        defer if (budgeted) |*allocator| allocator.deinit();
+        const working_alloc = if (budgeted) |*allocator| allocator.allocator() else self.runtime.alloc;
+        return self.onUnitWithAllocator(working_alloc, unit) catch |err| {
+            if (err == error.OutOfMemory) {
+                if (budgeted) |*allocator| if (allocator.denied())
+                    return error.DocumentExtractionWorkingSetTooLarge;
+            }
+            return err;
+        };
+    }
+
+    fn onUnitWithAllocator(self: *@This(), working_alloc: Allocator, unit: *document_extraction_mod.Unit) !void {
         if (runtimeGeneratedTextNeeded(self.config, self.info.route_type, unit.*)) {
             const cached = self.generated_units.get(unit.unit_id) orelse return error.MissingGeneratedUnitCache;
             try replaceDocumentExtractionUnitWithClone(self.runtime.alloc, unit, cached.*);
@@ -5350,17 +5485,22 @@ const RuntimeDocumentExtractionMaterializeContext = struct {
         try self.accountWorkingSet(unit_working_bytes, generated_cache_bytes);
 
         const unit_key = self.desired_unit_keys[self.unit_index];
-        const unit_range_id = try documentExtractionRangeIdAlloc(self.runtime.alloc, documentExtractionUnitRangeIndexFromTextLengths(self.unit_text_lengths, self.unit_index));
-        defer self.runtime.alloc.free(unit_range_id);
+        const unit_range_id = try documentExtractionRangeIdAlloc(working_alloc, documentExtractionUnitRangeIndexFromTextLengths(self.unit_text_lengths, self.unit_index));
+        defer working_alloc.free(unit_range_id);
         const unit_route = documentExtractionRangeRoute(self.previous_child_ranges, unit_range_id, "unit", self.artifact_name);
-        const payload = try documentUnitPayloadAlloc(self.runtime.alloc, self.doc_key, self.artifact_name, unit.*, self.source_url, self.info.content_type, unit_route);
-        defer self.runtime.alloc.free(payload);
+        const payload = try documentUnitPayloadAlloc(working_alloc, self.doc_key, self.artifact_name, unit.*, self.source_url, self.info.content_type, unit_route);
+        defer working_alloc.free(payload);
 
         if (self.mode == .store_artifacts) {
-            try self.writes.append(self.runtime.alloc, .{
-                .key = try self.runtime.alloc.dupe(u8, unit_key),
-                .value = try self.runtime.alloc.dupe(u8, payload),
-            });
+            try self.resource_tracker.reserveAdditional(addUsizeSaturating(@sizeOf(KVPair), addUsizeSaturating(unit_key.len, payload.len)));
+            try appendOwnedRuntimeKVPair(self.runtime.alloc, self.writes, unit_key, payload);
+            try self.accountWorkingSet(unit_working_bytes, generated_cache_bytes);
+            if (self.writes.items.len >= runtime_document_extraction_flush_write_count or
+                runtimeDocumentExtractionWriteBytes(self.writes.items) >= runtime_document_extraction_flush_write_bytes)
+            {
+                try flushRuntimeKVBatchAndClear(self.runtime, self.writes, self.deletes);
+                try self.accountWorkingSet(unit_working_bytes, generated_cache_bytes);
+            }
         } else {
             try appendUniqueDupeKey(self.runtime.alloc, &self.window.changed_artifact_keys, unit_key);
         }
@@ -5385,7 +5525,7 @@ const RuntimeDocumentExtractionMaterializeContext = struct {
             });
         }
 
-        try appendRuntimeDocumentUnitChunkWrites(self.runtime, self.doc_key, self.artifact_name, unit_key, unit.*, self.desired_chunk_keys, self.chunk_range_base_index, self.previous_child_ranges, self.writes, self.window, self.mode);
+        try appendRuntimeDocumentUnitChunkWrites(self, working_alloc, unit_key, unit.*, unit_working_bytes, generated_cache_bytes);
         self.unit_index += 1;
         try self.accountWorkingSet(unit_working_bytes, generated_cache_bytes);
 
@@ -5405,75 +5545,76 @@ const RuntimeDocumentExtractionMaterializeContext = struct {
 };
 
 fn appendRuntimeDocumentUnitChunkWrites(
-    runtime: *EnrichmentRuntime,
-    doc_key: []const u8,
-    source_artifact_name: []const u8,
+    context: *RuntimeDocumentExtractionMaterializeContext,
+    working_alloc: Allocator,
     unit_key: []const u8,
     unit: document_extraction_mod.Unit,
-    desired_chunk_keys: []const []const u8,
-    chunk_range_base_index: usize,
-    previous_child_ranges: []const types.DocumentArtifactChildRange,
-    writes: *std.ArrayListUnmanaged(KVPair),
-    window: *GeneratedReplayWindow,
-    mode: RuntimeDocumentExtractionMaterializeMode,
+    unit_working_bytes: usize,
+    generated_cache_bytes: usize,
 ) !void {
-    for (runtime.index_manager.enrichments.items) |entry| {
+    for (context.runtime.index_manager.enrichments.items) |entry| {
         if (entry.kind != .chunk) continue;
-        if (!std.mem.eql(u8, entry.source_artifact_name, source_artifact_name)) continue;
+        if (!std.mem.eql(u8, entry.source_artifact_name, context.artifact_name)) continue;
         const chunks = if (entry.chunker_json.len > 0)
-            try chunker_mod.chunkTextWithConfigJson(runtime.alloc, unit.text, entry.chunker_json)
+            try chunker_mod.chunkTextWithConfigJson(working_alloc, unit.text, entry.chunker_json)
         else
-            try chunker_mod.chunkText(runtime.alloc, unit.text, entry.chunk_size, entry.chunk_overlap);
-        defer chunker_mod.freeChunks(runtime.alloc, chunks);
+            try chunker_mod.chunkText(working_alloc, unit.text, entry.chunk_size, entry.chunk_overlap);
+        defer chunker_mod.freeChunks(working_alloc, chunks);
         if (chunks.len == 0) continue;
 
         const include_default_full_text = entry.full_text_index or
-            try chunking_types_mod.parseHasFullTextIndexFromSlice(runtime.alloc, entry.chunker_json);
-        const text_indexes = try runtime.index_manager.textIndexesForChunk(runtime.alloc, entry.name, include_default_full_text);
+            try chunking_types_mod.parseHasFullTextIndexFromSlice(working_alloc, entry.chunker_json);
+        const text_indexes = try context.runtime.index_manager.textIndexesForChunk(working_alloc, entry.name, include_default_full_text);
         defer {
-            for (text_indexes) |name| runtime.alloc.free(name);
-            runtime.alloc.free(text_indexes);
+            for (text_indexes) |name| working_alloc.free(name);
+            working_alloc.free(text_indexes);
         }
 
-        var arena_state = std.heap.ArenaAllocator.init(runtime.alloc);
+        var arena_state = std.heap.ArenaAllocator.init(working_alloc);
         defer arena_state.deinit();
         const scratch = arena_state.allocator();
 
         for (chunks) |chunk| {
             if (!chunk.isText()) continue;
-            const chunk_key = try internal_keys.documentUnitChunkArtifactKeyAlloc(runtime.alloc, doc_key, entry.name, unit.unit_id, @intCast(chunk.chunk_id));
-            defer runtime.alloc.free(chunk_key);
-            const chunk_key_index = documentExtractionKeyIndex(desired_chunk_keys, chunk_key) orelse return error.DocumentExtractionChunkRangeMissing;
-            const chunk_range_id = try documentExtractionRangeIdAlloc(scratch, chunk_range_base_index + (chunk_key_index / document_extraction_range_target_children));
-            const chunk_route = documentExtractionRangeRoute(previous_child_ranges, chunk_range_id, "chunk", "derived_chunks");
-            const payload = try buildDocumentUnitChunkPayloadAlloc(scratch, doc_key, unit_key, entry.name, source_artifact_name, entry.source_field, unit, chunk, true, chunk_route);
-            if (mode == .store_artifacts) {
-                try writes.append(runtime.alloc, .{
-                    .key = try runtime.alloc.dupe(u8, chunk_key),
-                    .value = try runtime.alloc.dupe(u8, payload),
-                });
+            const chunk_key = try internal_keys.documentUnitChunkArtifactKeyAlloc(working_alloc, context.doc_key, entry.name, unit.unit_id, @intCast(chunk.chunk_id));
+            defer working_alloc.free(chunk_key);
+            const chunk_key_index = documentExtractionKeyIndex(context.desired_chunk_keys, chunk_key) orelse return error.DocumentExtractionChunkRangeMissing;
+            const chunk_range_id = try documentExtractionRangeIdAlloc(scratch, context.chunk_range_base_index + (chunk_key_index / document_extraction_range_target_children));
+            const chunk_route = documentExtractionRangeRoute(context.previous_child_ranges, chunk_range_id, "chunk", "derived_chunks");
+            const payload = try buildDocumentUnitChunkPayloadAlloc(scratch, context.doc_key, unit_key, entry.name, context.artifact_name, entry.source_field, unit, chunk, true, chunk_route);
+            if (context.mode == .store_artifacts) {
+                try context.resource_tracker.reserveAdditional(addUsizeSaturating(@sizeOf(KVPair), addUsizeSaturating(chunk_key.len, payload.len)));
+                try appendOwnedRuntimeKVPair(context.runtime.alloc, context.writes, chunk_key, payload);
             } else {
-                try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, chunk_key);
+                try appendUniqueDupeKey(context.runtime.alloc, &context.window.changed_artifact_keys, chunk_key);
             }
 
-            if (mode == .publish_replay and text_indexes.len > 0) {
-                var targets = try runtime.alloc.alloc(derived_types.DerivedTargetRef, text_indexes.len);
+            if (context.mode == .publish_replay and text_indexes.len > 0) {
+                var targets = try context.runtime.alloc.alloc(derived_types.DerivedTargetRef, text_indexes.len);
                 errdefer {
-                    for (targets) |target| runtime.alloc.free(@constCast(target.index_name));
-                    runtime.alloc.free(targets);
+                    for (targets) |target| context.runtime.alloc.free(@constCast(target.index_name));
+                    context.runtime.alloc.free(targets);
                 }
                 for (text_indexes, 0..) |index_name, i| {
                     targets[i] = .{
                         .kind = .full_text,
-                        .index_name = try runtime.alloc.dupe(u8, index_name),
+                        .index_name = try context.runtime.alloc.dupe(u8, index_name),
                     };
                 }
-                try window.documents.append(runtime.alloc, .{
-                    .key = try runtime.alloc.dupe(u8, chunk_key),
+                try context.window.documents.append(context.runtime.alloc, .{
+                    .key = try context.runtime.alloc.dupe(u8, chunk_key),
                     .action = .upsert,
-                    .cleaned_value = try runtime.alloc.dupe(u8, payload),
+                    .cleaned_value = try context.runtime.alloc.dupe(u8, payload),
                     .targets = targets,
                 });
+            }
+
+            try context.accountWorkingSet(unit_working_bytes, generated_cache_bytes);
+            if (context.mode == .store_artifacts and (context.writes.items.len >= runtime_document_extraction_flush_write_count or
+                runtimeDocumentExtractionWriteBytes(context.writes.items) >= runtime_document_extraction_flush_write_bytes))
+            {
+                try flushRuntimeKVBatchAndClear(context.runtime, context.writes, context.deletes);
+                try context.accountWorkingSet(unit_working_bytes, generated_cache_bytes);
             }
 
             _ = arena_state.reset(.retain_capacity);
@@ -11402,7 +11543,7 @@ test "asset batch fallback keeps the logical request retry budget" {
     try std.testing.expectEqual(@as(u64, 2), failure_capture.failure.?.attempts);
 }
 
-test "document extraction generated OCR batch fallback isolates permanent unit failure" {
+test "document extraction generated OCR bypasses unsupported native batch" {
     const alloc = std.testing.allocator;
 
     const FallbackProducer = struct {
@@ -11415,8 +11556,13 @@ test "document extraction generated OCR batch fallback isolates permanent unit f
                 .vtable = &.{
                     .produce = produce,
                     .produce_batch = produceBatch,
+                    .can_produce_batch = canProduceBatch,
                 },
             };
+        }
+
+        fn canProduceBatch(_: *anyopaque, _: Allocator, _: []const asset_producer_mod.Request) !bool {
+            return false;
         }
 
         fn produce(ptr: *anyopaque, a: Allocator, request: asset_producer_mod.Request) ![]u8 {
@@ -11432,9 +11578,7 @@ test "document extraction generated OCR batch fallback isolates permanent unit f
         fn produceBatch(ptr: *anyopaque, _: Allocator, _: []const asset_producer_mod.Request) ![][]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.batch_count += 1;
-            // A known terminal request error triggers sequential isolation.
-            // Unknown provider errors intentionally remain retryable so a
-            // transient batch outage cannot fan out into N immediate calls.
+            // Capability admission must prevent this function from running.
             return error.BadUnitInput;
         }
     };
@@ -11495,7 +11639,7 @@ test "document extraction generated OCR batch fallback isolates permanent unit f
         .ocr,
     );
 
-    try std.testing.expectEqual(@as(usize, 1), fake.batch_count);
+    try std.testing.expectEqual(@as(usize, 0), fake.batch_count);
     try std.testing.expectEqual(@as(usize, 3), fake.single_count);
     try std.testing.expectEqualStrings("ok:unit:1", units[0].text);
     try std.testing.expectEqualStrings("completed", units[0].extraction_status.?);
