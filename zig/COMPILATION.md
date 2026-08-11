@@ -3257,15 +3257,126 @@ objects and executable exactly match the sizes above. The normal Linux runner
 cold build remains the authoritative per-unit timing gate before enabling the
 experiment by default.
 
+The first authoritative normal-runner build after this slice completed
+successfully in GitHub Actions run `31518438580`, job `93869276925`, on the
+ordinary `arc-antfly-publish` runner. All 34 build steps and artifact checks
+passed. The build shell took 16 minutes 34 seconds, peak cgroup RSS was
+9,337,216 KiB, swap remained zero, and the final static executable and C API
+library were 60,120,968 B and 16,615,400 B respectively. The compiler reports
+showed:
+
+| Unit | Real time | LLVM emission | Repository graph | Declarations |
+|---|---:|---:|---:|---:|
+| Storage kernel | 530.153 s | 519.188 s | 588 files / 917,498 lines | 33,392 |
+| Distributed/API control | 394.388 s | 384.861 s | 542 files / 762,997 lines | 28,499 |
+| Inference | 427.659 s | 384.039 s | 524 files / 580,405 lines | 24,994 |
+| Remote CLI | 60.469 s | — | — | — |
+
+This is important positive reliability evidence: the ordinary runner completed
+a cold ARM64 musl `ReleaseFast` archive without OOM, swap, cache priming, a
+larger runner, or serialized compilation. It is also a performance rejection
+for the current unit composition. Storage and distributed both exceed the
+380-second gate, and storage is now the critical compiler unit. Across the
+compiler reports there are 1,707 repository-file instances, 1,217 unique
+files, and 490 duplicate instances; conservative storage/distributed emitted
+text overlap is 1,854,020 B. The option therefore remains experimental.
+
+### Phase 4p: physical-root isolation and rejected product splits
+
+Three measurement-only ARM64 Linux musl `ReleaseFast` roots separated the
+physical owner/CAPI core from the serverless and Lite product roots. They used
+normal scheduling and the same production storage options:
+
+| Probe | Local real time | Peak RSS | Object size |
+|---|---:|---:|---:|
+| Physical storage owner + CAPI core | 226.48 s | 5 GiB | 26,804,064 B |
+| Serverless physical runtime | 122.91 s | 2 GiB | 13,459,256 B |
+| Lite physical runtime | 174.36 s | 3 GiB | 20,826,728 B |
+| Complete storage/product root | 261.36 s | 6 GiB | — |
+
+Removing the product roots saves only 34.88 seconds locally, or 13.3%. Applied
+to the normal-runner result, the physical core would still project far above
+380 seconds. More importantly, compiling the three roots independently emits
+507 repository-module instances but only 275 unique modules. The 167 repeated
+modules contain 8,949,496 B of duplicate text, led by `storage.db.db`,
+`storage.db.algebraic.index`, `storage.db.catalog.index_manager`, local search,
+enrichment, and aggregations. A separate physical serverless or Lite library
+would therefore trade a modest critical-unit reduction for another optimized
+copy of the storage implementation and substantial artifact growth.
+
+Decision: **reject the three physical product libraries**. Serverless and Lite
+may become thin consumers of one owner, but neither may instantiate its own DB,
+index, or query graph. The next substantial experiment must split within the
+physical owner around an independently owned local index/query subsystem, or
+otherwise remove a comparable operation family from the storage LLVM module.
+It must use opaque handles and coarse batch/query/lifecycle calls; no record,
+posting, candidate, or backend call may cross the ABI.
+
+The failure contract applies unchanged to that internal physical split. Every
+declared provider failure must receive a stable `Status` discriminant in
+`storage/kernel_error_identity.zig` and must map back to the exact original Zig
+error at the consumer. Distinct identities such as `ReadOnly`,
+`HAReadOnlyStandby`, `WouldBlock`, `StorageBusy`, `Canceled`, and `Cancelled`
+must not be normalized for convenience. Operation state—including admission,
+continuation, lifecycle phase, cancellation observation, and partial progress—
+uses separate typed fields or tagged results and is never smuggled through a
+generic status. Only an unregistered provider defect or an impossible ABI
+shape becomes `internal` / `StorageKernelFailure`. Each new operation family
+requires an exhaustive-registry canary plus at least one real provider/client
+failure round-trip test before it can be measured or kept.
+
+### Phase 4q: enrichment isolation probe
+
+A decoder-only root for document extraction, PDF text/rendering, and media
+decoding compiled in 23.92 seconds locally and emitted a 1.4 MB object. That is
+too small to justify a new compiled boundary by itself. A second root exercised
+the complete production enrichment catch-up path. With function sections it
+compiled in 48.40 seconds and emitted 2,916,916 B of text in a 6.3 MB object.
+Its Antfly-attributed graph contained only 23 modules and 759,613 B, including
+495,732 B from `enrichment_runtime`, 84,964 B from document extraction, and
+only 60,028 B from `IndexManager`; the remaining roughly 2.16 MB of text is
+media, archive, HTTP, template, and other external compute machinery. It does
+not instantiate DB core.
+
+This is a plausible parallel compute island, but the existing runtime cannot
+be compiled across an ABI unchanged. It performs 105 direct store, scan,
+catalog, checkpoint, replay-source, writer, and failure-ledger interactions.
+Wrapping those calls one-for-one would create a backend-shaped ABI, lose
+atomicity, and make the boundary chatty. That shape is **rejected**.
+
+The only acceptable enrichment experiment keeps replay collection, leases,
+catalog/index ownership, durable failure debt, coverage transitions,
+checkpoints, and atomic derived writes in storage. A separate compute unit may
+receive one bounded replay-window descriptor containing source documents,
+resolved enrichment plans, and immutable configuration, then return one owned
+derived batch with per-request outcomes. Embedding and asset-producer reverse
+calls must preserve the existing batch sizes. It may not request one store key,
+document, or index lookup at a time.
+
+The response has two independent identity domains:
+
+- the call-level `Status` identifies ABI, allocation, cancellation, and
+  unexpected provider failure; and
+- every item outcome is a tagged success, retryable failure, terminal failure,
+  or skipped result carrying the exact registered semantic status.
+
+Retryability and lifecycle state are explicit fields, not inferred by merging
+errors into a generic `busy`, `retry`, or `internal` value. The storage
+consumer maps every item status back to its original Zig error before applying
+the existing retry/failure-ledger policy. Unknown statuses and impossible wire
+shapes remain defects. This experiment is worth implementing only as a complete
+bounded-window operation; the 24-second decoder-only adapter and direct-store
+callback variants are not candidates.
+
 ## Holistic target architecture
 
 The current candidate is the opt-in four-unit source-selected topology above.
 Unlike the rejected source-only coalescing probes, it gives the distributed/API
 unit only control sources and gives the storage unit the one physical
-implementation. Both units are below the preferred 350-second local gate, but
-both exceed 380 seconds on the normal Linux runner. It is not yet the
-production baseline because the Linux time gate failed and the cold result has
-not been repeated.
+implementation. Both units exceed 380 seconds on the normal Linux runner; the
+storage unit is the 530-second compiler critical path. It is not yet the
+production baseline because the Linux time gate failed and has not yet been
+reduced by a substantial physical-source cut.
 
 The reopened target is a modular monolith with one compiled physical-storage
 owner and separately compiled control consumers:
