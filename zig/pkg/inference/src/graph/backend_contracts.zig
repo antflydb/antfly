@@ -393,6 +393,8 @@ pub const DecoderRuntimePrepareLinearRequest = struct {
     retain_dense_fallback: bool = true,
     disable_mapped_quant_weight: bool = false,
     dense_fallback_max_bytes: ?usize = null,
+    allow_direct_quant_fallback: bool = false,
+    prefer_f16_mps_fallback: bool = false,
 };
 
 pub const DecoderRuntimeEnsureLinearSlotRequest = struct {

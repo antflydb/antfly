@@ -370,11 +370,14 @@ fn runtimeDenseFallbackAllowedForQuantizedStorage(storage: *const QuantizedStora
 }
 
 fn runtimeDenseFallbackAllowedForRequest(request: anytype, storage: *const QuantizedStorage) bool {
-    if (!runtimeDenseFallbackAllowedForQuantizedStorage(storage)) return false;
-    if (comptime @hasField(@TypeOf(request), "dense_fallback_max_bytes")) {
-        if (request.dense_fallback_max_bytes != null) return true;
+    if (comptime @hasField(@TypeOf(request), "allow_direct_quant_fallback")) {
+        if (request.allow_direct_quant_fallback) return true;
     }
-    return true;
+    return runtimeDenseFallbackAllowedForQuantizedStorage(storage);
+}
+
+fn f32ToF16Bits(value: f32) u16 {
+    return @bitCast(@as(f16, @floatCast(value)));
 }
 
 fn traceGlinerStages() bool {
@@ -7006,11 +7009,16 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
         request.disable_mapped_quant_weight
     else
         false;
+    const prefer_f16_mps_fallback = if (@hasField(@TypeOf(request), "prefer_f16_mps_fallback"))
+        request.prefer_f16_mps_fallback
+    else
+        false;
     if (self.raw_linear_slots_prepared[request.slot] and
         self.raw_linear_slot_in_dims[request.slot] == request.in_dim and
         self.raw_linear_slot_out_dims[request.slot] == request.out_dim and
         ((request.quantized_storage != null and
-            (self.raw_linear_slot_kinds[request.slot] == .quantized or self.raw_linear_slot_kinds[request.slot] == .dense)) or
+            (self.raw_linear_slot_kinds[request.slot] == .dense or
+                (!prefer_f16_mps_fallback and self.raw_linear_slot_kinds[request.slot] == .quantized))) or
             (request.quantized_storage == null and
                 (self.raw_linear_slot_kinds[request.slot] == .dense or
                     (retain_dense_fallback and self.raw_linear_slot_kinds[request.slot] == .quantized)))))
@@ -7056,6 +7064,33 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
             runtimeDenseFallbackAllowedForRequest(request, storage) and
             dense_bytes <= dense_fallback_max_bytes)
         {
+            if (prefer_f16_mps_fallback) {
+                const dense_weight = try std.heap.c_allocator.alloc(f32, dense_values);
+                defer std.heap.c_allocator.free(dense_weight);
+                if (quant_codec.dequantizeToFloat32(storage.tensor_type, storage.raw_bytes, dense_weight)) {
+                    const f16_weight = try std.heap.c_allocator.alloc(u16, dense_values);
+                    defer std.heap.c_allocator.free(f16_weight);
+                    for (dense_weight, f16_weight) |value, *bits| bits.* = f32ToF16Bits(value);
+                    const f16_bytes = std.mem.sliceAsBytes(f16_weight);
+                    const rc = termite_metal_decode_runtime_prepare_linear_f16(
+                        runtime,
+                        request.slot,
+                        f16_bytes.ptr,
+                        f16_bytes.len,
+                        bias_base,
+                        request.in_dim,
+                        request.out_dim,
+                    );
+                    if (rc == 0) {
+                        stats.decoder_runtime_prepare_linear_calls += 1;
+                        self.raw_linear_slot_kinds[request.slot] = .dense;
+                        self.raw_linear_slots_prepared[request.slot] = true;
+                        self.raw_linear_slot_in_dims[request.slot] = request.in_dim;
+                        self.raw_linear_slot_out_dims[request.slot] = request.out_dim;
+                        return true;
+                    }
+                } else |_| {}
+            }
             if (try makeRuntimeQ8StorageFromQuantized(storage, dense_values)) |q8_storage| {
                 errdefer {
                     q8_storage.deinit();
@@ -8999,6 +9034,15 @@ pub extern fn termite_metal_decode_runtime_prepare_linear(
     runtime: ?*RawMetalDecodeRuntime,
     slot: usize,
     weight: [*c]const f32,
+    bias: [*c]const f32,
+    in_dim: usize,
+    out_dim: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_prepare_linear_f16(
+    runtime: ?*RawMetalDecodeRuntime,
+    slot: usize,
+    weight: [*c]const u8,
+    weight_bytes: usize,
     bias: [*c]const f32,
     in_dim: usize,
     out_dim: usize,
@@ -28431,6 +28475,89 @@ test "metal native decoder runtime bf16 multi-row linear matches identity projec
         for (0..out_dim) |col| {
             try std.testing.expectApproxEqAbs(input_data[row * hidden_size + col], actual[row * out_dim + col], 1e-3);
         }
+    }
+}
+
+test "metal native decoder runtime f16 MPS linear transitions from planned encoder" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const rows: usize = 3;
+    const hidden_size: usize = 128;
+    const slot: usize = 0;
+
+    const f16_one: u16 = @bitCast(@as(f16, 1.0));
+    const f16_weights = try allocator.alloc(u16, hidden_size * hidden_size);
+    defer allocator.free(f16_weights);
+    @memset(f16_weights, 0);
+    for (0..hidden_size) |i| f16_weights[i * hidden_size + i] = f16_one;
+    const f16_weight_bytes = std.mem.sliceAsBytes(f16_weights);
+
+    const bias = try allocator.alloc(f32, hidden_size);
+    defer allocator.free(bias);
+    @memset(bias, 0);
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_prepare_linear_f16(
+        runtime,
+        slot,
+        f16_weight_bytes.ptr,
+        f16_weight_bytes.len,
+        bias.ptr,
+        hidden_size,
+        hidden_size,
+    ));
+
+    const input_data = try allocator.alloc(f32, rows * hidden_size);
+    defer allocator.free(input_data);
+    for (input_data, 0..) |*value, i| {
+        const centered: i32 = @intCast(i % 29);
+        value.* = @as(f32, @floatFromInt(centered - 14)) * 0.125;
+    }
+    const shape = [_]i32{ @intCast(rows), @intCast(hidden_size) };
+    var input = try testDeviceTensorFromSlice(runtime, input_data, &shape);
+    defer input.deinit();
+    var scratch = try MetalTensor.deviceAllocate(runtime, input_data.len * @sizeOf(f32), .private, &shape);
+    defer scratch.deinit();
+    var output = try MetalTensor.deviceAllocate(runtime, input_data.len * @sizeOf(f32), .private, &shape);
+    defer output.deinit();
+
+    try beginFrame(runtime);
+    errdefer cancelFrame(runtime) catch {};
+    try beginPlannedComputeScope(runtime, @intFromEnum(ComputeSource.dense_linear), .ffn);
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_apply_add_device(
+        runtime,
+        input.deviceHandle(),
+        input.deviceByteOffset(),
+        input.deviceHandle(),
+        input.deviceByteOffset(),
+        input_data.len,
+        scratch.deviceHandle(),
+        scratch.deviceByteOffset(),
+    ));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_apply_linear_multi_row_device(
+        runtime,
+        slot,
+        input.deviceHandle(),
+        input.deviceByteOffset(),
+        rows,
+        hidden_size,
+        hidden_size,
+        output.deviceHandle(),
+        output.deviceByteOffset(),
+    ));
+    try endPlannedComputeScope(runtime);
+    try submitFrame(runtime);
+    try waitFrame(runtime);
+
+    const actual = try output.toHostSlice();
+    try std.testing.expectEqual(input_data.len, actual.len);
+    for (input_data, actual) |expected, got| {
+        try std.testing.expectApproxEqAbs(expected, got, 2e-3);
     }
 }
 

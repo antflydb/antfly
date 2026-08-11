@@ -88,6 +88,7 @@ test {
     _ = audio;
     _ = chunker;
     _ = pipelines;
+    _ = @import("pipelines/gliner.zig");
     _ = extractors;
     _ = server;
     _ = cache;
@@ -134,6 +135,7 @@ test {
     _ = native_smoke;
     _ = cuda_info;
     _ = cuda_microbench;
+    _ = metal_runtime;
     _ = native_compute.native;
     if (build_options.enable_metal) {
         _ = backends.metal_kv_storage;

@@ -1213,6 +1213,7 @@ pub const ComputeBackend = struct {
         /// takes the first encoder hidden row by a host words_mask into
         /// [batch * num_words, hidden_size].
         glinerWordEmbeddings: ?*const fn (ctx: *anyopaque, request: *const GlinerWordEmbeddingsRequest) anyerror!?CT = null,
+        preferEagerQuantMirrors: ?*const fn (ctx: *anyopaque, enabled: bool) void = null,
 
         /// GLiNER-specific CountLSTM GRU step plus skip connection:
         /// returns `gru(label_embeddings, pos0) + label_embeddings` as
@@ -2379,6 +2380,12 @@ pub const ComputeBackend = struct {
             });
         }
         return null;
+    }
+
+    /// Prefer bounded dense mirrors for large-row eager quantized linears.
+    /// Backends that do not support this optimization ignore the hint.
+    pub fn preferEagerQuantMirrors(self: *const ComputeBackend, enabled: bool) void {
+        if (self.vtable.preferEagerQuantMirrors) |op| op(self.ptr, enabled);
     }
 
     pub fn glinerLabelGruCombined(self: *const ComputeBackend, label_embeddings: CT, num_labels: usize, hidden_size: usize) !?CT {
