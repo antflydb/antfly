@@ -35,8 +35,7 @@ const resolver_catalog = @import("resolver_catalog.zig");
 pub const ResolverConfig = resolver_catalog.ResolverConfig;
 const enrichment_types = @import("../enrichment/enrichment_types.zig");
 const enrichment_artifact_codec = @import("../enrichment/artifact_codec.zig");
-const asset_producer_mod = @import("../enrichment/asset_producer.zig");
-const document_extraction_mod = @import("../enrichment/document_extraction.zig");
+const enrichment_config_validation = @import("../enrichment/config_validation.zig");
 const backfill_state_mod = @import("../backfill_state.zig");
 const db_config = @import("../config.zig");
 const persistent_mod = @import("../../persistent.zig");
@@ -10724,12 +10723,7 @@ pub const IndexManager = struct {
                 }
             },
             .asset => {
-                var producer = try asset_producer_mod.parseProducerConfig(self.alloc, cfg.producer_json);
-                defer producer.deinit(self.alloc);
-                if (producer.type == .document_extraction) {
-                    var extraction = try document_extraction_mod.parseConfig(self.alloc, producer.config_json);
-                    defer extraction.deinit(self.alloc);
-                }
+                try enrichment_config_validation.validateAssetProducerConfig(self.alloc, cfg.producer_json);
             },
         }
     }

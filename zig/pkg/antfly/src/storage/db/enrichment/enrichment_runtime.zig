@@ -3915,14 +3915,14 @@ pub fn completeDocumentExtractionGeneratedTextForRequest(
     if (!generated_text_enabled) return;
     const producer = runtime.config.asset_producer orelse return error.MissingAssetProducer;
     const batch_policy = requestGeneratedTextBatchPolicy(alloc, request);
-    try completeRuntimeDocumentExtractionGeneratedTextBatch(runtime, alloc, producer, config, batch_policy, source_url, source_bytes, extraction.route_type, source_content_type, extraction.units, .ocr, null);
-    try completeRuntimeDocumentExtractionGeneratedTextBatch(runtime, alloc, producer, config, batch_policy, source_url, source_bytes, extraction.route_type, source_content_type, extraction.units, .transcript, null);
+    try completeRuntimeDocumentExtractionGeneratedTextBatch(runtime, alloc, producer, config, batch_policy, source_url, source_bytes, extraction.route_type, source_content_type, extraction.units, .ocr);
+    try completeRuntimeDocumentExtractionGeneratedTextBatch(runtime, alloc, producer, config, batch_policy, source_url, source_bytes, extraction.route_type, source_content_type, extraction.units, .transcript);
 }
 
-/// Enforces a pre-reserved working-set ceiling without charging the node
-/// ResourceManager a second time. PDF admission reserves the worst-case decode
-/// budget before parsing; allocations made under that reservation still need a
-/// hard local ceiling, but must not acquire duplicate slice reservations.
+/// Enforces a pre-reserved decoder ceiling without charging the node
+/// ResourceManager a second time. Rendering and request serialization use a
+/// separate budgeted allocator because those bytes are additional to the PDF
+/// decoder reservation.
 const ReservedWorkingSetAllocator = struct {
     backing: Allocator,
     live_bytes: usize = 0,
@@ -3996,27 +3996,29 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatch(
     source_content_type: []const u8,
     units: []document_extraction_mod.Unit,
     kind: RuntimeGeneratedUnitTextKind,
-    pdf_session_override: ?*document_extraction_mod.PdfRenderSession,
 ) !void {
-    const uses_reserved_pdf_working_set = kind == .ocr and std.mem.eql(u8, route_type, "pdf");
-    var reserved_allocator: ?ReservedWorkingSetAllocator = if (uses_reserved_pdf_working_set)
+    const uses_pdf_decoder_reservation = kind == .ocr and std.mem.eql(u8, route_type, "pdf");
+    var decoder_allocator: ?ReservedWorkingSetAllocator = if (uses_pdf_decoder_reservation)
         ReservedWorkingSetAllocator.init(alloc, config.pdf_decode_limits.max_working_set_bytes)
     else
         null;
-    var budgeted_allocator: ?resource_manager_mod.BudgetedAllocator = if (!uses_reserved_pdf_working_set and (runtime.config.resource_manager orelse runtime.index_manager.resource_manager) != null)
+    var budgeted_allocator: ?resource_manager_mod.BudgetedAllocator = if ((runtime.config.resource_manager orelse runtime.index_manager.resource_manager) != null)
         resource_manager_mod.BudgetedAllocator.init((runtime.config.resource_manager orelse runtime.index_manager.resource_manager).?, .document_extraction_working_set, alloc, 1)
     else
         null;
     defer if (budgeted_allocator) |*budgeted| budgeted.deinit();
-    const working_alloc = if (reserved_allocator) |*reserved|
-        reserved.allocator()
-    else if (budgeted_allocator) |*budgeted|
+    const decoder_alloc = if (decoder_allocator) |*decoder|
+        decoder.allocator()
+    else
+        alloc;
+    const working_alloc = if (budgeted_allocator) |*budgeted|
         budgeted.allocator()
     else
         alloc;
     completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
         runtime,
         alloc,
+        decoder_alloc,
         working_alloc,
         producer,
         config,
@@ -4027,10 +4029,9 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatch(
         source_content_type,
         units,
         kind,
-        pdf_session_override,
     ) catch |err| {
-        if (reserved_allocator) |*reserved| {
-            if (reserved.limit_exceeded) return error.DocumentExtractionWorkingSetTooLarge;
+        if (decoder_allocator) |*decoder| {
+            if (decoder.limit_exceeded) return error.DocumentExtractionWorkingSetTooLarge;
         }
         if (budgeted_allocator) |*budgeted| {
             if (budgeted.denied()) return error.DocumentExtractionWorkingSetTooLarge;
@@ -4042,6 +4043,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatch(
 fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
     runtime: *EnrichmentRuntime,
     alloc: Allocator,
+    decoder_alloc: Allocator,
     working_alloc: Allocator,
     producer: asset_producer_mod.Producer,
     config: document_extraction_mod.Config,
@@ -4052,7 +4054,6 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
     source_content_type: []const u8,
     units: []document_extraction_mod.Unit,
     kind: RuntimeGeneratedUnitTextKind,
-    pdf_session_override: ?*document_extraction_mod.PdfRenderSession,
 ) !void {
     const enabled = switch (kind) {
         .ocr => document_extraction_mod.ocrEnabledForRoute(config, route_type),
@@ -4096,12 +4097,13 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
     var batch_bytes: usize = 0;
     var owned_pdf_session: ?document_extraction_mod.PdfRenderSession = null;
     defer if (owned_pdf_session) |*session| session.deinit();
-    var pdf_session = pdf_session_override;
-    if (pdf_session == null and kind == .ocr and std.mem.eql(u8, route_type, "pdf")) {
-        // The Reader owns decoded image resources and render runs in addition
-        // to the final PNG. Keep the whole render session on the working-set
-        // allocator so adversarial PDFs cannot allocate around admission.
-        owned_pdf_session = try document_extraction_mod.PdfRenderSession.initWithDecodeLimits(working_alloc, source_bytes, config.pdf_decode_limits);
+    var pdf_session: ?*document_extraction_mod.PdfRenderSession = null;
+    if (kind == .ocr and std.mem.eql(u8, route_type, "pdf")) {
+        // The reader and decoded stream graph consume the pre-reserved decoder
+        // credit. The RGBA canvas, PNG encoder, and serialized OCR request are
+        // additional live bytes and remain on the independently charged
+        // working allocator below.
+        owned_pdf_session = try document_extraction_mod.PdfRenderSession.initWithDecodeLimits(decoder_alloc, source_bytes, config.pdf_decode_limits);
         pdf_session = &owned_pdf_session.?;
     }
     for (units, 0..) |unit, idx| {
@@ -5016,7 +5018,6 @@ const RuntimeDocumentExtractionCollectContext = struct {
             self.info.content_type,
             self.pending_generated_units.items,
             kind,
-            null,
         );
         for (self.pending_generated_units.items) |*unit| {
             unit.char_start = std.math.cast(u32, self.resolved_char_cursor) orelse return error.DocumentExtractionOffsetOverflow;
@@ -5178,7 +5179,7 @@ test "document extraction reserves PDF decoder peak memory atomically" {
     try std.testing.expectError(error.DocumentExtractionWorkingSetTooLarge, tracker.setBytes(41));
 }
 
-test "document extraction transient allocator composes with reserved baseline" {
+test "PDF decoder credit and OCR transient allocations compose without double charging" {
     var budgets = resource_manager_mod.Options.defaultBudgets();
     budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{
         .soft_limit_bytes = 0,
@@ -5187,7 +5188,14 @@ test "document extraction transient allocator composes with reserved baseline" {
     var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
     var tracker = RuntimeDocumentExtractionResourceTracker{ .manager = &manager };
     defer tracker.deinit();
-    try tracker.setDownloadedBytes(60);
+    try tracker.setDownloadedBytes(40);
+    try std.testing.expectEqual(@as(usize, 20), try tracker.reservePdfDecodeWorkingSet(20));
+
+    var decoder = ReservedWorkingSetAllocator.init(std.testing.allocator, 20);
+    const decoder_alloc = decoder.allocator();
+    const decoded = try decoder_alloc.alloc(u8, 20);
+    defer decoder_alloc.free(decoded);
+    try std.testing.expectEqual(@as(u64, 60), manager.sliceStats(.document_extraction_working_set).used_bytes);
 
     var budgeted = resource_manager_mod.BudgetedAllocator.init(
         &manager,
@@ -11107,7 +11115,6 @@ test "document extraction rejects and records Florence prompt echoes" {
         "image/png",
         units[0..],
         .ocr,
-        null,
     );
 
     try std.testing.expectEqualStrings("failed_ocr", units[0].extraction_status.?);
@@ -11177,7 +11184,6 @@ test "document extraction missing OCR model is a terminal unit failure" {
         "image/png",
         units[0..],
         .ocr,
-        null,
     );
 
     try std.testing.expectEqualStrings("failed_ocr", units[0].extraction_status.?);
@@ -11487,7 +11493,6 @@ test "document extraction generated OCR batch fallback isolates permanent unit f
         "application/pdf",
         units[0..],
         .ocr,
-        null,
     );
 
     try std.testing.expectEqual(@as(usize, 1), fake.batch_count);
@@ -11591,7 +11596,6 @@ test "document extraction generated OCR batch fallback isolates malformed batch 
         "application/pdf",
         units[0..],
         .ocr,
-        null,
     );
 
     try std.testing.expectEqual(@as(usize, 1), fake.batch_count);

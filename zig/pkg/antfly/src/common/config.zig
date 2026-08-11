@@ -1842,24 +1842,27 @@ fn contentSecurityFromOpenApi(
     alloc: std.mem.Allocator,
     value: scraping_openapi.ContentSecurityConfig,
 ) !Config.ContentSecurityConfig {
-    return .{
-        .allowed_hosts = if (value.allowed_hosts) |hosts| try dupOwnedStringSlice(alloc, hosts) else null,
-        .block_private_ips = value.block_private_ips,
-        .max_download_size_bytes = if (value.max_download_size_bytes) |bytes|
-            std.math.cast(u64, bytes) orelse return error.InvalidConfig
-        else
-            null,
-        .download_timeout_seconds = if (value.download_timeout_seconds) |seconds|
-            std.math.cast(u32, seconds) orelse return error.InvalidConfig
-        else
-            null,
-        .max_image_dimension = if (value.max_image_dimension) |dimension|
-            std.math.cast(u32, dimension) orelse return error.InvalidConfig
-        else
-            null,
-        .allowed_paths = if (value.allowed_paths) |paths| try dupOwnedStringSlice(alloc, paths) else null,
-        .user_agent = if (value.user_agent) |user_agent| try alloc.dupe(u8, user_agent) else null,
-    };
+    var out = Config.ContentSecurityConfig{};
+    errdefer out.deinit(alloc);
+    out.allowed_hosts = if (value.allowed_hosts) |hosts| try dupOwnedStringSlice(alloc, hosts) else null;
+    out.block_private_ips = value.block_private_ips;
+    out.nat64_prefixes = if (value.nat64_prefixes) |prefixes| try dupOwnedStringSlice(alloc, prefixes) else null;
+    out.max_download_size_bytes = if (value.max_download_size_bytes) |bytes|
+        std.math.cast(u64, bytes) orelse return error.InvalidConfig
+    else
+        null;
+    out.download_timeout_seconds = if (value.download_timeout_seconds) |seconds|
+        std.math.cast(u32, seconds) orelse return error.InvalidConfig
+    else
+        null;
+    out.max_image_dimension = if (value.max_image_dimension) |dimension|
+        std.math.cast(u32, dimension) orelse return error.InvalidConfig
+    else
+        null;
+    out.allowed_paths = if (value.allowed_paths) |paths| try dupOwnedStringSlice(alloc, paths) else null;
+    out.user_agent = if (value.user_agent) |user_agent| try alloc.dupe(u8, user_agent) else null;
+    scraping.validateNat64Prefixes(out) catch return error.InvalidConfig;
+    return out;
 }
 
 fn corsFromOpenApi(
@@ -2190,6 +2193,7 @@ test "common config preserves remote content logging and storage fields" {
         \\    "security": {
         \\      "allowed_hosts": ["example.com", "cdn.example.com"],
         \\      "block_private_ips": true,
+        \\      "nat64_prefixes": ["2001:470:64::/96"],
         \\      "max_download_size_bytes": 104857600,
         \\      "download_timeout_seconds": 30,
         \\      "max_image_dimension": 2048
@@ -2233,6 +2237,7 @@ test "common config preserves remote content logging and storage fields" {
     try std.testing.expectEqual(@as(?bool, true), remote_content.security.?.block_private_ips);
     try std.testing.expectEqual(@as(?u64, 104857600), remote_content.security.?.max_download_size_bytes);
     try std.testing.expectEqualStrings("example.com", remote_content.security.?.allowed_hosts.?[0]);
+    try std.testing.expectEqualStrings("2001:470:64::/96", remote_content.security.?.nat64_prefixes.?[0]);
 
     const s3_credential = remote_content.getS3("primary").?;
     try std.testing.expectEqualStrings("s3.amazonaws.com", s3_credential.endpoint.?);
@@ -2243,6 +2248,16 @@ test "common config preserves remote content logging and storage fields" {
     const http_credential = remote_content.getHttp("internal-api").?;
     try std.testing.expectEqualStrings("https://docs.internal.com", http_credential.base_url.?);
     try std.testing.expectEqualStrings("Bearer abc", http_credential.headers.get("Authorization").?);
+}
+
+test "common config rejects invalid NAT64 translation prefixes" {
+    try std.testing.expectError(
+        error.InvalidConfig,
+        Config.parseFromSlice(
+            std.testing.allocator,
+            "{\"remote_content\":{\"security\":{\"nat64_prefixes\":[\"2001:470::/72\"]}}}",
+        ),
+    );
 }
 
 test "common config parses public connections map" {

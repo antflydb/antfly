@@ -8,6 +8,8 @@ pub const ContentSecurityConfig = struct {
     allowed_hosts: ?[]const []const u8 = null,
     /// Block requests to private IP ranges (127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16)
     block_private_ips: ?bool = null,
+    /// RFC 6052 network-specific NAT64 prefixes used by this deployment. Resolved IPv6 addresses under these prefixes are decoded and checked against the private IPv4 policy. Prefix length must be 32, 40, 48, 56, 64, or 96.
+    nat64_prefixes: ?[]const []const u8 = null,
     /// Maximum size of downloaded content in bytes
     max_download_size_bytes: ?i64 = null,
     /// Timeout for individual download operations in seconds

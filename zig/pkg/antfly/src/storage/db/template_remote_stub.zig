@@ -209,6 +209,7 @@ fn applyContentSecurityOverride(
 ) void {
     if (override.allowed_hosts) |value| effective.allowed_hosts = value;
     if (override.block_private_ips) |value| effective.block_private_ips = value;
+    if (override.nat64_prefixes) |value| effective.nat64_prefixes = value;
     if (override.max_download_size_bytes) |value| effective.max_download_size_bytes = value;
     if (override.download_timeout_seconds) |value| effective.download_timeout_seconds = value;
     if (override.max_image_dimension) |value| effective.max_image_dimension = value;
