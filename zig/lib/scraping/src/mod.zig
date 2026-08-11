@@ -764,9 +764,22 @@ fn isPublicAddress(address: std.Io.net.IpAddress) bool {
             const b = ip6.bytes;
             if (std.Io.net.Ip4Address.fromIp6(ip6)) |ip4| return isPublicAddress(.{ .ip4 = ip4 });
             const zero_96_prefix = std.mem.eql(u8, b[0..12], &([_]u8{0} ** 12));
-            const is_nat64 = std.mem.eql(u8, b[0..12], &.{ 0, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0 });
-            if (is_nat64) {
+            const is_well_known_nat64 = std.mem.eql(u8, b[0..12], &.{ 0, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0 });
+            if (is_well_known_nat64) {
                 return isPublicAddress(.{ .ip4 = .{ .bytes = b[12..16].*, .port = ip6.port } });
+            }
+            // RFC 8215 reserves 64:ff9b:1::/48 for local-use NAT64. RFC 6052
+            // places the IPv4 bits around the mandatory zero "u" octet for a
+            // /48 prefix. Decode valid addresses so private IPv4 destinations
+            // cannot bypass SSRF policy through an operator NAT64 gateway;
+            // reject malformed encodings inside the reserved prefix.
+            const is_local_use_nat64 = std.mem.eql(u8, b[0..6], &.{ 0, 0x64, 0xff, 0x9b, 0, 1 });
+            if (is_local_use_nat64) {
+                if (b[8] != 0 or !std.mem.allEqual(u8, b[11..16], 0)) return false;
+                return isPublicAddress(.{ .ip4 = .{
+                    .bytes = .{ b[6], b[7], b[9], b[10] },
+                    .port = ip6.port,
+                } });
             }
             return ip6.interface.isNone() and
                 !zero_96_prefix and
@@ -936,6 +949,9 @@ test "remote address policy rejects non-public ranges" {
     try std.testing.expect(!isPublicAddress(try parse("fc00::1", 80)));
     try std.testing.expect(!isPublicAddress(try parse("fe80::1", 80)));
     try std.testing.expect(!isPublicAddress(try parse("::ffff:127.0.0.1", 80)));
+    try std.testing.expect(!isPublicAddress(try parse("64:ff9b::a9fe:a9fe", 80)));
+    try std.testing.expect(!isPublicAddress(try parse("64:ff9b:1:a9fe:a9:fe00:0:0", 80)));
+    try std.testing.expect(isPublicAddress(try parse("64:ff9b:1:808:8:800:0:0", 80)));
     try std.testing.expect(isPublicAddress(try parse("8.8.8.8", 80)));
     try std.testing.expect(isPublicAddress(try parse("2606:4700:4700::1111", 80)));
 }

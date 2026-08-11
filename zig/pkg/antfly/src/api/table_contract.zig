@@ -15,6 +15,7 @@
 const std = @import("std");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const tables_api = @import("tables.zig");
+const indexes_api = @import("indexes.zig");
 
 fn stringifyJsonAlloc(alloc: std.mem.Allocator, value: anytype) ![]u8 {
     return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
@@ -86,6 +87,10 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
             alloc,
             fallback.indexes_json orelse tables_api.default_indexes_json,
         );
+        try validateCreateTableArtifactEnrichments(
+            alloc,
+            fallback.indexes_json orelse tables_api.default_indexes_json,
+        );
         return fallback;
     };
     defer parsed.deinit();
@@ -108,6 +113,7 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
     } else {
         req.indexes_json = try alloc.dupe(u8, tables_api.default_indexes_json);
     }
+    try validateCreateTableArtifactEnrichments(alloc, req.indexes_json.?);
 
     if (raw_root.get("schema")) |schema_value| {
         if (schema_value != .null) {
@@ -278,12 +284,25 @@ pub fn parseCreateIndexRequest(alloc: std.mem.Allocator, index_name: []const u8,
     }
     if (isReservedPublicCreateIndexName(index_name)) return error.InvalidCreateIndexRequest;
 
-    return normalizeIndexConfigJson(alloc, root, index_name, .{
+    const normalized = normalizeIndexConfigJson(alloc, root, index_name, .{
         .include_name = true,
         .default_type = true,
     }) catch |err| switch (err) {
-        error.InvalidCreateIndexRequest => error.InvalidCreateIndexRequest,
-        else => err,
+        error.InvalidCreateIndexRequest => return error.InvalidCreateIndexRequest,
+        else => return err,
+    };
+    errdefer alloc.free(normalized);
+    indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, normalized) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidCreateIndexRequest,
+    };
+    return normalized;
+}
+
+fn validateCreateTableArtifactEnrichments(alloc: std.mem.Allocator, indexes_json: []const u8) !void {
+    indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, indexes_json) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidCreateTableRequest,
     };
 }
 
@@ -883,6 +902,31 @@ test "table contract preserves artifact-backed public full text indexes" {
             std.testing.allocator,
             "full_text_index_v1",
             "{}",
+        ),
+    );
+}
+
+test "table contract rejects invalid inline artifact enrichments before admission" {
+    try std.testing.expectError(
+        error.InvalidCreateTableRequest,
+        parseCreateTableRequest(
+            std.testing.allocator,
+            "{\"indexes\":{\"document_text\":{\"type\":\"full_text\",\"artifact_name\":\"chunks\",\"enrichments\":[{\"name\":\"chunks\",\"kind\":\"chunk\",\"field\":\"text\"}]}}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidCreateTableRequest,
+        parseCreateTableRequest(
+            std.testing.allocator,
+            "{\"indexes\":{\"document_text\":{\"type\":\"full_text\",\"enrichments\":\"not-an-array\"}}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidCreateIndexRequest,
+        parseCreateIndexRequest(
+            std.testing.allocator,
+            "document_text",
+            "{\"type\":\"full_text\",\"enrichments\":[false]}",
         ),
     );
 }

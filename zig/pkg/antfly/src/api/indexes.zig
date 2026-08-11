@@ -391,18 +391,20 @@ fn collectArtifactEnrichmentsFromValue(
     switch (value) {
         .object => |object| {
             if (object.get("enrichments")) |enrichments| {
-                if (enrichments == .array) {
-                    for (enrichments.array.items) |item| {
-                        if (item != .object) continue;
-                        const parsed = try std.json.parseFromValue(db_mod.types.EnrichmentConfig, alloc, item, .{
-                            .allocate = .alloc_always,
-                            .ignore_unknown_fields = true,
-                        });
-                        defer parsed.deinit();
-                        var owned = try db_mod.types.EnrichmentConfig.clone(alloc, parsed.value);
-                        errdefer owned.deinit(alloc);
-                        try out.append(alloc, owned);
-                    }
+                if (enrichments != .array) return error.InvalidEnrichmentConfig;
+                for (enrichments.array.items) |item| {
+                    if (item != .object) return error.InvalidEnrichmentConfig;
+                    const parsed = std.json.parseFromValue(db_mod.types.EnrichmentConfig, alloc, item, .{
+                        .allocate = .alloc_always,
+                        .ignore_unknown_fields = true,
+                    }) catch |err| switch (err) {
+                        error.OutOfMemory => return err,
+                        else => return error.InvalidEnrichmentConfig,
+                    };
+                    defer parsed.deinit();
+                    var owned = try db_mod.types.EnrichmentConfig.clone(alloc, parsed.value);
+                    errdefer owned.deinit(alloc);
+                    try out.append(alloc, owned);
                 }
             }
             var it = object.iterator();

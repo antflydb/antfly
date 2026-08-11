@@ -3919,6 +3919,71 @@ pub fn completeDocumentExtractionGeneratedTextForRequest(
     try completeRuntimeDocumentExtractionGeneratedTextBatch(runtime, alloc, producer, config, batch_policy, source_url, source_bytes, extraction.route_type, source_content_type, extraction.units, .transcript, null);
 }
 
+/// Enforces a pre-reserved working-set ceiling without charging the node
+/// ResourceManager a second time. PDF admission reserves the worst-case decode
+/// budget before parsing; allocations made under that reservation still need a
+/// hard local ceiling, but must not acquire duplicate slice reservations.
+const ReservedWorkingSetAllocator = struct {
+    backing: Allocator,
+    live_bytes: usize = 0,
+    max_live_bytes: usize,
+    limit_exceeded: bool = false,
+
+    fn init(backing: Allocator, max_live_bytes: usize) @This() {
+        return .{ .backing = backing, .max_live_bytes = max_live_bytes };
+    }
+
+    fn allocator(self: *@This()) Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            },
+        };
+    }
+
+    fn permitsGrowth(self: *@This(), additional_bytes: usize) bool {
+        if (additional_bytes <= self.max_live_bytes -| self.live_bytes) return true;
+        self.limit_exceeded = true;
+        return false;
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        if (!self.permitsGrowth(len)) return null;
+        const ptr = self.backing.rawAlloc(len, alignment, ret_addr) orelse return null;
+        self.live_bytes += len;
+        return ptr;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        const growth = new_len -| memory.len;
+        if (growth > 0 and !self.permitsGrowth(growth)) return false;
+        if (!self.backing.rawResize(memory, alignment, new_len, ret_addr)) return false;
+        self.live_bytes = self.live_bytes -| memory.len +| new_len;
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        const growth = new_len -| memory.len;
+        if (growth > 0 and !self.permitsGrowth(growth)) return null;
+        const ptr = self.backing.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
+        self.live_bytes = self.live_bytes -| memory.len +| new_len;
+        return ptr;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.backing.rawFree(memory, alignment, ret_addr);
+        self.live_bytes -|= memory.len;
+    }
+};
+
 fn completeRuntimeDocumentExtractionGeneratedTextBatch(
     runtime: *EnrichmentRuntime,
     alloc: Allocator,
@@ -3933,12 +3998,22 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatch(
     kind: RuntimeGeneratedUnitTextKind,
     pdf_session_override: ?*document_extraction_mod.PdfRenderSession,
 ) !void {
-    var budgeted_allocator: ?resource_manager_mod.BudgetedAllocator = if (runtime.config.resource_manager orelse runtime.index_manager.resource_manager) |manager|
-        resource_manager_mod.BudgetedAllocator.init(manager, .document_extraction_working_set, alloc, 1)
+    const uses_reserved_pdf_working_set = kind == .ocr and std.mem.eql(u8, route_type, "pdf");
+    var reserved_allocator: ?ReservedWorkingSetAllocator = if (uses_reserved_pdf_working_set)
+        ReservedWorkingSetAllocator.init(alloc, config.pdf_decode_limits.max_working_set_bytes)
+    else
+        null;
+    var budgeted_allocator: ?resource_manager_mod.BudgetedAllocator = if (!uses_reserved_pdf_working_set and (runtime.config.resource_manager orelse runtime.index_manager.resource_manager) != null)
+        resource_manager_mod.BudgetedAllocator.init((runtime.config.resource_manager orelse runtime.index_manager.resource_manager).?, .document_extraction_working_set, alloc, 1)
     else
         null;
     defer if (budgeted_allocator) |*budgeted| budgeted.deinit();
-    const working_alloc = if (budgeted_allocator) |*budgeted| budgeted.allocator() else alloc;
+    const working_alloc = if (reserved_allocator) |*reserved|
+        reserved.allocator()
+    else if (budgeted_allocator) |*budgeted|
+        budgeted.allocator()
+    else
+        alloc;
     completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
         runtime,
         alloc,
@@ -3954,6 +4029,9 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatch(
         kind,
         pdf_session_override,
     ) catch |err| {
+        if (reserved_allocator) |*reserved| {
+            if (reserved.limit_exceeded) return error.DocumentExtractionWorkingSetTooLarge;
+        }
         if (budgeted_allocator) |*budgeted| {
             if (budgeted.denied()) return error.DocumentExtractionWorkingSetTooLarge;
         }
@@ -5125,6 +5203,28 @@ test "document extraction transient allocator composes with reserved baseline" {
     try std.testing.expect(budgeted.denied());
     transient_alloc.free(canvas);
     try std.testing.expectEqual(@as(u64, 60), manager.sliceStats(.document_extraction_working_set).used_bytes);
+}
+
+test "reserved PDF working set is bounded without duplicate resource charges" {
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{
+        .soft_limit_bytes = 0,
+        .hard_limit_bytes = 100,
+    };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    var tracker = RuntimeDocumentExtractionResourceTracker{ .manager = &manager };
+    defer tracker.deinit();
+    try tracker.setDownloadedBytes(10);
+    try std.testing.expectEqual(@as(usize, 60), try tracker.reservePdfDecodeWorkingSet(60));
+
+    var bounded = ReservedWorkingSetAllocator.init(std.testing.allocator, 60);
+    const working_alloc = bounded.allocator();
+    const canvas = try working_alloc.alloc(u8, 60);
+    try std.testing.expectEqual(@as(u64, 70), manager.sliceStats(.document_extraction_working_set).used_bytes);
+    try std.testing.expectError(error.OutOfMemory, working_alloc.alloc(u8, 1));
+    try std.testing.expect(bounded.limit_exceeded);
+    working_alloc.free(canvas);
+    try std.testing.expectEqual(@as(u64, 70), manager.sliceStats(.document_extraction_working_set).used_bytes);
 }
 
 fn addUsizeSaturating(a: usize, b: usize) usize {
