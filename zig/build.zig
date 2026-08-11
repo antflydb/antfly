@@ -4541,6 +4541,7 @@ pub fn build(b: *std.Build) void {
         "distributed join applies auth row filter to right table filter query",
         "distributed join preserves native public filters when adding join predicates",
         "scan request errors map to stable client responses",
+        "httpx antfly reads map missing table errors to not found",
         "httpx antfly scan honors optional body and documented bad requests",
         "httpx multi batch route uses the batch commit hook and public response contract",
         "httpx stable transaction commit durably hands off recovery before acknowledgement",
@@ -4598,6 +4599,7 @@ pub fn build(b: *std.Build) void {
 
     const lib_api_auth_default_filters = [_][]const u8{
         "api http server requires auth on public routes when enabled",
+        "api http server document scan requires table read permission",
         "api http server returns retryable not leader when local reconcile lease is lost",
         "api http server returns retryable not leader when metadata proposal is dropped",
         "api http server returns retryable not leader through public table adapter mutation",

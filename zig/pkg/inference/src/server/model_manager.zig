@@ -2069,11 +2069,10 @@ pub const LoadedModel = struct {
     // lifetime during execution; the mutex protects short slot mutations.
     embedding_asset_gate: EmbeddingAssetGate = .{},
     embedding_session_lock: std.atomic.Mutex = .unlocked,
-    /// Stateful GPU embedding sessions share mutable weight-store and command
-    /// state. Cold-load waiters are released together, so serialize their
-    /// forward passes without constraining thread-safe CPU sessions.
-    embedding_run_lock: std.atomic.Mutex = .unlocked,
-    reranking_session_lock: std.atomic.Mutex = .unlocked,
+    /// Stateful GPU pipelines share mutable command-frame and resident-slot
+    /// state within a loaded model. Keep one model-local lane while allowing
+    /// independent models to overlap.
+    target_inference_run_lock: std.atomic.Mutex = .unlocked,
     vision_session: ?backends.Session = null,
     audio_session: ?backends.Session = null,
     text_projection: ?backends.Session = null,
@@ -2351,13 +2350,16 @@ pub const LoadedModel = struct {
     }
 
     pub fn embeddingExecutionLock(self: *LoadedModel) ?*std.atomic.Mutex {
-        if (!embeddingBackendNeedsRunLock(self.session.backend())) return null;
-        return &self.embedding_run_lock;
+        return self.targetInferenceExecutionMutex();
+    }
+
+    pub fn targetInferenceExecutionMutex(self: *LoadedModel) ?*std.atomic.Mutex {
+        return targetInferenceExecutionMutexForBackend(self.session.backend(), &self.target_inference_run_lock);
     }
 
     pub fn rerankingPipeline(self: *LoadedModel, allocator: std.mem.Allocator) RerankingPipeline {
         const tok = self.getTokenizer();
-        return RerankingPipeline.init(allocator, self.session, tok, .{
+        var pipeline = RerankingPipeline.init(allocator, self.session, tok, .{
             .max_length = self.manifest.max_position_embeddings,
             .mode = if (self.manifest.hasCapability("late_interaction") or
                 self.manifest.hasCapability("colbert") or
@@ -2370,14 +2372,8 @@ pub const LoadedModel = struct {
             .add_bos_token = self.manifest.add_bos_token,
             .distributed = runtime.distributed.configFromEnv(),
         });
-    }
-
-    pub fn lockRerankingSession(self: *LoadedModel) void {
-        spinLock(&self.reranking_session_lock);
-    }
-
-    pub fn unlockRerankingSession(self: *LoadedModel) void {
-        self.reranking_session_lock.unlock();
+        pipeline.execution_lock = self.targetInferenceExecutionMutex();
+        return pipeline;
     }
 
     pub fn classificationPipeline(self: *LoadedModel, allocator: std.mem.Allocator, config: ClassificationConfig) ClassificationPipeline {
@@ -2435,6 +2431,7 @@ pub const LoadedModel = struct {
             .allocator = allocator,
             .session = self.session,
             .tok = tok,
+            .execution_lock = self.targetInferenceExecutionMutex(),
             .config = .{
                 .max_width = self.manifest.gliner_max_width,
                 .max_length = self.manifest.max_position_embeddings,
@@ -2522,8 +2519,14 @@ fn isJinaStyleEmbeddingManifest(manifest: *const manifest_mod.ModelManifest) boo
         (manifest.pooling == .last and std.mem.eql(u8, manifest.embedding_text_prefix, "Document: "));
 }
 
-fn embeddingBackendNeedsRunLock(backend: backends.BackendType) bool {
-    return backend.usesGpuHostedSession();
+fn targetInferenceExecutionMutexForBackend(
+    backend: backends.BackendType,
+    model_mutex: *std.atomic.Mutex,
+) ?*std.atomic.Mutex {
+    return switch (backend) {
+        .metal, .cuda => model_mutex,
+        else => null,
+    };
 }
 
 test "embedding asset gate admits concurrent readers and excludes writers" {
@@ -2744,12 +2747,16 @@ test "audio asset rollback closes every ephemeral session" {
     try std.testing.expect(model.audio_projection == null);
 }
 
-test "embedding run gate is limited to stateful GPU backends" {
-    try std.testing.expect(embeddingBackendNeedsRunLock(.metal));
-    try std.testing.expect(embeddingBackendNeedsRunLock(.cuda));
-    try std.testing.expect(!embeddingBackendNeedsRunLock(.native));
-    try std.testing.expect(!embeddingBackendNeedsRunLock(.onnx));
-    try std.testing.expect(!embeddingBackendNeedsRunLock(.wasm));
+test "target inference gates are GPU-only and model-local" {
+    var first: std.atomic.Mutex = .unlocked;
+    var second: std.atomic.Mutex = .unlocked;
+
+    try std.testing.expectEqual(&first, targetInferenceExecutionMutexForBackend(.metal, &first).?);
+    try std.testing.expectEqual(&second, targetInferenceExecutionMutexForBackend(.metal, &second).?);
+    try std.testing.expectEqual(&first, targetInferenceExecutionMutexForBackend(.cuda, &first).?);
+    try std.testing.expect(targetInferenceExecutionMutexForBackend(.native, &first) == null);
+    try std.testing.expect(targetInferenceExecutionMutexForBackend(.onnx, &first) == null);
+    try std.testing.expect(targetInferenceExecutionMutexForBackend(.wasm, &first) == null);
 }
 
 fn usesClipImagePreprocessProfile(manifest: *const manifest_mod.ModelManifest) bool {

@@ -2695,6 +2695,10 @@ pub const AntflyApiHandler = struct {
             scan_req.opts,
             .read_index,
         ) catch |err| switch (err) {
+            error.TableNotFound => {
+                _ = ctx.status(404);
+                return ctx.text("not found");
+            },
             error.HAReadRequiresPrimary, error.ReadRequiresPrimary => {
                 _ = ctx.status(503);
                 return ctx.text("read requires primary");
@@ -2753,6 +2757,10 @@ pub const AntflyApiHandler = struct {
         };
 
         var result = (source.lookup(alloc, decoded_table_name, decoded_key, lookup_opts.opts, consistency) catch |err| switch (err) {
+            error.TableNotFound => {
+                _ = ctx.status(404);
+                return ctx.text("not found");
+            },
             error.HAReadRequiresPrimary, error.ReadRequiresPrimary => {
                 _ = ctx.status(503);
                 return ctx.text("read requires primary");
@@ -4856,6 +4864,80 @@ test "httpx antfly lookup route preserves projection and headers" {
     var parsed = try std.json.parseFromSlice(LookupResponse, alloc, resp.body.?, .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings("alpha", parsed.value.title);
+}
+
+test "httpx antfly reads map missing table errors to not found" {
+    const MissingTableReads = struct {
+        fn source() table_reads.TableReadSource {
+            return .{ .ptr = undefined, .vtable = &vtable };
+        }
+
+        const vtable = table_reads.TableReadSource.VTable{
+            .lookup = lookup,
+            .scan = scan,
+            .query = query,
+        };
+
+        fn lookup(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.LookupOptions,
+            _: raft_mod.ReadConsistency,
+        ) anyerror!?table_reads.LookupResponse {
+            return error.TableNotFound;
+        }
+
+        fn scan(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.ScanOptions,
+            _: raft_mod.ReadConsistency,
+        ) anyerror!?table_reads.ScanResponse {
+            return error.TableNotFound;
+        }
+
+        fn query(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.SearchRequest,
+            _: raft_mod.ReadConsistency,
+        ) anyerror!?query_api.QueryResponse {
+            return error.UnexpectedTestCall;
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var status_source = LookupStatusSource{};
+    var api_server = ApiHttpServer.init(alloc, .{}, status_source.iface(), MissingTableReads.source(), null);
+    var handler = AntflyApiHandler{ .api_server = &api_server };
+
+    var request = try httpx.Request.init(alloc, .GET, "http://127.0.0.1/db/v1/tables/docs/documents/doc:a");
+    defer request.deinit();
+    var ctx = httpx.Context.init(alloc, undefined, &request);
+    defer ctx.deinit();
+
+    var response = try handler.lookupKey(&ctx, "docs", "doc:a", .{});
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 404), response.status.code);
+    try std.testing.expectEqualStrings("text/plain; charset=utf-8", response.contentType().?);
+    try std.testing.expectEqualStrings("not found", response.body.?);
+
+    var scan_request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/tables/docs/documents");
+    defer scan_request.deinit();
+    var scan_ctx = httpx.Context.init(alloc, undefined, &scan_request);
+    defer scan_ctx.deinit();
+
+    var scan_response = try handler.scanKeys(&scan_ctx, "docs");
+    defer scan_response.deinit();
+    try std.testing.expectEqual(@as(u16, 404), scan_response.status.code);
+    try std.testing.expectEqualStrings("text/plain; charset=utf-8", scan_response.contentType().?);
+    try std.testing.expectEqualStrings("not found", scan_response.body.?);
 }
 
 test "httpx antfly scan honors optional body and documented bad requests" {
