@@ -3999,6 +3999,7 @@ pub fn build(b: *std.Build) void {
             "PDF decoder credit and OCR transient allocations compose without double charging",
             "reserved PDF working set is bounded without duplicate resource charges",
             "budgeted document download composes with materialization accounting",
+            "retained document collection allocations compose with the hard working-set cap",
             "document replay payloads are admitted before persistent allocation",
             "document extraction generated OCR bypasses unsupported native batch",
             "generated text provider config is validated while parsing extraction config",
@@ -6523,6 +6524,7 @@ pub fn build(b: *std.Build) void {
     db_test_mod.addImport("inference_api", inference_api_mod);
     db_test_mod.addImport("antfly_reranking", reranking_mod);
     db_test_mod.addImport("antfly_scraping", scraping_mod);
+    db_test_mod.addImport("antfly_readers", readers_mod);
     db_test_mod.addImport("antfly_transcribing", transcribing_db_test_stub_mod);
     db_test_mod.addImport("httpx", httpx_mod);
     db_test_mod.addImport("antfly_pdf", pdf_mod);

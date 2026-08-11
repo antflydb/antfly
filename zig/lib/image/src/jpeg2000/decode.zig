@@ -116,6 +116,98 @@ pub const Header = struct {
     }
 };
 
+pub const Jp2ColorMetadata = struct {
+    color_method: ?box.ColorMethod = null,
+    enumerated_color_space: ?u32 = null,
+    has_icc_profile: bool = false,
+    /// Indexed by codestream component. Four is the maximum component count
+    /// accepted by the U8 decoder, so metadata remains allocation-free after
+    /// the JP2 box parser returns.
+    channel_definitions: [4]?box.ChannelDefinition = .{null} ** 4,
+
+    pub const AlphaLayout = struct {
+        red: u8,
+        green: u8,
+        blue: u8,
+        alpha: u8,
+        premultiplied: bool,
+    };
+
+    fn fromParsed(parsed: box.ParsedJp2) Jp2ColorMetadata {
+        var metadata = Jp2ColorMetadata{};
+        if (parsed.color_spec) |color_spec| {
+            metadata.color_method = color_spec.method;
+            if (color_spec.method == .enumerated) metadata.enumerated_color_space = color_spec.enum_cs;
+            metadata.has_icc_profile = color_spec.method == .restricted_icc or color_spec.method == .any_icc;
+        }
+        if (parsed.cdef) |definitions| {
+            for (definitions) |definition| {
+                if (definition.channel < metadata.channel_definitions.len)
+                    metadata.channel_definitions[definition.channel] = definition;
+            }
+        }
+        return metadata;
+    }
+
+    /// Resolve JP2 channel definitions into straight RGBA component indexes.
+    /// Partial color associations are completed in codestream order, but an
+    /// explicit opacity channel is mandatory so CMYK cannot be mistaken for
+    /// RGB plus alpha.
+    pub fn alphaLayout(self: Jp2ColorMetadata, components: u8) ?AlphaLayout {
+        if (components != 4) return null;
+        var color_indexes: [3]?u8 = .{ null, null, null };
+        var alpha: ?u8 = null;
+        var premultiplied = false;
+
+        for (self.channel_definitions, 0..) |maybe_definition, component_index| {
+            const definition = maybe_definition orelse continue;
+            if (definition.channel >= components or definition.channel != component_index) return null;
+            switch (definition.kind) {
+                .opacity, .premultiplied_opacity => {
+                    if (alpha != null) return null;
+                    alpha = @intCast(component_index);
+                    premultiplied = definition.kind == .premultiplied_opacity;
+                },
+                .color => {
+                    if (definition.association >= 1 and definition.association <= 3) {
+                        const association: usize = definition.association - 1;
+                        if (color_indexes[association] != null) return null;
+                        color_indexes[association] = @intCast(component_index);
+                    }
+                },
+                .unspecified => {},
+            }
+        }
+        const alpha_index = alpha orelse return null;
+
+        var used = [_]bool{false} ** 4;
+        used[alpha_index] = true;
+        for (color_indexes) |maybe_index| {
+            if (maybe_index) |index| {
+                if (used[index]) return null;
+                used[index] = true;
+            }
+        }
+        for (&color_indexes) |*maybe_index| {
+            if (maybe_index.* != null) continue;
+            for (0..components) |index| {
+                if (used[index]) continue;
+                maybe_index.* = @intCast(index);
+                used[index] = true;
+                break;
+            }
+            if (maybe_index.* == null) return null;
+        }
+        return .{
+            .red = color_indexes[0].?,
+            .green = color_indexes[1].?,
+            .blue = color_indexes[2].?,
+            .alpha = alpha_index,
+            .premultiplied = premultiplied,
+        };
+    }
+};
+
 pub const DecodedImage = struct {
     allocator: std.mem.Allocator,
     width: u32,
@@ -123,6 +215,7 @@ pub const DecodedImage = struct {
     components: u8,
     backend: DecodeBackend,
     pixels: []u8,
+    jp2_color: Jp2ColorMetadata = .{},
 
     pub fn deinit(self: *DecodedImage) void {
         self.allocator.free(self.pixels);
@@ -211,8 +304,11 @@ pub fn decodeU8(allocator: std.mem.Allocator, path: []const u8) !DecodedImage {
 }
 
 pub fn decodeU8Bytes(allocator: std.mem.Allocator, bytes: []const u8) !DecodedImage {
+    var jp2_color = Jp2ColorMetadata{};
     const codestream_bytes = if (box.hasSignature(bytes)) blk: {
-        const parsed = try box.parse(bytes);
+        var parsed = try box.parseOwned(allocator, bytes);
+        defer box.freeParsed(allocator, &parsed);
+        jp2_color = Jp2ColorMetadata.fromParsed(parsed);
         const offset = parsed.codestream_offset orelse return error.MissingCodestreamBox;
         break :blk bytes[offset..];
     } else if (codestream.hasSoc(bytes))
@@ -241,6 +337,7 @@ pub fn decodeU8Bytes(allocator: std.mem.Allocator, bytes: []const u8) !DecodedIm
             .components = @intCast(state.header.components.len),
             .backend = .pure_zig,
             .pixels = pixels,
+            .jp2_color = jp2_color,
         };
     }
 
@@ -299,6 +396,7 @@ pub fn decodeU8Bytes(allocator: std.mem.Allocator, bytes: []const u8) !DecodedIm
         .components = @intCast(state.header.components.len),
         .backend = .pure_zig,
         .pixels = pixels.pixels,
+        .jp2_color = jp2_color,
     };
 }
 
@@ -1753,6 +1851,22 @@ test "decode OpenJPEG lossless 4x4 RGB J2K" {
         1,   2,   3,   253, 254, 255, 127, 0,   255, 0,   127, 255,
     };
     try std.testing.expectEqualSlices(u8, &expected, decoded.pixels);
+}
+
+test "JP2 channel definitions distinguish opacity from a fourth color component" {
+    var metadata = Jp2ColorMetadata{};
+    try std.testing.expect(metadata.alphaLayout(4) == null);
+
+    metadata.channel_definitions[0] = .{ .channel = 0, .kind = .color, .association = 1 };
+    metadata.channel_definitions[1] = .{ .channel = 1, .kind = .color, .association = 2 };
+    metadata.channel_definitions[2] = .{ .channel = 2, .kind = .color, .association = 3 };
+    metadata.channel_definitions[3] = .{ .channel = 3, .kind = .opacity, .association = 0 };
+    const layout = metadata.alphaLayout(4) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u8, 0), layout.red);
+    try std.testing.expectEqual(@as(u8, 1), layout.green);
+    try std.testing.expectEqual(@as(u8, 2), layout.blue);
+    try std.testing.expectEqual(@as(u8, 3), layout.alpha);
+    try std.testing.expect(!layout.premultiplied);
 }
 
 test "decode OpenJPEG header parsing for lossy J2K" {

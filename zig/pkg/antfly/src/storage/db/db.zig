@@ -50074,7 +50074,7 @@ test "db document extraction completes image OCR with reader producer" {
         .kind = .asset,
         .field = "url",
         .content_type = "application/json",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"},\"ocr\":{\"enabled\":true,\"config\":{\"provider\":\"mock-reader\"}}}}",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"},\"ocr\":{\"enabled\":true,\"config\":{\"provider\":\"antfly\"}}}}",
     });
 
     try db.batch(.{
@@ -50126,7 +50126,7 @@ test "db document extraction attempts forced OCR for a scanned PDF" {
         .kind = .asset,
         .field = "url",
         .content_type = "application/json",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"},\"ocr\":{\"enabled\":true,\"mode\":\"always\",\"config\":{\"provider\":\"mock-reader\"}}}}",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"},\"ocr\":{\"enabled\":true,\"mode\":\"always\",\"config\":{\"provider\":\"antfly\"}}}}",
     });
 
     const pdf_bytes = try std.Io.Dir.cwd().readFileAlloc(
@@ -50193,7 +50193,7 @@ test "db async document extraction reuses generated OCR text across streaming pa
         .kind = .asset,
         .field = "url",
         .content_type = "application/json",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"},\"ocr\":{\"enabled\":true,\"config\":{\"provider\":\"mock-reader\"}}}}",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"},\"ocr\":{\"enabled\":true,\"config\":{\"provider\":\"antfly\"}}}}",
     });
 
     try db.batch(.{
@@ -50242,7 +50242,7 @@ test "db document extraction stores structured OCR confidence and coordinates" {
         .kind = .asset,
         .field = "url",
         .content_type = "application/json",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"},\"ocr\":{\"enabled\":true,\"config\":{\"provider\":\"mock-reader\"}}}}",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"},\"ocr\":{\"enabled\":true,\"config\":{\"provider\":\"antfly\"}}}}",
     });
 
     try db.batch(.{

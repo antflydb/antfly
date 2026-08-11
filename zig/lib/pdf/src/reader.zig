@@ -2338,7 +2338,10 @@ pub const Reader = struct {
         defer resolved_type.deinit(self.alloc);
         const name = resolved_type.asName() orelse return error.InvalidPageTree;
         if (std.mem.eql(u8, name, "Page")) {
-            try out.append(self.alloc, try node.clone(self.alloc));
+            // Grow first so a successful deep clone always has an infallible
+            // ownership transfer into the result list.
+            try out.ensureUnusedCapacity(self.alloc, 1);
+            out.appendAssumeCapacity(try node.clone(self.alloc));
             return;
         }
         if (!std.mem.eql(u8, name, "Pages")) return error.InvalidPageTree;
@@ -2370,7 +2373,10 @@ pub const Reader = struct {
         var resolved = try self.resolveValue(value);
         defer resolved.deinit(self.alloc);
         switch (resolved) {
-            .stream => try out.append(self.alloc, try resolved.clone(self.alloc)),
+            .stream => {
+                try out.ensureUnusedCapacity(self.alloc, 1);
+                out.appendAssumeCapacity(try resolved.clone(self.alloc));
+            },
             .array => |items| for (items) |*item| try self.appendContentStreams(out, item, depth + 1, guard),
             .null => {},
             else => return error.NotAStream,
@@ -3359,7 +3365,7 @@ pub const Reader = struct {
             var jp2_decoded = try image_lib.jpeg2000.decodeU8Bytes(self.alloc, raw);
             defer jp2_decoded.deinit();
             if (jp2_decoded.width != width or jp2_decoded.height != height) return error.UnsupportedPdfRendering;
-            const rgba = try jpeg2000DecodedToRgbaAlloc(self.alloc, &jp2_decoded);
+            const rgba = try self.jpeg2000DecodedToRgbaAlloc(&jp2_decoded, obj);
             errdefer self.alloc.free(rgba);
             try self.applyImageTransparencyAlloc(rgba, width, height, obj);
             return .{
@@ -3440,50 +3446,134 @@ pub const Reader = struct {
         return .{ .rgba = rgba, .width = width, .height = height };
     }
 
-    fn jpeg2000DecodedToRgbaAlloc(alloc: Allocator, decoded: *const image_lib.jpeg2000.DecodedImage) ![]u8 {
+    fn jpeg2000DecodedToRgbaAlloc(
+        self: *const Reader,
+        decoded: *const image_lib.jpeg2000.DecodedImage,
+        image_obj: *const syntax.Object,
+    ) ![]u8 {
         const pixel_count = std.math.mul(usize, decoded.width, decoded.height) catch return error.UnsupportedPdfRendering;
         if (pixel_count > 100_000_000) return error.RenderedPageTooLarge;
         const sample_count = std.math.mul(usize, pixel_count, decoded.components) catch return error.UnsupportedPdfRendering;
         if (decoded.pixels.len != sample_count) return error.UnsupportedPdfRendering;
 
         const rgba_len = std.math.mul(usize, pixel_count, 4) catch return error.UnsupportedPdfRendering;
-        const rgba = try alloc.alloc(u8, rgba_len);
-        errdefer alloc.free(rgba);
+        const rgba = try self.alloc.alloc(u8, rgba_len);
+        errdefer self.alloc.free(rgba);
+        const decode_obj = image_obj.get("Decode");
+
+        if (image_obj.get("ColorSpace")) |color_space_obj| {
+            var resolved_color_space = try self.resolveValue(color_space_obj);
+            defer resolved_color_space.deinit(self.alloc);
+
+            if (decoded.jp2_color.alphaLayout(decoded.components)) |layout| {
+                if (try self.colorSpaceInputComponentCount(&resolved_color_space) != 3) return error.UnsupportedPdfRendering;
+                try decodeJpeg2000RgbaChannels(rgba, pixel_count, decoded.pixels, layout, decode_obj);
+                return rgba;
+            }
+            if (try self.colorSpaceInputComponentCount(&resolved_color_space) != decoded.components)
+                return error.UnsupportedPdfRendering;
+
+            if (resolved_color_space.asName()) |color_space| {
+                try decodeDeviceColorSpaceToRgba(rgba, pixel_count, decoded.pixels, color_space, decode_obj);
+            } else if (resolved_color_space == .array) {
+                if (try self.tryDecodeIccBasedImageToRgba(rgba, pixel_count, decoded.pixels, resolved_color_space.array, decode_obj)) {
+                    // handled
+                } else if (try self.tryDecodeCalibratedImageToRgba(rgba, pixel_count, decoded.pixels, resolved_color_space.array, decode_obj)) {
+                    // handled
+                } else if (try self.tryDecodeSpotColorSpaceToRgba(rgba, pixel_count, decoded.pixels, resolved_color_space.array, decode_obj)) {
+                    // handled
+                } else {
+                    try self.decodeIndexedImageToRgba(rgba, pixel_count, decoded.pixels, resolved_color_space.array, decode_obj);
+                }
+            } else {
+                return error.UnsupportedPdfRendering;
+            }
+            return rgba;
+        }
+
+        // PDF permits ColorSpace to be omitted when the JP2 container carries
+        // sufficient color metadata. One- and three-component output is
+        // unambiguous after JPEG2000's component transform. Four components
+        // require an explicit JP2 opacity definition; otherwise they may be
+        // CMYK and must not be guessed as RGBA.
         switch (decoded.components) {
-            1 => {
-                for (decoded.pixels, 0..) |gray, i| {
-                    const dst = i * 4;
-                    rgba[dst + 0] = gray;
-                    rgba[dst + 1] = gray;
-                    rgba[dst + 2] = gray;
-                    rgba[dst + 3] = 0xff;
-                }
-            },
-            3 => {
-                var i: usize = 0;
-                while (i < pixel_count) : (i += 1) {
-                    const src = i * 3;
-                    const dst = i * 4;
-                    rgba[dst + 0] = decoded.pixels[src + 0];
-                    rgba[dst + 1] = decoded.pixels[src + 1];
-                    rgba[dst + 2] = decoded.pixels[src + 2];
-                    rgba[dst + 3] = 0xff;
-                }
-            },
-            4 => {
-                var i: usize = 0;
-                while (i < pixel_count) : (i += 1) {
-                    const src = i * 4;
-                    const dst = i * 4;
-                    rgba[dst + 0] = decoded.pixels[src + 0];
-                    rgba[dst + 1] = decoded.pixels[src + 1];
-                    rgba[dst + 2] = decoded.pixels[src + 2];
-                    rgba[dst + 3] = decoded.pixels[src + 3];
-                }
-            },
+            1 => try decodeDeviceColorSpaceToRgba(rgba, pixel_count, decoded.pixels, "DeviceGray", decode_obj),
+            3 => try decodeDeviceColorSpaceToRgba(rgba, pixel_count, decoded.pixels, "DeviceRGB", decode_obj),
+            4 => if (decoded.jp2_color.alphaLayout(decoded.components)) |layout|
+                try decodeJpeg2000RgbaChannels(rgba, pixel_count, decoded.pixels, layout, decode_obj)
+            else
+                return error.UnsupportedPdfRendering,
             else => return error.UnsupportedPdfRendering,
         }
         return rgba;
+    }
+
+    fn colorSpaceInputComponentCount(self: *const Reader, color_space: *const syntax.Object) !usize {
+        if (color_space.asName()) |name| {
+            if (std.mem.eql(u8, name, "DeviceGray") or std.mem.eql(u8, name, "G")) return 1;
+            if (std.mem.eql(u8, name, "DeviceRGB") or std.mem.eql(u8, name, "RGB")) return 3;
+            if (std.mem.eql(u8, name, "DeviceCMYK") or std.mem.eql(u8, name, "CMYK")) return 4;
+            return error.UnsupportedPdfRendering;
+        }
+        if (color_space.* != .array or color_space.array.len == 0) return error.UnsupportedPdfRendering;
+        const family = color_space.array[0].asName() orelse return error.UnsupportedPdfRendering;
+        if (std.mem.eql(u8, family, "CalGray") or
+            std.mem.eql(u8, family, "Indexed") or
+            std.mem.eql(u8, family, "I") or
+            std.mem.eql(u8, family, "Separation")) return 1;
+        if (std.mem.eql(u8, family, "CalRGB")) return 3;
+        if (std.mem.eql(u8, family, "DeviceN")) {
+            if (color_space.array.len < 2) return error.UnsupportedPdfRendering;
+            var names = try self.resolveValue(&color_space.array[1]);
+            defer names.deinit(self.alloc);
+            if (names != .array or names.array.len == 0) return error.UnsupportedPdfRendering;
+            return names.array.len;
+        }
+        if (std.mem.eql(u8, family, "ICCBased")) {
+            if (color_space.array.len < 2) return error.UnsupportedPdfRendering;
+            var profile = try self.resolveValue(&color_space.array[1]);
+            defer profile.deinit(self.alloc);
+            if (profile != .stream) return error.UnsupportedPdfRendering;
+            const count = (profile.get("N") orelse return error.UnsupportedPdfRendering).asInteger() orelse
+                return error.UnsupportedPdfRendering;
+            if (count <= 0) return error.UnsupportedPdfRendering;
+            return std.math.cast(usize, count) orelse return error.UnsupportedPdfRendering;
+        }
+        return error.UnsupportedPdfRendering;
+    }
+
+    fn decodeJpeg2000RgbaChannels(
+        rgba: []u8,
+        pixel_count: usize,
+        decoded: []const u8,
+        layout: image_lib.jpeg2000.Jp2ColorMetadata.AlphaLayout,
+        decode_obj: ?*const syntax.Object,
+    ) !void {
+        if (decoded.len != pixel_count * 4) return error.UnsupportedPdfRendering;
+        var i: usize = 0;
+        while (i < pixel_count) : (i += 1) {
+            const src = i * 4;
+            const dst = i * 4;
+            const alpha = decoded[src + layout.alpha];
+            var red = applyDecodeByte(decoded[src + layout.red], decode_obj, 0);
+            var green = applyDecodeByte(decoded[src + layout.green], decode_obj, 1);
+            var blue = applyDecodeByte(decoded[src + layout.blue], decode_obj, 2);
+            if (layout.premultiplied) {
+                if (alpha == 0) {
+                    red = 0;
+                    green = 0;
+                    blue = 0;
+                } else {
+                    red = @intCast(@min(@as(u32, 255), (@as(u32, red) * 255 + alpha / 2) / alpha));
+                    green = @intCast(@min(@as(u32, 255), (@as(u32, green) * 255 + alpha / 2) / alpha));
+                    blue = @intCast(@min(@as(u32, 255), (@as(u32, blue) * 255 + alpha / 2) / alpha));
+                }
+            }
+            rgba[dst + 0] = red;
+            rgba[dst + 1] = green;
+            rgba[dst + 2] = blue;
+            rgba[dst + 3] = alpha;
+        }
     }
 
     fn tryDecodeIccBasedImageToRgba(
@@ -9790,6 +9880,59 @@ test "reader can extract plain text from simple page content" {
     try std.testing.expectEqualStrings("Hello World\n", text);
 }
 
+test "recursive page and content collectors are allocation-failure safe" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            var font_cache: std.AutoHashMapUnmanaged(u64, PageFont) = .empty;
+            var decrypted_streams: std.AutoHashMapUnmanaged(usize, []u8) = .empty;
+            var reader = Reader{
+                .alloc = alloc,
+                .bytes = "",
+                .decode_limits = .{},
+                .version_minor = 7,
+                .startxref_offset = 0,
+                .xref_entries = &.{},
+                .trailer = .null,
+                .font_cache = &font_cache,
+                .decrypted_streams = &decrypted_streams,
+            };
+
+            var page_entries = [_]syntax.DictEntry{
+                .{ .key = @constCast("Type"), .value = .{ .name = @constCast("Page") } },
+            };
+            var kids = [_]syntax.Object{.{ .dict = &page_entries }};
+            var pages_entries = [_]syntax.DictEntry{
+                .{ .key = @constCast("Type"), .value = .{ .name = @constCast("Pages") } },
+                .{ .key = @constCast("Kids"), .value = .{ .array = &kids } },
+            };
+            var pages: syntax.Object = .{ .dict = &pages_entries };
+            var page_out = std.ArrayList(syntax.Object).empty;
+            defer {
+                for (page_out.items) |*page| page.deinit(alloc);
+                page_out.deinit(alloc);
+            }
+            var page_guard: Reader.TraversalGuard = .{};
+            defer page_guard.deinit(alloc);
+            try reader.appendPageTreeLeaves(&page_out, &pages, 0, &page_guard);
+            try std.testing.expectEqual(@as(usize, 1), page_out.items.len);
+
+            var stream_items = [_]syntax.Object{
+                .{ .stream = .{ .header = &.{}, .data_offset = 0, .data_length = 0 } },
+                .{ .stream = .{ .header = &.{}, .data_offset = 0, .data_length = 0 } },
+            };
+            var contents: syntax.Object = .{ .array = &stream_items };
+            const streams = try reader.collectContentStreamsAlloc(&contents);
+            defer {
+                for (streams) |*stream| stream.deinit(alloc);
+                alloc.free(streams);
+            }
+            try std.testing.expectEqual(@as(usize, 2), streams.len);
+        }
+    };
+
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
 test "reader ignores an invalid xref sentinel and repairs a stale zero page count" {
     const alloc = std.testing.allocator;
     const content = "BT\n(Recovered document text) Tj\nET\n";
@@ -11719,6 +11862,70 @@ test "reader decodes JPXDecode image xobject draw" {
     try std.testing.expectEqual(@as(u8, 0), runs[0].rgba[4]);
     try std.testing.expectEqual(@as(u8, 255), runs[0].rgba[5]);
     try std.testing.expectEqual(@as(u8, 0), runs[0].rgba[6]);
+}
+
+test "reader converts four-component JPXDecode DeviceCMYK instead of treating black as alpha" {
+    const alloc = std.testing.allocator;
+    const pixels = [_]u8{
+        255, 0, 0, 0, // cyan
+        0, 0, 0, 255, // black
+    };
+    const params = image_lib.jpeg2000.EncodeParams{
+        .width = 2,
+        .height = 1,
+        .components = 4,
+        .decomposition_levels = 0,
+        .wavelet_transform = 1,
+        .multiple_component_transform = false,
+        .format = .jp2,
+    };
+    const jp2_bytes = try image_lib.jpeg2000.encodeU8Bytes(alloc, pixels[0..], &params);
+    defer alloc.free(jp2_bytes);
+
+    const content = "q\n2 0 0 1 10 10 cm\n/Im0 Do\nQ\n";
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ content.len, content }),
+        try std.fmt.allocPrint(
+            alloc,
+            "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 2 /Height 1 /ColorSpace /DeviceCMYK /BitsPerComponent 8 /Filter /JPXDecode /Length {d} >>\nstream\n{s}\nendstream\nendobj\n",
+            .{ jp2_bytes.len, jp2_bytes },
+        ),
+    };
+    defer alloc.free(objects[3]);
+    defer alloc.free(objects[4]);
+
+    var prefix = std.ArrayList(u8).empty;
+    defer prefix.deinit(alloc);
+    try prefix.appendSlice(alloc, "%PDF-1.7\n");
+    var offsets: [objects.len]usize = undefined;
+    for (objects, 0..) |obj_src, i| {
+        offsets[i] = prefix.items.len;
+        try prefix.appendSlice(alloc, obj_src);
+    }
+    const xref_offset = prefix.items.len;
+    try prefix.appendSlice(alloc, "xref\n0 6\n0000000000 65535 f \n");
+    for (offsets) |off| {
+        const line = try std.fmt.allocPrint(alloc, "{d:0>10} 00000 n \n", .{off});
+        defer alloc.free(line);
+        try prefix.appendSlice(alloc, line);
+    }
+    try prefix.appendSlice(alloc, "trailer\n<< /Size 6 /Root 1 0 R >>\n");
+
+    const sample = try std.fmt.allocPrint(alloc, "{s}startxref\n{d}\n%%EOF\n", .{ prefix.items, xref_offset });
+    defer alloc.free(sample);
+    var pdf = try Reader.init(alloc, sample);
+    defer pdf.deinit();
+
+    const runs = try pdf.extractPageImageRunsAlloc(1);
+    defer {
+        for (runs) |*run| run.deinit(alloc);
+        alloc.free(runs);
+    }
+    try std.testing.expectEqual(@as(usize, 1), runs.len);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 255, 255, 255, 0, 0, 0, 255 }, runs[0].rgba);
 }
 
 test "reader applies ExtGState alpha to image runs" {

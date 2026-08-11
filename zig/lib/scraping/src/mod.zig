@@ -43,6 +43,10 @@ pub const DownloadOutcome = union(enum) {
 pub const HTTPHeader = struct {
     name: []const u8,
     value: []const u8,
+    /// Optional capability boundary for credential-bearing headers. When set,
+    /// redirects retain these headers only while every hop remains under this
+    /// canonical URL prefix. The slice is borrowed for the synchronous fetch.
+    credential_base_url: ?[]const u8 = null,
 };
 
 pub const ContentSecurityConfig = struct {
@@ -406,10 +410,18 @@ fn downloadHttpOutcomeAlloc(
 
     var headers = std.ArrayListUnmanaged([2][]const u8).empty;
     defer headers.deinit(alloc);
+    var credential_base_url: ?[]const u8 = null;
     if (http_headers) |extra_headers| {
         for (extra_headers) |header| {
             if (header.name.len == 0) continue;
             try headers.append(alloc, .{ header.name, header.value });
+            if (header.credential_base_url) |base_url| {
+                if (credential_base_url) |existing| {
+                    if (!std.mem.eql(u8, existing, base_url)) return error.InvalidCredentialScope;
+                } else {
+                    credential_base_url = base_url;
+                }
+            }
         }
     }
 
@@ -458,7 +470,9 @@ fn downloadHttpOutcomeAlloc(
             const next_uri = try std.Uri.parse(next_url);
             try validateHttpUri(next_uri);
             try validateUrlAdmission(next_uri, security);
-            if (!sameOrigin(current_uri, next_uri)) send_credentials = false;
+            send_credentials = send_credentials and
+                sameOrigin(current_uri, next_uri) and
+                (credential_base_url == null or httpUrlMatchesBase(next_uri, credential_base_url.?));
             alloc.free(current_url);
             current_url = next_url;
             redirects += 1;
@@ -516,6 +530,65 @@ fn sameOrigin(lhs: std.Uri, rhs: std.Uri) bool {
     return std.ascii.eqlIgnoreCase(lhs.scheme, rhs.scheme) and
         std.ascii.eqlIgnoreCase(lhs_host.percent_encoded, rhs_host.percent_encoded) and
         effectiveHttpPort(lhs) == effectiveHttpPort(rhs);
+}
+
+/// Match an HTTP(S) destination against a credential capability. Matching is
+/// canonical for scheme, host, effective port, and path-segment boundaries;
+/// query strings and fragments cannot widen the capability.
+pub fn httpUrlMatchesBase(target: std.Uri, base_url: []const u8) bool {
+    const base = std.Uri.parse(base_url) catch return false;
+    const target_host = target.host orelse return false;
+    const base_host = base.host orelse return false;
+    if (!std.ascii.eqlIgnoreCase(target.scheme, base.scheme) or
+        !std.ascii.eqlIgnoreCase(target_host.percent_encoded, base_host.percent_encoded) or
+        effectiveHttpPort(target) != effectiveHttpPort(base))
+    {
+        return false;
+    }
+
+    const base_path = base.path.percent_encoded;
+    const target_path = target.path.percent_encoded;
+    if (!credentialPathIsCanonical(base_path) or !credentialPathIsCanonical(target_path)) return false;
+    if (base_path.len == 0 or std.mem.eql(u8, base_path, "/")) return true;
+    if (std.mem.eql(u8, target_path, base_path)) return true;
+    if (!std.mem.startsWith(u8, target_path, base_path)) return false;
+    return std.mem.endsWith(u8, base_path, "/") or
+        (target_path.len > base_path.len and target_path[base_path.len] == '/');
+}
+
+/// Reject representations whose interpretation commonly changes between URI
+/// libraries, proxies, and origin servers. In particular, encoded separators
+/// and encoded/literal dot segments can otherwise pass a prefix check and be
+/// normalized outside the credential capability downstream.
+fn credentialPathIsCanonical(path: []const u8) bool {
+    var segment_start: usize = 0;
+    var i: usize = 0;
+    while (i <= path.len) : (i += 1) {
+        if (i != path.len and path[i] != '/') continue;
+        const segment = path[segment_start..i];
+        var decoded_len: usize = 0;
+        var only_dots = segment.len > 0;
+        var j: usize = 0;
+        while (j < segment.len) {
+            const byte = if (segment[j] == '%') blk: {
+                if (j + 2 >= segment.len) return false;
+                const high = std.fmt.charToDigit(segment[j + 1], 16) catch return false;
+                const low = std.fmt.charToDigit(segment[j + 2], 16) catch return false;
+                j += 3;
+                break :blk @as(u8, @intCast(high * 16 + low));
+            } else blk: {
+                const value = segment[j];
+                j += 1;
+                break :blk value;
+            };
+            if (byte == '/' or byte == '\\') return false;
+            decoded_len += 1;
+            only_dots = only_dots and byte == '.';
+        }
+        if (only_dots and (decoded_len == 1 or decoded_len == 2)) return false;
+        segment_start = i + 1;
+    }
+    return true;
 }
 
 fn formatUriAlloc(alloc: Allocator, uri: std.Uri) ![]u8 {
@@ -1128,6 +1201,22 @@ test "redirect resolution is RFC 3986 compliant and origin aware" {
     const cross_origin = try resolveRedirectUrlAlloc(alloc, base, "https://assets.example.net/page.png");
     defer alloc.free(cross_origin);
     try std.testing.expect(!sameOrigin(base, try std.Uri.parse(cross_origin)));
+}
+
+test "credential URL scope rejects same-origin redirect path escapes" {
+    const allowed = try std.Uri.parse("https://api.example.com/v1/documents/42");
+    const escaped = try std.Uri.parse("https://api.example.com/admin/export");
+    const confused = try std.Uri.parse("https://api.example.com/v10/documents/42");
+    const different_port = try std.Uri.parse("https://api.example.com:8443/v1/documents/42");
+    const encoded_traversal = try std.Uri.parse("https://api.example.com/v1/%2e%2e/admin");
+    const encoded_separator = try std.Uri.parse("https://api.example.com/v1%2fadmin");
+
+    try std.testing.expect(httpUrlMatchesBase(allowed, "https://api.example.com/v1"));
+    try std.testing.expect(!httpUrlMatchesBase(escaped, "https://api.example.com/v1"));
+    try std.testing.expect(!httpUrlMatchesBase(confused, "https://api.example.com/v1"));
+    try std.testing.expect(!httpUrlMatchesBase(different_port, "https://api.example.com/v1"));
+    try std.testing.expect(!httpUrlMatchesBase(encoded_traversal, "https://api.example.com/v1"));
+    try std.testing.expect(!httpUrlMatchesBase(encoded_separator, "https://api.example.com/v1"));
 }
 
 test "s3 URI cannot override the configured endpoint" {

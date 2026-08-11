@@ -36,6 +36,7 @@ pub const codestream_write = @import("codestream_write.zig");
 pub const conformance = @import("../conformance.zig").jpeg2000;
 pub const Format = decode.Format;
 pub const Header = decode.Header;
+pub const Jp2ColorMetadata = decode.Jp2ColorMetadata;
 pub const DecodedImage = decode.DecodedImage;
 pub const DecodedImageU16 = decode.DecodedImageU16;
 pub const DecodeBackend = decode.DecodeBackend;

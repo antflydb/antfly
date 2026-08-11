@@ -3484,6 +3484,16 @@ fn processDocumentExtractionAsset(
         config.pdf_decode_limits.max_decoded_stream_bytes = @min(config.pdf_decode_limits.max_decoded_stream_bytes, decode_budget);
     }
 
+    // Retained collection state can grow with row-controlled unit/chunk
+    // cardinality. Charge allocator capacity directly so the hard limit is
+    // enforced before each allocation without an O(n) rescan per unit.
+    var collection_budgeted: ?resource_manager_mod.BudgetedAllocator = if (resource_tracker.manager) |manager|
+        resource_manager_mod.BudgetedAllocator.init(manager, .document_extraction_working_set, runtime.alloc, 1)
+    else
+        null;
+    defer if (collection_budgeted) |*allocator| allocator.deinit();
+    const collection_alloc = if (collection_budgeted) |*allocator| allocator.allocator() else runtime.alloc;
+
     const byte_source_fingerprint = if (metadata_fingerprint == null)
         try documentExtractionFingerprintAlloc(runtime.alloc, source_url, config_json, config.content_type, config.filename, downloaded_mut.content_type, downloaded_mut.data)
     else
@@ -3493,26 +3503,27 @@ fn processDocumentExtractionAsset(
 
     var desired_unit_keys = std.ArrayListUnmanaged([]const u8).empty;
     defer {
-        for (desired_unit_keys.items) |key| runtime.alloc.free(@constCast(key));
-        desired_unit_keys.deinit(runtime.alloc);
+        for (desired_unit_keys.items) |key| collection_alloc.free(@constCast(key));
+        desired_unit_keys.deinit(collection_alloc);
     }
     var desired_unit_fingerprints = std.ArrayListUnmanaged([]const u8).empty;
     defer {
-        for (desired_unit_fingerprints.items) |fingerprint| runtime.alloc.free(@constCast(fingerprint));
-        desired_unit_fingerprints.deinit(runtime.alloc);
+        for (desired_unit_fingerprints.items) |fingerprint| collection_alloc.free(@constCast(fingerprint));
+        desired_unit_fingerprints.deinit(collection_alloc);
     }
     var desired_chunk_keys = std.ArrayListUnmanaged([]const u8).empty;
     defer {
-        for (desired_chunk_keys.items) |key| runtime.alloc.free(@constCast(key));
-        desired_chunk_keys.deinit(runtime.alloc);
+        for (desired_chunk_keys.items) |key| collection_alloc.free(@constCast(key));
+        desired_chunk_keys.deinit(collection_alloc);
     }
     var unit_text_lengths = std.ArrayListUnmanaged(usize).empty;
-    defer unit_text_lengths.deinit(runtime.alloc);
+    defer unit_text_lengths.deinit(collection_alloc);
     var generated_units = RuntimeGeneratedUnitCache{};
-    defer generated_units.deinit(runtime.alloc);
+    defer generated_units.deinit(collection_alloc);
 
     var collect_ctx = RuntimeDocumentExtractionCollectContext{
         .runtime = runtime,
+        .alloc = collection_alloc,
         .config = config,
         .batch_policy = requestGeneratedTextBatchPolicy(runtime.alloc, request),
         .source_url = source_url,
@@ -3526,8 +3537,12 @@ fn processDocumentExtractionAsset(
         .resource_tracker = &resource_tracker,
         .generated_units = &generated_units,
     };
-    defer collect_ctx.deinit(runtime.alloc);
-    document_extraction_mod.extractDownloadedStreaming(runtime.alloc, downloaded_mut, source_url, config, collect_ctx.sink()) catch |err| {
+    defer collect_ctx.deinit();
+    document_extraction_mod.extractDownloadedStreaming(runtime.alloc, downloaded_mut, source_url, config, collect_ctx.sink()) catch |raw_err| {
+        const err: anyerror = if (raw_err == error.OutOfMemory and collection_budgeted != null and collection_budgeted.?.denied())
+            error.DocumentExtractionWorkingSetTooLarge
+        else
+            raw_err;
         if (shouldYieldRequestError(runtime, err)) return err;
         try writeDocumentExtractionFailureManifest(
             runtime,
@@ -3548,12 +3563,23 @@ fn processDocumentExtractionAsset(
         try recordIsolatedRequestError(runtime, window, request, err);
         return;
     };
+    // The streaming extractor has released its last borrowed unit. Retained
+    // collection allocations remain independently charged by collection_alloc.
+    try resource_tracker.setBytes(resource_tracker.locallyAccountedDownloadedBytes());
 
-    const desired_unit_descriptors = try documentExtractionUnitDescriptorsFromKeysAlloc(runtime.alloc, desired_unit_keys.items, desired_unit_fingerprints.items);
-    defer runtime.alloc.free(desired_unit_descriptors);
+    const desired_unit_descriptors = documentExtractionUnitDescriptorsFromKeysAlloc(collection_alloc, desired_unit_keys.items, desired_unit_fingerprints.items) catch |err| {
+        if (err == error.OutOfMemory and collection_budgeted != null and collection_budgeted.?.denied())
+            return error.DocumentExtractionWorkingSetTooLarge;
+        return err;
+    };
+    defer collection_alloc.free(desired_unit_descriptors);
 
-    const new_state = try documentExtractionStateValueAlloc(runtime.alloc, source_fingerprint, desired_unit_keys.items, desired_unit_descriptors, desired_chunk_keys.items);
-    defer runtime.alloc.free(new_state);
+    const new_state = documentExtractionStateValueAlloc(collection_alloc, source_fingerprint, desired_unit_keys.items, desired_unit_descriptors, desired_chunk_keys.items) catch |err| {
+        if (err == error.OutOfMemory and collection_budgeted != null and collection_budgeted.?.denied())
+            return error.DocumentExtractionWorkingSetTooLarge;
+        return err;
+    };
+    defer collection_alloc.free(new_state);
 
     if (existing_state) |state| {
         if (std.mem.eql(u8, state, new_state)) {
@@ -4021,24 +4047,57 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatch(
     units: []document_extraction_mod.Unit,
     kind: RuntimeGeneratedUnitTextKind,
 ) !void {
+    return completeRuntimeDocumentExtractionGeneratedTextBatchWithBackingAllocator(
+        runtime,
+        alloc,
+        alloc,
+        producer,
+        config,
+        batch_policy,
+        source_url,
+        source_bytes,
+        route_type,
+        source_content_type,
+        units,
+        kind,
+    );
+}
+
+/// Keep retained unit ownership separate from transient decoder/provider
+/// allocations. Collection uses a persistent budgeted allocator for the former
+/// while the latter is independently charged against the same resource slice.
+fn completeRuntimeDocumentExtractionGeneratedTextBatchWithBackingAllocator(
+    runtime: *EnrichmentRuntime,
+    alloc: Allocator,
+    backing_alloc: Allocator,
+    producer: asset_producer_mod.Producer,
+    config: document_extraction_mod.Config,
+    batch_policy: GeneratedTextBatchPolicy,
+    source_url: []const u8,
+    source_bytes: []const u8,
+    route_type: []const u8,
+    source_content_type: []const u8,
+    units: []document_extraction_mod.Unit,
+    kind: RuntimeGeneratedUnitTextKind,
+) !void {
     const uses_pdf_decoder_reservation = kind == .ocr and std.mem.eql(u8, route_type, "pdf");
     var decoder_allocator: ?ReservedWorkingSetAllocator = if (uses_pdf_decoder_reservation)
-        ReservedWorkingSetAllocator.init(alloc, config.pdf_decode_limits.max_working_set_bytes)
+        ReservedWorkingSetAllocator.init(backing_alloc, config.pdf_decode_limits.max_working_set_bytes)
     else
         null;
     var budgeted_allocator: ?resource_manager_mod.BudgetedAllocator = if ((runtime.config.resource_manager orelse runtime.index_manager.resource_manager) != null)
-        resource_manager_mod.BudgetedAllocator.init((runtime.config.resource_manager orelse runtime.index_manager.resource_manager).?, .document_extraction_working_set, alloc, 1)
+        resource_manager_mod.BudgetedAllocator.init((runtime.config.resource_manager orelse runtime.index_manager.resource_manager).?, .document_extraction_working_set, backing_alloc, 1)
     else
         null;
     defer if (budgeted_allocator) |*budgeted| budgeted.deinit();
     const decoder_alloc = if (decoder_allocator) |*decoder|
         decoder.allocator()
     else
-        alloc;
+        backing_alloc;
     const working_alloc = if (budgeted_allocator) |*budgeted|
         budgeted.allocator()
     else
-        alloc;
+        backing_alloc;
     completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
         runtime,
         alloc,
@@ -4712,6 +4771,7 @@ fn runtimeDocumentGeneratedTextPartsJsonAlloc(
 
 fn collectRuntimeDocumentExtractionDesiredKeys(
     runtime: *EnrichmentRuntime,
+    alloc: Allocator,
     doc_key: []const u8,
     artifact_name: []const u8,
     units: []const document_extraction_mod.Unit,
@@ -4720,12 +4780,13 @@ fn collectRuntimeDocumentExtractionDesiredKeys(
     desired_chunk_keys: *std.ArrayListUnmanaged([]const u8),
 ) !void {
     for (units) |unit| {
-        try collectRuntimeDocumentExtractionDesiredKeysForUnit(runtime, doc_key, artifact_name, unit, desired_unit_keys, desired_unit_fingerprints, desired_chunk_keys);
+        try collectRuntimeDocumentExtractionDesiredKeysForUnit(runtime, alloc, doc_key, artifact_name, unit, desired_unit_keys, desired_unit_fingerprints, desired_chunk_keys);
     }
 }
 
 fn collectRuntimeDocumentExtractionDesiredKeysForUnit(
     runtime: *EnrichmentRuntime,
+    alloc: Allocator,
     doc_key: []const u8,
     artifact_name: []const u8,
     unit: document_extraction_mod.Unit,
@@ -4733,18 +4794,21 @@ fn collectRuntimeDocumentExtractionDesiredKeysForUnit(
     desired_unit_fingerprints: *std.ArrayListUnmanaged([]const u8),
     desired_chunk_keys: *std.ArrayListUnmanaged([]const u8),
 ) !void {
-    try desired_unit_keys.append(runtime.alloc, try internal_keys.documentUnitArtifactKeyAlloc(runtime.alloc, doc_key, artifact_name, unit.unit_id));
-    try desired_unit_fingerprints.append(runtime.alloc, try documentExtractionUnitFingerprintAlloc(runtime.alloc, unit));
+    try desired_unit_keys.ensureUnusedCapacity(alloc, 1);
+    desired_unit_keys.appendAssumeCapacity(try internal_keys.documentUnitArtifactKeyAlloc(alloc, doc_key, artifact_name, unit.unit_id));
+    try desired_unit_fingerprints.ensureUnusedCapacity(alloc, 1);
+    desired_unit_fingerprints.appendAssumeCapacity(try documentExtractionUnitFingerprintAlloc(alloc, unit));
     for (runtime.index_manager.enrichments.items) |entry| {
         if (entry.kind != .chunk) continue;
         if (!std.mem.eql(u8, entry.source_artifact_name, artifact_name)) continue;
         const chunks = if (entry.chunker_json.len > 0)
-            try chunker_mod.chunkTextWithConfigJson(runtime.alloc, unit.text, entry.chunker_json)
+            try chunker_mod.chunkTextWithConfigJson(alloc, unit.text, entry.chunker_json)
         else
-            try chunker_mod.chunkText(runtime.alloc, unit.text, entry.chunk_size, entry.chunk_overlap);
-        defer chunker_mod.freeChunks(runtime.alloc, chunks);
+            try chunker_mod.chunkText(alloc, unit.text, entry.chunk_size, entry.chunk_overlap);
+        defer chunker_mod.freeChunks(alloc, chunks);
         for (chunks) |chunk| {
-            try desired_chunk_keys.append(runtime.alloc, try internal_keys.documentUnitChunkArtifactKeyAlloc(runtime.alloc, doc_key, entry.name, unit.unit_id, @intCast(chunk.chunk_id)));
+            try desired_chunk_keys.ensureUnusedCapacity(alloc, 1);
+            desired_chunk_keys.appendAssumeCapacity(try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, doc_key, entry.name, unit.unit_id, @intCast(chunk.chunk_id)));
         }
     }
 }
@@ -4954,6 +5018,9 @@ fn runtimeGeneratedTextKind(config: document_extraction_mod.Config, route_type: 
 
 const RuntimeDocumentExtractionCollectContext = struct {
     runtime: *EnrichmentRuntime,
+    /// Owns every retained collection allocation and charges its actual
+    /// allocator capacity directly to the document-extraction resource slice.
+    alloc: Allocator,
     config: document_extraction_mod.Config,
     batch_policy: GeneratedTextBatchPolicy,
     source_url: []const u8,
@@ -4981,15 +5048,15 @@ const RuntimeDocumentExtractionCollectContext = struct {
         };
     }
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
-        self.info.deinit(alloc);
-        self.clearPendingGeneratedUnits(alloc);
-        self.pending_generated_units.deinit(alloc);
+    fn deinit(self: *@This()) void {
+        self.info.deinit(self.alloc);
+        self.clearPendingGeneratedUnits();
+        self.pending_generated_units.deinit(self.alloc);
     }
 
     fn onBegin(ptr: *anyopaque, info: document_extraction_mod.StreamInfo) anyerror!void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        try self.info.set(self.runtime.alloc, info);
+        try self.info.set(self.alloc, info);
     }
 
     fn onUnit(ptr: *anyopaque, unit: *document_extraction_mod.Unit) anyerror!void {
@@ -5006,10 +5073,10 @@ const RuntimeDocumentExtractionCollectContext = struct {
                 try self.flushPendingGeneratedText();
                 self.pending_generated_kind = kind;
             }
-            var cloned = try cloneDocumentExtractionUnit(self.runtime.alloc, unit.*);
+            var cloned = try cloneDocumentExtractionUnit(self.alloc, unit.*);
             var owns_cloned = true;
-            errdefer if (owns_cloned) cloned.deinit(self.runtime.alloc);
-            try self.pending_generated_units.append(self.runtime.alloc, cloned);
+            errdefer if (owns_cloned) cloned.deinit(self.alloc);
+            try self.pending_generated_units.append(self.alloc, cloned);
             owns_cloned = false;
             self.pending_generated_bytes = addUsizeSaturating(self.pending_generated_bytes, runtimeDocumentExtractionUnitOwnedBytes(cloned));
             if (self.pending_generated_units.items.len >= self.batch_policy.max_items or self.pending_generated_bytes >= self.batch_policy.max_bytes) {
@@ -5034,8 +5101,9 @@ const RuntimeDocumentExtractionCollectContext = struct {
         if (self.pending_generated_units.items.len == 0) return;
         const producer = self.runtime.config.asset_producer orelse return error.MissingAssetProducer;
         const kind = self.pending_generated_kind orelse return error.InvalidAssetProducerResponse;
-        try completeRuntimeDocumentExtractionGeneratedTextBatch(
+        try completeRuntimeDocumentExtractionGeneratedTextBatchWithBackingAllocator(
             self.runtime,
+            self.alloc,
             self.runtime.alloc,
             producer,
             self.config,
@@ -5052,24 +5120,23 @@ const RuntimeDocumentExtractionCollectContext = struct {
             self.resolved_char_cursor = std.math.add(usize, self.resolved_char_cursor, unit.text.len) catch
                 return error.DocumentExtractionOffsetOverflow;
             unit.char_end = std.math.cast(u32, self.resolved_char_cursor) orelse return error.DocumentExtractionOffsetOverflow;
-            try self.generated_units.putClone(self.runtime.alloc, unit.*);
+            try self.generated_units.putClone(self.alloc, unit.*);
             try self.collectUnit(unit.*, true);
         }
-        self.clearPendingGeneratedUnits(self.runtime.alloc);
+        self.clearPendingGeneratedUnits();
     }
 
     fn collectUnit(self: *@This(), unit: document_extraction_mod.Unit, generated: bool) !void {
         const current_unit_bytes: usize = if (generated) 0 else runtimeDocumentExtractionUnitOwnedBytes(unit);
-        try self.resource_tracker.setBytes(addUsizeSaturating(
-            addUsizeSaturating(self.resource_tracker.locallyAccountedDownloadedBytes(), self.generated_units.bytes),
-            current_unit_bytes,
-        ));
-        try collectRuntimeDocumentExtractionDesiredKeysForUnit(self.runtime, self.doc_key, self.artifact_name, unit, self.desired_unit_keys, self.desired_unit_fingerprints, self.desired_chunk_keys);
-        try self.unit_text_lengths.append(self.runtime.alloc, unit.text.len);
+        // Retained collection state is already charged by `self.alloc`; this
+        // tracker covers only the borrowed current unit and local download.
+        try self.resource_tracker.setBytes(addUsizeSaturating(self.resource_tracker.locallyAccountedDownloadedBytes(), current_unit_bytes));
+        try collectRuntimeDocumentExtractionDesiredKeysForUnit(self.runtime, self.alloc, self.doc_key, self.artifact_name, unit, self.desired_unit_keys, self.desired_unit_fingerprints, self.desired_chunk_keys);
+        try self.unit_text_lengths.append(self.alloc, unit.text.len);
     }
 
-    fn clearPendingGeneratedUnits(self: *@This(), alloc: Allocator) void {
-        for (self.pending_generated_units.items) |*unit| unit.deinit(alloc);
+    fn clearPendingGeneratedUnits(self: *@This()) void {
+        for (self.pending_generated_units.items) |*unit| unit.deinit(self.alloc);
         self.pending_generated_units.clearRetainingCapacity();
         self.pending_generated_kind = null;
         self.pending_generated_bytes = 0;
@@ -5242,6 +5309,33 @@ test "budgeted document download composes with materialization accounting" {
     try tracker.updateWorkingSet(20, 0, &writes, &deletes, &window);
     try std.testing.expectEqual(@as(u64, 60), manager.sliceStats(.document_extraction_working_set).used_bytes);
     try std.testing.expectError(error.DocumentExtractionWorkingSetTooLarge, tracker.reserveAdditional(41));
+}
+
+test "retained document collection allocations compose with the hard working-set cap" {
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{
+        .soft_limit_bytes = 0,
+        .hard_limit_bytes = 100,
+    };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    var tracker = RuntimeDocumentExtractionResourceTracker{ .manager = &manager };
+    defer tracker.deinit();
+    try tracker.setDownloadedBytes(40);
+
+    var collection = resource_manager_mod.BudgetedAllocator.init(
+        &manager,
+        .document_extraction_working_set,
+        std.testing.allocator,
+        1,
+    );
+    defer collection.deinit();
+    const collection_alloc = collection.allocator();
+    const retained = try collection_alloc.alloc(u8, 50);
+    defer collection_alloc.free(retained);
+
+    try std.testing.expectEqual(@as(u64, 90), manager.sliceStats(.document_extraction_working_set).used_bytes);
+    try std.testing.expectError(error.OutOfMemory, collection_alloc.alloc(u8, 11));
+    try std.testing.expect(collection.denied());
 }
 
 test "document replay payloads are admitted before persistent allocation" {
@@ -5599,7 +5693,9 @@ const RuntimeDocumentExtractionMaterializeContext = struct {
             return error.DocumentExtractionOffsetOverflow;
         unit.char_end = std.math.cast(u32, self.resolved_char_cursor) orelse return error.DocumentExtractionOffsetOverflow;
         const unit_working_bytes = runtimeDocumentExtractionUnitOwnedBytes(unit.*);
-        const generated_cache_bytes = self.generated_units.bytes;
+        // The generated cache is retained on the collection budget allocator,
+        // so its live capacity is already present in the resource manager.
+        const generated_cache_bytes: usize = 0;
         try self.accountWorkingSet(unit_working_bytes, generated_cache_bytes);
 
         const unit_key = self.desired_unit_keys[self.unit_index];
