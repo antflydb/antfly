@@ -397,7 +397,7 @@ def inference_command() -> list[str]:
             return [str(candidate), "inference"]
     raise RuntimeError(
         "ANTFLY_INFERENCE_DOWNLOAD=1 requires an antfly inference binary. "
-        "Set ANTFLY_BIN, or build zig-out/bin/antfly with `zig build antfly -Dedition=inference`."
+        "Set ANTFLY_BIN, or build zig-out/bin/antfly with `zig build antfly`."
     )
 
 

@@ -143,7 +143,6 @@ zig_build_options=(
   -Doptimize="$optimize"
   -Dstrip="$strip"
   -Dcpu=baseline
-  -Dedition=full
   -Dantfly-bin-name=antfly
   -Dantfly-version="$version"
   -Donnx=false

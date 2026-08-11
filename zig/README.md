@@ -61,7 +61,7 @@ currently live under `pkg/inference/`.
 ```sh
 zig build
 make test
-zig build antfly -Dedition=full
+zig build antfly
 ./zig-out/bin/antfly --help
 ```
 
@@ -122,7 +122,7 @@ Some e2e tests start local binaries from `zig-out/bin`; build the relevant
 binary first when running those tests directly:
 
 ```sh
-zig build antfly -Dedition=full
+zig build antfly
 (cd pkg/inference && zig build -Dshared-lib-root=../..)
 ```
 

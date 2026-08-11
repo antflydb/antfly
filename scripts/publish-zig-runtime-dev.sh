@@ -129,7 +129,6 @@ echo "Building $arch Zig runtime artifact for $zig_target"
     antfly \
     -Dtarget="$zig_target" \
     -Doptimize=ReleaseFast \
-    -Dedition=full \
     --prefix "$out_dir" \
     --global-cache-dir "$cache_dir"
 )

@@ -26,7 +26,7 @@ Pull-request CI runs fast required checks:
 
 - `zig build check-snowball`
 - `make zig-unit-test`
-- `zig build -Doptimize=ReleaseFast antfly -Dedition=full`
+- `zig build -Doptimize=ReleaseFast antfly`
 - shared release-binary smoke checks
 - `e2e-base`
 - TLA checks when relevant files change
@@ -162,7 +162,7 @@ external-service, model, browser, or slow integration coverage. Run the same
 base tier locally with the release binaries:
 
 ```sh
-zig build -Doptimize=ReleaseFast antfly -Dedition=full
+zig build -Doptimize=ReleaseFast antfly
 
 ANTFLY_BIN=./zig-out/bin/antfly uv run --project e2e/antfly pytest -q \
   -m "not objectstore_integration and not standalone_integration and not real_model and not postgres_integration and not slow" \
@@ -228,7 +228,7 @@ long-running scenarios so they stay in `e2e-full`.
 Run the Antfly product E2E suite:
 
 ```sh
-zig build antfly -Dedition=full
+zig build antfly
 ANTFLY_BIN=./zig-out/bin/antfly uv run --project e2e/antfly pytest -q e2e/antfly
 ```
 
@@ -281,7 +281,7 @@ export GOOGLE_CLOUD_PROJECT=my-project
 Run the inference product E2E suite:
 
 ```sh
-zig build antfly -Dedition=inference
+zig build antfly
 ANTFLY_BIN=./zig-out/bin/antfly uv run --project e2e/inference pytest -q e2e/inference
 ```
 

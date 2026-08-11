@@ -34,11 +34,6 @@ const makeLmdbModule = antfly_storage_build.makeLmdbModule;
 const makeRootBuildOptions = antfly_storage_build.makeRootBuildOptions;
 const selectTestFilters = antfly_tests_build.selectTestFilters;
 
-const BuildEdition = enum {
-    full,
-    inference,
-};
-
 const RuntimeArtifactRole = enum {
     cli,
     data,
@@ -98,8 +93,8 @@ fn pathExists(b: *std.Build, path: []const u8) bool {
 fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget) void {
     if (target.result.os.tag != .macos) return;
     const sdk_root = b.sysroot orelse
-        std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result) orelse
         b.graph.environ_map.get("SDK_PATH") orelse
+        std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result) orelse
         return;
     module.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{sdk_root}) });
     module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sdk_root}) });
@@ -1251,7 +1246,6 @@ pub fn build(b: *std.Build) void {
     const link_libc = b.option(bool, "link-libc", "Link Antfly runtime modules against libc") orelse true;
     const sanitize_thread = b.option(bool, "sanitize-thread", "Enable ThreadSanitizer for the Antfly runtime") orelse false;
     const include_ha_tests_in_aggregates = b.option(bool, "ha-tests", "Include hot-standby HA suites in aggregate test steps") orelse true;
-    const edition = b.option(BuildEdition, "edition", "Build edition: full or inference") orelse .full;
     const runtime_artifact_role = b.option(RuntimeArtifactRole, "runtime-artifact-role", "Build one focused runtime artifact: cli, data, inference, metadata, or standalone");
     const antfly_bin_name = b.option([]const u8, "antfly-bin-name", "Installed filename for the top-level Antfly CLI") orelse "antfly";
     if (antfly_bin_name.len == 0 or std.mem.indexOfAny(u8, antfly_bin_name, "/\\") != null) {
@@ -8843,41 +8837,16 @@ pub fn build(b: *std.Build) void {
     const recall_harness_step = b.step("recall-harness", "Run Zig recall suites against exported vector datasets");
     recall_harness_step.dependOn(&run_recall_harness.step);
 
-    const antfly_main_mod = if (edition == .full) blk: {
-        const mod = b.createModule(.{
-            .root_source_file = b.path("pkg/antfly/src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .sanitize_thread = sanitize_thread,
-        });
-        mod.addImport("antfly-client", antfly_client_pkg_mod);
-        mod.addImport("structlog", structlog_mod);
-        mod.addImport("antfly_platform", platform_mod);
-        mod.addOptions("build_options", production_build_options);
-        break :blk mod;
-    } else blk: {
-        const inference_cli_mod = b.createModule(.{
-            .root_source_file = b.path("pkg/inference/src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-        });
-        inference_cli_mod.addImport("inference", inference_server_mod);
-        inference_cli_mod.addImport("build_options", inference_build_options_mod);
-        inference_cli_mod.addImport("antfly_platform", platform_mod);
-        inference_cli_mod.addImport("structlog", structlog_mod);
-
-        const mod = b.createModule(.{
-            .root_source_file = b.path("pkg/antfly/src/inference_main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .sanitize_thread = sanitize_thread,
-        });
-        mod.addImport("inference_cli", inference_cli_mod);
-        mod.addImport("antfly_platform", platform_mod);
-        mod.addImport("structlog", structlog_mod);
-        mod.addOptions("build_options", build_options);
-        break :blk mod;
-    };
+    const antfly_main_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+    });
+    antfly_main_mod.addImport("antfly-client", antfly_client_pkg_mod);
+    antfly_main_mod.addImport("structlog", structlog_mod);
+    antfly_main_mod.addImport("antfly_platform", platform_mod);
+    antfly_main_mod.addOptions("build_options", production_build_options);
     addMacosSdkPaths(b, antfly_main_mod, target);
 
     const antfly_main = b.addExecutable(.{
@@ -8887,92 +8856,83 @@ pub fn build(b: *std.Build) void {
 
     var runtime_library_artifacts: [std.meta.fields(RuntimeLibraryUnit).len]?*std.Build.Step.Compile = @splat(null);
     inline for (std.meta.tags(RuntimeLibraryUnit)) |unit| {
-        // The C API reuses the distributed PIC archive independently of the
-        // executable edition. Focused artifacts also reuse their owning units
-        // instead of recompiling a role's implementation in an executable.
-        const focused_role_needs_unit = if (runtime_artifact_role) |role| switch (role) {
-            .cli => unit == .cli or unit == .distributed,
-            .data, .metadata => unit == .api_kernel or unit == .distributed,
-            .inference => unit == .inference,
-            .standalone => unit != .cli,
-        } else false;
-        if (edition == .full or unit == .distributed or focused_role_needs_unit) {
-            const unit_options = b.addOptions();
-            unit_options.addOption(RuntimeLibraryUnit, "unit", unit);
+        // The executable, C API, and focused artifacts reuse their owning
+        // runtime units instead of recompiling implementations in each root.
+        const unit_options = b.addOptions();
+        unit_options.addOption(RuntimeLibraryUnit, "unit", unit);
 
-            const role_mod = b.createModule(.{
-                .root_source_file = b.path("pkg/antfly/src/runtime_artifact_lib.zig"),
-                .target = target,
-                .optimize = optimize,
-                .sanitize_thread = sanitize_thread,
-                .pic = if (unit == .distributed) true else null,
-            });
-            production_antfly_imports.configureRuntime(
-                b,
-                role_mod,
-                false,
-                link_libc,
-                unit == .inference,
-            );
-            addMacosSdkPaths(b, role_mod, target);
-            role_mod.addImport("antfly-client", antfly_client_pkg_mod);
-            if (unit == .distributed) role_mod.addImport("antfly_storage_root", role_mod);
-            role_mod.addOptions("runtime_library_options", unit_options);
-            const role_usermgr_storage_mod = b.createModule(.{
-                .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
-                .target = target,
-                .optimize = optimize,
-            });
-            role_usermgr_storage_mod.addImport("antfly_root", role_mod);
-            role_usermgr_storage_mod.addImport("antfly_platform", platform_mod);
-            role_mod.addImport("usermgr_storage", role_usermgr_storage_mod);
+        const role_mod = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly/src/runtime_artifact_lib.zig"),
+            .target = target,
+            .optimize = optimize,
+            .sanitize_thread = sanitize_thread,
+            .pic = if (unit == .distributed) true else null,
+        });
+        production_antfly_imports.configureRuntime(
+            b,
+            role_mod,
+            false,
+            link_libc,
+            unit == .inference,
+        );
+        addMacosSdkPaths(b, role_mod, target);
+        role_mod.addImport("antfly-client", antfly_client_pkg_mod);
+        if (unit == .distributed) role_mod.addImport("antfly_storage_root", role_mod);
+        role_mod.addOptions("runtime_library_options", unit_options);
+        const role_usermgr_storage_mod = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        role_usermgr_storage_mod.addImport("antfly_root", role_mod);
+        role_usermgr_storage_mod.addImport("antfly_platform", platform_mod);
+        role_mod.addImport("usermgr_storage", role_usermgr_storage_mod);
 
-            const role_artifact = b.addLibrary(.{
-                .name = if (unit == .distributed)
-                    "antfly-storage-kernel"
-                else
-                    b.fmt("antfly-runtime-{s}", .{@tagName(unit)}),
-                .root_module = role_mod,
-                .linkage = .static,
-                .max_rss = switch (unit) {
-                    // Claims include roughly 1 GiB of headroom above observed
-                    // ReleaseFast peaks. They are scheduling limits, not
-                    // forced serialization: under CI's 12 GiB budget the API
-                    // and inference units can compile together while the
-                    // storage-heavy distributed unit runs alone.
-                    .api_kernel => 6 * 1024 * 1024 * 1024,
-                    // Native Darwin's object/Mach-O pipeline retains roughly
-                    // 1.7 GiB more than ELF for this same PIC unit. Keep the
-                    // scheduler claim honest on developer Macs without
-                    // penalizing Linux CI concurrency.
-                    .distributed => @as(usize, if (target.result.os.tag == .macos) 13 else 11) * 1024 * 1024 * 1024,
-                    .inference => @as(usize, if (target.result.os.tag == .macos) 8 else 5) * 1024 * 1024 * 1024,
-                    .cli => 2 * 1024 * 1024 * 1024,
-                },
-            });
-            runtime_library_artifacts[@intFromEnum(unit)] = role_artifact;
-            if (unit == .distributed) {
-                // The executable and C ABI libraries share this one optimized
-                // PIC object. Give the final links enough section granularity
-                // to retain only the C ABI roots in the shared libraries while
-                // the executable retains the runtime entry points as well.
-                role_artifact.link_function_sections = true;
-                role_artifact.link_data_sections = true;
-            }
-            // Zig's build runner uses these claims to run as many LLVM codegen
-            // steps concurrently as fit in available RAM. The distributed
-            // archive is PIC because the executable and C ABI libraries share
-            // it; both consumers therefore reuse the same analyzed and
-            // optimized storage graph.
-            if (unit == .distributed) {
-                libantfly_link_mod.linkLibrary(role_artifact);
-            }
-            if (edition == .full) antfly_main.root_module.linkLibrary(role_artifact);
-            if (strip) {
-                var visited = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
-                defer visited.deinit();
-                setStripRecursively(role_mod, &visited);
-            }
+        const role_artifact = b.addLibrary(.{
+            .name = if (unit == .distributed)
+                "antfly-storage-kernel"
+            else
+                b.fmt("antfly-runtime-{s}", .{@tagName(unit)}),
+            .root_module = role_mod,
+            .linkage = .static,
+            .max_rss = switch (unit) {
+                // Claims include roughly 1 GiB of headroom above observed
+                // ReleaseFast peaks. They are scheduling limits, not
+                // forced serialization: under CI's 12 GiB budget the API
+                // and inference units can compile together while the
+                // storage-heavy distributed unit runs alone.
+                .api_kernel => 6 * 1024 * 1024 * 1024,
+                // Native Darwin's object/Mach-O pipeline retains roughly
+                // 1.7 GiB more than ELF for this same PIC unit. Keep the
+                // scheduler claim honest on developer Macs without
+                // penalizing Linux CI concurrency.
+                .distributed => @as(usize, if (target.result.os.tag == .macos) 13 else 11) * 1024 * 1024 * 1024,
+                .inference => @as(usize, if (target.result.os.tag == .macos) 8 else 5) * 1024 * 1024 * 1024,
+                .cli => 2 * 1024 * 1024 * 1024,
+            },
+        });
+        runtime_library_artifacts[@intFromEnum(unit)] = role_artifact;
+        if (unit == .distributed) {
+            // The executable and C ABI libraries share this one optimized
+            // PIC object. Give the final links enough section granularity
+            // to retain only the C ABI roots in the shared libraries while
+            // the executable retains the runtime entry points as well.
+            role_artifact.link_function_sections = true;
+            role_artifact.link_data_sections = true;
+        }
+        // Zig's build runner uses these claims to run as many LLVM codegen
+        // steps concurrently as fit in available RAM. The distributed
+        // archive is PIC because the executable and C ABI libraries share
+        // it; both consumers therefore reuse the same analyzed and
+        // optimized storage graph.
+        if (unit == .distributed) {
+            libantfly_link_mod.linkLibrary(role_artifact);
+        }
+        antfly_main.root_module.linkLibrary(role_artifact);
+        if (strip) {
+            var visited = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
+            defer visited.deinit();
+            setStripRecursively(role_mod, &visited);
         }
     }
 
@@ -9061,14 +9021,10 @@ pub fn build(b: *std.Build) void {
         .install_subdir = "share/antfly/antfarm",
     });
     b.getInstallStep().dependOn(&install_antfly.step);
-    if (edition == .full) {
-        b.getInstallStep().dependOn(&install_antfarm_assets.step);
-    }
+    b.getInstallStep().dependOn(&install_antfarm_assets.step);
     const antfly_step = b.step("antfly", "Build and install the top-level Antfly CLI");
     antfly_step.dependOn(&install_antfly.step);
-    if (edition == .full) {
-        antfly_step.dependOn(&install_antfarm_assets.step);
-    }
+    antfly_step.dependOn(&install_antfarm_assets.step);
 
     const lite_core_main_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/lite_core_main.zig"),

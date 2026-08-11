@@ -37,7 +37,6 @@ RUN case "${TARGETARCH}" in \
     python3 tools/run_bounded_zig_build.py --zig zig -- build \
       -Dtarget="${zig_target}" \
       -Doptimize="${ZIG_OPTIMIZE}" \
-      -Dedition=full \
       antfly \
       --prefix /out
 

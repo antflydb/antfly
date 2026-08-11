@@ -237,7 +237,10 @@ fn configureMetal(
 
 fn addMacosSdkPaths(ctx: Context, module: *std.Build.Module) void {
     if (ctx.target.result.os.tag != .macos) return;
-    const sdk_root = std.zig.system.darwin.getSdk(ctx.b.allocator, ctx.b.graph.io, &ctx.target.result) orelse return;
+    const sdk_root = ctx.b.sysroot orelse
+        ctx.b.graph.environ_map.get("SDK_PATH") orelse
+        std.zig.system.darwin.getSdk(ctx.b.allocator, ctx.b.graph.io, &ctx.target.result) orelse
+        return;
     module.addSystemIncludePath(.{ .cwd_relative = ctx.b.fmt("{s}/usr/include", .{sdk_root}) });
     module.addLibraryPath(.{ .cwd_relative = ctx.b.fmt("{s}/usr/lib", .{sdk_root}) });
     module.addFrameworkPath(.{ .cwd_relative = ctx.b.fmt("{s}/System/Library/Frameworks", .{sdk_root}) });

@@ -12,6 +12,9 @@ permissions:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  ZIG_VERSION: 0.16.0
+  MACOS_SDK_VERSION: "15.5"
+  MACOS_SDK_SHA256: c15cf0f3f17d714d1aa5a642da8e118db53d79429eb015771ba816aa7c6c1cbd
 
 jobs:
   build-zig-runtime-archives:
@@ -30,27 +33,36 @@ jobs:
             zig_target: x86_64-linux-musl
             archive_os: Linux
             archive_arch: x86_64
+            macos_sdk: "false"
             metal: "false"
             system_blas: "false"
             zig_optimize: ReleaseFast
             zig_jobs: ""
           - artifact_name: antfly-zig-linux-arm64
-            runner: arc-antfly-publish-arm64
+            # Zig supplies the musl libc and target linker, so this artifact
+            # does not need a native ARM64 runner.
+            runner: arc-antfly-publish
             os: linux
-            zig_arch: aarch64
+            zig_arch: x86_64
             zig_target: aarch64-linux-musl
             archive_os: Linux
             archive_arch: arm64
+            macos_sdk: "false"
             metal: "false"
             system_blas: "false"
             zig_optimize: ReleaseFast
             zig_jobs: ""
           - artifact_name: antfly-zig-darwin-arm64
-            runner: macos-15
-            os: darwin
+            # The v0.1.x release used this same Linux-to-Darwin Zig toolchain.
+            # Metal and Accelerate are target framework links; they do not run
+            # on the build host.
+            runner: arc-antfly-publish
+            os: linux
+            zig_arch: x86_64
             zig_target: aarch64-macos
             archive_os: Darwin
             archive_arch: arm64
+            macos_sdk: "true"
             metal: "true"
             system_blas: "true"
             zig_optimize: ReleaseFast
@@ -70,16 +82,31 @@ jobs:
       - name: Install Zig (Linux)
         if: ${{ matrix.os == 'linux' }}
         run: |
-          curl -L "https://ziglang.org/download/0.16.0/zig-${{ matrix.zig_arch }}-linux-0.16.0.tar.xz" -o "$RUNNER_TEMP/zig.tar.xz"
+          curl --fail --location --retry 3 \
+            "https://ziglang.org/download/${ZIG_VERSION}/zig-${{ matrix.zig_arch }}-linux-${ZIG_VERSION}.tar.xz" \
+            -o "$RUNNER_TEMP/zig.tar.xz"
           mkdir -p "$RUNNER_TEMP/zig"
           tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
           echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
 
-      - name: Install Zig (macOS)
-        if: ${{ matrix.os == 'darwin' }}
-        uses: mlugg/setup-zig@v2
-        with:
-          version: "0.16.0"
+      - name: Install pinned macOS cross-compilation SDK
+        if: ${{ matrix.macos_sdk == 'true' }}
+        run: |
+          set -euo pipefail
+          sdk_archive="$RUNNER_TEMP/MacOSX${MACOS_SDK_VERSION}.sdk.tar.xz"
+          sdk_stage="$RUNNER_TEMP/macos-sdk"
+          curl --fail --location --retry 3 \
+            "https://github.com/joseluisq/macosx-sdks/releases/download/${MACOS_SDK_VERSION}/MacOSX${MACOS_SDK_VERSION}.sdk.tar.xz" \
+            -o "$sdk_archive"
+          echo "$MACOS_SDK_SHA256  $sdk_archive" | sha256sum --check --strict
+          mkdir -p "$sdk_stage"
+          tar -xJf "$sdk_archive" -C "$sdk_stage"
+
+          sdk_path="$sdk_stage/MacOSX${MACOS_SDK_VERSION}.sdk"
+          test -d "$sdk_path/System/Library/Frameworks/Metal.framework"
+          test -d "$sdk_path/System/Library/Frameworks/MetalPerformanceShaders.framework"
+          test -d "$sdk_path/System/Library/Frameworks/Accelerate.framework"
+          echo "SDK_PATH=$sdk_path" >> "$GITHUB_ENV"
 
       - name: Build archive
         run: |
@@ -171,7 +198,7 @@ jobs:
     needs:
       - build-zig-runtime-archives
       - publish-release-assets
-    runs-on: ubuntu-latest
+    runs-on: arc-antfly-standard
     steps:
       - uses: actions/checkout@v6
 
@@ -237,7 +264,7 @@ jobs:
   publish-cli-pypi:
     name: Publish antfly-cli to PyPI
     needs: package-cli-artifacts
-    runs-on: ubuntu-latest
+    runs-on: arc-antfly-standard
     environment:
       name: pypi
       url: https://pypi.org/p/antfly-cli
@@ -255,7 +282,7 @@ jobs:
   publish-cli-npm:
     name: Publish @antfly/cli to npm
     needs: package-cli-artifacts
-    runs-on: ubuntu-latest
+    runs-on: arc-antfly-standard
     environment: npm
     permissions:
       id-token: write
@@ -294,7 +321,7 @@ jobs:
       - build-zig-runtime-archives
       - publish-release-assets
     if: ${{ !contains(github.ref_name, '-') }}
-    runs-on: ubuntu-latest
+    runs-on: arc-antfly-standard
     steps:
       - uses: actions/checkout@v6
 
