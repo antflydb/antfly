@@ -238,14 +238,29 @@ const HttpxTransport = struct {
         });
         defer response.deinit();
 
+        const etag = if (response.headers.get("ETag")) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (etag) |value| alloc.free(value);
+        const response_content_type = if (response.headers.get("Content-Type")) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (response_content_type) |value| alloc.free(value);
+        const version_id = if (response.headers.get("x-amz-version-id")) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (version_id) |value| alloc.free(value);
+        const last_modified = if (response.headers.get("Last-Modified")) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (last_modified) |value| alloc.free(value);
+        const response_body = if (response.body) |value| blk: {
+            if (!response.body_owned) break :blk try alloc.dupe(u8, value);
+            response.body = null;
+            response.body_owned = false;
+            break :blk @constCast(value);
+        } else try alloc.alloc(u8, 0);
+
         return .{
             .status = response.status.code,
-            .body = if (response.body) |value| try alloc.dupe(u8, value) else try alloc.alloc(u8, 0),
-            .etag = if (response.headers.get("ETag")) |value| try alloc.dupe(u8, value) else null,
-            .content_type = if (response.headers.get("Content-Type")) |value| try alloc.dupe(u8, value) else null,
+            .body = response_body,
+            .etag = etag,
+            .content_type = response_content_type,
             .content_length = if (response.headers.get("Content-Length")) |value| std.fmt.parseInt(u64, value, 10) catch null else null,
-            .version_id = if (response.headers.get("x-amz-version-id")) |value| try alloc.dupe(u8, value) else null,
-            .last_modified = if (response.headers.get("Last-Modified")) |value| try alloc.dupe(u8, value) else null,
+            .version_id = version_id,
+            .last_modified = last_modified,
         };
     }
 };

@@ -25439,6 +25439,7 @@ fn isRetryableAssetProducerError(err: anyerror) bool {
         error.RecvFailed,
         error.ResourceBudgetExceeded,
         error.GenerateBatchTransientFailure,
+        error.ReadTransientFailure,
         => true,
         else => false,
     };
@@ -25532,6 +25533,14 @@ fn flushPrecomputeAssetProducerBatch(
     const requests = try alloc.alloc(asset_producer_mod.Request, items.items.len);
     defer alloc.free(requests);
     for (items.items, 0..) |*item, idx| requests[idx] = item.asRequest();
+
+    const can_batch = producer.canProduceBatch(alloc, requests) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        if (isRetryableAssetProducerError(err)) return err;
+        return try flushPrecomputeAssetProducerBatchSequential(alloc, producer, items.items, db, artifact_writes, documents);
+    };
+    if (!can_batch)
+        return try flushPrecomputeAssetProducerBatchSequential(alloc, producer, items.items, db, artifact_writes, documents);
 
     var produced = producer.produceBatch(alloc, requests) catch |err| {
         if (err == error.OutOfMemory) return err;
@@ -25971,6 +25980,8 @@ test "precompute OCR error policy distinguishes unavailable models from transien
     try std.testing.expect(!isUnavailableGeneratedTextModelError(.ocr, error.ConnectionTimedOut));
     try std.testing.expect(isRetryableAssetProducerError(error.ConnectionTimedOut));
     try std.testing.expect(isRetryableAssetProducerError(error.EmbedRateLimited));
+    try std.testing.expect(isRetryableAssetProducerError(error.ReadTransientFailure));
+    try std.testing.expect(!isRetryableAssetProducerError(error.ReadRequestFailed));
 }
 
 test "db document extraction OCR default is scoped to PDF routes" {

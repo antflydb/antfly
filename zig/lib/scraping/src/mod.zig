@@ -446,7 +446,7 @@ fn downloadHttpOutcomeAlloc(
             const mime = trimMimeParameters(response.contentType() orelse "application/octet-stream");
             const owned_mime = try alloc.dupe(u8, mime);
             errdefer alloc.free(owned_mime);
-            const body = try alloc.dupe(u8, response.body orelse "");
+            const body = try takeHttpResponseBodyAlloc(alloc, &response);
             return .{ .ok = .{ .content_type = owned_mime, .data = body } };
         }
 
@@ -470,6 +470,19 @@ fn downloadHttpOutcomeAlloc(
             .message = "remote fetch failed",
         } };
     }
+}
+
+/// Transfers an httpx-owned response body when possible. The downloader and
+/// client intentionally share an allocator, so successful buffered responses
+/// can cross the API boundary without briefly doubling the configured response
+/// limit. Hand-built/intercepted responses may borrow their body; retain the
+/// copy fallback for those callers.
+fn takeHttpResponseBodyAlloc(alloc: Allocator, response: *httpx.Response) ![]u8 {
+    const body = response.body orelse return try alloc.alloc(u8, 0);
+    if (!response.body_owned) return try alloc.dupe(u8, body);
+    response.body = null;
+    response.body_owned = false;
+    return @constCast(body);
 }
 
 fn validatePublicResolvedAddress(context: ?*anyopaque, address: httpx.Address) !void {
@@ -637,9 +650,13 @@ fn downloadS3Alloc(
     defer result.deinit(alloc);
 
     _ = original_uri;
+    const content_type = try alloc.dupe(u8, result.metadata.content_type orelse guessMimeType(key));
+    errdefer alloc.free(content_type);
+    const body = result.body;
+    result.body = &.{};
     return .{
-        .content_type = try alloc.dupe(u8, result.metadata.content_type orelse guessMimeType(key)),
-        .data = try alloc.dupe(u8, result.body),
+        .content_type = content_type,
+        .data = body,
     };
 }
 
@@ -924,6 +941,33 @@ test "download content parses data uri" {
     defer downloaded.deinit(alloc);
     try std.testing.expectEqualStrings("text/plain", downloaded.content_type);
     try std.testing.expectEqualStrings("hello", downloaded.data);
+}
+
+test "HTTP response body ownership transfers without a copy" {
+    const alloc = std.testing.allocator;
+    var response = httpx.Response.init(alloc, 200);
+    response.body = try alloc.dupe(u8, "owned-body");
+    response.body_owned = true;
+    defer response.deinit();
+
+    const original = response.body.?.ptr;
+    const taken = try takeHttpResponseBodyAlloc(alloc, &response);
+    defer alloc.free(taken);
+    try std.testing.expectEqual(original, taken.ptr);
+    try std.testing.expect(response.body == null);
+    try std.testing.expect(!response.body_owned);
+}
+
+test "borrowed HTTP response body is copied before transfer" {
+    const alloc = std.testing.allocator;
+    var response = httpx.Response.init(alloc, 200);
+    response.body = "borrowed-body";
+    defer response.deinit();
+
+    const taken = try takeHttpResponseBodyAlloc(alloc, &response);
+    defer alloc.free(taken);
+    try std.testing.expectEqualStrings("borrowed-body", taken);
+    try std.testing.expect(taken.ptr != response.body.?.ptr);
 }
 
 test "download content percent decodes non-base64 data uri" {
