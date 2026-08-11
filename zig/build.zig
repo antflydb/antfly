@@ -3475,6 +3475,9 @@ pub fn build(b: *std.Build) void {
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
+        // Mach-O debug codegen retained 10.3 GiB for this intentionally broad
+        // command root. Linux remains within the aggregate's 7 GiB claim.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
     });
     const run_cmd_tests = addFilteredTestRunArtifact(b, cmd_tests);
     const cmd_test_step = b.step("cmd-test", "Run Antfly command and client CLI tests");
@@ -8881,7 +8884,7 @@ pub fn build(b: *std.Build) void {
                     // scheduler claim honest on developer Macs without
                     // penalizing Linux CI concurrency.
                     .distributed => @as(usize, if (target.result.os.tag == .macos) 13 else 11) * 1024 * 1024 * 1024,
-                    .inference => 5 * 1024 * 1024 * 1024,
+                    .inference => @as(usize, if (target.result.os.tag == .macos) 8 else 5) * 1024 * 1024 * 1024,
                     .cli => 2 * 1024 * 1024 * 1024,
                 },
             });

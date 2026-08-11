@@ -136,6 +136,7 @@ pub const Detail = enum(c_int) {
     corrupt_restore_job_store,
     table_block_checksum_mismatch,
     value_too_long,
+    unsupported_platform,
 };
 
 pub const Status = extern struct {
@@ -224,6 +225,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.UnsupportedSyncLevel => status(.unsupported, .unsupported_sync_level),
         error.UnsupportedExactSort => status(.unsupported, .unsupported_exact_sort),
         error.UnsupportedVersion => status(.unsupported, .unsupported_version),
+        error.UnsupportedPlatform => status(.unsupported, .unsupported_platform),
         error.Timeout => status(.timeout, .timeout),
         error.ConnectionTimeout => status(.timeout, .connection_timeout),
         error.ConnectionTimedOut => status(.timeout, .connection_timed_out),
@@ -390,6 +392,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .corrupt_restore_job_store => "CorruptRestoreJobStore",
         .table_block_checksum_mismatch => "TableBlockChecksumMismatch",
         .value_too_long => "ValueTooLong",
+        .unsupported_platform => "UnsupportedPlatform",
     };
 }
 
@@ -400,6 +403,7 @@ test "stable status preserves public boundary semantics" {
     try std.testing.expectEqual(error.ExtensionOwnedObject, errorFromStatus(statusFromError(error.ExtensionOwnedObject)));
     try std.testing.expectEqual(error.ResourceRequestTooLarge, errorFromStatus(statusFromError(error.ResourceRequestTooLarge)));
     try std.testing.expectEqual(error.ResourceTemporarilyUnavailable, errorFromStatus(statusFromError(error.ResourceTemporarilyUnavailable)));
+    try std.testing.expectEqual(error.UnsupportedPlatform, errorFromStatus(statusFromError(error.UnsupportedPlatform)));
     try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(statusFromError(error.UnitPrivateError)));
 }
 

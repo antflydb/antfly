@@ -92,6 +92,7 @@ fn runtimeEntry(
     const command = context.command_ptr[0..context.command_len];
 
     run(runtimeInit(init.*), command, args) catch |err| {
+        if (@errorReturnTrace()) |trace| std.debug.dumpErrorReturnTrace(trace);
         const message = switch (err) {
             error.FileNotFound => "required file was not found; check the configured path",
             error.AddressInUse => "listen address is already in use",

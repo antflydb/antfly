@@ -84,14 +84,19 @@ pub fn create(context: *const CreateContext) callconv(.c) abi.Status {
     const reads: *const ?table_reads.TableReadSource = @ptrCast(@alignCast(context.table_reads));
     const writes: *const ?table_writes.TableWriteSource = @ptrCast(@alignCast(context.table_writes));
     const owner_alloc = owner_alloc_ptr.*;
-    const state = owner_alloc.create(ServerState) catch |err| return fail(err);
+    const state = owner_alloc.create(ServerState) catch |err| {
+        std.log.err("API kernel create failed allocating state: error.{s}", .{@errorName(err)});
+        return fail(err);
+    };
     errdefer owner_alloc.destroy(state);
 
     state.* = .{
         .owner_alloc = owner_alloc,
         .server = if (context.fallible)
-            server_mod.ApiHttpServer.initWithConfig(owner_alloc, cfg.*, source.*, reads.*, writes.*) catch |err|
-                return fail(err)
+            server_mod.ApiHttpServer.initWithConfig(owner_alloc, cfg.*, source.*, reads.*, writes.*) catch |err| {
+                std.log.err("API kernel create failed initializing server: error.{s}", .{@errorName(err)});
+                return fail(err);
+            }
         else
             server_mod.ApiHttpServer.initWithProcessRequestAllocator(owner_alloc, cfg.*, source.*, reads.*, writes.*),
     };

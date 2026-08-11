@@ -448,7 +448,13 @@ pub const TableWriteSource = struct {
         plan: backup_contract.TableBackupPlan,
     ) !?[]backup_contract.ShardSnapshot {
         const fn_ptr = self.vtable.backup_table orelse return null;
-        return try BoundaryAbi.call("backup_table", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, plan });
+        var owner_plan = plan;
+        // std.Io contains runtime-owned state and function pointers. It is safe
+        // to borrow for an in-unit callback, but it must never cross into an
+        // independently generated archive. A null override makes the storage
+        // owner select or create its own I/O runtime.
+        if (self.boundary_dispatch != BoundaryAbi.local_dispatch) owner_plan.io = null;
+        return try BoundaryAbi.call("backup_table", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, owner_plan });
     }
 
     pub fn backupTableToLocation(
@@ -487,7 +493,12 @@ pub const TableWriteSource = struct {
         plan: backup_contract.TableRestorePlan,
     ) !?void {
         const fn_ptr = self.vtable.restore_table orelse return null;
-        return try BoundaryAbi.call("restore_table", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, plan });
+        var owner_plan = plan;
+        // Restore materialization performs all I/O in the storage runtime that
+        // owns the callback. Do not pass the API archive's std.Io vtable across
+        // this boundary.
+        if (self.boundary_dispatch != BoundaryAbi.local_dispatch) owner_plan.io = null;
+        return try BoundaryAbi.call("restore_table", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, owner_plan });
     }
 
     pub fn beginRestoreLifecycle(self: TableWriteSource, table_name: []const u8) !bool {

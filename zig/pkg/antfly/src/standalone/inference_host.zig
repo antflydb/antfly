@@ -15,6 +15,7 @@
 //! Embedded inference lifecycle and provider adapters. This module is compiled
 //! once in the inference archive and used directly only by non-linked tests.
 
+const builtin = @import("builtin");
 const std = @import("std");
 const httpx = @import("httpx");
 const antfly = @import("inference_host_root.zig");
@@ -400,14 +401,24 @@ const BoundaryServer = struct {
         route.* = .{ .owner = self.owner, .handler = handler };
         try self.owner.routes.append(self.owner.alloc, route);
         errdefer _ = self.owner.routes.pop();
-        const status = antfly_distributed_inference_httpx_register(&.{
-            .abi_version = inference_bridge.abi_version,
-            .registrar_handle = self.registrar_handle,
-            .route_handle = route,
-            .method = method,
-            .path = http_abi.Bytes.init(path),
-        });
-        if (!status.isOk()) return inference_bridge.errorFromStatus(status);
+        if (comptime builtin.is_test) {
+            const server: *httpx.Server = @ptrCast(@alignCast(self.registrar_handle));
+            try server.routeWithData(switch (method) {
+                .get => .GET,
+                .post => .POST,
+                .put => .PUT,
+                .delete => .DELETE,
+            }, path, localInferenceHttpHandler, route);
+        } else {
+            const status = antfly_distributed_inference_httpx_register(&.{
+                .abi_version = inference_bridge.abi_version,
+                .registrar_handle = self.registrar_handle,
+                .route_handle = route,
+                .method = method,
+                .path = http_abi.Bytes.init(path),
+            });
+            if (!status.isOk()) return inference_bridge.errorFromStatus(status);
+        }
     }
 
     pub fn get(self: *const BoundaryServer, comptime path: []const u8, handler: httpx.Handler) !void {
@@ -426,6 +437,11 @@ const BoundaryServer = struct {
         try self.register(.delete, path, handler);
     }
 };
+
+fn localInferenceHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
+    const route: *RouteState = @ptrCast(@alignCast(context.route_data orelse return error.InferenceRouteUnavailable));
+    return route.handler(context);
+}
 
 pub fn linkedInferenceHandleHttp(context: *const inference_bridge.HttpHandleContext) !void {
     const route: *RouteState = @ptrCast(@alignCast(context.route_handle));
