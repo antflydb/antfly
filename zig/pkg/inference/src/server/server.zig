@@ -16953,7 +16953,10 @@ fn downloadReadBatchContent(
     if (current_bytes >= max_bytes) return error.ReadBatchTooLarge;
     const remaining = max_bytes - current_bytes;
     const remaining_u64: u64 = @intCast(remaining);
-    var bounded_security = boundedReadContentSecurity(self.config.content_security, url, remaining_u64, inline_content_trust);
+    // Apply the node's deny-by-default policy before imposing the per-request
+    // byte ceiling. Starting from the optional raw override would turn an
+    // absent or empty override into an allow-all policy for this read path.
+    var bounded_security = boundedReadContentSecurity(effectiveRequestContentSecurity(self), url, remaining_u64, inline_content_trust);
     const s3_credentials = if (self.config.s3_credentials) |*cfg| cfg else null;
     return try scraping.downloadContentAlloc(alloc, url, &bounded_security, s3_credentials);
 }
@@ -16974,12 +16977,12 @@ fn downloadReadBatchContentForRequest(
 const InlineContentTrust = enum { untrusted, trusted_internal };
 
 fn boundedReadContentSecurity(
-    configured: ?scraping.ContentSecurityConfig,
+    configured: scraping.ContentSecurityConfig,
     url: []const u8,
     remaining_bytes: u64,
     inline_content_trust: InlineContentTrust,
 ) scraping.ContentSecurityConfig {
-    var bounded = configured orelse scraping.ContentSecurityConfig{};
+    var bounded = configured;
     // Only the in-process enrichment bridge can assert trusted_internal.
     // Public callers can also submit data URIs, so URL shape alone must never
     // weaken the configured content policy.

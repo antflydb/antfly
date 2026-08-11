@@ -1981,10 +1981,11 @@ fn embedWithEntryParts(
                 try waitForEntryPacer(entry);
                 const context = embeddingRequestContext(entry);
                 try context.check();
-                const vectors = if (local.embed_dense_parts_with_context) |embed_parts_with_context|
-                    try AntflyProviderBoundary.call("embed_dense_parts_with_context", local.boundary_dispatch, embed_parts_with_context, .{ local.ptr, alloc, entry.model, parts, context })
+                const vectors = (if (local.embed_dense_parts_with_context) |embed_parts_with_context|
+                    AntflyProviderBoundary.call("embed_dense_parts_with_context", local.boundary_dispatch, embed_parts_with_context, .{ local.ptr, alloc, entry.model, parts, context })
                 else
-                    try AntflyProviderBoundary.call("embed_dense_parts", local.boundary_dispatch, embed_parts, .{ local.ptr, alloc, entry.model, parts });
+                    AntflyProviderBoundary.call("embed_dense_parts", local.boundary_dispatch, embed_parts, .{ local.ptr, alloc, entry.model, parts })) catch |err|
+                    return normalizeLocalEmbeddingError(err);
                 defer db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
                 try context.check();
                 if (vectors.len == 0) return error.EmptyEmbeddingResponse;
@@ -2049,7 +2050,8 @@ fn embedSparseBatchWithEntry(
         .antfly => {
             if (entry.antfly_provider) |local| {
                 try waitForEntryPacer(entry);
-                const embeddings = try AntflyProviderBoundary.call("embed_sparse_texts", local.boundary_dispatch, local.embed_sparse_texts, .{ local.ptr, alloc, entry.model, texts });
+                const embeddings = AntflyProviderBoundary.call("embed_sparse_texts", local.boundary_dispatch, local.embed_sparse_texts, .{ local.ptr, alloc, entry.model, texts }) catch |err|
+                    return normalizeLocalEmbeddingError(err);
                 errdefer db_embedder.freeSparseEmbeddingBatch(alloc, embeddings);
                 try validateSparseBatch(embeddings, texts.len);
                 return embeddings;
@@ -2256,10 +2258,11 @@ fn embedBatchWithEntry(
                 try waitForEntryPacer(entry);
                 const context = embeddingRequestContext(entry);
                 try context.check();
-                const vectors = if (local.embed_dense_texts_with_context) |embed_with_context|
-                    try AntflyProviderBoundary.call("embed_dense_texts_with_context", local.boundary_dispatch, embed_with_context, .{ local.ptr, alloc, entry.model, texts, context })
+                const vectors = (if (local.embed_dense_texts_with_context) |embed_with_context|
+                    AntflyProviderBoundary.call("embed_dense_texts_with_context", local.boundary_dispatch, embed_with_context, .{ local.ptr, alloc, entry.model, texts, context })
                 else
-                    try AntflyProviderBoundary.call("embed_dense_texts", local.boundary_dispatch, local.embed_dense_texts, .{ local.ptr, alloc, entry.model, texts });
+                    AntflyProviderBoundary.call("embed_dense_texts", local.boundary_dispatch, local.embed_dense_texts, .{ local.ptr, alloc, entry.model, texts })) catch |err|
+                    return normalizeLocalEmbeddingError(err);
                 errdefer db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
                 context.check() catch |err| {
                     db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
