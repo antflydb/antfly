@@ -105,8 +105,7 @@ pub const EncoderDecoderPipeline = struct {
 
         // Rename encoder hidden state for decoder input compatibility
         // (encoder outputs "last_hidden_state", decoder expects "encoder_hidden_states")
-        var enc_hidden_renamed = encoder_hidden.*;
-        enc_hidden_renamed.name = "encoder_hidden_states";
+        const enc_hidden_renamed = encoder_hidden.borrowedView("encoder_hidden_states");
 
         var decoder_outputs = try self.decoder.run(&.{
             dec_input_ids,
@@ -234,7 +233,9 @@ pub fn isEncoderDecoderModel(model_dir: []const u8) bool {
 
 /// Find encoder and decoder ONNX file paths for a model directory.
 /// Returns allocated paths that the caller must free.
-pub fn findEncoderDecoderPaths(allocator: std.mem.Allocator, model_dir: []const u8) !struct { encoder: []const u8, decoder: []const u8 } {
+pub const EncoderDecoderPaths = struct { encoder: []const u8, decoder: []const u8 };
+
+pub fn findEncoderDecoderPaths(allocator: std.mem.Allocator, model_dir: []const u8) !EncoderDecoderPaths {
     const encoder_path = try findModelFile(allocator, model_dir, encoder_candidates);
     const decoder_path = try findModelFile(allocator, model_dir, decoder_candidates);
 
@@ -247,6 +248,21 @@ pub fn findEncoderDecoderPaths(allocator: std.mem.Allocator, model_dir: []const 
     var manifest = try manifest_mod.loadFromDir(allocator, model_dir);
     defer manifest.deinit();
 
+    return nativeFlorenceEncoderDecoderPaths(allocator, model_dir, manifest);
+}
+
+/// The Florence fallback of `findEncoderDecoderPaths`, against a manifest the caller
+/// already has.
+///
+/// Every model without ONNX encoder/decoder files reaches that fallback, and it ends in a
+/// full `manifest.loadFromDir`. For a GGUF model that means parsing the whole tokenizer
+/// metadata table just to answer "is this a Florence bundle?", which is why listing every
+/// GGUF model cost about a second each.
+pub fn nativeFlorenceEncoderDecoderPaths(
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+    manifest: manifest_mod.ModelManifest,
+) !EncoderDecoderPaths {
     if (manifest.native_arch_hint == .florence and
         manifestHasNativeAssets(manifest) and
         manifest.visual_model_path != null)
@@ -260,6 +276,26 @@ pub fn findEncoderDecoderPaths(allocator: std.mem.Allocator, model_dir: []const 
     return error.EncoderModelNotFound;
 }
 
+/// Whether `findEncoderDecoderPaths` would succeed, without allocating the paths.
+pub fn hasEncoderDecoderPaths(
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+    manifest: manifest_mod.ModelManifest,
+) bool {
+    const encoder_path = findModelFile(allocator, model_dir, encoder_candidates) catch null;
+    defer if (encoder_path) |path| allocator.free(path);
+    const decoder_path = findModelFile(allocator, model_dir, decoder_candidates) catch null;
+    defer if (decoder_path) |path| allocator.free(path);
+    if (encoder_path != null and decoder_path != null) return true;
+
+    if (nativeFlorenceEncoderDecoderPaths(allocator, model_dir, manifest)) |paths| {
+        allocator.free(paths.encoder);
+        allocator.free(paths.decoder);
+        return true;
+    } else |_| {}
+    return false;
+}
+
 fn manifestHasNativeAssets(manifest: manifest_mod.ModelManifest) bool {
     return manifest.safetensors_path != null or manifest.safetensors_index_path != null or manifest.gguf_path != null;
 }
@@ -269,6 +305,12 @@ pub fn loadDecoderConfig(allocator: std.mem.Allocator, model_dir: []const u8) !D
     const path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{model_dir});
     defer allocator.free(path);
 
+    return loadDecoderConfigFile(allocator, path);
+}
+
+/// Parse decoder settings from an already resolved config artifact. Managed
+/// serving passes the receipt-validated canonical path through this API.
+pub fn loadDecoderConfigFile(allocator: std.mem.Allocator, path: []const u8) !DecoderConfig {
     const data = try c_file.readFile(allocator, path);
     defer allocator.free(data);
 

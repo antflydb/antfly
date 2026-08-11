@@ -15,6 +15,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const change_journal_mod = @import("change_journal.zig");
+const catch_up_policy = @import("catch_up_policy.zig");
 const replay_source_mod = @import("replay_source.zig");
 const derived_types = @import("derived_types.zig");
 const index_manager_mod = @import("../catalog/index_manager.zig");
@@ -150,10 +151,10 @@ fn logCatchUpError(
     applied_entries: usize,
     err: anyerror,
 ) void {
-    if (err == error.WriterLocked) return;
-    if (err == error.ResourceBudgetExceeded) return;
+    if (catch_up_policy.isRecoverableAdmissionError(err)) return;
     if (err == error.ReplayDocumentNotVisible) return;
     if (err == error.ArtifactRepairRequired) return;
+    if (err == error.CatchUpDeadlineExceeded) return;
     if (index_ref.kind == .dense_vector and err == error.NotFound) return;
     std.log.err(
         "derived catch_up failed index={s} kind={s} phase={s} sequence={} scanned_entries={} applied_entries={} err={s}",
@@ -544,24 +545,30 @@ const ReplayChunkBuilder = struct {
 
     fn finish(self: *@This(), sequence: u64) !derived_types.DerivedBatch {
         const changed_doc_keys = try self.changed_doc_keys.toOwnedSlice(self.alloc);
-        errdefer {
-            for (changed_doc_keys) |key| self.alloc.free(key);
+        var transferred_changed_doc_keys: usize = 0;
+        var changed_doc_keys_owned = true;
+        errdefer if (changed_doc_keys_owned) {
+            for (changed_doc_keys[transferred_changed_doc_keys..]) |key| self.alloc.free(key);
             if (changed_doc_keys.len > 0) self.alloc.free(changed_doc_keys);
-        }
+        };
 
         var documents = try self.alloc.alloc(derived_types.DerivedDocument, changed_doc_keys.len);
         var initialized_docs: usize = 0;
         errdefer {
-            var tmp = derived_types.DerivedBatch{ .documents = documents[0..initialized_docs] };
-            derived_types.deinitDerivedBatch(self.alloc, &tmp);
+            for (documents[0..initialized_docs]) |doc|
+                derived_types.deinitDerivedDocument(self.alloc, doc);
+            if (documents.len > 0) self.alloc.free(documents);
         }
         for (changed_doc_keys, 0..) |key, i| {
             const targets: []const derived_types.DerivedTargetRef = switch (self.index_ref.kind) {
                 .full_text, .algebraic => blk: {
                     const refs = try self.alloc.alloc(derived_types.DerivedTargetRef, 1);
+                    errdefer self.alloc.free(refs);
+                    const index_name = try self.alloc.dupe(u8, self.index_ref.name);
+                    errdefer self.alloc.free(index_name);
                     refs[0] = .{
                         .kind = if (self.index_ref.kind == .full_text) .full_text else .algebraic,
-                        .index_name = try self.alloc.dupe(u8, self.index_ref.name),
+                        .index_name = index_name,
                     };
                     break :blk refs;
                 },
@@ -573,8 +580,10 @@ const ReplayChunkBuilder = struct {
                 .targets = targets,
             };
             initialized_docs += 1;
+            transferred_changed_doc_keys += 1;
         }
         if (changed_doc_keys.len > 0) self.alloc.free(changed_doc_keys);
+        changed_doc_keys_owned = false;
 
         const deleted_keys = try self.deleted_doc_keys.toOwnedSlice(self.alloc);
         errdefer {

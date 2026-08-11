@@ -75,8 +75,13 @@ pub const RawNode = struct {
     }
 
     pub fn propose(self: *RawNode, data: []const u8) !void {
+        var accepted_index: ?types.Index = null;
+        return try self.proposeWithReceipt(data, &accepted_index);
+    }
+
+    pub fn proposeWithReceipt(self: *RawNode, data: []const u8, accepted_index: *?types.Index) !void {
         self.clearReadyMessages();
-        return try self.raft.propose(data);
+        return try self.raft.proposeWithReceipt(data, accepted_index);
     }
 
     pub fn readIndex(self: *RawNode, rctx: []const u8) !void {
@@ -160,6 +165,10 @@ pub const RawNode = struct {
 
     pub fn compactAppliedLogTo(self: *RawNode, index: types.Index) !void {
         try self.raft.compactAppliedLogTo(index);
+    }
+
+    pub fn termAt(self: *RawNode, index: types.Index) !types.Term {
+        return self.raft.log.term(index) orelse error.IndexNotFound;
     }
 
     fn needsStorageAppend(rd: ready_mod.Ready) bool {

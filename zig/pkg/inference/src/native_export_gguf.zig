@@ -139,6 +139,10 @@ const ExportSourceKind = enum {
     dense,
 };
 
+fn exportSourceKindForManifest(manifest: *const manifest_mod.ModelManifest) ExportSourceKind {
+    return if (manifest.usesGgufWeights()) .gguf else .dense;
+}
+
 const DenseDecoderExportSupport = enum {
     supported,
     unsupported_name_mapping,
@@ -1557,7 +1561,7 @@ fn buildPlannedExport(
     var access = try tensor_access_mod.openFromManifest(allocator, manifest);
     defer access.deinit();
     const source_metadata_file = if (parsed_source_gguf) |*source| &source.parsed else null;
-    const source_kind: ExportSourceKind = if (manifest.gguf_path != null and manifest.safetensors_path == null and manifest.safetensors_index_path == null) .gguf else .dense;
+    const source_kind = exportSourceKindForManifest(&manifest);
 
     if (export_arch == .bert) {
         var plan = try buildBertPlannedExport(
@@ -1773,7 +1777,7 @@ fn buildExportPlans(
     filter: QuantizationFilter,
     source_metadata_file: ?*const gguf_mod.format.File,
 ) !SplitExportPlans {
-    const source_is_gguf = manifest.safetensors_path == null and manifest.safetensors_index_path == null and manifest.gguf_path != null;
+    const source_is_gguf = exportSourceKindForManifest(&manifest) == .gguf;
     const keep_multimodal_aux_in_decoder = shouldKeepMultimodalAuxInDecoder(manifest, gpt_config);
     const names = try access.listNames(allocator);
     defer allocator.free(names);
@@ -2537,11 +2541,12 @@ fn buildClapPlannedExportFiltered(
             TensorTransform.none
         else
             clipClapOnnxDenseExportTransformForTensor(record.descriptor.name, record.descriptor.shape);
-        const dimensions = switch (transform) {
-            .none => try reversedDimsFromShape(allocator, record.descriptor.shape),
-            .transpose_2d_dense => try dimsFromShape(allocator, record.descriptor.shape),
-            .onnx_gru_zrh_to_rzn => return error.UnsupportedDenseArchitectureForGgufExport,
-        };
+        const dimensions = try clapGgufDimensions(
+            allocator,
+            output_name_result.name,
+            record.descriptor.shape,
+            transform,
+        );
         errdefer allocator.free(dimensions);
 
         const tensor_quantization = if (source_is_gguf)
@@ -3846,6 +3851,35 @@ fn reversedDimsFromShape(allocator: std.mem.Allocator, shape: []const i64) ![]u6
     return dims;
 }
 
+fn clapGgufDimensions(
+    allocator: std.mem.Allocator,
+    output_name: []const u8,
+    shape: []const i64,
+    transform: TensorTransform,
+) ![]u64 {
+    if (transform == .none and
+        std.mem.startsWith(u8, output_name, "audio_model.audio_encoder.layers.") and
+        std.mem.endsWith(u8, output_name, ".attention.self.relative_position_bias_table"))
+    {
+        if (shape.len == 0) return error.InvalidTensorShape;
+        var element_count: u64 = 1;
+        for (shape) |dim| {
+            if (dim <= 0) return error.InvalidTensorShape;
+            element_count = std.math.mul(u64, element_count, @intCast(dim)) catch
+                return error.InvalidTensorShape;
+        }
+        const dimensions = try allocator.alloc(u64, 1);
+        dimensions[0] = element_count;
+        return dimensions;
+    }
+
+    return switch (transform) {
+        .none => reversedDimsFromShape(allocator, shape),
+        .transpose_2d_dense => dimsFromShape(allocator, shape),
+        .onnx_gru_zrh_to_rzn => error.UnsupportedDenseArchitectureForGgufExport,
+    };
+}
+
 fn resolveExportArchitecture(
     allocator: std.mem.Allocator,
     model_dir: []const u8,
@@ -3886,7 +3920,8 @@ fn resolveExportArchitecture(
         return .{ .gpt = config };
     } else |_| {}
 
-    if (manifest.gguf_path) |path| {
+    if (manifest.usesGgufWeights()) {
+        const path = manifest.gguf_path.?;
         parsed_source_gguf.* = try SourceGguf.init(allocator, path);
         const view = gguf_mod.metadata.View.init(&parsed_source_gguf.*.?.parsed);
         if (gpt_mod.parseGgufMetadata(view)) |config| return .{ .gpt = config };
@@ -3902,6 +3937,20 @@ fn resolveExportArchitecture(
     }
 
     return error.UnsupportedModelForGgufExport;
+}
+
+test "GGUF export source follows the runtime artifact route" {
+    const allocator = std.testing.allocator;
+    var manifest = manifest_mod.ModelManifest{
+        .allocator = allocator,
+        .gguf_path = try allocator.dupe(u8, "export.gguf"),
+    };
+    defer manifest.deinit();
+
+    try std.testing.expectEqual(ExportSourceKind.gguf, exportSourceKindForManifest(&manifest));
+
+    manifest.safetensors_path = try allocator.dupe(u8, "model.safetensors");
+    try std.testing.expectEqual(ExportSourceKind.dense, exportSourceKindForManifest(&manifest));
 }
 
 fn buildDebertaMetadataEntries(
@@ -4422,6 +4471,7 @@ fn buildMetadataEntries(
     try appendArchU32(allocator, &entries, arch, "attention.head_count", config.num_attention_heads);
     try appendHeadCountKvMetadata(allocator, &entries, arch, config);
     try appendArchU32(allocator, &entries, arch, "attention.key_length", config.headDim());
+    try appendMultimodalDecoderMetadata(allocator, &entries, config);
 
     if (config.global_head_dim > 0) {
         try appendArchU32(allocator, &entries, arch, "attention.key_length_swa", config.attention_head_dim);
@@ -4501,6 +4551,49 @@ fn buildMetadataEntries(
     try appendStandaloneTokenizerMetadata(allocator, &entries, model_dir, manifest);
 
     return try entries.toOwnedSlice(allocator);
+}
+
+fn appendMultimodalDecoderMetadata(
+    allocator: std.mem.Allocator,
+    entries: *std.ArrayListUnmanaged(gguf_mod.format.MetadataEntry),
+    config: gpt_mod.Config,
+) !void {
+    if (!config.isMultimodal()) return;
+
+    // These keys are an Antfly-owned decoder contract. Upstream GGUF does not
+    // currently define a portable way to retain the HF multimodal decoder
+    // fields, but the native runtime needs them when the exported decoder and
+    // projector are deployed without the source config.json.
+    if (config.image_token_index >= 0)
+        try appendMetadataI64Entry(allocator, entries, "inference.multimodal.image_token_id", config.image_token_index);
+    if (config.boi_token_index >= 0)
+        try appendMetadataI64Entry(allocator, entries, "inference.multimodal.boi_token_id", config.boi_token_index);
+    if (config.eoi_token_index >= 0)
+        try appendMetadataI64Entry(allocator, entries, "inference.multimodal.eoi_token_id", config.eoi_token_index);
+    if (config.mm_tokens_per_image > 0)
+        try appendMetadataU32Entry(allocator, entries, "inference.multimodal.tokens_per_image", config.mm_tokens_per_image);
+    if (config.vision_hidden_size > 0)
+        try appendMetadataU32Entry(allocator, entries, "inference.multimodal.vision.hidden_size", config.vision_hidden_size);
+    if (config.vision_embed_dim > 0)
+        try appendMetadataU32Entry(allocator, entries, "inference.multimodal.vision.embedding_length", config.vision_embed_dim);
+    if (config.vision_num_hidden_layers > 0)
+        try appendMetadataU32Entry(allocator, entries, "inference.multimodal.vision.block_count", config.vision_num_hidden_layers);
+    if (config.vision_num_attention_heads > 0)
+        try appendMetadataU32Entry(allocator, entries, "inference.multimodal.vision.attention.head_count", config.vision_num_attention_heads);
+    if (config.vision_intermediate_size > 0)
+        try appendMetadataU32Entry(allocator, entries, "inference.multimodal.vision.feed_forward_length", config.vision_intermediate_size);
+    if (config.vision_image_size > 0)
+        try appendMetadataU32Entry(allocator, entries, "inference.multimodal.vision.image_size", config.vision_image_size);
+    if (config.vision_patch_size > 0)
+        try appendMetadataU32Entry(allocator, entries, "inference.multimodal.vision.patch_size", config.vision_patch_size);
+    if (config.vision_mlp_ratio > 0)
+        try appendMetadataU32Entry(allocator, entries, "inference.multimodal.vision.mlp_ratio", config.vision_mlp_ratio);
+    if (config.vision_spatial_merge_size > 0)
+        try appendMetadataU32Entry(allocator, entries, "inference.multimodal.vision.spatial_merge_size", config.vision_spatial_merge_size);
+    if (config.vision_temporal_patch_size > 0)
+        try appendMetadataU32Entry(allocator, entries, "inference.multimodal.vision.temporal_patch_size", config.vision_temporal_patch_size);
+    if (config.vision_use_quick_gelu)
+        try appendMetadataBoolEntry(allocator, entries, "inference.multimodal.vision.use_quick_gelu", true);
 }
 
 fn appendStandaloneTokenizerMetadata(
@@ -5792,6 +5885,10 @@ test "multimodal export writes decoder gguf and preserves companion projector gg
     defer parsed.deinit(allocator);
     const view = gguf_mod.metadata.View.init(&parsed);
     try std.testing.expectEqualStrings("gemma3", view.getString("general.architecture").?);
+    const exported_config = gpt_mod.parseGgufMetadata(view).?;
+    try std.testing.expect(exported_config.isMultimodal());
+    try std.testing.expectEqual(@as(i32, 1), exported_config.image_token_index);
+    try std.testing.expectEqual(@as(u32, 2), exported_config.mm_tokens_per_image);
     const catalog = gguf_mod.tensor_catalog.Catalog.init(&parsed);
     try std.testing.expect(catalog.find("token_embd.weight") != null);
     try std.testing.expect(catalog.find("vision_tower.vision_model.post_layernorm.weight") == null);
@@ -5911,6 +6008,16 @@ test "multimodal export synthesizes projector gguf from integrated tensors" {
     defer decoder_parsed.deinit(allocator);
     const decoder_view = gguf_mod.metadata.View.init(&decoder_parsed);
     try std.testing.expectEqualStrings("gemma3", decoder_view.getString("general.architecture").?);
+    const exported_config = gpt_mod.parseGgufMetadata(decoder_view).?;
+    try std.testing.expect(exported_config.isMultimodal());
+    try std.testing.expectEqual(@as(i32, 1), exported_config.image_token_index);
+    try std.testing.expectEqual(@as(u32, 2), exported_config.mm_tokens_per_image);
+    try std.testing.expectEqual(@as(u32, 8), exported_config.vision_hidden_size);
+    try std.testing.expectEqual(@as(u32, 3), exported_config.vision_num_hidden_layers);
+    try std.testing.expectEqual(@as(u32, 4), exported_config.vision_num_attention_heads);
+    try std.testing.expectEqual(@as(u32, 16), exported_config.vision_intermediate_size);
+    try std.testing.expectEqual(@as(u32, 224), exported_config.vision_image_size);
+    try std.testing.expectEqual(@as(u32, 14), exported_config.vision_patch_size);
     const decoder_catalog = gguf_mod.tensor_catalog.Catalog.init(&decoder_parsed);
     try std.testing.expect(decoder_catalog.find("token_embd.weight") != null);
     try std.testing.expect(decoder_catalog.find("vision_tower.vision_model.post_layernorm.weight") == null);
@@ -6473,7 +6580,7 @@ test "dense clap export writes clap metadata and tensors" {
     try compat.cwd().writeFile(compat.io(), .{
         .sub_path = config_path,
         .data =
-        \\{"model_type":"clap","projection_dim":4,"projection_hidden_act":"relu","logit_scale_init_value":14.285714,"text_config":{"vocab_size":32,"hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"intermediate_size":8,"max_position_embeddings":16,"type_vocab_size":1,"pad_token_id":1},"audio_config":{"hidden_size":8,"patch_embeds_hidden_size":4,"patch_embed_input_channels":1,"patch_size":4,"patch_stride":[4,4],"num_mel_bins":8,"spec_size":16,"window_size":4,"depths":[1,1,1,1],"num_attention_heads":[1,1,1,2],"mlp_ratio":2.0,"layer_norm_eps":1e-5,"enable_fusion":false}}
+        \\{"model_type":"clap","projection_dim":4,"projection_hidden_act":"relu","logit_scale_init_value":14.285714,"text_config":{"vocab_size":32,"hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"intermediate_size":8,"max_position_embeddings":16,"type_vocab_size":1,"pad_token_id":1},"audio_config":{"hidden_size":8,"patch_embeds_hidden_size":4,"patch_embed_input_channels":1,"patch_size":4,"patch_stride":[4,4],"num_mel_bins":8,"spec_size":16,"window_size":2,"depths":[1,1,1,1],"num_attention_heads":[2,1,1,2],"mlp_ratio":2.0,"layer_norm_eps":1e-5,"enable_fusion":false}}
         ,
     });
 
@@ -6489,6 +6596,11 @@ test "dense clap export writes clap metadata and tensors" {
         .{ .name = "clap.text_projection.linear2.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
         .{ .name = "clap.audio_model.audio_encoder.patch_embed.proj.weight", .shape = &.{ 4, 1, 4, 4 }, .data = &([_]f32{0.0} ** (4 * 1 * 4 * 4)) },
         .{ .name = "clap.audio_model.audio_encoder.patch_embed.proj.bias", .shape = &.{4}, .data = &[_]f32{ 0, 0, 0, 0 } },
+        .{ .name = "clap.audio_model.audio_encoder.layers.0.blocks.0.attention.self.relative_position_bias_table", .shape = &.{ 9, 2 }, .data = &[_]f32{
+            0,  1,  2,  3,  4,  5,
+            6,  7,  8,  9,  10, 11,
+            12, 13, 14, 15, 16, 17,
+        } },
         .{ .name = "clap.audio_model.audio_encoder.batch_norm.weight", .shape = &.{8}, .data = &([_]f32{1.0} ** 8) },
         .{ .name = "clap.audio_model.audio_encoder.batch_norm.bias", .shape = &.{8}, .data = &([_]f32{0.0} ** 8) },
         .{ .name = "clap.audio_model.audio_encoder.batch_norm.running_mean", .shape = &.{8}, .data = &([_]f32{0.0} ** 8) },
@@ -6522,6 +6634,41 @@ test "dense clap export writes clap metadata and tensors" {
     try std.testing.expect(catalog.find("audio_model.audio_encoder.patch_embed.proj.weight") != null);
     try std.testing.expect(catalog.find("audio_projection.linear1.weight") != null);
     try std.testing.expect(catalog.find("logit_scale") != null);
+
+    const relative_bias_name = "audio_model.audio_encoder.layers.0.blocks.0.attention.self.relative_position_bias_table";
+    const relative_bias = catalog.find(relative_bias_name).?;
+    try std.testing.expectEqualSlices(u64, &.{18}, relative_bias.dimensions);
+    const relative_bias_len = gguf_mod.tensor_types.byteLen(relative_bias.tensor_type, relative_bias.dimensions).?;
+    const relative_bias_bytes = try c_file.readRegion(allocator, out_path, relative_bias.data_offset, @intCast(relative_bias_len));
+    defer allocator.free(relative_bias_bytes);
+    try std.testing.expectEqualSlices(
+        u8,
+        std.mem.sliceAsBytes(&[_]f32{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17 }),
+        relative_bias_bytes,
+    );
+
+    // GGUF-to-GGUF export applies the same canonical layout, so artifacts
+    // produced by older exporters are repaired without touching tensor data.
+    const roundtrip_dir = try std.fs.path.join(allocator, &.{ dir_path, "roundtrip" });
+    defer allocator.free(roundtrip_dir);
+    try compat.cwd().createDirPath(compat.io(), roundtrip_dir);
+    const roundtrip_source = try std.fs.path.join(allocator, &.{ roundtrip_dir, "model.gguf" });
+    defer allocator.free(roundtrip_source);
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = roundtrip_source, .data = raw });
+    const roundtrip_path = try std.fs.path.join(allocator, &.{ roundtrip_dir, "roundtrip.gguf" });
+    defer allocator.free(roundtrip_path);
+    try exportModelDirToGguf(allocator, roundtrip_dir, roundtrip_path, .none);
+
+    const roundtrip_raw = try c_file.readFile(allocator, roundtrip_path);
+    defer allocator.free(roundtrip_raw);
+    var roundtrip_parsed = try gguf_mod.format.parse(allocator, roundtrip_raw);
+    defer roundtrip_parsed.deinit(allocator);
+    const roundtrip_bias = gguf_mod.tensor_catalog.Catalog.init(&roundtrip_parsed).find(relative_bias_name).?;
+    try std.testing.expectEqualSlices(u64, &.{18}, roundtrip_bias.dimensions);
+    const roundtrip_bias_len = gguf_mod.tensor_types.byteLen(roundtrip_bias.tensor_type, roundtrip_bias.dimensions).?;
+    const roundtrip_bias_bytes = try c_file.readRegion(allocator, roundtrip_path, roundtrip_bias.data_offset, @intCast(roundtrip_bias_len));
+    defer allocator.free(roundtrip_bias_bytes);
+    try std.testing.expectEqualSlices(u8, relative_bias_bytes, roundtrip_bias_bytes);
 }
 
 test "exported clap gguf loads and runs through native text path" {

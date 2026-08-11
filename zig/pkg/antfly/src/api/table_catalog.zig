@@ -30,8 +30,16 @@ pub const CatalogSource = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
+        /// Snapshot slices and all transitively referenced bytes must remain
+        /// valid until the matching `free_admin_snapshot` call returns.
         admin_snapshot: *const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot,
         free_admin_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void,
+        /// Production sources must fail closed when either linearizable
+        /// publication validator is unavailable.
+        requires_linearizable_publication_fence: bool = false,
+        /// Compares a compact contract after a Raft linearizable-read barrier.
+        validate_publication: ?*const fn (ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) anyerror!bool = null,
+        validate_table_publication: ?*const fn (ptr: *anyopaque, contract: metadata_api.CatalogTablePublicationContract) anyerror!bool = null,
     };
 
     pub fn adminSnapshot(self: CatalogSource) !metadata_api.AdminSnapshot {
@@ -42,12 +50,25 @@ pub const CatalogSource = struct {
         self.vtable.free_admin_snapshot(self.ptr, snapshot);
     }
 
+    pub fn validatePublication(self: CatalogSource, contract: metadata_api.CatalogPublicationContract) !bool {
+        const validate = self.vtable.validate_publication orelse return error.CatalogPublicationFenceUnavailable;
+        return try validate(self.ptr, contract);
+    }
+
+    pub fn validateTablePublication(self: CatalogSource, contract: metadata_api.CatalogTablePublicationContract) !bool {
+        const validate = self.vtable.validate_table_publication orelse return error.CatalogPublicationFenceUnavailable;
+        return try validate(self.ptr, contract);
+    }
+
     pub fn fromMetadataService(svc: *metadata_service.MetadataService) CatalogSource {
         return .{
             .ptr = svc,
             .vtable = &.{
                 .admin_snapshot = metadataServiceAdminSnapshot,
                 .free_admin_snapshot = metadataServiceFreeAdminSnapshot,
+                .requires_linearizable_publication_fence = true,
+                .validate_publication = metadataServiceValidatePublication,
+                .validate_table_publication = metadataServiceValidateTablePublication,
             },
         };
     }
@@ -58,6 +79,9 @@ pub const CatalogSource = struct {
             .vtable = &.{
                 .admin_snapshot = metadataHttpServiceAdminSnapshot,
                 .free_admin_snapshot = metadataHttpServiceFreeAdminSnapshot,
+                .requires_linearizable_publication_fence = true,
+                .validate_publication = metadataHttpServiceValidatePublication,
+                .validate_table_publication = metadataHttpServiceValidateTablePublication,
             },
         };
     }
@@ -68,6 +92,9 @@ pub const CatalogSource = struct {
             .vtable = &.{
                 .admin_snapshot = metadataServerAdminSnapshot,
                 .free_admin_snapshot = metadataServerFreeAdminSnapshot,
+                .requires_linearizable_publication_fence = true,
+                .validate_publication = metadataServerValidatePublication,
+                .validate_table_publication = metadataServerValidateTablePublication,
             },
         };
     }
@@ -136,6 +163,33 @@ pub fn resolveGroupForKey(
     return resolveGroupForKeyFromRanges(ranges, key);
 }
 
+pub const RoutedGroupSnapshot = struct {
+    group_id: ?u64,
+    topology_epoch: u64,
+};
+
+/// Resolve a key and compute the routing epoch from one catalog snapshot.
+/// Callers can perform an external consistency barrier, acquire structural
+/// read admission, and then validate the captured epoch without a torn
+/// epoch/route pair.
+pub fn routedGroupSnapshot(
+    alloc: std.mem.Allocator,
+    catalog: CatalogSource,
+    table_name: []const u8,
+    key: []const u8,
+) !RoutedGroupSnapshot {
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const table = tables_api.findTableByName(&snapshot, table_name) orelse return .{ .group_id = null, .topology_epoch = 0 };
+    const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
+    defer metadata_admin.freeRangeRefs(alloc, ranges);
+    sortRangeRefs(ranges);
+    return .{
+        .group_id = resolveGroupForKeyFromRanges(ranges, key),
+        .topology_epoch = topologyEpochFromSortedRanges(table.*, ranges),
+    };
+}
+
 pub fn resolveGroupForKeyFromRanges(
     ranges: []const *const metadata_table_manager.RangeRecord,
     key: []const u8,
@@ -144,6 +198,51 @@ pub fn resolveGroupForKeyFromRanges(
         if (rangeContainsKey(range.*, key)) return range.group_id;
     }
     return null;
+}
+
+/// Owns one catalog snapshot and its sorted table-range projection for the
+/// lifetime of transaction routing. This keeps every key in a table pinned to
+/// the same topology without taking a catalog snapshot for each operation.
+pub const TransactionRoutingSnapshot = struct {
+    catalog: CatalogSource,
+    snapshot: metadata_api.AdminSnapshot,
+    ranges: []const *const metadata_table_manager.RangeRecord,
+    topology_epoch: u64,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        metadata_admin.freeRangeRefs(alloc, self.ranges);
+        self.catalog.freeAdminSnapshot(&self.snapshot);
+        self.* = undefined;
+    }
+
+    pub fn resolveGroupForKey(self: *const @This(), key: []const u8) ?u64 {
+        return resolveGroupForKeyFromRanges(self.ranges, key);
+    }
+};
+
+/// Captures and validates the table topology once for a transaction routing
+/// pass. The returned range pointers remain valid until `deinit`.
+pub fn transactionRoutingSnapshot(
+    alloc: std.mem.Allocator,
+    catalog: CatalogSource,
+    table_name: []const u8,
+) !?TransactionRoutingSnapshot {
+    var snapshot = try catalog.adminSnapshot();
+    errdefer catalog.freeAdminSnapshot(&snapshot);
+    const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
+    try validateTransactionTopologyStableSnapshot(&snapshot, table.*);
+
+    const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
+    errdefer metadata_admin.freeRangeRefs(alloc, ranges);
+    if (ranges.len == 0) return null;
+    sortRangeRefs(ranges);
+
+    return .{
+        .catalog = catalog,
+        .snapshot = snapshot,
+        .ranges = ranges,
+        .topology_epoch = topologyEpochFromSortedRanges(table.*, ranges),
+    };
 }
 
 /// Whether a table with this name currently exists in the catalog. Used by
@@ -166,10 +265,25 @@ pub fn topologyEpoch(
     var snapshot = try catalog.adminSnapshot();
     defer catalog.freeAdminSnapshot(&snapshot);
     const table = tables_api.findTableByName(&snapshot, table_name) orelse return 0;
-    const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
+    return try topologyEpochFromSnapshot(alloc, &snapshot, table.*);
+}
+
+fn topologyEpochFromSnapshot(
+    alloc: std.mem.Allocator,
+    snapshot: *const metadata_api.AdminSnapshot,
+    table: metadata_table_manager.TableRecord,
+) !u64 {
+    const ranges = try metadata_admin.listTableRanges(alloc, snapshot, table.table_id);
     defer metadata_admin.freeRangeRefs(alloc, ranges);
 
     sortRangeRefs(ranges);
+    return topologyEpochFromSortedRanges(table, ranges);
+}
+
+fn topologyEpochFromSortedRanges(
+    table: metadata_table_manager.TableRecord,
+    ranges: []const *const metadata_table_manager.RangeRecord,
+) u64 {
     var hasher = std.hash.Wyhash.init(0);
     hasher.update(table.name);
     hasher.update(std.mem.asBytes(&table.table_id));
@@ -187,6 +301,31 @@ pub fn topologyEpoch(
     return hasher.final();
 }
 
+pub fn transactionTopologyEpoch(
+    alloc: std.mem.Allocator,
+    catalog: CatalogSource,
+    table_name: []const u8,
+) !u64 {
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const table = tables_api.findTableByName(&snapshot, table_name) orelse return 0;
+    try validateTransactionTopologyStableSnapshot(&snapshot, table.*);
+    return try topologyEpochFromSnapshot(alloc, &snapshot, table.*);
+}
+
+pub fn validateTransactionTopologyEpoch(
+    alloc: std.mem.Allocator,
+    catalog: CatalogSource,
+    table_name: []const u8,
+    expected_epoch: u64,
+) !void {
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+    try validateTransactionTopologyStableSnapshot(&snapshot, table.*);
+    if (expected_epoch != 0 and (try topologyEpochFromSnapshot(alloc, &snapshot, table.*)) != expected_epoch) return error.TopologyChanged;
+}
+
 pub fn validateTopologyEpoch(
     alloc: std.mem.Allocator,
     catalog: CatalogSource,
@@ -196,6 +335,111 @@ pub fn validateTopologyEpoch(
     if (expected_epoch == 0) return;
     const actual_epoch = try topologyEpoch(alloc, catalog, table_name);
     if (actual_epoch != expected_epoch) return error.TopologyChanged;
+}
+
+/// Validate an internally captured topology epoch, including the zero epoch
+/// used while a table is absent. Public graph requests use zero to mean
+/// "unstamped", so `validateTopologyEpoch` intentionally skips it; read
+/// admission needs an exact comparison to notice a table created after an
+/// absent-table snapshot was routed.
+pub fn validatePinnedTopologyEpoch(
+    alloc: std.mem.Allocator,
+    catalog: CatalogSource,
+    table_name: []const u8,
+    expected_epoch: u64,
+) !void {
+    const actual_epoch = try topologyEpoch(alloc, catalog, table_name);
+    if (actual_epoch != expected_epoch) return error.TopologyChanged;
+}
+
+/// Capture the current table topology epoch only if `group_id` is one of its
+/// published ranges. Internal group-local reads use this before a Raft wait so
+/// an obsolete group fails fast instead of waiting on a replica that has
+/// already left the table.
+pub fn groupTopologyEpoch(
+    alloc: std.mem.Allocator,
+    catalog: CatalogSource,
+    table_name: []const u8,
+    group_id: u64,
+) !u64 {
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+    const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
+    defer metadata_admin.freeRangeRefs(alloc, ranges);
+    sortRangeRefs(ranges);
+    for (ranges) |range| {
+        if (range.group_id == group_id) return topologyEpochFromSortedRanges(table.*, ranges);
+    }
+    return error.TopologyChanged;
+}
+
+pub fn validatePinnedGroupTopology(
+    alloc: std.mem.Allocator,
+    catalog: CatalogSource,
+    table_name: []const u8,
+    group_id: u64,
+    expected_epoch: u64,
+) !void {
+    if (try groupTopologyEpoch(alloc, catalog, table_name, group_id) != expected_epoch)
+        return error.TopologyChanged;
+}
+
+/// Transactions may not straddle a split or merge. The transition record is
+/// published before range cutover, so checking it in addition to the range
+/// epoch closes the prepare-to-cutover window where durable intents could
+/// otherwise be left on the previous owner.
+pub fn validateTransactionTopologyStable(
+    catalog: CatalogSource,
+    table_name: []const u8,
+) !void {
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+    return validateTransactionTopologyStableSnapshot(&snapshot, table.*);
+}
+
+fn validateTransactionTopologyStableSnapshot(
+    snapshot: *const metadata_api.AdminSnapshot,
+    table: metadata_table_manager.TableRecord,
+) !void {
+    for (snapshot.split_transitions) |transition| {
+        if (!transitionPhaseActive(transition.phase)) continue;
+        if (transition.table_contract.table_id == table.table_id or
+            std.mem.eql(u8, transition.table_contract.table_name, table.name))
+        {
+            return error.TopologyChanged;
+        }
+        if (transition.table_contract.table_id == 0 and
+            (rangeGroupBelongsToTable(snapshot.ranges, table.table_id, transition.source_group_id) or
+                rangeGroupBelongsToTable(snapshot.ranges, table.table_id, transition.destination_group_id)))
+        {
+            return error.TopologyChanged;
+        }
+    }
+    for (snapshot.merge_transitions) |transition| {
+        if (!transitionPhaseActive(transition.phase)) continue;
+        if (transition.table_contract.table_id == table.table_id or
+            std.mem.eql(u8, transition.table_contract.table_name, table.name))
+        {
+            return error.TopologyChanged;
+        }
+        if (transition.table_contract.table_id == 0 and
+            (rangeGroupBelongsToTable(snapshot.ranges, table.table_id, transition.donor_group_id) or
+                rangeGroupBelongsToTable(snapshot.ranges, table.table_id, transition.receiver_group_id)))
+        {
+            return error.TopologyChanged;
+        }
+    }
+}
+
+fn transitionPhaseActive(phase: metadata_transition_state.TransitionPhase) bool {
+    return phase != .finalized and phase != .rolled_back;
+}
+
+fn rangeGroupBelongsToTable(ranges: []const metadata_table_manager.RangeRecord, table_id: u64, group_id: u64) bool {
+    for (ranges) |range| if (range.table_id == table_id and range.group_id == group_id) return true;
+    return false;
 }
 
 pub fn validateDocIdentityReadyForTable(
@@ -297,6 +541,41 @@ pub fn resolveGroupsForSpan(
     return try groups.toOwnedSlice(alloc);
 }
 
+pub const RoutedSpanSnapshot = struct {
+    group_ids: []u64,
+    topology_epoch: u64,
+};
+
+/// Resolve a span and compute the routing epoch from one catalog snapshot.
+pub fn routedSpanSnapshot(
+    alloc: std.mem.Allocator,
+    catalog: CatalogSource,
+    table_name: []const u8,
+    from_key: []const u8,
+    to_key: []const u8,
+) !RoutedSpanSnapshot {
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const table = tables_api.findTableByName(&snapshot, table_name) orelse return .{
+        .group_ids = try alloc.alloc(u64, 0),
+        .topology_epoch = 0,
+    };
+    const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
+    defer metadata_admin.freeRangeRefs(alloc, ranges);
+
+    sortRangeRefs(ranges);
+    var groups = std.ArrayListUnmanaged(u64).empty;
+    defer groups.deinit(alloc);
+    for (ranges) |range| {
+        if (!rangeOverlapsSpan(range.*, from_key, to_key)) continue;
+        try groups.append(alloc, range.group_id);
+    }
+    return .{
+        .group_ids = try groups.toOwnedSlice(alloc),
+        .topology_epoch = topologyEpochFromSortedRanges(table.*, ranges),
+    };
+}
+
 pub fn resolveGroupsForSpanEventually(
     alloc: std.mem.Allocator,
     catalog: CatalogSource,
@@ -326,6 +605,16 @@ fn metadataServiceFreeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.Adm
     svc.freeAdminSnapshot(snapshot);
 }
 
+fn metadataServiceValidatePublication(ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) !bool {
+    const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+    return try svc.validatePublication(contract);
+}
+
+fn metadataServiceValidateTablePublication(ptr: *anyopaque, contract: metadata_api.CatalogTablePublicationContract) !bool {
+    const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+    return try svc.validateTablePublication(contract);
+}
+
 fn metadataHttpServiceAdminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
     const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     return try svc.adminSnapshot();
@@ -336,6 +625,16 @@ fn metadataHttpServiceFreeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api
     svc.freeAdminSnapshot(snapshot);
 }
 
+fn metadataHttpServiceValidatePublication(ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) !bool {
+    const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    return try svc.validatePublication(contract);
+}
+
+fn metadataHttpServiceValidateTablePublication(ptr: *anyopaque, contract: metadata_api.CatalogTablePublicationContract) !bool {
+    const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    return try svc.validateTablePublication(contract);
+}
+
 fn metadataServerAdminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
     const srv: *metadata_server.MetadataServer = @ptrCast(@alignCast(ptr));
     return try srv.adminSnapshot();
@@ -344,6 +643,16 @@ fn metadataServerAdminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
 fn metadataServerFreeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
     const srv: *metadata_server.MetadataServer = @ptrCast(@alignCast(ptr));
     srv.freeAdminSnapshot(snapshot);
+}
+
+fn metadataServerValidatePublication(ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) !bool {
+    const srv: *metadata_server.MetadataServer = @ptrCast(@alignCast(ptr));
+    return try srv.validatePublication(contract);
+}
+
+fn metadataServerValidateTablePublication(ptr: *anyopaque, contract: metadata_api.CatalogTablePublicationContract) !bool {
+    const srv: *metadata_server.MetadataServer = @ptrCast(@alignCast(ptr));
+    return try srv.validateTablePublication(contract);
 }
 
 fn sortRangeRefs(ranges: []const *const metadata_table_manager.RangeRecord) void {
@@ -368,6 +677,43 @@ fn rangeOverlapsSpan(range: metadata_table_manager.RangeRecord, from_key: []cons
         if (end_key.len > 0 and from_key.len > 0 and std.mem.order(u8, end_key, from_key) != .gt) return false;
     }
     return true;
+}
+
+test "transaction topology fence rejects active split transitions" {
+    const Source = struct {
+        fn snapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{.{
+                    .transition_id = 9,
+                    .attempt_epoch = 1,
+                    .source_group_id = 7001,
+                    .destination_group_id = 7002,
+                    .table_contract = .{ .table_id = 7, .table_name = "docs" },
+                }})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+        fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+    const source: CatalogSource = .{ .ptr = undefined, .vtable = &.{
+        .admin_snapshot = Source.snapshot,
+        .free_admin_snapshot = Source.free,
+    } };
+    try std.testing.expectError(error.TopologyChanged, validateTransactionTopologyStable(source, "docs"));
 }
 
 fn findMergedGroupStatus(statuses: []const metadata_reconciler.MergedGroupStatus, group_id: u64) ?metadata_reconciler.MergedGroupStatus {

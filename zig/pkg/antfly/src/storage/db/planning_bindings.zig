@@ -52,22 +52,30 @@ fn validateTextBindings(
     const needs_primary_text_index = preflightRequestNeedsPrimaryTextIndex(req);
     if (needs_primary_text_index) {
         const entry = core.textIndexEntry(req.index_name) orelse return error.IndexNotFound;
-        if (req.full_text) |full_text| {
-            try validateTextQueryAgainstIndex(entry, full_text);
-        }
-        if (!query_search.isDefaultMatchAll(req.query) and query_search.isTextQuery(req.query)) {
-            try validateTopLevelQueryAgainstTextIndex(entry, req.query);
-        }
-        if (req.filter_query_json.len > 0) {
-            try validateTextQueryJsonAgainstIndex(alloc, entry, req.filter_query_json);
-        }
-        if (req.exclusion_query_json.len > 0) {
-            try validateTextQueryJsonAgainstIndex(alloc, entry, req.exclusion_query_json);
+        {
+            entry.lockAnalysisShared();
+            defer entry.unlockAnalysisShared();
+            if (req.full_text) |full_text| {
+                try validateTextQueryAgainstIndex(entry, full_text);
+            }
+            if (!query_search.isDefaultMatchAll(req.query) and query_search.isTextQuery(req.query)) {
+                try validateTopLevelQueryAgainstTextIndex(entry, req.query);
+            }
+            if (req.filter_query_json.len > 0) {
+                try validateTextQueryJsonAgainstIndex(alloc, entry, req.filter_query_json);
+            }
+            if (req.exclusion_query_json.len > 0) {
+                try validateTextQueryJsonAgainstIndex(alloc, entry, req.exclusion_query_json);
+            }
         }
     }
     for (req.full_text_queries) |query| {
         const entry = core.textIndexEntry(query.index_name) orelse return error.IndexNotFound;
-        try validateTextQueryAgainstIndex(entry, query.query);
+        {
+            entry.lockAnalysisShared();
+            defer entry.unlockAnalysisShared();
+            try validateTextQueryAgainstIndex(entry, query.query);
+        }
     }
 }
 

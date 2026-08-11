@@ -609,6 +609,9 @@ const JsonTransactionRecoveryStats = struct {
 
 const JsonTextMergeStats = struct {
     enabled: bool,
+    active_indexes: u64,
+    active_segments: u64,
+    max_active_segments_per_index: u64,
     pending_indexes: u64,
     pending_segments: u64,
     pending_bytes: u64,
@@ -3889,6 +3892,9 @@ fn jsonDBStatsProjection(stats: db_mod.types.DBStats, indexes: []JsonDBIndexStat
         },
         .text_merge = .{
             .enabled = stats.text_merge.enabled,
+            .active_indexes = stats.text_merge.active_indexes,
+            .active_segments = stats.text_merge.active_segments,
+            .max_active_segments_per_index = stats.text_merge.max_active_segments_per_index,
             .pending_indexes = stats.text_merge.pending_indexes,
             .pending_segments = stats.text_merge.pending_segments,
             .pending_bytes = stats.text_merge.pending_bytes,
@@ -4053,6 +4059,8 @@ pub export fn antfly_db_search_json(
             if (full_result) |*value| value.deinit();
         }
         if (!agg_source_is_full) {
+            if (result.total_hits > aggregations_mod.max_aggregation_source_hits)
+                return capi.mapError(error.QueryCandidateBudgetExceeded);
             var agg_req = req;
             agg_req.offset = 0;
             agg_req.limit = if (result.total_hits == 0) 1 else result.total_hits;

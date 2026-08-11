@@ -79,6 +79,121 @@ pub const LinearNoBiasTripleResult = struct {
     third: CT,
 };
 
+pub const DotGeneral2DManyRequest = struct {
+    allocator: std.mem.Allocator,
+    lhs: []const CT,
+    rhs: []const CT,
+    m: usize,
+    n: usize,
+    k: usize,
+    rhs_contract_axis: u32,
+};
+
+pub const DotGeneral2DManyResult = struct {
+    outputs: []CT,
+};
+
+/// Backend-neutral inputs for a device-resident AdamW update.  Bias
+/// correction belongs to each parameter because conditional optimizer
+/// families can advance at different rates.
+pub const TrainingAdamWBatchInput = struct {
+    weight: CT,
+    grad: CT,
+    m: CT,
+    v: CT,
+    elem_count: usize,
+    bias_correction1: f32,
+    bias_correction2: f32,
+};
+
+pub const TrainingAdamWBatchOptions = struct {
+    lr: f32,
+    beta1: f32,
+    beta2: f32,
+    eps: f32,
+    weight_decay: f32,
+    grad_scale: f32 = 1.0,
+};
+
+pub const TrainingSumSquaresInput = struct {
+    tensor: CT,
+    elem_count: usize,
+};
+
+pub const MaskedBceWithLogitsRequest = struct {
+    logits: CT,
+    labels: CT,
+    mask: CT,
+    positive_weight: f32,
+    negative_weight: f32,
+    eps: f32,
+    mean_reduction: bool,
+    output_shape: []const i64,
+};
+
+pub const MaskedBceWithLogitsBackwardRequest = struct {
+    logits: CT,
+    labels: CT,
+    mask: CT,
+    upstream: CT,
+    positive_weight: f32,
+    negative_weight: f32,
+    eps: f32,
+    mean_reduction: bool,
+    logits_shape: []const i64,
+};
+
+pub const LoraLinearBranchResult = struct {
+    after_a: CT,
+    after_b: CT,
+    output: CT,
+};
+
+pub const LoraLinearBranchRequest = struct {
+    input: CT,
+    base: CT,
+    lora_a: CT,
+    lora_b: CT,
+    rows: usize,
+    in_dim: usize,
+    rank: usize,
+    out_dim: usize,
+    scale: f32,
+};
+
+pub const LoraLinearBackwardResult = struct {
+    grad_after_a: CT,
+    grad_a: CT,
+    grad_b: CT,
+};
+
+pub const LoraLinearBackwardBResult = struct {
+    grad_after_a: CT,
+    grad_b_transposed: CT,
+};
+
+pub const LoraLinearBackwardRequest = struct {
+    input: CT,
+    after_a: CT,
+    lora_b: CT,
+    output_grad: CT,
+    rows: usize,
+    in_dim: usize,
+    rank: usize,
+    out_dim: usize,
+    scale: f32,
+};
+
+pub const LoraLinearBackwardBRequest = struct {
+    after_a: CT,
+    lora_b: CT,
+    output_grad: CT,
+    rows: usize,
+    rank: usize,
+    out_dim: usize,
+    scale: f32,
+};
+
 pub const LinearPlannedRequest = struct {
     input: CT,
     weight: CT,
@@ -378,9 +493,15 @@ pub const DecoderRuntimeApplyLinearPairRequest = backend_contracts.DecoderRuntim
 pub const DecoderRuntimeApplyLinearQkvRequest = backend_contracts.DecoderRuntimeApplyLinearQkvRequest;
 pub const DecoderRuntimeActivationKind = backend_contracts.DecoderRuntimeActivationKind;
 pub const DecoderRuntimeApplyActivationRequest = backend_contracts.DecoderRuntimeApplyActivationRequest;
+pub const DecoderRuntimeApplyGeluBackwardRequest = backend_contracts.DecoderRuntimeApplyGeluBackwardRequest;
+pub const DecoderRuntimeFfnGeluBackwardChainRequest = backend_contracts.DecoderRuntimeFfnGeluBackwardChainRequest;
+pub const DecoderRuntimeFfnGeluBackwardChainResult = backend_contracts.DecoderRuntimeFfnGeluBackwardChainResult;
+pub const DecoderRuntimeFfnGeluBackwardOutputResult = backend_contracts.DecoderRuntimeFfnGeluBackwardOutputResult;
 pub const DecoderRuntimeApplyAddRequest = backend_contracts.DecoderRuntimeApplyAddRequest;
 pub const DecoderRuntimeApplyAddScaleRequest = backend_contracts.DecoderRuntimeApplyAddScaleRequest;
 pub const DecoderRuntimeApplyScaledAddScaleRequest = backend_contracts.DecoderRuntimeApplyScaledAddScaleRequest;
+pub const DecoderRuntimeApplyMultiplyAddRequest = backend_contracts.DecoderRuntimeApplyMultiplyAddRequest;
+pub const DecoderRuntimeApplyMultiplyAdd2Request = backend_contracts.DecoderRuntimeApplyMultiplyAdd2Request;
 pub const RunDenseFfnResidualRequest = backend_contracts.RunDenseFfnResidualRequest;
 pub const RunGatedFfnResidualRequest = backend_contracts.RunGatedFfnResidualRequest;
 pub const RunAttentionRequest = backend_contracts.RunAttentionRequest;
@@ -444,6 +565,11 @@ pub const NativeQuantTimingStats = struct {
     metal_tensor_device_owned_buffers_released: u64 = 0,
     metal_tensor_device_owned_live_bytes: u64 = 0,
     metal_tensor_device_owned_peak_live_bytes: u64 = 0,
+    metal_tensor_device_owned_peak_lt_256kb_bytes: u64 = 0,
+    metal_tensor_device_owned_peak_256kb_1mb_bytes: u64 = 0,
+    metal_tensor_device_owned_peak_1mb_4mb_bytes: u64 = 0,
+    metal_tensor_device_owned_peak_4mb_16mb_bytes: u64 = 0,
+    metal_tensor_device_owned_peak_ge_16mb_bytes: u64 = 0,
     metal_tensor_host_mirror_allocations: u64 = 0,
     metal_tensor_host_mirror_frees: u64 = 0,
     metal_tensor_host_mirror_live_bytes: u64 = 0,
@@ -476,6 +602,11 @@ pub const NativeQuantTimingStats = struct {
     metal_runtime_scratch_pool_slots: u64 = 0,
     metal_runtime_scratch_pool_in_use_slots: u64 = 0,
     metal_runtime_scratch_pool_pending_slots: u64 = 0,
+    metal_runtime_reuse_pool_bytes: u64 = 0,
+    metal_runtime_reuse_pool_slots: u64 = 0,
+    metal_runtime_reuse_pool_peak_slots: u64 = 0,
+    metal_runtime_reuse_alloc_count: u64 = 0,
+    metal_runtime_reuse_hit_count: u64 = 0,
     metal_runtime_attention_span_bytes: u64 = 0,
     metal_runtime_hidden_state_bytes: u64 = 0,
     metal_runtime_frame_retained_bytes: u64 = 0,
@@ -846,6 +977,29 @@ pub const BackendDebugTimingSnapshot = struct {
     quant: QuantExecutionTimingStats = .{},
 };
 
+/// Backend-neutral counters for one compiled training step. CUDA populates
+/// these from its driver/runtime accounting; other backends return zeros.
+pub const TrainingRuntimeStats = struct {
+    device_allocations: u64 = 0,
+    device_frees: u64 = 0,
+    h2d_bytes: u64 = 0,
+    d2h_bytes: u64 = 0,
+    largest_d2h_transfer_bytes: u64 = 0,
+    to_float32_calls: u64 = 0,
+    download_alloc_calls: u64 = 0,
+    stream_synchronizations: u64 = 0,
+    upload_synchronizations: u64 = 0,
+    temp_cache_hits: u64 = 0,
+    temp_cache_misses: u64 = 0,
+    kernel_launches: u64 = 0,
+    packed_attention_forward_calls: u64 = 0,
+    packed_attention_backward_calls: u64 = 0,
+    exact_gelu_forward_calls: u64 = 0,
+    exact_gelu_backward_calls: u64 = 0,
+    training_input_uploads: u64 = 0,
+    training_input_upload_bytes: u64 = 0,
+};
+
 pub const DecoderRuntimePrepareReuseResult = backend_contracts.DecoderRuntimePrepareReuseResult;
 pub const AttentionContext = backend_contracts.AttentionContext;
 pub const DecoderRuntimeDecodeContract = backend_contracts.DecoderRuntimeDecodeContract;
@@ -1021,6 +1175,7 @@ pub const ComputeBackend = struct {
         prefetchWeightHint: *const fn (ctx: *anyopaque, name: []const u8, hint: u32) void,
         drainPrefetchBudget: *const fn (ctx: *anyopaque, max_items: usize) void,
         debugProfileCheckpoint: ?*const fn (ctx: *anyopaque, label: []const u8, layer: usize) void = null,
+        trainingRuntimeStats: ?*const fn (ctx: *anyopaque) TrainingRuntimeStats = null,
 
         /// Embedding table lookup: weight[ids[i]] for each i. Returns [total, dim].
         embeddingLookup: *const fn (ctx: *anyopaque, weight: CT, ids: []const i64, total: usize, dim: usize) anyerror!CT,
@@ -1056,6 +1211,7 @@ pub const ComputeBackend = struct {
         /// takes the first encoder hidden row by a host words_mask into
         /// [batch * num_words, hidden_size].
         glinerWordEmbeddings: ?*const fn (ctx: *anyopaque, request: *const GlinerWordEmbeddingsRequest) anyerror!?CT = null,
+        preferEagerQuantMirrors: ?*const fn (ctx: *anyopaque, enabled: bool) void = null,
 
         /// GLiNER-specific CountLSTM GRU step plus skip connection:
         /// returns `gru(label_embeddings, pos0) + label_embeddings` as
@@ -1235,6 +1391,25 @@ pub const ComputeBackend = struct {
             out_dim: usize,
         ) anyerror!CT = null,
 
+        /// Training LoRA branch:
+        /// after_a = input @ lora_a^T
+        /// after_b = after_a @ lora_b^T
+        /// output = base + after_b * scale
+        ///
+        /// Returns all intermediates because the autodiff graph may consume
+        /// them later when accumulating adapter gradients.
+        loraLinearBranch: ?*const fn (ctx: *anyopaque, request: *const LoraLinearBranchRequest) anyerror!?LoraLinearBranchResult = null,
+
+        /// Training LoRA backward branch:
+        /// grad_b = scale * output_grad^T @ after_a
+        /// grad_a = scale * (output_grad @ lora_b)^T @ input
+        loraLinearBackward: ?*const fn (ctx: *anyopaque, request: *const LoraLinearBackwardRequest) anyerror!?LoraLinearBackwardResult = null,
+
+        /// B-side LoRA backward branch in graph-native layout:
+        /// grad_after_a = scale * output_grad @ lora_b
+        /// grad_b_transposed = scale * after_a^T @ output_grad
+        loraLinearBackwardB: ?*const fn (ctx: *anyopaque, request: *const LoraLinearBackwardBRequest) anyerror!?LoraLinearBackwardBResult = null,
+
         /// Split a rank-2 [rows, 3*dim] tensor into three [rows, dim] tensors
         /// along the last dimension. Backends may implement this without a host
         /// round-trip; otherwise the wrapper falls back to toFloat32+copy.
@@ -1324,6 +1499,13 @@ pub const ComputeBackend = struct {
         /// the input is at last use.
         layerNormConsumeInput: ?*const fn (ctx: *anyopaque, input: CT, gamma: CT, beta: CT, dim: usize, eps: f32) anyerror!?CT = null,
 
+        /// Backward of `fused_layer_norm` over the last axis. Inputs are the
+        /// forward input, gamma, beta, and the upstream adjoint dy. Returns the
+        /// packed adjoint `[rows + 2, dim]`: rows 0..rows = d_input, row `rows`
+        /// = d_gamma, row `rows+1` = d_beta. Optional; backends without it fall
+        /// back to the lowered (decomposed) backward.
+        layerNormBackward: ?*const fn (ctx: *anyopaque, input: CT, gamma: CT, beta: CT, dy: CT, dim: usize, eps: f32) anyerror!CT = null,
+
         /// RMS normalization: x * rsqrt(mean(x^2) + eps) * weight. No bias, no mean subtraction.
         rmsNorm: *const fn (ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32) anyerror!CT,
 
@@ -1339,6 +1521,10 @@ pub const ComputeBackend = struct {
 
         /// GELU activation (element-wise).
         gelu: *const fn (ctx: *anyopaque, input: CT) anyerror!CT,
+
+        /// Exact-erf GELU used by DeBERTa. Without this hook the graph
+        /// interpreter must materialize the complete activation on the host.
+        geluExact: ?*const fn (ctx: *anyopaque, input: CT) anyerror!CT = null,
 
         /// Tanh-approximate GELU activation used by GGUF `gelu_pytorch_tanh`.
         geluNew: ?*const fn (ctx: *anyopaque, input: CT) anyerror!CT = null,
@@ -1456,6 +1642,26 @@ pub const ComputeBackend = struct {
         /// Q_r/K_r are [2*seq_len-1, num_heads*head_dim].
         /// Returns [batch*seq_len, num_heads*head_dim].
         disentangledRelativeAttention: *const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, Q_r: CT, K_r: CT, mask: []const i64, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT,
+
+        /// Optional accelerator-native packed form. This avoids materializing
+        /// five slices and downloading the additive attention bias merely to
+        /// reconstruct a padding mask. qkv is [Q;K;V], qr_kr is [Qr;Kr], and
+        /// attn_bias is a hard validity mask in the existing
+        /// [batch*heads, seq, seq] device tensor: values >= -1e8 are valid and
+        /// values < -1e8 are masked. Finite additive score biases are not
+        /// supported by this packed operation.
+        disentangledRelativeAttentionPacked: ?*const fn (ctx: *anyopaque, qkv: CT, qr_kr: CT, attn_bias: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT = null,
+
+        /// VJP of disentangledRelativeAttention. Given the same inputs plus the
+        /// upstream gradient dO ([batch*seq_len, num_heads*head_dim]), returns
+        /// the packed gradients stacked on axis 0:
+        ///   [dQ (batch*seq rows) ; dK (batch*seq) ; dV (batch*seq) ;
+        ///    dQ_r (2*seq-1) ; dK_r (2*seq-1)]  → [3*batch*seq + 2*(2*seq-1), H].
+        disentangledRelativeAttentionBackward: *const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, Q_r: CT, K_r: CT, mask: []const i64, dO: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT,
+
+        /// Packed/mask counterpart of disentangledRelativeAttentionBackward;
+        /// attn_bias has the same mask-only threshold contract as the forward op.
+        disentangledRelativeAttentionBackwardPacked: ?*const fn (ctx: *anyopaque, qkv: CT, qr_kr: CT, attn_bias: CT, dO: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT = null,
 
         /// Optional destructive softmax over the last dimension. When this
         /// returns a tensor, the backend may have reused `input`'s storage, so
@@ -1605,9 +1811,24 @@ pub const ComputeBackend = struct {
         /// Return a caller-owned logical tensor shape when the backend can report one.
         tensorShape: ?*const fn (ctx: *anyopaque, tensor: CT, allocator: std.mem.Allocator) anyerror![]i64 = null,
 
+        /// Return whether the tensor's logical shape matches the provided
+        /// shape without requiring a caller-owned shape allocation.
+        tensorShapeMatches: ?*const fn (ctx: *anyopaque, tensor: CT, shape: []const i64) anyerror!?bool = null,
+
         /// Force backend completion for work producing this tensor.
         /// Backends may leave this null if they do not support explicit sync.
         evalTensor: ?*const fn (ctx: *anyopaque, tensor: CT) anyerror!void = null,
+
+        // Device-resident training capability.  These operations deliberately
+        // live on ComputeBackend instead of a concrete Metal/CUDA type so the
+        // generic autodiff trainer can retain parameters, gradients and Adam
+        // state without knowing which accelerator owns them.
+        trainingOverwriteF32: ?*const fn (ctx: *anyopaque, tensor: CT, data: []const f32, shape: []const i32) anyerror!void = null,
+        trainingZeroF32: ?*const fn (ctx: *anyopaque, elem_count: usize, shape: []const i32) anyerror!CT = null,
+        trainingAccumulateF32: ?*const fn (ctx: *anyopaque, accum: CT, grad: CT, elem_count: usize, scale: f32, first: bool) anyerror!void = null,
+        trainingAdamWManyF32: ?*const fn (ctx: *anyopaque, inputs: []const TrainingAdamWBatchInput, opts: TrainingAdamWBatchOptions) anyerror!void = null,
+        trainingSumSquaresManyF32: ?*const fn (ctx: *anyopaque, inputs: []const TrainingSumSquaresInput) anyerror!f32 = null,
+        trainingSynchronize: ?*const fn (ctx: *anyopaque) anyerror!void = null,
 
         /// Return the argmax token id from the last row of a [rows, dim] tensor.
         /// Backends may return null when they do not provide a specialized path.
@@ -1865,6 +2086,18 @@ pub const ComputeBackend = struct {
         /// Apply an activation inside the backend-owned decoder runtime.
         decoderRuntimeApplyActivation: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyActivationRequest) anyerror!?CT = null,
 
+        /// Apply tanh-approx GELU backward inside the backend runtime:
+        /// output = upstream_grad * d/dx(gelu(input)).
+        decoderRuntimeApplyGeluBackward: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyGeluBackwardRequest) anyerror!?CT = null,
+
+        /// Execute the hot DeBERTa FFN backward strip as one backend runtime
+        /// unit while returning each graph-visible intermediate.
+        decoderRuntimeFfnGeluBackwardChain: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeFfnGeluBackwardChainRequest) anyerror!?DecoderRuntimeFfnGeluBackwardChainResult = null,
+
+        /// Execute the rank-1 DeBERTa FFN backward strip while returning only
+        /// the first branch and final output nodes that remain graph-visible.
+        decoderRuntimeFfnGeluBackwardOutput: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeFfnGeluBackwardChainRequest) anyerror!?DecoderRuntimeFfnGeluBackwardOutputResult = null,
+
         /// Apply elementwise add inside the backend-owned decoder runtime.
         decoderRuntimeApplyAdd: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyAddRequest) anyerror!?CT = null,
 
@@ -1873,6 +2106,12 @@ pub const ComputeBackend = struct {
 
         /// Apply `(lhs * lhs_scale + rhs) * output_scale` inside the backend runtime.
         decoderRuntimeApplyScaledAddScale: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyScaledAddScaleRequest) anyerror!?CT = null,
+
+        /// Apply `lhs * rhs + addend` inside the backend runtime.
+        decoderRuntimeApplyMultiplyAdd: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyMultiplyAddRequest) anyerror!?CT = null,
+
+        /// Apply `lhs0 * rhs0 + lhs1 * rhs1` inside the backend runtime.
+        decoderRuntimeApplyMultiplyAdd2: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyMultiplyAdd2Request) anyerror!?CT = null,
 
         /// Apply a two-linear FFN strip (`linear -> activation -> linear ->
         /// residual add`) inside one backend-owned whole-token submission and
@@ -1978,8 +2217,13 @@ pub const ComputeBackend = struct {
         broadcastInDimOp: ?*const fn (ctx: *anyopaque, input: CT, target_shape: []const i64, broadcast_axes: []const u8, input_shape: []const i64) anyerror!CT = null,
         /// Generalized dot product (matmul with contracting/batch dims).
         dotGeneralOp: ?*const fn (ctx: *anyopaque, lhs: CT, rhs: CT, lhs_shape: []const i64, rhs_shape: []const i64, lhs_contracting: []const u8, rhs_contracting: []const u8, lhs_batch: []const u8, rhs_batch: []const u8) anyerror!CT = null,
+        /// Group several same-shape 2D dot products in one backend runtime call.
+        dotGeneral2DMany: ?*const fn (ctx: *anyopaque, request: *const DotGeneral2DManyRequest) anyerror!?DotGeneral2DManyResult = null,
         /// Scatter-add: accumulate updates into a zeroed output using indices.
         scatterAddOp: ?*const fn (ctx: *anyopaque, input: CT, indices: CT, input_shape: []const i64, indices_shape: []const i64, axis: u8) anyerror!CT = null,
+        /// Gather rows from `input + bias` without materializing the full
+        /// bias-added table. Bias is applied along the last dimension.
+        gatherAddBiasAxis0Op: ?*const fn (ctx: *anyopaque, input: CT, bias: CT, indices: CT, input_shape: []const i64) anyerror!?CT = null,
         /// Gather elements along an axis using indices.
         gatherOp: ?*const fn (ctx: *anyopaque, input: CT, indices: CT, axis: u8, input_shape: []const i64) anyerror!CT = null,
         /// Slice a tensor with starts/limits/strides per axis.
@@ -1992,6 +2236,10 @@ pub const ComputeBackend = struct {
         /// Log-softmax along last dimension: x - max - log(sum(exp(x-max))).
         /// `last_dim_size` is the size of the last dimension (not an axis index).
         logSoftmaxOp: ?*const fn (ctx: *anyopaque, input: CT, last_dim_size: u32) anyerror!CT = null,
+        /// GLiNER-style masked BCE-with-logits scalar loss.
+        maskedBceWithLogitsLoss: ?*const fn (ctx: *anyopaque, request: *const MaskedBceWithLogitsRequest) anyerror!CT = null,
+        /// Gradient of masked BCE-with-logits with respect to logits.
+        maskedBceWithLogitsBackward: ?*const fn (ctx: *anyopaque, request: *const MaskedBceWithLogitsBackwardRequest) anyerror!CT = null,
 
         /// Download multiple tensors to f32 in a single backend round-trip.
         /// Backends that support batched eval (e.g. a backend eval with a vector of
@@ -2132,6 +2380,12 @@ pub const ComputeBackend = struct {
         return null;
     }
 
+    /// Prefer bounded dense mirrors for large-row eager quantized linears.
+    /// Backends that do not support this optimization ignore the hint.
+    pub fn preferEagerQuantMirrors(self: *const ComputeBackend, enabled: bool) void {
+        if (self.vtable.preferEagerQuantMirrors) |op| op(self.ptr, enabled);
+    }
+
     pub fn glinerLabelGruCombined(self: *const ComputeBackend, label_embeddings: CT, num_labels: usize, hidden_size: usize) !?CT {
         if (self.vtable.glinerLabelGruCombined) |op| {
             return op(self.ptr, &.{
@@ -2234,6 +2488,21 @@ pub const ComputeBackend = struct {
             return op(self.ptr, input, base_weight, bias, lora_a, lora_b, alpha, rank, rows, in_dim, out_dim);
         }
         return fallbackLinearLoRA(self, input, base_weight, bias, lora_a, lora_b, alpha, rank, rows, in_dim, out_dim);
+    }
+
+    pub fn loraLinearBranch(self: *const ComputeBackend, request: *const LoraLinearBranchRequest) !?LoraLinearBranchResult {
+        const op = self.vtable.loraLinearBranch orelse return null;
+        return op(self.ptr, request);
+    }
+
+    pub fn loraLinearBackward(self: *const ComputeBackend, request: *const LoraLinearBackwardRequest) !?LoraLinearBackwardResult {
+        const op = self.vtable.loraLinearBackward orelse return null;
+        return op(self.ptr, request);
+    }
+
+    pub fn loraLinearBackwardB(self: *const ComputeBackend, request: *const LoraLinearBackwardBRequest) !?LoraLinearBackwardBResult {
+        const op = self.vtable.loraLinearBackwardB orelse return null;
+        return op(self.ptr, request);
     }
 
     pub fn zeroTensor(self: *const ComputeBackend, rows: usize, dim: usize) !?CT {
@@ -2683,6 +2952,11 @@ pub const ComputeBackend = struct {
         return null;
     }
 
+    pub fn layerNormBackward(self: *const ComputeBackend, input: CT, gamma: CT, beta: CT, dy: CT, dim: usize, eps: f32) !?CT {
+        if (self.vtable.layerNormBackward) |f| return try f(self.ptr, input, gamma, beta, dy, dim, eps);
+        return null;
+    }
+
     pub fn addLayerNorm(self: *const ComputeBackend, a: CT, b: CT, gamma: CT, beta: CT, dim: usize, eps: f32) !?CT {
         if (self.vtable.addLayerNorm) |f| return f(self.ptr, a, b, gamma, beta, dim, eps);
         return null;
@@ -2704,6 +2978,11 @@ pub const ComputeBackend = struct {
 
     pub fn gelu(self: *const ComputeBackend, input: CT) !CT {
         return self.vtable.gelu(self.ptr, input);
+    }
+
+    pub fn geluExact(self: *const ComputeBackend, input: CT) !?CT {
+        const op = self.vtable.geluExact orelse return null;
+        return try op(self.ptr, input);
     }
 
     pub fn geluNew(self: *const ComputeBackend, input: CT) !CT {
@@ -2890,8 +3169,22 @@ pub const ComputeBackend = struct {
         return self.vtable.relativePositionBias(self.ptr, weight, q_len, k_len, num_heads, num_buckets, max_distance, bidirectional);
     }
 
+    pub fn disentangledRelativeAttentionBackward(self: *const ComputeBackend, Q: CT, K: CT, V: CT, Q_r: CT, K_r: CT, mask: []const i64, dO: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !CT {
+        return self.vtable.disentangledRelativeAttentionBackward(self.ptr, Q, K, V, Q_r, K_r, mask, dO, batch, seq_len, num_heads, head_dim);
+    }
+
+    pub fn disentangledRelativeAttentionBackwardPacked(self: *const ComputeBackend, qkv: CT, qr_kr: CT, attn_bias: CT, dO: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !?CT {
+        const op = self.vtable.disentangledRelativeAttentionBackwardPacked orelse return null;
+        return try op(self.ptr, qkv, qr_kr, attn_bias, dO, batch, seq_len, num_heads, head_dim);
+    }
+
     pub fn disentangledRelativeAttention(self: *const ComputeBackend, Q: CT, K: CT, V: CT, Q_r: CT, K_r: CT, mask: []const i64, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !CT {
         return self.vtable.disentangledRelativeAttention(self.ptr, Q, K, V, Q_r, K_r, mask, batch, seq_len, num_heads, head_dim);
+    }
+
+    pub fn disentangledRelativeAttentionPacked(self: *const ComputeBackend, qkv: CT, qr_kr: CT, attn_bias: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !?CT {
+        const op = self.vtable.disentangledRelativeAttentionPacked orelse return null;
+        return try op(self.ptr, qkv, qr_kr, attn_bias, batch, seq_len, num_heads, head_dim);
     }
 
     pub fn softmaxConsume(self: *const ComputeBackend, input: CT, dim: u32) !?CT {
@@ -3136,6 +3429,44 @@ pub const ComputeBackend = struct {
         return self.vtable.toFloat32(self.ptr, tensor, allocator);
     }
 
+    pub fn supportsDeviceTraining(self: *const ComputeBackend) bool {
+        return self.vtable.trainingOverwriteF32 != null and
+            self.vtable.trainingZeroF32 != null and
+            self.vtable.trainingAccumulateF32 != null and
+            self.vtable.trainingAdamWManyF32 != null and
+            self.vtable.trainingSumSquaresManyF32 != null;
+    }
+
+    pub fn trainingOverwriteF32(self: *const ComputeBackend, tensor: CT, data: []const f32, shape: []const i32) !void {
+        const op = self.vtable.trainingOverwriteF32 orelse return error.DeviceTrainingUnavailable;
+        return op(self.ptr, tensor, data, shape);
+    }
+
+    pub fn trainingZeroF32(self: *const ComputeBackend, elem_count: usize, shape: []const i32) !CT {
+        const op = self.vtable.trainingZeroF32 orelse return error.DeviceTrainingUnavailable;
+        return op(self.ptr, elem_count, shape);
+    }
+
+    pub fn trainingAccumulateF32(self: *const ComputeBackend, accum: CT, grad: CT, elem_count: usize, scale: f32, first: bool) !void {
+        const op = self.vtable.trainingAccumulateF32 orelse return error.DeviceTrainingUnavailable;
+        return op(self.ptr, accum, grad, elem_count, scale, first);
+    }
+
+    pub fn trainingAdamWManyF32(self: *const ComputeBackend, inputs: []const TrainingAdamWBatchInput, opts: TrainingAdamWBatchOptions) !void {
+        const op = self.vtable.trainingAdamWManyF32 orelse return error.DeviceTrainingUnavailable;
+        return op(self.ptr, inputs, opts);
+    }
+
+    pub fn trainingSumSquaresManyF32(self: *const ComputeBackend, inputs: []const TrainingSumSquaresInput) !f32 {
+        const op = self.vtable.trainingSumSquaresManyF32 orelse return error.DeviceTrainingUnavailable;
+        return op(self.ptr, inputs);
+    }
+
+    pub fn trainingSynchronize(self: *const ComputeBackend) !void {
+        const op = self.vtable.trainingSynchronize orelse return;
+        return op(self.ptr);
+    }
+
     pub fn exportTensorData(self: *const ComputeBackend, tensor: CT, allocator: std.mem.Allocator) !?ExportTensorData {
         if (self.vtable.exportTensorData) |export_tensor_data| {
             return export_tensor_data(self.ptr, tensor, allocator);
@@ -3189,6 +3520,13 @@ pub const ComputeBackend = struct {
             return tensor_shape(self.ptr, tensor, allocator);
         }
         return error.UnsupportedShape;
+    }
+
+    pub fn tensorShapeMatches(self: *const ComputeBackend, tensor: CT, shape: []const i64) !?bool {
+        if (self.vtable.tensorShapeMatches) |tensor_shape_matches| {
+            return tensor_shape_matches(self.ptr, tensor, shape);
+        }
+        return null;
     }
 
     pub fn evalTensor(self: *const ComputeBackend, tensor: CT) !void {
@@ -3454,6 +3792,11 @@ pub const ComputeBackend = struct {
         return .{};
     }
 
+    pub fn trainingRuntimeStats(self: *const ComputeBackend) TrainingRuntimeStats {
+        if (self.vtable.trainingRuntimeStats) |op| return op(self.ptr);
+        return .{};
+    }
+
     pub fn resetDebugTimingStats(self: *const ComputeBackend) void {
         if (self.vtable.resetDebugTimingStats) |op| {
             op(self.ptr);
@@ -3628,6 +3971,27 @@ pub const ComputeBackend = struct {
         return null;
     }
 
+    pub fn decoderRuntimeApplyGeluBackward(self: *const ComputeBackend, request: *const DecoderRuntimeApplyGeluBackwardRequest) !?CT {
+        if (self.vtable.decoderRuntimeApplyGeluBackward) |op| {
+            return op(self.ptr, request);
+        }
+        return null;
+    }
+
+    pub fn decoderRuntimeFfnGeluBackwardChain(self: *const ComputeBackend, request: *const DecoderRuntimeFfnGeluBackwardChainRequest) !?DecoderRuntimeFfnGeluBackwardChainResult {
+        if (self.vtable.decoderRuntimeFfnGeluBackwardChain) |op| {
+            return op(self.ptr, request);
+        }
+        return null;
+    }
+
+    pub fn decoderRuntimeFfnGeluBackwardOutput(self: *const ComputeBackend, request: *const DecoderRuntimeFfnGeluBackwardChainRequest) !?DecoderRuntimeFfnGeluBackwardOutputResult {
+        if (self.vtable.decoderRuntimeFfnGeluBackwardOutput) |op| {
+            return op(self.ptr, request);
+        }
+        return null;
+    }
+
     pub fn decoderRuntimeApplyAdd(self: *const ComputeBackend, request: *const DecoderRuntimeApplyAddRequest) !?CT {
         if (self.vtable.decoderRuntimeApplyAdd) |op| {
             return op(self.ptr, request);
@@ -3644,6 +4008,20 @@ pub const ComputeBackend = struct {
 
     pub fn decoderRuntimeApplyScaledAddScale(self: *const ComputeBackend, request: *const DecoderRuntimeApplyScaledAddScaleRequest) !?CT {
         if (self.vtable.decoderRuntimeApplyScaledAddScale) |op| {
+            return op(self.ptr, request);
+        }
+        return null;
+    }
+
+    pub fn decoderRuntimeApplyMultiplyAdd(self: *const ComputeBackend, request: *const DecoderRuntimeApplyMultiplyAddRequest) !?CT {
+        if (self.vtable.decoderRuntimeApplyMultiplyAdd) |op| {
+            return op(self.ptr, request);
+        }
+        return null;
+    }
+
+    pub fn decoderRuntimeApplyMultiplyAdd2(self: *const ComputeBackend, request: *const DecoderRuntimeApplyMultiplyAdd2Request) !?CT {
+        if (self.vtable.decoderRuntimeApplyMultiplyAdd2) |op| {
             return op(self.ptr, request);
         }
         return null;
@@ -3852,6 +4230,10 @@ pub const ComputeBackend = struct {
         if (self.vtable.dotGeneralOp) |f| return f(self.ptr, lhs, rhs, lhs_shape, rhs_shape, lhs_contracting, rhs_contracting, lhs_batch, rhs_batch);
         return error.UnsupportedPrimitiveOp;
     }
+    pub fn dotGeneral2DMany(self: *const ComputeBackend, request: *const DotGeneral2DManyRequest) !?DotGeneral2DManyResult {
+        if (self.vtable.dotGeneral2DMany) |f| return f(self.ptr, request);
+        return null;
+    }
     pub fn primScatterAdd(self: *const ComputeBackend, input: CT, indices: CT, input_shape: []const i64, indices_shape: []const i64, axis: u8) !CT {
         if (self.vtable.scatterAddOp) |f| return f(self.ptr, input, indices, input_shape, indices_shape, axis);
         return error.UnsupportedPrimitiveOp;
@@ -3859,6 +4241,10 @@ pub const ComputeBackend = struct {
     pub fn primGather(self: *const ComputeBackend, input: CT, indices: CT, axis: u8, input_shape: []const i64) !CT {
         if (self.vtable.gatherOp) |f| return f(self.ptr, input, indices, axis, input_shape);
         return error.UnsupportedPrimitiveOp;
+    }
+    pub fn primGatherAddBiasAxis0(self: *const ComputeBackend, input: CT, bias: CT, indices: CT, input_shape: []const i64) !?CT {
+        if (self.vtable.gatherAddBiasAxis0Op) |f| return f(self.ptr, input, bias, indices, input_shape);
+        return null;
     }
     pub fn primSlice(self: *const ComputeBackend, input: CT, starts: []const i64, limits: []const i64, strides: []const i64, input_shape: []const i64) !CT {
         if (self.vtable.sliceOp) |f| return f(self.ptr, input, starts, limits, strides, input_shape);
@@ -3874,6 +4260,14 @@ pub const ComputeBackend = struct {
     }
     pub fn primLogSoftmax(self: *const ComputeBackend, input: CT, dim: u32) !CT {
         if (self.vtable.logSoftmaxOp) |f| return f(self.ptr, input, dim);
+        return error.UnsupportedPrimitiveOp;
+    }
+    pub fn maskedBceWithLogitsLoss(self: *const ComputeBackend, request: *const MaskedBceWithLogitsRequest) !CT {
+        if (self.vtable.maskedBceWithLogitsLoss) |f| return f(self.ptr, request);
+        return error.UnsupportedPrimitiveOp;
+    }
+    pub fn maskedBceWithLogitsBackward(self: *const ComputeBackend, request: *const MaskedBceWithLogitsBackwardRequest) !CT {
+        if (self.vtable.maskedBceWithLogitsBackward) |f| return f(self.ptr, request);
         return error.UnsupportedPrimitiveOp;
     }
 };

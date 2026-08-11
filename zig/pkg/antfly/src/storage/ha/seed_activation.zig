@@ -1939,7 +1939,9 @@ test "storage.ha bound activation keeps immutable transport separate from mutabl
 
     const raw_catalog_path = try std.fs.path.join(alloc, &.{ raw_generation_path, seed_materialization.topology_name });
     defer alloc.free(raw_catalog_path);
-    const raw_before = try readFileAlloc(std.testing.io, alloc, raw_catalog_path, 1024);
+    // The checksummed catalog envelope can exceed the legacy 1 KiB fixture
+    // bound even for this single materialized generation.
+    const raw_before = try readFileAlloc(std.testing.io, alloc, raw_catalog_path, 64 * 1024);
     defer alloc.free(raw_before);
     try std.testing.expect(std.mem.indexOf(u8, raw_before, "\"generation\":\"gen-materialized\"") != null);
 
@@ -1962,7 +1964,7 @@ test "storage.ha bound activation keeps immutable transport separate from mutabl
         .expected = expected,
         .binding = binding,
     }));
-    const raw_after = try readFileAlloc(std.testing.io, alloc, raw_catalog_path, 1024);
+    const raw_after = try readFileAlloc(std.testing.io, alloc, raw_catalog_path, 64 * 1024);
     defer alloc.free(raw_after);
     try std.testing.expectEqualSlices(u8, raw_before, raw_after);
 }

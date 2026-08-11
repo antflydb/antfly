@@ -287,6 +287,7 @@ pub const Options = struct {
     input_type: []const u8 = "",
     truncate: []const u8 = "",
     dimension: u32 = 0,
+    cancellation: ?*const std.atomic.Value(bool) = null,
 };
 
 pub const Provider = struct {
@@ -382,7 +383,11 @@ pub const Provider = struct {
         const signed = try signHeadersAlloc(alloc, creds, self.options.region, host, path, json_body);
         defer freeHeaderPairs(alloc, signed);
 
-        var resp = try self.http.request(.POST, url, .{ .headers = signed, .body = json_body });
+        var resp = try self.http.request(.POST, url, .{
+            .headers = signed,
+            .body = json_body,
+            .cancellation = self.options.cancellation,
+        });
         defer resp.deinit();
         if (!resp.ok()) return mapStatus(resp.status.code);
         const response_body = resp.body orelse return error.EmptyResponse;

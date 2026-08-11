@@ -20,6 +20,7 @@ const derived_types = @import("derived/derived_types.zig");
 const docstore_mod = @import("../docstore.zig");
 const algebraic_mod = @import("algebraic/mod.zig");
 const analysis_mod = @import("../../search/analysis.zig");
+const introducer_mod = @import("../../introducer.zig");
 const search_agg_mod = @import("../../search/aggregation.zig");
 const search_mod = @import("../../search/search.zig");
 const distributed_stats_mod = @import("../../search/distributed_stats.zig");
@@ -27,6 +28,13 @@ const geo_mod = @import("../../search/geo.zig");
 const regex_mod = @import("../../search/regex.zig");
 const doc_identity = @import("doc_identity.zig");
 const doc_set = @import("doc_set.zig");
+const roaring = @import("../../encoding/roaring.zig");
+
+pub const max_aggregation_source_hits: usize = 100_000;
+const max_significant_terms_candidates: usize = 4096;
+const min_significant_terms_candidates: usize = 256;
+const significant_terms_candidate_multiplier: usize = 8;
+const max_significant_terms_memberships: usize = 1_000_000;
 
 pub const NumericRangeRequest = struct {
     name: []const u8 = "",
@@ -184,6 +192,10 @@ pub const Context = struct {
     algebraic_available: bool = false,
     algebraic_constraints: []const FixedConstraint = &.{},
     identity_read_generation: ?u64 = null,
+    /// Owned by the caller for the duration of aggregation computation. This is
+    /// used by distributed/serverless coordinators that do not have a live DB
+    /// index manager from which to acquire a generation-pinned text lease.
+    text_analysis: ?*const introducer_mod.TextAnalysisConfig = null,
     distributed_text_stats: []const distributed_stats_mod.TextFieldStats = &.{},
     distributed_background_text_stats: []const DistributedBackgroundTextStats = &.{},
 };
@@ -259,6 +271,7 @@ pub fn computeSearchAggregations(
     result: types.SearchResult,
     ctx: Context,
 ) anyerror![]SearchAggregationResult {
+    if (result.hits.len > max_aggregation_source_hits) return error.QueryCandidateBudgetExceeded;
     return try computeSearchAggregationsAtDepth(alloc, requests, result, ctx, true);
 }
 
@@ -6675,12 +6688,32 @@ fn computeSignificantTermsAggregation(
     ctx: Context,
 ) anyerror!SearchAggregationResult {
     if (request.field.len == 0) return error.InvalidAggregation;
+    const size: usize = @intCast(if (request.size > 0) request.size else 10);
+    const candidate_limit = try significantTermsCandidateLimit(size);
     const manager = ctx.index_manager;
-    const text_index = if (manager) |mgr| mgr.textIndex(ctx.full_text_index_name) else null;
-    const snapshot = if (text_index) |index| index.snapshot() else null;
+    var analyzer_fields_buf: [2][]const u8 = undefined;
+    analyzer_fields_buf[0] = request.field;
+    var analyzer_field_count: usize = 1;
+    if (request.background_query) |background_query| switch (background_query) {
+        .match => |match| if (!std.mem.eql(u8, match.field, request.field)) {
+            analyzer_fields_buf[1] = match.field;
+            analyzer_field_count = 2;
+        },
+        else => {},
+    };
+    var text_lease = if (manager) |mgr|
+        try mgr.acquireTextQueryLease(alloc, ctx.full_text_index_name, analyzer_fields_buf[0..analyzer_field_count])
+    else
+        null;
+    defer if (text_lease) |*lease| lease.deinit();
+    const snapshot = if (text_lease) |*lease| lease.snapshot else null;
+    const field_analyzer = if (text_lease) |*lease|
+        lease.analyzerForField(request.field) orelse return error.InvalidIndexConfig
+    else
+        try aggregationAnalyzerForField(ctx, request.field);
     const distributed_stats = findDistributedTextStats(ctx.distributed_text_stats, request.field);
     const distributed_background_stats = findDistributedBackgroundTextStats(ctx.distributed_background_text_stats, request.name, request.field);
-    if (text_index == null and distributed_stats == null and distributed_background_stats == null) return error.UnsupportedAggregation;
+    if (text_lease == null and distributed_stats == null and distributed_background_stats == null) return error.UnsupportedAggregation;
 
     var foreground = std.StringHashMap(i64).init(alloc);
     defer {
@@ -6688,15 +6721,7 @@ fn computeSignificantTermsAggregation(
         while (it.next()) |key| alloc.free(key.*);
         foreground.deinit();
     }
-    var grouped = std.StringHashMap(std.ArrayListUnmanaged(types.SearchHit)).init(alloc);
-    defer {
-        var it = grouped.iterator();
-        while (it.next()) |entry| entry.value_ptr.deinit(alloc);
-        grouped.deinit();
-    }
-
     const min_doc_count: i64 = if (request.min_doc_count > 0) request.min_doc_count else 1;
-    const size: usize = @intCast(if (request.size > 0) request.size else 10);
     const foreground_doc_count: i64 = @intCast(hits.len);
     var background_counts = std.StringHashMap(i64).init(alloc);
     defer {
@@ -6707,14 +6732,16 @@ fn computeSignificantTermsAggregation(
     var background_doc_count: i64 = if (distributed_stats) |stats|
         @intCast(stats.global_doc_count)
     else if (snapshot) |snap|
-        @intCast(snap.global_doc_count)
+        @intCast(snap.liveDocCount())
     else
         0;
 
-    if (request.background_query) |background_query| {
+    if (request.background_query != null) {
         if (distributed_background_stats) |stats| {
             background_doc_count = @intCast(stats.background_doc_count);
             for (stats.term_doc_freqs) |term| {
+                if (!background_counts.contains(term.term) and background_counts.count() >= candidate_limit)
+                    return error.QueryCandidateBudgetExceeded;
                 const bg_entry = try background_counts.getOrPut(term.term);
                 if (bg_entry.found_existing) {
                     bg_entry.value_ptr.* = @intCast(term.doc_freq);
@@ -6723,42 +6750,10 @@ fn computeSignificantTermsAggregation(
                     bg_entry.value_ptr.* = @intCast(term.doc_freq);
                 }
             }
-        } else {
-            const snap = snapshot orelse return error.UnsupportedAggregation;
-            var background_result = try executeBackgroundQuery(alloc, snap, background_query);
-            defer background_result.deinit();
-            background_doc_count = @intCast(background_result.total_hits);
-            for (background_result.hits) |hit| {
-                const stored = hit.stored_data orelse continue;
-                var parsed = std.json.parseFromSlice(std.json.Value, alloc, stored, .{}) catch continue;
-                defer parsed.deinit();
-                const value = extractValueAtPath(parsed.value, request.field) orelse continue;
-
-                var seen_terms = std.StringHashMap(void).init(alloc);
-                defer {
-                    var it = seen_terms.keyIterator();
-                    while (it.next()) |key| alloc.free(key.*);
-                    seen_terms.deinit();
-                }
-                try collectSignificantTermsFromValue(alloc, value, &seen_terms);
-
-                var seen_it = seen_terms.keyIterator();
-                while (seen_it.next()) |term_ptr| {
-                    const term = term_ptr.*;
-                    if (request.term_prefix.len > 0 and !std.mem.startsWith(u8, term, request.term_prefix)) continue;
-                    if (request.term_pattern.len > 0 and !(try regexMatches(alloc, request.term_pattern, term))) continue;
-                    const bg_entry = try background_counts.getOrPut(term);
-                    if (bg_entry.found_existing) {
-                        bg_entry.value_ptr.* += 1;
-                    } else {
-                        bg_entry.key_ptr.* = try alloc.dupe(u8, term);
-                        bg_entry.value_ptr.* = 1;
-                    }
-                }
-            }
-        }
+        } else _ = snapshot orelse return error.UnsupportedAggregation;
     }
 
+    var foreground_memberships: usize = 0;
     for (hits) |hit| {
         const stored = hit.stored_data orelse continue;
         var parsed = std.json.parseFromSlice(std.json.Value, alloc, stored, .{}) catch continue;
@@ -6771,7 +6766,13 @@ fn computeSignificantTermsAggregation(
             while (it.next()) |key| alloc.free(key.*);
             seen_terms.deinit();
         }
-        try collectSignificantTermsFromValue(alloc, value, &seen_terms);
+        try collectSignificantTermsFromValue(
+            alloc,
+            value,
+            field_analyzer,
+            candidate_limit,
+            &seen_terms,
+        );
 
         var it = seen_terms.keyIterator();
         while (it.next()) |term_ptr| {
@@ -6779,6 +6780,12 @@ fn computeSignificantTermsAggregation(
             if (request.term_prefix.len > 0 and !std.mem.startsWith(u8, term, request.term_prefix)) continue;
             if (request.term_pattern.len > 0 and !(try regexMatches(alloc, request.term_pattern, term))) continue;
 
+            if (!foreground.contains(term) and foreground.count() >= candidate_limit)
+                return error.QueryCandidateBudgetExceeded;
+            foreground_memberships = std.math.add(usize, foreground_memberships, 1) catch
+                return error.QueryCandidateBudgetExceeded;
+            if (foreground_memberships > max_significant_terms_memberships)
+                return error.QueryCandidateBudgetExceeded;
             const count_entry = try foreground.getOrPut(term);
             if (count_entry.found_existing) {
                 count_entry.value_ptr.* += 1;
@@ -6786,10 +6793,40 @@ fn computeSignificantTermsAggregation(
                 count_entry.key_ptr.* = try alloc.dupe(u8, term);
                 count_entry.value_ptr.* = 1;
             }
+        }
+    }
 
-            const group_entry = try grouped.getOrPut(count_entry.key_ptr.*);
-            if (!group_entry.found_existing) group_entry.value_ptr.* = .empty;
-            try group_entry.value_ptr.append(alloc, hit);
+    if (request.background_query) |background_query| {
+        if (distributed_background_stats == null) {
+            const snap = snapshot orelse return error.UnsupportedAggregation;
+            const background_analyzer: ?*const analysis_mod.Analyzer = switch (background_query) {
+                .match => |match| if (text_lease) |*lease|
+                    lease.analyzerForField(match.field) orelse return error.InvalidIndexConfig
+                else
+                    try aggregationAnalyzerForField(ctx, match.field),
+                else => null,
+            };
+            var background_docs = try executeBackgroundQueryBitmap(
+                alloc,
+                snap,
+                background_query,
+                background_analyzer,
+            );
+            defer background_docs.deinit();
+            background_doc_count = @intCast(background_docs.cardinality());
+
+            var foreground_it = foreground.keyIterator();
+            while (foreground_it.next()) |term_ptr| {
+                const term = term_ptr.*;
+                if ((foreground.get(term) orelse 0) < min_doc_count) continue;
+                const count = try snap.countFilterIntersection(alloc, .{ .term = .{
+                    .field = request.field,
+                    .term = term,
+                } }, &background_docs);
+                const bg_entry = try background_counts.getOrPut(term);
+                if (!bg_entry.found_existing) bg_entry.key_ptr.* = try alloc.dupe(u8, term);
+                bg_entry.value_ptr.* = @intCast(count);
+            }
         }
     }
 
@@ -6847,28 +6884,70 @@ fn computeSignificantTermsAggregation(
     }.lessThan);
 
     const limit = @min(size, scored.items.len);
+    var grouped = std.StringHashMap(std.ArrayListUnmanaged(types.SearchHit)).init(alloc);
+    defer {
+        var grouped_it = grouped.iterator();
+        while (grouped_it.next()) |entry| entry.value_ptr.deinit(alloc);
+        grouped.deinit();
+    }
+    if (request.aggregations.len > 0 and limit > 0) {
+        for (scored.items[0..limit]) |entry| try grouped.put(entry.key, .empty);
+        var selected_memberships: usize = 0;
+        for (hits) |hit| {
+            const stored = hit.stored_data orelse continue;
+            var parsed = std.json.parseFromSlice(std.json.Value, alloc, stored, .{}) catch continue;
+            defer parsed.deinit();
+            const value = extractValueAtPath(parsed.value, request.field) orelse continue;
+            var seen_terms = std.StringHashMap(void).init(alloc);
+            defer {
+                var seen_it = seen_terms.keyIterator();
+                while (seen_it.next()) |key| alloc.free(key.*);
+                seen_terms.deinit();
+            }
+            try collectSignificantTermsFromValue(alloc, value, field_analyzer, candidate_limit, &seen_terms);
+            var term_it = seen_terms.keyIterator();
+            while (term_it.next()) |term| {
+                const bucket_hits = grouped.getPtr(term.*) orelse continue;
+                selected_memberships = std.math.add(usize, selected_memberships, 1) catch
+                    return error.QueryCandidateBudgetExceeded;
+                if (selected_memberships > max_significant_terms_memberships)
+                    return error.QueryCandidateBudgetExceeded;
+                try bucket_hits.append(alloc, hit);
+            }
+        }
+    }
+
     var buckets = try alloc.alloc(SearchAggregationBucket, limit);
+    var buckets_filled: usize = 0;
     errdefer {
-        for (buckets) |*bucket| bucket.deinit(alloc);
+        for (buckets[0..buckets_filled]) |*bucket| bucket.deinit(alloc);
         alloc.free(buckets);
     }
     for (scored.items[0..limit], 0..) |entry, idx| {
-        const grouped_hits = grouped.get(entry.key).?.items;
-        const nested = blk: {
-            if (request.aggregations.len == 0) break :blk try alloc.alloc(SearchAggregationResult, 0);
-            break :blk try computeSearchAggregationsAtDepth(alloc, request.aggregations, .{
+        const grouped_hits: []types.SearchHit = if (request.aggregations.len > 0)
+            grouped.get(entry.key).?.items
+        else
+            @constCast((&[_]types.SearchHit{})[0..]);
+        const key_json = try std.json.Stringify.valueAlloc(alloc, entry.key, .{});
+        const nested = (if (request.aggregations.len == 0)
+            alloc.alloc(SearchAggregationResult, 0)
+        else
+            computeSearchAggregationsAtDepth(alloc, request.aggregations, .{
                 .alloc = alloc,
                 .hits = grouped_hits,
                 .total_hits = @intCast(grouped_hits.len),
-            }, ctx, false);
+            }, ctx, false)) catch |err| {
+            alloc.free(key_json);
+            return err;
         };
         buckets[idx] = .{
-            .key_json = try std.fmt.allocPrint(alloc, "\"{s}\"", .{entry.key}),
+            .key_json = key_json,
             .count = entry.fg_count,
             .score = entry.score,
             .bg_count = entry.bg_count,
             .aggregations = nested,
         };
+        buckets_filled = idx + 1;
     }
 
     return .{
@@ -6888,6 +6967,28 @@ fn computeSignificantTermsAggregation(
         ),
         .buckets = buckets,
     };
+}
+
+pub fn significantTermsCandidateLimit(size: usize) !usize {
+    if (size > max_significant_terms_candidates) return error.QueryCandidateBudgetExceeded;
+    const scaled = std.math.mul(usize, size, significant_terms_candidate_multiplier) catch
+        max_significant_terms_candidates;
+    return @min(max_significant_terms_candidates, @max(min_significant_terms_candidates, scaled));
+}
+
+fn aggregationAnalyzerForField(ctx: Context, field: []const u8) !*const analysis_mod.Analyzer {
+    const cfg = ctx.text_analysis orelse return &analysis_mod.default_analyzer;
+    var analyzer_name: ?[]const u8 = null;
+    for (cfg.field_analyzers) |item| {
+        if (!std.mem.eql(u8, item.field_name, field)) continue;
+        if (analyzer_name) |existing| {
+            if (!std.mem.eql(u8, existing, item.analyzer_name)) return error.InvalidIndexConfig;
+        } else {
+            analyzer_name = item.analyzer_name;
+        }
+    }
+    return introducer_mod.resolveAnalyzerName(analyzer_name orelse "standard", cfg.*) orelse
+        error.InvalidIndexConfig;
 }
 
 fn findDistributedTextStats(
@@ -6911,27 +7012,28 @@ fn findDistributedBackgroundTextStats(
     return null;
 }
 
-fn executeBackgroundQuery(
+fn executeBackgroundQueryBitmap(
     alloc: Allocator,
     snapshot: *const @import("../../index.zig").IndexSnapshot,
     query: BackgroundQuery,
-) !search_mod.SearchResult {
-    const request: search_mod.SearchRequest = .{
-        .query = switch (query) {
-            .match_all => .{ .match_all = {} },
-            .match => |match| .{ .match = .{
-                .field = match.field,
-                .text = match.text,
-            } },
-            .term => |term| .{ .term = .{
-                .field = term.field,
-                .term = term.term,
-            } },
-        },
-        .k = snapshot.global_doc_count,
-        .include_stored = true,
+    match_analyzer: ?*const analysis_mod.Analyzer,
+) !roaring.RoaringBitmap {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const search_query: search_mod.SearchQuery = switch (query) {
+        .match_all => .{ .match_all = {} },
+        .match => |match| .{ .match = .{
+            .field = match.field,
+            .text = match.text,
+            .analyzer = match_analyzer orelse return error.InvalidIndexConfig,
+        } },
+        .term => |term| .{ .term = .{
+            .field = term.field,
+            .term = term.term,
+        } },
     };
-    return search_mod.execute(alloc, snapshot, request);
+    const filter = try search_mod.searchQueryToFilterArena(arena.allocator(), search_query);
+    return try snapshot.executeFilterBitmap(alloc, filter);
 }
 
 fn computeHistogramAggregation(
@@ -7890,14 +7992,24 @@ fn calculatePercentage(fg_count: i64, fg_total: i64, bg_count: i64, bg_total: i6
 fn collectSignificantTermsFromValue(
     alloc: Allocator,
     value: std.json.Value,
+    analyzer: *const analysis_mod.Analyzer,
+    candidate_limit: usize,
     seen_terms: *std.StringHashMap(void),
 ) !void {
     switch (value) {
-        .array => |arr| for (arr.items) |item| try collectSignificantTermsFromValue(alloc, item, seen_terms),
+        .array => |arr| for (arr.items) |item| try collectSignificantTermsFromValue(
+            alloc,
+            item,
+            analyzer,
+            candidate_limit,
+            seen_terms,
+        ),
         .string => {
-            const tokens = try analysis_mod.default_analyzer.analyze(alloc, value.string);
+            const tokens = try analyzer.analyze(alloc, value.string);
             defer analysis_mod.Analyzer.freeTokens(alloc, tokens);
             for (tokens) |tok| {
+                if (!seen_terms.contains(tok.term) and seen_terms.count() >= candidate_limit)
+                    return error.QueryCandidateBudgetExceeded;
                 const entry = try seen_terms.getOrPut(tok.term);
                 if (entry.found_existing) continue;
                 entry.key_ptr.* = try alloc.dupe(u8, tok.term);
@@ -8044,6 +8156,169 @@ test "significant_terms can use distributed background stats without a local tex
     try std.testing.expect(std.mem.indexOf(u8, aggregations[0].metadata_json.?, "\"bg_doc_count\":2") != null);
     try std.testing.expectEqual(@as(i64, 2), aggregations[0].buckets[0].bg_count.?);
     try std.testing.expectEqual(@as(i64, 1), aggregations[0].buckets[1].bg_count.?);
+}
+
+test "significant_terms local background stats use postings without stored index source" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const relative_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const cwd = try std.process.currentPathAlloc(io_impl.io(), alloc);
+    defer alloc.free(cwd);
+    const path = try std.fs.path.resolve(alloc, &.{ cwd, relative_path });
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var manager = try index_manager_mod.IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+    try manager.addAllNoBackfill(&store, &.{.{
+        .name = "full_text_index_v0",
+        .kind = .full_text,
+        .config_json = "{}",
+    }});
+
+    const writes = [_]types.BatchWrite{
+        .{ .key = "doc:a", .value = "{\"body\":\"alpha beta\"}" },
+        .{ .key = "doc:b", .value = "{\"body\":\"alpha\"}" },
+        .{ .key = "doc:c", .value = "{\"body\":\"beta\"}" },
+    };
+    try manager.indexBatch(&store, &writes);
+
+    const snapshot = manager.textIndex("full_text_index_v0").?.snapshot();
+    const stored = (try snapshot.storedDocDecompressed(alloc, 0)).?;
+    defer alloc.free(stored.data);
+    try std.testing.expectEqualStrings("{}", stored.data);
+
+    const hits = try alloc.alloc(types.SearchHit, 2);
+    defer {
+        for (hits) |*hit| hit.deinit(alloc);
+        alloc.free(hits);
+    }
+    hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:a"),
+        .stored_data = try alloc.dupe(u8, writes[0].value),
+    };
+    hits[1] = .{
+        .id = try alloc.dupe(u8, "doc:b"),
+        .stored_data = try alloc.dupe(u8, writes[1].value),
+    };
+
+    const requests = [_]SearchAggregationRequest{.{
+        .name = "sig_terms",
+        .type = "significant_terms",
+        .field = "body",
+        .size = 2,
+        .background_query = .{ .match = .{ .field = "body", .text = "alpha" } },
+    }};
+    const aggregations = try computeSearchAggregations(alloc, &requests, .{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 2,
+    }, .{
+        .index_manager = &manager,
+        .full_text_index_name = "full_text_index_v0",
+    });
+    defer deinitResults(alloc, aggregations);
+
+    try std.testing.expectEqual(@as(usize, 2), aggregations[0].buckets.len);
+    try std.testing.expectEqualStrings("\"alpha\"", aggregations[0].buckets[0].key_json);
+    try std.testing.expectEqual(@as(i64, 2), aggregations[0].buckets[0].bg_count.?);
+    try std.testing.expectEqualStrings("\"beta\"", aggregations[0].buckets[1].key_json);
+    try std.testing.expectEqual(@as(i64, 1), aggregations[0].buckets[1].bg_count.?);
+}
+
+test "significant_terms uses the configured field analyzer for foreground and background" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/configured-analyzer", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var manager = try index_manager_mod.IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+    try manager.addAllNoBackfill(&store, &.{.{
+        .name = "full_text_index_v0",
+        .kind = .full_text,
+        .config_json = "{\"analysis_config\":{\"field_analyzers\":{\"body\":\"keyword\"}}}",
+    }});
+
+    const writes = [_]types.BatchWrite{
+        .{ .key = "doc:a", .value = "{\"body\":\"New \\\"York\"}" },
+        .{ .key = "doc:b", .value = "{\"body\":\"Boston\"}" },
+    };
+    try manager.indexBatch(&store, &writes);
+
+    const hits = try alloc.alloc(types.SearchHit, writes.len);
+    defer {
+        for (hits) |*hit| hit.deinit(alloc);
+        alloc.free(hits);
+    }
+    for (writes, 0..) |write, i| {
+        hits[i] = .{
+            .id = try alloc.dupe(u8, write.key),
+            .stored_data = try alloc.dupe(u8, write.value),
+        };
+    }
+
+    const requests = [_]SearchAggregationRequest{.{
+        .name = "sig_terms",
+        .type = "significant_terms",
+        .field = "body",
+        .size = 10,
+        .background_query = .{ .match_all = {} },
+    }};
+    const aggregations = try computeSearchAggregations(alloc, &requests, .{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = @intCast(hits.len),
+    }, .{
+        .index_manager = &manager,
+        .full_text_index_name = "full_text_index_v0",
+    });
+    defer deinitResults(alloc, aggregations);
+
+    try std.testing.expectEqual(@as(usize, 2), aggregations[0].buckets.len);
+    try std.testing.expectEqualStrings("\"Boston\"", aggregations[0].buckets[0].key_json);
+    var parsed_key = try std.json.parseFromSlice(std.json.Value, alloc, aggregations[0].buckets[1].key_json, .{});
+    defer parsed_key.deinit();
+    try std.testing.expectEqualStrings("New \"York", parsed_key.value.string);
+    try std.testing.expectEqual(@as(i64, 1), aggregations[0].buckets[0].bg_count.?);
+    try std.testing.expectEqual(@as(i64, 1), aggregations[0].buckets[1].bg_count.?);
+}
+
+test "significant_terms rejects candidate growth at the admission boundary" {
+    const alloc = std.testing.allocator;
+    var seen_terms = std.StringHashMap(void).init(alloc);
+    defer {
+        var it = seen_terms.keyIterator();
+        while (it.next()) |term| alloc.free(term.*);
+        seen_terms.deinit();
+    }
+
+    try std.testing.expectError(
+        error.QueryCandidateBudgetExceeded,
+        collectSignificantTermsFromValue(
+            alloc,
+            .{ .string = "one two" },
+            &analysis_mod.default_analyzer,
+            1,
+            &seen_terms,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 1), seen_terms.count());
 }
 
 test "algebraic distributed partials build exact terms response" {

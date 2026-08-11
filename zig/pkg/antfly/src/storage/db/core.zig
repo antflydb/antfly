@@ -20,6 +20,7 @@ const apply_rw_lock_mod = @import("apply_rw_lock.zig");
 const apply_state = @import("derived/apply_state.zig");
 const index_repair_state = @import("derived/index_repair_state.zig");
 const doc_identity = @import("doc_identity.zig");
+const range_cardinality = @import("range_cardinality.zig");
 const internal_keys = @import("../internal_keys.zig");
 const docstore_mod = @import("../docstore.zig");
 const change_journal_mod = @import("derived/change_journal.zig");
@@ -37,6 +38,7 @@ const ttl_mod = @import("../ttl.zig");
 const fs_paths = @import("../../common/fs_paths.zig");
 const lsm_table_file = @import("../lsm/table_file.zig");
 const graph_mod = @import("../../graph/graph.zig");
+const NodeAdmission = @import("../../graph/node_admission.zig").NodeAdmission;
 const graph_pattern_mod = @import("../../graph/pattern.zig");
 const paths_mod = @import("../../graph/paths.zig");
 const traversal_mod = @import("../../graph/traversal.zig");
@@ -157,7 +159,7 @@ pub const PrimaryStoreOwner = union(enum) {
     pub fn nextLsmMaintenanceWakeDelayNsBestEffort(self: *const PrimaryStoreOwner) ?u64 {
         return switch (self.*) {
             .none, .mem => null,
-            .lsm => |owner| owner.handle.backend.nextObsoleteReclaimDelayNsBestEffort(),
+            .lsm => |owner| owner.handle.backend.nextMaintenanceWakeDelayNsBestEffort(),
         };
     }
 
@@ -237,11 +239,31 @@ pub const OpenedPrimaryStore = struct {
     owner: PrimaryStoreOwner = .none,
 };
 
+pub const IndexRepairCheckpoint = struct {
+    lock_key: []u8,
+    path: []u8,
+    storage: ?lsm_backend_mod.Storage = null,
+
+    pub fn location(self: *const @This()) index_repair_state.Location {
+        return .{
+            .lock_key = self.lock_key,
+            .path = self.path,
+            .storage = self.storage,
+        };
+    }
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.lock_key);
+        alloc.free(self.path);
+        self.* = undefined;
+    }
+};
+
 pub const OpenedCoreResources = struct {
     path: []u8,
     root_generation: u64,
     applied_sequence_checkpoint_path: ?[]u8,
-    index_repair_checkpoint_path: ?[]u8,
+    index_repair_checkpoint: ?IndexRepairCheckpoint,
     store: *docstore_mod.DocStore,
     primary_store_owner: PrimaryStoreOwner,
     change_journal: *change_journal_mod.Journal,
@@ -272,7 +294,7 @@ pub const OpenedCoreResources = struct {
         alloc.destroy(self.store);
         self.primary_store_owner.close(alloc);
         if (self.applied_sequence_checkpoint_path) |checkpoint_path| alloc.free(checkpoint_path);
-        if (self.index_repair_checkpoint_path) |checkpoint_path| alloc.free(checkpoint_path);
+        if (self.index_repair_checkpoint) |*checkpoint| checkpoint.deinit(alloc);
         alloc.free(self.path);
         self.* = undefined;
     }
@@ -281,7 +303,7 @@ pub const OpenedCoreResources = struct {
 pub const AsyncResources = struct {
     store: *docstore_mod.DocStore,
     applied_sequence_checkpoint_path: ?[]const u8,
-    index_repair_checkpoint_path: ?[]const u8,
+    index_repair_checkpoint: ?index_repair_state.Location,
     index_manager: *index_manager_mod.IndexManager,
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
     repair_replay_mutex: *std.atomic.Mutex,
@@ -290,7 +312,7 @@ pub const AsyncResources = struct {
 pub const BatchExecutionResources = struct {
     store: *docstore_mod.DocStore,
     applied_sequence_checkpoint_path: ?[]const u8,
-    index_repair_checkpoint_path: ?[]const u8,
+    index_repair_checkpoint: ?index_repair_state.Location,
     shard_manager: *shard_mod.ShardManager,
     change_journal: *change_journal_mod.Journal,
     replay_source: replay_source_mod.Source,
@@ -323,7 +345,7 @@ pub const DBCore = struct {
     path: []u8,
     root_generation: u64,
     applied_sequence_checkpoint_path: ?[]u8,
-    index_repair_checkpoint_path: ?[]u8,
+    index_repair_checkpoint: ?IndexRepairCheckpoint,
     store: *docstore_mod.DocStore,
     primary_store_owner: PrimaryStoreOwner,
     change_journal: *change_journal_mod.Journal,
@@ -342,7 +364,7 @@ pub const DBCore = struct {
             .path = opened.path,
             .root_generation = opened.root_generation,
             .applied_sequence_checkpoint_path = opened.applied_sequence_checkpoint_path,
-            .index_repair_checkpoint_path = opened.index_repair_checkpoint_path,
+            .index_repair_checkpoint = opened.index_repair_checkpoint,
             .store = opened.store,
             .primary_store_owner = opened.primary_store_owner,
             .change_journal = opened.change_journal,
@@ -375,7 +397,7 @@ pub const DBCore = struct {
         self.alloc.destroy(self.store);
         self.primary_store_owner.close(self.alloc);
         if (self.applied_sequence_checkpoint_path) |checkpoint_path| self.alloc.free(checkpoint_path);
-        if (self.index_repair_checkpoint_path) |checkpoint_path| self.alloc.free(checkpoint_path);
+        if (self.index_repair_checkpoint) |*checkpoint| checkpoint.deinit(self.alloc);
         self.alloc.free(self.path);
         self.* = undefined;
     }
@@ -392,7 +414,7 @@ pub const DBCore = struct {
         return .{
             .store = self.store,
             .applied_sequence_checkpoint_path = self.applied_sequence_checkpoint_path,
-            .index_repair_checkpoint_path = self.index_repair_checkpoint_path,
+            .index_repair_checkpoint = if (self.index_repair_checkpoint) |*checkpoint| checkpoint.location() else null,
             .index_manager = self.index_manager,
             .apply_mutex = self.apply_mutex,
             .repair_replay_mutex = self.repair_replay_mutex,
@@ -403,7 +425,7 @@ pub const DBCore = struct {
         return .{
             .store = self.store,
             .applied_sequence_checkpoint_path = self.applied_sequence_checkpoint_path,
-            .index_repair_checkpoint_path = self.index_repair_checkpoint_path,
+            .index_repair_checkpoint = if (self.index_repair_checkpoint) |*checkpoint| checkpoint.location() else null,
             .shard_manager = self.shard_manager,
             .change_journal = self.change_journal,
             .replay_source = self.replaySource(),
@@ -465,9 +487,27 @@ pub const DBCore = struct {
     }
 
     pub fn updateRange(self: *DBCore, byte_range: types.ByteRange) !void {
-        try self.shard_manager.setByteRange(byte_range);
+        const start = try self.alloc.dupe(u8, byte_range.start);
+        errdefer self.alloc.free(start);
+        const end = try self.alloc.dupe(u8, byte_range.end);
+        errdefer self.alloc.free(end);
+        try range_state_mod.saveRange(self.store, .{ .start = start, .end = end });
+        self.adoptRangeInMemoryOwned(start, end);
+    }
+
+    pub fn adoptRangeInMemoryOwned(self: *DBCore, start: []u8, end: []u8) void {
+        self.shard_manager.replaceByteRangeOwned(start, end);
         self.refreshIndexRange();
-        try range_state_mod.saveRange(self.store, self.shard_manager.getByteRange());
+    }
+
+    pub fn adoptPersistedRangeOwned(self: *DBCore, start: []u8, end: []u8) void {
+        self.shard_manager.adoptOwnedByteRange(start, end);
+        self.refreshIndexRange();
+    }
+
+    pub fn replaceRangeInMemoryOwned(self: *DBCore, start: []u8, end: []u8) void {
+        self.shard_manager.replaceByteRangeOwned(start, end);
+        self.refreshIndexRange();
     }
 
     pub fn nextDerivedSequence(self: *DBCore) u64 {
@@ -552,13 +592,29 @@ pub const DBCore = struct {
         try range_state_mod.clearSplitBootstrapMarker(self.store);
     }
 
-    pub fn addIndex(self: *DBCore, cfg: types.IndexConfig) !u64 {
-        try self.index_manager.add(self.store, cfg);
+    pub fn addIndex(
+        self: *DBCore,
+        cfg: types.IndexConfig,
+        admission: ?index_manager_mod.IndexManager.AtomicCatalogMutation,
+    ) !u64 {
+        try self.index_manager.addWithAtomicMutation(self.store, cfg, admission);
         const applied = if (try self.index_manager.requiresEnrichmentReplay(cfg.name))
             0
         else
             self.nextDerivedSequence();
-        try self.saveAppliedSequence(cfg.name, applied);
+        return applied;
+    }
+
+    pub fn addManagedIndex(
+        self: *DBCore,
+        cfg: types.IndexConfig,
+        admission: ?index_manager_mod.IndexManager.AtomicCatalogMutation,
+    ) !u64 {
+        try self.index_manager.addManaged(self.store, cfg, admission);
+        // A managed generation with an admission marker is rebuilt from a
+        // stable source snapshot before replay catch-up. Starting at zero is
+        // fail-closed if the process exits before the outbox is materialized.
+        const applied = if (admission == null) self.nextDerivedSequence() else 0;
         return applied;
     }
 
@@ -636,6 +692,10 @@ pub const DBCore = struct {
 
     pub fn deleteIndex(self: *DBCore, name: []const u8) !bool {
         return try self.index_manager.remove(self.store, name);
+    }
+
+    pub fn deleteManagedIndex(self: *DBCore, name: []const u8, admission_key: []const u8) !bool {
+        return try self.index_manager.removeManaged(self.store, name, admission_key);
     }
 
     pub fn deleteEnrichment(self: *DBCore, kind: types.EnrichmentKind, name: []const u8) !bool {
@@ -739,6 +799,7 @@ pub const DBCore = struct {
         }
         return apply_state.loadAppliedSequenceWithCheckpoint(
             alloc,
+            self.index_manager.checkpointIo(),
             self.store,
             self.applied_sequence_checkpoint_path,
             index_name,
@@ -754,6 +815,7 @@ pub const DBCore = struct {
         }
         return apply_state.loadProjectionCheckpointWithSidecar(
             alloc,
+            self.index_manager.checkpointIo(),
             self.store,
             self.applied_sequence_checkpoint_path,
             index_name,
@@ -795,6 +857,7 @@ pub const DBCore = struct {
         }
         try apply_state.saveAppliedSequenceUpdateWithCheckpoint(
             self.alloc,
+            self.index_manager.checkpointIo(),
             self.store,
             self.applied_sequence_checkpoint_path,
             .{
@@ -821,6 +884,7 @@ pub const DBCore = struct {
         }
         try apply_state.saveProjectionCheckpointWithSidecar(
             self.alloc,
+            self.index_manager.checkpointIo(),
             self.store,
             self.applied_sequence_checkpoint_path,
             index_name,
@@ -927,8 +991,17 @@ pub const DBCore = struct {
     }
 
     pub fn setSchema(self: *DBCore, table_schema: schema_mod.TableSchema) !void {
-        try schema_mod.saveSchema(self.store, self.alloc, table_schema);
+        const changed = try schema_mod.saveSchema(self.store, self.alloc, table_schema);
+        // Refresh even when the durable value is unchanged. An index may have
+        // been provisioned between the original schema commit and this
+        // idempotent retry, and empty generations still need the mapping.
+        if (!changed) {
+            try self.index_manager.refreshEmptyTextIndexSchemas(self.store);
+            return;
+        }
         const next_schema = try schema_mod.loadSchema(self.store, self.alloc);
+        errdefer if (next_schema) |schema| schema_mod.freeSchema(self.alloc, schema);
+        try self.index_manager.refreshEmptyTextIndexSchemas(self.store);
         if (self.schema) |existing| schema_mod.freeSchema(self.alloc, existing);
         self.schema = next_schema;
     }
@@ -1037,6 +1110,7 @@ pub const DBCore = struct {
         max_depth: u32,
         min_weight: f64,
         max_weight: f64,
+        node_admission: ?NodeAdmission,
     ) !?paths_mod.Path {
         const entry = self.index_manager.graphIndex(index_name) orelse return error.IndexNotFound;
         return try paths_mod.findShortestPath(alloc, &entry.index, source, target, .{
@@ -1046,6 +1120,7 @@ pub const DBCore = struct {
             .max_depth = max_depth,
             .min_weight = min_weight,
             .max_weight = max_weight,
+            .node_admission = node_admission,
         });
     }
 
@@ -1062,6 +1137,7 @@ pub const DBCore = struct {
         max_depth: u32,
         min_weight: f64,
         max_weight: f64,
+        node_admission: ?NodeAdmission,
     ) ![]paths_mod.Path {
         const entry = self.index_manager.graphIndex(index_name) orelse return error.IndexNotFound;
         return try paths_mod.findKShortestPaths(alloc, &entry.index, source, target, k, .{
@@ -1071,6 +1147,7 @@ pub const DBCore = struct {
             .max_depth = max_depth,
             .min_weight = min_weight,
             .max_weight = max_weight,
+            .node_admission = node_admission,
         });
     }
 
@@ -1141,9 +1218,59 @@ pub const DBCore = struct {
         timestamp_ns: u64,
         participants: []const []const u8,
     ) !transactions_mod.TxnId {
+        return try self.beginTransactionWithParticipantsCreatedAt(txn_id, timestamp_ns, timestamp_ns, participants);
+    }
+
+    pub fn beginTransactionWithParticipantsCreatedAt(
+        self: *DBCore,
+        txn_id: transactions_mod.TxnId,
+        timestamp_ns: u64,
+        created_at_ns: u64,
+        participants: []const []const u8,
+    ) !transactions_mod.TxnId {
         var manager = try self.initTxnManager();
         defer manager.deinit();
-        try manager.initTransactionWithParticipants(txn_id, timestamp_ns, participants);
+        try manager.initTransactionWithParticipantsCreatedAt(txn_id, timestamp_ns, created_at_ns, participants);
+        return txn_id;
+    }
+
+    pub fn beginTransactionWithParticipantsCreatedAtAndRole(
+        self: *DBCore,
+        txn_id: transactions_mod.TxnId,
+        timestamp_ns: u64,
+        created_at_ns: u64,
+        participants: []const []const u8,
+        coordinator: bool,
+    ) !transactions_mod.TxnId {
+        return try self.beginTransactionWithParticipantsCreatedAtRoleAndRetention(
+            txn_id,
+            timestamp_ns,
+            created_at_ns,
+            participants,
+            coordinator,
+            false,
+        );
+    }
+
+    pub fn beginTransactionWithParticipantsCreatedAtRoleAndRetention(
+        self: *DBCore,
+        txn_id: transactions_mod.TxnId,
+        timestamp_ns: u64,
+        created_at_ns: u64,
+        participants: []const []const u8,
+        coordinator: bool,
+        retain_terminal: bool,
+    ) !transactions_mod.TxnId {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        try manager.initTransactionWithParticipantsCreatedAtRoleAndRetention(
+            txn_id,
+            timestamp_ns,
+            created_at_ns,
+            participants,
+            coordinator,
+            retain_terminal,
+        );
         return txn_id;
     }
 
@@ -1168,13 +1295,24 @@ pub const DBCore = struct {
         try manager.checkVersionPredicates(predicates, exclude_txn_id);
     }
 
+    pub fn checkOrdinaryWriteConflicts(
+        self: *DBCore,
+        writes: []const types.BatchWrite,
+        deletes: []const []const u8,
+    ) !void {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        for (writes) |write| try manager.checkOrdinaryWriteConflict(write.key);
+        for (deletes) |key| try manager.checkOrdinaryWriteConflict(key);
+    }
+
     pub fn resolveTransactionIntents(
         self: *DBCore,
         txn_id: transactions_mod.TxnId,
         status: transactions_mod.TxnStatus,
         commit_version: u64,
     ) !void {
-        try self.resolveTransactionIntentsWithExtraBatch(txn_id, status, commit_version, .{});
+        _ = try self.resolveTransactionIntentsWithExtraBatch(txn_id, status, commit_version, .{});
     }
 
     pub fn resolveTransactionIntentsWithExtraBatch(
@@ -1183,10 +1321,58 @@ pub const DBCore = struct {
         status: transactions_mod.TxnStatus,
         commit_version: u64,
         extra_batch: transactions_mod.ResolutionExtraBatch,
+    ) !transactions_mod.ResolutionOutcome {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        return try manager.resolveIntentsWithExtraBatch(txn_id, status, commit_version, extra_batch);
+    }
+
+    pub fn collectTransactionIntentBatch(self: *DBCore, alloc: Allocator, txn_id: transactions_mod.TxnId) !transactions_mod.IntentBatch {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        return try manager.collectIntentBatch(alloc, txn_id);
+    }
+
+    pub fn transactionHasIntents(self: *DBCore, txn_id: transactions_mod.TxnId) !bool {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        return try manager.hasIntents(txn_id);
+    }
+
+    pub fn validateTransactionIntentSnapshot(
+        self: *DBCore,
+        txn_id: transactions_mod.TxnId,
+        expected_revision: u64,
+    ) !transactions_mod.IntentSnapshotValidation {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        return try manager.validateIntentSnapshot(txn_id, expected_revision);
+    }
+
+    pub fn loadTransactionHAOutbox(
+        self: *DBCore,
+        alloc: Allocator,
+        txn_id: transactions_mod.TxnId,
+    ) !transactions_mod.HAOutbox {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        return try manager.loadHAOutbox(alloc, txn_id);
+    }
+
+    pub fn transactionHasHAOutbox(self: *DBCore, txn_id: transactions_mod.TxnId) !bool {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        return try manager.hasHAOutbox(txn_id);
+    }
+
+    pub fn clearTransactionHAOutbox(
+        self: *DBCore,
+        txn_id: transactions_mod.TxnId,
+        kind: transactions_mod.HAOutboxKind,
     ) !void {
         var manager = try self.initTxnManager();
         defer manager.deinit();
-        try manager.resolveIntentsWithExtraBatch(txn_id, status, commit_version, extra_batch);
+        try manager.clearHAOutbox(txn_id, kind);
     }
 
     pub fn collectTransactionIntentDocumentKeys(
@@ -1213,16 +1399,45 @@ pub const DBCore = struct {
         return try manager.getCommitVersion(txn_id);
     }
 
+    pub fn transactionDefersCoordinatorAcknowledgement(self: *DBCore, txn_id: transactions_mod.TxnId) !bool {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        return try manager.defersCoordinatorAcknowledgement(txn_id);
+    }
+
     pub fn markTransactionParticipantResolved(self: *DBCore, txn_id: transactions_mod.TxnId, participant: []const u8) !void {
         var manager = try self.initTxnManager();
         defer manager.deinit();
         try manager.markParticipantResolved(txn_id, participant);
     }
 
+    pub fn cleanupTransactionMetadataIfEligible(
+        self: *DBCore,
+        txn_id: transactions_mod.TxnId,
+        cutoff_timestamp: u64,
+        retained_cutoff_timestamp: u64,
+    ) !bool {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        return try manager.cleanupTransactionMetadataIfEligible(txn_id, cutoff_timestamp, retained_cutoff_timestamp);
+    }
+
     pub fn getTransactionParticipants(self: *DBCore, alloc: Allocator, txn_id: transactions_mod.TxnId) ![][]u8 {
         var manager = try self.initTxnManager();
         defer manager.deinit();
         return try manager.getParticipants(alloc, txn_id);
+    }
+
+    pub fn listTransactions(self: *DBCore, alloc: Allocator) ![]transactions_mod.TxnSummary {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        return try manager.listTransactions(alloc);
+    }
+
+    pub fn hasTopologySensitiveTransactions(self: *DBCore) !bool {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        return try manager.hasTopologySensitiveTransactions();
     }
 
     pub fn getUnresolvedTransactionParticipants(self: *DBCore, alloc: Allocator, txn_id: transactions_mod.TxnId) ![][]u8 {
@@ -1316,6 +1531,7 @@ fn buildTransactionRecoveryIdentityExtraBatch(
         for (identity_visibility_deletes.items) |key| alloc.free(key);
         identity_visibility_deletes.deinit(alloc);
     }
+    const identity_live_before = (try doc_identity.fastStatsFromStore(identity_ctx.store)).live_ordinals;
     try doc_identity.appendBatchIdentityMetadataForNamespaceWithVisibilityDeletesAlloc(
         alloc,
         identity_ctx.store,
@@ -1326,6 +1542,21 @@ fn buildTransactionRecoveryIdentityExtraBatch(
         identity_upserts.items,
         identity_deletes.items,
     );
+    if (try doc_identity.visibilitySummaryFromWrites(identity_writes.items)) |summary| {
+        const byte_range = try range_state_mod.loadRange(alloc, identity_ctx.store);
+        defer {
+            alloc.free(@constCast(byte_range.start));
+            alloc.free(@constCast(byte_range.end));
+        }
+        try range_cardinality.appendIdentityTransitionAlloc(
+            alloc,
+            identity_ctx.store,
+            byte_range,
+            identity_live_before,
+            summary.live_ordinals,
+            &identity_writes,
+        );
+    }
     if (identity_writes.items.len == 0 and identity_visibility_deletes.items.len == 0) return .{};
     const owned_writes = try identity_writes.toOwnedSlice(alloc);
     errdefer {
@@ -1451,12 +1682,13 @@ pub fn openCoreResourcesFromPrimaryStore(
     persist_identity_namespace_if_missing: bool,
     identity_namespace_mismatch_policy: doc_identity.NamespaceMismatchPolicy,
     external_derived_checkpoints: bool,
+    index_repair_checkpoint_storage: ?lsm_backend_mod.Storage,
     root_generation: u64,
     read_only: bool,
 ) !OpenedCoreResources {
     var owned_path: ?[]u8 = null;
     var owned_applied_sequence_checkpoint_path: ?[]u8 = null;
-    var owned_index_repair_checkpoint_path: ?[]u8 = null;
+    var owned_index_repair_checkpoint: ?IndexRepairCheckpoint = null;
     var owned_store: ?*docstore_mod.DocStore = null;
     var owned_primary_store_owner = opened_primary.owner;
     var owned_change_journal: ?*change_journal_mod.Journal = null;
@@ -1478,7 +1710,7 @@ pub fn openCoreResourcesFromPrimaryStore(
         }
         owned_primary_store_owner.close(alloc);
         if (owned_applied_sequence_checkpoint_path) |buf| alloc.free(buf);
-        if (owned_index_repair_checkpoint_path) |buf| alloc.free(buf);
+        if (owned_index_repair_checkpoint) |*checkpoint| checkpoint.deinit(alloc);
         if (owned_path) |buf| alloc.free(buf);
     }
 
@@ -1508,11 +1740,27 @@ pub fn openCoreResourcesFromPrimaryStore(
         .mem, .lsm_memory => null,
     } else null;
     owned_applied_sequence_checkpoint_path = applied_sequence_checkpoint_path;
-    const index_repair_checkpoint_path = switch (primary_backend_kind) {
-        .lmdb, .lsm => try index_repair_state.checkpointPathAlloc(alloc, path),
+    const index_repair_checkpoint = if (index_repair_checkpoint_storage) |storage| checkpoint_blk: {
+        const checkpoint_path = try index_repair_state.checkpointPathAlloc(alloc, index_base_path);
+        errdefer alloc.free(checkpoint_path);
+        const lock_key = try storage.rootIdentityAlloc(alloc, checkpoint_path);
+        break :checkpoint_blk IndexRepairCheckpoint{
+            .lock_key = lock_key,
+            .path = checkpoint_path,
+            .storage = storage,
+        };
+    } else switch (primary_backend_kind) {
+        .lmdb, .lsm => checkpoint_blk: {
+            const checkpoint_path = try index_repair_state.checkpointPathAlloc(alloc, path);
+            errdefer alloc.free(checkpoint_path);
+            break :checkpoint_blk IndexRepairCheckpoint{
+                .lock_key = try alloc.dupe(u8, checkpoint_path),
+                .path = checkpoint_path,
+            };
+        },
         .mem, .lsm_memory => null,
     };
-    owned_index_repair_checkpoint_path = index_repair_checkpoint_path;
+    owned_index_repair_checkpoint = index_repair_checkpoint;
 
     const change_journal_path = try std.fmt.allocPrint(alloc, "{s}/change_journal", .{path});
     defer alloc.free(change_journal_path);
@@ -1556,7 +1804,7 @@ pub fn openCoreResourcesFromPrimaryStore(
 
     owned_path = null;
     owned_applied_sequence_checkpoint_path = null;
-    owned_index_repair_checkpoint_path = null;
+    owned_index_repair_checkpoint = null;
     owned_store = null;
     owned_primary_store_owner = .none;
     owned_change_journal = null;
@@ -1570,7 +1818,7 @@ pub fn openCoreResourcesFromPrimaryStore(
         .path = path_copy,
         .root_generation = root_generation,
         .applied_sequence_checkpoint_path = applied_sequence_checkpoint_path,
-        .index_repair_checkpoint_path = index_repair_checkpoint_path,
+        .index_repair_checkpoint = index_repair_checkpoint,
         .store = store,
         .primary_store_owner = opened_primary.owner,
         .change_journal = change_journal,

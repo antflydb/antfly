@@ -18,6 +18,9 @@ const platform = @import("antfly_platform");
 const platform_time = @import("antfly_platform").time;
 const AtomicU64 = platform.atomic.Value(u64);
 
+/// Writer-preferring service fence. Shared acquisition is intentionally not
+/// reentrant: once a writer owns `reader_gate`, a call tree that already holds
+/// shared must use lock-assuming helpers instead of acquiring shared again.
 pub const ApplyRwLock = struct {
     pub const Stats = struct {
         shared_lock_calls: u64 = 0,
@@ -183,7 +186,7 @@ fn atomicMaxU64(value: *AtomicU64, candidate: u64) void {
     }
 }
 
-test "apply rw lock supports repeated shared acquisition" {
+test "apply rw lock permits nested shared acquisition while no writer is queued" {
     var lock: ApplyRwLock = .{};
 
     lock.lockShared();

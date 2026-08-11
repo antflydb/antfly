@@ -36,7 +36,7 @@ var ErrShardNotReady = errors.New("shard is still initializing")
 var _ ShardIface = (*Shard)(nil)
 
 type ShardIface interface {
-	Backup(ctx context.Context, location, backupID string) error
+	Backup(ctx context.Context, backup common.BackupConfig) error
 	ExportPortable(ctx context.Context, w io.Writer) error
 	ImportPortable(ctx context.Context, r io.Reader) error
 	PrepareSplit(ctx context.Context, splitKey []byte) error
@@ -497,11 +497,11 @@ func (s *Shard) FinalizeMerge(ctx context.Context, byteRange [2][]byte) error {
 	return s.storeDB.FinalizeMerge(ctx, byteRange)
 }
 
-func (s *Shard) Backup(ctx context.Context, loc, id string) error {
+func (s *Shard) Backup(ctx context.Context, backup common.BackupConfig) error {
 	if err := s.checkReady(); err != nil {
 		return err
 	}
-	return s.storeDB.Backup(ctx, loc, id)
+	return s.storeDB.Backup(ctx, backup)
 }
 
 func (s *Shard) ExportPortable(ctx context.Context, w io.Writer) error {

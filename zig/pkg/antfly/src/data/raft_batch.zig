@@ -98,7 +98,9 @@ test "raft batch round trips table batch payload" {
 test "raft batch round trips internal split checkpoint" {
     const encoded = try encode(std.testing.allocator, "docs", .{
         .split_checkpoint = .{
-            .kind = .destination,
+            .kind = .destination_complete,
+            .transition_id = 40,
+            .attempt_epoch = 1,
             .source_group_id = 41,
             .destination_group_id = 42,
             .range_start = "doc:m",
@@ -111,7 +113,8 @@ test "raft batch round trips internal split checkpoint" {
     var decoded = try decode(std.testing.allocator, encoded);
     defer decoded.deinit(std.testing.allocator);
     const checkpoint = decoded.batch.req.split_checkpoint orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(db_mod.types.SplitReplicationCheckpoint.Kind.destination, checkpoint.kind);
+    try std.testing.expectEqual(db_mod.types.SplitReplicationCheckpoint.Kind.destination_complete, checkpoint.kind);
+    try std.testing.expectEqual(@as(u64, 40), checkpoint.transition_id);
     try std.testing.expectEqual(@as(u64, 41), checkpoint.source_group_id);
     try std.testing.expectEqual(@as(u64, 42), checkpoint.destination_group_id);
     try std.testing.expectEqualStrings("doc:m", checkpoint.range_start);
@@ -124,6 +127,8 @@ test "raft batch round trips internal split replication identity" {
     const encoded = try encode(std.testing.allocator, "docs", .{
         .writes = &.{.{ .key = "doc:m", .value = "{}" }},
         .split_replication = .{
+            .transition_id = 40,
+            .attempt_epoch = 1,
             .source_group_id = 41,
             .destination_group_id = 42,
             .identity_namespace = namespace,
@@ -134,7 +139,32 @@ test "raft batch round trips internal split replication identity" {
     var decoded = try decode(std.testing.allocator, encoded);
     defer decoded.deinit(std.testing.allocator);
     const replication = decoded.batch.req.split_replication orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, 40), replication.transition_id);
     try std.testing.expectEqual(@as(u64, 41), replication.source_group_id);
     try std.testing.expectEqual(@as(u64, 42), replication.destination_group_id);
     try std.testing.expect(replication.identity_namespace.eql(namespace));
+}
+
+test "raft batch round trips deterministic transaction begin" {
+    const txn_id: db_mod.types.TxnId = .{1} ** 16;
+    const encoded = try encode(std.testing.allocator, "docs", .{
+        .transaction = .{ .begin = .{
+            .txn_id = txn_id,
+            .begin_timestamp = 100,
+            .created_at_ns = 200,
+            .topology_epoch = 3,
+            .participants = &.{ "table2:4:docs:group:7", "table2:5:other:group:8" },
+        } },
+    });
+    defer std.testing.allocator.free(encoded);
+
+    var decoded = try decode(std.testing.allocator, encoded);
+    defer decoded.deinit(std.testing.allocator);
+    const begin = switch (decoded.batch.req.transaction orelse return error.TestExpectedEqual) {
+        .begin => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(txn_id, begin.txn_id);
+    try std.testing.expectEqual(@as(u64, 200), begin.created_at_ns);
+    try std.testing.expectEqualStrings("table2:4:docs:group:7", begin.participants[0]);
 }

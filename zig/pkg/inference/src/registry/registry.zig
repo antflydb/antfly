@@ -19,6 +19,7 @@ const Io = std.Io;
 const Dir = Io.Dir;
 const build_options = @import("build_options");
 const manifest_mod = @import("../models/manifest.zig");
+const managed_receipt = @import("managed_receipt.zig");
 pub const download = @import("download.zig");
 
 pub const ModelKind = enum {
@@ -72,9 +73,14 @@ pub const ModelRef = struct {
         }
 
         if (std.mem.indexOfScalar(u8, name_part, '/')) |slash| {
+            const owner = name_part[0..slash];
+            const name = name_part[slash + 1 ..];
+            if (!hubRepoComponentIsSafe(owner) or !hubRepoComponentIsSafe(name)) {
+                return error.InvalidModelRef;
+            }
             return .{
-                .owner = name_part[0..slash],
-                .name = name_part[slash + 1 ..],
+                .owner = owner,
+                .name = name,
                 .variant = variant,
             };
         }
@@ -82,6 +88,16 @@ pub const ModelRef = struct {
         return error.InvalidModelRef;
     }
 };
+
+fn hubRepoComponentIsSafe(component: []const u8) bool {
+    if (component.len == 0 or
+        std.mem.eql(u8, component, ".") or
+        std.mem.eql(u8, component, "..")) return false;
+    for (component) |char| {
+        if (!std.ascii.isAlphanumeric(char) and char != '-' and char != '_' and char != '.') return false;
+    }
+    return true;
+}
 
 pub const ModelRegistry = struct {
     allocator: std.mem.Allocator,
@@ -110,6 +126,13 @@ pub const ModelRegistry = struct {
 
     fn discoverWithKindMode(self: *ModelRegistry, io: Io, kind_mode: DiscoverKindMode) ![]ModelEntry {
         var entries = std.ArrayListUnmanaged(ModelEntry).empty;
+        errdefer {
+            for (entries.items) |entry| {
+                self.allocator.free(entry.name);
+                self.allocator.free(entry.path);
+            }
+            entries.deinit(self.allocator);
+        }
         var seen = std.StringHashMapUnmanaged(void){};
         defer {
             var it = seen.keyIterator();
@@ -130,12 +153,20 @@ pub const ModelRegistry = struct {
         seen: *std.StringHashMapUnmanaged(void),
         kind_mode: DiscoverKindMode,
     ) !void {
-        var dir = Dir.cwd().openDir(io, self.models_dir, .{ .iterate = true }) catch return;
+        var dir = Dir.cwd().openDir(io, self.models_dir, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
         defer dir.close(io);
 
         var iter = dir.iterate();
         while (try iter.next(io)) |entry| {
-            if (entry.kind != .directory and entry.kind != .sym_link) continue;
+            if (entry.name.len == 0 or entry.name[0] == '.') continue;
+            const entry_kind = resolvedEntryKind(dir, io, entry) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                else => return err,
+            };
+            if (entry_kind != .directory and entry_kind != .sym_link) continue;
             if (isLegacyTaskDir(entry.name)) continue;
 
             const entry_path = try std.fs.path.join(self.allocator, &.{ self.models_dir, entry.name });
@@ -146,12 +177,20 @@ pub const ModelRegistry = struct {
                 continue;
             }
 
-            var owner_dir = Dir.cwd().openDir(io, entry_path, .{ .iterate = true }) catch continue;
+            var owner_dir = Dir.cwd().openDir(io, entry_path, .{ .iterate = true }) catch |err| switch (err) {
+                error.FileNotFound, error.NotDir => continue,
+                else => return err,
+            };
             defer owner_dir.close(io);
 
             var owner_iter = owner_dir.iterate();
             while (try owner_iter.next(io)) |model_entry| {
-                if (model_entry.kind != .directory and model_entry.kind != .sym_link) continue;
+                if (model_entry.name.len == 0 or model_entry.name[0] == '.') continue;
+                const model_entry_kind = resolvedEntryKind(owner_dir, io, model_entry) catch |err| switch (err) {
+                    error.FileNotFound => continue,
+                    else => return err,
+                };
+                if (model_entry_kind != .directory and model_entry_kind != .sym_link) continue;
                 const model_path = try std.fs.path.join(self.allocator, &.{ entry_path, model_entry.name });
                 defer self.allocator.free(model_path);
                 if (!isModelDir(io, model_path)) continue;
@@ -174,7 +213,6 @@ pub const ModelRegistry = struct {
             .{ .dir = "chunkers", .kind = .chunker },
             .{ .dir = "rerankers", .kind = .reranker },
             .{ .dir = "generators", .kind = .generator },
-            .{ .dir = "recognizers", .kind = .recognizer },
             .{ .dir = "classifiers", .kind = .classifier },
             .{ .dir = "rewriters", .kind = .rewriter },
             .{ .dir = "readers", .kind = .reader },
@@ -186,25 +224,39 @@ pub const ModelRegistry = struct {
             const path = try std.fs.path.join(self.allocator, &.{ self.models_dir, subdir.dir });
             defer self.allocator.free(path);
 
-            var dir = Dir.cwd().openDir(io, path, .{ .iterate = true }) catch continue;
+            var dir = Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| switch (err) {
+                error.FileNotFound, error.NotDir => continue,
+                else => return err,
+            };
             defer dir.close(io);
 
             var iter = dir.iterate();
             while (try iter.next(io)) |entry| {
-                if (entry.kind == .directory or entry.kind == .sym_link) {
+                if (entry.name.len == 0 or entry.name[0] == '.') continue;
+                const entry_kind = resolvedEntryKind(dir, io, entry) catch |err| switch (err) {
+                    error.FileNotFound => continue,
+                    else => return err,
+                };
+                if (entry_kind == .directory or entry_kind == .sym_link) {
                     const entry_path = try std.fs.path.join(self.allocator, &.{ path, entry.name });
                     defer self.allocator.free(entry_path);
                     if (isModelDir(io, entry_path)) {
                         try self.appendDiscoveredModel(io, entries, seen, entry_path, entry.name, kind_mode, subdir.kind);
                     } else {
-                        var owner_dir = Dir.cwd().openDir(io, entry_path, .{ .iterate = true }) catch {
-                            continue;
+                        var owner_dir = Dir.cwd().openDir(io, entry_path, .{ .iterate = true }) catch |err| switch (err) {
+                            error.FileNotFound, error.NotDir => continue,
+                            else => return err,
                         };
                         defer owner_dir.close(io);
 
                         var owner_iter = owner_dir.iterate();
                         while (try owner_iter.next(io)) |model_entry| {
-                            if (model_entry.kind == .directory or model_entry.kind == .sym_link) {
+                            if (model_entry.name.len == 0 or model_entry.name[0] == '.') continue;
+                            const model_entry_kind = resolvedEntryKind(owner_dir, io, model_entry) catch |err| switch (err) {
+                                error.FileNotFound => continue,
+                                else => return err,
+                            };
+                            if (model_entry_kind == .directory or model_entry_kind == .sym_link) {
                                 const model_path = try std.fs.path.join(self.allocator, &.{ path, entry.name, model_entry.name });
                                 defer self.allocator.free(model_path);
                                 if (!isModelDir(io, model_path)) {
@@ -226,7 +278,7 @@ pub const ModelRegistry = struct {
         self: *ModelRegistry,
         io: std.Io,
         ref_str: []const u8,
-        token: ?[]const u8,
+        hub_config: download.HubConfig,
         tasks_csv: ?[]const u8,
         capabilities_csv: ?[]const u8,
         projector_selection: download.ProjectorSelection,
@@ -238,15 +290,30 @@ pub const ModelRegistry = struct {
         // Destination: models_dir/owner/name
         const dest = try std.fmt.allocPrint(self.allocator, "{s}/{s}/{s}", .{ resolved_models_dir, ref.owner, ref.name });
         defer self.allocator.free(dest);
+        const dest_parent = std.fs.path.dirname(dest) orelse resolved_models_dir;
+        try std.Io.Dir.cwd().createDirPath(io, dest_parent);
+
+        // The lock lives beside the model directory so publishing the staged
+        // directory cannot move the lock inode out from under another pull.
+        const lock_path = try download.managedModelLockPathAlloc(self.allocator, dest);
+        defer self.allocator.free(lock_path);
+        var download_lock = try std.Io.Dir.cwd().createFile(io, lock_path, .{
+            .truncate = false,
+            .lock = .exclusive,
+        });
+        defer download_lock.close(io);
+
+        var transaction = try download.ManagedModelTransaction.begin(self.allocator, io, dest);
+        defer transaction.deinit(io);
 
         var progress = ProgressPrinter{};
-        try download.downloadModel(self.allocator, io, ref.owner, ref.name, ref.variant, dest, .{
-            .token = token,
-        }, projector_selection, .{
+        try download.downloadModel(self.allocator, io, ref.owner, ref.name, ref.variant, transaction.staging, hub_config, projector_selection, .{
             .callback = ProgressPrinter.onProgress,
             .context = &progress,
         });
-        try self.writePulledModelManifest(io, dest, tasks_csv, capabilities_csv);
+        try self.writePulledModelManifest(io, transaction.staging, tasks_csv, capabilities_csv);
+        try download.completeManagedDownload(self.allocator, io, transaction.staging);
+        try transaction.commit(io);
     }
 
     fn appendDiscoveredModel(
@@ -262,22 +329,28 @@ pub const ModelRegistry = struct {
         if (seen.contains(model_path)) return;
 
         const seen_path = try self.allocator.dupe(u8, model_path);
-        errdefer self.allocator.free(seen_path);
-        try seen.put(self.allocator, seen_path, {});
+        seen.put(self.allocator, seen_path, {}) catch |err| {
+            self.allocator.free(seen_path);
+            return err;
+        };
 
         const kind = switch (kind_mode) {
             .manifest => blk: {
-                var manifest = manifest_mod.loadFromDir(self.allocator, model_path) catch break :blk inferModelKindFromPath(model_path);
+                var manifest = try manifest_mod.loadFromDir(self.allocator, model_path);
                 defer manifest.deinit();
                 break :blk modelKindFromManifestType(manifest.model_type);
             },
             .path => kind_hint orelse inferModelKindFromPath(model_path),
         };
 
+        const owned_name = try self.allocator.dupe(u8, display_name);
+        errdefer self.allocator.free(owned_name);
+        const owned_path = try self.allocator.dupe(u8, model_path);
+        errdefer self.allocator.free(owned_path);
         try entries.append(self.allocator, .{
-            .name = try self.allocator.dupe(u8, display_name),
+            .name = owned_name,
             .kind = kind,
-            .path = try self.allocator.dupe(u8, model_path),
+            .path = owned_path,
             .variant = "f32",
         });
     }
@@ -289,16 +362,19 @@ pub const ModelRegistry = struct {
         tasks_csv: ?[]const u8,
         capabilities_csv: ?[]const u8,
     ) !void {
-        var existing = try manifest_mod.loadFromDir(self.allocator, dest_dir);
+        var existing = try manifest_mod.loadFromManagedPlanDir(self.allocator, dest_dir);
         defer existing.deinit();
         if (existing.model_manifest_path != null and tasks_csv == null and capabilities_csv == null) return;
 
-        const manifest_json = try synthesizePulledModelManifestJson(self.allocator, io, dest_dir, tasks_csv, capabilities_csv);
+        const manifest_json = try synthesizePulledModelManifestJsonFromPlan(self.allocator, dest_dir, tasks_csv, capabilities_csv);
         defer self.allocator.free(manifest_json);
-
-        const manifest_path = try std.fmt.allocPrint(self.allocator, "{s}/model_manifest.json", .{dest_dir});
-        defer self.allocator.free(manifest_path);
-        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = manifest_path, .data = manifest_json });
+        try download.writeManagedArtifactAndUpdatePlan(
+            self.allocator,
+            io,
+            dest_dir,
+            "model_manifest.json",
+            manifest_json,
+        );
     }
 
     fn resolveModelsDirForWriteAlloc(allocator: std.mem.Allocator, io: std.Io, models_dir: []const u8) ![]u8 {
@@ -379,6 +455,20 @@ pub const ModelRegistry = struct {
                 return;
             }
 
+            if (p.cached) {
+                var total_buf: [32]u8 = undefined;
+                var elapsed_buf: [32]u8 = undefined;
+                const size = p.total_bytes orelse p.bytes_downloaded;
+                std.debug.print("  [{d}/{d}] {s} cached ({s}, verified in {s})\n", .{
+                    p.files_done,
+                    p.files_total,
+                    p.file,
+                    formatBytes(size, &total_buf),
+                    formatDurationNs(@max(monotonicNowNs() - self.started_ns, 1), &elapsed_buf),
+                });
+                return;
+            }
+
             const elapsed_ns = @max(monotonicNowNs() - self.started_ns, 1);
             const bytes_per_sec = (@as(f64, @floatFromInt(p.bytes_downloaded)) * @as(f64, std.time.ns_per_s)) / @as(f64, @floatFromInt(elapsed_ns));
             var elapsed_buf: [32]u8 = undefined;
@@ -442,6 +532,10 @@ pub const ModelRegistry = struct {
             } else {
                 std.debug.print("  [{d}/{d}] {s}...\n", .{ p.files_done + 1, p.files_total, p.file });
             }
+        } else if (p.cached) {
+            var total_buf: [32]u8 = undefined;
+            const size = p.total_bytes orelse p.bytes_downloaded;
+            std.debug.print("  [{d}/{d}] {s} cached ({s})\n", .{ p.files_done, p.files_total, p.file, formatBytes(size, &total_buf) });
         } else if (p.total_bytes) |total| {
             if (p.bytes_downloaded < total) {
                 var done_buf: [32]u8 = undefined;
@@ -466,12 +560,33 @@ pub const ModelRegistry = struct {
     }
 };
 
+fn resolvedEntryKind(dir: Dir, io: Io, entry: Dir.Entry) !std.Io.File.Kind {
+    if (entry.kind != .unknown) return entry.kind;
+    return (try dir.statFile(io, entry.name, .{ .follow_symlinks = false })).kind;
+}
+
+test "registry resolves unknown directory entry kinds" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "model");
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.gguf", .data = "model" });
+
+    try std.testing.expectEqual(
+        std.Io.File.Kind.directory,
+        try resolvedEntryKind(tmp.dir, io, .{ .name = "model", .kind = .unknown, .inode = 0 }),
+    );
+    try std.testing.expectEqual(
+        std.Io.File.Kind.file,
+        try resolvedEntryKind(tmp.dir, io, .{ .name = "model.gguf", .kind = .unknown, .inode = 0 }),
+    );
+}
+
 fn isLegacyTaskDir(name: []const u8) bool {
     return std.mem.eql(u8, name, "embedders") or
         std.mem.eql(u8, name, "chunkers") or
         std.mem.eql(u8, name, "rerankers") or
         std.mem.eql(u8, name, "generators") or
-        std.mem.eql(u8, name, "recognizers") or
         std.mem.eql(u8, name, "classifiers") or
         std.mem.eql(u8, name, "rewriters") or
         std.mem.eql(u8, name, "readers") or
@@ -501,7 +616,6 @@ fn inferModelKindFromPath(path: []const u8) ModelKind {
         if (std.mem.eql(u8, component, "chunkers")) return .chunker;
         if (std.mem.eql(u8, component, "rerankers")) return .reranker;
         if (std.mem.eql(u8, component, "generators")) return .generator;
-        if (std.mem.eql(u8, component, "recognizers")) return .recognizer;
         if (std.mem.eql(u8, component, "classifiers")) return .classifier;
         if (std.mem.eql(u8, component, "rewriters")) return .rewriter;
         if (std.mem.eql(u8, component, "readers")) return .reader;
@@ -562,7 +676,7 @@ fn appendManifestTasks(
         .chunker => try appendUniqueOwnedString(allocator, tasks, "chunk"),
         .reranker => try appendUniqueOwnedString(allocator, tasks, "rerank"),
         .generator => try appendUniqueOwnedString(allocator, tasks, "generate"),
-        .recognizer => try appendUniqueOwnedString(allocator, tasks, "recognize"),
+        .recognizer => try appendUniqueOwnedString(allocator, tasks, "extract"),
         .classifier => try appendUniqueOwnedString(allocator, tasks, "classify"),
         .rewriter => try appendUniqueOwnedString(allocator, tasks, "rewrite"),
         .reader => try appendUniqueOwnedString(allocator, tasks, "read"),
@@ -592,17 +706,6 @@ fn taskListContains(tasks: []const []const u8, needle: []const u8) bool {
     return false;
 }
 
-fn fileExistsUnder(allocator: std.mem.Allocator, io: Io, dir: []const u8, relative_path: []const u8) bool {
-    const path = std.fs.path.join(allocator, &.{ dir, relative_path }) catch return false;
-    defer allocator.free(path);
-    Dir.cwd().access(io, path, .{}) catch return false;
-    return true;
-}
-
-fn looksLikeSpladeModel(allocator: std.mem.Allocator, io: Io, dir: []const u8) bool {
-    return fileExistsUnder(allocator, io, dir, "1_SpladePooling/config.json");
-}
-
 fn sparse3DOutputLayoutName(layout: manifest_mod.Sparse3DOutputLayout) []const u8 {
     return switch (layout) {
         .batch_seq => "batch_seq",
@@ -611,28 +714,20 @@ fn sparse3DOutputLayoutName(layout: manifest_mod.Sparse3DOutputLayout) []const u
 }
 
 fn inferredSparse3DOutputLayout(
-    allocator: std.mem.Allocator,
-    io: Io,
     manifest: *const manifest_mod.ModelManifest,
-    model_dir_path: []const u8,
-    tasks: []const []const u8,
 ) ?manifest_mod.Sparse3DOutputLayout {
-    if (manifest.sparse_3d_output_layout) |layout| return layout;
-    if (taskListContains(tasks, "embed") and looksLikeSpladeModel(allocator, io, model_dir_path)) return .batch_seq;
-    return null;
+    return manifest.sparse_3d_output_layout;
 }
 
 fn appendInferredCapabilities(
     allocator: std.mem.Allocator,
-    io: Io,
     manifest: *const manifest_mod.ModelManifest,
-    model_dir_path: []const u8,
     tasks: []const []const u8,
     capabilities: *std.ArrayListUnmanaged([]const u8),
 ) !void {
     for (manifest.capabilities) |cap| try appendUniqueOwnedString(allocator, capabilities, cap);
 
-    if (taskListContains(tasks, "embed") and looksLikeSpladeModel(allocator, io, model_dir_path)) {
+    if (taskListContains(tasks, "embed") and manifest.sparse_3d_output_layout != null) {
         try appendUniqueOwnedString(allocator, capabilities, "sparse");
     }
 }
@@ -657,8 +752,6 @@ fn normalizeTaskHint(raw_task: []const u8) []const u8 {
         "chunk"
     else if (std.mem.eql(u8, raw_task, "generators"))
         "generate"
-    else if (std.mem.eql(u8, raw_task, "recognizers"))
-        "recognize"
     else if (std.mem.eql(u8, raw_task, "classifiers"))
         "classify"
     else if (std.mem.eql(u8, raw_task, "rewriters"))
@@ -764,8 +857,7 @@ fn appendJsonStringArray(
 
 fn manifestTypeFromTasks(tasks: []const []const u8, fallback: manifest_mod.ModelType) manifest_mod.ModelType {
     for (tasks) |task| {
-        if (std.mem.eql(u8, task, "recognize") or std.mem.eql(u8, task, "recognizers") or
-            std.mem.eql(u8, task, "extract") or std.mem.eql(u8, task, "extractors")) return .recognizer;
+        if (std.mem.eql(u8, task, "extract") or std.mem.eql(u8, task, "extractors")) return .recognizer;
     }
     for (tasks) |task| {
         if (std.mem.eql(u8, task, "rerank") or std.mem.eql(u8, task, "rerankers")) return .reranker;
@@ -796,12 +888,47 @@ fn manifestTypeFromTasks(tasks: []const []const u8, fallback: manifest_mod.Model
 
 fn synthesizePulledModelManifestJson(
     allocator: std.mem.Allocator,
-    io: Io,
     dest_dir: []const u8,
     tasks_csv: ?[]const u8,
     capabilities_csv: ?[]const u8,
 ) ![]u8 {
-    var manifest = try manifest_mod.loadFromDir(allocator, dest_dir);
+    return synthesizePulledModelManifestJsonInternal(
+        allocator,
+        dest_dir,
+        tasks_csv,
+        capabilities_csv,
+        .published,
+    );
+}
+
+fn synthesizePulledModelManifestJsonFromPlan(
+    allocator: std.mem.Allocator,
+    dest_dir: []const u8,
+    tasks_csv: ?[]const u8,
+    capabilities_csv: ?[]const u8,
+) ![]u8 {
+    return synthesizePulledModelManifestJsonInternal(
+        allocator,
+        dest_dir,
+        tasks_csv,
+        capabilities_csv,
+        .staging_plan,
+    );
+}
+
+const PulledManifestSource = enum { published, staging_plan };
+
+fn synthesizePulledModelManifestJsonInternal(
+    allocator: std.mem.Allocator,
+    dest_dir: []const u8,
+    tasks_csv: ?[]const u8,
+    capabilities_csv: ?[]const u8,
+    source: PulledManifestSource,
+) ![]u8 {
+    var manifest = switch (source) {
+        .published => try manifest_mod.loadFromDir(allocator, dest_dir),
+        .staging_plan => try manifest_mod.loadFromManagedPlanDir(allocator, dest_dir),
+    };
     defer manifest.deinit();
 
     var tasks = std.ArrayListUnmanaged([]const u8).empty;
@@ -830,10 +957,10 @@ fn synthesizePulledModelManifestJson(
         for (capabilities.items) |cap| allocator.free(cap);
         capabilities.deinit(allocator);
     }
-    try appendInferredCapabilities(allocator, io, &manifest, dest_dir, tasks.items, &capabilities);
+    try appendInferredCapabilities(allocator, &manifest, tasks.items, &capabilities);
     if (capabilities_csv) |csv| try appendCsvCapabilities(allocator, &capabilities, csv);
 
-    const sparse_3d_output_layout = inferredSparse3DOutputLayout(allocator, io, &manifest, dest_dir, tasks.items);
+    const sparse_3d_output_layout = inferredSparse3DOutputLayout(&manifest);
 
     var body = std.ArrayListUnmanaged(u8).empty;
     errdefer body.deinit(allocator);
@@ -864,27 +991,41 @@ fn synthesizePulledModelManifestJson(
 /// A model dir contains config.json, tokenizer.json, genai_config.json, a GGUF file, or an onnx/ subdir.
 fn isModelDir(io: Io, path: []const u8) bool {
     const allocator = if (build_options.link_libc) std.heap.c_allocator else std.heap.smp_allocator;
+    var receipt = managed_receipt.loadValidated(allocator, io, path) catch return false;
+    if (receipt) |*validated| {
+        validated.deinit();
+        // Receipt validation already requires at least one supported model
+        // payload, including payloads nested below the model root.
+        return true;
+    }
+    const publicationStable = struct {
+        fn check(alloc: std.mem.Allocator, check_io: Io, model_path: []const u8) bool {
+            return !download.managedDownloadPublicationBlocked(alloc, check_io, model_path);
+        }
+    }.check;
     const indicators = [_][]const u8{ "config.json", "tokenizer.json", "genai_config.json", "antfly_metadata.json" };
     for (indicators) |filename| {
         const file_path = std.fs.path.join(allocator, &.{ path, filename }) catch continue;
         defer allocator.free(file_path);
         var f = Dir.cwd().openFile(io, file_path, .{}) catch continue;
         f.close(io);
-        return true;
+        return publicationStable(allocator, io, path);
     }
     // Check for top-level .gguf file
     var dir = Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return false;
     defer dir.close(io);
     var iter = dir.iterate();
     while (iter.next(io) catch null) |entry| {
-        if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".gguf")) return true;
+        const entry_kind = resolvedEntryKind(dir, io, entry) catch continue;
+        if (entry_kind == .file and std.mem.endsWith(u8, entry.name, ".gguf"))
+            return publicationStable(allocator, io, path);
     }
     // Check for onnx/ subdirectory
     const onnx_path = std.fs.path.join(allocator, &.{ path, "onnx" }) catch return false;
     defer allocator.free(onnx_path);
     var onnx_dir = Dir.cwd().openDir(io, onnx_path, .{}) catch return false;
     onnx_dir.close(io);
-    return true;
+    return publicationStable(allocator, io, path);
 }
 
 test "parse model ref" {
@@ -943,6 +1084,11 @@ test "discover skips empty owner subdirectories and keeps multistage readers" {
         ,
     });
     try tmp.dir.createDirPath(io, "readers/monkt/empty-placeholder");
+    try tmp.dir.createDirPath(io, "readers/monkt/.paddleocr-onnx.antfly-download-backup");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "readers/monkt/.paddleocr-onnx.antfly-download-backup/antfly_metadata.json",
+        .data = "{\"model_type\":\"paddleocr\",\"pipeline_type\":\"multistage_ocr\",\"stages\":{}}",
+    });
 
     const models_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
     defer allocator.free(models_dir);
@@ -959,6 +1105,122 @@ test "discover skips empty owner subdirectories and keeps multistage readers" {
 
     try std.testing.expectEqual(@as(usize, 1), models.len);
     try std.testing.expectEqualStrings("monkt/paddleocr-onnx", models[0].name);
+}
+
+test "shallow discovery cleans up every allocation failure" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "owner/model-a");
+    try tmp.dir.writeFile(io, .{ .sub_path = "owner/model-a/config.json", .data = "{}" });
+    try tmp.dir.createDirPath(io, "owner/model-b");
+    try tmp.dir.writeFile(io, .{ .sub_path = "owner/model-b/config.json", .data = "{}" });
+
+    const models_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(models_dir);
+
+    const Runner = struct {
+        fn run(alloc: std.mem.Allocator, root: []const u8) !void {
+            var registry = ModelRegistry.init(alloc, root);
+            const models = try registry.discoverShallow(std.testing.io);
+            defer {
+                for (models) |model| {
+                    alloc.free(model.name);
+                    alloc.free(model.path);
+                }
+                if (models.len > 0) alloc.free(models);
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Runner.run, .{models_dir});
+}
+
+test "model discovery rejects incomplete or invalid managed downloads" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "models/owner/model");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "models/owner/model/config.json",
+        .data = "{}",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "models/owner/model/.antfly-download-in-progress",
+        .data = "{\"version\":1,\"state\":\"in_progress\"}",
+    });
+
+    const model_dir = try std.fs.path.join(
+        allocator,
+        &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "models/owner/model" },
+    );
+    defer allocator.free(model_dir);
+    try std.testing.expect(!isModelDir(io, model_dir));
+
+    try tmp.dir.deleteFile(io, "models/owner/model/.antfly-download-in-progress");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "models/owner/model/model.onnx",
+        .data = "payload",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "models/owner/model/.antfly-download-complete.json",
+        .data = "{\"version\":1,\"artifacts\":[{\"path\":\"config.json\",\"size\":2},{\"path\":\"model.onnx\",\"size\":7}]}",
+    });
+    try std.testing.expect(isModelDir(io, model_dir));
+
+    try tmp.dir.deleteFile(io, "models/owner/model/model.onnx");
+    try std.testing.expect(!isModelDir(io, model_dir));
+}
+
+test "pull manifest synthesis operates on private staging and remains receipted" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "staging" });
+    defer allocator.free(model_dir);
+    try download.beginManagedDownload(allocator, io, model_dir);
+    const decoder_path = try std.fs.path.join(allocator, &.{ model_dir, "model.gguf" });
+    defer allocator.free(decoder_path);
+    try Dir.cwd().writeFile(io, .{ .sub_path = decoder_path, .data = "decoder" });
+    const plan_path = try std.fs.path.join(allocator, &.{ model_dir, download.managed_download_plan_filename });
+    defer allocator.free(plan_path);
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = plan_path,
+        .data = "{\"version\":1,\"artifacts\":[{\"path\":\"model.gguf\",\"size\":7}]}",
+    });
+
+    var registry = ModelRegistry.init(allocator, model_dir);
+    try registry.writePulledModelManifest(io, model_dir, "generate", null);
+    var plan = try managed_receipt.loadValidatedPlan(allocator, io, model_dir);
+    defer plan.deinit();
+    try std.testing.expect(plan.find("model_manifest.json") != null);
+
+    try download.completeManagedDownload(allocator, io, model_dir);
+    var manifest = try manifest_mod.loadFromDir(allocator, model_dir);
+    defer manifest.deinit();
+    try std.testing.expectEqual(manifest_mod.ModelType.generator, manifest.model_type);
+}
+
+test "managed discovery recognizes receipted nested payloads" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "model/artifacts");
+    try tmp.dir.writeFile(io, .{ .sub_path = "model/artifacts/model.gguf", .data = "decoder" });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "model/.antfly-download-complete.json",
+        .data = "{\"version\":1,\"artifacts\":[{\"path\":\"artifacts/model.gguf\",\"size\":7}]}",
+    });
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "model" });
+    defer allocator.free(model_dir);
+    try std.testing.expect(isModelDir(io, model_dir));
 }
 
 test "synthesized pulled manifest marks splade embedders as sparse" {
@@ -986,7 +1248,7 @@ test "synthesized pulled manifest marks splade embedders as sparse" {
     const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "models/sparse-encoder-testing/splade-bert-tiny-nq-onnx" });
     defer allocator.free(model_dir);
 
-    const manifest_json = try synthesizePulledModelManifestJson(allocator, io, model_dir, "embed", null);
+    const manifest_json = try synthesizePulledModelManifestJson(allocator, model_dir, "embed", null);
     defer allocator.free(manifest_json);
 
     try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"type\":\"embedder\"") != null);
@@ -1011,7 +1273,7 @@ test "synthesized pulled manifest accepts plural task directory hints" {
     const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "models/florence-reader" });
     defer allocator.free(model_dir);
 
-    const manifest_json = try synthesizePulledModelManifestJson(allocator, io, model_dir, "readers", null);
+    const manifest_json = try synthesizePulledModelManifestJson(allocator, model_dir, "readers", null);
     defer allocator.free(manifest_json);
 
     try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"type\":\"reader\"") != null);
@@ -1040,7 +1302,7 @@ test "synthesized pulled manifest keeps generate read gguf as generator" {
     const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "models/google/gemma-4-E4B-it-qat-q4_0-gguf" });
     defer allocator.free(model_dir);
 
-    const manifest_json = try synthesizePulledModelManifestJson(allocator, io, model_dir, "generate,read", "text,image,audio");
+    const manifest_json = try synthesizePulledModelManifestJson(allocator, model_dir, "generate,read", "text,image,audio");
     defer allocator.free(manifest_json);
 
     try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"type\":\"generator\"") != null);
@@ -1069,7 +1331,7 @@ test "synthesized pulled manifest treats rerank-named sequence classifiers as re
     const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "models/mixedbread-ai/mxbai-rerank-base-v1" });
     defer allocator.free(model_dir);
 
-    const manifest_json = try synthesizePulledModelManifestJson(allocator, io, model_dir, null, null);
+    const manifest_json = try synthesizePulledModelManifestJson(allocator, model_dir, null, null);
     defer allocator.free(manifest_json);
 
     try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"type\":\"reranker\"") != null);
@@ -1096,7 +1358,7 @@ test "synthesized pulled manifest preserves explicit sparse capability" {
     const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "models/plain-embedder" });
     defer allocator.free(model_dir);
 
-    const manifest_json = try synthesizePulledModelManifestJson(allocator, io, model_dir, "embed", "sparse");
+    const manifest_json = try synthesizePulledModelManifestJson(allocator, model_dir, "embed", "sparse");
     defer allocator.free(manifest_json);
 
     try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"capabilities\":[\"sparse\"]") != null);
@@ -1122,7 +1384,7 @@ test "synthesized pulled manifest does not infer sparse from path name alone" {
     const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "models/not-really-splade" });
     defer allocator.free(model_dir);
 
-    const manifest_json = try synthesizePulledModelManifestJson(allocator, io, model_dir, "embed", null);
+    const manifest_json = try synthesizePulledModelManifestJson(allocator, model_dir, "embed", null);
     defer allocator.free(manifest_json);
 
     try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"type\":\"embedder\"") != null);
@@ -1132,36 +1394,58 @@ test "synthesized pulled manifest does not infer sparse from path name alone" {
 /// Resolve a model name by variant suffix.
 /// If `requested` isn't found in the directory, looks for entries prefixed with
 /// "requested-" and returns the shortest match. Matches Go inference's resolveVariant.
-/// Uses Io-based dir iteration (Zig 0.16).
-pub fn resolveVariant(allocator: std.mem.Allocator, io: Io, models_dir: []const u8, requested: []const u8) ?[]const u8 {
-    const prefix = std.fmt.allocPrint(allocator, "{s}-", .{requested}) catch return null;
+/// Returns null only for a missing directory or missing match; allocation and
+/// directory iteration failures remain actionable to callers.
+pub fn resolveVariant(allocator: std.mem.Allocator, io: Io, models_dir: []const u8, requested: []const u8) !?[]const u8 {
+    const prefix = try std.fmt.allocPrint(allocator, "{s}-", .{requested});
     defer allocator.free(prefix);
 
-    var dir = Dir.cwd().openDir(io, models_dir, .{ .iterate = true }) catch return null;
+    var dir = Dir.cwd().openDir(io, models_dir, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
     defer dir.close(io);
 
     var best_name: ?[]const u8 = null;
+    defer if (best_name) |name| allocator.free(name);
 
     var iter = dir.iterate();
-    while (iter.next(io) catch null) |entry| {
-        if (entry.kind != .directory) continue;
+    while (try iter.next(io)) |entry| {
+        const entry_kind = resolvedEntryKind(dir, io, entry) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        if (entry_kind != .directory) continue;
         if (std.mem.startsWith(u8, entry.name, prefix)) {
             if (best_name == null or entry.name.len < best_name.?.len) {
+                const new_best = try allocator.dupe(u8, entry.name);
                 if (best_name) |old| allocator.free(old);
-                best_name = allocator.dupe(u8, entry.name) catch continue;
+                best_name = new_best;
             }
         }
     }
 
     if (best_name) |bn| {
-        const result = std.fs.path.join(allocator, &.{ models_dir, bn }) catch {
-            allocator.free(bn);
-            return null;
-        };
-        allocator.free(bn);
-        return result;
+        return try std.fs.path.join(allocator, &.{ models_dir, bn });
     }
     return null;
+}
+
+test "resolveVariant preserves allocation failure" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        resolveVariant(failing.allocator(), std.testing.io, "/models", "acme/model"),
+    );
+}
+
+test "resolveVariant treats a missing model directory as no match" {
+    try std.testing.expect(try resolveVariant(
+        std.testing.allocator,
+        std.testing.io,
+        "/definitely-not-an-antfly-model-directory",
+        "acme/model",
+    ) == null);
 }
 
 test "parse hf: prefix" {
@@ -1181,4 +1465,8 @@ test "parse hf: prefix no variant" {
 test "parse invalid ref" {
     const result = ModelRef.parse("no-slash");
     try std.testing.expectError(error.InvalidModelRef, result);
+    try std.testing.expectError(error.InvalidModelRef, ModelRef.parse("../model"));
+    try std.testing.expectError(error.InvalidModelRef, ModelRef.parse("owner/../model"));
+    try std.testing.expectError(error.InvalidModelRef, ModelRef.parse("owner/model/extra"));
+    try std.testing.expectError(error.InvalidModelRef, ModelRef.parse("owner\\escape/model"));
 }

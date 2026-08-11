@@ -309,7 +309,7 @@ type DB interface {
 	SearchTyped(ctx context.Context, req *indexes.RemoteIndexSearchRequest) (*indexes.RemoteIndexSearchResult, error)
 	Split(currRange types.Range, splitKey []byte, destDir1, destDir2 string, prepareOnly bool) error
 	FinalizeSplit(newRange types.Range) error
-	Snapshot(id string) (int64, error)
+	Snapshot(ctx context.Context, id string) (int64, error)
 	// diskSize is used for the split computation and empty for merge
 	Stats() (diskSize uint64, empty bool, indexStats map[string]indexes.IndexStats, err error)
 
@@ -423,6 +423,10 @@ type DBImpl struct {
 	traceShardIDStr string // cached shard ID for trace events; set lazily
 
 	cache *pebbleutils.Cache // shared Pebble block cache (may be nil)
+
+	lifecycleMu     sync.Mutex
+	lifecycleCtx    context.Context
+	lifecycleCancel context.CancelFunc
 }
 
 // NewDBImpl creates a new DBImpl instance with the given configuration.
@@ -1651,6 +1655,13 @@ func (db *DBImpl) OpenIndexes(dir string) error {
 
 func (s *DBImpl) Close() (err error) {
 	defer pebbleutils.RecoverPebbleClosed(&err)
+	s.lifecycleMu.Lock()
+	if s.lifecycleCancel != nil {
+		s.lifecycleCancel()
+		s.lifecycleCancel = nil
+		s.lifecycleCtx = nil
+	}
+	s.lifecycleMu.Unlock()
 	var closeErr error
 	if err := s.CloseShadowIndexManager(); err != nil {
 		closeErr = errors.Join(closeErr, fmt.Errorf("closing shadow indexes: %w", err))
@@ -1679,6 +1690,15 @@ func (s *DBImpl) Close() (err error) {
 		}
 	}
 	return closeErr
+}
+
+func (db *DBImpl) ownedLifecycleContext() context.Context {
+	db.lifecycleMu.Lock()
+	defer db.lifecycleMu.Unlock()
+	if db.lifecycleCtx == nil || db.lifecycleCtx.Err() != nil {
+		db.lifecycleCtx, db.lifecycleCancel = context.WithCancel(context.Background()) //nolint:gosec // owned and canceled by DBImpl.Close
+	}
+	return db.lifecycleCtx
 }
 
 // getPebbleOpts creates and configures Pebble options, including S3 storage if enabled.
@@ -1711,7 +1731,10 @@ func (db *DBImpl) getPebbleOpts() (*pebble.Options, error) {
 // This sets up the LeaderAwareS3Storage wrapper which only allows the Raft leader to write to S3.
 // Note: This method should only be called when S3 storage is enabled.
 func (db *DBImpl) configureS3Storage(pebbleOpts *pebble.Options) error {
-	s3Info := db.antflyConfig.Storage.Local.S3
+	s3Info, err := db.antflyConfig.ResolveObjectStorageS3("artifacts")
+	if err != nil {
+		return fmt.Errorf("resolving object storage artifacts lane: %w", err)
+	}
 	db.logger.Info("Configuring S3 storage for Pebble",
 		zap.String("endpoint", s3Info.Endpoint),
 		zap.String("bucket", s3Info.Bucket),
@@ -1720,9 +1743,11 @@ func (db *DBImpl) configureS3Storage(pebbleOpts *pebble.Options) error {
 	)
 
 	// Create Minio client for S3 operations
-	minioClient, err := s3Info.NewMinioClient()
+	bucketCtx, cancelBucket := context.WithTimeout(db.ownedLifecycleContext(), 30*time.Second)
+	defer cancelBucket()
+	minioClient, err := s3Info.EnsureBucket(bucketCtx)
 	if err != nil {
-		return fmt.Errorf("creating S3 client: %w", err)
+		return fmt.Errorf("preparing S3 bucket: %w", err)
 	}
 
 	// Create base S3 storage
@@ -3603,7 +3628,10 @@ func (db *DBImpl) mergeVectorResults(primary, shadow *vectorindex.SearchResult) 
 	return merged
 }
 
-func (s *DBImpl) Snapshot(id string) (int64, error) {
+func (s *DBImpl) Snapshot(ctx context.Context, id string) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	// Create a temporary staging directory for the snapshot (Archive Format v2)
 	stagingDir := filepath.Join(os.TempDir(), fmt.Sprintf("antfly-snap-%s-%s", id, uuid.NewString()))
 	defer func() {
@@ -3617,15 +3645,23 @@ func (s *DBImpl) Snapshot(id string) (int64, error) {
 	}
 
 	// Pause IndexManager (and all indexes) before checkpoint
-	indexesPaused := false
+	var pausedIndexManager *IndexManager
 	if im := s.getIndexManager(); im != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if err := im.Pause(ctx); err != nil {
-			s.logger.Warn("Failed to pause IndexManager, snapshot without indexes", zap.Error(err))
+		pauseCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		pauseErr := im.Pause(pauseCtx)
+		cancel()
+		if pauseErr != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return 0, ctxErr
+			}
+			s.logger.Warn("Failed to pause IndexManager, snapshot without indexes", zap.Error(pauseErr))
 		} else {
-			indexesPaused = true
-			defer im.Resume()
+			pausedIndexManager = im
+			defer func() {
+				if pausedIndexManager != nil {
+					pausedIndexManager.Resume()
+				}
+			}()
 		}
 	}
 
@@ -3645,13 +3681,19 @@ func (s *DBImpl) Snapshot(id string) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("failed to create checkpoint: %w", err)
 	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 
 	// Copy indexes directory (only if paused successfully)
-	if indexesPaused {
-		indexDir := s.getIndexManager().GetDir()
+	if pausedIndexManager != nil {
+		indexDir := pausedIndexManager.GetDir()
 		if indexDir != "" {
 			indexStagingDir := filepath.Join(stagingDir, "indexes")
-			if err := common.CopyDir(indexDir, indexStagingDir); err != nil {
+			if err := common.CopyDirContext(ctx, indexDir, indexStagingDir); err != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return 0, ctxErr
+				}
 				s.logger.Warn("Failed to copy indexes, will rebuild on restore", zap.Error(err))
 				_ = os.RemoveAll(indexStagingDir)
 			} else {
@@ -3660,10 +3702,12 @@ func (s *DBImpl) Snapshot(id string) (int64, error) {
 					zap.String("stagingIndexDir", indexStagingDir))
 			}
 		}
+		pausedIndexManager.Resume()
+		pausedIndexManager = nil
 	}
 
 	// Parse shard and node IDs from directory path for snapshot metadata
-	nodeID, shardID, err := common.ParseStorageDBDir(s.dir)
+	shardID, nodeID, err := common.ParseStorageDBDir(s.dir)
 	if err != nil {
 		s.logger.Warn("Failed to parse storage dir for snapshot metadata", zap.Error(err))
 	}
@@ -3676,7 +3720,7 @@ func (s *DBImpl) Snapshot(id string) (int64, error) {
 	}
 
 	// Use SnapStore to create and store the archive with metadata
-	size, err := s.snapStore.CreateSnapshot(context.Background(), id, stagingDir, snapOpts)
+	size, err := s.snapStore.CreateSnapshot(ctx, id, stagingDir, snapOpts)
 	if err != nil {
 		return 0, fmt.Errorf("creating snapshot archive: %w", err)
 	}

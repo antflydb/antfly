@@ -351,14 +351,14 @@ pub fn ServerRouter(comptime Impl: type) type {
         fn getHAPrimaryStatus(ctx: *httpx.Context) anyerror!httpx.Response {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
             const query_params = GetHAPrimaryStatusParams{
-                .max_lag_lsn = ctx.query("max_lag_lsn"),
-                .max_retained_bytes = ctx.query("max_retained_bytes"),
-                .max_retained_age_ns = ctx.query("max_retained_age_ns"),
-                .sync_mode = ctx.query("sync_mode"),
-                .sync_selection = ctx.query("sync_selection"),
-                .sync_required = ctx.query("sync_required"),
-                .sync_standby = ctx.query("sync_standby"),
-                .sync_failure = ctx.query("sync_failure"),
+                .max_lag_lsn = try ctx.queryDecoded("max_lag_lsn"),
+                .max_retained_bytes = try ctx.queryDecoded("max_retained_bytes"),
+                .max_retained_age_ns = try ctx.queryDecoded("max_retained_age_ns"),
+                .sync_mode = try ctx.queryDecoded("sync_mode"),
+                .sync_selection = try ctx.queryDecoded("sync_selection"),
+                .sync_required = try ctx.queryDecoded("sync_required"),
+                .sync_standby = try ctx.queryDecoded("sync_standby"),
+                .sync_failure = try ctx.queryDecoded("sync_failure"),
             };
             return impl.getHAPrimaryStatus(ctx, query_params);
         }
@@ -474,7 +474,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         fn getHAStandbyStatus(ctx: *httpx.Context) anyerror!httpx.Response {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
             const query_params = GetHAStandbyStatusParams{
-                .upstream_lsn = ctx.query("upstream_lsn"),
+                .upstream_lsn = try ctx.queryDecoded("upstream_lsn"),
             };
             return impl.getHAStandbyStatus(ctx, query_params);
         }

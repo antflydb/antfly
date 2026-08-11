@@ -25,6 +25,8 @@ const Crc32 = std.hash.Crc32;
 const replication_log = @import("replication_log.zig");
 const replication_record = @import("replication_record.zig");
 const wal_mod = @import("../wal.zig");
+const fs_paths = @import("../../common/fs_paths.zig");
+const platform_sync = @import("antfly_platform").sync;
 
 const progress_magic = [8]u8{ 'A', 'F', 'H', 'A', 'P', 'R', 'G', '\n' };
 const progress_version: u16 = 1;
@@ -120,14 +122,28 @@ pub const OpenOptions = struct {
 
 pub const ApplyFn = *const fn (ctx: *anyopaque, record: replication_record.RecordView) anyerror!void;
 
+pub const Snapshot = struct {
+    identity: Identity,
+    progress: Progress,
+};
+
+pub const PathMatchResult = enum {
+    match,
+    receive_log_mismatch,
+    progress_wal_mismatch,
+};
+
 pub const Standby = struct {
     alloc: Allocator,
-    identity: Identity,
+    identity_state: Identity,
     receive_log_path: [:0]u8,
     progress_wal_path: [:0]u8,
     receive_log: replication_log.ReplicationLog,
     progress_wal: wal_mod.WAL,
-    progress: Progress,
+    progress_state: Progress,
+    operation_mutex: std.atomic.Mutex = .unlocked,
+    state_mutex: std.atomic.Mutex = .unlocked,
+    consumed: bool = false,
 
     pub fn open(
         alloc: Allocator,
@@ -151,29 +167,29 @@ pub const Standby = struct {
         };
         var standby = Standby{
             .alloc = alloc,
-            .identity = identity,
+            .identity_state = identity,
             .receive_log_path = owned_receive_log_path,
             .progress_wal_path = owned_progress_wal_path,
             .receive_log = receive_log,
             .progress_wal = progress_wal,
-            .progress = .{},
+            .progress_state = .{},
         };
         receive_path_owned_locally = false;
         progress_path_owned_locally = false;
         errdefer standby.close();
 
         const replayed = try standby.replayProgress();
-        standby.progress = replayed.progress;
+        standby.progress_state = replayed.progress;
         const received_identity = try standby.validateReceivedLog();
         if (received_identity) |received| {
-            standby.identity = try advanceOpenIdentityFromReceived(standby.identity, received);
+            standby.identity_state = try advanceOpenIdentityFromReceived(standby.identity_state, received);
         }
 
         const durable_received_lsn = standby.receive_log.lastLsn();
-        const replayed_progress = standby.progress;
-        if (standby.progress.received_lsn > durable_received_lsn) {
+        const replayed_progress = standby.progress_state;
+        if (standby.progress_state.received_lsn > durable_received_lsn) {
             const can_recover_truncated_promotion = try standby.progressRecordTargetsTimelineSwitch(.{
-                .identity = replayed.identity orelse standby.identity,
+                .identity = replayed.identity orelse standby.identity_state,
                 .progress = .{
                     .received_lsn = durable_received_lsn,
                     .applied_lsn = durable_received_lsn,
@@ -182,139 +198,192 @@ pub const Standby = struct {
             });
             if (!can_recover_truncated_promotion) return error.ProgressAheadOfReceivedWal;
         }
-        standby.progress.received_lsn = durable_received_lsn;
+        standby.progress_state.received_lsn = durable_received_lsn;
         if (try standby.recoverTimelineSwitch(replayed_progress)) |timeline_recovery| {
-            standby.identity = timeline_recovery.identity;
-            standby.progress = timeline_recovery.progress;
+            standby.identity_state = timeline_recovery.identity;
+            standby.progress_state = timeline_recovery.progress;
         } else if (try standby.recoverBootstrapCheckpoint(replayed_progress)) |checkpoint_progress| {
-            standby.progress = checkpoint_progress;
+            standby.progress_state = checkpoint_progress;
         }
-        try validateOpenIdentities(replayed.identity, received_identity, standby.identity);
-        if (standby.progress.applied_lsn > standby.progress.received_lsn) return error.AppliedAheadOfReceived;
-        if (standby.progress.safe_read_lsn > standby.progress.applied_lsn) return error.SafeReadAheadOfApplied;
+        try validateOpenIdentities(replayed.identity, received_identity, standby.identity_state);
+        if (standby.progress_state.applied_lsn > standby.progress_state.received_lsn) return error.AppliedAheadOfReceived;
+        if (standby.progress_state.safe_read_lsn > standby.progress_state.applied_lsn) return error.SafeReadAheadOfApplied;
 
-        if (standby.progress.received_lsn != replayed_progress.received_lsn or
-            standby.progress.applied_lsn != replayed_progress.applied_lsn or
-            standby.progress.safe_read_lsn != replayed_progress.safe_read_lsn)
+        if (standby.progress_state.received_lsn != replayed_progress.received_lsn or
+            standby.progress_state.applied_lsn != replayed_progress.applied_lsn or
+            standby.progress_state.safe_read_lsn != replayed_progress.safe_read_lsn)
         {
-            try standby.persistProgress(standby.progress);
+            try standby.persistProgressForIdentity(standby.identity_state, standby.progress_state);
         }
 
         return standby;
     }
 
     pub fn close(self: *Standby) void {
+        platform_sync.lockYielding(&self.operation_mutex);
+        defer self.operation_mutex.unlock();
+        if (self.consumed) return;
         const alloc = self.alloc;
         self.progress_wal.close();
         self.receive_log.close();
         alloc.free(self.progress_wal_path);
         alloc.free(self.receive_log_path);
-        self.* = undefined;
+        self.consumed = true;
     }
 
-    pub fn receiveLogPath(self: *const Standby) []const u8 {
-        return self.receive_log_path;
+    /// Returns identity and progress from one synchronization point. Observers
+    /// use a short publication lock and never wait behind receive-log I/O,
+    /// database apply, or promotion resource transfer.
+    pub fn snapshot(self: *const Standby) Snapshot {
+        const mutable: *Standby = @constCast(self);
+        platform_sync.lockYielding(&mutable.state_mutex);
+        defer mutable.state_mutex.unlock();
+        return .{
+            .identity = mutable.identity_state,
+            .progress = mutable.progress_state,
+        };
     }
 
-    pub fn progressWalPath(self: *const Standby) []const u8 {
-        return self.progress_wal_path;
+    /// The caller holds the exclusive operation lease; state publication still
+    /// uses its independent short lock so observers remain race-free.
+    pub fn snapshotLocked(self: *const Standby) Snapshot {
+        return self.snapshot();
+    }
+
+    fn publishState(self: *Standby, identity: Identity, progress: Progress) void {
+        platform_sync.lockYielding(&self.state_mutex);
+        defer self.state_mutex.unlock();
+        self.identity_state = identity;
+        self.progress_state = progress;
+    }
+
+    pub fn identitySnapshot(self: *const Standby) Identity {
+        return self.snapshot().identity;
     }
 
     pub fn currentProgress(self: *const Standby) Progress {
-        return self.progress;
+        return self.snapshot().progress;
     }
 
     pub fn nextReceiveLsn(self: *const Standby) u64 {
-        return self.progress.nextReceiveLsn();
+        return self.snapshot().progress.nextReceiveLsn();
     }
 
     pub fn nextApplyLsn(self: *const Standby) u64 {
-        return self.progress.nextApplyLsn();
+        return self.snapshot().progress.nextApplyLsn();
+    }
+
+    /// Compares configured paths while holding the lifetime lease that protects
+    /// the owned path buffers from promotion adoption or close.
+    pub fn pathsMatch(
+        self: *Standby,
+        alloc: Allocator,
+        io: std.Io,
+        receive_log_path: []const u8,
+        progress_wal_path: []const u8,
+    ) !PathMatchResult {
+        try self.lockExclusive();
+        defer self.unlockExclusive();
+        if (!try fs_paths.pathsReferToSameExistingFile(alloc, io, receive_log_path, self.receive_log_path))
+            return .receive_log_mismatch;
+        if (!try fs_paths.pathsReferToSameExistingFile(alloc, io, progress_wal_path, self.progress_wal_path))
+            return .progress_wal_mismatch;
+        return .match;
     }
 
     pub fn receive(self: *Standby, record: replication_record.Record) !u64 {
+        try self.lockExclusive();
+        defer self.unlockExclusive();
+        return try self.receiveLocked(record);
+    }
+
+    /// The caller must hold the exclusive standby operation lease.
+    pub fn receiveLocked(self: *Standby, record: replication_record.Record) !u64 {
         if (record.kind == .timeline_switch) {
             return try self.receiveTimelineSwitch(record);
         }
 
         try self.validateRecord(record);
-        if (record.lsn <= self.progress.received_lsn) return error.RecordAlreadyReceived;
+        if (record.lsn <= self.progress_state.received_lsn) return error.RecordAlreadyReceived;
 
         const durable_received_lsn = self.receive_log.lastLsn();
         if (record.lsn <= durable_received_lsn) {
-            if (record.lsn != self.progress.received_lsn + 1) return error.UnexpectedRecordLsn;
+            if (record.lsn != self.progress_state.received_lsn + 1) return error.UnexpectedRecordLsn;
             var existing = (try self.receive_log.entryAt(self.alloc, record.lsn)) orelse return error.MissingReceivedRecord;
             defer existing.deinit(self.alloc);
             try self.validateRecord(existing.record);
             if (!recordsEqual(existing.record, record)) return error.ConflictingReceivedRecord;
 
-            var next = self.progress;
+            var next = self.progress_state;
             next.received_lsn = record.lsn;
-            try self.persistProgress(next);
-            self.progress = next;
+            try self.persistProgressForIdentity(self.identity_state, next);
+            self.publishState(self.identity_state, next);
             return record.lsn;
         }
 
-        if (record.lsn != self.progress.received_lsn + 1) return error.UnexpectedRecordLsn;
-        if (record.previous_lsn != self.progress.received_lsn) return error.UnexpectedPreviousLsn;
+        if (record.lsn != self.progress_state.received_lsn + 1) return error.UnexpectedRecordLsn;
+        if (record.previous_lsn != self.progress_state.received_lsn) return error.UnexpectedPreviousLsn;
 
         const lsn = try self.receive_log.append(self.alloc, record);
-        var next = self.progress;
+        var next = self.progress_state;
         next.received_lsn = lsn;
-        try self.persistProgress(next);
-        self.progress = next;
+        try self.persistProgressForIdentity(self.identity_state, next);
+        self.publishState(self.identity_state, next);
         return lsn;
     }
 
     fn receiveTimelineSwitch(self: *Standby, record: replication_record.Record) !u64 {
-        if (record.cluster_id != self.identity.cluster_id) return error.WrongCluster;
-        if (!scopeDimensionMatches(self.identity.shard_id, record.shard_id)) return error.WrongShard;
-        if (!scopeDimensionMatches(self.identity.table_id, record.table_id)) return error.WrongTable;
-        if (record.timeline_id <= self.identity.timeline_id) return error.InvalidTimelineSwitch;
-        if (record.epoch <= self.identity.epoch) return error.InvalidTimelineSwitch;
-        if (record.lsn != self.progress.received_lsn + 1) return error.UnexpectedRecordLsn;
-        if (record.previous_lsn != self.progress.received_lsn) return error.UnexpectedPreviousLsn;
-        if (self.progress.applied_lsn != self.progress.received_lsn or
-            self.progress.safe_read_lsn != self.progress.applied_lsn) return error.TimelineSwitchRequiresAppliedProgress;
+        if (record.cluster_id != self.identity_state.cluster_id) return error.WrongCluster;
+        if (!scopeDimensionMatches(self.identity_state.shard_id, record.shard_id)) return error.WrongShard;
+        if (!scopeDimensionMatches(self.identity_state.table_id, record.table_id)) return error.WrongTable;
+        if (record.timeline_id <= self.identity_state.timeline_id) return error.InvalidTimelineSwitch;
+        if (record.epoch <= self.identity_state.epoch) return error.InvalidTimelineSwitch;
+        if (record.lsn != self.progress_state.received_lsn + 1) return error.UnexpectedRecordLsn;
+        if (record.previous_lsn != self.progress_state.received_lsn) return error.UnexpectedPreviousLsn;
+        if (self.progress_state.applied_lsn != self.progress_state.received_lsn or
+            self.progress_state.safe_read_lsn != self.progress_state.applied_lsn) return error.TimelineSwitchRequiresAppliedProgress;
 
         const lsn = try self.receive_log.append(self.alloc, record);
-        const old_identity = self.identity;
-        const old_progress = self.progress;
-        self.identity = .{
+        const next_identity = Identity{
             .cluster_id = record.cluster_id,
-            .shard_id = self.identity.shard_id,
-            .table_id = self.identity.table_id,
+            .shard_id = self.identity_state.shard_id,
+            .table_id = self.identity_state.table_id,
             .timeline_id = record.timeline_id,
             .epoch = record.epoch,
         };
-        self.progress = .{
+        const next_progress = Progress{
             .received_lsn = lsn,
             .applied_lsn = lsn,
             .safe_read_lsn = lsn,
         };
-        errdefer {
-            self.identity = old_identity;
-            self.progress = old_progress;
-        }
-        try self.persistProgress(self.progress);
+        self.persistProgressForIdentity(next_identity, next_progress) catch |err| {
+            // The receive log already durably owns the timeline switch. Keep
+            // in-memory identity aligned with that authoritative log so a
+            // caller cannot append another record on the retired timeline.
+            self.publishState(next_identity, next_progress);
+            return err;
+        };
+        self.publishState(next_identity, next_progress);
         return lsn;
     }
 
     pub fn bootstrapCheckpoint(self: *Standby, checkpoint_lsn: u64, payload: []const u8) !void {
+        try self.lockExclusive();
+        defer self.unlockExclusive();
         if (checkpoint_lsn == 0) return error.InvalidCheckpointLsn;
-        if (self.progress.received_lsn != 0 or
-            self.progress.applied_lsn != 0 or
-            self.progress.safe_read_lsn != 0 or
+        if (self.progress_state.received_lsn != 0 or
+            self.progress_state.applied_lsn != 0 or
+            self.progress_state.safe_read_lsn != 0 or
             self.receive_log.lastLsn() != 0) return error.StandbyAlreadyBootstrapped;
 
         _ = try self.receive_log.bootstrapAt(self.alloc, .{
             .kind = .checkpoint,
             .payload_codec = .json,
-            .cluster_id = self.identity.cluster_id,
-            .shard_id = self.identity.shard_id,
-            .table_id = self.identity.table_id,
-            .timeline_id = self.identity.timeline_id,
-            .epoch = self.identity.epoch,
+            .cluster_id = self.identity_state.cluster_id,
+            .shard_id = self.identity_state.shard_id,
+            .table_id = self.identity_state.table_id,
+            .timeline_id = self.identity_state.timeline_id,
+            .epoch = self.identity_state.epoch,
             .lsn = checkpoint_lsn,
             .previous_lsn = checkpoint_lsn - 1,
             .payload = payload,
@@ -325,17 +394,28 @@ pub const Standby = struct {
             .applied_lsn = checkpoint_lsn,
             .safe_read_lsn = checkpoint_lsn,
         };
-        try self.persistProgress(next);
-        self.progress = next;
+        self.persistProgressForIdentity(self.identity_state, next) catch |err| {
+            // bootstrapAt has already established the durable checkpoint.
+            self.publishState(self.identity_state, next);
+            return err;
+        };
+        self.publishState(self.identity_state, next);
     }
 
     pub fn applyAvailable(self: *Standby, ctx: *anyopaque, apply_fn: ApplyFn) !usize {
-        const from_lsn = self.progress.applied_lsn + 1;
+        try self.lockExclusive();
+        defer self.unlockExclusive();
+        return try self.applyAvailableLocked(ctx, apply_fn);
+    }
+
+    /// The caller must hold the exclusive standby operation lease.
+    pub fn applyAvailableLocked(self: *Standby, ctx: *anyopaque, apply_fn: ApplyFn) !usize {
+        const from_lsn = self.progress_state.applied_lsn + 1;
         const entries = try self.receive_log.iterateFrom(self.alloc, from_lsn);
         defer replication_log.freeEntries(self.alloc, entries);
 
         if (entries.len == 0) {
-            if (self.progress.applied_lsn < self.progress.received_lsn) return error.MissingReceivedRecord;
+            if (self.progress_state.applied_lsn < self.progress_state.received_lsn) return error.MissingReceivedRecord;
             return 0;
         }
 
@@ -346,11 +426,11 @@ pub const Standby = struct {
             try self.validateRecord(entry.record);
             try apply_fn(ctx, entry.record);
 
-            var next = self.progress;
+            var next = self.progress_state;
             next.applied_lsn = entry.record.lsn;
             next.safe_read_lsn = entry.record.lsn;
-            try self.persistProgress(next);
-            self.progress = next;
+            try self.persistProgressForIdentity(self.identity_state, next);
+            self.publishState(self.identity_state, next);
 
             applied_count += 1;
             expected_lsn += 1;
@@ -360,25 +440,27 @@ pub const Standby = struct {
     }
 
     pub fn promote(self: *Standby, request: PromotionRequest) !PromotionResult {
-        if (request.new_timeline_id <= self.identity.timeline_id) return error.InvalidTimelineSwitch;
-        if (request.new_epoch <= self.identity.epoch) return error.InvalidTimelineSwitch;
+        try self.lockExclusive();
+        defer self.unlockExclusive();
+        if (request.new_timeline_id <= self.identity_state.timeline_id) return error.InvalidTimelineSwitch;
+        if (request.new_epoch <= self.identity_state.epoch) return error.InvalidTimelineSwitch;
         if (!request.fencing_confirmed and !request.force) return error.FencingRequired;
 
-        const required_lsn = request.required_lsn orelse self.progress.received_lsn;
-        const data_loss_possible = self.progress.received_lsn < required_lsn or
-            self.progress.applied_lsn < self.progress.received_lsn or
-            self.progress.applied_lsn < required_lsn;
+        const required_lsn = request.required_lsn orelse self.progress_state.received_lsn;
+        const data_loss_possible = self.progress_state.received_lsn < required_lsn or
+            self.progress_state.applied_lsn < self.progress_state.received_lsn or
+            self.progress_state.applied_lsn < required_lsn;
         if (data_loss_possible and !request.force) return error.PromotionRequiresForce;
 
-        const old_identity = self.identity;
+        const old_identity = self.identity_state;
         const new_identity = Identity{
-            .cluster_id = self.identity.cluster_id,
-            .shard_id = self.identity.shard_id,
-            .table_id = self.identity.table_id,
+            .cluster_id = self.identity_state.cluster_id,
+            .shard_id = self.identity_state.shard_id,
+            .table_id = self.identity_state.table_id,
             .timeline_id = request.new_timeline_id,
             .epoch = request.new_epoch,
         };
-        const switch_lsn = self.progress.received_lsn + 1;
+        const switch_lsn = self.progress_state.received_lsn + 1;
         const payload = try promotionPayload(self.alloc, old_identity, new_identity, required_lsn, request.force, data_loss_possible);
         defer self.alloc.free(payload);
 
@@ -395,13 +477,17 @@ pub const Standby = struct {
             .payload = payload,
         });
 
-        self.identity = new_identity;
-        self.progress = .{
+        const promoted_progress = Progress{
             .received_lsn = switch_lsn,
             .applied_lsn = switch_lsn,
             .safe_read_lsn = switch_lsn,
         };
-        try self.persistProgress(self.progress);
+        self.persistProgressForIdentity(new_identity, promoted_progress) catch |err| {
+            // The timeline-switch record is authoritative once appended.
+            self.publishState(new_identity, promoted_progress);
+            return err;
+        };
+        self.publishState(new_identity, promoted_progress);
 
         return .{
             .switch_lsn = switch_lsn,
@@ -413,32 +499,64 @@ pub const Standby = struct {
     }
 
     pub fn promotedPrimaryHandoff(self: *Standby) !PromotionHandoff {
-        if (self.progress.safe_read_lsn == 0) return error.StandbyNotPromoted;
-        if (self.progress.applied_lsn != self.progress.safe_read_lsn) return error.PromotionNotApplied;
+        try self.lockExclusive();
+        defer self.unlockExclusive();
+        if (self.progress_state.safe_read_lsn == 0) return error.StandbyNotPromoted;
+        if (self.progress_state.applied_lsn != self.progress_state.safe_read_lsn) return error.PromotionNotApplied;
 
-        const switch_lsn = self.progress.safe_read_lsn;
+        const switch_lsn = self.progress_state.safe_read_lsn;
         var entry = (try self.receive_log.entryAt(self.alloc, switch_lsn)) orelse return error.MissingReceivedRecord;
         defer entry.deinit(self.alloc);
         if (entry.record.kind != .timeline_switch) return error.StandbyNotPromoted;
         try self.validateRecord(entry.record);
 
-        if (self.progress.received_lsn > switch_lsn) {
+        if (self.progress_state.received_lsn > switch_lsn) {
             try self.receive_log.truncateAfter(switch_lsn);
-            self.progress = .{
+            const truncated_progress = Progress{
                 .received_lsn = switch_lsn,
                 .applied_lsn = switch_lsn,
                 .safe_read_lsn = switch_lsn,
             };
-            try self.persistProgress(self.progress);
-        } else if (self.progress.received_lsn != switch_lsn) {
+            self.persistProgressForIdentity(self.identity_state, truncated_progress) catch |err| {
+                self.publishState(self.identity_state, truncated_progress);
+                return err;
+            };
+            self.publishState(self.identity_state, truncated_progress);
+        } else if (self.progress_state.received_lsn != switch_lsn) {
             return error.PromotionNotApplied;
         }
 
         return .{
-            .identity = self.identity,
+            .identity = self.identity_state,
             .switch_lsn = switch_lsn,
             .next_lsn = switch_lsn + 1,
         };
+    }
+
+    pub fn lockExclusive(self: *Standby) !void {
+        platform_sync.lockYielding(&self.operation_mutex);
+        if (self.consumed) {
+            self.operation_mutex.unlock();
+            return error.StandbyConsumed;
+        }
+    }
+
+    pub fn unlockExclusive(self: *Standby) void {
+        self.operation_mutex.unlock();
+    }
+
+    /// Transfers the receive log after the caller has acquired the exclusive
+    /// standby operation lease. The standby remains a valid consumed tombstone
+    /// so blocked operations can fail deterministically instead of observing
+    /// poisoned memory.
+    pub fn consumePromotedReceiveLogLocked(self: *Standby) replication_log.ReplicationLog {
+        std.debug.assert(!self.consumed);
+        const log = self.receive_log;
+        self.progress_wal.close();
+        self.alloc.free(self.progress_wal_path);
+        self.alloc.free(self.receive_log_path);
+        self.consumed = true;
+        return log;
     }
 
     fn validateReceivedLog(self: *Standby) !?Identity {
@@ -453,9 +571,9 @@ pub const Standby = struct {
             } else {
                 expected_lsn = entry.record.lsn;
             }
-            if (entry.record.cluster_id != self.identity.cluster_id) return error.WrongCluster;
-            if (!scopeDimensionMatches(self.identity.shard_id, entry.record.shard_id)) return error.WrongShard;
-            if (!scopeDimensionMatches(self.identity.table_id, entry.record.table_id)) return error.WrongTable;
+            if (entry.record.cluster_id != self.identity_state.cluster_id) return error.WrongCluster;
+            if (!scopeDimensionMatches(self.identity_state.shard_id, entry.record.shard_id)) return error.WrongShard;
+            if (!scopeDimensionMatches(self.identity_state.table_id, entry.record.table_id)) return error.WrongTable;
 
             if (current_identity) |current| {
                 if (recordMatchesTimeline(entry.record, current)) {
@@ -469,8 +587,8 @@ pub const Standby = struct {
 
             current_identity = .{
                 .cluster_id = entry.record.cluster_id,
-                .shard_id = self.identity.shard_id,
-                .table_id = self.identity.table_id,
+                .shard_id = self.identity_state.shard_id,
+                .table_id = self.identity_state.table_id,
                 .timeline_id = entry.record.timeline_id,
                 .epoch = entry.record.epoch,
             };
@@ -511,19 +629,19 @@ pub const Standby = struct {
         var entry = (try self.receive_log.entryAt(self.alloc, durable_received_lsn)) orelse return error.MissingReceivedRecord;
         defer entry.deinit(self.alloc);
         if (entry.record.kind != .timeline_switch) return null;
-        if (entry.record.cluster_id != self.identity.cluster_id) return error.WrongCluster;
-        if (!scopeDimensionMatches(self.identity.shard_id, entry.record.shard_id)) return error.WrongShard;
-        if (!scopeDimensionMatches(self.identity.table_id, entry.record.table_id)) return error.WrongTable;
-        if (entry.record.timeline_id < self.identity.timeline_id) return error.WrongTimeline;
-        if (entry.record.timeline_id == self.identity.timeline_id and entry.record.epoch != self.identity.epoch) return error.WrongEpoch;
-        if (entry.record.timeline_id > self.identity.timeline_id and entry.record.epoch <= self.identity.epoch) return error.InvalidTimelineSwitch;
+        if (entry.record.cluster_id != self.identity_state.cluster_id) return error.WrongCluster;
+        if (!scopeDimensionMatches(self.identity_state.shard_id, entry.record.shard_id)) return error.WrongShard;
+        if (!scopeDimensionMatches(self.identity_state.table_id, entry.record.table_id)) return error.WrongTable;
+        if (entry.record.timeline_id < self.identity_state.timeline_id) return error.WrongTimeline;
+        if (entry.record.timeline_id == self.identity_state.timeline_id and entry.record.epoch != self.identity_state.epoch) return error.WrongEpoch;
+        if (entry.record.timeline_id > self.identity_state.timeline_id and entry.record.epoch <= self.identity_state.epoch) return error.InvalidTimelineSwitch;
         if (entry.record.previous_lsn != replayed_progress.received_lsn) return error.MissingReceivedRecord;
 
         return .{
             .identity = .{
                 .cluster_id = entry.record.cluster_id,
-                .shard_id = self.identity.shard_id,
-                .table_id = self.identity.table_id,
+                .shard_id = self.identity_state.shard_id,
+                .table_id = self.identity_state.table_id,
                 .timeline_id = entry.record.timeline_id,
                 .epoch = entry.record.epoch,
             },
@@ -536,11 +654,11 @@ pub const Standby = struct {
     }
 
     fn validateRecord(self: *const Standby, record: replication_record.RecordView) !void {
-        if (record.cluster_id != self.identity.cluster_id) return error.WrongCluster;
-        if (!scopeDimensionMatches(self.identity.shard_id, record.shard_id)) return error.WrongShard;
-        if (!scopeDimensionMatches(self.identity.table_id, record.table_id)) return error.WrongTable;
-        if (record.timeline_id != self.identity.timeline_id) return error.WrongTimeline;
-        if (record.epoch != self.identity.epoch) return error.WrongEpoch;
+        if (record.cluster_id != self.identity_state.cluster_id) return error.WrongCluster;
+        if (!scopeDimensionMatches(self.identity_state.shard_id, record.shard_id)) return error.WrongShard;
+        if (!scopeDimensionMatches(self.identity_state.table_id, record.table_id)) return error.WrongTable;
+        if (record.timeline_id != self.identity_state.timeline_id) return error.WrongTimeline;
+        if (record.epoch != self.identity_state.epoch) return error.WrongEpoch;
     }
 
     fn replayProgress(self: *Standby) !ProgressReplay {
@@ -554,9 +672,9 @@ pub const Standby = struct {
         var current_identity: ?Identity = null;
         for (entries) |entry| {
             const decoded = try decodeProgressRecord(entry.data);
-            if (decoded.identity.cluster_id != self.identity.cluster_id) return error.WrongCluster;
-            if (decoded.identity.shard_id != self.identity.shard_id) return error.WrongShard;
-            if (decoded.identity.table_id != self.identity.table_id) return error.WrongTable;
+            if (decoded.identity.cluster_id != self.identity_state.cluster_id) return error.WrongCluster;
+            if (decoded.identity.shard_id != self.identity_state.shard_id) return error.WrongShard;
+            if (decoded.identity.table_id != self.identity_state.table_id) return error.WrongTable;
 
             if (current_identity) |current| {
                 if (decoded.identity.timeline_id < current.timeline_id) return error.NonMonotonicTimeline;
@@ -597,11 +715,11 @@ pub const Standby = struct {
             entry.record.epoch == decoded.identity.epoch;
     }
 
-    fn persistProgress(self: *Standby, progress: Progress) !void {
+    fn persistProgressForIdentity(self: *Standby, identity: Identity, progress: Progress) !void {
         if (progress.applied_lsn > progress.received_lsn) return error.AppliedAheadOfReceived;
         if (progress.safe_read_lsn > progress.applied_lsn) return error.SafeReadAheadOfApplied;
 
-        const encoded = encodeProgress(self.identity, progress);
+        const encoded = encodeProgress(identity, progress);
         _ = try self.progress_wal.append(&encoded);
     }
 };
@@ -899,9 +1017,66 @@ test "storage.ha standby whole instance identity accepts mixed table records acr
     {
         var reopened = try Standby.open(alloc, paths.receive_log.ptr, paths.progress_wal.ptr, identity, .{});
         defer reopened.close();
-        try std.testing.expectEqual(identity, reopened.identity);
+        try std.testing.expectEqual(identity, reopened.identitySnapshot());
         try std.testing.expectEqual(@as(u64, 2), reopened.currentProgress().safe_read_lsn);
     }
+}
+
+test "storage.ha standby snapshots do not wait behind the operation lease" {
+    const alloc = std.testing.allocator;
+    const identity = Identity{ .cluster_id = 10, .timeline_id = 1, .epoch = 1 };
+    const paths = try testPaths(alloc, "snapshot-publication-lock");
+    defer paths.deinit(alloc);
+
+    var standby = try Standby.open(alloc, paths.receive_log.ptr, paths.progress_wal.ptr, identity, .{});
+    defer standby.close();
+    const Worker = struct {
+        standby: *Standby,
+        started: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            self.started.store(true, .release);
+            _ = self.standby.snapshot();
+            self.done.store(true, .release);
+        }
+    };
+
+    try standby.lockExclusive();
+    var operation_locked = true;
+    defer if (operation_locked) standby.unlockExclusive();
+    var worker = Worker{ .standby = &standby };
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    while (!worker.started.load(.acquire)) std.atomic.spinLoopHint();
+    var attempts: usize = 0;
+    while (!worker.done.load(.acquire) and attempts < 1_000) : (attempts += 1)
+        std.Thread.yield() catch {};
+    const completed_while_operation_locked = worker.done.load(.acquire);
+    standby.unlockExclusive();
+    operation_locked = false;
+    thread.join();
+    try std.testing.expect(completed_while_operation_locked);
+}
+
+test "storage.ha standby path observation is fenced after consumption" {
+    const alloc = std.testing.allocator;
+    const identity = Identity{ .cluster_id = 10, .timeline_id = 1, .epoch = 1 };
+    const paths = try testPaths(alloc, "path-observation");
+    defer paths.deinit(alloc);
+
+    var standby = try Standby.open(alloc, paths.receive_log.ptr, paths.progress_wal.ptr, identity, .{});
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    try std.testing.expectEqual(
+        PathMatchResult.match,
+        try standby.pathsMatch(alloc, io_impl.io(), paths.receive_log, paths.progress_wal),
+    );
+    standby.close();
+    try std.testing.expectError(
+        error.StandbyConsumed,
+        standby.pathsMatch(alloc, io_impl.io(), paths.receive_log, paths.progress_wal),
+    );
+    try std.testing.expectEqual(identity, standby.snapshot().identity);
 }
 
 test "storage.ha standby receives applies and persists progress across reopen" {
@@ -1012,8 +1187,8 @@ test "storage.ha standby follows promoted timeline switch after applying parent 
         try std.testing.expectEqual(@as(usize, 2), try standby.applyAvailable(&capture, ApplyCapture.apply));
 
         try std.testing.expectEqual(@as(u64, 3), try standby.receive(timelineSwitchRecord(promoted, 3, 2)));
-        try std.testing.expectEqual(promoted.timeline_id, standby.identity.timeline_id);
-        try std.testing.expectEqual(promoted.epoch, standby.identity.epoch);
+        try std.testing.expectEqual(promoted.timeline_id, standby.identity_state.timeline_id);
+        try std.testing.expectEqual(promoted.epoch, standby.identity_state.epoch);
         try std.testing.expectEqual(@as(u64, 3), standby.currentProgress().received_lsn);
         try std.testing.expectEqual(@as(u64, 3), standby.currentProgress().applied_lsn);
         try std.testing.expectEqual(@as(u64, 3), standby.currentProgress().safe_read_lsn);
@@ -1046,14 +1221,14 @@ test "storage.ha standby receive retry reconciles durable record when progress l
 
     const first = baseRecord(identity, 1, "one");
     _ = try standby.receive(first);
-    standby.progress = .{};
+    standby.progress_state = .{};
 
     try std.testing.expectEqual(@as(u64, 1), try standby.receive(first));
     try std.testing.expectEqual(@as(u64, 1), standby.currentProgress().received_lsn);
     try std.testing.expectEqual(@as(u64, 0), standby.currentProgress().applied_lsn);
     try std.testing.expectEqual(@as(u64, 1), standby.receive_log.lastLsn());
 
-    standby.progress = .{};
+    standby.progress_state = .{};
     try std.testing.expectError(error.ConflictingReceivedRecord, standby.receive(baseRecord(identity, 1, "different")));
     try std.testing.expectEqual(@as(u64, 0), standby.currentProgress().received_lsn);
 }
@@ -1126,7 +1301,7 @@ test "storage.ha standby promotion requires fencing and appends timeline switch"
     try std.testing.expectEqual(@as(u64, 2), result.new_identity.timeline_id);
     try std.testing.expect(!result.forced);
     try std.testing.expect(!result.data_loss_possible);
-    try std.testing.expectEqual(@as(u64, 2), standby.identity.timeline_id);
+    try std.testing.expectEqual(@as(u64, 2), standby.identity_state.timeline_id);
     try std.testing.expectEqual(@as(u64, 3), standby.currentProgress().applied_lsn);
 
     const entries = try standby.receive_log.iterateFrom(alloc, 3);
@@ -1168,7 +1343,7 @@ test "storage.ha promoted standby handoff truncates unapplied received records a
     });
     try std.testing.expectEqual(@as(u64, 3), result.switch_lsn);
 
-    _ = try standby.receive(baseRecord(standby.identity, 4, "unapplied-after-switch"));
+    _ = try standby.receive(baseRecord(standby.identity_state, 4, "unapplied-after-switch"));
     try std.testing.expectEqual(@as(u64, 4), standby.currentProgress().received_lsn);
     try std.testing.expectEqual(@as(u64, 3), standby.currentProgress().applied_lsn);
     try std.testing.expectEqual(@as(u64, 3), standby.currentProgress().safe_read_lsn);
@@ -1206,7 +1381,7 @@ test "storage.ha standby forced promotion records possible data loss" {
     try std.testing.expectEqual(@as(u64, 3), result.switch_lsn);
     try std.testing.expect(result.forced);
     try std.testing.expect(result.data_loss_possible);
-    try std.testing.expectEqual(@as(u64, 2), standby.identity.timeline_id);
+    try std.testing.expectEqual(@as(u64, 2), standby.identity_state.timeline_id);
     try std.testing.expectEqual(@as(u64, 3), standby.currentProgress().received_lsn);
     try std.testing.expectEqual(@as(u64, 3), standby.currentProgress().applied_lsn);
 
@@ -1251,8 +1426,8 @@ test "storage.ha promoted standby reopens on new timeline and rejects old timeli
     {
         var recovered = try Standby.open(alloc, paths.receive_log.ptr, paths.progress_wal.ptr, identity, .{});
         defer recovered.close();
-        try std.testing.expectEqual(@as(u64, 2), recovered.identity.timeline_id);
-        try std.testing.expectEqual(@as(u64, 2), recovered.identity.epoch);
+        try std.testing.expectEqual(@as(u64, 2), recovered.identitySnapshot().timeline_id);
+        try std.testing.expectEqual(@as(u64, 2), recovered.identitySnapshot().epoch);
         try std.testing.expectEqual(@as(u64, 2), recovered.currentProgress().received_lsn);
         try std.testing.expectEqual(@as(u64, 2), recovered.currentProgress().applied_lsn);
         try std.testing.expectError(error.WrongTimeline, recovered.receive(baseRecord(identity, 3, "old-timeline")));
@@ -1261,7 +1436,7 @@ test "storage.ha promoted standby reopens on new timeline and rejects old timeli
     {
         var reopened = try Standby.open(alloc, paths.receive_log.ptr, paths.progress_wal.ptr, promoted_identity, .{});
         defer reopened.close();
-        try std.testing.expectEqual(@as(u64, 2), reopened.identity.timeline_id);
+        try std.testing.expectEqual(@as(u64, 2), reopened.identitySnapshot().timeline_id);
         try std.testing.expectEqual(@as(u64, 2), reopened.currentProgress().received_lsn);
         try std.testing.expectEqual(@as(u64, 2), reopened.currentProgress().applied_lsn);
         try std.testing.expectError(error.WrongTimeline, reopened.receive(baseRecord(identity, 3, "old-timeline")));
@@ -1308,8 +1483,8 @@ test "storage.ha standby recovers timeline switch when promotion progress lags" 
     {
         var recovered = try Standby.open(alloc, paths.receive_log.ptr, paths.progress_wal.ptr, identity, .{});
         defer recovered.close();
-        try std.testing.expectEqual(promoted_identity.timeline_id, recovered.identity.timeline_id);
-        try std.testing.expectEqual(promoted_identity.epoch, recovered.identity.epoch);
+        try std.testing.expectEqual(promoted_identity.timeline_id, recovered.identitySnapshot().timeline_id);
+        try std.testing.expectEqual(promoted_identity.epoch, recovered.identitySnapshot().epoch);
         try std.testing.expectEqual(@as(u64, 3), recovered.currentProgress().received_lsn);
         try std.testing.expectEqual(@as(u64, 3), recovered.currentProgress().applied_lsn);
         try std.testing.expectEqual(@as(u64, 3), recovered.currentProgress().safe_read_lsn);

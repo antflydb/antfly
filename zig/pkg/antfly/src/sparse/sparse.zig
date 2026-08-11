@@ -160,7 +160,14 @@ pub const SearchConstraints = struct {
     exclude_doc_ids: []const []const u8 = &.{},
     filter_doc_nums: []const u32 = &.{},
     exclude_doc_nums: []const u32 = &.{},
+    cancellation: ?*const std.atomic.Value(bool) = null,
 };
+
+fn checkSearchCancellation(cancellation: ?*const std.atomic.Value(bool)) !void {
+    if (cancellation) |value| {
+        if (value.load(.acquire)) return error.Cancelled;
+    }
+}
 
 const BulkPosting = struct {
     term_id: u32,
@@ -1172,6 +1179,22 @@ pub const SparseIndex = struct {
             self.* = .none;
         }
 
+        fn abandonAfterCrash(self: *StoreOwner, alloc: Allocator) void {
+            switch (self.*) {
+                .none => {},
+                .lmdb => |backend| {
+                    backend.close();
+                    alloc.destroy(backend);
+                },
+                .mem => |backend| {
+                    backend.close();
+                    alloc.destroy(backend);
+                },
+                .lsm => |*handle| handle.abandonAfterCrash(),
+            }
+            self.* = .none;
+        }
+
         fn sync(self: *StoreOwner, force: bool) !void {
             switch (self.*) {
                 .none, .mem => {},
@@ -1384,6 +1407,12 @@ pub const SparseIndex = struct {
     pub fn close(self: *SparseIndex) void {
         self.store.deinit();
         self.owner.close(self.alloc);
+        self.* = undefined;
+    }
+
+    pub fn abandonAfterCrash(self: *SparseIndex) void {
+        self.store.deinit();
+        self.owner.abandonAfterCrash(self.alloc);
         self.* = undefined;
     }
 
@@ -3098,6 +3127,7 @@ pub const SparseIndex = struct {
         k: u32,
         constraints: SearchConstraints,
     ) ![]SearchResult {
+        try checkSearchCancellation(constraints.cancellation);
         const profile_enabled = sparseSearchProfileEnabled();
         const total_start_ns = if (profile_enabled) nowNs() else 0;
         var profile: SearchProfile = .{};
@@ -3176,10 +3206,12 @@ pub const SparseIndex = struct {
             direct_exclude_doc_nums: *const std.AutoHashMapUnmanaged(u32, void),
             profile: ?*SearchProfile,
             source: ScoreSource,
+            cancellation: ?*const std.atomic.Value(bool),
 
             fn visit(ctx: *@This(), decoded: DecodedChunk) !void {
                 const collect_start_ns = if (ctx.profile != null) nowNs() else 0;
                 for (decoded.doc_nums, 0..) |doc_num, di| {
+                    if (di % 256 == 0) try checkSearchCancellation(ctx.cancellation);
                     if (ctx.filter_doc_nums.count() > 0 and !ctx.filter_doc_nums.contains(doc_num)) continue;
                     if (ctx.direct_filter_doc_nums.count() > 0 and !ctx.direct_filter_doc_nums.contains(doc_num)) continue;
                     if (ctx.exclude_doc_nums.contains(doc_num)) continue;
@@ -3206,6 +3238,7 @@ pub const SparseIndex = struct {
         var maybe_segment = try segment_cur.seekAtOrAfter(taggedPrefix(key_segment));
         if (profile_enabled) profile.segment_seek_ns += nowNs() - segment_seek_start_ns;
         while (maybe_segment) |segment_entry| {
+            try checkSearchCancellation(constraints.cancellation);
             if (segment_entry.key.len == 0 or segment_entry.key[0] != key_segment) break;
             if (profile_enabled) profile.segment_entries += 1;
             for (query_vec.indices, 0..) |term_id, qi| {
@@ -3219,6 +3252,7 @@ pub const SparseIndex = struct {
                     .direct_exclude_doc_nums = &direct_exclude_doc_nums,
                     .profile = if (profile_enabled) &profile else null,
                     .source = .segment,
+                    .cancellation = constraints.cancellation,
                 };
                 const segment_decode_start_ns = if (profile_enabled) nowNs() else 0;
                 try forEachSegmentChunk(alloc, segment_entry.value, term_id, &ctx, AccumulateContext.visit);
@@ -3230,6 +3264,7 @@ pub const SparseIndex = struct {
         }
 
         for (query_vec.indices, 0..) |term_id, qi| {
+            try checkSearchCancellation(constraints.cancellation);
             const query_weight = query_vec.values[qi];
             // Check term metadata
             var meta_key_buf: [256]u8 = undefined;
@@ -3239,6 +3274,7 @@ pub const SparseIndex = struct {
 
             // Scan all chunks for this term
             for (0..tm.chunk_count) |ci| {
+                if (ci % 32 == 0) try checkSearchCancellation(constraints.cancellation);
                 var ck_buf: [256]u8 = undefined;
                 const ck = invChunkKey(&ck_buf, term_id, @intCast(ci));
                 const chunk_data = txn.get(ck) catch continue;
@@ -3258,6 +3294,7 @@ pub const SparseIndex = struct {
                     .direct_exclude_doc_nums = &direct_exclude_doc_nums,
                     .profile = if (profile_enabled) &profile else null,
                     .source = .delta,
+                    .cancellation = constraints.cancellation,
                 };
                 try AccumulateContext.visit(&ctx, decoded);
                 if (profile_enabled) profile.delta_chunk_ns += nowNs() - delta_start_ns;
@@ -3271,6 +3308,7 @@ pub const SparseIndex = struct {
 
         var it = scores.iterator();
         while (it.next()) |e| {
+            try checkSearchCancellation(constraints.cancellation);
             try entries.append(alloc, .{ .doc_num = e.key_ptr.*, .score = e.value_ptr.* });
         }
         if (profile_enabled) profile.scored_docs = entries.items.len;
@@ -3298,6 +3336,7 @@ pub const SparseIndex = struct {
         var cursor: usize = 0;
         const hydrate_start_ns = if (profile_enabled) nowNs() else 0;
         while (cursor < entries.items.len and valid < n) {
+            try checkSearchCancellation(constraints.cancellation);
             const batch_len = @min(candidate_batch_size, entries.items.len - cursor);
             var candidates = try alloc.alloc(SearchCandidate, batch_len);
             defer {

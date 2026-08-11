@@ -14,6 +14,6 @@
 
 pub const runtime = @import("runtime.zig");
 
-test "inference module compiles" {
+test "inference runtime package exports runtime module" {
     _ = runtime;
 }

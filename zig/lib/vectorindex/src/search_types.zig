@@ -35,7 +35,16 @@ pub const SearchRequest = struct {
     distance_under: ?f32 = null,
     filter_ids: []const u64 = &.{},
     exclude_ids: []const u64 = &.{},
+    /// Borrowed request-lifecycle signal. Search loops poll this at bounded
+    /// intervals so a disconnected caller does not retain query capacity.
+    cancellation: ?*const std.atomic.Value(bool) = null,
 };
+
+pub fn checkCancelled(req: SearchRequest) !void {
+    if (req.cancellation) |cancellation| {
+        if (cancellation.load(.acquire)) return error.Cancelled;
+    }
+}
 
 pub const SearchProfile = struct {
     total_ns: u64 = 0,

@@ -172,7 +172,7 @@ class HAStandaloneNode:
             cwd=self.root,
             env=env,
         )
-        if not wait_for_server(self.url, path="/status", timeout=30.0):
+        if not wait_for_server(self.url, path="/readyz", timeout=30.0):
             logs = self.debug_logs()
             self.stop()
             raise RuntimeError(f"HA {self.role} node failed to start at {self.url}\n{logs}")
@@ -211,8 +211,20 @@ class HAStandaloneNode:
             return None
         return {"Authorization": f"Bearer {self.admin_token}"}
 
+    def _request(self, method: str, url: str, **kwargs: Any) -> requests.Response:
+        try:
+            return requests.request(method, url, **kwargs)
+        except requests.RequestException as err:
+            exit_code = self.proc.poll() if self.proc is not None else None
+            err.add_note(
+                f"HA {self.role} request failed; process_exit_code={exit_code}\n"
+                f"[logs]\n{self.debug_logs()}"
+            )
+            raise
+
     def admin_get_response(self, path: str, **params: Any) -> requests.Response:
-        return requests.get(
+        return self._request(
+            "GET",
             f"{self.url}{HA_ADMIN_ROOT}{path}",
             params=params,
             headers=self.admin_headers(),
@@ -220,7 +232,8 @@ class HAStandaloneNode:
         )
 
     def admin_post_response(self, path: str, payload: dict[str, Any]) -> requests.Response:
-        return requests.post(
+        return self._request(
+            "POST",
             f"{self.url}{HA_ADMIN_ROOT}{path}",
             json=payload,
             headers=self.admin_headers(),
@@ -236,7 +249,8 @@ class HAStandaloneNode:
         return self._check(response)
 
     def create_table(self, table_name: str) -> dict[str, Any]:
-        response = requests.post(
+        response = self._request(
+            "POST",
             f"{self.url}{DB_API_ROOT}/tables/{table_name}",
             json={"num_shards": 1},
             timeout=30,
@@ -248,7 +262,8 @@ class HAStandaloneNode:
         return self._check(response)
 
     def batch_write_response(self, table_name: str, inserts: dict[str, dict[str, Any]]) -> requests.Response:
-        return requests.post(
+        return self._request(
+            "POST",
             f"{self.url}{DB_API_ROOT}/tables/{table_name}/batch",
             json={"inserts": inserts},
             timeout=30,
@@ -256,7 +271,8 @@ class HAStandaloneNode:
 
     def lookup_key(self, table_name: str, key: str, *, consistency: str | None = None) -> dict[str, Any]:
         params = {"consistency": consistency} if consistency is not None else None
-        response = requests.get(
+        response = self._request(
+            "GET",
             f"{self.url}{DB_API_ROOT}{lookup_key_path(table_name, key)}",
             params=params,
             timeout=30,
@@ -408,10 +424,10 @@ class HACluster:
             },
         )
 
-    def close(self) -> None:
+    def close(self, *, test_failed: bool = False) -> None:
         self.standby.close()
         self.primary.close()
-        if not maybe_preserve_tempdir(self.tempdir):
+        if not maybe_preserve_tempdir(self.tempdir, failed=test_failed):
             self.tempdir.cleanup()
 
     def debug_logs(self) -> str:
@@ -419,7 +435,7 @@ class HACluster:
 
 
 @pytest.fixture
-def ha_cluster() -> HACluster:
+def ha_cluster(request: pytest.FixtureRequest) -> HACluster:
     binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
     if not Path(binary).exists():
         pytest.skip(f"Antfly binary not found: {binary}")
@@ -432,7 +448,8 @@ def ha_cluster() -> HACluster:
     try:
         yield cluster
     finally:
-        cluster.close()
+        report = getattr(request.node, "rep_call", None)
+        cluster.close(test_failed=bool(report and report.failed))
 
 
 def _wait_for_standby_applied(cluster: HACluster, lsn: int, *, timeout_s: float = 20.0) -> dict[str, Any]:

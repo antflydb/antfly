@@ -2608,6 +2608,8 @@ func (r *AntflyClusterReconciler) reconcileConfigMap(ctx context.Context, cluste
 	if err != nil {
 		return fmt.Errorf("failed to generate complete config: %w", err)
 	}
+	configSum := sha256.Sum256([]byte(completeConfig))
+	configHash := fmt.Sprintf("%x", configSum)[:16]
 
 	configMap := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
@@ -2627,11 +2629,22 @@ func (r *AntflyClusterReconciler) reconcileConfigMap(ctx context.Context, cluste
 		configMap.Data = map[string]string{
 			"config.json": completeConfig,
 		}
+		if configMap.Annotations == nil {
+			configMap.Annotations = make(map[string]string)
+		}
+		configMap.Annotations[generatedConfigHashAnnotation] = configHash
 
 		return nil
 	})
 
-	return err
+	if err != nil {
+		return err
+	}
+	cluster.Status.ConfigPublication = &antflyv1.ConfigPublicationStatus{
+		ObservedGeneration: cluster.Generation,
+		SHA256:             fmt.Sprintf("%x", configSum),
+	}
+	return nil
 }
 
 // generateCompleteConfig creates a complete Antfly configuration by merging user config with generated metadata network config
@@ -3337,15 +3350,35 @@ exec /antfly standalone --id %d --config /config/config.json \
 	return err
 }
 
+const generatedConfigHashAnnotation = "antfly.io/config-hash"
+const compatibilityRolloutGenerationAnnotation = "cloud.antfly.io/compatibility-rollout-generation"
+
 // buildPodAnnotations returns the complete annotations for pod templates including:
 // - Service mesh annotations
-// - EnvFrom hash annotation for secret rotation detection
+// - Generated non-secret Antfly config hash
+// - EnvFrom hash annotation (ConfigMap contents and Secret reference names only)
 func (r *AntflyClusterReconciler) buildPodAnnotations(ctx context.Context, cache *envFromCache, cluster *antflyv1.AntflyCluster, envFrom []corev1.EnvFromSource) map[string]string {
 	annotations := make(map[string]string)
 
 	// Add service mesh annotations
 	if cluster.Spec.ServiceMesh != nil && cluster.Spec.ServiceMesh.Enabled {
 		maps.Copy(annotations, cluster.Spec.ServiceMesh.Annotations)
+	}
+	// Colony uses this non-secret generation only when the running Antfly
+	// version does not expose live-reload acknowledgements. Copying it to the
+	// template provides a compatibility rollout without granting the operator
+	// permission to read Secret contents.
+	if generation := strings.TrimSpace(cluster.Annotations[compatibilityRolloutGenerationAnnotation]); generation != "" {
+		annotations[compatibilityRolloutGenerationAnnotation] = generation
+	}
+
+	// ConfigMap volumes are updated in place, but older Antfly versions only
+	// parse config.json during startup. Hash the generated non-secret config so
+	// those versions roll when routing or credential references change. Secret
+	// values are deliberately absent from this hash and remain live-reloadable.
+	if completeConfig, err := r.generateCompleteConfig(cluster); err == nil {
+		sum := sha256.Sum256([]byte(completeConfig))
+		annotations[generatedConfigHashAnnotation] = fmt.Sprintf("%x", sum)[:16]
 	}
 
 	// Add envFrom hash annotation if there are envFrom sources

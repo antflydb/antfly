@@ -73,25 +73,46 @@ pub const BatchDelete = struct {
     edge_type: []const u8,
 };
 
-/// Encode edge value: [weight:f64 LE][created_at:u64 LE][updated_at:u64 LE][metadata]
-pub fn encodeEdgeValue(buf: []u8, weight: f64, created_at: u64, updated_at: u64, metadata: []const u8) []const u8 {
+const edge_value_header_len: usize = 24;
+
+pub const DecodedEdgeValue = struct {
+    weight: f64,
+    created_at: u64,
+    updated_at: u64,
+    metadata: []const u8,
+};
+
+/// Encode edge value: [weight:f64 LE][created_at:u64 LE][updated_at:u64 LE][metadata].
+///
+/// Values are allocated to their exact size so valid metadata is not coupled
+/// to a fixed stack buffer. The graph batch retains no reference after `put`.
+pub fn encodeEdgeValueAlloc(
+    alloc: Allocator,
+    weight: f64,
+    created_at: u64,
+    updated_at: u64,
+    metadata: []const u8,
+) ![]u8 {
+    const encoded_len = std.math.add(usize, edge_value_header_len, metadata.len) catch
+        return error.EdgeMetadataTooLarge;
+    const buf = try alloc.alloc(u8, encoded_len);
+    errdefer alloc.free(buf);
     const weight_bits: u64 = @bitCast(weight);
     std.mem.writeInt(u64, buf[0..8], weight_bits, .little);
     std.mem.writeInt(u64, buf[8..16], created_at, .little);
     std.mem.writeInt(u64, buf[16..24], updated_at, .little);
-    if (metadata.len > 0) {
-        @memcpy(buf[24 .. 24 + metadata.len], metadata);
-    }
-    return buf[0 .. 24 + metadata.len];
+    @memcpy(buf[edge_value_header_len..], metadata);
+    return buf;
 }
 
 /// Decode edge value from binary format.
-pub fn decodeEdgeValue(data: []const u8) struct { weight: f64, created_at: u64, updated_at: u64, metadata: []const u8 } {
+pub fn decodeEdgeValue(data: []const u8) !DecodedEdgeValue {
+    if (data.len < edge_value_header_len) return error.InvalidGraphEdgeValue;
     const weight_bits = std.mem.readInt(u64, data[0..8], .little);
     const weight: f64 = @bitCast(weight_bits);
     const created_at = std.mem.readInt(u64, data[8..16], .little);
     const updated_at = std.mem.readInt(u64, data[16..24], .little);
-    const metadata = if (data.len > 24) data[24..] else &[0]u8{};
+    const metadata = data[edge_value_header_len..];
     return .{ .weight = weight, .created_at = created_at, .updated_at = updated_at, .metadata = metadata };
 }
 
@@ -264,6 +285,7 @@ pub const GraphIndexOptions = struct {
     reverse_lsm_root_generation: u64 = 0,
     edge_type_configs: []const EdgeTypeConfig = &.{},
     rebuild_root_path: ?[]const u8 = null,
+    rebuild_owner_generation: u64 = 0,
     algebraic_semiring_traversal: bool = false,
 };
 
@@ -318,6 +340,8 @@ pub const GraphIndex = struct {
     reverse_owner: ReverseStoreOwner,
     edge_type_configs: []const EdgeTypeConfig,
     rebuild_root_path: ?[]u8,
+    rebuild_storage: ?lsm_backend.Storage,
+    rebuild_owner_generation: u64,
     algebraic_semiring_traversal: bool,
     edge_count: u64,
     node_count: u64,
@@ -347,6 +371,22 @@ pub const GraphIndex = struct {
                     alloc.destroy(backend);
                 },
                 .lsm => |*handle| handle.close(),
+            }
+            self.* = .none;
+        }
+
+        fn abandonAfterCrash(self: *ReverseStoreOwner, alloc: Allocator) void {
+            switch (self.*) {
+                .none => {},
+                .lmdb => |backend| {
+                    backend.close();
+                    alloc.destroy(backend);
+                },
+                .mem => |backend| {
+                    backend.close();
+                    alloc.destroy(backend);
+                },
+                .lsm => |*handle| handle.abandonAfterCrash(),
             }
             self.* = .none;
         }
@@ -682,6 +722,8 @@ pub const GraphIndex = struct {
             .reverse_owner = reverse_store.owner,
             .edge_type_configs = opts.edge_type_configs,
             .rebuild_root_path = if (opts.rebuild_root_path) |path| try alloc.dupe(u8, path) else null,
+            .rebuild_storage = opts.reverse_lsm_storage,
+            .rebuild_owner_generation = opts.rebuild_owner_generation,
             .algebraic_semiring_traversal = opts.algebraic_semiring_traversal,
             .edge_count = loaded_stats.edge_count,
             .node_count = loaded_stats.node_count,
@@ -698,6 +740,15 @@ pub const GraphIndex = struct {
         self.outgoing_owner.close(self.alloc);
         self.reverse_store.deinit();
         self.reverse_owner.close(self.alloc);
+        if (self.rebuild_root_path) |path| self.alloc.free(path);
+        self.* = undefined;
+    }
+
+    pub fn abandonAfterCrash(self: *GraphIndex) void {
+        self.outgoing_store.deinit();
+        self.outgoing_owner.abandonAfterCrash(self.alloc);
+        self.reverse_store.deinit();
+        self.reverse_owner.abandonAfterCrash(self.alloc);
         if (self.rebuild_root_path) |path| self.alloc.free(path);
         self.* = undefined;
     }
@@ -904,8 +955,14 @@ pub const GraphIndex = struct {
         }
 
         for (writes) |write| {
-            var val_buf: [4096]u8 = undefined;
-            const edge_val = encodeEdgeValue(&val_buf, write.weight, write.created_at, write.updated_at, write.metadata_json);
+            const edge_val = try encodeEdgeValueAlloc(
+                self.alloc,
+                write.weight,
+                write.created_at,
+                write.updated_at,
+                write.metadata_json,
+            );
+            defer self.alloc.free(edge_val);
 
             const out_key = try edgeKeyAlloc(self.alloc, write.source, self.index_name, write.edge_type, write.target);
             defer self.alloc.free(out_key);
@@ -951,6 +1008,32 @@ pub const GraphIndex = struct {
         return owned;
     }
 
+    /// Probe incoming-edge existence for a key batch using one reverse-store
+    /// snapshot and one cursor. Results are aligned with `keys`.
+    pub fn hasIncomingEdgesManyAlloc(
+        self: *GraphIndex,
+        alloc: Allocator,
+        keys: []const []const u8,
+    ) ![]bool {
+        const result = try alloc.alloc(bool, keys.len);
+        errdefer alloc.free(result);
+        @memset(result, false);
+        if (keys.len == 0) return result;
+
+        var txn = try self.beginReadReverseTxn();
+        defer txn.abort();
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+
+        for (keys, 0..) |key, i| {
+            const prefix = try reverseEdgePrefixAlloc(alloc, key, self.index_name, "");
+            defer alloc.free(prefix);
+            const first = (try cursor.seekAtOrAfter(prefix)) orelse continue;
+            result[i] = std.mem.startsWith(u8, first.key, prefix);
+        }
+        return result;
+    }
+
     fn scanOutgoingEdges(self: *GraphIndex, alloc: Allocator, results: *std.ArrayListUnmanaged(Edge), key: []const u8, edge_type: []const u8) !void {
         const prefix = try edgePrefixAlloc(alloc, key, self.index_name, edge_type);
         defer alloc.free(prefix);
@@ -961,7 +1044,7 @@ pub const GraphIndex = struct {
         for (pairs) |pair| {
             var parsed = (try parseOutgoingEdgeKeyAlloc(alloc, pair.key)) orelse continue;
             defer parsed.deinit(alloc);
-            const decoded = decodeEdgeValue(pair.value);
+            const decoded = try decodeEdgeValue(pair.value);
             try results.append(alloc, .{
                 .source = try alloc.dupe(u8, parsed.source),
                 .target = try alloc.dupe(u8, parsed.target),
@@ -1011,7 +1094,7 @@ pub const GraphIndex = struct {
     }
 
     fn appendParsedEdge(alloc: Allocator, results: *std.ArrayListUnmanaged(Edge), parsed: ParsedGraphEdgeKey, value: []const u8) !void {
-        const decoded = decodeEdgeValue(value);
+        const decoded = try decodeEdgeValue(value);
         try results.append(alloc, .{
             .source = try alloc.dupe(u8, parsed.source),
             .target = try alloc.dupe(u8, parsed.target),
@@ -1066,7 +1149,9 @@ pub const GraphIndex = struct {
     }
 
     pub fn rebuildReverseFromOwnedOutgoingEdges(self: *GraphIndex, alloc: Allocator, lower: []const u8, upper: []const u8) !usize {
-        return try self.rebuildReverseFromOwnedOutgoingEdgesResume(alloc, lower, upper, null);
+        var io_impl = std.Io.Threaded.init(alloc, .{});
+        defer io_impl.deinit();
+        return try self.rebuildReverseFromOwnedOutgoingEdgesResumeWithIo(alloc, io_impl.io(), lower, upper, null);
     }
 
     pub fn copyOwnedOutgoingEdgesTo(self: *GraphIndex, dest: *GraphIndex, alloc: Allocator, lower: []const u8, upper: []const u8) !usize {
@@ -1102,6 +1187,19 @@ pub const GraphIndex = struct {
         upper: []const u8,
         resume_from: ?[]const u8,
     ) !usize {
+        var io_impl = std.Io.Threaded.init(alloc, .{});
+        defer io_impl.deinit();
+        return try self.rebuildReverseFromOwnedOutgoingEdgesResumeWithIo(alloc, io_impl.io(), lower, upper, resume_from);
+    }
+
+    pub fn rebuildReverseFromOwnedOutgoingEdgesResumeWithIo(
+        self: *GraphIndex,
+        alloc: Allocator,
+        io: std.Io,
+        lower: []const u8,
+        upper: []const u8,
+        resume_from: ?[]const u8,
+    ) !usize {
         const base_lower_owned = if (lower.len > 0) try internal_keys.documentRangeLowerAlloc(alloc, lower) else null;
         defer if (base_lower_owned) |key| alloc.free(key);
         const range_upper_owned = if (upper.len > 0) try internal_keys.documentRangeLowerAlloc(alloc, upper) else null;
@@ -1123,7 +1221,13 @@ pub const GraphIndex = struct {
         var txn = try self.beginWriteReverseTxn();
         var txn_active = true;
         errdefer if (txn_active) txn.abort();
-        const rebuild_state = if (self.rebuild_root_path) |path| backfill_state_mod.RebuildState.init(path) else null;
+        const rebuild_state = if (self.rebuild_root_path) |path|
+            if (self.rebuild_owner_generation != 0)
+                backfill_state_mod.RebuildState.initOwned(path, self.rebuild_storage, self.rebuild_owner_generation)
+            else
+                backfill_state_mod.RebuildState.initWithStorage(path, self.rebuild_storage)
+        else
+            null;
 
         for (pairs) |pair| {
             if (resume_from) |resume_key| {
@@ -1143,7 +1247,7 @@ pub const GraphIndex = struct {
             if (batch_count >= reverse_rebuild_batch_size) {
                 try txn.commit();
                 txn_active = false;
-                if (rebuild_state) |state| try state.update(pair.key);
+                if (rebuild_state) |state| try state.updateWithIo(io, pair.key);
                 flushed_batches += 1;
                 if (@import("builtin").is_test) {
                     if (test_abort_reverse_rebuild_after_batches) |limit| {
@@ -1158,7 +1262,7 @@ pub const GraphIndex = struct {
 
         try txn.commit();
         txn_active = false;
-        if (rebuild_state) |state| try state.clear();
+        if (rebuild_state) |state| try state.clearWithIo(io);
         try self.rebuildCounterMetadata();
         try self.checkpointLsmWalAfterDurableBoundary();
         return rebuilt;
@@ -1377,6 +1481,11 @@ test "graph addEdge and getEdges in (reverse index)" {
     for (edges) |e| {
         try std.testing.expectEqualStrings("b", e.target);
     }
+
+    const keys = [_][]const u8{ "a", "b", "missing", "c" };
+    const incoming = try graph.hasIncomingEdgesManyAlloc(alloc, &keys);
+    defer alloc.free(incoming);
+    try std.testing.expectEqualSlices(bool, &.{ false, true, false, false }, incoming);
 }
 
 test "graph edge keys support arbitrary document ids and edge types" {
@@ -1491,14 +1600,52 @@ test "graph batchApply applies writes and deletes together" {
 }
 
 test "graph edge encoding round-trip" {
-    var buf: [256]u8 = undefined;
-    const encoded = encodeEdgeValue(&buf, 0.75, 1234567890, 1234567891, "{\"key\":\"val\"}");
-    const decoded = decodeEdgeValue(encoded);
+    const encoded = try encodeEdgeValueAlloc(std.testing.allocator, 0.75, 1234567890, 1234567891, "{\"key\":\"val\"}");
+    defer std.testing.allocator.free(encoded);
+    const decoded = try decodeEdgeValue(encoded);
 
     try std.testing.expectApproxEqAbs(@as(f64, 0.75), decoded.weight, 0.001);
     try std.testing.expectEqual(@as(u64, 1234567890), decoded.created_at);
     try std.testing.expectEqual(@as(u64, 1234567891), decoded.updated_at);
     try std.testing.expectEqualStrings("{\"key\":\"val\"}", decoded.metadata);
+}
+
+test "graph edge values support large metadata and reject truncated records" {
+    const alloc = std.testing.allocator;
+    const metadata = try alloc.alloc(u8, 16 * 1024);
+    defer alloc.free(metadata);
+    @memset(metadata, 'm');
+
+    const encoded = try encodeEdgeValueAlloc(alloc, 1.25, 17, 19, metadata);
+    defer alloc.free(encoded);
+    const decoded = try decodeEdgeValue(encoded);
+    try std.testing.expectEqualStrings(metadata, decoded.metadata);
+    try std.testing.expectError(error.InvalidGraphEdgeValue, decodeEdgeValue(encoded[0..23]));
+}
+
+test "graph index persists metadata larger than the former stack buffer" {
+    const alloc = std.testing.allocator;
+    var store_buf: [256]u8 = undefined;
+    const store_path = tmpPath(&store_buf, "large-edge-metadata-store");
+    defer cleanupTmp(store_path);
+    var reverse_buf: [256]u8 = undefined;
+    const reverse_path = tmpPath(&reverse_buf, "large-edge-metadata-reverse");
+    defer cleanupTmp(reverse_path);
+
+    const metadata = try alloc.alloc(u8, 16 * 1024);
+    defer alloc.free(metadata);
+    @memset(metadata, 'm');
+
+    var store = try docstore.DocStore.open(alloc, store_path, .{});
+    defer store.close();
+    var graph = try GraphIndex.open(alloc, &store, reverse_path, "g", .{});
+    defer graph.close();
+
+    try graph.addEdge("source", "target", "references", 1.0, 10, 11, metadata);
+    const edges = try graph.getEdges(alloc, "source", "references", .out);
+    defer GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqualStrings(metadata, edges[0].metadata);
 }
 
 test "graph getEdges with edge type filter" {
@@ -1573,8 +1720,8 @@ test "graph rebuildReverseFromOwnedOutgoingEdges reconstructs incoming index" {
     var graph = try GraphIndex.open(alloc, &store, rev_path, "g", .{});
     defer graph.close();
 
-    var val_buf: [128]u8 = undefined;
-    const edge_val = encodeEdgeValue(&val_buf, 1.0, 10, 11, "");
+    const edge_val = try encodeEdgeValueAlloc(alloc, 1.0, 10, 11, "");
+    defer alloc.free(edge_val);
     const edge_key = try edgeKeyAlloc(alloc, "doc:m", "g", "ref", "doc:z");
     defer alloc.free(edge_key);
     {
@@ -1606,8 +1753,8 @@ test "graph rebuildReverseFromOwnedOutgoingEdges respects split ownership bounds
     var graph = try GraphIndex.open(alloc, &store, rev_path, "g", .{});
     defer graph.close();
 
-    var val_buf: [128]u8 = undefined;
-    const edge_val = encodeEdgeValue(&val_buf, 1.0, 10, 11, "");
+    const edge_val = try encodeEdgeValueAlloc(alloc, 1.0, 10, 11, "");
+    defer alloc.free(edge_val);
 
     const edge_a = try edgeKeyAlloc(alloc, "doc:a", "g", "ref", "doc:z");
     defer alloc.free(edge_a);

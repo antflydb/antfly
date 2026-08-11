@@ -65,6 +65,7 @@ export type Style = components["schemas"]["InferenceStyle"];
 
 // Error type
 export type InferenceError = components["schemas"]["InferenceError"];
+export type TransientCapacityError = components["schemas"]["InferenceTransientCapacityError"];
 
 // Utility type for extracting response data
 export type ResponseData<T extends keyof operations> = operations[T]["responses"] extends {

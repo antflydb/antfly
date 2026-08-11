@@ -3080,7 +3080,7 @@ fn spawnStandalone(
                     bind_port_arg,
                     "--health-port",
                     health_port_arg,
-                    "--tick-ms",
+                    "--control-tick-ms",
                     "5",
                     "--replica-root-dir",
                     replica_root,

@@ -5,13 +5,13 @@ export type ModelType =
   | "embedder"
   | "reranker"
   | "chunker"
-  | "recognizer"
+  | "extractor"
   | "rewriter"
   | "generator"
   | "reader"
   | "transcriber";
 
-export type RecognizerCapability = "labels" | "zeroshot" | "relations" | "answers";
+export type ExtractorCapability = "labels" | "zeroshot" | "relations" | "answers";
 
 export type QuantizationType = "f32" | "f16" | "i8" | "i8-st" | "i4" | "i4-cuda";
 
@@ -153,7 +153,7 @@ export interface InferenceModel {
   sourceUrl: string;
   type: ModelType;
   description: string;
-  capabilities?: RecognizerCapability[];
+  capabilities?: ExtractorCapability[];
   variants: QuantizationType[];
   backends?: Backend[];
   architecture?: string;
@@ -198,7 +198,7 @@ export function getExportableModels(models: InferenceModel[]): InferenceModel[] 
 
 export function getModelsWithCapability(
   models: InferenceModel[],
-  capability: RecognizerCapability
+  capability: ExtractorCapability
 ): InferenceModel[] {
   return models.filter((model) => model.capabilities?.includes(capability));
 }
@@ -246,7 +246,7 @@ export function getDownloadCommand(model: InferenceModel, quantization?: Quantiz
 export const MODEL_TYPE_PLAYGROUND: Partial<Record<ModelType, string>> = {
   embedder: "/inference/playground/embed",
   chunker: "/inference/playground/chunk",
-  recognizer: "/inference/playground/extract",
+  extractor: "/inference/playground/extract",
   rewriter: "/inference/playground/rewrite",
   reranker: "/inference/playground/rerank",
   reader: "/inference/playground/read",
@@ -305,11 +305,11 @@ export const MODEL_TYPE_DETAILS: Record<ModelType, ModelTypeDetail> = {
     pipelineNote:
       "Chunkers are the first step in an indexing pipeline. Good chunking directly impacts retrieval quality — chunks that are too large dilute relevance, too small lose context.",
   },
-  recognizer: {
-    type: "recognizer",
+  extractor: {
+    type: "extractor",
     tagline: "Extract named entities and structured data from text",
     description:
-      "Recognizer models identify and classify entities (people, organizations, dates, custom types) in text. GLiNER-based models support zero-shot recognition — add any label without retraining.",
+      "Extractor models identify and classify entities (people, organizations, dates, custom types) in text. GLiNER-based models support zero-shot extraction — add any label without retraining.",
     useCases: [
       "Extracting people, places, and organizations from documents",
       "Building knowledge graphs from unstructured text",
@@ -317,7 +317,7 @@ export const MODEL_TYPE_DETAILS: Record<ModelType, ModelTypeDetail> = {
       "Structured data extraction with custom schemas",
     ],
     pipelineNote:
-      "Recognizers enhance indexed documents with structured metadata. Entity annotations improve faceted search, filtering, and knowledge graph construction.",
+      "Extractors enhance indexed documents with structured metadata. Entity annotations improve faceted search, filtering, and knowledge graph construction.",
   },
   rewriter: {
     type: "rewriter",
@@ -363,7 +363,7 @@ export const MODEL_TYPE_DETAILS: Record<ModelType, ModelTypeDetail> = {
   },
   transcriber: {
     type: "transcriber",
-    tagline: "Convert speech to text with automatic speech recognition",
+    tagline: "Convert speech to text with automatic speech extraction",
     description:
       "Transcriber models perform speech-to-text (ASR), converting audio into accurate text transcriptions. Whisper-based models support multilingual transcription and can handle noisy audio, accents, and technical vocabulary.",
     useCases: [

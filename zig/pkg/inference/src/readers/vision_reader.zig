@@ -18,7 +18,6 @@ const manifest_mod = @import("../models/manifest.zig");
 const session_factory = @import("../architectures/session_factory.zig");
 const model_manager_mod = @import("../server/model_manager.zig");
 const tokenizer_mod = @import("inference_tokenizer");
-const hf_tokenizer = @import("inference_hf_tokenizer");
 const reading_pipeline_mod = @import("../pipelines/reading.zig");
 const image = @import("../pipelines/image.zig");
 const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
@@ -44,8 +43,11 @@ pub const LoadedVisionReader = struct {
     dec_config: enc_dec_mod.DecoderConfig,
     preproc: PreprocessorConfig,
     loaded_model: ?*model_manager_mod.LoadedModel = null,
-    hf_tok: ?*hf_tokenizer.HfTokenizer = null,
+    loaded_model_handle: ?model_manager_mod.ModelHandle = null,
+    managed_hf_tok: ?model_manager_mod.ManagedHfTokenizer = null,
     owns_sessions: bool = false,
+    encoder_managed: ?model_manager_mod.ManagedSession = null,
+    decoder_managed: ?model_manager_mod.ManagedSession = null,
     florence_final_logits_bias_zero: ?bool = null,
 
     pub fn loadFromDir(
@@ -60,11 +62,27 @@ pub const LoadedVisionReader = struct {
             defer allocator.free(paths.encoder);
             defer allocator.free(paths.decoder);
 
-            return loadEncoderDecoderPaths(allocator, model_path, paths.encoder, paths.decoder, dec_config, loadPreprocessorConfig(allocator, model_path), session_manager);
+            var loader = try model_manager.componentLoaderForPaths(
+                model_path,
+                session_manager.preferred_backends,
+                &.{ paths.encoder, paths.decoder },
+            );
+            return loadEncoderDecoderPaths(allocator, model_path, paths.encoder, paths.decoder, dec_config, loadPreprocessorConfig(allocator, model_path), &loader, null);
         } else |_| {}
 
-        const model = try model_manager.loadFromDir(model_path);
-        const florence_config = session_factory.getFlorenceConfig(model.session) orelse return error.InvalidModelForReading;
+        var model_handle = model_manager.acquireFromDir(model_path) catch |err| {
+            std.log.err("reader native model load failed model={s} err={t}", .{ model_path, err });
+            return err;
+        };
+        errdefer model_handle.release();
+        const model = model_handle.get();
+        const florence_config = session_factory.getFlorenceConfig(model.session) orelse {
+            std.log.err(
+                "reader model resolved without a Florence session requested_path={s} loaded_path={s} backend={s}",
+                .{ model_path, model.model_dir, @tagName(model.session.backend()) },
+            );
+            return error.InvalidModelForReading;
+        };
         const preproc_path = model.manifest.preprocessor_config_path orelse return error.IncompleteFlorence2Bundle;
         const preproc = try loadPreprocessorConfigFile(allocator, preproc_path);
         if (preproc.image_size != @as(usize, florence_config.image_size)) {
@@ -79,6 +97,7 @@ pub const LoadedVisionReader = struct {
             .dec_config = dec_config,
             .preproc = preproc,
             .loaded_model = model,
+            .loaded_model_handle = model_handle,
             .owns_sessions = false,
         };
     }
@@ -86,19 +105,36 @@ pub const LoadedVisionReader = struct {
     pub fn loadFromStagePaths(
         allocator: std.mem.Allocator,
         model_path: []const u8,
-        encoder_file: []const u8,
-        decoder_file: []const u8,
-        session_manager: *backends.SessionManager,
+        encoder_path: []const u8,
+        decoder_path: []const u8,
+        component_loader: *const model_manager_mod.ModelManager.ComponentLoader,
     ) !LoadedVisionReader {
         const dec_config = enc_dec_mod.loadDecoderConfig(allocator, model_path) catch enc_dec_mod.DecoderConfig{};
         const preproc = loadPreprocessorConfig(allocator, model_path);
 
-        const encoder_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ model_path, encoder_file });
-        defer allocator.free(encoder_path);
-        const decoder_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ model_path, decoder_file });
-        defer allocator.free(decoder_path);
+        return loadEncoderDecoderPaths(allocator, model_path, encoder_path, decoder_path, dec_config, preproc, component_loader, null);
+    }
 
-        return loadEncoderDecoderPaths(allocator, model_path, encoder_path, decoder_path, dec_config, preproc, session_manager);
+    pub fn loadFromStagePathsWithTokenizer(
+        allocator: std.mem.Allocator,
+        model_path: []const u8,
+        encoder_path: []const u8,
+        decoder_path: []const u8,
+        component_loader: *const model_manager_mod.ModelManager.ComponentLoader,
+        managed_tokenizer: *model_manager_mod.ManagedHfTokenizer,
+    ) !LoadedVisionReader {
+        const dec_config = enc_dec_mod.loadDecoderConfig(allocator, model_path) catch enc_dec_mod.DecoderConfig{};
+        const preproc = loadPreprocessorConfig(allocator, model_path);
+        return loadEncoderDecoderPaths(
+            allocator,
+            model_path,
+            encoder_path,
+            decoder_path,
+            dec_config,
+            preproc,
+            component_loader,
+            managed_tokenizer,
+        );
     }
 
     fn loadEncoderDecoderPaths(
@@ -108,21 +144,25 @@ pub const LoadedVisionReader = struct {
         decoder_path: []const u8,
         dec_config: enc_dec_mod.DecoderConfig,
         preproc: PreprocessorConfig,
-        session_manager: *backends.SessionManager,
+        component_loader: *const model_manager_mod.ModelManager.ComponentLoader,
+        preloaded_tokenizer: ?*model_manager_mod.ManagedHfTokenizer,
     ) !LoadedVisionReader {
-        const encoder_session = try session_manager.loadModel(encoder_path);
-        errdefer encoder_session.close();
+        var encoder_managed = try component_loader.load(encoder_path);
+        errdefer encoder_managed.deinit();
+        const encoder_session = encoder_managed.session;
 
-        const decoder_session = try session_manager.loadModel(decoder_path);
-        errdefer decoder_session.close();
+        var strict_loader = try component_loader.restrictToBackend(encoder_session.backend());
+        var decoder_managed = try strict_loader.load(decoder_path);
+        errdefer decoder_managed.deinit();
+        const decoder_session = decoder_managed.session;
 
         const tok_path = try std.fmt.allocPrint(allocator, "{s}/tokenizer.json", .{model_path});
         defer allocator.free(tok_path);
-        const tok_bytes = try c_file.readFile(allocator, tok_path);
-        defer allocator.free(tok_bytes);
-
-        const tok = try hf_tokenizer.HfTokenizer.loadFromBytes(allocator, tok_bytes);
-        errdefer tok.deinitSelf();
+        var loaded_tokenizer = if (preloaded_tokenizer) |managed|
+            managed.take()
+        else
+            try component_loader.loadHfTokenizerFile(tok_path);
+        errdefer loaded_tokenizer.deinit();
 
         return .{
             .allocator = allocator,
@@ -130,17 +170,20 @@ pub const LoadedVisionReader = struct {
             .decoder_session = decoder_session,
             .dec_config = dec_config,
             .preproc = preproc,
-            .hf_tok = tok,
+            .managed_hf_tok = loaded_tokenizer,
             .owns_sessions = true,
+            .encoder_managed = encoder_managed,
+            .decoder_managed = decoder_managed,
         };
     }
 
     pub fn deinit(self: *LoadedVisionReader) void {
-        if (self.hf_tok) |tok| tok.deinitSelf();
+        if (self.managed_hf_tok) |*managed| managed.deinit();
         if (self.owns_sessions) {
-            self.encoder_session.close();
-            self.decoder_session.close();
+            if (self.encoder_managed) |*managed| managed.deinit() else self.encoder_session.close();
+            if (self.decoder_managed) |*managed| managed.deinit() else self.decoder_session.close();
         }
+        if (self.loaded_model_handle) |*handle| handle.release();
     }
 
     pub fn readRaw(self: *LoadedVisionReader, image_data: []const u8, options: reader_types.ReadOptions) !reading_pipeline_mod.ReadResult {
@@ -190,7 +233,7 @@ pub const LoadedVisionReader = struct {
 
     fn tokenizer(self: *LoadedVisionReader) tokenizer_mod.Tokenizer {
         if (self.loaded_model) |model| return model.getTokenizer();
-        if (self.hf_tok) |tok| return tok.tokenizer();
+        if (self.managed_hf_tok) |*managed| return managed.tokenizer.tokenizer();
         unreachable;
     }
 };
@@ -215,6 +258,16 @@ pub fn isSupportedModelDir(allocator: std.mem.Allocator, model_path: []const u8)
     var man = manifest_mod.loadFromDir(allocator, model_path) catch return false;
     defer man.deinit();
 
+    return isSupportedManifest(man);
+}
+
+/// Same check against a manifest the caller already has.
+///
+/// Only `native_arch_hint` and the artifact paths matter here, all of which
+/// `loadListingFromDir` populates. Callers in listing paths should prefer this: a full
+/// `loadFromDir` parses GGUF tokenizer metadata, which for a large vocab costs over a
+/// second per model.
+pub fn isSupportedManifest(man: manifest_mod.ModelManifest) bool {
     return man.native_arch_hint == .florence and
         (man.gguf_path != null or man.safetensors_path != null or man.safetensors_index_path != null);
 }

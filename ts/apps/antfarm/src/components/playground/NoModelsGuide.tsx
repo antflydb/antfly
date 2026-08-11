@@ -3,11 +3,11 @@ import { Check, Copy, Download, ExternalLink } from "lucide-react";
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import {
+  type ExtractorCapability,
   getDownloadCommand,
   getModelsByType,
   getModelsWithCapability,
   type ModelType,
-  type RecognizerCapability,
 } from "@/data/inference-models";
 import { useInferenceRegistry } from "@/hooks/use-inference-registry";
 
@@ -38,7 +38,7 @@ function CopyCommandButton({ command }: { command: string }) {
 
 interface NoModelsGuideProps {
   modelType: ModelType;
-  requiredCapability?: RecognizerCapability;
+  requiredCapability?: ExtractorCapability;
   typeName: string;
   /** Use muted palette instead of amber (for playgrounds with a fallback mode) */
   soft?: boolean;

@@ -15,8 +15,8 @@ T = TypeVar("T", bound="ReplicationTransformOp")
 class ReplicationTransformOp:
     """
     Attributes:
-        op (str): Transform operation. Standard ops: `$set`, `$unset`, `$inc`, `$push`, `$pull`,
-            `$addToSet`, `$pop`, `$mul`, `$min`, `$max`, `$currentDate`, `$rename`.
+        op (str): Transform operation. Supported ops: `$set`, `$setOnInsert`, `$unset`, `$inc`, `$push`, `$addToSet`,
+            `$max`.
             Replication-specific: `$merge` (flatten JSONB into top-level fields),
             `$delete_document` (delete entire Antfly doc, `on_delete` only).
              Example: $set.

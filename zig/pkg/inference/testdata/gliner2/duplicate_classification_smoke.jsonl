@@ -1,0 +1,1 @@
+{"input":"fine","output":{"classifications":[{"task":"sentiment","labels":["positive","negative"],"true_label":["positive"]},{"task":"sentiment","labels":["yes","no"],"true_label":["yes"]}]}}

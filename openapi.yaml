@@ -2233,7 +2233,6 @@ paths:
               - generate
               - rerank
               - chunk
-              - recognize
               - extract
               - rewrite
               - read
@@ -2410,12 +2409,30 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/MultiBatchResponse'
+        '202':
+          description: Commit decision is durable; visibility or participant recovery is still pending
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MultiBatchResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '409':
+          description: Transaction aborted because a predicate, topology fence, or participant state conflicted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionCommitResponse'
         '404':
           $ref: '#/components/responses/NotFound'
+        '503':
+          description: The coordinator was unavailable before a commit decision; retry is safe
+          content:
+            text/plain:
+              schema:
+                type: string
         '500':
-          $ref: '#/components/responses/InternalServerError'
+          $ref: '#/components/responses/StatelessTransactionFailure'
       security:
         - BasicAuth: []
         - ApiKeyAuth: []
@@ -2465,6 +2482,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/TransactionCommitResponse'
+        '202':
+          description: Transaction committed durably with visibility or participant recovery pending
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionCommitResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
         '404':
@@ -2475,8 +2498,14 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/TransactionCommitResponse'
+        '503':
+          description: The coordinator was unavailable before a commit decision; retry is safe
+          content:
+            text/plain:
+              schema:
+                type: string
         '500':
-          $ref: '#/components/responses/InternalServerError'
+          $ref: '#/components/responses/StatelessTransactionFailure'
       security:
         - BasicAuth: []
         - ApiKeyAuth: []
@@ -2797,6 +2826,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/TransactionSessionCommitResponse'
+        '202':
+          description: Session committed durably with visibility or participant recovery pending
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionSessionCommitResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
         '404':
@@ -2853,9 +2888,17 @@ paths:
         - All shard data (compressed with zstd)
 
 
-        The backup creates a cluster-level manifest that tracks all included tables
+        A non-empty backup publishes a cluster-level manifest only after every
 
-        and their individual backup locations.
+        requested table backup is durable. The manifest is the final commit
+
+        point and records complete expected/completed table counts. A `partial`
+
+        or `failed` attempt returns per-table diagnostics but does not publish a
+
+        restorable aggregate manifest. A cluster with no selected tables returns
+
+        `400` without writing a backup artifact.
 
 
         Backup IDs are immutable. Reusing an ID that already has a published
@@ -2896,6 +2939,8 @@ paths:
             is fully successful, while `partial` or `failed` reports per-table
 
             failures even though the request itself was processed successfully.
+
+            Only `completed` publishes a restorable cluster manifest.
           content:
             application/json:
               schema:
@@ -3300,11 +3345,7 @@ paths:
         '422':
           $ref: '#/components/responses/UnsupportedExactSort'
         '500':
-          description: Internal server error
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
+          $ref: '#/components/responses/QueryInternalServerError'
       security:
         - BasicAuth: []
         - ApiKeyAuth: []
@@ -3777,7 +3818,7 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '500':
-          $ref: '#/components/responses/InternalServerError'
+          $ref: '#/components/responses/QueryInternalServerError'
       security:
         - BasicAuth: []
         - ApiKeyAuth: []
@@ -3808,14 +3849,40 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/BatchResponse'
+        '202':
+          description: Commit decision is durable; visibility or participant recovery is still pending
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          description: >
+            The atomic batch conflicted, the serving replica is fenced, or the
+
+            server could not determine whether a single-group Raft command
+
+            committed. An ambiguous outcome is not safe to replay blindly when
+
+            the request contains non-idempotent transforms.
+          content:
+            text/plain:
+              schema:
+                type: string
         '429':
           $ref: '#/components/responses/DenseRepairBackpressure'
+        '503':
+          description: Write routing, document identity, or the coordinator is temporarily unavailable
+            before a commit decision
+          content:
+            text/plain:
+              schema:
+                type: string
         '500':
-          $ref: '#/components/responses/InternalServerError'
+          $ref: '#/components/responses/StatelessTransactionFailure'
       security:
         - BasicAuth: []
         - ApiKeyAuth: []
@@ -4588,13 +4655,13 @@ paths:
       - name: artifactName
         in: path
         required: true
-        description: Name of the derived document artifact.
+        description: Name of the derived asset enrichment.
         schema:
           type: string
     post:
-      summary: Reprocess a derived document artifact across a table range
+      summary: Reprocess a derived asset across a table range
       description: >
-        Runs a bounded operational repair pass for a derived document artifact
+        Runs a bounded operational repair pass for any asset producer type
 
         across source rows in key order. Use `next_key` from the response as
 
@@ -4732,7 +4799,7 @@ paths:
       - name: artifactName
         in: path
         required: true
-        description: Name of the derived document artifact.
+        description: Name of the derived asset enrichment.
         schema:
           type: string
     post:
@@ -5017,11 +5084,15 @@ paths:
         schema:
           type: string
     post:
-      summary: Reprocess a derived document artifact
+      summary: Reprocess a derived asset
       description: >
         Invalidates the current artifact state and requests the producer to
 
-        rebuild the derived document hierarchy for the source document.
+        rebuild the derived asset for the source document. Copy, generator,
+
+        reader, transcriber, extractor, and document-extraction producers are
+
+        all supported.
       tags:
         - data_operations
       operationId: reprocessDocumentArtifact
@@ -6084,6 +6155,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
+        '503':
+          $ref: '#/components/responses/TransientCapacity'
         '500':
           description: Internal server error
           content:
@@ -6148,6 +6221,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
+        '503':
+          $ref: '#/components/responses/TransientCapacity'
   /ai/v1/rerank_multimodal:
     post:
       summary: Rerank multimodal documents by relevance
@@ -6194,6 +6269,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
+        '503':
+          $ref: '#/components/responses/TransientCapacity'
   /ai/v1/rerank:
     post:
       summary: Rerank prompts by relevance
@@ -6272,11 +6349,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/InferenceError'
         '503':
-          description: Reranking service unavailable (no models configured)
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/InferenceError'
+          $ref: '#/components/responses/TransientCapacity'
   /ai/v1/generate:
     post:
       summary: Generate text using LLM (OpenAI-compatible)
@@ -6349,11 +6422,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/InferenceError'
         '503':
-          description: Generation service unavailable (no models configured)
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/InferenceError'
+          $ref: '#/components/responses/TransientCapacity'
   /ai/v1/generate/batch:
     post:
       summary: Generate text for a synchronous batch of requests
@@ -6397,11 +6466,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/InferenceError'
         '503':
-          description: Generation service unavailable
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/InferenceError'
+          $ref: '#/components/responses/TransientCapacity'
   /ai/v1/chat/completions:
     post:
       summary: OpenAI Chat Completions endpoint
@@ -6448,11 +6513,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/InferenceError'
         '503':
-          description: Generation service unavailable (no models configured)
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/InferenceError'
+          $ref: '#/components/responses/TransientCapacity'
   /ai/v1/rewrite:
     post:
       summary: Rewrite text using Seq2Seq models
@@ -6513,11 +6574,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/InferenceError'
         '503':
-          description: Generation service unavailable (no models configured)
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/InferenceError'
+          $ref: '#/components/responses/TransientCapacity'
   /ai/v1/read:
     post:
       summary: Read text from images (OCR/document understanding)
@@ -6595,11 +6652,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/InferenceError'
         '503':
-          description: Reader service unavailable (no models configured)
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/InferenceError'
+          $ref: '#/components/responses/TransientCapacity'
   /ai/v1/transcribe:
     post:
       summary: Transcribe audio to text (speech-to-text)
@@ -6693,11 +6746,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/InferenceError'
         '503':
-          description: Transcription service unavailable (no models configured)
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/InferenceError'
+          $ref: '#/components/responses/TransientCapacity'
   /ai/v1/extract:
     post:
       summary: Extract entities, relations, classifications, and structures
@@ -6742,17 +6791,13 @@ paths:
               schema:
                 $ref: '#/components/schemas/InferenceError'
         '503':
-          description: Extraction service unavailable (no models configured)
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/InferenceError'
+          $ref: '#/components/responses/TransientCapacity'
   /ai/v1/models:
     get:
       summary: List available models
       description: >
-        Returns lists of available embedding, chunking, reranking, generator, NER, rewriter, reader, and
-        transcriber models.
+        Returns lists of available embedding, chunking, reranking, generator, extractor, rewriter, reader,
+        and transcriber models.
 
 
         ## Embedders
@@ -6790,12 +6835,12 @@ paths:
         - Empty if no models configured
 
 
-        ## Recognizers
+        ## Extractors
 
 
-        - ONNX models from `models_dir/recognizers/`
+        - Extraction-capable models from the managed model registry
 
-        - Includes GLiNER models for zero-shot recognition
+        - Includes GLiNER models for zero-shot entity and relation extraction
 
 
         ## Rewriters
@@ -6882,6 +6927,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
+        '503':
+          $ref: '#/components/responses/TransientCapacity'
         '500':
           description: Internal server error
           content:
@@ -7262,6 +7309,32 @@ components:
           example: An error message
       required:
         - error
+    TableStorageUnreadableError:
+      type: object
+      additionalProperties: false
+      description: A non-retryable table-storage integrity or format failure.
+      required:
+        - code
+        - error
+        - message
+        - retryable
+      properties:
+        code:
+          type: string
+          enum:
+            - table_storage_unreadable
+          description: Stable client-routing code for unreadable table storage.
+        error:
+          type: string
+          description: Concrete storage error class, such as InvalidManifest.
+        message:
+          type: string
+          description: Human-readable summary.
+        retryable:
+          type: boolean
+          enum:
+            - false
+          description: Always false; recovery requires repair, restore, or table replacement.
     ExactSortError:
       type: object
       additionalProperties: false
@@ -7396,6 +7469,8 @@ components:
           description: Runtime deployment topology
         secret_store:
           $ref: '#/components/schemas/SecretStoreStatus'
+        runtime_config:
+          $ref: '#/components/schemas/RuntimeConfigStatus'
         storage:
           $ref: '#/components/schemas/StorageRuntimeStatus'
     ClusterTopology:
@@ -7424,6 +7499,8 @@ components:
           description: Runtime deployment topology
         secret_store:
           $ref: '#/components/schemas/SecretStoreStatus'
+        runtime_config:
+          $ref: '#/components/schemas/RuntimeConfigStatus'
         storage:
           $ref: '#/components/schemas/StorageRuntimeStatus'
         data:
@@ -7537,7 +7614,6 @@ components:
         - generator
         - reranker
         - chunker
-        - recognizer
         - classifier
         - rewriter
         - reader
@@ -7608,7 +7684,7 @@ components:
 
             pluralized ConnectedModelType values ("embedders", "generators",
 
-            "rerankers", "chunkers", "recognizers", "classifiers", "rewriters",
+            "rerankers", "chunkers", "classifiers", "rewriters",
 
             "readers", "transcribers", "extractors") plus "other" for models
 
@@ -8036,6 +8112,7 @@ components:
         - missing_artifact
         - corrupt_artifact
         - unreadable_artifact
+        - enrichment_failed
     RepairTarget:
       type: string
       description: Repair subsystem to inspect or run.
@@ -8054,6 +8131,7 @@ components:
         - repairable
         - sequence
         - reason
+        - generation_attempts
         - attempts
         - first_seen_ns
         - last_seen_ns
@@ -8098,6 +8176,13 @@ components:
           description: Derived replay sequence that observed the issue.
         reason:
           $ref: '#/components/schemas/ArtifactRepairReason'
+        generation_attempts:
+          type: integer
+          format: uint64
+          description: Number of enrichment generation attempts made before this issue was parked.
+        generation_error:
+          type: string
+          description: Stable source-generation error code that caused this issue to be parked.
         attempts:
           type: integer
           format: uint64
@@ -8232,7 +8317,8 @@ components:
         - unresolved
         - in_progress
         - indexes_rebuilt
-        - indexes_degraded
+        - indexes_degraded_before
+        - indexes_degraded_after
         - controls_applied
         - limit
         - has_more
@@ -8280,10 +8366,16 @@ components:
           type: integer
           format: uint64
           description: Number of indexes rebuilt by this pass when target is index.
-        indexes_degraded:
+        indexes_degraded_before:
           type: integer
           format: uint64
-          description: Number of selected indexes that were already degraded or quarantined before repair.
+          description: Number of selected indexes that were degraded or quarantined when this repair pass
+            began.
+        indexes_degraded_after:
+          type: integer
+          format: uint64
+          description: Number of selected indexes that remain degraded or quarantined when this repair
+            pass returns.
         controls_applied:
           type: integer
           format: uint64
@@ -8892,10 +8984,64 @@ components:
       type: object
       description: Non-secret status for the local secrets file store, when one is available.
       properties:
+        generation:
+          type: integer
+          format: uint64
+          description: Generation of the currently published secret-store snapshot.
+        supports_source_generation:
+          type: boolean
+          description: Whether this store can expose one exact opaque source-generation acknowledgement.
+            This remains true when a single loaded file predates the generation field, and is false for
+            layered stores whose served snapshot has multiple publication sources.
+          x-omitzero: false
+        source_generation:
+          type: string
+          nullable: true
+          description: Opaque, non-secret generation embedded by the control plane in the currently applied
+            secrets file. It is null for files without an acknowledgement generation and never derives
+            from secret values.
+        last_reload_failed:
+          type: boolean
+          description: Whether the latest observed replacement failed to load.
+          x-omitzero: false
         stale:
           type: boolean
           description: Whether Antfly is serving a last-known-good secrets snapshot after a failed refresh.
           x-omitzero: false
+        reload_successes:
+          type: integer
+          format: uint64
+        reload_failures:
+          type: integer
+          format: uint64
+    RuntimeConfigStatus:
+      type: object
+      description: Non-secret status for the applied config.json snapshot. Hot publication accepts validated
+        remote_content-only changes; startup-only changes remain stale until restart.
+      properties:
+        generation:
+          type: integer
+          format: uint64
+          description: Generation of the fully validated and atomically published configuration.
+        hash:
+          type: string
+          description: Lowercase SHA-256 of the exact fully applied config.json bytes; its first 16 characters
+            match the operator config-hash annotation.
+        last_reload_failed:
+          type: boolean
+          description: Whether the latest observed replacement failed loading, semantic validation, or
+            requires restart because startup-only fields changed.
+          x-omitzero: false
+        stale:
+          type: boolean
+          description: Whether requests are using the last-known-good snapshot after a failed reload.
+          x-omitzero: false
+        reload_successes:
+          type: integer
+          format: uint64
+        reload_failures:
+          type: integer
+          format: uint64
     SecretStatus:
       type: string
       enum:
@@ -9765,6 +9911,35 @@ components:
         wal_retained_bytes:
           type: integer
           format: uint64
+        wal_checkpoint_pending:
+          type: boolean
+          description: Whether WAL checkpoint maintenance is pending.
+        wal_pressure_blocked:
+          type: boolean
+          description: Whether WAL hard-limit admission is currently blocked.
+        wal_checkpoint_retry_reason:
+          type: string
+          description: Representative reason for the earliest pending WAL checkpoint retry.
+        wal_checkpoint_retry_attempts:
+          type: integer
+          format: uint64
+          description: Consecutive failures for the representative WAL checkpoint retry.
+        wal_checkpoint_retry_delay_ns:
+          type: integer
+          format: uint64
+          description: Nanoseconds until the earliest WAL checkpoint retry; zero means due now.
+        active_immutable_logical_bytes:
+          type: integer
+          format: uint64
+          description: Logical bytes in immutable memtables awaiting run publication.
+        unpublished_wal_logical_bytes:
+          type: integer
+          format: uint64
+          description: Logical bytes in runs awaiting durable manifest publication.
+        unpublished_wal_max_batch_logical_bytes:
+          type: integer
+          format: uint64
+          description: Largest logical batch awaiting durable manifest publication.
         compaction_backlog_bytes:
           type: integer
           format: uint64
@@ -9947,14 +10122,16 @@ components:
         - $unset
         - $inc
         - $push
-        - $pull
         - $addToSet
-        - $pop
-        - $mul
-        - $min
         - $max
-        - $currentDate
-        - $rename
+      x-enum-varnames:
+        - SET
+        - SET_ON_INSERT
+        - UNSET
+        - INC
+        - PUSH
+        - ADD_TO_SET
+        - MAX
       description: MongoDB-style update operator
     TransformOp:
       type: object
@@ -9969,8 +10146,7 @@ components:
           description: JSONPath to field (e.g., "$.user.name", "$.tags", or "user.name")
           example: $.views
         value:
-          description: Value for operation (not required for $unset, $currentDate). Type depends on operator
-            (number for $inc/$mul, any for $set/$setOnInsert, etc.)
+          description: Value for operation (not required for $unset). Type depends on the supported operator.
     Transform:
       type: object
       required:
@@ -10007,8 +10183,9 @@ components:
           - op: $inc
             path: $.views
             value: 1
-          - op: $currentDate
+          - op: $set
             path: $.lastViewed
+            value: '2026-07-28T12:00:00Z'
     ScanKeysRequest:
       type: object
       description: >
@@ -10075,20 +10252,24 @@ components:
             - $ref: '#/components/schemas/Query'
             - x-go-type: json.RawMessage
           description: >
-            Antfly query to filter documents. Only documents matching this query
+            Structured subset of the Antfly query AST used to filter a primary-key
 
-            are included in results. Uses the sear library for efficient per-document
+            scan. Only documents matching this query are included in results.
 
-            matching without requiring a full index.
+            Because scans do not open a text index, text-index-only variants such
+
+            as phrase and multi-match queries are rejected with a validation error
+
+            instead of being evaluated with slower stored-document semantics.
 
 
             Examples:
 
-            - Status filtering: `{"query": "status:published"}`
+            - Status filtering: `{"term":{"path":"/status","value":"published"}}`
 
-            - Date ranges: `{"query": "created_at:>2023-01-01"}`
+            - Date ranges: `{"range":{"/created_at":{"gte":"2023-01-01"}}}`
 
-            - Field matching: `{"query": "category:technology"}`
+            - Field existence: `{"exists":{"path":"/category"}}`
         limit:
           type: integer
           minimum: 1
@@ -10212,16 +10393,16 @@ components:
 
             - Multiple operations per document are applied in sequence
 
-            - Supports numeric operations ($inc, $mul), array operations ($push, $pull), and more
+            - Supports numeric and set-like operations ($inc, $max, $addToSet)
 
 
             Common use cases:
 
             - Increment counters (views, likes, votes)
 
-            - Update timestamps ($currentDate)
+            - Update timestamps ($set)
 
-            - Manage arrays (add/remove tags, items)
+            - Add unique array values ($addToSet)
 
             - Update nested fields without overwriting the entire document
           items:
@@ -10232,11 +10413,12 @@ components:
                 - op: $inc
                   path: $.views
                   value: 1
-                - op: $currentDate
+                - op: $set
                   path: $.lastViewed
+                  value: '2026-07-28T12:00:00Z'
             - key: user:456
               operations:
-                - op: $push
+                - op: $addToSet
                   path: $.tags
                   value: vip
         sync_level:
@@ -10262,6 +10444,12 @@ components:
     BatchResponse:
       type: object
       properties:
+        status:
+          type: string
+          enum:
+            - committed
+            - committed_pending
+          description: Durable commit and visibility/participant recovery state.
         inserted:
           type: integer
           description: Number of documents successfully inserted
@@ -10341,6 +10529,13 @@ components:
       description: >
         Response for a cross-table batch operation. Contains per-table results.
       properties:
+        status:
+          type: string
+          description: Durable commit and visibility/propagation state.
+          enum:
+            - committed
+            - committed_visibility_pending
+            - committed_recovery_pending
         tables:
           type: object
           description: Per-table batch results
@@ -10407,6 +10602,78 @@ components:
             $ref: '#/components/schemas/BatchRequest'
         sync_level:
           $ref: '#/components/schemas/SyncLevel'
+    TransactionConflictParticipant:
+      type: object
+      description: Participant location and 2PC phase where the conflict occurred.
+      properties:
+        group_id:
+          type: integer
+          format: uint64
+          description: Raft group that reported the conflict.
+        phase:
+          type: string
+          enum:
+            - begin
+            - prepare
+            - resolve
+          description: 2PC participant phase that reported the conflict.
+    TransactionConflict:
+      type: object
+      description: Structured details for an aborted transaction attempt.
+      required:
+        - table
+        - key
+        - message
+        - kind
+        - retryable
+      properties:
+        table:
+          type: string
+          description: Table where the conflict was detected.
+        key:
+          type: string
+          description: Document key associated with the conflict, when applicable.
+        message:
+          type: string
+          description: Human-readable conflict description.
+        kind:
+          type: string
+          enum:
+            - version_conflict
+            - intent_conflict
+            - topology_changed
+            - participant_unavailable
+            - doc_identity_unavailable
+            - session_lease_lost
+            - transaction_conflict
+            - torn_state
+          description: Stable machine-readable conflict classification.
+        retryable:
+          type: boolean
+          description: Whether retrying the transaction may succeed without changing its writes.
+        retry_after_ms:
+          type: integer
+          format: uint32
+          minimum: 1
+          description: Minimum suggested delay before retrying a retryable conflict.
+        retry_scope:
+          type: string
+          enum:
+            - topology
+            - participant
+            - doc_identity
+            - session
+          description: Component whose state should be refreshed before retrying.
+        expected_version:
+          type: integer
+          format: uint64
+          description: Version required by the transaction predicate.
+        current_version:
+          type: integer
+          format: uint64
+          description: Version observed while validating the transaction predicate.
+        participant:
+          $ref: '#/components/schemas/TransactionConflictParticipant'
     TransactionCommitResponse:
       type: object
       description: Result of an OCC transaction commit attempt.
@@ -10417,24 +10684,21 @@ components:
           type: string
           enum:
             - committed
+            - committed_visibility_pending
+            - committed_recovery_pending
             - aborted
-          description: Whether the transaction was committed or aborted due to a conflict
+          description: >
+            Durable transaction outcome. Pending committed states mean the
+
+            commit decision is durable while its requested visibility barrier
+
+            or participant recovery is still completing.
         conflict:
-          type: object
           description: Details about the conflict that caused an abort (only present when status is "aborted")
-          properties:
-            table:
-              type: string
-              description: Table where the conflict was detected
-            key:
-              type: string
-              description: Key that had a version mismatch
-            message:
-              type: string
-              description: Human-readable conflict description
+          $ref: '#/components/schemas/TransactionConflict'
         tables:
           type: object
-          description: Per-table batch results (only present when status is "committed")
+          description: Per-table batch results (present for every committed status)
           additionalProperties:
             $ref: '#/components/schemas/BatchResponse'
     TransactionBeginRequest:
@@ -10828,6 +11092,7 @@ components:
           example: portable
         table_names:
           type: array
+          minItems: 1
           maxItems: 256
           uniqueItems: true
           items:
@@ -11817,6 +12082,13 @@ components:
         **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to
 
         call, using the queries to determine available tables and indexes.
+
+
+        Authenticated row filters are enforced on every initial and generated
+
+        operation in both modes, including scans, aggregates, and graph/tree
+
+        traversal. They cannot be replaced or weakened by model tool arguments.
       required:
         - query
         - queries
@@ -11838,6 +12110,19 @@ components:
             In pipeline mode (max_internal_iterations=0), these are executed directly.
 
             In agentic mode, these declare which table and indexes are available.
+
+
+            `filter_query` and `exclusion_query` are mandatory table predicates
+
+            for retrieval-agent execution. Predicates declared by any query for
+
+            a table are conjoined (or unioned for exclusions) and applied to
+
+            every initial query, generated refinement, probe, aggregation,
+
+            graph/tree traversal, root scan, and follow-up for that table.
+
+            They cannot be weakened by generated operations.
           example:
             - table: docs
               semantic_search: How do I configure OAuth?
@@ -11862,13 +12147,17 @@ components:
           items:
             $ref: '#/components/schemas/FilterSpec'
           description: >
-            Pre-applied filters from prior interactions. These are applied to
+            Mandatory filters from prior interactions. These are converted to
 
-            all search tool invocations.
+            structured Antfly predicates and applied to every table and every
+
+            search tool invocation, including generated follow-ups, graph/tree
+
+            traversal, aggregations, and root scans.
         session_id:
           type: string
-          description: Correlation identifier for a bounded agent interaction. In Phase 1 this is echoed
-            back to the client but does not imply server-side session persistence.
+          description: Correlation identifier for a bounded agent interaction. This is echoed back to
+            the client and does not imply server-side session persistence.
         decisions:
           type: array
           items:
@@ -12263,16 +12552,16 @@ components:
 
             - `bool.must` is scoring query input.
 
-            - `bool.filter` is a non-scoring structured filter.
+            - `bool.filter` is non-scoring query input.
 
-            - `bool.must_not` is a structured exclusion filter.
+            - `bool.must_not` is non-scoring exclusion query input.
 
 
-            The same AST accepts direct structured filters using `field` or JSON-pointer
+            Filter branches accept the same query variants as `filter_query` and
 
-            `path`, scalar `term` values, multi-value `terms`, and `exists`.
+            `exclusion_query`. Structured clauses use the native document-value
 
-            Query-string objects remain supported as a full-text escape hatch.
+            path; text clauses are resolved through the text index before scoring.
           example:
             bool:
               must:
@@ -14526,9 +14815,8 @@ components:
         op:
           type: string
           description: >
-            Transform operation. Standard ops: `$set`, `$unset`, `$inc`, `$push`, `$pull`,
-
-            `$addToSet`, `$pop`, `$mul`, `$min`, `$max`, `$currentDate`, `$rename`.
+            Transform operation. Supported ops: `$set`, `$setOnInsert`, `$unset`, `$inc`, `$push`, `$addToSet`,
+            `$max`.
 
             Replication-specific: `$merge` (flatten JSONB into top-level fields),
 
@@ -16444,7 +16732,9 @@ components:
         version:
           type: integer
           format: uint32
-          description: Version of the schema. Used for migrations.
+          readOnly: true
+          description: Backend-managed schema generation used for migrations. Omit it from create and
+            update requests.
         default_type:
           type: string
           description: Default type to use from the document_types.
@@ -16498,14 +16788,6 @@ components:
           $ref: '#/components/schemas/Boost'
       required:
         - term
-    Fuzziness:
-      description: The fuzziness of the query. Can be an integer or "auto".
-      anyOf:
-        - type: integer
-          format: int32
-        - type: string
-          enum:
-            - auto
     MatchQuery:
       type: object
       properties:
@@ -16517,16 +16799,6 @@ components:
           type: string
         boost:
           $ref: '#/components/schemas/Boost'
-        prefix_length:
-          type: integer
-          format: int32
-        fuzziness:
-          $ref: '#/components/schemas/Fuzziness'
-        operator:
-          type: string
-          enum:
-            - or
-            - and
       required:
         - match
     MultiMatchBody:
@@ -16556,6 +16828,16 @@ components:
           $ref: '#/components/schemas/MultiMatchBody'
       required:
         - multi_match
+    Fuzziness:
+      description: The fuzziness of the query. Can be an integer or "auto".
+      anyOf:
+        - type: integer
+          format: int32
+          minimum: 0
+          maximum: 2
+        - type: string
+          enum:
+            - auto
     MatchPhraseQuery:
       type: object
       properties:
@@ -16611,6 +16893,8 @@ components:
         prefix_length:
           type: integer
           format: int32
+          minimum: 0
+          maximum: 255
         fuzziness:
           $ref: '#/components/schemas/Fuzziness'
         field:
@@ -17030,7 +17314,7 @@ components:
         backfill_state:
           x-go-type-skip-optional-pointer: true
           type: string
-          description: Operational readiness state such as ready, running, retrying, or failed.
+          description: Operational readiness state such as ready, running, retrying, degraded, or failed.
         doc_count:
           x-go-type-skip-optional-pointer: true
           type: integer
@@ -17105,10 +17389,10 @@ components:
           type: integer
           format: uint64
           description: Projection generation associated with the durable checkpoint.
-        projection_checkpoint_config_hash:
+        projection_checkpoint_config_fingerprint:
           x-go-type-skip-optional-pointer: true
-          type: integer
-          format: uint64
+          type: string
+          pattern: ^[0-9a-f]{16}$
           description: Projection configuration identity associated with the durable checkpoint.
         checkpoint_replay_tail_sequence_count:
           x-go-type-skip-optional-pointer: true
@@ -17209,6 +17493,8 @@ components:
         - skipped
         - terminal_failed
         - covered
+        - settled
+        - uncovered
         - pending
         - complete
         - healthy
@@ -17261,13 +17547,25 @@ components:
           format: uint64
           description: Raw terminal source outcomes counted by the configured policy. This may exceed
             source_total only while observation_complete is false with counter_mismatch.
+        settled:
+          type: integer
+          format: uint64
+          description: 'Source documents with any durable terminal outcome: produced, intentionally skipped,
+            or terminally failed.'
+        uncovered:
+          x-go-type-skip-optional-pointer: false
+          type: integer
+          format: uint64
+          nullable: true
+          description: Source documents without an outcome accepted by the configured coverage policy.
+            Null when observations are incomplete.
         pending:
           x-go-type-skip-optional-pointer: false
           type: integer
           format: uint64
           nullable: true
-          description: Source documents without a policy-accepted terminal outcome. Null when observations
-            are incomplete and the global value is unknown.
+          description: Source documents that have not reached any terminal outcome and may still be processing.
+            Null when observations are incomplete.
         complete:
           type: boolean
           description: Whether observations are complete, replay has reached its target, and every observed
@@ -17277,7 +17575,166 @@ components:
           description: Whether coverage is complete without terminal failures.
         degraded:
           type: boolean
-          description: Whether coverage is complete under best_effort but includes terminal failures.
+          description: Whether all sources are settled but coverage remains unhealthy under the configured
+            policy, including terminal failures or policy-rejected skips.
+    EnrichmentRuntimeStatus:
+      type: object
+      additionalProperties: false
+      description: Runtime state for the durable embeddings enrichment worker.
+      required:
+        - enabled
+        - target_sequence
+        - applied_sequence
+        - pending_sequence_count
+        - projection_checkpoint_status
+        - projection_checkpoint_applied_sequence
+        - projection_checkpoint_generation
+        - projection_checkpoint_config_fingerprint
+        - projection_checkpoint_identity_consistent
+        - checkpoint_replay_tail_sequence_count
+        - processed_requests
+        - error_count
+        - retryable_error_count
+        - fatal_error_count
+        - consecutive_retry_count
+        - next_retry_at_ms
+        - retrying
+        - worker_failed
+        - worker_started
+        - stalled
+        - skip_by_hash_count
+        - skipped_source_count
+        - codec_decode_failures
+        - embed_batches_started
+        - embed_batches_completed
+        - embed_items_started
+        - embed_items_completed
+        - active_embed_batch_items
+        - active_embed_batch_bytes
+        - active_embed_batch_max_bytes
+        - active_embed_batch_started_ms
+        - last_embed_batch_items
+        - last_embed_batch_bytes
+        - last_embed_batch_max_bytes
+        - last_embed_batch_completed_ms
+        - last_embed_batch_ns
+        - total_embed_ns
+      properties:
+        enabled:
+          type: boolean
+        target_sequence:
+          type: integer
+          format: uint64
+        applied_sequence:
+          type: integer
+          format: uint64
+        pending_sequence_count:
+          type: integer
+          format: uint64
+        projection_checkpoint_status:
+          type: string
+        projection_checkpoint_applied_sequence:
+          type: integer
+          format: uint64
+        projection_checkpoint_generation:
+          type: integer
+          format: uint64
+        projection_checkpoint_config_fingerprint:
+          type: string
+          pattern: ^[0-9a-f]{16}$
+        projection_checkpoint_identity_consistent:
+          type: boolean
+          description: Whether every shard contributing to this status reports the same checkpoint generation
+            and configuration identity.
+        checkpoint_replay_tail_sequence_count:
+          type: integer
+          format: uint64
+        processed_requests:
+          type: integer
+          format: uint64
+        error_count:
+          type: integer
+          format: uint64
+        retryable_error_count:
+          type: integer
+          format: uint64
+        fatal_error_count:
+          type: integer
+          format: uint64
+        consecutive_retry_count:
+          type: integer
+          format: uint32
+          description: Consecutive durable worker retries for the current failed request window.
+        next_retry_at_ms:
+          type: integer
+          format: uint64
+          description: Unix epoch time in milliseconds when the current durable retry becomes eligible.
+            Zero when not retrying.
+        retrying:
+          type: boolean
+        worker_failed:
+          type: boolean
+        worker_started:
+          type: boolean
+          description: Whether the background enrichment worker is currently running.
+        stalled:
+          type: boolean
+          description: Whether work is pending with no running worker, retry, or terminal failure explaining
+            the backlog.
+        skip_by_hash_count:
+          type: integer
+          format: uint64
+        skipped_source_count:
+          type: integer
+          format: uint64
+        codec_decode_failures:
+          type: integer
+          format: uint64
+        embed_batches_started:
+          type: integer
+          format: uint64
+        embed_batches_completed:
+          type: integer
+          format: uint64
+        embed_items_started:
+          type: integer
+          format: uint64
+        embed_items_completed:
+          type: integer
+          format: uint64
+        active_embed_batch_items:
+          type: integer
+          format: uint64
+        active_embed_batch_bytes:
+          type: integer
+          format: uint64
+        active_embed_batch_max_bytes:
+          type: integer
+          format: uint64
+        active_embed_batch_started_ms:
+          type: integer
+          format: uint64
+        last_embed_batch_items:
+          type: integer
+          format: uint64
+        last_embed_batch_bytes:
+          type: integer
+          format: uint64
+        last_embed_batch_max_bytes:
+          type: integer
+          format: uint64
+        last_embed_batch_completed_ms:
+          type: integer
+          format: uint64
+          description: Wall-clock completion time in Unix milliseconds for the most recently completed
+            embedding batch.
+        last_embed_batch_ns:
+          type: integer
+          format: uint64
+          description: Elapsed duration in nanoseconds for the most recently completed embedding batch.
+        total_embed_ns:
+          type: integer
+          format: uint64
     EmbeddingsIndexStats:
       type: object
       description: Statistics for an embeddings index (dense or sparse)
@@ -17317,7 +17774,8 @@ components:
         rebuilding:
           x-go-type-skip-optional-pointer: true
           type: boolean
-          description: Whether the index enricher is currently backfilling
+          description: Whether enrichment, publication, or replay work is still pending. Documents that
+            do not contain the indexed field are terminal skipped outcomes and do not keep this true.
         repair:
           $ref: '#/components/schemas/IndexRepairStatus'
         wal_backlog:
@@ -17333,7 +17791,9 @@ components:
           x-go-type-skip-optional-pointer: true
           type: number
           format: double
-          description: Backfill progress as a ratio from 0.0 to 1.0
+          description: Fraction of source documents with a terminal materialization outcome, including
+            produced embeddings and intentionally skipped documents. Reaches 1.0 when no source work is
+            pending and replay is current.
         backfill_items_processed:
           x-go-type-skip-optional-pointer: true
           type: integer
@@ -17342,7 +17802,8 @@ components:
         backfill_state:
           x-go-type-skip-optional-pointer: true
           type: string
-          description: Operational readiness state such as ready, running, retrying, or failed.
+          description: Operational readiness state. Clients should use ready (or rebuilding=false) for
+            query readiness; replay watermarks diagnose replay progress but do not replace this signal.
         doc_count:
           x-go-type-skip-optional-pointer: true
           type: integer
@@ -17424,14 +17885,7 @@ components:
           type: integer
           format: uint64
         enrichment_runtime:
-          x-go-type-skip-optional-pointer: true
-          type: object
-          additionalProperties: true
-          properties:
-            pending_sequence_count:
-              type: integer
-              format: uint64
-          description: Embedding enrichment worker runtime diagnostics.
+          $ref: '#/components/schemas/EnrichmentRuntimeStatus'
         hbc_cache:
           x-go-type-skip-optional-pointer: true
           type: object
@@ -17458,10 +17912,10 @@ components:
           type: integer
           format: uint64
           description: Projection generation associated with the durable checkpoint.
-        projection_checkpoint_config_hash:
+        projection_checkpoint_config_fingerprint:
           x-go-type-skip-optional-pointer: true
-          type: integer
-          format: uint64
+          type: string
+          pattern: ^[0-9a-f]{16}$
           description: Projection configuration identity associated with the durable checkpoint.
         checkpoint_replay_tail_sequence_count:
           x-go-type-skip-optional-pointer: true
@@ -17582,7 +18036,7 @@ components:
         backfill_state:
           x-go-type-skip-optional-pointer: true
           type: string
-          description: Operational readiness state such as ready, running, retrying, or failed.
+          description: Operational readiness state such as ready, running, retrying, degraded, or failed.
         doc_count:
           x-go-type-skip-optional-pointer: true
           type: integer
@@ -17663,10 +18117,10 @@ components:
           type: integer
           format: uint64
           description: Projection generation associated with the durable checkpoint.
-        projection_checkpoint_config_hash:
+        projection_checkpoint_config_fingerprint:
           x-go-type-skip-optional-pointer: true
-          type: integer
-          format: uint64
+          type: string
+          pattern: ^[0-9a-f]{16}$
           description: Projection configuration identity associated with the durable checkpoint.
         checkpoint_replay_tail_sequence_count:
           x-go-type-skip-optional-pointer: true
@@ -17802,7 +18256,7 @@ components:
         backfill_state:
           x-go-type-skip-optional-pointer: true
           type: string
-          description: Operational readiness state such as ready, running, retrying, or failed.
+          description: Operational readiness state such as ready, running, retrying, degraded, or failed.
         doc_count:
           x-go-type-skip-optional-pointer: true
           type: integer
@@ -17955,10 +18409,10 @@ components:
           type: integer
           format: uint64
           description: Projection generation associated with the durable checkpoint.
-        projection_checkpoint_config_hash:
+        projection_checkpoint_config_fingerprint:
           x-go-type-skip-optional-pointer: true
-          type: integer
-          format: uint64
+          type: string
+          pattern: ^[0-9a-f]{16}$
           description: Projection configuration identity associated with the durable checkpoint.
         checkpoint_replay_tail_sequence_count:
           x-go-type-skip-optional-pointer: true
@@ -19578,6 +20032,8 @@ components:
         max_depth:
           x-go-type-skip-optional-pointer: true
           type: integer
+          minimum: 1
+          maximum: 64
           description: Maximum traversal depth
         min_weight:
           x-go-type-skip-optional-pointer: true
@@ -19592,6 +20048,8 @@ components:
         max_results:
           x-go-type-skip-optional-pointer: true
           type: integer
+          minimum: 1
+          maximum: 10000
           description: Maximum number of results (traversal)
         deduplicate_nodes:
           x-go-type-skip-optional-pointer: true
@@ -19606,6 +20064,8 @@ components:
         k:
           x-go-type-skip-optional-pointer: true
           type: integer
+          minimum: 1
+          maximum: 100
           description: Number of paths to find (k-shortest-paths)
         node_filter:
           $ref: '#/components/schemas/NodeFilter'
@@ -19792,6 +20252,10 @@ components:
           x-go-type-skip-optional-pointer: true
           type: string
           description: Document key
+        table:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Owning table for a cross-table node; omitted for nodes in the queried table
         depth:
           x-go-type-skip-optional-pointer: true
           type: integer
@@ -19938,7 +20402,54 @@ components:
       properties:
         error:
           type: string
-          description: Error message
+          description: Stable machine-readable error code
+        message:
+          type: string
+          description: Human-readable error description
+        reason:
+          type: string
+          description: Machine-readable capacity source when the failure is retryable
+          enum:
+            - inference_capacity
+            - request_queue
+        retryable:
+          type: boolean
+          description: Whether retrying the same request may succeed
+        retry_after_ms:
+          type: integer
+          minimum: 0
+          description: Minimum retry delay in milliseconds
+    InferenceTransientCapacityError:
+      type: object
+      description: Actionable retry contract for temporary inference-capacity failures.
+      required:
+        - error
+        - message
+        - reason
+        - retryable
+        - retry_after_ms
+      properties:
+        error:
+          type: string
+          description: Stable machine-readable error code
+        message:
+          type: string
+          description: Human-readable error description
+        reason:
+          type: string
+          description: Machine-readable capacity source
+          enum:
+            - inference_capacity
+            - request_queue
+        retryable:
+          type: boolean
+          enum:
+            - true
+          description: Always true for a transient-capacity response
+        retry_after_ms:
+          type: integer
+          minimum: 1
+          description: Minimum retry delay in milliseconds
     InferencePredictRequest:
       type: object
       required:
@@ -20190,6 +20701,7 @@ components:
             - text_inference
             - image_inference
             - audio_inference
+            - model_admission
             - inference
         retryable:
           type: boolean
@@ -20197,6 +20709,11 @@ components:
         status:
           type: integer
           description: HTTP-style status classification for this item
+        retry_after_ms:
+          type: integer
+          minimum: 0
+          nullable: true
+          description: Minimum retry delay in milliseconds for a retryable transient failure
     InferenceEmbeddingBatchSummary:
       type: object
       description: Counts for per-item embedding responses
@@ -20719,7 +21236,6 @@ components:
         - rerankers
         - embedders
         - generators
-        - recognizers
         - extractors
         - rewriters
         - classifiers
@@ -20773,11 +21289,6 @@ components:
           additionalProperties:
             $ref: '#/components/schemas/InferenceModelInfo'
           description: Available generator/LLM models from models_dir/generators/
-        recognizers:
-          type: object
-          additionalProperties:
-            $ref: '#/components/schemas/InferenceModelInfo'
-          description: Available recognizer models from models_dir/recognizers/
         rewriters:
           type: object
           additionalProperties:
@@ -21153,6 +21664,7 @@ components:
       required:
         - code
         - message
+        - retryable
       properties:
         code:
           type: string
@@ -21161,6 +21673,11 @@ components:
         retryable:
           type: boolean
           default: false
+        retry_after_ms:
+          type: integer
+          minimum: 1
+          nullable: true
+          description: Minimum retry delay in milliseconds for a retryable capacity failure.
     InferenceGenerateBatchResultItem:
       type: object
       required:
@@ -21346,7 +21863,6 @@ components:
         - reranker
         - chunker
         - classifier
-        - recognizer
         - rewriter
         - reader
         - transcriber
@@ -21512,7 +22028,7 @@ components:
 
             - `{models_dir}/rerankers/` - Reranking models (ONNX)
 
-            - `{models_dir}/recognizers/` - Recognition models (ONNX)
+            - `{models_dir}/extractors/` - Entity, relation, and structured extraction models
 
             - `{models_dir}/rewriters/` - Seq2Seq rewriter models (ONNX)
 
@@ -21544,11 +22060,11 @@ components:
 
             Models are automatically unloaded after this duration of inactivity.
 
-            Use Go duration format: "5m" (5 minutes), "1h" (1 hour), "0" (eager loading).
+            Use Go duration format: "5m" (5 minutes), "1h" (1 hour), or "0".
 
-            Defaults to "5m" (lazy loading) like Ollama. Set to "0" to explicitly enable eager loading
+            Defaults to "5m". Set to "0" to disable idle-time eviction; models can
 
-            where all models are loaded at startup and never unloaded.
+            still be evicted under resource pressure or to enforce max_loaded_models.
           default: 5m
           example: 5m
         max_loaded_models:
@@ -21558,8 +22074,10 @@ components:
 
             generators, chunkers, etc.). When the limit is reached, the least-recently-used
 
-            idle model from any registry is evicted to make room. Set to 0 for unlimited (default).
-          default: 0
+            idle model from any registry is evicted to make room. Set to 0 for unlimited.
+
+            Defaults to 10.
+          default: 10
           example: 3
         pool_size:
           type: integer
@@ -21678,11 +22196,9 @@ components:
           description: >
             Per-model loading strategy overrides. Maps model names to their loading strategy.
 
-            Models not in this map use the default strategy based on keep_alive:
+            Models not in this map load on demand. keep_alive controls their idle
 
-            - If keep_alive>0 (default "5m"): lazy loading (load on demand, unload after idle)
-
-            - If keep_alive="0": eager loading (load at startup, never unload)
+            eviction; setting it to "0" disables idle eviction but does not preload or pin them.
 
 
             When a model has strategy "eager" in this map:
@@ -22341,15 +22857,20 @@ components:
           additionalProperties: true
     ExtractionRelationSchema:
       type: object
+      description: Optional source and target labels constrain relation endpoints. A target requires a
+        source.
       required:
         - type
       properties:
         type:
           type: string
+          minLength: 1
         source:
           type: string
+          minLength: 1
         target:
           type: string
+          minLength: 1
     ExtractionClassificationSchema:
       type: object
       required:
@@ -22369,22 +22890,46 @@ components:
       oneOf:
         - type: string
         - type: object
+          properties:
+            type:
+              type: string
+              enum:
+                - str
+                - string
+                - list
+                - array
+            enum:
+              type: array
+              minItems: 2
+              items:
+                type: string
+                minLength: 1
           additionalProperties: true
     ExtractionStructureSchema:
       type: object
+      required:
+        - fields
       properties:
         fields:
           type: object
+          minProperties: 1
           additionalProperties:
             $ref: '#/components/schemas/ExtractionStructureField'
       additionalProperties: true
     ExtractionSchema:
       type: object
+      description: >
+        Selects one extraction operation family per request. Entity labels may
+
+        accompany relation schemas so relation extraction can return its
+
+        participating entities in the same response.
       properties:
         entities:
           type: array
           items:
             type: string
+            minLength: 1
         relations:
           type: array
           items:
@@ -22410,6 +22955,37 @@ components:
         api_url:
           type: string
       additionalProperties: true
+    ExtractionResolverOptions:
+      type: object
+      description: Optional cross-input entity and relation deduplication.
+      properties:
+        similarity_threshold:
+          type: number
+          format: float
+          default: 0.85
+          minimum: 0
+          maximum: 1
+        type_must_match:
+          type: boolean
+          default: true
+        min_entity_confidence:
+          type: number
+          format: float
+          default: 0
+          minimum: 0
+          maximum: 1
+        min_relation_confidence:
+          type: number
+          format: float
+          default: 0
+          minimum: 0
+          maximum: 1
+        deduplicate_relations:
+          type: boolean
+          default: true
+        track_provenance:
+          type: boolean
+          default: true
     ExtractionOptions:
       type: object
       properties:
@@ -22424,6 +23000,8 @@ components:
           type: boolean
         reader:
           $ref: '#/components/schemas/ExtractionReaderOptions'
+        resolver:
+          $ref: '#/components/schemas/ExtractionResolverOptions'
       additionalProperties: true
     ExtractionRequest:
       type: object
@@ -22434,8 +23012,10 @@ components:
       properties:
         model:
           type: string
+          minLength: 1
         inputs:
           type: array
+          minItems: 1
           items:
             $ref: '#/components/schemas/ExtractionInput'
         schema:
@@ -22635,6 +23215,22 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
+    StatelessTransactionFailure:
+      description: >
+        Internal transaction failure. If the response says that the outcome is
+
+        unknown, the request may already have committed and the stateless
+
+        request MUST NOT be retried. Use a transaction session when a commit
+
+        must be safely retryable by transaction ID.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+        text/plain:
+          schema:
+            type: string
     DenseRepairBackpressure:
       description: Writes are temporarily limited while a dense-index rebuild catches up.
       headers:
@@ -22665,6 +23261,27 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
+    QueryInternalServerError:
+      description: Query failure. Storage integrity failures use a stable non-retryable error payload.
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - $ref: '#/components/schemas/Error'
+              - $ref: '#/components/schemas/TableStorageUnreadableError'
+    TransientCapacity:
+      description: Inference capacity is temporarily unavailable
+      headers:
+        Retry-After:
+          required: true
+          description: Minimum number of seconds clients should wait before retrying
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/InferenceTransientCapacityError'
 x-tagGroups:
   - name: Antfly
     tags:

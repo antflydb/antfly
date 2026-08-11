@@ -77,7 +77,7 @@ Models are downloaded to the appropriate directory based on their type:
   - Chunkers:     models/chunkers/<owner>/<model-name>/
   - Rerankers:    models/rerankers/<owner>/<model-name>/
   - Generators:   models/generators/<owner>/<model-name>/
-  - Recognizers:  models/recognizers/<owner>/<model-name>/
+  - Extractors:   models/extractors/<owner>/<model-name>/
   - Rewriters:    models/rewriters/<owner>/<model-name>/
 
 Variants (append :variant to model name, e.g., BAAI/bge-small-en-v1.5:i8):
@@ -162,7 +162,7 @@ func init() {
 	inferencePullCmd.Flags().StringSliceVar(&inferenceVariants, "variants", nil,
 		"Variant IDs to download (f32,f16,i8,i8-st,i4). Defaults to f32 if not specified.")
 	inferencePullCmd.Flags().String("type", "",
-		"Model type (embedder, chunker, reranker, generator, recognizer, rewriter) - auto-detected for generators")
+		"Model type (embedder, chunker, reranker, generator, extractor, rewriter) - auto-detected for generators")
 	inferencePullCmd.Flags().String("hf-token", "",
 		"HuggingFace API token for gated models (or use HF_TOKEN env var)")
 	inferencePullCmd.Flags().String("variant", "",
@@ -170,7 +170,7 @@ func init() {
 
 	// List command flags
 	inferenceListCmd.Flags().Bool("remote", false, "List models from remote registry")
-	inferenceListCmd.Flags().String("type", "", "Filter by model type (embedder, chunker, reranker, generator, recognizer, rewriter)")
+	inferenceListCmd.Flags().String("type", "", "Filter by model type (embedder, chunker, reranker, generator, extractor, rewriter)")
 }
 
 func runInference(cmd *cobra.Command, args []string) error {

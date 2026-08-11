@@ -1100,6 +1100,13 @@ pub const DocStore = struct {
         try self.putBatchWithReplayWithOptions(io, writes, deletes, replay, .{});
     }
 
+    /// Update the in-memory replay watermark after a replay entry was committed
+    /// by an external atomic batch (for example transaction intent resolution).
+    pub fn observeExternalReplayCommit(self: *DocStore, sequence: u64) void {
+        self.markReplayIndexAvailable();
+        self.observeCommittedReplaySequence(sequence);
+    }
+
     pub fn lastReplaySequence(self: *DocStore, fallback_last: u64) u64 {
         const next = self.nextReplaySequence(fallback_last + 1);
         return if (next <= 1) 0 else next - 1;
@@ -1487,6 +1494,11 @@ pub const DocStore = struct {
         var txn = try self.beginReadTxn();
         defer txn.abort();
 
+        return try scanPrefixTxn(alloc, &txn, prefix);
+    }
+
+    /// Scan a prefix from an existing point-in-time read transaction.
+    pub fn scanPrefixTxn(alloc: Allocator, txn: *Txn, prefix: []const u8) ![]OwnedKVPair {
         var cur = try txn.openCursor();
         defer cur.close();
 
@@ -1567,6 +1579,11 @@ pub const DocStore = struct {
         var txn = try self.beginReadTxn();
         defer txn.abort();
 
+        return try scanRangeTxn(alloc, &txn, lower, upper);
+    }
+
+    /// Scan a range from an existing point-in-time read transaction.
+    pub fn scanRangeTxn(alloc: Allocator, txn: *Txn, lower: []const u8, upper: []const u8) ![]OwnedKVPair {
         var cur = try txn.openCursor();
         defer cur.close();
         cur.setUpperBound(if (upper.len > 0) upper else null);
@@ -1601,6 +1618,31 @@ pub const DocStore = struct {
         const owned = try alloc.dupe(OwnedKVPair, results.items);
         results.deinit(alloc);
         return owned;
+    }
+
+    /// Scan only keys in [lower, upper). This avoids copying document values
+    /// when callers need an atomic delete set for generation replacement.
+    pub fn scanRangeKeys(self: *DocStore, alloc: Allocator, lower: []const u8, upper: []const u8) ![][]u8 {
+        var txn = try self.beginReadTxn();
+        defer txn.abort();
+
+        var cur = try txn.openCursor();
+        defer cur.close();
+        cur.setUpperBound(if (upper.len > 0) upper else null);
+
+        var keys = std.ArrayListUnmanaged([]u8).empty;
+        errdefer {
+            for (keys.items) |key| alloc.free(key);
+            keys.deinit(alloc);
+        }
+        var entry = if (lower.len == 0) try cur.first() else try cur.seekAtOrAfter(lower);
+        while (entry) |kv| : (entry = try cur.next()) {
+            if (upper.len > 0 and std.mem.order(u8, kv.key, upper) != .lt) break;
+            const key = try alloc.dupe(u8, kv.key);
+            errdefer alloc.free(key);
+            try keys.append(alloc, key);
+        }
+        return try keys.toOwnedSlice(alloc);
     }
 
     pub fn findMedianKey(self: *DocStore, alloc: Allocator, lower: []const u8, upper: []const u8, options: ScanOptions) ![]u8 {

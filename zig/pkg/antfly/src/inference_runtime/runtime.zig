@@ -64,6 +64,7 @@ pub const SpawnedServer = struct {
 const EmbeddedServerConfig = struct {
     api_url: []const u8,
     models_dir: ?[]const u8 = null,
+    allow_unknown_models: bool = false,
     ml_dir: ?[]const u8 = null,
     content_security: ?common_config.Config.ContentSecurityConfig = null,
     s3_credentials: ?common_config.Config.S3CredentialsConfig = null,
@@ -143,6 +144,10 @@ pub fn runFromIterator(
     const command = args.next() orelse "run";
 
     if (std.mem.eql(u8, command, "run")) {
+        if (runHelpRequested(args)) {
+            printUsage();
+            return;
+        }
         return try runServer(alloc, io, args);
     } else if (std.mem.eql(u8, command, "embed")) {
         return try inference.native_embed.main(alloc, io, try collectArgs(alloc, args));
@@ -176,8 +181,6 @@ pub fn runFromIterator(
         return try inference.native_transcribe.main(alloc, io, try collectArgs(alloc, args));
     } else if (std.mem.eql(u8, command, "read")) {
         return try inference.native_read.main(alloc, io, try collectArgs(alloc, args));
-    } else if (std.mem.eql(u8, command, "recognize")) {
-        return try inference.native_recognize.main(alloc, io, try collectArgs(alloc, args));
     } else if (std.mem.eql(u8, command, "extract")) {
         return try inference.native_extract.main(alloc, io, try collectArgs(alloc, args));
     } else if (std.mem.eql(u8, command, "compare")) {
@@ -201,17 +204,45 @@ pub fn runFromIterator(
     }
 }
 
+fn runHelpRequested(args: *std.process.Args.Iterator) bool {
+    var probe = args.*;
+    while (probe.next()) |arg| {
+        if (isHelpArg(arg)) return true;
+    }
+    return false;
+}
+
 fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
+    // Help is side-effect free and wins over every run option, even if it
+    // follows an otherwise invalid value. Probe a copy so normal parsing can
+    // still consume the original iterator.
+    var help_probe = args.*;
+    var first_arg = true;
+    while (help_probe.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h") or
+            (first_arg and std.mem.eql(u8, arg, "help")))
+        {
+            printUsage();
+            return;
+        }
+        first_arg = false;
+    }
+
     var host: []const u8 = "127.0.0.1";
     var port: u16 = 8090;
     var models_dir: []const u8 = defaultModelsDir(alloc);
     var ml_dir: []const u8 = defaultMlDir(alloc);
+    var max_loaded_models: usize = 10;
     var budget_overrides_mb = BudgetOverridesMb{};
+    var allow_unknown_models = false;
     var preload_models = std.ArrayListUnmanaged(inference.server.WarmModel).empty;
     defer preload_models.deinit(alloc);
 
     while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--host")) {
+        if (isHelpArg(arg)) {
+            printUsage();
+            return;
+        } else if (std.mem.eql(u8, arg, "--host")) {
             host = args.next() orelse host;
         } else if (std.mem.eql(u8, arg, "--port")) {
             if (args.next()) |p| port = std.fmt.parseInt(u16, p, 10) catch 8090;
@@ -219,6 +250,12 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
             models_dir = args.next() orelse models_dir;
         } else if (std.mem.eql(u8, arg, "--ml-dir")) {
             ml_dir = args.next() orelse ml_dir;
+        } else if (std.mem.eql(u8, arg, "--max-loaded-models")) {
+            max_loaded_models = try std.fmt.parseInt(
+                usize,
+                args.next() orelse return error.InvalidArguments,
+                10,
+            );
         } else if (std.mem.eql(u8, arg, "--host-budget-mb")) {
             budget_overrides_mb.host_budget_mb = try parseBudgetMbArg(args);
         } else if (std.mem.eql(u8, arg, "--backend-budget-mb")) {
@@ -231,6 +268,8 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
             budget_overrides_mb.scratch_budget_mb = try parseBudgetMbArg(args);
         } else if (std.mem.eql(u8, arg, "--preload-model")) {
             try preload_models.append(alloc, try parsePreloadModelFlag(args.next() orelse return error.InvalidArguments));
+        } else if (std.mem.eql(u8, arg, "--allow-unknown-models")) {
+            allow_unknown_models = true;
         }
     }
 
@@ -241,12 +280,18 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
     var node = try inference.server.Node.init(alloc, .{
         .models_dir = models_dir,
         .ml_dir = ml_dir,
+        .max_loaded_models = max_loaded_models,
         .generation_budget_overrides = budgetOverridesFromMb(budget_overrides_mb),
         .preload = preload_models.items,
+        .allow_unknown_models = allow_unknown_models,
     });
     defer node.deinit();
 
+    // Bind the caller-owned runtime before warmup so model loading, tokenizer
+    // work, and backend sessions all compose with the same executor.
+    node.attachIo(io);
     try node.warmConfiguredGenerators(alloc);
+    node.configureForcedRunAdmissionDenialsFromEnvironmentForTesting();
     std.debug.print("listening on {s}:{d}\n", .{ host, port });
     try node.serve(alloc, io, host, port);
 }
@@ -265,6 +310,7 @@ pub fn spawnServerProcess(
         .ml_dir = config.ml_dir orelse defaultMlDir(alloc),
         .generation_budget_overrides = config.generation_budget_overrides,
         .preload = config.preload,
+        .allow_unknown_models = config.allow_unknown_models,
     };
     if (config.content_security) |sec| node_cfg.content_security = sec;
     if (config.s3_credentials) |creds| node_cfg.s3_credentials = creds;
@@ -290,6 +336,7 @@ pub fn spawnServerProcess(
 fn serveThread(node: *inference.server.Node, alloc: std.mem.Allocator, host: []const u8, port: u16) void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
+    node.attachIo(io_impl.io());
     node.warmConfiguredGenerators(alloc) catch |err| {
         std.debug.print("inference warmup error: {}\n", .{err});
         return;
@@ -335,6 +382,8 @@ fn pullModel(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
     var tasks_csv: ?[]const u8 = null;
     var capabilities_csv: ?[]const u8 = null;
     var projector_selection: inference.registry.download.ProjectorSelection = .auto;
+    var max_artifact_bytes = inference.registry.download.default_max_artifact_bytes;
+    var max_model_bytes = inference.registry.download.default_max_model_bytes;
     var predictor_pull = false;
     var first_ai_only_flag: ?[]const u8 = null;
     var first_predictor_only_flag: ?[]const u8 = null;
@@ -389,6 +438,10 @@ fn pullModel(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
             capabilities_csv = value;
         } else if (std.mem.eql(u8, arg, "--projector")) {
             projector_selection = inference.registry.download.parseProjectorSelection(value) orelse return error.InvalidArguments;
+        } else if (std.mem.eql(u8, arg, "--max-artifact-bytes")) {
+            max_artifact_bytes = try parsePositiveDownloadBytes(value);
+        } else if (std.mem.eql(u8, arg, "--max-model-bytes")) {
+            max_model_bytes = try parsePositiveDownloadBytes(value);
         } else {
             if (std.mem.eql(u8, arg, "--type") and (std.mem.eql(u8, value, "predictor") or std.mem.eql(u8, value, "predictors"))) predictor_pull = true;
             try passthrough.appendSlice(alloc, &.{ arg, value });
@@ -423,6 +476,11 @@ fn pullModel(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
 
     var reg = inference.registry.ModelRegistry.init(alloc, models_dir);
     defer reg.deinit();
+    const hub_config = inference.registry.download.HubConfig{
+        .token = token,
+        .max_artifact_bytes = max_artifact_bytes,
+        .max_model_bytes = max_model_bytes,
+    };
     for (refs.items) |ref| {
         if (variants_csv) |raw_variants| {
             var variants = std.mem.splitScalar(u8, raw_variants, ',');
@@ -433,11 +491,11 @@ fn pullModel(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
                 pulled_any = true;
                 const qualified_ref = try std.fmt.allocPrint(alloc, "{s}:{s}", .{ ref, variant });
                 defer alloc.free(qualified_ref);
-                try pullOneModel(&reg, io, qualified_ref, token, tasks_csv, capabilities_csv, projector_selection);
+                try pullOneModel(&reg, io, qualified_ref, hub_config, tasks_csv, capabilities_csv, projector_selection);
             }
             if (!pulled_any) return error.InvalidArguments;
         } else {
-            try pullOneModel(&reg, io, ref, token, tasks_csv, capabilities_csv, projector_selection);
+            try pullOneModel(&reg, io, ref, hub_config, tasks_csv, capabilities_csv, projector_selection);
         }
     }
 }
@@ -446,20 +504,21 @@ fn pullOneModel(
     registry: *inference.registry.ModelRegistry,
     io: std.Io,
     ref: []const u8,
-    token: ?[]const u8,
+    hub_config: inference.registry.download.HubConfig,
     tasks_csv: ?[]const u8,
     capabilities_csv: ?[]const u8,
     projector_selection: inference.registry.download.ProjectorSelection,
 ) !void {
     std.debug.print("pulling {s}...\n", .{ref});
-    try registry.pull(io, ref, token, tasks_csv, capabilities_csv, projector_selection);
+    try registry.pull(io, ref, hub_config, tasks_csv, capabilities_csv, projector_selection);
     std.debug.print("done.\n", .{});
 }
 
 fn pullFlagTakesValue(arg: []const u8) bool {
     const flags = [_][]const u8{
-        "--variants", "--token", "--models-dir", "--ml-dir",    "--tasks",               "--capabilities", "--projector",
-        "--type",     "--name",  "--file",       "--framework", "--dead-leaf-threshold",
+        "--variants",  "--token",               "--models-dir",      "--ml-dir", "--tasks", "--capabilities",
+        "--projector", "--max-artifact-bytes",  "--max-model-bytes", "--type",   "--name",  "--file",
+        "--framework", "--dead-leaf-threshold",
     };
     for (flags) |flag| if (std.mem.eql(u8, arg, flag)) return true;
     return false;
@@ -470,7 +529,7 @@ const PullFlagDomain = enum { shared, ai, predictor };
 fn pullFlagDomain(arg: []const u8) PullFlagDomain {
     if (std.mem.eql(u8, arg, "--token")) return .shared;
     const ai_flags = [_][]const u8{
-        "--variants", "--models-dir", "--tasks", "--capabilities", "--projector",
+        "--variants", "--models-dir", "--tasks", "--capabilities", "--projector", "--max-artifact-bytes", "--max-model-bytes",
     };
     for (ai_flags) |flag| if (std.mem.eql(u8, arg, flag)) return .ai;
     return .predictor;
@@ -498,8 +557,14 @@ fn isHelpArg(arg: []const u8) bool {
     return std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "help");
 }
 
+fn parsePositiveDownloadBytes(value: []const u8) !u64 {
+    const parsed = try std.fmt.parseInt(u64, value, 10);
+    if (parsed == 0) return error.InvalidArguments;
+    return parsed;
+}
+
 fn printPullUsage() void {
-    std.debug.print("usage: antfly inference pull [--variants <csv>] <model-ref>... [--token <hf-token>] [--models-dir <dir>] [--tasks <csv>] [--capabilities <csv>] [--projector <auto|none|Q8_0|filename>]\n", .{});
+    std.debug.print("usage: antfly inference pull [--variants <csv>] <model-ref>... [--token <hf-token>] [--models-dir <dir>] [--tasks <csv>] [--capabilities <csv>] [--projector <auto|none|Q8_0|filename>] [--max-artifact-bytes <n>] [--max-model-bytes <n>]\n", .{});
     std.debug.print("       antfly inference pull hf:<owner>/<repo> --type predictor [--name <predictor-name>] [--ml-dir <dir>] [--file <repo-path>] [--framework auto|onnx|xgboost|lightgbm]\n", .{});
     std.debug.print("       antfly inference pull <https-url-to-tabular-artifact> --name <predictor-name> [--ml-dir <dir>] [--token <bearer-token>]\n", .{});
     std.debug.print("variants: <model-ref>:gguf, <model-ref>:gguf:Q4_K, <model-ref>:onnx, <model-ref>:hybrid, <model-ref>:safetensors\n", .{});
@@ -557,8 +622,7 @@ fn printUsage() void {
         \\  run-artifact Run or validate compiled artifacts
         \\  transcribe  Run audio transcription
         \\  read        Run image/document reading
-        \\  recognize   Run entity recognition
-        \\  extract     Run structured extraction
+        \\  extract     Run entity, relation, or structured extraction
         \\  compare     Compare generation outputs
         \\  finetune    Run LoRA finetuning
         \\  smoke       Run a model smoke test
@@ -571,12 +635,14 @@ fn printUsage() void {
         \\  --port <port>    Listen port (default: 8090)
         \\  --models-dir <dir> AI models directory (default: ~/.antfly/inference/models)
         \\  --ml-dir <dir>     Traditional ML directory (default: ~/.antfly/inference/ml)
+        \\  --max-loaded-models <n> Maximum resident models; 0 disables the count limit (default: 10)
         \\  --host-budget-mb <n>      Native generation host budget override
         \\  --backend-budget-mb <n>   Native generation backend budget override
         \\  --combined-budget-mb <n>  Native generation combined budget override
         \\  --kv-budget-mb <n>        Native generation KV cache budget override
         \\  --scratch-budget-mb <n>   Native generation scratch budget override
         \\  --preload-model <kind:name|kind:backend:name>  Preload and warm a configured model before serving
+        \\  --allow-unknown-models  Permit artifacts whose compatibility cannot be proven; known incompatible models remain blocked
         \\
         \\Pull options:
         \\  --token <token>  HuggingFace API token (or set HF_TOKEN env var)
@@ -584,6 +650,8 @@ fn printUsage() void {
         \\  --tasks <list>   Comma-separated task hints for the pulled model
         \\  --capabilities <list> Comma-separated capability hints for the pulled model
         \\  --projector <value> Projector sidecar selection for GGUF pulls: auto, none, quant suffix, or filename
+        \\  --max-artifact-bytes <n> Maximum bytes accepted for one model artifact (default: 68719476736)
+        \\  --max-model-bytes <n> Maximum aggregate bytes accepted for one pull (default: 137438953472)
         \\  --models-dir <dir> AI models directory (default: ~/.antfly/inference/models)
         \\  --ml-dir <dir>     Traditional ML directory for URL pulls (default: ~/.antfly/inference/ml)
         \\
@@ -596,6 +664,17 @@ test "inference runtime module compiles" {
     _ = spawnServerProcess;
 }
 
+test "inference run detects trailing help without consuming arguments" {
+    var argv = [_][*:0]const u8{ "--host", "127.0.0.1", "--help" };
+    var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    try std.testing.expect(runHelpRequested(&args));
+    try std.testing.expectEqualStrings("--host", args.next().?);
+
+    var no_help_argv = [_][*:0]const u8{ "--host", "127.0.0.1" };
+    var no_help_args = std.process.Args.Iterator.init(.{ .vector = no_help_argv[0..] });
+    try std.testing.expect(!runHelpRequested(&no_help_args));
+}
+
 test "inference pull recognizes help before model resolution" {
     try std.testing.expect(isHelpArg("--help"));
     try std.testing.expect(isHelpArg("-h"));
@@ -603,9 +682,16 @@ test "inference pull recognizes help before model resolution" {
     try std.testing.expect(!isHelpArg("antflydb/clipclap"));
 }
 
+test "inference run recognizes help before server startup" {
+    try std.testing.expect(isHelpArg("--help"));
+    try std.testing.expect(isHelpArg("-h"));
+    try std.testing.expect(isHelpArg("help"));
+}
+
 test "inference pull classifies order independent value flags" {
     try std.testing.expect(pullFlagTakesValue("--variants"));
     try std.testing.expect(pullFlagTakesValue("--models-dir"));
+    try std.testing.expect(pullFlagTakesValue("--max-model-bytes"));
     try std.testing.expect(pullFlagTakesValue("--framework"));
     try std.testing.expect(!pullFlagTakesValue("--optimize"));
     try std.testing.expect(!pullFlagTakesValue("--unknown"));

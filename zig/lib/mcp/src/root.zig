@@ -53,7 +53,12 @@ pub const HttpResult = struct {
     body: []u8,
 
     pub fn deinit(self: *HttpResult, alloc: std.mem.Allocator) void {
-        if (self.headers.len > 0) alloc.free(self.headers);
+        if (self.headers.len > 0) {
+            for (self.headers) |header| {
+                if (header.owns_value) alloc.free(@constCast(header.value));
+            }
+            alloc.free(self.headers);
+        }
         alloc.free(self.body);
         self.* = undefined;
     }
@@ -62,17 +67,18 @@ pub const HttpResult = struct {
 pub const HttpHeader = struct {
     name: []const u8,
     value: []const u8,
+    owns_value: bool = false,
 };
 
 pub const SessionStore = struct {
     ptr: *anyopaque,
-    create_fn: *const fn (*anyopaque) anyerror![]const u8,
+    create_fn: *const fn (*anyopaque, std.mem.Allocator) anyerror![]u8,
     exists_fn: *const fn (*anyopaque, []const u8) bool,
     close_fn: *const fn (*anyopaque, []const u8) bool,
     next_event_id_fn: *const fn (*anyopaque, []const u8, ?[]const u8) anyerror!?u64,
 
-    pub fn create(self: SessionStore) ![]const u8 {
-        return try self.create_fn(self.ptr);
+    pub fn create(self: SessionStore, alloc: std.mem.Allocator) ![]u8 {
+        return try self.create_fn(self.ptr, alloc);
     }
 
     pub fn exists(self: SessionStore, session_id: []const u8) bool {
@@ -89,22 +95,44 @@ pub const SessionStore = struct {
 };
 
 pub const InMemorySessionStore = struct {
+    pub const Options = struct {
+        max_sessions: usize = 1024,
+        idle_ttl_ns: u64 = std.time.ns_per_hour,
+        cleanup_interval_ns: u64 = std.time.ns_per_min,
+        now_ns_fn: ?*const fn () u64 = null,
+    };
+
     const SessionState = struct {
         next_event_id: u64 = 1,
+        last_activity_ns: u64,
     };
 
     alloc: ?std.mem.Allocator = null,
-    next_id: u64 = 1,
+    io: ?std.Io = null,
+    options: Options = .{},
+    mutex: std.Io.Mutex = .init,
     sessions: std.StringHashMapUnmanaged(SessionState) = .empty,
+    next_cleanup_ns: u64 = 0,
 
     pub fn init(alloc: std.mem.Allocator) InMemorySessionStore {
-        return .{ .alloc = alloc };
+        return .{
+            .alloc = alloc,
+            .io = std.Io.Threaded.global_single_threaded.io(),
+        };
+    }
+
+    pub fn initWithOptions(alloc: std.mem.Allocator, io: std.Io, options: Options) InMemorySessionStore {
+        return .{ .alloc = alloc, .io = io, .options = options };
     }
 
     pub fn deinit(self: *InMemorySessionStore, alloc: std.mem.Allocator) void {
+        const store_alloc = self.alloc orelse alloc;
+        const io = self.io orelse std.Io.Threaded.global_single_threaded.io();
+        self.mutex.lockUncancelable(io);
         var iter = self.sessions.keyIterator();
-        while (iter.next()) |key| alloc.free(key.*);
-        self.sessions.deinit(alloc);
+        while (iter.next()) |key| store_alloc.free(key.*);
+        self.sessions.deinit(store_alloc);
+        self.mutex.unlock(io);
         self.* = undefined;
     }
 
@@ -118,41 +146,128 @@ pub const InMemorySessionStore = struct {
         };
     }
 
-    fn create(ptr: *anyopaque) ![]const u8 {
+    fn create(ptr: *anyopaque, response_alloc: std.mem.Allocator) ![]u8 {
         const self: *InMemorySessionStore = @ptrCast(@alignCast(ptr));
-        const alloc = self.alloc orelse return error.MissingAllocator;
-        const session_id = try std.fmt.allocPrint(alloc, "mcp-session-{d}", .{self.next_id});
-        errdefer alloc.free(session_id);
-        self.next_id += 1;
-        try self.sessions.put(alloc, session_id, .{});
-        return session_id;
+        const store_alloc = self.alloc orelse return error.MissingAllocator;
+        const io = self.io orelse return error.MissingSecureRandomSource;
+
+        for (0..8) |_| {
+            var entropy: [16]u8 = undefined;
+            try io.randomSecure(&entropy);
+            const encoded = std.fmt.bytesToHex(entropy, .lower);
+            const response_id = try std.fmt.allocPrint(response_alloc, "mcp-session-{s}", .{&encoded});
+            errdefer response_alloc.free(response_id);
+            const stored_id = try store_alloc.dupe(u8, response_id);
+            errdefer store_alloc.free(stored_id);
+
+            const now_ns = self.nowNs();
+            self.mutex.lockUncancelable(io);
+            self.cleanupExpiredLocked(store_alloc, now_ns, false);
+            if (self.sessions.count() >= self.options.max_sessions) {
+                self.cleanupExpiredLocked(store_alloc, now_ns, true);
+            }
+            if (self.sessions.count() >= self.options.max_sessions) {
+                self.mutex.unlock(io);
+                return error.McpSessionCapacityExceeded;
+            }
+            if (self.sessions.contains(stored_id)) {
+                self.mutex.unlock(io);
+                store_alloc.free(stored_id);
+                response_alloc.free(response_id);
+                continue;
+            }
+            self.sessions.put(store_alloc, stored_id, .{ .last_activity_ns = now_ns }) catch |err| {
+                self.mutex.unlock(io);
+                return err;
+            };
+            self.mutex.unlock(io);
+            return response_id;
+        }
+        return error.McpSessionIdCollision;
     }
 
     fn exists(ptr: *anyopaque, session_id: []const u8) bool {
         const self: *InMemorySessionStore = @ptrCast(@alignCast(ptr));
-        return self.sessions.contains(session_id);
+        const alloc = self.alloc orelse return false;
+        const io = self.io orelse return false;
+        const now_ns = self.nowNs();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.cleanupExpiredLocked(alloc, now_ns, false);
+        const state = self.sessions.getPtr(session_id) orelse return false;
+        if (self.isExpired(state.*, now_ns)) {
+            _ = self.removeLocked(alloc, session_id);
+            return false;
+        }
+        state.last_activity_ns = now_ns;
+        return true;
     }
 
     fn close(ptr: *anyopaque, session_id: []const u8) bool {
         const self: *InMemorySessionStore = @ptrCast(@alignCast(ptr));
         const alloc = self.alloc orelse return false;
-        const removed = self.sessions.fetchRemove(session_id) orelse return false;
-        alloc.free(removed.key);
-        return true;
+        const io = self.io orelse return false;
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return self.removeLocked(alloc, session_id);
     }
 
     fn nextEventId(ptr: *anyopaque, session_id: []const u8, last_event_id: ?[]const u8) !?u64 {
         const self: *InMemorySessionStore = @ptrCast(@alignCast(ptr));
+        const alloc = self.alloc orelse return error.MissingAllocator;
+        const io = self.io orelse return error.MissingSecureRandomSource;
+        const now_ns = self.nowNs();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.cleanupExpiredLocked(alloc, now_ns, false);
         const entry = self.sessions.getEntry(session_id) orelse return null;
-        if (last_event_id) |raw| {
-            const parsed = std.fmt.parseUnsigned(u64, raw, 10) catch null;
-            if (parsed) |seen| {
-                if (entry.value_ptr.next_event_id <= seen) entry.value_ptr.next_event_id = seen +| 1;
-            }
+        if (self.isExpired(entry.value_ptr.*, now_ns)) {
+            _ = self.removeLocked(alloc, session_id);
+            return null;
         }
+        if (last_event_id) |raw| {
+            const seen = std.fmt.parseUnsigned(u64, raw, 10) catch return error.InvalidLastEventId;
+            if (seen == std.math.maxInt(u64)) return error.McpEventIdExhausted;
+            if (entry.value_ptr.next_event_id <= seen) entry.value_ptr.next_event_id = seen + 1;
+        }
+        if (entry.value_ptr.next_event_id == std.math.maxInt(u64)) return error.McpEventIdExhausted;
         const event_id = entry.value_ptr.next_event_id;
-        entry.value_ptr.next_event_id +|= 1;
+        entry.value_ptr.next_event_id += 1;
+        entry.value_ptr.last_activity_ns = now_ns;
         return event_id;
+    }
+
+    fn nowNs(self: *const InMemorySessionStore) u64 {
+        if (self.options.now_ns_fn) |now_ns_fn| return now_ns_fn();
+        const io = self.io orelse return 0;
+        return @intCast(std.Io.Timestamp.now(io, .awake).toNanoseconds());
+    }
+
+    fn cleanupExpiredLocked(self: *InMemorySessionStore, alloc: std.mem.Allocator, now_ns: u64, force: bool) void {
+        if (self.options.idle_ttl_ns == 0) return;
+        if (!force and self.next_cleanup_ns != 0 and now_ns < self.next_cleanup_ns) return;
+        self.next_cleanup_ns = now_ns +| @min(
+            self.options.cleanup_interval_ns,
+            self.options.idle_ttl_ns,
+        );
+        var iter = self.sessions.iterator();
+        while (iter.next()) |entry| {
+            if (!self.isExpired(entry.value_ptr.*, now_ns)) continue;
+            alloc.free(@constCast(entry.key_ptr.*));
+            self.sessions.removeByPtr(entry.key_ptr);
+        }
+    }
+
+    fn isExpired(self: *const InMemorySessionStore, state: SessionState, now_ns: u64) bool {
+        return self.options.idle_ttl_ns != 0 and
+            now_ns >= state.last_activity_ns and
+            now_ns - state.last_activity_ns >= self.options.idle_ttl_ns;
+    }
+
+    fn removeLocked(self: *InMemorySessionStore, alloc: std.mem.Allocator, session_id: []const u8) bool {
+        const removed = self.sessions.fetchRemove(session_id) orelse return false;
+        alloc.free(removed.key);
+        return true;
     }
 };
 
@@ -170,8 +285,45 @@ pub const Server = struct {
     }
 
     pub fn handleStreamableHttpPost(self: *Server, alloc: std.mem.Allocator, body: []const u8) !HttpResult {
-        if (try self.handleJsonRpc(alloc, body)) |response_body| {
-            const headers = if (try self.sessionHeadersForRequest(alloc, body)) |session_headers|
+        return try self.handleStreamableHttpPostWithSession(alloc, body, null);
+    }
+
+    pub fn handleStreamableHttpPostWithSession(self: *Server, alloc: std.mem.Allocator, body: []const u8, session_id: ?[]const u8) !HttpResult {
+        var arena_impl = std.heap.ArenaAllocator.init(alloc);
+        defer arena_impl.deinit();
+        const temp_alloc = arena_impl.allocator();
+
+        const request = std.json.parseFromSliceLeaky(std.json.Value, temp_alloc, body, .{}) catch {
+            return .{
+                .status = 200,
+                .content_type = "application/json",
+                .body = try stringifyValue(alloc, try errorResponse(temp_alloc, .null, -32700, "parse error")),
+            };
+        };
+        const method = if (request == .object) stringField(request.object, "method") else null;
+        if (self.session_store) |store| {
+            if (method) |name| {
+                if (!std.mem.eql(u8, name, "initialize")) {
+                    const id = session_id orelse return .{
+                        .status = 400,
+                        .content_type = "text/plain",
+                        .body = try alloc.dupe(u8, "missing MCP session"),
+                    };
+                    if (!store.exists(id)) {
+                        return .{
+                            .status = 404,
+                            .content_type = "text/plain",
+                            .body = try alloc.dupe(u8, "unknown MCP session"),
+                        };
+                    }
+                }
+            }
+        }
+
+        if (try self.handleJsonRpcRequest(temp_alloc, request)) |response| {
+            const response_body = try stringifyValue(alloc, response);
+            errdefer alloc.free(response_body);
+            const headers = if (try self.sessionHeadersForMethod(alloc, method)) |session_headers|
                 session_headers
             else
                 &.{};
@@ -194,10 +346,18 @@ pub const Server = struct {
     }
 
     pub fn handleStreamableHttpGetWithSession(self: *Server, alloc: std.mem.Allocator, endpoint: []const u8, session_id: ?[]const u8, last_event_id: ?[]const u8) !HttpResult {
-        const event_id = if (session_id) |id|
-            if (self.session_store) |store| try store.nextEventId(id, last_event_id) else null
-        else
-            null;
+        const event_id = if (self.session_store) |store| blk: {
+            const id = session_id orelse return .{
+                .status = 400,
+                .content_type = "text/plain",
+                .body = try alloc.dupe(u8, "missing MCP session"),
+            };
+            break :blk (try store.nextEventId(id, last_event_id)) orelse return .{
+                .status = 404,
+                .content_type = "text/plain",
+                .body = try alloc.dupe(u8, "unknown MCP session"),
+            };
+        } else null;
         const body = if (event_id) |id|
             try std.fmt.allocPrint(alloc, "id: {d}\nevent: endpoint\ndata: {s}\n\n", .{ id, endpoint })
         else
@@ -210,15 +370,22 @@ pub const Server = struct {
     }
 
     pub fn handleStreamableHttpDelete(self: *Server, alloc: std.mem.Allocator, session_id: ?[]const u8) !HttpResult {
-        const closed = if (session_id) |id|
-            if (self.session_store) |store| store.close(id) else false
-        else
-            false;
+        const store = self.session_store orelse return .{
+            .status = 404,
+            .content_type = "text/plain",
+            .body = try alloc.dupe(u8, "session storage not configured"),
+        };
+        const id = session_id orelse return .{
+            .status = 400,
+            .content_type = "text/plain",
+            .body = try alloc.dupe(u8, "missing MCP session"),
+        };
+        const closed = store.close(id);
         if (!closed) {
             return .{
                 .status = 404,
                 .content_type = "text/plain",
-                .body = try alloc.dupe(u8, "session not found"),
+                .body = try alloc.dupe(u8, "unknown MCP session"),
             };
         }
         return .{
@@ -245,33 +412,38 @@ pub const Server = struct {
         const request = std.json.parseFromSliceLeaky(std.json.Value, temp_alloc, body, .{}) catch {
             return try stringifyValue(alloc, try errorResponse(temp_alloc, .null, -32700, "parse error"));
         };
+        const response = (try self.handleJsonRpcRequest(temp_alloc, request)) orelse return null;
+        return try stringifyValue(alloc, response);
+    }
+
+    fn handleJsonRpcRequest(self: *Server, alloc: std.mem.Allocator, request: std.json.Value) !?std.json.Value {
         if (request != .object) {
-            return try stringifyValue(alloc, try errorResponse(temp_alloc, .null, -32600, "invalid request"));
+            return try errorResponse(alloc, .null, -32600, "invalid request");
         }
 
         const root = request.object;
         const method = stringField(root, "method") orelse {
-            return try stringifyValue(alloc, try errorResponse(temp_alloc, idField(root), -32600, "invalid request"));
+            return try errorResponse(alloc, idField(root), -32600, "invalid request");
         };
         const id = idField(root);
 
         if (std.mem.eql(u8, method, "notifications/initialized")) return null;
         if (std.mem.eql(u8, method, "initialize")) {
-            return try stringifyValue(alloc, try successResponse(temp_alloc, id, try self.initializeResult(temp_alloc)));
+            return try successResponse(alloc, id, try self.initializeResult(alloc));
         }
         if (std.mem.eql(u8, method, "tools/list")) {
-            return try stringifyValue(alloc, try successResponse(temp_alloc, id, try self.toolsListResult(temp_alloc)));
+            return try successResponse(alloc, id, try self.toolsListResult(alloc));
         }
         if (std.mem.eql(u8, method, "tools/call")) {
             const params = root.get("params") orelse .null;
-            const result = self.toolsCallResult(temp_alloc, params) catch |err| switch (err) {
-                error.UnknownTool => return try stringifyValue(alloc, try errorResponse(temp_alloc, id, -32602, "unknown tool")),
-                error.InvalidParams => return try stringifyValue(alloc, try errorResponse(temp_alloc, id, -32602, "invalid params")),
+            const result = self.toolsCallResult(alloc, params) catch |err| switch (err) {
+                error.UnknownTool => return try errorResponse(alloc, id, -32602, "unknown tool"),
+                error.InvalidParams => return try errorResponse(alloc, id, -32602, "invalid params"),
                 else => return err,
             };
-            return try stringifyValue(alloc, try successResponse(temp_alloc, id, result));
+            return try successResponse(alloc, id, result);
         }
-        return try stringifyValue(alloc, try errorResponse(temp_alloc, id, -32601, "method not found"));
+        return try errorResponse(alloc, id, -32601, "method not found");
     }
 
     fn initializeResult(self: *const Server, alloc: std.mem.Allocator) !std.json.Value {
@@ -292,12 +464,16 @@ pub const Server = struct {
         return .{ .object = result };
     }
 
-    fn sessionHeadersForRequest(self: *Server, alloc: std.mem.Allocator, body: []const u8) !?[]const HttpHeader {
+    fn sessionHeadersForMethod(self: *Server, alloc: std.mem.Allocator, method: ?[]const u8) !?[]const HttpHeader {
         if (self.session_store == null) return null;
-        if (!isJsonRpcMethod(alloc, body, "initialize")) return null;
-        const session_id = try self.session_store.?.create();
+        if (method == null or !std.mem.eql(u8, method.?, "initialize")) return null;
+        const session_id = try self.session_store.?.create(alloc);
+        errdefer {
+            _ = self.session_store.?.close(session_id);
+            alloc.free(session_id);
+        }
         const headers = try alloc.alloc(HttpHeader, 2);
-        headers[0] = .{ .name = session_id_header, .value = session_id };
+        headers[0] = .{ .name = session_id_header, .value = session_id, .owns_value = true };
         headers[1] = .{ .name = protocol_version_header, .value = protocol_version };
         return headers;
     }
@@ -343,15 +519,6 @@ pub const Server = struct {
         return error.UnknownTool;
     }
 };
-
-fn isJsonRpcMethod(alloc: std.mem.Allocator, body: []const u8, method_name: []const u8) bool {
-    var arena_impl = std.heap.ArenaAllocator.init(alloc);
-    defer arena_impl.deinit();
-    const request = std.json.parseFromSliceLeaky(std.json.Value, arena_impl.allocator(), body, .{}) catch return false;
-    if (request != .object) return false;
-    const method = stringField(request.object, "method") orelse return false;
-    return std.mem.eql(u8, method, method_name);
-}
 
 fn emptyObject() std.json.Value {
     return .{ .object = .empty };
@@ -509,12 +676,56 @@ test "mcp streamable http creates and closes sessions" {
     try std.testing.expectEqualStrings(protocol_version_header, post.headers[1].name);
     try std.testing.expectEqualStrings(protocol_version, post.headers[1].value);
 
-    const session_id = try alloc.dupe(u8, post.headers[0].value);
-    defer alloc.free(session_id);
+    const session_id = post.headers[0].value;
     var deleted = try server.handleStreamableHttpDelete(alloc, session_id);
     defer deleted.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 202), deleted.status);
     try std.testing.expect(!sessions.iface().exists(session_id));
+    try std.testing.expect(std.mem.startsWith(u8, session_id, "mcp-session-"));
+}
+
+test "mcp streamable http enforces sessions inside the transport" {
+    const alloc = std.testing.allocator;
+    var sessions = InMemorySessionStore.init(alloc);
+    defer sessions.deinit(alloc);
+    var server = Server{ .session_store = sessions.iface() };
+
+    var initialized = try server.handleStreamableHttpPost(alloc,
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}
+    );
+    defer initialized.deinit(alloc);
+    const session_id = initialized.headers[0].value;
+
+    var missing = try server.handleStreamableHttpPostWithSession(alloc,
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
+    , null);
+    defer missing.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), missing.status);
+
+    var unknown = try server.handleStreamableHttpPostWithSession(alloc,
+        \\{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}}
+    , "mcp-session-unknown");
+    defer unknown.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 404), unknown.status);
+
+    var valid = try server.handleStreamableHttpPostWithSession(alloc,
+        \\{"jsonrpc":"2.0","id":4,"method":"tools/list","params":{}}
+    , session_id);
+    defer valid.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), valid.status);
+
+    var malformed = try server.handleStreamableHttpPostWithSession(alloc, "{", null);
+    defer malformed.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), malformed.status);
+    try std.testing.expect(std.mem.indexOf(u8, malformed.body, "\"code\":-32700") != null);
+
+    var missing_get = try server.handleStreamableHttpGetWithSession(alloc, "/mcp/v1", null, null);
+    defer missing_get.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), missing_get.status);
+
+    var missing_delete = try server.handleStreamableHttpDelete(alloc, null);
+    defer missing_delete.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), missing_delete.status);
 }
 
 test "mcp streamable http get emits session event ids and honors resume cursor" {
@@ -536,6 +747,74 @@ test "mcp streamable http get emits session event ids and honors resume cursor" 
     var resumed = try server.handleStreamableHttpGetWithSession(alloc, "/mcp/v1", session_id, "7");
     defer resumed.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, resumed.body, "id: 8\n") != null);
+}
+
+test "mcp session store enforces capacity and reclaims expired sessions" {
+    const alloc = std.testing.allocator;
+    const Clock = struct {
+        var now_ns: std.atomic.Value(u64) = .init(100);
+
+        fn read() u64 {
+            return now_ns.load(.acquire);
+        }
+    };
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    var sessions = InMemorySessionStore.initWithOptions(alloc, io_impl.io(), .{
+        .max_sessions = 2,
+        .idle_ttl_ns = 10,
+        .cleanup_interval_ns = 100,
+        .now_ns_fn = Clock.read,
+    });
+    defer sessions.deinit(alloc);
+
+    const first = try sessions.iface().create(alloc);
+    defer alloc.free(first);
+    const second = try sessions.iface().create(alloc);
+    defer alloc.free(second);
+    try std.testing.expectError(
+        error.McpSessionCapacityExceeded,
+        sessions.iface().create(alloc),
+    );
+
+    Clock.now_ns.store(110, .release);
+    const replacement = try sessions.iface().create(alloc);
+    defer alloc.free(replacement);
+    try std.testing.expect(!sessions.iface().exists(first));
+    try std.testing.expect(!sessions.iface().exists(second));
+    try std.testing.expect(sessions.iface().exists(replacement));
+}
+
+test "mcp session close is synchronized across callers" {
+    const alloc = std.testing.allocator;
+    const session_count = 32;
+    const worker_count = 4;
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    var sessions = InMemorySessionStore.initWithOptions(alloc, io_impl.io(), .{});
+    defer sessions.deinit(alloc);
+
+    var ids: [session_count][]u8 = undefined;
+    for (&ids) |*id| id.* = try sessions.iface().create(alloc);
+    defer for (ids) |id| alloc.free(id);
+
+    const Worker = struct {
+        fn run(store: *InMemorySessionStore, assigned: []const []u8) void {
+            for (assigned) |id| _ = store.iface().close(id);
+        }
+    };
+    var workers: [worker_count]std.Thread = undefined;
+    const per_worker = session_count / worker_count;
+    for (&workers, 0..) |*worker, i| {
+        worker.* = try std.Thread.spawn(.{}, Worker.run, .{
+            &sessions,
+            ids[i * per_worker .. (i + 1) * per_worker],
+        });
+    }
+    for (&workers) |*worker| worker.join();
+    for (ids) |id| try std.testing.expect(!sessions.iface().exists(id));
 }
 
 test "mcp stdio line dispatch frames responses" {

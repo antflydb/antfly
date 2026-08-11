@@ -247,7 +247,7 @@ pub fn promoteWithFence(
     standby: *standby_mod.Standby,
     request: FencedPromotionRequest,
 ) !FencedPromotionResult {
-    try validateFenceRequestForStandby(standby.identity, request.fence);
+    try validateFenceRequestForStandby(standby.identitySnapshot(), request.fence);
     const receipt = try fence_store.acquirePromotionFence(request.fence);
     defer fencing.freeReceipt(fence_store.alloc, receipt);
     return try promoteWithReceipt(alloc, standby, receipt);
@@ -268,7 +268,7 @@ fn promoteWithReceipt(
     standby: *standby_mod.Standby,
     receipt: fencing.Receipt,
 ) !FencedPromotionResult {
-    try validateFenceReceiptForStandby(standby.identity, receipt);
+    try validateFenceReceiptForStandby(standby.identitySnapshot(), receipt);
     const assessment = status.assessPromotionWithFence(standby, receipt);
     if (!assessment.can_promote) return error.PromotionNotAllowed;
 
@@ -655,7 +655,7 @@ test "storage.ha admin acquires fence and promotes standby" {
     try std.testing.expectEqual(@as(u64, 1), result.fence_generation);
     try std.testing.expect(result.fence_token.len > 0);
     try std.testing.expectEqual(@as(u64, 3), result.promotion.switch_lsn);
-    try std.testing.expectEqual(@as(u64, 2), standby.identity.timeline_id);
+    try std.testing.expectEqual(@as(u64, 2), standby.identitySnapshot().timeline_id);
     try std.testing.expect(!result.forced);
 
     const promoted_write = try evaluateStandbyWrite(&standby, .{ .expected_identity = result.promotion.new_identity });
@@ -718,7 +718,7 @@ test "storage.ha admin rejects mismatched fence identity for promotion" {
     });
     defer fencing.freeReceipt(alloc, wrong_receipt);
     try std.testing.expectError(error.WrongTimeline, promoteWithCurrentFence(alloc, &store, &standby));
-    try std.testing.expectEqual(@as(u64, identity.timeline_id), standby.identity.timeline_id);
+    try std.testing.expectEqual(@as(u64, identity.timeline_id), standby.identitySnapshot().timeline_id);
 }
 
 test "storage.ha admin assesses former primary rejoin workflow" {

@@ -560,7 +560,7 @@ func TestTermiteNode_ListModels_IncludesAllRegistries(t *testing.T) {
 				"gliner2-base": mockNER,
 			},
 			capabilities: map[string][]string{
-				"gliner2-base": {"recognition", "extraction"},
+				"gliner2-base": {"labels", "extraction"},
 			},
 		},
 	}
@@ -586,11 +586,11 @@ func TestTermiteNode_ListModels_IncludesAllRegistries(t *testing.T) {
 	assert.Contains(t, resp.Embedders, "embedder-1")
 	assert.Contains(t, resp.Embedders, "antfly-builtin-embedder")
 
-	// Recognizers should include NER models with capabilities
-	assert.Len(t, resp.Recognizers, 1)
-	assert.Contains(t, resp.Recognizers, "gliner2-base")
-	info := resp.Recognizers["gliner2-base"]
-	assert.Contains(t, info.Capabilities, "recognition")
+	// All NER-backed models are exposed through the extractor collection.
+	assert.Len(t, resp.Extractors, 1)
+	assert.Contains(t, resp.Extractors, "gliner2-base")
+	info := resp.Extractors["gliner2-base"]
+	assert.Contains(t, info.Capabilities, "labels")
 	assert.Contains(t, info.Capabilities, "extraction")
 }
 
@@ -615,7 +615,7 @@ func TestTermiteNode_ListModels_EmptyRegistries(t *testing.T) {
 
 	assert.Empty(t, resp.Rerankers)
 	assert.Empty(t, resp.Embedders)
-	assert.Empty(t, resp.Recognizers)
+	assert.Empty(t, resp.Extractors)
 	assert.Empty(t, resp.Generators)
 	assert.Empty(t, resp.Rewriters)
 }
@@ -648,5 +648,5 @@ func TestTermiteNode_ListModels_OnlyRerankers(t *testing.T) {
 	assert.Len(t, resp.Rerankers, 1)
 	assert.Contains(t, resp.Rerankers, "antfly-builtin-reranker")
 	assert.Empty(t, resp.Embedders)
-	assert.Empty(t, resp.Recognizers)
+	assert.Empty(t, resp.Extractors)
 }

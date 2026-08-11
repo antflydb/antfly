@@ -40,7 +40,7 @@ export {
   DEFAULT_WRITE_MAX_RESPONSE_BYTES,
   type RestoreOptions,
 } from "./client.js";
-export { InferenceClient } from "./inference-client.js";
+export { InferenceCapacityError, InferenceClient } from "./inference-client.js";
 export { deserializeEmbeddings, serializeEmbeddings } from "./inference-codec.js";
 export type {
   Chunk,
@@ -76,6 +76,7 @@ export type {
   TextContentPart,
   TranscribeRequest,
   TranscribeResponse,
+  TransientCapacityError,
 } from "./inference-types.js";
 export { logLevels, logStyles } from "./inference-types.js";
 // Re-export the generated types for advanced users

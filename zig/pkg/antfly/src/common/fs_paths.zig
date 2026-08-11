@@ -67,32 +67,24 @@ pub fn createFilePortable(io: anytype, path: []const u8, flags: std.Io.Dir.Creat
 }
 
 pub fn syncDirPortable(io: anytype, path: []const u8) !void {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) return;
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding)
+        return error.DurableDirectorySyncUnsupported;
 
     var dir = if (std.fs.path.isAbsolute(path))
         try std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true })
     else
         try std.Io.Dir.cwd().openDir(io, if (path.len == 0) "." else path, .{ .iterate = true });
     defer dir.close(io);
-
-    while (true) switch (std.posix.errno(std.posix.system.fsync(dir.handle))) {
-        .SUCCESS => return,
-        .INTR => continue,
-        .INVAL => return,
-        .BADF => return error.InvalidFileDescriptor,
-        .IO => return error.InputOutput,
-        .NOSPC => return error.NoSpaceLeft,
-        .DQUOT => return error.DiskQuota,
-        else => |err| return std.posix.unexpectedErrno(err),
-    };
+    try syncDirectoryFdPortable(dir.handle);
 }
 
-pub fn syncFdPortable(fd: std.posix.fd_t) !void {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) return;
+pub fn syncFileFdPortable(fd: std.posix.fd_t) !void {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding)
+        return error.DurableFileSyncUnsupported;
     while (true) switch (std.posix.errno(std.posix.system.fsync(fd))) {
         .SUCCESS => return,
         .INTR => continue,
-        .INVAL => return,
+        .INVAL => return error.DurableFileSyncUnsupported,
         .BADF => return error.InvalidFileDescriptor,
         .IO => return error.InputOutput,
         .NOSPC => return error.NoSpaceLeft,
@@ -101,13 +93,32 @@ pub fn syncFdPortable(fd: std.posix.fd_t) !void {
     };
 }
 
-pub fn syncFileAndParentPortable(io: anytype, path: []const u8) !void {
+pub fn syncDirectoryFdPortable(fd: std.posix.fd_t) !void {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding)
+        return error.DurableDirectorySyncUnsupported;
+    while (true) switch (std.posix.errno(std.posix.system.fsync(fd))) {
+        .SUCCESS => return,
+        .INTR => continue,
+        .INVAL => return error.DurableDirectorySyncUnsupported,
+        .BADF => return error.InvalidFileDescriptor,
+        .IO => return error.InputOutput,
+        .NOSPC => return error.NoSpaceLeft,
+        .DQUOT => return error.DiskQuota,
+        else => |err| return std.posix.unexpectedErrno(err),
+    };
+}
+
+pub fn syncFilePortable(io: anytype, path: []const u8) !void {
     const file = if (std.fs.path.isAbsolute(path))
         try std.Io.Dir.openFileAbsolute(io, path, .{})
     else
         try std.Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
     try file.sync(io);
+}
+
+pub fn syncFileAndParentPortable(io: anytype, path: []const u8) !void {
+    try syncFilePortable(io, path);
     const parent = std.fs.path.dirname(path) orelse if (std.fs.path.isAbsolute(path)) "/" else ".";
     try syncDirPortable(io, parent);
 }

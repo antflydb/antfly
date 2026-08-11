@@ -24,6 +24,9 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const platform_time = @import("antfly_platform").time;
 const graph_mod = @import("graph.zig");
+const node_identity = @import("node_identity.zig");
+const NodeAdmission = @import("node_admission.zig").NodeAdmission;
+const NodeRef = @import("node_admission.zig").NodeRef;
 const pattern_mod = @import("pattern.zig");
 const traversal_mod = @import("traversal.zig");
 const paths_mod = @import("paths.zig");
@@ -64,7 +67,12 @@ pub const QueryParams = struct {
     include_paths: bool = false,
     weight_mode: paths_mod.PathWeightMode = .min_hops,
     algebraic_semiring: bool = false,
+    node_filter: pattern_mod.NodeFilter = .{},
 };
+
+pub fn nodeFilterActive(filter: pattern_mod.NodeFilter) bool {
+    return filter.filter_prefix.len > 0 or filter.filter_query_json != null;
+}
 
 pub const AlgebraicTraversalRejectReason = algebraic_path_mod.ExecutionRejectReason;
 pub const AlgebraicTraversalProof = algebraic_path_mod.ExecutionProof;
@@ -167,6 +175,7 @@ pub const GraphQueryResult = struct {
 
 pub const GraphQueryEngine = struct {
     alloc: Allocator,
+    node_admission: ?NodeAdmission = null,
 
     /// Execute a graph query. For result_ref node selectors, the caller must
     /// resolve refs to keys and pass them as resolved_keys.
@@ -219,7 +228,10 @@ pub const GraphQueryEngine = struct {
             .max_results = params.max_results,
             .deduplicate = params.deduplicate,
             .include_paths = params.include_paths,
+            .node_admission = self.node_admission,
         };
+        const admitted_starts = try self.admittedStartKeysAlloc(start_keys, params.direction);
+        defer if (admitted_starts) |mask| self.alloc.free(mask);
 
         var all_results = std.ArrayListUnmanaged(GraphResultNode).empty;
         var cleanup_results = true;
@@ -235,7 +247,8 @@ pub const GraphQueryEngine = struct {
             seen.deinit(self.alloc);
         }
 
-        for (start_keys) |key| {
+        for (start_keys, 0..) |key, start_index| {
+            if (admitted_starts) |mask| if (!mask[start_index]) continue;
             const trav_results = try traversal_mod.traverse(self.alloc, graph_index, key, rules);
             defer traversal_mod.freeOwnedResults(self.alloc, trav_results);
 
@@ -297,9 +310,21 @@ pub const GraphQueryEngine = struct {
             seen.deinit(self.alloc);
         }
 
-        for (start_keys) |start_key| {
+        const admitted_starts = try self.admittedStartKeysAlloc(start_keys, params.direction);
+        defer if (admitted_starts) |mask| self.alloc.free(mask);
+        if (self.node_admission != null and admitted_starts == null) return null;
+
+        for (start_keys, 0..) |start_key, start_index| {
+            if (admitted_starts) |mask| if (!mask[start_index]) continue;
             var algebraic_edges = try collectAlgebraicReachabilityEdges(self.alloc, graph_index, start_key, params);
             defer algebraic_edges.deinit(self.alloc);
+            if (self.node_admission) |admission| {
+                try filterAlgebraicReachabilityEdgesWithAdmission(
+                    self.alloc,
+                    &algebraic_edges,
+                    admission,
+                );
+            }
 
             const reached = try algebraic_path_mod.boundedReachabilityWithOptionsAlloc(self.alloc, start_key, algebraic_edges.items, params.max_depth, .{ .target_nodes = target_keys });
             defer algebraic_path_mod.deinitPathResults(self.alloc, reached);
@@ -356,7 +381,10 @@ pub const GraphQueryEngine = struct {
             .max_depth = gq.params.max_depth,
             .min_weight = gq.params.min_weight,
             .max_weight = gq.params.max_weight,
+            .node_admission = self.node_admission,
         };
+        const admitted_starts = try self.admittedStartKeysAlloc(start_keys, gq.params.direction);
+        defer if (admitted_starts) |mask| self.alloc.free(mask);
 
         var all_results = std.ArrayListUnmanaged(GraphResultNode).empty;
         errdefer {
@@ -364,7 +392,8 @@ pub const GraphQueryEngine = struct {
             all_results.deinit(self.alloc);
         }
 
-        for (start_keys) |sk| {
+        for (start_keys, 0..) |sk, start_index| {
+            if (admitted_starts) |mask| if (!mask[start_index]) continue;
             for (target_keys) |tk| {
                 const path = try paths_mod.findShortestPath(self.alloc, graph_index, sk, tk, opts);
                 if (path) |p| {
@@ -398,7 +427,12 @@ pub const GraphQueryEngine = struct {
             all_results.deinit(self.alloc);
         }
 
-        for (start_keys) |start_key| {
+        const admitted_starts = try self.admittedStartKeysAlloc(start_keys, params.direction);
+        defer if (admitted_starts) |mask| self.alloc.free(mask);
+        if (self.node_admission != null and admitted_starts == null) return null;
+
+        for (start_keys, 0..) |start_key, start_index| {
+            if (admitted_starts) |mask| if (!mask[start_index]) continue;
             for (target_keys) |target_key| {
                 if (std.mem.eql(u8, start_key, target_key)) {
                     try all_results.append(self.alloc, try trivialPathResultNode(self.alloc, start_key));
@@ -407,6 +441,13 @@ pub const GraphQueryEngine = struct {
 
                 var algebraic_edges = try collectAlgebraicReachabilityEdges(self.alloc, graph_index, start_key, params);
                 defer algebraic_edges.deinit(self.alloc);
+                if (self.node_admission) |admission| {
+                    try filterAlgebraicReachabilityEdgesWithAdmission(
+                        self.alloc,
+                        &algebraic_edges,
+                        admission,
+                    );
+                }
 
                 const reached = try algebraic_path_mod.boundedReachabilityWithOptionsAlloc(
                     self.alloc,
@@ -447,7 +488,10 @@ pub const GraphQueryEngine = struct {
             .max_depth = gq.params.max_depth,
             .min_weight = gq.params.min_weight,
             .max_weight = gq.params.max_weight,
+            .node_admission = self.node_admission,
         };
+        const admitted_starts = try self.admittedStartKeysAlloc(start_keys, gq.params.direction);
+        defer if (admitted_starts) |mask| self.alloc.free(mask);
 
         var all_results = std.ArrayListUnmanaged(GraphResultNode).empty;
         errdefer {
@@ -455,7 +499,8 @@ pub const GraphQueryEngine = struct {
             all_results.deinit(self.alloc);
         }
 
-        for (start_keys) |sk| {
+        for (start_keys, 0..) |sk, start_index| {
+            if (admitted_starts) |mask| if (!mask[start_index]) continue;
             for (target_keys) |tk| {
                 const found = try paths_mod.findKShortestPaths(self.alloc, graph_index, sk, tk, gq.k, opts);
                 defer paths_mod.freePaths(self.alloc, found);
@@ -477,17 +522,19 @@ pub const GraphQueryEngine = struct {
         gq: GraphQuery,
         start_keys: []const []const u8,
     ) !GraphQueryResult {
-        if (algebraicPatternPlan(gq)) |plan_for_status| {
-            if (algebraicTraversalConsidered(graph_index, plan_for_status.params)) {
-                graph_index.noteAlgebraicTraversalAttempt();
-                if (try self.executeAlgebraicPattern(graph_index, gq, start_keys)) |result| {
-                    graph_index.noteAlgebraicTraversalProven(result.nodes.len);
-                    return result;
-                }
-                if (algebraicTraversalProof(graph_index, plan_for_status.params).safe()) {
-                    graph_index.noteAlgebraicTraversalFallback();
-                } else {
-                    graph_index.noteAlgebraicTraversalRejected();
+        if (self.node_admission == null) {
+            if (algebraicPatternPlan(gq)) |plan_for_status| {
+                if (algebraicTraversalConsidered(graph_index, plan_for_status.params)) {
+                    graph_index.noteAlgebraicTraversalAttempt();
+                    if (try self.executeAlgebraicPattern(graph_index, gq, start_keys)) |result| {
+                        graph_index.noteAlgebraicTraversalProven(result.nodes.len);
+                        return result;
+                    }
+                    if (algebraicTraversalProof(graph_index, plan_for_status.params).safe()) {
+                        graph_index.noteAlgebraicTraversalFallback();
+                    } else {
+                        graph_index.noteAlgebraicTraversalRejected();
+                    }
                 }
             }
         }
@@ -500,12 +547,36 @@ pub const GraphQueryEngine = struct {
             .{
                 .max_results = gq.params.max_results,
                 .return_aliases = gq.return_aliases,
+                .node_admission = self.node_admission,
             },
         );
         errdefer pattern_mod.freeMatches(self.alloc, matches);
 
         const owned_nodes = try collectUniqueNodesFromMatches(self.alloc, matches);
         return .{ .nodes = owned_nodes, .matches = matches };
+    }
+
+    fn admittedStartKeysAlloc(
+        self: *GraphQueryEngine,
+        start_keys: []const []const u8,
+        direction: graph_mod.EdgeDirection,
+    ) !?[]bool {
+        const admission = self.node_admission orelse return null;
+        // A document-model graph may still contain resolver-produced
+        // cross-table targets identified only by edge metadata. Let the graph
+        // algorithm classify reverse and bidirectional starts in that case.
+        // Bidirectional starts are role-ambiguous even for a statically
+        // external target model, so classify them against actual edges.
+        if (direction == .both or
+            (direction == .in and !admission.external_targets))
+        {
+            return null;
+        }
+        return try admission.filterKeysAlloc(
+            self.alloc,
+            start_keys,
+            admission.external_targets and direction == .in,
+        );
     }
 
     fn executeAlgebraicPattern(
@@ -563,12 +634,8 @@ pub fn collectUniqueNodesFromMatches(
     alloc: Allocator,
     matches: []const pattern_mod.PatternMatch,
 ) ![]GraphResultNode {
-    var seen = std.StringHashMapUnmanaged(void).empty;
-    defer {
-        var it = seen.keyIterator();
-        while (it.next()) |k| alloc.free(k.*);
-        seen.deinit(alloc);
-    }
+    var seen = node_identity.Map(void){};
+    defer seen.deinit(alloc);
 
     var nodes = std.ArrayListUnmanaged(GraphResultNode).empty;
     errdefer {
@@ -578,14 +645,25 @@ pub fn collectUniqueNodesFromMatches(
 
     for (matches) |m| {
         for (m.bindings) |binding| {
-            if (seen.contains(binding.key)) continue;
-            try seen.put(alloc, try alloc.dupe(u8, binding.key), {});
+            if (!try seen.putIfAbsent(
+                alloc,
+                .{ .table = binding.table, .key = binding.key },
+                {},
+            )) continue;
+            const key = try alloc.dupe(u8, binding.key);
+            errdefer alloc.free(key);
+            const table = if (binding.table) |table_name|
+                try alloc.dupe(u8, table_name)
+            else
+                null;
+            errdefer if (table) |table_name| alloc.free(table_name);
             try nodes.append(alloc, .{
-                .key = try alloc.dupe(u8, binding.key),
+                .key = key,
                 .depth = binding.depth,
                 .distance = 0,
                 .path = null,
                 .path_edges = null,
+                .table = table,
             });
         }
     }
@@ -694,11 +772,18 @@ fn algebraicPatternMatchFromNodeAlloc(
         if (!graphQueryPassesPrefixFilter(node_path[i], step.node_filter)) return null;
         var alias_buf: [32]u8 = undefined;
         const alias = graphQueryEffectiveAlias(step.alias, i, &alias_buf);
-        all_bindings[i] = .{
-            .alias = try alloc.dupe(u8, alias),
-            .key = try alloc.dupe(u8, node_path[i]),
-            .depth = std.math.cast(u32, i) orelse return null,
-        };
+        const table = if (i > 0 and
+            std.mem.eql(u8, edge_path[i - 1].target, node_path[i]))
+            traversal_mod.metadataTargetTable(edge_path[i - 1].metadata)
+        else
+            null;
+        all_bindings[i] = try clonePatternBindingAlloc(
+            alloc,
+            alias,
+            node_path[i],
+            table,
+            std.math.cast(u32, i) orelse return null,
+        );
         initialized += 1;
     }
 
@@ -730,14 +815,37 @@ fn graphQueryFilterBindings(
     }
     for (bindings) |binding| {
         if (!graphQueryShouldReturnAlias(binding.alias, requested)) continue;
-        filtered[out_idx] = .{
-            .alias = try alloc.dupe(u8, binding.alias),
-            .key = try alloc.dupe(u8, binding.key),
-            .depth = binding.depth,
-        };
+        filtered[out_idx] = try clonePatternBindingAlloc(
+            alloc,
+            binding.alias,
+            binding.key,
+            binding.table,
+            binding.depth,
+        );
         out_idx += 1;
     }
     return filtered;
+}
+
+fn clonePatternBindingAlloc(
+    alloc: Allocator,
+    alias: []const u8,
+    key: []const u8,
+    table: ?[]const u8,
+    depth: u32,
+) !pattern_mod.PatternBinding {
+    const owned_alias = try alloc.dupe(u8, alias);
+    errdefer alloc.free(owned_alias);
+    const owned_key = try alloc.dupe(u8, key);
+    errdefer alloc.free(owned_key);
+    const owned_table = if (table) |table_name| try alloc.dupe(u8, table_name) else null;
+    errdefer if (owned_table) |table_name| alloc.free(table_name);
+    return .{
+        .alias = owned_alias,
+        .key = owned_key,
+        .table = owned_table,
+        .depth = depth,
+    };
 }
 
 fn graphQueryShouldReturnAlias(alias: []const u8, requested: []const []const u8) bool {
@@ -1170,6 +1278,45 @@ fn collectAlgebraicReachabilityEdges(
     const tables_out = target_tables;
     target_tables = .empty;
     return .{ .items = owned, .target_tables = tables_out };
+}
+
+fn filterAlgebraicReachabilityEdgesWithAdmission(
+    alloc: Allocator,
+    edges: *AlgebraicReachabilityEdges,
+    admission: NodeAdmission,
+) !void {
+    if (edges.items.len == 0) return;
+    const refs = try alloc.alloc(NodeRef, edges.items.len);
+    defer alloc.free(refs);
+    for (edges.items, 0..) |edge, i| {
+        const table = edges.target_tables.get(edge.to);
+        refs[i] = .{
+            .key = edge.to,
+            .table = table,
+            .external = table != null,
+        };
+    }
+    const allowed = try admission.filterAlloc(alloc, refs);
+    defer alloc.free(allowed);
+
+    var allowed_count: usize = 0;
+    for (allowed) |value| allowed_count += @intFromBool(value);
+    if (allowed_count == edges.items.len) return;
+
+    const filtered = try alloc.alloc(algebraic_path_mod.Edge, allowed_count);
+    var write_index: usize = 0;
+    for (edges.items, allowed) |edge, include| {
+        if (include) {
+            filtered[write_index] = edge;
+            write_index += 1;
+        } else {
+            alloc.free(edge.from);
+            alloc.free(edge.to);
+            alloc.free(edge.provenance);
+        }
+    }
+    alloc.free(edges.items);
+    edges.items = filtered;
 }
 
 fn algebraicTraversalTensorProgramAccepted(
@@ -1666,6 +1813,57 @@ test "traverse algebraic semiring path supports deterministic result limits" {
     try std.testing.expectEqualStrings("C", result.nodes[1].key);
     try std.testing.expect(result.nodes[0].provenance != null);
     try std.testing.expect(result.nodes[1].provenance != null);
+}
+
+test "algebraic traversal intersects query-scoped node admission" {
+    const alloc = std.testing.allocator;
+    var sb: [256]u8 = undefined;
+    var rb: [256]u8 = undefined;
+    const ctx = try setupGraph(alloc, "gq-alg-admission-s", "gq-alg-admission-r", &sb, &rb);
+    defer {
+        ctx.deinit();
+        alloc.destroy(ctx);
+    }
+
+    ctx.graph.algebraic_semiring_traversal = true;
+    try ctx.graph.addEdge("A", "B", "e", 1.0, 0, 0, "");
+    try ctx.graph.addEdge("B", "C", "e", 1.0, 0, 0, "");
+    try ctx.graph.addEdge("A", "D", "e", 1.0, 0, 0, "");
+
+    const Admission = struct {
+        fn filter(
+            _: ?*anyopaque,
+            result_alloc: Allocator,
+            nodes: []const NodeRef,
+        ) ![]bool {
+            const out = try result_alloc.alloc(bool, nodes.len);
+            for (nodes, 0..) |node, i| {
+                out[i] = !std.mem.eql(u8, node.key, "B");
+            }
+            return out;
+        }
+    };
+    var engine = GraphQueryEngine{
+        .alloc = alloc,
+        .node_admission = .{
+            .ctx = null,
+            .filter_many = Admission.filter,
+        },
+    };
+    const start_keys: []const []const u8 = &.{"A"};
+    var result = try engine.execute(&ctx.graph, .{
+        .query_type = .traverse,
+        .index_name = "test",
+        .start_nodes = .{ .keys = start_keys },
+        .params = .{ .max_depth = 2 },
+    }, start_keys);
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), result.nodes.len);
+    try std.testing.expectEqualStrings("D", result.nodes[0].key);
+    const stats = ctx.graph.algebraicTraversalRuntimeStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.proven_count);
+    try std.testing.expectEqual(@as(u64, 0), stats.fallback_count);
 }
 
 test "algebraic traversal reconstructs path-returning shapes when provenance is unique" {

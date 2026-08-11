@@ -113,11 +113,14 @@ pub const DocumentTransform = struct {
 
 pub const SplitReplicationCheckpoint = struct {
     pub const Kind = enum {
-        destination,
+        destination_begin,
+        destination_complete,
         source_ack,
     };
 
     kind: Kind,
+    transition_id: u64,
+    attempt_epoch: u64,
     source_group_id: u64,
     destination_group_id: u64,
     range_start: []const u8 = "",
@@ -129,9 +132,23 @@ pub const SplitReplicationCheckpoint = struct {
 /// destination batch carries this context so all replicas create the physical
 /// DB with the same namespace before the destination range is catalog-visible.
 pub const SplitReplicationContext = struct {
+    pub const Operation = enum {
+        bootstrap_chunk,
+        delta,
+        checkpoint,
+    };
+
+    transition_id: u64,
+    attempt_epoch: u64,
     source_group_id: u64,
     destination_group_id: u64,
     identity_namespace: doc_identity_mod.Namespace,
+    /// Present only while streaming a baseline bootstrap. Catch-up deltas use
+    /// null and are fenced by the completed destination marker.
+    bootstrap_sequence: ?u64 = null,
+    operation: Operation = .bootstrap_chunk,
+    /// Source split-delta sequence. Zero for bootstrap chunks.
+    sequence: u64 = 0,
 };
 
 pub const SplitTransitionMutation = struct {
@@ -143,8 +160,50 @@ pub const SplitTransitionMutation = struct {
     };
 
     kind: Kind,
+    transition_id: u64,
+    attempt_epoch: u64,
     destination_group_id: u64,
     split_key: []const u8 = "",
+};
+
+/// Private data-Raft command used by the distributed transaction protocol.
+/// Every value that can affect durable state is carried in the command so
+/// replay is deterministic on followers and after restart.
+pub const TransactionMutation = union(enum) {
+    begin: struct {
+        txn_id: TxnId,
+        begin_timestamp: u64,
+        created_at_ns: u64,
+        topology_epoch: u64,
+        /// Long-lived, externally addressable transaction sessions retain a
+        /// terminal decision for their full retry window. Anonymous commits
+        /// use the shorter ordinary recovery retention.
+        retain_terminal: bool = false,
+        participants: []const []const u8,
+    },
+    prepare: struct {
+        txn_id: TxnId,
+        topology_epoch: u64,
+    },
+    resolve: struct {
+        txn_id: TxnId,
+        status: TxnStatus,
+        commit_version: u64,
+    },
+    /// Coordinator-side acknowledgement that one participant has durably
+    /// learned the terminal decision. This must be ordered by coordinator
+    /// Raft rather than written by a replica-local recovery worker.
+    acknowledge: struct {
+        txn_id: TxnId,
+        participant: []const u8,
+    },
+    /// Deterministic coordinator/participant metadata cleanup. The cutoff is
+    /// carried in the command so every replica evaluates the same predicate.
+    cleanup: struct {
+        txn_id: TxnId,
+        cutoff_timestamp: u64,
+        retained_cutoff_timestamp: u64,
+    },
 };
 
 pub const BatchRequest = struct {
@@ -162,6 +221,8 @@ pub const BatchRequest = struct {
     split_replication: ?SplitReplicationContext = null,
     /// Internal source lifecycle mutation. It must be ordered with data writes.
     split_transition: ?SplitTransitionMutation = null,
+    /// Internal 2PC phase. Public batch parsing never accepts this field.
+    transaction: ?TransactionMutation = null,
 };
 
 pub const GraphEdgeWrite = struct {
@@ -616,6 +677,9 @@ pub const TextBoolQuery = struct {
     should: []const TextQuery = &.{},
     must_not: []const TextQuery = &.{},
     min_should: u32 = 0,
+    /// Distinguishes an explicitly optional pure-`should` query from the
+    /// conventional pure disjunction whose implicit minimum is one.
+    pure_should_optional: bool = false,
     boost: f32 = 1.0,
 };
 
@@ -1188,6 +1252,12 @@ pub const SearchRequest = struct {
     count_only: bool = false,
     profile: bool = false,
     full_text: ?TextQuery = null,
+    /// Text-native positive filter. Unlike `full_text`, this constrains every
+    /// retrieval source without contributing a score.
+    filter_text: ?TextQuery = null,
+    /// Text-native negative filter. Matches are removed from every retrieval
+    /// source without contributing a score.
+    exclusion_text: ?TextQuery = null,
     filter_query_json: []const u8 = "",
     exclusion_query_json: []const u8 = "",
     full_text_queries: []const NamedFullTextQuery = &.{},
@@ -1232,10 +1302,46 @@ pub const SearchRequest = struct {
     resolved_text_doc_filter: ?*const anyopaque = null,
     resolved_doc_filter_owned: bool = false,
     resolved_doc_filter_wire_context: ?ResolvedDocFilterWireContext = null,
+    /// Request-local authorization hook used only by the distributed graph
+    /// coordinator when an edge names a document in another table. The hook is
+    /// never serialized to a shard worker; it resolves the target table to a
+    /// trusted internal row predicate before owner-routed admission.
+    graph_table_read_authorizer: ?GraphTableReadAuthorizer = null,
     identity_read_generation: ?u64 = null,
     execution_deadline_ns: ?u64 = null,
+    /// Borrowed listener lifecycle signal. It is request-local and must never
+    /// be retained by asynchronous work after query execution returns.
+    cancellation: ?*const std.atomic.Value(bool) = null,
     require_algebraic_filter_resolution: bool = false,
     distributed_text_stats: []const distributed_stats_mod.TextFieldStats = &.{},
+};
+
+pub const GraphTableReadAuthorization = struct {
+    allowed: bool,
+    /// Owned by this value when non-null.
+    filter_query_json: ?[]u8 = null,
+
+    pub fn deinit(self: *GraphTableReadAuthorization, alloc: std.mem.Allocator) void {
+        if (self.filter_query_json) |value| alloc.free(value);
+        self.* = undefined;
+    }
+};
+
+pub const GraphTableReadAuthorizer = struct {
+    ctx: ?*const anyopaque,
+    authorize_table: *const fn (
+        ctx: ?*const anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+    ) anyerror!GraphTableReadAuthorization,
+
+    pub fn authorize(
+        self: GraphTableReadAuthorizer,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+    ) !GraphTableReadAuthorization {
+        return try self.authorize_table(self.ctx, alloc, table_name);
+    }
 };
 
 pub const SortField = struct {
@@ -1297,6 +1403,9 @@ pub const MergeConfig = struct {
 
 pub const SearchHit = struct {
     id: []u8,
+    /// Internal graph-hydration namespace. Null means the query's source
+    /// table. This is not serialized as part of the public search-hit shape.
+    source_table: ?[]u8 = null,
     doc_ordinal: ?u32 = null,
     native_text_doc_id: ?u32 = null,
     score: ?f32 = null,
@@ -1309,21 +1418,10 @@ pub const SearchHit = struct {
     chunk_hits: []ChunkHit = &.{},
 
     pub fn clone(self: SearchHit, alloc: Allocator) !SearchHit {
-        var cloned = SearchHit{
-            .id = try alloc.dupe(u8, self.id),
-            .doc_ordinal = self.doc_ordinal,
-            .native_text_doc_id = self.native_text_doc_id,
-            .score = self.score,
-            .index_scores = try cloneIndexScores(alloc, self.index_scores),
-            .sort_values = try cloneJsonValues(alloc, self.sort_values),
-            .stored_data = if (self.stored_data) |data| try alloc.dupe(u8, data) else null,
-            .ancestor_source_data = if (self.ancestor_source_data) |data| try alloc.dupe(u8, data) else null,
-            .ancestor_unit_data = if (self.ancestor_unit_data) |data| try alloc.dupe(u8, data) else null,
-            .artifact_ref = if (self.artifact_ref) |artifact_ref| try artifact_ref.clone(alloc) else null,
-            .chunk_hits = &.{},
-        };
+        var cloned = SearchHit{ .id = try alloc.dupe(u8, self.id) };
         errdefer {
             alloc.free(cloned.id);
+            if (cloned.source_table) |table| alloc.free(table);
             freeIndexScores(alloc, cloned.index_scores);
             freeJsonValues(alloc, cloned.sort_values);
             if (cloned.stored_data) |data| alloc.free(data);
@@ -1331,24 +1429,36 @@ pub const SearchHit = struct {
             if (cloned.ancestor_unit_data) |data| alloc.free(data);
             if (cloned.artifact_ref) |*artifact_ref| artifact_ref.deinit(alloc);
         }
+        cloned.source_table = if (self.source_table) |table| try alloc.dupe(u8, table) else null;
+        cloned.doc_ordinal = self.doc_ordinal;
+        cloned.native_text_doc_id = self.native_text_doc_id;
+        cloned.score = self.score;
+        cloned.index_scores = try cloneIndexScores(alloc, self.index_scores);
+        cloned.sort_values = try cloneJsonValues(alloc, self.sort_values);
+        cloned.stored_data = if (self.stored_data) |data| try alloc.dupe(u8, data) else null;
+        cloned.ancestor_source_data = if (self.ancestor_source_data) |data| try alloc.dupe(u8, data) else null;
+        cloned.ancestor_unit_data = if (self.ancestor_unit_data) |data| try alloc.dupe(u8, data) else null;
+        cloned.artifact_ref = if (self.artifact_ref) |artifact_ref| try artifact_ref.clone(alloc) else null;
 
         if (self.chunk_hits.len == 0) return cloned;
 
-        cloned.chunk_hits = try alloc.alloc(ChunkHit, self.chunk_hits.len);
+        const chunk_hits = try alloc.alloc(ChunkHit, self.chunk_hits.len);
         var initialized: usize = 0;
         errdefer {
-            for (cloned.chunk_hits[0..initialized]) |*chunk| chunk.deinit(alloc);
-            alloc.free(cloned.chunk_hits);
+            for (chunk_hits[0..initialized]) |*chunk| chunk.deinit(alloc);
+            alloc.free(chunk_hits);
         }
         for (self.chunk_hits, 0..) |chunk, i| {
-            cloned.chunk_hits[i] = try chunk.clone(alloc);
+            chunk_hits[i] = try chunk.clone(alloc);
             initialized += 1;
         }
+        cloned.chunk_hits = chunk_hits;
         return cloned;
     }
 
     pub fn deinit(self: *SearchHit, alloc: Allocator) void {
         alloc.free(self.id);
+        if (self.source_table) |table| alloc.free(table);
         freeIndexScores(alloc, self.index_scores);
         freeJsonValues(alloc, self.sort_values);
         if (self.stored_data) |data| alloc.free(data);
@@ -1691,13 +1801,18 @@ pub const EnrichmentStats = struct {
     projection_checkpoint_applied_sequence: u64 = 0,
     projection_checkpoint_generation: u64 = 0,
     projection_checkpoint_config_hash: u64 = 0,
+    projection_checkpoint_identity_consistent: bool = true,
     checkpoint_replay_tail_sequence_count: u64 = 0,
     processed_requests: u64 = 0,
     error_count: u64 = 0,
     retryable_error_count: u64 = 0,
     fatal_error_count: u64 = 0,
+    consecutive_retry_count: u32 = 0,
+    next_retry_at_ms: u64 = 0,
     retrying: bool = false,
     worker_failed: bool = false,
+    worker_started: bool = false,
+    stalled: bool = false,
     skip_by_hash_count: u64 = 0,
     skipped_source_count: u64 = 0,
     codec_decode_failures: u64 = 0,
@@ -1712,6 +1827,7 @@ pub const EnrichmentStats = struct {
     last_embed_batch_items: u64 = 0,
     last_embed_batch_bytes: u64 = 0,
     last_embed_batch_max_bytes: u64 = 0,
+    last_embed_batch_completed_ms: u64 = 0,
     last_embed_batch_ns: u64 = 0,
     total_embed_ns: u64 = 0,
     dense_artifact_bytes_written: u64 = 0,
@@ -1770,6 +1886,9 @@ pub const TransactionRecoveryStats = struct {
 
 pub const TextMergeStats = struct {
     enabled: bool = false,
+    active_indexes: u64 = 0,
+    active_segments: u64 = 0,
+    max_active_segments_per_index: u64 = 0,
     pending_indexes: u64 = 0,
     pending_segments: u64 = 0,
     pending_bytes: u64 = 0,
@@ -1799,12 +1918,17 @@ pub const TextMergeStats = struct {
     deferred_for_pressure: u64 = 0,
     backpressure_events: u64 = 0,
     backpressure_ns: u64 = 0,
+    backpressure_timeouts: u64 = 0,
+    backpressure_failures: u64 = 0,
     max_pending_segments: u64 = 0,
     max_pending_bytes: u64 = 0,
 };
 
 pub fn accumulateTextMergeStats(dst: *TextMergeStats, src: TextMergeStats) void {
     dst.enabled = dst.enabled or src.enabled;
+    dst.active_indexes +|= src.active_indexes;
+    dst.active_segments +|= src.active_segments;
+    dst.max_active_segments_per_index = @max(dst.max_active_segments_per_index, src.max_active_segments_per_index);
     dst.pending_indexes +|= src.pending_indexes;
     dst.pending_segments +|= src.pending_segments;
     dst.pending_bytes +|= src.pending_bytes;
@@ -1834,6 +1958,8 @@ pub fn accumulateTextMergeStats(dst: *TextMergeStats, src: TextMergeStats) void 
     dst.deferred_for_pressure +|= src.deferred_for_pressure;
     dst.backpressure_events +|= src.backpressure_events;
     dst.backpressure_ns +|= src.backpressure_ns;
+    dst.backpressure_timeouts +|= src.backpressure_timeouts;
+    dst.backpressure_failures +|= src.backpressure_failures;
     dst.max_pending_segments = @max(dst.max_pending_segments, src.max_pending_segments);
     dst.max_pending_bytes = @max(dst.max_pending_bytes, src.max_pending_bytes);
 }
@@ -1893,6 +2019,9 @@ pub const VisibilityStats = struct {
 };
 
 pub const DBStats = struct {
+    /// Process-local fingerprint of physical LSM/WAL publications. Runtime
+    /// status uses it only to invalidate cached directory-byte observations.
+    storage_change_token: u64 = 0,
     /// Canonical live primary-document cardinality from durable identity metadata.
     /// Unlike doc_count, this is independent of derived index fan-out.
     source_doc_count: u64 = 0,
@@ -1942,7 +2071,123 @@ pub const ArtifactRepairReason = enum {
     missing_artifact,
     corrupt_artifact,
     unreadable_artifact,
+    enrichment_failed,
 };
+
+/// Policy-independent coverage health shared by status and repair reporting.
+/// A source is settled once it has any terminal outcome; settled failures are
+/// degraded, never pending and never healthy completion.
+pub const DerivedCoverageHealth = struct {
+    settled: u64,
+    pending: ?u64,
+    counters_valid: bool,
+    all_sources_terminal: bool,
+    degraded: bool,
+};
+
+pub const DerivedCoveragePolicy = enum {
+    strict,
+    partial,
+    best_effort,
+};
+
+/// One authoritative interpretation of durable derived-coverage counters.
+/// Status endpoints and repair completion must use the same policy semantics:
+/// a settled source that the policy does not cover is degraded debt, not a
+/// healthy repair merely because the worker has no pending input.
+pub const DerivedCoverageAssessment = struct {
+    covered: u64,
+    health: DerivedCoverageHealth,
+    complete: bool,
+    healthy: bool,
+    degraded: bool,
+};
+
+pub fn evaluateDerivedCoverageHealth(
+    source_total: u64,
+    produced: u64,
+    skipped: u64,
+    terminal_failed: u64,
+    observation_complete: bool,
+    replay_current: bool,
+) DerivedCoverageHealth {
+    const produced_and_skipped = std.math.add(u64, produced, skipped) catch return .{
+        .settled = 0,
+        .pending = null,
+        .counters_valid = false,
+        .all_sources_terminal = false,
+        .degraded = false,
+    };
+    const settled = std.math.add(u64, produced_and_skipped, terminal_failed) catch return .{
+        .settled = 0,
+        .pending = null,
+        .counters_valid = false,
+        .all_sources_terminal = false,
+        .degraded = false,
+    };
+    const counters_valid = settled <= source_total;
+    const all_sources_terminal = counters_valid and settled == source_total;
+    return .{
+        .settled = settled,
+        .pending = if (observation_complete and counters_valid) source_total - settled else null,
+        .counters_valid = counters_valid,
+        .all_sources_terminal = all_sources_terminal,
+        .degraded = observation_complete and replay_current and all_sources_terminal and terminal_failed > 0,
+    };
+}
+
+pub fn evaluateDerivedCoverageAssessment(
+    policy: DerivedCoveragePolicy,
+    source_total: u64,
+    produced: u64,
+    skipped: u64,
+    terminal_failed: u64,
+    observation_complete: bool,
+    replay_current: bool,
+) DerivedCoverageAssessment {
+    const covered = switch (policy) {
+        .strict => produced,
+        .partial => std.math.add(u64, produced, skipped) catch std.math.maxInt(u64),
+        .best_effort => blk: {
+            const produced_and_skipped = std.math.add(u64, produced, skipped) catch break :blk std.math.maxInt(u64);
+            break :blk std.math.add(u64, produced_and_skipped, terminal_failed) catch std.math.maxInt(u64);
+        },
+    };
+    const health = evaluateDerivedCoverageHealth(
+        source_total,
+        produced,
+        skipped,
+        terminal_failed,
+        observation_complete,
+        replay_current,
+    );
+    const complete = observation_complete and replay_current and health.counters_valid and
+        health.all_sources_terminal and covered == source_total;
+    return .{
+        .covered = covered,
+        .health = health,
+        .complete = complete,
+        .healthy = complete and terminal_failed == 0,
+        .degraded = observation_complete and replay_current and health.all_sources_terminal and
+            (terminal_failed > 0 or covered != source_total),
+    };
+}
+
+test "derived coverage assessment honors completion policy" {
+    const strict = evaluateDerivedCoverageAssessment(.strict, 2, 1, 1, 0, true, true);
+    try std.testing.expect(!strict.complete);
+    try std.testing.expect(strict.degraded);
+
+    const partial = evaluateDerivedCoverageAssessment(.partial, 2, 1, 1, 0, true, true);
+    try std.testing.expect(partial.complete);
+    try std.testing.expect(partial.healthy);
+    try std.testing.expect(!partial.degraded);
+
+    const best_effort = evaluateDerivedCoverageAssessment(.best_effort, 2, 1, 0, 1, true, true);
+    try std.testing.expect(best_effort.complete);
+    try std.testing.expect(!best_effort.healthy);
+    try std.testing.expect(best_effort.degraded);
+}
 
 pub const ArtifactRepairIssue = struct {
     artifact_kind: ArtifactRepairKind = .embedding,
@@ -1958,6 +2203,10 @@ pub const ArtifactRepairIssue = struct {
     unsupported_reason: []const u8 = "",
     sequence: u64 = 0,
     reason: ArtifactRepairReason = .missing_artifact,
+    /// Number of source-generation attempts made before the request was
+    /// parked. Kept separate from repair attempts for operational clarity.
+    generation_attempts: u64 = 0,
+    generation_error: []const u8 = "",
     attempts: u64 = 0,
     first_seen_ns: u64 = 0,
     last_seen_ns: u64 = 0,
@@ -1972,6 +2221,7 @@ pub const ArtifactRepairIssue = struct {
         if (self.artifact_name.len > 0) alloc.free(@constCast(self.artifact_name));
         if (self.artifact_key.len > 0) alloc.free(@constCast(self.artifact_key));
         if (self.unsupported_reason.len > 0) alloc.free(@constCast(self.unsupported_reason));
+        if (self.generation_error.len > 0) alloc.free(@constCast(self.generation_error));
         if (self.last_error.len > 0) alloc.free(@constCast(self.last_error));
         self.* = undefined;
     }
@@ -2141,7 +2391,10 @@ pub const ArtifactRepairResult = struct {
     unresolved: u64 = 0,
     in_progress: u64 = 0,
     indexes_rebuilt: u64 = 0,
-    indexes_degraded: u64 = 0,
+    /// Selected indexes that were degraded when this repair pass began.
+    indexes_degraded_before: u64 = 0,
+    /// Selected indexes that remain degraded when this repair pass returns.
+    indexes_degraded_after: u64 = 0,
     controls_applied: u64 = 0,
     limit: u32 = 0,
     next_cursor: ?[]u8 = null,
@@ -2173,6 +2426,8 @@ pub const EmbeddingArtifactRepairIssue = struct {
     unsupported_reason: []const u8 = "",
     sequence: u64 = 0,
     reason: EmbeddingArtifactRepairReason = .missing_embedding_artifact,
+    generation_attempts: u64 = 0,
+    generation_error: []const u8 = "",
     attempts: u64 = 0,
     first_seen_ns: u64 = 0,
     last_seen_ns: u64 = 0,
@@ -2187,6 +2442,7 @@ pub const EmbeddingArtifactRepairIssue = struct {
         if (self.artifact_name.len > 0) alloc.free(@constCast(self.artifact_name));
         if (self.artifact_key.len > 0) alloc.free(@constCast(self.artifact_key));
         if (self.unsupported_reason.len > 0) alloc.free(@constCast(self.unsupported_reason));
+        if (self.generation_error.len > 0) alloc.free(@constCast(self.generation_error));
         if (self.last_error.len > 0) alloc.free(@constCast(self.last_error));
         self.* = undefined;
     }
@@ -2196,7 +2452,7 @@ pub const EmbeddingArtifactRepairResult = ArtifactRepairResult;
 pub fn embeddingArtifactRepairReasonFromArtifact(reason: ArtifactRepairReason) EmbeddingArtifactRepairReason {
     return switch (reason) {
         .missing_artifact => .missing_embedding_artifact,
-        .corrupt_artifact, .unreadable_artifact => .corrupt_embedding_artifact,
+        .corrupt_artifact, .unreadable_artifact, .enrichment_failed => .corrupt_embedding_artifact,
     };
 }
 
@@ -2207,6 +2463,7 @@ pub fn embeddingArtifactRepairIssueFromArtifactAlloc(alloc: Allocator, issue: Ar
         .repairable = issue.repairable,
         .sequence = issue.sequence,
         .reason = embeddingArtifactRepairReasonFromArtifact(issue.reason),
+        .generation_attempts = issue.generation_attempts,
         .attempts = issue.attempts,
         .first_seen_ns = issue.first_seen_ns,
         .last_seen_ns = issue.last_seen_ns,
@@ -2220,6 +2477,7 @@ pub fn embeddingArtifactRepairIssueFromArtifactAlloc(alloc: Allocator, issue: Ar
     out.artifact_name = try alloc.dupe(u8, issue.artifact_name);
     out.artifact_key = try alloc.dupe(u8, issue.artifact_key);
     out.unsupported_reason = try alloc.dupe(u8, issue.unsupported_reason);
+    out.generation_error = try alloc.dupe(u8, issue.generation_error);
     out.last_error = try alloc.dupe(u8, issue.last_error);
     return out;
 }
@@ -2738,6 +2996,19 @@ pub const AsyncIndexingStats = struct {
     startup: StartupCatchUpStats = .{},
     dense_catch_up: DenseCatchUpStats = .{},
     bulk_coalescing: BulkCoalescingStats = .{},
+    derived_workers: DerivedWorkerStats = .{},
+};
+
+pub const DerivedWorkerStats = struct {
+    workers: u64 = 0,
+    workers_with_replay_debt: u64 = 0,
+    max_replay_lag_sequences: u64 = 0,
+    recoverable_retries: u64 = 0,
+    writer_locked_retries: u64 = 0,
+    resource_budget_retries: u64 = 0,
+    replay_document_not_visible_retries: u64 = 0,
+    artifact_repair_required_retries: u64 = 0,
+    not_found_retries: u64 = 0,
 };
 
 pub const BulkCoalescingStats = struct {
@@ -2875,6 +3146,15 @@ pub fn accumulateAsyncIndexingStats(dst: *AsyncIndexingStats, src: AsyncIndexing
     dst.bulk_coalescing.stage_transforms += src.bulk_coalescing.stage_transforms;
     dst.bulk_coalescing.flush_calls += src.bulk_coalescing.flush_calls;
     dst.bulk_coalescing.flushed_keys += src.bulk_coalescing.flushed_keys;
+    dst.derived_workers.workers += src.derived_workers.workers;
+    dst.derived_workers.workers_with_replay_debt += src.derived_workers.workers_with_replay_debt;
+    dst.derived_workers.max_replay_lag_sequences = @max(dst.derived_workers.max_replay_lag_sequences, src.derived_workers.max_replay_lag_sequences);
+    dst.derived_workers.recoverable_retries += src.derived_workers.recoverable_retries;
+    dst.derived_workers.writer_locked_retries += src.derived_workers.writer_locked_retries;
+    dst.derived_workers.resource_budget_retries += src.derived_workers.resource_budget_retries;
+    dst.derived_workers.replay_document_not_visible_retries += src.derived_workers.replay_document_not_visible_retries;
+    dst.derived_workers.artifact_repair_required_retries += src.derived_workers.artifact_repair_required_retries;
+    dst.derived_workers.not_found_retries += src.derived_workers.not_found_retries;
 }
 
 pub fn freeResolverReplayDiagnostics(alloc: Allocator, stats: ResolverReplayDiagnostics) void {

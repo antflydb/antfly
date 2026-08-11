@@ -12,6 +12,19 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const std = @import("std");
+
 pub const ReallocationRequestRecord = struct {
+    request_id: u128,
     requested_at_ms: u64,
 };
+
+pub fn generateRequestId(io: std.Io) !u128 {
+    var request_id: u128 = 0;
+    while (request_id == 0) try io.randomSecure(std.mem.asBytes(&request_id));
+    return request_id;
+}
+
+pub fn isValid(record: ReallocationRequestRecord) bool {
+    return record.request_id != 0;
+}

@@ -17,13 +17,12 @@ const bloom = @import("bloom");
 const byte_copy = @import("../../common/byte_copy.zig");
 const snappy = @import("../../encoding/snappy.zig");
 
-pub const magic = "ALSMTBL2";
-pub const footer_magic = "ALSMIDX2";
+pub const magic = "ALSMTBL3";
+pub const footer_magic = "ALSMIDX3";
 pub const header_len = magic.len + 12;
-pub const footer_len = footer_magic.len + @sizeOf(u64) * 2 + @sizeOf(u32) * 2;
+pub const footer_len = footer_magic.len + @sizeOf(u32) * 6 + @sizeOf(u64) * 2;
 pub const default_block_size: usize = 32 * 1024;
-pub const version: u32 = 10;
-pub const previous_version: u32 = 9;
+pub const version: u32 = 11;
 pub const max_entry_data_len: usize = std.math.maxInt(u32);
 pub const max_entry_count: usize = std.math.maxInt(u32);
 pub const default_filter_config: bloom.Config = .{ .bits_per_key = 14 };
@@ -32,10 +31,8 @@ const min_compress_block_bytes: usize = 1024;
 const compression_savings_denominator: usize = 8;
 const prefix_block_magic = "ALSMPFX1";
 const prefix_restart_interval: usize = 16;
-/// v10 footer metadata starts with an explicit marker because footer-only
-/// index reads deliberately avoid fetching the table header. The marker makes
-/// the packed-offset layout independently dispatchable while v9 metadata
-/// continues to begin directly with global u32 offsets.
+/// Footer metadata starts with an explicit marker because footer-only index
+/// reads deliberately avoid fetching the table header.
 const packed_offsets_magic = "ALSMOFF1";
 
 pub const PrefixExtractor = enum(u32) {
@@ -135,6 +132,7 @@ pub const TableIndex = struct {
         physical_relative_offset: u32 = 0,
         physical_len: u32 = 0,
         compression: BlockCompression = .none,
+        checksum: u32 = 0,
         first_entry_index: u32,
         entry_count: u32,
         smallest_namespace_name: ?[]u8 = null,
@@ -177,6 +175,7 @@ pub const TableIndex = struct {
                 .physical_relative_offset = self.physicalRelativeOffset(),
                 .physical_len = self.physicalLen(),
                 .compression = self.compression,
+                .checksum = self.checksum,
                 .first_entry_index = self.first_entry_index,
                 .entry_count = self.entry_count,
                 .smallest_namespace_name = smallest_namespace_name,
@@ -238,9 +237,7 @@ pub const TableIndex = struct {
         }
     };
 
-    // Current tables persist offsets as u16 values local to each block. Keep
-    // that representation in memory instead of expanding every entry to u32;
-    // legacy origin/main tables retain their absolute u32 offsets.
+    // Tables persist offsets as u16 values local to each block.
     entry_offsets: []u32 = &.{},
     block_entry_offsets: []u16 = &.{},
     entry_data_start: usize,
@@ -379,6 +376,7 @@ pub const TableIndex = struct {
             .physical_relative_offset = block.physicalRelativeOffset(),
             .physical_len = block.physicalLen(),
             .compression = block.compression,
+            .checksum = block.checksum,
         };
     }
 
@@ -420,6 +418,7 @@ pub const Footer = struct {
     metadata_len: usize,
     entry_count: usize,
     entry_data_len: usize,
+    metadata_checksum: u32,
 };
 
 pub const EntryDataWindow = struct {
@@ -428,6 +427,7 @@ pub const EntryDataWindow = struct {
     physical_relative_offset: u32 = 0,
     physical_len: u32 = 0,
     compression: BlockCompression = .none,
+    checksum: u32 = 0,
 
     pub fn physicalRelativeOffset(self: EntryDataWindow) u32 {
         return if (self.physical_len == 0 and self.compression == .none) self.relative_offset else self.physical_relative_offset;
@@ -676,6 +676,7 @@ const EncodedBlockMeta = struct {
     physical_relative_offset: u32,
     physical_len: u32,
     compression: BlockCompression,
+    checksum: u32,
     first_entry_index: u32,
     entry_count: u32,
     smallest_namespace_name: ?[]const u8,
@@ -693,6 +694,7 @@ const OwnedEncodedBlockMeta = struct {
     physical_relative_offset: u32,
     physical_len: u32,
     compression: BlockCompression,
+    checksum: u32,
     first_entry_index: u32,
     entry_count: u32,
     smallest_namespace_name: ?[]u8 = null,
@@ -794,6 +796,50 @@ const memory_table_sink_vtable = TableSink.VTable{
     .append_slice = MemoryTableSink.appendSlice,
     .append_byte = MemoryTableSink.appendByte,
     .write_at = MemoryTableSink.writeAt,
+};
+
+const ChecksummedTableSink = struct {
+    parent: *TableSink,
+    crc: std.hash.Crc32 = .init(),
+
+    fn sink(self: *ChecksummedTableSink) TableSink {
+        return .{
+            .ptr = self,
+            .vtable = &checksummed_table_sink_vtable,
+        };
+    }
+
+    fn checksum(self: *const ChecksummedTableSink) u32 {
+        return self.crc.final();
+    }
+
+    fn len(ptr: *anyopaque) usize {
+        const self: *ChecksummedTableSink = @ptrCast(@alignCast(ptr));
+        return self.parent.len();
+    }
+
+    fn appendSlice(ptr: *anyopaque, bytes: []const u8) !void {
+        const self: *ChecksummedTableSink = @ptrCast(@alignCast(ptr));
+        try self.parent.appendSlice(bytes);
+        self.crc.update(bytes);
+    }
+
+    fn appendByte(ptr: *anyopaque, byte: u8) !void {
+        const self: *ChecksummedTableSink = @ptrCast(@alignCast(ptr));
+        try self.parent.appendByte(byte);
+        self.crc.update(&.{byte});
+    }
+
+    fn writeAt(_: *anyopaque, _: usize, _: []const u8) !void {
+        return error.InvalidTableFile;
+    }
+};
+
+const checksummed_table_sink_vtable = TableSink.VTable{
+    .len = ChecksummedTableSink.len,
+    .append_slice = ChecksummedTableSink.appendSlice,
+    .append_byte = ChecksummedTableSink.appendByte,
+    .write_at = ChecksummedTableSink.writeAt,
 };
 
 test "memory table sink supports overlapping writes and appends" {
@@ -974,64 +1020,69 @@ pub fn encodeWithFilterToSinkOptions(
     try sink.writeAt(entry_data_len_offset, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, physical_entry_data_len_u32))));
 
     const metadata_offset = sink.len();
-    try sink.appendSlice(packed_offsets_magic);
-    for (entry_offsets.items) |offset| try sinkAppendU16(sink, offset);
-    try sinkAppendU32(sink, try checkedU32(encoded_filter.len));
-    try sink.appendSlice(encoded_filter);
-    try sinkAppendU32(sink, try checkedU32(blocks.items.len));
+    var metadata_sink_impl = ChecksummedTableSink{ .parent = sink };
+    var metadata_sink = metadata_sink_impl.sink();
+    try metadata_sink.appendSlice(packed_offsets_magic);
+    for (entry_offsets.items) |offset| try sinkAppendU16(&metadata_sink, offset);
+    try sinkAppendU32(&metadata_sink, try checkedU32(encoded_filter.len));
+    try metadata_sink.appendSlice(encoded_filter);
+    try sinkAppendU32(&metadata_sink, try checkedU32(blocks.items.len));
     for (blocks.items) |block| {
-        try sinkAppendU32(sink, block.relative_offset);
-        try sinkAppendU32(sink, block.len);
-        try sinkAppendU32(sink, block.first_entry_index);
-        try sinkAppendU32(sink, block.entry_count);
-        try sinkAppendU32(sink, if (block.largest_namespace_name) |name| try checkedU32(name.len) else std.math.maxInt(u32));
-        try sinkAppendU32(sink, try checkedU32(block.largest_key.len));
-        if (block.largest_namespace_name) |name| try sink.appendSlice(name);
-        try sink.appendSlice(block.largest_key);
+        try sinkAppendU32(&metadata_sink, block.relative_offset);
+        try sinkAppendU32(&metadata_sink, block.len);
+        try sinkAppendU32(&metadata_sink, block.first_entry_index);
+        try sinkAppendU32(&metadata_sink, block.entry_count);
+        try sinkAppendU32(&metadata_sink, if (block.largest_namespace_name) |name| try checkedU32(name.len) else std.math.maxInt(u32));
+        try sinkAppendU32(&metadata_sink, try checkedU32(block.largest_key.len));
+        if (block.largest_namespace_name) |name| try metadata_sink.appendSlice(name);
+        try metadata_sink.appendSlice(block.largest_key);
     }
-    try sinkAppendU32(sink, try checkedU32(blocks.items.len));
+    try sinkAppendU32(&metadata_sink, try checkedU32(blocks.items.len));
     for (blocks.items) |block| {
         const encoded_block_filter = try block.filter.encodeInto(allocator, &encoded_filter_bytes);
-        try sinkAppendU32(sink, try checkedU32(encoded_block_filter.len));
-        try sink.appendSlice(encoded_block_filter);
+        try sinkAppendU32(&metadata_sink, try checkedU32(encoded_block_filter.len));
+        try metadata_sink.appendSlice(encoded_block_filter);
     }
-    try sinkAppendU32(sink, try checkedU32(blocks.items.len));
+    try sinkAppendU32(&metadata_sink, try checkedU32(blocks.items.len));
     for (blocks.items) |block| {
-        try sinkAppendU32(sink, try checkedU32(block.hash_slots.len));
-        for (block.hash_slots) |slot| try sinkAppendU32(sink, slot);
+        try sinkAppendU32(&metadata_sink, try checkedU32(block.hash_slots.len));
+        for (block.hash_slots) |slot| try sinkAppendU32(&metadata_sink, slot);
     }
-    try sinkAppendU32(sink, try checkedU32(blocks.items.len));
+    try sinkAppendU32(&metadata_sink, try checkedU32(blocks.items.len));
     for (blocks.items) |block| {
-        try sinkAppendU32(sink, block.physical_relative_offset);
-        try sinkAppendU32(sink, block.physical_len);
-        try sinkAppendU32(sink, @intFromEnum(block.compression));
+        try sinkAppendU32(&metadata_sink, block.physical_relative_offset);
+        try sinkAppendU32(&metadata_sink, block.physical_len);
+        try sinkAppendU32(&metadata_sink, @intFromEnum(block.compression));
+        try sinkAppendU32(&metadata_sink, block.checksum);
     }
-    try sinkAppendU32(sink, try checkedU32(blocks.items.len));
+    try sinkAppendU32(&metadata_sink, try checkedU32(blocks.items.len));
     for (blocks.items) |block| {
-        try sinkAppendU32(sink, if (block.smallest_namespace_name) |name| try checkedU32(name.len) else std.math.maxInt(u32));
-        try sinkAppendU32(sink, try checkedU32(block.smallest_key.len));
-        if (block.smallest_namespace_name) |name| try sink.appendSlice(name);
-        try sink.appendSlice(block.smallest_key);
+        try sinkAppendU32(&metadata_sink, if (block.smallest_namespace_name) |name| try checkedU32(name.len) else std.math.maxInt(u32));
+        try sinkAppendU32(&metadata_sink, try checkedU32(block.smallest_key.len));
+        if (block.smallest_namespace_name) |name| try metadata_sink.appendSlice(name);
+        try metadata_sink.appendSlice(block.smallest_key);
     }
-    try sinkAppendU32(sink, @intFromEnum(options.prefix_extractor));
-    try sinkAppendU32(sink, try checkedU32(encoded_prefix_filter.len));
-    try sink.appendSlice(encoded_prefix_filter);
-    try sinkAppendU32(sink, try checkedU32(blocks.items.len));
+    try sinkAppendU32(&metadata_sink, @intFromEnum(options.prefix_extractor));
+    try sinkAppendU32(&metadata_sink, try checkedU32(encoded_prefix_filter.len));
+    try metadata_sink.appendSlice(encoded_prefix_filter);
+    try sinkAppendU32(&metadata_sink, try checkedU32(blocks.items.len));
     for (blocks.items) |block| {
         const encoded_block_prefix_filter = if (block.prefix_filter) |block_prefix_filter|
             try block_prefix_filter.encodeInto(allocator, &encoded_filter_bytes)
         else
             "";
-        try sinkAppendU32(sink, try checkedU32(encoded_block_prefix_filter.len));
-        try sink.appendSlice(encoded_block_prefix_filter);
+        try sinkAppendU32(&metadata_sink, try checkedU32(encoded_block_prefix_filter.len));
+        try metadata_sink.appendSlice(encoded_block_prefix_filter);
     }
     const metadata_len = sink.len() - metadata_offset;
-
-    try sink.appendSlice(footer_magic);
-    try sinkAppendU64(sink, metadata_offset);
-    try sinkAppendU64(sink, metadata_len);
-    try sinkAppendU32(sink, try checkedU32(entries.len));
-    try sinkAppendU32(sink, entry_data_len_u32);
+    try appendFooter(
+        sink,
+        metadata_offset,
+        metadata_len,
+        entries.len,
+        entry_data_len_u32,
+        metadata_sink_impl.checksum(),
+    );
 
     if (options.compression_stats) |stats| {
         stats.* = summarizeCompressionStats(logical_entry_data_len, physical_entry_data_len, blocks.items);
@@ -1074,6 +1125,9 @@ pub const StreamingEncoder = struct {
     encoded_filter_bytes: std.ArrayListUnmanaged(u8) = .empty,
     block_hashes: std.ArrayListUnmanaged([2]u64) = .empty,
     block_prefix_hashes: std.ArrayListUnmanaged([2]u64) = .empty,
+    /// Exact encoded metadata contribution of completed blocks. Maintaining it
+    /// at flush time keeps physical-size admission O(1) per appended entry.
+    completed_blocks_metadata_bytes: usize = 0,
     /// Heap owned by completed block metadata. Keep this incrementally so
     /// resource accounting remains O(1) as a streaming table grows.
     blocks_owned_heap_bytes: u64 = 0,
@@ -1158,6 +1212,84 @@ pub const StreamingEncoder = struct {
         return bytes;
     }
 
+    /// Returns a conservative upper bound for the complete encoded table if
+    /// `entry` is appended and the encoder is finished immediately afterward.
+    /// Block compression is deliberately ignored because every adaptive codec
+    /// falls back to the raw payload when compression would grow the block.
+    /// This lets streaming compaction split before an append without buffering
+    /// or rolling back an arbitrarily large entry.
+    pub fn encodedSizeUpperBoundAfterEntry(self: *const StreamingEncoder, entry: Entry) !usize {
+        if (self.finished or self.entry_count >= max_entry_count) return error.TableFileTooLarge;
+        const entry_len = try tableEntryEncodedLen(entry);
+        if (self.logical_entry_data_len > max_entry_data_len or
+            entry_len > max_entry_data_len - self.logical_entry_data_len)
+        {
+            return error.TableFileTooLarge;
+        }
+
+        const split_pending_block = self.block_entry_count > 0 and
+            self.block_bytes.items.len +| entry_len > default_block_size;
+        const projected_entry_count = try checkedAddUsize(self.entry_count, 1);
+
+        var total = self.sink.len();
+        total = try checkedAddUsize(total, self.block_bytes.items.len);
+        total = try checkedAddUsize(total, entry_len);
+
+        // Metadata section headers and the packed local entry offsets.
+        total = try checkedAddUsize(total, packed_offsets_magic.len);
+        total = try checkedAddUsize(
+            total,
+            std.math.mul(usize, projected_entry_count, @sizeOf(u16)) catch return error.TableFileTooLarge,
+        );
+        total = try checkedAddUsize(total, @sizeOf(u32));
+        total = try checkedAddUsize(total, bloomEncodedLenForBytes(self.filter_builder.bytes.len));
+        // Six block-index sections, each prefixed by a u32 block count.
+        total = try checkedAddUsize(total, 6 * @sizeOf(u32));
+        total = try checkedAddUsize(total, self.completed_blocks_metadata_bytes);
+
+        if (split_pending_block) {
+            total = try checkedAddUsize(total, try encodedBlockMetadataLen(
+                self.block_smallest_namespace_name,
+                self.block_smallest_key,
+                self.block_largest_namespace_name,
+                self.block_largest_key,
+                try bloomEncodedLenForKeyCount(self.block_hashes.items.len, block_filter_config),
+                try bloomEncodedLenForKeyCount(self.block_prefix_hashes.items.len, block_filter_config),
+            ));
+            total = try checkedAddUsize(total, try encodedBlockMetadataLen(
+                entry.namespace_name,
+                entry.key,
+                entry.namespace_name,
+                entry.key,
+                try bloomEncodedLenForKeyCount(1, block_filter_config),
+                try bloomEncodedLenForKeyCount(if (entryPrefixHashes(self.prefix_extractor, entry.namespace_name, entry.key) != null) 1 else 0, block_filter_config),
+            ));
+        } else {
+            const smallest_namespace_name = if (self.block_entry_count == 0) entry.namespace_name else self.block_smallest_namespace_name;
+            const smallest_key = if (self.block_entry_count == 0) entry.key else self.block_smallest_key;
+            const candidate_prefix = entryPrefixHashes(self.prefix_extractor, entry.namespace_name, entry.key);
+            const block_prefix_count = self.block_prefix_hashes.items.len + @intFromBool(candidate_prefix != null and
+                (self.block_prefix_hashes.items.len == 0 or !std.meta.eql(self.block_prefix_hashes.items[self.block_prefix_hashes.items.len - 1], candidate_prefix.?)));
+            total = try checkedAddUsize(total, try encodedBlockMetadataLen(
+                smallest_namespace_name,
+                smallest_key,
+                entry.namespace_name,
+                entry.key,
+                try bloomEncodedLenForKeyCount(self.block_hashes.items.len + 1, block_filter_config),
+                try bloomEncodedLenForKeyCount(block_prefix_count, block_filter_config),
+            ));
+        }
+
+        // Prefix extractor, run-level prefix Bloom filter, and footer.
+        const candidate_prefix = entryPrefixHashes(self.prefix_extractor, entry.namespace_name, entry.key);
+        const prefix_count = self.prefix_hashes.items.len + @intFromBool(candidate_prefix != null and
+            (self.prefix_hashes.items.len == 0 or !std.meta.eql(self.prefix_hashes.items[self.prefix_hashes.items.len - 1], candidate_prefix.?)));
+        total = try checkedAddUsize(total, 2 * @sizeOf(u32));
+        total = try checkedAddUsize(total, try bloomEncodedLenForKeyCount(prefix_count, self.bloom_config));
+        total = try checkedAddUsize(total, footer_len);
+        return total;
+    }
+
     pub fn appendEntry(self: *StreamingEncoder, entry: Entry) !void {
         if (self.finished) return error.InvalidTableFile;
         if (self.entry_count >= max_entry_count) return error.TableFileTooLarge;
@@ -1217,64 +1349,69 @@ pub const StreamingEncoder = struct {
         defer self.allocator.free(encoded_prefix_filter);
 
         const metadata_offset = self.sink.len();
-        try self.sink.appendSlice(packed_offsets_magic);
-        for (self.entry_offsets.items) |offset| try sinkAppendU16(self.sink, offset);
-        try sinkAppendU32(self.sink, try checkedU32(encoded_filter.len));
-        try self.sink.appendSlice(encoded_filter);
-        try sinkAppendU32(self.sink, try checkedU32(self.blocks.items.len));
+        var metadata_sink_impl = ChecksummedTableSink{ .parent = self.sink };
+        var metadata_sink = metadata_sink_impl.sink();
+        try metadata_sink.appendSlice(packed_offsets_magic);
+        for (self.entry_offsets.items) |offset| try sinkAppendU16(&metadata_sink, offset);
+        try sinkAppendU32(&metadata_sink, try checkedU32(encoded_filter.len));
+        try metadata_sink.appendSlice(encoded_filter);
+        try sinkAppendU32(&metadata_sink, try checkedU32(self.blocks.items.len));
         for (self.blocks.items) |block| {
-            try sinkAppendU32(self.sink, block.relative_offset);
-            try sinkAppendU32(self.sink, block.len);
-            try sinkAppendU32(self.sink, block.first_entry_index);
-            try sinkAppendU32(self.sink, block.entry_count);
-            try sinkAppendU32(self.sink, if (block.largest_namespace_name) |name| try checkedU32(name.len) else std.math.maxInt(u32));
-            try sinkAppendU32(self.sink, try checkedU32(block.largest_key.len));
-            if (block.largest_namespace_name) |name| try self.sink.appendSlice(name);
-            try self.sink.appendSlice(block.largest_key);
+            try sinkAppendU32(&metadata_sink, block.relative_offset);
+            try sinkAppendU32(&metadata_sink, block.len);
+            try sinkAppendU32(&metadata_sink, block.first_entry_index);
+            try sinkAppendU32(&metadata_sink, block.entry_count);
+            try sinkAppendU32(&metadata_sink, if (block.largest_namespace_name) |name| try checkedU32(name.len) else std.math.maxInt(u32));
+            try sinkAppendU32(&metadata_sink, try checkedU32(block.largest_key.len));
+            if (block.largest_namespace_name) |name| try metadata_sink.appendSlice(name);
+            try metadata_sink.appendSlice(block.largest_key);
         }
-        try sinkAppendU32(self.sink, try checkedU32(self.blocks.items.len));
+        try sinkAppendU32(&metadata_sink, try checkedU32(self.blocks.items.len));
         for (self.blocks.items) |block| {
             const encoded_block_filter = try block.filter.encodeInto(self.allocator, &self.encoded_filter_bytes);
-            try sinkAppendU32(self.sink, try checkedU32(encoded_block_filter.len));
-            try self.sink.appendSlice(encoded_block_filter);
+            try sinkAppendU32(&metadata_sink, try checkedU32(encoded_block_filter.len));
+            try metadata_sink.appendSlice(encoded_block_filter);
         }
-        try sinkAppendU32(self.sink, try checkedU32(self.blocks.items.len));
+        try sinkAppendU32(&metadata_sink, try checkedU32(self.blocks.items.len));
         for (self.blocks.items) |block| {
-            try sinkAppendU32(self.sink, try checkedU32(block.hash_slots.len));
-            for (block.hash_slots) |slot| try sinkAppendU32(self.sink, slot);
+            try sinkAppendU32(&metadata_sink, try checkedU32(block.hash_slots.len));
+            for (block.hash_slots) |slot| try sinkAppendU32(&metadata_sink, slot);
         }
-        try sinkAppendU32(self.sink, try checkedU32(self.blocks.items.len));
+        try sinkAppendU32(&metadata_sink, try checkedU32(self.blocks.items.len));
         for (self.blocks.items) |block| {
-            try sinkAppendU32(self.sink, block.physical_relative_offset);
-            try sinkAppendU32(self.sink, block.physical_len);
-            try sinkAppendU32(self.sink, @intFromEnum(block.compression));
+            try sinkAppendU32(&metadata_sink, block.physical_relative_offset);
+            try sinkAppendU32(&metadata_sink, block.physical_len);
+            try sinkAppendU32(&metadata_sink, @intFromEnum(block.compression));
+            try sinkAppendU32(&metadata_sink, block.checksum);
         }
-        try sinkAppendU32(self.sink, try checkedU32(self.blocks.items.len));
+        try sinkAppendU32(&metadata_sink, try checkedU32(self.blocks.items.len));
         for (self.blocks.items) |block| {
-            try sinkAppendU32(self.sink, if (block.smallest_namespace_name) |name| try checkedU32(name.len) else std.math.maxInt(u32));
-            try sinkAppendU32(self.sink, try checkedU32(block.smallest_key.len));
-            if (block.smallest_namespace_name) |name| try self.sink.appendSlice(name);
-            try self.sink.appendSlice(block.smallest_key);
+            try sinkAppendU32(&metadata_sink, if (block.smallest_namespace_name) |name| try checkedU32(name.len) else std.math.maxInt(u32));
+            try sinkAppendU32(&metadata_sink, try checkedU32(block.smallest_key.len));
+            if (block.smallest_namespace_name) |name| try metadata_sink.appendSlice(name);
+            try metadata_sink.appendSlice(block.smallest_key);
         }
-        try sinkAppendU32(self.sink, @intFromEnum(self.prefix_extractor));
-        try sinkAppendU32(self.sink, try checkedU32(encoded_prefix_filter.len));
-        try self.sink.appendSlice(encoded_prefix_filter);
-        try sinkAppendU32(self.sink, try checkedU32(self.blocks.items.len));
+        try sinkAppendU32(&metadata_sink, @intFromEnum(self.prefix_extractor));
+        try sinkAppendU32(&metadata_sink, try checkedU32(encoded_prefix_filter.len));
+        try metadata_sink.appendSlice(encoded_prefix_filter);
+        try sinkAppendU32(&metadata_sink, try checkedU32(self.blocks.items.len));
         for (self.blocks.items) |block| {
             const encoded_block_prefix_filter = if (block.prefix_filter) |block_prefix_filter|
                 try block_prefix_filter.encodeInto(self.allocator, &self.encoded_filter_bytes)
             else
                 "";
-            try sinkAppendU32(self.sink, try checkedU32(encoded_block_prefix_filter.len));
-            try self.sink.appendSlice(encoded_block_prefix_filter);
+            try sinkAppendU32(&metadata_sink, try checkedU32(encoded_block_prefix_filter.len));
+            try metadata_sink.appendSlice(encoded_block_prefix_filter);
         }
         const metadata_len = self.sink.len() - metadata_offset;
-
-        try self.sink.appendSlice(footer_magic);
-        try sinkAppendU64(self.sink, metadata_offset);
-        try sinkAppendU64(self.sink, metadata_len);
-        try sinkAppendU32(self.sink, try checkedU32(self.entry_count));
-        try sinkAppendU32(self.sink, entry_data_len_u32);
+        try appendFooter(
+            self.sink,
+            metadata_offset,
+            metadata_len,
+            self.entry_count,
+            entry_data_len_u32,
+            metadata_sink_impl.checksum(),
+        );
 
         const compression_stats = summarizeOwnedCompressionStats(self.logical_entry_data_len, physical_entry_data_len, self.blocks.items);
         if (self.compression_stats_out) |stats| stats.* = compression_stats;
@@ -1350,12 +1487,25 @@ pub const StreamingEncoder = struct {
             self.allocator.free(largest_key);
         }
 
+        const next_completed_blocks_metadata_bytes = try checkedAddUsize(
+            self.completed_blocks_metadata_bytes,
+            try encodedBlockMetadataLen(
+                smallest_namespace_name,
+                smallest_key,
+                largest_namespace_name,
+                largest_key,
+                bloomEncodedLenForBytes(block_filter.bytes.len),
+                bloomEncodedLenForBytes(block_prefix_filter.bytes.len),
+            ),
+        );
+
         try self.blocks.append(self.allocator, .{
             .relative_offset = self.block_start.?,
             .len = try checkedU32(self.block_bytes.items.len),
             .physical_relative_offset = physical_relative_offset,
             .physical_len = try checkedU32(encoded_payload.payload.len),
             .compression = encoded_payload.compression,
+            .checksum = std.hash.Crc32.hash(encoded_payload.payload),
             .first_entry_index = try checkedU32(self.block_first_entry_index),
             .entry_count = try checkedU32(self.block_entry_count),
             .smallest_namespace_name = smallest_namespace_name,
@@ -1366,6 +1516,7 @@ pub const StreamingEncoder = struct {
             .prefix_filter = block_prefix_filter,
             .hash_slots = hash_slots,
         });
+        self.completed_blocks_metadata_bytes = next_completed_blocks_metadata_bytes;
         self.blocks_owned_heap_bytes +|= ownedEncodedBlockMetaHeapBytes(self.blocks.items[self.blocks.items.len - 1]);
 
         self.block_bytes.clearRetainingCapacity();
@@ -1375,6 +1526,43 @@ pub const StreamingEncoder = struct {
         self.block_entry_count = 0;
     }
 };
+
+const bloom_encoded_header_len = bloom.magic.len + @sizeOf(u32) * 3 + @sizeOf(u8);
+
+fn bloomEncodedLenForBytes(byte_len: usize) usize {
+    return bloom_encoded_header_len +| byte_len;
+}
+
+fn bloomEncodedLenForKeyCount(key_count: usize, config: bloom.Config) !usize {
+    if (key_count == 0) return bloomEncodedLenForBytes(0);
+    const requested_bits = std.math.mul(usize, key_count, config.bits_per_key) catch return error.TableFileTooLarge;
+    const raw_bits = @max(config.min_bits, requested_bits);
+    const bit_count = std.math.ceilPowerOfTwo(usize, raw_bits) catch raw_bits;
+    if (bit_count > std.math.maxInt(u32)) return error.TableFileTooLarge;
+    const byte_len = try checkedAddUsize(bit_count, 7) / 8;
+    return try checkedAddUsize(bloom_encoded_header_len, byte_len);
+}
+
+fn encodedBlockMetadataLen(
+    smallest_namespace_name: ?[]const u8,
+    smallest_key: []const u8,
+    largest_namespace_name: ?[]const u8,
+    largest_key: []const u8,
+    encoded_filter_len: usize,
+    encoded_prefix_filter_len: usize,
+) !usize {
+    // Largest bound: six u32 fields. Bloom and prefix Bloom: a u32 length
+    // each. Empty hash slots: one u32 length. Physical block metadata: four
+    // u32 fields. Smallest bound: two u32 fields.
+    var total: usize = 15 * @sizeOf(u32);
+    if (smallest_namespace_name) |name| total = try checkedAddUsize(total, name.len);
+    total = try checkedAddUsize(total, smallest_key.len);
+    if (largest_namespace_name) |name| total = try checkedAddUsize(total, name.len);
+    total = try checkedAddUsize(total, largest_key.len);
+    total = try checkedAddUsize(total, encoded_filter_len);
+    total = try checkedAddUsize(total, encoded_prefix_filter_len);
+    return total;
+}
 
 fn capacityBytes(comptime T: type, capacity: usize) u64 {
     return @as(u64, @intCast(capacity)) *| @as(u64, @intCast(@sizeOf(T)));
@@ -1474,6 +1662,7 @@ fn flushEncodedBlock(
         .physical_relative_offset = physical_relative_offset,
         .physical_len = try checkedU32(encoded_payload.payload.len),
         .compression = encoded_payload.compression,
+        .checksum = std.hash.Crc32.hash(encoded_payload.payload),
         .first_entry_index = try checkedU32(block_first_entry_index),
         .entry_count = try checkedU32(block_entry_count),
         .smallest_namespace_name = block_smallest_namespace_name,
@@ -1956,10 +2145,12 @@ pub fn findExactEntryInCompressedBlockPayloadAlloc(
     allocator: std.mem.Allocator,
     compression: BlockCompression,
     payload: []const u8,
+    expected_checksum: u32,
     first_entry_index: usize,
     namespace_name: ?[]const u8,
     key: []const u8,
 ) !?OwnedPositionedEntry {
+    try validateBlockPayload(payload, expected_checksum);
     return switch (compression) {
         .prefix => try findExactEntryInPrefixPayloadAlloc(allocator, payload, first_entry_index, namespace_name, key),
         .prefix_snappy => blk: {
@@ -1983,7 +2174,9 @@ pub fn decodeBlockPayloadAlloc(
     compression: BlockCompression,
     payload: []const u8,
     expected_len: usize,
+    expected_checksum: u32,
 ) ![]u8 {
+    try validateBlockPayload(payload, expected_checksum);
     return switch (compression) {
         .none => blk: {
             if (payload.len != expected_len) return error.InvalidTableFile;
@@ -2018,7 +2211,22 @@ pub fn decodeWindowFromRawAlloc(
         window.compression,
         raw[physical_start..][0..physical_len],
         window.len,
+        window.checksum,
     );
+}
+
+pub fn validateBlockPayload(payload: []const u8, expected_checksum: u32) !void {
+    if (std.hash.Crc32.hash(payload) != expected_checksum) return error.TableBlockChecksumMismatch;
+}
+
+fn validateRawBlockChecksums(raw: []const u8, index: *const TableIndex) !void {
+    for (0..index.blocks.len) |block_index| {
+        const window = index.blockWindow(block_index);
+        const physical_start = index.entry_data_start + @as(usize, window.physicalRelativeOffset());
+        const physical_len: usize = @intCast(window.physicalLen());
+        if (physical_start > raw.len or physical_len > raw.len - physical_start) return error.InvalidTableFile;
+        try validateBlockPayload(raw[physical_start..][0..physical_len], window.checksum);
+    }
 }
 
 fn materializeLogicalEntryDataRawAlloc(
@@ -2046,7 +2254,7 @@ pub fn decodeIndexAlloc(allocator: std.mem.Allocator, raw: []const u8) !TableInd
     var cursor: usize = 0;
     const header = try decodeHeader(raw, &cursor);
     return switch (header.version) {
-        previous_version, version => decodeVersionedIndexAlloc(allocator, raw, header),
+        version => decodeVersionedIndexAlloc(allocator, raw, header),
         else => error.UnsupportedVersion,
     };
 }
@@ -2059,7 +2267,7 @@ pub fn decodeHeader(raw: []const u8, cursor: *usize) !Header {
     const found_version = try readU32(raw, cursor);
     const entry_count: usize = @intCast(try readU32(raw, cursor));
     return switch (found_version) {
-        previous_version, version => blk: {
+        version => blk: {
             const entry_data_len: usize = @intCast(try readU32(raw, cursor));
             const entry_data_start = cursor.*;
             break :blk .{
@@ -2086,23 +2294,27 @@ pub fn decodeFooter(raw: []const u8) !Footer {
 pub fn decodeFooterBytes(raw: []const u8) !Footer {
     if (raw.len != footer_len) return error.InvalidTableFile;
     if (!hasFooterMagic(raw)) return error.InvalidTableFile;
+    const stored_footer_checksum = std.mem.readInt(u32, raw[44..48], .little);
+    if (std.hash.Crc32.hash(raw[0..44]) != stored_footer_checksum) return error.InvalidTableFile;
 
     var cursor: usize = footer_magic.len;
+    if (try readU32(raw, &cursor) != version) return error.UnsupportedVersion;
+    if (try readU32(raw, &cursor) != 0) return error.InvalidTableFile;
     const metadata_offset: usize = @intCast(try readU64(raw, &cursor));
     const metadata_len: usize = @intCast(try readU64(raw, &cursor));
     const entry_count: usize = @intCast(try readU32(raw, &cursor));
     const entry_data_len: usize = @intCast(try readU32(raw, &cursor));
+    const metadata_checksum = try readU32(raw, &cursor);
+    _ = try readU32(raw, &cursor);
     if (cursor != raw.len) return error.InvalidTableFile;
-    // The exact offset width is dispatched from the metadata itself: v9 uses
-    // global u32 values, while v10 starts with packed_offsets_magic and uses
-    // block-local u16 values.
-    if (metadata_len < @sizeOf(u32)) return error.InvalidTableFile;
+    if (metadata_offset < header_len or metadata_len < packed_offsets_magic.len) return error.InvalidTableFile;
 
     return .{
         .metadata_offset = metadata_offset,
         .metadata_len = metadata_len,
         .entry_count = entry_count,
         .entry_data_len = entry_data_len,
+        .metadata_checksum = metadata_checksum,
     };
 }
 
@@ -2112,7 +2324,16 @@ pub fn decodeIndexFromFooterAlloc(
     metadata: []const u8,
 ) !TableIndex {
     if (metadata.len != footer.metadata_len) return error.InvalidTableFile;
-    return try decodeFooterMetadataAlloc(allocator, metadata, header_len, footer.entry_count, footer.entry_data_len, null);
+    if (std.hash.Crc32.hash(metadata) != footer.metadata_checksum) return error.InvalidTableFile;
+    return try decodeFooterMetadataAlloc(
+        allocator,
+        metadata,
+        header_len,
+        footer.entry_count,
+        footer.entry_data_len,
+        footer.metadata_offset - header_len,
+        null,
+    );
 }
 
 pub fn decodeSequentialIndexFromFooterAlloc(
@@ -2121,26 +2342,23 @@ pub fn decodeSequentialIndexFromFooterAlloc(
     metadata: []const u8,
 ) !SequentialTableIndex {
     if (metadata.len != footer.metadata_len) return error.InvalidTableFile;
+    if (std.hash.Crc32.hash(metadata) != footer.metadata_checksum) return error.InvalidTableFile;
     var cursor: usize = 0;
 
     // Entry offsets and all lookup accelerators are deliberately skipped.
-    const packed_offsets = consumePackedOffsetsMarker(metadata, &cursor);
-    const offset_width: usize = if (packed_offsets) @sizeOf(u16) else @sizeOf(u32);
-    if (footer.entry_count > (metadata.len - cursor) / offset_width) return error.InvalidTableFile;
-    _ = try readSlice(metadata, &cursor, footer.entry_count * offset_width);
+    try consumePackedOffsetsMarker(metadata, &cursor);
+    if (footer.entry_count > (metadata.len - cursor) / @sizeOf(u16)) return error.InvalidTableFile;
+    _ = try readSlice(metadata, &cursor, footer.entry_count * @sizeOf(u16));
     const bloom_len: usize = @intCast(try readU32(metadata, &cursor));
     _ = try readSlice(metadata, &cursor, bloom_len);
 
-    if (cursor == metadata.len) {
-        if (footer.entry_count != 0) return error.InvalidTableFile;
-        return .{
-            .entry_data_start = header_len,
-            .entry_count = 0,
-            .blocks = try allocator.alloc(SequentialTableIndex.Block, 0),
-        };
-    }
-
     const block_count: usize = @intCast(try readU32(metadata, &cursor));
+    const minimum_block_metadata_bytes = @sizeOf(u32) * 6;
+    if (block_count > footer.entry_count or
+        block_count > (metadata.len - cursor) / minimum_block_metadata_bytes)
+    {
+        return error.InvalidTableFile;
+    }
     const blocks = try allocator.alloc(SequentialTableIndex.Block, block_count);
     errdefer allocator.free(blocks);
     var expected_entry_index: usize = 0;
@@ -2207,12 +2425,15 @@ pub fn decodeSequentialIndexFromFooterAlloc(
             @intFromEnum(BlockCompression.prefix_snappy) => BlockCompression.prefix_snappy,
             else => return error.InvalidTableFile,
         };
+        const checksum = try readU32(metadata, &cursor);
         if (physical_len == 0 or physical_relative_offset != expected_physical_offset) return error.InvalidTableFile;
         block.window.physical_relative_offset = physical_relative_offset;
         block.window.physical_len = physical_len;
         block.window.compression = compression;
+        block.window.checksum = checksum;
         expected_physical_offset += physical_len;
     }
+    if (expected_physical_offset != footer.metadata_offset - header_len) return error.InvalidTableFile;
 
     // Smallest key bounds.
     const smallest_count: usize = @intCast(try readU32(metadata, &cursor));
@@ -2377,6 +2598,27 @@ fn sinkAppendU64(sink: *TableSink, value: usize) !void {
     try sink.appendSlice(&buf);
 }
 
+fn appendFooter(
+    sink: *TableSink,
+    metadata_offset: usize,
+    metadata_len: usize,
+    entry_count: usize,
+    entry_data_len: usize,
+    metadata_checksum: u32,
+) !void {
+    var raw: [footer_len]u8 = undefined;
+    @memcpy(raw[0..footer_magic.len], footer_magic);
+    std.mem.writeInt(u32, raw[8..12], version, .little);
+    std.mem.writeInt(u32, raw[12..16], 0, .little);
+    std.mem.writeInt(u64, raw[16..24], @intCast(metadata_offset), .little);
+    std.mem.writeInt(u64, raw[24..32], @intCast(metadata_len), .little);
+    std.mem.writeInt(u32, raw[32..36], try checkedU32(entry_count), .little);
+    std.mem.writeInt(u32, raw[36..40], try checkedU32(entry_data_len), .little);
+    std.mem.writeInt(u32, raw[40..44], metadata_checksum, .little);
+    std.mem.writeInt(u32, raw[44..48], std.hash.Crc32.hash(raw[0..44]), .little);
+    try sink.appendSlice(&raw);
+}
+
 fn readByte(raw: []const u8, cursor: *usize) !u8 {
     if (cursor.* >= raw.len) return error.InvalidTableFile;
     const out = raw[cursor.*];
@@ -2406,11 +2648,11 @@ fn readSlice(raw: []const u8, cursor: *usize, len: usize) ![]const u8 {
     return out;
 }
 
-fn consumePackedOffsetsMarker(metadata: []const u8, cursor: *usize) bool {
-    if (metadata.len -| cursor.* < packed_offsets_magic.len) return false;
-    if (!std.mem.eql(u8, metadata[cursor.*..][0..packed_offsets_magic.len], packed_offsets_magic)) return false;
+fn consumePackedOffsetsMarker(metadata: []const u8, cursor: *usize) !void {
+    if (metadata.len -| cursor.* < packed_offsets_magic.len) return error.InvalidTableFile;
+    if (!std.mem.eql(u8, metadata[cursor.*..][0..packed_offsets_magic.len], packed_offsets_magic))
+        return error.InvalidTableFile;
     cursor.* += packed_offsets_magic.len;
-    return true;
 }
 
 fn decodeVersionedIndexAlloc(
@@ -2422,9 +2664,22 @@ fn decodeVersionedIndexAlloc(
     if (footer.entry_count != header.entry_count) return error.InvalidTableFile;
     if (footer.metadata_offset != header.entry_data_start + header.entry_data_len) return error.InvalidTableFile;
     const footer_offset = raw.len - footer_len;
-    if (footer.metadata_offset + footer.metadata_len != footer_offset) return error.InvalidTableFile;
+    if (footer.metadata_offset > footer_offset or footer.metadata_len != footer_offset - footer.metadata_offset)
+        return error.InvalidTableFile;
     const metadata = raw[footer.metadata_offset..footer_offset];
-    return try decodeFooterMetadataAlloc(allocator, metadata, header.entry_data_start, footer.entry_count, footer.entry_data_len, header.version);
+    if (std.hash.Crc32.hash(metadata) != footer.metadata_checksum) return error.InvalidTableFile;
+    var index = try decodeFooterMetadataAlloc(
+        allocator,
+        metadata,
+        header.entry_data_start,
+        footer.entry_count,
+        footer.entry_data_len,
+        footer.metadata_offset - header.entry_data_start,
+        header.version,
+    );
+    errdefer index.deinit(allocator);
+    try validateRawBlockChecksums(raw, &index);
+    return index;
 }
 
 fn decodeFooterMetadataAlloc(
@@ -2433,61 +2688,43 @@ fn decodeFooterMetadataAlloc(
     entry_data_start: usize,
     entry_count: usize,
     entry_data_len: usize,
+    physical_entry_data_len: usize,
     expected_version: ?u32,
 ) !TableIndex {
     var cursor: usize = 0;
-    const packed_offsets = consumePackedOffsetsMarker(metadata, &cursor);
-    if (expected_version) |expected| {
-        if ((expected == version) != packed_offsets) return error.InvalidTableFile;
-        if (expected != version and expected != previous_version) return error.UnsupportedVersion;
-    }
-    var offsets: []u32 = &.{};
+    try consumePackedOffsetsMarker(metadata, &cursor);
+    if (expected_version) |expected| if (expected != version) return error.UnsupportedVersion;
+    const offsets: []u32 = &.{};
     var block_offsets: []u16 = &.{};
-    errdefer allocator.free(offsets);
     errdefer allocator.free(block_offsets);
-    if (packed_offsets) {
-        block_offsets = try allocator.alloc(u16, entry_count);
-        for (block_offsets) |*offset| offset.* = try readU16(metadata, &cursor);
-    } else {
-        offsets = try allocator.alloc(u32, entry_count);
-        for (offsets) |*offset| offset.* = try readU32(metadata, &cursor);
-    }
+    if (entry_count > (metadata.len - cursor) / @sizeOf(u16))
+        return error.InvalidTableFile;
+    block_offsets = try allocator.alloc(u16, entry_count);
+    for (block_offsets) |*offset| offset.* = try readU16(metadata, &cursor);
 
     const bloom_len: usize = @intCast(try readU32(metadata, &cursor));
     const encoded_filter = try readSlice(metadata, &cursor, bloom_len);
     var filter = try bloom.OwnedFilter.decodeAlloc(allocator, encoded_filter);
     errdefer filter.deinit(allocator);
-    const blocks = if (cursor == metadata.len)
-        try allocator.alloc(TableIndex.BlockMeta, 0)
-    else
-        try decodeBlockMetasAlloc(allocator, metadata, &cursor, entry_count, entry_data_len);
+    const blocks = try decodeBlockMetasAlloc(allocator, metadata, &cursor, entry_count, entry_data_len);
     errdefer {
         for (blocks) |*block| block.deinit(allocator);
         allocator.free(blocks);
     }
-    if (cursor < metadata.len) {
-        try decodeBlockFiltersAlloc(allocator, metadata, &cursor, blocks);
-    }
-    if (cursor < metadata.len) {
-        try skipBlockHashSlots(metadata, &cursor, blocks);
-    }
-    if (cursor < metadata.len) {
-        try decodeBlockPhysicalMetas(metadata, &cursor, blocks);
-    }
-    if (cursor < metadata.len) {
-        try decodeBlockSmallestKeysAlloc(allocator, metadata, &cursor, blocks);
-    }
+    try decodeBlockFiltersAlloc(allocator, metadata, &cursor, blocks);
+    try skipBlockHashSlots(metadata, &cursor, blocks);
+    try decodeBlockPhysicalMetas(metadata, &cursor, blocks);
+    try validateBlockPhysicalCoverage(blocks, physical_entry_data_len);
+    try decodeBlockSmallestKeysAlloc(allocator, metadata, &cursor, blocks);
     var prefix_extractor: PrefixExtractor = .none;
     var prefix_filter: ?bloom.OwnedFilter = null;
     errdefer if (prefix_filter) |*filter_ptr| filter_ptr.deinit(allocator);
-    if (cursor < metadata.len) {
-        prefix_extractor = try decodePrefixExtractor(try readU32(metadata, &cursor));
-        const prefix_filter_len: usize = @intCast(try readU32(metadata, &cursor));
-        if (prefix_filter_len > 0) {
-            prefix_filter = try bloom.OwnedFilter.decodeAlloc(allocator, try readSlice(metadata, &cursor, prefix_filter_len));
-        }
-        try decodeBlockPrefixFiltersAlloc(allocator, metadata, &cursor, blocks);
+    prefix_extractor = try decodePrefixExtractor(try readU32(metadata, &cursor));
+    const prefix_filter_len: usize = @intCast(try readU32(metadata, &cursor));
+    if (prefix_filter_len > 0) {
+        prefix_filter = try bloom.OwnedFilter.decodeAlloc(allocator, try readSlice(metadata, &cursor, prefix_filter_len));
     }
+    try decodeBlockPrefixFiltersAlloc(allocator, metadata, &cursor, blocks);
     if (cursor != metadata.len) return error.InvalidTableFile;
 
     try validateEntryOffsets(offsets, block_offsets, blocks, entry_data_len);
@@ -2553,6 +2790,12 @@ fn decodeBlockMetasAlloc(
     entry_data_len: usize,
 ) ![]TableIndex.BlockMeta {
     const block_count: usize = @intCast(try readU32(metadata, cursor));
+    const minimum_block_metadata_bytes = @sizeOf(u32) * 6;
+    if (block_count > entry_count or
+        block_count > (metadata.len - cursor.*) / minimum_block_metadata_bytes)
+    {
+        return error.InvalidTableFile;
+    }
     const blocks = try allocator.alloc(TableIndex.BlockMeta, block_count);
     errdefer allocator.free(blocks);
 
@@ -2652,6 +2895,7 @@ fn decodeBlockPhysicalMetas(
         const physical_relative_offset = try readU32(metadata, cursor);
         const physical_len = try readU32(metadata, cursor);
         const compression_raw = try readU32(metadata, cursor);
+        const checksum = try readU32(metadata, cursor);
         const compression: BlockCompression = switch (compression_raw) {
             @intFromEnum(BlockCompression.none) => .none,
             @intFromEnum(BlockCompression.snappy) => .snappy,
@@ -2664,8 +2908,19 @@ fn decodeBlockPhysicalMetas(
         block.physical_relative_offset = physical_relative_offset;
         block.physical_len = physical_len;
         block.compression = compression;
+        block.checksum = checksum;
         expected_physical_offset += physical_len;
     }
+}
+
+fn validateBlockPhysicalCoverage(blocks: []const TableIndex.BlockMeta, physical_entry_data_len: usize) !void {
+    if (blocks.len == 0) {
+        if (physical_entry_data_len != 0) return error.InvalidTableFile;
+        return;
+    }
+    const last = blocks[blocks.len - 1];
+    if (@as(usize, last.physical_relative_offset) + last.physical_len != physical_entry_data_len)
+        return error.InvalidTableFile;
 }
 
 fn decodeBlockSmallestKeysAlloc(
@@ -2843,38 +3098,6 @@ fn encodeV3ForTest(allocator: std.mem.Allocator, entries: []const Entry) ![]u8 {
     return try bytes.toOwnedSlice(allocator);
 }
 
-/// Reframes a current table as the origin/main v9 metadata layout. Keeping the
-/// fixture generator next to the decoder prevents compatibility tests from
-/// accidentally following the current writer, which is how the prior nominal
-/// "v9" footer test stopped testing v9.
-fn encodeV9ForTest(allocator: std.mem.Allocator, entries: []const Entry) ![]u8 {
-    const current = try encodeAlloc(allocator, entries);
-    defer allocator.free(current);
-    const footer = try decodeFooter(current);
-    const metadata = current[footer.metadata_offset .. footer.metadata_offset + footer.metadata_len];
-    if (!std.mem.startsWith(u8, metadata, packed_offsets_magic)) return error.InvalidTableFile;
-
-    var index = try decodeIndexAlloc(allocator, current);
-    defer index.deinit(allocator);
-
-    var bytes = std.ArrayListUnmanaged(u8).empty;
-    errdefer bytes.deinit(allocator);
-    try bytes.appendSlice(allocator, current[0..footer.metadata_offset]);
-    std.mem.writeInt(u32, bytes.items[magic.len..][0..4], previous_version, .little);
-
-    for (0..index.entryCount()) |entry_index| try appendU32(allocator, &bytes, index.entryStart(entry_index));
-    const packed_offsets_end = packed_offsets_magic.len + entries.len * @sizeOf(u16);
-    try bytes.appendSlice(allocator, metadata[packed_offsets_end..]);
-    const metadata_len = bytes.items.len - footer.metadata_offset;
-
-    try bytes.appendSlice(allocator, footer_magic);
-    try appendU64(allocator, &bytes, footer.metadata_offset);
-    try appendU64(allocator, &bytes, metadata_len);
-    try appendU32(allocator, &bytes, @intCast(entries.len));
-    try appendU32(allocator, &bytes, @intCast(footer.entry_data_len));
-    return try bytes.toOwnedSlice(allocator);
-}
-
 test "table file codec round trips namespaced entries" {
     const entries = [_]Entry{
         .{ .key = "a", .value = "1" },
@@ -2901,7 +3124,78 @@ test "table file codec round trips namespaced entries" {
     try std.testing.expect(maybeContains(decoded.filter, "docs", "doc:b"));
 }
 
-test "table file v10 packed footer metadata decodes through footer" {
+test "table file rejects corrupt footer metadata before using bloom filters" {
+    const entries = [_]Entry{
+        .{ .namespace_name = "docs", .key = "doc:a", .value = "A" },
+        .{ .namespace_name = "docs", .key = "doc:b", .value = "B" },
+    };
+    const encoded = try encodeAlloc(std.testing.allocator, &entries);
+    defer std.testing.allocator.free(encoded);
+    const footer = try decodeFooter(encoded);
+    encoded[footer.metadata_offset + packed_offsets_magic.len] ^= 0x40;
+
+    try std.testing.expectError(
+        error.InvalidTableFile,
+        decodeIndexAlloc(std.testing.allocator, encoded),
+    );
+    try std.testing.expectError(
+        error.InvalidTableFile,
+        decodeIndexFromFooterAlloc(
+            std.testing.allocator,
+            footer,
+            encoded[footer.metadata_offset .. footer.metadata_offset + footer.metadata_len],
+        ),
+    );
+}
+
+test "table file rejects forged footer entry count before allocating offsets" {
+    const entries = [_]Entry{
+        .{ .namespace_name = "docs", .key = "doc:a", .value = "A" },
+    };
+    const encoded = try encodeAlloc(std.testing.allocator, &entries);
+    defer std.testing.allocator.free(encoded);
+
+    const footer_bytes = encoded[encoded.len - footer_len ..];
+    std.mem.writeInt(u32, footer_bytes[32..36], std.math.maxInt(u32), .little);
+    std.mem.writeInt(u32, footer_bytes[44..48], std.hash.Crc32.hash(footer_bytes[0..44]), .little);
+    const footer = try decodeFooterBytes(footer_bytes);
+    const metadata = encoded[footer.metadata_offset .. footer.metadata_offset + footer.metadata_len];
+
+    try std.testing.expectError(
+        error.InvalidTableFile,
+        decodeIndexFromFooterAlloc(std.testing.allocator, footer, metadata),
+    );
+}
+
+test "table file rejects corrupt physical blocks before decoding or caching" {
+    const entries = [_]Entry{
+        .{ .namespace_name = "docs", .key = "doc:a", .value = "A" },
+        .{ .namespace_name = "docs", .key = "doc:b", .value = "B" },
+    };
+    const encoded = try encodeAlloc(std.testing.allocator, &entries);
+    defer std.testing.allocator.free(encoded);
+    const footer = try decodeFooter(encoded);
+    var footer_index = try decodeIndexFromFooterAlloc(
+        std.testing.allocator,
+        footer,
+        encoded[footer.metadata_offset .. footer.metadata_offset + footer.metadata_len],
+    );
+    defer footer_index.deinit(std.testing.allocator);
+    const window = footer_index.blockWindow(0);
+    const physical_offset = footer_index.entry_data_start + window.physicalRelativeOffset();
+    encoded[physical_offset] ^= 0x20;
+
+    try std.testing.expectError(
+        error.TableBlockChecksumMismatch,
+        decodeIndexAlloc(std.testing.allocator, encoded),
+    );
+    try std.testing.expectError(
+        error.TableBlockChecksumMismatch,
+        decodeWindowFromRawAlloc(std.testing.allocator, encoded, &footer_index, window),
+    );
+}
+
+test "table file v11 checksummed footer metadata decodes through footer" {
     const entries = [_]Entry{
         .{ .namespace_name = "docs", .key = "doc:a", .value = "A" },
         .{ .namespace_name = "docs", .key = "doc:b", .value = "B" },
@@ -2939,49 +3233,6 @@ test "table file v10 packed footer metadata decodes through footer" {
     try std.testing.expectEqual(index.blocks.len, sequential.blocks.len);
     try std.testing.expectEqual(index.blocks[0].entry_count, sequential.blocks[0].entry_count);
     try std.testing.expectEqual(index.blockWindow(0), sequential.blocks[0].window);
-}
-
-test "table file reads origin main v9 global offsets through full and footer paths" {
-    const allocator = std.testing.allocator;
-    var entries: [128]Entry = undefined;
-    var keys: [entries.len][16]u8 = undefined;
-    for (&entries, &keys, 0..) |*entry, *key_buf, i| {
-        const key = try std.fmt.bufPrint(key_buf, "doc:{d:0>6}", .{i});
-        entry.* = .{ .namespace_name = "docs", .key = key, .value = "value" };
-    }
-
-    const v10 = try encodeAlloc(allocator, &entries);
-    defer allocator.free(v10);
-    const v9 = try encodeV9ForTest(allocator, &entries);
-    defer allocator.free(v9);
-    try std.testing.expectEqual(v9.len - entries.len * 2 + packed_offsets_magic.len, v10.len);
-
-    var header_cursor: usize = 0;
-    try std.testing.expectEqual(previous_version, (try decodeHeader(v9, &header_cursor)).version);
-    var full_index = try decodeIndexAlloc(allocator, v9);
-    defer full_index.deinit(allocator);
-    try std.testing.expectEqual(entries.len, full_index.entryCount());
-    const last_block_index = full_index.blocks.len - 1;
-    const raw_block = try decodeWindowFromRawAlloc(allocator, v9, &full_index, full_index.blockWindow(last_block_index));
-    defer allocator.free(raw_block);
-    try std.testing.expectEqualStrings("doc:000127", (try findExactEntryInBlock(
-        &full_index,
-        raw_block,
-        last_block_index,
-        "docs",
-        "doc:000127",
-    )).?.entry.key);
-
-    const footer = try decodeFooter(v9);
-    const metadata = v9[footer.metadata_offset .. footer.metadata_offset + footer.metadata_len];
-    var footer_index = try decodeIndexFromFooterAlloc(allocator, footer, metadata);
-    defer footer_index.deinit(allocator);
-    try std.testing.expectEqualSlices(u32, full_index.entry_offsets, footer_index.entry_offsets);
-
-    var sequential = try decodeSequentialIndexFromFooterAlloc(allocator, footer, metadata);
-    defer sequential.deinit(allocator);
-    try std.testing.expectEqual(entries.len, sequential.entry_count);
-    try std.testing.expectEqual(full_index.blocks.len, sequential.blocks.len);
 }
 
 test "table file footer metadata includes block bounds for point reads" {
@@ -3239,6 +3490,7 @@ test "table file prefix-compressed blocks round trip long shared keys" {
         allocator,
         block.compression,
         payload,
+        block.checksum,
         block.first_entry_index,
         "docs",
         target_key,
@@ -3253,6 +3505,7 @@ test "table file prefix-compressed blocks round trip long shared keys" {
         allocator,
         block.compression,
         payload,
+        block.checksum,
         block.first_entry_index,
         "docs",
         "tenant:docs:collection:very-long-shared-prefix:segment:000037:field:absent",

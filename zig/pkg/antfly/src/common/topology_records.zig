@@ -8,6 +8,8 @@
 //! portable storage artifacts. Keep this module below both layers so decoding
 //! a seed never imports the metadata control loop into storage-only binaries.
 
+const std = @import("std");
+
 pub const TableRecord = struct {
     table_id: u64,
     name: []const u8,
@@ -55,7 +57,29 @@ pub const RangeRecord = struct {
     end_key: ?[]const u8 = null,
     doc_identity_shard_id: u64 = 0,
     doc_identity_range_id: u64 = 0,
+    /// Monotonic source-local split attempt allocator. Durable metadata
+    /// advances this only in the CAS command that admits the corresponding
+    /// transition, so an epoch cannot be consumed without recovery state.
+    split_attempt_epoch: u64 = 0,
     restore_backup_id: []const u8 = "",
+    restore_artifact_backup_id: []const u8 = "",
     restore_location: []const u8 = "",
     restore_snapshot_path: []const u8 = "",
+    /// Cluster-local authority used to resolve `restore_location`. This is an
+    /// identifier only; credentials remain in each node's secret/config store.
+    restore_connection: []const u8 = "",
+    /// Content identity captured from the immutable backup manifest at
+    /// admission. New restores require a SHA-256 binding.
+    restore_artifact_size_bytes: u64 = 0,
+    restore_artifact_sha256: []const u8 = "",
+    /// Durable, bounded idempotency provenance for the most recently
+    /// completed restore. Active replica progress can be garbage-collected
+    /// without making an exact job retry ambiguous.
+    completed_restore_fingerprint: RestoreCompletionFingerprint =
+        empty_restore_completion_fingerprint,
 };
+
+pub const RestoreCompletionFingerprint =
+    [std.crypto.hash.sha2.Sha256.digest_length]u8;
+pub const empty_restore_completion_fingerprint: RestoreCompletionFingerprint =
+    [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length;

@@ -518,10 +518,9 @@ test "leader transfer aborts if transferee stops being a voter" {
         .change_type = .remove_node,
         .node_id = 3,
     }};
-    try cluster.proposeConfChangeV2(1, .{
+    _ = try cluster.node(1).applyConfChangeV2(.{
         .changes = changes[0..],
     });
-    try cluster.deliverAll();
 
     try cluster.propose(1, "after-abort");
     try cluster.deliverAll();

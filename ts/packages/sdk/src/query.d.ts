@@ -31,11 +31,6 @@ export interface components {
             field?: string;
             analyzer?: string;
             boost?: components["schemas"]["Boost"];
-            /** Format: int32 */
-            prefix_length?: number;
-            fuzziness?: components["schemas"]["Fuzziness"];
-            /** @enum {string} */
-            operator?: "or" | "and";
         };
         MultiMatchBody: {
             query: string;

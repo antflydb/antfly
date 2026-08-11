@@ -32,6 +32,25 @@ const AcceptMergeReceiver = @FieldType(metadata_mod.TransitionAction, "accept_me
 const CatchUpMergeReceiver = @FieldType(metadata_mod.TransitionAction, "catch_up_merge_receiver");
 const FinalizeMerge = @FieldType(metadata_mod.TransitionAction, "finalize_merge");
 const RollbackMerge = @FieldType(metadata_mod.TransitionAction, "rollback_merge");
+const test_transition_table_contract: metadata_mod.TransitionTableContract = .{
+    .table_id = 1,
+    .table_name = "docs",
+    .indexes_json = "{}",
+    .source_identity = .{ .shard_id = 1, .range_id = 1 },
+    .target_identity = .{ .shard_id = 1, .range_id = 1 },
+};
+
+pub const GroupTransitionReadinessSource = struct {
+    ptr: *anyopaque,
+    readiness: *const fn (
+        ptr: *anyopaque,
+        group_id: u64,
+    ) anyerror!metadata_transition_state.StablePlacementReadiness,
+
+    pub fn get(self: @This(), group_id: u64) !metadata_transition_state.StablePlacementReadiness {
+        return try self.readiness(self.ptr, group_id);
+    }
+};
 
 pub const HostedShardOperationAdapter = struct {
     alloc: std.mem.Allocator,
@@ -39,6 +58,7 @@ pub const HostedShardOperationAdapter = struct {
     router: api_table_router.HostedGroupRouter,
     data_router: api_table_router.HostedGroupRouter,
     executor: http_common.RequestExecutor,
+    readiness: GroupTransitionReadinessSource,
     local_ops: ?shard_ops.ShardOperationAdapter = null,
 
     pub fn init(
@@ -46,9 +66,10 @@ pub const HostedShardOperationAdapter = struct {
         catalog: api_table_catalog.CatalogSource,
         router: api_table_router.HostedGroupRouter,
         executor: http_common.RequestExecutor,
+        readiness: GroupTransitionReadinessSource,
         local_ops: ?shard_ops.ShardOperationAdapter,
     ) HostedShardOperationAdapter {
-        return initWithRouters(alloc, catalog, router, router, executor, local_ops);
+        return initWithRouters(alloc, catalog, router, router, executor, readiness, local_ops);
     }
 
     pub fn initWithRouters(
@@ -57,6 +78,7 @@ pub const HostedShardOperationAdapter = struct {
         placement_router: api_table_router.HostedGroupRouter,
         data_router: api_table_router.HostedGroupRouter,
         executor: http_common.RequestExecutor,
+        readiness: GroupTransitionReadinessSource,
         local_ops: ?shard_ops.ShardOperationAdapter,
     ) HostedShardOperationAdapter {
         return .{
@@ -65,6 +87,7 @@ pub const HostedShardOperationAdapter = struct {
             .router = placement_router,
             .data_router = data_router,
             .executor = executor,
+            .readiness = readiness,
             .local_ops = local_ops,
         };
     }
@@ -89,70 +112,64 @@ pub const HostedShardOperationAdapter = struct {
         };
     }
 
-    fn observeSplit(ptr: *anyopaque, record: metadata_transition_state.SplitTransitionRecord) !metadata_transition_state.SplitObservation {
+    fn observeSplit(ptr: *anyopaque, _: u64, record: metadata_transition_state.SplitTransitionRecord) !metadata_transition_state.SplitObservation {
         const self: *HostedShardOperationAdapter = @ptrCast(@alignCast(ptr));
         return try self.observeSplitRouted(record);
     }
 
-    fn observeMerge(ptr: *anyopaque, record: metadata_transition_state.MergeTransitionRecord) !metadata_transition_state.MergeObservation {
+    fn observeMerge(ptr: *anyopaque, _: u64, record: metadata_transition_state.MergeTransitionRecord) !metadata_transition_state.MergeObservation {
         const self: *HostedShardOperationAdapter = @ptrCast(@alignCast(ptr));
         return try self.observeMergeRouted(record);
     }
 
-    fn prepareSplitSource(ptr: *anyopaque, op: PrepareSplitSource) !void {
+    fn prepareSplitSource(ptr: *anyopaque, _: u64, op: PrepareSplitSource) !void {
         const self: *HostedShardOperationAdapter = @ptrCast(@alignCast(ptr));
         try self.executeRouted(self.data_router, op.source_group_id, .{ .prepare_split_source = op });
     }
 
-    fn startSplitSource(ptr: *anyopaque, op: StartSplitSource) !void {
+    fn startSplitSource(ptr: *anyopaque, _: u64, op: StartSplitSource) !void {
         const self: *HostedShardOperationAdapter = @ptrCast(@alignCast(ptr));
         try self.executeRouted(self.data_router, op.source_group_id, .{ .start_split_source = op });
     }
 
-    fn bootstrapSplitDestination(ptr: *anyopaque, op: BootstrapSplitDestination) !void {
+    fn bootstrapSplitDestination(ptr: *anyopaque, _: u64, op: BootstrapSplitDestination) !void {
         const self: *HostedShardOperationAdapter = @ptrCast(@alignCast(ptr));
-        const destination_base_uri = try self.groupBaseUriAlloc(self.data_router, op.destination_group_id);
-        defer self.alloc.free(destination_base_uri);
-        var routed_op = op;
-        routed_op.destination_base_uri = destination_base_uri;
-        try self.executeRouted(self.data_router, op.source_group_id, .{ .bootstrap_split_destination = routed_op });
+        try self.requireGroupReadyForTransition(op.destination_group_id);
+        try self.executeRouted(self.data_router, op.source_group_id, .{ .bootstrap_split_destination = op });
     }
 
-    fn catchUpSplitDestination(ptr: *anyopaque, op: CatchUpSplitDestination) !void {
+    fn catchUpSplitDestination(ptr: *anyopaque, _: u64, op: CatchUpSplitDestination) !void {
         const self: *HostedShardOperationAdapter = @ptrCast(@alignCast(ptr));
-        const destination_base_uri = try self.groupBaseUriAlloc(self.data_router, op.destination_group_id);
-        defer self.alloc.free(destination_base_uri);
-        var routed_op = op;
-        routed_op.destination_base_uri = destination_base_uri;
-        try self.executeRouted(self.data_router, op.source_group_id, .{ .catch_up_split_destination = routed_op });
+        try self.requireGroupReadyForTransition(op.destination_group_id);
+        try self.executeRouted(self.data_router, op.source_group_id, .{ .catch_up_split_destination = op });
     }
 
-    fn finalizeSplitSource(ptr: *anyopaque, op: FinalizeSplitSource) !void {
+    fn finalizeSplitSource(ptr: *anyopaque, _: u64, op: FinalizeSplitSource) !void {
         const self: *HostedShardOperationAdapter = @ptrCast(@alignCast(ptr));
         try self.executeRouted(self.data_router, op.source_group_id, .{ .finalize_split_source = op });
     }
 
-    fn rollbackSplit(ptr: *anyopaque, op: RollbackSplit) !void {
+    fn rollbackSplit(ptr: *anyopaque, _: u64, op: RollbackSplit) !void {
         const self: *HostedShardOperationAdapter = @ptrCast(@alignCast(ptr));
         try self.executeRouted(self.data_router, op.source_group_id, .{ .rollback_split = op });
     }
 
-    fn acceptMergeReceiver(ptr: *anyopaque, op: AcceptMergeReceiver) !void {
+    fn acceptMergeReceiver(ptr: *anyopaque, _: u64, op: AcceptMergeReceiver) !void {
         const self: *HostedShardOperationAdapter = @ptrCast(@alignCast(ptr));
         try self.executeRouted(self.data_router, op.receiver_group_id, .{ .accept_merge_receiver = op });
     }
 
-    fn catchUpMergeReceiver(ptr: *anyopaque, op: CatchUpMergeReceiver) !void {
+    fn catchUpMergeReceiver(ptr: *anyopaque, _: u64, op: CatchUpMergeReceiver) !void {
         const self: *HostedShardOperationAdapter = @ptrCast(@alignCast(ptr));
         try self.executeRouted(self.data_router, op.receiver_group_id, .{ .catch_up_merge_receiver = op });
     }
 
-    fn finalizeMerge(ptr: *anyopaque, op: FinalizeMerge) !void {
+    fn finalizeMerge(ptr: *anyopaque, _: u64, op: FinalizeMerge) !void {
         const self: *HostedShardOperationAdapter = @ptrCast(@alignCast(ptr));
         try self.executeRouted(self.data_router, op.receiver_group_id, .{ .finalize_merge = op });
     }
 
-    fn rollbackMerge(ptr: *anyopaque, op: RollbackMerge) !void {
+    fn rollbackMerge(ptr: *anyopaque, _: u64, op: RollbackMerge) !void {
         const self: *HostedShardOperationAdapter = @ptrCast(@alignCast(ptr));
         try self.executeRouted(self.data_router, op.receiver_group_id, .{ .rollback_merge = op });
     }
@@ -160,126 +177,265 @@ pub const HostedShardOperationAdapter = struct {
     fn observeSplitRouted(self: *HostedShardOperationAdapter, record: metadata_transition_state.SplitTransitionRecord) !metadata_transition_state.SplitObservation {
         var route = (try api_table_router.resolveGroupRoute(self.alloc, self.catalog, self.data_router, record.source_group_id, .prefer_leader)) orelse return error.UnknownGroup;
         defer route.deinit(self.alloc);
-        return switch (route) {
+        const attempted_node_id = switch (route) {
+            .local => self.data_router.localNodeId(),
+            .remote => |remote| remote.node_id,
+        };
+        const preferred_error: anyerror = preferred: switch (route) {
             .local => {
                 const local_ops = self.local_ops orelse return error.UnsupportedOperation;
-                var observation = try local_ops.observeSplit(record);
+                var observation = local_ops.observeSplit(record) catch |err| {
+                    if (!isLeaderRediscoveryError(err)) return err;
+                    break :preferred err;
+                };
                 observation.source_local_leader = true;
                 return observation;
             },
             .remote => |remote| {
                 var client = api_http_client.ApiHttpClient.init(self.alloc, self.executor);
-                return try client.fetchGroupShardObserveSplit(remote.base_uri, record.source_group_id, record);
+                return client.fetchGroupShardObserveSplit(remote.base_uri, record.source_group_id, record) catch |err| {
+                    if (!isLeaderRediscoveryError(err)) return err;
+                    break :preferred err;
+                };
             },
+        };
+        return self.observeSplitFromCandidates(record, attempted_node_id) catch |err| {
+            if (isLeaderRediscoveryError(err)) return preferred_error;
+            return err;
         };
     }
 
     fn observeMergeRouted(self: *HostedShardOperationAdapter, record: metadata_transition_state.MergeTransitionRecord) !metadata_transition_state.MergeObservation {
         var route = (try api_table_router.resolveGroupRoute(self.alloc, self.catalog, self.data_router, record.receiver_group_id, .prefer_leader)) orelse return error.UnknownGroup;
         defer route.deinit(self.alloc);
-        return switch (route) {
+        const attempted_node_id = switch (route) {
+            .local => self.data_router.localNodeId(),
+            .remote => |remote| remote.node_id,
+        };
+        const preferred_error: anyerror = preferred: switch (route) {
             .local => {
                 const local_ops = self.local_ops orelse return error.UnsupportedOperation;
-                var observation = try local_ops.observeMerge(record);
+                var observation = local_ops.observeMerge(record) catch |err| {
+                    if (!isLeaderRediscoveryError(err)) return err;
+                    break :preferred err;
+                };
                 observation.receiver_local_leader = true;
                 return observation;
             },
             .remote => |remote| {
                 var client = api_http_client.ApiHttpClient.init(self.alloc, self.executor);
-                return try client.fetchGroupShardObserveMerge(remote.base_uri, record.receiver_group_id, record);
+                return client.fetchGroupShardObserveMerge(remote.base_uri, record.receiver_group_id, record) catch |err| {
+                    if (!isLeaderRediscoveryError(err)) return err;
+                    break :preferred err;
+                };
             },
+        };
+        return self.observeMergeFromCandidates(record, attempted_node_id) catch |err| {
+            if (isLeaderRediscoveryError(err)) return preferred_error;
+            return err;
         };
     }
 
     fn executeRouted(self: *HostedShardOperationAdapter, router: api_table_router.HostedGroupRouter, group_id: u64, action: metadata_mod.TransitionAction) !void {
         var route = (try api_table_router.resolveGroupRoute(self.alloc, self.catalog, router, group_id, .prefer_leader)) orelse return error.UnknownGroup;
         defer route.deinit(self.alloc);
+        const attempted_node_id = switch (route) {
+            .local => router.localNodeId(),
+            .remote => |remote| remote.node_id,
+        };
         switch (route) {
             .local => {
                 const local_ops = self.local_ops orelse return error.UnsupportedOperation;
-                try local_ops.execute(action);
+                local_ops.execute(action) catch |err| {
+                    if (!isLeaderRediscoveryError(err)) return err;
+                    return try self.executeFromCandidates(router, group_id, action, attempted_node_id);
+                };
             },
             .remote => |remote| {
                 var client = api_http_client.ApiHttpClient.init(self.alloc, self.executor);
-                _ = try client.fetchGroupShardExecute(remote.base_uri, group_id, action);
+                _ = client.fetchGroupShardExecute(remote.base_uri, group_id, action) catch |err| {
+                    if (!isLeaderRediscoveryError(err)) return err;
+                    return try self.executeFromCandidates(router, group_id, action, attempted_node_id);
+                };
             },
         }
     }
 
-    fn groupBaseUriAlloc(self: *HostedShardOperationAdapter, router: api_table_router.HostedGroupRouter, group_id: u64) ![]u8 {
-        var snapshot = try self.catalog.adminSnapshot();
-        defer self.catalog.freeAdminSnapshot(&snapshot);
-        if (!groupReadyForTransition(&snapshot, group_id)) return error.GroupLeaderUnavailable;
-
-        const leader_node_id = router.groupLeaderNodeId(group_id) orelse return error.GroupLeaderUnavailable;
-        if (leader_node_id == router.localNodeId()) {
-            if (router.localStatus(group_id) != .active) return error.GroupLeaderUnavailable;
-        } else if (router.nodeStatus(leader_node_id, group_id)) |status| {
-            if (status != .active) return error.GroupLeaderUnavailable;
+    fn observeSplitFromCandidates(
+        self: *HostedShardOperationAdapter,
+        record: metadata_transition_state.SplitTransitionRecord,
+        attempted_node_id: u64,
+    ) !metadata_transition_state.SplitObservation {
+        const node_ids = (try self.data_router.groupNodeIds(self.alloc, record.source_group_id)) orelse
+            return error.GroupLeaderUnavailable;
+        defer self.alloc.free(node_ids);
+        for (node_ids) |node_id| {
+            if (node_id == attempted_node_id) continue;
+            const observation = self.observeSplitAtNode(record, node_id) catch |err| {
+                if (isLeaderRediscoveryError(err)) continue;
+                return err;
+            };
+            return observation;
         }
-        return (try router.nodeBaseUriForGroup(self.alloc, group_id, leader_node_id)) orelse error.GroupLeaderUnavailable;
+        return error.GroupLeaderUnavailable;
+    }
+
+    fn observeSplitAtNode(
+        self: *HostedShardOperationAdapter,
+        record: metadata_transition_state.SplitTransitionRecord,
+        node_id: u64,
+    ) !metadata_transition_state.SplitObservation {
+        if (node_id == self.data_router.localNodeId()) {
+            if (self.data_router.localStatus(record.source_group_id) != .active) return error.UnknownGroup;
+            const local_ops = self.local_ops orelse return error.UnsupportedOperation;
+            var observation = try local_ops.observeSplit(record);
+            observation.source_local_leader = true;
+            return observation;
+        }
+        if (self.data_router.nodeStatus(node_id, record.source_group_id)) |status| {
+            if (status != .active) return error.UnknownGroup;
+        }
+        const base_uri = (try self.data_router.nodeBaseUriForGroup(self.alloc, record.source_group_id, node_id)) orelse
+            return error.UnknownGroup;
+        defer self.alloc.free(base_uri);
+        var client = api_http_client.ApiHttpClient.init(self.alloc, self.executor);
+        return try client.fetchGroupShardObserveSplit(base_uri, record.source_group_id, record);
+    }
+
+    fn observeMergeFromCandidates(
+        self: *HostedShardOperationAdapter,
+        record: metadata_transition_state.MergeTransitionRecord,
+        attempted_node_id: u64,
+    ) !metadata_transition_state.MergeObservation {
+        const node_ids = (try self.data_router.groupNodeIds(self.alloc, record.receiver_group_id)) orelse
+            return error.GroupLeaderUnavailable;
+        defer self.alloc.free(node_ids);
+        for (node_ids) |node_id| {
+            if (node_id == attempted_node_id) continue;
+            const observation = self.observeMergeAtNode(record, node_id) catch |err| {
+                if (isLeaderRediscoveryError(err)) continue;
+                return err;
+            };
+            return observation;
+        }
+        return error.GroupLeaderUnavailable;
+    }
+
+    fn observeMergeAtNode(
+        self: *HostedShardOperationAdapter,
+        record: metadata_transition_state.MergeTransitionRecord,
+        node_id: u64,
+    ) !metadata_transition_state.MergeObservation {
+        if (node_id == self.data_router.localNodeId()) {
+            if (self.data_router.localStatus(record.receiver_group_id) != .active) return error.UnknownGroup;
+            const local_ops = self.local_ops orelse return error.UnsupportedOperation;
+            var observation = try local_ops.observeMerge(record);
+            observation.receiver_local_leader = true;
+            return observation;
+        }
+        if (self.data_router.nodeStatus(node_id, record.receiver_group_id)) |status| {
+            if (status != .active) return error.UnknownGroup;
+        }
+        const base_uri = (try self.data_router.nodeBaseUriForGroup(self.alloc, record.receiver_group_id, node_id)) orelse
+            return error.UnknownGroup;
+        defer self.alloc.free(base_uri);
+        var client = api_http_client.ApiHttpClient.init(self.alloc, self.executor);
+        return try client.fetchGroupShardObserveMerge(base_uri, record.receiver_group_id, record);
+    }
+
+    fn executeFromCandidates(
+        self: *HostedShardOperationAdapter,
+        router: api_table_router.HostedGroupRouter,
+        group_id: u64,
+        action: metadata_mod.TransitionAction,
+        attempted_node_id: u64,
+    ) !void {
+        const node_ids = (try router.groupNodeIds(self.alloc, group_id)) orelse return error.GroupLeaderUnavailable;
+        defer self.alloc.free(node_ids);
+        for (node_ids) |node_id| {
+            if (node_id == attempted_node_id) continue;
+            self.executeAtNode(router, group_id, action, node_id) catch |err| {
+                if (isLeaderRediscoveryError(err)) continue;
+                return err;
+            };
+            return;
+        }
+        return error.GroupLeaderUnavailable;
+    }
+
+    fn executeAtNode(
+        self: *HostedShardOperationAdapter,
+        router: api_table_router.HostedGroupRouter,
+        group_id: u64,
+        action: metadata_mod.TransitionAction,
+        node_id: u64,
+    ) !void {
+        if (node_id == router.localNodeId()) {
+            if (router.localStatus(group_id) != .active) return error.UnknownGroup;
+            const local_ops = self.local_ops orelse return error.UnsupportedOperation;
+            return try local_ops.execute(action);
+        }
+        if (router.nodeStatus(node_id, group_id)) |status| {
+            if (status != .active) return error.UnknownGroup;
+        }
+        const base_uri = (try router.nodeBaseUriForGroup(self.alloc, group_id, node_id)) orelse
+            return error.UnknownGroup;
+        defer self.alloc.free(base_uri);
+        var client = api_http_client.ApiHttpClient.init(self.alloc, self.executor);
+        _ = try client.fetchGroupShardExecute(base_uri, group_id, action);
+    }
+
+    fn requireGroupReadyForTransition(self: *HostedShardOperationAdapter, group_id: u64) !void {
+        const readiness = try self.readiness.get(group_id);
+        if (readiness == .ready) return;
+        std.log.warn("group transition destination not ready group={} reason={s}", .{
+            group_id,
+            @tagName(readiness),
+        });
+        return error.GroupLeaderUnavailable;
     }
 };
 
-fn groupReadyForTransition(snapshot: *const metadata_api.AdminSnapshot, group_id: u64) bool {
-    var expected_voters: usize = 0;
-    for (snapshot.placement_intents) |intent| {
-        if (intent.record.group_id == group_id) expected_voters += 1;
-    }
-    if (expected_voters == 0 or expected_voters > std.math.maxInt(u16)) return false;
-
-    const expected_voter_count: u16 = @intCast(expected_voters);
-    for (snapshot.merged_group_statuses) |status| {
-        if (status.group_id != group_id) continue;
-        return status.leader_known and
-            status.leader_store_id != 0 and
-            status.voter_count_known and
-            status.voter_count == expected_voter_count and
-            status.voter_count > 0 and
-            status.healthy_voter_reports >= status.voter_count and
-            !status.joint_consensus;
-    }
-    return false;
+fn isLeaderRediscoveryError(err: anyerror) bool {
+    return switch (err) {
+        error.GroupLeaderUnavailable, error.LeaderUnavailable, error.UnknownGroup => true,
+        else => false,
+    };
 }
 
 test "transition destination requires a stable healthy voter set" {
-    const metadata_table_manager = @import("../metadata/table_manager.zig");
-    const metadata_reconciler = @import("../metadata/reconciler.zig");
-    const raft_reconciler = @import("reconciler.zig");
+    const Readiness = struct {
+        readiness: metadata_transition_state.StablePlacementReadiness,
+        calls: usize = 0,
 
-    var placements = [_]raft_reconciler.PlacementIntent{
-        .{ .record = .{ .group_id = 77, .replica_id = 1, .local_node_id = 1 } },
-        .{ .record = .{ .group_id = 77, .replica_id = 2, .local_node_id = 2 } },
-        .{ .record = .{ .group_id = 77, .replica_id = 3, .local_node_id = 3 } },
-    };
-    var statuses = [_]metadata_reconciler.MergedGroupStatus{.{
-        .group_id = 77,
-        .leader_known = true,
-        .leader_store_id = 1,
-        .voter_count_known = true,
-        .voter_count = 3,
-        .healthy_voter_reports = 3,
-    }};
-    var snapshot = metadata_api.AdminSnapshot{
-        .status = .{ .metadata_group_id = 1, .metrics = .{} },
-        .tables = @constCast((&[_]metadata_table_manager.TableRecord{})[0..]),
-        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
-        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
-        .placement_intents = placements[0..],
-        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
-        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
-        .merged_group_statuses = statuses[0..],
+        fn source(self: *@This()) GroupTransitionReadinessSource {
+            return .{ .ptr = self, .readiness = get };
+        }
+
+        fn get(
+            ptr: *anyopaque,
+            group_id: u64,
+        ) !metadata_transition_state.StablePlacementReadiness {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(u64, 77), group_id);
+            self.calls += 1;
+            return self.readiness;
+        }
     };
 
-    try std.testing.expect(groupReadyForTransition(&snapshot, 77));
-    statuses[0].healthy_voter_reports = 2;
-    try std.testing.expect(!groupReadyForTransition(&snapshot, 77));
-    statuses[0].healthy_voter_reports = 3;
-    statuses[0].joint_consensus = true;
-    try std.testing.expect(!groupReadyForTransition(&snapshot, 77));
-    statuses[0].joint_consensus = false;
-    statuses[0].voter_count = 2;
-    try std.testing.expect(!groupReadyForTransition(&snapshot, 77));
+    var readiness = Readiness{ .readiness = .ready };
+    var adapter = HostedShardOperationAdapter{
+        .alloc = std.testing.allocator,
+        .catalog = undefined,
+        .router = undefined,
+        .data_router = undefined,
+        .executor = undefined,
+        .readiness = readiness.source(),
+    };
+    try adapter.requireGroupReadyForTransition(77);
+    readiness.readiness = .voter_count_unknown;
+    try std.testing.expectError(error.GroupLeaderUnavailable, adapter.requireGroupReadyForTransition(77));
+    try std.testing.expectEqual(@as(usize, 2), readiness.calls);
 }
 
 pub const HostedShardDbAdapter = struct {
@@ -320,7 +476,16 @@ pub const HostedShardDbAdapter = struct {
         var tried_node_ids = std.ArrayListUnmanaged(u64).empty;
         defer tried_node_ids.deinit(self.alloc);
 
-        if (try self.fetchMedianKeyFromResolvedRoute(alloc, group_id, .prefer_leader, &tried_node_ids)) |median_key| {
+        const preferred_median_key = self.fetchMedianKeyFromResolvedRoute(
+            alloc,
+            group_id,
+            .prefer_leader,
+            &tried_node_ids,
+        ) catch |err| preferred: {
+            if (!isLeaderRediscoveryError(err)) return err;
+            break :preferred null;
+        };
+        if (preferred_median_key) |median_key| {
             return median_key;
         }
 
@@ -343,7 +508,11 @@ pub const HostedShardDbAdapter = struct {
         if (self.router.localStatus(group_id) == .active and !containsNodeId(tried_node_ids.items, local_node_id)) {
             try tried_node_ids.append(self.alloc, local_node_id);
             if (self.local_db) |local_db| {
-                if (try local_db.fetchMedianKey(alloc, group_id)) |median_key| return median_key;
+                const local_median_key = local_db.fetchMedianKey(alloc, group_id) catch |err| local: {
+                    if (!isLeaderRediscoveryError(err)) return err;
+                    break :local null;
+                };
+                if (local_median_key) |median_key| return median_key;
             }
         }
 
@@ -358,7 +527,11 @@ pub const HostedShardDbAdapter = struct {
             defer self.alloc.free(base_uri);
             saw_candidate = true;
             var client = api_http_client.ApiHttpClient.init(alloc, self.executor);
-            if (try client.fetchGroupDbMedianKey(base_uri, group_id)) |median_key| return median_key;
+            const candidate_median_key = client.fetchGroupDbMedianKey(base_uri, group_id) catch |err| {
+                if (isLeaderRediscoveryError(err)) continue;
+                return err;
+            };
+            if (candidate_median_key) |median_key| return median_key;
         }
 
         return if (saw_candidate) null else error.UnknownGroup;
@@ -506,7 +679,7 @@ test "hosted shard operation adapter uses local shard ops when preferred leader 
             };
         }
 
-        fn observeSplit(_: *anyopaque, _: metadata_transition_state.SplitTransitionRecord) !metadata_transition_state.SplitObservation {
+        fn observeSplit(_: *anyopaque, _: u64, _: metadata_transition_state.SplitTransitionRecord) !metadata_transition_state.SplitObservation {
             return .{
                 .status = .{
                     .phase = .cutover_ready,
@@ -522,7 +695,7 @@ test "hosted shard operation adapter uses local shard ops when preferred leader 
             };
         }
 
-        fn observeMerge(_: *anyopaque, record: metadata_transition_state.MergeTransitionRecord) !metadata_transition_state.MergeObservation {
+        fn observeMerge(_: *anyopaque, _: u64, record: metadata_transition_state.MergeTransitionRecord) !metadata_transition_state.MergeObservation {
             const status = @import("../data/mod.zig").MergeTransitionStatus{
                 .phase = .replay_deltas,
                 .donor_group_id = record.donor_group_id,
@@ -539,19 +712,19 @@ test "hosted shard operation adapter uses local shard ops when preferred leader 
             return .{ .donor = status, .receiver = status };
         }
 
-        fn prepareSplitSource(ptr: *anyopaque, _: PrepareSplitSource) !void {
+        fn prepareSplitSource(ptr: *anyopaque, _: u64, _: PrepareSplitSource) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.execute_called = true;
         }
-        fn noopStartSplitSource(_: *anyopaque, _: StartSplitSource) !void {}
-        fn noopBootstrapSplitDestination(_: *anyopaque, _: BootstrapSplitDestination) !void {}
-        fn noopCatchUpSplitDestination(_: *anyopaque, _: CatchUpSplitDestination) !void {}
-        fn noopFinalizeSplitSource(_: *anyopaque, _: FinalizeSplitSource) !void {}
-        fn noopRollbackSplit(_: *anyopaque, _: RollbackSplit) !void {}
-        fn noopAcceptMergeReceiver(_: *anyopaque, _: AcceptMergeReceiver) !void {}
-        fn noopCatchUpMergeReceiver(_: *anyopaque, _: CatchUpMergeReceiver) !void {}
-        fn noopFinalizeMerge(_: *anyopaque, _: FinalizeMerge) !void {}
-        fn noopRollbackMerge(_: *anyopaque, _: RollbackMerge) !void {}
+        fn noopStartSplitSource(_: *anyopaque, _: u64, _: StartSplitSource) !void {}
+        fn noopBootstrapSplitDestination(_: *anyopaque, _: u64, _: BootstrapSplitDestination) !void {}
+        fn noopCatchUpSplitDestination(_: *anyopaque, _: u64, _: CatchUpSplitDestination) !void {}
+        fn noopFinalizeSplitSource(_: *anyopaque, _: u64, _: FinalizeSplitSource) !void {}
+        fn noopRollbackSplit(_: *anyopaque, _: u64, _: RollbackSplit) !void {}
+        fn noopAcceptMergeReceiver(_: *anyopaque, _: u64, _: AcceptMergeReceiver) !void {}
+        fn noopCatchUpMergeReceiver(_: *anyopaque, _: u64, _: CatchUpMergeReceiver) !void {}
+        fn noopFinalizeMerge(_: *anyopaque, _: u64, _: FinalizeMerge) !void {}
+        fn noopRollbackMerge(_: *anyopaque, _: u64, _: RollbackMerge) !void {}
     };
 
     var fake_ops = FakeShardOps{};
@@ -561,11 +734,13 @@ test "hosted shard operation adapter uses local shard ops when preferred leader 
         FakeCatalog.iface(),
         router.iface(),
         undefined,
+        undefined,
         fake_ops.adapter(),
     );
 
     const observation = try hosted.adapter().observeSplit(.{
         .transition_id = 1,
+        .attempt_epoch = 1,
         .source_group_id = 77,
         .destination_group_id = 78,
     });
@@ -575,12 +750,99 @@ test "hosted shard operation adapter uses local shard ops when preferred leader 
     try hosted.adapter().execute(.{
         .prepare_split_source = .{
             .transition_id = 1,
+            .attempt_epoch = 1,
             .source_group_id = 77,
             .destination_group_id = 78,
             .split_key = "doc:m",
+            .table_contract = test_transition_table_contract,
         },
     });
     try std.testing.expect(fake_ops.execute_called);
+}
+
+test "hosted shard operation adapter rediscovers leader across placed replicas" {
+    const raft_host = @import("host.zig");
+
+    const FakeRouter = struct {
+        fn iface(self: *@This()) api_table_router.HostedGroupRouter {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .local_node_id = localNodeId,
+                    .local_status = localStatus,
+                    .group_leader_node_id = groupLeaderNodeId,
+                    .group_node_ids = groupNodeIds,
+                    .node_status = nodeStatus,
+                    .node_base_uri = nodeBaseUri,
+                },
+            };
+        }
+
+        fn localNodeId(_: *anyopaque) u64 {
+            return 99;
+        }
+
+        fn localStatus(_: *anyopaque, _: u64) raft_host.HostedReplicaStatus {
+            return .absent;
+        }
+
+        fn groupLeaderNodeId(_: *anyopaque, _: u64) ?u64 {
+            return 1;
+        }
+
+        fn groupNodeIds(_: *anyopaque, alloc: std.mem.Allocator, _: u64) ![]u64 {
+            return try alloc.dupe(u64, &.{ 1, 2, 3 });
+        }
+
+        fn nodeStatus(_: *anyopaque, node_id: u64, _: u64) raft_host.HostedReplicaStatus {
+            return if (node_id >= 1 and node_id <= 3) .active else .absent;
+        }
+
+        fn nodeBaseUri(_: *anyopaque, alloc: std.mem.Allocator, node_id: u64) !?[]u8 {
+            return try std.fmt.allocPrint(alloc, "http://node-{d}", .{node_id});
+        }
+    };
+
+    const FakeExecutor = struct {
+        calls: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            self.calls += 1;
+            if (std.mem.indexOf(u8, req.uri, "node-1") != null) {
+                return .{ .status = 503, .body = try alloc.dupe(u8, "group leader unavailable") };
+            }
+            try std.testing.expect(std.mem.indexOf(u8, req.uri, "node-2") != null);
+            return .{ .status = 200, .body = try alloc.dupe(u8, "{}") };
+        }
+    };
+
+    var router = FakeRouter{};
+    var executor = FakeExecutor{};
+    var hosted = HostedShardOperationAdapter.init(
+        std.testing.allocator,
+        undefined,
+        router.iface(),
+        executor.executor(),
+        undefined,
+        null,
+    );
+    try hosted.adapter().execute(.{
+        .prepare_split_source = .{
+            .transition_id = 10,
+            .attempt_epoch = 1,
+            .source_group_id = 77,
+            .destination_group_id = 78,
+            .split_key = "doc:m",
+            .table_contract = test_transition_table_contract,
+        },
+    });
+    try std.testing.expectEqual(@as(usize, 2), executor.calls);
 }
 
 test "hosted shard db adapter routes median key to remote leader" {
@@ -729,4 +991,85 @@ test "hosted shard db adapter routes median key to remote leader" {
     defer std.testing.allocator.free(median_key);
     try std.testing.expectEqualStrings("doc:m", median_key);
     try std.testing.expectError(error.UnsupportedOperation, hosted.adapter().schemaIndexReady(std.testing.allocator, "docs", 88, 2, 1));
+}
+
+test "hosted shard db adapter rediscovers median key after stale leader route" {
+    const raft_host = @import("host.zig");
+
+    const FakeRouter = struct {
+        fn iface(self: *@This()) api_table_router.HostedGroupRouter {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .local_node_id = localNodeId,
+                    .local_status = localStatus,
+                    .group_leader_node_id = groupLeaderNodeId,
+                    .group_node_ids = groupNodeIds,
+                    .node_status = nodeStatus,
+                    .node_base_uri = nodeBaseUri,
+                },
+            };
+        }
+
+        fn localNodeId(_: *anyopaque) u64 {
+            return 99;
+        }
+
+        fn localStatus(_: *anyopaque, _: u64) raft_host.HostedReplicaStatus {
+            return .absent;
+        }
+
+        fn groupLeaderNodeId(_: *anyopaque, _: u64) ?u64 {
+            return 1;
+        }
+
+        fn groupNodeIds(_: *anyopaque, alloc: std.mem.Allocator, _: u64) ![]u64 {
+            return try alloc.dupe(u64, &.{ 1, 2, 3 });
+        }
+
+        fn nodeStatus(_: *anyopaque, node_id: u64, _: u64) raft_host.HostedReplicaStatus {
+            return if (node_id >= 1 and node_id <= 3) .active else .absent;
+        }
+
+        fn nodeBaseUri(_: *anyopaque, alloc: std.mem.Allocator, node_id: u64) !?[]u8 {
+            return try std.fmt.allocPrint(alloc, "http://node-{d}", .{node_id});
+        }
+    };
+
+    const FakeExecutor = struct {
+        stale_status: u16,
+        calls: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(http_common.Method.GET, req.method);
+            self.calls += 1;
+            if (std.mem.indexOf(u8, req.uri, "node-1") != null) {
+                return .{ .status = self.stale_status, .body = try alloc.dupe(u8, "unavailable") };
+            }
+            try std.testing.expect(std.mem.indexOf(u8, req.uri, "node-2") != null);
+            return .{ .status = 200, .body = try alloc.dupe(u8, "{\"median_key\":\"doc:m\"}") };
+        }
+    };
+
+    for ([_]u16{ 404, 503 }) |stale_status| {
+        var router = FakeRouter{};
+        var executor = FakeExecutor{ .stale_status = stale_status };
+        var hosted = HostedShardDbAdapter.init(
+            std.testing.allocator,
+            undefined,
+            router.iface(),
+            executor.executor(),
+            null,
+        );
+
+        const median_key = (try hosted.adapter().fetchMedianKey(std.testing.allocator, 88)).?;
+        defer std.testing.allocator.free(median_key);
+        try std.testing.expectEqualStrings("doc:m", median_key);
+        try std.testing.expectEqual(@as(usize, 2), executor.calls);
+    }
 }

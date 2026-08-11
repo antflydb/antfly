@@ -168,11 +168,11 @@ pub const DeleteArtifactEnrichmentPathParams = struct {
     artifact_name: []const u8,
 };
 
-/// Reprocess a derived document artifact across a table range
+/// Reprocess a derived asset across a table range
 pub const ReprocessDocumentArtifactRangePathParams = struct {
     /// Name of the table
     table_name: []const u8,
-    /// Name of the derived document artifact.
+    /// Name of the derived asset enrichment.
     artifact_name: []const u8,
 };
 
@@ -185,7 +185,7 @@ pub fn parseReprocessDocumentArtifactRangeBody(allocator: std.mem.Allocator, bod
 pub const StartDocumentArtifactReprocessJobPathParams = struct {
     /// Name of the table
     table_name: []const u8,
-    /// Name of the derived document artifact.
+    /// Name of the derived asset enrichment.
     artifact_name: []const u8,
 };
 
@@ -300,7 +300,7 @@ pub const GetDocumentArtifactManifestParams = struct {
     detail: ?[]const u8 = null,
 };
 
-/// Reprocess a derived document artifact
+/// Reprocess a derived asset
 pub const ReprocessDocumentArtifactPathParams = struct {
     /// Name of the table
     table_name: []const u8,
@@ -786,10 +786,10 @@ pub fn ServerRouter(comptime Impl: type) type {
         fn listBackups(ctx: *httpx.Context) anyerror!httpx.Response {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
             const query_params = ListBackupsParams{
-                .location = ctx.query("location") orelse return ctx.status(400).json(.{ .@"error" = "missing_query_param", .message = "Missing required query parameter: location" }),
-                .connection = ctx.query("connection") orelse return ctx.status(400).json(.{ .@"error" = "missing_query_param", .message = "Missing required query parameter: connection" }),
-                .limit = ctx.query("limit"),
-                .cursor = ctx.query("cursor"),
+                .location = (try ctx.queryDecoded("location")) orelse return ctx.status(400).json(.{ .@"error" = "missing_query_param", .message = "Missing required query parameter: location" }),
+                .connection = (try ctx.queryDecoded("connection")) orelse return ctx.status(400).json(.{ .@"error" = "missing_query_param", .message = "Missing required query parameter: connection" }),
+                .limit = try ctx.queryDecoded("limit"),
+                .cursor = try ctx.queryDecoded("cursor"),
             };
             return impl.listBackups(ctx, query_params);
         }
@@ -813,9 +813,9 @@ pub fn ServerRouter(comptime Impl: type) type {
         fn listConnections(ctx: *httpx.Context) anyerror!httpx.Response {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
             const query_params = ListConnectionsParams{
-                .types = ctx.query("types"),
-                .include = ctx.query("include"),
-                .refresh = ctx.query("refresh"),
+                .types = try ctx.queryDecoded("types"),
+                .include = try ctx.queryDecoded("include"),
+                .refresh = try ctx.queryDecoded("refresh"),
             };
             return impl.listConnections(ctx, query_params);
         }
@@ -855,10 +855,10 @@ pub fn ServerRouter(comptime Impl: type) type {
         fn listRestoreJobs(ctx: *httpx.Context) anyerror!httpx.Response {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
             const query_params = ListRestoreJobsParams{
-                .limit = ctx.query("limit"),
-                .cursor = ctx.query("cursor"),
-                .phase = ctx.query("phase"),
-                .scope = ctx.query("scope"),
+                .limit = try ctx.queryDecoded("limit"),
+                .cursor = try ctx.queryDecoded("cursor"),
+                .phase = try ctx.queryDecoded("phase"),
+                .scope = try ctx.queryDecoded("scope"),
             };
             return impl.listRestoreJobs(ctx, query_params);
         }
@@ -914,8 +914,8 @@ pub fn ServerRouter(comptime Impl: type) type {
         fn listTables(ctx: *httpx.Context) anyerror!httpx.Response {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
             const query_params = ListTablesParams{
-                .prefix = ctx.query("prefix"),
-                .pattern = ctx.query("pattern"),
+                .prefix = try ctx.queryDecoded("prefix"),
+                .pattern = try ctx.queryDecoded("pattern"),
             };
             return impl.listTables(ctx, query_params);
         }
@@ -970,7 +970,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.deleteArtifactEnrichment(ctx, table_name, artifact_name);
         }
 
-        /// Reprocess a derived document artifact across a table range
+        /// Reprocess a derived asset across a table range
         /// POST /tables/{tableName}/artifacts/{artifactName}/reprocess
         fn reprocessDocumentArtifactRange(ctx: *httpx.Context) anyerror!httpx.Response {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
@@ -1049,8 +1049,8 @@ pub fn ServerRouter(comptime Impl: type) type {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             const key = ctx.param("key") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: key" });
             const query_params = LookupKeyParams{
-                .fields = ctx.query("fields"),
-                .consistency = ctx.query("consistency"),
+                .fields = try ctx.queryDecoded("fields"),
+                .consistency = try ctx.queryDecoded("consistency"),
             };
             return impl.lookupKey(ctx, table_name, key, query_params);
         }
@@ -1062,7 +1062,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             const key = ctx.param("key") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: key" });
             const query_params = ListDocumentArtifactManifestsParams{
-                .detail = ctx.query("detail"),
+                .detail = try ctx.queryDecoded("detail"),
             };
             return impl.listDocumentArtifactManifests(ctx, table_name, key, query_params);
         }
@@ -1075,12 +1075,12 @@ pub fn ServerRouter(comptime Impl: type) type {
             const key = ctx.param("key") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: key" });
             const artifact_name = ctx.param("artifactName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: artifactName" });
             const query_params = GetDocumentArtifactManifestParams{
-                .detail = ctx.query("detail"),
+                .detail = try ctx.queryDecoded("detail"),
             };
             return impl.getDocumentArtifactManifest(ctx, table_name, key, artifact_name, query_params);
         }
 
-        /// Reprocess a derived document artifact
+        /// Reprocess a derived asset
         /// POST /tables/{tableName}/documents/{key}/artifacts/{artifactName}/reprocess
         fn reprocessDocumentArtifact(ctx: *httpx.Context) anyerror!httpx.Response {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
@@ -1227,7 +1227,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         fn cleanupTransactionSessions(ctx: *httpx.Context) anyerror!httpx.Response {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
             const query_params = CleanupTransactionSessionsParams{
-                .cutoff_ns = ctx.query("cutoff_ns"),
+                .cutoff_ns = try ctx.queryDecoded("cutoff_ns"),
             };
             return impl.cleanupTransactionSessions(ctx, query_params);
         }

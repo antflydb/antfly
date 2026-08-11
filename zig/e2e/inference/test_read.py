@@ -22,7 +22,23 @@ import os
 from pathlib import Path
 
 import pytest
-from .helpers import TINY_PNG_URI, assert_openai_list_response, load_go_sample_page_fixture, make_text_png_uri
+import requests
+
+from .conftest import InferenceServer, api_path, find_free_port
+from .helpers import (
+    TINY_PNG_URI,
+    assert_openai_list_response,
+    load_go_sample_page_fixture,
+    make_text_png_uri,
+)
+from .models import (
+    ensure_model_by_name,
+    inference_command,
+    inference_download_enabled,
+    local_model_exists,
+    ml_dir,
+    models_dir,
+)
 
 pytestmark = pytest.mark.model_integration
 
@@ -160,21 +176,41 @@ def _maybe_write_surya_expectations(result: dict, regions: list[dict], labels: l
     Path(path).write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def _read_or_skip_backend_unavailable(api, *, images, model: str = "", prompt: str = "", **kwargs):
+def _read_or_skip_backend_unavailable(
+    api,
+    *,
+    images,
+    model: str = "",
+    prompt: str = "",
+    require_runtime_support: bool = False,
+    **kwargs,
+):
     image_objs = [{"url": img} if isinstance(img, str) else img for img in images]
     body = {"model": model, "images": image_objs, "prompt": prompt, **kwargs}
     resp = api.post("/read", json=body)
 
     if resp.status_code == 500 and resp.headers.get("content-type", "").startswith("application/json"):
         payload = resp.json()
-        if payload.get("error") == "MODEL_LOAD_FAILED" and payload.get("message") == "NoBackendAvailable":
+        if (
+            not require_runtime_support
+            and payload.get("error") == "MODEL_LOAD_FAILED"
+            and payload.get("message") == "NoBackendAvailable"
+        ):
             pytest.skip("Reader model is installed, but this antfly runtime was built without a compatible backend")
-        if payload.get("error") in {"MODEL_LOAD_FAILED", "INFERENCE_FAILED"} and payload.get("message") in {
-            "MissingWeight",
-            "ShapeMismatch",
-            "UnsupportedShape",
-        }:
+        if (
+            not require_runtime_support
+            and payload.get("error") in {"MODEL_LOAD_FAILED", "INFERENCE_FAILED"}
+            and payload.get("message") in {
+                "MissingWeight",
+                "ShapeMismatch",
+                "UnsupportedShape",
+            }
+        ):
             pytest.skip("Reader model is installed, but this antfly graph runtime does not support it yet")
+        if require_runtime_support:
+            pytest.fail(
+                f"required reader {model!r} failed with HTTP {resp.status_code}: {payload!r}"
+            )
 
     resp.raise_for_status()
     return resp.json()
@@ -200,11 +236,11 @@ def test_read_with_prompt(api):
 
 
 @pytest.mark.multimodal
-def test_read_trocr_model_answers_text(api):
-    """TrOCR-style readers should load explicitly and return text."""
-    model = os.environ.get("ANTFLY_INFERENCE_TROCR_MODEL") or _find_reader_model(api, "trocr")
+def test_read_florence_model_answers_text(api):
+    """Florence readers should load explicitly and return text."""
+    model = os.environ.get("ANTFLY_INFERENCE_FLORENCE_MODEL") or _find_reader_model(api, "florence")
     if not model:
-        pytest.skip("No TrOCR reader model is available")
+        pytest.skip("No Florence reader model is available")
 
     test_image = make_text_png_uri(
         [
@@ -221,11 +257,89 @@ def test_read_trocr_model_answers_text(api):
         images=[test_image],
         model=model,
         max_tokens=64,
+        require_runtime_support=True,
     )
     results = resp["data"]
     assert len(results) == 1
     _assert_read_result_shape(results[0])
-    assert results[0]["text"].strip()
+    observed = _normalize_text(results[0]["text"])
+    assert "invoice" in observed, f"Florence OCR missed INVOICE: {results[0]['text']!r}"
+    assert "123" in observed, f"Florence OCR missed TOTAL 123: {results[0]['text']!r}"
+
+
+@pytest.mark.multimodal
+@pytest.mark.slow
+def test_read_recovers_after_forced_run_admission_denials():
+    """A loaded Florence reader survives repeated pre-execution denials."""
+    if os.environ.get("RUN_INFERENCE_ADMISSION_RECOVERY_TESTS") != "1":
+        pytest.skip(
+            "Set RUN_INFERENCE_ADMISSION_RECOVERY_TESTS=1 to run admission recovery coverage"
+        )
+
+    model = (
+        os.environ.get("ANTFLY_INFERENCE_FLORENCE_MODEL")
+        or "antflydb/florence-2-base"
+    )
+    if not local_model_exists(model, "readers"):
+        if not inference_download_enabled():
+            pytest.skip(f"{model} is not available")
+        if ensure_model_by_name(model, "readers") is None:
+            pytest.skip(f"{model} is not a curated reader model")
+
+    forced_denials = 3
+    server = InferenceServer(
+        inference_command(),
+        str(models_dir()),
+        str(ml_dir()),
+        "127.0.0.1",
+        find_free_port(),
+        max_loaded_models="1",
+        extra_env={
+            "ANTFLY_INFERENCE_TEST_FORCE_RUN_ADMISSION_DENIALS": str(forced_denials),
+        },
+    )
+    payload = {
+        "model": model,
+        "images": [{"url": TINY_PNG_URI}],
+        "max_tokens": 1,
+    }
+    read_url = f"{server.url}{api_path('/read')}"
+
+    def post_read():
+        try:
+            return requests.post(read_url, json=payload, timeout=300)
+        except requests.RequestException as exc:
+            raise AssertionError(server.failure_diagnostic()) from exc
+
+    try:
+        startup_marker = (
+            "enabling test-only forced inference run admission denials "
+            f"count={forced_denials}"
+        )
+        assert startup_marker in server.read_output(), server.failure_diagnostic()
+
+        for _ in range(forced_denials):
+            response = post_read()
+            assert response.status_code == 503, (
+                f"{response.text[:2000]}\n{server.failure_diagnostic()}"
+            )
+            body = response.json()
+            assert body["error"] == "MODEL_RESOURCE_BUSY"
+            assert body["retryable"] is True
+            assert response.headers["Retry-After"]
+            assert server.proc.poll() is None, server.failure_diagnostic()
+
+        response = post_read()
+        assert response.status_code == 200, response.text[:2000]
+        results = response.json()["data"]
+        assert len(results) == 1
+        _assert_read_result_shape(results[0])
+        assert server.proc.poll() is None, server.failure_diagnostic()
+
+        output = server.read_output()
+        assert output.count("test-only forced inference run admission denial") >= forced_denials
+    finally:
+        server.stop()
 
 
 @pytest.mark.multimodal

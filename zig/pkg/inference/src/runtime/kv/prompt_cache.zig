@@ -106,6 +106,10 @@ pub const PromptPrefixCache = struct {
     storage: ?storage_runtime_mod.KvStorageRuntime = null,
     pool_id: ?block.KvPoolId = null,
     pool_config: ?pool_mod.KvPoolConfig = null,
+    /// Set while ModelManager has admitted this cache into the node-wide
+    /// budget but the first request has not finished creating its KV pool.
+    /// Counting this state closes the gap between rebalance and ensurePool.
+    activation_pending: bool = false,
     entries: std.ArrayListUnmanaged(Entry) = .empty,
     block_hash_entries: std.ArrayListUnmanaged(BlockHashEntry) = .empty,
     block_hash_index: std.AutoHashMapUnmanaged(Hash, usize) = .empty,
@@ -147,8 +151,28 @@ pub const PromptPrefixCache = struct {
             if (!same_observer) old_observer.update(old_observer.context, &self.resource_accounted_bytes, 0);
         }
         self.config = config;
+        if (!config.enabled) self.activation_pending = false;
         self.evictToBudget();
         self.updateResourceUsage();
+    }
+
+    /// Reserve this cache's place in node-wide accounting before any
+    /// potentially failing pool allocation runs outside ModelManager's lock.
+    pub fn reserveActivation(self: *PromptPrefixCache) void {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.pool_id == null) self.activation_pending = true;
+    }
+
+    /// Roll back a failed first activation. Returns whether a pending
+    /// reservation was removed; an already-created pool remains active.
+    pub fn cancelPendingActivation(self: *PromptPrefixCache) bool {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+        if (!self.activation_pending) return false;
+        self.activation_pending = false;
+        self.config.enabled = false;
+        return true;
     }
 
     pub fn ensurePool(self: *PromptPrefixCache, config: pool_mod.KvPoolConfig) !?block.KvPoolId {
@@ -166,6 +190,7 @@ pub const PromptPrefixCache = struct {
         const id = try self.manager.addPool(config);
         self.pool_id = id;
         self.pool_config = config;
+        self.activation_pending = false;
         return id;
     }
 
@@ -538,6 +563,15 @@ pub const PromptPrefixCache = struct {
         spinLock(&self.mutex);
         defer self.mutex.unlock();
         return self.config.enabled and self.pool_id != null;
+    }
+
+    /// Includes admitted first-use activations whose pool allocation has not
+    /// completed yet. ModelManager uses this for race-free budget splitting.
+    pub fn isParticipating(self: *PromptPrefixCache) bool {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+        return self.config.enabled and
+            (self.activation_pending or self.pool_id != null);
     }
 
     fn findExact(self: *const PromptPrefixCache, namespace: []const u8, tokens: []const i64) ?usize {

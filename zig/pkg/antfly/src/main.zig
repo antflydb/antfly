@@ -27,7 +27,20 @@ pub const std_options: std.Options = .{
     .logFn = structlog.logFn,
 };
 
-pub fn main(init: std.process.Init) !void {
+pub fn main(init: std.process.Init) void {
+    mainImpl(init) catch |err| {
+        const message = switch (err) {
+            error.FileNotFound => "required file was not found; check the configured path",
+            error.AddressInUse => "listen address is already in use",
+            error.InvalidCharacter, error.InvalidArguments => "invalid command-line value; run with --help",
+            else => "startup failed; see the preceding diagnostic for details",
+        };
+        std.debug.print("antfly: {s}\n", .{message});
+        std.process.exit(1);
+    };
+}
+
+fn mainImpl(init: std.process.Init) !void {
     structlog.init(.{ .formatter = .json, .level = .info });
 
     var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);

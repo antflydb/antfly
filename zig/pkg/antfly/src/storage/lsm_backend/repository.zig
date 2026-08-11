@@ -343,6 +343,30 @@ pub fn persistRunFileWithStorageAccounted(
     prefix_extractor: lsm_table_file.PrefixExtractor,
     resource_manager: ?*resource_manager_mod.ResourceManager,
 ) ![]u8 {
+    return try persistRunFileWithStorageAccountedOptions(
+        storage,
+        allocator,
+        root_dir,
+        run,
+        lsm_table_file.default_filter_config,
+        compression_policy,
+        prefix_extractor,
+        resource_manager,
+        max_run_file_read_bytes,
+    );
+}
+
+pub fn persistRunFileWithStorageAccountedOptions(
+    storage: storage_io.Storage,
+    allocator: Allocator,
+    root_dir: []const u8,
+    run: *Run,
+    bloom_config: bloom.Config,
+    compression_policy: lsm_table_file.CompressionPolicy,
+    prefix_extractor: lsm_table_file.PrefixExtractor,
+    resource_manager: ?*resource_manager_mod.ResourceManager,
+    max_file_bytes: usize,
+) ![]u8 {
     const state = run.state orelse return error.RunStateUnavailable;
     var writer: StreamingRunFileWriter = undefined;
     try writer.initInPlace(
@@ -351,7 +375,8 @@ pub fn persistRunFileWithStorageAccounted(
         root_dir,
         run.id,
         state.entries.items.len,
-        lsm_table_file.default_filter_config,
+        @min(max_file_bytes, max_run_file_read_bytes),
+        bloom_config,
         compression_policy,
         prefix_extractor,
         resource_manager,
@@ -496,7 +521,6 @@ pub fn persistManifestWithStorageCount(
     });
     defer allocator.free(encoded);
     try replaceFileAtomicallyAbsolute(storage, manifest_path, encoded);
-    try storage.syncFileAbsolute(manifest_path);
     return @intCast(encoded.len);
 }
 
@@ -528,7 +552,13 @@ pub fn loadRunStateAllocWithStorage(storage: storage_io.Storage, allocator: Allo
             window.physicalLen(),
         );
         defer allocator.free(payload);
-        const bytes = try lsm_table_file.decodeBlockPayloadAlloc(allocator, window.compression, payload, window.len);
+        const bytes = try lsm_table_file.decodeBlockPayloadAlloc(
+            allocator,
+            window.compression,
+            payload,
+            window.len,
+            window.checksum,
+        );
         defer allocator.free(bytes);
 
         const end = block.first_entry_index + block.entry_count;
@@ -584,16 +614,10 @@ pub fn loadRunTableIndexAllocWithStorage(
     // obsoleted and reclaimed it after this reader loaded the manifest;
     // propagate the transient error so callers can retry against a fresh
     // manifest instead of misreporting a format mismatch.
-    const footer_bytes = try storage.readFileTrailerAlloc(allocator, path, lsm_table_file.footer_len);
-    defer allocator.free(footer_bytes);
-
-    if (lsm_table_file.hasFooterMagic(footer_bytes)) {
-        const footer = try lsm_table_file.decodeFooterBytes(footer_bytes);
-        const metadata_bytes = try storage.readFileRangeAlloc(allocator, path, footer.metadata_offset, footer.metadata_len);
-        defer allocator.free(metadata_bytes);
-        return try lsm_table_file.decodeIndexFromFooterAlloc(allocator, footer, metadata_bytes);
-    }
-    return error.UnsupportedVersion;
+    const footer = try loadRunFooterWithStorage(storage, allocator, path);
+    const metadata_bytes = try storage.readFileRangeAlloc(allocator, path, footer.metadata_offset, footer.metadata_len);
+    defer allocator.free(metadata_bytes);
+    return try lsm_table_file.decodeIndexFromFooterAlloc(allocator, footer, metadata_bytes);
 }
 
 pub fn loadRunSequentialTableIndexAllocWithStorage(
@@ -601,14 +625,58 @@ pub fn loadRunSequentialTableIndexAllocWithStorage(
     allocator: Allocator,
     path: []const u8,
 ) !lsm_table_file.SequentialTableIndex {
-    const footer_bytes = try storage.readFileTrailerAlloc(allocator, path, lsm_table_file.footer_len);
-    defer allocator.free(footer_bytes);
-    if (!lsm_table_file.hasFooterMagic(footer_bytes)) return error.UnsupportedVersion;
-
-    const footer = try lsm_table_file.decodeFooterBytes(footer_bytes);
+    const footer = try loadRunFooterWithStorage(storage, allocator, path);
     const metadata_bytes = try storage.readFileRangeAlloc(allocator, path, footer.metadata_offset, footer.metadata_len);
     defer allocator.free(metadata_bytes);
     return try lsm_table_file.decodeSequentialIndexFromFooterAlloc(allocator, footer, metadata_bytes);
+}
+
+fn loadRunFooterWithStorage(
+    storage: storage_io.Storage,
+    allocator: Allocator,
+    path: []const u8,
+) !lsm_table_file.Footer {
+    var trailer = try storage.readFileTrailerAlloc(
+        allocator,
+        path,
+        lsm_table_file.footer_len,
+    );
+    defer trailer.deinit(allocator);
+
+    const file_size = trailer.file_size;
+    if (file_size > max_run_file_read_bytes) return error.FileTooBig;
+    if (file_size < lsm_table_file.header_len + lsm_table_file.footer_len)
+        return error.InvalidTableFile;
+
+    const footer_offset_u64 = file_size - lsm_table_file.footer_len;
+    if (!lsm_table_file.hasFooterMagic(trailer.bytes)) return error.UnsupportedVersion;
+
+    const footer = try lsm_table_file.decodeFooterBytes(trailer.bytes);
+    const footer_offset: usize = @intCast(footer_offset_u64);
+    if (footer.metadata_offset > footer_offset or
+        footer.metadata_len != footer_offset - footer.metadata_offset)
+    {
+        return error.InvalidTableFile;
+    }
+    return footer;
+}
+
+/// Validate the checksummed manifest's exact physical run size during mount.
+/// This preserves lazy table I/O while ensuring an oversized run is rejected
+/// before the backend can report ready.
+pub fn validateManifestRunSize(manifest_size: u64) !void {
+    if (manifest_size > max_run_file_read_bytes) return error.FileTooBig;
+}
+
+/// Validate the immutable file against the checksummed manifest without
+/// decoding or allocating the table. Run files are atomically published and
+/// never modified in place, so a size mismatch means the manifest and file do
+/// not describe the same durable object. Reject it during mount instead of
+/// letting the backend report ready and fail on the first query.
+pub fn validateManifestRunPhysicalSize(manifest_size: u64, physical_size: u64) !void {
+    try validateManifestRunSize(manifest_size);
+    if (physical_size > max_run_file_read_bytes) return error.FileTooBig;
+    if (physical_size != manifest_size) return error.InvalidTableFile;
 }
 
 pub fn deleteFileAbsolute(path: []const u8) !void {
@@ -713,6 +781,10 @@ fn writeTableFileAtomically(
         .block_compression = compression_policy,
         .compression_stats = &compression_stats,
     });
+    // The legacy whole-table path is not used by normal flush or compaction,
+    // but it must obey the same reader contract: never publish a run that the
+    // repository's own bounded reader will reject.
+    if (size_bytes > max_run_file_read_bytes) return error.TableFileTooLarge;
     try adapter.flush();
 
     active = false;
@@ -819,38 +891,25 @@ fn joinPath(allocator: Allocator, root_dir: []const u8, suffix: []const u8) ![]u
 }
 
 fn replaceFileAtomicallyAbsolute(storage: storage_io.Storage, path: []const u8, contents: []const u8) !void {
-    const tmp_path = try tempSiblingPath(std.heap.page_allocator, path);
-    defer std.heap.page_allocator.free(tmp_path);
-    writeFileAbsoluteWithStorage(storage, tmp_path, contents) catch |err| {
+    var writer = storage.beginAtomicWrite(std.heap.page_allocator, path) catch |err| {
         if (!isInjectedStorageFault(err)) {
-            std.log.err("lsm replace write failed path={s} tmp_path={s} bytes={} err={s}", .{ path, tmp_path, contents.len, @errorName(err) });
+            std.log.err("lsm atomic replace begin failed path={s} bytes={} err={s}", .{ path, contents.len, @errorName(err) });
         }
-        deleteFileAbsoluteWithStorage(storage, tmp_path) catch {};
         return err;
     };
-
-    storage.renameAbsolute(tmp_path, path) catch |err| {
-        if (err == error.FileNotFound) {
-            writeFileAbsoluteWithStorage(storage, tmp_path, contents) catch |rewrite_err| {
-                if (!isInjectedStorageFault(rewrite_err)) {
-                    std.log.err("lsm replace rewrite failed path={s} tmp_path={s} bytes={} err={s}", .{ path, tmp_path, contents.len, @errorName(rewrite_err) });
-                }
-                deleteFileAbsoluteWithStorage(storage, tmp_path) catch {};
-                return rewrite_err;
-            };
-            storage.renameAbsolute(tmp_path, path) catch |retry_err| {
-                if (!isInjectedStorageFault(retry_err)) {
-                    std.log.err("lsm replace rename retry failed path={s} tmp_path={s} bytes={} err={s}", .{ path, tmp_path, contents.len, @errorName(retry_err) });
-                }
-                deleteFileAbsoluteWithStorage(storage, tmp_path) catch {};
-                return retry_err;
-            };
-            return;
-        }
+    var writer_open = true;
+    defer if (writer_open) writer.abort();
+    writer.appendSlice(contents) catch |err| {
         if (!isInjectedStorageFault(err)) {
-            std.log.err("lsm replace rename failed path={s} tmp_path={s} bytes={} err={s}", .{ path, tmp_path, contents.len, @errorName(err) });
+            std.log.err("lsm atomic replace write failed path={s} bytes={} err={s}", .{ path, contents.len, @errorName(err) });
         }
-        deleteFileAbsoluteWithStorage(storage, tmp_path) catch {};
+        return err;
+    };
+    writer_open = false;
+    writer.finish() catch |err| {
+        if (!isInjectedStorageFault(err)) {
+            std.log.err("lsm atomic replace publish failed path={s} bytes={} err={s}", .{ path, contents.len, @errorName(err) });
+        }
         return err;
     };
 }
@@ -895,6 +954,7 @@ pub const StreamingRunFileWriter = struct {
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     tracked_builder_bytes: u64 = 0,
     last_reported_builder_bytes: u64 = 0,
+    max_file_bytes: usize = max_run_file_read_bytes,
 
     pub fn initInPlace(
         self: *StreamingRunFileWriter,
@@ -903,12 +963,17 @@ pub const StreamingRunFileWriter = struct {
         root_dir: []const u8,
         run_id: u64,
         expected_entries: usize,
+        max_file_bytes: usize,
         bloom_config: bloom.Config,
         compression_policy: lsm_table_file.CompressionPolicy,
         prefix_extractor: lsm_table_file.PrefixExtractor,
         resource_manager: ?*resource_manager_mod.ResourceManager,
     ) !void {
-        self.* = .{ .allocator = allocator, .resource_manager = resource_manager };
+        self.* = .{
+            .allocator = allocator,
+            .resource_manager = resource_manager,
+            .max_file_bytes = max_file_bytes,
+        };
         try ensureOpenDirsWithStorage(storage, root_dir);
         self.path = try runPath(allocator, root_dir, run_id);
         errdefer {
@@ -966,10 +1031,15 @@ pub const StreamingRunFileWriter = struct {
         self.observeBuilderWorkingSet(false);
     }
 
+    pub fn canAppendEntry(self: *const StreamingRunFileWriter, entry: lsm_table_file.Entry) bool {
+        return (self.encoder.encodedSizeUpperBoundAfterEntry(entry) catch return false) <= self.max_file_bytes;
+    }
+
     pub fn finish(self: *StreamingRunFileWriter) !PersistedStreamingRunFile {
         self.observeBuilderWorkingSet(true);
         var encoded = try self.encoder.finish();
         errdefer encoded.filter.deinit(self.allocator);
+        if (encoded.size_bytes > self.max_file_bytes) return error.TableFileTooLarge;
         self.observeBuilderWorkingSet(true);
         self.encoder_active = false;
         self.encoder.deinit();
@@ -1072,6 +1142,160 @@ test "repository run table index load surfaces missing run file" {
     try std.testing.expectError(
         error.FileNotFound,
         loadRunTableIndexAllocWithStorage(storage.storage(), allocator, missing_path),
+    );
+}
+
+test "repository refuses to publish a streaming run above the reader cap" {
+    const allocator = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(allocator);
+    defer storage.deinit();
+
+    const root_dir = "/repository-streaming-run-reader-cap";
+    var writer: StreamingRunFileWriter = undefined;
+    try writer.initInPlace(
+        storage.storage(),
+        allocator,
+        root_dir,
+        1,
+        1,
+        32,
+        .{},
+        .none,
+        .none,
+        null,
+    );
+    var writer_active = true;
+    defer if (writer_active) writer.deinit();
+
+    const entry = lsm_table_file.Entry{
+        .namespace_name = "docs",
+        .key = "doc:a",
+        .value = "alpha",
+    };
+    try std.testing.expect(!writer.canAppendEntry(entry));
+    try writer.appendEntry(entry);
+    try std.testing.expectError(error.TableFileTooLarge, writer.finish());
+    writer.deinit();
+    writer_active = false;
+
+    const path = try runPath(allocator, root_dir, 1);
+    defer allocator.free(path);
+    try std.testing.expectError(error.FileNotFound, storage.storage().readFileAlloc(allocator, path, 1024));
+}
+
+test "repository streaming size admission bounds metadata-heavy runs" {
+    const allocator = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(allocator);
+    defer storage.deinit();
+
+    const max_file_bytes = 1024;
+    var writer: StreamingRunFileWriter = undefined;
+    try writer.initInPlace(
+        storage.storage(),
+        allocator,
+        "/repository-streaming-run-size-admission",
+        1,
+        128,
+        max_file_bytes,
+        .{},
+        .none,
+        .first_separator,
+        null,
+    );
+    var writer_active = true;
+    defer if (writer_active) writer.deinit();
+
+    var admitted: usize = 0;
+    var key_buf: [32]u8 = undefined;
+    for (0..128) |i| {
+        const key = try std.fmt.bufPrint(&key_buf, "tenant:{d:0>4}", .{i});
+        const entry = lsm_table_file.Entry{ .namespace_name = "docs", .key = key, .value = "v" };
+        if (!writer.canAppendEntry(entry)) break;
+        try writer.appendEntry(entry);
+        admitted += 1;
+    }
+    try std.testing.expect(admitted > 0);
+    try std.testing.expect(admitted < 128);
+
+    var persisted = try writer.finish();
+    writer_active = false;
+    defer {
+        allocator.free(persisted.path);
+        persisted.filter.deinit(allocator);
+    }
+    try std.testing.expect(persisted.size_bytes <= max_file_bytes);
+    var index = try loadRunTableIndexAllocWithStorage(storage.storage(), allocator, persisted.path);
+    defer index.deinit(allocator);
+    try std.testing.expectEqual(admitted, index.entryCount());
+}
+
+test "repository streaming size admission remains exact across completed blocks" {
+    const allocator = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(allocator);
+    defer storage.deinit();
+
+    const max_file_bytes = 96 * 1024;
+    const entry_count = 20;
+    var writer: StreamingRunFileWriter = undefined;
+    try writer.initInPlace(
+        storage.storage(),
+        allocator,
+        "/repository-streaming-run-multi-block-admission",
+        1,
+        entry_count,
+        max_file_bytes,
+        .{},
+        .none,
+        .none,
+        null,
+    );
+    var writer_active = true;
+    defer if (writer_active) writer.deinit();
+
+    var value: [4096]u8 = undefined;
+    @memset(&value, 'v');
+    var key_buf: [32]u8 = undefined;
+    for (0..entry_count) |i| {
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d:0>4}", .{i});
+        const entry = lsm_table_file.Entry{ .namespace_name = "docs", .key = key, .value = &value };
+        try std.testing.expect(writer.canAppendEntry(entry));
+        try writer.appendEntry(entry);
+    }
+
+    var persisted = try writer.finish();
+    writer_active = false;
+    defer {
+        allocator.free(persisted.path);
+        persisted.filter.deinit(allocator);
+    }
+    try std.testing.expect(persisted.size_bytes <= max_file_bytes);
+    var index = try loadRunTableIndexAllocWithStorage(storage.storage(), allocator, persisted.path);
+    defer index.deinit(allocator);
+    try std.testing.expect(index.blocks.len > 1);
+    try std.testing.expectEqual(@as(usize, entry_count), index.entryCount());
+}
+
+test "repository rejects forged run metadata length before allocating" {
+    const allocator = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(allocator);
+    defer storage.deinit();
+
+    const entries = [_]lsm_table_file.Entry{
+        .{ .namespace_name = "docs", .key = "doc:a", .value = "A" },
+    };
+    const encoded = try lsm_table_file.encodeAlloc(allocator, &entries);
+    defer allocator.free(encoded);
+
+    const footer_offset = encoded.len - lsm_table_file.footer_len;
+    const footer = encoded[footer_offset..];
+    std.mem.writeInt(u64, footer[24..32], max_run_file_read_bytes, .little);
+    std.mem.writeInt(u32, footer[44..48], std.hash.Crc32.hash(footer[0..44]), .little);
+
+    const path = "/repository-forged-run-metadata/run.tbl";
+    try storage.storage().writeFileAbsolute(path, encoded);
+    try std.testing.expectError(
+        error.InvalidTableFile,
+        loadRunTableIndexAllocWithStorage(storage.storage(), allocator, path),
     );
 }
 

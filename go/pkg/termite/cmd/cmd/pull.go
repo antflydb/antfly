@@ -38,7 +38,7 @@ Models are downloaded to the appropriate directory based on their type:
   - Chunkers:      models/chunkers/<owner>/<model-name>/
   - Rerankers:     models/rerankers/<owner>/<model-name>/
   - Generators:    models/generators/<owner>/<model-name>/
-  - Recognizers:   models/recognizers/<owner>/<model-name>/
+  - Extractors:    models/extractors/<owner>/<model-name>/
   - Rewriters:     models/rewriters/<owner>/<model-name>/
 
 Variants (append :variant to model name, e.g., BAAI/bge-small-en-v1.5:i8):
@@ -73,11 +73,11 @@ Examples:
   # Pull generator from HuggingFace
   termite pull hf:onnxruntime/Gemma-3-ONNX
 
-  # Pull recognizer model from HuggingFace
-  termite pull hf:dslim/bert-base-NER --type recognizer
+  # Pull entity extractor model from HuggingFace
+  termite pull hf:dslim/bert-base-NER --type extractor
 
   # Pull GLiNER model from HuggingFace
-  termite pull hf:onnx-community/gliner_small-v2.1 --type recognizer
+  termite pull hf:onnx-community/gliner_small-v2.1 --type extractor
 
   # Pull rewriter model from HuggingFace
   termite pull hf:onnx-community/gemma-3-270m-it-ONNX --type rewriter
@@ -96,7 +96,7 @@ func init() {
 	pullCmd.Flags().StringSliceVar(&variants, "variants", nil,
 		"Variant IDs to download (f32,f16,i8,i8-st,i4). Defaults to f32 if not specified.")
 	pullCmd.Flags().String("type", "",
-		"Model type (embedder, chunker, reranker, generator, recognizer, rewriter) - auto-detected for generators")
+		"Model type (embedder, chunker, reranker, generator, extractor, rewriter) - auto-detected for generators")
 	pullCmd.Flags().String("hf-token", "",
 		"HuggingFace API token for gated models (or use HF_TOKEN env var)")
 	pullCmd.Flags().String("variant", "",

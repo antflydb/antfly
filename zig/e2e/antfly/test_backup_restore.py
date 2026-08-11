@@ -22,6 +22,7 @@ import signal
 import subprocess
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -318,7 +319,9 @@ class MultiMetadataBackupCluster:
             str(self.metadata_admin_ports[node_id - 1]),
             "--health",
             "false",
-            "--tick-ms",
+            "--raft-tick-ms",
+            "5",
+            "--control-tick-ms",
             "5",
             "--data-dir",
             str(self.root / f"metadata-{node_id}"),
@@ -352,7 +355,9 @@ class MultiMetadataBackupCluster:
             "data",
             "--health",
             "false",
-            "--tick-ms",
+            "--raft-tick-ms",
+            "5",
+            "--control-tick-ms",
             "5",
             "--data-dir",
             str(self.root / "data"),
@@ -404,30 +409,48 @@ class MultiMetadataBackupCluster:
         parts.append(f"[data]\n{_read_log_tail(self.data_log_path)}")
         return "\n".join(parts)
 
-    def metadata_statuses(self) -> list[dict | None]:
-        statuses: list[dict | None] = []
-        for url in self.metadata_admin_urls:
+    def metadata_statuses(self, *, request_timeout_s: float = 1.0) -> list[dict | None]:
+        def fetch(url: str) -> dict | None:
             try:
-                response = requests.get(f"{url}/metadata/v1/status", timeout=5)
-                statuses.append(_check_response(response))
+                response = requests.get(
+                    f"{url}/metadata/v1/status", timeout=request_timeout_s
+                )
+                return _check_response(response)
             except (AssertionError, requests.RequestException, ValueError):
-                statuses.append(None)
-        return statuses
+                return None
+
+        # A serial probe makes one unavailable node consume the complete
+        # election-observation window before healthy peers are considered.
+        # Keep one bounded request per node and preserve configured ordering.
+        with ThreadPoolExecutor(max_workers=len(self.metadata_admin_urls)) as executor:
+            return list(executor.map(fetch, self.metadata_admin_urls))
+
+    def metadata_leader_index_once(self, *, request_timeout_s: float) -> int | None:
+        statuses = self.metadata_statuses(request_timeout_s=request_timeout_s)
+        leader_ids = {
+            int(status["metadata_raft_leader_id"])
+            for status in statuses
+            if status and status.get("metadata_raft_leader_id") is not None
+        }
+        if len(leader_ids) != 1:
+            return None
+        leader_id = leader_ids.pop()
+        if leader_id < 1 or leader_id > len(self.metadata_admin_urls):
+            return None
+        leader_status = statuses[leader_id - 1]
+        if not leader_status:
+            return None
+        if leader_status.get("metadata_raft_role") != "leader":
+            return None
+        if int(leader_status.get("metadata_raft_local_node_id", 0)) != leader_id:
+            return None
+        return leader_id - 1
 
     def metadata_leader_index(self, *, timeout_s: float) -> int | None:
         def current_leader() -> int | None:
-            statuses = self.metadata_statuses()
-            leader_ids = {
-                int(status["metadata_raft_leader_id"])
-                for status in statuses
-                if status and status.get("metadata_raft_leader_id") is not None
-            }
-            if len(leader_ids) != 1:
-                return None
-            leader_id = leader_ids.pop()
-            if leader_id < 1 or leader_id > len(self.metadata_admin_urls):
-                return None
-            return leader_id - 1
+            return self.metadata_leader_index_once(
+                request_timeout_s=min(1.0, max(0.05, timeout_s))
+            )
 
         return wait_until(current_leader, timeout_s=timeout_s, interval_s=0.25)
 
@@ -443,7 +466,9 @@ class MultiMetadataBackupCluster:
 
         def current_stable_leader() -> int | None:
             nonlocal last_leader, observed
-            leader_index = self.metadata_leader_index(timeout_s=interval_s)
+            leader_index = self.metadata_leader_index_once(
+                request_timeout_s=min(1.0, max(0.05, interval_s))
+            )
             if leader_index is None:
                 last_leader = None
                 observed = 0
@@ -1016,8 +1041,9 @@ def test_cluster_restore_modes(backup_api):
         assert restored_docs[table_b]["title"] == "Original Beta"
 
 
-def test_cluster_backup_restore_partial_statuses(backup_api):
+def test_partial_cluster_backup_is_not_published_and_can_retry(backup_api):
     table_name = f"cluster_partial_{time.time_ns()}"
+    missing_table = f"cluster_partial_missing_{time.time_ns()}"
     backup_id = f"cluster-partial-{time.time_ns()}"
 
     created = backup_api.create_table(table_name, num_shards=1, description="partial backup docs")
@@ -1035,45 +1061,65 @@ def test_cluster_backup_restore_partial_statuses(backup_api):
         backup = backup_api.cluster_backup(
             backup_id=backup_id,
             location=location,
-            table_names=[table_name, "missing"],
+            table_names=[table_name, missing_table],
         )
         assert backup["status"] == "partial"
         by_name = {table["name"]: table for table in backup["tables"]}
         assert by_name[table_name]["status"] == "completed"
-        assert by_name["missing"]["status"] == "failed"
-        assert "not found" in by_name["missing"]["error"]
+        assert by_name[missing_table]["status"] == "failed"
+        assert "not found" in by_name[missing_table]["error"]
+
+        # A partial attempt is diagnostic output, not a restorable aggregate.
+        # It must remain absent from discovery, and cleanup must release the
+        # reservation and all per-table artifacts so the same id is reusable.
+        listed = backup_api.list_backups(location=location)
+        matched = [item for item in listed["backups"] if item["backup_id"] == backup_id]
+        assert matched == []
+
+        created = backup_api.create_table(missing_table, num_shards=1, description="retry backup docs")
+        assert created["name"] == missing_table
+        _write_single_doc(
+            backup_api,
+            missing_table,
+            "doc:2",
+            title="Recovered Missing Table",
+            content="Recovered Missing Table retry publishes a complete aggregate",
+        )
+        assert wait_until(
+            lambda: _top_hit(backup_api, missing_table, "recovered missing table", "doc:2"),
+            timeout_s=60.0,
+            interval_s=1.0,
+        )
+
+        retried = backup_api.cluster_backup(
+            backup_id=backup_id,
+            location=location,
+            table_names=[table_name, missing_table],
+        )
+        assert retried["status"] == "completed"
+        assert {table["name"] for table in retried["tables"]} == {table_name, missing_table}
 
         listed = backup_api.list_backups(location=location)
         matched = [item for item in listed["backups"] if item["backup_id"] == backup_id]
         assert len(matched) == 1
-        assert matched[0]["tables"] == [table_name]
+        assert set(matched[0]["tables"]) == {table_name, missing_table}
 
         backup_api.delete_table(table_name)
-        _wait_until_table_absent(backup_api, table_name, timeout_s=10.0, interval_s=0.5)
-        _wait_until_absent(backup_api, table_name, "doc:1", timeout_s=10.0, interval_s=0.5)
+        backup_api.delete_table(missing_table)
+        for deleted_table, doc_id in ((table_name, "doc:1"), (missing_table, "doc:2")):
+            _wait_until_table_absent(backup_api, deleted_table, timeout_s=10.0, interval_s=0.5)
+            _wait_until_absent(backup_api, deleted_table, doc_id, timeout_s=10.0, interval_s=0.5)
 
-        restore_response = backup_api._request(
-            "POST",
-            "/restore",
-            {
-                "backup_id": backup_id,
-                "location": location,
-                "connection": BACKUP_CONNECTION,
-                "table_names": [table_name, "missing"],
-            },
+        restore = backup_api.cluster_restore(
+            backup_id=backup_id,
+            location=location,
+            restore_mode="fail_if_exists",
         )
-        restore_job = _wait_for_terminal_restore_job(backup_api, restore_response)
-        assert restore_job["phase"] == "failed"
-        restore = restore_job["result"]
-        assert restore["status"] == "partial"
-        assert restore["committed_table_count"] == 1
+        assert restore["status"] == "completed"
+        assert restore["committed_table_count"] == 2
         assert restore["triggered_table_count"] == 0
         assert restore["skipped_table_count"] == 0
-        assert restore["failed_table_count"] == 1
-        assert restore["failure_details_truncated"] is False
-        assert len(restore["failure_details"]) == 1
-        assert restore["failure_details"][0]["table_name"] == "missing"
-        assert "backup does not include table" in restore["failure_details"][0]["error"]
+        assert restore["failed_table_count"] == 0
 
         restored_doc = wait_until(
             lambda: _lookup_doc(backup_api, table_name, "doc:1"),
@@ -1082,6 +1128,13 @@ def test_cluster_backup_restore_partial_statuses(backup_api):
         )
         assert restored_doc is not None
         assert restored_doc["title"] == "Partial Table"
+        restored_missing_doc = wait_until(
+            lambda: _lookup_doc(backup_api, missing_table, "doc:2"),
+            timeout_s=60.0,
+            interval_s=1.0,
+        )
+        assert restored_missing_doc is not None
+        assert restored_missing_doc["title"] == "Recovered Missing Table"
 
 
 def test_backup_restore_request_validation(backup_api):
@@ -1144,6 +1197,17 @@ def test_backup_restore_request_validation(backup_api):
         )
         assert unsupported_location.status_code == 400
         assert "unsupported backup location" in unsupported_location.text
+
+        encoded_location = backup_api.s.get(
+            f"{backup_api.url}/backups",
+            params={
+                "location": "ftp://bucket/path",
+                "connection": BACKUP_CONNECTION,
+            },
+            timeout=30,
+        )
+        assert encoded_location.status_code == 400
+        assert "unsupported backup location" in encoded_location.text
 
 
 def test_list_backups_empty_location(backup_api):

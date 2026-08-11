@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const build_test_filters = @import("build/test_filters.zig");
 const runtime_build = @import("build/runtime.zig");
 const finetune_common = @import("build/finetune/common.zig");
 const finetune_tests = @import("build/finetune/tests.zig");
@@ -33,13 +34,11 @@ fn resolveSharedLibRoot(b: *std.Build) []const u8 {
 }
 
 fn selectTestFilters(b: *std.Build, default_filters: []const []const u8) []const []const u8 {
-    const args = b.args orelse return default_filters;
-    if (args.len == 0) return default_filters;
-    if (std.mem.eql(u8, args[0], "--test-filter")) {
-        if (args.len <= 1) return default_filters;
-        return args[1..];
-    }
-    return args;
+    return build_test_filters.select(
+        b.allocator,
+        b.args orelse &.{},
+        default_filters,
+    );
 }
 
 fn defaultOnnxRuntimeRoot(b: *std.Build, target: std.Build.ResolvedTarget) []const u8 {
@@ -263,6 +262,8 @@ pub fn build(b: *std.Build) void {
     const inference_audio_mod = runtime_graph.inference_audio_mod;
     const inference_chunker_mod = runtime_graph.inference_chunker_mod;
     const generating_openapi_mod = runtime_graph.generating_openapi_mod;
+    const extraction_openapi_mod = runtime_graph.extraction_openapi_mod;
+    const extracting_mod = runtime_graph.extracting_mod;
     const client_mod = runtime_graph.inference_client_mod;
     const inference_internal_mod = runtime_graph.inference_internal_mod;
 
@@ -503,7 +504,10 @@ pub fn build(b: *std.Build) void {
     gliner2_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
     gliner2_bench_exe.root_module.addImport("antfly_platform", platform_mod);
     gliner2_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
-    configureNativeTool(b, gliner2_bench_exe, target, enable_system_blas, blas_root, enable_metal);
+    // inference_internal already owns the native backend linkage, including
+    // metal_kernels.m. Linking it again at the executable root produces
+    // duplicate Metal symbols in these standalone benchmark tools.
+    gliner2_bench_exe.root_module.link_libc = true;
     configureOnnxRuntime(b, gliner2_bench_exe.root_module, enable_onnx, effective_onnx_root);
     const run_gliner2_bench = b.addRunArtifact(gliner2_bench_exe);
     if (b.args) |args| {
@@ -530,7 +534,7 @@ pub fn build(b: *std.Build) void {
     gliner2_e2e_bench_exe.root_module.addImport("protobuf", protobuf_mod);
     gliner2_e2e_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
     gliner2_e2e_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
-    configureNativeTool(b, gliner2_e2e_bench_exe, target, enable_system_blas, blas_root, enable_metal);
+    gliner2_e2e_bench_exe.root_module.link_libc = true;
     configureOnnxRuntime(b, gliner2_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);
     const run_gliner2_e2e_bench = b.addRunArtifact(gliner2_e2e_bench_exe);
     if (b.args) |args| {
@@ -611,7 +615,7 @@ pub fn build(b: *std.Build) void {
     reranker_e2e_bench_exe.root_module.addImport("protobuf", protobuf_mod);
     reranker_e2e_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
     reranker_e2e_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
-    configureNativeTool(b, reranker_e2e_bench_exe, target, enable_system_blas, blas_root, enable_metal);
+    reranker_e2e_bench_exe.root_module.link_libc = true;
     configureOnnxRuntime(b, reranker_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);
     const run_reranker_e2e_bench = b.addRunArtifact(reranker_e2e_bench_exe);
     if (b.args) |args| {
@@ -640,7 +644,8 @@ pub fn build(b: *std.Build) void {
 
     // Tests
     const runtime_test_filter = b.option(bool, "runtime-test-filter", "Build unit tests with a simple runtime-filtering test runner") orelse false;
-    const main_test_filters = if (runtime_test_filter) &.{} else selectTestFilters(b, &.{});
+    const selected_test_filters = selectTestFilters(b, &.{});
+    const main_test_filters = if (runtime_test_filter) &.{} else selected_test_filters;
     const runtime_filter_test_runner: std.Build.Step.Compile.TestRunner = .{
         .path = b.path("src/test_runner_filter.zig"),
         .mode = .simple,
@@ -658,6 +663,8 @@ pub fn build(b: *std.Build) void {
     tests.root_module.addImport("httpx", httpx_mod);
     tests.root_module.addImport("inference_api", inference_api_mod);
     tests.root_module.addImport("antfly_generating_openapi", generating_openapi_mod);
+    tests.root_module.addImport("antfly_extraction_openapi", extraction_openapi_mod);
+    tests.root_module.addImport("antfly_extracting", extracting_mod);
     tests.root_module.addImport("inference_audio", inference_audio_mod);
     tests.root_module.addImport("inference_chunker", inference_chunker_mod);
     tests.root_module.addImport("jinja", jinja_mod);
@@ -711,9 +718,10 @@ pub fn build(b: *std.Build) void {
     finetune_tests.register(finetune_ctx);
 
     const run_tests = b.addRunArtifact(tests);
-    if (runtime_test_filter) {
-        if (b.args) |args| run_tests.addArgs(args);
+    for (selected_test_filters) |filter| {
+        run_tests.addArgs(&.{ "--test-filter", filter });
     }
+    build_test_filters.addRuntimeControls(run_tests, b.args orelse &.{});
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
     const install_tests = b.addInstallArtifact(tests, .{
@@ -842,8 +850,21 @@ pub fn build(b: *std.Build) void {
     });
     tok_tests.root_module.addImport("sentencepiece_proto", sentencepiece_proto_mod);
     const run_tok_tests = b.addRunArtifact(tok_tests);
+
+    const hf_tok_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(b.fmt("{s}/lib/tokenizer/src/hf_tokenizer.zig", .{shared_lib_root})),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    hf_tok_tests.root_module.addImport("sentencepiece_proto", sentencepiece_proto_mod);
+    const run_hf_tok_tests = b.addRunArtifact(hf_tok_tests);
+
     const tok_test_step = b.step("test-tokenizer", "Run tokenizer tests");
     tok_test_step.dependOn(&run_tok_tests.step);
+    tok_test_step.dependOn(&run_hf_tok_tests.step);
 
     const audio_tests = b.addTest(.{
         .root_module = b.createModule(.{

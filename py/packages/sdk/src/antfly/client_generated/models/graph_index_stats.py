@@ -38,7 +38,7 @@ class GraphIndexStats:
         backfill_active (bool | Unset): Whether the index is actively rebuilding, materializing, or catching up.
         backfill_progress (float | Unset): Rebuild progress as a ratio from 0.0 to 1.0
         backfill_items_processed (int | Unset): Number of edges indexed during current rebuild
-        backfill_state (str | Unset): Operational readiness state such as ready, running, retrying, or failed.
+        backfill_state (str | Unset): Operational readiness state such as ready, running, retrying, degraded, or failed.
         doc_count (int | Unset): Number of documents covered by the graph index.
         edge_count (int | Unset): Number of graph edges currently indexed.
         node_count (int | Unset): Number of graph nodes currently indexed.
@@ -61,8 +61,8 @@ class GraphIndexStats:
         projection_checkpoint_applied_sequence (int | Unset): Highest derived-log sequence covered by the durable
             projection checkpoint.
         projection_checkpoint_generation (int | Unset): Projection generation associated with the durable checkpoint.
-        projection_checkpoint_config_hash (int | Unset): Projection configuration identity associated with the durable
-            checkpoint.
+        projection_checkpoint_config_fingerprint (str | Unset): Projection configuration identity associated with the
+            durable checkpoint.
         checkpoint_replay_tail_sequence_count (int | Unset): Number of derived-log sequences after the durable
             checkpoint that still need replay.
         repair_scan_issue_count (int | Unset): Repair issues found by explicit repair-scan accounting for this
@@ -114,7 +114,7 @@ class GraphIndexStats:
     projection_checkpoint_status: str | Unset = UNSET
     projection_checkpoint_applied_sequence: int | Unset = UNSET
     projection_checkpoint_generation: int | Unset = UNSET
-    projection_checkpoint_config_hash: int | Unset = UNSET
+    projection_checkpoint_config_fingerprint: str | Unset = UNSET
     checkpoint_replay_tail_sequence_count: int | Unset = UNSET
     repair_scan_issue_count: int | Unset = UNSET
     term_count: int | Unset = UNSET
@@ -204,7 +204,7 @@ class GraphIndexStats:
 
         projection_checkpoint_generation = self.projection_checkpoint_generation
 
-        projection_checkpoint_config_hash = self.projection_checkpoint_config_hash
+        projection_checkpoint_config_fingerprint = self.projection_checkpoint_config_fingerprint
 
         checkpoint_replay_tail_sequence_count = self.checkpoint_replay_tail_sequence_count
 
@@ -309,8 +309,8 @@ class GraphIndexStats:
             field_dict["projection_checkpoint_applied_sequence"] = projection_checkpoint_applied_sequence
         if projection_checkpoint_generation is not UNSET:
             field_dict["projection_checkpoint_generation"] = projection_checkpoint_generation
-        if projection_checkpoint_config_hash is not UNSET:
-            field_dict["projection_checkpoint_config_hash"] = projection_checkpoint_config_hash
+        if projection_checkpoint_config_fingerprint is not UNSET:
+            field_dict["projection_checkpoint_config_fingerprint"] = projection_checkpoint_config_fingerprint
         if checkpoint_replay_tail_sequence_count is not UNSET:
             field_dict["checkpoint_replay_tail_sequence_count"] = checkpoint_replay_tail_sequence_count
         if repair_scan_issue_count is not UNSET:
@@ -443,7 +443,7 @@ class GraphIndexStats:
 
         projection_checkpoint_generation = d.pop("projection_checkpoint_generation", UNSET)
 
-        projection_checkpoint_config_hash = d.pop("projection_checkpoint_config_hash", UNSET)
+        projection_checkpoint_config_fingerprint = d.pop("projection_checkpoint_config_fingerprint", UNSET)
 
         checkpoint_replay_tail_sequence_count = d.pop("checkpoint_replay_tail_sequence_count", UNSET)
 
@@ -523,7 +523,7 @@ class GraphIndexStats:
             projection_checkpoint_status=projection_checkpoint_status,
             projection_checkpoint_applied_sequence=projection_checkpoint_applied_sequence,
             projection_checkpoint_generation=projection_checkpoint_generation,
-            projection_checkpoint_config_hash=projection_checkpoint_config_hash,
+            projection_checkpoint_config_fingerprint=projection_checkpoint_config_fingerprint,
             checkpoint_replay_tail_sequence_count=checkpoint_replay_tail_sequence_count,
             repair_scan_issue_count=repair_scan_issue_count,
             term_count=term_count,

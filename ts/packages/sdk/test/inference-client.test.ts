@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { InferenceClient, serializeEmbeddings } from "../src/index.js";
+import { InferenceCapacityError, InferenceClient, serializeEmbeddings } from "../src/index.js";
 
 describe("InferenceClient", () => {
   it("should create a client with base config", () => {
@@ -32,7 +32,7 @@ describe("InferenceClient", () => {
     expect(typeof client.extract).toBe("function");
     expect(typeof client.extractRaw).toBe("function");
     expect(typeof client.classify).toBe("function");
-    expect(typeof client.recognize).toBe("function");
+    expect(typeof client.extractEntities).toBe("function");
     expect(typeof client.rewrite).toBe("function");
     expect(typeof client.transcribe).toBe("function");
     expect(typeof client.listModels).toBe("function");
@@ -143,6 +143,34 @@ describe("InferenceClient with mock fetch", () => {
 
       await expect(client.embed("invalid-model", ["test"])).rejects.toThrow();
     });
+
+    it("should preserve structured transient capacity errors", async () => {
+      const capacity = {
+        error: "MODEL_RESOURCE_BUSY",
+        message: "insufficient inference capacity is currently available",
+        reason: "inference_capacity",
+        retryable: true,
+        retry_after_ms: 1000,
+      };
+      vi.mocked(fetch).mockResolvedValueOnce({
+        ok: false,
+        status: 503,
+        json: () => Promise.resolve(capacity),
+        text: () => Promise.resolve(JSON.stringify(capacity)),
+        headers: new Headers({ "Content-Type": "application/json", "Retry-After": "1" }),
+      } as Response);
+
+      const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
+      const error = await client.embed("busy-model", ["test"]).catch((caught: unknown) => caught);
+
+      expect(error).toBeInstanceOf(InferenceCapacityError);
+      expect(error).toMatchObject({
+        code: "MODEL_RESOURCE_BUSY",
+        reason: "inference_capacity",
+        retryable: true,
+        retryAfterMs: 1000,
+      });
+    });
   });
 
   describe("embedBinary (binary response)", () => {
@@ -181,6 +209,30 @@ describe("InferenceClient with mock fetch", () => {
       expect(options?.headers).toBeDefined();
       const headers = options?.headers as Record<string, string>;
       expect(headers.Accept).toBe("application/octet-stream");
+    });
+
+    it("should parse capacity metadata from JSON error responses", async () => {
+      const capacity = {
+        error: "SERVICE_UNAVAILABLE",
+        message: "server at capacity, try again later",
+        reason: "request_queue",
+        retryable: true,
+        retry_after_ms: 1000,
+      };
+      vi.mocked(fetch).mockResolvedValueOnce({
+        ok: false,
+        status: 503,
+        text: () => Promise.resolve(JSON.stringify(capacity)),
+        headers: new Headers({ "Content-Type": "application/json", "Retry-After": "1" }),
+      } as Response);
+
+      const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
+      const error = await client
+        .embedBinary("busy-model", ["test"])
+        .catch((caught: unknown) => caught);
+
+      expect(error).toBeInstanceOf(InferenceCapacityError);
+      expect(error).toMatchObject({ reason: "request_queue", retryAfterMs: 1000 });
     });
 
     it("should handle empty embeddings in binary response", async () => {
@@ -425,7 +477,7 @@ describe("InferenceClient with mock fetch", () => {
       });
     });
 
-    it("should recognize entities through the canonical extract endpoint", async () => {
+    it("should extract entities through the canonical extract endpoint", async () => {
       const mockResponse = {
         object: "extraction",
         model: "gliner2-base-v1",
@@ -448,7 +500,7 @@ describe("InferenceClient with mock fetch", () => {
       } as Response);
 
       const client = new InferenceClient({ baseUrl: "http://localhost:8080/api" });
-      const result = await client.recognize(
+      const result = await client.extractEntities(
         "gliner2-base-v1",
         ["John Smith works at Google."],
         ["person", "company"]

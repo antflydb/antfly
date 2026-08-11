@@ -33,6 +33,7 @@ pub const Storage = impl.Storage;
 pub const HostStorage = storage_io.HostStorage;
 pub const MemoryStorage = storage_io.MemoryStorage;
 pub const NativeStorageStats = impl.NativeStorageStats;
+pub const WalCheckpointRetryReason = impl.WalCheckpointRetryReason;
 pub const Cache = impl.Cache;
 pub const DefaultCacheSizeBytes = impl.DefaultCacheSizeBytes;
 pub const TableEntry = impl.TableEntry;
@@ -42,10 +43,15 @@ pub const reader_pin_kind_count = impl.reader_pin_kind_count;
 pub const readerPinKindName = impl.readerPinKindName;
 pub const mutableSnapshotReasonName = impl.mutableSnapshotReasonName;
 
-test {
-    _ = impl;
-    _ = cache;
-    _ = wal;
-    _ = background;
-    _ = compaction_scheduler;
+test "lsm backend module tests are reachable" {
+    const std = @import("std");
+    std.testing.refAllDecls(impl);
+    std.testing.refAllDecls(cache);
+    std.testing.refAllDecls(repository);
+    std.testing.refAllDecls(compaction);
+    std.testing.refAllDecls(storage_io);
+    std.testing.refAllDecls(wal);
+    std.testing.refAllDecls(background);
+    std.testing.refAllDecls(compaction_scheduler);
+    std.testing.refAllDecls(@import("../sim_runtime.zig"));
 }

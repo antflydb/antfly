@@ -54,6 +54,7 @@ from .batch_request import BatchRequest
 from .batch_request_inserts import BatchRequestInserts
 from .batch_request_inserts_additional_property import BatchRequestInsertsAdditionalProperty
 from .batch_response import BatchResponse
+from .batch_response_status import BatchResponseStatus
 from .bedrock_embedder_config import BedrockEmbedderConfig
 from .bedrock_generator_config import BedrockGeneratorConfig
 from .bool_field_query import BoolFieldQuery
@@ -164,7 +165,6 @@ from .embedding_type_3 import EmbeddingType3
 from .embeddings_index_config import EmbeddingsIndexConfig
 from .embeddings_index_stats import EmbeddingsIndexStats
 from .embeddings_index_stats_async_indexing import EmbeddingsIndexStatsAsyncIndexing
-from .embeddings_index_stats_enrichment_runtime import EmbeddingsIndexStatsEnrichmentRuntime
 from .embeddings_index_stats_hbc_cache import EmbeddingsIndexStatsHbcCache
 from .embeddings_index_stats_hbc_posting import EmbeddingsIndexStatsHbcPosting
 from .embeddings_index_stats_index_type import EmbeddingsIndexStatsIndexType
@@ -172,6 +172,7 @@ from .embeddings_index_stats_promotion import EmbeddingsIndexStatsPromotion
 from .embeddings_index_stats_resolution import EmbeddingsIndexStatsResolution
 from .enrichment_config import EnrichmentConfig
 from .enrichment_kind import EnrichmentKind
+from .enrichment_runtime_status import EnrichmentRuntimeStatus
 from .error import Error
 from .eval_config import EvalConfig
 from .eval_options import EvalOptions
@@ -210,12 +211,14 @@ from .extraction_relation import ExtractionRelation
 from .extraction_relation_endpoint import ExtractionRelationEndpoint
 from .extraction_relation_schema import ExtractionRelationSchema
 from .extraction_request import ExtractionRequest
+from .extraction_resolver_options import ExtractionResolverOptions
 from .extraction_response import ExtractionResponse
 from .extraction_response_object import ExtractionResponseObject
 from .extraction_response_usage import ExtractionResponseUsage
 from .extraction_schema import ExtractionSchema
 from .extraction_schema_structures import ExtractionSchemaStructures
 from .extraction_structure_field_type_1 import ExtractionStructureFieldType1
+from .extraction_structure_field_type_1_type import ExtractionStructureFieldType1Type
 from .extraction_structure_schema import ExtractionStructureSchema
 from .extraction_structure_schema_fields import ExtractionStructureSchemaFields
 from .extraction_token import ExtractionToken
@@ -319,6 +322,7 @@ from .inference_embedding_object import InferenceEmbeddingObject
 from .inference_embedding_object_object import InferenceEmbeddingObjectObject
 from .inference_embedding_usage import InferenceEmbeddingUsage
 from .inference_error import InferenceError
+from .inference_error_reason import InferenceErrorReason
 from .inference_finish_reason import InferenceFinishReason
 from .inference_function_definition import InferenceFunctionDefinition
 from .inference_function_definition_parameters import InferenceFunctionDefinitionParameters
@@ -369,7 +373,6 @@ from .inference_models_response_extractors import InferenceModelsResponseExtract
 from .inference_models_response_generators import InferenceModelsResponseGenerators
 from .inference_models_response_object import InferenceModelsResponseObject
 from .inference_models_response_readers import InferenceModelsResponseReaders
-from .inference_models_response_recognizers import InferenceModelsResponseRecognizers
 from .inference_models_response_rerankers import InferenceModelsResponseRerankers
 from .inference_models_response_rewriters import InferenceModelsResponseRewriters
 from .inference_models_response_transcribers import InferenceModelsResponseTranscribers
@@ -422,11 +425,16 @@ from .inference_transcribe_object_object import InferenceTranscribeObjectObject
 from .inference_transcribe_request import InferenceTranscribeRequest
 from .inference_transcribe_response import InferenceTranscribeResponse
 from .inference_transcribe_response_object import InferenceTranscribeResponseObject
+from .inference_transient_capacity_error import InferenceTransientCapacityError
+from .inference_transient_capacity_error_reason import InferenceTransientCapacityErrorReason
 from .inferenceschemas_config import InferenceschemasConfig
 from .install_extension_request import InstallExtensionRequest
 from .install_manifest import InstallManifest
 from .installed_extension import InstalledExtension
 from .installed_extension_status import InstalledExtensionStatus
+from .invoke_inference_connection_body import InvokeInferenceConnectionBody
+from .invoke_inference_connection_operation import InvokeInferenceConnectionOperation
+from .invoke_inference_connection_response_200 import InvokeInferenceConnectionResponse200
 from .ip_range_query import IPRangeQuery
 from .join_condition import JoinCondition
 from .join_operator import JoinOperator
@@ -454,7 +462,6 @@ from .match_none_query import MatchNoneQuery
 from .match_none_query_match_none import MatchNoneQueryMatchNone
 from .match_phrase_query import MatchPhraseQuery
 from .match_query import MatchQuery
-from .match_query_operator import MatchQueryOperator
 from .media_content_part import MediaContentPart
 from .media_content_part_type import MediaContentPartType
 from .merge_config import MergeConfig
@@ -464,6 +471,7 @@ from .merge_strategy import MergeStrategy
 from .multi_batch_request import MultiBatchRequest
 from .multi_batch_request_tables import MultiBatchRequestTables
 from .multi_batch_response import MultiBatchResponse
+from .multi_batch_response_status import MultiBatchResponseStatus
 from .multi_batch_response_tables import MultiBatchResponseTables
 from .multi_match_body import MultiMatchBody
 from .multi_match_body_type import MultiMatchBodyType
@@ -557,6 +565,7 @@ from .role_assignment import RoleAssignment
 from .route_type import RouteType
 from .row_filter_entry import RowFilterEntry
 from .row_filter_entry_filter import RowFilterEntryFilter
+from .runtime_config_status import RuntimeConfigStatus
 from .runtime_decl import RuntimeDecl
 from .runtime_decl_mode import RuntimeDeclMode
 from .secret_entry import SecretEntry
@@ -610,6 +619,8 @@ from .table_schema import TableSchema
 from .table_schema_document_schemas import TableSchemaDocumentSchemas
 from .table_statistics import TableStatistics
 from .table_statistics_field_stats import TableStatisticsFieldStats
+from .table_storage_unreadable_error import TableStorageUnreadableError
+from .table_storage_unreadable_error_code import TableStorageUnreadableErrorCode
 from .tavily_search_config import TavilySearchConfig
 from .tavily_search_config_search_depth import TavilySearchConfigSearchDepth
 from .template_field_mapping import TemplateFieldMapping
@@ -627,9 +638,13 @@ from .transaction_begin_response import TransactionBeginResponse
 from .transaction_commit_request import TransactionCommitRequest
 from .transaction_commit_request_tables import TransactionCommitRequestTables
 from .transaction_commit_response import TransactionCommitResponse
-from .transaction_commit_response_conflict import TransactionCommitResponseConflict
 from .transaction_commit_response_status import TransactionCommitResponseStatus
 from .transaction_commit_response_tables import TransactionCommitResponseTables
+from .transaction_conflict import TransactionConflict
+from .transaction_conflict_kind import TransactionConflictKind
+from .transaction_conflict_participant import TransactionConflictParticipant
+from .transaction_conflict_participant_phase import TransactionConflictParticipantPhase
+from .transaction_conflict_retry_scope import TransactionConflictRetryScope
 from .transaction_read_item import TransactionReadItem
 from .transaction_savepoint_response import TransactionSavepointResponse
 from .transaction_session_cleanup_response import TransactionSessionCleanupResponse
@@ -726,6 +741,7 @@ __all__ = (
     "BatchRequestInserts",
     "BatchRequestInsertsAdditionalProperty",
     "BatchResponse",
+    "BatchResponseStatus",
     "BedrockEmbedderConfig",
     "BedrockGeneratorConfig",
     "BooleanQuery",
@@ -832,7 +848,6 @@ __all__ = (
     "EmbeddingsIndexConfig",
     "EmbeddingsIndexStats",
     "EmbeddingsIndexStatsAsyncIndexing",
-    "EmbeddingsIndexStatsEnrichmentRuntime",
     "EmbeddingsIndexStatsHbcCache",
     "EmbeddingsIndexStatsHbcPosting",
     "EmbeddingsIndexStatsIndexType",
@@ -842,6 +857,7 @@ __all__ = (
     "EmbeddingType3",
     "EnrichmentConfig",
     "EnrichmentKind",
+    "EnrichmentRuntimeStatus",
     "Error",
     "EvalConfig",
     "EvalOptions",
@@ -880,12 +896,14 @@ __all__ = (
     "ExtractionRelationEndpoint",
     "ExtractionRelationSchema",
     "ExtractionRequest",
+    "ExtractionResolverOptions",
     "ExtractionResponse",
     "ExtractionResponseObject",
     "ExtractionResponseUsage",
     "ExtractionSchema",
     "ExtractionSchemaStructures",
     "ExtractionStructureFieldType1",
+    "ExtractionStructureFieldType1Type",
     "ExtractionStructureSchema",
     "ExtractionStructureSchemaFields",
     "ExtractionToken",
@@ -989,6 +1007,7 @@ __all__ = (
     "InferenceEmbedResponse",
     "InferenceEmbedResponseObject",
     "InferenceError",
+    "InferenceErrorReason",
     "InferenceFinishReason",
     "InferenceFunctionDefinition",
     "InferenceFunctionDefinitionParameters",
@@ -1039,7 +1058,6 @@ __all__ = (
     "InferenceModelsResponseGenerators",
     "InferenceModelsResponseObject",
     "InferenceModelsResponseReaders",
-    "InferenceModelsResponseRecognizers",
     "InferenceModelsResponseRerankers",
     "InferenceModelsResponseRewriters",
     "InferenceModelsResponseTranscribers",
@@ -1093,10 +1111,15 @@ __all__ = (
     "InferenceTranscribeRequest",
     "InferenceTranscribeResponse",
     "InferenceTranscribeResponseObject",
+    "InferenceTransientCapacityError",
+    "InferenceTransientCapacityErrorReason",
     "InstalledExtension",
     "InstalledExtensionStatus",
     "InstallExtensionRequest",
     "InstallManifest",
+    "InvokeInferenceConnectionBody",
+    "InvokeInferenceConnectionOperation",
+    "InvokeInferenceConnectionResponse200",
     "IPRangeQuery",
     "JoinCondition",
     "JoinOperator",
@@ -1124,7 +1147,6 @@ __all__ = (
     "MatchNoneQueryMatchNone",
     "MatchPhraseQuery",
     "MatchQuery",
-    "MatchQueryOperator",
     "MediaContentPart",
     "MediaContentPartType",
     "MergeConfig",
@@ -1134,6 +1156,7 @@ __all__ = (
     "MultiBatchRequest",
     "MultiBatchRequestTables",
     "MultiBatchResponse",
+    "MultiBatchResponseStatus",
     "MultiBatchResponseTables",
     "MultiMatchBody",
     "MultiMatchBodyType",
@@ -1227,6 +1250,7 @@ __all__ = (
     "RouteType",
     "RowFilterEntry",
     "RowFilterEntryFilter",
+    "RuntimeConfigStatus",
     "RuntimeDecl",
     "RuntimeDeclMode",
     "SecretEntry",
@@ -1280,6 +1304,8 @@ __all__ = (
     "TableSchemaDocumentSchemas",
     "TableStatistics",
     "TableStatisticsFieldStats",
+    "TableStorageUnreadableError",
+    "TableStorageUnreadableErrorCode",
     "TavilySearchConfig",
     "TavilySearchConfigSearchDepth",
     "TemplateFieldMapping",
@@ -1297,9 +1323,13 @@ __all__ = (
     "TransactionCommitRequest",
     "TransactionCommitRequestTables",
     "TransactionCommitResponse",
-    "TransactionCommitResponseConflict",
     "TransactionCommitResponseStatus",
     "TransactionCommitResponseTables",
+    "TransactionConflict",
+    "TransactionConflictKind",
+    "TransactionConflictParticipant",
+    "TransactionConflictParticipantPhase",
+    "TransactionConflictRetryScope",
     "TransactionReadItem",
     "TransactionSavepointResponse",
     "TransactionSessionCleanupResponse",

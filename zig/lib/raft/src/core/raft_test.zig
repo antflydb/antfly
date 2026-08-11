@@ -491,6 +491,73 @@ test "leader provides snapshot to active follower behind compaction" {
     try std.testing.expectEqual(@as(types.Index, 11), fixture.raft.messages.items[0].snapshot.?.metadata.index);
 }
 
+test "leader incrementally catches up follower within retained snapshot suffix" {
+    var storage = storage_mod.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    var voters = [_]types.NodeId{ 1, 2 };
+    try storage.seedConfState(.{ .voters = voters[0..] });
+    var entries: [11]types.Entry = undefined;
+    for (&entries, 1..) |*entry, index| {
+        entry.* = .{ .index = @intCast(index), .term = @intCast(index) };
+    }
+    try storage.append(&entries);
+    try storage.compactToSnapshot(.{
+        .metadata = .{
+            .index = 11,
+            .term = 11,
+            .conf_state = .{ .voters = voters[0..] },
+        },
+        .data = @constCast("latest-state"),
+    }, 7);
+    storage.setHardState(.{ .current_term = 11, .commit_index = 11 });
+
+    var raft = try raft_mod.Raft.init(std.testing.allocator, .{
+        .id = 1,
+        .group_id = 1,
+        .peers = &.{ 1, 2 },
+        .election_tick = 10,
+        .heartbeat_tick = 1,
+        .check_quorum = false,
+        .pre_vote = false,
+    }, storage.storage());
+    defer raft.deinit();
+
+    try raft.campaign();
+    clearMessages(&raft);
+    try raft.step(.{
+        .msg_type = .request_vote_response,
+        .from = 2,
+        .to = 1,
+        .term = 12,
+    });
+    clearMessages(&raft);
+
+    raft.progress[1] = .{
+        .match_index = 7,
+        .next_index = 8,
+        .state = .probe,
+        .recent_active = true,
+    };
+    try raft.step(.{
+        .msg_type = .append_entries_response,
+        .from = 2,
+        .to = 1,
+        .term = 12,
+        .log_index = 7,
+        .reject = true,
+        .reject_hint = 8,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), raft.messages.items.len);
+    const append = raft.messages.items[0];
+    try std.testing.expectEqual(message_mod.MessageType.append_entries, append.msg_type);
+    try std.testing.expectEqual(@as(types.Index, 7), append.log_index);
+    try std.testing.expectEqual(@as(types.Term, 7), append.log_term);
+    try std.testing.expect(append.entries.len > 0);
+    try std.testing.expectEqual(@as(types.Index, 8), append.entries[0].index);
+}
+
 test "leader ignores providing snapshot to inactive follower" {
     var fixture = try initLeaderFromSnapshot();
     defer fixture.raft.deinit();
@@ -717,6 +784,33 @@ test "max_uncommitted_entries_size drops new proposals until committed entries a
     try std.testing.expectEqual(@as(usize, 1), fixture.raft.uncommitted_size);
 }
 
+test "proposal receipt survives replication dispatch allocation failure" {
+    var fixture = try initLeaderFromSnapshot();
+    defer fixture.raft.deinit();
+    defer fixture.storage.deinit();
+
+    // The first Raft allocation owns the candidate entry. RaftLog uses its
+    // stable allocator to append it; the second Raft allocation clones entries
+    // for the peer message and fails after local acceptance.
+    fixture.raft.messages.clearAndFree(std.testing.allocator);
+    fixture.raft.progress[1].probe_sent = false;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    fixture.raft.alloc = failing.allocator();
+    defer fixture.raft.alloc = std.testing.allocator;
+    var accepted_index: ?types.Index = null;
+    const expected_index = fixture.raft.status().last_index + 1;
+    try std.testing.expectError(error.OutOfMemory, fixture.raft.proposeWithReceipt("accepted-before-dispatch", &accepted_index));
+    fixture.raft.alloc = std.testing.allocator;
+
+    try std.testing.expectEqual(@as(?types.Index, expected_index), accepted_index);
+    try std.testing.expectEqual(expected_index, fixture.raft.status().last_index);
+
+    // A pre-append rejection always clears a reused receipt.
+    fixture.raft.lead_transferee = 2;
+    try std.testing.expectError(error.LeaderTransferInProgress, fixture.raft.proposeWithReceipt("rejected", &accepted_index));
+    try std.testing.expect(accepted_index == null);
+}
+
 test "max_committed_size_per_ready paginates committed entries without gaps" {
     var storage = storage_mod.MemoryStorage.init(std.testing.allocator);
     defer storage.deinit();
@@ -855,6 +949,37 @@ test "applying voter changes keeps all peer-indexed leader state aligned" {
     _ = try raft.applyConfChange(.{ .change_type = .remove_node, .node_id = 1 });
     try std.testing.expectEqualSlices(types.NodeId, &.{ 2, 3 }, raft.status().conf_state.voters);
     try raft.propose("still-aligned");
+}
+
+test "removed leader rejects proposals without mutating its log" {
+    var storage = storage_mod.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    try storage.seedConfState(.{ .voters = @constCast((&[_]types.NodeId{1})[0..]) });
+
+    var raft = try raft_mod.Raft.init(std.testing.allocator, .{
+        .id = 1,
+        .group_id = 1,
+        .peers = &.{1},
+        .election_tick = 3,
+        .heartbeat_tick = 1,
+        .check_quorum = false,
+        .pre_vote = false,
+        .step_down_on_removal = false,
+    }, storage.storage());
+    defer raft.deinit();
+
+    try raft.campaign();
+    _ = try raft.applyConfChange(.{ .change_type = .add_node, .node_id = 2 });
+    _ = try raft.applyConfChange(.{ .change_type = .remove_node, .node_id = 1 });
+
+    const last_index = raft.status().last_index;
+    try std.testing.expectEqual(types.StateRole.leader, raft.status().soft.role);
+    try std.testing.expectError(error.NotLeader, raft.propose("must-not-append"));
+    var changes = [_]types.ConfChangeSingle{.{ .change_type = .add_node, .node_id = 3 }};
+    try std.testing.expectError(error.NotLeader, raft.proposeConfChangeV2(.{
+        .changes = changes[0..],
+    }));
+    try std.testing.expectEqual(last_index, raft.status().last_index);
 }
 
 test "memory storage compaction preserves snapshot term and trimmed bounds" {

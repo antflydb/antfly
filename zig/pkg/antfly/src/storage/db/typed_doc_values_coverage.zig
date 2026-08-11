@@ -63,12 +63,16 @@ pub fn readerCoversLiveDocsAlloc(
         }
     }
 
-    for (0..doc_count) |local_doc_id| {
-        const local_doc_u32: u32 = @intCast(local_doc_id);
-        if (segment.shared.deleted) |deleted| {
-            if (deleted.contains(local_doc_u32)) continue;
+    {
+        segment.shared.lockDeletionShared();
+        defer segment.shared.unlockDeletionShared();
+        for (0..doc_count) |local_doc_id| {
+            const local_doc_u32: u32 = @intCast(local_doc_id);
+            if (segment.shared.deleted) |deleted| {
+                if (deleted.contains(local_doc_u32)) continue;
+            }
+            if (!present.isSet(local_doc_id)) return .sparse_live_doc_values;
         }
-        if (!present.isSet(local_doc_id)) return .sparse_live_doc_values;
     }
     return .covered;
 }

@@ -68,7 +68,10 @@ fn bucketPathFromSchemeAlloc(alloc: Allocator, uri: []const u8, prefix: []const 
     const slash = std.mem.indexOfScalar(u8, rest, '/');
     const bucket = if (slash) |idx| rest[0..idx] else rest;
     if (bucket.len == 0) return error.InvalidRemoteUri;
-    const object_prefix = if (slash) |idx| trimLeftSlash(rest[idx + 1 ..]) else "";
+    const object_prefix = if (slash) |idx|
+        trimRightSlash(trimLeftSlash(rest[idx + 1 ..]))
+    else
+        "";
 
     return .{
         .bucket = try alloc.dupe(u8, bucket),
@@ -99,6 +102,25 @@ test "remote uri parses s3 scheme" {
     try std.testing.expectEqualStrings("manifests/prod", bucket_path.prefix);
 }
 
+test "remote uri canonicalizes object prefix separators" {
+    const alloc = std.testing.allocator;
+    inline for (&.{
+        .{ "s3://bucket/prefix", "prefix" },
+        .{ "s3://bucket/prefix/", "prefix" },
+        .{ "s3://bucket/", "" },
+        .{ "s3://bucket/prefix//nested/", "prefix//nested" },
+    }) |case| {
+        var bucket_path = try bucketPathFromS3UriAlloc(alloc, case[0]);
+        defer bucket_path.deinit(alloc);
+        try std.testing.expectEqualStrings("bucket", bucket_path.bucket);
+        try std.testing.expectEqualStrings(case[1], bucket_path.prefix);
+    }
+
+    var gcs_bucket_path = try bucketPathFromGsUriAlloc(alloc, "gs://bucket/prefix/");
+    defer gcs_bucket_path.deinit(alloc);
+    try std.testing.expectEqualStrings("prefix", gcs_bucket_path.prefix);
+}
+
 test "remote uri parse alloc returns tagged result" {
     const alloc = std.testing.allocator;
     var parsed = try parseAlloc(alloc, "gs://bucket/path");
@@ -113,4 +135,10 @@ fn trimLeftSlash(value: []const u8) []const u8 {
     var idx: usize = 0;
     while (idx < value.len and value[idx] == '/') : (idx += 1) {}
     return value[idx..];
+}
+
+fn trimRightSlash(value: []const u8) []const u8 {
+    var end = value.len;
+    while (end > 0 and value[end - 1] == '/') : (end -= 1) {}
+    return value[0..end];
 }

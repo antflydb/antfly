@@ -32,7 +32,7 @@ const { wasm, alloc, free, bytesIn, write, read, size } = await instantiateAntfl
 
 // --- Model paths ---
 
-const modelDir = path.join(root, 'models', 'recognizers', 'fastino', 'gliner2-base-v1');
+const modelDir = path.join(root, 'models', 'extractors', 'fastino', 'gliner2-base-v1');
 const tokenizerPath = path.join(modelDir, 'tokenizer.json');
 const modelPath = path.join(modelDir, 'model.safetensors');
 const configPath = path.join(modelDir, 'config.json');

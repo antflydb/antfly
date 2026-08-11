@@ -4974,6 +4974,18 @@ spec:
                   - type
                   type: object
                 type: array
+              configPublication:
+                properties:
+                  observedGeneration:
+                    format: int64
+                    type: integer
+                  sha256:
+                    pattern: ^[0-9a-f]{64}$
+                    type: string
+                required:
+                - observedGeneration
+                - sha256
+                type: object
               dataNodesReady:
                 format: int32
                 type: integer

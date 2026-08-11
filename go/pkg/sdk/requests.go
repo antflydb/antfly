@@ -41,7 +41,7 @@ type BatchRequest struct {
 	// Transform operations allow you to modify documents without read-modify-write races:
 	// - Operations are applied atomically on the server
 	// - Multiple operations per document are applied in sequence
-	// - Supports numeric operations ($inc, $mul, $min, $max), array operations ($push, $pull), and more
+	// - Supports $set, $setOnInsert, $unset, $inc, $addToSet, and $max
 	Transforms []Transform `json:"transforms,omitempty"`
 
 	// SyncLevel Synchronization level for the batch operation:
@@ -55,6 +55,11 @@ type BatchRequest struct {
 
 // BatchResult represents the result of a batch operation with detailed failure information
 type BatchResult struct {
+	// Status is "committed" or "committed_pending". A pending result has a
+	// durable commit decision but has not yet reached the requested visibility
+	// or participant-recovery barrier.
+	Status string `json:"status,omitempty"`
+
 	// Deleted Number of documents successfully deleted
 	Deleted int `json:"deleted,omitempty"`
 
@@ -304,13 +309,24 @@ type MultiBatchRequest struct {
 
 // MultiBatchResult represents the result of a cross-table batch operation.
 type MultiBatchResult struct {
+	// Status is "committed", "committed_visibility_pending",
+	// "committed_recovery_pending", or "aborted". "committed_pending" is
+	// used as a generic fallback when an older server returns HTTP 202 without
+	// a status field.
+	Status string `json:"status,omitempty"`
+
+	// Conflict describes why the atomic batch was aborted. It is present only
+	// when Status is "aborted".
+	Conflict *TransactionConflict `json:"conflict,omitempty"`
+
 	// Tables maps table names to their batch results.
 	Tables map[string]BatchResult `json:"tables,omitempty"`
 }
 
 // TransactionCommitResult represents the result of an OCC transaction commit.
 type TransactionCommitResult struct {
-	// Status is "committed" or "aborted".
+	// Status is "committed", "committed_visibility_pending",
+	// "committed_recovery_pending", or "aborted".
 	Status string `json:"status"`
 
 	// Conflict details (only present when status is "aborted").
@@ -320,9 +336,55 @@ type TransactionCommitResult struct {
 	Tables map[string]BatchResult `json:"tables,omitempty"`
 }
 
-// TransactionConflict describes a version conflict that caused a transaction abort.
+// TransactionConflictKind is the stable machine-readable transaction conflict classification.
+type TransactionConflictKind string
+
+const (
+	TransactionConflictVersionConflict        TransactionConflictKind = "version_conflict"
+	TransactionConflictIntentConflict         TransactionConflictKind = "intent_conflict"
+	TransactionConflictTopologyChanged        TransactionConflictKind = "topology_changed"
+	TransactionConflictParticipantUnavailable TransactionConflictKind = "participant_unavailable"
+	TransactionConflictDocIdentityUnavailable TransactionConflictKind = "doc_identity_unavailable"
+	TransactionConflictSessionLeaseLost       TransactionConflictKind = "session_lease_lost"
+	TransactionConflictTransactionConflict    TransactionConflictKind = "transaction_conflict"
+	TransactionConflictTornState              TransactionConflictKind = "torn_state"
+)
+
+// TransactionConflictPhase identifies the 2PC participant phase that reported a conflict.
+type TransactionConflictPhase string
+
+const (
+	TransactionConflictPhaseBegin   TransactionConflictPhase = "begin"
+	TransactionConflictPhasePrepare TransactionConflictPhase = "prepare"
+	TransactionConflictPhaseResolve TransactionConflictPhase = "resolve"
+)
+
+// TransactionConflictRetryScope identifies the component that should be refreshed before retrying.
+type TransactionConflictRetryScope string
+
+const (
+	TransactionConflictRetryScopeTopology    TransactionConflictRetryScope = "topology"
+	TransactionConflictRetryScopeParticipant TransactionConflictRetryScope = "participant"
+	TransactionConflictRetryScopeDocIdentity TransactionConflictRetryScope = "doc_identity"
+	TransactionConflictRetryScopeSession     TransactionConflictRetryScope = "session"
+)
+
+// TransactionConflictParticipant identifies where a distributed transaction conflict occurred.
+type TransactionConflictParticipant struct {
+	GroupID *uint64                  `json:"group_id,omitempty"`
+	Phase   TransactionConflictPhase `json:"phase,omitempty"`
+}
+
+// TransactionConflict describes the conflict that caused a transaction abort and whether it is safe to retry.
 type TransactionConflict struct {
-	Table   string `json:"table,omitempty"`
-	Key     string `json:"key,omitempty"`
-	Message string `json:"message,omitempty"`
+	Table           string                          `json:"table,omitempty"`
+	Key             string                          `json:"key,omitempty"`
+	Message         string                          `json:"message,omitempty"`
+	Kind            TransactionConflictKind         `json:"kind,omitempty"`
+	Retryable       bool                            `json:"retryable"`
+	RetryAfterMS    *uint32                         `json:"retry_after_ms,omitempty"`
+	RetryScope      TransactionConflictRetryScope   `json:"retry_scope,omitempty"`
+	ExpectedVersion *uint64                         `json:"expected_version,omitempty"`
+	CurrentVersion  *uint64                         `json:"current_version,omitempty"`
+	Participant     *TransactionConflictParticipant `json:"participant,omitempty"`
 }

@@ -2596,6 +2596,11 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
     errdefer if (owns_hidden) cb.free(hidden);
 
     if (config.family == .deepseek_v4 and config.deepseek_v4_hc_mult > 0) {
+        // Ownership of hidden_input transfers to the callee, which frees it as soon as
+        // it has split the hyper-connection streams. Leaving owns_hidden set means any
+        // later error in there comes back here and frees it a second time, so the real
+        // failure is replaced by a segfault in freeTensor.
+        owns_hidden = false;
         return forwardDeepSeekV4FinalHiddenWithStreams(
             cb,
             allocator,
@@ -9644,7 +9649,13 @@ pub fn getLayerOutputScaleWeight(
         error.MissingWeight, error.WeightNotFound => blk: {
             var fallback_buf: [256]u8 = undefined;
             const fallback = std.fmt.bufPrint(&fallback_buf, "model.layers.{d}.layer_scalar", .{layer}) catch return error.NameTooLong;
-            break :blk try getModelWeight(cb, config, fallback);
+            // The per-layer output scale is a Gemma 4 tensor. Gemma 3 carries neither
+            // name, and this returns an optional precisely so callers can skip the
+            // scale; propagating MissingWeight here failed every Gemma 3 prefill.
+            break :blk getModelWeight(cb, config, fallback) catch |fallback_err| switch (fallback_err) {
+                error.MissingWeight, error.WeightNotFound => null,
+                else => return fallback_err,
+            };
         },
         else => return err,
     };

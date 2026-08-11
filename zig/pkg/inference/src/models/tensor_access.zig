@@ -663,17 +663,18 @@ fn isOnnxBiasInputName(name: []const u8) bool {
 }
 
 pub fn openFromManifest(allocator: std.mem.Allocator, manifest: manifest_mod.ModelManifest) !TensorAccess {
-    if (manifest.safetensors_path) |path| {
-        const access = try SafetensorsAccess.initAbsolute(allocator, path);
-        return access.tensorAccess();
-    }
-    if (manifest.safetensors_index_path) |path| {
-        const access = try ShardedSafetensorsAccess.initAbsolute(allocator, path);
-        return access.tensorAccess();
-    }
-    if (manifest.gguf_path) |path| {
-        const access = try GgufAccess.initAbsolute(allocator, path);
-        return access.tensorAccess();
+    if (manifest.nativeWeightArtifactKind()) |artifact| {
+        return switch (artifact) {
+            .gguf => (try GgufAccess.initAbsolute(allocator, manifest.gguf_path.?)).tensorAccess(),
+            .safetensors => (try SafetensorsAccess.initAbsolute(
+                allocator,
+                manifest.safetensors_path.?,
+            )).tensorAccess(),
+            .sharded_safetensors => (try ShardedSafetensorsAccess.initAbsolute(
+                allocator,
+                manifest.safetensors_index_path.?,
+            )).tensorAccess(),
+        };
     }
     if (manifest.onnx_path != null or
         manifest.visual_model_path != null or

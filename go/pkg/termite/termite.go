@@ -392,7 +392,7 @@ func NewTermiteNode(ctx context.Context, zl *zap.Logger, config Config) *Termite
 	var nerRegistry *NERRegistry
 	var nerModelsDir string
 	if config.ModelsDir != "" {
-		nerModelsDir = filepath.Join(config.ModelsDir, "recognizers")
+		nerModelsDir = filepath.Join(config.ModelsDir, "extractors")
 	}
 	if nerModelsDir != "" {
 		nerRegistry, err = NewNERRegistry(

@@ -253,8 +253,9 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
 
     const num_templates = readU32(data, &pos);
     const templates = try alloc.alloc(DynamicTemplate, num_templates);
+    var templates_initialized: usize = 0;
     errdefer {
-        for (templates[0..num_templates]) |t| {
+        for (templates[0..templates_initialized]) |t| {
             alloc.free(t.name);
             if (t.match_pattern) |p| alloc.free(p);
             if (t.unmatch_pattern) |p| alloc.free(p);
@@ -338,6 +339,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
                 .analyzer = analyzer,
             },
         };
+        templates_initialized += 1;
     }
 
     const full_text_documents: []FullTextDocument = if (fmt_version >= 2) blk: {
@@ -575,10 +577,12 @@ pub fn freeSchema(alloc: Allocator, s: TableSchema) void {
     if (s.index_sort.len > 0) alloc.free(s.index_sort);
 }
 
-/// Save a schema to DocStore.
-pub fn saveSchema(store: anytype, alloc: Allocator, schema: TableSchema) !void {
+/// Save a schema to DocStore. Returns whether durable state changed.
+pub fn saveSchema(store: anytype, alloc: Allocator, schema: TableSchema) !bool {
     const data = try serializeSchema(alloc, schema);
     defer alloc.free(data);
+    if (try activeSchemaDataMatches(store, alloc, data)) return false;
+
     const versioned_key = try schemaVersionKeyAlloc(alloc, schema.version);
     defer alloc.free(versioned_key);
     const previous_schema = try loadSchema(store, alloc);
@@ -608,6 +612,19 @@ pub fn saveSchema(store: anytype, alloc: Allocator, schema: TableSchema) !void {
     try txn.put(schema_key, data);
     try txn.put(versioned_key, data);
     try txn.commit();
+    return true;
+}
+
+fn activeSchemaDataMatches(store: anytype, alloc: Allocator, expected: []const u8) !bool {
+    var runtime = try initRuntimeStore(alloc, store);
+    defer runtime.deinit();
+    var txn = try runtime.store.beginProbe();
+    defer txn.abort();
+    const raw = txn.get(schema_key) catch |err| switch (err) {
+        error.NotFound => return false,
+        else => return err,
+    };
+    return std.mem.eql(u8, raw, expected);
 }
 
 /// Load a schema from DocStore. Returns null if no schema exists.
@@ -1509,6 +1526,35 @@ test "schema serialize/deserialize round-trip" {
     try std.testing.expect(!loaded.index_sort[1].desc);
 }
 
+test "schema deserialization cleans only initialized dynamic templates on allocation failure" {
+    const alloc = std.testing.allocator;
+    const templates = [_]DynamicTemplate{
+        .{
+            .name = "first",
+            .match_pattern = "first_*",
+            .path_match = "meta.first.*",
+            .mapping = .{ .analyzer = "keyword" },
+        },
+        .{
+            .name = "second",
+            .unmatch_pattern = "private_*",
+            .path_unmatch = "meta.private.*",
+            .match_mapping_type = "string",
+            .mapping = .{ .analyzer = "standard" },
+        },
+    };
+    const encoded = try serializeSchema(alloc, .{ .dynamic_templates = &templates });
+    defer alloc.free(encoded);
+
+    const Runner = struct {
+        fn run(failing_alloc: Allocator, data: []const u8) !void {
+            const schema = try deserializeSchema(failing_alloc, data);
+            defer freeSchema(failing_alloc, schema);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, Runner.run, .{encoded});
+}
+
 test "schema save/load via DocStore" {
     const alloc = std.testing.allocator;
     const path = try tempTestPath(alloc, "schema-store");
@@ -1524,7 +1570,10 @@ test "schema save/load via DocStore" {
 
     // Save and reload
     const schema = TableSchema{ .version = 7, .default_type = "doc" };
-    try saveSchema(&store, alloc, schema);
+    try std.testing.expect(try saveSchema(&store, alloc, schema));
+    const saved_sequence = store.lastReplaySequence(0);
+    try std.testing.expect(!try saveSchema(&store, alloc, schema));
+    try std.testing.expectEqual(saved_sequence, store.lastReplaySequence(0));
 
     const loaded = (try loadSchema(&store, alloc)).?;
     defer freeSchema(alloc, loaded);
@@ -1545,8 +1594,8 @@ test "schema preserves versioned history in DocStore" {
     defer store.close();
     defer cleanupTestDir(path);
 
-    try saveSchema(&store, alloc, .{ .version = 0, .default_type = "doc_v0" });
-    try saveSchema(&store, alloc, .{ .version = 1, .default_type = "doc_v1" });
+    _ = try saveSchema(&store, alloc, .{ .version = 0, .default_type = "doc_v0" });
+    _ = try saveSchema(&store, alloc, .{ .version = 1, .default_type = "doc_v1" });
 
     const active = (try loadSchema(&store, alloc)).?;
     defer freeSchema(alloc, active);
@@ -1576,8 +1625,8 @@ test "schema copy includes versioned history" {
     var dst = try DocStore.open(alloc, dst_path, .{});
     defer dst.close();
 
-    try saveSchema(&src, alloc, .{ .version = 0, .default_type = "doc_v0" });
-    try saveSchema(&src, alloc, .{ .version = 1, .default_type = "doc_v1" });
+    _ = try saveSchema(&src, alloc, .{ .version = 0, .default_type = "doc_v0" });
+    _ = try saveSchema(&src, alloc, .{ .version = 1, .default_type = "doc_v1" });
     try copySchemas(&src, &dst, alloc);
 
     const active = (try loadSchema(&dst, alloc)).?;
@@ -1605,7 +1654,7 @@ test "schema save upgrades legacy active-only schema into versioned history" {
     defer alloc.free(legacy_data);
     try store.put(schema_key, legacy_data);
 
-    try saveSchema(&store, alloc, .{ .version = 1, .default_type = "next_v1" });
+    _ = try saveSchema(&store, alloc, .{ .version = 1, .default_type = "next_v1" });
 
     const active = (try loadSchema(&store, alloc)).?;
     defer freeSchema(alloc, active);
@@ -1630,7 +1679,7 @@ test "schema save/load via memory backend store" {
     try std.testing.expect(none == null);
 
     const schema = TableSchema{ .version = 11, .default_type = "memdoc" };
-    try saveSchema(runtime, alloc, schema);
+    _ = try saveSchema(runtime, alloc, schema);
 
     const loaded = (try loadSchema(runtime, alloc)).?;
     defer freeSchema(alloc, loaded);
@@ -1650,7 +1699,7 @@ test "schema save/load via lsm backend store" {
     try std.testing.expect(none == null);
 
     const schema = TableSchema{ .version = 12, .default_type = "lsmdoc" };
-    try saveSchema(runtime, alloc, schema);
+    _ = try saveSchema(runtime, alloc, schema);
 
     const loaded = (try loadSchema(runtime, alloc)).?;
     defer freeSchema(alloc, loaded);

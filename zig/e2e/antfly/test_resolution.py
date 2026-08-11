@@ -50,6 +50,8 @@ AUTOGRAPH_CLUSTER_STARTUP_TIMEOUT_S = 115.0
 AUTOGRAPH_E2E_TEARDOWN_TIMEOUT_S = 5.0
 POLL_INTERVAL_S = 0.5
 POLL_REQUEST_TIMEOUT_S = 5.0
+WRITE_REQUEST_TIMEOUT_FLOOR_S = 5.0
+WRITE_OUTCOME_RECONCILE_TIMEOUT_S = 5.0
 
 
 def _new_e2e_deadline() -> "_Deadline":
@@ -99,7 +101,7 @@ DOCUMENTS_INDEXES = {
 
 
 @pytest.fixture(scope="function")
-def resolution_cluster():
+def resolution_cluster(request: pytest.FixtureRequest):
     binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
     if not Path(binary).exists():
         pytest.skip(f"Antfly binary not found: {binary} (set ANTFLY_BIN)")
@@ -114,7 +116,11 @@ def resolution_cluster():
     try:
         yield cluster
     finally:
-        cluster.stop(timeout_s=AUTOGRAPH_E2E_TEARDOWN_TIMEOUT_S)
+        report = getattr(request.node, "rep_call", None)
+        cluster.stop(
+            timeout_s=AUTOGRAPH_E2E_TEARDOWN_TIMEOUT_S,
+            test_failed=bool(report and report.failed),
+        )
 
 
 class _Api:
@@ -169,8 +175,27 @@ class _Api:
     ) -> dict:
         payload = {"inserts": {doc_id: body}, "sync_level": sync_level}
         max_timeout = 120.0 if sync_level in {"enrichments", "full_index"} else 30.0
+        last_retryable_response: str | None = None
         while True:
-            timeout = deadline.request_timeout(max_timeout) if deadline is not None else max_timeout
+            try:
+                timeout = (
+                    deadline.request_timeout(
+                        max_timeout,
+                        minimum_timeout_s=WRITE_REQUEST_TIMEOUT_FLOOR_S,
+                    )
+                    if deadline is not None
+                    else max_timeout
+                )
+            except AssertionError as exc:
+                stacks = self._server.native_stack_dumps()
+                raise AssertionError(
+                    f"batch insert exhausted its {deadline.timeout_s:.1f}s deadline "
+                    f"table={table!r} key={doc_id!r} sync_level={sync_level!r} "
+                    f"last_retryable_response={last_retryable_response!r}"
+                    f"\n[native stacks]\n{stacks}"
+                    f"\n[metadata snapshot]\n{self._server.metadata_snapshot_diagnostic()}"
+                    f"\n[logs]\n{self._server.debug_logs()}"
+                ) from exc
             try:
                 response = self.s.post(f"{self.url}/tables/{table}/batch", json=payload, timeout=timeout)
             except requests.RequestException as exc:
@@ -181,6 +206,7 @@ class _Api:
                 raise AssertionError(
                     f"batch insert timed out/failed table={table!r} key={doc_id!r} "
                     f"sync_level={sync_level!r}: {exc!r}\n[native stacks]\n{stacks}"
+                    f"\n[metadata snapshot]\n{self._server.metadata_snapshot_diagnostic()}"
                     f"\n[logs]\n{self._server.debug_logs()}"
                 ) from exc
             if (
@@ -189,9 +215,64 @@ class _Api:
                 and response.text.strip() == "write unavailable"
                 and not deadline.expired()
             ):
+                last_retryable_response = (
+                    f"{response.status_code} {response.text.strip()} from {self.url}"
+                )
+                deadline.sleep()
+                continue
+            if (
+                deadline is not None
+                and response.status_code == 409
+                and response.text.strip() == "write outcome unknown"
+                and not deadline.expired()
+            ):
+                last_retryable_response = (
+                    f"{response.status_code} {response.text.strip()} from {self.url}"
+                )
+                # This helper only emits a single deterministic keyed upsert,
+                # unlike the generic batch API whose transforms may not be
+                # replay-safe. Reconcile the desired state before retrying so
+                # a lost acknowledgement cannot create a second journal event.
+                if sync_level == "write" and self._reconcile_upsert(
+                    table,
+                    doc_id,
+                    body,
+                    deadline=deadline,
+                ):
+                    return {}
                 deadline.sleep()
                 continue
             return self._check(response)
+
+    def _reconcile_upsert(
+        self,
+        table: str,
+        doc_id: str,
+        body: dict,
+        *,
+        deadline: "_Deadline",
+    ) -> bool:
+        reconcile_expires_at = min(
+            deadline.expires_at,
+            time.monotonic() + WRITE_OUTCOME_RECONCILE_TIMEOUT_S,
+        )
+        while True:
+            remaining = min(deadline.remaining(), reconcile_expires_at - time.monotonic())
+            if remaining < 0.1:
+                return False
+            try:
+                observed = self.lookup(
+                    table,
+                    doc_id,
+                    timeout=min(POLL_REQUEST_TIMEOUT_S, remaining),
+                )
+            except requests.RequestException as exc:
+                if not _transient_poll_error(exc):
+                    raise
+            else:
+                if observed == body:
+                    return True
+            time.sleep(min(POLL_INTERVAL_S, remaining))
 
     def lookup(self, table: str, key: str, *, timeout: float = 10.0) -> dict | None:
         response = self.s.get(
@@ -264,16 +345,57 @@ class _Deadline:
     def expired(self) -> bool:
         return self.remaining() <= 0.0
 
-    def request_timeout(self, max_timeout_s: float = POLL_REQUEST_TIMEOUT_S) -> float:
+    def request_timeout(
+        self,
+        max_timeout_s: float = POLL_REQUEST_TIMEOUT_S,
+        *,
+        minimum_timeout_s: float = 0.1,
+    ) -> float:
         remaining = self.remaining()
-        if remaining <= 0.0:
-            raise AssertionError(f"deadline expired after {self.timeout_s}s")
-        return max(0.1, min(max_timeout_s, remaining))
+        if remaining < minimum_timeout_s:
+            raise AssertionError(
+                f"deadline has {remaining:.3f}s remaining, below the "
+                f"{minimum_timeout_s:.3f}s request floor"
+            )
+        return min(max_timeout_s, remaining)
 
     def sleep(self) -> None:
         remaining = self.remaining()
         if remaining > 0.0:
             time.sleep(min(POLL_INTERVAL_S, remaining))
+
+
+def test_insert_reconciles_unknown_upsert_before_retry(monkeypatch: pytest.MonkeyPatch):
+    class _Server:
+        pass
+
+    api = _Api("http://data-a/db/v1", _Server())
+    body = {"relations": {"entities": [{"id": "e0", "text": "Ada Lovelace"}]}}
+    post_calls: list[str] = []
+    lookup_calls: list[str] = []
+
+    def post(url: str, **_: Any) -> requests.Response:
+        post_calls.append(url)
+        response = requests.Response()
+        response.status_code = 409
+        response._content = b"write outcome unknown"
+        response.url = url
+        return response
+
+    def get(url: str, **_: Any) -> requests.Response:
+        lookup_calls.append(url)
+        response = requests.Response()
+        response.status_code = 200
+        response._content = json.dumps(body).encode()
+        response.url = url
+        return response
+
+    monkeypatch.setattr(api.s, "post", post)
+    monkeypatch.setattr(api.s, "get", get)
+
+    assert api.insert("documents", "doc:a", body, deadline=_Deadline(10.0)) == {}
+    assert post_calls == ["http://data-a/db/v1/tables/documents/batch"]
+    assert lookup_calls == ["http://data-a/db/v1/tables/documents/documents/doc%3Aa"]
 
 
 def _wait_for_entities(api: _Api, expected_names: dict[str, str], *, deadline: _Deadline) -> dict[str, dict]:

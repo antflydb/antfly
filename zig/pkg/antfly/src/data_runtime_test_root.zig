@@ -13,7 +13,11 @@
 // limitations.
 
 const runtime = @import("data/runtime.zig");
+const raft_batch = @import("data/raft_batch.zig");
 const runtime_status = @import("api/runtime_status.zig");
+const indexes = @import("api/indexes.zig");
+const table_writes = @import("api/table_writes.zig");
+const enrichment_runtime = @import("storage/db/enrichment/enrichment_runtime.zig");
 
 // The auth storage adapter deliberately receives storage through an injected
 // module to avoid a production import cycle. Focused runtime tests expose the
@@ -23,5 +27,9 @@ pub const lsm_backend = @import("storage/lsm_backend.zig");
 
 test {
     _ = runtime;
+    _ = raft_batch;
     _ = runtime_status;
+    _ = indexes;
+    _ = table_writes;
+    _ = enrichment_runtime;
 }

@@ -47,7 +47,6 @@ pub const Metrics = struct {
     rerank_requests: prometheus.Counter(u64),
     chunk_requests: prometheus.Counter(u64),
     classify_requests: prometheus.Counter(u64),
-    recognize_requests: prometheus.Counter(u64),
     extract_requests: prometheus.Counter(u64),
     rewrite_requests: prometheus.Counter(u64),
     generate_requests: prometheus.Counter(u64),
@@ -88,7 +87,6 @@ pub const Metrics = struct {
             .rerank_requests = prometheus.Counter(u64).init("antfly_inference_endpoint_requests_rerank", .{ .help = "Rerank endpoint requests" }, .{}),
             .chunk_requests = prometheus.Counter(u64).init("antfly_inference_endpoint_requests_chunk", .{ .help = "Chunk endpoint requests" }, .{}),
             .classify_requests = prometheus.Counter(u64).init("antfly_inference_endpoint_requests_classify", .{ .help = "Classify endpoint requests" }, .{}),
-            .recognize_requests = prometheus.Counter(u64).init("antfly_inference_endpoint_requests_recognize", .{ .help = "Recognize endpoint requests" }, .{}),
             .extract_requests = prometheus.Counter(u64).init("antfly_inference_endpoint_requests_extract", .{ .help = "Extract endpoint requests" }, .{}),
             .rewrite_requests = prometheus.Counter(u64).init("antfly_inference_endpoint_requests_rewrite", .{ .help = "Rewrite endpoint requests" }, .{}),
             .generate_requests = prometheus.Counter(u64).init("antfly_inference_endpoint_requests_generate", .{ .help = "Generate endpoint requests" }, .{}),
@@ -122,8 +120,6 @@ pub const Metrics = struct {
             self.chunk_requests.incr();
         } else if (std.mem.eql(u8, endpoint, "classify")) {
             self.classify_requests.incr();
-        } else if (std.mem.eql(u8, endpoint, "recognize")) {
-            self.recognize_requests.incr();
         } else if (std.mem.eql(u8, endpoint, "extract")) {
             self.extract_requests.incr();
         } else if (std.mem.eql(u8, endpoint, "rewrite")) {

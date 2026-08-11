@@ -412,6 +412,7 @@ pub fn compilePartitionWithOptions(
             },
 
             .slice => |attrs| {
+                if (attrs.runtime_starts or attrs.runtime_limits) return error.UnsupportedShape;
                 const rank: usize = attrs.num_axes;
                 if (rank == 0 or rank > 8) return error.UnsupportedShape;
                 var starts: [8]i64 = undefined;

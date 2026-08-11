@@ -239,7 +239,11 @@ pub const HealthServer = struct {
         if (self.metrics == null or self.metrics_refresh_future != null) return;
         self.metrics_refresh_stop.store(false, .release);
         if (self.metrics_refresh_io == null) {
-            self.metrics_refresh_io = Io.Threaded.init(self.alloc, .{ .stack_size = health_thread_stack_size });
+            self.metrics_refresh_io = Io.Threaded.init(self.alloc, .{
+                .stack_size = health_thread_stack_size,
+                // This executor owns exactly one long-lived refresh future.
+                .concurrent_limit = .limited(1),
+            });
         }
         const io = self.metrics_refresh_io.?.io();
         self.metrics_refresh_future = try io.concurrent(metricsRefreshTask, .{self});

@@ -27,6 +27,9 @@ const ml = @import("ml");
 const contracts = @import("backend_contracts.zig");
 const ops_mod = @import("../ops/ops.zig");
 const native_mod = @import("../ops/native_compute.zig");
+const cache_mod = @import("cache.zig");
+const compiled_backend = @import("compiled_backend.zig");
+const compiled_registry = @import("compiled_registry.zig");
 const interpreter = @import("interpreter.zig");
 const partition_mod = @import("partition.zig");
 const metal_capabilities = @import("metal_capabilities.zig");
@@ -80,6 +83,8 @@ pub const Runtime = struct {
     default_backend: *const ComputeBackend,
     mesh: ?device_mesh_mod.DeviceMesh = null,
     plan: ?multi_executor.DevicePartitionPlan = null,
+    runtime_cache_entry: ?cache_mod.CacheEntry = null,
+    native_partition_executors: std.ArrayListUnmanaged(*native_partition_executor.NativePartitionExecutor) = .empty,
     fallback_native: ?FallbackNativeBackend = null,
 
     pub fn init(
@@ -97,7 +102,7 @@ pub const Runtime = struct {
 
         if (requested_strategy != .interpreter) {
             try runtime.initSingleDevicePlan(graph, backend);
-            if (requested_strategy == .compiled_required and !runtime.allPartitionsHaveAttachedExecutors()) {
+            if (requested_strategy == .compiled_required and !runtime.allComputePartitionsHaveAttachedExecutors(graph)) {
                 return error.UnsupportedCompiledGraphRuntime;
             }
         }
@@ -109,6 +114,15 @@ pub const Runtime = struct {
         if (self.plan) |*plan| {
             plan.deinit();
             self.plan = null;
+        }
+        for (self.native_partition_executors.items) |exec| {
+            exec.partitionExecutor().deinitExecutor();
+        }
+        self.native_partition_executors.deinit(self.allocator);
+        if (self.runtime_cache_entry) |*entry| {
+            entry.resetCompiledModelExecutor();
+            entry.resetCompiledPartitions();
+            self.runtime_cache_entry = null;
         }
         if (self.mesh) |*mesh| {
             mesh.deinit();
@@ -233,7 +247,12 @@ pub const Runtime = struct {
             .tensor_descs = descriptor_seeds,
             .diagnostics = &diagnostics,
         });
-        errdefer base.deinit();
+        // Once self.plan takes ownership of base/assignments (below), plan.deinit
+        // (run via the Runtime.init errdefer) is the sole owner. Guard the local
+        // ownership errdefers with this flag so a failure in the compiled-executor
+        // attach after installation does not free base/assignments a second time.
+        var plan_installed = false;
+        errdefer if (!plan_installed) base.deinit();
         if (graphPartitionReportRequested()) {
             dumpPartitionReport(graph, &base, target_kind, use_native_fallback, &diagnostics);
         }
@@ -243,7 +262,7 @@ pub const Runtime = struct {
         });
 
         const assignments = try self.allocator.alloc(device_mesh_mod.DeviceId, base.partitions.len);
-        errdefer self.allocator.free(assignments);
+        errdefer if (!plan_installed) self.allocator.free(assignments);
         for (base.partitions, 0..) |part, i| {
             assignments[i] = if (use_native_fallback and part.backend == .native) 1 else 0;
         }
@@ -254,14 +273,59 @@ pub const Runtime = struct {
             .device_assignment = assignments,
             .allocator = self.allocator,
         };
+        plan_installed = true;
+        try self.attachCompiledPartitionExecutors(graph, backend, target_kind);
     }
 
-    fn allPartitionsHaveAttachedExecutors(self: *const Runtime) bool {
+    fn allComputePartitionsHaveAttachedExecutors(self: *const Runtime, graph: *const Graph) bool {
         const plan = self.plan orelse return false;
+        var compute_partitions: usize = 0;
         for (plan.base.partitions) |part| {
+            if (!partitionHasCompute(graph, part)) continue;
+            compute_partitions += 1;
             if (part.executor == null) return false;
         }
-        return plan.base.partitions.len > 0;
+        return compute_partitions > 0;
+    }
+
+    fn ensureRuntimeCacheEntry(self: *Runtime, graph: *const Graph) void {
+        if (self.runtime_cache_entry != null) return;
+        self.runtime_cache_entry = .{
+            .key = .{
+                .config_hash = 0,
+                .batch = 0,
+                .seq_len = 0,
+                .attention_mode = .full_recompute,
+            },
+            .graph = graph.*,
+            .last_used = 0,
+        };
+    }
+
+    fn attachCompiledPartitionExecutors(
+        self: *Runtime,
+        graph: *const Graph,
+        backend: *const ComputeBackend,
+        target_kind: BackendKind,
+    ) !void {
+        const backend_def = compiled_registry.find(target_kind) orelse return;
+        const plan = if (self.plan) |*p| p else return error.MissingGraphRuntimePlan;
+        const context = compiled_backend.AttachContext{
+            .cb = backend,
+            .requested_backend = target_kind,
+            .attachment_target = .partitioned,
+        };
+        if (!backend_def.should_attach(context, .single_device)) return;
+        if (!backend_def.has_compilable_partition(graph, plan, context, .single_device)) return;
+        self.ensureRuntimeCacheEntry(graph);
+        try backend_def.attach_executors(
+            self.allocator,
+            &self.runtime_cache_entry.?,
+            graph,
+            plan,
+            context,
+            .single_device,
+        );
     }
 
     fn attachNativePartitionExecutors(
@@ -281,6 +345,13 @@ pub const Runtime = struct {
                 graph,
                 dev_entry.backend,
             );
+            errdefer exec.partitionExecutor().deinitExecutor();
+            try self.native_partition_executors.append(self.allocator, exec);
+            // Ownership transfers to self.native_partition_executors immediately.
+            // Clear base.owns_executors before assigning part.executor so a later
+            // mid-loop error cannot make base.deinit double-free the executors that
+            // are already tracked in self.native_partition_executors.
+            base.owns_executors = false;
             part.executor = exec.partitionExecutor();
         }
     }
@@ -406,6 +477,13 @@ const PartitionGateSummary = struct {
 fn graphPartitionNodeHasCompute(graph: *const Graph, node_id: NodeId) bool {
     const op = graph.node(node_id).op;
     return op != .parameter and op != .constant;
+}
+
+fn partitionHasCompute(graph: *const Graph, part: partition_mod.Partition) bool {
+    for (part.node_ids) |node_id| {
+        if (graphPartitionNodeHasCompute(graph, node_id)) return true;
+    }
+    return false;
 }
 
 fn summarizePartitionGates(

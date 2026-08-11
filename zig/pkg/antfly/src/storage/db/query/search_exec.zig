@@ -23,10 +23,12 @@ const internal_keys = @import("../../internal_keys.zig");
 const doc_set = @import("../doc_set.zig");
 const doc_identity = @import("../doc_identity.zig");
 const typed_dv_coverage = @import("../typed_doc_values_coverage.zig");
+const dense_exact = @import("../dense_exact.zig");
 const graph_exec = @import("graph_exec.zig");
 const result_shape = @import("result_shape.zig");
 const search_mod = @import("../../../search/search.zig");
 const query_mod = @import("../../../search/query.zig");
+const pattern_filter_contract = @import("../../../search/pattern_filter_contract.zig");
 const index_mod = @import("../../../index.zig");
 const segment_mod = @import("../../../segment.zig");
 const typed_dv = @import("../../../section/typed_doc_values.zig");
@@ -38,6 +40,7 @@ const introducer_mod = @import("../../../introducer.zig");
 const mapper_mod = @import("../document_mapper.zig");
 const schema_api = @import("../../../schema/mod.zig");
 const persistent_mod = @import("../../persistent.zig");
+const hbc_mod = @import("../../hbc_adapter.zig");
 const platform_time = @import("antfly_platform").time;
 const platform = @import("antfly_platform");
 const vectorindex_mod = @import("antfly_vectorindex");
@@ -55,6 +58,15 @@ fn getenv(name: [*:0]const u8) ?[]const u8 {
 const default_balanced_search_effort: f32 = 0.5;
 const default_late_visibility_exact_candidate_budget: u32 = 100_000;
 const default_exact_native_filter_candidate_budget: u32 = 1024;
+// Exact filtered search performs one storage lookup and one distance evaluation
+// per candidate. Bound both sources of work: candidate count protects the
+// storage path while component count keeps high-dimensional indexes from
+// consuming disproportionate CPU. These are routing budgets, not result caps;
+// requests above them continue through filtered HBC.
+const default_selective_exact_candidate_budget: usize = 32 * 1024;
+const default_selective_exact_component_budget: usize = 16 * 1024 * 1024;
+const exact_native_filter_cancellation_stride: usize = 64;
+const exact_native_filter_metadata_batch_size: usize = 1024;
 const default_distributed_sort_shard_window_budget: u32 = 100_000;
 const default_sorted_segment_scan_budget: u64 = 100_000;
 const sorted_segment_deadline_check_interval: u64 = 1024;
@@ -416,7 +428,7 @@ pub const DenseSearchExecutor = struct {
         ctx: ?*anyopaque,
         entry: *index_manager_mod.IndexManager.DenseIndex,
         req: vectorindex_mod.SearchRequest,
-    ) anyerror!vectorindex_mod.SearchResults = null,
+    ) anyerror!dense_exact.SearchOutcome = null,
     postprocess: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -453,6 +465,9 @@ pub const DenseSearchProfile = struct {
     hbc_quantized_cache_lookup_ns: u64 = 0,
     resolved_search_width: u32 = 0,
     resolved_epsilon: f32 = 0,
+    native_filter_candidate_count: u64 = 0,
+    search_route: []const u8 = "",
+    route_reason: []const u8 = "",
     hbc_nodes_visited: u64 = 0,
     hbc_leaves_explored: u64 = 0,
     hbc_approx_vectors_scored: u64 = 0,
@@ -1089,6 +1104,8 @@ pub fn searchComposed(
     if (shared_filter) |*filter| {
         shared_req.resolved_doc_filter = filter;
         shared_req.resolved_doc_filter_owned = false;
+        shared_req.filter_text = null;
+        shared_req.exclusion_text = null;
         shared_req.filter_query_json = "";
         shared_req.exclusion_query_json = "";
     }
@@ -1114,6 +1131,7 @@ pub fn searchComposed(
                 .name = "$full_text_results",
                 .hits = text_result.hits,
                 .total_hits = text_result.total_hits,
+                .total_hits_relation = text_result.total_hits_relation,
                 .resolved_doc_set = resolved_doc_set,
             });
             try owned_results.append(alloc, text_result);
@@ -1131,6 +1149,7 @@ pub fn searchComposed(
                 .name = "$full_text_results",
                 .hits = text_result.hits,
                 .total_hits = text_result.total_hits,
+                .total_hits_relation = text_result.total_hits_relation,
                 .resolved_doc_set = resolved_doc_set,
             });
             try owned_results.append(alloc, text_result);
@@ -1152,6 +1171,7 @@ pub fn searchComposed(
                 .name = full_text_query.name,
                 .hits = text_result.hits,
                 .total_hits = text_result.total_hits,
+                .total_hits_relation = text_result.total_hits_relation,
                 .resolved_doc_set = resolved_doc_set,
             });
             try owned_results.append(alloc, text_result);
@@ -1171,6 +1191,7 @@ pub fn searchComposed(
             .name = if (vector_req.sparse == null) "$embeddings_results" else "dense",
             .hits = dense_result.hits,
             .total_hits = dense_result.total_hits,
+            .total_hits_relation = dense_result.total_hits_relation,
             .resolved_doc_set = resolved_doc_set,
         });
         try owned_results.append(alloc, dense_result);
@@ -1187,6 +1208,7 @@ pub fn searchComposed(
                 .name = dense_query.name,
                 .hits = dense_result.hits,
                 .total_hits = dense_result.total_hits,
+                .total_hits_relation = dense_result.total_hits_relation,
                 .resolved_doc_set = resolved_doc_set,
             });
             try owned_results.append(alloc, dense_result);
@@ -1203,6 +1225,7 @@ pub fn searchComposed(
             .name = if (vector_req.dense == null) "$embeddings_results" else "sparse",
             .hits = sparse_result.hits,
             .total_hits = sparse_result.total_hits,
+            .total_hits_relation = sparse_result.total_hits_relation,
             .resolved_doc_set = resolved_doc_set,
         });
         try owned_results.append(alloc, sparse_result);
@@ -1219,6 +1242,7 @@ pub fn searchComposed(
                 .name = sparse_query.name,
                 .hits = sparse_result.hits,
                 .total_hits = sparse_result.total_hits,
+                .total_hits_relation = sparse_result.total_hits_relation,
                 .resolved_doc_set = resolved_doc_set,
             });
             try owned_results.append(alloc, sparse_result);
@@ -1240,6 +1264,7 @@ pub fn searchComposed(
         .name = "$fused_results",
         .hits = base.hits,
         .total_hits = base.total_hits,
+        .total_hits_relation = base.total_hits_relation,
         .resolved_doc_set = fused_resolved_doc_set,
     });
 
@@ -1402,6 +1427,7 @@ fn appendEmbeddingsResultAlias(
             .name = "$embeddings_results",
             .hits = embedding_sets.items[0].hits,
             .total_hits = embedding_sets.items[0].total_hits,
+            .total_hits_relation = embedding_sets.items[0].total_hits_relation,
             .resolved_doc_set = embedding_sets.items[0].resolved_doc_set,
         });
         return;
@@ -1416,6 +1442,7 @@ fn appendEmbeddingsResultAlias(
         .name = "$embeddings_results",
         .hits = embeddings_result.hits,
         .total_hits = embeddings_result.total_hits,
+        .total_hits_relation = embeddings_result.total_hits_relation,
         .resolved_doc_set = resolved_doc_set,
     });
     try owned_results.append(alloc, embeddings_result);
@@ -1447,6 +1474,7 @@ pub fn isDefaultMatchAll(query: types.Query) bool {
 fn hasSearchRequestFullTextResults(req: types.SearchRequest) bool {
     if (req.full_text != null) return true;
     if (req.full_text_queries.len > 0) return true;
+    if (req.filter_text != null or req.exclusion_text != null) return true;
     if (req.filter_query_json.len > 0 or req.exclusion_query_json.len > 0) return true;
     return !isDefaultMatchAll(req.query) and isTextQuery(req.query);
 }
@@ -1678,12 +1706,19 @@ fn requestHasPostprocessPageTransforms(req: types.SearchRequest) bool {
 }
 
 fn hasStoredPatternFilters(req: types.SearchRequest) bool {
-    return req.filter_query_json.len > 0 or req.exclusion_query_json.len > 0;
+    return req.filter_text != null or
+        req.exclusion_text != null or
+        req.filter_query_json.len > 0 or
+        req.exclusion_query_json.len > 0;
 }
 
 fn requestWithoutResolvedStoredFilters(req: types.SearchRequest, filter_query_json_resolved: bool, exclusion_query_json_resolved: bool) types.SearchRequest {
-    if (!filter_query_json_resolved and !exclusion_query_json_resolved) return req;
     var next = req;
+    // Native text filters are resolved into the candidate constraints before
+    // post-processing. Clear the borrowed query views so later stages cannot
+    // accidentally resolve or apply them a second time.
+    next.filter_text = null;
+    next.exclusion_text = null;
     if (filter_query_json_resolved) next.filter_query_json = "";
     if (exclusion_query_json_resolved) next.exclusion_query_json = "";
     return next;
@@ -1821,7 +1856,13 @@ pub fn resolveStructuredDocFilterForComposedAlloc(
     executor: StructuredFilterResolverExecutor,
 ) !?doc_set.ResolvedDocFilter {
     if (req.resolved_doc_filter != null) return null;
-    if (req.filter_query_json.len == 0 and req.exclusion_query_json.len == 0) return null;
+    if (req.filter_text == null and
+        req.exclusion_text == null and
+        req.filter_query_json.len == 0 and
+        req.exclusion_query_json.len == 0)
+    {
+        return null;
+    }
 
     var active_executor = executor;
     if (active_executor.identity_read_generation == null) active_executor.identity_read_generation = req.identity_read_generation;
@@ -1829,14 +1870,32 @@ pub fn resolveStructuredDocFilterForComposedAlloc(
     defer cache.deinit(alloc);
 
     var out = doc_set.ResolvedDocFilter{};
-    errdefer out.deinit(alloc);
+    var owns_out = true;
+    defer if (owns_out) out.deinit(alloc);
     var changed = false;
+
+    if (req.filter_text) |filter_text| {
+        var include = (try collectFullTextResolvedDocSetAlloc(alloc, req, active_executor, filter_text)) orelse return null;
+        defer include.deinit(alloc);
+        const next_include = (try doc_set.intersectAlloc(alloc, &out.include, &include)) orelse return null;
+        out.include.deinit(alloc);
+        out.include = next_include;
+        changed = true;
+    }
+
+    if (req.exclusion_text) |exclusion_text| {
+        var exclude = (try collectFullTextResolvedDocSetAlloc(alloc, req, active_executor, exclusion_text)) orelse return null;
+        defer exclude.deinit(alloc);
+        const next_exclude = (try doc_set.unionAlloc(alloc, &out.exclude, &exclude)) orelse return null;
+        out.exclude.deinit(alloc);
+        out.exclude = next_exclude;
+        changed = true;
+    }
 
     if (req.filter_query_json.len > 0) {
         var include = (try collectStructuredFilterResolvedDocSetCachedAlloc(alloc, req, active_executor, &cache, req.filter_query_json)) orelse return null;
         defer include.deinit(alloc);
-        var next_include = (try doc_set.intersectAlloc(alloc, &out.include, &include)) orelse return null;
-        errdefer next_include.deinit(alloc);
+        const next_include = (try doc_set.intersectAlloc(alloc, &out.include, &include)) orelse return null;
         out.include.deinit(alloc);
         out.include = next_include;
         changed = true;
@@ -1845,14 +1904,15 @@ pub fn resolveStructuredDocFilterForComposedAlloc(
     if (req.exclusion_query_json.len > 0) {
         var exclude = (try collectStructuredFilterResolvedDocSetCachedAlloc(alloc, req, active_executor, &cache, req.exclusion_query_json)) orelse return null;
         defer exclude.deinit(alloc);
-        var next_exclude = (try doc_set.unionAlloc(alloc, &out.exclude, &exclude)) orelse return null;
-        errdefer next_exclude.deinit(alloc);
+        const next_exclude = (try doc_set.unionAlloc(alloc, &out.exclude, &exclude)) orelse return null;
         out.exclude.deinit(alloc);
         out.exclude = next_exclude;
         changed = true;
     }
 
-    return if (changed) out else null;
+    if (!changed) return null;
+    owns_out = false;
+    return out;
 }
 
 pub fn resolveStructuredTextDocNumFilterForComposedAlloc(
@@ -1872,7 +1932,8 @@ pub fn resolveStructuredTextDocNumFilterForComposedAlloc(
     if (!all_visible) return null;
 
     var out = ResolvedTextDocNumFilter{};
-    errdefer out.deinit(alloc);
+    var owns_out = true;
+    defer if (owns_out) out.deinit(alloc);
     var changed = false;
 
     if (req.filter_query_json.len > 0) {
@@ -1889,7 +1950,9 @@ pub fn resolveStructuredTextDocNumFilterForComposedAlloc(
         changed = true;
     }
 
-    return if (changed) out else null;
+    if (!changed) return null;
+    owns_out = false;
+    return out;
 }
 
 const StructuredFilterDocSetCache = struct {
@@ -2139,6 +2202,38 @@ fn deriveNativeDocIdConstraintsAlloc(
         }
     }
 
+    if (req.filter_text) |filter_text| {
+        const resolved = (try collectFullTextResolvedDocSetAlloc(
+            alloc,
+            req,
+            active_executor,
+            filter_text,
+        )) orelse return error.UnsupportedQueryRequest;
+        var owned_resolved = resolved;
+        defer owned_resolved.deinit(alloc);
+        const filter = doc_set.ResolvedDocFilter{
+            .include = owned_resolved,
+            .exclude = .none,
+        };
+        try applyResolvedDocFilterToNativeConstraintsAlloc(alloc, &out, &filter, active_executor);
+    }
+
+    if (req.exclusion_text) |exclusion_text| {
+        const resolved = (try collectFullTextResolvedDocSetAlloc(
+            alloc,
+            req,
+            active_executor,
+            exclusion_text,
+        )) orelse return error.UnsupportedQueryRequest;
+        var owned_resolved = resolved;
+        defer owned_resolved.deinit(alloc);
+        const filter = doc_set.ResolvedDocFilter{
+            .include = .all,
+            .exclude = owned_resolved,
+        };
+        try applyResolvedDocFilterToNativeConstraintsAlloc(alloc, &out, &filter, active_executor);
+    }
+
     if (req.filter_query_json.len > 0) {
         const phase_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
         if (try collectStructuredFilterResolvedDocSetCachedAlloc(alloc, req, active_executor, &structured_filter_doc_sets, req.filter_query_json)) |resolved| {
@@ -2168,6 +2263,7 @@ fn deriveNativeDocIdConstraintsAlloc(
             defer arena.deinit();
             const arena_alloc = arena.allocator();
             const parsed = try std.json.parseFromSlice(std.json.Value, arena_alloc, req.filter_query_json, .{});
+            try rejectStoredMatchFallback(parsed.value);
             if (try compilePatternFilterOptional(arena_alloc, parsed.value)) |compiled| {
                 var doc_ids = std.ArrayListUnmanaged([]const u8).empty;
                 defer doc_ids.deinit(arena_alloc);
@@ -2187,25 +2283,31 @@ fn deriveNativeDocIdConstraintsAlloc(
             }
         }
 
-        var arena = std.heap.ArenaAllocator.init(alloc);
-        defer arena.deinit();
-        const arena_alloc = arena.allocator();
-        const parsed = try std.json.parseFromSlice(std.json.Value, arena_alloc, req.filter_query_json, .{});
-        if (try compilePatternFilterOptional(arena_alloc, parsed.value)) |compiled| {
-            var excluded_doc_ids = std.ArrayListUnmanaged([]const u8).empty;
-            defer excluded_doc_ids.deinit(arena_alloc);
-            try collectBoolMustNotExactDocIds(arena_alloc, compiled, &excluded_doc_ids);
-            if (excluded_doc_ids.items.len > 0) {
-                const owned_excludes = try dupeDocIdSliceAlloc(alloc, excluded_doc_ids.items);
-                if (out.exclude_doc_ids.len > 0) {
-                    const merged = try unionDocIdsAlloc(alloc, out.exclude_doc_ids, owned_excludes);
-                    if (out.exclude_doc_ids_owned) freeDocIdSlice(alloc, out.exclude_doc_ids);
-                    freeDocIdSlice(alloc, owned_excludes);
-                    out.exclude_doc_ids = merged;
-                } else {
-                    out.exclude_doc_ids = owned_excludes;
+        // An exactly resolved filter already includes its bool.must_not
+        // semantics. Only mine exact exclusions from an unresolved stored tree;
+        // recompiling a resolved analyzer-backed match would incorrectly route
+        // it through the deliberately unsupported stored evaluator.
+        if (!out.filter_query_json_resolved) {
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const arena_alloc = arena.allocator();
+            const parsed = try std.json.parseFromSlice(std.json.Value, arena_alloc, req.filter_query_json, .{});
+            if (try compilePatternFilterOptional(arena_alloc, parsed.value)) |compiled| {
+                var excluded_doc_ids = std.ArrayListUnmanaged([]const u8).empty;
+                defer excluded_doc_ids.deinit(arena_alloc);
+                try collectBoolMustNotExactDocIds(arena_alloc, compiled, &excluded_doc_ids);
+                if (excluded_doc_ids.items.len > 0) {
+                    const owned_excludes = try dupeDocIdSliceAlloc(alloc, excluded_doc_ids.items);
+                    if (out.exclude_doc_ids.len > 0) {
+                        const merged = try unionDocIdsAlloc(alloc, out.exclude_doc_ids, owned_excludes);
+                        if (out.exclude_doc_ids_owned) freeDocIdSlice(alloc, out.exclude_doc_ids);
+                        freeDocIdSlice(alloc, owned_excludes);
+                        out.exclude_doc_ids = merged;
+                    } else {
+                        out.exclude_doc_ids = owned_excludes;
+                    }
+                    out.exclude_doc_ids_owned = true;
                 }
-                out.exclude_doc_ids_owned = true;
             }
         }
         if (bench_query_profile) filter_json_ns += platform_time.monotonicNs() - phase_start_ns;
@@ -2239,6 +2341,7 @@ fn deriveNativeDocIdConstraintsAlloc(
             defer arena.deinit();
             const arena_alloc = arena.allocator();
             const parsed = try std.json.parseFromSlice(std.json.Value, arena_alloc, req.exclusion_query_json, .{});
+            try rejectStoredMatchFallback(parsed.value);
             if (try compilePatternFilterOptional(arena_alloc, parsed.value)) |compiled| {
                 var doc_ids = std.ArrayListUnmanaged([]const u8).empty;
                 defer doc_ids.deinit(arena_alloc);
@@ -2290,13 +2393,22 @@ fn collectFullTextResolvedDocSetAlloc(
     text_query: types.TextQuery,
 ) !?doc_set.ResolvedDocSet {
     const text_entry = try resolveFilterTextIndexEntry(executor, req.primary_text_index_name, req.index_name) orelse return null;
+    text_entry.lockAnalysisShared();
+    defer text_entry.unlockAnalysisShared();
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const arena_alloc = arena.allocator();
     const search_query = try textQueryToSearchQuery(arena_alloc, text_query, text_entry.text_analysis, text_entry.runtime_schema);
 
-    return try collectSearchQueryResolvedDocSetAlloc(alloc, arena_alloc, executor, text_entry, search_query);
+    return try collectSearchQueryResolvedDocSetAlloc(
+        alloc,
+        arena_alloc,
+        executor,
+        text_entry,
+        search_query,
+        true,
+    );
 }
 
 fn resolvedDocFilterFromRequest(req: types.SearchRequest) ?*const doc_set.ResolvedDocFilter {
@@ -2489,6 +2601,7 @@ fn applyLiveAllDocFilterToNativeConstraintsAlloc(
             // would strip the very ordinals it exists to exclude.
             var already_filtered_executor = executor;
             already_filtered_executor.live_filter_doc_set = null;
+            already_filtered_executor.nonvisible_doc_set = null;
 
             // Preserve the provenance of the broad-live exclusion before it is
             // unioned with request exclusions. Dense search can use only this
@@ -2528,6 +2641,7 @@ fn applyLiveAllDocFilterToNativeConstraintsAlloc(
     // filter over it would redo one visibility probe per document.
     var already_filtered_executor = executor;
     already_filtered_executor.live_filter_doc_set = null;
+    already_filtered_executor.nonvisible_doc_set = null;
 
     const resolved_stored_filters_before_live_filter = out.resolved_stored_filters;
     try applyResolvedDocFilterToNativeConstraintsAlloc(alloc, out, &owned_filter, already_filtered_executor);
@@ -2587,7 +2701,7 @@ fn applyResolvedDocFilterToTextDocNumsAlloc(
         return;
     }
 
-    const can_project_ordinals = snapshot.hasDocOrdinalCoverage();
+    const can_project_ordinals = try snapshot.hasDocOrdinalCoverage();
     var include_represented = include_set.* == .all;
     if (can_project_ordinals) {
         if (try textDocNumsForResolvedDocSetAlloc(alloc, snapshot, include_set)) |doc_nums| {
@@ -2679,6 +2793,27 @@ fn maybeLiveFilterResolvedDocSetAlloc(
         .doc_keys, .ordinals, .ordinal_bitmap => {},
         .all, .none => return set,
     }
+
+    // Prefer subtracting the usually tiny non-visible complement. A single
+    // tombstone used to make every broad structured filter probe every
+    // matching ordinal in the primary store, turning an indexed term filter
+    // into O(table size) work. Ordinal sets can reconcile visibility exactly
+    // with O(non-visible) bitmap/list subtraction; doc-key sets still require
+    // the general live-filter callback below.
+    switch (set.*) {
+        .ordinals, .ordinal_bitmap => if (executor.nonvisible_doc_set) |nonvisible| {
+            if (try nonvisible(executor.ctx, alloc, executor.identity_read_generation)) |resolved_nonvisible| {
+                var owned_nonvisible = resolved_nonvisible;
+                defer owned_nonvisible.deinit(alloc);
+                if (try doc_set.differenceAlloc(alloc, set, &owned_nonvisible)) |visible| {
+                    owned.* = visible;
+                    return &owned.*.?;
+                }
+            }
+        },
+        .all, .none, .doc_keys => {},
+    }
+
     const live_filter = executor.live_filter_doc_set orelse return set;
     owned.* = try live_filter(executor.ctx, alloc, set, executor.identity_read_generation);
     return &owned.*.?;
@@ -2863,6 +2998,9 @@ fn logExactSortBudgetRejection(
 }
 
 fn checkSearchRequestDeadline(req: types.SearchRequest) !void {
+    if (req.cancellation) |cancellation| {
+        if (cancellation.load(.acquire)) return error.Cancelled;
+    }
     const deadline_ns = req.execution_deadline_ns orelse return;
     if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
 }
@@ -6679,7 +6817,7 @@ fn nativeSortValueFromTextDocValuesAlloc(
 ) !?SortValue {
     const resolved = snapshot.resolveDocId(native_text_doc_id) orelse return null;
     const segment = &snapshot.segments[resolved.seg_idx];
-    const section_data = segment.reader.getSection(field, .typed_doc_values) orelse {
+    const section_data = (try segment.reader.getSection(field, .typed_doc_values)) orelse {
         logNativeDocValueLoadFailure(field, "missing_doc_values_section");
         return error.UnsupportedExactSort;
     };
@@ -7602,6 +7740,8 @@ fn sortedSegmentIteratorAdvance(iterator: *SortedSegmentIterator, reverse: bool)
 }
 
 fn sortedSegmentLocalDocDeleted(segment: *const index_mod.SegmentEntry, local_doc_id: u32) bool {
+    segment.shared.lockDeletionShared();
+    defer segment.shared.unlockDeletionShared();
     if (segment.shared.deleted) |deleted| return deleted.contains(local_doc_id);
     return false;
 }
@@ -7700,7 +7840,7 @@ fn decorateSortedSegmentDocAlloc(
     profile: ?*SortCollectorProfile,
 ) !DecoratedSortHit {
     const segment = &snapshot.segments[segment_index];
-    const stored = segment.reader.storedDoc(local_doc_id) orelse return error.InvalidSegment;
+    const stored = (try segment.reader.storedDoc(local_doc_id)) orelse return error.InvalidSegment;
     const ordinal = try segment.reader.docOrdinal(local_doc_id);
     const global_doc_id = doc_base + local_doc_id;
     const raw_hit = types.SearchHit{
@@ -7922,7 +8062,7 @@ fn nextSortedSegmentHeadAlloc(
         if (membership) |m| {
             if (!m.contains(iterator.segment_index, local_doc_id)) continue;
         }
-        const stored = segment.reader.storedDoc(local_doc_id) orelse return error.InvalidSegment;
+        const stored = (try segment.reader.storedDoc(local_doc_id)) orelse return error.InvalidSegment;
         if (executor.is_expired_key) |is_expired| {
             if (try is_expired(executor.ctx, alloc, stored.id)) continue;
         }
@@ -8007,7 +8147,7 @@ fn countSortedSegmentVisibleCandidatesWithoutSortValuesAlloc(
             if (membership) |m| {
                 if (!m.contains(segment_index, local_doc_id)) continue;
             }
-            const stored = segment.reader.storedDoc(local_doc_id) orelse return error.InvalidSegment;
+            const stored = (try segment.reader.storedDoc(local_doc_id)) orelse return error.InvalidSegment;
             if (executor.is_expired_key) |is_expired| {
                 if (try is_expired(executor.ctx, alloc, stored.id)) continue;
             }
@@ -8071,7 +8211,7 @@ fn countSortedSegmentVisibleCandidatesFromSeekAlloc(
             if (membership) |m| {
                 if (!m.contains(iterator.segment_index, local_doc_id)) continue;
             }
-            const stored = segment.reader.storedDoc(local_doc_id) orelse return error.InvalidSegment;
+            const stored = (try segment.reader.storedDoc(local_doc_id)) orelse return error.InvalidSegment;
             if (executor.is_expired_key) |is_expired| {
                 if (try is_expired(executor.ctx, alloc, stored.id)) continue;
             }
@@ -8500,6 +8640,8 @@ fn collectStructuredFilterResolvedDocSetAlloc(
     filter_query_json: []const u8,
 ) !?doc_set.ResolvedDocSet {
     const text_entry = try resolveFilterTextIndexEntry(executor, req.primary_text_index_name, req.index_name) orelse return null;
+    text_entry.lockAnalysisShared();
+    defer text_entry.unlockAnalysisShared();
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -8508,7 +8650,14 @@ fn collectStructuredFilterResolvedDocSetAlloc(
     if (patternFilterValueHasRole(parsed.value)) return null;
     const search_query = patternFilterValueToSearchQuery(arena_alloc, parsed.value, text_entry.text_analysis, text_entry.runtime_schema) catch return null;
 
-    return try collectSearchQueryResolvedDocSetAlloc(alloc, arena_alloc, executor, text_entry, search_query);
+    return try collectSearchQueryResolvedDocSetAlloc(
+        alloc,
+        arena_alloc,
+        executor,
+        text_entry,
+        search_query,
+        false,
+    );
 }
 
 fn collectSearchQueryResolvedDocSetAlloc(
@@ -8517,6 +8666,7 @@ fn collectSearchQueryResolvedDocSetAlloc(
     executor: StructuredFilterResolverExecutor,
     text_entry: *index_manager_mod.IndexManager.TextIndex,
     search_query: search_mod.SearchQuery,
+    allow_analyzed_terms: bool,
 ) !?doc_set.ResolvedDocSet {
     const bench_profile = getenv("ANTFLY_BENCH_QUERY_PROFILE") != null;
     const total_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
@@ -8535,6 +8685,7 @@ fn collectSearchQueryResolvedDocSetAlloc(
         search_query,
         text_entry.text_analysis,
         text_entry.runtime_schema,
+        allow_analyzed_terms,
     ))) return null;
     if (bench_profile) capability_ns = platform_time.monotonicNs() - capability_start_ns;
 
@@ -8556,7 +8707,7 @@ fn collectSearchQueryResolvedDocSetAlloc(
         return empty;
     }
 
-    if (snapshot.hasDocOrdinalCoverage()) {
+    if (try snapshot.hasDocOrdinalCoverage()) {
         const ordinal_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         if (try resolvedDocSetForTextDocNumsFromOrdinalSidecarAlloc(alloc, snapshot, doc_nums, executor)) |resolved| {
             if (bench_profile) {
@@ -8575,7 +8726,7 @@ fn collectSearchQueryResolvedDocSetAlloc(
     var doc_ids = std.ArrayListUnmanaged([]const u8).empty;
     defer freeDocIdArrayList(alloc, &doc_ids);
     for (doc_nums) |doc_num| {
-        const stored = snapshot.storedDoc(doc_num) orelse continue;
+        const stored = (try snapshot.storedDoc(doc_num)) orelse continue;
         try doc_ids.append(alloc, try alloc.dupe(u8, stored.id));
     }
     const resolved = try resolve(executor.ctx, alloc, doc_ids.items, executor.identity_read_generation);
@@ -8595,6 +8746,8 @@ fn collectStructuredFilterTextDocNumsAlloc(
     filter_query_json: []const u8,
 ) !?TextDocNumSet {
     const text_entry = try resolveFilterTextIndexEntry(executor, req.primary_text_index_name, req.index_name) orelse return null;
+    text_entry.lockAnalysisShared();
+    defer text_entry.unlockAnalysisShared();
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -8610,6 +8763,7 @@ fn collectStructuredFilterTextDocNumsAlloc(
         search_query,
         text_entry.text_analysis,
         text_entry.runtime_schema,
+        false,
     ))) return null;
 
     const filter = search_mod.searchQueryToFilterArena(arena_alloc, search_query) catch return null;
@@ -8686,11 +8840,14 @@ fn collectStructuredFilterDocIdsAlloc(
     filter_query_json: []const u8,
 ) !?[]const []const u8 {
     const text_entry = try resolveFilterTextIndexEntry(executor, req.primary_text_index_name, req.index_name) orelse return null;
+    text_entry.lockAnalysisShared();
+    defer text_entry.unlockAnalysisShared();
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const arena_alloc = arena.allocator();
     const parsed = std.json.parseFromSlice(std.json.Value, arena_alloc, filter_query_json, .{}) catch return null;
+    if (patternFilterValueHasRole(parsed.value)) return null;
     const search_query = patternFilterValueToSearchQuery(arena_alloc, parsed.value, text_entry.text_analysis, text_entry.runtime_schema) catch return null;
 
     const snapshot = text_entry.persistent.acquireSnapshot();
@@ -8700,8 +8857,9 @@ fn collectStructuredFilterDocIdsAlloc(
         search_query,
         text_entry.text_analysis,
         text_entry.runtime_schema,
+        false,
     ))) return null;
-    const k: u32 = @intCast(@min(snapshot.global_doc_count, @as(u64, std.math.maxInt(u32))));
+    const k: u32 = @intCast(@min(snapshot.liveDocCount(), @as(u64, std.math.maxInt(u32))));
     var result = try search_mod.execute(alloc, snapshot, .{
         .query = search_query,
         .k = k,
@@ -8716,7 +8874,7 @@ fn collectStructuredFilterDocIdsAlloc(
     errdefer freeDocIdArrayList(alloc, &out);
     for (result.hits) |hit| {
         const id = hit.id orelse blk: {
-            const stored = snapshot.storedDoc(hit.doc_id) orelse continue;
+            const stored = (try snapshot.storedDoc(hit.doc_id)) orelse continue;
             break :blk stored.id;
         };
         try appendOwnedDocId(alloc, &out, id);
@@ -8729,6 +8887,7 @@ fn searchQueryCanUseSnapshot(
     query: search_mod.SearchQuery,
     text_analysis: introducer_mod.TextAnalysisConfig,
     runtime_schema: ?runtime_schema_mod.TableSchema,
+    allow_analyzed_terms: bool,
 ) !bool {
     return switch (query) {
         .match_none,
@@ -8742,7 +8901,8 @@ fn searchQueryCanUseSnapshot(
         .phrase => |item| try snapshot.hasInvertedField(item.field),
         .term_phrase => |item| try snapshot.hasInvertedField(item.field),
         .multi_phrase => |item| try snapshot.hasInvertedField(item.field),
-        .term => |item| (try queryFieldUsesKeywordAnalyzer(item.field, text_analysis, runtime_schema)) and
+        .term => |item| (allow_analyzed_terms or
+            try queryFieldUsesKeywordAnalyzer(item.field, text_analysis, runtime_schema)) and
             try snapshot.hasInvertedField(item.field),
         .fuzzy => |item| try snapshot.hasInvertedField(item.field),
         .numeric_range => |item| try searchQueryCanUseMappedDocValues(snapshot, item.field, runtime_schema, .numeric),
@@ -8760,13 +8920,13 @@ fn searchQueryCanUseSnapshot(
         .regexp => |item| try snapshot.hasInvertedField(item.field),
         .bool_query => |item| {
             for (item.must) |child| {
-                if (!(try searchQueryCanUseSnapshot(snapshot, child, text_analysis, runtime_schema))) return false;
+                if (!(try searchQueryCanUseSnapshot(snapshot, child, text_analysis, runtime_schema, allow_analyzed_terms))) return false;
             }
             for (item.should) |child| {
-                if (!(try searchQueryCanUseSnapshot(snapshot, child, text_analysis, runtime_schema))) return false;
+                if (!(try searchQueryCanUseSnapshot(snapshot, child, text_analysis, runtime_schema, allow_analyzed_terms))) return false;
             }
             for (item.must_not) |child| {
-                if (!(try searchQueryCanUseSnapshot(snapshot, child, text_analysis, runtime_schema))) return false;
+                if (!(try searchQueryCanUseSnapshot(snapshot, child, text_analysis, runtime_schema, allow_analyzed_terms))) return false;
             }
             return true;
         },
@@ -8780,10 +8940,28 @@ fn searchQueryCanUseMappedDocValues(
     expected_type: runtime_schema_mod.AntflyType,
 ) !bool {
     const schema = runtime_schema orelse return false;
-    const mapping = runtime_schema_mod.resolveDeclaredFieldType(schema, field) orelse return false;
+    const mapping = runtime_schema_mod.resolveDeclaredFieldType(schema, field) orelse blk: {
+        if (!schemaInfersDynamicFieldType(schema, field)) return false;
+        if (expected_type != .numeric and expected_type != .boolean) return false;
+        break :blk runtime_schema_mod.FieldMapping{
+            .field_type = expected_type,
+            .doc_values = true,
+        };
+    };
     if (mapping.field_type != expected_type) return false;
     if (!runtime_schema_mod.mappingHasNativeDocValues(mapping)) return false;
     return try snapshotTypedDocValuesCoverageForMapping(snapshot, field, mapping) == .covered;
+}
+
+fn schemaInfersDynamicFieldType(schema: runtime_schema_mod.TableSchema, field: []const u8) bool {
+    for (schema.full_text_documents) |document| {
+        for (document.infer_type_dynamic_paths) |path| {
+            if (path.len == 0) return true;
+            if (!std.mem.startsWith(u8, field, path)) continue;
+            if (field.len == path.len or (field.len > path.len and field[path.len] == '.')) return true;
+        }
+    }
+    return false;
 }
 
 fn searchQueryCanUseMappedGeoDocValues(
@@ -9076,7 +9254,7 @@ fn patternFilterValueToSearchQuery(
     text_analysis: introducer_mod.TextAnalysisConfig,
     runtime_schema: ?runtime_schema_mod.TableSchema,
 ) anyerror!search_mod.SearchQuery {
-    if (value != .object) return error.InvalidArgument;
+    _ = try pattern_filter_contract.requireSingleRoot(value);
     if (value.object.get("match_all") != null) return .{ .match_all = {} };
     if (value.object.get("match_none") != null) return .{ .match_none = {} };
     if (value.object.get("doc_id")) |doc_id| return .{ .doc_id = .{
@@ -9108,29 +9286,71 @@ fn patternFilterValueToSearchQuery(
         return .{ .bool_query = .{ .should = should, .min_should = 1 } };
     }
     if (value.object.get("match")) |match| {
+        try validateStructuredMatchGrammar(match);
         const field_value = try singleFieldString(match, "text");
+        const analyzer_name = if (match == .object)
+            if (match.object.get("analyzer")) |analyzer|
+                jsonString(analyzer) orelse return error.InvalidArgument
+            else
+                null
+        else
+            null;
         return .{ .match = .{
             .field = field_value.field,
             .text = field_value.value,
-            .analyzer = try resolveQueryAnalyzer(field_value.field, null, text_analysis, runtime_schema),
+            .analyzer = try resolveQueryAnalyzer(
+                field_value.field,
+                analyzer_name,
+                text_analysis,
+                runtime_schema,
+            ),
         } };
     }
     if (value.object.get("prefix")) |prefix| {
         const field_value = try singleFieldString(prefix, "prefix");
-        return .{ .prefix = .{ .field = field_value.field, .prefix = field_value.value } };
+        return .{ .prefix = .{
+            .field = try exactTermFilterFieldAlloc(
+                alloc,
+                field_value.field,
+                text_analysis,
+                runtime_schema,
+            ),
+            .prefix = field_value.value,
+        } };
     }
     if (value.object.get("wildcard")) |wildcard| {
         const field_value = try singleFieldString(wildcard, "pattern");
-        return .{ .wildcard = .{ .field = field_value.field, .pattern = field_value.value } };
+        return .{ .wildcard = .{
+            .field = try exactTermFilterFieldAlloc(
+                alloc,
+                field_value.field,
+                text_analysis,
+                runtime_schema,
+            ),
+            .pattern = field_value.value,
+        } };
     }
     if (value.object.get("regexp")) |regexp| {
         const field_value = try singleFieldString(regexp, "pattern");
-        return .{ .regexp = .{ .field = field_value.field, .pattern = field_value.value } };
+        return .{ .regexp = .{
+            .field = try exactTermFilterFieldAlloc(
+                alloc,
+                field_value.field,
+                text_analysis,
+                runtime_schema,
+            ),
+            .pattern = field_value.value,
+        } };
     }
     if (value.object.get("fuzzy")) |fuzzy| {
         const field_fuzzy = try singleFieldFuzzy(fuzzy);
         return .{ .fuzzy = .{
-            .field = field_fuzzy.field,
+            .field = try exactTermFilterFieldAlloc(
+                alloc,
+                field_fuzzy.field,
+                text_analysis,
+                runtime_schema,
+            ),
             .term = field_fuzzy.term,
             .max_edits = field_fuzzy.max_edits,
             .prefix_len = field_fuzzy.prefix_len,
@@ -9148,6 +9368,247 @@ fn patternFilterValueToSearchQuery(
     return error.UnsupportedQueryRequest;
 }
 
+/// Match filters always depend on the field's index analyzer, even when the
+/// request does not select an analyzer explicitly. Stored JSON cannot reproduce
+/// those token semantics, so every unresolved match must fail closed instead of
+/// degrading to substring matching.
+fn rejectStoredMatchFallback(value: std.json.Value) !void {
+    if (try patternFilterContainsMatch(value, 0)) {
+        return error.UnsupportedQueryRequest;
+    }
+}
+
+fn patternFilterContainsMatch(value: std.json.Value, depth: u8) !bool {
+    if (depth >= 64 or value != .object) return error.InvalidArgument;
+    if (value.object.get("match") != null) return true;
+
+    inline for ([_][]const u8{ "conjuncts", "disjuncts" }) |compound| {
+        if (value.object.get(compound)) |children| {
+            if (children != .array or children.array.items.len == 0) {
+                return error.InvalidArgument;
+            }
+            for (children.array.items) |child| {
+                if (try patternFilterContainsMatch(child, depth + 1)) return true;
+            }
+            return false;
+        }
+    }
+    if (value.object.get("bool")) |bool_query| {
+        if (bool_query != .object) return error.InvalidArgument;
+        inline for ([_][]const u8{ "filter", "must", "should", "must_not" }) |branch| {
+            if (bool_query.object.get(branch)) |children| {
+                if (children != .array or children.array.items.len == 0) {
+                    return error.InvalidArgument;
+                }
+                for (children.array.items) |child| {
+                    if (try patternFilterContainsMatch(child, depth + 1)) return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+/// Validates the storage-level structured-filter grammar without retaining any
+/// parsed state. Public request normalization uses this at the raw DSL
+/// compatibility boundary so malformed filters are rejected before execution.
+///
+/// An arena keeps validation cleanup constant-time and avoids duplicating the
+/// production parser's recursive ownership rules.
+pub fn validateStructuredFilterValueAlloc(
+    alloc: Allocator,
+    value: std.json.Value,
+) !void {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var remaining_nodes: usize = 16 * 1024;
+    try validateStructuredFilterGrammar(
+        arena.allocator(),
+        value,
+        0,
+        &remaining_nodes,
+    );
+}
+
+/// Validates the schema-independent shape of the structured-filter DSL.
+/// Standard `range` nodes cannot be lowered until the table schema identifies
+/// their scalar type, so validation handles those nodes structurally and
+/// delegates every other leaf to the production parser.
+fn validateStructuredFilterGrammar(
+    alloc: Allocator,
+    value: std.json.Value,
+    depth: u8,
+    remaining_nodes: *usize,
+) anyerror!void {
+    if (remaining_nodes.* == 0 or depth >= 64) {
+        return error.InvalidArgument;
+    }
+    _ = try pattern_filter_contract.requireSingleRoot(value);
+    remaining_nodes.* -= 1;
+
+    if (value.object.get("ref")) |reference| {
+        if (value.object.count() != 1 or
+            reference != .string or
+            reference.string.len == 0)
+        {
+            return error.InvalidArgument;
+        }
+        return;
+    }
+    if (value.object.get("match")) |match| {
+        try validateStructuredMatchGrammar(match);
+        return;
+    }
+    if (value.object.get("range")) |range_query| {
+        try validateStandardRangeGrammar(range_query);
+        return;
+    }
+    inline for ([_][]const u8{ "conjuncts", "disjuncts" }) |compound| {
+        if (value.object.get(compound)) |children| {
+            try validateStructuredFilterChildren(
+                alloc,
+                children,
+                depth + 1,
+                remaining_nodes,
+            );
+            return;
+        }
+    }
+    if (value.object.get("bool")) |bool_query| {
+        if (bool_query != .object) return error.InvalidArgument;
+        try pattern_filter_contract.validateBool(bool_query.object);
+        var should_count: usize = 0;
+        var has_branch = false;
+        inline for ([_][]const u8{ "filter", "must", "should", "must_not" }) |branch| {
+            if (bool_query.object.get(branch)) |children| {
+                has_branch = true;
+                try validateStructuredFilterChildren(
+                    alloc,
+                    children,
+                    depth + 1,
+                    remaining_nodes,
+                );
+                if (comptime std.mem.eql(u8, branch, "should")) {
+                    should_count = children.array.items.len;
+                }
+            }
+        }
+        if (!has_branch) {
+            _ = try patternFilterValueToSearchQuery(alloc, value, .{}, null);
+            return;
+        }
+        _ = try pattern_filter_contract.minimumShould(
+            bool_query.object,
+            should_count,
+            bool_query.object.get("filter") != null or
+                bool_query.object.get("must") != null,
+        );
+        return;
+    }
+
+    _ = patternFilterValueToSearchQuery(alloc, value, .{}, null) catch |search_err| {
+        if (search_err == error.OutOfMemory) return error.OutOfMemory;
+        // Some canonical predicates (notably typed scalar terms) cannot be
+        // lowered to an inverted-index query without a runtime schema, but
+        // are executable by the prepared stored-document matcher. Admission
+        // must accept the union of those two production execution paths.
+        _ = graph_exec.compilePatternFilter(alloc, value) catch |stored_err| {
+            if (stored_err == error.OutOfMemory) return error.OutOfMemory;
+            return search_err;
+        };
+        return;
+    };
+}
+
+fn validateStructuredFilterChildren(
+    alloc: Allocator,
+    value: std.json.Value,
+    depth: u8,
+    remaining_nodes: *usize,
+) anyerror!void {
+    if (value != .array or value.array.items.len == 0) {
+        return error.InvalidArgument;
+    }
+    for (value.array.items) |child| {
+        try validateStructuredFilterGrammar(
+            alloc,
+            child,
+            depth,
+            remaining_nodes,
+        );
+    }
+}
+
+fn validateStructuredMatchGrammar(value: std.json.Value) !void {
+    if (value != .object) return error.InvalidArgument;
+    const field = value.object.get("field");
+    const path = value.object.get("path");
+    if (field == null and path == null) {
+        if (value.object.count() != 1) return error.InvalidArgument;
+        var it = value.object.iterator();
+        const entry = it.next() orelse return error.InvalidArgument;
+        if (entry.key_ptr.len == 0 or entry.value_ptr.* != .string) {
+            return error.InvalidArgument;
+        }
+        return;
+    }
+    if (field != null and path != null) return error.InvalidArgument;
+    const field_value = field orelse path.?;
+    if (field_value != .string or field_value.string.len == 0) {
+        return error.InvalidArgument;
+    }
+
+    const text = value.object.get("text");
+    const alias = value.object.get("value");
+    if ((text == null) == (alias == null)) return error.InvalidArgument;
+    const text_value = text orelse alias.?;
+    if (text_value != .string) return error.InvalidArgument;
+    if (value.object.get("analyzer")) |analyzer| {
+        if (analyzer != .string or analyzer.string.len == 0) {
+            return error.InvalidArgument;
+        }
+    }
+    var recognized: usize = 2;
+    if (value.object.get("analyzer") != null) recognized += 1;
+    if (recognized != value.object.count()) return error.InvalidArgument;
+}
+
+fn validateStandardRangeGrammar(value: std.json.Value) !void {
+    if (value != .object) return error.InvalidArgument;
+    const bounds = if (value.object.get("field") orelse value.object.get("path")) |field_value| blk: {
+        const field = jsonString(field_value) orelse return error.InvalidArgument;
+        if (field.len == 0) return error.InvalidArgument;
+        break :blk value.object;
+    } else blk: {
+        if (value.object.count() != 1) return error.InvalidArgument;
+        var it = value.object.iterator();
+        const entry = it.next() orelse return error.InvalidArgument;
+        if (entry.key_ptr.len == 0 or entry.value_ptr.* != .object) {
+            return error.InvalidArgument;
+        }
+        break :blk entry.value_ptr.object;
+    };
+
+    const lower = try standardRangeLowerBound(bounds);
+    const upper = try standardRangeUpperBound(bounds);
+    if (lower == null and upper == null) return error.InvalidArgument;
+    if (lower) |bound| try validateStandardRangeBound(bound.value);
+    if (upper) |bound| try validateStandardRangeBound(bound.value);
+}
+
+fn validateStandardRangeBound(value: std.json.Value) !void {
+    switch (value) {
+        .integer, .string => {},
+        .float => |number| if (!std.math.isFinite(number)) return error.InvalidArgument,
+        .number_string => |text| {
+            const number = std.fmt.parseFloat(f64, text) catch
+                return error.InvalidArgument;
+            if (!std.math.isFinite(number)) return error.InvalidArgument;
+        },
+        else => return error.InvalidArgument,
+    }
+}
+
 fn patternBoolFilterToSearchQuery(
     alloc: Allocator,
     value: std.json.Value,
@@ -9155,6 +9616,7 @@ fn patternBoolFilterToSearchQuery(
     runtime_schema: ?runtime_schema_mod.TableSchema,
 ) !search_mod.SearchQuery {
     if (value != .object) return error.InvalidArgument;
+    try pattern_filter_contract.validateBool(value.object);
     var must_out = std.ArrayListUnmanaged(search_mod.SearchQuery).empty;
     errdefer must_out.deinit(alloc);
     if (value.object.get("filter")) |filter| {
@@ -9166,6 +9628,15 @@ fn patternBoolFilterToSearchQuery(
     const has_must = value.object.get("must") != null or value.object.get("filter") != null;
     const has_should = value.object.get("should") != null;
     const only_must_not = !has_must and !has_should and value.object.get("must_not") != null;
+    const should = if (value.object.get("should")) |should_value|
+        try patternFilterArrayToSearchQueries(alloc, should_value, text_analysis, runtime_schema)
+    else
+        &.{};
+    const min_should: u32 = @intCast(try pattern_filter_contract.minimumShould(
+        value.object,
+        should.len,
+        has_must,
+    ));
     return .{ .bool_query = .{
         .must = if (must_out.items.len > 0)
             try must_out.toOwnedSlice(alloc)
@@ -9173,15 +9644,12 @@ fn patternBoolFilterToSearchQuery(
             &.{.{ .match_all = {} }}
         else
             &.{},
-        .should = if (value.object.get("should")) |should|
-            try patternFilterArrayToSearchQueries(alloc, should, text_analysis, runtime_schema)
-        else
-            &.{},
+        .should = should,
         .must_not = if (value.object.get("must_not")) |must_not|
             try patternFilterArrayToSearchQueries(alloc, must_not, text_analysis, runtime_schema)
         else
             &.{},
-        .min_should = if (!has_must and has_should) 1 else 0,
+        .min_should = min_should,
     } };
 }
 
@@ -9388,6 +9856,31 @@ test "pattern bool filter clauses are merged into required search clauses" {
     try std.testing.expectEqualStrings("doc:must", query.bool_query.must[1].doc_id.ids[0]);
 }
 
+test "pattern bool filter preserves explicit minimum should match" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"bool":{"should":[{"term":{"status":"active"}},{"term":{"tier":"gold"}}],"minimum_should_match":2}}
+    , .{});
+
+    const query = try patternFilterValueToSearchQuery(alloc, parsed.value, .{}, null);
+    try std.testing.expect(query == .bool_query);
+    try std.testing.expectEqual(@as(usize, 2), query.bool_query.should.len);
+    try std.testing.expectEqual(@as(u32, 2), query.bool_query.min_should);
+
+    const pure_should_zero = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"bool":{"should":[{"term":{"status":"missing"}}],"minimum_should_match":0}}
+    , .{});
+    const pure_should_query = try patternFilterValueToSearchQuery(
+        alloc,
+        pure_should_zero.value,
+        .{},
+        null,
+    );
+    try std.testing.expectEqual(@as(u32, 1), pure_should_query.bool_query.min_should);
+}
+
 test "pattern date range filter lowers public date and timestamp bounds" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -9572,12 +10065,14 @@ test "native string range filters require exact keyword-style postings coverage"
         ip_query,
         text_analysis,
         keyword_schema,
+        false,
     ));
     try std.testing.expect(try searchQueryCanUseSnapshot(
         keyword_snapshot,
         term_range_query,
         text_analysis,
         keyword_schema,
+        false,
     ));
 
     const text_schema = runtime_schema_mod.TableSchema{
@@ -9608,12 +10103,14 @@ test "native string range filters require exact keyword-style postings coverage"
         ip_query,
         text_analysis,
         text_schema,
+        false,
     )));
     try std.testing.expect(!(try searchQueryCanUseSnapshot(
         text_snapshot,
         term_range_query,
         text_analysis,
         text_schema,
+        false,
     )));
 }
 
@@ -9685,8 +10182,129 @@ test "pattern standard range filter lowers through runtime scalar mappings" {
     try std.testing.expect(!keyword_query.term_range.inclusive_max);
 }
 
+test "structured filter grammar validates ranges without a runtime schema" {
+    const alloc = std.testing.allocator;
+    var valid = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"bool":{"must":[{"range":{"price":{"gte":10,"lt":20}}}],"must_not":[{"range":{"created_at":{"lt":"2026-07-01"}}}]}}
+    , .{});
+    defer valid.deinit();
+    try validateStructuredFilterValueAlloc(alloc, valid.value);
+
+    inline for ([_][]const u8{
+        \\{"term":{"path":"/published","value":true}}
+        ,
+        \\{"ref":"published"}
+        ,
+    }) |encoded| {
+        var valid_leaf = try std.json.parseFromSlice(
+            std.json.Value,
+            alloc,
+            encoded,
+            .{},
+        );
+        defer valid_leaf.deinit();
+        try validateStructuredFilterValueAlloc(alloc, valid_leaf.value);
+    }
+
+    inline for ([_][]const u8{
+        \\{"range":{"price":{}}}
+        ,
+        \\{"range":{"price":{"gte":null}}}
+        ,
+        \\{"range":{"price":{"gte":10,"gt":11}}}
+        ,
+        \\{"range":{"price":{"gte":{"nested":"value"}}}}
+        ,
+        \\{"range":{"field":"price","from":10,"include_lower":"yes"}}
+        ,
+        \\{"range":{"price":{"gte":10}},"term":{"path":"status","term":"active"}}
+        ,
+        \\{"bool":{"should":[{"match_all":{}}],"minimum_should_match":0,"min_should":0}}
+        ,
+        \\{"bool":{"should":[{"match_all":{}}],"unknown":true}}
+        ,
+        \\{"ref":""}
+        ,
+        \\{"ref":42}
+        ,
+        \\{"ref":"published","match_all":{}}
+        ,
+    }) |encoded| {
+        var invalid = try std.json.parseFromSlice(
+            std.json.Value,
+            alloc,
+            encoded,
+            .{},
+        );
+        defer invalid.deinit();
+        try std.testing.expectError(
+            error.InvalidArgument,
+            validateStructuredFilterValueAlloc(alloc, invalid.value),
+        );
+    }
+}
+
+test "stored fallback rejects every analyzer-dependent match filter" {
+    const alloc = std.testing.allocator;
+    inline for ([_][]const u8{
+        \\{"match":{"path":"status","text":"active user","analyzer":"tenant_search"}}
+        ,
+        \\{"bool":{"must":[{"term":{"path":"tenant","term":"acme"}},{"match":{"path":"status","text":"active","analyzer":"keyword"}}]}}
+        ,
+    }) |encoded| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{});
+        defer parsed.deinit();
+        try validateStructuredFilterValueAlloc(alloc, parsed.value);
+        try std.testing.expectError(
+            error.UnsupportedQueryRequest,
+            rejectStoredMatchFallback(parsed.value),
+        );
+    }
+
+    var role_match = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        \\{"match":{"path":"status","text":"active","role":"measure"}}
+    ,
+        .{},
+    );
+    defer role_match.deinit();
+    try std.testing.expectError(
+        error.InvalidArgument,
+        validateStructuredFilterValueAlloc(alloc, role_match.value),
+    );
+
+    var exact = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        \\{"term":{"path":"status","term":"active"}}
+    ,
+        .{},
+    );
+    defer exact.deinit();
+    try rejectStoredMatchFallback(exact.value);
+
+    var analyzerless_match = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        \\{"match":{"path":"status","text":"active"}}
+    ,
+        .{},
+    );
+    defer analyzerless_match.deinit();
+    try std.testing.expectError(
+        error.UnsupportedQueryRequest,
+        rejectStoredMatchFallback(analyzerless_match.value),
+    );
+}
+
 fn parseFuzzyOptions(object: anytype, out: *FieldFuzzy) !void {
-    if (object.get("max_edits")) |edits| out.max_edits = jsonU8(edits) orelse return error.InvalidArgument;
+    if (object.get("max_edits")) |edits| {
+        out.max_edits = jsonU8(edits) orelse return error.InvalidArgument;
+        if (out.max_edits > pattern_filter_contract.max_fuzzy_edits) {
+            return error.InvalidArgument;
+        }
+    }
     if (object.get("prefix_length")) |prefix| out.prefix_len = jsonU8(prefix) orelse return error.InvalidArgument;
     if (object.get("auto_fuzzy")) |auto| {
         if (auto != .bool) return error.InvalidArgument;
@@ -9798,7 +10416,7 @@ fn standardRangeUpperBound(object: anytype) !?JsonRangeBound {
 }
 
 fn setJsonRangeBound(found: *?JsonRangeBound, value: std.json.Value, inclusive: bool) !void {
-    if (found.* != null) return error.InvalidArgument;
+    if (found.* != null or value == .null) return error.InvalidArgument;
     found.* = .{ .value = value, .inclusive = inclusive };
 }
 
@@ -10033,6 +10651,20 @@ fn jsonU8(value: std.json.Value) ?u8 {
             if (!std.math.isFinite(number) or @round(number) != number) break :blk null;
             const parsed: i64 = @intFromFloat(number);
             break :blk std.math.cast(u8, parsed);
+        },
+        else => null,
+    };
+}
+
+fn jsonU32(value: std.json.Value) ?u32 {
+    return switch (value) {
+        .integer => |number| std.math.cast(u32, number),
+        .float => |number| blk: {
+            if (!std.math.isFinite(number) or @round(number) != number) break :blk null;
+            if (number < 0 or number > @as(f64, @floatFromInt(std.math.maxInt(u32)))) {
+                break :blk null;
+            }
+            break :blk @intFromFloat(number);
         },
         else => null,
     };
@@ -10616,7 +11248,7 @@ fn sortAndPageTextDocValueDocNumsAlloc(
     var visible_candidate_count: usize = 0;
     for (doc_nums, 0..) |doc_num, i| {
         if (i % 1024 == 0) try checkSearchRequestDeadline(effective_req);
-        const stored = snapshot.storedDoc(doc_num) orelse return error.StoredDocMissing;
+        const stored = (try snapshot.storedDoc(doc_num)) orelse return error.StoredDocMissing;
         if (executor.is_expired_key) |is_expired| {
             if (try is_expired(executor.ctx, alloc, stored.id)) continue;
         }
@@ -10736,7 +11368,7 @@ fn visibleTextDocNumCountAfterCursorAlloc(
     var visible_count: usize = 0;
     for (doc_nums, 0..) |doc_num, i| {
         if (i % 1024 == 0) try checkSearchRequestDeadline(req);
-        const stored = snapshot.storedDoc(doc_num) orelse return error.StoredDocMissing;
+        const stored = (try snapshot.storedDoc(doc_num)) orelse return error.StoredDocMissing;
         if (executor.is_expired_key) |is_expired| {
             if (try is_expired(executor.ctx, alloc, stored.id)) continue;
         }
@@ -10783,7 +11415,7 @@ fn visibleTextDocNumCount(
     var visible_count: usize = 0;
     for (doc_nums, 0..) |doc_num, i| {
         if (i % 1024 == 0) try checkSearchRequestDeadline(req);
-        const stored = snapshot.storedDoc(doc_num) orelse return error.StoredDocMissing;
+        const stored = (try snapshot.storedDoc(doc_num)) orelse return error.StoredDocMissing;
         if (try executor.is_expired_key.?(executor.ctx, alloc, stored.id)) continue;
         visible_count += 1;
     }
@@ -10814,6 +11446,8 @@ pub fn searchTextQuery(
         .match_all => executor.search_match_all(executor.ctx, alloc, effective_req),
         else => error.IndexNotFound,
     };
+    text_entry.lockAnalysisShared();
+    defer text_entry.unlockAnalysisShared();
     if (effective_req.index_name == null) effective_req.index_name = text_entry.config.name;
     const text_index = &text_entry.persistent;
     const chunk_backed = try executor.text_index_is_chunk_backed(executor.ctx, alloc, effective_req.index_name);
@@ -10831,7 +11465,7 @@ pub fn searchTextQuery(
     // still scoring it (observed as allocator corruption in termDocFreq()).
     const snapshot = text_index.acquireSnapshot();
     defer snapshot.release();
-    const can_apply_live_all_docs = !chunk_backed or snapshot.hasDocOrdinalCoverage();
+    const can_apply_live_all_docs = !chunk_backed or (try snapshot.hasDocOrdinalCoverage());
     const constraints_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
     var constraint_req = effective_req;
     constraint_req.resolved_doc_filter = null;
@@ -10860,6 +11494,7 @@ pub fn searchTextQuery(
             .resolve_doc_set_doc_ids = executor.resolve_doc_set_doc_ids,
             .resolve_doc_ids_to_doc_set = executor.resolve_doc_ids_to_doc_set,
             .live_filter_doc_set = executor.live_filter_doc_set,
+            .nonvisible_doc_set = executor.nonvisible_doc_set,
             .project_ordinals_to_doc_ids = false,
             .identity_read_generation = effective_req.identity_read_generation,
         });
@@ -10901,7 +11536,7 @@ pub fn searchTextQuery(
         native_constraints.positive_filter,
         effective_req.identity_read_generation,
     );
-    const full_candidate_limit = effectiveTextCandidateLimit(snapshot.global_doc_count, native_constraints);
+    const full_candidate_limit = effectiveTextCandidateLimit(snapshot.liveDocCount(), native_constraints);
     const requires_field_sort = effective_req.order_by.len > 0;
     const search_query = try textSearchQueryWithNativeDocIdsAlloc(arena_alloc, base_search_query, native_constraints, effective_req.count_only);
     // The primary document store is the source of truth. Production text
@@ -11103,7 +11738,7 @@ pub fn searchTextQuery(
             if (i % 1024 == 0) try checkSearchRequestDeadline(effective_req);
             const doc_ordinal = try snapshot.docOrdinal(hit.doc_id);
             const id = hit.id orelse {
-                const stored = snapshot.storedDoc(hit.doc_id) orelse return error.StoredDocMissing;
+                const stored = (try snapshot.storedDoc(hit.doc_id)) orelse return error.StoredDocMissing;
                 var materialized = types.SearchHit{
                     .id = try alloc.dupe(u8, stored.id),
                     .doc_ordinal = doc_ordinal,
@@ -11142,11 +11777,18 @@ pub fn searchTextQuery(
 
         owns_hits = false;
         const postprocess_start_ns = if (collect_score_timing) platform_time.monotonicNs() else 0;
+        const exhaustive_candidate_window = paging.offset == 0 and
+            paging.limit >= full_candidate_limit and
+            result.hits.len == @as(usize, result.total_hits);
         var out = try executor.postprocess(executor.ctx, alloc, postprocess_req, .{
             .alloc = alloc,
             .hits = hits,
             .total_hits = result.total_hits,
-            .total_hits_relation = switch (result.total_hits_relation) {
+            // The scorer may conservatively label a top-k count as `gte`.
+            // When k covers the complete candidate upper bound and every
+            // reported match was returned, the query layer has a stronger
+            // exactness proof. Limited pages keep the scorer's relation.
+            .total_hits_relation = if (exhaustive_candidate_window) .exact else switch (result.total_hits_relation) {
                 .exact => .exact,
                 .gte => .gte,
             },
@@ -11226,7 +11868,7 @@ pub fn searchTextQuery(
                     native_constraints.filter_doc_ids.len,
                     native_constraints.exclude_doc_nums.len,
                     native_constraints.exclude_doc_ids.len,
-                    snapshot.global_doc_count,
+                    snapshot.liveDocCount(),
                     candidate_limit,
                     candidate_iterations,
                     late_visibility_paginate,
@@ -11378,19 +12020,23 @@ fn textDocNumsForDocIdsAlloc(
     var doc_offset: u32 = 0;
     var scanned_count: u64 = 0;
     for (snapshot.segments) |*seg| {
-        for (0..seg.reader.doc_count) |local_doc_usize| {
-            scanned_count +|= 1;
-            if (scanned_count == 1 or scanned_count % 1024 == 0) try checkSearchRequestDeadline(req);
-            const local_doc: u32 = @intCast(local_doc_usize);
-            if (seg.shared.deleted) |deleted| {
-                if (deleted.contains(local_doc)) continue;
+        {
+            seg.shared.lockDeletionShared();
+            defer seg.shared.unlockDeletionShared();
+            for (0..seg.reader.doc_count) |local_doc_usize| {
+                scanned_count +|= 1;
+                if (scanned_count == 1 or scanned_count % 1024 == 0) try checkSearchRequestDeadline(req);
+                const local_doc: u32 = @intCast(local_doc_usize);
+                if (seg.shared.deleted) |deleted| {
+                    if (deleted.contains(local_doc)) continue;
+                }
+                const stored = (try seg.reader.storedDoc(local_doc)) orelse continue;
+                if (!doc_id_set.contains(stored.id)) continue;
+                const doc_num = doc_offset + local_doc;
+                const gop = try doc_num_set.getOrPut(alloc, doc_num);
+                if (gop.found_existing) continue;
+                try out.append(alloc, doc_num);
             }
-            const stored = seg.reader.storedDoc(local_doc) orelse continue;
-            if (!doc_id_set.contains(stored.id)) continue;
-            const doc_num = doc_offset + local_doc;
-            const gop = try doc_num_set.getOrPut(alloc, doc_num);
-            if (gop.found_existing) continue;
-            try out.append(alloc, doc_num);
         }
         doc_offset += seg.reader.doc_count;
     }
@@ -11437,26 +12083,42 @@ pub fn collectSearchRequestTextStats(
     if (req.full_text_queries.len == 0) {
         if (req.full_text) |text_query| {
             const text_entry = (try executor.text_index_entry(executor.ctx, req.index_name)) orelse return &.{};
-            try collectTextQueryTerms(alloc, &stats_map, req.index_name, text_query, text_entry.text_analysis, text_entry.runtime_schema);
+            {
+                text_entry.lockAnalysisShared();
+                defer text_entry.unlockAnalysisShared();
+                try collectTextQueryTerms(alloc, &stats_map, req.index_name, text_query, text_entry.text_analysis, text_entry.runtime_schema);
+            }
         } else if (isTextQuery(req.query) and !isDefaultMatchAll(req.query)) {
             const text_entry = (try executor.text_index_entry(executor.ctx, req.index_name)) orelse return &.{};
-            try collectQueryTerms(alloc, &stats_map, req.index_name, req.query, text_entry.text_analysis, text_entry.runtime_schema);
+            {
+                text_entry.lockAnalysisShared();
+                defer text_entry.unlockAnalysisShared();
+                try collectQueryTerms(alloc, &stats_map, req.index_name, req.query, text_entry.text_analysis, text_entry.runtime_schema);
+            }
         }
     } else {
         for (req.full_text_queries) |item| {
             const text_entry = (try executor.text_index_entry(executor.ctx, item.index_name)) orelse continue;
-            try collectTextQueryTerms(alloc, &stats_map, item.index_name, item.query, text_entry.text_analysis, text_entry.runtime_schema);
+            {
+                text_entry.lockAnalysisShared();
+                defer text_entry.unlockAnalysisShared();
+                try collectTextQueryTerms(alloc, &stats_map, item.index_name, item.query, text_entry.text_analysis, text_entry.runtime_schema);
+            }
         }
     }
 
     if (req.filter_query_json.len > 0 or req.exclusion_query_json.len > 0) {
         const filter_index_name = req.primary_text_index_name orelse req.index_name;
         const text_entry = (try executor.text_index_entry(executor.ctx, filter_index_name)) orelse return &.{};
-        if (req.filter_query_json.len > 0) {
-            try collectPatternFilterQueryTerms(alloc, &stats_map, filter_index_name, req.filter_query_json, text_entry.text_analysis, text_entry.runtime_schema);
-        }
-        if (req.exclusion_query_json.len > 0) {
-            try collectPatternFilterQueryTerms(alloc, &stats_map, filter_index_name, req.exclusion_query_json, text_entry.text_analysis, text_entry.runtime_schema);
+        {
+            text_entry.lockAnalysisShared();
+            defer text_entry.unlockAnalysisShared();
+            if (req.filter_query_json.len > 0) {
+                try collectPatternFilterQueryTerms(alloc, &stats_map, filter_index_name, req.filter_query_json, text_entry.text_analysis, text_entry.runtime_schema);
+            }
+            if (req.exclusion_query_json.len > 0) {
+                try collectPatternFilterQueryTerms(alloc, &stats_map, filter_index_name, req.exclusion_query_json, text_entry.text_analysis, text_entry.runtime_schema);
+            }
         }
     }
 
@@ -11529,8 +12191,8 @@ pub fn collectExplicitTextStats(
         }
         out[i] = .{
             .field = try alloc.dupe(u8, request.field),
-            .global_doc_count = snapshot.global_doc_count,
-            .global_total_field_len = snapshot.global_total_field_len.get(request.field) orelse 0,
+            .global_doc_count = snapshot.scoringDocCount(),
+            .global_total_field_len = snapshot.liveTotalFieldLen(request.field),
             .term_doc_freqs = term_doc_freqs,
         };
         initialized += 1;
@@ -11565,16 +12227,20 @@ fn collectFilteredExplicitTextStats(
     defer selected_doc_keys.deinit(alloc);
     var doc_offset: u32 = 0;
     for (snapshot.segments) |*seg| {
-        for (0..seg.reader.doc_count) |local_doc_usize| {
-            const local_doc: u32 = @intCast(local_doc_usize);
-            if (seg.shared.deleted) |deleted| {
-                if (deleted.contains(local_doc)) continue;
+        {
+            seg.shared.lockDeletionShared();
+            defer seg.shared.unlockDeletionShared();
+            for (0..seg.reader.doc_count) |local_doc_usize| {
+                const local_doc: u32 = @intCast(local_doc_usize);
+                if (seg.shared.deleted) |deleted| {
+                    if (deleted.contains(local_doc)) continue;
+                }
+                const doc_id = doc_offset + local_doc;
+                if (!(try docAllowedByResolvedFilter(snapshot, doc_id, filter))) continue;
+                global_doc_count += 1;
+                const stored = (try snapshot.storedDoc(doc_id)) orelse continue;
+                try selected_doc_keys.append(alloc, stored.id);
             }
-            const doc_id = doc_offset + local_doc;
-            if (!(try docAllowedByResolvedFilter(snapshot, doc_id, filter))) continue;
-            global_doc_count += 1;
-            const stored = snapshot.storedDoc(doc_id) orelse continue;
-            try selected_doc_keys.append(alloc, stored.id);
         }
         doc_offset += seg.reader.doc_count;
     }
@@ -11612,13 +12278,17 @@ fn collectFilteredExplicitTextStats(
         for (snapshot.segments) |*seg| {
             var allowed_local_docs = roaring.RoaringBitmap.init(alloc);
             defer allowed_local_docs.deinit();
-            for (0..seg.reader.doc_count) |local_doc_usize| {
-                const local_doc: u32 = @intCast(local_doc_usize);
-                if (seg.shared.deleted) |deleted| {
-                    if (deleted.contains(local_doc)) continue;
-                }
-                if (try docAllowedByResolvedFilter(snapshot, doc_offset + local_doc, filter)) {
-                    try allowed_local_docs.add(local_doc);
+            {
+                seg.shared.lockDeletionShared();
+                defer seg.shared.unlockDeletionShared();
+                for (0..seg.reader.doc_count) |local_doc_usize| {
+                    const local_doc: u32 = @intCast(local_doc_usize);
+                    if (seg.shared.deleted) |deleted| {
+                        if (deleted.contains(local_doc)) continue;
+                    }
+                    if (try docAllowedByResolvedFilter(snapshot, doc_offset + local_doc, filter)) {
+                        try allowed_local_docs.add(local_doc);
+                    }
                 }
             }
             if (try seg.reader.invertedIndex(request.field)) |inv_reader| {
@@ -11671,7 +12341,7 @@ fn docSetContainsSnapshotDoc(
             break :blk set.containsOrdinal(ordinal);
         },
         .doc_keys => |keys| blk: {
-            const stored = snapshot.storedDoc(doc_id) orelse break :blk false;
+            const stored = (try snapshot.storedDoc(doc_id)) orelse break :blk false;
             for (keys) |key| {
                 if (std.mem.eql(u8, key, stored.id)) break :blk true;
             }
@@ -11770,7 +12440,7 @@ pub fn executeBackgroundQuery(
                 .term = term.term,
             } },
         },
-        .k = snapshot.global_doc_count,
+        .k = snapshot.liveDocCount(),
         .include_stored = false,
     };
     return search_mod.execute(alloc, snapshot, request);
@@ -12193,7 +12863,19 @@ fn searchDenseInternal(
     const collect_sort_profile = bench_query_profile or req.profile;
     const collect_hbc_profile = include_hbc_profile or bench_query_profile;
 
-    if (native_constraints.positive_filter and native_constraints.filter_ids.len == 0) {
+    const effective_filter_ids = if (native_constraints.positive_filter) native_constraints.filter_ids else req.filter_ids;
+    profile.native_filter_candidate_count = @intCast(effective_filter_ids.len);
+    const effective_exclude_ids = if (native_constraints.exclude_ids.len > 0) native_constraints.exclude_ids else req.exclude_ids;
+    const effective_native_filter_candidate_count = if (native_constraints.positive_filter)
+        if (native_constraints.exclude_ids_owned)
+            dense_exact.differenceCandidateUpperBoundNormalizedExclusions(effective_filter_ids, effective_exclude_ids)
+        else
+            dense_exact.differenceCandidateUpperBound(effective_filter_ids, effective_exclude_ids) orelse effective_filter_ids.len
+    else
+        effective_filter_ids.len;
+    if (native_constraints.positive_filter and effective_native_filter_candidate_count == 0) {
+        profile.search_route = "empty_result";
+        profile.route_reason = "empty_native_filter";
         profile.returned_hit_count = 0;
         profile.total_ns = platform_time.monotonicNs() - total_start;
         return .{
@@ -12204,11 +12886,8 @@ fn searchDenseInternal(
             .graph_results = &.{},
         };
     }
-
-    const effective_filter_ids = if (native_constraints.positive_filter) native_constraints.filter_ids else req.filter_ids;
-    const effective_exclude_ids = if (native_constraints.exclude_ids.len > 0) native_constraints.exclude_ids else req.exclude_ids;
     var bounded_full_candidate_count: u32 = if (native_constraints.positive_filter)
-        @intCast(@min(native_constraints.filter_ids.len, std.math.maxInt(u32)))
+        @intCast(@min(effective_native_filter_candidate_count, std.math.maxInt(u32)))
     else
         @intCast(index_stats.active_count);
     if (!native_constraints.positive_filter and native_constraints.broad_live_exclude_ids.len > 0) {
@@ -12257,18 +12936,30 @@ fn searchDenseInternal(
             .distance_under = req.distance_under,
             .filter_ids = effective_filter_ids,
             .exclude_ids = effective_exclude_ids,
+            .cancellation = req.cancellation,
         };
 
         const hbc_search_start = platform_time.monotonicNs();
-        const use_exact_native_filter = shouldExactScoreNativeDenseFilter(native_constraints, paging);
-        var results = if (use_exact_native_filter) blk: {
+        const route = denseSearchRoute(
+            native_constraints.positive_filter,
+            effective_native_filter_candidate_count,
+            index_stats.active_count,
+            entry.dims,
+            paging,
+            executor.exact_dense_search != null,
+        );
+        profile.search_route = route.name;
+        profile.route_reason = route.reason;
+        var results = if (route.exact_native_filter) blk: {
+            // The callback is an optional executor override, not an exact-route
+            // capability gate. Preserve the built-in exact scorer fallback.
             const exact = if (executor.exact_dense_search) |exact_search|
                 try exact_search(executor.ctx, entry, hbc_req)
             else
                 try exactScoreNativeDenseFilter(alloc, entry, hbc_req);
-            profile.hbc_exact_vectors_scored = @intCast(native_constraints.filter_ids.len);
+            profile.hbc_exact_vectors_scored = exact.vectors_scored;
             score_exactness = .exact;
-            break :blk exact;
+            break :blk exact.results;
         } else if (collect_hbc_profile) blk: {
             const profiled = executor.hbc_search_profiled(executor.ctx, entry, hbc_req) catch |err| switch (err) {
                 error.NotFound => {
@@ -12468,15 +13159,130 @@ fn shouldLogBenchQueryProfile() bool {
     return current % every == 0;
 }
 
-fn shouldExactScoreNativeDenseFilter(
-    native_constraints: NativeDenseConstraints,
+const DenseSearchRoute = struct {
+    exact_native_filter: bool,
+    name: []const u8,
+    reason: []const u8,
+};
+
+fn denseSearchRoute(
+    positive_filter: bool,
+    effective_candidate_count: usize,
+    active_count: u64,
+    vector_dims: usize,
     paging: ComponentPaging,
-) bool {
-    if (!native_constraints.positive_filter) return false;
-    if (native_constraints.filter_ids.len == 0) return false;
-    const paging_budget = pagingCandidateWindow(paging) *| 32;
-    const budget = @max(paging_budget, default_exact_native_filter_candidate_budget);
-    return native_constraints.filter_ids.len <= budget;
+    exact_executor_available: bool,
+) DenseSearchRoute {
+    if (!positive_filter) return .{
+        .exact_native_filter = false,
+        .name = "hbc",
+        .reason = "no_native_filter",
+    };
+    if (effective_candidate_count == 0) return .{
+        .exact_native_filter = false,
+        .name = "hbc",
+        .reason = "empty_native_filter",
+    };
+    const paging_budget: usize = pagingCandidateWindow(paging) *| 32;
+    const requested_budget = @max(paging_budget, default_exact_native_filter_candidate_budget);
+    const work_budget = selectiveExactCandidateWorkBudget(vector_dims);
+    if (effective_candidate_count <= @min(requested_budget, work_budget)) return .{
+        .exact_native_filter = true,
+        .name = "exact_native_filter",
+        .reason = if (exact_executor_available)
+            "candidate_count_within_budget"
+        else
+            "candidate_count_within_budget_builtin",
+    };
+    // Rare positive subsets are a poor fit for graph traversal: the HBC
+    // centroids describe the whole corpus, so a traversal can spend most of
+    // its work on leaves whose members the filter rejects and still miss
+    // eligible neighbours. Exact scoring is recall-safe for these subsets, but
+    // selectivity alone is not a cost bound on a large index. Require both the
+    // relative threshold and the dimension-aware absolute work budget. Use
+    // division for the relative threshold to avoid candidate_count * 100
+    // overflow.
+    const selective_candidate_limit: usize = @intCast(@min(active_count / 100, std.math.maxInt(usize)));
+    if (selective_candidate_limit > 0 and
+        effective_candidate_count <= selective_candidate_limit and
+        effective_candidate_count <= work_budget)
+    {
+        return .{
+            .exact_native_filter = true,
+            .name = "exact_native_filter",
+            .reason = if (exact_executor_available)
+                "selectivity_within_exact_threshold"
+            else
+                "selectivity_within_exact_threshold_builtin",
+        };
+    }
+    if ((effective_candidate_count <= requested_budget or
+        (selective_candidate_limit > 0 and effective_candidate_count <= selective_candidate_limit)) and
+        effective_candidate_count > work_budget)
+    {
+        return .{
+            .exact_native_filter = false,
+            .name = "hbc",
+            .reason = "selective_exact_work_budget_exceeded",
+        };
+    }
+    return .{
+        .exact_native_filter = false,
+        .name = "hbc",
+        .reason = "native_filter_candidate_budget_exceeded",
+    };
+}
+
+fn selectiveExactCandidateWorkBudget(vector_dims: usize) usize {
+    const dimensions = @max(vector_dims, 1);
+    const component_limited = @max(default_selective_exact_component_budget / dimensions, 1);
+    return @min(default_selective_exact_candidate_budget, component_limited);
+}
+
+test "dense search route reports exact native filter budget decisions" {
+    const paging = ComponentPaging{ .offset = 0, .limit = 100 };
+
+    const no_filter = denseSearchRoute(false, 0, 1_000_000, 768, paging, false);
+    try std.testing.expect(!no_filter.exact_native_filter);
+    try std.testing.expectEqualStrings("hbc", no_filter.name);
+    try std.testing.expectEqualStrings("no_native_filter", no_filter.reason);
+
+    const within_budget = denseSearchRoute(true, 500, 10_000, 768, paging, true);
+    try std.testing.expect(within_budget.exact_native_filter);
+    try std.testing.expectEqualStrings("exact_native_filter", within_budget.name);
+    try std.testing.expectEqualStrings("candidate_count_within_budget", within_budget.reason);
+
+    const builtin_fallback = denseSearchRoute(true, 500, 10_000, 768, paging, false);
+    try std.testing.expect(builtin_fallback.exact_native_filter);
+    try std.testing.expectEqualStrings("exact_native_filter", builtin_fallback.name);
+    try std.testing.expectEqualStrings("candidate_count_within_budget_builtin", builtin_fallback.reason);
+
+    const one_percent = denseSearchRoute(true, 10_000, 1_000_000, 768, paging, true);
+    try std.testing.expect(one_percent.exact_native_filter);
+    try std.testing.expectEqualStrings("exact_native_filter", one_percent.name);
+    try std.testing.expectEqualStrings("selectivity_within_exact_threshold", one_percent.reason);
+
+    const one_percent_builtin = denseSearchRoute(true, 10_000, 1_000_000, 768, paging, false);
+    try std.testing.expect(one_percent_builtin.exact_native_filter);
+    try std.testing.expectEqualStrings("selectivity_within_exact_threshold_builtin", one_percent_builtin.reason);
+
+    const over_budget = denseSearchRoute(true, 10_001, 1_000_000, 768, paging, false);
+    try std.testing.expect(!over_budget.exact_native_filter);
+    try std.testing.expectEqualStrings("hbc", over_budget.name);
+    try std.testing.expectEqualStrings("native_filter_candidate_budget_exceeded", over_budget.reason);
+
+    const exclusion_reduced = denseSearchRoute(true, 201, 10_000, 768, paging, true);
+    try std.testing.expect(exclusion_reduced.exact_native_filter);
+    try std.testing.expectEqualStrings("candidate_count_within_budget", exclusion_reduced.reason);
+
+    const oversized_one_percent = denseSearchRoute(true, 1_000_000, 100_000_000, 768, paging, true);
+    try std.testing.expect(!oversized_one_percent.exact_native_filter);
+    try std.testing.expectEqualStrings("hbc", oversized_one_percent.name);
+    try std.testing.expectEqualStrings("selective_exact_work_budget_exceeded", oversized_one_percent.reason);
+
+    try std.testing.expectEqual(@as(usize, 32 * 1024), selectiveExactCandidateWorkBudget(2));
+    try std.testing.expectEqual(@as(usize, 16 * 1024), selectiveExactCandidateWorkBudget(1024));
+    try std.testing.expectEqual(@as(usize, 1), selectiveExactCandidateWorkBudget(std.math.maxInt(usize)));
 }
 
 fn pagingCandidateWindow(paging: ComponentPaging) u32 {
@@ -12531,30 +13337,70 @@ fn exactScoreNativeDenseFilter(
     alloc: Allocator,
     entry: *index_manager_mod.IndexManager.DenseIndex,
     req: vectorindex_mod.SearchRequest,
-) !vectorindex_mod.SearchResults {
+) !dense_exact.SearchOutcome {
+    try checkVectorSearchCancelled(req);
+    var candidates = try dense_exact.CandidateDifference.init(alloc, req.filter_ids, req.exclude_ids);
+    defer candidates.deinit();
+    const unique_candidate_ids = candidates.values;
+
     var results = try vectorindex_mod.SearchResults.initCapacity(
         alloc,
         req.k,
         req.k,
-        @min(req.k, req.filter_ids.len),
+        @min(req.k, unique_candidate_ids.len),
     );
     errdefer results.deinit();
 
     var txn = try entry.index.beginReadTxn();
     defer txn.abort();
+    var vector_cursor = entry.index.openNamespacedCursor(alloc, &txn, .vecs) catch |err| switch (err) {
+        error.Unsupported => null,
+        else => return err,
+    };
+    defer if (vector_cursor) |*cursor| cursor.close();
+
+    const candidate_metadata = try alloc.alloc(
+        ?[]const u8,
+        if (req.filter_prefix.len > 0) unique_candidate_ids.len else 0,
+    );
+    defer alloc.free(candidate_metadata);
+    if (candidate_metadata.len > 0) {
+        @memset(candidate_metadata, null);
+        var metadata_start: usize = 0;
+        while (metadata_start < unique_candidate_ids.len) {
+            try checkVectorSearchCancelled(req);
+            const metadata_end = @min(metadata_start + exact_native_filter_metadata_batch_size, unique_candidate_ids.len);
+            try entry.index.getMetadataManySortedInTxn(
+                &txn,
+                unique_candidate_ids[metadata_start..metadata_end],
+                candidate_metadata[metadata_start..metadata_end],
+            );
+            metadata_start = metadata_end;
+        }
+        try checkVectorSearchCancelled(req);
+    }
 
     const vector_scratch = try alloc.alloc(f32, entry.dims);
     defer alloc.free(vector_scratch);
     const query_measure = vector_mod.norm(req.query);
+    var vectors_scored: u64 = 0;
 
-    for (req.filter_ids) |vector_id| {
-        if (containsVectorId(req.exclude_ids, vector_id)) continue;
-        const vector = entry.index.getVectorViewOrScratch(&txn, vector_id, vector_scratch) catch |err| switch (err) {
+    for (unique_candidate_ids, 0..) |vector_id, i| {
+        if (i % exact_native_filter_cancellation_stride == 0) try checkVectorSearchCancelled(req);
+        if (req.filter_prefix.len > 0) {
+            const metadata = candidate_metadata[i] orelse continue;
+            if (!std.mem.startsWith(u8, metadata, req.filter_prefix)) continue;
+        }
+        const vector = (if (vector_cursor) |*cursor|
+            entry.index.getVectorViewOrScratchWithCursor(cursor, vector_id, vector_scratch)
+        else
+            entry.index.getVectorViewOrScratch(&txn, vector_id, vector_scratch)) catch |err| switch (err) {
             error.NotFound => continue,
             else => return err,
         };
         if (vector.len != req.query.len) return error.DimensionMismatch;
 
+        vectors_scored += 1;
         const distance = vector_mod.distanceToQuery(req.query, query_measure, vector, entry.metric);
         if (!std.math.isFinite(distance)) continue;
         if (req.distance_over) |threshold| {
@@ -12563,14 +13409,308 @@ fn exactScoreNativeDenseFilter(
         if (req.distance_under) |threshold| {
             if (distance >= threshold) continue;
         }
-        if (req.filter_prefix.len > 0) {
-            const metadata = (try entry.index.getMetadataInTxn(&txn, vector_id)) orelse continue;
-            if (!std.mem.startsWith(u8, metadata, req.filter_prefix)) continue;
-        }
         results.addResult(vector_id, distance, 0);
     }
     results.sort();
-    return results;
+    return .{
+        .results = results,
+        .vectors_scored = vectors_scored,
+    };
+}
+
+inline fn checkVectorSearchCancelled(req: vectorindex_mod.SearchRequest) !void {
+    if (req.cancellation) |cancellation| {
+        if (cancellation.load(.acquire)) return error.Cancelled;
+    }
+}
+
+test "built-in exact dense scorer filters metadata before vector reads" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/builtin-exact-prefix", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var index = try hbc_mod.HBCIndex.open(alloc, path_z.ptr, .{
+        .dims = 2,
+        .leaf_size = 2,
+        .branching_factor = 2,
+    });
+    var index_owned = true;
+    defer if (index_owned) index.close();
+    try index.bulkBuildWithMetadata(&.{
+        .{ .vector_id = 1, .vector = &.{ 0.0, 0.0 }, .metadata = "doc:keep:a" },
+        .{ .vector_id = 2, .vector = &.{ 1.0, 0.0 }, .metadata = "doc:keep:b" },
+        .{ .vector_id = 3, .vector = &.{ 2.0, 0.0 }, .metadata = "doc:drop:a" },
+        .{ .vector_id = 4, .vector = &.{ 3.0, 0.0 }, .metadata = "doc:drop:b" },
+    });
+
+    var apply_mutex = std.atomic.Mutex.unlocked;
+    var entry = index_manager_mod.IndexManager.DenseIndex{
+        .apply_mutex = &apply_mutex,
+        .config = .{ .name = "dense", .kind = .dense_vector, .config_json = "{}" },
+        .field_name = @constCast("embedding"),
+        .dims = 2,
+        .metric = .l2_squared,
+        .external = false,
+        .chunk_name = null,
+        .embedding_name = null,
+        .index = index,
+    };
+    index_owned = false;
+    defer entry.index.close();
+
+    const VectorLoadCounter = struct {
+        count: usize = 0,
+
+        fn onLoad(ctx_ptr: ?*anyopaque, _: *hbc_mod.HBCIndex, _: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx_ptr.?));
+            self.count += 1;
+        }
+    };
+    var counter = VectorLoadCounter{};
+    hbc_mod.setTestGetVectorViewOrScratchHook(&counter, VectorLoadCounter.onLoad);
+    defer hbc_mod.setTestGetVectorViewOrScratchHook(null, null);
+
+    var outcome = try exactScoreNativeDenseFilter(alloc, &entry, .{
+        .query = &.{ 0.0, 0.0 },
+        .k = 4,
+        .filter_prefix = "doc:keep:",
+        .filter_ids = &.{ 4, 2, 3, 1 },
+    });
+    defer outcome.results.deinit();
+
+    try std.testing.expectEqual(@as(u64, 2), outcome.vectors_scored);
+    try std.testing.expectEqual(@as(usize, 2), counter.count);
+    const hits = outcome.results.getHits();
+    try std.testing.expectEqual(@as(usize, 2), hits.len);
+    try std.testing.expectEqual(@as(u64, 1), hits[0].vector_id);
+    try std.testing.expectEqual(@as(u64, 2), hits[1].vector_id);
+}
+
+test "one percent filtered route preserves exact recall with candidate-linear IO" {
+    const alloc = std.testing.allocator;
+    const candidate_count: usize = 1100;
+    const dims: usize = 8;
+    const result_count: usize = 10;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/selective-exact-recall", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var index = try hbc_mod.HBCIndex.open(alloc, path_z.ptr, .{
+        .dims = dims,
+        .leaf_size = 64,
+        .branching_factor = 8,
+    });
+    var index_owned = true;
+    defer if (index_owned) index.close();
+
+    const vectors = try alloc.alloc(f32, candidate_count * dims);
+    defer alloc.free(vectors);
+    @memset(vectors, 0);
+    const items = try alloc.alloc(hbc_mod.BatchInsertItem, candidate_count);
+    defer alloc.free(items);
+    const filter_ids = try alloc.alloc(u64, candidate_count);
+    defer alloc.free(filter_ids);
+    for (items, 0..) |*item, i| {
+        const vector_id: u64 = @intCast(i + 1);
+        const vector = vectors[i * dims ..][0..dims];
+        vector[0] = @floatFromInt(vector_id);
+        item.* = .{ .vector_id = vector_id, .vector = vector };
+        filter_ids[i] = vector_id;
+    }
+    try index.bulkBuildWithMetadata(items);
+
+    var apply_mutex = std.atomic.Mutex.unlocked;
+    var entry = index_manager_mod.IndexManager.DenseIndex{
+        .apply_mutex = &apply_mutex,
+        .config = .{ .name = "dense", .kind = .dense_vector, .config_json = "{}" },
+        .field_name = @constCast("embedding"),
+        .dims = dims,
+        .metric = .l2_squared,
+        .external = false,
+        .chunk_name = null,
+        .embedding_name = null,
+        .index = index,
+    };
+    index_owned = false;
+    defer entry.index.close();
+
+    const paging = ComponentPaging{ .offset = 0, .limit = result_count };
+    const route = denseSearchRoute(true, candidate_count, candidate_count * 100, dims, paging, false);
+    try std.testing.expect(route.exact_native_filter);
+    try std.testing.expectEqualStrings("selectivity_within_exact_threshold_builtin", route.reason);
+
+    const VectorLoadCounter = struct {
+        count: usize = 0,
+        cancel_after: usize = 0,
+        cancellation: ?*std.atomic.Value(bool) = null,
+
+        fn onLoad(ctx_ptr: ?*anyopaque, _: *hbc_mod.HBCIndex, _: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx_ptr.?));
+            self.count += 1;
+            if (self.cancel_after > 0 and self.count >= self.cancel_after) {
+                self.cancellation.?.store(true, .release);
+            }
+        }
+    };
+    var counter = VectorLoadCounter{};
+    hbc_mod.setTestGetVectorViewOrScratchHook(&counter, VectorLoadCounter.onLoad);
+    defer hbc_mod.setTestGetVectorViewOrScratchHook(null, null);
+
+    var query = [_]f32{0} ** dims;
+    query[0] = @floatFromInt(candidate_count);
+    var outcome = try exactScoreNativeDenseFilter(alloc, &entry, .{
+        .query = &query,
+        .k = result_count,
+        .filter_ids = filter_ids,
+    });
+    defer outcome.results.deinit();
+
+    try std.testing.expectEqual(@as(u64, candidate_count), outcome.vectors_scored);
+    try std.testing.expectEqual(candidate_count, counter.count);
+    const hits = outcome.results.getHits();
+    try std.testing.expectEqual(result_count, hits.len);
+    for (hits, 0..) |hit, rank| {
+        try std.testing.expectEqual(@as(u64, @intCast(candidate_count - rank)), hit.vector_id);
+    }
+
+    var cancellation = std.atomic.Value(bool).init(false);
+    counter = .{
+        .cancel_after = exact_native_filter_cancellation_stride,
+        .cancellation = &cancellation,
+    };
+    try std.testing.expectError(error.Cancelled, exactScoreNativeDenseFilter(alloc, &entry, .{
+        .query = &query,
+        .k = result_count,
+        .filter_ids = filter_ids,
+        .cancellation = &cancellation,
+    }));
+    try std.testing.expectEqual(exact_native_filter_cancellation_stride, counter.count);
+}
+
+test "one percent native filter routes through integrated dense search exactly" {
+    const alloc = std.testing.allocator;
+    const active_count: usize = 110_000;
+    const candidate_count: usize = active_count / 100;
+    const dims: usize = 2;
+    const result_count: usize = 10;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/integrated-selective-exact", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var index = try hbc_mod.HBCIndex.open(alloc, path_z.ptr, .{
+        .dims = dims,
+        .leaf_size = 128,
+        .branching_factor = 16,
+    });
+    var index_owned = true;
+    defer if (index_owned) index.close();
+
+    const vectors = try alloc.alloc(f32, active_count * dims);
+    defer alloc.free(vectors);
+    @memset(vectors, 0);
+    const items = try alloc.alloc(hbc_mod.BatchInsertItem, active_count);
+    defer alloc.free(items);
+    const filter_ids = try alloc.alloc(u64, candidate_count);
+    defer alloc.free(filter_ids);
+    for (items, 0..) |*item, i| {
+        const vector_id: u64 = @intCast(i + 1);
+        const vector = vectors[i * dims ..][0..dims];
+        vector[0] = @floatFromInt(vector_id);
+        item.* = .{ .vector_id = vector_id, .vector = vector, .metadata = "doc" };
+        if (i >= active_count - candidate_count) filter_ids[i - (active_count - candidate_count)] = vector_id;
+    }
+    try index.bulkBuildWithMetadata(items);
+
+    var apply_mutex = std.atomic.Mutex.unlocked;
+    var entry = index_manager_mod.IndexManager.DenseIndex{
+        .apply_mutex = &apply_mutex,
+        .config = .{ .name = "dense", .kind = .dense_vector, .config_json = "{}" },
+        .field_name = @constCast("embedding"),
+        .dims = dims,
+        .metric = .l2_squared,
+        .external = false,
+        .chunk_name = null,
+        .embedding_name = null,
+        .index = index,
+    };
+    index_owned = false;
+    defer entry.index.close();
+
+    const Harness = struct {
+        entry: *index_manager_mod.IndexManager.DenseIndex,
+
+        fn self(ctx: ?*anyopaque) *@This() {
+            return @ptrCast(@alignCast(ctx.?));
+        }
+        fn textIndex(_: ?*anyopaque, _: ?[]const u8) anyerror!?*index_manager_mod.IndexManager.TextIndex {
+            return null;
+        }
+        fn denseIndex(ctx: ?*anyopaque, _: ?[]const u8) anyerror!?*index_manager_mod.IndexManager.DenseIndex {
+            return self(ctx).entry;
+        }
+        fn unexpectedDocKey(_: ?*anyopaque, _: []const u8, _: u64) anyerror!?[]u8 {
+            return error.UnexpectedTestCall;
+        }
+        fn unexpectedVectorId(_: ?*anyopaque, _: []const u8, _: []const u8) anyerror!?u64 {
+            return error.UnexpectedTestCall;
+        }
+        fn unexpectedLoad(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, _: []const u8) anyerror![]u8 {
+            return error.UnexpectedTestCall;
+        }
+        fn unexpectedHbc(_: ?*anyopaque, _: *index_manager_mod.IndexManager.DenseIndex, _: vectorindex_mod.SearchRequest) anyerror!vectorindex_mod.SearchResults {
+            return error.UnexpectedHbcRoute;
+        }
+        fn unexpectedHbcProfiled(_: ?*anyopaque, _: *index_manager_mod.IndexManager.DenseIndex, _: vectorindex_mod.SearchRequest) anyerror!vectorindex_mod.ProfiledSearchResults {
+            return error.UnexpectedHbcRoute;
+        }
+        fn postprocess(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, raw: types.SearchResult, _: bool) anyerror!types.SearchResult {
+            return raw;
+        }
+    };
+    var harness = Harness{ .entry = &entry };
+    const executor = DenseSearchExecutor{
+        .ctx = &harness,
+        .text_index_entry = Harness.textIndex,
+        .dense_index = Harness.denseIndex,
+        .lookup_doc_key = Harness.unexpectedDocKey,
+        .lookup_vector_id = Harness.unexpectedVectorId,
+        .load_projected_document = Harness.unexpectedLoad,
+        .hbc_search = Harness.unexpectedHbc,
+        .hbc_search_profiled = Harness.unexpectedHbcProfiled,
+        .postprocess = Harness.postprocess,
+    };
+
+    var query = [_]f32{ 0, 0 };
+    query[0] = @floatFromInt(active_count);
+    var profiled = try searchDenseProfiled(alloc, .{
+        .index_name = "dense",
+        .limit = result_count,
+        .include_stored = false,
+        .profile = true,
+        .filter_ids = filter_ids,
+    }, .{
+        .vector = &query,
+        .k = result_count,
+    }, executor);
+    defer profiled.result.deinit();
+
+    try std.testing.expectEqualStrings("exact_native_filter", profiled.profile.search_route);
+    try std.testing.expectEqualStrings("selectivity_within_exact_threshold_builtin", profiled.profile.route_reason);
+    try std.testing.expectEqual(@as(u64, candidate_count), profiled.profile.hbc_exact_vectors_scored);
+    try std.testing.expectEqual(result_count, profiled.result.hits.len);
+    try std.testing.expectEqualStrings("exact", profiled.result.sort_profile.?.exactness);
 }
 
 fn countActiveDenseVectorIdsAlloc(
@@ -12745,12 +13885,12 @@ fn logBenchDenseQueryProfile(
 ) void {
     const estimated_leaves = estimateLeafCount(index_stats);
     std.log.info(
-        "antfly_bench_dense_query index={s} primary_text={s} has_filter={} has_exclusion={} k={d} limit={d} offset={d} effort={d:.3} nodes={d} active={d} estimated_leaves={d} leaf_size={d} branching={d} search_width={d} epsilon={d:.3} total_us={d} index_lookup_us={d} constraint_us={d} hbc_us={d} doc_key_us={d} doc_ordinal_us={d} load_projected_us={d} postprocess_us={d} raw_hits={d} returned_hits={d}",
+        "antfly_bench_dense_query index={s} primary_text={s} has_filter={} has_exclusion={} k={d} limit={d} offset={d} effort={d:.3} nodes={d} active={d} estimated_leaves={d} leaf_size={d} branching={d} search_width={d} epsilon={d:.3} native_filter_candidates={d} route={s} route_reason={s} total_us={d} index_lookup_us={d} constraint_us={d} hbc_us={d} doc_key_us={d} doc_ordinal_us={d} load_projected_us={d} postprocess_us={d} raw_hits={d} returned_hits={d}",
         .{
             req.index_name orelse "",
             req.primary_text_index_name orelse "",
-            req.filter_query_json.len > 0,
-            req.exclusion_query_json.len > 0,
+            req.filter_text != null or req.filter_query_json.len > 0,
+            req.exclusion_text != null or req.exclusion_query_json.len > 0,
             dense.k,
             req.limit,
             req.offset,
@@ -12762,6 +13902,9 @@ fn logBenchDenseQueryProfile(
             index_stats.branching_factor,
             profile.resolved_search_width,
             profile.resolved_epsilon,
+            profile.native_filter_candidate_count,
+            profile.search_route,
+            profile.route_reason,
             nsToUs(profile.total_ns),
             nsToUs(profile.index_lookup_ns),
             nsToUs(profile.constraint_ns),
@@ -12977,6 +14120,7 @@ pub fn searchSparse(
     executor: SparseSearchExecutor,
 ) !types.SearchResult {
     resetLastSortRejectionDiagnostic();
+    try checkSearchRequestDeadline(req);
     try rejectApproximateSortPageOptions(req);
     const bench_query_profile = shouldLogBenchQueryProfile();
     const collect_sort_profile = bench_query_profile or req.profile;
@@ -13045,7 +14189,9 @@ pub fn searchSparse(
         .exclude_doc_ids = native_constraints.exclude_doc_ids,
         .filter_doc_nums = native_constraints.filter_doc_nums,
         .exclude_doc_nums = native_constraints.exclude_doc_nums,
+        .cancellation = req.cancellation,
     });
+    try checkSearchRequestDeadline(req);
     if (bench_query_profile) index_search_ns = platform_time.monotonicNs() - index_search_start_ns;
     defer sparse_mod.SparseIndex.freeResults(alloc, raw_hits);
 
@@ -13588,7 +14734,7 @@ fn snapshotTypedDocValuesCoverageDetailsForMapping(
     var expected_value_type: ?typed_dv.ValueType = null;
     for (snapshot.segments) |*segment| {
         if (segment.liveDocCount() == 0) continue;
-        const section_data = segment.reader.getSection(field, .typed_doc_values) orelse return .{ .status = .missing_doc_values_section };
+        const section_data = (try segment.reader.getSection(field, .typed_doc_values)) orelse return .{ .status = .missing_doc_values_section };
         const reader = typed_dv.TypedDocValuesReader.init(snapshot.alloc, section_data) catch return .{ .status = .malformed_doc_values_section };
         if (!typedDocValuesTypeMatchesMappedSortField(reader.value_type, mapping)) return .{ .status = .doc_values_kind_mismatch };
         if (expected_value_type) |expected| {
@@ -13616,7 +14762,7 @@ fn snapshotGeoPointDocValuesCoverage(
 ) !TypedDocValuesCoverageStatus {
     for (snapshot.segments) |*segment| {
         if (segment.liveDocCount() == 0) continue;
-        const section_data = segment.reader.getSection(field, .typed_doc_values) orelse return .missing_doc_values_section;
+        const section_data = (try segment.reader.getSection(field, .typed_doc_values)) orelse return .missing_doc_values_section;
         const reader = typed_dv.TypedDocValuesReader.init(snapshot.alloc, section_data) catch return .malformed_doc_values_section;
         if (reader.value_type != .geo_point) return .doc_values_kind_mismatch;
         const live_status = try typed_dv_coverage.readerCoversLiveDocsAlloc(snapshot.alloc, segment, &reader);
@@ -14065,7 +15211,7 @@ fn planTextNativeSortFields(
                 return error.InvalidQueryRequest;
             }
         }
-        if (snapshot.global_doc_count == 0) continue;
+        if (snapshot.liveDocCount() == 0) continue;
         const coverage = try snapshotTypedDocValuesCoverageDetailsForMapping(snapshot, field.field, mapping);
         if (coverage.status != .covered) {
             const reason = typedDocValuesCoverageRejectionReason(coverage.status) orelse .missing_doc_values_capability;
@@ -14125,7 +15271,7 @@ fn buildOrdinalTextDocIdMapAlloc(
     candidates: []const MatchAllCandidate,
     ordinal_to_text_doc_id: *std.AutoHashMapUnmanaged(doc_set.DocOrdinal, u32),
 ) !bool {
-    if (!snapshot.hasDocOrdinalCoverage()) return false;
+    if (!(try snapshot.hasDocOrdinalCoverage())) return false;
 
     var ordinals = std.ArrayListUnmanaged(doc_set.DocOrdinal).empty;
     defer ordinals.deinit(alloc);
@@ -14149,19 +15295,23 @@ fn buildAllOrdinalTextDocIdMapAlloc(
     snapshot: *const index_mod.IndexSnapshot,
     ordinal_to_text_doc_id: *std.AutoHashMapUnmanaged(doc_set.DocOrdinal, u32),
 ) !bool {
-    if (!snapshot.hasDocOrdinalCoverage()) return false;
+    if (!(try snapshot.hasDocOrdinalCoverage())) return false;
 
     var doc_offset: u32 = 0;
     var saw_live_doc = false;
     for (snapshot.segments) |*segment| {
-        for (0..segment.reader.doc_count) |local_usize| {
-            const local_doc: u32 = @intCast(local_usize);
-            if (segment.shared.deleted) |deleted| {
-                if (deleted.contains(local_doc)) continue;
+        {
+            segment.shared.lockDeletionShared();
+            defer segment.shared.unlockDeletionShared();
+            for (0..segment.reader.doc_count) |local_usize| {
+                const local_doc: u32 = @intCast(local_usize);
+                if (segment.shared.deleted) |deleted| {
+                    if (deleted.contains(local_doc)) continue;
+                }
+                saw_live_doc = true;
+                const ordinal = (try segment.reader.docOrdinal(local_doc)) orelse return false;
+                try ordinal_to_text_doc_id.put(alloc, ordinal, doc_offset + local_doc);
             }
-            saw_live_doc = true;
-            const ordinal = (try segment.reader.docOrdinal(local_doc)) orelse return false;
-            try ordinal_to_text_doc_id.put(alloc, ordinal, doc_offset + local_doc);
         }
         doc_offset += segment.reader.doc_count;
     }
@@ -14183,26 +15333,30 @@ fn matchAllDocOrdinalsForDocIdsAlloc(
     errdefer out.deinit(alloc);
     var scanned_count: u64 = 0;
     for (snapshot.segments) |*segment| {
-        for (0..segment.reader.doc_count) |local_usize| {
-            scanned_count +|= 1;
-            if (scanned_count == 1 or scanned_count % 1024 == 0) try checkSearchRequestDeadline(req);
-            const local_doc: u32 = @intCast(local_usize);
-            if (segment.shared.deleted) |deleted| {
-                if (deleted.contains(local_doc)) continue;
+        {
+            segment.shared.lockDeletionShared();
+            defer segment.shared.unlockDeletionShared();
+            for (0..segment.reader.doc_count) |local_usize| {
+                scanned_count +|= 1;
+                if (scanned_count == 1 or scanned_count % 1024 == 0) try checkSearchRequestDeadline(req);
+                const local_doc: u32 = @intCast(local_usize);
+                if (segment.shared.deleted) |deleted| {
+                    if (deleted.contains(local_doc)) continue;
+                }
+                const stored = (try segment.reader.storedDoc(local_doc)) orelse continue;
+                if (!doc_id_set.contains(stored.id)) continue;
+                const ordinal = (try segment.reader.docOrdinal(local_doc)) orelse {
+                    logNativeSortPlanRejection(
+                        "*",
+                        nativeSortPlanRejectionReasonName(.missing_doc_values_capability),
+                        "doc_ordinal_projection_unavailable",
+                    );
+                    return error.UnsupportedQueryRequest;
+                };
+                const gop = try doc_num_set.getOrPut(alloc, ordinal);
+                if (gop.found_existing) continue;
+                try out.append(alloc, ordinal);
             }
-            const stored = segment.reader.storedDoc(local_doc) orelse continue;
-            if (!doc_id_set.contains(stored.id)) continue;
-            const ordinal = (try segment.reader.docOrdinal(local_doc)) orelse {
-                logNativeSortPlanRejection(
-                    "*",
-                    nativeSortPlanRejectionReasonName(.missing_doc_values_capability),
-                    "doc_ordinal_projection_unavailable",
-                );
-                return error.UnsupportedQueryRequest;
-            };
-            const gop = try doc_num_set.getOrPut(alloc, ordinal);
-            if (gop.found_existing) continue;
-            try out.append(alloc, ordinal);
         }
     }
     return try out.toOwnedSlice(alloc);
@@ -14372,7 +15526,7 @@ fn sortAndPageMatchAllOrdinalDocValueCandidatesAlloc(
             );
             return error.UnsupportedQueryRequest;
         };
-        const stored = snapshot.storedDoc(doc_num) orelse return error.StoredDocMissing;
+        const stored = (try snapshot.storedDoc(doc_num)) orelse return error.StoredDocMissing;
         const candidate = MatchAllCandidate{
             .id = @constCast(stored.id),
             .ordinal = ordinal,
@@ -14511,7 +15665,7 @@ fn visibleMatchAllOrdinalDocValueCandidateCountAfterCursorAlloc(
             );
             return error.UnsupportedQueryRequest;
         };
-        const stored = snapshot.storedDoc(doc_num) orelse return error.StoredDocMissing;
+        const stored = (try snapshot.storedDoc(doc_num)) orelse return error.StoredDocMissing;
         const candidate = MatchAllCandidate{
             .id = @constCast(stored.id),
             .ordinal = ordinal,
@@ -14573,7 +15727,7 @@ fn visibleMatchAllOrdinalDocValueCandidateCount(
             );
             return error.UnsupportedQueryRequest;
         };
-        const stored = snapshot.storedDoc(doc_num) orelse return error.StoredDocMissing;
+        const stored = (try snapshot.storedDoc(doc_num)) orelse return error.StoredDocMissing;
         const candidate = MatchAllCandidate{
             .id = @constCast(stored.id),
             .ordinal = ordinal,
@@ -14616,6 +15770,8 @@ fn planMatchAllSortBeforeCandidatesAlloc(
         );
         return error.UnsupportedExactSort;
     };
+    text_entry.lockAnalysisShared();
+    defer text_entry.unlockAnalysisShared();
     const plan = try planTextNativeSortFields(effective_req, text_entry.persistent.snapshot(), text_entry.runtime_schema);
     if (plan.sorted_segment_executor_available) {
         return .{
@@ -14688,6 +15844,8 @@ fn buildMatchAllNativeSortContextAlloc(
     if (req.order_by.len == 0 or !requestNeedsNativeSortValues(req)) return null;
     try validateMatchAllSortDoesNotUseScore(req);
     const text_entry = (try executor.text_index_entry(executor.ctx, req.index_name)) orelse return null;
+    text_entry.lockAnalysisShared();
+    defer text_entry.unlockAnalysisShared();
     const snapshot = text_entry.persistent.snapshot();
     const plan = try planTextNativeSortFields(req, snapshot, text_entry.runtime_schema);
     if (plan.kind != .native_doc_values_top_n) return null;
@@ -15650,6 +16808,7 @@ pub fn textQueryToSearchQuery(
             .should = try textQuerySliceToSearchQuerySlice(alloc, bool_query.should, text_analysis, runtime_schema),
             .must_not = try textQuerySliceToSearchQuerySlice(alloc, bool_query.must_not, text_analysis, runtime_schema),
             .min_should = bool_query.min_should,
+            .pure_should_optional = bool_query.pure_should_optional,
             .boost = bool_query.boost,
         } },
     };
@@ -15673,9 +16832,12 @@ fn textQuerySliceToSearchQuerySlice(
 const ResolvedMultiMatchField = struct {
     field: []const u8,
     boost: f32,
+    index_prefix_companion: ?[]const u8 = null,
 };
 
-const search_as_you_type_max_shingle_size: usize = 3;
+const search_as_you_type_max_shingle_size: usize = analysis_mod.search_as_you_type_max_shingle_size;
+const search_as_you_type_min_prefix_length: usize = analysis_mod.search_as_you_type_min_prefix_length;
+const search_as_you_type_max_prefix_length: usize = analysis_mod.search_as_you_type_max_prefix_length;
 
 fn multiMatchBoolPrefixToSearchQuery(
     alloc: Allocator,
@@ -15712,16 +16874,57 @@ fn appendResolvedMultiMatchFields(
     text_analysis: introducer_mod.TextAnalysisConfig,
     runtime_schema: ?runtime_schema_mod.TableSchema,
 ) !void {
-    try appendUniqueResolvedMultiMatchField(alloc, fields, requested.field, requested.boost);
-    if (isSearchAsYouTypeGeneratedField(requested.field)) return;
-    if (!try fieldHasSearchAsYouTypeSubfields(alloc, text_analysis, runtime_schema, requested.field)) return;
-
+    if (isSearchAsYouTypeGeneratedField(requested.field)) {
+        try appendUniqueResolvedMultiMatchField(alloc, fields, requested.field, requested.boost, null);
+        return;
+    }
     const two_gram = try std.fmt.allocPrint(alloc, "{s}._2gram", .{requested.field});
-    try appendUniqueResolvedMultiMatchField(alloc, fields, two_gram, requested.boost);
+    const has_two_gram = fieldUsesAnalyzer(text_analysis, runtime_schema, two_gram, "search_as_you_type_2gram");
     const three_gram = try std.fmt.allocPrint(alloc, "{s}._3gram", .{requested.field});
-    try appendUniqueResolvedMultiMatchField(alloc, fields, three_gram, requested.boost);
+    const has_three_gram = fieldUsesAnalyzer(text_analysis, runtime_schema, three_gram, "search_as_you_type_3gram");
+    if (!has_two_gram and !has_three_gram) {
+        try appendUniqueResolvedMultiMatchField(alloc, fields, requested.field, requested.boost, null);
+        return;
+    }
+
     const index_prefix = try std.fmt.allocPrint(alloc, "{s}._index_prefix", .{requested.field});
-    try appendUniqueResolvedMultiMatchField(alloc, fields, index_prefix, requested.boost);
+    const has_index_prefix = fieldUsesAnalyzer(
+        text_analysis,
+        runtime_schema,
+        index_prefix,
+        "search_as_you_type_index_prefix",
+    );
+    const root_prefix = try std.fmt.allocPrint(alloc, "{s}._root_prefix", .{requested.field});
+    const has_root_prefix = fieldUsesAnalyzer(
+        text_analysis,
+        runtime_schema,
+        root_prefix,
+        "search_as_you_type_root_prefix",
+    );
+    const root_uses_default_analyzer = fieldUsesAnalyzer(text_analysis, runtime_schema, requested.field, "standard") or
+        fieldUsesAnalyzer(text_analysis, runtime_schema, requested.field, "default");
+
+    // Every companion is analyzer-verified independently. PrefixFilter checks
+    // for the companion per segment and falls back to the source dictionary,
+    // so old and new segments remain correct during rolling upgrades.
+    try appendUniqueResolvedMultiMatchField(
+        alloc,
+        fields,
+        requested.field,
+        requested.boost,
+        if (has_root_prefix and root_uses_default_analyzer) root_prefix else null,
+    );
+    if (has_two_gram) {
+        try appendUniqueResolvedMultiMatchField(alloc, fields, two_gram, requested.boost, if (has_index_prefix) index_prefix else null);
+    }
+    if (has_three_gram) {
+        try appendUniqueResolvedMultiMatchField(alloc, fields, three_gram, requested.boost, if (has_index_prefix) index_prefix else null);
+    }
+    // Preserve the original BM25-scored trailing-shingle clause. Indexed
+    // companions replace only constant-score prefix clauses.
+    if (has_index_prefix) {
+        try appendUniqueResolvedMultiMatchField(alloc, fields, index_prefix, requested.boost, null);
+    }
 }
 
 fn appendUniqueResolvedMultiMatchField(
@@ -15729,27 +16932,40 @@ fn appendUniqueResolvedMultiMatchField(
     fields: *std.ArrayListUnmanaged(ResolvedMultiMatchField),
     field: []const u8,
     boost: f32,
+    index_prefix_companion: ?[]const u8,
 ) !void {
-    for (fields.items) |item| {
-        if (std.mem.eql(u8, item.field, field)) return;
+    for (fields.items) |*item| {
+        if (!std.mem.eql(u8, item.field, field)) continue;
+        if (item.index_prefix_companion == null) item.index_prefix_companion = index_prefix_companion;
+        return;
     }
-    try fields.append(alloc, .{ .field = field, .boost = boost });
+    try fields.append(alloc, .{
+        .field = field,
+        .boost = boost,
+        .index_prefix_companion = index_prefix_companion,
+    });
 }
 
-fn fieldHasSearchAsYouTypeSubfields(
-    alloc: Allocator,
+fn fieldUsesAnalyzer(
     text_analysis: introducer_mod.TextAnalysisConfig,
     runtime_schema: ?runtime_schema_mod.TableSchema,
     field: []const u8,
-) !bool {
-    const two_gram = try std.fmt.allocPrint(alloc, "{s}._2gram", .{field});
-    defer alloc.free(two_gram);
-    if (resolveConfiguredFieldAnalyzerName(text_analysis, two_gram)) |analyzer| {
-        if (std.mem.eql(u8, analyzer, "search_as_you_type_2gram")) return true;
+    expected_analyzer: []const u8,
+) bool {
+    var configured_count: usize = 0;
+    var configured_matches = true;
+    for (text_analysis.field_analyzers) |item| {
+        if (!std.mem.eql(u8, item.field_name, field)) continue;
+        configured_count += 1;
+        configured_matches = configured_matches and std.mem.eql(u8, item.analyzer_name, expected_analyzer);
     }
+    // Configured analyzer observations describe the actual persisted field and
+    // take precedence over a schema declaration. Any disagreement disables the
+    // optimization rather than risking false positives.
+    if (configured_count > 0) return configured_matches;
     if (runtime_schema) |schema| {
-        if (resolveIndexedFieldAnalyzer(schema, two_gram)) |analyzer| {
-            if (std.mem.eql(u8, analyzer, "search_as_you_type_2gram")) return true;
+        if (resolveIndexedFieldAnalyzer(schema, field)) |analyzer| {
+            if (std.mem.eql(u8, analyzer, expected_analyzer)) return true;
         }
     }
     return false;
@@ -15792,10 +17008,28 @@ fn fieldBoolPrefixSearchQuery(
             } });
         }
     }
-    try should.append(alloc, .{ .prefix = .{
-        .field = field.field,
-        .prefix = try alloc.dupe(u8, tokens[tokens.len - 1].term),
-    } });
+    const final_token = tokens[tokens.len - 1].term;
+    if (field.index_prefix_companion) |index_prefix| {
+        if (final_token.len >= search_as_you_type_min_prefix_length and
+            final_token.len <= search_as_you_type_max_prefix_length)
+        {
+            try should.append(alloc, .{ .prefix = .{
+                .field = field.field,
+                .prefix = try alloc.dupe(u8, final_token),
+                .indexed_field = index_prefix,
+            } });
+        } else {
+            try should.append(alloc, .{ .prefix = .{
+                .field = field.field,
+                .prefix = try alloc.dupe(u8, final_token),
+            } });
+        }
+    } else {
+        try should.append(alloc, .{ .prefix = .{
+            .field = field.field,
+            .prefix = try alloc.dupe(u8, final_token),
+        } });
+    }
     return .{ .bool_query = .{
         .should = try should.toOwnedSlice(alloc),
         .min_should = 1,
@@ -15814,7 +17048,8 @@ fn joinTokenTermsAlloc(alloc: Allocator, tokens: []const analysis_mod.Token) ![]
 }
 
 fn isSearchAsYouTypeGeneratedField(field: []const u8) bool {
-    return std.mem.endsWith(u8, field, "._2gram") or
+    return std.mem.endsWith(u8, field, "._root_prefix") or
+        std.mem.endsWith(u8, field, "._2gram") or
         std.mem.endsWith(u8, field, "._3gram") or
         std.mem.endsWith(u8, field, "._index_prefix");
 }
@@ -16129,6 +17364,164 @@ test "multi_match bool_prefix index prefix uses trailing shingle window" {
     try std.testing.expect(query.bool_query.should[0] == .term);
     try std.testing.expectEqualStrings("name._index_prefix", query.bool_query.should[0].term.field);
     try std.testing.expectEqualStrings("smartphone apple ip", query.bool_query.should[0].term.term);
+}
+
+test "multi_match bool_prefix preserves root semantics and bounds shingle prefixes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const text_analysis: introducer_mod.TextAnalysisConfig = .{
+        .field_analyzers = &.{
+            .{ .field_name = "title", .analyzer_name = "standard" },
+            .{ .field_name = "title._root_prefix", .analyzer_name = "search_as_you_type_root_prefix" },
+            .{ .field_name = "title._2gram", .analyzer_name = "search_as_you_type_2gram" },
+            .{ .field_name = "title._3gram", .analyzer_name = "search_as_you_type_3gram" },
+            .{ .field_name = "title._index_prefix", .analyzer_name = "search_as_you_type_index_prefix" },
+            .{ .field_name = "body", .analyzer_name = "standard" },
+        },
+    };
+    const fields = [_]types.TextMultiMatchField{.{ .field = "title" }};
+
+    const single = try textQueryToSearchQuery(alloc, .{ .multi_match_bool_prefix = .{
+        .query = "zul",
+        .fields = &fields,
+    } }, text_analysis, null);
+    try std.testing.expect(single == .bool_query);
+    try std.testing.expectEqual(@as(usize, 2), single.bool_query.should.len);
+    try std.testing.expect(single.bool_query.should[0] == .bool_query);
+    try std.testing.expectEqual(@as(usize, 1), single.bool_query.should[0].bool_query.should.len);
+    try std.testing.expect(single.bool_query.should[0].bool_query.should[0] == .prefix);
+    try std.testing.expectEqualStrings("title", single.bool_query.should[0].bool_query.should[0].prefix.field);
+    try std.testing.expectEqualStrings("zul", single.bool_query.should[0].bool_query.should[0].prefix.prefix);
+    try std.testing.expectEqualStrings("title._root_prefix", single.bool_query.should[0].bool_query.should[0].prefix.indexed_field.?);
+    try std.testing.expect(single.bool_query.should[1] == .term);
+    try std.testing.expectEqualStrings("title._index_prefix", single.bool_query.should[1].term.field);
+    try std.testing.expectEqualStrings("zul", single.bool_query.should[1].term.term);
+
+    const mixed_fields = [_]types.TextMultiMatchField{ .{ .field = "title" }, .{ .field = "body" } };
+    const mixed = try textQueryToSearchQuery(alloc, .{ .multi_match_bool_prefix = .{
+        .query = "zul",
+        .fields = &mixed_fields,
+    } }, text_analysis, null);
+    try std.testing.expect(mixed == .bool_query);
+    try std.testing.expectEqual(@as(usize, 3), mixed.bool_query.should.len);
+    try std.testing.expect(mixed.bool_query.should[1] == .term);
+    try std.testing.expectEqualStrings("title._index_prefix", mixed.bool_query.should[1].term.field);
+    try std.testing.expect(mixed.bool_query.should[2] == .bool_query);
+    try std.testing.expect(mixed.bool_query.should[2].bool_query.should[0] == .prefix);
+    try std.testing.expectEqualStrings("body", mixed.bool_query.should[2].bool_query.should[0].prefix.field);
+
+    const multiple = try textQueryToSearchQuery(alloc, .{ .multi_match_bool_prefix = .{
+        .query = "catalog item 099",
+        .fields = &fields,
+    } }, text_analysis, null);
+    try std.testing.expect(multiple == .bool_query);
+    try std.testing.expectEqual(@as(usize, 4), multiple.bool_query.should.len);
+    try std.testing.expect(multiple.bool_query.should[0] == .bool_query);
+    try std.testing.expectEqual(@as(usize, 3), multiple.bool_query.should[0].bool_query.should.len);
+    try std.testing.expect(multiple.bool_query.should[0].bool_query.should[0] == .term);
+    try std.testing.expect(multiple.bool_query.should[0].bool_query.should[1] == .term);
+    try std.testing.expect(multiple.bool_query.should[0].bool_query.should[2] == .prefix);
+    try std.testing.expectEqualStrings("title", multiple.bool_query.should[0].bool_query.should[2].prefix.field);
+    try std.testing.expectEqualStrings("099", multiple.bool_query.should[0].bool_query.should[2].prefix.prefix);
+    try std.testing.expectEqualStrings("title._root_prefix", multiple.bool_query.should[0].bool_query.should[2].prefix.indexed_field.?);
+    try std.testing.expect(multiple.bool_query.should[1] == .bool_query);
+    try std.testing.expectEqual(@as(usize, 2), multiple.bool_query.should[1].bool_query.should.len);
+    try std.testing.expect(multiple.bool_query.should[1].bool_query.should[0] == .term);
+    try std.testing.expect(multiple.bool_query.should[1].bool_query.should[1] == .prefix);
+    try std.testing.expectEqualStrings("title._2gram", multiple.bool_query.should[1].bool_query.should[1].prefix.field);
+    try std.testing.expectEqualStrings("item 099", multiple.bool_query.should[1].bool_query.should[1].prefix.prefix);
+    try std.testing.expectEqualStrings("title._index_prefix", multiple.bool_query.should[1].bool_query.should[1].prefix.indexed_field.?);
+    try std.testing.expect(multiple.bool_query.should[2] == .bool_query);
+    try std.testing.expectEqual(@as(usize, 1), multiple.bool_query.should[2].bool_query.should.len);
+    try std.testing.expect(multiple.bool_query.should[2].bool_query.should[0] == .prefix);
+    try std.testing.expectEqualStrings("title._3gram", multiple.bool_query.should[2].bool_query.should[0].prefix.field);
+    try std.testing.expectEqualStrings("catalog item 099", multiple.bool_query.should[2].bool_query.should[0].prefix.prefix);
+    try std.testing.expectEqualStrings("title._index_prefix", multiple.bool_query.should[2].bool_query.should[0].prefix.indexed_field.?);
+    try std.testing.expect(multiple.bool_query.should[3] == .term);
+    try std.testing.expectEqualStrings("title._index_prefix", multiple.bool_query.should[3].term.field);
+    try std.testing.expectEqualStrings("catalog item 099", multiple.bool_query.should[3].term.term);
+
+    const incomplete_analysis: introducer_mod.TextAnalysisConfig = .{
+        .field_analyzers = &.{
+            .{ .field_name = "title", .analyzer_name = "standard" },
+            .{ .field_name = "title._2gram", .analyzer_name = "search_as_you_type_2gram" },
+            .{ .field_name = "title._3gram", .analyzer_name = "search_as_you_type_3gram" },
+        },
+    };
+    const missing_companion = try textQueryToSearchQuery(alloc, .{ .multi_match_bool_prefix = .{
+        .query = "catalog item 099",
+        .fields = &fields,
+    } }, incomplete_analysis, null);
+    try std.testing.expect(missing_companion == .bool_query);
+    try std.testing.expect(missing_companion.bool_query.should[1] == .bool_query);
+    try std.testing.expect(missing_companion.bool_query.should[1].bool_query.should[1] == .prefix);
+    try std.testing.expectEqualStrings("title._2gram", missing_companion.bool_query.should[1].bool_query.should[1].prefix.field);
+
+    // Root analysis is intentionally not substituted with the simple prefix
+    // analyzer: stop words and stems must retain the legacy union of root and
+    // materialized-prefix behavior.
+    const stop_word = try textQueryToSearchQuery(alloc, .{ .multi_match_bool_prefix = .{
+        .query = "the",
+        .fields = &fields,
+    } }, text_analysis, null);
+    try std.testing.expect(stop_word == .bool_query);
+    try std.testing.expectEqual(@as(usize, 1), stop_word.bool_query.should.len);
+    try std.testing.expect(stop_word.bool_query.should[0] == .term);
+    try std.testing.expectEqualStrings("the", stop_word.bool_query.should[0].term.term);
+
+    const stemmed = try textQueryToSearchQuery(alloc, .{ .multi_match_bool_prefix = .{
+        .query = "happy",
+        .fields = &fields,
+    } }, text_analysis, null);
+    try std.testing.expect(stemmed == .bool_query);
+    try std.testing.expectEqual(@as(usize, 2), stemmed.bool_query.should.len);
+    try std.testing.expect(stemmed.bool_query.should[0] == .bool_query);
+    try std.testing.expect(stemmed.bool_query.should[0].bool_query.should[0] == .prefix);
+    try std.testing.expectEqualStrings("happi", stemmed.bool_query.should[0].bool_query.should[0].prefix.prefix);
+    try std.testing.expectEqualStrings("title._root_prefix", stemmed.bool_query.should[0].bool_query.should[0].prefix.indexed_field.?);
+    try std.testing.expect(stemmed.bool_query.should[1] == .term);
+    try std.testing.expectEqualStrings("happy", stemmed.bool_query.should[1].term.term);
+
+    // Prefixes outside the configured edge-ngram range keep the dictionary
+    // prefix clause so one-character and long-prefix behavior is unchanged.
+    const short = try textQueryToSearchQuery(alloc, .{ .multi_match_bool_prefix = .{
+        .query = "z",
+        .fields = &fields,
+    } }, text_analysis, null);
+    try std.testing.expect(short == .bool_query);
+    try std.testing.expect(short.bool_query.should[0] == .bool_query);
+    try std.testing.expect(short.bool_query.should[0].bool_query.should[0] == .prefix);
+    try std.testing.expectEqualStrings("title", short.bool_query.should[0].bool_query.should[0].prefix.field);
+
+    const long = try textQueryToSearchQuery(alloc, .{ .multi_match_bool_prefix = .{
+        .query = "abcdefghijklmnopqrstuvwxyz",
+        .fields = &fields,
+    } }, text_analysis, null);
+    try std.testing.expect(long == .bool_query);
+    try std.testing.expect(long.bool_query.should[0] == .bool_query);
+    try std.testing.expect(long.bool_query.should[0].bool_query.should[0] == .prefix);
+    try std.testing.expectEqualStrings("title", long.bool_query.should[0].bool_query.should[0].prefix.field);
+    try std.testing.expectEqual(@as(?[]const u8, null), long.bool_query.should[0].bool_query.should[0].prefix.indexed_field);
+
+    const incompatible_three_gram: introducer_mod.TextAnalysisConfig = .{
+        .field_analyzers = &.{
+            .{ .field_name = "title", .analyzer_name = "standard" },
+            .{ .field_name = "title._root_prefix", .analyzer_name = "search_as_you_type_root_prefix" },
+            .{ .field_name = "title._2gram", .analyzer_name = "search_as_you_type_2gram" },
+            .{ .field_name = "title._3gram", .analyzer_name = "standard" },
+            .{ .field_name = "title._index_prefix", .analyzer_name = "search_as_you_type_index_prefix" },
+        },
+    };
+    const without_three_gram = try textQueryToSearchQuery(alloc, .{ .multi_match_bool_prefix = .{
+        .query = "catalog item 099",
+        .fields = &fields,
+    } }, incompatible_three_gram, null);
+    try std.testing.expectEqual(@as(usize, 3), without_three_gram.bool_query.should.len);
+    try std.testing.expect(without_three_gram.bool_query.should[0] == .bool_query);
+    try std.testing.expect(without_three_gram.bool_query.should[1] == .bool_query);
+    try std.testing.expect(without_three_gram.bool_query.should[2] == .term);
 }
 
 fn testDenseIndexCallback(_: ?*anyopaque, _: ?[]const u8) anyerror!?*index_manager_mod.IndexManager.DenseIndex {
@@ -24342,6 +25735,107 @@ test "match_all rejects expired execution deadline" {
     }, testMatchAllExecutor(&ctx)));
 }
 
+test "match_all aborts the real search execution path when request cancellation is signaled" {
+    const alloc = std.testing.allocator;
+    const ctx = TestMatchAllCtx{
+        .ids = &.{ "doc:a", "doc:b", "doc:c" },
+        .ordinals = &.{ 1, 2, 3 },
+    };
+    var cancellation = std.atomic.Value(bool).init(true);
+
+    try std.testing.expectError(error.Cancelled, searchMatchAll(alloc, .{
+        .include_stored = false,
+        .limit = 10,
+        .cancellation = &cancellation,
+    }, testMatchAllExecutor(&ctx)));
+}
+
+test "match_all primary scan aborts promptly when cancellation arrives mid-flight" {
+    const Harness = struct {
+        alloc: Allocator,
+        reached_checkpoint: std.atomic.Value(bool) = .init(false),
+        release_checkpoint: std.atomic.Value(bool) = .init(false),
+
+        fn scanUnexpected(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: []const u8,
+            _: []const u8,
+        ) anyerror![]docstore_mod.OwnedKVPair {
+            return error.UnexpectedTestCall;
+        }
+
+        fn scan(
+            ctx: ?*anyopaque,
+            _: []const u8,
+            _: []const u8,
+            _: docstore_mod.DocStore.ScanOptions,
+            scan_ctx: ?*anyopaque,
+            callback: docstore_mod.DocStore.ScanWithContextCallback,
+        ) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            for (0..2048) |i| {
+                var id_buf: [32]u8 = undefined;
+                const id = try std.fmt.bufPrint(&id_buf, "doc:{d:0>8}", .{i});
+                const key = try internal_keys.documentKeyAlloc(self.alloc, id);
+                defer self.alloc.free(key);
+                if (i == 1023) {
+                    self.reached_checkpoint.store(true, .release);
+                    while (!self.release_checkpoint.load(.acquire)) std.Thread.yield() catch {};
+                }
+                if (try callback(scan_ctx, key, "{}") == .stop) return;
+            }
+        }
+
+        fn isExpired(_: ?*anyopaque, _: Allocator, _: []const u8) anyerror!bool {
+            return false;
+        }
+    };
+    const Worker = struct {
+        harness: *Harness,
+        cancellation: *std.atomic.Value(bool),
+        observed_cancel: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            var candidates = collectMatchAllCandidatesWithOptions(std.heap.page_allocator, .{
+                .cancellation = self.cancellation,
+            }, .{
+                .ctx = self.harness,
+                .scan_store_range = Harness.scanUnexpected,
+                .scan_store_range_with_context = Harness.scan,
+                .is_expired_key = Harness.isExpired,
+            }, .{}) catch |err| {
+                if (err == error.Cancelled) self.observed_cancel.store(true, .release);
+                return;
+            };
+            candidates.deinit(std.heap.page_allocator);
+        }
+    };
+
+    var harness = Harness{ .alloc = std.heap.page_allocator };
+    var cancellation = std.atomic.Value(bool).init(false);
+    var worker = Worker{ .harness = &harness, .cancellation = &cancellation };
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    var joined = false;
+    defer if (!joined) {
+        harness.release_checkpoint.store(true, .release);
+        thread.join();
+    };
+
+    var wait_io = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer wait_io.deinit();
+    for (0..2_000) |_| {
+        if (harness.reached_checkpoint.load(.acquire)) break;
+        wait_io.io().sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+    try std.testing.expect(harness.reached_checkpoint.load(.acquire));
+    cancellation.store(true, .release);
+    harness.release_checkpoint.store(true, .release);
+    thread.join();
+    joined = true;
+    try std.testing.expect(worker.observed_cancel.load(.acquire));
+}
+
 test "match_all applies stored pattern filters before paging" {
     const alloc = std.testing.allocator;
     const ctx = TestMatchAllCtx{
@@ -26051,6 +27545,15 @@ fn testNonVisibleDocSetUnavailableCallback(
     return null;
 }
 
+fn testUnexpectedLiveFilterDocSetCallback(
+    _: ?*anyopaque,
+    _: Allocator,
+    _: *const doc_set.ResolvedDocSet,
+    _: ?u64,
+) anyerror!doc_set.ResolvedDocSet {
+    return error.TestUnexpectedResult;
+}
+
 test "broad live doc filter prefers small non-visible exclude set" {
     const alloc = std.testing.allocator;
     var constraints = try deriveNativeDocIdConstraintsAlloc(alloc, .{}, .{
@@ -26102,6 +27605,31 @@ test "broad live doc filter falls back to include set when complement unavailabl
 
     try std.testing.expect(constraints.positive_filter);
     try std.testing.expectEqual(@as(usize, 2), constraints.filter_doc_nums.len);
+    try std.testing.expect(containsDocNum(constraints.filter_doc_nums, 2));
+    try std.testing.expect(containsDocNum(constraints.filter_doc_nums, 3));
+}
+
+test "resolved ordinal filters subtract non-visible complement without live probes" {
+    const alloc = std.testing.allocator;
+    var filter = doc_set.ResolvedDocFilter{
+        .include = try doc_set.fromOrdinalsAlloc(alloc, &.{ 1, 2, 3 }),
+    };
+    defer filter.deinit(alloc);
+
+    var constraints = try deriveNativeDocIdConstraintsAlloc(alloc, .{
+        .resolved_doc_filter = &filter,
+    }, .{
+        .ctx = null,
+        .text_index_entry = testTextIndexEntryCallback,
+        .live_filter_doc_set = testUnexpectedLiveFilterDocSetCallback,
+        .nonvisible_doc_set = testNonVisibleDocSetCallback,
+        .project_ordinals_to_doc_ids = false,
+    });
+    defer constraints.deinit(alloc);
+
+    try std.testing.expect(constraints.positive_filter);
+    try std.testing.expectEqual(@as(usize, 2), constraints.filter_doc_nums.len);
+    try std.testing.expect(!containsDocNum(constraints.filter_doc_nums, 1));
     try std.testing.expect(containsDocNum(constraints.filter_doc_nums, 2));
     try std.testing.expect(containsDocNum(constraints.filter_doc_nums, 3));
 }
@@ -26345,7 +27873,7 @@ test "text native constraints resolve explicit request doc ids through ordinal s
     });
     defer constraints.deinit(alloc);
 
-    try std.testing.expect(writer.snapshot().hasDocOrdinalCoverage());
+    try std.testing.expect(try writer.snapshot().hasDocOrdinalCoverage());
     try std.testing.expect(constraints.positive_filter);
     try std.testing.expectEqual(@as(usize, 2), constraints.filter_doc_nums.len);
     try std.testing.expect(containsDocNum(constraints.filter_doc_nums, 1));
@@ -26393,7 +27921,7 @@ test "text native constraints fall back for mixed ordinal sidecar coverage" {
     });
     defer constraints.deinit(alloc);
 
-    try std.testing.expect(!writer.snapshot().hasDocOrdinalCoverage());
+    try std.testing.expect(!(try writer.snapshot().hasDocOrdinalCoverage()));
     try std.testing.expect(constraints.positive_filter);
     try std.testing.expectEqual(@as(usize, 0), constraints.filter_doc_nums.len);
     try std.testing.expectEqual(@as(usize, 0), constraints.exclude_doc_nums.len);
@@ -26421,7 +27949,7 @@ test "text native constraints fail closed when resolved ordinals cannot be proje
     };
     defer filter.deinit(alloc);
 
-    try std.testing.expect(!writer.snapshot().hasDocOrdinalCoverage());
+    try std.testing.expect(!(try writer.snapshot().hasDocOrdinalCoverage()));
     try std.testing.expectError(error.UnsupportedQueryRequest, deriveNativeDocIdConstraintsAlloc(alloc, .{
         .resolved_doc_filter = &filter,
     }, .{

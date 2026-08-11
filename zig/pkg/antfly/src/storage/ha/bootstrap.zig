@@ -43,7 +43,7 @@ pub fn bootstrapFromManifest(
     contents: []const backup_manifest.FileContent,
 ) !BootstrapResult {
     try backup_manifest.validateManifestView(manifest);
-    try validateIdentity(manifest.identity, standby.identity);
+    try validateIdentity(manifest.identity, standby.identitySnapshot());
     try backup_manifest.verifyFileContents(manifest, contents);
 
     const payload = try checkpointPayload(alloc, manifest);

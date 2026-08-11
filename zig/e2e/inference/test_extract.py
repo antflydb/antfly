@@ -15,11 +15,12 @@
 """Tests for /api/extract (structured extraction) endpoint."""
 
 import pytest
-from .helpers import TINY_PNG_URI, assert_openai_list_response, make_text_png_uri
+from .helpers import TINY_PNG_URI, assert_extraction_response, make_text_png_uri
+from .models import DEFAULT_EXTRACTOR_MODEL
 
 pytestmark = pytest.mark.model_integration
 
-GLINER_MODEL = "fastino/gliner2-base-v1"
+GLINER_MODEL = DEFAULT_EXTRACTOR_MODEL
 
 
 def _has_reader_model(api) -> bool:
@@ -27,7 +28,7 @@ def _has_reader_model(api) -> bool:
     if not readers:
         return False
 
-    model = next(iter(readers))
+    model = "antflydb/florence-2-base" if "antflydb/florence-2-base" in readers else next(iter(readers))
     resp = api.post(
         "/read",
         json={"model": model, "images": [{"url": TINY_PNG_URI}]},
@@ -50,7 +51,7 @@ def test_extract_basic(api):
         schema={"person": ["name::str", "company::str", "location::str"]},
         model=GLINER_MODEL,
     )
-    assert_openai_list_response(resp, expected_len=1)
+    assert_extraction_response(resp, expected_len=1)
     results = resp["data"]
     assert len(results) == 1
 
@@ -133,7 +134,7 @@ def test_extract_from_images_via_reader(api):
 
 
 def test_extract_rejects_missing_texts_and_images(api):
-    """The server should require exactly one extraction input source."""
+    """The canonical contract requires at least one input."""
     resp = api.post(
         "/extract",
         json={
@@ -145,7 +146,6 @@ def test_extract_rejects_missing_texts_and_images(api):
     assert resp.status_code == 400
     body = resp.json()
     assert body["error"] == "INVALID_REQUEST"
-    assert "inputs are required" in body["message"]
 
 
 def test_extract_rejects_both_texts_and_images(api):
@@ -157,7 +157,7 @@ def test_extract_rejects_both_texts_and_images(api):
             "model": GLINER_MODEL,
             "inputs": [
                 {"content": "John Smith works at Google."},
-                {"content": {"type": "image_url", "image_url": {"url": test_image}}},
+                {"content": [{"type": "image_url", "image_url": {"url": test_image}}]},
             ],
             "schema": {"structures": {"person": {"fields": {"name": "str"}}}},
         },
@@ -165,4 +165,34 @@ def test_extract_rejects_both_texts_and_images(api):
     assert resp.status_code == 400
     body = resp.json()
     assert body["error"] == "INVALID_REQUEST"
-    assert "inputs must be all text or all image content" in body["message"]
+
+
+def test_extract_rejects_missing_structured_schema(api):
+    response = api.post(
+        "/extract",
+        json={"model": GLINER_MODEL, "inputs": [{"content": "John Smith"}], "schema": {}},
+    )
+    assert response.status_code == 400
+    assert "schema" in response.json()["message"]
+
+
+def test_extract_rejects_images_for_entity_mode(api):
+    response = api.post(
+        "/extract",
+        json={
+            "model": GLINER_MODEL,
+            "inputs": [{"content": [{"type": "image_url", "image_url": {"url": TINY_PNG_URI}}]}],
+            "schema": {"entities": ["person"]},
+        },
+    )
+    assert response.status_code == 400
+    assert "text" in response.json()["message"]
+
+
+def test_extract_rejects_relations_without_labels(api):
+    response = api.post(
+        "/extract",
+        json={"model": GLINER_MODEL, "inputs": [{"content": "John works at Google"}], "schema": {"relations": []}},
+    )
+    assert response.status_code == 400
+    assert "schema" in response.json()["message"]

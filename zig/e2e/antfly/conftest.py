@@ -71,12 +71,28 @@ def preserve_e2e_root() -> bool:
     return value != "" and value not in {"0", "false", "False"}
 
 
-def maybe_preserve_tempdir(tempdir: tempfile.TemporaryDirectory[str]) -> bool:
-    if not preserve_e2e_root():
+def preserve_failed_e2e_root() -> bool:
+    value = os.environ.get("ANTFLY_E2E_PRESERVE_ROOT_ON_FAILURE", "")
+    return value != "" and value not in {"0", "false", "False"}
+
+
+def maybe_preserve_tempdir(
+    tempdir: tempfile.TemporaryDirectory[str],
+    *,
+    failed: bool = False,
+) -> bool:
+    if not preserve_e2e_root() and not (failed and preserve_failed_e2e_root()):
         return False
     tempdir._finalizer.detach()
     print(f"preserving e2e tempdir: {tempdir.name}")
     return True
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo[object]):
+    outcome = yield
+    report = outcome.get_result()
+    setattr(item, f"rep_{report.when}", report)
 
 
 def default_antfly_api_root(binary: str) -> str:
@@ -196,9 +212,22 @@ def ready_index_status(index_info: dict[str, Any], *, require_query_fresh: bool 
         return None
     if not isinstance(status, dict):
         return None
+    if status.get("error"):
+        return None
     if status.get("materialization_blocked", False):
         return None
     if status.get("rebuilding", status.get("backfill_active", False)):
+        return None
+    if status.get("backfill_state") == "failed":
+        return None
+    if isinstance(status.get("repair"), dict):
+        return None
+    if status.get("repair_degraded") is True:
+        return None
+    if status.get("repair_summary_ready") is False:
+        return None
+    repair_issue_count = status.get("repair_issue_count")
+    if type(repair_issue_count) is int and repair_issue_count > 0:
         return None
     if status.get("dense_publish_pending", False):
         return None
@@ -206,12 +235,22 @@ def ready_index_status(index_info: dict[str, Any], *, require_query_fresh: bool 
         return None
     if status.get("catch_up_active", False):
         return None
+    coverage = status.get("coverage")
+    if isinstance(coverage, dict):
+        if coverage.get("observation_complete") is not True:
+            return None
+        mismatch_count = coverage.get("config_mismatch_group_count")
+        if type(mismatch_count) is not int or mismatch_count != 0:
+            return None
     if require_query_fresh:
         expected_groups = status.get("expected_groups")
         fresh_groups = status.get("fresh_groups")
-        if isinstance(expected_groups, int) and expected_groups > 0:
-            if not isinstance(fresh_groups, int) or fresh_groups < expected_groups:
-                return None
+        if not isinstance(expected_groups, int) or expected_groups <= 0:
+            return None
+        if not isinstance(fresh_groups, int) or fresh_groups < expected_groups:
+            return None
+        if status.get("runtime_present") is not True:
+            return None
         stale_groups = status.get("stale_groups")
         if isinstance(stale_groups, int) and stale_groups > 0:
             return None
@@ -306,7 +345,7 @@ def raise_request_error_with_logs(
         raise err
     message = f"{err}\nserver logs:\n{logs}"
     if proc_statuses:
-        message += f"\nserver exit status:\n" + "\n".join(proc_statuses)
+        message += "\nserver exit status:\n" + "\n".join(proc_statuses)
     raise err.__class__(
         message,
         request=getattr(err, "request", None),
@@ -465,10 +504,10 @@ class PublicAntflyServer:
             self.stop()
             raise RuntimeError(f"Public API server failed to resume at {self.url}\n{out}")
 
-    def stop(self) -> None:
+    def stop(self, *, test_failed: bool = False) -> None:
         self.pause()
         self.log_file.close()
-        if not maybe_preserve_tempdir(self.tempdir):
+        if not maybe_preserve_tempdir(self.tempdir, failed=test_failed):
             self.tempdir.cleanup()
 
 
@@ -535,7 +574,7 @@ def _standalone_stateful_command(binary: str, *, host: str, port: int, root: Pat
         str(port),
         "--data-dir",
         str(root),
-        "--tick-ms",
+        "--control-tick-ms",
         "5",
         "--replica-root-dir",
         str(root / "replicas"),
@@ -560,7 +599,9 @@ def _metadata_command(binary: str, *, host: str, raft_port: int, admin_port: int
         str(admin_port),
         "--data-dir",
         str(root),
-        "--tick-ms",
+        "--raft-tick-ms",
+        "5",
+        "--control-tick-ms",
         "5",
         "--replica-root-dir",
         str(root / "metadata-replicas"),
@@ -600,7 +641,9 @@ def _data_command(
         "2",
         "--data-dir",
         str(root),
-        "--tick-ms",
+        "--raft-tick-ms",
+        "5",
+        "--control-tick-ms",
         "5",
         "--replica-root-dir",
         str(root / "data-replicas"),
@@ -737,11 +780,11 @@ class StatefulAntflyServer:
     def resume(self) -> None:
         self._start_processes(truncate_logs=False)
 
-    def stop(self) -> None:
+    def stop(self, *, test_failed: bool = False) -> None:
         self._stop_processes()
         self.data_log_file.close()
         self.metadata_log_file.close()
-        if not maybe_preserve_tempdir(self.tempdir):
+        if not maybe_preserve_tempdir(self.tempdir, failed=test_failed):
             self.tempdir.cleanup()
 
 
@@ -808,10 +851,10 @@ class StandaloneAntflyServer:
     def resume(self) -> None:
         self._start_process(truncate_logs=False)
 
-    def stop(self) -> None:
+    def stop(self, *, test_failed: bool = False) -> None:
         self._stop_process()
         self.log_file.close()
-        if not maybe_preserve_tempdir(self.tempdir):
+        if not maybe_preserve_tempdir(self.tempdir, failed=test_failed):
             self.tempdir.cleanup()
 
 
@@ -1102,6 +1145,10 @@ class RateLimitedOpenAiEmbeddingServer:
     def allow_all_requests(self) -> None:
         with self._lock:
             self._allowed_successes = 2**31 - 1
+
+    def deny_requests(self) -> None:
+        with self._lock:
+            self._allowed_successes = self._successful_requests
 
     def stats(self) -> dict[str, int]:
         with self._lock:
@@ -1673,7 +1720,7 @@ def real_clipclap_backup_api(request, clipclap_model_available):
 
 
 @pytest.fixture(scope="function")
-def stateful_api():
+def stateful_api(request: pytest.FixtureRequest):
     base_url = os.environ.get("ANTFLY_STATEFUL_URL")
     server: PublicAntflyServer | StandaloneAntflyServer | StatefulAntflyServer | None = None
     default_root = os.environ.get("ANTFLY_STATEFUL_API_ROOT")
@@ -1747,16 +1794,44 @@ def stateful_api():
                 return {}
             return response.json()
 
+        @property
+        def supports_restart(self) -> bool:
+            """Whether this fixture owns a server with a restart lifecycle."""
+            return self._server is not None and callable(getattr(self._server, "restart", None))
+
         def restart_server(self) -> None:
             server = self._server
-            if server is None or not hasattr(server, "restart"):
-                raise AssertionError("restart is only available for locally managed stateful servers")
+            if not self.supports_restart:
+                raise RuntimeError("restart is only available for locally managed stateful servers")
+            assert server is not None
             with self._request_lock:
                 self.s.close()
                 server.restart()
                 if not wait_for_server(self.url, timeout=20):
                     logs = server.debug_logs().strip()
-                    raise AssertionError(f"stateful server failed to restart at {self.url}\n{logs}")
+                    raise RuntimeError(f"stateful server failed to restart at {self.url}\n{logs}")
+                new_session = requests.Session()
+                new_session.headers["Content-Type"] = "application/json"
+                new_session.headers["Connection"] = "close"
+                self.s = new_session
+
+        def pause_server(self) -> None:
+            server = self._server
+            if server is None or not hasattr(server, "pause"):
+                raise AssertionError("pause is only available for locally managed stateful servers")
+            with self._request_lock:
+                self.s.close()
+                server.pause()
+
+        def resume_server(self) -> None:
+            server = self._server
+            if server is None or not hasattr(server, "resume"):
+                raise AssertionError("resume is only available for locally managed stateful servers")
+            with self._request_lock:
+                server.resume()
+                if not wait_for_server(self.url, timeout=20):
+                    logs = server.debug_logs().strip()
+                    raise AssertionError(f"stateful server failed to resume at {self.url}\n{logs}")
                 new_session = requests.Session()
                 new_session.headers["Content-Type"] = "application/json"
                 new_session.headers["Connection"] = "close"
@@ -2004,14 +2079,11 @@ def stateful_api():
             return self._check(response)
 
         def multi_batch(self, tables: dict[str, dict], *, sync_level: str | None = None) -> dict:
-            payload: dict[str, object] = {
-                "read_set": [],
-                "tables": tables,
-            }
+            payload: dict[str, object] = {"tables": tables}
             if sync_level is not None:
                 payload["sync_level"] = sync_level
-            response = self._request("POST", "/transactions/commit", payload)
-            if response.status_code != 200:
+            response = self._request("POST", "/batch", payload)
+            if response.status_code != 201:
                 return self._check(response)
             return self._decode(response)
 
@@ -2171,10 +2243,16 @@ def stateful_api():
         def delete_index(self, table_name: str, index_name: str) -> dict:
             return self.delete(f"/tables/{table_name}/indexes/{index_name}")
 
+        def debug_logs(self) -> str:
+            if self._server is None:
+                return ""
+            return self._server.debug_logs().strip()
+
     yield PublicApi(session, base, server)
     session.close()
     if server is not None:
-        server.stop()
+        report = getattr(request.node, "rep_call", None)
+        server.stop(test_failed=bool(report and report.failed))
 
 
 @pytest.fixture(scope="function")
@@ -2581,6 +2659,39 @@ def table_api(request):
 
         def create_index(self, table_name: str, index_name: str, payload: dict) -> dict:
             return self.raw.create_index(table_name, index_name, payload)
+
+        def wait_index_ready(
+            self,
+            table_name: str,
+            index_name: str,
+            *,
+            timeout_s: float = 30.0,
+            interval_s: float = 0.5,
+            require_query_fresh: bool = False,
+        ) -> dict:
+            deadline = time.monotonic() + timeout_s
+            last_info: dict[str, Any] | None = None
+            last_error: BaseException | None = None
+            while True:
+                try:
+                    last_info = self.get_index(table_name, index_name)
+                    ready = ready_index_status(last_info, require_query_fresh=require_query_fresh)
+                    if ready is not None:
+                        return ready
+                except requests.RequestException as exc:
+                    last_error = exc
+                if time.monotonic() >= deadline:
+                    raise AssertionError(
+                        _index_ready_timeout_message(
+                            table_name,
+                            index_name,
+                            timeout_s,
+                            last_info,
+                            last_error,
+                            getattr(self.raw, "_server", None),
+                        )
+                    )
+                time.sleep(interval_s)
 
         def delete_index(self, table_name: str, index_name: str) -> dict:
             return self.raw.delete_index(table_name, index_name)

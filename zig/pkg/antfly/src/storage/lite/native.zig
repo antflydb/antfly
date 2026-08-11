@@ -21,6 +21,7 @@ const std = @import("std");
 const antfly_platform = @import("antfly_platform");
 const platform_sync = antfly_platform.sync;
 const fs_paths = @import("../../common/fs_paths.zig");
+const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
 const lsm_backend = @import("../lsm_backend.zig");
 const backend_types = @import("../backend_types.zig");
@@ -786,7 +787,7 @@ pub const NativeFile = struct {
     }
 
     pub fn openWithOptions(allocator: Allocator, path: []const u8, opts: OpenOptions) !NativeFile {
-        var io_impl = std.Io.Threaded.init(allocator, .{});
+        var io_impl = threaded_io_limits.initService(allocator);
         errdefer io_impl.deinit();
         const io = io_impl.io();
 
@@ -844,7 +845,7 @@ pub const NativeFile = struct {
         no_sync: bool,
         resource_manager: ?*resource_manager_mod.ResourceManager,
     ) !NativeFile {
-        var io_impl = std.Io.Threaded.init(allocator, .{});
+        var io_impl = threaded_io_limits.initService(allocator);
         errdefer io_impl.deinit();
         const io = io_impl.io();
 
@@ -3569,6 +3570,10 @@ pub const NativeFile = struct {
     fn syncIfRequired(self: *NativeFile) !void {
         if (!self.no_sync) try self.file.sync(self.io_impl.io());
     }
+
+    pub fn sync(self: *NativeFile) !void {
+        try self.syncIfRequired();
+    }
     /// Publishes a fully synced vacuum file and adopts its already-open handle.
     /// Once rename succeeds there are deliberately no fallible reopen steps:
     /// even if the parent-directory sync reports an error, subsequent requests
@@ -3863,7 +3868,7 @@ pub fn create(io: std.Io, path: []const u8) !void {
 }
 
 pub fn lockWriterPath(allocator: Allocator, path: []const u8) !PathWriterLock {
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = threaded_io_limits.initService(allocator);
     errdefer io_impl.deinit();
 
     const file = (try acquireWriterLock(allocator, io_impl.io(), path)).file;

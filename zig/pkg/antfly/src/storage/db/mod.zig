@@ -140,6 +140,13 @@ pub fn searchRequestHasScoreBearingSource(req: types.SearchRequest) bool {
     return query_search.searchRequestHasScoreBearingSource(req);
 }
 
+pub fn validateStructuredFilterValueAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) !void {
+    return query_search.validateStructuredFilterValueAlloc(alloc, value);
+}
+
 pub fn requestHasVectorScoreOrderOnly(req: types.SearchRequest) bool {
     return query_search.requestHasVectorScoreOrderOnly(req);
 }

@@ -340,12 +340,11 @@ fn statSize(stat: c.struct_stat) std.c.off_t {
 const Advice = enum { sequential, random };
 
 fn openReadOnlyZ(path_z: [:0]const u8) !std.posix.fd_t {
-    if (comptime build_options.link_libc) {
-        const fd = c.open(path_z.ptr, c.O_RDONLY, @as(c.mode_t, 0));
-        if (fd < 0) return error.FileNotFound;
-        return @intCast(fd);
-    }
-    return std.posix.openatZ(std.posix.AT.FDCWD, path_z.ptr, .{ .ACCMODE = .RDONLY }, 0) catch error.FileNotFound;
+    // std.posix.openatZ preserves actionable failures such as AccessDenied,
+    // NotDir, and descriptor exhaustion while still retrying EINTR. Flattening
+    // every failure to FileNotFound makes callers misreport operational faults
+    // as absent model metadata.
+    return std.posix.openatZ(std.posix.AT.FDCWD, path_z.ptr, .{ .ACCMODE = .RDONLY }, 0);
 }
 
 fn closeFd(fd: std.posix.fd_t) void {
@@ -433,6 +432,24 @@ pub fn readFileFromDir(allocator: std.mem.Allocator, dir: []const u8, name: []co
 
 test "fileExistsZ on nonexistent" {
     try std.testing.expect(!fileExistsZ("/tmp/this_file_should_not_exist_termite_zig_test"));
+}
+
+test "readFile preserves non-missing open failures" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "not-a-directory", .data = "file" });
+
+    const path = try std.fs.path.join(allocator, &.{
+        ".zig-cache",
+        "tmp",
+        tmp.sub_path[0..],
+        "not-a-directory",
+        "metadata.json",
+    });
+    defer allocator.free(path);
+
+    try std.testing.expectError(error.NotDir, readFile(allocator, path));
 }
 
 test "MmapRegion maps file data correctly and adviseRandom does not crash" {

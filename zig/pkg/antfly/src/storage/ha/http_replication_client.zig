@@ -76,6 +76,7 @@ pub const FetchedBatch = struct {
 pub const AppliedBatch = struct {
     received_count: usize,
     applied_count: usize,
+    identity: standby_mod.Identity,
     progress: standby_mod.Progress,
 };
 
@@ -111,7 +112,7 @@ pub const Client = struct {
         free_uri_on_error = false;
         defer self.alloc.free(resp.request_uri);
         defer resp.response.deinit(self.alloc);
-        try mapStatus(resp.response.status);
+        try mapStatus(resp.response.status, resp.response.body);
 
         var parsed = try std.json.parseFromSlice(
             internal_api.HAIdentifySystemResponse,
@@ -155,7 +156,7 @@ pub const Client = struct {
         free_uri_on_error = false;
         defer self.alloc.free(resp.request_uri);
         defer resp.response.deinit(self.alloc);
-        try mapStatus(resp.response.status);
+        try mapStatus(resp.response.status, resp.response.body);
     }
 
     pub fn createReplicationSlotForStandby(
@@ -175,7 +176,7 @@ pub const Client = struct {
         base_uri: []const u8,
         standby: *const standby_mod.Standby,
     ) !void {
-        return try self.verifyCompatibleUpstreamIdentity(base_uri, standby.identity);
+        return try self.verifyCompatibleUpstreamIdentity(base_uri, standby.identitySnapshot());
     }
 
     pub fn verifyCompatibleUpstreamIdentity(
@@ -239,17 +240,25 @@ pub const Client = struct {
         apply_fn: standby_mod.ApplyFn,
     ) !AppliedBatch {
         _ = self;
-        if (!std.meta.eql(standby.identity, batch.identity)) return error.HAStandbyStateChanged;
-        if (standby.nextReceiveLsn() != batch.requested_lsn) return error.HAStandbyStateChanged;
+        try standby.lockExclusive();
+        defer standby.unlockExclusive();
+        const before = standby.snapshotLocked();
+        if (!std.meta.eql(before.identity, batch.identity) or
+            before.progress.nextReceiveLsn() != batch.requested_lsn)
+        {
+            return error.HAStandbyStateChanged;
+        }
 
         for (batch.frames) |frame| {
-            _ = try standby.receive(frame.record);
+            _ = try standby.receiveLocked(frame.record);
         }
-        const applied_count = try standby.applyAvailable(apply_ctx, apply_fn);
+        const applied_count = try standby.applyAvailableLocked(apply_ctx, apply_fn);
+        const after = standby.snapshotLocked();
         return .{
             .received_count = batch.frames.len,
             .applied_count = applied_count,
-            .progress = standby.currentProgress(),
+            .identity = after.identity,
+            .progress = after.progress,
         };
     }
 
@@ -262,15 +271,17 @@ pub const Client = struct {
         apply_fn: standby_mod.ApplyFn,
         options: ReplicateOptions,
     ) !Result {
-        const requested_lsn = standby.nextReceiveLsn();
-        const identity = standby.identity;
+        const before = standby.snapshot();
+        const requested_lsn = before.progress.nextReceiveLsn();
+        const identity = before.identity;
         var batch = try self.fetchAvailable(base_uri, slot_name, identity, requested_lsn, options);
         defer batch.deinit();
         const applied = self.applyFetched(&batch, standby, apply_ctx, apply_fn) catch |err| {
-            _ = self.updateStandbyStatusSnapshot(base_uri, slot_name, standby.identity, standby.currentProgress()) catch {};
+            const failed = standby.snapshot();
+            _ = self.updateStandbyStatusSnapshot(base_uri, slot_name, failed.identity, failed.progress) catch {};
             return err;
         };
-        try self.updateStandbyStatusSnapshot(base_uri, slot_name, standby.identity, applied.progress);
+        try self.updateStandbyStatusSnapshot(base_uri, slot_name, applied.identity, applied.progress);
         return .{
             .received_count = applied.received_count,
             .applied_count = applied.applied_count,
@@ -379,7 +390,7 @@ pub const Client = struct {
             self.alloc.free(resp.request_uri);
             resp.response.deinit(self.alloc);
         }
-        try mapStatus(resp.response.status);
+        try mapStatus(resp.response.status, resp.response.body);
 
         const parsed = try std.json.parseFromSlice(
             internal_api.HAStartReplicationResponse,
@@ -434,7 +445,7 @@ pub const Client = struct {
         free_uri_on_error = false;
         defer self.alloc.free(resp.request_uri);
         defer resp.response.deinit(self.alloc);
-        try mapStatus(resp.response.status);
+        try mapStatus(resp.response.status, resp.response.body);
 
         var parsed = try std.json.parseFromSlice(
             internal_api.HAStandbyStatusUpdateResponse,
@@ -687,14 +698,25 @@ fn join(alloc: Allocator, base_uri: []const u8, path: []const u8) ![]u8 {
     return try routes.Routes.join(alloc, base_uri, path);
 }
 
-fn mapStatus(status: u16) !void {
+fn mapStatus(status: u16, body: []const u8) !void {
     if (status >= 200 and status < 300) return;
     if (status == 400) return error.InvalidInternalReplicationRequest;
-    if (status == 404) return error.InternalReplicationEndpointNotFound;
+    // Fixed internal routes use the error name as their command-error body.
+    // Preserve resource absence separately from an incompatible/missing route
+    // so the standby exposes an actionable degraded-state reason.
+    if (status == 404) {
+        if (std.mem.eql(u8, std.mem.trim(u8, body, " \t\r\n"), "SlotNotFound")) return error.SlotNotFound;
+        return error.InternalReplicationEndpointNotFound;
+    }
     if (status == 405) return error.UnsupportedOperation;
     if (status == 409) return error.InternalReplicationConflict;
     if (status == 503) return error.InternalReplicationEndpointNotReady;
     return error.UnexpectedHttpStatus;
+}
+
+test "http replication status distinguishes missing slots from missing routes" {
+    try std.testing.expectError(error.SlotNotFound, mapStatus(404, "SlotNotFound"));
+    try std.testing.expectError(error.InternalReplicationEndpointNotFound, mapStatus(404, "not found"));
 }
 
 const TestPaths = struct {
@@ -1270,7 +1292,7 @@ test "storage.ha http replication client replicates mixed tables for whole insta
 
     var reopened = try standby_mod.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, identity, .{});
     defer reopened.close();
-    try std.testing.expectEqual(identity, reopened.identity);
+    try std.testing.expectEqual(identity, reopened.identitySnapshot());
     try std.testing.expectEqual(@as(u64, 2), reopened.currentProgress().safe_read_lsn);
 }
 

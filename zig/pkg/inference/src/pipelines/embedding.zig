@@ -164,6 +164,10 @@ pub const EmbeddingPipeline = struct {
     session: backends.Session,
     tok: Tokenizer,
     config: EmbeddingConfig,
+    /// Optional owner-provided gate for stateful backend sessions. Metal and
+    /// CUDA sessions share mutable backend state across request pipelines and
+    /// must not execute overlapping forward passes.
+    execution_lock: ?*std.atomic.Mutex = null,
     /// Optional vision encoder session for CLIP/SigLIP multimodal embedding.
     vision_session: ?backends.Session = null,
     /// Optional audio encoder session for CLAP multimodal embedding.
@@ -214,18 +218,46 @@ pub const EmbeddingPipeline = struct {
     /// Caller owns the returned slices and must free them with the allocator.
     pub fn embed(self: *EmbeddingPipeline, texts: []const []const u8) ![][]f32 {
         if (texts.len == 0) return try self.allocator.alloc([]f32, 0);
+        self.lockExecution();
+        defer self.unlockExecution();
         const text_session = self.textEncodingSession();
-        if (textSessionRequiresSerialBatch(text_session, texts.len)) {
-            return try self.embedSerial(texts);
+        if (textSessionBatchPlan(text_session, texts.len)) |plan| {
+            return try self.embedWithBatchPlan(texts, plan);
         }
 
+        return self.embedDirect(texts, texts.len);
+    }
+
+    /// Execute one backend batch. `texts` contains only caller-provided rows;
+    /// any required static-batch padding is added after tokenization by copying
+    /// the final encoded row. This keeps fixed-batch compatibility from
+    /// multiplying tokenizer and prefix-allocation work on short tail batches.
+    fn embedDirect(
+        self: *EmbeddingPipeline,
+        texts: []const []const u8,
+        execution_batch: usize,
+    ) ![][]f32 {
+        if (texts.len == 0 or execution_batch < texts.len) return error.InvalidInputShape;
+
+        const text_session = self.textEncodingSession();
         const alloc = self.allocator;
         const input_info = text_session.inputInfo();
         const max_len = textSequenceLengthForInputs(input_info, self.config.max_length);
         const fixed_len = hasFixedTextSequenceLength(input_info);
-        const batch = texts.len;
+        const batch = execution_batch;
+        const admitted_tokens = std.math.mul(usize, batch, max_len) catch
+            return error.ResourceLimitExceeded;
+        var run_permit = try text_session.admit(.{
+            .batch = batch,
+            .sequence = max_len,
+            .input_bytes = std.math.mul(usize, admitted_tokens, 24) catch
+                return error.ResourceLimitExceeded,
+            .host_preprocess_bytes = std.math.mul(usize, admitted_tokens, 32) catch
+                return error.ResourceLimitExceeded,
+        });
+        defer run_permit.deinit();
 
-        const encoded = try alloc.alloc(EncodeResult, batch);
+        const encoded = try alloc.alloc(EncodeResult, texts.len);
         defer alloc.free(encoded);
         var encoded_count: usize = 0;
         defer {
@@ -252,9 +284,13 @@ pub const EmbeddingPipeline = struct {
         const all_mask = try alloc.alloc(i32, batch * effective_len);
         defer alloc.free(all_mask);
 
-        for (encoded[0..batch], 0..) |result, i| {
+        for (encoded, 0..) |result, i| {
             @memcpy(all_ids[i * effective_len .. (i + 1) * effective_len], result.ids[0..effective_len]);
             @memcpy(all_mask[i * effective_len .. (i + 1) * effective_len], result.attention_mask[0..effective_len]);
+        }
+        for (texts.len..batch) |i| {
+            @memcpy(all_ids[i * effective_len .. (i + 1) * effective_len], all_ids[(texts.len - 1) * effective_len .. texts.len * effective_len]);
+            @memcpy(all_mask[i * effective_len .. (i + 1) * effective_len], all_mask[(texts.len - 1) * effective_len .. texts.len * effective_len]);
         }
 
         // Convert i32 token IDs to i64 for ONNX Runtime (expects int64 tensors)
@@ -280,7 +316,14 @@ pub const EmbeddingPipeline = struct {
         const inputs = input_set.slice();
 
         if (self.text_projection) |proj| {
-            if (try self.tryEmbedTextResidentProjection(inputs, all_mask, batch, effective_len, proj)) |resident_embeddings| {
+            if (try self.tryEmbedTextResidentProjection(
+                inputs,
+                all_mask,
+                batch,
+                effective_len,
+                proj,
+                &run_permit,
+            )) |resident_embeddings| {
                 return resident_embeddings;
             }
         } else if (try self.tryEmbedTextResidentQwen3(all_mask, ids_i64, batch, effective_len)) |resident_embeddings| {
@@ -289,7 +332,7 @@ pub const EmbeddingPipeline = struct {
 
         // Run inference
         const encoder_start = embedTimingStart(self.print_timing);
-        var outputs = try text_session.run(inputs, alloc);
+        var outputs = try run_permit.run(inputs, alloc);
         logEmbedTiming("text.encoder", batch, encoder_start);
         defer {
             for (outputs) |*o| o.deinit();
@@ -343,7 +386,12 @@ pub const EmbeddingPipeline = struct {
         return self.session;
     }
 
-    fn embedSerial(self: *EmbeddingPipeline, texts: []const []const u8) anyerror![][]f32 {
+    fn embedWithBatchPlan(
+        self: *EmbeddingPipeline,
+        texts: []const []const u8,
+        plan: TextSessionBatchPlan,
+    ) anyerror![][]f32 {
+        if (plan.batch_size == 0) return error.InvalidInputShape;
         const embeddings = try self.allocator.alloc([]f32, texts.len);
         var initialized: usize = 0;
         errdefer {
@@ -351,15 +399,26 @@ pub const EmbeddingPipeline = struct {
             self.allocator.free(embeddings);
         }
 
-        for (texts, 0..) |_, idx| {
-            const single = try self.embed(texts[idx .. idx + 1]);
-            if (single.len != 1) {
-                freeEmbeddingSlices(self.allocator, single);
+        var offset: usize = 0;
+        while (offset < texts.len) {
+            const real_count = @min(plan.batch_size, texts.len - offset);
+            if (real_count != plan.batch_size and !plan.pad_final_batch) return error.InvalidInputShape;
+            const batch_embeddings = try self.embedDirect(
+                texts[offset .. offset + real_count],
+                plan.batch_size,
+            );
+            if (batch_embeddings.len != plan.batch_size) {
+                freeEmbeddingSlices(self.allocator, batch_embeddings);
                 return error.UnexpectedOutputShape;
             }
-            embeddings[idx] = single[0];
-            self.allocator.free(single);
-            initialized += 1;
+
+            for (batch_embeddings[0..real_count], 0..) |embedding, index| {
+                embeddings[offset + index] = embedding;
+            }
+            for (batch_embeddings[real_count..]) |embedding| self.allocator.free(embedding);
+            self.allocator.free(batch_embeddings);
+            initialized += real_count;
+            offset += real_count;
         }
 
         return embeddings;
@@ -489,12 +548,55 @@ pub const EmbeddingPipeline = struct {
     /// Embed a batch of images (raw JPEG/PNG bytes), returning [batch][projection_dim] embeddings.
     /// Requires a vision_session (CLIP/SigLIP model).
     pub fn embedImages(self: *EmbeddingPipeline, images: []const []const u8) anyerror![][]f32 {
-        const vs = self.vision_session orelse if (sessionHasInput(self.session, "pixel_values")) self.session else return error.NoVisionSession;
         if (images.len == 0) return try self.allocator.alloc([]f32, 0);
+        self.lockExecution();
+        defer self.unlockExecution();
+        return self.embedImagesBatch(images) catch |err| {
+            if (images.len > 1 and shouldFallbackBatchedImageError(err)) {
+                return self.embedImagesIndividually(images);
+            }
+            return err;
+        };
+    }
+
+    fn embedImagesBatch(self: *EmbeddingPipeline, images: []const []const u8) anyerror![][]f32 {
+        const vs = self.vision_session orelse if (sessionHasInput(self.session, "pixel_values")) self.session else return error.NoVisionSession;
 
         const alloc = self.allocator;
         const img_size = self.config.image_size;
         const batch = images.len;
+        const pixel_elements = std.math.mul(
+            usize,
+            std.math.mul(
+                usize,
+                std.math.mul(usize, batch, 3) catch
+                    return error.ResourceLimitExceeded,
+                img_size,
+            ) catch return error.ResourceLimitExceeded,
+            img_size,
+        ) catch return error.ResourceLimitExceeded;
+        const pixel_bytes = std.math.mul(usize, pixel_elements, @sizeOf(f32)) catch
+            return error.ResourceLimitExceeded;
+        var encoded_bytes: usize = 0;
+        for (images) |encoded| {
+            encoded_bytes = std.math.add(usize, encoded_bytes, encoded.len) catch
+                return error.ResourceLimitExceeded;
+        }
+        var run_permit = try vs.admit(.{
+            .batch = batch,
+            // Pixel area is fully represented by input_bytes. Patch/token
+            // sequence length is backend-specific and must not be guessed from
+            // raw pixels for the transformer activation profile.
+            .sequence = 1,
+            .input_bytes = pixel_bytes,
+            .host_preprocess_bytes = std.math.add(
+                usize,
+                encoded_bytes,
+                std.math.mul(usize, pixel_bytes, 2) catch
+                    return error.ResourceLimitExceeded,
+            ) catch return error.ResourceLimitExceeded,
+        });
+        defer run_permit.deinit();
 
         // Preprocess all images to [batch, 3, H, W]
         const preprocess_start = embedTimingStart(self.print_timing);
@@ -525,18 +627,15 @@ pub const EmbeddingPipeline = struct {
 
         if (self.visual_projection) |proj| {
             const resident = self.tryEmbedResidentProjection(
-                vs,
                 &.{pv_tensor},
                 proj,
                 .image,
                 batch,
                 "image.encoder.resident",
                 "image.projection.resident",
+                &run_permit,
             ) catch |err| {
                 if (self.residentProjectionRequired()) return err;
-                if (batch > 1 and shouldFallbackBatchedImageError(err)) {
-                    return self.embedImagesIndividually(images);
-                }
                 return err;
             };
             if (resident) |embeddings| return embeddings;
@@ -544,10 +643,7 @@ pub const EmbeddingPipeline = struct {
 
         // Run vision encoder
         const encoder_start = embedTimingStart(self.print_timing);
-        const outputs = vs.run(&.{pv_tensor}, alloc) catch |err| {
-            if (batch > 1 and shouldFallbackBatchedImageError(err)) {
-                return self.embedImagesIndividually(images);
-            }
+        const outputs = run_permit.run(&.{pv_tensor}, alloc) catch |err| {
             return err;
         };
         logEmbedTiming("image.encoder", batch, encoder_start);
@@ -557,9 +653,6 @@ pub const EmbeddingPipeline = struct {
         }
 
         const embeddings = self.imageEmbeddingsFromOutputs(outputs, batch) catch |err| {
-            if (batch > 1 and shouldFallbackBatchedImageError(err)) {
-                return self.embedImagesIndividually(images);
-            }
             return err;
         };
         return embeddings;
@@ -609,7 +702,10 @@ pub const EmbeddingPipeline = struct {
             alloc.free(embeddings);
         }
         for (images, 0..) |img, i| {
-            const single = try self.embedImages(&.{img});
+            // The public entry point already owns execution_lock while it
+            // evaluates the batch fallback. Call the unlocked implementation
+            // directly so the non-reentrant mutex is not acquired twice.
+            const single = try self.embedImagesBatch(&.{img});
             defer alloc.free(single);
             embeddings[i] = single[0];
             initialized += 1;
@@ -699,9 +795,30 @@ pub const EmbeddingPipeline = struct {
 
     /// Embed a batch of PCM audio clips, returning [batch][embed_dim] embeddings.
     /// Requires an audio_session (CLAP model).
-    pub fn embedAudioPcm(self: *EmbeddingPipeline, audio_clips: []const audio.PcmAudio) ![][]f32 {
-        const as = self.audio_session orelse if (sessionHasInput(self.session, "input_features")) self.session else return error.NoAudioSession;
+    pub fn embedAudioPcm(self: *EmbeddingPipeline, audio_clips: []const audio.PcmAudio) anyerror![][]f32 {
         if (audio_clips.len == 0) return try self.allocator.alloc([]f32, 0);
+        self.lockExecution();
+        defer self.unlockExecution();
+        return self.embedAudioPcmBatch(audio_clips) catch |err| {
+            if (audio_clips.len > 1 and err == error.BatchedAudioOutputCollapsed) {
+                return self.embedAudioPcmIndividually(audio_clips);
+            }
+            return err;
+        };
+    }
+
+    fn lockExecution(self: *EmbeddingPipeline) void {
+        const mutex = self.execution_lock orelse return;
+        platform.sync.lockYielding(mutex);
+    }
+
+    fn unlockExecution(self: *EmbeddingPipeline) void {
+        const mutex = self.execution_lock orelse return;
+        mutex.unlock();
+    }
+
+    fn embedAudioPcmBatch(self: *EmbeddingPipeline, audio_clips: []const audio.PcmAudio) ![][]f32 {
+        const as = self.audio_session orelse if (sessionHasInput(self.session, "input_features")) self.session else return error.NoAudioSession;
 
         const alloc = self.allocator;
         const batch = audio_clips.len;
@@ -717,7 +834,40 @@ pub const EmbeddingPipeline = struct {
         const default_frames = audio.CLAP_CONFIG.chunk_length_s * audio.CLAP_CONFIG.sample_rate / audio.CLAP_CONFIG.hop_length + 1;
         const n_frames = clapInputFeatureFrames(as, default_frames);
         const n_mels = audio.CLAP_CONFIG.n_mels;
-        const all_mels = try alloc.alloc(f32, batch * clap_channels * n_frames * n_mels);
+        const feature_elements = std.math.mul(
+            usize,
+            std.math.mul(
+                usize,
+                std.math.mul(usize, batch, clap_channels) catch
+                    return error.ResourceLimitExceeded,
+                n_frames,
+            ) catch return error.ResourceLimitExceeded,
+            n_mels,
+        ) catch return error.ResourceLimitExceeded;
+        const feature_bytes = std.math.mul(usize, feature_elements, @sizeOf(f32)) catch
+            return error.ResourceLimitExceeded;
+        var pcm_bytes: usize = 0;
+        for (audio_clips) |clip| {
+            pcm_bytes = std.math.add(
+                usize,
+                pcm_bytes,
+                std.math.mul(usize, clip.samples.len, @sizeOf(f32)) catch
+                    return error.ResourceLimitExceeded,
+            ) catch return error.ResourceLimitExceeded;
+        }
+        var run_permit = try as.admit(.{
+            .batch = batch,
+            .sequence = n_frames,
+            .input_bytes = feature_bytes,
+            .host_preprocess_bytes = std.math.add(
+                usize,
+                pcm_bytes,
+                std.math.mul(usize, feature_bytes, 2) catch
+                    return error.ResourceLimitExceeded,
+            ) catch return error.ResourceLimitExceeded,
+        });
+        defer run_permit.deinit();
+        const all_mels = try alloc.alloc(f32, feature_elements);
         @memset(all_mels, 0.0);
         defer alloc.free(all_mels);
 
@@ -780,18 +930,18 @@ pub const EmbeddingPipeline = struct {
 
         if (self.audio_projection) |proj| {
             if (try self.tryEmbedResidentProjection(
-                as,
                 run_inputs,
                 proj,
                 .audio,
                 batch,
                 "audio.encoder.resident",
                 "audio.projection.resident",
+                &run_permit,
             )) |embeddings| return embeddings;
         }
 
         const encoder_start = embedTimingStart(self.print_timing);
-        var outputs = try as.run(run_inputs, alloc);
+        var outputs = try run_permit.run(run_inputs, alloc);
         logEmbedTiming("audio.encoder", batch, encoder_start);
         logEmbedTensorShapes(self.print_timing, "audio.outputs", outputs);
         defer {
@@ -817,7 +967,7 @@ pub const EmbeddingPipeline = struct {
 
         if (batch > 1 and !outputsContainBatchRows(outputs, batch)) {
             logEmbedFallback(self.print_timing, "audio.individual", batch);
-            return self.embedAudioPcmIndividually(audio_clips);
+            return error.BatchedAudioOutputCollapsed;
         }
 
         const embeddings = switch (outputs[0].shape.len) {
@@ -835,7 +985,7 @@ pub const EmbeddingPipeline = struct {
         return embeddings;
     }
 
-    fn embedAudioPcmIndividually(self: *EmbeddingPipeline, audio_clips: []const audio.PcmAudio) ![][]f32 {
+    fn embedAudioPcmIndividually(self: *EmbeddingPipeline, audio_clips: []const audio.PcmAudio) anyerror![][]f32 {
         const alloc = self.allocator;
         const embeddings = try alloc.alloc([]f32, audio_clips.len);
         var initialized: usize = 0;
@@ -845,7 +995,9 @@ pub const EmbeddingPipeline = struct {
         }
 
         for (audio_clips, 0..) |_, i| {
-            const one = try self.embedAudioPcm(audio_clips[i .. i + 1]);
+            // embedAudioPcm holds execution_lock across the complete fallback,
+            // so individual attempts must use the unlocked batch primitive.
+            const one = try self.embedAudioPcmBatch(audio_clips[i .. i + 1]);
             defer alloc.free(one);
             if (one.len != 1) return error.UnexpectedOutputShape;
             embeddings[i] = one[0];
@@ -874,8 +1026,19 @@ pub const EmbeddingPipeline = struct {
         for (embeddings) |embedding| {
             if (embedding.len != in_dim) return error.ShapeMismatch;
         }
+        const input_elements = std.math.mul(usize, batch, in_dim) catch
+            return error.ResourceLimitExceeded;
+        const input_bytes = std.math.mul(usize, input_elements, @sizeOf(f32)) catch
+            return error.ResourceLimitExceeded;
+        var run_permit = try proj.admit(.{
+            .batch = batch,
+            .sequence = 1,
+            .input_bytes = input_bytes,
+            .host_preprocess_bytes = input_bytes,
+        });
+        defer run_permit.deinit();
 
-        const packed_embeddings = try alloc.alloc(f32, batch * in_dim);
+        const packed_embeddings = try alloc.alloc(f32, input_elements);
         defer alloc.free(packed_embeddings);
         for (embeddings, 0..) |embedding, b| {
             @memcpy(packed_embeddings[b * in_dim ..][0..in_dim], embedding);
@@ -886,7 +1049,7 @@ pub const EmbeddingPipeline = struct {
         defer proj_input.deinit();
 
         const projection_start = embedTimingStart(self.print_timing);
-        var proj_outputs = try proj.run(&.{proj_input}, alloc);
+        var proj_outputs = try run_permit.run(&.{proj_input}, alloc);
         logEmbedTiming("projection", batch, projection_start);
         defer {
             for (proj_outputs) |*o| o.deinit();
@@ -1183,9 +1346,17 @@ pub const EmbeddingPipeline = struct {
         batch: usize,
         seq_len: usize,
         proj: backends.Session,
+        permit: *session_mod.RunPermit,
     ) !?[][]f32 {
+        const expected_dim = projectionInputDim(proj) orelse
+            return self.residentProjectionFallback(
+                .text,
+                "text.projection.resident",
+                batch,
+                "unknown_projection_input_dim",
+            );
         const encoder_start = embedTimingStart(self.print_timing);
-        var encoder_outputs = (try self.session.runResident(inputs, self.allocator)) orelse
+        var encoder_outputs = (try permit.runResident(inputs, self.allocator)) orelse
             return self.residentProjectionFallback(.text, "text.encoder.resident", batch, "unsupported");
         logEmbedTiming("text.encoder.resident", batch, encoder_start);
         defer encoder_outputs.deinit();
@@ -1201,9 +1372,17 @@ pub const EmbeddingPipeline = struct {
         };
         defer pooled.deinit();
 
+        const resident_shape = [_]i64{ @intCast(batch), @intCast(expected_dim) };
         const resident_input = [_]session_mod.ResidentInput{.{
             .value = pooled.value,
             .backend = pooled.backend,
+            .estimated_bytes = std.math.mul(
+                usize,
+                std.math.mul(usize, batch, expected_dim) catch
+                    return error.ResourceLimitExceeded,
+                @sizeOf(f32),
+            ) catch return error.ResourceLimitExceeded,
+            .shape = &resident_shape,
         }};
         const projection_start = embedTimingStart(self.print_timing);
         var proj_outputs = (proj.runResidentInputs(&resident_input, self.allocator) catch |err| switch (err) {
@@ -1220,19 +1399,19 @@ pub const EmbeddingPipeline = struct {
 
     fn tryEmbedResidentProjection(
         self: *EmbeddingPipeline,
-        encoder: backends.Session,
         inputs: []const Tensor,
         proj: backends.Session,
         modality: ResidentProjectionModality,
         batch: usize,
         encoder_phase: []const u8,
         projection_phase: []const u8,
+        permit: *session_mod.RunPermit,
     ) !?[][]f32 {
         const expected_dim = projectionInputDim(proj) orelse
             return self.residentProjectionFallback(modality, projection_phase, batch, "unknown_projection_input_dim");
 
         const encoder_start = embedTimingStart(self.print_timing);
-        var encoder_outputs = (try encoder.runResident(inputs, self.allocator)) orelse
+        var encoder_outputs = (try permit.runResident(inputs, self.allocator)) orelse
             return self.residentProjectionFallback(modality, encoder_phase, batch, "unsupported");
         logEmbedTiming(encoder_phase, batch, encoder_start);
         defer encoder_outputs.deinit();
@@ -1248,9 +1427,17 @@ pub const EmbeddingPipeline = struct {
         };
         defer selected.deinit();
 
+        const resident_shape = [_]i64{ @intCast(batch), @intCast(expected_dim) };
         const resident_input = [_]session_mod.ResidentInput{.{
             .value = selected.value,
             .backend = selected.backend,
+            .estimated_bytes = std.math.mul(
+                usize,
+                std.math.mul(usize, batch, expected_dim) catch
+                    return error.ResourceLimitExceeded,
+                @sizeOf(f32),
+            ) catch return error.ResourceLimitExceeded,
+            .shape = &resident_shape,
         }};
         const projection_start = embedTimingStart(self.print_timing);
         var proj_outputs = (proj.runResidentInputs(&resident_input, self.allocator) catch |err| switch (err) {
@@ -1616,16 +1803,42 @@ test "embedding text length follows fixed input_ids sequence dimension" {
     try std.testing.expectEqual(@as(usize, 77), textSequenceLengthForInputs(&input_info, 512));
 }
 
-test "embedding text serializes batches that exceed declared input_ids batch" {
+test "embedding text plans backend and fixed-shape batches" {
     const dynamic = fakeTextSession(.native, &.{ -1, 77 });
-    try std.testing.expect(!textSessionRequiresSerialBatch(dynamic, 2));
+    try std.testing.expect(textSessionBatchPlan(dynamic, 2) == null);
 
     const fixed_one = fakeTextSession(.native, &.{ 1, 77 });
-    try std.testing.expect(!textSessionRequiresSerialBatch(fixed_one, 1));
-    try std.testing.expect(textSessionRequiresSerialBatch(fixed_one, 2));
+    try std.testing.expect(textSessionBatchPlan(fixed_one, 1) == null);
+    try std.testing.expectEqual(
+        TextSessionBatchPlan{ .batch_size = 1, .pad_final_batch = true },
+        textSessionBatchPlan(fixed_one, 2).?,
+    );
+
+    const fixed_two = fakeTextSession(.native, &.{ 2, 77 });
+    try std.testing.expectEqual(
+        TextSessionBatchPlan{ .batch_size = 2, .pad_final_batch = true },
+        textSessionBatchPlan(fixed_two, 1).?,
+    );
+    try std.testing.expect(textSessionBatchPlan(fixed_two, 2) == null);
+    try std.testing.expectEqual(
+        TextSessionBatchPlan{ .batch_size = 2, .pad_final_batch = true },
+        textSessionBatchPlan(fixed_two, 3).?,
+    );
 
     const external_onnx = fakeTextSession(.onnx, &.{ -1, 77 });
-    try std.testing.expect(textSessionRequiresSerialBatch(external_onnx, 2));
+    try std.testing.expectEqual(
+        TextSessionBatchPlan{ .batch_size = 1, .pad_final_batch = false },
+        textSessionBatchPlan(external_onnx, 2).?,
+    );
+
+    const dynamic_info = [_]backends.TensorInfo{
+        .{ .name = "input_ids", .dtype = .i64, .shape = &.{ -1, 77 } },
+    };
+    try std.testing.expect(textSessionBatchPlanForRuntime(&dynamic_info, .native, true, 3) == null);
+    try std.testing.expectEqual(
+        TextSessionBatchPlan{ .batch_size = 1, .pad_final_batch = false },
+        textSessionBatchPlanForRuntime(&dynamic_info, .metal, true, 3).?,
+    );
 }
 
 fn sessionHasInput(session: backends.Session, name: []const u8) bool {
@@ -1635,17 +1848,51 @@ fn sessionHasInput(session: backends.Session, name: []const u8) bool {
     return false;
 }
 
-fn textSessionRequiresSerialBatch(session: backends.Session, requested_batch: usize) bool {
-    if (requested_batch <= 1) return false;
-    if (session.backend() == .onnx) return true;
-    if (backends.imported_onnx_session.sharedBackendContext(session) != null) return true;
-    for (session.inputInfo()) |info| {
+pub const TextSessionBatchPlan = struct {
+    batch_size: usize,
+    pad_final_batch: bool,
+};
+
+/// Return an execution plan only when the requested batch cannot be sent to
+/// the session directly. Fixed-shape models are processed at their declared
+/// batch size, padding only the final partial chunk. External ONNX sessions
+/// and non-native imported graphs retain the conservative single-row path;
+/// imported native graphs preserve runtime batch dimensions and execute whole.
+pub fn textSessionBatchPlan(session: backends.Session, requested_batch: usize) ?TextSessionBatchPlan {
+    return textSessionBatchPlanForRuntime(
+        session.inputInfo(),
+        session.backend(),
+        backends.imported_onnx_session.sharedBackendContext(session) != null,
+        requested_batch,
+    );
+}
+
+fn textSessionBatchPlanForRuntime(
+    input_info: []const backends.TensorInfo,
+    backend: backends.BackendType,
+    imported: bool,
+    requested_batch: usize,
+) ?TextSessionBatchPlan {
+    if (requested_batch == 0) return null;
+    for (input_info) |info| {
         if (!std.mem.eql(u8, info.name, "input_ids")) continue;
-        if (info.shape.len == 0) return false;
+        if (info.shape.len == 0) break;
         const declared_batch = info.shape[0];
-        return declared_batch > 0 and @as(usize, @intCast(declared_batch)) < requested_batch;
+        if (declared_batch > 0) {
+            const batch_size: usize = @intCast(declared_batch);
+            if (batch_size == requested_batch) return null;
+            return .{ .batch_size = batch_size, .pad_final_batch = true };
+        }
+        break;
     }
-    return false;
+    if (requested_batch <= 1) return null;
+    if (backend == .onnx) {
+        return .{ .batch_size = 1, .pad_final_batch = false };
+    }
+    if (imported and backend != .native) {
+        return .{ .batch_size = 1, .pad_final_batch = false };
+    }
+    return null;
 }
 
 fn shouldFallbackBatchedImageError(err: anyerror) bool {
@@ -1863,6 +2110,24 @@ fn selectProjectedOutput(outputs: []Tensor, expected_dim: usize, expected_batch:
         }
     }
     return null;
+}
+
+test "embedding execution gate owns the supplied mutex" {
+    var gate: std.atomic.Mutex = .unlocked;
+    var pipeline = EmbeddingPipeline{
+        .allocator = undefined,
+        .session = undefined,
+        .tok = undefined,
+        .config = .{},
+        .execution_lock = &gate,
+    };
+
+    pipeline.lockExecution();
+    try std.testing.expect(!gate.tryLock());
+    pipeline.unlockExecution();
+
+    try std.testing.expect(gate.tryLock());
+    gate.unlock();
 }
 
 test "projectEmbeddings runs projection as a single batch" {
@@ -2256,11 +2521,13 @@ test "embedImages falls back to per-image runs when batched image shape collapse
     const allocator = std.testing.allocator;
 
     var fake = FakeCollapsingVisionSession{};
+    var execution_gate: std.atomic.Mutex = .unlocked;
     var pipeline = EmbeddingPipeline{
         .allocator = allocator,
         .session = fake.session(),
         .tok = undefined,
         .config = .{ .normalize = false, .image_size = 2 },
+        .execution_lock = &execution_gate,
         .vision_session = fake.session(),
     };
 
@@ -2273,6 +2540,39 @@ test "embedImages falls back to per-image runs when batched image shape collapse
     try std.testing.expectEqual(@as(usize, 2), embeddings.len);
     try std.testing.expectEqualSlices(f32, &.{ 1.0, 2.0 }, embeddings[0]);
     try std.testing.expectEqualSlices(f32, &.{ 1.0, 2.0 }, embeddings[1]);
+    try std.testing.expect(execution_gate.tryLock());
+    execution_gate.unlock();
+}
+
+test "embedAudioPcm falls back under the execution gate without re-entry" {
+    const allocator = std.testing.allocator;
+
+    var fake = FakeCollapsingAudioSession{};
+    var execution_gate: std.atomic.Mutex = .unlocked;
+    var pipeline = EmbeddingPipeline{
+        .allocator = allocator,
+        .session = fake.session(),
+        .tok = undefined,
+        .config = .{ .normalize = false },
+        .execution_lock = &execution_gate,
+        .audio_session = fake.session(),
+    };
+
+    const samples = [_]f32{0.0} ** 1024;
+    const clips = [_]audio.PcmAudio{
+        .{ .samples = &samples, .sample_rate = audio.CLAP_CONFIG.sample_rate },
+        .{ .samples = &samples, .sample_rate = audio.CLAP_CONFIG.sample_rate },
+    };
+    const embeddings = try pipeline.embedAudioPcm(&clips);
+    defer freeEmbeddingSlices(allocator, embeddings);
+
+    try std.testing.expectEqual(@as(usize, 3), fake.run_count);
+    try std.testing.expectEqual(@as(usize, 2), fake.collapsed_batch_attempts);
+    try std.testing.expectEqual(@as(usize, 2), embeddings.len);
+    try std.testing.expectEqualSlices(f32, &.{ 1.0, 2.0 }, embeddings[0]);
+    try std.testing.expectEqualSlices(f32, &.{ 1.0, 2.0 }, embeddings[1]);
+    try std.testing.expect(execution_gate.tryLock());
+    execution_gate.unlock();
 }
 
 test "selectProjectedOutput skips collapsed pooled output for image batch" {
@@ -2357,6 +2657,52 @@ const FakeCollapsingVisionSession = struct {
         out[0] = try Tensor.initFloat32(allocator, "image_embeds", &.{ @intCast(actual_batch), 2 }, data[0 .. actual_batch * 2]);
         return out;
     }
+};
+
+const FakeCollapsingAudioSession = struct {
+    run_count: usize = 0,
+    collapsed_batch_attempts: usize = 0,
+
+    fn session(self: *FakeCollapsingAudioSession) backends.Session {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .run = run,
+                .inputInfo = inputInfo,
+                .outputInfo = outputInfo,
+                .backend = backend,
+                .close = close,
+            },
+        };
+    }
+
+    fn run(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator) anyerror![]Tensor {
+        const self: *FakeCollapsingAudioSession = @ptrCast(@alignCast(ptr));
+        try std.testing.expectEqual(@as(usize, 1), inputs.len);
+        const requested_batch: usize = @intCast(inputs[0].shape[0]);
+        self.run_count += 1;
+        if (requested_batch > 1) self.collapsed_batch_attempts = requested_batch;
+
+        const actual_batch: usize = if (requested_batch > 1) 1 else requested_batch;
+        const data = [_]f32{ 1.0, 2.0 };
+        const out = try allocator.alloc(Tensor, 1);
+        out[0] = try Tensor.initFloat32(allocator, "audio_embeds", &.{ @intCast(actual_batch), 2 }, data[0 .. actual_batch * 2]);
+        return out;
+    }
+
+    fn inputInfo(_: *anyopaque) []const backends.TensorInfo {
+        return &.{.{ .name = "input_features", .dtype = .f32, .shape = &.{ -1, 1, 1001, 64 } }};
+    }
+
+    fn outputInfo(_: *anyopaque) []const backends.TensorInfo {
+        return &.{.{ .name = "audio_embeds", .dtype = .f32, .shape = &.{ -1, 2 } }};
+    }
+
+    fn backend(_: *anyopaque) backends.BackendType {
+        return .native;
+    }
+
+    fn close(_: *anyopaque) void {}
 };
 
 fn fakeVisionSession(ptr: anytype, comptime runFn: anytype) backends.Session {

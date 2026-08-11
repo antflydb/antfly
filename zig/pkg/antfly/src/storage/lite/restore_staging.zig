@@ -155,7 +155,7 @@ pub fn stageAfliteRestoreBackup(
 
     const snapshot_path = try std.fmt.allocPrint(allocator, "{s}.afb", .{backup_id});
     errdefer allocator.free(snapshot_path);
-    const manifest = try promoteManifest(allocator, &lite.db, table_name, backup_id, snapshot_path);
+    const manifest = try promoteManifest(allocator, &lite.db, table_name, backup_id, snapshot_path, portable.items);
     defer freeManifest(allocator, manifest);
 
     try backups_api.writeFileToLocation(allocator, &location, snapshot_path, portable.items, "application/vnd.antfly.backup");
@@ -206,12 +206,13 @@ fn promoteManifest(
     table_name: []const u8,
     backup_id: []const u8,
     snapshot_path: []const u8,
+    portable: []const u8,
 ) !backups_api.TableBackupManifest {
     const schema_json = (try db.getSchemaJson(allocator)) orelse try allocator.dupe(u8, "{}");
     errdefer allocator.free(schema_json);
     const indexes_json = try indexesObjectJson(allocator, db);
     errdefer allocator.free(indexes_json);
-    return try manifestFromParts(allocator, table_name, backup_id, snapshot_path, schema_json, indexes_json, "Promoted from Antfly Lite");
+    return try manifestFromParts(allocator, table_name, backup_id, snapshot_path, portable, schema_json, indexes_json, "Promoted from Antfly Lite");
 }
 
 fn portableFileManifest(
@@ -226,7 +227,7 @@ fn portableFileManifest(
     errdefer allocator.free(schema_json);
     const indexes_json = metadata.indexes_json;
     errdefer allocator.free(indexes_json);
-    return try manifestFromParts(allocator, table_name, backup_id, snapshot_path, schema_json, indexes_json, "Restored from portable Antfly backup");
+    return try manifestFromParts(allocator, table_name, backup_id, snapshot_path, portable, schema_json, indexes_json, "Restored from portable Antfly backup");
 }
 
 fn portableManifestMetadataAlloc(allocator: Allocator, portable: []const u8) !PortableManifestMetadata {
@@ -423,6 +424,7 @@ fn manifestFromParts(
     table_name: []const u8,
     backup_id: []const u8,
     snapshot_path: []const u8,
+    portable: []const u8,
     schema_json: []const u8,
     indexes_json: []const u8,
     description: []const u8,
@@ -436,8 +438,13 @@ fn manifestFromParts(
         .snapshot_path = try allocator.dupe(u8, snapshot_path),
     };
     errdefer shard[0].deinit(allocator);
+    var integrity = try backups_api.portableBytesIntegrityAlloc(allocator, portable);
+    shard[0].artifact_size_bytes = integrity.size_bytes;
+    shard[0].artifact_sha256 = integrity.sha256;
+    integrity = undefined;
 
     return .{
+        .format = .portable,
         .backup_id = try allocator.dupe(u8, backup_id),
         .table_name = try allocator.dupe(u8, table_name),
         .description = try allocator.dupe(u8, description),
@@ -1025,6 +1032,8 @@ test "lite portable backup roundtrips through normal table backup APIs" {
     _ = try normal_source.source().restoreTable(allocator, "docs", .{
         .backup_root = backup_root,
         .manifest = &lite_manifest,
+        .artifact_backup_id = lite_manifest.backup_id,
+        .source_location = location,
     });
     _ = try normal_db.rebuildDenseIndexesForTargetCoverage(allocator);
     _ = try normal_db.rebuildSparseIndexesForTargetCoverage(allocator);
@@ -1059,7 +1068,7 @@ test "lite portable backup roundtrips through normal table backup APIs" {
         .schema_json = table_schema_json,
         .indexes_json = table_indexes_json,
     });
-    var normal_manifest = try backups_api.createManifest(allocator, "lite-normal-lite-out", &table, normal_shards);
+    var normal_manifest = try backups_api.createManifest(allocator, "lite-normal-lite-out", .portable, &table, normal_shards);
     defer normal_manifest.deinit(allocator);
     try std.testing.expectEqualStrings(schema_json, normal_manifest.schema_json);
     try std.testing.expect(std.mem.indexOf(u8, normal_manifest.indexes_json, "\"roundtrip_graph\"") != null);

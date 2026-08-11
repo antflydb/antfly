@@ -62,6 +62,9 @@ type ResolvedEntity struct {
 	Score float32
 	// Mentions are the distinct surface forms that resolved to this entity.
 	Mentions []string
+	// TextIndices identifies the input texts containing this entity. It is kept
+	// independently of TrackProvenance so API responses retain one result per input.
+	TextIndices []int
 }
 
 // ResolvedRelation represents a relation between resolved entities.
@@ -74,6 +77,8 @@ type ResolvedRelation struct {
 	Label string
 	// Score is the maximum confidence across duplicate relations.
 	Score float32
+	// TextIndices identifies the input texts containing this relation.
+	TextIndices []int
 }
 
 // KnowledgeGraph holds the resolved entity graph.
@@ -95,33 +100,43 @@ func BuildKnowledgeGraph(entities [][]Entity, relations [][]Relation, cfg Resolv
 		}
 	}
 
-	// Flatten all relations across texts, applying confidence filter.
-	var allRelations []Relation
-	for _, textRelations := range relations {
-		for _, r := range textRelations {
-			if r.Score >= cfg.MinRelationConfidence {
-				allRelations = append(allRelations, r)
+	// Resolve entities: group similar mentions into clusters.
+	resolved, mentionToID := resolveEntities(allEntities, cfg)
+	resolvedIndexByID := make(map[string]int, len(resolved))
+	for i := range resolved {
+		resolvedIndexByID[resolved[i].ID] = i
+	}
+	for textIndex, textEntities := range entities {
+		for _, entity := range textEntities {
+			id := lookupEntityID(mentionToID, entity, cfg)
+			resolvedIndex, ok := resolvedIndexByID[id]
+			if !ok || slices.Contains(resolved[resolvedIndex].TextIndices, textIndex) {
+				continue
 			}
+			resolved[resolvedIndex].TextIndices = append(resolved[resolvedIndex].TextIndices, textIndex)
 		}
 	}
 
-	// Resolve entities: group similar mentions into clusters.
-	resolved, mentionToID := resolveEntities(allEntities, cfg)
-
 	// Map relations to resolved entity IDs.
 	var resolvedRelations []ResolvedRelation
-	for _, rel := range allRelations {
-		headID := lookupEntityID(mentionToID, rel.HeadEntity, cfg)
-		tailID := lookupEntityID(mentionToID, rel.TailEntity, cfg)
-		if headID == "" || tailID == "" {
-			continue
+	for textIndex, textRelations := range relations {
+		for _, rel := range textRelations {
+			if rel.Score < cfg.MinRelationConfidence {
+				continue
+			}
+			headID := lookupEntityID(mentionToID, rel.HeadEntity, cfg)
+			tailID := lookupEntityID(mentionToID, rel.TailEntity, cfg)
+			if headID == "" || tailID == "" {
+				continue
+			}
+			resolvedRelations = append(resolvedRelations, ResolvedRelation{
+				HeadID:      headID,
+				TailID:      tailID,
+				Label:       rel.Label,
+				Score:       rel.Score,
+				TextIndices: []int{textIndex},
+			})
 		}
-		resolvedRelations = append(resolvedRelations, ResolvedRelation{
-			HeadID: headID,
-			TailID: tailID,
-			Label:  rel.Label,
-			Score:  rel.Score,
-		})
 	}
 
 	// Deduplicate relations if configured.
@@ -283,8 +298,14 @@ func deduplicateRelations(relations []ResolvedRelation) []ResolvedRelation {
 			if r.Score > existing.Score {
 				existing.Score = r.Score
 			}
+			for _, textIndex := range r.TextIndices {
+				if !slices.Contains(existing.TextIndices, textIndex) {
+					existing.TextIndices = append(existing.TextIndices, textIndex)
+				}
+			}
 		} else {
 			cp := *r
+			cp.TextIndices = slices.Clone(r.TextIndices)
 			best[key] = &cp
 		}
 	}

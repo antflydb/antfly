@@ -86,12 +86,22 @@ pub fn save(
     try jw.writeByte('}');
 
     const json_bytes = json_buf.written();
-    const header_size: u64 = json_bytes.len;
+    // SafeTensors permits trailing spaces in the JSON header. Align the data
+    // section so mmap readers can borrow typed f32 slices without copying.
+    const header_padding = (8 - json_bytes.len % 8) % 8;
+    const header_size: u64 = json_bytes.len + header_padding;
 
     // 3. Write the file.
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    defer out.deinit();
-    const w = &out.writer;
+    if (std.fs.path.dirname(path)) |dir| {
+        if (dir.len > 0) try compat.cwd().createDirPath(compat.io(), dir);
+    }
+    const io = compat.io();
+    var file = try compat.cwd().createFile(io, path, .{ .truncate = true });
+    defer file.close(io);
+    var write_buffer: [64 * 1024]u8 = undefined;
+    var file_writer = file.writer(io, &write_buffer);
+    defer file_writer.end() catch {};
+    const w = &file_writer.interface;
 
     // 8-byte header size (little-endian u64).
     var size_buf: [8]u8 = undefined;
@@ -100,6 +110,7 @@ pub fn save(
 
     // JSON header.
     try w.writeAll(json_bytes);
+    for (0..header_padding) |_| try w.writeByte(' ');
 
     // Tensor data: each f32 written as 4 little-endian bytes.
     for (tensors) |t| {
@@ -117,8 +128,6 @@ pub fn save(
         }
     }
 
-    if (std.fs.path.dirname(path)) |dir| {
-        if (dir.len > 0) try compat.cwd().createDirPath(compat.io(), dir);
-    }
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = out.written() });
+    try w.flush();
+    try file.sync(io);
 }

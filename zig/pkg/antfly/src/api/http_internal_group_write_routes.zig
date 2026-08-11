@@ -19,6 +19,7 @@ const distributed_txn = @import("distributed_txn.zig");
 const http_client = @import("http_client.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const http_route_helpers = @import("http_route_helpers.zig");
+const internal_batch_forwarding = @import("internal_batch_forwarding.zig");
 const internal_keys = @import("../storage/internal_keys.zig");
 const metadata_mod = @import("../metadata/mod.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
@@ -47,16 +48,54 @@ pub const TxnValidator = struct {
     }
 };
 
+pub const RoutedRaftBatchWriter = struct {
+    ptr: *anyopaque,
+    write: *const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_mod.types.BatchRequest,
+        forwarding: internal_batch_forwarding.Context,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) anyerror!?void,
+
+    fn run(
+        self: RoutedRaftBatchWriter,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_mod.types.BatchRequest,
+        forwarding: internal_batch_forwarding.Context,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) !?void {
+        return try self.write(self.ptr, alloc, group_id, table_name, req, forwarding, cancellation);
+    }
+};
+
 pub const Context = struct {
     alloc: std.mem.Allocator,
     shard_ops: ?raft_mod.ShardOperationAdapter,
     shard_db_adapter: ?metadata_mod.ShardDbAdapter = null,
     writes: ?table_writes.TableWriteSource,
+    routed_raft_batch_writer: ?RoutedRaftBatchWriter = null,
     repair_job_store: ?*repair_jobs.Store = null,
     repair_cancel_executor: ?http_common.RequestExecutor = null,
     batch_validator: BatchValidator,
     txn_validator: TxnValidator,
 };
+
+fn raftBatchOutcomeResponse(
+    alloc: std.mem.Allocator,
+    status: u16,
+    body: []const u8,
+    outcome: []const u8,
+) !http_common.HttpResponse {
+    return try http_route_helpers.textResponseWithHeaders(alloc, status, body, &.{.{
+        .name = internal_batch_forwarding.outcome_header,
+        .value = outcome,
+    }});
+}
 
 const RepairJobCancelProbe = struct {
     alloc: std.mem.Allocator,
@@ -248,6 +287,14 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
         var observation = ops.observeSplit(record) catch |err| switch (err) {
             error.UnknownGroup, error.UnknownSplitRuntime, error.MissingSplitRuntime => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
             error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
+            error.LeaderUnavailable,
+            error.GroupLeaderUnavailable,
+            error.SplitSourceProjectionNotReady,
+            error.DurableRootIncarnationUnavailable,
+            error.AutoBulkIngestBusy,
+            error.ApplyStoreGroupRetired,
+            error.ApplyStoreShuttingDown,
+            => return try http_route_helpers.textResponse(ctx.alloc, 503, "group leader unavailable"),
             else => return err,
         };
         if (route.group_id == record.source_group_id) observation.source_local_leader = true;
@@ -266,6 +313,7 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
         var observation = ops.observeMerge(record) catch |err| switch (err) {
             error.UnknownGroup, error.UnknownMergeRuntime, error.MissingMergeRuntime => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
             error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
+            error.LeaderUnavailable, error.GroupLeaderUnavailable => return try http_route_helpers.textResponse(ctx.alloc, 503, "group leader unavailable"),
             else => return err,
         };
         if (route.group_id == record.donor_group_id) observation.donor_local_leader = true;
@@ -287,7 +335,19 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
             },
             error.TopologyChanged => return try http_route_helpers.textResponse(ctx.alloc, 409, "topology changed"),
             error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
-            error.LeaderUnavailable, error.GroupLeaderUnavailable, error.MetadataSnapshotUnavailable => {
+            error.LeaderUnavailable,
+            error.GroupLeaderUnavailable,
+            error.MetadataSnapshotUnavailable,
+            error.SplitSourceProjectionNotReady,
+            error.SplitSourceProjectionAdvanced,
+            error.DurableRootIncarnationUnavailable,
+            error.AutoBulkIngestBusy,
+            error.ApplyStoreGroupRetired,
+            error.ApplyStoreShuttingDown,
+            error.BackgroundOwnerClosing,
+            error.BackgroundOwnerClosed,
+            error.TransitionOperationBusy,
+            => {
                 return try http_route_helpers.textResponse(ctx.alloc, 503, "group leader unavailable");
             },
             error.UnsupportedOperation => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
@@ -296,7 +356,25 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
         return try http_route_helpers.jsonResponse(ctx.alloc, struct {}{});
     }
 
-    if (routes.Routes.matchGroupBatch(path)) |batch_route| {
+    const routed_batch_route = routes.Routes.matchGroupRoutedBatch(path);
+    if (routed_batch_route orelse routes.Routes.matchGroupBatch(path)) |batch_route| {
+        if (routed_batch_route == null and ctx.routed_raft_batch_writer != null) {
+            // The legacy endpoint has no end-to-end outcome contract. Reject it
+            // solely by route, before trusting headers or parsing the request,
+            // so forwarding semantics cannot bypass protocol negotiation. The
+            // 404 is deliberate: pre-protocol nodes classify it as terminal
+            // instead of replaying a transform after an ambiguous response.
+            return try http_route_helpers.textResponse(ctx.alloc, 404, "legacy raft batch forwarding unsupported");
+        }
+        const forwarding = internal_batch_forwarding.parse(req) catch {
+            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid raft batch forwarding headers");
+        };
+        if (routed_batch_route != null and forwarding == null) {
+            return try http_route_helpers.textResponse(ctx.alloc, 400, "missing raft batch forwarding headers");
+        }
+        if (routed_batch_route == null and forwarding != null) {
+            return try http_route_helpers.textResponse(ctx.alloc, 400, "raft batch forwarding headers require routed endpoint");
+        }
         const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
         var batch_req = batch_api.parseInternalBatchRequest(ctx.alloc, req.body) catch |err| switch (err) {
             error.InvalidBatchRequest => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid batch request"),
@@ -309,11 +387,38 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
             else => return err,
         };
 
-        _ = (writes.batchGroupLocal(ctx.alloc, batch_route.group_id, batch_route.table_name, batch_req.req) catch |err| switch (err) {
+        _ = ((if (forwarding) |forwarding_context|
+            if (ctx.routed_raft_batch_writer) |writer|
+                writer.run(ctx.alloc, batch_route.group_id, batch_route.table_name, batch_req.req, forwarding_context, req.cancellation)
+            else
+                return try raftBatchOutcomeResponse(
+                    ctx.alloc,
+                    503,
+                    "routed raft batch unavailable",
+                    internal_batch_forwarding.outcome_not_proposed_v1,
+                )
+        else
+            writes.batchGroupLocal(ctx.alloc, batch_route.group_id, batch_route.table_name, batch_req.req)) catch |err| switch (err) {
             error.InvalidBatchRequest => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid batch request"),
             error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
+            error.RaftBatchWriteOutcomeUnknown => {
+                // A generic 5xx retry policy could duplicate a transform that
+                // already committed. Conflict is deliberately non-retryable;
+                // the body preserves the machine-readable outcome class.
+                return try raftBatchOutcomeResponse(
+                    ctx.alloc,
+                    409,
+                    "write outcome unknown",
+                    internal_batch_forwarding.outcome_unknown_v1,
+                );
+            },
             error.LeaderUnavailable, error.GroupLeaderUnavailable, error.MetadataSnapshotUnavailable => {
-                return try http_route_helpers.textResponse(ctx.alloc, 503, "group leader unavailable");
+                return try raftBatchOutcomeResponse(
+                    ctx.alloc,
+                    503,
+                    "group leader unavailable",
+                    internal_batch_forwarding.outcome_not_proposed_v1,
+                );
             },
             else => return err,
         }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
@@ -625,9 +730,11 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
             txn_req.txn_id,
             txn_req.begin_timestamp,
             txn_req.topology_epoch,
+            txn_req.retain_terminal,
             txn_req.participants,
         ) catch |err| switch (err) {
             error.InvalidBatchRequest => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid transaction request"),
+            error.DecisionConflict => return try http_route_helpers.textResponse(ctx.alloc, 409, "decision conflict"),
             error.TopologyChanged => return try http_route_helpers.textResponse(ctx.alloc, 409, "topology changed"),
             error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
             error.UnsupportedOperation => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
@@ -675,8 +782,11 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
             txn_req.txn_id,
             txn_req.status,
             txn_req.commit_version,
+            txn_req.topology_epoch,
+            txn_req.sync_level,
         ) catch |err| switch (err) {
             error.DecisionConflict => return try http_route_helpers.textResponse(ctx.alloc, 409, "decision conflict"),
+            error.TopologyChanged => return try http_route_helpers.textResponse(ctx.alloc, 409, "topology changed"),
             error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
             error.UnsupportedOperation => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
             error.UnknownGroup, error.TxnNotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
@@ -702,6 +812,26 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
         }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
         return try http_route_helpers.jsonResponse(ctx.alloc, distributed_txn.TxnStatusResponse{ .status = status });
     }
+    if (routes.Routes.matchGroupTxnAcknowledge(path)) |txn_route| {
+        const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        var txn_req = distributed_txn.parseTxnAcknowledgeRequest(ctx.alloc, req.body) catch {
+            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid transaction request");
+        };
+        defer distributed_txn.freeTxnAcknowledgeRequest(ctx.alloc, &txn_req);
+        _ = (writes.txnAcknowledgeGroupLocal(
+            ctx.alloc,
+            txn_route.group_id,
+            txn_route.table_name,
+            txn_req.txn_id,
+            txn_req.participant,
+        ) catch |err| switch (err) {
+            error.InvalidParticipant, error.DecisionConflict => return try http_route_helpers.textResponse(ctx.alloc, 409, "decision conflict"),
+            error.UnsupportedOperation => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
+            error.UnknownGroup, error.TxnNotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
+            else => return err,
+        }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        return try http_route_helpers.jsonResponse(ctx.alloc, struct {}{});
+    }
 
     return null;
 }
@@ -720,6 +850,7 @@ const EncodedTransitionAction = struct {
         rollback_merge,
     },
     transition_id: u64,
+    attempt_epoch: u64 = 0,
     source_group_id: ?u64 = null,
     destination_group_id: ?u64 = null,
     donor_group_id: ?u64 = null,
@@ -727,116 +858,238 @@ const EncodedTransitionAction = struct {
     allow_doc_identity_reassignment: bool = false,
     split_key: ?[]const u8 = null,
     source_range_end: ?[]const u8 = null,
-    destination_base_uri: ?[]const u8 = null,
+    table_contract: metadata_transition_state.TransitionTableContract = .{},
 };
+
+const test_transition_table_contract: metadata_transition_state.TransitionTableContract = .{
+    .table_id = 7,
+    .table_name = "docs",
+    .schema_json = "",
+    .indexes_json = "{}",
+    .source_identity = .{ .shard_id = 7, .range_id = 7 },
+    .target_identity = .{ .shard_id = 7, .range_id = 7 },
+};
+
+fn requiredTransitionGroupId(value: ?u64) !u64 {
+    const group_id = value orelse return error.InvalidTransitionActionRequest;
+    if (group_id == 0) return error.InvalidTransitionActionRequest;
+    return group_id;
+}
 
 fn parseSplitTransitionRecord(alloc: std.mem.Allocator, body: []const u8) !metadata_transition_state.SplitTransitionRecord {
     var parsed = try std.json.parseFromSlice(metadata_transition_state.SplitTransitionRecord, alloc, body, .{ .allocate = .alloc_always });
     defer parsed.deinit();
+    if (parsed.value.transition_id == 0 or parsed.value.attempt_epoch == 0 or
+        parsed.value.source_group_id == 0 or parsed.value.destination_group_id == 0)
+    {
+        return error.InvalidTransitionActionRequest;
+    }
+    try parsed.value.table_contract.validateForSplit();
+    const split_key = if (parsed.value.split_key) |value|
+        try alloc.dupe(u8, value)
+    else
+        null;
+    errdefer if (split_key) |value| alloc.free(value);
+    const source_range_end = if (parsed.value.source_range_end) |value|
+        try alloc.dupe(u8, value)
+    else
+        null;
+    errdefer if (source_range_end) |value| alloc.free(value);
+    const rollback_reason = if (parsed.value.rollback_reason) |value|
+        try alloc.dupe(u8, value)
+    else
+        null;
+    errdefer if (rollback_reason) |value| alloc.free(value);
+    const table_contract = try parsed.value.table_contract.clone(alloc);
     return .{
         .transition_id = parsed.value.transition_id,
+        .attempt_epoch = parsed.value.attempt_epoch,
         .source_group_id = parsed.value.source_group_id,
         .destination_group_id = parsed.value.destination_group_id,
         .phase = parsed.value.phase,
-        .split_key = if (parsed.value.split_key) |value| try alloc.dupe(u8, value) else null,
-        .source_range_end = if (parsed.value.source_range_end) |value| try alloc.dupe(u8, value) else null,
-        .rollback_reason = if (parsed.value.rollback_reason) |value| try alloc.dupe(u8, value) else null,
+        .split_key = split_key,
+        .source_range_end = source_range_end,
+        .rollback_reason = rollback_reason,
+        .table_contract = table_contract,
     };
 }
 
 fn parseMergeTransitionRecord(alloc: std.mem.Allocator, body: []const u8) !metadata_transition_state.MergeTransitionRecord {
     var parsed = try std.json.parseFromSlice(metadata_transition_state.MergeTransitionRecord, alloc, body, .{ .allocate = .alloc_always });
     defer parsed.deinit();
+    if (parsed.value.transition_id == 0 or parsed.value.donor_group_id == 0 or
+        parsed.value.receiver_group_id == 0)
+    {
+        return error.InvalidTransitionActionRequest;
+    }
+    try parsed.value.table_contract.validateForMerge(
+        parsed.value.allow_doc_identity_reassignment,
+    );
+    const rollback_reason = if (parsed.value.rollback_reason) |value|
+        try alloc.dupe(u8, value)
+    else
+        null;
+    errdefer if (rollback_reason) |value| alloc.free(value);
+    const table_contract = try parsed.value.table_contract.clone(alloc);
     return .{
         .transition_id = parsed.value.transition_id,
         .donor_group_id = parsed.value.donor_group_id,
         .receiver_group_id = parsed.value.receiver_group_id,
         .phase = parsed.value.phase,
-        .rollback_reason = if (parsed.value.rollback_reason) |value| try alloc.dupe(u8, value) else null,
+        .rollback_reason = rollback_reason,
         .allow_doc_identity_reassignment = parsed.value.allow_doc_identity_reassignment,
+        .table_contract = table_contract,
     };
 }
 
 fn parseTransitionAction(alloc: std.mem.Allocator, body: []const u8) !metadata_mod.TransitionAction {
     var parsed = try std.json.parseFromSlice(EncodedTransitionAction, alloc, body, .{ .allocate = .alloc_always });
     defer parsed.deinit();
+    switch (parsed.value.kind) {
+        .prepare_split_source,
+        .start_split_source,
+        .bootstrap_split_destination,
+        .catch_up_split_destination,
+        .finalize_split_source,
+        .rollback_split,
+        => if (parsed.value.attempt_epoch == 0) return error.InvalidTransitionActionRequest,
+        else => {},
+    }
+    if (parsed.value.transition_id == 0)
+        return error.InvalidTransitionActionRequest;
+    switch (parsed.value.kind) {
+        .prepare_split_source,
+        .start_split_source,
+        .bootstrap_split_destination,
+        .catch_up_split_destination,
+        .finalize_split_source,
+        .rollback_split,
+        => try parsed.value.table_contract.validateForSplit(),
+        .accept_merge_receiver,
+        .catch_up_merge_receiver,
+        .finalize_merge,
+        .rollback_merge,
+        => try parsed.value.table_contract.validateForMerge(
+            parsed.value.allow_doc_identity_reassignment,
+        ),
+    }
     return switch (parsed.value.kind) {
-        .prepare_split_source => .{
-            .prepare_split_source = .{
-                .transition_id = parsed.value.transition_id,
-                .source_group_id = parsed.value.source_group_id orelse return error.InvalidTransitionActionRequest,
-                .destination_group_id = parsed.value.destination_group_id orelse return error.InvalidTransitionActionRequest,
-                .split_key = try alloc.dupe(u8, parsed.value.split_key orelse return error.InvalidTransitionActionRequest),
-                .source_range_end = if (parsed.value.source_range_end) |value| try alloc.dupe(u8, value) else null,
-            },
-        },
+        .prepare_split_source => try parsePrepareSplitTransitionAction(
+            alloc,
+            parsed.value,
+        ),
         .start_split_source => .{
             .start_split_source = .{
                 .transition_id = parsed.value.transition_id,
-                .source_group_id = parsed.value.source_group_id orelse return error.InvalidTransitionActionRequest,
-                .destination_group_id = parsed.value.destination_group_id orelse return error.InvalidTransitionActionRequest,
+                .attempt_epoch = parsed.value.attempt_epoch,
+                .source_group_id = try requiredTransitionGroupId(parsed.value.source_group_id),
+                .destination_group_id = try requiredTransitionGroupId(parsed.value.destination_group_id),
+                .table_contract = try parsed.value.table_contract.clone(alloc),
             },
         },
         .bootstrap_split_destination => .{
             .bootstrap_split_destination = .{
                 .transition_id = parsed.value.transition_id,
-                .source_group_id = parsed.value.source_group_id orelse return error.InvalidTransitionActionRequest,
-                .destination_group_id = parsed.value.destination_group_id orelse return error.InvalidTransitionActionRequest,
-                .destination_base_uri = if (parsed.value.destination_base_uri) |value| try alloc.dupe(u8, value) else null,
+                .attempt_epoch = parsed.value.attempt_epoch,
+                .source_group_id = try requiredTransitionGroupId(parsed.value.source_group_id),
+                .destination_group_id = try requiredTransitionGroupId(parsed.value.destination_group_id),
+                .table_contract = try parsed.value.table_contract.clone(alloc),
             },
         },
         .catch_up_split_destination => .{
             .catch_up_split_destination = .{
                 .transition_id = parsed.value.transition_id,
-                .source_group_id = parsed.value.source_group_id orelse return error.InvalidTransitionActionRequest,
-                .destination_group_id = parsed.value.destination_group_id orelse return error.InvalidTransitionActionRequest,
-                .destination_base_uri = if (parsed.value.destination_base_uri) |value| try alloc.dupe(u8, value) else null,
+                .attempt_epoch = parsed.value.attempt_epoch,
+                .source_group_id = try requiredTransitionGroupId(parsed.value.source_group_id),
+                .destination_group_id = try requiredTransitionGroupId(parsed.value.destination_group_id),
+                .table_contract = try parsed.value.table_contract.clone(alloc),
             },
         },
         .finalize_split_source => .{
             .finalize_split_source = .{
                 .transition_id = parsed.value.transition_id,
-                .source_group_id = parsed.value.source_group_id orelse return error.InvalidTransitionActionRequest,
-                .destination_group_id = parsed.value.destination_group_id orelse return error.InvalidTransitionActionRequest,
+                .attempt_epoch = parsed.value.attempt_epoch,
+                .source_group_id = try requiredTransitionGroupId(parsed.value.source_group_id),
+                .destination_group_id = try requiredTransitionGroupId(parsed.value.destination_group_id),
+                .table_contract = try parsed.value.table_contract.clone(alloc),
             },
         },
         .rollback_split => .{
             .rollback_split = .{
                 .transition_id = parsed.value.transition_id,
-                .source_group_id = parsed.value.source_group_id orelse return error.InvalidTransitionActionRequest,
-                .destination_group_id = parsed.value.destination_group_id orelse return error.InvalidTransitionActionRequest,
+                .attempt_epoch = parsed.value.attempt_epoch,
+                .source_group_id = try requiredTransitionGroupId(parsed.value.source_group_id),
+                .destination_group_id = try requiredTransitionGroupId(parsed.value.destination_group_id),
+                .table_contract = try parsed.value.table_contract.clone(alloc),
             },
         },
         .accept_merge_receiver => .{
             .accept_merge_receiver = .{
                 .transition_id = parsed.value.transition_id,
-                .donor_group_id = parsed.value.donor_group_id orelse return error.InvalidTransitionActionRequest,
-                .receiver_group_id = parsed.value.receiver_group_id orelse return error.InvalidTransitionActionRequest,
+                .donor_group_id = try requiredTransitionGroupId(parsed.value.donor_group_id),
+                .receiver_group_id = try requiredTransitionGroupId(parsed.value.receiver_group_id),
                 .allow_doc_identity_reassignment = parsed.value.allow_doc_identity_reassignment,
+                .table_contract = try parsed.value.table_contract.clone(alloc),
             },
         },
         .catch_up_merge_receiver => .{
             .catch_up_merge_receiver = .{
                 .transition_id = parsed.value.transition_id,
-                .donor_group_id = parsed.value.donor_group_id orelse return error.InvalidTransitionActionRequest,
-                .receiver_group_id = parsed.value.receiver_group_id orelse return error.InvalidTransitionActionRequest,
+                .donor_group_id = try requiredTransitionGroupId(parsed.value.donor_group_id),
+                .receiver_group_id = try requiredTransitionGroupId(parsed.value.receiver_group_id),
                 .allow_doc_identity_reassignment = parsed.value.allow_doc_identity_reassignment,
+                .table_contract = try parsed.value.table_contract.clone(alloc),
             },
         },
         .finalize_merge => .{
             .finalize_merge = .{
                 .transition_id = parsed.value.transition_id,
-                .donor_group_id = parsed.value.donor_group_id orelse return error.InvalidTransitionActionRequest,
-                .receiver_group_id = parsed.value.receiver_group_id orelse return error.InvalidTransitionActionRequest,
+                .donor_group_id = try requiredTransitionGroupId(parsed.value.donor_group_id),
+                .receiver_group_id = try requiredTransitionGroupId(parsed.value.receiver_group_id),
                 .allow_doc_identity_reassignment = parsed.value.allow_doc_identity_reassignment,
+                .table_contract = try parsed.value.table_contract.clone(alloc),
             },
         },
         .rollback_merge => .{
             .rollback_merge = .{
                 .transition_id = parsed.value.transition_id,
-                .donor_group_id = parsed.value.donor_group_id orelse return error.InvalidTransitionActionRequest,
-                .receiver_group_id = parsed.value.receiver_group_id orelse return error.InvalidTransitionActionRequest,
+                .donor_group_id = try requiredTransitionGroupId(parsed.value.donor_group_id),
+                .receiver_group_id = try requiredTransitionGroupId(parsed.value.receiver_group_id),
+                .allow_doc_identity_reassignment = parsed.value.allow_doc_identity_reassignment,
+                .table_contract = try parsed.value.table_contract.clone(alloc),
             },
+        },
+    };
+}
+
+fn parsePrepareSplitTransitionAction(
+    alloc: std.mem.Allocator,
+    encoded: EncodedTransitionAction,
+) !metadata_mod.TransitionAction {
+    const source_group_id = try requiredTransitionGroupId(encoded.source_group_id);
+    const destination_group_id = try requiredTransitionGroupId(
+        encoded.destination_group_id,
+    );
+    const raw_split_key = encoded.split_key orelse
+        return error.InvalidTransitionActionRequest;
+    if (raw_split_key.len == 0) return error.InvalidTransitionActionRequest;
+    const split_key = try alloc.dupe(u8, raw_split_key);
+    errdefer alloc.free(split_key);
+    const source_range_end = if (encoded.source_range_end) |value|
+        try alloc.dupe(u8, value)
+    else
+        null;
+    errdefer if (source_range_end) |value| alloc.free(value);
+    const table_contract = try encoded.table_contract.clone(alloc);
+    return .{
+        .prepare_split_source = .{
+            .transition_id = encoded.transition_id,
+            .attempt_epoch = encoded.attempt_epoch,
+            .source_group_id = source_group_id,
+            .destination_group_id = destination_group_id,
+            .split_key = split_key,
+            .source_range_end = source_range_end,
+            .table_contract = table_contract,
         },
     };
 }
@@ -845,11 +1098,13 @@ fn freeSplitTransitionRecordOwned(alloc: std.mem.Allocator, record: *metadata_tr
     if (record.split_key) |value| alloc.free(value);
     if (record.source_range_end) |value| alloc.free(value);
     if (record.rollback_reason) |value| alloc.free(value);
+    record.table_contract.deinitOwned(alloc);
     record.* = undefined;
 }
 
 fn freeMergeTransitionRecordOwned(alloc: std.mem.Allocator, record: *metadata_transition_state.MergeTransitionRecord) void {
     if (record.rollback_reason) |value| alloc.free(value);
+    record.table_contract.deinitOwned(alloc);
     record.* = undefined;
 }
 
@@ -871,6 +1126,179 @@ test "internal group write routes validate batch requests" {
 
     try std.testing.expectEqual(@as(u16, 400), resp.status);
     try std.testing.expectEqualStrings("invalid batch request", resp.body);
+}
+
+test "internal group write route dispatches bounded raft forwarding context" {
+    const Capture = struct {
+        forwarding: ?internal_batch_forwarding.Context = null,
+        failure: ?anyerror = null,
+
+        fn write(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            _: db_mod.types.BatchRequest,
+            forwarding: internal_batch_forwarding.Context,
+            cancellation: ?*const http_common.RequestCancellation,
+        ) !?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(u64, 7), group_id);
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expect(cancellation != null);
+            self.forwarding = forwarding;
+            if (self.failure) |err| return err;
+            return {};
+        }
+    };
+
+    const headers = [_]http_common.RequestHeader{
+        .{ .name = internal_batch_forwarding.remaining_ms_header, .value = "425" },
+        .{ .name = internal_batch_forwarding.forwards_remaining_header, .value = "1" },
+        .{ .name = internal_batch_forwarding.campaign_allowed_header, .value = "false" },
+    };
+    var capture = Capture{};
+    var cancellation = http_common.RequestCancellation{};
+    var resp = (try handle(.{
+        .alloc = std.testing.allocator,
+        .shard_ops = null,
+        .writes = TestWriteSource.source(),
+        .routed_raft_batch_writer = .{ .ptr = &capture, .write = Capture.write },
+        .batch_validator = TestWriteSource.batchValidator(),
+        .txn_validator = TestWriteSource.txnValidator(),
+    }, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/batch-routed-v1",
+        .headers = &headers,
+        .body = "{}",
+        .cancellation = &cancellation,
+    }, "/internal/v1/groups/7/tables/docs/batch-routed-v1")).?;
+    defer resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 201), resp.status);
+    try std.testing.expectEqual(@as(u32, 425), capture.forwarding.?.remaining_ms);
+    try std.testing.expectEqual(@as(u8, 1), capture.forwarding.?.forwards_remaining);
+    try std.testing.expect(!capture.forwarding.?.campaign_allowed);
+
+    capture.forwarding = null;
+    var legacy_resp = (try handle(.{
+        .alloc = std.testing.allocator,
+        .shard_ops = null,
+        .writes = TestWriteSource.source(),
+        .routed_raft_batch_writer = .{ .ptr = &capture, .write = Capture.write },
+        .batch_validator = TestWriteSource.batchValidator(),
+        .txn_validator = TestWriteSource.txnValidator(),
+    }, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/batch",
+        .headers = &headers,
+        .body = "{}",
+        .cancellation = &cancellation,
+    }, "/internal/v1/groups/7/tables/docs/batch")).?;
+    defer legacy_resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 404), legacy_resp.status);
+    try std.testing.expectEqualStrings("legacy raft batch forwarding unsupported", legacy_resp.body);
+    try std.testing.expect(capture.forwarding == null);
+
+    capture.forwarding = null;
+    var missing_headers_resp = (try handle(.{
+        .alloc = std.testing.allocator,
+        .shard_ops = null,
+        .writes = TestWriteSource.source(),
+        .routed_raft_batch_writer = .{ .ptr = &capture, .write = Capture.write },
+        .batch_validator = TestWriteSource.batchValidator(),
+        .txn_validator = TestWriteSource.txnValidator(),
+    }, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/batch-routed-v1",
+        .body = "{}",
+    }, "/internal/v1/groups/7/tables/docs/batch-routed-v1")).?;
+    defer missing_headers_resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 400), missing_headers_resp.status);
+    try std.testing.expect(capture.forwarding == null);
+
+    capture.failure = error.RaftBatchWriteOutcomeUnknown;
+    var unknown_resp = (try handle(.{
+        .alloc = std.testing.allocator,
+        .shard_ops = null,
+        .writes = TestWriteSource.source(),
+        .routed_raft_batch_writer = .{ .ptr = &capture, .write = Capture.write },
+        .batch_validator = TestWriteSource.batchValidator(),
+        .txn_validator = TestWriteSource.txnValidator(),
+    }, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/batch-routed-v1",
+        .headers = &headers,
+        .body = "{}",
+        .cancellation = &cancellation,
+    }, "/internal/v1/groups/7/tables/docs/batch-routed-v1")).?;
+    defer unknown_resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 409), unknown_resp.status);
+    try std.testing.expectEqualStrings("write outcome unknown", unknown_resp.body);
+    try std.testing.expectEqualStrings(
+        internal_batch_forwarding.outcome_unknown_v1,
+        unknown_resp.header(internal_batch_forwarding.outcome_header).?,
+    );
+
+    capture.failure = error.LeaderUnavailable;
+    var unavailable_resp = (try handle(.{
+        .alloc = std.testing.allocator,
+        .shard_ops = null,
+        .writes = TestWriteSource.source(),
+        .routed_raft_batch_writer = .{ .ptr = &capture, .write = Capture.write },
+        .batch_validator = TestWriteSource.batchValidator(),
+        .txn_validator = TestWriteSource.txnValidator(),
+    }, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/batch-routed-v1",
+        .headers = &headers,
+        .body = "{}",
+        .cancellation = &cancellation,
+    }, "/internal/v1/groups/7/tables/docs/batch-routed-v1")).?;
+    defer unavailable_resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 503), unavailable_resp.status);
+    try std.testing.expectEqualStrings(
+        internal_batch_forwarding.outcome_not_proposed_v1,
+        unavailable_resp.header(internal_batch_forwarding.outcome_header).?,
+    );
+
+    var local_fallback_resp = (try handle(.{
+        .alloc = std.testing.allocator,
+        .shard_ops = null,
+        .writes = TestWriteSource.source(),
+        .batch_validator = TestWriteSource.batchValidator(),
+        .txn_validator = TestWriteSource.txnValidator(),
+    }, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/batch",
+        .body = "{}",
+    }, "/internal/v1/groups/7/tables/docs/batch")).?;
+    defer local_fallback_resp.deinit(std.testing.allocator);
+
+    // The fake source reports no matching group, proving the request reached
+    // batchGroupLocal instead of the absent routed writer.
+    try std.testing.expectEqual(@as(u16, 404), local_fallback_resp.status);
+
+    var legacy_headers_resp = (try handle(.{
+        .alloc = std.testing.allocator,
+        .shard_ops = null,
+        .writes = TestWriteSource.source(),
+        .batch_validator = TestWriteSource.batchValidator(),
+        .txn_validator = TestWriteSource.txnValidator(),
+    }, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/batch",
+        .headers = &headers,
+        .body = "{}",
+    }, "/internal/v1/groups/7/tables/docs/batch")).?;
+    defer legacy_headers_resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 400), legacy_headers_resp.status);
+    try std.testing.expectEqualStrings("raft batch forwarding headers require routed endpoint", legacy_headers_resp.body);
 }
 
 test "internal group write routes validate transaction status requests" {
@@ -970,6 +1398,19 @@ test "internal group artifact repair rejects callback token without cancel execu
 
 test "internal group write routes reject mismatched shard execute requests" {
     const alloc = std.testing.allocator;
+    const body = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(
+        EncodedTransitionAction{
+            .kind = .prepare_split_source,
+            .transition_id = 1,
+            .attempt_epoch = 1,
+            .source_group_id = 8,
+            .destination_group_id = 9,
+            .split_key = "doc:m",
+            .table_contract = test_transition_table_contract,
+        },
+        .{},
+    )});
+    defer alloc.free(body);
 
     var resp = (try handle(.{
         .alloc = alloc,
@@ -980,7 +1421,7 @@ test "internal group write routes reject mismatched shard execute requests" {
     }, .{
         .method = .POST,
         .uri = "/internal/v1/groups/7/shard-ops/execute",
-        .body = "{\"kind\":\"prepare_split_source\",\"transition_id\":1,\"source_group_id\":8,\"destination_group_id\":9,\"split_key\":\"doc:m\"}",
+        .body = body,
     }, "/internal/v1/groups/7/shard-ops/execute")).?;
     defer resp.deinit(alloc);
 
@@ -991,8 +1432,10 @@ test "internal group write routes reject mismatched shard execute requests" {
 test "internal group write routes allow source-hosted split destination actions" {
     const action = metadata_mod.TransitionAction{ .bootstrap_split_destination = .{
         .transition_id = 1,
+        .attempt_epoch = 1,
         .source_group_id = 7,
         .destination_group_id = 8,
+        .table_contract = test_transition_table_contract,
     } };
     try std.testing.expect(transitionActionMatchesRouteGroup(action, 7));
     try std.testing.expect(transitionActionMatchesRouteGroup(action, 8));
@@ -1001,13 +1444,54 @@ test "internal group write routes allow source-hosted split destination actions"
 
 test "internal group write routes parse merge doc identity reassignment action flag" {
     const alloc = std.testing.allocator;
-    var action = try parseTransitionAction(alloc,
-        \\{"kind":"catch_up_merge_receiver","transition_id":4,"donor_group_id":10,"receiver_group_id":9,"allow_doc_identity_reassignment":true}
-    );
+    const body = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(
+        EncodedTransitionAction{
+            .kind = .catch_up_merge_receiver,
+            .transition_id = 4,
+            .donor_group_id = 10,
+            .receiver_group_id = 9,
+            .allow_doc_identity_reassignment = true,
+            .table_contract = test_transition_table_contract,
+        },
+        .{},
+    )});
+    defer alloc.free(body);
+    var action = try parseTransitionAction(alloc, body);
     defer freeTransitionActionOwned(alloc, &action);
 
     try std.testing.expect(action == .catch_up_merge_receiver);
     try std.testing.expect(action.catch_up_merge_receiver.allow_doc_identity_reassignment);
+    try std.testing.expect(action.catch_up_merge_receiver.table_contract.eql(
+        test_transition_table_contract,
+    ));
+}
+
+test "internal group write routes reject incomplete transition contracts" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(
+        error.InvalidTransitionTableContract,
+        parseTransitionAction(alloc,
+            \\{"kind":"catch_up_merge_receiver","transition_id":4,"donor_group_id":10,"receiver_group_id":9}
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidTransitionActionRequest,
+        parseTransitionAction(alloc,
+            \\{"kind":"prepare_split_source","transition_id":4,"attempt_epoch":1,"source_group_id":10,"destination_group_id":9,"split_key":"","table_contract":{"table_id":7,"table_name":"docs","schema_json":"","indexes_json":"{}","source_identity":{"shard_id":7,"range_id":7},"target_identity":{"shard_id":7,"range_id":7}}}
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidTransitionTableContract,
+        parseTransitionAction(alloc,
+            \\{"kind":"catch_up_merge_receiver","transition_id":4,"donor_group_id":10,"receiver_group_id":9,"table_contract":{"table_id":7,"table_name":"docs","schema_json":"","indexes_json":"{}","source_identity":{"shard_id":7,"range_id":7},"target_identity":{"shard_id":8,"range_id":8}}}
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidTransitionTableContract,
+        parseTransitionAction(alloc,
+            \\{"kind":"prepare_split_source","transition_id":4,"attempt_epoch":1,"source_group_id":10,"destination_group_id":9,"split_key":"doc:m","table_contract":{"table_id":7,"table_name":"docs","schema_json":"","indexes_json":"{}","source_identity":{"shard_id":7,"range_id":7},"target_identity":{"shard_id":8,"range_id":8}}}
+        ),
+    );
 }
 
 test "internal group write routes map shard doc identity mismatch to conflict" {
@@ -1033,51 +1517,51 @@ test "internal group write routes map shard doc identity mismatch to conflict" {
             };
         }
 
-        fn observeSplit(_: *anyopaque, _: metadata_transition_state.SplitTransitionRecord) !metadata_transition_state.SplitObservation {
+        fn observeSplit(_: *anyopaque, _: u64, _: metadata_transition_state.SplitTransitionRecord) !metadata_transition_state.SplitObservation {
             return error.DocIdentityNamespaceMismatch;
         }
 
-        fn observeMerge(_: *anyopaque, _: metadata_transition_state.MergeTransitionRecord) !metadata_transition_state.MergeObservation {
+        fn observeMerge(_: *anyopaque, _: u64, _: metadata_transition_state.MergeTransitionRecord) !metadata_transition_state.MergeObservation {
             return error.DocIdentityNamespaceMismatch;
         }
 
-        fn prepareSplitSource(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .prepare_split_source).type) !void {
+        fn prepareSplitSource(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .prepare_split_source).type) !void {
             unreachable;
         }
 
-        fn startSplitSource(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .start_split_source).type) !void {
+        fn startSplitSource(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .start_split_source).type) !void {
             unreachable;
         }
 
-        fn bootstrapSplitDestination(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .bootstrap_split_destination).type) !void {
+        fn bootstrapSplitDestination(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .bootstrap_split_destination).type) !void {
             unreachable;
         }
 
-        fn catchUpSplitDestination(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .catch_up_split_destination).type) !void {
+        fn catchUpSplitDestination(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .catch_up_split_destination).type) !void {
             unreachable;
         }
 
-        fn finalizeSplitSource(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .finalize_split_source).type) !void {
+        fn finalizeSplitSource(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .finalize_split_source).type) !void {
             unreachable;
         }
 
-        fn rollbackSplit(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .rollback_split).type) !void {
+        fn rollbackSplit(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .rollback_split).type) !void {
             unreachable;
         }
 
-        fn acceptMergeReceiver(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .accept_merge_receiver).type) !void {
+        fn acceptMergeReceiver(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .accept_merge_receiver).type) !void {
             unreachable;
         }
 
-        fn catchUpMergeReceiver(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .catch_up_merge_receiver).type) !void {
+        fn catchUpMergeReceiver(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .catch_up_merge_receiver).type) !void {
             unreachable;
         }
 
-        fn finalizeMerge(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .finalize_merge).type) !void {
+        fn finalizeMerge(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .finalize_merge).type) !void {
             return error.DocIdentityNamespaceMismatch;
         }
 
-        fn rollbackMerge(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .rollback_merge).type) !void {
+        fn rollbackMerge(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .rollback_merge).type) !void {
             unreachable;
         }
     };
@@ -1093,7 +1577,7 @@ test "internal group write routes map shard doc identity mismatch to conflict" {
     var split_resp = (try handle(ctx, .{
         .method = .POST,
         .uri = "/internal/v1/groups/7/shard-ops/observe-split",
-        .body = "{\"transition_id\":1,\"source_group_id\":7,\"destination_group_id\":8,\"split_key\":\"doc:m\"}",
+        .body = "{\"transition_id\":1,\"attempt_epoch\":1,\"source_group_id\":7,\"destination_group_id\":8,\"split_key\":\"doc:m\",\"table_contract\":{\"table_id\":7,\"table_name\":\"docs\",\"schema_json\":\"\",\"indexes_json\":\"{}\",\"source_identity\":{\"shard_id\":7,\"range_id\":7},\"target_identity\":{\"shard_id\":7,\"range_id\":7}}}",
     }, "/internal/v1/groups/7/shard-ops/observe-split")).?;
     defer split_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 409), split_resp.status);
@@ -1102,7 +1586,7 @@ test "internal group write routes map shard doc identity mismatch to conflict" {
     var merge_resp = (try handle(ctx, .{
         .method = .POST,
         .uri = "/internal/v1/groups/7/shard-ops/observe-merge",
-        .body = "{\"transition_id\":2,\"donor_group_id\":8,\"receiver_group_id\":7}",
+        .body = "{\"transition_id\":2,\"donor_group_id\":8,\"receiver_group_id\":7,\"allow_doc_identity_reassignment\":true,\"table_contract\":{\"table_id\":7,\"table_name\":\"docs\",\"schema_json\":\"\",\"indexes_json\":\"{}\",\"source_identity\":{\"shard_id\":7,\"range_id\":7},\"target_identity\":{\"shard_id\":7,\"range_id\":7}}}",
     }, "/internal/v1/groups/7/shard-ops/observe-merge")).?;
     defer merge_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 409), merge_resp.status);
@@ -1111,7 +1595,7 @@ test "internal group write routes map shard doc identity mismatch to conflict" {
     var execute_resp = (try handle(ctx, .{
         .method = .POST,
         .uri = "/internal/v1/groups/7/shard-ops/execute",
-        .body = "{\"kind\":\"finalize_merge\",\"transition_id\":3,\"donor_group_id\":8,\"receiver_group_id\":7,\"allow_doc_identity_reassignment\":true}",
+        .body = "{\"kind\":\"finalize_merge\",\"transition_id\":3,\"donor_group_id\":8,\"receiver_group_id\":7,\"allow_doc_identity_reassignment\":true,\"table_contract\":{\"table_id\":7,\"table_name\":\"docs\",\"schema_json\":\"\",\"indexes_json\":\"{}\",\"source_identity\":{\"shard_id\":7,\"range_id\":7},\"target_identity\":{\"shard_id\":7,\"range_id\":7}}}",
     }, "/internal/v1/groups/7/shard-ops/execute")).?;
     defer execute_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 409), execute_resp.status);
@@ -1161,7 +1645,7 @@ const TestWriteSource = struct {
         return null;
     }
 
-    fn txnBeginGroupLocal(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: u64, _: []const []const u8) !?void {
+    fn txnBeginGroupLocal(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: u64, _: bool, _: []const []const u8) !?void {
         return null;
     }
 
@@ -1169,7 +1653,7 @@ const TestWriteSource = struct {
         return null;
     }
 
-    fn txnResolveGroupLocal(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: db_mod.types.TxnStatus, _: u64) !?void {
+    fn txnResolveGroupLocal(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: db_mod.types.TxnStatus, _: u64, _: u64, _: db_mod.types.SyncLevel) !?void {
         return null;
     }
 
@@ -1240,64 +1724,70 @@ const TestShardOps = struct {
         };
     }
 
-    fn observeSplit(_: *anyopaque, _: metadata_transition_state.SplitTransitionRecord) !metadata_transition_state.SplitObservation {
+    fn observeSplit(_: *anyopaque, _: u64, _: metadata_transition_state.SplitTransitionRecord) !metadata_transition_state.SplitObservation {
         unreachable;
     }
 
-    fn observeMerge(_: *anyopaque, _: metadata_transition_state.MergeTransitionRecord) !metadata_transition_state.MergeObservation {
+    fn observeMerge(_: *anyopaque, _: u64, _: metadata_transition_state.MergeTransitionRecord) !metadata_transition_state.MergeObservation {
         unreachable;
     }
 
-    fn prepareSplitSource(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .prepare_split_source).type) !void {
+    fn prepareSplitSource(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .prepare_split_source).type) !void {
         unreachable;
     }
 
-    fn startSplitSource(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .start_split_source).type) !void {
+    fn startSplitSource(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .start_split_source).type) !void {
         unreachable;
     }
 
-    fn bootstrapSplitDestination(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .bootstrap_split_destination).type) !void {
+    fn bootstrapSplitDestination(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .bootstrap_split_destination).type) !void {
         unreachable;
     }
 
-    fn catchUpSplitDestination(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .catch_up_split_destination).type) !void {
+    fn catchUpSplitDestination(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .catch_up_split_destination).type) !void {
         unreachable;
     }
 
-    fn finalizeSplitSource(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .finalize_split_source).type) !void {
+    fn finalizeSplitSource(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .finalize_split_source).type) !void {
         unreachable;
     }
 
-    fn rollbackSplit(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .rollback_split).type) !void {
+    fn rollbackSplit(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .rollback_split).type) !void {
         unreachable;
     }
 
-    fn acceptMergeReceiver(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .accept_merge_receiver).type) !void {
+    fn acceptMergeReceiver(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .accept_merge_receiver).type) !void {
         unreachable;
     }
 
-    fn catchUpMergeReceiver(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .catch_up_merge_receiver).type) !void {
+    fn catchUpMergeReceiver(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .catch_up_merge_receiver).type) !void {
         unreachable;
     }
 
-    fn finalizeMerge(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .finalize_merge).type) !void {
+    fn finalizeMerge(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .finalize_merge).type) !void {
         unreachable;
     }
 
-    fn rollbackMerge(_: *anyopaque, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .rollback_merge).type) !void {
+    fn rollbackMerge(_: *anyopaque, _: u64, _: std.meta.fieldInfo(metadata_mod.TransitionAction, .rollback_merge).type) !void {
         unreachable;
     }
 };
 
 fn freeTransitionActionOwned(alloc: std.mem.Allocator, action: *metadata_mod.TransitionAction) void {
+    const table_contract: ?metadata_transition_state.TransitionTableContract = switch (action.*) {
+        .none => null,
+        inline else => |op| op.table_contract,
+    };
     switch (action.*) {
         .prepare_split_source => |op| {
             alloc.free(op.split_key);
             if (op.source_range_end) |value| alloc.free(value);
         },
-        .bootstrap_split_destination => |op| if (op.destination_base_uri) |value| alloc.free(@constCast(value)),
-        .catch_up_split_destination => |op| if (op.destination_base_uri) |value| alloc.free(@constCast(value)),
         else => {},
+    }
+    if (table_contract) |contract| {
+        var owned = contract;
+        owned.deinitOwned(alloc);
     }
     action.* = undefined;
 }

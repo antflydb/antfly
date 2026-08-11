@@ -75,7 +75,7 @@ func (sa *SecretsApi) ListSecrets(w http.ResponseWriter, r *http.Request) {
 			if secrets.IsEnvVarSet(key) {
 				entry.Status = SecretStatusConfiguredBoth
 			} else {
-				entry.Status = SecretStatusConfiguredKeystore
+				entry.Status = SecretStatusConfiguredFile
 			}
 			entries = append(entries, entry)
 		}
@@ -183,7 +183,7 @@ func (sa *SecretsApi) PutSecret(w http.ResponseWriter, r *http.Request, key stri
 	if secrets.IsEnvVarSet(key) {
 		entry.Status = SecretStatusConfiguredBoth
 	} else {
-		entry.Status = SecretStatusConfiguredKeystore
+		entry.Status = SecretStatusConfiguredFile
 	}
 	if e, ok := keystore.Entries[key]; ok {
 		entry.CreatedAt = e.CreatedAt

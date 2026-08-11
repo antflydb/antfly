@@ -114,7 +114,11 @@ pub const MergePolicy = struct {
                 else
                     0.0;
                 const width_ratio = @as(f64, @floatFromInt(len)) / @as(f64, @floatFromInt(max_merge_at_once));
-                const backlog_width_bonus = if (budget_pressure > 1.0) (budget_pressure - 1.0) * width_ratio else 0.0;
+                // Once the segment budget is exceeded, prefer enough fan-in
+                // to drain the debt rather than repeatedly merging pairs. A
+                // single worker cannot catch a sustained producer when every
+                // merge reduces the live set by only one segment.
+                const backlog_width_bonus = budget_pressure * width_ratio * 2.0;
                 const score = (skew * self.skew_weight) +
                     (size_ratio * self.size_weight) -
                     (delete_ratio * self.delete_reclaim_weight) -
@@ -171,11 +175,20 @@ pub fn mergeSegments(
 
     var inputs = try alloc.alloc(segment_mod.MergeInput, segment_indices.len);
     defer alloc.free(inputs);
+    const deleted_docs = try alloc.alloc(?roaring.RoaringBitmap, segment_indices.len);
+    defer {
+        for (deleted_docs) |*maybe_deleted| {
+            if (maybe_deleted.*) |*deleted| deleted.deinit();
+        }
+        alloc.free(deleted_docs);
+    }
+    @memset(deleted_docs, null);
     for (segment_indices, 0..) |si, i| {
         const seg = &snap.segments[si];
+        deleted_docs[i] = try seg.cloneDeleted(alloc);
         inputs[i] = .{
             .reader = &seg.reader,
-            .deleted = seg.shared.deleted,
+            .deleted = deleted_docs[i],
         };
     }
     const index_sort = try segment_mod.commonIndexSortForMergeInputsAlloc(alloc, inputs);
@@ -200,14 +213,26 @@ pub fn mergeSegmentsBounded(
 
     var inputs = try alloc.alloc(segment_mod.MergeInput, segment_indices.len);
     defer alloc.free(inputs);
+    const owned_deleted_docs = try alloc.alloc(
+        ?roaring.RoaringBitmap,
+        if (options.deleted_docs == null) segment_indices.len else 0,
+    );
+    defer {
+        for (owned_deleted_docs) |*maybe_deleted| {
+            if (maybe_deleted.*) |*deleted| deleted.deinit();
+        }
+        alloc.free(owned_deleted_docs);
+    }
+    if (owned_deleted_docs.len > 0) @memset(owned_deleted_docs, null);
 
     var total_input_bytes: u64 = 0;
     for (segment_indices, 0..) |si, i| {
         const seg = &snap.segments[si];
         total_input_bytes += seg.data.bytes().len;
+        if (options.deleted_docs == null) owned_deleted_docs[i] = try seg.cloneDeleted(alloc);
         inputs[i] = .{
             .reader = &seg.reader,
-            .deleted = if (options.deleted_docs) |deleted_docs| deleted_docs[i] else seg.shared.deleted,
+            .deleted = if (options.deleted_docs) |deleted_docs| deleted_docs[i] else owned_deleted_docs[i],
         };
     }
     const common_index_sort = if (options.index_sort.len == 0)
@@ -484,8 +509,8 @@ test "merge preserves common sorted segment index_sort metadata" {
 
     var reader = try segment_mod.SegmentReader.init(alloc, merged);
     defer reader.deinit();
-    try std.testing.expectEqualStrings("doc:a", reader.storedDoc(0).?.id);
-    try std.testing.expectEqualStrings("doc:c", reader.storedDoc(1).?.id);
+    try std.testing.expectEqualStrings("doc:a", (try reader.storedDoc(0)).?.id);
+    try std.testing.expectEqualStrings("doc:c", (try reader.storedDoc(1)).?.id);
 
     const fields = (try reader.indexSortFieldsAlloc(alloc)) orelse return error.TestExpectedEqual;
     defer segment_mod.freeIndexSortFields(alloc, fields);
@@ -543,7 +568,7 @@ test "bounded merge splits output and preserves live documents" {
     try std.testing.expectEqual(@as(u32, 3), total_docs);
 }
 
-test "merge policy picks small segments and applyMerge replaces them" {
+test "merge policy drains a small-segment backlog and applyMerge replaces it" {
     const alloc = std.testing.allocator;
     const introducer = @import("introducer.zig");
 
@@ -575,12 +600,13 @@ test "merge policy picks small segments and applyMerge replaces them" {
     defer alloc.free(infos);
 
     for (snap.segments, 0..) |seg, i| {
+        const deletion_summary = seg.deletionSummary();
         infos[i] = .{
             .index = i,
             .size = seg.data.bytes().len,
             .doc_count = seg.reader.doc_count,
-            .deleted_count = if (seg.shared.deleted) |deleted| @intCast(deleted.cardinality()) else 0,
-            .has_deletions = seg.shared.deleted != null,
+            .deleted_count = deletion_summary.count,
+            .has_deletions = deletion_summary.has_deletions,
         };
     }
 
@@ -592,14 +618,17 @@ test "merge policy picks small segments and applyMerge replaces them" {
     const planned = (try policy.plan(alloc, infos)).?;
     defer alloc.free(planned);
 
-    try std.testing.expectEqual(@as(usize, 2), planned.len);
+    // All three floor-sized segments are above the two-segment tier budget.
+    // Draining the full eligible fan-in is the behavior that prevents a
+    // sustained producer from outrunning pairwise compaction.
+    try std.testing.expectEqual(@as(usize, 3), planned.len);
 
     const merged = try mergeSegments(alloc, writer.snapshot(), planned);
     defer alloc.free(merged);
 
     try applyMerge(&writer, planned, merged);
 
-    try std.testing.expectEqual(@as(usize, 2), writer.snapshot().segments.len);
+    try std.testing.expectEqual(@as(usize, 1), writer.snapshot().segments.len);
 
     const results = try writer.snapshot().search(alloc, "body", &.{ "hello", "world" }, 10);
     defer alloc.free(results.hits);
@@ -688,6 +717,29 @@ test "merge policy compacts floor segments under tier pressure" {
     try std.testing.expect(planned.len >= 2);
 }
 
+test "merge policy uses full fan-in while tiny segment backlog is growing" {
+    const alloc = std.testing.allocator;
+    const policy = MergePolicy{
+        .max_segments_per_tier = 10,
+        .max_merge_at_once = 10,
+        .max_segment_size = 5 * 1024 * 1024 * 1024,
+        .floor_segment_size = 16 * 1024 * 1024,
+    };
+    var infos: [64]SegmentInfo = undefined;
+    for (&infos, 0..) |*info, i| {
+        info.* = .{
+            .index = i,
+            .size = 32 * 1024 + i,
+            .doc_count = 8,
+            .has_deletions = false,
+        };
+    }
+
+    const planned = (try policy.plan(alloc, &infos)).?;
+    defer alloc.free(planned);
+    try std.testing.expectEqual(@as(usize, policy.max_merge_at_once), planned.len);
+}
+
 test "merge direct-copies single-source field sections when eligible" {
     const alloc = std.testing.allocator;
     const introducer = @import("introducer.zig");
@@ -710,7 +762,7 @@ test "merge direct-copies single-source field sections when eligible" {
     } });
 
     const snap = writer.snapshot();
-    const original_title = snap.segments[0].reader.getSection("title", .inverted_text).?;
+    const original_title = (try snap.segments[0].reader.getSection("title", .inverted_text)).?;
 
     const merged = try mergeSegments(alloc, snap, &.{ 0, 1 });
     defer alloc.free(merged);
@@ -718,7 +770,7 @@ test "merge direct-copies single-source field sections when eligible" {
     var merged_reader = try segment_mod.SegmentReader.init(alloc, merged);
     defer merged_reader.deinit();
 
-    const merged_title = merged_reader.getSection("title", .inverted_text).?;
+    const merged_title = (try merged_reader.getSection("title", .inverted_text)).?;
     try std.testing.expectEqualStrings(original_title, merged_title);
 
     const stored0 = (try merged_reader.storedDocDecompressed(alloc, 0)).?;
@@ -819,17 +871,17 @@ test "merge mapper-built segments preserves typed doc values" {
     var reader = try segment_mod.SegmentReader.init(alloc, merged);
     defer reader.deinit();
 
-    const price_section = reader.getSection("price", .typed_doc_values) orelse return error.TestExpectedEqual;
+    const price_section = (try reader.getSection("price", .typed_doc_values)) orelse return error.TestExpectedEqual;
     var price_reader = try typed_dv.TypedDocValuesReader.init(alloc, price_section);
     try std.testing.expectEqual(@as(?f64, 10.0), try price_reader.getF64(0));
     try std.testing.expectEqual(@as(?f64, 20.0), try price_reader.getF64(1));
 
-    const ts_section = reader.getSection("published_at", .typed_doc_values) orelse return error.TestExpectedEqual;
+    const ts_section = (try reader.getSection("published_at", .typed_doc_values)) orelse return error.TestExpectedEqual;
     var ts_reader = try typed_dv.TypedDocValuesReader.init(alloc, ts_section);
     try std.testing.expect((try ts_reader.getU64(0)) != null);
     try std.testing.expect((try ts_reader.getU64(1)) != null);
 
-    const geo_section = reader.getSection("location", .typed_doc_values) orelse return error.TestExpectedEqual;
+    const geo_section = (try reader.getSection("location", .typed_doc_values)) orelse return error.TestExpectedEqual;
     var geo_reader = try typed_dv.TypedDocValuesReader.init(alloc, geo_section);
     try std.testing.expect((try geo_reader.getGeoPoint(0)) != null);
     try std.testing.expect((try geo_reader.getGeoPoint(1)) != null);

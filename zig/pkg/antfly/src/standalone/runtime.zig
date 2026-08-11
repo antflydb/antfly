@@ -14,10 +14,12 @@
 
 const std = @import("std");
 const lease_executor = @import("lease_executor.zig");
+const builtin = @import("builtin");
 const platform_sync = @import("antfly_platform").sync;
 const httpx = @import("httpx");
 const antfly = @import("../root.zig");
 const group_ids = @import("../common/group_ids.zig");
+const threaded_io_limits = @import("../common/threaded_io_limits.zig");
 const inference = @import("inference_server");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const usermgr_openapi = @import("antfly_usermgr_openapi");
@@ -30,6 +32,16 @@ const http_common = antfly.common.http;
 const public_api_max_requests_per_connection: u32 = 64;
 const public_api_max_body_size: usize = antfly.common.http.default_max_request_bytes;
 const local_schema_migration_finalize_interval_ms: u64 = std.time.ms_per_s;
+
+const LocalSchemaProgressProvider = struct {
+    ptr: *anyopaque,
+    collect: *const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        tables: []const antfly.metadata.TableRecord,
+        ranges: []const antfly.metadata.RangeRecord,
+    ) anyerror!antfly.data.runtime.DataServer.LocalSchemaProgressSnapshot,
+};
 const default_public_port: u16 = 8080;
 const antfarm_max_file_bytes: usize = 64 * 1024 * 1024;
 const standalone_session_ttl_ns: u64 = std.time.ns_per_hour;
@@ -100,11 +112,12 @@ const TerminationSignalScope = struct {
 
 const CliConfig = struct {
     config_path: ?[]const u8 = null,
+    experimental: bool = false,
     bind_host: ?[]const u8 = null,
     bind_port: ?u16 = null,
     health_enabled: ?bool = null,
     health_port: ?u16 = null,
-    tick_ms: ?u64 = null,
+    control_tick_ms: u64 = antfly.raft.RuntimeCadence.default_control_tick_ms,
     local_node_id: ?u64 = null,
     auth_enabled: ?bool = null,
     ard_base_url: ?[]const u8 = null,
@@ -514,6 +527,8 @@ const StandaloneHealthSource = struct {
     data_server: *antfly.data.runtime.DataServer,
     unified_api_ready: *const std.atomic.Value(bool),
     startup_checkpoint_lsn: ?u64 = null,
+    handler: *const AntflyApiHandler,
+    unified_lifecycle: *UnifiedServerLifecycle,
 
     fn readiness(self: *StandaloneHealthSource) antfly.common.health_server.ReadinessChecker {
         return .{
@@ -554,6 +569,33 @@ const StandaloneHealthSource = struct {
         const self: *StandaloneHealthSource = @ptrCast(@alignCast(ptr));
         var data_health = antfly.data.runtime.HealthSource{ .data_server = self.data_server };
         try data_health.metricsWriter().writeMetrics(writer);
+
+        const query = self.handler.query_admission.stats();
+        const query_body = self.handler.query_body_admission.stats();
+        const handler = self.handler.runtimeStats();
+        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_capacity", "gauge", "Maximum concurrent expensive public queries", query.capacity);
+        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_in_flight", "gauge", "Currently executing expensive public queries", query.in_flight);
+        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_peak_in_flight", "gauge", "Peak concurrent expensive public queries since process start", query.peak_in_flight);
+        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_rejected_total", "counter", "Public queries rejected by admission control", query.rejected_total);
+        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_body_capacity", "gauge", "Maximum concurrent streaming H2 query bodies", query_body.capacity);
+        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_bodies_in_flight", "gauge", "Streaming H2 query bodies currently admitted", query_body.in_flight);
+        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_body_peak_in_flight", "gauge", "Peak concurrent streaming H2 query bodies since process start", query_body.peak_in_flight);
+        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_body_rejected_total", "counter", "Streaming H2 query bodies rejected by admission control", query_body.rejected_total);
+        try antfly.common.health_server.appendPromMetric(writer, "antfly_http_cancellation_watcher_start_failures_total", "counter", "Public queries rejected because peer observation could not be scheduled", handler.cancellation_watcher_start_failures_total);
+        try antfly.common.health_server.appendPromMetric(writer, "antfly_http_peer_disconnects_total", "counter", "Public query peer disconnects propagated to cancellation", handler.peer_disconnect_cancellations_total);
+        try antfly.common.health_server.appendPromMetric(writer, "antfly_http_peer_observer_failures_total", "counter", "Public queries cancelled after peer observation failed", handler.peer_observer_failures_total);
+        try antfly.common.health_server.appendPromMetric(writer, "antfly_http_active_peer_observers", "gauge", "Public query sockets currently watched for disconnect", handler.active_peer_observers);
+
+        if (self.unified_lifecycle.runtimeStats()) |http| {
+            try antfly.common.health_server.appendPromMetric(writer, "antfly_http_connection_limit", "gauge", "Maximum concurrent public HTTP connections", http.max_connections);
+            try antfly.common.health_server.appendPromMetric(writer, "antfly_http_active_connections", "gauge", "Currently active public HTTP connections", http.active_connections);
+            try antfly.common.health_server.appendPromMetric(writer, "antfly_http_active_requests", "gauge", "Currently active public HTTP requests", http.active_requests);
+            try antfly.common.health_server.appendPromMetric(writer, "antfly_http_accept_errors_total", "counter", "Public HTTP listener accept failures", http.accept_errors_total);
+            try antfly.common.health_server.appendPromMetric(writer, "antfly_http_body_buffer_capacity_bytes", "gauge", "Aggregate HTTP request-body buffer capacity", http.body_buffer_capacity_bytes);
+            try antfly.common.health_server.appendPromMetric(writer, "antfly_http_body_buffer_in_use_bytes", "gauge", "HTTP request-body bytes admitted across HTTP/1 and HTTP/2", http.body_buffer_in_use_bytes);
+            try antfly.common.health_server.appendPromMetric(writer, "antfly_http_body_buffer_peak_bytes", "gauge", "Peak admitted HTTP request-body bytes since process start", http.body_buffer_peak_bytes);
+            try antfly.common.health_server.appendPromMetric(writer, "antfly_http_body_buffer_rejected_total", "counter", "HTTP request bodies rejected by aggregate memory admission", http.body_buffer_rejected_total);
+        }
     }
 };
 
@@ -615,6 +657,13 @@ const UnifiedServerLifecycle = struct {
         return if (self.state.load(.acquire) == .failed) self.failure else null;
     }
 
+    fn runtimeStats(self: *UnifiedServerLifecycle) ?httpx.Server.RuntimeStats {
+        platform_sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        const server = self.server orelse return null;
+        return server.runtimeStats();
+    }
+
     fn stop(self: *UnifiedServerLifecycle) void {
         const prior = self.state.swap(.stopping, .acq_rel);
         if (prior == .failed or prior == .stopped) return;
@@ -644,7 +693,7 @@ const PublicListenerLease = struct {
     path: []u8,
 
     fn acquire(alloc: std.mem.Allocator, bind_port: u16) !PublicListenerLease {
-        var io_impl = std.Io.Threaded.init(alloc, .{});
+        var io_impl = threaded_io_limits.initService(alloc);
         errdefer io_impl.deinit();
         // Lease by port rather than host spelling: wildcard/specific binds and
         // IPv6 aliases can overlap even when their input strings differ.
@@ -686,6 +735,7 @@ const LocalStandaloneMetadata = struct {
     storage_engine: antfly.common.config.StorageEngine = .local,
     epoch: u64 = 1,
     last_schema_migration_finalize_at_ms: u64 = 0,
+    local_schema_progress_provider: ?LocalSchemaProgressProvider = null,
 
     const PersistedCatalog = struct {
         epoch: u64 = 1,
@@ -748,25 +798,28 @@ const LocalStandaloneMetadata = struct {
         catalog_store: ?*antfly.storage_backend_erased.Store,
         storage_engine: antfly.common.config.StorageEngine,
     ) !LocalStandaloneMetadata {
-        const owned_api_url = try alloc.dupe(u8, api_url);
-        errdefer alloc.free(owned_api_url);
-        const owned_replica_root_dir = try alloc.dupe(u8, replica_root_dir);
-        errdefer alloc.free(owned_replica_root_dir);
-        const owned_catalog_path = try alloc.dupe(u8, catalog_path);
-        errdefer alloc.free(owned_catalog_path);
+        var owned_api_url: ?[]u8 = try alloc.dupe(u8, api_url);
+        errdefer if (owned_api_url) |value| alloc.free(value);
+        var owned_replica_root_dir: ?[]u8 = try alloc.dupe(u8, replica_root_dir);
+        errdefer if (owned_replica_root_dir) |value| alloc.free(value);
+        var owned_catalog_path: ?[]u8 = try alloc.dupe(u8, catalog_path);
+        errdefer if (owned_catalog_path) |value| alloc.free(value);
         var self = LocalStandaloneMetadata{
             .alloc = alloc,
             .manager = antfly.metadata.TableManager.init(alloc),
             .extension_catalog = antfly.extensions.ExtensionCatalog.init(alloc),
             .local_node_id = local_node_id,
             .store_id = store_id,
-            .api_url = owned_api_url,
-            .replica_root_dir = owned_replica_root_dir,
-            .catalog_path = owned_catalog_path,
+            .api_url = owned_api_url.?,
+            .replica_root_dir = owned_replica_root_dir.?,
+            .catalog_path = owned_catalog_path.?,
             .catalog_store = catalog_store,
             .backend_runtime = backend_runtime,
             .storage_engine = storage_engine,
         };
+        owned_api_url = null;
+        owned_replica_root_dir = null;
+        owned_catalog_path = null;
         errdefer self.deinit();
         try self.loadPersistedCatalog();
         return self;
@@ -804,6 +857,7 @@ const LocalStandaloneMetadata = struct {
                 .restore_table = restoreTable,
                 .drop_table = dropTable,
                 .update_schema = updateSchema,
+                .update_schema_versioned = updateSchemaVersioned,
                 .create_index = createIndex,
                 .drop_index = dropIndex,
                 .put_artifact_enrichment = putArtifactEnrichment,
@@ -1022,16 +1076,28 @@ const LocalStandaloneMetadata = struct {
         };
     }
 
-    fn restoreTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8) !void {
+    fn restoreTable(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        location_uri: []const u8,
+        connection: []const u8,
+        artifact_backup_id: []const u8,
+        manifest: *const antfly.public_api.backups.TableBackupManifest,
+    ) !void {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
-        var location = try antfly.public_api.backups.openBackupLocation(alloc, location_uri);
-        defer location.deinit(alloc);
-        var manifest = antfly.public_api.backups.readManifestFromLocation(alloc, &location, backup_id) catch return error.InvalidBackupRequest;
-        defer manifest.deinit(alloc);
+        try antfly.public_api.backups.validateTableManifest(alloc, manifest, manifest.backup_id);
         if (!std.mem.eql(u8, manifest.table_name, table_name)) return error.InvalidBackupRequest;
-        var table = try antfly.public_api.backups.deriveRestoreTableRecord(alloc, table_name, location_uri, &manifest);
+        var table = try antfly.public_api.backups.deriveRestoreTableRecord(alloc, table_name, location_uri, manifest);
         defer antfly.metadata.table_manager.freeTable(alloc, table);
-        const ranges = try antfly.public_api.backups.deriveRestoreRanges(alloc, table.table_id, location_uri, &manifest);
+        const ranges = try antfly.public_api.backups.deriveRestoreRanges(
+            alloc,
+            table.table_id,
+            location_uri,
+            connection,
+            artifact_backup_id,
+            manifest,
+        );
         defer {
             for (ranges) |record| antfly.metadata.table_manager.freeRange(alloc, record);
             alloc.free(ranges);
@@ -1063,17 +1129,23 @@ const LocalStandaloneMetadata = struct {
     }
 
     fn updateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
+        _ = try updateSchemaVersioned(ptr, alloc, table_name, schema_json);
+    }
+
+    fn updateSchemaVersioned(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !u32 {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         const table = self.findTableByNameLocked(table_name) orelse return error.TableNotFound;
         const updated = try antfly.public_api.tables.applySchemaUpdateRecord(alloc, table, schema_json);
         defer antfly.metadata.table_manager.freeTable(alloc, updated);
+        const version = try antfly.public_api.tables.schemaVersion(updated.schema_json);
         var mutation = try self.beginCatalogMutationLocked();
         defer mutation.deinit(self);
         try self.manager.upsertTable(updated);
         self.epoch +|= 1;
         try mutation.commit(self);
+        return version;
     }
 
     fn createIndex(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
@@ -1339,19 +1411,33 @@ const LocalStandaloneMetadata = struct {
         defer self.alloc.free(hosted_group_ids);
         for (snapshot.ranges, 0..) |range, i| hosted_group_ids[i] = range.group_id;
 
-        const progress = try antfly.metadata.table_provisioner.collectLocalSchemaProgressWithOptions(
-            self.alloc,
-            self.replica_root_dir,
-            group_ids.main_metadata_group_id,
-            self.local_node_id,
-            hosted_group_ids,
-            snapshot.tables,
-            snapshot.ranges,
-            .{
-                .backend_runtime = self.backend_runtime,
-            },
-        );
-        defer self.alloc.free(progress);
+        var runtime_progress: ?antfly.data.runtime.DataServer.LocalSchemaProgressSnapshot = null;
+        defer if (runtime_progress) |*progress| progress.deinit(self.alloc);
+        var filesystem_progress: ?[]antfly.metadata.SchemaProgressRecord = null;
+        defer if (filesystem_progress) |progress| self.alloc.free(progress);
+        const progress: []const antfly.metadata.SchemaProgressRecord = progress: {
+            if (self.local_schema_progress_provider) |provider| {
+                runtime_progress = try provider.collect(provider.ptr, self.alloc, snapshot.tables, snapshot.ranges);
+                if (runtime_progress.?.records.len != 0) break :progress runtime_progress.?.records;
+                // A complete runtime observation is authoritative even while
+                // not ready. Do not contend with its live writer by reopening
+                // the same root through the filesystem fallback.
+                if (runtime_progress.?.runtime_coverage_complete) return;
+            }
+            filesystem_progress = try antfly.metadata.table_provisioner.collectLocalSchemaProgressWithOptions(
+                self.alloc,
+                self.replica_root_dir,
+                group_ids.main_metadata_group_id,
+                self.local_node_id,
+                hosted_group_ids,
+                snapshot.tables,
+                snapshot.ranges,
+                .{
+                    .backend_runtime = self.backend_runtime,
+                },
+            );
+            break :progress filesystem_progress.?;
+        };
         if (progress.len == 0) return;
 
         lockAtomic(&self.mutex);
@@ -1593,6 +1679,25 @@ pub fn runFromIterator(
         null;
     defer if (loaded_config) |*cfg| cfg.deinit();
 
+    var remote_content_runtime: antfly.common.remote_content_runtime.Runtime = undefined;
+    var remote_content_runtime_initialized = false;
+    defer if (remote_content_runtime_initialized) remote_content_runtime.deinit();
+    var remote_content_facade = antfly.common.config.Config.RemoteContentConfig{};
+    const remote_content = if (cli.config_path) |config_path| blk: {
+        remote_content_runtime = try antfly.common.remote_content_runtime.Runtime.init(
+            alloc,
+            config_path,
+            if (secret_store_initialized) &secret_store else null,
+            .standalone,
+        );
+        remote_content_runtime_initialized = true;
+        remote_content_runtime.attach(&remote_content_facade);
+        break :blk &remote_content_facade;
+    } else if (loaded_config) |*cfg|
+        if (cfg.remote_content) |*configured| configured else null
+    else
+        null;
+
     const storage_engine = cli.storage_engine orelse if (loaded_config) |*cfg| cfg.storage.engine else .local;
     if (storage_engine == .object) return error.UnsupportedStandaloneStorageEngine;
     const lite_path = if (storage_engine == .lite)
@@ -1656,10 +1761,18 @@ pub fn runFromIterator(
     if (loaded_config) |*cfg| {
         if (cfg.effectiveAntflyContentSecurity()) |security| antfly_node_cfg.content_security = security.*;
         if (cfg.inference.s3_credentials) |creds| antfly_node_cfg.s3_credentials = creds;
+        if (cfg.inference.keep_alive) |value|
+            antfly_node_cfg.keep_alive_ms = try parseInferenceKeepAliveMs(value);
+        if (cfg.inference.max_loaded_models) |value|
+            antfly_node_cfg.max_loaded_models =
+                std.math.cast(usize, value) orelse return error.InvalidInferenceModelCacheConfig;
     }
     var antfly_node = try inference.server.Node.init(alloc, antfly_node_cfg);
-    defer antfly_node.deinit();
-    try antfly_node.warmConfiguredModels(alloc);
+    // Until DataServer exists, error cleanup is owned here. Once its
+    // ResourceManager is attached below, the regular defer is registered
+    // after DataServer's so tokenizer budget callbacks are torn down first.
+    var antfly_node_needs_errdeinit = true;
+    errdefer if (antfly_node_needs_errdeinit) antfly_node.deinit();
 
     var active_audio_runtime = try antfly.common.audio_runtime.ActiveRuntime.init(
         alloc,
@@ -1862,6 +1975,7 @@ pub fn runFromIterator(
             .ha_failover_safe_mutations_only = ha_role_requested,
             .ha_remote_apply_mutations_enabled = haRemoteApplyMutationsEnabled(ha_sync_policy.policy),
             .auth_enabled = auth_enabled,
+            .experimental = cli.experimental,
             .ard_base_url = cli.ard_base_url,
             .ard_publisher_domain = cli.ard_publisher_domain orelse "antfly.local",
             .ard_display_name = cli.ard_display_name orelse "Antfly",
@@ -1870,7 +1984,7 @@ pub fn runFromIterator(
             .storage_maintenance = &storage_maintenance,
             .admin_bearer_token = admin_bearer_token,
             .secret_store = &secret_store,
-            .remote_content = if (loaded_config) |*cfg| if (cfg.remote_content) |*remote_content| remote_content else null else null,
+            .remote_content = remote_content,
             .inference_api_key = if (loaded_config) |*cfg| if (cfg.inference.api_key) |value| value else null else null,
             .extension_package_store_dir = resolved.extension_package_store_dir,
             .node_config = if (loaded_config) |*cfg| cfg else null,
@@ -1906,6 +2020,15 @@ pub fn runFromIterator(
         .backend_runtime = node_backend_runtime.ptr(),
     }, local_metadata.catalogSource(), local_metadata.statusSource());
     defer data_server.deinit();
+    antfly_node_needs_errdeinit = false;
+    defer {
+        // DataServer sources, recovery workers, and durable API jobs retain the
+        // embedded provider. Drain them while the node is valid, then release
+        // tokenizer reservations while DataServer's ResourceManager is valid.
+        // The earlier data_server.deinit defer performs final storage teardown.
+        data_server.quiesceBackgroundWork();
+        antfly_node.deinit();
+    }
 
     if (ha_lease_watchdog) |*watchdog| {
         data_server.ha_public_gate_state.requireExternalAuthority();
@@ -1935,11 +2058,30 @@ pub fn runFromIterator(
         worker.join();
     };
 
+    antfly_node.configureAdmissionResourceBudget(inferenceAdmissionResourceBudget(
+        &data_server.provisioned_storage.resource_manager,
+    ));
     antfly_node.config.prompt_cache_resource_usage_observer = promptCacheResourceUsageObserver(&data_server.provisioned_storage.resource_manager);
+    try antfly_node.configureTokenizerCaches(.{
+        // Keep the small lock-free front table hot while providing enough
+        // second-tier slots for large ingestion corpora. The table and every
+        // admitted entry are charged to inference.tokenizer_cache; pressure
+        // can decline the optional table without making model warmup fail.
+        .bulk_slots_per_shard = 16 * 1024,
+        .resource_budget = tokenizerCacheResourceBudget(
+            &data_server.provisioned_storage.resource_manager,
+        ),
+    });
+    if (node_backend_runtime.ptr().io()) |io| antfly_node.attachIo(io);
+    antfly_node.warmConfiguredModels(alloc) catch |err| {
+        std.log.err("standalone startup failed step=warm_inference_models err={}", .{err});
+        return err;
+    };
     data_server.setAntflyProvider(localAntflyProvider(&antfly_node));
 
     // Initialize API server (wires caches + sources) without binding a listener.
     try data_server.initApiServer();
+    local_metadata.local_schema_progress_provider = localSchemaProgressProvider(&data_server);
     const api_server = &data_server.http_server.?;
     if (lite_backend) |*backend| {
         try api_server.attachRestoreJobRuntimeStore(try backend.runtimeStoreForNamespace("system/api-restore-jobs"));
@@ -1963,6 +2105,8 @@ pub fn runFromIterator(
     // ---------------------------------------------------------------
 
     var handler = AntflyApiHandler{ .api_server = api_server };
+    try handler.initRuntime(alloc);
+    defer handler.deinitRuntime();
 
     const bind_host = public_listener.bind_host;
     const bind_port = public_listener.bind_port;
@@ -1971,10 +2115,13 @@ pub fn runFromIterator(
     var public_listener_lease = try PublicListenerLease.acquire(alloc, bind_port);
     defer public_listener_lease.deinit();
 
+    var unified_lifecycle = UnifiedServerLifecycle{};
     var standalone_health = StandaloneHealthSource{
         .data_server = &data_server,
         .unified_api_ready = &unified_api_ready,
         .startup_checkpoint_lsn = ha_startup_checkpoint_lsn,
+        .handler = &handler,
+        .unified_lifecycle = &unified_lifecycle,
     };
     const health_enabled = cli.health_enabled orelse if (loaded_config) |*cfg| cfg.health_enabled else true;
     const health_port = if (health_enabled)
@@ -1994,9 +2141,10 @@ pub fn runFromIterator(
     };
     defer if (health_server) |hs| hs.deinit();
 
-    var unified_lifecycle = UnifiedServerLifecycle{};
+    const public_io = node_backend_runtime.ptr().io() orelse return error.BackendRuntimeUnavailable;
     const thread = std.Thread.spawn(.{}, serveUnified, .{
         alloc,
+        public_io,
         bind_host,
         bind_port,
         &handler,
@@ -2021,7 +2169,11 @@ pub fn runFromIterator(
     // Print only after the public listener has successfully bound.
     std.debug.print("standalone local metadata enabled (raft disabled)\n", .{});
 
-    const tick_ms = cli.tick_ms orelse 100;
+    const runtime_cadence = antfly.raft.RuntimeCadence.fromMillis(
+        antfly.raft.RuntimeCadence.default_raft_tick_ms,
+        cli.control_tick_ms,
+    ) catch return error.InvalidArguments;
+    const tick_ms = @divExact(runtime_cadence.control_tick_ns, std.time.ns_per_ms);
     var req = std.posix.timespec{
         .sec = @intCast(tick_ms / std.time.ms_per_s),
         .nsec = @intCast((tick_ms % std.time.ms_per_s) * std.time.ns_per_ms),
@@ -2146,9 +2298,144 @@ fn promptCacheResourceUsageObserver(manager: *antfly.resource_manager.ResourceMa
     };
 }
 
+fn inferenceAdmissionResourceBudget(
+    manager: *antfly.resource_manager.ResourceManager,
+) inference.runtime.tier.memory.AdmissionResourceBudget {
+    return .{
+        .context = manager,
+        .try_reserve = reserveInferenceAdmissionResources,
+        .release = releaseInferenceAdmissionResources,
+    };
+}
+
+fn inferenceAdmissionSliceAmounts(
+    amounts: inference.runtime.tier.memory.AdmissionAmounts,
+) ![3]antfly.resource_manager.SliceAmount {
+    const model_residency = try std.math.add(
+        usize,
+        amounts.host_weight_bytes,
+        amounts.backend_weight_bytes,
+    );
+    const kv_working_set = try std.math.add(
+        usize,
+        amounts.host_kv_bytes,
+        amounts.backend_kv_bytes,
+    );
+    const scratch_working_set = try std.math.add(
+        usize,
+        amounts.host_scratch_bytes,
+        amounts.backend_scratch_bytes,
+    );
+    return .{
+        .{ .slice = .inference_model_residency, .bytes = @intCast(model_residency) },
+        .{ .slice = .inference_kv_working_set, .bytes = @intCast(kv_working_set) },
+        .{ .slice = .inference_scratch_working_set, .bytes = @intCast(scratch_working_set) },
+    };
+}
+
+fn reserveInferenceAdmissionResources(
+    context: *anyopaque,
+    amounts: inference.runtime.tier.memory.AdmissionAmounts,
+) inference.runtime.tier.memory.AdmissionResourceError!void {
+    const manager: *antfly.resource_manager.ResourceManager = @ptrCast(@alignCast(context));
+    const slices = inferenceAdmissionSliceAmounts(amounts) catch
+        return error.ResourceLimitExceeded;
+    manager.reserveBatchClassified(&slices) catch |err| switch (err) {
+        error.ResourceRequestTooLarge => return error.ResourceLimitExceeded,
+        error.ResourceTemporarilyUnavailable => return error.ResourceTemporarilyUnavailable,
+        // Duplicate slices are impossible in the fixed bridge plan.
+        error.DuplicateResourceSlice => unreachable,
+    };
+}
+
+fn releaseInferenceAdmissionResources(
+    context: *anyopaque,
+    amounts: inference.runtime.tier.memory.AdmissionAmounts,
+) void {
+    const manager: *antfly.resource_manager.ResourceManager = @ptrCast(@alignCast(context));
+    const slices = inferenceAdmissionSliceAmounts(amounts) catch unreachable;
+    manager.releaseBatch(&slices);
+}
+
+test "inference admission bridge charges combined native residency to resource manager" {
+    var budgets = antfly.resource_manager.Options.defaultBudgets();
+    budgets[@intFromEnum(antfly.resource_manager.Slice.inference_model_residency)] =
+        .{ .hard_limit_bytes = 100 };
+    var manager = antfly.resource_manager.ResourceManager.init(.{ .budgets = budgets });
+    const budget = inferenceAdmissionResourceBudget(&manager);
+
+    try std.testing.expectError(
+        error.ResourceLimitExceeded,
+        budget.try_reserve(budget.context, .{
+            .host_weight_bytes = 80,
+            .backend_weight_bytes = 30,
+        }),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        manager.sliceStats(.inference_model_residency).used_bytes,
+    );
+
+    const admitted = inference.runtime.tier.memory.AdmissionAmounts{
+        .host_weight_bytes = 60,
+        .backend_weight_bytes = 30,
+    };
+    try budget.try_reserve(budget.context, admitted);
+    try std.testing.expectEqual(
+        @as(u64, 90),
+        manager.sliceStats(.inference_model_residency).used_bytes,
+    );
+    try std.testing.expectError(
+        error.ResourceTemporarilyUnavailable,
+        budget.try_reserve(budget.context, .{
+            .host_weight_bytes = 11,
+        }),
+    );
+    budget.release(budget.context, admitted);
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        manager.sliceStats(.inference_model_residency).used_bytes,
+    );
+}
+
 fn observePromptCacheResourceUsage(context: *anyopaque, current: *u64, next: u64) void {
     const manager: *antfly.resource_manager.ResourceManager = @ptrCast(@alignCast(context));
     manager.observeUsage(.inference_prompt_cache, current, next);
+}
+
+fn tokenizerCacheResourceBudget(
+    manager: *antfly.resource_manager.ResourceManager,
+) inference.hf_tokenizer.HfTokenizer.BpeCacheResourceBudget {
+    return .{
+        .context = manager,
+        .try_reserve = reserveTokenizerCacheBytes,
+        .release = releaseTokenizerCacheBytes,
+    };
+}
+
+fn reserveTokenizerCacheBytes(context: *anyopaque, bytes: usize) bool {
+    const manager: *antfly.resource_manager.ResourceManager =
+        @ptrCast(@alignCast(context));
+    // Cache growth is optional: honor the slice's shrink policy at the soft
+    // boundary by declining new entries/workspace retention. reserve() below
+    // remains the atomic hard guard if another producer wins the race.
+    if (manager.admissionDecision(
+        .inference_tokenizer_cache,
+        @intCast(bytes),
+    ).action == .shrink_cache) return false;
+    var reservation = manager.reserve(
+        .inference_tokenizer_cache,
+        @intCast(bytes),
+    ) catch return false;
+    // The tokenizer owns the reservation until its entry/cache is released.
+    reservation.released = true;
+    return true;
+}
+
+fn releaseTokenizerCacheBytes(context: *anyopaque, bytes: usize) void {
+    const manager: *antfly.resource_manager.ResourceManager =
+        @ptrCast(@alignCast(context));
+    manager.releaseBytes(.inference_tokenizer_cache, @intCast(bytes));
 }
 
 fn localAntflyListModelsJson(ptr: *anyopaque, alloc: std.mem.Allocator) anyerror![]u8 {
@@ -2548,6 +2835,7 @@ fn decodeLocalGenerateDataUri(
 
 fn serveUnified(
     alloc: std.mem.Allocator,
+    io: std.Io,
     bind_host: []const u8,
     bind_port: u16,
     handler: *AntflyApiHandler,
@@ -2556,7 +2844,7 @@ fn serveUnified(
     unified_api_ready: *std.atomic.Value(bool),
     lifecycle: *UnifiedServerLifecycle,
 ) void {
-    serveUnifiedInner(alloc, bind_host, bind_port, handler, antfly_node, api_server, unified_api_ready, lifecycle) catch |err| {
+    serveUnifiedInner(alloc, io, bind_host, bind_port, handler, antfly_node, api_server, unified_api_ready, lifecycle) catch |err| {
         unified_api_ready.store(false, .release);
         lifecycle.publishFailure(err);
         std.debug.print("unified server error: {}\n", .{err});
@@ -2568,6 +2856,7 @@ fn serveUnified(
 
 fn serveUnifiedInner(
     alloc: std.mem.Allocator,
+    io: std.Io,
     bind_host: []const u8,
     bind_port: u16,
     handler: *AntflyApiHandler,
@@ -2576,10 +2865,7 @@ fn serveUnifiedInner(
     unified_api_ready: *std.atomic.Value(bool),
     lifecycle: *UnifiedServerLifecycle,
 ) !void {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-
-    var server = httpx.Server.initWithConfig(alloc, io_impl.io(), publicHttpServerConfig(bind_host, bind_port));
+    var server = httpx.Server.initWithConfig(alloc, io, publicHttpServerConfig(bind_host, bind_port));
     defer server.deinit();
     lifecycle.attach(&server);
     defer lifecycle.detach(&server);
@@ -2614,6 +2900,8 @@ fn serveUnifiedInner(
     try registerHAAdminRoutes(&server);
     try registerHAInternalRoutes(&server);
     try registerMcpRoutes(&server);
+    try registerExperimentalRoutes(&server, api_server.cfg.experimental);
+    try registerArdRoutes(&server);
     try registerExtensionRoutes(&server);
     try registerInternalGroupRoutes(&server);
     try registerAntfarmRoutes(&server);
@@ -2623,10 +2911,27 @@ fn serveUnifiedInner(
     lifecycle.publishReady();
 
     if (server.boundAddress()) |addr| {
-        std.debug.print("standalone public api listening on http://{}\n", .{addr});
+        std.debug.print("standalone public api listening on http://{f}\n", .{addr});
     }
 
     try server.listen();
+}
+
+const public_http_connection_ceiling: u32 = 256;
+
+fn publicHttpConnectionLimitForFdSoftLimit(fd_soft_limit: u64) u32 {
+    // Public inbound sockets may use at most one quarter of the process FD
+    // budget. Storage files, Raft, metadata, outbound providers, logs, and an
+    // operator shell retain the rest even when the deployment lowers RLIMIT.
+    const proportional_limit = @max(@as(u64, 1), fd_soft_limit / 4);
+    return @intCast(@min(proportional_limit, public_http_connection_ceiling));
+}
+
+fn configuredPublicHttpConnectionLimit() u32 {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return public_http_connection_ceiling;
+    const limit = std.posix.getrlimit(.NOFILE) catch return public_http_connection_ceiling;
+    if (limit.cur == std.math.maxInt(@TypeOf(limit.cur))) return public_http_connection_ceiling;
+    return publicHttpConnectionLimitForFdSoftLimit(@intCast(limit.cur));
 }
 
 fn publicHttpServerConfig(bind_host: []const u8, bind_port: u16) httpx.ServerConfig {
@@ -2634,7 +2939,21 @@ fn publicHttpServerConfig(bind_host: []const u8, bind_port: u16) httpx.ServerCon
         .host = bind_host,
         .port = bind_port,
         .max_body_size = antfly.public_api.http_server.public_api_max_request_body_bytes,
+        // Bound aggregate request-body buffering across HTTP/1 and HTTP/2.
+        // Four maximum-sized public requests may complete while excess uploads
+        // are shed before allocator pressure becomes systemic.
+        .request_body_buffer_budget_bytes = 256 * 1024 * 1024,
+        // Query execution admits 32 requests. Apply the same bound while H1
+        // bodies are still streaming so the remaining public connections can
+        // service health, control, and recovery traffic.
+        .max_h1_inflight_bodies = 32,
         .request_timeout_ms = 300_000,
+        // Keep a large process-wide FD reserve for storage, Raft, outbound
+        // clients, and diagnostics. This prevents the historical 1,000-socket
+        // cliff under the common 1,024 descriptor soft limit.
+        .max_connections = configuredPublicHttpConnectionLimit(),
+        .accept_error_backoff_initial_ms = 5,
+        .accept_error_backoff_max_ms = 1_000,
         .max_requests_per_connection = public_api_max_requests_per_connection,
         // std.Io currently maps this to SO_REUSEADDR + SO_REUSEPORT on POSIX.
         // The standalone listener lease supplies exclusivity while preserving
@@ -2700,10 +3019,31 @@ fn registerMcpRoutes(server: anytype) !void {
         routes.mcp_v1_prefix ++ "*",
     };
     inline for (mcp_paths) |path| {
-        try server.get(path, mcpBridgeHandler);
-        try server.post(path, mcpBridgeHandler);
-        try server.delete(path, mcpBridgeHandler);
+        try server.get(path, protocolBridgeHandler);
+        try server.post(path, protocolBridgeHandler);
+        try server.delete(path, protocolBridgeHandler);
     }
+}
+
+fn registerA2aRoutes(server: anytype) !void {
+    const routes = antfly.public_api.http_routes.Routes;
+    try server.post(routes.a2a, protocolBridgeHandler);
+    try server.get(routes.agent_card, protocolBridgeHandler);
+    try server.get(routes.agent_card_legacy, protocolBridgeHandler);
+}
+
+fn registerExperimentalRoutes(server: anytype, enabled: bool) !void {
+    if (!enabled) return;
+    try registerA2aRoutes(server);
+}
+
+fn registerArdRoutes(server: anytype) !void {
+    const routes = antfly.public_api.http_routes.Routes;
+    try server.get(routes.ai_catalog, protocolBridgeHandler);
+    try server.get(routes.ard_v1, protocolBridgeHandler);
+    try server.get(routes.ard_v1 ++ "/*", protocolBridgeHandler);
+    try server.post(routes.ard_v1_search, protocolBridgeHandler);
+    try server.post(routes.ard_v1_explore, protocolBridgeHandler);
 }
 
 fn registerHAAdminRoutes(server: anytype) !void {
@@ -2885,6 +3225,8 @@ fn isAntfarmReservedPath(path: []const u8) bool {
         "/admin",
         "/internal",
         "/mcp",
+        "/a2a",
+        "/.well-known",
         "/extensions",
         "/healthz",
         "/readyz",
@@ -3002,6 +3344,23 @@ fn localReplicaRootReconcileHook(data_server: *antfly.data.runtime.DataServer) a
     };
 }
 
+fn localSchemaProgressProvider(data_server: *antfly.data.runtime.DataServer) LocalSchemaProgressProvider {
+    return .{
+        .ptr = data_server,
+        .collect = collectLocalSchemaProgress,
+    };
+}
+
+fn collectLocalSchemaProgress(
+    ptr: *anyopaque,
+    alloc: std.mem.Allocator,
+    tables: []const antfly.metadata.TableRecord,
+    ranges: []const antfly.metadata.RangeRecord,
+) !antfly.data.runtime.DataServer.LocalSchemaProgressSnapshot {
+    const data_server: *antfly.data.runtime.DataServer = @ptrCast(@alignCast(ptr));
+    return try data_server.collectLocalSchemaProgressSnapshot(alloc, tables, ranges);
+}
+
 fn localReplicaRootReconcilePermitHook(data_server: *antfly.data.runtime.DataServer) antfly.metadata_service.LocalReplicaRootReconcilePermitHook {
     return .{
         .ptr = data_server,
@@ -3011,9 +3370,17 @@ fn localReplicaRootReconcilePermitHook(data_server: *antfly.data.runtime.DataSer
     };
 }
 
-fn runLocalReplicaRootReconcileHook(ptr: *anyopaque) !void {
+fn runLocalReplicaRootReconcileHook(
+    ptr: *anyopaque,
+    request: antfly.metadata_service.LocalReplicaRootReconcileHook.Request,
+) !antfly.metadata.table_provisioner.ProvisionSummary {
     const data_server: *antfly.data.runtime.DataServer = @ptrCast(@alignCast(ptr));
-    try data_server.reconcileVisibleProvisionedReplicaState();
+    return try data_server.reconcileVisibleProvisionedReplicaStateFromSnapshot(
+        request.metadata_group_id,
+        request.group_ids,
+        request.tables,
+        request.ranges,
+    );
 }
 
 fn runLocalReplicaRootReconcilePermitHook(ptr: *anyopaque) bool {
@@ -3046,12 +3413,15 @@ fn writeFileAtomically(alloc: std.mem.Allocator, path: []const u8, contents: []c
         var writer = file.writer(io, &buf);
         try writer.interface.writeAll(contents);
         try writer.end();
+        try file.sync(io);
     }
 
     std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, io) catch |err| {
         std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
         return err;
     };
+    const parent = std.fs.path.dirname(path) orelse if (std.fs.path.isAbsolute(path)) "/" else ".";
+    try fs_paths.syncDirPortable(io, parent);
 }
 
 fn registerInternalGroupRoutes(server: anytype) !void {
@@ -3112,36 +3482,38 @@ fn internalBridgeHandler(ctx: *httpx.Context) anyerror!httpx.Response {
         return ctx.text("not ready");
     };
 
-    const legacy_req = AntflyApiHandler.httpRequestFromContext(ctx, null) catch |err| switch (err) {
+    var converted_req = AntflyApiHandler.httpRequestFromContext(ctx, null) catch |err| switch (err) {
         error.UnsupportedMethod => {
             _ = ctx.status(405);
             return ctx.text("method not allowed");
         },
         else => return err,
     };
+    defer converted_req.deinit();
 
-    var resp = (try server.handleInternalRoute(legacy_req)) orelse {
+    var resp = (try server.handleInternalRoute(converted_req.value)) orelse {
         _ = ctx.status(404);
         return ctx.text("not found");
     };
     return AntflyApiHandler.respondWithAllocator(ctx, &resp, server.alloc);
 }
 
-fn mcpBridgeHandler(ctx: *httpx.Context) anyerror!httpx.Response {
+fn protocolBridgeHandler(ctx: *httpx.Context) anyerror!httpx.Response {
     const server = active_api_server orelse {
         _ = ctx.status(503);
         return ctx.text("not ready");
     };
 
-    const legacy_req = AntflyApiHandler.httpRequestFromContext(ctx, null) catch |err| switch (err) {
+    var converted_req = AntflyApiHandler.httpRequestFromContext(ctx, null) catch |err| switch (err) {
         error.UnsupportedMethod => {
             _ = ctx.status(405);
             return ctx.text("method not allowed");
         },
         else => return err,
     };
+    defer converted_req.deinit();
 
-    var resp = try server.handle(legacy_req);
+    var resp = try server.handle(converted_req.value);
     return AntflyApiHandler.respondWithAllocator(ctx, &resp, server.alloc);
 }
 
@@ -3151,15 +3523,16 @@ fn extensionBridgeHandler(ctx: *httpx.Context) anyerror!httpx.Response {
         return ctx.text("not ready");
     };
 
-    const legacy_req = AntflyApiHandler.httpRequestFromContext(ctx, null) catch |err| switch (err) {
+    var converted_req = AntflyApiHandler.httpRequestFromContext(ctx, null) catch |err| switch (err) {
         error.UnsupportedMethod => {
             _ = ctx.status(405);
             return ctx.text("method not allowed");
         },
         else => return err,
     };
+    defer converted_req.deinit();
 
-    var resp = try server.handle(legacy_req);
+    var resp = try server.handle(converted_req.value);
     return AntflyApiHandler.respondWithAllocator(ctx, &resp, server.alloc);
 }
 
@@ -3206,6 +3579,10 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
             cfg.help = true;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--experimental")) {
+            cfg.experimental = true;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--config")) {
             cfg.config_path = args.next() orelse return error.InvalidArguments;
             continue;
@@ -3235,8 +3612,8 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
             cfg.health_enabled = parseBoolFlag(arg["--health=".len..]) orelse return error.InvalidArguments;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--tick-ms")) {
-            cfg.tick_ms = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
+        if (std.mem.eql(u8, arg, "--control-tick-ms")) {
+            cfg.control_tick_ms = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
         if (std.mem.eql(u8, arg, "--auth")) {
@@ -4152,6 +4529,52 @@ fn resolveInferenceModelsDir(cli: CliConfig, cfg: ?*const antfly.common.config.C
     return null;
 }
 
+fn parseInferenceKeepAliveMs(raw: []const u8) !u64 {
+    if (std.mem.eql(u8, raw, "0")) return 0;
+    if (raw.len == 0) return error.InvalidInferenceModelCacheConfig;
+    var i: usize = 0;
+    var total_ns: u64 = 0;
+    while (i < raw.len) {
+        const start = i;
+        while (i < raw.len and std.ascii.isDigit(raw[i])) : (i += 1) {}
+        if (i == start) return error.InvalidInferenceModelCacheConfig;
+        const value = std.fmt.parseUnsigned(u64, raw[start..i], 10) catch
+            return error.InvalidInferenceModelCacheConfig;
+        const unit_ns: u64 = if (std.mem.startsWith(u8, raw[i..], "ms")) blk: {
+            i += 2;
+            break :blk std.time.ns_per_ms;
+        } else if (i < raw.len and raw[i] == 's') blk: {
+            i += 1;
+            break :blk std.time.ns_per_s;
+        } else if (i < raw.len and raw[i] == 'm') blk: {
+            i += 1;
+            break :blk std.time.ns_per_min;
+        } else if (i < raw.len and raw[i] == 'h') blk: {
+            i += 1;
+            break :blk std.time.ns_per_hour;
+        } else return error.InvalidInferenceModelCacheConfig;
+        const part_ns = std.math.mul(u64, value, unit_ns) catch
+            return error.InvalidInferenceModelCacheConfig;
+        total_ns = std.math.add(u64, total_ns, part_ns) catch
+            return error.InvalidInferenceModelCacheConfig;
+    }
+    if (total_ns == 0) return 0;
+    return @max(@as(u64, 1), total_ns / std.time.ns_per_ms);
+}
+
+test "standalone inference keep alive parses compound durations and zero" {
+    try std.testing.expectEqual(@as(u64, 0), try parseInferenceKeepAliveMs("0"));
+    try std.testing.expectEqual(@as(u64, 0), try parseInferenceKeepAliveMs("0s"));
+    try std.testing.expectEqual(
+        @as(u64, 90_000),
+        try parseInferenceKeepAliveMs("1m30s"),
+    );
+    try std.testing.expectError(
+        error.InvalidInferenceModelCacheConfig,
+        parseInferenceKeepAliveMs("forever"),
+    );
+}
+
 fn resolveInferenceMlDir(cli: CliConfig, cfg: ?*const antfly.common.config.Config) ?[]const u8 {
     if (cli.inference_ml_dir) |value| return value;
     if (cfg) |loaded| return loaded.inference.ml_dir;
@@ -4218,11 +4641,12 @@ fn printUsage() void {
         \\  --id <node-id>                        Local node id (default: 1)
         \\  --health <true|false>                 Enable health/metrics server (default: true)
         \\  --health-port <port>                  Dedicated health/metrics port on --host (default: 4200)
+        \\  --experimental                        Enable experimental A2A protocol surfaces
         \\  --ard-base-url <url>                  Absolute public base URL for ARD catalog artifact links
         \\  --ard-publisher-domain <name>         ARD did:web publisher domain (default: antfly.local)
         \\  --ard-display-name <name>             ARD catalog host display name (default: Antfly)
         \\  --ard-public-catalog <bool>           Publish anonymous /.well-known ARD bootstrap when auth is enabled
-        \\  --tick-ms <ms>                        Sleep interval while serving (default: 25)
+        \\  --control-tick-ms <ms>                Control scheduling interval, 1-60000 (default: 100)
         \\  --models-dir <path>                   Embedded AI models directory (default: ~/.antfly/inference/models)
         \\  --ml-dir <path>                       Embedded Traditional ML directory (default: ~/.antfly/inference/ml)
         \\  --inference-host-budget-mb <n>        Embedded inference native generation host budget override
@@ -4512,6 +4936,14 @@ test "standalone HA roles freeze startup-local mutation producers" {
     }));
 }
 
+test "standalone runtime parses experimental flag" {
+    const argv = [_][*:0]const u8{"--experimental"};
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var parsed = try parseCli(std.testing.allocator, &iter);
+    defer parsed.deinit(std.testing.allocator);
+    try std.testing.expect(parsed.experimental);
+}
+
 test "standalone bridge shared adapter preserves protocol headers and absent body" {
     const alloc = std.testing.allocator;
 
@@ -4522,14 +4954,54 @@ test "standalone bridge shared adapter preserves protocol headers and absent bod
     var ctx = httpx.Context.init(alloc, undefined, &request);
     defer ctx.deinit();
 
-    const req = try AntflyApiHandler.httpRequestFromContext(&ctx, null);
-    defer alloc.free(req.headers);
+    var converted = try AntflyApiHandler.httpRequestFromContext(&ctx, null);
+    defer converted.deinit();
 
-    try std.testing.expectEqualStrings("session-123", req.header("mcp-session-id") orelse return error.MissingHeader);
-    try std.testing.expectEqualStrings("", req.body);
+    try std.testing.expectEqualStrings("session-123", converted.value.header("mcp-session-id") orelse return error.MissingHeader);
+    try std.testing.expectEqualStrings("", converted.value.body);
 }
 
-test "standalone runtime local replica reconcile permit stays blocked while startup debt is unresolved" {
+test "standalone protocol bridge releases converted request headers" {
+    const FakeSource = struct {
+        fn iface(_: *@This()) antfly.public_api.http_server.StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .status = status },
+            };
+        }
+
+        fn status(_: *anyopaque) !antfly.metadata.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+
+    var source = FakeSource{};
+    var api_server = antfly.public_api.http_server.ApiHttpServer.init(
+        std.testing.allocator,
+        .{},
+        source.iface(),
+        null,
+        null,
+    );
+    defer api_server.deinit();
+
+    const previous_api_server = active_api_server;
+    active_api_server = &api_server;
+    defer active_api_server = previous_api_server;
+
+    var request = try httpx.Request.init(std.testing.allocator, .GET, "http://127.0.0.1/mcp/v1");
+    defer request.deinit();
+    try request.setHeader("Mcp-Protocol-Version", "2025-06-18");
+
+    var ctx = httpx.Context.init(std.testing.allocator, undefined, &request);
+    defer ctx.deinit();
+
+    var response = try protocolBridgeHandler(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 404), response.status.code);
+}
+
+test "standalone runtime local replica reconcile permit blocks only active startup catch-up" {
     var data_server = antfly.data.runtime.DataServer{
         .alloc = std.testing.allocator,
         .provisioned_storage = undefined,
@@ -4548,7 +5020,7 @@ test "standalone runtime local replica reconcile permit stays blocked while star
     try std.testing.expect(runLocalReplicaRootReconcilePermitHook(&data_server));
 
     data_server.last_provision_metadata_epoch = 17;
-    try std.testing.expect(!runLocalReplicaRootReconcilePermitHook(&data_server));
+    try std.testing.expect(runLocalReplicaRootReconcilePermitHook(&data_server));
 
     data_server.last_provision_fingerprint = 99;
     try std.testing.expect(runLocalReplicaRootReconcilePermitHook(&data_server));
@@ -4655,6 +5127,44 @@ test "standalone runtime registers mcp routes before antfarm catch-all" {
     try std.testing.expect(server.hasRoute(.get, "/*"));
 }
 
+test "standalone runtime registers A2A routes before antfarm catch-all" {
+    const routes = antfly.public_api.http_routes.Routes;
+
+    var disabled = RecordingServer{ .allocator = std.testing.allocator };
+    defer disabled.deinit();
+    try registerExperimentalRoutes(&disabled, false);
+    try registerAntfarmRoutes(&disabled);
+    try std.testing.expect(!disabled.hasRoute(.post, routes.a2a));
+    try std.testing.expect(!disabled.hasRoute(.get, routes.agent_card));
+    try std.testing.expect(!disabled.hasRoute(.get, routes.agent_card_legacy));
+    try std.testing.expect(disabled.hasRoute(.get, "/*"));
+
+    var enabled = RecordingServer{ .allocator = std.testing.allocator };
+    defer enabled.deinit();
+    try registerExperimentalRoutes(&enabled, true);
+    try registerAntfarmRoutes(&enabled);
+    try std.testing.expect(enabled.hasRoute(.post, routes.a2a));
+    try std.testing.expect(enabled.hasRoute(.get, routes.agent_card));
+    try std.testing.expect(enabled.hasRoute(.get, routes.agent_card_legacy));
+    try std.testing.expect(enabled.hasRoute(.get, "/*"));
+}
+
+test "standalone runtime registers ARD routes before antfarm catch-all" {
+    var server = RecordingServer{ .allocator = std.testing.allocator };
+    defer server.deinit();
+
+    try registerArdRoutes(&server);
+    try registerAntfarmRoutes(&server);
+
+    const routes = antfly.public_api.http_routes.Routes;
+    try std.testing.expect(server.hasRoute(.get, routes.ai_catalog));
+    try std.testing.expect(server.hasRoute(.get, routes.ard_v1));
+    try std.testing.expect(server.hasRoute(.get, routes.ard_v1 ++ "/*"));
+    try std.testing.expect(server.hasRoute(.post, routes.ard_v1_search));
+    try std.testing.expect(server.hasRoute(.post, routes.ard_v1_explore));
+    try std.testing.expect(server.hasRoute(.get, "/*"));
+}
+
 test "standalone runtime registers extension routes before antfarm catch-all" {
     var server = RecordingServer{ .allocator = std.testing.allocator };
     defer server.deinit();
@@ -4690,6 +5200,8 @@ test "standalone runtime antfarm path guards keep api routes reserved" {
     try std.testing.expect(isAntfarmReservedPath("/ai/v1/models"));
     try std.testing.expect(isAntfarmReservedPath("/antfly/readyz"));
     try std.testing.expect(isAntfarmReservedPath(antfly.admin.routes.ha_primary_status));
+    try std.testing.expect(isAntfarmReservedPath("/a2a"));
+    try std.testing.expect(isAntfarmReservedPath("/.well-known/agent-card.json"));
     try std.testing.expect(isAntfarmReservedPath("/extensions/v1/packages"));
     try std.testing.expect(isAntfarmReservedPath("/unknown/v1/status"));
     try std.testing.expect(isAntfarmReservedPath("/unknown/v12/status"));
@@ -5626,6 +6138,15 @@ test "standalone public HTTP server is restart-safe and uses public API request 
     const cfg = publicHttpServerConfig("127.0.0.1", 8080);
     try std.testing.expect(cfg.reuse_address);
     try std.testing.expectEqual(antfly.public_api.http_server.public_api_max_request_body_bytes, cfg.max_body_size);
+    try std.testing.expectEqual(@as(usize, 256 * 1024 * 1024), cfg.request_body_buffer_budget_bytes);
+    try std.testing.expect(cfg.max_connections >= 1);
+    try std.testing.expect(cfg.max_connections <= public_http_connection_ceiling);
+    try std.testing.expectEqual(@as(u32, 5), cfg.accept_error_backoff_initial_ms);
+    try std.testing.expectEqual(@as(u32, 1_000), cfg.accept_error_backoff_max_ms);
+    try std.testing.expectEqual(@as(u32, 256), publicHttpConnectionLimitForFdSoftLimit(1024));
+    try std.testing.expectEqual(@as(u32, 128), publicHttpConnectionLimitForFdSoftLimit(512));
+    try std.testing.expectEqual(@as(u32, 32), publicHttpConnectionLimitForFdSoftLimit(128));
+    try std.testing.expectEqual(@as(u32, 1), publicHttpConnectionLimitForFdSoftLimit(3));
 }
 
 test "standalone Lite transaction sessions survive file reopen" {
@@ -5922,6 +6443,93 @@ test "standalone metadata rolls back an undurable catalog mutation" {
     }
     try std.testing.expectEqual(@as(u64, 1), metadata.epoch);
     try std.testing.expect(metadata.findTableByNameLocked("docs") == null);
+}
+
+test "standalone metadata rejects corrupt catalog without double-freeing owned paths" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const catalog_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/corrupt-catalog.json", .{tmp.sub_path});
+    defer alloc.free(catalog_path);
+    try writeFileAtomically(alloc, catalog_path, "{not-json");
+
+    var backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend_runtime.deinit();
+    const result = LocalStandaloneMetadata.init(
+        alloc,
+        1,
+        1,
+        "http://127.0.0.1:8080",
+        ".",
+        catalog_path,
+        backend_runtime.ptr(),
+        null,
+        .local,
+    );
+    if (result) |value| {
+        var metadata = value;
+        defer metadata.deinit();
+        return error.TestUnexpectedResult;
+    } else |_| {}
+}
+
+test "standalone metadata finalizes schema migration from resident runtime evidence" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const catalog_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog.json", .{tmp.sub_path});
+    defer alloc.free(catalog_path);
+
+    var backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend_runtime.deinit();
+    var metadata = LocalStandaloneMetadata{
+        .alloc = alloc,
+        .manager = antfly.metadata.TableManager.init(alloc),
+        .extension_catalog = antfly.extensions.ExtensionCatalog.init(alloc),
+        .local_node_id = 1,
+        .store_id = 1,
+        .api_url = try alloc.dupe(u8, "http://127.0.0.1:8080"),
+        .replica_root_dir = try alloc.dupe(u8, "."),
+        .catalog_path = try alloc.dupe(u8, catalog_path),
+        .catalog_store = null,
+        .backend_runtime = backend_runtime.ptr(),
+    };
+    defer metadata.deinit();
+    try metadata.manager.upsertTable(.{
+        .table_id = 7,
+        .name = "docs",
+        .schema_json = "{\"version\":1}",
+        .read_schema_json = "{\"version\":0}",
+        .indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"},\"full_text_index_v1\":{\"type\":\"full_text\"}}",
+    });
+    try metadata.manager.upsertRange(.{
+        .group_id = 70,
+        .table_id = 7,
+        .start_key = "",
+    });
+
+    const Provider = struct {
+        fn collect(
+            _: *anyopaque,
+            provider_alloc: std.mem.Allocator,
+            _: []const antfly.metadata.TableRecord,
+            _: []const antfly.metadata.RangeRecord,
+        ) !antfly.data.runtime.DataServer.LocalSchemaProgressSnapshot {
+            const records = try provider_alloc.alloc(antfly.metadata.SchemaProgressRecord, 1);
+            records[0] = .{ .table_id = 7, .node_id = 1, .schema_version = 1 };
+            return .{ .records = records, .runtime_coverage_complete = true };
+        }
+    };
+    metadata.local_schema_progress_provider = .{
+        .ptr = undefined,
+        .collect = Provider.collect,
+    };
+
+    try metadata.finalizeReadySchemaMigrations();
+    const table = metadata.findTableByNameLocked("docs") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("", table.read_schema_json);
+    try std.testing.expect(std.mem.indexOf(u8, table.indexes_json, "full_text_index_v0") == null);
+    try std.testing.expect(std.mem.indexOf(u8, table.indexes_json, "full_text_index_v1") != null);
 }
 
 test "standalone unified server lifecycle propagates startup failure" {

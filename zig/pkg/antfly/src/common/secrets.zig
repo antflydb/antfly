@@ -154,6 +154,12 @@ pub const ResolvedSecret = struct {
 
 pub const ReloadHealth = struct {
     generation: u64,
+    content_hash: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+    /// Whether this store can expose one exact control-plane publication
+    /// generation. Layered stores intentionally cannot: more than one file
+    /// contributes to the served snapshot.
+    supports_source_generation: bool,
+    source_generation: ?[std.crypto.hash.sha2.Sha256.digest_length]u8 = null,
     entry_count: usize,
     last_reload_failed: bool,
     stale_snapshot: bool,
@@ -206,6 +212,11 @@ const StoredSecret = struct {
     }
 };
 
+// Status is polled independently of request traffic. Refresh there as well so
+// control planes can acknowledge a projected Secret before the first request,
+// while bounding filesystem work under aggressive health polling.
+const health_refresh_interval_ns: u64 = 500 * std.time.ns_per_ms;
+
 const PersistedSecret = struct {
     key: []const u8,
     value: []const u8,
@@ -214,15 +225,19 @@ const PersistedSecret = struct {
 };
 
 const PersistedSecretsFile = struct {
+    /// Opaque, non-secret control-plane generation used to acknowledge an
+    /// exact projected file without exposing a digest of its secret values.
+    generation: ?[]const u8 = null,
     secrets: []const PersistedSecret,
 };
 
 const FileMetadata = struct {
+    inode: std.Io.File.INode,
     size: u64,
     mtime_ns: i128,
 
     fn eql(self: FileMetadata, other: FileMetadata) bool {
-        return self.size == other.size and self.mtime_ns == other.mtime_ns;
+        return self.inode == other.inode and self.size == other.size and self.mtime_ns == other.mtime_ns;
     }
 };
 
@@ -235,6 +250,8 @@ pub const FileStore = struct {
     observed_metadata: ?FileMetadata = null,
     generation_value: u64 = 0,
     generation_snapshot: std.atomic.Value(u64) = .init(0),
+    content_hash: [std.crypto.hash.sha2.Sha256.digest_length]u8 = [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length,
+    source_generation: ?[std.crypto.hash.sha2.Sha256.digest_length]u8 = null,
     last_reload_failed: bool = false,
     reload_success_count: u64 = 0,
     reload_failure_count: u64 = 0,
@@ -306,11 +323,22 @@ pub const FileStore = struct {
     }
 
     pub fn healthSnapshot(self: *FileStore) ReloadHealth {
+        _ = self.refreshIfChangedThrottled(health_refresh_interval_ns) catch {
+            self.lock();
+            self.markReloadFailedLocked();
+            self.unlock();
+        };
         self.lock();
         defer self.unlock();
         var health = self.healthSnapshotLocked();
         for (self.fallbacks, 1..) |*fallback, index| {
             const fallback_health = fallback.healthSnapshot();
+            var combined_hash: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+            var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+            hasher.update(&health.content_hash);
+            hasher.update(&fallback_health.content_hash);
+            hasher.final(&combined_hash);
+            health.content_hash = combined_hash;
             health.generation +%= fallback_health.generation *% @as(u64, @intCast(index + 1));
             health.entry_count += fallback_health.entry_count;
             health.last_reload_failed = health.last_reload_failed or fallback_health.last_reload_failed;
@@ -418,8 +446,8 @@ pub const FileStore = struct {
             });
             break :insert;
         }
-        try self.persistEntries(&next);
-        try self.replaceEntriesAfterLocalWriteLocked(&next);
+        const content_hash = try self.persistEntries(&next);
+        try self.replaceEntriesAfterLocalWriteLocked(&next, content_hash);
         return try self.describeOneLocked(alloc, key);
     }
 
@@ -441,8 +469,8 @@ pub const FileStore = struct {
         stored.deinit(self.alloc);
         _ = next.swapRemoveAt(next_index);
         _ = index;
-        try self.persistEntries(&next);
-        try self.replaceEntriesAfterLocalWriteLocked(&next);
+        const content_hash = try self.persistEntries(&next);
+        try self.replaceEntriesAfterLocalWriteLocked(&next, content_hash);
         return true;
     }
 
@@ -568,7 +596,8 @@ pub const FileStore = struct {
             return;
         }
 
-        var next = try loadEntriesFromFile(self.alloc, self.path);
+        const loaded = try loadEntriesFromFile(self.alloc, self.path);
+        var next = loaded.entries;
         errdefer {
             deinitEntries(self.alloc, &next);
             next.deinit(self.alloc);
@@ -578,6 +607,8 @@ pub const FileStore = struct {
         self.entries.deinit(self.alloc);
         self.entries = next;
         next = .{};
+        self.content_hash = loaded.content_hash;
+        self.source_generation = loaded.source_generation;
         self.observed_metadata = metadata;
         self.markReloadHealthyLocked(true);
     }
@@ -607,22 +638,25 @@ pub const FileStore = struct {
             return false;
         }
         if (self.observed_metadata) |observed| {
-            if (observed.eql(metadata.?)) {
+            if (observed.eql(metadata.?) and !self.last_reload_failed) {
                 return false;
             }
         }
 
-        var next = loadEntriesFromFile(self.alloc, self.path) catch |err| {
+        const loaded = loadEntriesFromFile(self.alloc, self.path) catch |err| {
             const first_failure = !self.last_reload_failed;
             self.markReloadFailedLocked();
             if (first_failure) std.log.warn("secret store reload failed; keeping last known good snapshot path={s} err={}", .{ self.path, err });
             return false;
         };
+        var next = loaded.entries;
         errdefer {
             deinitEntries(self.alloc, &next);
             next.deinit(self.alloc);
         }
         self.replaceEntriesLocked(&next);
+        self.content_hash = loaded.content_hash;
+        self.source_generation = loaded.source_generation;
         self.observed_metadata = metadata;
         self.generation_value +%= 1;
         self.generation_snapshot.store(self.generation_value, .release);
@@ -630,7 +664,7 @@ pub const FileStore = struct {
         return true;
     }
 
-    fn persistEntries(self: *FileStore, entries: *const std.StringArrayHashMapUnmanaged(StoredSecret)) !void {
+    fn persistEntries(self: *FileStore, entries: *const std.StringArrayHashMapUnmanaged(StoredSecret)) ![std.crypto.hash.sha2.Sha256.digest_length]u8 {
         const alloc = self.alloc;
         var persisted = try alloc.alloc(PersistedSecret, entries.count());
         defer alloc.free(persisted);
@@ -655,10 +689,17 @@ pub const FileStore = struct {
 
         try ensureParentDir(self.path);
         try writeFileAtomically(self.path, encoded);
+        var content_hash: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(encoded, &content_hash, .{});
+        return content_hash;
     }
 
-    fn replaceEntriesAfterLocalWriteLocked(self: *FileStore, next: *std.StringArrayHashMapUnmanaged(StoredSecret)) !void {
+    fn replaceEntriesAfterLocalWriteLocked(self: *FileStore, next: *std.StringArrayHashMapUnmanaged(StoredSecret), content_hash: [std.crypto.hash.sha2.Sha256.digest_length]u8) !void {
         self.replaceEntriesLocked(next);
+        self.content_hash = content_hash;
+        // Local API writes are not control-plane publications and therefore
+        // must not preserve an acknowledgement generation from older bytes.
+        self.source_generation = null;
         self.observed_metadata = try statFileMetadata(self.path);
         self.generation_value +%= 1;
         self.generation_snapshot.store(self.generation_value, .release);
@@ -691,6 +732,9 @@ pub const FileStore = struct {
     fn healthSnapshotLocked(self: *FileStore) ReloadHealth {
         return .{
             .generation = self.generation_value,
+            .content_hash = self.content_hash,
+            .supports_source_generation = self.fallbacks.len == 0,
+            .source_generation = if (self.fallbacks.len == 0) self.source_generation else null,
             .entry_count = self.entries.count(),
             .last_reload_failed = self.last_reload_failed,
             .stale_snapshot = self.last_reload_failed and self.observed_metadata != null,
@@ -716,15 +760,30 @@ pub const FileStore = struct {
     }
 };
 
-fn loadEntriesFromFile(alloc: std.mem.Allocator, path: []const u8) !std.StringArrayHashMapUnmanaged(StoredSecret) {
+const LoadedEntries = struct {
+    entries: std.StringArrayHashMapUnmanaged(StoredSecret),
+    content_hash: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+    source_generation: ?[std.crypto.hash.sha2.Sha256.digest_length]u8,
+};
+
+fn loadEntriesFromFile(alloc: std.mem.Allocator, path: []const u8) !LoadedEntries {
     const raw = try readFileAlloc(alloc, path);
     defer alloc.free(raw);
+    var content_hash: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(raw, &content_hash, .{});
 
     var parsed = try std.json.parseFromSlice(PersistedSecretsFile, alloc, raw, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
     });
     defer parsed.deinit();
+
+    const source_generation = if (parsed.value.generation) |encoded| blk: {
+        if (encoded.len != std.crypto.hash.sha2.Sha256.digest_length * 2) return error.InvalidSecretStoreGeneration;
+        var decoded: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        _ = std.fmt.hexToBytes(&decoded, encoded) catch return error.InvalidSecretStoreGeneration;
+        break :blk decoded;
+    } else null;
 
     var entries: std.StringArrayHashMapUnmanaged(StoredSecret) = .{};
     errdefer {
@@ -746,7 +805,7 @@ fn loadEntriesFromFile(alloc: std.mem.Allocator, path: []const u8) !std.StringAr
         });
     }
 
-    return entries;
+    return .{ .entries = entries, .content_hash = content_hash, .source_generation = source_generation };
 }
 
 fn cloneEntries(
@@ -944,7 +1003,7 @@ fn hasEnvVar(env_var: []const u8) bool {
     return std.c.getenv(env_var_z.ptr) != null;
 }
 
-fn envValueOwned(alloc: std.mem.Allocator, env_var: []const u8) ?[]u8 {
+pub fn envValueOwned(alloc: std.mem.Allocator, env_var: []const u8) ?[]u8 {
     if (!builtin.link_libc) return null;
     const env_var_z = alloc.dupeZ(u8, env_var) catch return null;
     defer alloc.free(env_var_z);
@@ -991,6 +1050,7 @@ fn statFileMetadata(path: []const u8) !?FileMetadata {
         else => return err,
     };
     return .{
+        .inode = stat.inode,
         .size = stat.size,
         .mtime_ns = stat.mtime.toNanoseconds(),
     };
@@ -1133,6 +1193,80 @@ test "file secret store reloads valid external replacements including deletions"
     try std.testing.expectEqual(@as(?[]u8, null), deleted);
 }
 
+test "file secret store detects projected volume symlink target replacement" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) {
+        return error.SkipZigTest;
+    }
+
+    const alloc = std.testing.allocator;
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/test-secrets-projected-{d}", .{nowNs()});
+    defer alloc.free(root);
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+
+    const first_dir = try std.fmt.allocPrint(alloc, "{s}/..2026_01", .{root});
+    defer alloc.free(first_dir);
+    const second_dir = try std.fmt.allocPrint(alloc, "{s}/..2026_02", .{root});
+    defer alloc.free(second_dir);
+    try fs_paths.createDirPathPortable(io, first_dir);
+    try fs_paths.createDirPathPortable(io, second_dir);
+
+    const first_path = try std.fmt.allocPrint(alloc, "{s}/secrets.json", .{first_dir});
+    defer alloc.free(first_path);
+    const second_path = try std.fmt.allocPrint(alloc, "{s}/secrets.json", .{second_dir});
+    defer alloc.free(second_path);
+    const first_json =
+        \\{"generation":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","secrets":[{"key":"openai.api_key","value":"first","created_at_ns":1,"updated_at_ns":1}]}
+    ;
+    const second_json =
+        \\{"generation":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","secrets":[{"key":"openai.api_key","value":"other","created_at_ns":1,"updated_at_ns":1}]}
+    ;
+    try std.testing.expectEqual(first_json.len, second_json.len);
+    try writeFileAtomically(first_path, first_json);
+    try writeFileAtomically(second_path, second_json);
+
+    // Reproduce the hard case for size+mtime detection: projected generations
+    // contain same-length values and carry the same modification timestamp.
+    const first_stat = try std.Io.Dir.cwd().statFile(io, first_path, .{});
+    try std.Io.Dir.cwd().setTimestamps(io, second_path, .{
+        .modify_timestamp = .{ .new = first_stat.mtime },
+    });
+
+    const data_link = try std.fmt.allocPrint(alloc, "{s}/..data", .{root});
+    defer alloc.free(data_link);
+    const next_data_link = try std.fmt.allocPrint(alloc, "{s}/..data-next", .{root});
+    defer alloc.free(next_data_link);
+    const secret_link = try std.fmt.allocPrint(alloc, "{s}/secrets.json", .{root});
+    defer alloc.free(secret_link);
+    try std.Io.Dir.cwd().symLink(io, "..2026_01", data_link, .{ .is_directory = true });
+    try std.Io.Dir.cwd().symLink(io, "..data/secrets.json", secret_link, .{});
+
+    var store = try FileStore.init(alloc, secret_link);
+    defer store.deinit();
+    const initial_generation = store.generation();
+    const initial_metadata = store.observed_metadata.?;
+
+    try std.Io.Dir.cwd().symLink(io, "..2026_02", next_data_link, .{ .is_directory = true });
+    try std.Io.Dir.rename(std.Io.Dir.cwd(), next_data_link, std.Io.Dir.cwd(), data_link, io);
+
+    const replacement_metadata = (try statFileMetadata(secret_link)).?;
+    try std.testing.expectEqual(initial_metadata.size, replacement_metadata.size);
+    try std.testing.expectEqual(initial_metadata.mtime_ns, replacement_metadata.mtime_ns);
+    try std.testing.expect(initial_metadata.inode != replacement_metadata.inode);
+
+    const reloaded = try store.getOwned(alloc, "openai.api_key");
+    defer if (reloaded) |value| alloc.free(value);
+    try std.testing.expectEqualStrings("other", reloaded.?);
+    try std.testing.expectEqual(initial_generation + 1, store.generation());
+    const health = store.healthSnapshot();
+    const expected_source_generation = [_]u8{0xbb} ** 32;
+    try std.testing.expect(health.supports_source_generation);
+    try std.testing.expectEqualSlices(u8, &expected_source_generation, &health.source_generation.?);
+}
+
 test "file secret store throttles cache-key freshness checks" {
     const alloc = std.testing.allocator;
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/test-secrets-throttle-{d}.json", .{nowNs()});
@@ -1164,12 +1298,14 @@ test "file secret store keeps last known good snapshot for malformed and missing
     defer alloc.free(path);
     defer deleteFile(path) catch {};
 
-    try writeFileAtomically(path,
+    const stable_json =
         \\{"secrets":[{"key":"openai.api_key","value":"stable","created_at_ns":1,"updated_at_ns":1}]}
-    );
+    ;
+    try writeFileAtomically(path, stable_json);
 
     var store = try FileStore.init(alloc, path);
     defer store.deinit();
+    const initial_health = store.healthSnapshot();
 
     try writeFileAtomically(path, "{not-json");
     const malformed_generation = store.generation();
@@ -1195,6 +1331,18 @@ test "file secret store keeps last known good snapshot for malformed and missing
     try std.testing.expect(missing_health.last_reload_failed);
     try std.testing.expect(missing_health.stale_snapshot);
     try std.testing.expectEqual(@as(u64, 1), missing_health.reload_failures);
+    try std.testing.expectEqualSlices(u8, &initial_health.content_hash, &missing_health.content_hash);
+
+    // Recovery must be observable through status polling even before another
+    // secret-backed request arrives. Restoring the exact original bytes also
+    // verifies that a previous failure does not suppress revalidation.
+    try writeFileAtomically(path, stable_json);
+    store.next_throttled_refresh_ns.store(0, .release);
+    const recovered_health = store.healthSnapshot();
+    try std.testing.expect(!recovered_health.last_reload_failed);
+    try std.testing.expect(!recovered_health.stale_snapshot);
+    try std.testing.expectEqual(missing_generation + 1, recovered_health.generation);
+    try std.testing.expectEqualSlices(u8, &initial_health.content_hash, &recovered_health.content_hash);
 }
 
 test "file secret store write refreshes first and preserves external keys" {
@@ -1239,7 +1387,7 @@ test "layered file secret store resolves primary before fallback and writes prim
     defer deleteFile(fallback_path) catch {};
 
     try writeFileAtomically(primary_path,
-        \\{"secrets":[{"key":"openai.api_key","value":"primary-openai","created_at_ns":1,"updated_at_ns":1},{"key":"shared.key","value":"primary-shared","created_at_ns":1,"updated_at_ns":1}]}
+        \\{"generation":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","secrets":[{"key":"openai.api_key","value":"primary-openai","created_at_ns":1,"updated_at_ns":1},{"key":"shared.key","value":"primary-shared","created_at_ns":1,"updated_at_ns":1}]}
     );
     try writeFileAtomically(fallback_path,
         \\{"secrets":[{"key":"antfly.runtime.test.token","value":"fallback-token","created_at_ns":1,"updated_at_ns":1},{"key":"shared.key","value":"fallback-shared","created_at_ns":1,"updated_at_ns":1}]}
@@ -1247,6 +1395,10 @@ test "layered file secret store resolves primary before fallback and writes prim
 
     var store = try FileStore.initLayered(alloc, &.{ primary_path, fallback_path });
     defer store.deinit();
+
+    const health = store.healthSnapshot();
+    try std.testing.expect(!health.supports_source_generation);
+    try std.testing.expectEqual(@as(?[std.crypto.hash.sha2.Sha256.digest_length]u8, null), health.source_generation);
 
     const primary = try store.getOwned(alloc, "openai.api_key");
     defer if (primary) |value| alloc.free(value);

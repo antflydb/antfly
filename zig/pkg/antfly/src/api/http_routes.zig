@@ -83,6 +83,7 @@ pub const Routes = struct {
     pub const internal_groups_prefix = "/internal/v1/groups/";
     pub const internal_tables_prefix = "/internal/v1/tables/";
     pub const batch_suffix = "/batch";
+    pub const routed_batch_suffix = "/batch-routed-v1";
     pub const merge_suffix = "/merge";
     pub const backup_suffix = "/backup";
     pub const restore_suffix = "/restore";
@@ -103,6 +104,7 @@ pub const Routes = struct {
     pub const txn_prepare_suffix = "/txn-prepare";
     pub const txn_resolve_suffix = "/txn-resolve";
     pub const txn_status_suffix = "/txn-status";
+    pub const txn_acknowledge_suffix = "/txn-acknowledge";
     pub const corrupt_embedding_artifact_suffix = "/corrupt-embedding-artifact";
     pub const group_db_median_key_suffix = "/db/median-key";
     pub const shard_ops_observe_split_suffix = "/shard-ops/observe-split";
@@ -390,6 +392,11 @@ pub const Routes = struct {
     };
 
     pub const GroupTxnStatus = struct {
+        group_id: u64,
+        table_name: []const u8,
+    };
+
+    pub const GroupTxnAcknowledge = struct {
         group_id: u64,
         table_name: []const u8,
     };
@@ -997,11 +1004,19 @@ pub const Routes = struct {
     }
 
     pub fn matchGroupBatch(path: []const u8) ?GroupBatch {
+        return matchGroupBatchWithSuffix(path, batch_suffix);
+    }
+
+    pub fn matchGroupRoutedBatch(path: []const u8) ?GroupBatch {
+        return matchGroupBatchWithSuffix(path, routed_batch_suffix);
+    }
+
+    fn matchGroupBatchWithSuffix(path: []const u8, suffix: []const u8) ?GroupBatch {
         const group = parseGroupPrefix(path) orelse return null;
         const rest = group.rest;
         if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
-        if (!std.mem.endsWith(u8, rest, batch_suffix)) return null;
-        const table_name = rest[tables_prefix.len .. rest.len - batch_suffix.len];
+        if (!std.mem.endsWith(u8, rest, suffix)) return null;
+        const table_name = rest[tables_prefix.len .. rest.len - suffix.len];
         if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
         return .{ .group_id = group.group_id, .table_name = table_name };
     }
@@ -1232,6 +1247,16 @@ pub const Routes = struct {
         if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
         if (!std.mem.endsWith(u8, rest, txn_status_suffix)) return null;
         const table_name = rest[tables_prefix.len .. rest.len - txn_status_suffix.len];
+        if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
+        return .{ .group_id = group.group_id, .table_name = table_name };
+    }
+
+    pub fn matchGroupTxnAcknowledge(path: []const u8) ?GroupTxnAcknowledge {
+        const group = parseGroupPrefix(path) orelse return null;
+        const rest = group.rest;
+        if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, rest, txn_acknowledge_suffix)) return null;
+        const table_name = rest[tables_prefix.len .. rest.len - txn_acknowledge_suffix.len];
         if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
         return .{ .group_id = group.group_id, .table_name = table_name };
     }
@@ -1484,6 +1509,10 @@ test "public api routes compile" {
     try std.testing.expectEqual(@as(u64, 7), group_query_preflight.group_id);
     const group_batch = Routes.matchGroupBatch("/internal/v1/groups/7/tables/docs/batch").?;
     try std.testing.expectEqual(@as(u64, 7), group_batch.group_id);
+    const routed_group_batch = Routes.matchGroupRoutedBatch("/internal/v1/groups/7/tables/docs/batch-routed-v1").?;
+    try std.testing.expectEqual(@as(u64, 7), routed_group_batch.group_id);
+    try std.testing.expectEqualStrings("docs", routed_group_batch.table_name);
+    try std.testing.expect(Routes.matchGroupBatch("/internal/v1/groups/7/tables/docs/batch-routed-v1") == null);
     const group_artifact = Routes.matchGroupDocumentArtifact("/internal/v1/groups/7/tables/docs/documents/doc%2Fa/artifacts/document_units_v1").?;
     try std.testing.expectEqual(@as(u64, 7), group_artifact.group_id);
     try std.testing.expectEqualStrings("docs", group_artifact.table_name);

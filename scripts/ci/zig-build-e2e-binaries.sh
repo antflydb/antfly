@@ -34,6 +34,15 @@ target_args=()
 if [[ -n "${ANTFLY_CI_ZIG_TARGET:-}" ]]; then
   target_args+=("-Dtarget=$ANTFLY_CI_ZIG_TARGET")
 fi
+strip="${ANTFLY_CI_ZIG_STRIP:-false}"
+
+case "$strip" in
+  true|false) ;;
+  *)
+    echo "ANTFLY_CI_ZIG_STRIP must be true or false, got: $strip" >&2
+    exit 2
+    ;;
+esac
 
 cd "$repo_root/zig"
 
@@ -44,6 +53,7 @@ zig build \
   "${target_args[@]}" \
   -Dcpu="$cpu" \
   -Doptimize="$optimize" \
+  -Dstrip="$strip" \
   -Dedition=full \
   install
 

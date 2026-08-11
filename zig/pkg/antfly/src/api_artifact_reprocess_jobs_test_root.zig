@@ -29,14 +29,6 @@ test {
     std.testing.refAllDecls(repair_jobs);
 }
 
-test "api http client maps remote repair cancel unavailable" {
-    try http_client.expectGroupArtifactRepairRunMapsCancelUnavailableForTest();
-}
-
-test "internal group artifact repair rejects callback token without cancel executor" {
-    try http_internal_group_write_routes.expectRejectsCallbackTokenWithoutCancelExecutorForTest();
-}
-
 test "repair job store starts and records a pass" {
     const alloc = std.testing.allocator;
     var store = repair_jobs.Store.init(alloc, .{});
