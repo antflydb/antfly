@@ -23530,7 +23530,15 @@ test "provisioned restore repair worker retries transient step failures to compl
     source.invalidateWriteCacheForTable("docs");
     source.clearDirtyWriteTable("docs");
 
-    try db_mod.DB.markRestorePrimaryRestoredForPath(alloc, db_path, "snap1", "local", "snap1/groups/7001", 7001);
+    try db_mod.DB.markRestorePrimaryRestoredForPathWithArtifact(
+        alloc,
+        db_path,
+        "snap1",
+        "local",
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "snap1/groups/7001",
+        7001,
+    );
     try std.testing.expect(try db_mod.DB.restoreRuntimeRepairNeededForPath(alloc, db_path));
 
     const HookCtx = struct {
@@ -32518,7 +32526,7 @@ test "provisioned table write source restore repair completion retires cached ve
         .on_change = Hook.onChange,
     });
 
-    try snapshot_cache.upsertGroupStatusPreservingMetadata("docs", .{
+    try publishRuntimeStatusGroupForTest(&snapshot_cache, "docs", .{
         .group_id = 7001,
         .metadata = .{
             .source = .cached_snapshot,
