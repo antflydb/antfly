@@ -326,7 +326,7 @@ extern fn antfly_api_kernel_handler_handle_http(context: *const api_kernel_abi.H
 extern fn antfly_api_kernel_handler_destroy_http_response(handle: *anyopaque) callconv(.c) void;
 
 fn distributedHttpxRegister(context: *const api_kernel_abi.RouteContext) callconv(.c) api_kernel_abi.Status {
-    if (context.abi_version != api_kernel_abi.abi_version)
+    if (context.abi_version != api_kernel_abi.abi_version or context._reserved != 0)
         return api_kernel_abi.statusFromError(error.UnsupportedVersion);
     const server: *httpx.Server = @ptrCast(@alignCast(context.server));
     const path = context.path_ptr[0..context.path_len];

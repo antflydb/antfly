@@ -214,7 +214,7 @@ fn createOpaqueServer(
         .table_reads_contract = .of(?table_reads.TableReadSource),
         .table_writes = &writes_copy,
         .table_writes_contract = .of(?table_writes.TableWriteSource),
-        .fallible = fallible,
+        .flags = if (fallible) CreateContext.fallible_init else 0,
         .out_handle = &handle,
         .out_request_alloc = &request_alloc_abi,
     });

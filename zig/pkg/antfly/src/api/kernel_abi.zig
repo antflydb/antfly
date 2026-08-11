@@ -24,12 +24,16 @@ pub const native_abi = @import("../runtime_native_abi.zig");
 pub const Status = error_abi.Status;
 pub const StatusCode = error_abi.Code;
 pub const StatusDetail = error_abi.Detail;
-pub const abi_version = error_abi.abi_version;
+/// Version of the API-kernel control structs below. This is intentionally
+/// independent of the status ABI: adding flags/reserved fields must invalidate
+/// an older context before the callee reads beyond its layout.
+pub const abi_version: u32 = 2;
 pub const statusFromError = error_abi.statusFromError;
 pub const errorFromStatus = error_abi.errorFromStatus;
 
 pub const CreateContext = extern struct {
     abi_version: u32,
+    flags: u32 = 0,
     owner_alloc: *const memory_abi.Allocator,
     cfg: *const anyopaque,
     cfg_contract: native_abi.TypeContract,
@@ -39,13 +43,15 @@ pub const CreateContext = extern struct {
     table_reads_contract: native_abi.TypeContract,
     table_writes: *const anyopaque,
     table_writes_contract: native_abi.TypeContract,
-    fallible: bool,
     out_handle: *?*anyopaque,
     out_request_alloc: *?*const memory_abi.Allocator,
+
+    pub const fallible_init: u32 = 1 << 0;
 };
 
 pub const CallContext = extern struct {
     abi_version: u32,
+    _reserved: u32 = 0,
     handle: *anyopaque,
     input: ?*const anyopaque = null,
     input_contract: native_abi.TypeContract = .of(void),
@@ -55,6 +61,7 @@ pub const CallContext = extern struct {
 
 pub const HandlerCreateContext = extern struct {
     abi_version: u32,
+    _reserved: u32 = 0,
     api_server_handle: *anyopaque,
     out_handle: *?*anyopaque,
 };
@@ -69,6 +76,7 @@ pub const HttpResponseView = http_abi.HttpResponseView;
 
 pub const HttpHandleContext = extern struct {
     abi_version: u32,
+    _reserved: u32 = 0,
     route_handle: *anyopaque,
     request: *const HttpRequestView,
     out_response_handle: *?*anyopaque,
@@ -77,6 +85,7 @@ pub const HttpHandleContext = extern struct {
 
 pub const RouteContext = extern struct {
     abi_version: u32,
+    _reserved: u32 = 0,
     server: *anyopaque,
     route_handle: *anyopaque,
     method: HttpMethod,

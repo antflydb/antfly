@@ -202,7 +202,7 @@ pub const ReplicatedPersistence = extern struct {
                 allocator: *const runtime_memory_abi.Allocator,
                 out: *AbiRows,
             ) callconv(.c) runtime_error_abi.Status {
-                if (allocator.version != runtime_memory_abi.Allocator.abi_version)
+                if (!allocator.valid())
                     return fail(error.UnsupportedVersion);
                 const alloc = allocator.asStd();
                 const rows = local.load(ptr, alloc) catch |err| return fail(err);
@@ -230,7 +230,7 @@ pub const ReplicatedPersistence = extern struct {
                 key: runtime_memory_abi.Bytes,
                 out: *runtime_memory_abi.OptionalOwnedBytes,
             ) callconv(.c) runtime_error_abi.Status {
-                if (allocator.version != runtime_memory_abi.Allocator.abi_version)
+                if (!allocator.valid())
                     return fail(error.UnsupportedVersion);
                 const value = local.get(ptr, allocator.asStd(), key.slice()) catch |err| return fail(err);
                 out.* = if (value) |bytes| .{
@@ -263,7 +263,7 @@ pub const ReplicatedPersistence = extern struct {
                 keys_ptr: ?[*]const runtime_memory_abi.Bytes,
                 key_count: usize,
             ) callconv(.c) runtime_error_abi.Status {
-                if (allocator.version != runtime_memory_abi.Allocator.abi_version)
+                if (!allocator.valid())
                     return fail(error.UnsupportedVersion);
                 const alloc = allocator.asStd();
                 const keys = alloc.alloc([]const u8, key_count) catch |err| return fail(err);

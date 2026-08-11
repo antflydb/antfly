@@ -70,6 +70,10 @@ pub const Allocator = extern struct {
         return .{ .ptr = @ptrCast(@constCast(self)), .vtable = &std_vtable };
     }
 
+    pub fn valid(self: *const Allocator) bool {
+        return self.version == abi_version and self._reserved == 0;
+    }
+
     fn stdAllocate(
         context: *anyopaque,
         len: usize,
@@ -107,7 +111,7 @@ pub const Allocator = extern struct {
         _: usize,
     ) ?[*]u8 {
         const self: *const Allocator = @ptrCast(@alignCast(context));
-        if (self.version != abi_version) return null;
+        if (!self.valid()) return null;
         return self.allocate(self.context, len, alignment.toByteUnits());
     }
 
@@ -138,7 +142,7 @@ pub const Allocator = extern struct {
         _: usize,
     ) void {
         const self: *const Allocator = @ptrCast(@alignCast(context));
-        if (self.version != abi_version)
+        if (!self.valid())
             @panic("runtime ABI allocator version mismatch");
         self.release(self.context, memory.ptr, memory.len, alignment.toByteUnits());
     }
@@ -150,4 +154,7 @@ test "ABI allocator preserves allocation ownership" {
     const foreign = abi_allocator.asStd();
     const bytes = try foreign.alloc(u8, 32);
     foreign.free(bytes);
+
+    abi_allocator._reserved = 1;
+    try std.testing.expect(!abi_allocator.valid());
 }

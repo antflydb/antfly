@@ -90,6 +90,7 @@ fn validateNativeOutput(
 
 fn validateCall(comptime Input: type, comptime Output: type, context: *const CallContext) ?abi.Status {
     if (validateVersion(context.abi_version)) |failure| return failure;
+    if (context._reserved != 0) return fail(error.UnsupportedVersion);
     if (validateNativeValue(Input, context.input, context.input_contract)) |failure| return failure;
     if (validateNativeOutput(Output, context.output, context.output_contract)) |failure| return failure;
     return null;
@@ -109,7 +110,9 @@ fn output(comptime T: type, context: *const CallContext) *T {
 
 pub fn create(context: *const CreateContext) callconv(.c) abi.Status {
     if (validateVersion(context.abi_version)) |failure| return failure;
-    if (context.owner_alloc.version != abi.memory_abi.Allocator.abi_version)
+    if (context.flags & ~CreateContext.fallible_init != 0)
+        return fail(error.UnsupportedVersion);
+    if (!context.owner_alloc.valid())
         return fail(error.UnsupportedVersion);
     if (!context.cfg_contract.matches(.of(server_mod.ApiHttpServerConfig)) or
         !context.source_contract.matches(.of(server_mod.StatusSource)) or
@@ -129,7 +132,7 @@ pub fn create(context: *const CreateContext) callconv(.c) abi.Status {
 
     state.* = .{
         .owner_alloc = owner_alloc,
-        .server = if (context.fallible)
+        .server = if (context.flags & CreateContext.fallible_init != 0)
             server_mod.ApiHttpServer.initWithConfig(owner_alloc, cfg.*, source.*, reads.*, writes.*) catch |err| {
                 std.log.err("API kernel create failed initializing server: error.{s}", .{@errorName(err)});
                 return fail(err);
@@ -248,6 +251,7 @@ pub fn handleInternal(context: *const CallContext) callconv(.c) abi.Status {
 
 pub fn handlerCreate(context: *const HandlerCreateContext) callconv(.c) abi.Status {
     if (validateVersion(context.abi_version)) |failure| return failure;
+    if (context._reserved != 0) return fail(error.UnsupportedVersion);
     const api_state: *ServerState = @ptrCast(@alignCast(context.api_server_handle));
     const state = api_state.owner_alloc.create(HandlerState) catch |err| return fail(err);
     state.* = .{
@@ -316,6 +320,7 @@ pub fn handlerRegisterRoutes(context: *const CallContext) callconv(.c) abi.Statu
 
 pub fn handlerHandleHttp(context: *const abi.HttpHandleContext) callconv(.c) abi.Status {
     if (validateVersion(context.abi_version)) |failure| return failure;
+    if (context._reserved != 0) return fail(error.UnsupportedVersion);
     const route: *RouteState = @ptrCast(@alignCast(context.route_handle));
     const state = route.owner;
     const request = context.request;
