@@ -277,7 +277,7 @@ pub fn reconcileDbIndexesWithOptions(
         desired_enrichments.deinit(alloc);
     }
     try collectDesiredEnrichmentsFromJson(alloc, indexes_json, &desired_enrichments);
-    try indexes_api.validateArtifactEnrichmentConfigs(desired_enrichments.items);
+    try indexes_api.validateArtifactEnrichmentConfigs(alloc, desired_enrichments.items);
     dedupeDesiredEnrichments(alloc, &desired_enrichments);
     indexes_api.sortArtifactEnrichmentsByDependency(desired_enrichments.items);
 

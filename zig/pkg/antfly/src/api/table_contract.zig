@@ -391,6 +391,7 @@ fn validatePublicIndexObject(object: anytype) !void {
     }
     const index_type = extractPublicIndexType(object) orelse "full_text";
     if (!isSupportedPublicIndexType(index_type)) return error.InvalidCreateIndexRequest;
+    try validatePublicInlineArtifactEnrichments(object);
     if (std.mem.eql(u8, index_type, "full_text")) {
         try validatePublicFullTextIndexObject(object);
         return;
@@ -402,6 +403,21 @@ fn validatePublicIndexObject(object: anytype) !void {
         return;
     }
     return error.InvalidCreateIndexRequest;
+}
+
+fn validatePublicInlineArtifactEnrichments(object: anytype) !void {
+    const Object = @TypeOf(object);
+    const enrichments = if (@hasField(Object, "map"))
+        object.map.get("enrichments")
+    else
+        object.get("enrichments");
+    const value = enrichments orelse return;
+    if (value != .array) return error.InvalidCreateIndexRequest;
+    for (value.array.items) |item| {
+        if (item != .object) return error.InvalidCreateIndexRequest;
+        validatePublicArtifactEnrichmentObject(item.object) catch
+            return error.InvalidCreateIndexRequest;
+    }
 }
 
 fn validateCreateTableIndexesValue(value: std.json.Value) !void {
@@ -469,12 +485,31 @@ fn validatePublicArtifactEnrichmentObject(object: anytype) !void {
         while (it.next()) |entry| {
             if (!isAllowedPublicArtifactEnrichmentField(entry.key_ptr.*)) return error.InvalidArtifactEnrichmentRequest;
         }
-        return;
+    } else {
+        var it = object.iterator();
+        while (it.next()) |entry| {
+            if (!isAllowedPublicArtifactEnrichmentField(entry.key_ptr.*)) return error.InvalidArtifactEnrichmentRequest;
+        }
     }
 
-    var it = object.iterator();
+    const execution = if (@hasField(Object, "map"))
+        object.map.get("execution")
+    else
+        object.get("execution");
+    if (execution) |value| try validatePublicEnrichmentExecution(value);
+}
+
+fn validatePublicEnrichmentExecution(value: std.json.Value) !void {
+    if (value != .object) return error.InvalidArtifactEnrichmentRequest;
+    var it = value.object.iterator();
     while (it.next()) |entry| {
-        if (!isAllowedPublicArtifactEnrichmentField(entry.key_ptr.*)) return error.InvalidArtifactEnrichmentRequest;
+        if (!std.mem.eql(u8, entry.key_ptr.*, "batch_items") and
+            !std.mem.eql(u8, entry.key_ptr.*, "batch_bytes"))
+        {
+            return error.InvalidArtifactEnrichmentRequest;
+        }
+        if (entry.value_ptr.* != .integer or entry.value_ptr.integer <= 0)
+            return error.InvalidArtifactEnrichmentRequest;
     }
 }
 
@@ -927,6 +962,30 @@ test "table contract rejects invalid inline artifact enrichments before admissio
             std.testing.allocator,
             "document_text",
             "{\"type\":\"full_text\",\"enrichments\":[false]}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidCreateIndexRequest,
+        parseCreateIndexRequest(
+            std.testing.allocator,
+            "document_text",
+            "{\"type\":\"full_text\",\"enrichments\":[{\"name\":\"chunks\",\"kind\":\"chunk\",\"field\":\"text\",\"chunk_size\":512,\"chunk_overalp\":50}]}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidCreateIndexRequest,
+        parseCreateIndexRequest(
+            std.testing.allocator,
+            "document_text",
+            "{\"type\":\"full_text\",\"enrichments\":[{\"name\":\"chunks\",\"kind\":\"chunk\",\"field\":\"text\",\"chunk_size\":512,\"execution\":{\"batch_itmes\":4}}]}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidCreateIndexRequest,
+        parseCreateIndexRequest(
+            std.testing.allocator,
+            "document_text",
+            "{\"type\":\"full_text\",\"enrichments\":[{\"name\":\"units\",\"kind\":\"asset\",\"field\":\"url\",\"producer_json\":\"{\"}]}",
         ),
     );
 }

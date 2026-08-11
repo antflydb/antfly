@@ -38,6 +38,7 @@ pub const DownloadOutcome = union(enum) {
 pub const ContentSecurityConfig = struct {
     allowed_hosts: ?[]const []u8 = null,
     block_private_ips: ?bool = null,
+    nat64_prefixes: ?[]const []u8 = null,
     max_download_size_bytes: ?u64 = null,
     download_timeout_seconds: ?u32 = null,
     max_image_dimension: ?u32 = null,

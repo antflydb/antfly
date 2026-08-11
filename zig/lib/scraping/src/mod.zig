@@ -48,6 +48,10 @@ pub const HTTPHeader = struct {
 pub const ContentSecurityConfig = struct {
     allowed_hosts: ?[]const []u8 = null,
     block_private_ips: ?bool = null,
+    /// RFC 6052 network-specific prefixes used by the deployment's NAT64
+    /// translators. Addresses inside these prefixes are decoded before the
+    /// private-address decision is made.
+    nat64_prefixes: ?[]const []u8 = null,
     max_download_size_bytes: ?u64 = null,
     download_timeout_seconds: ?u32 = null,
     max_image_dimension: ?u32 = null,
@@ -56,6 +60,7 @@ pub const ContentSecurityConfig = struct {
 
     pub fn deinit(self: *ContentSecurityConfig, alloc: std.mem.Allocator) void {
         if (self.allowed_hosts) |values| freeOwnedStringSlice(alloc, values);
+        if (self.nat64_prefixes) |values| freeOwnedStringSlice(alloc, values);
         if (self.allowed_paths) |values| freeOwnedStringSlice(alloc, values);
         if (self.user_agent) |value| alloc.free(value);
         self.* = undefined;
@@ -253,6 +258,7 @@ pub fn downloadContentOutcomeAllocWithHeaders(
 pub fn isEmptyContentSecurity(value: ContentSecurityConfig) bool {
     return value.allowed_hosts == null and
         value.block_private_ips == null and
+        value.nat64_prefixes == null and
         value.max_download_size_bytes == null and
         value.download_timeout_seconds == null and
         value.max_image_dimension == null and
@@ -394,6 +400,7 @@ fn downloadHttpOutcomeAlloc(
         .keep_alive = false,
         .cookies_enabled = false,
         .resolved_address_validator = if (block_private) validatePublicResolvedAddress else null,
+        .resolved_address_validator_context = if (block_private) @ptrCast(@constCast(security.?)) else null,
     });
     defer client.deinit();
 
@@ -465,8 +472,9 @@ fn downloadHttpOutcomeAlloc(
     }
 }
 
-fn validatePublicResolvedAddress(_: ?*anyopaque, address: httpx.Address) !void {
-    if (!isPublicAddress(address)) return error.PrivateIpBlocked;
+fn validatePublicResolvedAddress(context: ?*anyopaque, address: httpx.Address) !void {
+    const security: ?*const ContentSecurityConfig = if (context) |ptr| @ptrCast(@alignCast(ptr)) else null;
+    if (!isPublicAddressWithSecurity(address, security)) return error.PrivateIpBlocked;
 }
 
 fn validateHttpUri(uri: std.Uri) !void {
@@ -602,6 +610,10 @@ fn downloadS3Alloc(
         .io = io_impl.io(),
         .resolved_address_validator = if (security) |cfg|
             if (cfg.block_private_ips orelse false) validatePublicResolvedAddress else null
+        else
+            null,
+        .resolved_address_validator_context = if (security) |cfg|
+            if (cfg.block_private_ips orelse false) @ptrCast(@constCast(cfg)) else null
         else
             null,
     });
@@ -742,7 +754,86 @@ fn pathIsWithinRoot(root: []const u8, path: []const u8) bool {
         path[root.len] == std.fs.path.sep;
 }
 
+const Nat64Prefix = struct {
+    bytes: [16]u8,
+    length: u8,
+};
+
+const Nat64Decode = union(enum) {
+    no_match,
+    malformed,
+    ipv4: [4]u8,
+};
+
+const well_known_nat64 = Nat64Prefix{
+    .bytes = .{ 0, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    .length = 96,
+};
+const local_use_nat64 = Nat64Prefix{
+    .bytes = .{ 0, 0x64, 0xff, 0x9b, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    .length = 48,
+};
+
+fn validNat64PrefixLength(length: u8) bool {
+    return switch (length) {
+        32, 40, 48, 56, 64, 96 => true,
+        else => false,
+    };
+}
+
+fn parseNat64Prefix(text: []const u8) !Nat64Prefix {
+    const slash = std.mem.lastIndexOfScalar(u8, text, '/') orelse return error.InvalidNat64Prefix;
+    if (slash == 0 or slash + 1 == text.len) return error.InvalidNat64Prefix;
+    const length = std.fmt.parseUnsigned(u8, text[slash + 1 ..], 10) catch return error.InvalidNat64Prefix;
+    if (!validNat64PrefixLength(length)) return error.InvalidNat64Prefix;
+    const address = std.Io.net.IpAddress.parse(text[0..slash], 0) catch return error.InvalidNat64Prefix;
+    const bytes = switch (address) {
+        .ip6 => |ip6| ip6.bytes,
+        .ip4 => return error.InvalidNat64Prefix,
+    };
+    const prefix_bytes = @as(usize, length) / 8;
+    if (!std.mem.allEqual(u8, bytes[prefix_bytes..], 0)) return error.InvalidNat64Prefix;
+    return .{ .bytes = bytes, .length = length };
+}
+
+pub fn validateNat64Prefixes(security: ContentSecurityConfig) !void {
+    if (security.nat64_prefixes) |prefixes| {
+        for (prefixes) |prefix| _ = try parseNat64Prefix(prefix);
+    }
+}
+
+fn decodeNat64(ip6: std.Io.net.Ip6Address, prefix: Nat64Prefix) Nat64Decode {
+    const b = ip6.bytes;
+    const prefix_bytes = @as(usize, prefix.length) / 8;
+    if (!std.mem.eql(u8, b[0..prefix_bytes], prefix.bytes[0..prefix_bytes])) return .no_match;
+
+    if (prefix.length == 96) return .{ .ipv4 = b[12..16].* };
+    if (b[8] != 0) return .malformed;
+    const decoded, const suffix_start = switch (prefix.length) {
+        32 => .{ b[4..8].*, @as(usize, 9) },
+        40 => .{ .{ b[5], b[6], b[7], b[9] }, @as(usize, 10) },
+        48 => .{ .{ b[6], b[7], b[9], b[10] }, @as(usize, 11) },
+        56 => .{ .{ b[7], b[9], b[10], b[11] }, @as(usize, 12) },
+        64 => .{ b[9..13].*, @as(usize, 13) },
+        else => return .malformed,
+    };
+    if (!std.mem.allEqual(u8, b[suffix_start..], 0)) return .malformed;
+    return .{ .ipv4 = decoded };
+}
+
+fn nat64PublicAddress(ip6: std.Io.net.Ip6Address, prefix: Nat64Prefix) ?bool {
+    return switch (decodeNat64(ip6, prefix)) {
+        .no_match => null,
+        .malformed => false,
+        .ipv4 => |bytes| isPublicAddressWithSecurity(.{ .ip4 = .{ .bytes = bytes, .port = ip6.port } }, null),
+    };
+}
+
 fn isPublicAddress(address: std.Io.net.IpAddress) bool {
+    return isPublicAddressWithSecurity(address, null);
+}
+
+fn isPublicAddressWithSecurity(address: std.Io.net.IpAddress, security: ?*const ContentSecurityConfig) bool {
     return switch (address) {
         .ip4 => |ip4| {
             const b = ip4.bytes;
@@ -762,25 +853,16 @@ fn isPublicAddress(address: std.Io.net.IpAddress) bool {
         },
         .ip6 => |ip6| {
             const b = ip6.bytes;
-            if (std.Io.net.Ip4Address.fromIp6(ip6)) |ip4| return isPublicAddress(.{ .ip4 = ip4 });
+            if (std.Io.net.Ip4Address.fromIp6(ip6)) |ip4| return isPublicAddressWithSecurity(.{ .ip4 = ip4 }, null);
             const zero_96_prefix = std.mem.eql(u8, b[0..12], &([_]u8{0} ** 12));
-            const is_well_known_nat64 = std.mem.eql(u8, b[0..12], &.{ 0, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0 });
-            if (is_well_known_nat64) {
-                return isPublicAddress(.{ .ip4 = .{ .bytes = b[12..16].*, .port = ip6.port } });
-            }
-            // RFC 8215 reserves 64:ff9b:1::/48 for local-use NAT64. RFC 6052
-            // places the IPv4 bits around the mandatory zero "u" octet for a
-            // /48 prefix. Decode valid addresses so private IPv4 destinations
-            // cannot bypass SSRF policy through an operator NAT64 gateway;
-            // reject malformed encodings inside the reserved prefix.
-            const is_local_use_nat64 = std.mem.eql(u8, b[0..6], &.{ 0, 0x64, 0xff, 0x9b, 0, 1 });
-            if (is_local_use_nat64) {
-                if (b[8] != 0 or !std.mem.allEqual(u8, b[11..16], 0)) return false;
-                return isPublicAddress(.{ .ip4 = .{
-                    .bytes = .{ b[6], b[7], b[9], b[10] },
-                    .port = ip6.port,
-                } });
-            }
+            if (nat64PublicAddress(ip6, well_known_nat64)) |public| return public;
+            if (nat64PublicAddress(ip6, local_use_nat64)) |public| return public;
+            if (security) |cfg| if (cfg.nat64_prefixes) |prefixes| {
+                for (prefixes) |text| {
+                    const prefix = parseNat64Prefix(text) catch return false;
+                    if (nat64PublicAddress(ip6, prefix)) |public| return public;
+                }
+            };
             return ip6.interface.isNone() and
                 !zero_96_prefix and
                 (b[0] & 0xfe) != 0xfc and
@@ -954,6 +1036,41 @@ test "remote address policy rejects non-public ranges" {
     try std.testing.expect(isPublicAddress(try parse("64:ff9b:1:808:8:800:0:0", 80)));
     try std.testing.expect(isPublicAddress(try parse("8.8.8.8", 80)));
     try std.testing.expect(isPublicAddress(try parse("2606:4700:4700::1111", 80)));
+}
+
+test "remote address policy decodes configured network-specific NAT64 prefixes" {
+    const parse = std.Io.net.IpAddress.parse;
+    const prefixes = [_][]u8{@constCast("2001:470:64::/96")};
+    const security = ContentSecurityConfig{ .nat64_prefixes = &prefixes };
+    try validateNat64Prefixes(security);
+    try std.testing.expect(!isPublicAddressWithSecurity(try parse("2001:470:64::a9fe:a9fe", 80), &security));
+    try std.testing.expect(isPublicAddressWithSecurity(try parse("2001:470:64::808:808", 80), &security));
+    // Without operator configuration the same globally routed IPv6 address is
+    // not guessed to be translated; arbitrary public prefixes remain usable.
+    try std.testing.expect(isPublicAddress(try parse("2001:470:64::a9fe:a9fe", 80)));
+}
+
+test "NAT64 prefix validation accepts RFC 6052 lengths and rejects ambiguity" {
+    const cases = [_]struct { prefix: []u8, private_address: []const u8 }{
+        .{ .prefix = @constCast("2001:470::/32"), .private_address = "2001:470:a9fe:a9fe::" },
+        .{ .prefix = @constCast("2001:470:1200::/40"), .private_address = "2001:470:12a9:fea9:fe::" },
+        .{ .prefix = @constCast("2001:470:1234::/48"), .private_address = "2001:470:1234:a9fe:a9:fe00::" },
+        .{ .prefix = @constCast("2001:470:1234:5600::/56"), .private_address = "2001:470:1234:56a9:fe:a9fe::" },
+        .{ .prefix = @constCast("2001:470:1234:5678::/64"), .private_address = "2001:470:1234:5678:a9:fea9:fe00:0" },
+        .{ .prefix = @constCast("2001:470:1234:5678:9abc:def0::/96"), .private_address = "2001:470:1234:5678:9abc:def0:a9fe:a9fe" },
+    };
+    var valid: [cases.len][]u8 = undefined;
+    for (cases, 0..) |case, i| valid[i] = case.prefix;
+    try validateNat64Prefixes(.{ .nat64_prefixes = &valid });
+    for (cases) |case| {
+        const one = [_][]u8{case.prefix};
+        const security = ContentSecurityConfig{ .nat64_prefixes = &one };
+        try std.testing.expect(!isPublicAddressWithSecurity(try std.Io.net.IpAddress.parse(case.private_address, 80), &security));
+    }
+    const invalid_length = [_][]u8{@constCast("2001:470::/72")};
+    try std.testing.expectError(error.InvalidNat64Prefix, validateNat64Prefixes(.{ .nat64_prefixes = &invalid_length }));
+    const non_canonical = [_][]u8{@constCast("2001:470::1/96")};
+    try std.testing.expectError(error.InvalidNat64Prefix, validateNat64Prefixes(.{ .nat64_prefixes = &non_canonical }));
 }
 
 test "redirect resolution is RFC 3986 compliant and origin aware" {
