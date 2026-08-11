@@ -30,6 +30,8 @@ Usage:
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
 import re
@@ -972,6 +974,192 @@ class InferenceGeneratorServer:
         self._thread.join(timeout=5)
 
 
+class PdfOcrE2EServer:
+    """Serves a real PDF URL and a deterministic Antfly Reader endpoint."""
+
+    def __init__(self, host: str = "127.0.0.1"):
+        port = find_free_port()
+        self.base_url = f"http://{host}:{port}"
+        self.reader_api_url = f"{self.base_url}{INFERENCE_PUBLIC_API_ROOT}"
+        self.pdf_url = f"{self.base_url}/fixtures/two-page.pdf"
+        self.form_pdf_url = f"{self.base_url}/fixtures/form-xobject-text.pdf"
+        self._pdf = (
+            REPO_ROOT / "lib/pdf/testdata/two_page_text_fixture.pdf"
+        ).read_bytes()
+        self._form_pdf = (
+            REPO_ROOT / "lib/pdf/testdata/form_xobject_text_fixture.pdf"
+        ).read_bytes()
+        self._lock = threading.Lock()
+        self._png_page_by_hash: dict[str, int] = {}
+        self._png_hashes: set[str] = set()
+        self._requests: list[dict[str, Any]] = []
+
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                if self.path == "/fixtures/two-page.pdf":
+                    pdf = outer._pdf
+                elif self.path == "/fixtures/form-xobject-text.pdf":
+                    pdf = outer._form_pdf
+                else:
+                    self.send_error(404)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/pdf")
+                self.send_header("Content-Length", str(len(pdf)))
+                self.end_headers()
+                self.wfile.write(pdf)
+
+            def do_POST(self) -> None:  # noqa: N802
+                if self.path != f"{INFERENCE_PUBLIC_API_ROOT}/read":
+                    self.send_error(404)
+                    return
+                content_length = int(self.headers.get("Content-Length", "0"))
+                payload = json.loads(
+                    self.rfile.read(content_length).decode("utf-8") or "{}"
+                )
+                images = payload.get("images", [])
+                prompt = str(payload.get("prompt", ""))
+                data: list[dict[str, object]] = []
+                request_images: list[dict[str, object]] = []
+                for index, image in enumerate(images):
+                    url = (
+                        str(image.get("url", ""))
+                        if isinstance(image, dict)
+                        else str(image)
+                    )
+                    if url.startswith("data:image/jpeg;base64,"):
+                        decoded = base64.b64decode(url.split(",", 1)[1], validate=True)
+                        request_images.append({"kind": "jpeg", "bytes": len(decoded)})
+                        text = (
+                            "Inline JPEG caption: a compact monochrome document image supplied directly "
+                            "in the source row and described by the configured Reader."
+                        )
+                    elif url.startswith("data:image/png;base64,"):
+                        decoded = base64.b64decode(url.split(",", 1)[1], validate=True)
+                        if not decoded.startswith(b"\x89PNG\r\n\x1a\n"):
+                            self.send_error(400, "Reader input was not a PNG")
+                            return
+                        digest = hashlib.sha256(decoded).hexdigest()
+                        width = int.from_bytes(decoded[16:20], "big")
+                        height = int.from_bytes(decoded[20:24], "big")
+                        with outer._lock:
+                            outer._png_hashes.add(digest)
+                            page_number = (
+                                0
+                                if width < 200 and height < 200
+                                else outer._png_page_by_hash.setdefault(
+                                    digest, len(outer._png_page_by_hash) + 1
+                                )
+                            )
+                        request_images.append(
+                            {
+                                "kind": "png",
+                                "bytes": len(decoded),
+                                "sha256": digest,
+                                "page": page_number,
+                            }
+                        )
+                        if page_number == 0:
+                            text = (
+                                "OfficeQA scanned table transcription.\n"
+                                "Office | Quarter | Revenue\nSeattle | Q1 | $410\nBoston | Q1 | $275\n"
+                                "The scanned raster contains no embedded PDF text, and the layout-aware Reader "
+                                "preserves its rows and columns as a searchable Markdown-style table."
+                            ) + (
+                                " Scanned table continuation preserves OfficeQA row and column context."
+                                * 80
+                            )
+                        elif page_number == 1:
+                            text = (
+                                "Forced OCR page one contains alpha ledger entries and a preserved table row. "
+                                "The page-specific raster is chunked and indexed for full text retrieval. "
+                                "Account | Owner | Amount\nA-100 | Northwind | $125.00\n"
+                                "The layout-aware Reader keeps headings, cell boundaries, and values together. "
+                                "This deliberately extended page proves that a single rendered page produces "
+                                "multiple independently searchable chunks without an intermediate JSON pipeline. "
+                                "Additional ledger notes preserve the alpha account context across the chunk boundary."
+                            ) + (
+                                " Alpha ledger continuation preserves account row structure for retrieval."
+                                * 80
+                            )
+                        elif page_number == 2:
+                            text = (
+                                "Forced OCR page two contains beta invoice entries and another preserved table row. "
+                                "This distinct page raster proves page-number rendering before chunking. "
+                                "Invoice | Vendor | Total\nB-200 | Contoso | $250.00\n"
+                                "The layout-aware Reader emits a table-like representation suitable for retrieval. "
+                                "This deliberately extended page proves that page-n rendering feeds automatic "
+                                "chunking and indexing while retaining document and page provenance. Additional "
+                                "invoice notes preserve the beta vendor context across the chunk boundary."
+                            ) + (
+                                " Beta invoice continuation preserves vendor row structure for retrieval."
+                                * 80
+                            )
+                        else:
+                            text = f"Unexpected additional rendered PDF page {page_number}."
+                    else:
+                        self.send_error(400, "Reader input was not inline image media")
+                        return
+                    data.append({"object": "read_result", "index": index, "text": text})
+
+                with outer._lock:
+                    outer._requests.append({"prompt": prompt, "images": request_images})
+                body = json.dumps(
+                    {
+                        "object": "list",
+                        "data": data,
+                        "model": payload.get("model", "e2e-reader"),
+                        "usage": {
+                            "prompt_tokens": 1,
+                            "completion_tokens": max(1, len(data)),
+                            "total_tokens": max(2, len(data) + 1),
+                        },
+                    }
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format: str, *args: object) -> None:
+                _ = format
+                _ = args
+
+        self._server = ThreadingHTTPServer((host, port), Handler)
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+        if not wait_for_listener(self.base_url):
+            raise RuntimeError(f"PDF OCR E2E server failed to start at {self.base_url}")
+
+    def stats(self) -> dict[str, object]:
+        with self._lock:
+            requests_snapshot = json.loads(json.dumps(self._requests))
+            return {
+                "requests": requests_snapshot,
+                "unique_pngs": len(self._png_hashes),
+                "png_requests": sum(
+                    1
+                    for request in requests_snapshot
+                    for image in request["images"]
+                    if image["kind"] == "png"
+                ),
+                "jpeg_requests": sum(
+                    1
+                    for request in requests_snapshot
+                    for image in request["images"]
+                    if image["kind"] == "jpeg"
+                ),
+            }
+
+    def stop(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=5)
+
+
 class OpenAiEmbeddingServer:
     def __init__(self, host: str = "127.0.0.1"):
         port = find_free_port()
@@ -1633,6 +1821,13 @@ def inference_reranker():
 def inference_generator():
     server = InferenceGeneratorServer()
     yield server.url
+    server.stop()
+
+
+@pytest.fixture(scope="function")
+def pdf_ocr_e2e_server():
+    server = PdfOcrE2EServer()
+    yield server
     server.stop()
 
 

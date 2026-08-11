@@ -41,6 +41,11 @@ pub const Config = struct {
     /// clients normally use the transport defaults; health probes set this so
     /// an unreachable endpoint cannot monopolize an API worker.
     request_timeout_ms: ?u64 = null,
+    /// Optional admission hook for the exact resolved endpoint address. This
+    /// is evaluated immediately before connect and therefore remains safe
+    /// against DNS rebinding.
+    resolved_address_validator: ?httpx.ResolvedAddressValidator = null,
+    resolved_address_validator_context: ?*anyopaque = null,
     /// Optional borrowed application runtime. When absent, the client owns a
     /// threaded fallback for standalone library use.
     io: ?std.Io = null,
@@ -157,7 +162,13 @@ const HttpxTransport = struct {
     io_impl: ?*std.Io.Threaded,
     client: httpx.Client,
 
-    fn init(alloc: Allocator, request_timeout_ms: ?u64, shared_io: ?std.Io) !HttpxTransport {
+    fn init(
+        alloc: Allocator,
+        request_timeout_ms: ?u64,
+        shared_io: ?std.Io,
+        resolved_address_validator: ?httpx.ResolvedAddressValidator,
+        resolved_address_validator_context: ?*anyopaque,
+    ) !HttpxTransport {
         const io_impl: ?*std.Io.Threaded = if (shared_io == null) blk: {
             const owned = try alloc.create(std.Io.Threaded);
             owned.* = std.Io.Threaded.init(alloc, .{});
@@ -167,7 +178,7 @@ const HttpxTransport = struct {
             owned.deinit();
             alloc.destroy(owned);
         };
-        const client_config: httpx.ClientConfig = if (request_timeout_ms) |timeout_ms| .{
+        var client_config: httpx.ClientConfig = if (request_timeout_ms) |timeout_ms| .{
             .timeouts = .{
                 .connect_ms = timeout_ms,
                 .read_ms = timeout_ms,
@@ -177,6 +188,14 @@ const HttpxTransport = struct {
                 .request_ms = timeout_ms,
             },
         } else .{};
+        // S3 authorization is signed for one exact authority and path. Never
+        // replay it across an HTTP redirect: doing so would bypass the
+        // caller's endpoint admission policy and expose the signed request (and
+        // a temporary-session token, when present) to the redirect target.
+        client_config.redirect_policy = httpx.RedirectPolicy.noFollow();
+        client_config.cookies_enabled = false;
+        client_config.resolved_address_validator = resolved_address_validator;
+        client_config.resolved_address_validator_context = resolved_address_validator_context;
         return .{
             .alloc = alloc,
             .io_impl = io_impl,
@@ -235,11 +254,13 @@ test "s3 http transport borrows a shared io runtime" {
     const alloc = std.testing.allocator;
     var shared = std.Io.Threaded.init(alloc, .{});
     defer shared.deinit();
-    var transport = try HttpxTransport.init(alloc, null, shared.io());
+    var transport = try HttpxTransport.init(alloc, null, shared.io(), null, null);
     defer transport.deinit();
     try std.testing.expect(transport.io_impl == null);
+    try std.testing.expect(!transport.client.config.redirect_policy.follow_redirects);
+    try std.testing.expect(!transport.client.config.cookies_enabled);
 
-    var fallback = try HttpxTransport.init(alloc, null, null);
+    var fallback = try HttpxTransport.init(alloc, null, null, null, null);
     defer fallback.deinit();
     try std.testing.expect(fallback.io_impl != null);
     try std.testing.expect(fallback.client.io.userdata == @as(?*anyopaque, @ptrCast(fallback.io_impl.?)));
@@ -255,7 +276,13 @@ pub const Client = struct {
     pub fn init(alloc: Allocator, cfg: Config) !Client {
         const transport = try alloc.create(HttpxTransport);
         errdefer alloc.destroy(transport);
-        transport.* = try HttpxTransport.init(alloc, cfg.request_timeout_ms, cfg.io);
+        transport.* = try HttpxTransport.init(
+            alloc,
+            cfg.request_timeout_ms,
+            cfg.io,
+            cfg.resolved_address_validator,
+            cfg.resolved_address_validator_context,
+        );
         return .{
             .alloc = alloc,
             .cfg = cfg,

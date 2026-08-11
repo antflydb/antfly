@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub fn supportsOutputU8(components: u16, bits_per_component: u8, is_signed: bool) bool {
-    _ = is_signed;
-    return (components == 1 or components == 3 or components == 4) and bits_per_component >= 1 and bits_per_component <= 16;
+const antfly_pdf = @import("src/mod.zig");
+
+test {
+    _ = antfly_pdf;
 }

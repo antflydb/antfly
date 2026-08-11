@@ -1152,6 +1152,18 @@ pub const DocumentArtifactManifest = struct {
     unit_count: i64,
     /// Number of indexable chunks derived from the units.
     chunk_count: i64,
+    /// Number of pages for which OCR was attempted.
+    ocr_attempted_count: ?i64 = null,
+    /// Number of pages where OCR text was selected over embedded text.
+    ocr_selected_count: ?i64 = null,
+    /// Number of attempted pages where embedded text remained preferable.
+    ocr_retained_embedded_count: ?i64 = null,
+    /// Number of pages whose OCR rendering or recognition failed.
+    ocr_failed_count: ?i64 = null,
+    /// Up to 32 one-based page numbers where OCR failed.
+    ocr_failed_page_numbers: ?[]const i64 = null,
+    /// Whether additional failed page numbers were omitted from the summary.
+    ocr_failed_pages_truncated: ?bool = null,
     /// Parsed child range descriptors for this artifact generation.
     child_ranges: []const DocumentArtifactChildRange,
     /// Number of storage child ranges used by this artifact.

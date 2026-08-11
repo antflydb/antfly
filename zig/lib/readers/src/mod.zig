@@ -20,6 +20,19 @@ const inference_api = @import("inference_api");
 const Allocator = std.mem.Allocator;
 const vertex_auth_scope = "https://www.googleapis.com/auth/cloud-platform";
 
+fn readHttpStatusError(status: u16) anyerror {
+    return if (status == 408 or status == 409 or status == 425 or status == 429 or status >= 500)
+        error.ReadTransientFailure
+    else
+        error.ReadRequestFailed;
+}
+
+test "reader classifies retryable HTTP statuses" {
+    try std.testing.expect(readHttpStatusError(429) == error.ReadTransientFailure);
+    try std.testing.expect(readHttpStatusError(503) == error.ReadTransientFailure);
+    try std.testing.expect(readHttpStatusError(400) == error.ReadRequestFailed);
+}
+
 pub const Provider = enum {
     antfly,
     openai,
@@ -64,10 +77,21 @@ pub const Config = struct {
     }
 };
 
+pub const InlineContentTrust = enum {
+    untrusted,
+    trusted_internal,
+};
+
 pub const Request = struct {
     images: []const []const u8,
     prompt: ?[]const u8 = null,
     max_tokens: ?i64 = null,
+    /// Trust applies only to inline `data:` image content. Network locations
+    /// always retain the configured download policy.
+    inline_content_trust: InlineContentTrust = .untrusted,
+    /// Stable source fingerprint for opt-in inference profiling. Remote reader
+    /// providers deliberately do not serialize this internal-only value.
+    source_fingerprint: ?[]const u8 = null,
 };
 
 pub const Result = struct {
@@ -328,7 +352,7 @@ const AntflyReaderState = struct {
         } else &.{};
         var resp = try self.http.post(url, .{ .json = body, .headers = headers });
         defer resp.deinit();
-        if (!resp.ok()) return error.ReadRequestFailed;
+        if (!resp.ok()) return readHttpStatusError(resp.status.code);
 
         const payload = resp.body orelse return error.EmptyResponse;
         var parsed = try std.json.parseFromSlice(inference_api.ReadResponse, alloc, payload, .{
@@ -504,7 +528,7 @@ fn CloudReaderState(comptime provider: Provider) type {
             try self.appendAuthHeaders(alloc, &headers, &minted_auth);
             var resp = try self.http.post(url, .{ .json = body, .headers = headers.items });
             defer resp.deinit();
-            if (!resp.ok()) return error.ReadRequestFailed;
+            if (!resp.ok()) return readHttpStatusError(resp.status.code);
             const Response = struct { choices: []const struct { message: struct { content: ?[]const u8 = null } } = &.{} };
             var parsed = try std.json.parseFromSlice(Response, alloc, resp.body orelse return error.EmptyResponse, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
@@ -540,7 +564,7 @@ fn CloudReaderState(comptime provider: Provider) type {
             try self.appendAuthHeaders(alloc, &headers, &minted_auth);
             var resp = try self.http.post(url, .{ .json = body, .headers = headers.items });
             defer resp.deinit();
-            if (!resp.ok()) return error.ReadRequestFailed;
+            if (!resp.ok()) return readHttpStatusError(resp.status.code);
             const Response = struct {
                 candidates: []const struct {
                     content: struct {
