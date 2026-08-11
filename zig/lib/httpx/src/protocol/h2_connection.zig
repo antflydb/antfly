@@ -199,7 +199,7 @@ pub const H2Connection = struct {
         try http.applySettingsPayload(&self.peer_settings, payload);
         const new_window = self.peer_settings.initial_window_size;
         if (old_window != new_window) {
-            try self.stream_manager.applyInitialWindowSizeChange(old_window, new_window);
+            try self.stream_manager.applyInitialWindowSizeChange(self.io, old_window, new_window);
         }
         // RFC 7541 §4.2: When peer changes HEADER_TABLE_SIZE, our encoder must
         // emit a size update at the start of the next header block.
@@ -486,7 +486,7 @@ pub const H2Connection = struct {
                     s.stream_error = error.ProtocolError;
                     s.completed = true;
                     if (s.data_event) |ev| ev.set(self.io);
-                    if (s.completion_sem) |sem| sem.post(self.io);
+                    s.completion_event.set(self.io);
                 }
                 return;
             }
@@ -505,7 +505,7 @@ pub const H2Connection = struct {
                 s.stream_error = error.FlowControlError;
                 s.completed = true;
                 if (s.data_event) |ev| ev.set(self.io);
-                if (s.completion_sem) |sem| sem.post(self.io);
+                s.completion_event.set(self.io);
                 return;
             };
         }
@@ -518,7 +518,11 @@ pub const H2Connection = struct {
     /// last_stream_id were never processed and can be safely retried).
     pub fn handleGoaway(self: *Self, frame: *const Frame) !void {
         if (frame.payload.len < 8) return error.FrameSizeError;
-        self.last_peer_stream_id = @intCast(mem.readInt(u32, frame.payload[0..4], .big) & 0x7FFFFFFF);
+        const received_last_stream_id: u31 = @intCast(mem.readInt(u32, frame.payload[0..4], .big) & 0x7FFFFFFF);
+        self.last_peer_stream_id = if (self.goaway_received)
+            @min(self.last_peer_stream_id, received_last_stream_id)
+        else
+            received_last_stream_id;
         self.goaway_received = true;
 
         // Signal streams above last_stream_id — they were never processed.
@@ -529,9 +533,30 @@ pub const H2Connection = struct {
                 s.stream_error = error.GoawayRefused;
                 s.completed = true;
                 if (s.data_event) |ev| ev.set(self.io);
-                if (s.completion_sem) |sem| sem.post(self.io);
+                s.completion_event.set(self.io);
             }
         }
+    }
+
+    pub const PeerGoawayState = enum {
+        none,
+        draining,
+        drained,
+    };
+
+    /// Returns the peer GOAWAY state while holding the same lock used for
+    /// frame delivery. A connection is drained only after every stream the
+    /// peer said it may have processed has completed or been removed.
+    pub fn peerGoawayState(self: *Self) PeerGoawayState {
+        self.write_mutex.lockUncancelable(self.io);
+        defer self.write_mutex.unlock(self.io);
+        if (!self.goaway_received) return .none;
+        var it = self.stream_manager.streams.iterator();
+        while (it.next()) |entry| {
+            const stream = entry.value_ptr.*;
+            if (stream.id <= self.last_peer_stream_id and !stream.completed) return .draining;
+        }
+        return .drained;
     }
 
     /// Sends a GOAWAY frame advertising the last stream ID we processed (RFC 7540 §6.8).
@@ -837,7 +862,7 @@ pub const H2Connection = struct {
                         stream.completed = true;
                         stream_mod.freeDecodedHeaders(self.allocator, dec.headers);
                         if (stream.data_event) |ev| ev.set(self.io);
-                        if (stream.completion_sem) |sem| sem.post(self.io);
+                        stream.completion_event.set(self.io);
                         return;
                     }
                     // Store trailing headers separately to avoid overwriting
@@ -874,13 +899,13 @@ pub const H2Connection = struct {
                             stream.stream_error = error.ContentLengthMismatch;
                             stream.completed = true;
                             if (stream.data_event) |ev2| ev2.set(self.io);
-                            if (stream.completion_sem) |sem| sem.post(self.io);
+                            stream.completion_event.set(self.io);
                             return;
                         }
                     }
                     stream.completed = true;
                     stream.receiveEndStream();
-                    if (stream.completion_sem) |sem| sem.post(self.io);
+                    stream.completion_event.set(self.io);
                 }
             },
             .data => {
@@ -907,7 +932,7 @@ pub const H2Connection = struct {
                         stream.stream_error = error.FlowControlError;
                         stream.completed = true;
                         if (stream.data_event) |ev| ev.set(self.io);
-                        if (stream.completion_sem) |sem| sem.post(self.io);
+                        stream.completion_event.set(self.io);
                         return;
                     };
                     // RFC 7540 §6.9.1: connection-level flow control violation
@@ -921,7 +946,7 @@ pub const H2Connection = struct {
                     stream.stream_error = error.StreamClosed;
                     stream.completed = true;
                     if (stream.data_event) |ev| ev.set(self.io);
-                    if (stream.completion_sem) |sem| sem.post(self.io);
+                    stream.completion_event.set(self.io);
                     return;
                 }
                 const stream_data_limit: ?usize = stream.max_data_size orelse
@@ -930,7 +955,7 @@ pub const H2Connection = struct {
                     stream.stream_error = error.StreamDataOverflow;
                     stream.completed = true;
                     if (stream.data_event) |ev| ev.set(self.io);
-                    if (stream.completion_sem) |sem| sem.post(self.io);
+                    stream.completion_event.set(self.io);
                     return;
                 };
                 const new_size = std.math.add(
@@ -941,7 +966,7 @@ pub const H2Connection = struct {
                     stream.stream_error = error.StreamDataOverflow;
                     stream.completed = true;
                     if (stream.data_event) |ev| ev.set(self.io);
-                    if (stream.completion_sem) |sem| sem.post(self.io);
+                    stream.completion_event.set(self.io);
                     return;
                 };
                 if (stream_data_limit) |limit| {
@@ -953,7 +978,7 @@ pub const H2Connection = struct {
                         stream.stream_error = error.StreamDataOverflow;
                         stream.completed = true;
                         if (stream.data_event) |ev| ev.set(self.io);
-                        if (stream.completion_sem) |sem| sem.post(self.io);
+                        stream.completion_event.set(self.io);
                         return;
                     }
                 }
@@ -963,7 +988,7 @@ pub const H2Connection = struct {
                         stream.stream_error = error.BodyCapacityExceeded;
                         stream.completed = true;
                         if (stream.data_event) |ev| ev.set(self.io);
-                        if (stream.completion_sem) |sem| sem.post(self.io);
+                        stream.completion_event.set(self.io);
                         return;
                     }
                 }
@@ -987,13 +1012,13 @@ pub const H2Connection = struct {
                             stream.stream_error = error.ContentLengthMismatch;
                             stream.completed = true;
                             if (stream.data_event) |ev2| ev2.set(self.io);
-                            if (stream.completion_sem) |sem| sem.post(self.io);
+                            stream.completion_event.set(self.io);
                             return;
                         }
                     }
                     stream.completed = true;
                     stream.receiveEndStream();
-                    if (stream.completion_sem) |sem| sem.post(self.io);
+                    stream.completion_event.set(self.io);
                     if (stream.data_event) |ev2| ev2.set(self.io);
                 }
             },
@@ -1012,7 +1037,7 @@ pub const H2Connection = struct {
                 stream.stream_error = error.StreamReset;
                 stream.completed = true;
                 stream.reset();
-                if (stream.completion_sem) |sem| sem.post(self.io);
+                stream.completion_event.set(self.io);
                 if (stream.data_event) |ev| ev.set(self.io);
             },
             else => {},
@@ -1169,12 +1194,12 @@ pub const H2Connection = struct {
     }
 
     /// Continuously pumps frames until GOAWAY or connection error.
-    /// Delivers stream-level frames to per-stream mailboxes (posting
-    /// completion semaphores when set). Intended for a background
+    /// Delivers stream-level frames to per-stream mailboxes (setting
+    /// completion events). Intended for a background
     /// receive fiber on client-side multiplexed connections.
     pub fn runReceiveLoop(self: *Self, reader: anytype, writer: anytype) !void {
         defer self.signalAllStreams(error.ConnectionClosed);
-        while (!self.goaway_received) {
+        while (self.peerGoawayState() != .drained) {
             _ = self.processOneFrameLocked(reader, writer) catch |err| switch (err) {
                 error.ConnectionClosed => return,
                 else => return err,
@@ -1182,7 +1207,7 @@ pub const H2Connection = struct {
         }
     }
 
-    /// Signals all active streams with an error and posts their events/semaphores
+    /// Signals all active streams with an error and sets their events
     /// so waiting fibers don't hang forever after the receive loop exits.
     pub fn signalAllStreams(self: *Self, err: anyerror) void {
         self.write_mutex.lockUncancelable(self.io);
@@ -1195,7 +1220,7 @@ pub const H2Connection = struct {
                 s.stream_error = err;
                 s.completed = true;
                 if (s.data_event) |ev| ev.set(self.io);
-                if (s.completion_sem) |sem| sem.post(self.io);
+                s.completion_event.set(self.io);
             }
         }
     }
@@ -1422,6 +1447,42 @@ test "GOAWAY handling" {
     try conn.handleGoaway(&frame);
     try std.testing.expect(conn.goaway_received);
     try std.testing.expectEqual(@as(u31, 7), conn.last_peer_stream_id);
+}
+
+test "successive GOAWAY frames lower the accepted stream boundary" {
+    const allocator = std.testing.allocator;
+    var conn = H2Connection.initClient(allocator, std.testing.io);
+    defer conn.deinit();
+
+    const stream1 = try conn.stream_manager.createStream();
+    const stream3 = try conn.stream_manager.createStream();
+    const stream5 = try conn.stream_manager.createStream();
+
+    var first_payload: [8]u8 = undefined;
+    mem.writeInt(u32, first_payload[0..4], 5, .big);
+    mem.writeInt(u32, first_payload[4..8], @intFromEnum(Http2ErrorCode.no_error), .big);
+    var first = Frame{
+        .header = .{ .length = 8, .frame_type = .goaway, .flags = 0, .stream_id = 0 },
+        .payload = &first_payload,
+    };
+    try conn.handleGoaway(&first);
+    try std.testing.expectEqual(H2Connection.PeerGoawayState.draining, conn.peerGoawayState());
+
+    var second_payload: [8]u8 = undefined;
+    mem.writeInt(u32, second_payload[0..4], 1, .big);
+    mem.writeInt(u32, second_payload[4..8], @intFromEnum(Http2ErrorCode.no_error), .big);
+    var second = Frame{
+        .header = .{ .length = 8, .frame_type = .goaway, .flags = 0, .stream_id = 0 },
+        .payload = &second_payload,
+    };
+    try conn.handleGoaway(&second);
+
+    try std.testing.expectEqual(@as(u31, 1), conn.last_peer_stream_id);
+    try std.testing.expect(!stream1.completed);
+    try std.testing.expectEqual(error.GoawayRefused, stream3.stream_error.?);
+    try std.testing.expectEqual(error.GoawayRefused, stream5.stream_error.?);
+    stream1.completed = true;
+    try std.testing.expectEqual(H2Connection.PeerGoawayState.drained, conn.peerGoawayState());
 }
 
 test "WINDOW_UPDATE handling" {
@@ -3196,12 +3257,31 @@ test "applyInitialWindowSizeChange skips closed streams" {
     s3.send_window = 500;
 
     // Apply window size change: 65535 → 70000 (delta = +4465).
-    try manager.applyInitialWindowSizeChange(65535, 70000);
+    try manager.applyInitialWindowSizeChange(std.testing.io, 65535, 70000);
 
     // Open stream should be updated.
     try std.testing.expectEqual(@as(i32, 1000 + 4465), s1.send_window);
     // Closed stream should be unchanged (canSend() = false).
     try std.testing.expectEqual(@as(i32, 500), s3.send_window);
+}
+
+test "initial window overflow wakes stream waiters" {
+    const allocator = std.testing.allocator;
+    var manager = stream_mod.StreamManager.init(allocator, true);
+    defer manager.deinit();
+
+    const stream = try manager.createStream();
+    stream.state = .open;
+    stream.send_window = std.math.maxInt(i32) - 1;
+    var data_event: Io.Event = .unset;
+    stream.data_event = &data_event;
+
+    try manager.applyInitialWindowSizeChange(std.testing.io, 65535, 70000);
+
+    try std.testing.expectEqual(error.FlowControlError, stream.stream_error.?);
+    try std.testing.expect(stream.completed);
+    try std.testing.expect(data_event.isSet());
+    try std.testing.expect(stream.completion_event.isSet());
 }
 
 test "processOneFrameLocked propagates reader errors distinctly" {

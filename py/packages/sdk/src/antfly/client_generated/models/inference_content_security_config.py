@@ -13,31 +13,38 @@ T = TypeVar("T", bound="InferenceContentSecurityConfig")
 
 @_attrs_define
 class InferenceContentSecurityConfig:
-    """
-    Attributes:
-        allowed_hosts (list[str] | Unset): Whitelist of allowed hostnames/IPs for link downloads. If empty, all hosts
-            are allowed (except private IPs if block_private_ips is true). Example: ['example.com', 'cdn.example.com',
-            '192.0.2.1'].
-        block_private_ips (bool | Unset): Block requests to private IP ranges (127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12,
-            192.168.0.0/16, 169.254.0.0/16) Default: True.
-        max_download_size_bytes (int | Unset): Maximum size of downloaded content in bytes Default: 104857600. Example:
-            104857600.
-        download_timeout_seconds (int | Unset): Timeout for individual download operations in seconds Default: 30.
-            Example: 30.
-        max_image_dimension (int | Unset): Maximum image width/height in pixels (images will be resized) Default: 2048.
-            Example: 2048.
-        allowed_paths (list[str] | Unset): Whitelist of allowed path prefixes for file:// and s3:// URLs. If empty, all
-            paths are allowed. For file:// use absolute paths (e.g., /Users/data/). For s3:// use bucket/prefix (e.g., my-
-            bucket/uploads/). Example: ['/Users/data/', 'my-bucket/uploads/'].
-        user_agent (str | Unset): User-Agent header for HTTP downloads. Defaults to 'AntflyDB/1.0' if not set. Some
-            servers (e.g., Wikipedia) reject requests without a User-Agent. Example: AntflyDB/1.0.
+    """Inference merges configured fields over a fail-closed baseline. HTTP(S), file, and S3 content require explicit
+    allowlists; data URIs remain allowed within the configured size budget.
+
+        Attributes:
+            allowed_hosts (list[str] | Unset): Explicit HTTP(S) host allowlist for inference downloads. Omission and an
+                explicit empty list both deny all hosts. With block_private_ips enabled, IP literals and every address resolved
+                from an allowlisted DNS hostname must be globally routable; the connection is pinned to a vetted address.
+                Example: ['93.184.216.34'].
+            block_private_ips (bool | Unset): Reject loopback, private, link-local, carrier-grade NAT, reserved, and
+                multicast destinations. Allowlisted DNS hostnames are resolved, every result is filtered by this policy, and the
+                connection is pinned to a vetted address. Set false only as an explicit opt-out that permits private and special
+                destinations. Default: True.
+            max_download_size_bytes (int | Unset): Maximum size of downloaded content in bytes Default: 104857600. Example:
+                104857600.
+            download_timeout_seconds (int | Unset): Maximum HTTP download duration in seconds. Defaults to 30; 0 disables
+                the deadline. Default: 30.
+            max_image_dimension (int | Unset): Maximum source-image width or height for accepted inference image inputs,
+                including generate/chat, dense embed, multimodal rerank, `/read`, image `/extract`, and their embedded direct
+                APIs. Headers exceeding this limit are rejected before model execution; images are not resized. Batch generation
+                rejects multimodal content before fetch. Non-inference scraping consumers do not enforce this setting.
+            allowed_paths (list[str] | Unset): Explicit path-prefix allowlist for inference file:// and s3:// URLs. Omission
+                and an explicit empty list both deny all file and S3 paths. For file:// use absolute paths (e.g., /Users/data/).
+                For s3:// use bucket/prefix (e.g., my-bucket/uploads/). Example: ['/Users/data/', 'my-bucket/uploads/'].
+            user_agent (str | Unset): User-Agent header for HTTP downloads. Defaults to 'AntflyDB/1.0' if not set. Some
+                servers (e.g., Wikipedia) reject requests without a User-Agent. Example: AntflyDB/1.0.
     """
 
     allowed_hosts: list[str] | Unset = UNSET
     block_private_ips: bool | Unset = True
     max_download_size_bytes: int | Unset = 104857600
     download_timeout_seconds: int | Unset = 30
-    max_image_dimension: int | Unset = 2048
+    max_image_dimension: int | Unset = UNSET
     allowed_paths: list[str] | Unset = UNSET
     user_agent: str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)

@@ -265,14 +265,26 @@ pub fn printBackendTimingDetails(
         },
     );
     std.debug.print(
-        "{s}_attention_dispatch: paged_1x={d}\n",
-        .{ prefix, provider_stats.metal_runtime_paged_attention_1x_calls },
+        "{s}_attention_dispatch: paged_1x={d} decode_gqa_split={d} generated_decode_1x={d} generated_flash_prefill={d} generated_flash_prefill_hd512={d} generated_rms_norm={d}\n",
+        .{
+            prefix,
+            provider_stats.metal_runtime_paged_attention_1x_calls,
+            provider_stats.metal_runtime_decode_gqa_split_calls,
+            provider_stats.metal_runtime_generated_attention_decode_1x_calls,
+            provider_stats.metal_runtime_generated_attention_flash_prefill_calls,
+            provider_stats.metal_runtime_generated_attention_flash_prefill_hd512_calls,
+            provider_stats.metal_runtime_generated_rms_norm_calls,
+        },
     );
     std.debug.print(
-        "{s}_q4_0_dispatch: linear_reduce={d} linear_reduce_in_f16={d} linear_reduce_out_f16={d} linear_reduce_in_f16_out_f16={d} linear_reduce_sumsq={d} pair_act_reduce={d} pair_act_reduce_out_f16={d} pair_act_rms_scale_reduce_out_f16={d} activation_rhs_reduce={d} activation_rhs_reduce_out_f16={d} rms_norm_add_sumsq={d} pair_reduce={d} pair={d}\n",
+        "{s}_q4_0_dispatch: linear_reduce={d} linear_reduce_rows={d}/{d}/{d}/{d} linear_reduce_in_f16={d} linear_reduce_out_f16={d} linear_reduce_in_f16_out_f16={d} linear_reduce_sumsq={d} pair_act_reduce={d} pair_act_reduce_out_f16={d} pair_act_rms_scale_reduce_out_f16={d} activation_rhs_reduce={d} activation_rhs_reduce_out_f16={d} rms_norm_add_sumsq={d} pair_reduce={d} pair={d}\n",
         .{
             prefix,
             provider_stats.metal_runtime_q4_0_linear_reduce,
+            provider_stats.metal_runtime_q4_0_linear_reduce_rows_1,
+            provider_stats.metal_runtime_q4_0_linear_reduce_rows_2_8,
+            provider_stats.metal_runtime_q4_0_linear_reduce_rows_9_64,
+            provider_stats.metal_runtime_q4_0_linear_reduce_rows_65_plus,
             provider_stats.metal_runtime_q4_0_linear_reduce_f16_input,
             provider_stats.metal_runtime_q4_0_linear_reduce_f16_output,
             provider_stats.metal_runtime_q4_0_linear_reduce_f16_input_f16_output,
@@ -288,15 +300,23 @@ pub fn printBackendTimingDetails(
         },
     );
     std.debug.print(
-        "{s}_q4_q6_k_dispatch: q4_linear_reduce={d} q4_pair_reduce={d} q4_pair_act_reduce={d} q4_pair_act_reduce_out_f16={d} q4_activation_rhs_reduce={d} q6_linear_reduce={d} q6_linear_reduce_in_f16={d}\n",
+        "{s}_q4_q6_k_dispatch: q4_linear_reduce={d} q4_linear_reduce_rows={d}/{d}/{d}/{d} q4_pair_reduce={d} q4_pair_act_reduce={d} q4_pair_act_reduce_out_f16={d} q4_activation_rhs_reduce={d} q6_linear_reduce={d} q6_linear_reduce_rows={d}/{d}/{d}/{d} q6_linear_reduce_in_f16={d}\n",
         .{
             prefix,
             provider_stats.metal_runtime_q4_k_linear_reduce,
+            provider_stats.metal_runtime_q4_k_linear_reduce_rows_1,
+            provider_stats.metal_runtime_q4_k_linear_reduce_rows_2_8,
+            provider_stats.metal_runtime_q4_k_linear_reduce_rows_9_64,
+            provider_stats.metal_runtime_q4_k_linear_reduce_rows_65_plus,
             provider_stats.metal_runtime_q4_k_pair_reduce,
             provider_stats.metal_runtime_q4_k_pair_activation_reduce,
             provider_stats.metal_runtime_q4_k_pair_activation_reduce_f16_output,
             provider_stats.metal_runtime_q4_k_activation_rhs_reduce,
             provider_stats.metal_runtime_q6_k_linear_reduce,
+            provider_stats.metal_runtime_q6_k_linear_reduce_rows_1,
+            provider_stats.metal_runtime_q6_k_linear_reduce_rows_2_8,
+            provider_stats.metal_runtime_q6_k_linear_reduce_rows_9_64,
+            provider_stats.metal_runtime_q6_k_linear_reduce_rows_65_plus,
             provider_stats.metal_runtime_q6_k_linear_reduce_f16_input,
         },
     );

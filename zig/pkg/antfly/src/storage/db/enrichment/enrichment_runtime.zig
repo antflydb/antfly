@@ -418,6 +418,14 @@ fn yieldToInteractiveEmbeds(runtime: *EnrichmentRuntime) void {
     }
 }
 
+fn yieldToInteractiveGeneration(runtime: *EnrichmentRuntime) void {
+    if (comptime builtin.os.tag == .freestanding) return;
+    while (enrichment_types.interactive_generate_inflight.load(.monotonic) > 0) {
+        if (runtimeShuttingDown(runtime)) return;
+        sleepRetryBackoff(query_yield_poll_ns);
+    }
+}
+
 fn runtimeShuttingDown(runtime: *EnrichmentRuntime) bool {
     if (comptime builtin.os.tag == .freestanding) return false;
     const io_impl = runtime.io_impl orelse return runtime.shutdown;
@@ -589,6 +597,7 @@ fn enrichmentErrorDisposition(err: anyerror) EnrichmentErrorDisposition {
         error.InvalidDocumentExtractionManifest,
         error.InvalidDocumentExtractionState,
         error.InvalidGraphAssetState,
+        error.ResourceLimitExceeded,
         error.MissingDocxDocumentXml,
         error.PdfExtractionUnavailable,
         error.UnsupportedCompressionMethod,
@@ -753,8 +762,10 @@ fn isEnrichmentControlError(err: anyerror) bool {
     return err == error.EnrichmentRetryAborted;
 }
 
-test "enrichment treats missing local model as retryable" {
+test "enrichment distinguishes transient capacity from permanent resource limits" {
     try std.testing.expect(isRetryableEnrichmentError(error.ModelNotFound));
+    try std.testing.expect(isRetryableEnrichmentError(error.ResourceTemporarilyUnavailable));
+    try std.testing.expect(!isRetryableEnrichmentError(error.ResourceLimitExceeded));
 }
 
 test "enrichment retries unknown errors and isolates known permanent errors" {
@@ -3051,6 +3062,8 @@ fn flushAssetProducerBatch(
     if (items.items.len == 0) return;
     setActiveFailureFingerprint(runtime, assetProducerBatchFailureFingerprint(items.items));
     defer clearAssetProducerBatchItems(runtime.alloc, items);
+
+    yieldToInteractiveGeneration(runtime);
 
     const producer = runtime.config.asset_producer orelse return error.MissingAssetProducer;
     const requests = try runtime.alloc.alloc(asset_producer_mod.Request, items.items.len);
@@ -6642,7 +6655,13 @@ fn processDenseEmbedding(
     defer runtime.alloc.free(raw);
 
     if (request.source_template.len > 0 and dense_embedder.supportsParts()) {
-        const source_parts = try renderSourceParts(runtime.alloc, runtime.config, raw, request);
+        const source_parts = try renderSourceParts(
+            runtime.alloc,
+            runtime.config,
+            raw,
+            request,
+            dense_embedder.mediaPartLimit(embedding_artifact_name),
+        );
         if (source_parts) |parts| {
             defer template.freeContentParts(runtime.alloc, parts);
 
@@ -9711,6 +9730,7 @@ fn storePutBatch(runtime: *EnrichmentRuntime, writes: []const KVPair, deletes: [
 fn remoteRenderConfig(
     secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
+    max_media_parts: ?usize,
 ) template_remote.RenderConfig {
     var config: template_remote.RenderConfig = .{};
     if (comptime @hasField(template_remote.RenderConfig, "secret_store")) {
@@ -9718,6 +9738,9 @@ fn remoteRenderConfig(
     }
     if (comptime @hasField(template_remote.RenderConfig, "remote_content")) {
         config.remote_content = remote_content;
+    }
+    if (comptime @hasField(template_remote.RenderConfig, "max_media_parts")) {
+        config.max_media_parts = max_media_parts;
     }
     return config;
 }
@@ -9764,14 +9787,14 @@ fn renderSourceTemplateText(
             alloc,
             source_template,
             raw_doc,
-            remoteRenderConfig(config.secret_store, config.remote_content),
+            remoteRenderConfig(config.secret_store, config.remote_content, null),
         );
     }
     return try template_remote.renderJsonToTextWithConfig(
         alloc,
         source_template,
         raw_doc,
-        remoteRenderConfig(config.secret_store, config.remote_content),
+        remoteRenderConfig(config.secret_store, config.remote_content, null),
     );
 }
 
@@ -9818,10 +9841,11 @@ fn renderSourceParts(
     config: Config,
     raw_doc: []const u8,
     request: enrichment_types.GeneratedEnrichmentRequest,
+    max_media_parts: ?usize,
 ) !?[]template.ContentPart {
     if (request.source_template.len == 0) return null;
     const parts = if (comptime @hasDecl(template_remote, "renderJsonToPartsWithConfig"))
-        template_remote.renderJsonToPartsWithConfig(alloc, request.source_template, raw_doc, remoteRenderConfig(config.secret_store, config.remote_content)) catch |err| switch (err) {
+        template_remote.renderJsonToPartsWithConfig(alloc, request.source_template, raw_doc, remoteRenderConfig(config.secret_store, config.remote_content, max_media_parts)) catch |err| switch (err) {
             error.PermanentPromptFailure, error.TransientPromptFailure => return err,
             else => return null,
         }
@@ -9843,7 +9867,7 @@ fn renderSourcePartsJson(
     raw_doc: []const u8,
     request: enrichment_types.GeneratedEnrichmentRequest,
 ) !?[]u8 {
-    const parts = try renderSourceParts(alloc, config, raw_doc, request) orelse return null;
+    const parts = try renderSourceParts(alloc, config, raw_doc, request, null) orelse return null;
     defer template.freeContentParts(alloc, parts);
     return try contentPartsJsonAlloc(alloc, parts);
 }

@@ -4,7 +4,6 @@
 const std = @import("std");
 const antfly_chunking_api_openapi = @import("antfly_chunking_api_openapi");
 const antfly_generating_openapi = @import("antfly_generating_openapi");
-const antfly_logging_openapi = @import("antfly_logging_openapi");
 const antfly_s3_openapi = @import("antfly_s3_openapi");
 const antfly_scraping_openapi = @import("antfly_scraping_openapi");
 
@@ -89,7 +88,7 @@ pub const Config = struct {
     models_dir: ?[]const u8 = null,
     /// Base directory containing Traditional ML predictor subdirectories. The `/ml/v1/*` API auto-discovers predictors from `{ml_dir}/{name}/tabular_model.json`. Defaults to ~/.antfly/inference/ml.
     ml_dir: ?[]const u8 = null,
-    /// Security settings for downloading content from URLs (e.g., images for CLIP models). Controls allowed hosts, private IP blocking, download limits, and timeouts.
+    /// Configured fields are merged individually over a fail-closed inference baseline. Omitted or empty policies deny HTTP(S), file, and S3 while allowing data URIs; omitted allowed_hosts and allowed_paths remain explicit deny-all lists even when another field is configured. Enable remote sources only with explicit allowlists. block_private_ips defaults to true; while enabled, IP literals and every address resolved from an allowlisted DNS hostname must be globally routable, and the connection is pinned to a vetted address. Setting it to false explicitly opts into private and special destinations. Across generate, dense embed, and multimodal rerank, downloaded and inline encoded media is capped cumulatively per request at the lower of 100 MiB, max_download_size_bytes, and—when max_concurrent_requests is positive—16 MiB times that capacity; zero max_download_size_bytes disables nonempty media. Remote URL byte potential is reserved before fetch, while inline sources use their actual encoded size. Accepted image inputs also undergo header-only dimension and aggregate decoded-pixel admission before model execution. Batch generation rejects multimodal content before fetch. Embedded direct transcription and extraction use the configured encoded-media per-call ceiling, and direct dense embedding also applies pre-allocation and decoded-image admission. In unified Antfly configuration, an empty inference policy may first inherit a nonempty remote_content security policy, which is then merged over this baseline.
     content_security: ?antfly_scraping_openapi.ContentSecurityConfig = null,
     /// S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail.
     s3_credentials: ?antfly_s3_openapi.Credentials = null,
@@ -97,27 +96,29 @@ pub const Config = struct {
     keep_alive: ?[]const u8 = null,
     /// Maximum total models loaded across all registry types (embedders, rerankers, generators, chunkers, etc.). When the limit is reached, the least-recently-used idle model from any registry is evicted to make room. Set to 0 for unlimited. Defaults to 10.
     max_loaded_models: ?i64 = null,
-    /// Number of concurrent inference pipelines per model. Each pipeline loads a copy of the model, so higher values use more memory but allow more concurrent requests. Note: pool_size multiplies per-model memory independently of max_loaded_models.
+    /// Legacy compatibility field. The current Zig inference runtime does not create per-model pipeline pools from this setting; configuring it has no effect.
     pool_size: ?i64 = null,
     /// Native generator prompt KV cache settings.
     prompt_cache: ?PromptCacheConfig = null,
-    /// Backend priority order for model loading with optional device specifiers. Format: `backend` or `backend:device` where device defaults to `auto`. Antfly inference tries entries in order and uses the first available backend+device combination that supports the model. **Backends** (depend on build flags): - `native` - Native CPU backend - `onnx` - ONNX Runtime backend - `metal` - Apple Metal backend - `cuda` - NVIDIA CUDA backend - `xla` - PJRT/XLA compiled backend **Devices**: - `auto` - Auto-detect best available (default) - `cuda` - NVIDIA CUDA GPU - `tpu` - Google TPU (used by XLA) - `cpu` - Force CPU only **Examples**: - `["native", "onnx", "xla"]` - Try backends with auto device detection - `["cuda", "onnx:cuda", "xla:tpu", "native"]` - Prefer GPU, fall back to CPU
+    kernel_jit: ?KernelJitConfig = null,
+    /// Legacy compatibility field. The current Zig inference runtime selects a backend from model metadata, explicit preload settings, and compiled capabilities; configuring this list has no effect.
     backend_priority: ?[]const []const u8 = null,
-    /// Maximum number of concurrent inference requests allowed. Additional requests will be queued up to max_queue_size. Set to 0 for unlimited (default).
+    /// Maximum concurrent weighted inference admission units in the Zig runtime. Request body size, generation workload, and image byte/count reservations can consume more than one unit. Read and image-extraction admission reserves the effective downloaded-byte ceiling at 16 MiB per unit and at least one unit per two images. A positive capacity also clamps each such request's downloaded-image ceiling to 16 MiB times this value. Set to 0 disables both admission accounting and that capacity-derived clamp. When a positive limit is exhausted, new requests are rejected immediately with 503 Service Unavailable and Retry-After: 1; they are not retained in an in-process queue. Set to 0 only as an operational escape hatch for trusted testing environments; unlimited admission is not recommended for production native generation. Use a positive production limit. The default is 32.
     max_concurrent_requests: ?i64 = null,
-    /// Maximum number of requests to queue when max_concurrent_requests is reached. When the queue is full, new requests receive 503 Service Unavailable with Retry-After header. Set to 0 for unlimited queue (default). Only effective when max_concurrent_requests > 0.
+    /// Legacy Go-runtime queue setting. The current Zig runtime does not retain excess inference requests in memory and ignores this field.
     max_queue_size: ?i64 = null,
-    /// Maximum time to wait for a request to complete, including queue wait time. Use Go duration format: "30s", "1m", "0" (no timeout, default). Requests exceeding this timeout receive 504 Gateway Timeout.
+    /// Legacy Go-runtime queue/request timeout. The current Zig runtime ignores this field; its HTTP listener applies a separate fixed transport timeout.
     request_timeout: ?[]const u8 = null,
-    /// Models to preload and warm at startup. Generators run a tiny generation request so native/Metal weights, KV setup, and kernels use the same budgeted path as request-time generation. Other model kinds use the best available warm path for that kind.
+    /// Models to preload and warm at startup. Generators run a tiny generation request so native/Metal weights, KV setup, and kernels use the same budgeted path as request-time generation. Other model kinds use the best available warm path for that kind. When runtime kernel JIT is enabled, every vision, audio, and projection session declared by a preloaded model is also loaded without running media inference. Runtime kernel JIT `required` mode rejects an empty preload list.
     preload: ?[]const ModelRef = null,
-    /// Maximum memory (in MB) to use for loaded models. When this limit is approached, least recently used models are unloaded. Set to 0 for unlimited (default). This is an advisory limit - actual memory usage depends on model sizes and may temporarily exceed this value. Works alongside max_loaded_models for fine-grained control.
+    /// Legacy compatibility field. The current Zig runtime uses explicit host, backend, combined, KV, and scratch budgets instead and ignores this field.
     max_memory_mb: ?i64 = null,
     /// Per-model loading strategy overrides. Maps model names to their loading strategy. Models not in this map load on demand. keep_alive controls their idle eviction; setting it to "0" disables idle eviction but does not preload or pin them. When a model has strategy "eager" in this map: - It is loaded at startup through the same startup warmup path - It is never unloaded, even when keep_alive>0 (pinned in memory) This allows mixing eager and lazy models in the same pool.
     model_strategies: ?std.json.ArrayHashMap([]const u8) = null,
-    /// Whether the dashboard should show model download commands. Defaults to true for standalone inference and Antfly standalone deployments. Set to false in managed deployments (e.g., Kubernetes operator) where models are managed externally.
+    /// Legacy compatibility field controlling whether dashboards show model download commands. It defaults to true for standalone deployments; managed deployments historically set it to false. Download-command availability is a build-time setting in the current Zig runtime, so configuring this field has no effect.
     allow_downloads: ?bool = null,
-    log: ?antfly_logging_openapi.Config = null,
+    /// Legacy inference-local logging field. The current unified Zig runtime ignores it; configure the top-level `log` object instead.
+    log: ?std.json.Value = null,
 };
 
 /// A content part for multimodal input (text, image URL, or inline media)
@@ -252,6 +253,7 @@ pub const FunctionDefinition = struct {
 };
 
 pub const GenerateBatchError = struct {
+    /// Stable machine-readable item error code, including `CONTENT_TOO_LARGE` for aggregate media-budget failures.
     code: []const u8,
     message: []const u8,
     retryable: ?bool = null,
@@ -413,6 +415,49 @@ pub const ImageURL = struct {
 pub const ImageURLContentPart = struct {
     type: []const u8,
     image_url: ImageURL,
+};
+
+/// Runtime Metal and CUDA kernel JIT configuration. Live compilation and GPU qualification run only for models in the configured startup `preload` list, before serving begins. A cold dynamic model load never benchmarks against an in-use GPU: `on` and `shadow` retain bundled kernels, while `required` rejects the load. When runtime JIT is enabled, startup also materializes every vision, audio, and projection session declared by each preloaded model without running media inference. Preload every model that must use runtime-JIT kernels; `required` rejects an empty preload list.
+pub const KernelJitConfig = struct {
+    mode: ?KernelJitMode = null,
+    /// Persistent artifact cache directory on Linux and macOS. Omit to use ~/.antfly/inference/jit when HOME is available.
+    cache_dir: ?[]const u8 = null,
+    /// Persistent cache size limit in MiB. Set to 0 to disable disk persistence.
+    max_cache_bytes_mb: ?i64 = null,
+    /// Per direct model session pre-publication start budget for best-effort `on` and `shadow` JIT work. A compiler or qualification operation already started may overrun the budget. Multimodal model preloads may create several direct sessions, each with this budget. `required` completes or fails all required routes and may exceed this value.
+    preload_budget_ms: ?i64 = null,
+};
+
+/// Runtime kernel JIT operating mode. `off` disables compilation. `shadow` compiles and validates without dispatching JIT kernels. `on` may activate qualified kernels while preserving the production fallback. `required` fails model loading when there are no eligible routes or any scoped route cannot qualify, rejects sessions that are not direct Metal or CUDA sessions, and requires at least one configured startup preload. Backend preference remains separately configured; this mode neither enables nor selects a backend. Runtime JIT is currently supported on Linux and macOS; other platforms reject non-`off` modes rather than silently degrading.
+pub const KernelJitMode = enum {
+    off,
+    shadow,
+    on,
+    required,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .off => "off",
+            .shadow => "shadow",
+            .on => "on",
+            .required => "required",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "off", .off },
+            .{ "shadow", .shadow },
+            .{ "on", .on },
+            .{ "required", .required },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// Binary or URL media content for providers that support non-image media parts.
@@ -586,7 +631,7 @@ pub const ModelQuantization = enum {
     }
 };
 
-/// Model reference used by startup preload and model-loading configuration.
+/// Model reference used by startup preload and model-loading configuration. When a preload selects an explicit backend, that warmed session also becomes the model's default in-process session for later `auto` requests; callers do not need to repeat the backend on every request.
 pub const ModelRef = struct {
     kind: ModelKind,
     /// Model name to resolve within the registry for the selected kind, usually in `<owner>/<repo>` format.
@@ -628,7 +673,7 @@ pub const ModelsResponse = struct {
 pub const PromptCacheConfig = struct {
     /// Enable inference-native prompt KV cache reuse for generator requests.
     enabled: ?bool = null,
-    /// Prompt KV cache implementation. `block_hash` (default) uses hash-addressed full KV blocks under prompt_cache_key with O(1) block lookup and is the scalable production mode. `simple` keeps the linear-scan retained-prefix cache and is only suitable for small caches or debugging.
+    /// Prompt KV cache implementation. `block_hash` (default) uses hash-addressed full KV blocks under prompt_cache_key with O(1) block lookup. `radix` is an opt-in page-aligned compressed radix tree with shared-prefix ownership and leaf-only LRU eviction; it is currently qualified for native and Metal backends. Eligible Metal requests use eager paged attention; explicit compiled generation is incompatible with prompt caching. `simple` keeps the linear-scan retained-prefix cache and is only suitable for small caches or debugging.
     mode: ?[]const u8 = null,
     /// Node-wide target for live prompt-cache entries. The runtime divides it across participating model caches and evicts using estimated metadata and logical host/device KV bytes. Backend allocators may retain reusable capacity, so this is not a hard cap on process or accelerator memory.
     max_bytes_mb: ?i64 = null,

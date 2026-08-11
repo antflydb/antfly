@@ -6,9 +6,9 @@
 //! ## What Works Today
 //!
 //! - **Client TLS 1.2/1.3**: Full handshake, certificate verification, SNI.
-//! - **HTTP/2 over TLS**: Set `http2_enabled` or `force_http2` in `ClientConfig`.
-//!   The client sends the h2 connection preface directly ("prior knowledge" mode,
-//!   RFC 7540 §3.4) and multiplexes streams on a single connection.
+//! - **HTTP/2 over TLS**: Zig cannot negotiate or report ALPN. Callers must
+//!   explicitly opt into non-negotiated H2 for an endpoint known to require it;
+//!   ordinary HTTPS requests must remain on HTTP/1.1.
 //!
 //! ## Stdlib Limitations (Zig 0.16)
 //!
@@ -156,7 +156,7 @@ pub const TlsSession = struct {
 
     /// Protocol negotiated via ALPN (e.g. "h2", "http/1.1").
     /// Currently always null because `std.crypto.tls.Client` does not expose
-    /// the negotiated protocol. Set manually when using "prior knowledge" mode.
+    /// the negotiated protocol.
     negotiated_protocol: ?[]const u8 = null,
 
     const Self = @This();
@@ -288,7 +288,7 @@ pub const TlsSession = struct {
         // Zig 0.16 `std.crypto.tls.Client` does not expose this field.
         // When the stdlib adds ALPN support, wire it in here:
         //   self.negotiated_protocol = client.alpn_protocol;
-        // Until then, callers that need h2 use "prior knowledge" mode.
+        // Until then, callers cannot infer that a TLS peer selected h2.
     }
 
     fn caBundleOption(self: *Self) @FieldType(TlsClient.Options, "ca") {

@@ -3000,6 +3000,11 @@ fn isRetryableMetadataBootstrapError(err: anyerror) bool {
         error.ProposalDropped,
         error.LeaderTransferInProgress,
         error.StoreRegistrationNotVisible,
+        // Metadata listeners can accept connections before their first
+        // authoritative incarnation has been established. Data nodes that
+        // start in that window must retry; an actual incarnation mismatch or
+        // invalid incarnation remains fatal.
+        error.MetadataIncarnationUnavailable,
         // Destination admission intentionally fails closed while another
         // table/group lifecycle owner is active. Retrying through the bounded
         // control-plane backoff preserves that exclusion without terminating
@@ -3052,9 +3057,11 @@ test "data runtime treats metadata leadership churn as retryable bootstrap failu
     try std.testing.expect(isRetryableMetadataBootstrapError(error.LeaderTransferInProgress));
     try std.testing.expect(isRetryableMetadataBootstrapError(error.ConnectionRefused));
     try std.testing.expect(isRetryableMetadataBootstrapError(error.StoreRegistrationNotVisible));
+    try std.testing.expect(isRetryableMetadataBootstrapError(error.MetadataIncarnationUnavailable));
     try std.testing.expect(isRetryableMetadataBootstrapError(error.MissingAuthoritativeBootstrapVoters));
     try std.testing.expect(isRetryableMetadataBootstrapError(error.TransitionDestinationProvisioningBusy));
     try std.testing.expect(!isRetryableMetadataBootstrapError(error.InvalidArguments));
+    try std.testing.expect(!isRetryableMetadataBootstrapError(error.MetadataIncarnationMismatch));
 }
 
 test "replicated transition action lanes fail fast without serializing unrelated groups" {

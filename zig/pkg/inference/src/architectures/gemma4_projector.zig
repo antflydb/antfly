@@ -348,8 +348,10 @@ fn prepareGemma4RawAudioFrames(
     const target_rate: u32 = 16_000;
     const max_samples = std.math.mul(usize, samples_per_token, max_tokens) catch return error.InvalidTensorShape;
 
-    var decoded = try audio.decode(allocator, audio_bytes, .{});
+    var decoded = try audio.decodeBounded(allocator, audio_bytes, .{}, audio.default_decode_working_bytes);
     defer decoded.deinit();
+    const source_limit = try sourceSampleLimitForResample(max_samples, decoded.sample_rate, target_rate);
+    if (decoded.samples.len > source_limit) return error.AudioInputTooLong;
     const resampled = try audio.copyOrResample(allocator, decoded.samples, decoded.sample_rate, target_rate);
     defer allocator.free(resampled);
 
@@ -364,6 +366,14 @@ fn prepareGemma4RawAudioFrames(
     @memset(out, 0.0);
     if (real_samples > 0) @memcpy(out[0..real_samples], resampled[0..real_samples]);
     return out;
+}
+
+fn sourceSampleLimitForResample(target_samples: usize, source_rate: u32, target_rate: u32) !usize {
+    if (source_rate == 0 or target_rate == 0) return error.UnsupportedAudioFormat;
+    const numerator = std.math.mul(u128, @as(u128, target_samples), @as(u128, source_rate)) catch
+        return error.AudioInputTooLong;
+    const source_samples = numerator / @as(u128, target_rate);
+    return std.math.cast(usize, source_samples) orelse error.AudioInputTooLong;
 }
 
 test "gemma4 direct audio frames preserve raw waveform samples" {
@@ -386,6 +396,12 @@ test "gemma4 direct audio frames preserve raw waveform samples" {
     try std.testing.expectEqual(@as(f32, 0.0), frames[5]);
     try std.testing.expectEqual(@as(f32, 0.0), frames[6]);
     try std.testing.expectEqual(@as(f32, 0.0), frames[7]);
+}
+
+test "gemma4 audio source window is bounded before resampling" {
+    try std.testing.expectEqual(@as(usize, 30), try sourceSampleLimitForResample(480_000, 1, 16_000));
+    try std.testing.expectEqual(@as(usize, 1_440_000), try sourceSampleLimitForResample(480_000, 48_000, 16_000));
+    try std.testing.expectError(error.UnsupportedAudioFormat, sourceSampleLimitForResample(480_000, 0, 16_000));
 }
 
 const AudioFeatures = struct {
@@ -424,9 +440,11 @@ fn prepareGemma4AudioFeatures(
     const max_samples: usize = 480_000;
     const pad_multiple: usize = 128;
 
-    var decoded = try audio.decode(allocator, audio_bytes, .{});
+    var decoded = try audio.decodeBounded(allocator, audio_bytes, .{}, audio.default_decode_working_bytes);
     defer decoded.deinit();
-    const resampled = try audio.copyOrResample(allocator, decoded.samples, decoded.sample_rate, target_rate);
+    const source_limit = try sourceSampleLimitForResample(max_samples, decoded.sample_rate, target_rate);
+    const source_window = decoded.samples[0..@min(decoded.samples.len, source_limit)];
+    const resampled = try audio.copyOrResample(allocator, source_window, decoded.sample_rate, target_rate);
     defer allocator.free(resampled);
 
     const real_samples: usize = @min(resampled.len, max_samples);

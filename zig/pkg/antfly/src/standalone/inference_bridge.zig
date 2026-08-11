@@ -19,7 +19,9 @@
 const error_abi = @import("../runtime_error_abi.zig");
 const http_abi = @import("../runtime_http_abi.zig");
 
-pub const abi_version = error_abi.abi_version;
+pub const abi_version: u32 = 2;
+pub const ai_api_prefix = "/ai/v1";
+pub const public_api_prefix = "/ml/v1";
 pub const Status = error_abi.Status;
 pub const statusFromError = error_abi.statusFromError;
 pub const errorFromStatus = error_abi.errorFromStatus;
@@ -78,6 +80,7 @@ pub const CreateContext = extern struct {
     has_max_loaded_models: u8,
     content_security_json: OptionalString,
     s3_credentials_json: OptionalString,
+    runtime_config_json: String,
     out_handle: *?*anyopaque,
 };
 

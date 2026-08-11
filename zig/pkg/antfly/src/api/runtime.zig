@@ -57,6 +57,7 @@ pub const http_internal_group_join_routes = @import("http_internal_group_join_ro
 pub const internal_batch_forwarding = @import("internal_batch_forwarding.zig");
 pub const http_server = @import("http_server.zig");
 pub const kernel_bridge = @import("kernel_bridge.zig");
+pub const kernel_abi = @import("kernel_abi.zig");
 pub const http_client = @import("http_client.zig");
 pub const httpx_handler = @import("httpx_handler.zig");
 pub const connections = @import("connections.zig");

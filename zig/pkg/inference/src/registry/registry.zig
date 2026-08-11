@@ -51,6 +51,56 @@ test {
     _ = download;
 }
 
+/// Friendly short names accepted by user-facing commands (chat) in place of a
+/// full HuggingFace `owner/name[:variant]` reference. The blessed sources are
+/// Google's official QAT q4_0 GGUF conversions — the checkpoints production
+/// workflows already run on. Each repo carries a single decoder GGUF plus an
+/// mmproj sidecar, so the plain `:gguf` variant resolves unambiguously.
+pub const FriendlyAlias = struct {
+    alias: []const u8,
+    ref: []const u8,
+};
+
+pub const friendly_aliases = [_]FriendlyAlias{
+    .{ .alias = "gemma4-e2b", .ref = "google/gemma-4-E2B-it-qat-q4_0-gguf:gguf" },
+    .{ .alias = "gemma-4-e2b", .ref = "google/gemma-4-E2B-it-qat-q4_0-gguf:gguf" },
+    .{ .alias = "gemma4-e2b-it", .ref = "google/gemma-4-E2B-it-qat-q4_0-gguf:gguf" },
+    .{ .alias = "gemma4-e4b", .ref = "google/gemma-4-E4B-it-qat-q4_0-gguf:gguf" },
+    .{ .alias = "gemma-4-e4b", .ref = "google/gemma-4-E4B-it-qat-q4_0-gguf:gguf" },
+    .{ .alias = "gemma4-e4b-it", .ref = "google/gemma-4-E4B-it-qat-q4_0-gguf:gguf" },
+};
+
+/// Resolve a friendly alias to its pinned `owner/name:variant` reference.
+/// Returns null when the name is not a known alias (callers then treat it as
+/// a raw model reference or path).
+pub fn resolveFriendlyRef(name: []const u8) ?[]const u8 {
+    for (friendly_aliases) |entry| {
+        if (std.ascii.eqlIgnoreCase(entry.alias, name)) return entry.ref;
+    }
+    return null;
+}
+
+test "resolveFriendlyRef resolves gemma4 aliases case-insensitively" {
+    const expected_e2b = "google/gemma-4-E2B-it-qat-q4_0-gguf:gguf";
+    const expected_e4b = "google/gemma-4-E4B-it-qat-q4_0-gguf:gguf";
+    try std.testing.expectEqualStrings(expected_e2b, resolveFriendlyRef("gemma4-e2b").?);
+    try std.testing.expectEqualStrings(expected_e2b, resolveFriendlyRef("gemma-4-e2b").?);
+    try std.testing.expectEqualStrings(expected_e2b, resolveFriendlyRef("Gemma4-E2B").?);
+    try std.testing.expectEqualStrings(expected_e4b, resolveFriendlyRef("gemma4-e4b").?);
+    try std.testing.expectEqualStrings(expected_e4b, resolveFriendlyRef("gemma4-e4b-it").?);
+    try std.testing.expect(resolveFriendlyRef("gemma4") == null);
+    try std.testing.expect(resolveFriendlyRef("ggml-org/gemma-4-e2b-it-gguf") == null);
+}
+
+test "friendly alias refs parse as model refs" {
+    for (friendly_aliases) |entry| {
+        const ref = try ModelRef.parse(entry.ref);
+        try std.testing.expect(ref.owner.len > 0);
+        try std.testing.expect(ref.name.len > 0);
+        try std.testing.expectEqualStrings("gguf", ref.variant);
+    }
+}
+
 pub const ModelRef = struct {
     owner: []const u8,
     name: []const u8,
@@ -75,14 +125,13 @@ pub const ModelRef = struct {
         if (std.mem.indexOfScalar(u8, name_part, '/')) |slash| {
             const owner = name_part[0..slash];
             const name = name_part[slash + 1 ..];
-            if (!hubRepoComponentIsSafe(owner) or !hubRepoComponentIsSafe(name)) {
+            if (!hubRepoComponentIsSafe(owner) or
+                !hubRepoComponentIsSafe(name) or
+                variant.len == 0)
+            {
                 return error.InvalidModelRef;
             }
-            return .{
-                .owner = owner,
-                .name = name,
-                .variant = variant,
-            };
+            return .{ .owner = owner, .name = name, .variant = variant };
         }
 
         return error.InvalidModelRef;
@@ -99,6 +148,27 @@ fn hubRepoComponentIsSafe(component: []const u8) bool {
     return true;
 }
 
+/// Return the stable install directory for a Hub reference. Explicit variants
+/// get separate leaf directories so two quantizations/formats can coexist and
+/// can never be mistaken for one another. The legacy path remains the natural
+/// home for the variant-less `auto` selection.
+pub fn modelInstallDirAlloc(
+    allocator: std.mem.Allocator,
+    models_dir: []const u8,
+    ref: ModelRef,
+) ![]u8 {
+    if (std.mem.eql(u8, ref.variant, "auto")) {
+        return std.fmt.allocPrint(allocator, "{s}/{s}/{s}", .{ models_dir, ref.owner, ref.name });
+    }
+    var variant_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(ref.variant, &variant_digest, .{});
+    const variant_hex = std.fmt.bytesToHex(variant_digest, .lower);
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}/{s}/{s}--antfly-{s}",
+        .{ models_dir, ref.owner, ref.name, variant_hex[0..16] },
+    );
+}
 pub const ModelRegistry = struct {
     allocator: std.mem.Allocator,
     models_dir: []const u8,
@@ -287,8 +357,7 @@ pub const ModelRegistry = struct {
         const resolved_models_dir = try resolveModelsDirForWriteAlloc(self.allocator, io, self.models_dir);
         defer self.allocator.free(resolved_models_dir);
 
-        // Destination: models_dir/owner/name
-        const dest = try std.fmt.allocPrint(self.allocator, "{s}/{s}/{s}", .{ resolved_models_dir, ref.owner, ref.name });
+        const dest = try modelInstallDirAlloc(self.allocator, resolved_models_dir, ref);
         defer self.allocator.free(dest);
         const dest_parent = std.fs.path.dirname(dest) orelse resolved_models_dir;
         try std.Io.Dir.cwd().createDirPath(io, dest_parent);
@@ -1392,15 +1461,25 @@ test "synthesized pulled manifest does not infer sparse from path name alone" {
 }
 
 /// Resolve a model name by variant suffix.
-/// If `requested` isn't found in the directory, looks for entries prefixed with
-/// "requested-" and returns the shortest match. Matches Go inference's resolveVariant.
+/// If `requested` isn't found in the directory, looks for sibling entries
+/// prefixed with "requested-" and returns the shortest deterministic match.
+/// `requested` may include an owner directory (for example `owner/model`).
+/// Matches Go inference's resolveVariant.
 /// Returns null only for a missing directory or missing match; allocation and
 /// directory iteration failures remain actionable to callers.
 pub fn resolveVariant(allocator: std.mem.Allocator, io: Io, models_dir: []const u8, requested: []const u8) !?[]const u8 {
-    const prefix = try std.fmt.allocPrint(allocator, "{s}-", .{requested});
+    const requested_dir = std.fs.path.dirname(requested);
+    const requested_name = std.fs.path.basename(requested);
+    const prefix = try std.fmt.allocPrint(allocator, "{s}-", .{requested_name});
     defer allocator.free(prefix);
 
-    var dir = Dir.cwd().openDir(io, models_dir, .{ .iterate = true }) catch |err| switch (err) {
+    const search_dir = if (requested_dir) |relative_dir|
+        try std.fs.path.join(allocator, &.{ models_dir, relative_dir })
+    else
+        try allocator.dupe(u8, models_dir);
+    defer allocator.free(search_dir);
+
+    var dir = Dir.cwd().openDir(io, search_dir, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
@@ -1417,7 +1496,9 @@ pub fn resolveVariant(allocator: std.mem.Allocator, io: Io, models_dir: []const 
         };
         if (entry_kind != .directory) continue;
         if (std.mem.startsWith(u8, entry.name, prefix)) {
-            if (best_name == null or entry.name.len < best_name.?.len) {
+            if (best_name == null or entry.name.len < best_name.?.len or
+                (entry.name.len == best_name.?.len and std.mem.lessThan(u8, entry.name, best_name.?)))
+            {
                 const new_best = try allocator.dupe(u8, entry.name);
                 if (best_name) |old| allocator.free(old);
                 best_name = new_best;
@@ -1426,7 +1507,7 @@ pub fn resolveVariant(allocator: std.mem.Allocator, io: Io, models_dir: []const 
     }
 
     if (best_name) |bn| {
-        return try std.fs.path.join(allocator, &.{ models_dir, bn });
+        return try std.fs.path.join(allocator, &.{ search_dir, bn });
     }
     return null;
 }
@@ -1465,8 +1546,44 @@ test "parse hf: prefix no variant" {
 test "parse invalid ref" {
     const result = ModelRef.parse("no-slash");
     try std.testing.expectError(error.InvalidModelRef, result);
+    try std.testing.expectError(error.InvalidModelRef, ModelRef.parse("../outside:gguf"));
+    try std.testing.expectError(error.InvalidModelRef, ModelRef.parse("owner/nested/model:gguf"));
+    try std.testing.expectError(error.InvalidModelRef, ModelRef.parse("owner/model:"));
     try std.testing.expectError(error.InvalidModelRef, ModelRef.parse("../model"));
     try std.testing.expectError(error.InvalidModelRef, ModelRef.parse("owner/../model"));
     try std.testing.expectError(error.InvalidModelRef, ModelRef.parse("owner/model/extra"));
     try std.testing.expectError(error.InvalidModelRef, ModelRef.parse("owner\\escape/model"));
+}
+
+test "explicit model variants use distinct stable install directories" {
+    const allocator = std.testing.allocator;
+    const q4 = try modelInstallDirAlloc(allocator, "/models", try ModelRef.parse("owner/model:gguf:Q4_K_M"));
+    defer allocator.free(q4);
+    const q8 = try modelInstallDirAlloc(allocator, "/models", try ModelRef.parse("owner/model:gguf:Q8_0"));
+    defer allocator.free(q8);
+    const auto = try modelInstallDirAlloc(allocator, "/models", try ModelRef.parse("owner/model"));
+    defer allocator.free(auto);
+
+    try std.testing.expect(!std.mem.eql(u8, q4, q8));
+    try std.testing.expect(std.mem.startsWith(u8, q4, "/models/owner/model--antfly-"));
+    try std.testing.expectEqualStrings("/models/owner/model", auto);
+}
+
+test "resolveVariant finds nested explicit variant install" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "models/owner/model--antfly-0123456789abcdef");
+
+    const models_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "models" });
+    defer allocator.free(models_dir);
+    const resolved = (try resolveVariant(allocator, io, models_dir, "owner/model")) orelse
+        return error.ExpectedVariantResolution;
+    defer allocator.free(resolved);
+
+    const expected = try std.fs.path.join(allocator, &.{ models_dir, "owner", "model--antfly-0123456789abcdef" });
+    defer allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, resolved);
 }

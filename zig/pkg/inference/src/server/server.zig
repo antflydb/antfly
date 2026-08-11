@@ -44,6 +44,7 @@ const model_compatibility = @import("../models/compatibility.zig");
 const chunking_mod = @import("../pipelines/chunking.zig");
 const embedding_mod = @import("../pipelines/embedding.zig");
 const extraction_mod = @import("../pipelines/extraction.zig");
+const image_pipeline = @import("../pipelines/image.zig");
 const sparse_embedding_mod = @import("../pipelines/sparse_embedding.zig");
 const generation = @import("../pipelines/generation.zig");
 const multimodal_reranker = @import("../pipelines/multimodal_reranker.zig");
@@ -87,9 +88,281 @@ fn shouldSkipAutoMtpDraftLoad(config: generation.GenerationConfig, draft_cfg: gp
     if (config.speculation_policy != .auto) return false;
     if (!draft_cfg.gemma4_mtp_assistant) return false;
     if (config.speculation_calibration == .none) return true;
-    if (!generation.gemma4MtpTargetReplayLikelyActive()) return true;
     const requested_max_tokens: usize = @intCast(@max(config.max_tokens, 1));
     return requested_max_tokens < generation.gemma4MtpAutoMinGenerationTokens();
+}
+
+fn requiresNativeChannelProjection(config: gpt_model_mod.Config) bool {
+    return config.family == .gemma and config.hasPle();
+}
+
+fn generationPipelineSession(pipeline: anytype) ?backends_mod.Session {
+    const Pipeline = switch (@typeInfo(@TypeOf(pipeline))) {
+        .pointer => |pointer| pointer.child,
+        else => @TypeOf(pipeline),
+    };
+    if (comptime @hasField(Pipeline, "session")) return pipeline.session;
+    return null;
+}
+
+fn generationStreamShouldContinue(
+    write_failed: bool,
+    cancellation: ?*const std.atomic.Value(bool),
+) bool {
+    if (write_failed) return false;
+    if (cancellation) |signal| return !signal.load(.acquire);
+    return true;
+}
+
+test "generation pipeline session lookup is field safe" {
+    var pipeline = struct {}{};
+    try std.testing.expect(generationPipelineSession(&pipeline) == null);
+}
+
+test "generation stream continuation observes writes and peer cancellation" {
+    var cancellation = std.atomic.Value(bool).init(false);
+    try std.testing.expect(generationStreamShouldContinue(false, &cancellation));
+    cancellation.store(true, .release);
+    try std.testing.expect(!generationStreamShouldContinue(false, &cancellation));
+    try std.testing.expect(!generationStreamShouldContinue(true, null));
+}
+
+test "channel-aware Gemma generation stays on projected native backends" {
+    try std.testing.expect(!requiresNativeChannelProjection(.{}));
+    try std.testing.expect(!requiresNativeChannelProjection(.{ .family = .gemma }));
+    try std.testing.expect(requiresNativeChannelProjection(.{
+        .family = .gemma,
+        .ple_hidden_size = 256,
+    }));
+}
+
+const GenerateSpeculationOptions = struct {
+    k: u32,
+    policy: generation.SpeculationPolicy,
+    calibration: generation.SpeculationCalibration,
+};
+
+const GenerateNumericOptions = struct {
+    max_tokens: i32,
+    top_k: i32,
+};
+
+const GenerateSamplingOptions = struct {
+    temperature: f32,
+    top_p: f32,
+    min_p: f32,
+    repetition_penalty: f32,
+    frequency_penalty: f32,
+    presence_penalty: f32,
+};
+
+const GenerateSamplingError = error{
+    InvalidTemperature,
+    InvalidTopP,
+    InvalidMinP,
+    InvalidRepetitionPenalty,
+    InvalidFrequencyPenalty,
+    InvalidPresencePenalty,
+};
+
+fn parseGenerateNumericOptions(max_tokens_raw: ?i64, top_k_raw: ?i64) !GenerateNumericOptions {
+    const max_tokens = std.math.cast(i32, max_tokens_raw orelse 256) orelse return error.InvalidMaxTokens;
+    if (max_tokens < 1) return error.InvalidMaxTokens;
+    const top_k = std.math.cast(i32, top_k_raw orelse 0) orelse return error.InvalidTopK;
+    if (top_k < 0) return error.InvalidTopK;
+    return .{ .max_tokens = max_tokens, .top_k = top_k };
+}
+
+fn parseGenerateSamplingOptions(
+    temperature_raw: ?f32,
+    top_p_raw: ?f32,
+    min_p_raw: ?f32,
+    repetition_penalty_raw: ?f32,
+    frequency_penalty_raw: ?f32,
+    presence_penalty_raw: ?f32,
+) GenerateSamplingError!GenerateSamplingOptions {
+    const temperature = temperature_raw orelse 0;
+    if (!std.math.isFinite(temperature) or temperature < 0 or temperature > 2) return error.InvalidTemperature;
+    const top_p = top_p_raw orelse 0;
+    if (!std.math.isFinite(top_p) or top_p < 0 or top_p > 1) return error.InvalidTopP;
+    const min_p = min_p_raw orelse 0;
+    if (!std.math.isFinite(min_p) or min_p < 0 or min_p > 1) return error.InvalidMinP;
+    const repetition_penalty = repetition_penalty_raw orelse 1;
+    if (!std.math.isFinite(repetition_penalty) or repetition_penalty <= 0) return error.InvalidRepetitionPenalty;
+    const frequency_penalty = frequency_penalty_raw orelse 0;
+    if (!std.math.isFinite(frequency_penalty) or frequency_penalty < -2 or frequency_penalty > 2) return error.InvalidFrequencyPenalty;
+    const presence_penalty = presence_penalty_raw orelse 0;
+    if (!std.math.isFinite(presence_penalty) or presence_penalty < -2 or presence_penalty > 2) return error.InvalidPresencePenalty;
+    return .{
+        .temperature = temperature,
+        .top_p = top_p,
+        .min_p = min_p,
+        .repetition_penalty = repetition_penalty,
+        .frequency_penalty = frequency_penalty,
+        .presence_penalty = presence_penalty,
+    };
+}
+
+fn generateSamplingErrorMessage(err: GenerateSamplingError) []const u8 {
+    return switch (err) {
+        error.InvalidTemperature => "temperature must be finite and between 0 and 2",
+        error.InvalidTopP => "top_p must be finite and between 0 and 1",
+        error.InvalidMinP => "min_p must be finite and between 0 and 1",
+        error.InvalidRepetitionPenalty => "repetition_penalty must be finite and greater than 0",
+        error.InvalidFrequencyPenalty => "frequency_penalty must be finite and between -2 and 2",
+        error.InvalidPresencePenalty => "presence_penalty must be finite and between -2 and 2",
+    };
+}
+
+fn parseGenerateSpeculationOptions(
+    draft_requested: bool,
+    speculative_k: ?i64,
+    policy_raw: ?[]const u8,
+    calibration_raw: ?[]const u8,
+) !GenerateSpeculationOptions {
+    if (!draft_requested and (speculative_k != null or policy_raw != null or calibration_raw != null)) {
+        return error.SpeculationRequiresDraftModel;
+    }
+    const k = speculative_k orelse 4;
+    if (k < 1 or k > 16) return error.InvalidSpeculativeK;
+    const policy: generation.SpeculationPolicy = if (policy_raw) |raw|
+        generation.parseSpeculationPolicy(raw) orelse return error.InvalidSpeculationPolicy
+    else
+        .auto;
+    const calibration: generation.SpeculationCalibration = if (calibration_raw) |raw| blk: {
+        if (!std.mem.eql(u8, raw, "none") and
+            !std.mem.eql(u8, raw, "probe") and
+            !std.mem.eql(u8, raw, "positive"))
+        {
+            return error.InvalidSpeculationCalibration;
+        }
+        break :blk generation.parseSpeculationCalibration(raw).?;
+    } else .none;
+    return .{
+        .k = @intCast(k),
+        .policy = policy,
+        .calibration = calibration,
+    };
+}
+
+fn generateSpeculationErrorMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.InvalidSpeculativeK => "speculative_k must be between 1 and 16",
+        error.InvalidSpeculationPolicy => "speculation_policy must be auto, force, or off",
+        error.InvalidSpeculationCalibration => "speculation_calibration must be none, probe, or positive",
+        error.SpeculationRequiresDraftModel => "speculative_k, speculation_policy, and speculation_calibration require draft_model",
+        else => "speculation options are invalid",
+    };
+}
+
+fn generateSpeculationStatus(stats: ?generation.SpeculativeDecodeStats) ?api.GenerateSpeculationStatus {
+    const value = stats orelse return null;
+    return .{
+        .policy = value.speculation_policy.name(),
+        .calibration = value.speculation_calibration.name(),
+        .decision = value.speculation_policy_decision.name(),
+        .disabled_reason = value.mtp_disabled_reason orelse switch (value.speculation_policy_decision) {
+            .disabled_off => "speculation_policy_off",
+            .disabled_unavailable => "draft_backend_unavailable",
+            .disabled_uncalibrated => "speculation_calibration_required",
+            .disabled_low_acceptance => "mtp_auto_low_acceptance",
+            .disabled_zero_match => "mtp_auto_zero_match",
+            .disabled_slow => "mtp_auto_cost_probe_slow",
+            .disabled_insufficient_probe => "mtp_auto_insufficient_cost_probe",
+            .inactive, .active, .forced => null,
+        },
+    };
+}
+
+fn shouldResolveDraftModel(policy: generation.SpeculationPolicy) bool {
+    return policy != .off;
+}
+
+fn effectiveDraftModelName(requested: ?[]const u8, policy: generation.SpeculationPolicy) ?[]const u8 {
+    return if (shouldResolveDraftModel(policy)) requested else null;
+}
+
+fn validateQualifiedProfileDraft(
+    qualified_profile_requested: bool,
+    effective_draft_model: ?[]const u8,
+) !void {
+    if (qualified_profile_requested and effective_draft_model != null) {
+        return error.KernelJitQualifiedProfileDraftUnsupported;
+    }
+}
+
+fn generateQueueUnitsForSpeculation(
+    base_units: usize,
+    draft_requested: bool,
+    policy: generation.SpeculationPolicy,
+) usize {
+    if (!draft_requested or !shouldResolveDraftModel(policy)) return base_units;
+    return std.math.add(usize, base_units, base_units) catch std.math.maxInt(usize);
+}
+
+fn generationBackendKind(backend: backends_mod.BackendType) ?runtime.kv.pool.BackendKind {
+    return switch (backend) {
+        .native => .native,
+        .metal => .metal,
+        .cuda => .cuda,
+        .onnx, .pjrt, .wasm => null,
+    };
+}
+
+fn promptCacheBackendEligible(mode: runtime.kv.prompt_cache.Mode, backend: runtime.kv.pool.BackendKind) bool {
+    return switch (backend) {
+        .native, .metal => true,
+        // CUDA still owns device KV by transient sequence id. Keep the new
+        // radix mode fail-closed there until its page pool has block lifetime.
+        .cuda => mode != .radix,
+    };
+}
+
+test "radix prompt cache is opt in and excludes CUDA device storage" {
+    try std.testing.expect(promptCacheBackendEligible(.radix, .metal));
+    try std.testing.expect(promptCacheBackendEligible(.radix, .native));
+    try std.testing.expect(!promptCacheBackendEligible(.radix, .cuda));
+    try std.testing.expect(promptCacheBackendEligible(.block_hash, .cuda));
+}
+
+fn generationKvSlidingTrimForced() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_KV_SLIDING_TRIM", false);
+}
+
+fn validateCacheCompactionRatio(ratio: ?f32) !void {
+    if (ratio) |value| try (runtime.kv.compaction.CompactionConfig{ .target_ratio = value }).validate();
+}
+
+fn effectiveSpeculationStats(
+    stats: ?generation.SpeculativeDecodeStats,
+    requested: bool,
+    policy: generation.SpeculationPolicy,
+    calibration: generation.SpeculationCalibration,
+) ?generation.SpeculativeDecodeStats {
+    if (stats != null) return stats;
+    if (!requested or policy != .off) return null;
+    return .{
+        .speculation_policy = policy,
+        .speculation_calibration = calibration,
+        .speculation_policy_decision = .disabled_off,
+        .mtp_disabled_reason = "speculation_policy_off",
+    };
+}
+
+fn recordSpeculationOutcome(metrics: *metrics_mod.Metrics, stats: ?generation.SpeculativeDecodeStats) void {
+    const value = stats orelse return;
+    switch (value.speculation_policy_decision) {
+        .active, .forced => metrics.incSpeculationActive(),
+        .inactive,
+        .disabled_off,
+        .disabled_unavailable,
+        .disabled_uncalibrated,
+        .disabled_low_acceptance,
+        .disabled_zero_match,
+        .disabled_slow,
+        .disabled_insufficient_probe,
+        => metrics.incSpeculationDisabled(),
+    }
 }
 
 pub const BudgetOverrides = struct {
@@ -117,8 +390,15 @@ pub const PromptCacheConfig = struct {
     min_tokens: usize = 64,
     ttl_ms: u64 = 300_000,
 
-    /// max_bytes_mb is a node-wide accounting target. ModelManager divides it
-    /// across active caches and reconfigures them together.
+    pub fn validate(self: @This()) !void {
+        if (self.max_bytes_mb > runtime.kv.prompt_cache.max_config_bytes_mb or
+            self.ttl_ms > runtime.kv.prompt_cache.max_config_ttl_ms)
+        {
+            return error.InvalidPromptCacheConfig;
+        }
+    }
+
+    /// max_bytes_mb is the node-wide target for the single active model cache.
     pub fn runtimeConfig(
         self: @This(),
         resource_usage_observer: ?runtime.kv.prompt_cache.ResourceUsageObserver,
@@ -126,7 +406,9 @@ pub const PromptCacheConfig = struct {
         return .{
             .enabled = self.enabled,
             .mode = self.mode,
-            .max_bytes = self.max_bytes_mb * 1024 * 1024,
+            // Node.init rejects overflow; saturation also keeps this boundary
+            // safe if an embedding mutates the public config after init.
+            .max_bytes = std.math.mul(usize, self.max_bytes_mb, runtime.kv.prompt_cache.bytes_per_mebibyte) catch std.math.maxInt(usize),
             .min_tokens = self.min_tokens,
             .ttl_ms = self.ttl_ms,
             .resource_usage_observer = resource_usage_observer,
@@ -154,50 +436,55 @@ test "prompt cache config reports node target in bytes" {
     try std.testing.expectEqual(@as(usize, 512 * 1024 * 1024), cfg.runtimeConfig(null).max_bytes);
 }
 
-test "model manager rebalances every active prompt cache" {
+test "prompt cache config rejects unrepresentable runtime values" {
+    try std.testing.expectError(error.InvalidPromptCacheConfig, (PromptCacheConfig{
+        .max_bytes_mb = runtime.kv.prompt_cache.max_config_bytes_mb + 1,
+    }).validate());
+    try std.testing.expectError(error.InvalidPromptCacheConfig, (PromptCacheConfig{
+        .ttl_ms = runtime.kv.prompt_cache.max_config_ttl_ms + 1,
+    }).validate());
+}
+
+test "native prompt cache seeds a second request from cache-owned storage" {
     const allocator = std.testing.allocator;
-    var manager = model_manager_mod.ModelManager.init(allocator, backends_mod.SessionManager.init(allocator));
-    defer manager.loaded.deinit(allocator);
-    defer manager.loaded_aliases.deinit(allocator);
-
-    var first: model_manager_mod.LoadedModel = undefined;
-    first.prompt_prefix_cache = runtime.kv.prompt_cache.PromptPrefixCache.init(allocator);
-    defer first.prompt_prefix_cache.deinit();
-    var second: model_manager_mod.LoadedModel = undefined;
-    second.prompt_prefix_cache = runtime.kv.prompt_cache.PromptPrefixCache.init(allocator);
-    defer second.prompt_prefix_cache.deinit();
-    try manager.loaded.put(allocator, "first", &first);
-    try manager.loaded.put(allocator, "second", &second);
-
-    first.prompt_prefix_cache.configure(.{
+    var cache = runtime.kv.prompt_cache.PromptPrefixCache.init(allocator);
+    defer cache.deinit();
+    cache.configure(.{
         .enabled = true,
-        .mode = .simple,
+        .mode = .block_hash,
         .min_tokens = 2,
         .max_bytes = 1 << 20,
     });
-    const first_pool_id = (try first.prompt_prefix_cache.ensurePool(.{
+
+    const pool_config = runtime.kv.pool.KvPoolConfig{
         .backend = .native,
         .dtype = .f32,
         .page_size_tokens = 2,
         .num_layers_packed = 1,
         .num_kv_heads = 1,
         .head_dim = 2,
-    })).?;
-    const first_sequence_id = try first.prompt_prefix_cache.manager.attachSequence(first_pool_id);
-    try first.prompt_prefix_cache.manager.appendTokens(first_sequence_id, 2);
-    try first.prompt_prefix_cache.storeFromSequence("", &.{ 1, 2 }, first_sequence_id);
-    try std.testing.expectEqual(@as(usize, 1), first.prompt_prefix_cache.stats().live_entries);
+    };
+    const storage = (try cache.ensureStorage(pool_config)).?.storage;
+    const pool_id = cache.pool_id.?;
 
-    manager.rebalancePromptCaches(&second, .{
-        .enabled = true,
-        .mode = .simple,
-        .min_tokens = 2,
-        .max_bytes = 2,
-    });
+    const source_id = try cache.manager.attachSequence(pool_id);
+    try cache.manager.appendTokens(source_id, 4);
+    const storage_source_id = try storage.attachSequence(storage.poolId());
+    try std.testing.expectEqual(source_id, storage_source_id);
+    try storage.appendTokens(storage_source_id, 4);
+    try cache.storeFromSequence("native", &.{ 1, 2, 3, 4 }, source_id);
+    try cache.manager.releaseSequence(source_id);
+    try storage.releaseSequence(storage_source_id);
 
-    try std.testing.expectEqual(@as(usize, 1), first.prompt_prefix_cache.config.max_bytes);
-    try std.testing.expectEqual(@as(usize, 1), second.prompt_prefix_cache.config.max_bytes);
-    try std.testing.expectEqual(@as(usize, 0), first.prompt_prefix_cache.stats().live_entries);
+    const hit = (try cache.attachLongestPrefix("native", &.{ 1, 2, 3, 9 }, 2)).?;
+    var decode_state = generation.NativeDecodeState.initPaged(allocator, cache.managerPtr(), pool_id, null);
+    decode_state.kv_storage = storage;
+    defer decode_state.deinit();
+    try decode_state.seedAttachedPrefix(hit.sequence_id, hit.token_count);
+
+    try std.testing.expectEqual(@as(usize, 2), hit.token_count);
+    try std.testing.expectEqual(@as(?usize, 2), cache.manager.tokenCount(hit.sequence_id));
+    try std.testing.expectEqual(@as(?usize, 2), storage.tokenCount(hit.sequence_id));
 }
 
 test "concurrent first prompt cache activations share the node budget" {
@@ -224,14 +511,126 @@ test "concurrent first prompt cache activations share the node budget" {
     manager.rebalancePromptCaches(&first, node_config);
     manager.rebalancePromptCaches(&second, node_config);
 
+    // Rebalancing a foreign cache must not synchronously evict from its pool;
+    // its owning generation path applies the queued budget on the next request.
     try std.testing.expectEqual(@as(usize, 512), first.prompt_prefix_cache.config.max_bytes);
+    try std.testing.expectEqual(@as(usize, 512), first.prompt_prefix_cache.pending_config.?.max_bytes);
     try std.testing.expectEqual(@as(usize, 512), second.prompt_prefix_cache.config.max_bytes);
     try std.testing.expect(first.prompt_prefix_cache.isParticipating());
     try std.testing.expect(second.prompt_prefix_cache.isParticipating());
 
     manager.cancelPromptCacheActivation(&second, node_config);
-    try std.testing.expectEqual(@as(usize, 1024), first.prompt_prefix_cache.config.max_bytes);
+    try std.testing.expectEqual(@as(usize, 512), first.prompt_prefix_cache.config.max_bytes);
+    try std.testing.expectEqual(@as(usize, 1024), first.prompt_prefix_cache.pending_config.?.max_bytes);
     try std.testing.expect(!second.prompt_prefix_cache.isParticipating());
+}
+
+test "deferred foreign prompt cache eviction does not collapse active share" {
+    const allocator = std.testing.allocator;
+    var manager = model_manager_mod.ModelManager.init(allocator, backends_mod.SessionManager.init(allocator));
+    defer manager.loaded.deinit(allocator);
+    defer manager.loaded_aliases.deinit(allocator);
+
+    var idle: model_manager_mod.LoadedModel = undefined;
+    idle.prompt_prefix_cache = runtime.kv.prompt_cache.PromptPrefixCache.init(allocator);
+    defer idle.prompt_prefix_cache.deinit();
+    var active: model_manager_mod.LoadedModel = undefined;
+    active.prompt_prefix_cache = runtime.kv.prompt_cache.PromptPrefixCache.init(allocator);
+    defer active.prompt_prefix_cache.deinit();
+    try manager.loaded.put(allocator, "idle", &idle);
+    try manager.loaded.put(allocator, "active", &active);
+
+    const node_config = runtime.kv.prompt_cache.Config{
+        .enabled = true,
+        .mode = .simple,
+        .min_tokens = 2,
+        .max_bytes = 1 << 20,
+    };
+    manager.rebalancePromptCaches(&idle, node_config);
+    const pool_id = (try idle.prompt_prefix_cache.ensurePool(.{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 2,
+        .num_layers_packed = 1,
+        .num_kv_heads = 1,
+        .head_dim = 64,
+    })).?;
+    const sequence_id = try idle.prompt_prefix_cache.managerPtr().attachSequence(pool_id);
+    defer idle.prompt_prefix_cache.managerPtr().releaseSequence(sequence_id) catch {};
+    try idle.prompt_prefix_cache.managerPtr().appendTokens(sequence_id, 1024);
+    const tokens = try allocator.alloc(i64, 1024);
+    defer allocator.free(tokens);
+    for (tokens, 0..) |*token, idx| token.* = @intCast(idx);
+    try idle.prompt_prefix_cache.storeFromSequence("idle", tokens, sequence_id);
+    try std.testing.expect(idle.prompt_prefix_cache.stats().live_bytes > node_config.max_bytes / 2);
+
+    manager.rebalancePromptCaches(&active, node_config);
+    try std.testing.expectEqual(
+        node_config.max_bytes / 2,
+        active.prompt_prefix_cache.config.max_bytes,
+    );
+    try std.testing.expectEqual(
+        node_config.max_bytes / 2,
+        idle.prompt_prefix_cache.pending_config.?.max_bytes,
+    );
+}
+
+fn chatTemplateKwargsValueIsValid(value: std.json.Value) bool {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return false,
+    };
+    var iterator = object.iterator();
+    while (iterator.next()) |entry| {
+        if (!std.mem.eql(u8, entry.key_ptr.*, "enable_thinking")) return false;
+        switch (entry.value_ptr.*) {
+            .bool => {},
+            else => return false,
+        }
+    }
+    return true;
+}
+
+fn generateRequestChatTemplateKwargsAreValid(value: std.json.Value) bool {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return true,
+    };
+    const kwargs = object.get("chat_template_kwargs") orelse return true;
+    return chatTemplateKwargsValueIsValid(kwargs);
+}
+
+fn rawGenerateChatTemplateKwargsAreValid(
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+    batch: bool,
+) bool {
+    // Cheap pre-gate: the field cannot be present when its name never appears in
+    // the raw body, so skip the full Value parse (substring false positives just
+    // fall through to the full validation below).
+    if (std.mem.indexOf(u8, raw, "chat_template_kwargs") == null) return true;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return true;
+    defer parsed.deinit();
+    if (!batch) return generateRequestChatTemplateKwargsAreValid(parsed.value);
+
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return true,
+    };
+    const requests_value = root.get("requests") orelse return true;
+    const requests = switch (requests_value) {
+        .array => |array| array,
+        else => return true,
+    };
+    for (requests.items) |item| {
+        const item_object = switch (item) {
+            .object => |object| object,
+            else => continue,
+        };
+        const request_body = item_object.get("body") orelse continue;
+        if (!generateRequestChatTemplateKwargsAreValid(request_body)) return false;
+    }
+    return true;
 }
 
 pub const NodeConfig = struct {
@@ -245,14 +644,139 @@ pub const NodeConfig = struct {
     max_concurrent_requests: usize = 32,
     pool_size: usize = 2,
     generation_budget_overrides: BudgetOverrides = .{},
+    generation_batching: GenerationBatchingConfig = .{},
+    kernel_jit: graph_mod.kernel_jit.Config = .{},
     prompt_cache: PromptCacheConfig = .{},
     prompt_cache_resource_usage_observer: ?runtime.kv.prompt_cache.ResourceUsageObserver = null,
     tokenizer_cache: hf_tokenizer_mod.HfTokenizer.BpeCacheConfig = .{},
     tokenizer_parallel_bpe: hf_tokenizer_mod.HfTokenizer.ParallelBpeConfig = .{},
+    allow_insecure_public_bind: bool = false,
     /// Permit artifacts whose compatibility cannot be proven by this build.
     /// Known incompatible or unsafe artifacts remain blocked.
     allow_unknown_models: bool = false,
 };
+
+fn isLoopbackBindHost(host: []const u8) bool {
+    const address = std.Io.net.IpAddress.parse(host, 0) catch return false;
+    return switch (address) {
+        .ip4 => |ip4| ip4.bytes[0] == 127,
+        .ip6 => |ip6| blk: {
+            const loopback = std.Io.net.Ip6Address.loopback(0);
+            break :blk std.mem.eql(u8, &ip6.bytes, &loopback.bytes);
+        },
+    };
+}
+
+fn validateStandaloneBind(host: []const u8, allow_insecure_public_bind: bool) !void {
+    if (!allow_insecure_public_bind and !isLoopbackBindHost(host)) return error.InsecurePublicBind;
+}
+
+test "standalone inference bind is loopback-only unless explicitly overridden" {
+    for ([_][]const u8{ "127.0.0.1", "127.42.0.9", "::1" }) |host| {
+        try validateStandaloneBind(host, false);
+    }
+    for ([_][]const u8{ "0.0.0.0", "::", "192.168.1.10", "localhost", "inference.internal" }) |host| {
+        try std.testing.expectError(error.InsecurePublicBind, validateStandaloneBind(host, false));
+    }
+    try validateStandaloneBind("0.0.0.0", true);
+}
+
+pub const GenerationBatchingMode = enum {
+    off,
+    auto,
+    on,
+};
+
+fn cudaDecodeGraphReplayRequested(raw_opt: ?[]const u8) bool {
+    const raw = raw_opt orelse return false;
+    return !(std.mem.eql(u8, raw, "off") or
+        std.mem.eql(u8, raw, "0") or
+        std.mem.eql(u8, raw, "false") or
+        std.mem.eql(u8, raw, "no"));
+}
+
+pub const GenerationBatchingConfig = struct {
+    // Experimental CUDA batching: prefill remains singleton and decode batches
+    // homogeneous sequence positions within the bounded row-2 envelope. Keep
+    // the default and `auto` serialized until the promotion gate passes;
+    // `mode: on` is an explicit opt-in for validation and benchmarking.
+    mode: GenerationBatchingMode = .off,
+    max_step_items: usize = 2,
+    max_step_query_tokens: usize = 512,
+    max_decode_wait_us: u32 = 1_000,
+    max_idle_prefill_chunk_size: usize = 2048,
+
+    pub fn enabledForBackend(self: @This(), backend: backends_mod.BackendType) bool {
+        if (backend != .cuda) return false;
+        if (platform.env.getenvBool("ANTFLY_INFERENCE_DISABLE_CONTINUOUS_BATCHING")) return false;
+        // Request-scoped CUDA graph state is shared by the model backend. If a
+        // deployment enables graph reset manually, preserve the model-wide
+        // lock even when the server config requests batching.
+        if (platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_SERVER_REQUEST_GRAPH_RESET")) return false;
+        if (cudaDecodeGraphReplayRequested(platform.env.getenv("ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY"))) return false;
+        return self.mode == .on;
+    }
+
+    pub fn enabledForRequest(
+        self: @This(),
+        backend: backends_mod.BackendType,
+        graph_mode: bool,
+        speculation_requested: bool,
+        has_multimodal_input: bool,
+    ) bool {
+        if (!self.enabledForBackend(backend)) return false;
+        // These paths issue CUDA work outside the row scheduler. They retain
+        // the model-wide generation lock until their execution is scheduler-
+        // aware, while ordinary decode requests remain batchable.
+        return !graph_mode and !speculation_requested and !has_multimodal_input;
+    }
+
+    pub fn schedulerPolicy(self: @This()) runtime.scheduler.native_generate.Policy {
+        const validated_max_items: usize = 2;
+        return .{
+            .max_step_items = @min(@max(self.max_step_items, 1), validated_max_items),
+            .max_step_query_tokens = @max(self.max_step_query_tokens, 1),
+            .max_decode_wait_us = if (self.mode == .on) self.max_decode_wait_us else 0,
+            .max_idle_prefill_chunk_size = @min(@max(self.max_idle_prefill_chunk_size, 32), 2048),
+            // Wider active sets currently lose response equivalence even when
+            // individual steps are capped to two rows. Preserve the proven
+            // direct path until the multi-wave row scheduler is validated.
+            .max_active_requests_for_batching = validated_max_items,
+        };
+    }
+};
+
+fn logAdmittedPrefillChunkPlan(plan: runtime.scheduler.native_generate.PrefillChunkPlan) void {
+    const tail = plan.tail();
+    std.log.info(
+        "prefill_chunk_plan: status=admitted fingerprint={x} selection={s} fairness={s} prompt_tokens={d} chunks={d} max_chunk_rows={d} max_scratch_bytes={d} forced_drain_budget_bytes={d} tail_rows={d} tail_weight_route={s}",
+        .{
+            plan.fingerprint,
+            @tagName(plan.selection),
+            @tagName(plan.fairness),
+            plan.prompt_tokens,
+            plan.chunks.len,
+            plan.max_chunk_rows,
+            plan.max_scratch_bytes,
+            plan.forced_drain_budget_bytes,
+            tail.rows,
+            @tagName(tail.weight_route_hint),
+        },
+    );
+}
+
+fn promptCacheEligibleForNativeRequest(
+    enabled: bool,
+    continuous_batching: bool,
+    backend: runtime.kv.pool.BackendKind,
+    has_compiled_partition: bool,
+    has_draft: bool,
+    has_compaction: bool,
+) bool {
+    return enabled and !continuous_batching and
+        (backend == .native or backend == .metal or backend == .cuda) and
+        !has_compiled_partition and !has_draft and !has_compaction;
+}
 
 pub const WarmModelKind = enum {
     generator,
@@ -274,6 +798,34 @@ pub const WarmModel = struct {
     quantization: ?[]const u8 = null,
 };
 
+fn warmModelTaskDir(kind: WarmModelKind) []const u8 {
+    return switch (kind) {
+        .generator => "generators",
+        .embedder => "embedders",
+        .reranker => "rerankers",
+        .chunker => "chunkers",
+        .classifier => "classifiers",
+        .rewriter => "rewriters",
+        .reader => "readers",
+        .transcriber => "transcribers",
+        .extractor => "extractors",
+    };
+}
+
+fn ensureKernelJitRequestSurfacesPublishable(
+    mode: graph_mod.kernel_jit.Mode,
+    qualified_profile_requested: bool,
+    startup_preloads_materialized: bool,
+) !void {
+    if ((mode.failClosed() or qualified_profile_requested) and !startup_preloads_materialized) {
+        return error.KernelJitRequiredPreloadUnmaterialized;
+    }
+}
+
+fn kernelJitMaterializesOptionalSessions(mode: graph_mod.kernel_jit.Mode) bool {
+    return mode.compiles();
+}
+
 pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
 const max_generate_batch_items: usize = 128;
@@ -281,6 +833,21 @@ const max_read_batch_images: usize = 64;
 const default_read_queue_max_tokens: usize = 256;
 const max_read_tokens: usize = 1024;
 const default_max_read_batch_bytes: usize = 256 * 1024 * 1024;
+const default_max_request_media_bytes: usize = 100 * 1024 * 1024;
+const read_admission_bytes_per_unit: usize = 16 * 1024 * 1024;
+const default_max_audio_decode_working_bytes: usize = audio_mod.default_decode_working_bytes;
+const read_admission_images_per_unit: usize = 2;
+// Conservative admission estimate for decoder canvas/scratch, RGB conversion,
+// and preprocessing overlap. This bounds request pressure; allocator OOM
+// handling remains the final hard limit.
+const read_decoded_working_bytes_per_pixel: usize = 16;
+const default_max_read_decoded_working_bytes: usize = 512 * 1024 * 1024;
+const default_request_content_security = scraping.ContentSecurityConfig{
+    .allowed_hosts = &.{},
+    .allowed_paths = &.{},
+    .block_private_ips = true,
+    .max_download_size_bytes = 100 * 1024 * 1024,
+};
 
 const GenerateBackendSelection = struct {
     native_choice: native_backend_choice.Choice = .auto,
@@ -333,17 +900,34 @@ fn parseGenerateBackendSelection(
     };
 }
 
+fn validateGenerateDraftBackend(selection: GenerateBackendSelection, draft_model: ?[]const u8) !void {
+    if (draft_model != null and selection.native_choice == .onnx) return error.OnnxDraftUnsupported;
+}
+
 fn shouldAutoUseMetalWholeModelGenerate(
     loaded_backend: backends_mod.BackendType,
     metal_executor_supported: bool,
     deepseek_compressed_cache: bool,
+    prompt_cache_requested: bool,
     selection: GenerateBackendSelection,
 ) bool {
     if (!build_options.enable_metal) return false;
+    // An eligible cache request must stay on the eager paged-KV route. Silently
+    // auto-selecting whole-model compiled execution would ignore an explicit
+    // prompt_cache_key and make the opt-in cache appear enabled but inert.
+    if (prompt_cache_requested) return false;
     if (selection.eager_mode_requested) return false;
     if (selection.compiled_partition_backend != null) return false;
     if (selection.native_choice == .native) return false;
     return loaded_backend == .metal and metal_executor_supported and !deepseek_compressed_cache;
+}
+
+fn validatePromptCacheExecutionMode(
+    prompt_cache_requested: bool,
+    selection: GenerateBackendSelection,
+) !void {
+    if (prompt_cache_requested and selection.graph_mode_requested)
+        return error.PromptCacheCompiledModeUnsupported;
 }
 
 fn modelBackendToNativeChoice(value: api.ModelBackend) native_backend_choice.Choice {
@@ -392,9 +976,288 @@ fn embedTimingNowNs() u128 {
     };
 }
 
+const DenseEmbedRequestContext = struct {
+    io: std.Io,
+    deadline_ns: ?u64 = null,
+};
+
+fn remainingDirectEmbeddingDeadlineMs(deadline_ns: ?u64, now_ns: u128) !?u64 {
+    const deadline: u128 = deadline_ns orelse return null;
+    if (now_ns >= deadline) return error.Timeout;
+    const remaining_ns = deadline - now_ns;
+    const timeout_ms = (remaining_ns - 1) / std.time.ns_per_ms + 1;
+    return @intCast(timeout_ms);
+}
+
+fn denseEmbedDownloadContext(context: DenseEmbedRequestContext) !scraping.DownloadContext {
+    return .{
+        .io = context.io,
+        .timeout_ms = try remainingDirectEmbeddingDeadlineMs(context.deadline_ns, embedTimingNowNs()),
+    };
+}
+
 fn ensureDirectEmbeddingDeadline(deadline_ns: ?u64) !void {
-    const deadline = deadline_ns orelse return;
-    if (embedTimingNowNs() >= deadline) return error.Timeout;
+    _ = try remainingDirectEmbeddingDeadlineMs(deadline_ns, embedTimingNowNs());
+}
+
+fn isRecoverableEmbeddingRuntimeIntegrityError(err: anyerror) bool {
+    return err == error.MissingWeight or err == error.WeightNotFound;
+}
+
+fn shouldAbortDensePartialFallback(err: anyerror) bool {
+    return err == error.OutOfMemory or isRecoverableEmbeddingRuntimeIntegrityError(err);
+}
+
+const LoadedEmbeddingRuntimeAttemptFn = *const fn (
+    ctx: *anyopaque,
+    model: *model_manager_mod.LoadedModel,
+) anyerror!void;
+
+const LoadedEmbeddingRecoveryOptions = struct {
+    preferred_backends: ?[]const backends_mod.BackendType = null,
+    cache_default_alias: bool = true,
+    pin_on_success: bool = false,
+    failure_stage: ?*EmbeddingRuntimeFailureStage = null,
+};
+
+const EmbeddingRuntimeFailureStage = enum { acquire, execute };
+
+fn runEmbeddingRuntimeRecoveryLoop(adapter: anytype) !void {
+    var recovery_attempted = false;
+    while (true) {
+        var handle = try adapter.acquire();
+        defer adapter.release(&handle);
+
+        adapter.execute(&handle) catch |err| {
+            if (isRecoverableEmbeddingRuntimeIntegrityError(err)) {
+                adapter.retire(&handle);
+                if (!recovery_attempted) {
+                    recovery_attempted = true;
+                    continue;
+                }
+            }
+            return err;
+        };
+        adapter.succeed(&handle);
+        return;
+    }
+}
+
+fn runLoadedEmbeddingRuntimeWithRecovery(
+    node: *Node,
+    model_path: []const u8,
+    options: LoadedEmbeddingRecoveryOptions,
+    ctx: *anyopaque,
+    attempt: LoadedEmbeddingRuntimeAttemptFn,
+) anyerror!void {
+    const Adapter = struct {
+        node: *Node,
+        model_path: []const u8,
+        options: LoadedEmbeddingRecoveryOptions,
+        ctx: *anyopaque,
+        attempt: LoadedEmbeddingRuntimeAttemptFn,
+
+        fn acquire(self: *@This()) !model_manager_mod.ModelHandle {
+            if (self.options.failure_stage) |stage| stage.* = .acquire;
+            return if (self.options.preferred_backends) |preferred_backends|
+                try self.node.model_manager.acquireFromDirWithPreferredBackends(
+                    self.model_path,
+                    preferred_backends,
+                    self.options.cache_default_alias,
+                )
+            else
+                try self.node.model_manager.acquireFromDir(self.model_path);
+        }
+
+        fn execute(self: *@This(), handle: *model_manager_mod.ModelHandle) !void {
+            if (self.options.failure_stage) |stage| stage.* = .execute;
+            try self.attempt(self.ctx, handle.get());
+        }
+
+        fn retire(_: *@This(), handle: *model_manager_mod.ModelHandle) void {
+            // The callback has unwound every model-owned asset lease before
+            // control returns here, so it is safe to detach the failed
+            // runtime. The loop retires the bounded retry as well if it is
+            // corrupt, preventing later requests from reusing a known-bad
+            // cache entry.
+            handle.retire();
+        }
+
+        fn release(_: *@This(), handle: *model_manager_mod.ModelHandle) void {
+            handle.release();
+        }
+
+        fn succeed(self: *@This(), handle: *model_manager_mod.ModelHandle) void {
+            if (self.options.pin_on_success) handle.pin();
+        }
+    };
+    var adapter = Adapter{
+        .node = node,
+        .model_path = model_path,
+        .options = options,
+        .ctx = ctx,
+        .attempt = attempt,
+    };
+    return runEmbeddingRuntimeRecoveryLoop(&adapter);
+}
+
+test "embedding runtime recovery retries once and retires every corrupt runtime" {
+    const Probe = struct {
+        const FailureMode = enum { first_missing, persistent_missing, capacity };
+        const Handle = struct { active: bool = true };
+
+        mode: FailureMode,
+        acquire_count: usize = 0,
+        execute_count: usize = 0,
+        retire_count: usize = 0,
+        release_count: usize = 0,
+        succeed_count: usize = 0,
+
+        fn acquire(self: *@This()) !Handle {
+            self.acquire_count += 1;
+            return .{};
+        }
+
+        fn execute(self: *@This(), _: *Handle) !void {
+            self.execute_count += 1;
+            switch (self.mode) {
+                .first_missing => if (self.execute_count == 1) return error.MissingWeight,
+                .persistent_missing => return error.MissingWeight,
+                .capacity => return error.ResourceTemporarilyUnavailable,
+            }
+        }
+
+        fn retire(self: *@This(), handle: *Handle) void {
+            std.debug.assert(handle.active);
+            handle.active = false;
+            self.retire_count += 1;
+        }
+
+        fn release(self: *@This(), handle: *Handle) void {
+            if (!handle.active) return;
+            handle.active = false;
+            self.release_count += 1;
+        }
+
+        fn succeed(self: *@This(), _: *Handle) void {
+            self.succeed_count += 1;
+        }
+    };
+
+    var recovered = Probe{ .mode = .first_missing };
+    try runEmbeddingRuntimeRecoveryLoop(&recovered);
+    try std.testing.expectEqual(@as(usize, 2), recovered.acquire_count);
+    try std.testing.expectEqual(@as(usize, 2), recovered.execute_count);
+    try std.testing.expectEqual(@as(usize, 1), recovered.retire_count);
+    try std.testing.expectEqual(@as(usize, 1), recovered.release_count);
+    try std.testing.expectEqual(@as(usize, 1), recovered.succeed_count);
+
+    var persistent = Probe{ .mode = .persistent_missing };
+    try std.testing.expectError(error.MissingWeight, runEmbeddingRuntimeRecoveryLoop(&persistent));
+    try std.testing.expectEqual(@as(usize, 2), persistent.acquire_count);
+    try std.testing.expectEqual(@as(usize, 2), persistent.retire_count);
+    try std.testing.expectEqual(@as(usize, 0), persistent.release_count);
+
+    var capacity = Probe{ .mode = .capacity };
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, runEmbeddingRuntimeRecoveryLoop(&capacity));
+    try std.testing.expectEqual(@as(usize, 1), capacity.acquire_count);
+    try std.testing.expectEqual(@as(usize, 0), capacity.retire_count);
+    try std.testing.expectEqual(@as(usize, 1), capacity.release_count);
+}
+
+test "embedding runtime recovery is limited to weight integrity failures" {
+    try std.testing.expect(isRecoverableEmbeddingRuntimeIntegrityError(error.MissingWeight));
+    try std.testing.expect(isRecoverableEmbeddingRuntimeIntegrityError(error.WeightNotFound));
+    try std.testing.expect(!isRecoverableEmbeddingRuntimeIntegrityError(error.ResourceLimitExceeded));
+    try std.testing.expect(!isRecoverableEmbeddingRuntimeIntegrityError(error.Canceled));
+    try std.testing.expect(shouldAbortDensePartialFallback(error.MissingWeight));
+    try std.testing.expect(shouldAbortDensePartialFallback(error.WeightNotFound));
+    try std.testing.expect(shouldAbortDensePartialFallback(error.OutOfMemory));
+    try std.testing.expect(!shouldAbortDensePartialFallback(error.ResourceTemporarilyUnavailable));
+}
+
+test "dense embed download deadline is a nonzero remaining ceiling" {
+    try std.testing.expect((try remainingDirectEmbeddingDeadlineMs(null, 100)) == null);
+    try std.testing.expectError(error.Timeout, remainingDirectEmbeddingDeadlineMs(100, 100));
+    try std.testing.expectError(error.Timeout, remainingDirectEmbeddingDeadlineMs(99, 100));
+    try std.testing.expectEqual(@as(?u64, 1), try remainingDirectEmbeddingDeadlineMs(101, 100));
+    try std.testing.expectEqual(@as(?u64, 1), try remainingDirectEmbeddingDeadlineMs(std.time.ns_per_ms, 0));
+    try std.testing.expectEqual(@as(?u64, 2), try remainingDirectEmbeddingDeadlineMs(std.time.ns_per_ms + 1, 0));
+}
+
+test "dense embed parser contexts reject expired image fetches" {
+    const allocator = std.testing.allocator;
+    var node: Node = undefined;
+    node.config = .{};
+    const manifest = manifest_mod.ModelManifest{
+        .allocator = allocator,
+        .model_type = .embedder,
+        .visual_model_path = "visual.onnx",
+    };
+    const context = DenseEmbedRequestContext{ .io = std.testing.io, .deadline_ns = 0 };
+
+    var fail_fast_input = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        "[{\"type\":\"image_url\",\"image_url\":\"data:image/png;base64,AA==\"}]",
+        .{},
+    );
+    defer fail_fast_input.deinit();
+    var fail_fast_budget = RequestMediaBudget.init(1024);
+    resetRequestWorkTestCounters();
+    try std.testing.expectError(
+        error.Timeout,
+        parseDenseEmbedInputsWithBudgetAndContext(
+            &node,
+            allocator,
+            &manifest,
+            fail_fast_input.value,
+            &fail_fast_budget,
+            context,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.media_fetch_attempts);
+    try std.testing.expectEqual(@as(usize, 0), fail_fast_budget.used_bytes);
+
+    var per_item_input = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        "[{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,AA==\"}}]",
+        .{},
+    );
+    defer per_item_input.deinit();
+    var per_item_budget = RequestMediaBudget.init(1024);
+    resetRequestWorkTestCounters();
+    try std.testing.expectError(
+        error.Timeout,
+        parseDenseEmbedInputsPerItemWithBudgetAndContext(
+            &node,
+            allocator,
+            &manifest,
+            per_item_input.value,
+            &per_item_budget,
+            context,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.media_fetch_attempts);
+    try std.testing.expectEqual(@as(usize, 0), per_item_budget.used_bytes);
+
+    const parts = [_]Node.DirectDenseEmbedPart{.{ .image_url = "data:image/png;base64,AA==" }};
+    var direct_budget = RequestMediaBudget.init(1024);
+    resetRequestWorkTestCounters();
+    try std.testing.expectError(
+        error.Timeout,
+        parseDirectDenseEmbedInputsWithContext(
+            &node,
+            allocator,
+            &manifest,
+            &parts,
+            &direct_budget,
+            context,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.media_fetch_attempts);
+    try std.testing.expectEqual(@as(usize, 0), direct_budget.used_bytes);
 }
 
 fn freeDirectDenseVectors(allocator: std.mem.Allocator, vectors: [][]f32) void {
@@ -477,6 +1340,16 @@ fn tokenUsage(prompt_tokens: usize, completion_tokens: usize) api.GenerateUsage 
         .completion_tokens = @intCast(completion_tokens),
         .total_tokens = @intCast(prompt_tokens + completion_tokens),
     };
+}
+
+fn tokenUsageWithCachedPrompt(
+    prompt_tokens: usize,
+    completion_tokens: usize,
+    cached_prompt_tokens: usize,
+) api.GenerateUsage {
+    var usage = tokenUsage(prompt_tokens, completion_tokens);
+    usage.cached_prompt_tokens = if (cached_prompt_tokens == 0) null else @intCast(cached_prompt_tokens);
+    return usage;
 }
 
 fn estimateTextTokens(text: []const u8) usize {
@@ -878,8 +1751,9 @@ fn addCompatibilityManifestFacts(
     man: *const manifest_mod.ModelManifest,
 ) void {
     const model_type: u8 = @intFromEnum(man.model_type);
+    const model_type_origin: u8 = @intFromEnum(man.model_type_origin);
     const native_arch_hint: u8 = @intFromEnum(man.native_arch_hint);
-    signature.update(&.{ model_type, native_arch_hint });
+    signature.update(&.{ model_type, model_type_origin, native_arch_hint });
     updateCompatibilitySignatureSlice(signature, man.config_model_arch);
     updateCompatibilitySignatureSlice(signature, man.gliner_model_type);
     updateCompatibilitySignatureSlice(signature, man.inference_bundle_family);
@@ -1464,6 +2338,142 @@ fn collectDiscoveredModelCounts(models_dir: []const u8, allocator: std.mem.Alloc
     return counts;
 }
 
+fn validateRequestModelIdentifier(raw: []const u8) !void {
+    if (raw.len == 0 or
+        std.fs.path.isAbsolute(raw) or
+        std.mem.indexOfScalar(u8, raw, '\\') != null or
+        std.mem.indexOfScalar(u8, raw, 0) != null)
+    {
+        return error.InvalidModelIdentifier;
+    }
+
+    const value = if (std.mem.startsWith(u8, raw, "hf:")) raw[3..] else raw;
+    if (value.len == 0) return error.InvalidModelIdentifier;
+    const colon = std.mem.indexOfScalar(u8, value, ':');
+    const identifier = if (colon) |index| value[0..index] else value;
+    if (colon) |index| {
+        const variant = value[index + 1 ..];
+        if (variant.len == 0 or
+            std.mem.indexOfScalar(u8, variant, '/') != null or
+            variant.len > 256)
+        {
+            return error.InvalidModelIdentifier;
+        }
+        var variant_components = std.mem.splitScalar(u8, variant, ':');
+        while (variant_components.next()) |component| {
+            if (component.len == 0 or std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, "..")) {
+                return error.InvalidModelIdentifier;
+            }
+            for (component) |byte| {
+                if (byte < 0x20 or byte == 0x7f) return error.InvalidModelIdentifier;
+            }
+        }
+    }
+
+    var components = std.mem.splitScalar(u8, identifier, '/');
+    while (components.next()) |component| {
+        if (component.len == 0 or std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, "..")) {
+            return error.InvalidModelIdentifier;
+        }
+    }
+}
+
+fn realPathExistingAlloc(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const len = if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.realPathFileAbsolute(io, path, &buffer)
+    else
+        try std.Io.Dir.cwd().realPathFile(io, path, &buffer);
+    return allocator.dupe(u8, buffer[0..len]);
+}
+
+fn pathHasComponentPrefix(path: []const u8, prefix: []const u8) bool {
+    if (prefix.len == 0 or !std.mem.startsWith(u8, path, prefix)) return false;
+    return path.len == prefix.len or prefix[prefix.len - 1] == std.fs.path.sep or path[prefix.len] == std.fs.path.sep;
+}
+
+fn discoveredContainsModelDir(discovered: []const registry_mod.ModelEntry, model_dir: []const u8) bool {
+    for (discovered) |entry| {
+        if (std.mem.eql(u8, entry.path, model_dir)) return true;
+    }
+    return false;
+}
+
+fn stringSliceContains(values: []const []const u8, needle: []const u8) bool {
+    for (values) |value| {
+        if (std.mem.eql(u8, value, needle)) return true;
+    }
+    return false;
+}
+
+/// Return the exact request identifier for an existing canonical model path.
+/// Internal cache keys and paths outside models_dir deliberately have no
+/// public identifier.
+fn loadedModelRequestIdentifier(canonical_models_dir: []const u8, canonical_model_dir: []const u8) ?[]const u8 {
+    if (!pathHasComponentPrefix(canonical_model_dir, canonical_models_dir) or
+        canonical_model_dir.len == canonical_models_dir.len)
+    {
+        return null;
+    }
+
+    const relative_start = canonical_models_dir.len + @intFromBool(canonical_models_dir[canonical_models_dir.len - 1] != std.fs.path.sep);
+    if (relative_start >= canonical_model_dir.len) return null;
+    const identifier = canonical_model_dir[relative_start..];
+    if (std.mem.indexOfScalar(u8, identifier, ':') != null) return null;
+    for (identifier) |byte| {
+        if (byte < 0x20 or byte == 0x7f) return null;
+    }
+    validateRequestModelIdentifier(identifier) catch return null;
+    return identifier;
+}
+
+test "loaded model listing uses model directories and safe relative identifiers" {
+    const discovered = [_]registry_mod.ModelEntry{.{
+        .name = "owner/model",
+        .kind = .embedder,
+        .path = "models/owner/model",
+        .variant = "auto",
+    }};
+
+    try std.testing.expect(discoveredContainsModelDir(&discovered, "models/owner/model"));
+    try std.testing.expect(!discoveredContainsModelDir(&discovered, "models/owner/model\nbackend=metal"));
+    // Canonical comparison closes the relative-vs-absolute spelling gap.
+    try std.testing.expect(!discoveredContainsModelDir(&discovered, "/srv/models/owner/model"));
+    try std.testing.expect(stringSliceContains(&.{ "/srv/models/owner/model", "/srv/models/other" }, "/srv/models/owner/model"));
+    try std.testing.expectEqualStrings(
+        "embedders/owner/model",
+        loadedModelRequestIdentifier("/srv/models", "/srv/models/embedders/owner/model").?,
+    );
+    try std.testing.expect(loadedModelRequestIdentifier("/srv/models", "/srv/models") == null);
+    try std.testing.expect(loadedModelRequestIdentifier("/srv/models", "/srv/models-old/owner/model") == null);
+    try std.testing.expect(loadedModelRequestIdentifier("/srv/models", "/tmp/private-model") == null);
+    try std.testing.expect(loadedModelRequestIdentifier("/srv/models", "/srv/models/owner/model\nbackend=metal") == null);
+    try std.testing.expect(loadedModelRequestIdentifier("/srv/models", "/srv/models/owner/model:q4") == null);
+}
+
+const RequestModelResolutionErrorKind = enum { invalid, missing, internal };
+
+const RequestWorkTestCounters = struct {
+    model_resolution_attempts: usize = 0,
+    model_load_attempts: usize = 0,
+    media_fetch_attempts: usize = 0,
+};
+// Ordering tests assert real side-effect boundaries. Both this storage and all
+// mutations become void/dead code in production builds.
+var request_work_test_counters: if (builtin.is_test) RequestWorkTestCounters else void = if (builtin.is_test) .{} else {};
+
+fn resetRequestWorkTestCounters() void {
+    if (comptime builtin.is_test) request_work_test_counters = .{};
+}
+
+fn requestModelResolutionErrorKind(err: anyerror) RequestModelResolutionErrorKind {
+    return switch (err) {
+        error.InvalidModelIdentifier, error.ModelOutsideModelsDir => .invalid,
+        error.ModelNotFound, error.ModelNotSpecified, error.FileNotFound, error.NotDir => .missing,
+        else => .internal,
+    };
+}
+
 const ExtractionResolutionFailure = enum {
     not_found,
     resource_exhausted,
@@ -1491,15 +2501,128 @@ pub const Node = struct {
     request_queue: request_queue_mod.RequestQueue,
     compatibility_cache: std.StringHashMapUnmanaged(*CachedCompatibility) = .empty,
     compatibility_cache_lock: std.atomic.Mutex = .unlocked,
+    /// Runtime JIT qualification is limited to the single-threaded startup phase.
+    request_surfaces_published: bool = false,
+    /// Set after configured preloads, including declared optional sessions,
+    /// have completed successfully.
+    startup_preloads_materialized: bool = false,
 
     pub const DirectSparseEmbedding = sparse_embedding_mod.SparseVector;
 
+    /// Borrowed inputs for the embedded dense-embedding API. The caller keeps
+    /// every slice alive until the synchronous call returns; the Node never
+    /// stores or frees them.
+    pub const DirectDenseEmbedPart = union(enum) {
+        text: []const u8,
+        image_url: []const u8,
+        media: struct {
+            mime_type: []const u8,
+            data: []const u8,
+        },
+    };
+
+    pub const DirectGeneratePreflight = struct {
+        text_bytes: usize = 0,
+        encoded_media_bytes: usize = 0,
+        decoded_media_bytes: usize = 0,
+        media_count: usize = 0,
+        image_count: usize = 0,
+        has_audio: bool = false,
+    };
+
+    /// Owns one direct-generation queue admission from source preflight through
+    /// media conversion and model execution. Call deinit exactly once when
+    /// ownership ends; repeated calls are harmless to keep error cleanup safe.
+    pub const DirectGenerateAdmission = struct {
+        node: ?*Node,
+        reserved_units: usize,
+        resident_bytes: usize,
+        expected: DirectGeneratePreflight,
+        max_tokens: i32,
+        prepared: bool = false,
+
+        fn prepareMessages(self: *DirectGenerateAdmission, messages: []const generation.Message) !void {
+            const node = self.node orelse return error.InvalidGenerationAdmission;
+            if (self.prepared) return error.InvalidGenerationAdmission;
+
+            const actual = try directGeneratePreflightForMessages(messages);
+            if (actual.text_bytes != self.expected.text_bytes or
+                actual.decoded_media_bytes != self.expected.decoded_media_bytes or
+                actual.media_count != self.expected.media_count or
+                actual.image_count != self.expected.image_count or
+                actual.has_audio != self.expected.has_audio)
+            {
+                return error.InvalidGenerationAdmission;
+            }
+
+            if (actual.image_count > 0) {
+                const max_dimension = effectiveRequestContentSecurity(node).max_image_dimension;
+                const decoded_pixel_cap = readDecodedPixelCapForLimits(
+                    actual.image_count,
+                    node.request_queue.max_concurrent,
+                    max_dimension,
+                    self.resident_bytes,
+                );
+                const image_admission = ReadRequestAdmission{
+                    .units = self.reserved_units,
+                    .byte_cap = self.resident_bytes,
+                    .resident_byte_cap = self.resident_bytes,
+                    .decoded_pixel_cap = decoded_pixel_cap,
+                };
+                var decoded_budget = ReadDecodedImageBudget.init(image_admission, max_dimension);
+                for (messages) |message| {
+                    if (message.image_bytes) |images| {
+                        for (images) |image_bytes| try decoded_budget.addImage(image_bytes);
+                    }
+                }
+
+                const required_units = @max(self.reserved_units, decoded_budget.requiredUnits());
+                try node.request_queue.growUnits(self.reserved_units, required_units);
+                self.reserved_units = required_units;
+                node.updateQueueMetrics();
+            }
+            self.prepared = true;
+        }
+
+        pub fn deinit(self: *DirectGenerateAdmission) void {
+            const node = self.node orelse return;
+            self.node = null;
+            node.releaseSlotUnits(self.reserved_units);
+            node.metrics.decActive();
+        }
+    };
+
     pub fn init(allocator: std.mem.Allocator, config: NodeConfig) !Node {
+        if (config.kernel_jit.profile_capture_only) {
+            return error.KernelJitProfileCaptureUnsupportedInServer;
+        }
+        try config.kernel_jit.validate();
+        try config.prompt_cache.validate();
+        var session_manager = backends_mod.SessionManager.init(allocator);
+        session_manager.kernel_jit = config.kernel_jit;
+        try graph_mod.kernel_jit.validateMetalProfileBackend(
+            backends_mod.BackendType.metal.available(),
+            false,
+            config.kernel_jit.qualified_profile_path != null,
+        );
+        if (config.kernel_jit.mode.compiles()) {
+            if (session_manager.bestKernelJitBackend()) |backend| {
+                std.log.info(
+                    "kernel_jit_backend mode={s} preferred_backend={s}",
+                    .{ @tagName(config.kernel_jit.mode), @tagName(backend) },
+                );
+            } else {
+                std.log.warn(
+                    "kernel_jit_backend mode={s} preferred_backend=none; backend preference is configured separately (set ANTFLY_INFERENCE_PREFERRED_BACKEND=cuda for CUDA)",
+                    .{@tagName(config.kernel_jit.mode)},
+                );
+            }
+        }
         var node: Node = .{
             .config = config,
             .allocator = allocator,
-            .session_manager = backends_mod.SessionManager.init(allocator),
-            .model_manager = model_manager_mod.ModelManager.init(allocator, backends_mod.SessionManager.init(allocator)),
+            .session_manager = session_manager,
+            .model_manager = model_manager_mod.ModelManager.init(allocator, session_manager),
             .registry = registry_mod.ModelRegistry.init(allocator, config.models_dir),
             .extraction_reader_resolver = extractors_mod.ReaderResolver.init(allocator),
             .tabular_registry = tabular_mod.registry.Registry.init(allocator),
@@ -1724,6 +2847,11 @@ pub const Node = struct {
         self.model_manager.attachIo(io);
     }
 
+    pub fn detachPromptCacheResourceUsageObserver(self: *Node) void {
+        self.config.prompt_cache_resource_usage_observer = null;
+        self.model_manager.detachPromptCacheResourceUsageObserver();
+    }
+
     pub fn embedDenseTextsDirect(
         self: *Node,
         allocator: std.mem.Allocator,
@@ -1752,23 +2880,54 @@ pub const Node = struct {
         defer self.metrics.decActive();
 
         const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "embedders");
+        defer self.allocator.free(model_path);
         try ensureDirectEmbeddingDeadline(deadline_ns);
-        var model_handle = try self.model_manager.acquireFromDir(model_path);
-        defer model_handle.release();
-        const model = model_handle.get();
-        try ensureDirectEmbeddingDeadline(deadline_ns);
-        if (model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
-        var asset_lease = model.acquireEmbeddingAssetLease(false);
-        defer asset_lease.release();
+        var admission_manifest = try manifest_mod.loadFromDir(allocator, model_path);
+        defer admission_manifest.deinit();
+        if (admission_manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
+
+        const Attempt = struct {
+            allocator: std.mem.Allocator,
+            deadline_ns: ?u64,
+            texts: []const []const u8,
+            vectors: ?[][]f32 = null,
+
+            fn run(ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
+                const attempt: *@This() = @ptrCast(@alignCast(ctx));
+                if (model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
+                var asset_lease = model.acquireEmbeddingAssetLease(false);
+                defer asset_lease.release();
+                const vectors = try embedDenseTextsOnLoadedModel(
+                    attempt.allocator,
+                    attempt.deadline_ns,
+                    model,
+                    attempt.texts,
+                );
+                asset_lease.release();
+                errdefer freeDirectDenseVectors(attempt.allocator, vectors);
+                try ensureDirectEmbeddingDeadline(attempt.deadline_ns);
+                attempt.vectors = vectors;
+            }
+        };
+        var attempt = Attempt{
+            .allocator = allocator,
+            .deadline_ns = deadline_ns,
+            .texts = texts,
+        };
+        try runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{}, &attempt, Attempt.run);
+        return attempt.vectors.?;
+    }
+
+    fn embedDenseTextsOnLoadedModel(
+        allocator: std.mem.Allocator,
+        deadline_ns: ?u64,
+        model: *model_manager_mod.LoadedModel,
+        texts: []const []const u8,
+    ) ![][]f32 {
         try model.ensureEmbeddingAssets(true, false, false);
         try ensureDirectEmbeddingDeadline(deadline_ns);
-
         var pipeline = model.embeddingPipeline(allocator);
-        const vectors = try pipeline.embed(texts);
-        asset_lease.release();
-        errdefer freeDirectDenseVectors(allocator, vectors);
-        try ensureDirectEmbeddingDeadline(deadline_ns);
-        return vectors;
+        return pipeline.embed(texts);
     }
 
     pub fn embedSparseTextsDirect(
@@ -1788,18 +2947,28 @@ pub const Node = struct {
         defer io_impl.deinit();
 
         const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "embedders");
-        var model_handle = try self.model_manager.acquireFromDir(model_path);
-        defer model_handle.release();
-        const model = model_handle.get();
-        if (!model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
-        var pipeline = sparse_embedding_mod.SparseEmbeddingPipeline{
-            .allocator = allocator,
-            .session = model.session,
-            .tok = model.getTokenizer(),
-            .config = sparse_embedding_mod.SparseEmbeddingConfig.fromManifest(&model.manifest),
-            .execution_lock = model.embeddingExecutionLock(),
+        defer self.allocator.free(model_path);
+        const Attempt = struct {
+            allocator: std.mem.Allocator,
+            texts: []const []const u8,
+            vectors: ?[]DirectSparseEmbedding = null,
+
+            fn run(ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
+                const attempt: *@This() = @ptrCast(@alignCast(ctx));
+                if (!model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
+                var pipeline = sparse_embedding_mod.SparseEmbeddingPipeline{
+                    .allocator = attempt.allocator,
+                    .session = model.session,
+                    .tok = model.getTokenizer(),
+                    .config = sparse_embedding_mod.SparseEmbeddingConfig.fromManifest(&model.manifest),
+                    .execution_lock = model.embeddingExecutionLock(),
+                };
+                attempt.vectors = try pipeline.embed(attempt.texts);
+            }
         };
-        return try pipeline.embed(texts);
+        var attempt = Attempt{ .allocator = allocator, .texts = texts };
+        try runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{}, &attempt, Attempt.run);
+        return attempt.vectors.?;
     }
 
     pub fn rerankTextsDirect(
@@ -1846,7 +3015,7 @@ pub const Node = struct {
             };
         }
 
-        return self.generateMessagesDirectMaxTokens(allocator, model_name, messages, 256, null, null, false);
+        return self.generateMessagesDirectMaxTokens(allocator, model_name, messages, 256, null, false, null, false);
     }
 
     pub fn generateMessagesDirect(
@@ -1855,7 +3024,84 @@ pub const Node = struct {
         model_name: []const u8,
         messages: []const generation.Message,
     ) ![]u8 {
-        return self.generateMessagesDirectMaxTokens(allocator, model_name, messages, 256, null, null, false);
+        return self.generateMessagesDirectMaxTokens(allocator, model_name, messages, 256, null, false, null, false);
+    }
+
+    pub fn beginDirectGenerateAdmission(
+        self: *Node,
+        preflight: DirectGeneratePreflight,
+        max_tokens: i32,
+    ) !DirectGenerateAdmission {
+        if (max_tokens < 1 or
+            preflight.image_count > preflight.media_count or
+            preflight.has_audio != (preflight.media_count > preflight.image_count) or
+            (preflight.media_count == 0 and
+                (preflight.encoded_media_bytes != 0 or preflight.decoded_media_bytes != 0)))
+        {
+            return error.InvalidGenerationRequest;
+        }
+
+        const resident_bytes = std.math.add(
+            usize,
+            preflight.encoded_media_bytes,
+            preflight.decoded_media_bytes,
+        ) catch return error.RemoteContentTooLarge;
+        if (resident_bytes > requestMediaMaxBytes(self)) return error.RemoteContentTooLarge;
+
+        const audio_working_bytes = if (preflight.has_audio)
+            default_max_audio_decode_working_bytes
+        else
+            0;
+        const peak_bytes = std.math.add(usize, resident_bytes, audio_working_bytes) catch
+            std.math.maxInt(usize);
+        if (preflight.has_audio and self.request_queue.max_concurrent != 0) {
+            const capacity_bytes = std.math.mul(
+                usize,
+                self.request_queue.max_concurrent,
+                read_admission_bytes_per_unit,
+            ) catch std.math.maxInt(usize);
+            if (peak_bytes > capacity_bytes) return error.AudioTooLarge;
+        }
+        const generation_units = estimateGenerateQueueUnitsFromShape(
+            preflight.text_bytes,
+            preflight.media_count,
+            max_tokens,
+        );
+        const byte_units = @max(
+            @as(usize, 1),
+            admissionUnitsFor(peak_bytes, read_admission_bytes_per_unit),
+        );
+        const reserved_units = @max(generation_units, byte_units);
+
+        try self.request_queue.acquireUnits(reserved_units);
+        self.updateQueueMetrics();
+        self.metrics.incRequest("generate.local");
+        return .{
+            .node = self,
+            .reserved_units = reserved_units,
+            .resident_bytes = resident_bytes,
+            .expected = preflight,
+            .max_tokens = max_tokens,
+        };
+    }
+
+    pub fn generateMessagesDirectAdmitted(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        messages: []const generation.Message,
+        admission: *DirectGenerateAdmission,
+    ) ![]u8 {
+        return self.generateMessagesDirectWithAdmission(
+            allocator,
+            model_name,
+            messages,
+            admission,
+            null,
+            false,
+            null,
+            false,
+        );
     }
 
     const DirectGenerateTiming = struct {
@@ -1869,7 +3115,9 @@ pub const Node = struct {
     fn countPromptTokens(
         allocator: std.mem.Allocator,
         model: *model_manager_mod.LoadedModel,
+        gpt_config: gpt_model_mod.Config,
         messages: []const generation.Message,
+        max_tokens: i32,
     ) !usize {
         const prompt = if (model.chat_tmpl) |ct|
             try ct.apply(allocator, messages, true)
@@ -1877,11 +3125,19 @@ pub const Node = struct {
             try generation.formatMessages(allocator, messages);
         defer allocator.free(prompt);
 
-        var encoded = try generation.encodePromptForGeneration(
+        const media_allowance = generation.nativeGenerationMediaTokenAllowance(messages, gpt_config);
+        const prompt_token_limit = try generation.nativeGenerationPromptTokenLimit(
+            gpt_config,
+            null,
+            @intCast(@max(max_tokens, 1)),
+            0,
+            media_allowance,
+        );
+        var encoded = try generation.encodeNativeGenerationPrompt(
             model.getTokenizer(),
             allocator,
             prompt,
-            2048,
+            prompt_token_limit,
             model.manifest.add_bos_token,
             model.manifest.bos_token,
         );
@@ -1890,7 +3146,7 @@ pub const Node = struct {
         var prompt_tokens: usize = 0;
         while (prompt_tokens < encoded.attention_mask.len and encoded.attention_mask[prompt_tokens] != 0) : (prompt_tokens += 1) {}
         if (prompt_tokens == 0) return error.EmptyPrompt;
-        return prompt_tokens;
+        return std.math.add(usize, prompt_tokens, media_allowance) catch error.PromptTooLong;
     }
 
     fn generateMessagesDirectMaxTokens(
@@ -1900,33 +3156,65 @@ pub const Node = struct {
         messages: []const generation.Message,
         max_tokens: i32,
         preferred_backends: ?[]const backends_mod.BackendType,
+        cache_default_alias: bool,
         timing: ?*DirectGenerateTiming,
         pin_after_success: bool,
     ) ![]u8 {
         if (messages.len == 0) return error.InvalidGenerationRequest;
-        const started_at_ns = embedTimingNowNs();
+        const preflight = try directGeneratePreflightForMessages(messages);
+        var admission = try self.beginDirectGenerateAdmission(preflight, max_tokens);
+        defer admission.deinit();
+        return self.generateMessagesDirectWithAdmission(
+            allocator,
+            model_name,
+            messages,
+            &admission,
+            preferred_backends,
+            cache_default_alias,
+            timing,
+            pin_after_success,
+        );
+    }
 
-        const queue_units = self.estimateGenerateQueueUnits(messages, max_tokens);
-        try self.request_queue.acquireUnits(queue_units);
-        self.updateQueueMetrics();
-        defer self.releaseSlotUnits(queue_units);
-        self.metrics.incRequest("generate.local");
-        defer self.metrics.decActive();
+    fn generateMessagesDirectWithAdmission(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        messages: []const generation.Message,
+        admission: *DirectGenerateAdmission,
+        preferred_backends: ?[]const backends_mod.BackendType,
+        cache_default_alias: bool,
+        timing: ?*DirectGenerateTiming,
+        pin_after_success: bool,
+    ) ![]u8 {
+        if (messages.len == 0) return error.InvalidGenerationRequest;
+        const admitted_node = admission.node orelse return error.InvalidGenerationAdmission;
+        if (admitted_node != self) return error.InvalidGenerationAdmission;
+        try admission.prepareMessages(messages);
+        const max_tokens = admission.max_tokens;
+        const started_at_ns = embedTimingNowNs();
 
         var io_impl = std.Io.Threaded.init(allocator, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
 
-        const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "generators");
+        const model_path = self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "generators") catch |err| {
+            std.log.err("direct generator resolve failed model={s}: {s}", .{ model_name, @errorName(err) });
+            return err;
+        };
+        defer self.allocator.free(model_path);
         const resolved_at_ns = embedTimingNowNs();
         var model_handle = if (preferred_backends) |backends|
-            try self.model_manager.acquireFromDirWithPreferredBackends(model_path, backends, false)
+            try self.model_manager.acquireFromDirWithPreferredBackends(model_path, backends, cache_default_alias)
         else
             try self.model_manager.acquireFromDir(model_path);
         defer model_handle.release();
         const model = model_handle.get();
         const loaded_at_ns = embedTimingNowNs();
-        model.lockNativeGeneration();
+        if (timing != null) {
+            std.log.info("direct generator loaded model={s} backend={s}", .{ model_name, @tagName(model.session.backend()) });
+        }
+        model.lockNativeGeneration(io);
         defer model.unlockNativeGeneration();
         const gpt_config = session_factory.getGptConfig(model.session) orelse return error.UnsupportedGeneratorProvider;
         const backend_kind: runtime.kv.pool.BackendKind = switch (model.session.backend()) {
@@ -1945,16 +3233,25 @@ pub const Node = struct {
             runtime.tier.memory.defaultLimitsForBackend(budget_backend_class),
         ));
         var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
-        const prompt_tokens = try countPromptTokens(allocator, model, messages);
-        const resource_estimate = try runtime.tier.memory.estimateGptGeneration(
-            backend_kind,
-            kv_dtype,
-            gpt_config,
+        const prompt_tokens = try countPromptTokens(allocator, model, gpt_config, messages, max_tokens);
+        const budget_components = [_]runtime.tier.memory.GptGenerationBudgetComponent{
+            .{ .backend = backend_kind, .kv_dtype = kv_dtype, .config = gpt_config },
+        };
+        const direct_prefill_ceiling = @min(
+            prompt_tokens,
+            generation.nativeGenerationPrefillChunkCeiling(
+                backend_kind,
+                gpt_config,
+                self.config.generation_batching.schedulerPolicy().max_idle_prefill_chunk_size,
+            ),
+        );
+        const admitted_prefill_chunk = runtime.tier.memory.reserveGptGenerationAtLargestChunk(
+            &run_budget,
+            &budget_components,
             prompt_tokens,
             @intCast(@max(max_tokens, 1)),
-            256,
-        );
-        run_budget.reserveEstimate(resource_estimate) catch |err| {
+            direct_prefill_ceiling,
+        ) catch |err| {
             if (err == error.MemoryBudgetExceeded) {
                 var buf: [512]u8 = undefined;
                 std.log.warn("{s}", .{
@@ -1964,6 +3261,14 @@ pub const Node = struct {
             }
             return err;
         };
+        const resource_estimate = try runtime.tier.memory.estimateGptGeneration(
+            backend_kind,
+            kv_dtype,
+            gpt_config,
+            prompt_tokens,
+            @intCast(@max(max_tokens, 1)),
+            admitted_prefill_chunk,
+        );
         var admission_lease = try self.model_manager.acquireRunResources(
             budget_backend_class,
             budget_limits,
@@ -1985,32 +3290,9 @@ pub const Node = struct {
         };
         defer cb.deinit();
 
-        const sliding_window_size: ?u32 = if (gpt_config.position_encoding == .absolute)
-            null
-        else if (gpt_config.sliding_window > 0)
-            gpt_config.sliding_window
-        else if (gpt_config.max_position_embeddings > 0)
-            gpt_config.max_position_embeddings
-        else
-            null;
-        const pool_id = try kv_manager.addPool(.{
-            .backend = backend_kind,
-            .dtype = kv_dtype,
-            .page_size_tokens = 16,
-            .num_layers_packed = @intCast(gpt_config.num_hidden_layers),
-            .num_kv_heads = gpt_config.maxKvHeads(),
-            .head_dim = gpt_config.maxHeadDim(),
-            .sliding_window_size = sliding_window_size,
-        });
-        var kv_storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, .{
-            .backend = backend_kind,
-            .dtype = kv_dtype,
-            .page_size_tokens = 16,
-            .num_layers_packed = @intCast(gpt_config.num_hidden_layers),
-            .num_kv_heads = gpt_config.maxKvHeads(),
-            .head_dim = gpt_config.maxHeadDim(),
-            .sliding_window_size = sliding_window_size,
-        });
+        const kv_pool_config = generation.kvPoolConfig(backend_kind, kv_dtype, gpt_config, generationKvSlidingTrimForced());
+        const pool_id = try kv_manager.addPool(kv_pool_config);
+        var kv_storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, kv_pool_config);
         defer kv_storage.deinit();
         try cb.provisionKvDeviceWriteHook(&kv_storage);
         var decode_state = generation.NativeDecodeState.initPaged(allocator, &kv_manager, pool_id, model.shared_moe_cache);
@@ -2044,9 +3326,41 @@ pub const Node = struct {
         const debug_metal_timing = timing != null and use_metal_whole_model and platform.env.getenvBool("TERMITE_DEBUG_METAL_TIMING");
         if (debug_metal_timing) graph_mod.metal_executor.resetTimingStats();
         const setup_at_ns = embedTimingNowNs();
-        var result = try pipeline.generate(messages, .{ .max_tokens = max_tokens, .prefill_chunk_size = 256 });
+        if (timing != null) {
+            std.log.info("direct generator starting generation model={s} backend={s}", .{ model_name, @tagName(model.session.backend()) });
+        }
+        // Snapshot CUDA op-profile counters before generation so the emitted
+        // line below reflects this request alone (warmup/other requests excluded).
+        const cuda_profile_before: ?session_factory.CudaRuntimeStats =
+            if (comptime build_options.enable_cuda)
+                (if (session_factory.cudaOpProfileLoggingEnabled()) session_factory.getCudaRuntimeStats(model.session) else null)
+            else
+                null;
+        var result = pipeline.generate(messages, .{ .max_tokens = max_tokens, .prefill_chunk_size = admitted_prefill_chunk }) catch |err| {
+            if (comptime build_options.enable_cuda) session_factory.drainCudaProfile(model.session);
+            std.log.err("direct generator generation failed model={s} backend={s}: {s}", .{
+                model_name,
+                @tagName(model.session.backend()),
+                @errorName(err),
+            });
+            return err;
+        };
         const generated_at_ns = embedTimingNowNs();
         defer result.deinit();
+        // Drain buffered per-op profile events (single host sync, off the hot
+        // path) and emit the same lines the CLI prints, so profiling works
+        // against the warm server too.
+        if (comptime build_options.enable_cuda) {
+            if (cuda_profile_before) |before| {
+                session_factory.drainCudaProfile(model.session);
+                if (session_factory.getCudaRuntimeStats(model.session)) |after| {
+                    const profile_delta = session_factory.cudaStatsDelta(after, before);
+                    var cuda_profile_line_buf: [768]u8 = undefined;
+                    std.log.info("{s}", .{session_factory.formatCudaDecodeProfileLine(&cuda_profile_line_buf, profile_delta)});
+                    std.log.info("{s}", .{session_factory.formatCudaPrefillProfileLine(&cuda_profile_line_buf, profile_delta)});
+                }
+            }
+        }
         if (debug_metal_timing) {
             if (model.native_generation_graph_cache.getSessionCompiledModelRuntime(.metal, .whole_model)) |runtime_model| {
                 runtime_model.printDebugTiming();
@@ -2069,32 +3383,96 @@ pub const Node = struct {
     pub fn warmConfiguredModels(self: *Node, allocator: std.mem.Allocator) !void {
         for (self.config.preload) |model| {
             self.warmModel(allocator, model) catch |err| {
-                if (model.backend) |backend| {
-                    std.log.err(
-                        "failed to warm configured inference model kind={s} model={s} backend={s} err={}",
-                        .{ @tagName(model.kind), model.name, @tagName(backend), err },
-                    );
-                } else {
-                    std.log.err(
-                        "failed to warm configured inference model kind={s} model={s} backend=auto err={}",
-                        .{ @tagName(model.kind), model.name, err },
-                    );
+                const backend_name = if (model.backend) |backend| @tagName(backend) else "auto";
+                if (!builtin.is_test) {
+                    std.log.err("failed to warm configured inference model kind={s} model={s} backend={s} err={}", .{
+                        @tagName(model.kind),
+                        model.name,
+                        backend_name,
+                        err,
+                    });
                 }
                 return err;
             };
         }
     }
 
-    pub fn warmConfiguredGenerators(self: *Node, allocator: std.mem.Allocator) !void {
+    /// Warm configured models while the caller still owns the exclusive
+    /// pre-serving startup phase. This is the only server path allowed to run
+    /// live kernel compilation and GPU qualification. Call before publishing
+    /// any listener or request handler that can reach this Node.
+    pub fn warmConfiguredModelsBeforeServing(self: *Node, allocator: std.mem.Allocator) !void {
+        if (self.request_surfaces_published) return error.KernelJitStartupWindowClosed;
+        // A retry must earn readiness again. Otherwise a failed second warm
+        // could leave a stale successful latch and permit route publication.
+        self.startup_preloads_materialized = false;
+        if ((self.config.kernel_jit.mode.failClosed() or
+            self.config.kernel_jit.qualified_profile_path != null) and
+            self.config.preload.len == 0)
+        {
+            if (!builtin.is_test) {
+                std.log.err(
+                    "kernel_jit required/qualified activation needs one startup preload; configure inference.preload before serving",
+                    .{},
+                );
+            }
+            return error.KernelJitRequiredPreloadMissing;
+        }
+        if (self.config.kernel_jit.qualified_profile_path != null and self.config.preload.len != 1) {
+            return error.KernelJitQualifiedProfileMultiplePreloadsUnsupported;
+        }
+        if (self.config.kernel_jit.qualified_profile_path != null and
+            self.config.preload[0].backend != null and
+            self.config.preload[0].backend.? != .metal)
+        {
+            return error.KernelJitQualifiedProfileRequiresMetalPreload;
+        }
+        const model_previous = self.model_manager.session_manager.kernel_jit_load_context;
+        const direct_previous = self.session_manager.kernel_jit_load_context;
+        self.model_manager.session_manager.kernel_jit_load_context = .startup_preload;
+        self.session_manager.kernel_jit_load_context = .startup_preload;
+        defer {
+            self.model_manager.session_manager.kernel_jit_load_context = model_previous;
+            self.session_manager.kernel_jit_load_context = direct_previous;
+        }
         try self.warmConfiguredModels(allocator);
+        self.startup_preloads_materialized = true;
+    }
+
+    pub fn warmConfiguredGenerators(self: *Node, allocator: std.mem.Allocator) !void {
+        try self.warmConfiguredModelsBeforeServing(allocator);
     }
 
     pub fn warmModel(self: *Node, allocator: std.mem.Allocator, model: WarmModel) !void {
+        const materialize_optional_sessions = kernelJitMaterializesOptionalSessions(self.config.kernel_jit.mode);
         switch (model.kind) {
             .generator => try self.warmGeneratorWithBackend(allocator, model.name, model.backend),
-            .embedder => try self.warmEmbedder(allocator, model.name, model.backend),
+            .embedder => try self.warmEmbedder(allocator, model.name, model.backend, materialize_optional_sessions),
             .reranker => try self.warmReranker(allocator, model.name, model.backend),
             .chunker, .classifier, .rewriter, .reader, .transcriber, .extractor => try self.warmLoadOnlyModel(allocator, model),
+        }
+        if (materialize_optional_sessions and model.kind != .embedder) {
+            try self.materializeWarmModelOptionalSessions(allocator, model);
+        }
+    }
+
+    fn materializeWarmModelOptionalSessions(self: *Node, allocator: std.mem.Allocator, model: WarmModel) !void {
+        var io_impl = std.Io.Threaded.init(allocator, .{});
+        defer io_impl.deinit();
+        const model_path = try self.resolveModelPath(io_impl.io(), model.name, warmModelTaskDir(model.kind));
+        defer self.allocator.free(model_path);
+        var loaded_handle = if (model.backend) |backend|
+            try self.model_manager.acquireFromDirWithPreferredBackends(model_path, singleBackendPreference(backend), true)
+        else
+            try self.model_manager.acquireFromDir(model_path);
+        defer loaded_handle.release();
+        const loaded = loaded_handle.get();
+
+        try loaded.materializeDeclaredOptionalSessions();
+        if (self.config.kernel_jit.mode.failClosed() and
+            !loaded.declaredOptionalSessionsMaterialized())
+        {
+            return error.KernelJitRequiredOptionalSessionUnmaterialized;
         }
     }
 
@@ -2112,7 +3490,7 @@ pub const Node = struct {
             .content = "ping",
         }};
         var timing = DirectGenerateTiming{};
-        const text = try self.generateMessagesDirectMaxTokens(allocator, model_name, &messages, 1, preferred_backends, &timing, true);
+        const text = try self.generateMessagesDirectMaxTokens(allocator, model_name, &messages, 1, preferred_backends, true, &timing, true);
         defer allocator.free(text);
         const elapsed_ms = elapsedMs(started_at_ns, embedTimingNowNs());
         std.log.info(
@@ -2128,7 +3506,13 @@ pub const Node = struct {
         );
     }
 
-    fn warmEmbedder(self: *Node, allocator: std.mem.Allocator, model_name: []const u8, backend: ?backends_mod.BackendType) !void {
+    fn warmEmbedder(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        backend: ?backends_mod.BackendType,
+        materialize_optional_sessions: bool,
+    ) !void {
         if (model_name.len == 0) return error.InvalidGenerationRequest;
         const started_at_ns = embedTimingNowNs();
         std.log.info("warming inference embedder model={s}", .{model_name});
@@ -2137,38 +3521,58 @@ pub const Node = struct {
         var io_impl = std.Io.Threaded.init(allocator, .{});
         defer io_impl.deinit();
         const model_path = try self.resolveModelPath(io_impl.io(), model_name, "embedders");
-        var model_handle = if (backend) |value|
-            try self.model_manager.acquireFromDirWithPreferredBackends(model_path, singleBackendPreference(value), false)
-        else
-            try self.model_manager.acquireFromDir(model_path);
-        defer model_handle.release();
-        const model = model_handle.get();
+        defer self.allocator.free(model_path);
+        const Attempt = struct {
+            allocator: std.mem.Allocator,
+            texts: []const []const u8,
+            materialize_optional_sessions: bool,
+            fail_closed: bool,
 
-        if (model.manifest.hasCapability("sparse")) {
-            var pipeline = sparse_embedding_mod.SparseEmbeddingPipeline{
-                .allocator = allocator,
-                .session = model.session,
-                .tok = model.getTokenizer(),
-                .config = sparse_embedding_mod.SparseEmbeddingConfig.fromManifest(&model.manifest),
-                .execution_lock = model.embeddingExecutionLock(),
-            };
-            const sparse = try pipeline.embed(&texts);
-            defer {
-                for (sparse) |*item| item.deinit(allocator);
-                allocator.free(sparse);
+            fn run(ctx: *anyopaque, loaded: *model_manager_mod.LoadedModel) !void {
+                const attempt: *@This() = @ptrCast(@alignCast(ctx));
+                if (loaded.manifest.hasCapability("sparse")) {
+                    var pipeline = sparse_embedding_mod.SparseEmbeddingPipeline{
+                        .allocator = attempt.allocator,
+                        .session = loaded.session,
+                        .tok = loaded.getTokenizer(),
+                        .config = sparse_embedding_mod.SparseEmbeddingConfig.fromManifest(&loaded.manifest),
+                        .execution_lock = loaded.embeddingExecutionLock(),
+                    };
+                    const sparse = try pipeline.embed(attempt.texts);
+                    defer {
+                        for (sparse) |*item| item.deinit(attempt.allocator);
+                        attempt.allocator.free(sparse);
+                    }
+                } else {
+                    var asset_lease = loaded.acquireEmbeddingAssetLease(false);
+                    defer asset_lease.release();
+                    try loaded.ensureEmbeddingAssets(true, false, false);
+                    var pipeline = loaded.embeddingPipeline(attempt.allocator);
+                    const embeddings = try pipeline.embed(attempt.texts);
+                    defer {
+                        for (embeddings) |embedding| attempt.allocator.free(embedding);
+                        attempt.allocator.free(embeddings);
+                    }
+                }
+                if (attempt.materialize_optional_sessions) {
+                    try loaded.materializeDeclaredOptionalSessions();
+                    if (attempt.fail_closed and !loaded.declaredOptionalSessionsMaterialized()) {
+                        return error.KernelJitRequiredOptionalSessionUnmaterialized;
+                    }
+                }
             }
-        } else {
-            var asset_lease = model.acquireEmbeddingAssetLease(false);
-            defer asset_lease.release();
-            try model.ensureEmbeddingAssets(true, false, false);
-            var pipeline = model.embeddingPipeline(allocator);
-            const embeddings = try pipeline.embed(&texts);
-            defer {
-                for (embeddings) |embedding| allocator.free(embedding);
-                allocator.free(embeddings);
-            }
-        }
-        model_handle.pin();
+        };
+        var attempt = Attempt{
+            .allocator = allocator,
+            .texts = &texts,
+            .materialize_optional_sessions = materialize_optional_sessions,
+            .fail_closed = self.config.kernel_jit.mode.failClosed(),
+        };
+        try runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{
+            .preferred_backends = if (backend) |value| singleBackendPreference(value) else null,
+            .cache_default_alias = false,
+            .pin_on_success = true,
+        }, &attempt, Attempt.run);
         std.log.info("warmed inference embedder model={s} elapsed_ms={d}", .{ model_name, elapsedMs(started_at_ns, embedTimingNowNs()) });
     }
 
@@ -2195,15 +3599,7 @@ pub const Node = struct {
 
     fn warmLoadOnlyModel(self: *Node, allocator: std.mem.Allocator, model: WarmModel) !void {
         if (model.name.len == 0) return error.InvalidGenerationRequest;
-        const task_dir = switch (model.kind) {
-            .chunker => "chunkers",
-            .classifier => "classifiers",
-            .rewriter => "rewriters",
-            .reader => "readers",
-            .transcriber => "transcribers",
-            .extractor => "extractors",
-            else => return error.UnsupportedWarmModelKind,
-        };
+        const task_dir = warmModelTaskDir(model.kind);
         const started_at_ns = embedTimingNowNs();
         std.log.info("loading inference {s} model={s}", .{ @tagName(model.kind), model.name });
         var io_impl = std.Io.Threaded.init(allocator, .{});
@@ -2238,45 +3634,191 @@ pub const Node = struct {
         input: std.json.Value,
     ) ![][]f32 {
         try ensureDirectEmbeddingDeadline(deadline_ns);
-        try self.request_queue.acquire();
+        const media_admission = requestMediaAdmission(self, denseEmbedRequestMediaShape(input));
+        try self.request_queue.acquireUnits(media_admission.units);
         self.updateQueueMetrics();
-        defer self.releaseSlot();
+        var reserved_units = media_admission.units;
+        defer self.releaseSlotUnits(reserved_units);
         self.metrics.incRequest("embed.local");
         defer self.metrics.decActive();
 
         const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "embedders");
+        defer self.allocator.free(model_path);
         try ensureDirectEmbeddingDeadline(deadline_ns);
-        var model_handle = try self.model_manager.acquireFromDir(model_path);
-        defer model_handle.release();
-        const model = model_handle.get();
+        var admission_manifest = try manifest_mod.loadFromDir(allocator, model_path);
+        defer admission_manifest.deinit();
+        if (admission_manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
         try ensureDirectEmbeddingDeadline(deadline_ns);
-        if (model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
 
-        var parsed = try parseDenseEmbedInputs(self, allocator, &model.manifest, input);
-        defer parsed.deinit(allocator);
-        if (parsed.total_count == 0) return try allocator.alloc([]f32, 0);
-
-        var asset_lease = model.acquireEmbeddingAssetLease(parsed.audio.items.len > 0);
-        defer asset_lease.release();
-        try ensureDirectEmbeddingDeadline(deadline_ns);
-        var pipeline = try prepareInitialDenseEmbeddingPipeline(model, allocator, &parsed);
-        var audio_asset_guard = AudioEmbeddingAssetGuard.init(
-            model,
-            parsed.audio.items.len > 0,
-        );
-        defer audio_asset_guard.deinit();
-        const vectors = try embedDenseInputs(
+        var media_budget = RequestMediaBudget.init(media_admission.byte_cap);
+        var parsed = try parseDenseEmbedInputsWithBudgetAndContext(
+            self,
             allocator,
-            &pipeline,
-            &parsed,
-            model,
-            &audio_asset_guard,
-            &asset_lease,
+            &admission_manifest,
+            input,
+            &media_budget,
+            .{ .io = io, .deadline_ns = deadline_ns },
         );
-        asset_lease.release();
-        errdefer freeDirectDenseVectors(allocator, vectors);
+        defer parsed.deinit(allocator);
+        return try self.embedParsedDenseInputsDirect(
+            allocator,
+            model_path,
+            media_admission,
+            &parsed,
+            &reserved_units,
+            deadline_ns,
+        );
+    }
+
+    pub fn embedDensePartsDirect(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        parts: []const DirectDenseEmbedPart,
+    ) ![][]f32 {
+        var io_impl = std.Io.Threaded.init(allocator, .{});
+        defer io_impl.deinit();
+        return try self.embedDensePartsDirectWithContext(allocator, io_impl.io(), null, model_name, parts);
+    }
+
+    pub fn embedDensePartsDirectWithContext(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        deadline_ns: ?u64,
+        model_name: []const u8,
+        parts: []const DirectDenseEmbedPart,
+    ) ![][]f32 {
+        if (parts.len == 0) return try allocator.alloc([]f32, 0);
         try ensureDirectEmbeddingDeadline(deadline_ns);
-        return vectors;
+
+        const preflight = try directDenseEmbedPreflight(parts);
+        const media_admission = requestMediaAdmission(self, preflight.shape);
+        if (preflight.known_media_bytes > media_admission.byte_cap) return error.RemoteContentTooLarge;
+        const audio_admission = if (preflight.has_audio)
+            audioDecodeAdmission(self, media_admission.resident_byte_cap)
+        else
+            null;
+        if (audio_admission) |admission| {
+            if (self.request_queue.max_concurrent != 0 and admission.max_decode_working_bytes == 0)
+                return error.AudioTooLarge;
+        }
+        const initial_units = if (audio_admission) |admission|
+            @max(media_admission.units, admission.units)
+        else
+            media_admission.units;
+
+        // Only bounded arithmetic and borrowed-slice inspection precede this
+        // lease. Fetch, decode, model resolution/loading, and output allocation
+        // all happen while the weighted request remains admitted.
+        try self.request_queue.acquireUnits(initial_units);
+        self.updateQueueMetrics();
+        var reserved_units = initial_units;
+        defer self.releaseSlotUnits(reserved_units);
+        self.metrics.incRequest("embed.local");
+        defer self.metrics.decActive();
+
+        const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "embedders");
+        defer self.allocator.free(model_path);
+        try ensureDirectEmbeddingDeadline(deadline_ns);
+        var admission_manifest = try manifest_mod.loadFromDir(allocator, model_path);
+        defer admission_manifest.deinit();
+        if (admission_manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
+
+        var media_budget = RequestMediaBudget.init(media_admission.byte_cap);
+        var parsed = try parseDirectDenseEmbedInputsWithContext(
+            self,
+            allocator,
+            &admission_manifest,
+            parts,
+            &media_budget,
+            .{ .io = io, .deadline_ns = deadline_ns },
+        );
+        defer parsed.deinit(allocator);
+        return try self.embedParsedDenseInputsDirect(
+            allocator,
+            model_path,
+            media_admission,
+            &parsed,
+            &reserved_units,
+            deadline_ns,
+        );
+    }
+
+    fn embedParsedDenseInputsDirect(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_path: []const u8,
+        media_admission: ReadRequestAdmission,
+        parsed: *ParsedDenseEmbedInputs,
+        reserved_units: *usize,
+        deadline_ns: ?u64,
+    ) ![][]f32 {
+        if (parsed.total_count == 0) return try allocator.alloc([]f32, 0);
+        try ensureDirectEmbeddingDeadline(deadline_ns);
+
+        var audio_decode_working_bytes = default_max_audio_decode_working_bytes;
+
+        if (parsed.images.items.len > 0) {
+            var decoded_budget = ReadDecodedImageBudget.init(media_admission, effectiveRequestContentSecurity(self).max_image_dimension);
+            for (parsed.images.items) |image| try decoded_budget.addImage(image.bytes);
+            const required_units = @max(reserved_units.*, decoded_budget.requiredUnits());
+            try self.request_queue.growUnits(reserved_units.*, required_units);
+            reserved_units.* = required_units;
+            self.updateQueueMetrics();
+        }
+
+        if (parsed.audio.items.len > 0) {
+            const audio_admission = audioDecodeAdmission(self, media_admission.resident_byte_cap);
+            const required_units = @max(reserved_units.*, audio_admission.units);
+            try self.request_queue.growUnits(reserved_units.*, required_units);
+            reserved_units.* = required_units;
+            audio_decode_working_bytes = audio_admission.max_decode_working_bytes;
+            self.updateQueueMetrics();
+        }
+
+        const Attempt = struct {
+            allocator: std.mem.Allocator,
+            parsed: *ParsedDenseEmbedInputs,
+            audio_decode_working_bytes: usize,
+            deadline_ns: ?u64,
+            vectors: ?[][]f32 = null,
+
+            fn run(ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
+                const attempt: *@This() = @ptrCast(@alignCast(ctx));
+                if (model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
+                var asset_lease = model.acquireEmbeddingAssetLease(attempt.parsed.audio.items.len > 0);
+                defer asset_lease.release();
+                try ensureDirectEmbeddingDeadline(attempt.deadline_ns);
+                var pipeline = try prepareInitialDenseEmbeddingPipeline(model, attempt.allocator, attempt.parsed);
+                pipeline.config.max_audio_decode_working_bytes = attempt.audio_decode_working_bytes;
+                var audio_asset_guard = AudioEmbeddingAssetGuard.init(
+                    model,
+                    attempt.parsed.audio.items.len > 0,
+                );
+                defer audio_asset_guard.deinit();
+                const vectors = try embedDenseInputs(
+                    attempt.allocator,
+                    &pipeline,
+                    attempt.parsed,
+                    model,
+                    &audio_asset_guard,
+                    &asset_lease,
+                );
+                asset_lease.release();
+                errdefer freeDirectDenseVectors(attempt.allocator, vectors);
+                try ensureDirectEmbeddingDeadline(attempt.deadline_ns);
+                attempt.vectors = vectors;
+            }
+        };
+        var attempt = Attempt{
+            .allocator = allocator,
+            .parsed = parsed,
+            .audio_decode_working_bytes = audio_decode_working_bytes,
+            .deadline_ns = deadline_ns,
+        };
+        try runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{}, &attempt, Attempt.run);
+        return attempt.vectors.?;
     }
 
     pub fn readImagesDirect(
@@ -2288,10 +3830,16 @@ pub const Node = struct {
         if (request.images.len == 0) return try allocator.alloc(readers_api.Result, 0);
         if (request.images.len > max_read_batch_images) return error.ReadBatchTooLarge;
         const max_tokens = try validateReadMaxTokens(request.max_tokens);
-        const queue_units = estimateReadQueueUnits(request.images.len, max_tokens);
-        try self.request_queue.acquireUnits(queue_units);
+        const inline_source_cap = readInlineSourceByteCap(self);
+        var inline_source_bytes: usize = 0;
+        for (request.images) |url| {
+            inline_source_bytes = try addReadInlineSourceBytes(inline_source_bytes, url, inline_source_cap);
+        }
+        const admission = readRequestAdmission(self, request.images.len, inline_source_bytes, max_tokens);
+        try self.request_queue.acquireUnits(admission.units);
         self.updateQueueMetrics();
-        defer self.releaseSlotUnits(queue_units);
+        var reserved_units = admission.units;
+        defer self.releaseSlotUnits(reserved_units);
         self.metrics.incRequest("read.local");
         defer self.metrics.decActive();
 
@@ -2299,15 +3847,7 @@ pub const Node = struct {
         defer io_impl.deinit();
 
         const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "readers");
-        var reader = try readers_mod.LoadedReader.loadFromDir(allocator, model_path, &self.session_manager, &self.model_manager);
-        defer reader.deinit();
-
-        const out = try allocator.alloc(readers_api.Result, request.images.len);
-        var initialized: usize = 0;
-        errdefer {
-            for (out[0..initialized]) |*result| readers_api.deinitResult(allocator, result);
-            allocator.free(out);
-        }
+        defer self.allocator.free(model_path);
 
         const downloaded = try allocator.alloc(scraping.DownloadedContent, request.images.len);
         var downloaded_count: usize = 0;
@@ -2318,15 +3858,32 @@ pub const Node = struct {
         const image_datas = try allocator.alloc([]const u8, request.images.len);
         defer allocator.free(image_datas);
 
-        const batch_byte_cap = readBatchMaxBytes();
+        const batch_byte_cap = admission.byte_cap;
         var batch_bytes: usize = 0;
+        var decoded_budget = ReadDecodedImageBudget.init(admission, effectiveRequestContentSecurity(self).max_image_dimension);
         for (request.images, 0..) |image_url, i| {
             var item = try downloadReadBatchContent(self, allocator, image_url, batch_byte_cap, batch_bytes);
             errdefer item.deinit(allocator);
             batch_bytes = try addReadBatchDownloadedBytes(batch_bytes, item, batch_byte_cap);
+            try decoded_budget.addImage(item.data);
             downloaded[i] = item;
             downloaded_count += 1;
             image_datas[i] = downloaded[i].data;
+        }
+
+        const required_units = @max(admission.units, decoded_budget.requiredUnits());
+        try self.request_queue.growUnits(reserved_units, required_units);
+        reserved_units = required_units;
+        self.updateQueueMetrics();
+
+        var reader = try readers_mod.LoadedReader.loadFromDir(allocator, model_path, &self.session_manager, &self.model_manager);
+        defer reader.deinit();
+
+        const out = try allocator.alloc(readers_api.Result, request.images.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |*result| readers_api.deinitResult(allocator, result);
+            allocator.free(out);
         }
 
         const results = try reader.readBatch(image_datas, .{
@@ -2361,9 +3918,16 @@ pub const Node = struct {
         model_name: []const u8,
         request: transcribing_api.Request,
     ) !transcribing_api.Response {
-        try self.request_queue.acquire();
+        var media_shape: RequestMediaAdmissionShape = .{};
+        if (std.mem.startsWith(u8, request.url, "data:"))
+            media_shape.addInline(request.url.len, false)
+        else
+            media_shape.has_remote = true;
+        const media_admission = requestMediaAdmission(self, media_shape);
+        try self.request_queue.acquireUnits(media_admission.units);
         self.updateQueueMetrics();
-        defer self.releaseSlot();
+        var reserved_units = media_admission.units;
+        defer self.releaseSlotUnits(reserved_units);
         self.metrics.incRequest("transcribe.local");
         defer self.metrics.decActive();
 
@@ -2371,6 +3935,38 @@ pub const Node = struct {
         defer io_impl.deinit();
 
         const model_path = try self.resolveModelPath(io_impl.io(), if (model_name.len > 0) model_name else null, "transcribers");
+        defer self.allocator.free(model_path);
+
+        var media_budget = RequestMediaBudget.init(media_admission.byte_cap);
+        var downloaded = try downloadRemoteContentWithBudgetForRequest(self, allocator, request.url, &media_budget);
+        defer downloaded.deinit(allocator);
+        const decode_options = audio_mod.DecodeOptions{ .mime_hint = downloaded.content_type };
+        const resident_bytes = if (std.mem.startsWith(u8, request.url, "data:"))
+            std.math.add(usize, media_budget.used_bytes, downloaded.data.len) catch std.math.maxInt(usize)
+        else
+            downloaded.data.len;
+        const audio_admission = audioDecodeAdmission(self, resident_bytes);
+        // Keep the reservation monotonic: a remote URL is admitted against the
+        // *potential* max download, which is typically larger than the actual
+        // clip's decode reservation. growUnits() is grow-only, so overwriting
+        // reserved_units downward here would under-release on the deferred
+        // releaseSlotUnits() and permanently leak shared-queue capacity.
+        const required_units = @max(reserved_units, audio_admission.units);
+        try self.request_queue.growUnits(reserved_units, required_units);
+        reserved_units = required_units;
+        self.updateQueueMetrics();
+
+        var decoded = audio_mod.decodeBounded(
+            allocator,
+            downloaded.data,
+            decode_options,
+            audio_admission.max_decode_working_bytes,
+        ) catch |err| switch (err) {
+            error.AudioTooLarge, error.OutOfMemory => return err,
+            else => return error.UnsupportedAudioInput,
+        };
+        defer decoded.deinit();
+
         var model_handle = try self.model_manager.acquireFromDir(model_path);
         defer model_handle.release();
         const model = model_handle.get();
@@ -2395,16 +3991,12 @@ pub const Node = struct {
                 .eos_token_id = whisper_config.eos_token_id,
                 .language = request.language,
                 .forced_decoder_ids = forced_ids,
+                .max_decode_working_bytes = audio_admission.max_decode_working_bytes,
                 .language_tokens = prompt_cache.language_tokens,
             },
         );
 
-        var downloaded = try downloadRemoteContent(self, allocator, request.url);
-        defer downloaded.deinit(allocator);
-        const decode_options = audio_mod.DecodeOptions{ .mime_hint = downloaded.content_type };
-        if (!audio_mod.canDecodeWithOptions(downloaded.data, decode_options)) return error.UnsupportedAudioInput;
-
-        var result = try pipeline.transcribeWithOptions(downloaded.data, decode_options);
+        var result = try pipeline.transcribePcm(decoded.samples, decoded.sample_rate);
         defer result.deinit();
         return .{
             .text = try allocator.dupe(u8, result.text),
@@ -2420,10 +4012,16 @@ pub const Node = struct {
     ) !extracting_api.Response {
         try self.request_queue.acquire();
         self.updateQueueMetrics();
-        var queue_units: usize = 1;
-        defer if (queue_units > 0) self.releaseSlotUnits(queue_units);
+        var reserved_units: usize = 1;
+        defer self.releaseSlotUnits(reserved_units);
         self.metrics.incRequest("extract.local");
         defer self.metrics.decActive();
+
+        const media_shape = try directExtractionMediaShape(allocator, request.inputs);
+        const media_admission = requestMediaAdmission(self, media_shape);
+        try self.request_queue.growUnits(reserved_units, media_admission.units);
+        reserved_units = media_admission.units;
+        self.updateQueueMetrics();
 
         var schema_parsed = try std.json.parseFromSlice(extraction_api.ExtractionSchema, allocator, request.schema_json, .{
             .allocate = .alloc_always,
@@ -2445,24 +4043,6 @@ pub const Node = struct {
             .include_spans = options.include_spans orelse false,
         };
 
-        var parsed_inputs = try parseDirectExtractionInputs(self, allocator, request.inputs, options.prompt, options.max_tokens);
-        defer parsed_inputs.deinit();
-        try validateExtractionInputKinds(parsed_inputs.texts.items.len, parsed_inputs.images.items.len);
-        const required_units = if (parsed_inputs.images.items.len > 0) blk: {
-            if (parsed_inputs.images.items.len > max_read_batch_images) return error.ReadBatchTooLarge;
-            if (parsed_inputs.max_tokens) |max_tokens| {
-                if (max_tokens == 0 or max_tokens > max_read_tokens) return error.InvalidMaxTokens;
-            }
-            break :blk estimateReadQueueUnits(parsed_inputs.images.items.len, parsed_inputs.max_tokens);
-        } else 1;
-        if (required_units > queue_units) {
-            self.releaseSlotUnits(queue_units);
-            queue_units = 0;
-            try self.request_queue.acquireUnits(required_units);
-            queue_units = required_units;
-            self.updateQueueMetrics();
-        }
-
         var io_impl = std.Io.Threaded.init(allocator, .{});
         defer io_impl.deinit();
 
@@ -2474,8 +4054,38 @@ pub const Node = struct {
             .model_manager = &self.model_manager,
             .reader_resolver = &self.extraction_reader_resolver,
         };
-        var extractor = try extractors_mod.resolve(extractor_ctx, model_name, parsed_inputs.images.items.len > 0);
+        // Resolve the cheap manifest/path surface before any remote fetch or
+        // media decode. The extractor itself does not load model weights until
+        // extractText/extractImages below.
+        var extractor = try extractors_mod.resolve(extractor_ctx, model_name, media_shape.image_count > 0);
         defer extractor.deinit(allocator);
+
+        var parsed_inputs = try parseDirectExtractionInputs(
+            self,
+            allocator,
+            request.inputs,
+            options.prompt,
+            options.max_tokens,
+            media_admission.byte_cap,
+        );
+        defer parsed_inputs.deinit();
+
+        try validateExtractionInputKinds(parsed_inputs.texts.items.len, parsed_inputs.images.items.len);
+        if (parsed_inputs.images.items.len > max_read_batch_images) return error.ReadBatchTooLarge;
+        if (parsed_inputs.max_tokens) |max_tokens| {
+            if (max_tokens == 0 or max_tokens > max_read_tokens) return error.InvalidMaxTokens;
+        }
+        if (parsed_inputs.images.items.len > 0) {
+            var decoded_budget = ReadDecodedImageBudget.init(media_admission, effectiveRequestContentSecurity(self).max_image_dimension);
+            for (parsed_inputs.images.items) |image_bytes| try decoded_budget.addImage(image_bytes);
+            const required_units = @max(
+                @max(reserved_units, decoded_budget.requiredUnits()),
+                estimateReadQueueUnits(parsed_inputs.images.items.len, parsed_inputs.max_tokens),
+            );
+            try self.request_queue.growUnits(reserved_units, required_units);
+            reserved_units = required_units;
+            self.updateQueueMetrics();
+        }
 
         const results = if (parsed_inputs.images.items.len > 0)
             try extractor.extractImages(extractor_ctx, schemas, config, parsed_inputs.images.items, .{
@@ -2495,20 +4105,79 @@ pub const Node = struct {
         };
     }
 
-    /// Resolve a model name to a directory path.
+    /// Returns a newly allocated canonical path. The caller must free it with
+    /// the allocator passed to this function.
+    fn resolveRequestModelPath(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        name: ?[]const u8,
+        task_type: ?[]const u8,
+    ) ![]const u8 {
+        if (comptime builtin.is_test) request_work_test_counters.model_resolution_attempts += 1;
+        if (name) |raw| try validateRequestModelIdentifier(raw);
+        const resolved = try self.resolveModelPath(io, name, task_type);
+        defer self.allocator.free(resolved);
+
+        const root = try realPathExistingAlloc(allocator, io, self.config.models_dir);
+        defer allocator.free(root);
+        const canonical = try realPathExistingAlloc(allocator, io, resolved);
+        errdefer allocator.free(canonical);
+        if (!pathHasComponentPrefix(canonical, root)) return error.ModelOutsideModelsDir;
+        return canonical;
+    }
+
+    fn requestModelResolutionError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        return switch (requestModelResolutionErrorKind(err)) {
+            .invalid => ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "model must be a relative identifier within models_dir",
+            }),
+            .missing => ctx.status(404).json(.{
+                .@"error" = "MODEL_NOT_FOUND",
+                .message = "model not found",
+            }),
+            .internal => ctx.status(500).json(.{
+                .@"error" = "MODEL_RESOLUTION_FAILED",
+                .message = internalErrorMessage("MODEL_RESOLUTION_FAILED", err),
+            }),
+        };
+    }
+
+    /// Resolve a model name to a directory path for trusted in-process callers.
     /// Supports: absolute path, "hf:owner/name:variant", "owner/name", variant resolution.
     /// Matches Go inference's resolveModel: exact match → re-scan → variant resolution.
     /// When task_type is provided (e.g. "embedders"), also searches models_dir/task_type/.
+    /// Always returns memory owned by `self.allocator`; the caller must free it.
     pub fn resolveModelPath(self: *Node, io: std.Io, name: ?[]const u8, task_type: ?[]const u8) ![]const u8 {
         if (name) |raw| {
             // Strip "hf:" prefix if present
             const n = if (std.mem.startsWith(u8, raw, "hf:")) raw[3..] else raw;
 
+            // Explicit Hub variants installed by the registry live in stable,
+            // variant-specific leaf directories. Resolve that identity before
+            // the legacy variant-stripping fallback below.
+            if (registry_mod.ModelRef.parse(n)) |ref| {
+                if (!std.mem.eql(u8, ref.variant, "auto")) {
+                    const variant_path = try registry_mod.modelInstallDirAlloc(self.allocator, self.config.models_dir, ref);
+                    if (dirContainsModel(variant_path)) return variant_path;
+                    self.allocator.free(variant_path);
+
+                    if (task_type) |tt| {
+                        const task_dir = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.config.models_dir, tt });
+                        defer self.allocator.free(task_dir);
+                        const task_variant_path = try registry_mod.modelInstallDirAlloc(self.allocator, task_dir, ref);
+                        if (dirContainsModel(task_variant_path)) return task_variant_path;
+                        self.allocator.free(task_variant_path);
+                    }
+                }
+            } else |_| {}
+
             // Strip ":variant" suffix for path resolution (variant is for pulling, not path lookup)
             const name_without_variant = if (std.mem.indexOfScalar(u8, n, ':')) |colon| n[0..colon] else n;
 
             // Absolute path
-            if (std.mem.startsWith(u8, name_without_variant, "/")) return name_without_variant;
+            if (std.mem.startsWith(u8, name_without_variant, "/")) return try self.allocator.dupe(u8, name_without_variant);
 
             // Try exact match: models_dir/name
             const path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.config.models_dir, name_without_variant });
@@ -2562,7 +4231,7 @@ pub const Node = struct {
         // No model specified — use models_dir itself if it contains model files,
         // otherwise scan for the first subdirectory.
         if (dirContainsModel(self.config.models_dir)) {
-            return self.config.models_dir;
+            return try self.allocator.dupe(u8, self.config.models_dir);
         }
         // Scan models_dir for subdirectories that contain model files
         // If task_type is provided, prefer scanning within that subdirectory
@@ -2695,6 +4364,23 @@ pub const Node = struct {
         return null;
     }
 
+    fn growSlotUnits(self: *Node, ctx: *httpx.Context, current_units: usize, target_units: usize) !?httpx.Response {
+        const requested_units = self.request_queue.capacityUnits(target_units);
+        self.request_queue.growUnits(current_units, target_units) catch {
+            self.metrics.incError();
+            self.metrics.recordQueueRejection(requested_units);
+            self.updateQueueMetrics();
+            return try transientCapacityFailureResponse(
+                ctx,
+                "SERVICE_UNAVAILABLE",
+                "server at capacity for expanded request workload, try again later",
+                "request_queue",
+            );
+        };
+        self.updateQueueMetrics();
+        return null;
+    }
+
     fn releaseSlot(self: *Node) void {
         self.releaseSlotUnits(1);
     }
@@ -2719,19 +4405,134 @@ pub const Node = struct {
         return 1 + (body_len / bytes_per_unit);
     }
 
+    fn directGeneratePreflightForMessages(messages: []const generation.Message) !DirectGeneratePreflight {
+        var preflight: DirectGeneratePreflight = .{};
+        for (messages) |message| {
+            preflight.text_bytes = std.math.add(
+                usize,
+                preflight.text_bytes,
+                message.content.len,
+            ) catch return error.RemoteContentTooLarge;
+            if (message.image_bytes) |images| {
+                for (images) |image_bytes| {
+                    preflight.decoded_media_bytes = std.math.add(
+                        usize,
+                        preflight.decoded_media_bytes,
+                        image_bytes.len,
+                    ) catch return error.RemoteContentTooLarge;
+                    preflight.media_count = std.math.add(
+                        usize,
+                        preflight.media_count,
+                        1,
+                    ) catch return error.RemoteContentTooLarge;
+                    preflight.image_count = std.math.add(
+                        usize,
+                        preflight.image_count,
+                        1,
+                    ) catch return error.RemoteContentTooLarge;
+                }
+            }
+            if (message.audio_bytes) |audio_clips| {
+                for (audio_clips) |audio_bytes| {
+                    preflight.decoded_media_bytes = std.math.add(
+                        usize,
+                        preflight.decoded_media_bytes,
+                        audio_bytes.len,
+                    ) catch return error.RemoteContentTooLarge;
+                    preflight.media_count = std.math.add(
+                        usize,
+                        preflight.media_count,
+                        1,
+                    ) catch return error.RemoteContentTooLarge;
+                    preflight.has_audio = true;
+                }
+            }
+        }
+        return preflight;
+    }
+
     fn estimateGenerateQueueUnits(self: *Node, messages: []const generation.Message, max_tokens: i32) usize {
         _ = self;
         var text_bytes: usize = 0;
-        var image_count: usize = 0;
+        var media_count: usize = 0;
         for (messages) |msg| {
-            text_bytes += msg.content.len;
-            if (msg.image_bytes) |images| image_count += images.len;
+            text_bytes = std.math.add(usize, text_bytes, msg.content.len) catch std.math.maxInt(usize);
+            if (msg.image_bytes) |images| media_count = std.math.add(usize, media_count, images.len) catch std.math.maxInt(usize);
+            if (msg.audio_bytes) |audio| media_count = std.math.add(usize, media_count, audio.len) catch std.math.maxInt(usize);
         }
 
-        const prompt_units = 1 + (text_bytes / 2048);
+        return estimateGenerateQueueUnitsFromShape(text_bytes, media_count, max_tokens);
+    }
+
+    fn estimateGenerateRequestQueueUnits(body: api.GenerateRequest, max_tokens: i32) usize {
+        var text_bytes: usize = 0;
+        var media_count: usize = 0;
+        for (body.messages) |msg| {
+            const content = msg.content orelse continue;
+            switch (content) {
+                .string => |text| text_bytes = std.math.add(usize, text_bytes, text.len) catch std.math.maxInt(usize),
+                .array => |parts| for (parts.items) |part| {
+                    if (part != .object) {
+                        media_count = std.math.add(usize, media_count, 1) catch std.math.maxInt(usize);
+                        continue;
+                    }
+                    const part_type = part.object.get("type") orelse {
+                        media_count = std.math.add(usize, media_count, 1) catch std.math.maxInt(usize);
+                        continue;
+                    };
+                    if (part_type == .string and std.mem.eql(u8, part_type.string, "text")) {
+                        if (part.object.get("text")) |text_value| {
+                            if (text_value == .string) {
+                                text_bytes = std.math.add(usize, text_bytes, text_value.string.len) catch std.math.maxInt(usize);
+                            }
+                        }
+                    } else {
+                        media_count = std.math.add(usize, media_count, 1) catch std.math.maxInt(usize);
+                    }
+                },
+                else => media_count = std.math.add(usize, media_count, 1) catch std.math.maxInt(usize),
+            }
+        }
+
+        const base_units = estimateGenerateQueueUnitsFromShape(text_bytes, media_count, max_tokens);
+        const speculation = parseGenerateSpeculationOptions(
+            body.draft_model != null,
+            body.speculative_k,
+            body.speculation_policy,
+            body.speculation_calibration,
+        ) catch return base_units;
+        return generateQueueUnitsForSpeculation(
+            base_units,
+            body.draft_model != null,
+            speculation.policy,
+        );
+    }
+
+    fn estimateGenerateBatchQueueUnitsPreflight(self: *Node, requests: []const api.GenerateBatchRequestItem, pending: []const bool) usize {
+        _ = self;
+        var total: usize = 1;
+        for (requests, pending) |item, is_pending| {
+            if (!is_pending) continue;
+            const max_tokens: i32 = if (item.body.max_tokens) |value|
+                if (value >= 1 and value <= std.math.maxInt(i32)) @intCast(value) else std.math.maxInt(i32)
+            else
+                256;
+            total = std.math.add(
+                usize,
+                total,
+                estimateGenerateRequestQueueUnits(item.body, max_tokens),
+            ) catch std.math.maxInt(usize);
+        }
+        return total;
+    }
+
+    fn estimateGenerateQueueUnitsFromShape(text_bytes: usize, media_count: usize, max_tokens: i32) usize {
+        const prompt_units = std.math.add(usize, 1, text_bytes / 2048) catch std.math.maxInt(usize);
         const decode_units: usize = @intCast(@max(@divTrunc(max_tokens, 256), 0));
-        const image_units = image_count * 2;
-        return 1 + prompt_units + decode_units + image_units;
+        const media_units = std.math.mul(usize, media_count, 2) catch std.math.maxInt(usize);
+        var total = std.math.add(usize, 1, prompt_units) catch std.math.maxInt(usize);
+        total = std.math.add(usize, total, decode_units) catch std.math.maxInt(usize);
+        return std.math.add(usize, total, media_units) catch std.math.maxInt(usize);
     }
 
     fn estimateGenerateBatchQueueUnits(
@@ -2759,30 +4560,51 @@ pub const Node = struct {
         return text_bytes;
     }
 
+    fn acquireNativeGenerateLease(
+        self: *const Node,
+        coordinator: *runtime.scheduler.native_generate.NativeGenerateCoordinator,
+        admission: runtime.scheduler.native_generate.Admission,
+    ) !runtime.scheduler.native_generate.Lease {
+        coordinator.setPolicy(self.config.generation_batching.schedulerPolicy());
+        return coordinator.acquire(admission);
+    }
+
     fn estimateNativePromptTokens(
         self: *Node,
         allocator: std.mem.Allocator,
         model: *model_manager_mod.LoadedModel,
+        gpt_config: gpt_model_mod.Config,
         messages: []const generation.Message,
+        max_tokens: i32,
+        speculative_bonus_tokens: usize,
+        enable_thinking: ?bool,
     ) !usize {
         _ = self;
         const prompt = if (model.chat_tmpl) |ct|
-            try ct.apply(allocator, messages, true)
+            try ct.applyWithOptions(allocator, messages, .{ .enable_thinking = enable_thinking })
         else
             try generation.formatMessages(allocator, messages);
         defer allocator.free(prompt);
-        var encoded = try generation.encodePromptForGeneration(
+        const media_allowance = generation.nativeGenerationMediaTokenAllowance(messages, gpt_config);
+        const prompt_token_limit = try generation.nativeGenerationPromptTokenLimit(
+            gpt_config,
+            null,
+            @intCast(@max(max_tokens, 1)),
+            speculative_bonus_tokens,
+            media_allowance,
+        );
+        var encoded = try generation.encodeNativeGenerationPrompt(
             model.getTokenizer(),
             allocator,
             prompt,
-            2048,
+            prompt_token_limit,
             model.manifest.add_bos_token,
             model.manifest.bos_token,
         );
         defer encoded.deinit();
         var count: usize = 0;
         while (count < encoded.attention_mask.len and encoded.attention_mask[count] != 0) : (count += 1) {}
-        return count;
+        return std.math.add(usize, count, media_allowance) catch error.PromptTooLong;
     }
 
     fn memoryBudgetExceededMessage(
@@ -2825,28 +4647,26 @@ pub const Node = struct {
             });
         };
 
-        const queue_units = self.estimateHttpRequestQueueUnits(ctx);
+        const media_admission = requestMediaAdmission(self, denseEmbedRequestMediaShape(request.input));
+        const queue_units = @max(self.estimateHttpRequestQueueUnits(ctx), media_admission.units);
         if (try self.acquireSlotUnits(ctx, queue_units)) |resp| return resp;
-        defer self.releaseSlotUnits(queue_units);
+        var reserved_units = queue_units;
+        defer self.releaseSlotUnits(reserved_units);
         self.metrics.incRequest("embed");
         defer self.metrics.decActive();
 
-        // Resolve and load model.
+        // Read only the lightweight manifest first so media can be admitted
+        // before loading tokenizer, weights, or accelerator sessions.
         const model_name: ?[]const u8 = if (request.model.len > 0) request.model else null;
-        const model_path = self.resolveModelPath(ctx.io, model_name, "embedders") catch
-            return ctx.status(404).json(.{
-                .@"error" = "MODEL_NOT_FOUND",
-                .message = "model not found; specify 'model' as a path or owner/name",
-            });
+        const model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "embedders") catch |err|
+            return requestModelResolutionError(ctx, err);
+        defer ctx.allocator.free(model_path);
 
-        if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
-
-        var model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
+        var admission_manifest = manifest_mod.loadFromDir(ctx.allocator, model_path) catch |err|
             return modelLoadFailureResponse(ctx, err);
-        defer model_handle.release();
-        const model = model_handle.get();
+        defer admission_manifest.deinit();
 
-        if (model.manifest.hasCapability("sparse")) {
+        if (admission_manifest.hasCapability("sparse")) {
             const sparse_texts = parseSparseEmbedInputs(ctx.allocator, request.input) catch {
                 return ctx.status(400).json(.{
                     .@"error" = "INVALID_REQUEST",
@@ -2864,15 +4684,41 @@ pub const Node = struct {
                     .message = "dimensions is not supported for sparse embedding models",
                 });
             }
-            var pipeline = sparse_embedding_mod.SparseEmbeddingPipeline{
-                .allocator = ctx.allocator,
-                .session = model.session,
-                .tok = model.getTokenizer(),
-                .config = sparse_embedding_mod.SparseEmbeddingConfig.fromManifest(&model.manifest),
-                .execution_lock = model.embeddingExecutionLock(),
+            if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
+            const Attempt = struct {
+                allocator: std.mem.Allocator,
+                io: ?std.Io,
+                texts: []const []const u8,
+                vectors: ?[]DirectSparseEmbedding = null,
+                prompt_tokens: usize = 0,
+
+                fn run(attempt_ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
+                    const attempt: *@This() = @ptrCast(@alignCast(attempt_ctx));
+                    if (!model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
+                    var pipeline = sparse_embedding_mod.SparseEmbeddingPipeline{
+                        .allocator = attempt.allocator,
+                        .session = model.session,
+                        .tok = model.getTokenizer(),
+                        .config = sparse_embedding_mod.SparseEmbeddingConfig.fromManifest(&model.manifest),
+                        .execution_lock = model.embeddingExecutionLock(),
+                    };
+                    const vectors = try pipeline.embed(attempt.texts);
+                    errdefer {
+                        for (vectors) |*item| item.deinit(attempt.allocator);
+                        attempt.allocator.free(vectors);
+                    }
+                    attempt.prompt_tokens = countTokenizerTexts(attempt.allocator, attempt.io, model.getTokenizer(), attempt.texts) catch estimateTextsTokens(attempt.texts);
+                    attempt.vectors = vectors;
+                }
             };
-            const sparse_vecs = pipeline.embed(sparse_texts) catch |err|
+            var attempt = Attempt{
+                .allocator = ctx.allocator,
+                .io = self.session_manager.io,
+                .texts = sparse_texts,
+            };
+            runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{}, &attempt, Attempt.run) catch |err|
                 return inferenceFailureResponse(ctx, err);
+            const sparse_vecs = attempt.vectors.?;
             defer {
                 for (sparse_vecs) |*sv| @constCast(sv).deinit(ctx.allocator);
                 ctx.allocator.free(sparse_vecs);
@@ -2880,15 +4726,18 @@ pub const Node = struct {
 
             var arena = std.heap.ArenaAllocator.init(ctx.allocator);
             defer arena.deinit();
-            const prompt_tokens = countTokenizerTexts(ctx.allocator, self.session_manager.io, model.getTokenizer(), sparse_texts) catch estimateTextsTokens(sparse_texts);
-            const response = try buildEmbedSparseResponse(arena.allocator(), request.model, sparse_vecs, prompt_tokens);
+            const response = try buildEmbedSparseResponse(arena.allocator(), request.model, sparse_vecs, attempt.prompt_tokens);
             return ctx.json(response);
         }
 
+        var media_budget = RequestMediaBudget.init(media_admission.byte_cap);
+        const download_context = DenseEmbedRequestContext{ .io = ctx.io };
         var inputs = switch (request.error_policy) {
-            .fail_fast => parseDenseEmbedInputs(self, ctx.allocator, &model.manifest, request.input),
-            .per_item => parseDenseEmbedInputsPerItem(self, ctx.allocator, &model.manifest, request.input),
+            .fail_fast => parseDenseEmbedInputsWithBudgetAndContext(self, ctx.allocator, &admission_manifest, request.input, &media_budget, download_context),
+            .per_item => parseDenseEmbedInputsPerItemWithBudgetAndContext(self, ctx.allocator, &admission_manifest, request.input, &media_budget, download_context),
         } catch |err| {
+            if (isRemoteContentRequestError(err)) return remoteContentErrorResponse(ctx, err);
+            if (isDenseEmbedRequestAbort(err)) return err;
             return ctx.status(400).json(.{
                 .@"error" = "INVALID_REQUEST",
                 .message = embedInputParseErrorMessage(err),
@@ -2900,47 +4749,113 @@ pub const Node = struct {
             return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "input is empty" });
         }
 
-        var asset_lease = model.acquireEmbeddingAssetLease(inputs.audio.items.len > 0);
-        defer asset_lease.release();
-        var pipeline = prepareInitialDenseEmbeddingPipeline(model, ctx.allocator, &inputs) catch |err|
-            return inferenceFailureResponse(ctx, err);
-        var audio_asset_guard = AudioEmbeddingAssetGuard.init(
-            model,
-            inputs.audio.items.len > 0,
-        );
-        defer audio_asset_guard.deinit();
-        applyDenseEmbeddingRequestOptions(&pipeline, &model.manifest, request) catch |err| {
-            return ctx.status(400).json(.{
-                .@"error" = "INVALID_REQUEST",
-                .message = embedRequestOptionErrorMessage(err),
-            });
+        var audio_decode_working_bytes = default_max_audio_decode_working_bytes;
+
+        if (inputs.images.items.len > 0) {
+            var decoded_budget = ReadDecodedImageBudget.init(media_admission, effectiveRequestContentSecurity(self).max_image_dimension);
+            for (inputs.images.items) |image| decoded_budget.addImage(image.bytes) catch |err|
+                return readImageErrorResponse(ctx, err);
+            const required_units = @max(reserved_units, decoded_budget.requiredUnits());
+            if (try self.growSlotUnits(ctx, reserved_units, required_units)) |resp| return resp;
+            reserved_units = required_units;
+        }
+
+        if (inputs.audio.items.len > 0) {
+            const audio_admission = audioDecodeAdmission(self, media_admission.resident_byte_cap);
+            const required_units = @max(reserved_units, audio_admission.units);
+            if (try self.growSlotUnits(ctx, reserved_units, required_units)) |resp| return resp;
+            reserved_units = required_units;
+            audio_decode_working_bytes = audio_admission.max_decode_working_bytes;
+        }
+
+        if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
+        const ExecutionResult = union(EmbedErrorPolicy) {
+            fail_fast: [][]f32,
+            per_item: DenseEmbedPartialResult,
         };
+        const Attempt = struct {
+            allocator: std.mem.Allocator,
+            io: ?std.Io,
+            inputs: *ParsedDenseEmbedInputs,
+            request: ParsedEmbedRequest,
+            audio_decode_working_bytes: usize,
+            result: ?ExecutionResult = null,
+            prompt_tokens: usize = 0,
+
+            fn run(attempt_ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
+                const attempt: *@This() = @ptrCast(@alignCast(attempt_ctx));
+                if (model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
+                var asset_lease = model.acquireEmbeddingAssetLease(attempt.inputs.audio.items.len > 0);
+                defer asset_lease.release();
+                var pipeline = try prepareInitialDenseEmbeddingPipeline(model, attempt.allocator, attempt.inputs);
+                var audio_asset_guard = AudioEmbeddingAssetGuard.init(
+                    model,
+                    attempt.inputs.audio.items.len > 0,
+                );
+                defer audio_asset_guard.deinit();
+                pipeline.config.max_audio_decode_working_bytes = attempt.audio_decode_working_bytes;
+                try applyDenseEmbeddingRequestOptions(&pipeline, &model.manifest, attempt.request);
+                attempt.prompt_tokens = if (attempt.inputs.texts.items.len > 0)
+                    countParsedDenseEmbedTextTokens(attempt.allocator, attempt.io, model.getTokenizer(), attempt.inputs)
+                else
+                    estimateParsedDenseEmbedPromptTokens(attempt.inputs);
+
+                attempt.result = switch (attempt.request.error_policy) {
+                    .fail_fast => .{ .fail_fast = try embedDenseInputs(
+                        attempt.allocator,
+                        &pipeline,
+                        attempt.inputs,
+                        model,
+                        &audio_asset_guard,
+                        &asset_lease,
+                    ) },
+                    .per_item => .{ .per_item = try embedDenseInputsPartial(
+                        attempt.allocator,
+                        &pipeline,
+                        attempt.inputs,
+                        model,
+                        &audio_asset_guard,
+                        &asset_lease,
+                    ) },
+                };
+                asset_lease.release();
+            }
+        };
+        var attempt = Attempt{
+            .allocator = ctx.allocator,
+            .io = self.session_manager.io,
+            .inputs = &inputs,
+            .request = request,
+            .audio_decode_working_bytes = audio_decode_working_bytes,
+        };
+        var failure_stage: EmbeddingRuntimeFailureStage = .acquire;
         const pipeline_start = embedTimingStart();
+        runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{
+            .failure_stage = &failure_stage,
+        }, &attempt, Attempt.run) catch |err| {
+            if (err == error.UnsupportedEmbeddingTaskType) {
+                return ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = embedRequestOptionErrorMessage(err),
+                });
+            }
+            return switch (failure_stage) {
+                .acquire => modelLoadFailureResponse(ctx, err),
+                .execute => embedDenseInputFailureResponse(ctx, err),
+            };
+        };
+        logEmbedTiming("embed.pipeline", inputs.total_count, pipeline_start);
         var arena = std.heap.ArenaAllocator.init(ctx.allocator);
         defer arena.deinit();
         const response_build_start = embedTimingStart();
-        const prompt_tokens = if (inputs.texts.items.len > 0)
-            countParsedDenseEmbedTextTokens(ctx.allocator, self.session_manager.io, model.getTokenizer(), &inputs)
-        else
-            estimateParsedDenseEmbedPromptTokens(&inputs);
 
-        switch (request.error_policy) {
-            .fail_fast => {
-                const embeddings = embedDenseInputs(
-                    ctx.allocator,
-                    &pipeline,
-                    &inputs,
-                    model,
-                    &audio_asset_guard,
-                    &asset_lease,
-                ) catch |err| return embedDenseInputFailureResponse(ctx, err);
-                asset_lease.release();
-                logEmbedTiming("embed.pipeline", inputs.total_count, pipeline_start);
+        switch (attempt.result.?) {
+            .fail_fast => |embeddings| {
                 defer {
                     for (embeddings) |e| ctx.allocator.free(e);
                     ctx.allocator.free(embeddings);
                 }
-                const response = buildEmbedDenseResponse(arena.allocator(), request.model, embeddings, requested_dimensions, prompt_tokens) catch |err| switch (err) {
+                const response = buildEmbedDenseResponse(arena.allocator(), request.model, embeddings, requested_dimensions, attempt.prompt_tokens) catch |err| switch (err) {
                     error.InvalidEmbeddingDimensions => {
                         return ctx.status(400).json(.{
                             .@"error" = "INVALID_REQUEST",
@@ -2955,19 +4870,10 @@ pub const Node = struct {
                 logEmbedTiming("embed.response_json", inputs.total_count, response_json_start);
                 return http_response;
             },
-            .per_item => {
-                var partial = try embedDenseInputsPartial(
-                    ctx.allocator,
-                    &pipeline,
-                    &inputs,
-                    model,
-                    &audio_asset_guard,
-                    &asset_lease,
-                );
-                asset_lease.release();
-                logEmbedTiming("embed.pipeline", inputs.total_count, pipeline_start);
+            .per_item => |partial_value| {
+                var partial = partial_value;
                 defer partial.deinit(ctx.allocator);
-                const response = buildEmbedDensePartialResponse(arena.allocator(), request.model, &partial, requested_dimensions, prompt_tokens) catch |err| switch (err) {
+                const response = buildEmbedDensePartialResponse(arena.allocator(), request.model, &partial, requested_dimensions, attempt.prompt_tokens) catch |err| switch (err) {
                     error.InvalidEmbeddingDimensions => {
                         return ctx.status(400).json(.{
                             .@"error" = "INVALID_REQUEST",
@@ -3018,7 +4924,7 @@ pub const Node = struct {
         }
 
         const chunks = lib_chunker.fixed_multimodal.chunkInput(ctx.allocator, input, config) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "CHUNKING_FAILED", .message = @errorName(err) });
+            return ctx.status(500).json(.{ .@"error" = "CHUNKING_FAILED", .message = internalErrorMessage("CHUNKING_FAILED", err) });
         defer lib_chunker.types.freeChunks(ctx.allocator, chunks);
 
         const api_chunks = try ctx.allocator.alloc(api.ChunkObject, chunks.len);
@@ -3083,11 +4989,9 @@ pub const Node = struct {
         defer self.metrics.decActive();
 
         const model_name: ?[]const u8 = if (body.model.len > 0) body.model else null;
-        const model_path = self.resolveModelPath(ctx.io, model_name, "rerankers") catch
-            return ctx.status(404).json(.{
-                .@"error" = "MODEL_NOT_FOUND",
-                .message = "model not found; specify 'model' as a path or owner/name",
-            });
+        const model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "rerankers") catch |err|
+            return requestModelResolutionError(ctx, err);
+        defer ctx.allocator.free(model_path);
 
         var model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
             return modelLoadFailureResponse(ctx, err);
@@ -3110,8 +5014,11 @@ pub const Node = struct {
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed_body.deinit();
         const body = parsed_body.value;
-        if (try self.acquireSlot(ctx)) |resp| return resp;
-        defer self.releaseSlot();
+        const media_shape = multimodalRerankRequestMediaShape(body);
+        const media_admission = requestMediaAdmission(self, media_shape);
+        if (try self.acquireSlotUnits(ctx, media_admission.units)) |resp| return resp;
+        var reserved_units = media_admission.units;
+        defer self.releaseSlotUnits(reserved_units);
         self.metrics.incRequest("rerank");
         defer self.metrics.decActive();
 
@@ -3120,16 +5027,23 @@ pub const Node = struct {
         }
 
         const model_name: ?[]const u8 = if (body.model.len > 0) body.model else null;
-        const model_path = self.resolveModelPath(ctx.io, model_name, "rerankers") catch
-            return ctx.status(404).json(.{
-                .@"error" = "MODEL_NOT_FOUND",
-                .message = "model not found; specify 'model' as a path or owner/name",
-            });
+        const model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "rerankers") catch |err|
+            return requestModelResolutionError(ctx, err);
+        defer ctx.allocator.free(model_path);
 
-        var model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
-            return modelLoadFailureResponse(ctx, err);
-        defer model_handle.release();
-        const model = model_handle.get();
+        // Reject a text-only model from its lightweight manifest before
+        // fetching request media or loading weights and accelerator sessions.
+        if (media_shape.image_count > 0) {
+            var admission_manifest = manifest_mod.loadFromDir(ctx.allocator, model_path) catch |err|
+                return modelLoadFailureResponse(ctx, err);
+            defer admission_manifest.deinit();
+            if (!(admission_manifest.hasCapability("colqwen") or admission_manifest.hasCapability("multimodal_late_interaction"))) {
+                return ctx.status(400).json(.{
+                    .@"error" = "MODEL_NOT_SUPPORTED",
+                    .message = "model does not advertise multimodal late-interaction reranking capability",
+                });
+            }
+        }
 
         var parsed_docs = std.ArrayListUnmanaged(ParsedMultimodalRerankDocument).empty;
         defer {
@@ -3137,19 +5051,40 @@ pub const Node = struct {
             parsed_docs.deinit(ctx.allocator);
         }
 
-        var has_images = false;
+        var image_count: usize = 0;
+        var media_budget = RequestMediaBudget.init(media_admission.byte_cap);
         for (body.documents) |doc| {
-            const parsed = parseChatMessageContentToTextAndImages(self, ctx.allocator, doc.content) catch |err| switch (err) {
+            const parsed = parseChatMessageContentToTextAndImagesWithBudget(self, ctx.allocator, doc.content, &media_budget) catch |err| switch (err) {
                 error.InvalidImageDataUri => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid image data URI" }),
-                error.ImageDownloadFailed => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "image download failed" }),
+                error.RemoteContentTooLarge,
+                error.RemoteContentNotAllowed,
+                error.RemoteContentInvalid,
+                error.RemoteContentNotConfigured,
+                error.RemoteContentUnavailable,
+                => return remoteContentErrorResponse(ctx, err),
                 error.UnsupportedContentPartType => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "multimodal rerank documents only support text and image content parts" }),
-                else => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = @errorName(err) }),
+                error.OutOfMemory, error.Timeout, error.Canceled => return err,
+                else => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid multimodal rerank document content" }),
             };
-            if (parsed.images.len > 0) has_images = true;
+            image_count = std.math.add(usize, image_count, parsed.images.len) catch std.math.maxInt(usize);
             try parsed_docs.append(ctx.allocator, parsed);
         }
 
-        if (!has_images) {
+        if (image_count > 0) {
+            var decoded_budget = ReadDecodedImageBudget.init(media_admission, effectiveRequestContentSecurity(self).max_image_dimension);
+            for (parsed_docs.items) |doc| for (doc.images) |image| decoded_budget.addImage(image) catch |err|
+                return readImageErrorResponse(ctx, err);
+            const required_units = @max(reserved_units, decoded_budget.requiredUnits());
+            if (try self.growSlotUnits(ctx, reserved_units, required_units)) |resp| return resp;
+            reserved_units = required_units;
+        }
+
+        var model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
+            return modelLoadFailureResponse(ctx, err);
+        defer model_handle.release();
+        const model = model_handle.get();
+
+        if (image_count == 0) {
             const flat_texts = try ctx.allocator.alloc([]const u8, parsed_docs.items.len);
             defer ctx.allocator.free(flat_texts);
             for (parsed_docs.items, 0..) |doc, idx| flat_texts[idx] = doc.text;
@@ -3179,8 +5114,8 @@ pub const Node = struct {
         if (vision_session == null and !gpt_cfg.supportsNativeQwen2VlVision()) {
             return ctx.status(400).json(.{ .@"error" = "MODEL_NOT_SUPPORTED", .message = "model lacks both visual_model.onnx and native qwen2-vl vision config" });
         }
-        const prep_cfg = multimodal_qwen_adapter.loadPreprocessorConfig(ctx.allocator, model_path) catch |err|
-            return ctx.status(400).json(.{ .@"error" = "MODEL_NOT_SUPPORTED", .message = @errorName(err) });
+        const prep_cfg = multimodal_qwen_adapter.loadPreprocessorConfig(ctx.allocator, model_path) catch
+            return ctx.status(400).json(.{ .@"error" = "MODEL_NOT_SUPPORTED", .message = "model preprocessor configuration is unsupported" });
 
         // The compute backend and resident slots below share the loaded
         // model's stateful GPU runtime. Hold the target-model lane for their
@@ -3246,6 +5181,14 @@ pub const Node = struct {
     }
 
     pub fn generateContent(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        const raw_body = (try ctx.body()) orelse
+            return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
+        if (!rawGenerateChatTemplateKwargsAreValid(ctx.allocator, raw_body, false)) {
+            return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "chat_template_kwargs accepts only a boolean enable_thinking field",
+            });
+        }
         var parsed = (try ctx.parseJson(api.GenerateRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
@@ -3261,119 +5204,72 @@ pub const Node = struct {
         self.metrics.incRequest("generate");
         defer self.metrics.decActive();
 
-        // Resolve model
+        const numeric = parseGenerateNumericOptions(body.max_tokens, body.top_k) catch |err| {
+            return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = switch (err) {
+                    error.InvalidMaxTokens => "max_tokens must be between 1 and 2147483647",
+                    error.InvalidTopK => "top_k must be between 0 and 2147483647",
+                },
+            });
+        };
+        const sampling = parseGenerateSamplingOptions(
+            body.temperature,
+            body.top_p,
+            body.min_p,
+            body.repetition_penalty,
+            body.frequency_penalty,
+            body.presence_penalty,
+        ) catch |err| return ctx.status(400).json(.{
+            .@"error" = "INVALID_REQUEST",
+            .message = generateSamplingErrorMessage(err),
+        });
+
+        // Admission precedes model resolution and media decoding so rejected
+        // requests cannot consume model or download work first.
+        const media_admission = requestMediaAdmission(self, generateRequestMediaShape(body));
+        const queue_units = @max(estimateGenerateRequestQueueUnits(body, numeric.max_tokens), media_admission.units);
+        if (try self.acquireSlotUnits(ctx, queue_units)) |resp| return resp;
+        var reserved_units = queue_units;
+        defer self.releaseSlotUnits(reserved_units);
+        var media_budget = RequestMediaBudget.init(media_admission.byte_cap);
+
         const model_name: ?[]const u8 = if (body.model.len > 0) body.model else null;
-        const model_path = self.resolveModelPath(ctx.io, model_name, "generators") catch
-            return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" });
+        const model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "generators") catch |err|
+            return requestModelResolutionError(ctx, err);
+        defer ctx.allocator.free(model_path);
+        var draft_model_path_storage: ?[]const u8 = null;
+        defer if (draft_model_path_storage) |path| ctx.allocator.free(path);
+
+        var owned_messages = self.parseGenerateMessagesWithBudget(ctx.allocator, body, &media_budget) catch |err| {
+            if (err == error.InvalidImageUrl) {
+                return ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = "image_url must contain a URL string",
+                });
+            }
+            return remoteContentErrorResponse(ctx, err);
+        };
+        defer owned_messages.deinit();
+
+        if (owned_messages.decoded_images.len > 0) {
+            var decoded_budget = ReadDecodedImageBudget.init(media_admission, effectiveRequestContentSecurity(self).max_image_dimension);
+            for (owned_messages.decoded_images) |image| decoded_budget.addImage(image) catch |err|
+                return readImageErrorResponse(ctx, err);
+            const required_units = @max(reserved_units, decoded_budget.requiredUnits());
+            if (try self.growSlotUnits(ctx, reserved_units, required_units)) |resp| return resp;
+            reserved_units = required_units;
+        }
 
         if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
 
-        // Extract messages from request body
-        var messages = std.ArrayListUnmanaged(generation.Message).empty;
-        defer messages.deinit(ctx.allocator);
-
-        // Track decoded image bytes for cleanup
-        var decoded_images = std.ArrayListUnmanaged([]u8).empty;
+        // Tool prompting can mutate the message list; media ownership remains
+        // with OwnedGenerateMessages while this list owns message text.
+        var messages = std.ArrayListUnmanaged(generation.Message).fromOwnedSlice(owned_messages.messages);
+        owned_messages.messages = &.{};
         defer {
-            for (decoded_images.items) |img| ctx.allocator.free(img);
-            decoded_images.deinit(ctx.allocator);
-        }
-        // Track per-message image slices for cleanup
-        var image_slices = std.ArrayListUnmanaged([]const []const u8).empty;
-        defer {
-            for (image_slices.items) |s| ctx.allocator.free(s);
-            image_slices.deinit(ctx.allocator);
-        }
-
-        for (body.messages) |msg| {
-            const role: []const u8 = switch (msg.role) {
-                .system => "system",
-                .user => "user",
-                .assistant => "assistant",
-                .tool => "tool",
-            };
-
-            var text_buf = std.ArrayListUnmanaged(u8).empty;
-            defer text_buf.deinit(ctx.allocator);
-            var msg_images = std.ArrayListUnmanaged([]const u8).empty;
-            defer msg_images.deinit(ctx.allocator);
-            var msg_parts = std.ArrayListUnmanaged(generation.Message.ContentPart).empty;
-            defer msg_parts.deinit(ctx.allocator);
-
-            if (msg.content) |cv| {
-                switch (cv) {
-                    .string => |s| {
-                        try text_buf.appendSlice(ctx.allocator, s);
-                    },
-                    .array => |arr| {
-                        // OpenAI-style content parts array
-                        for (arr.items) |part| {
-                            if (part != .object) continue;
-                            const obj = part.object;
-                            const type_val = obj.get("type") orelse continue;
-                            if (type_val != .string) continue;
-                            const ptype = type_val.string;
-
-                            if (std.mem.eql(u8, ptype, "text")) {
-                                if (obj.get("text")) |tv| {
-                                    if (tv == .string) {
-                                        try text_buf.appendSlice(ctx.allocator, tv.string);
-                                        try msg_parts.append(ctx.allocator, .{ .text = tv.string });
-                                    }
-                                }
-                            } else if (std.mem.eql(u8, ptype, "image_url")) {
-                                // Extract URL from image_url object or string
-                                const url_str = blk: {
-                                    const iu = obj.get("image_url") orelse {
-                                        return ctx.status(400).json(.{
-                                            .@"error" = "INVALID_REQUEST",
-                                            .message = "image_url content part missing 'image_url' field",
-                                        });
-                                    };
-                                    if (iu == .object) {
-                                        if (iu.object.get("url")) |u| {
-                                            if (u == .string) break :blk u.string;
-                                        }
-                                    } else if (iu == .string) break :blk iu.string;
-                                    return ctx.status(400).json(.{
-                                        .@"error" = "INVALID_REQUEST",
-                                        .message = "image_url must contain a 'url' string",
-                                    });
-                                };
-                                const downloaded = downloadRemoteContent(self, ctx.allocator, url_str) catch {
-                                    return ctx.status(400).json(.{
-                                        .@"error" = "INVALID_REQUEST",
-                                        .message = "failed to download image_url content",
-                                    });
-                                };
-                                defer ctx.allocator.free(downloaded.content_type);
-                                try decoded_images.append(ctx.allocator, downloaded.data);
-                                try msg_images.append(ctx.allocator, downloaded.data);
-                                try msg_parts.append(ctx.allocator, .{ .image = msg_images.items.len - 1 });
-                            }
-                        }
-                    },
-                    else => {},
-                }
-            }
-
-            const content = try ctx.allocator.dupe(u8, text_buf.items);
-            const msg_img_slice: ?[]const []const u8 = if (msg_images.items.len > 0)
-                try ctx.allocator.dupe([]const u8, msg_images.items)
-            else
-                null;
-            if (msg_img_slice) |s| try image_slices.append(ctx.allocator, s);
-            const msg_part_slice: ?[]const generation.Message.ContentPart = if (msg_parts.items.len > 0)
-                try ctx.allocator.dupe(generation.Message.ContentPart, msg_parts.items)
-            else
-                null;
-
-            try messages.append(ctx.allocator, .{
-                .role = role,
-                .content = content,
-                .image_bytes = msg_img_slice,
-                .content_parts = msg_part_slice,
-            });
+            for (messages.items) |message| ctx.allocator.free(message.content);
+            messages.deinit(ctx.allocator);
         }
 
         if (messages.items.len == 0) {
@@ -3460,39 +5356,85 @@ pub const Node = struct {
             }
         }
 
-        const same_named_draft_model = if (body.draft_model) |draft_model_name|
-            body.model.len > 0 and std.mem.eql(u8, draft_model_name, body.model)
-        else
-            false;
-        const effective_draft_model_name: ?[]const u8 = if (same_named_draft_model) null else body.draft_model;
+        const requested_draft_model_name = body.draft_model;
+        if (requested_draft_model_name != null and requested_draft_model_name.?.len == 0) {
+            return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "draft_model must not be empty",
+            });
+        }
+        const speculation = parseGenerateSpeculationOptions(
+            requested_draft_model_name != null,
+            body.speculative_k,
+            body.speculation_policy,
+            body.speculation_calibration,
+        ) catch |err| {
+            return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = generateSpeculationErrorMessage(err),
+            });
+        };
+        const effective_draft_model_name = effectiveDraftModelName(requested_draft_model_name, speculation.policy);
+        validateQualifiedProfileDraft(
+            self.config.kernel_jit.qualified_profile_path != null,
+            effective_draft_model_name,
+        ) catch {
+            return ctx.status(400).json(.{
+                .@"error" = "UNSUPPORTED_FEATURE",
+                .message = "qualified-profile server JIT does not yet support draft_model; use local generate with separate target and draft profiles",
+            });
+        };
+        if (effective_draft_model_name) |draft_model_name| {
+            if (body.model.len > 0 and std.mem.eql(u8, draft_model_name, body.model)) {
+                return ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = "draft_model must identify a model different from model",
+                });
+            }
+        }
+        validateCacheCompactionRatio(body.cache_compaction_ratio) catch {
+            return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "cache_compaction_ratio must be finite, greater than 0, and at most 1",
+            });
+        };
+        if (body.cache_compaction_ratio != null) {
+            return ctx.status(400).json(.{
+                .@"error" = "UNSUPPORTED_FEATURE",
+                .message = "cache_compaction_ratio is not supported by resident server generation",
+            });
+        }
+        if (requested_draft_model_name != null) self.metrics.incSpeculationRequested();
 
         const want_stream = body.stream orelse false;
+        const include_stream_usage = want_stream and (if (body.stream_options) |options|
+            options.include_usage orelse false
+        else
+            false);
         // Caching requires an explicit non-empty key: keyless requests would all
         // share one per-model namespace, leaking prompt presence across callers.
         const prompt_cache_key: ?[]const u8 = if (body.prompt_cache_key) |key|
             (if (key.len > 0) key else null)
         else
             null;
-        const configured_max_tokens: i32 = if (body.max_tokens) |mt| @intCast(mt) else 256;
-        const queue_units = self.estimateGenerateQueueUnits(messages.items, configured_max_tokens);
-        if (try self.acquireSlotUnits(ctx, queue_units)) |resp| return resp;
-        defer self.releaseSlotUnits(queue_units);
+        const configured_max_tokens = numeric.max_tokens;
 
         var config = generation.GenerationConfig{
             .max_tokens = configured_max_tokens,
-            .temperature = body.temperature orelse 0,
-            .top_p = body.top_p orelse 0,
-            .top_k = if (body.top_k) |tk| @intCast(tk) else 0,
-            .min_p = body.min_p orelse 0,
-            .repetition_penalty = body.repetition_penalty orelse 1.0,
-            .frequency_penalty = body.frequency_penalty orelse 0,
-            .presence_penalty = body.presence_penalty orelse 0,
-            .speculative_k = if (effective_draft_model_name != null)
-                if (body.speculative_k) |k| @intCast(@max(k, 1)) else 4
-            else
-                4,
-            .speculation_requested = effective_draft_model_name != null,
-            .prefill_chunk_size = 256,
+            .ignore_eos = body.ignore_eos orelse false,
+            .enable_thinking = if (body.chat_template_kwargs) |kwargs| kwargs.enable_thinking else null,
+            .temperature = sampling.temperature,
+            .top_p = sampling.top_p,
+            .top_k = numeric.top_k,
+            .min_p = sampling.min_p,
+            .repetition_penalty = sampling.repetition_penalty,
+            .frequency_penalty = sampling.frequency_penalty,
+            .presence_penalty = sampling.presence_penalty,
+            .speculative_k = speculation.k,
+            .speculation_requested = requested_draft_model_name != null,
+            .speculation_policy = speculation.policy,
+            .speculation_calibration = speculation.calibration,
+            .prefill_chunk_size = 0,
             .cache_dtype = body.cache_dtype,
             .cache_compaction_ratio = body.cache_compaction_ratio,
             .prompt_cache_enabled = self.config.prompt_cache.enabled and (body.prompt_cache orelse true) and prompt_cache_key != null and !want_stream,
@@ -3506,6 +5448,18 @@ pub const Node = struct {
                     error.InvalidCompiledTarget => "unsupported compiled_target",
                     else => "unsupported backend",
                 },
+            });
+        };
+        validatePromptCacheExecutionMode(config.prompt_cache_enabled, backend_selection) catch {
+            return ctx.status(400).json(.{
+                .@"error" = "UNSUPPORTED_FEATURE",
+                .message = "prompt caching requires eager generation; omit mode or set mode=eager",
+            });
+        };
+        validateGenerateDraftBackend(backend_selection, effective_draft_model_name) catch {
+            return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "draft_model is not supported with backend=onnx; use native, metal, or cuda",
             });
         };
         if (try rejectExplicitBackendIncompatibility(
@@ -3590,6 +5544,13 @@ pub const Node = struct {
             defer pipeline.deinit();
             pipeline.prompt_override = if (prompt_override) |prompt| prompt else null;
 
+            if (requiresNativeChannelProjection(pipeline.gpt_config)) {
+                return ctx.status(400).json(.{
+                    .@"error" = "UNSUPPORTED_FEATURE",
+                    .message = "channel-aware Gemma generation requires the native, Metal, or CUDA backend",
+                });
+            }
+
             if (config.grammar != null) {
                 return ctx.status(400).json(.{
                     .@"error" = "INVALID_REQUEST",
@@ -3598,7 +5559,15 @@ pub const Node = struct {
             }
 
             if (want_stream) {
-                return self.streamGenerate(ctx, body.model, &pipeline, messages.items, config, if (tool_parser) |*parser| parser else null);
+                return self.streamGenerate(
+                    ctx,
+                    body.model,
+                    &pipeline,
+                    messages.items,
+                    config,
+                    if (tool_parser) |*parser| parser else null,
+                    include_stream_usage,
+                );
             }
 
             var result = generateMaybeStopOnTool(&pipeline, messages.items, config, if (tool_parser) |*parser| parser else null) catch |err|
@@ -3653,9 +5622,28 @@ pub const Node = struct {
             const ort_model_dir = ortgenai.prepareGenerativeModelPackage(ctx.allocator, model_path) catch null;
             defer if (ort_model_dir) |prepared| ctx.allocator.free(prepared);
             if (ort_model_dir) |prepared_model_dir| {
+                if (config.ignore_eos) {
+                    return ctx.status(400).json(.{
+                        .@"error" = "UNSUPPORTED_FEATURE",
+                        .message = "ignore_eos is not supported by the ONNX Runtime GenAI backend",
+                    });
+                }
                 var ort_manifest = manifest_mod.loadFromDir(ctx.allocator, prepared_model_dir) catch |err|
                     return modelLoadFailureResponse(ctx, err);
                 defer ort_manifest.deinit();
+                const ort_gpt_config = session_factory.loadGptConfigFromModelDir(
+                    ctx.allocator,
+                    prepared_model_dir,
+                    ort_manifest,
+                ) catch null;
+                if (ort_gpt_config) |gpt_config| {
+                    if (requiresNativeChannelProjection(gpt_config)) {
+                        return ctx.status(400).json(.{
+                            .@"error" = "UNSUPPORTED_FEATURE",
+                            .message = "channel-aware Gemma generation requires the native, Metal, or CUDA backend",
+                        });
+                    }
+                }
 
                 const use_functiongemma_prompt_override = if (tool_parser) |*parser|
                     std.mem.eql(u8, parser.name(), "functiongemma")
@@ -3709,7 +5697,15 @@ pub const Node = struct {
                 }
 
                 if (want_stream) {
-                    return self.streamGenerate(ctx, body.model, &pipeline, messages.items, config, if (tool_parser) |*parser| parser else null);
+                    return self.streamGenerate(
+                        ctx,
+                        body.model,
+                        &pipeline,
+                        messages.items,
+                        config,
+                        if (tool_parser) |*parser| parser else null,
+                        include_stream_usage,
+                    );
                 }
 
                 var result = generateMaybeStopOnTool(&pipeline, messages.items, config, if (tool_parser) |*parser| parser else null) catch |err|
@@ -3769,23 +5765,6 @@ pub const Node = struct {
             return modelLoadFailureResponse(ctx, err);
         defer model_handle.release();
         const model = model_handle.get();
-        model.lockNativeGeneration();
-        defer model.unlockNativeGeneration();
-        const prompt_bytes = self.estimateGeneratePromptBytes(messages.items);
-        const prompt_tokens = self.estimateNativePromptTokens(ctx.allocator, model, messages.items) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "TOKENIZE_FAILED", .message = @errorName(err) });
-        var native_generate_lease: ?runtime.scheduler.native_generate.Lease = null;
-        defer if (native_generate_lease) |lease| {
-            if (model.native_generate_coordinator) |coordinator| coordinator.release(lease);
-        };
-        if (model.native_generate_coordinator) |coordinator| {
-            native_generate_lease = try coordinator.acquire(.{
-                .requested_units = queue_units,
-                .prompt_bytes = prompt_bytes,
-                .max_tokens = configured_max_tokens,
-            });
-            config.prefill_chunk_size = native_generate_lease.?.prefill_chunk_size;
-        }
 
         const gpt_config = session_factory.getGptConfig(model.session) orelse {
             // The session is not a decoder at all, which in practice means the
@@ -3813,29 +5792,62 @@ pub const Node = struct {
             .onnx => return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = "unexpected ONNX backend in native generation path" }),
             .wasm => return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = "unexpected WASM backend in server generation path" }),
         };
+        const auto_metal_whole_model = shouldAutoUseMetalWholeModelGenerate(
+            model.session.backend(),
+            graph_mod.metal_executor.supportsSession(model.session),
+            generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config),
+            config.prompt_cache_enabled,
+            backend_selection,
+        );
+        const effective_compiled_partition_backend: ?ops.BackendKind = if (auto_metal_whole_model)
+            .metal
+        else
+            backend_selection.compiled_partition_backend;
+        const effective_compiled_attachment_target: graph_mod.compiled_backend.AttachmentTarget = if (auto_metal_whole_model)
+            .whole_model
+        else
+            backend_selection.compiled_attachment_target;
         const kv_dtype = if (config.cache_dtype) |name|
             runtime.kv.pool.parseKvDType(name) orelse
                 return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid cache_dtype value" })
         else
             session_factory.recommendedKvDTypeForSession(model.session, backend_kind);
-        const admission_prefill_chunk = if (config.prefill_chunk_size > 0) config.prefill_chunk_size else 256;
-        const resource_estimate = runtime.tier.memory.estimateGptGeneration(
-            backend_kind,
-            kv_dtype,
+        const prompt_bytes = self.estimateGeneratePromptBytes(messages.items);
+        const prompt_tokens = self.estimateNativePromptTokens(
+            ctx.allocator,
+            model,
             gpt_config,
-            prompt_tokens,
-            @intCast(@max(config.max_tokens, 1)),
-            admission_prefill_chunk,
-        ) catch |err| switch (err) {
-            error.InvalidModelConfig => return ctx.status(400).json(.{
-                .@"error" = "INVALID_MODEL",
-                .message = "model contains invalid generation dimensions",
-            }),
-            error.ResourceLimitExceeded => return ctx.status(400).json(.{
-                .@"error" = "MODEL_RESOURCE_LIMIT",
-                .message = "request resource estimate exceeds addressable memory",
-            }),
+            messages.items,
+            configured_max_tokens,
+            if (config.speculation_requested and config.speculation_policy != .off and config.speculative_k > 0) 1 else 0,
+            config.enable_thinking,
+        ) catch |err| {
+            if (err == error.PromptTooLong) {
+                return ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = "prompt exceeds the model context window after reserving output tokens",
+                });
+            }
+            return ctx.status(500).json(.{ .@"error" = "TOKENIZE_FAILED", .message = internalErrorMessage("TOKENIZE_FAILED", err) });
         };
+        const idle_prefill_ceiling = generation.nativeGenerationPrefillChunkCeiling(
+            backend_kind,
+            gpt_config,
+            self.config.generation_batching.schedulerPolicy().max_idle_prefill_chunk_size,
+        );
+        var native_generate_lease: ?runtime.scheduler.native_generate.Lease = null;
+        defer if (native_generate_lease) |lease| {
+            if (model.native_generate_coordinator) |coordinator| coordinator.release(lease);
+        };
+        if (model.native_generate_coordinator) |coordinator| {
+            native_generate_lease = try self.acquireNativeGenerateLease(coordinator, .{
+                .requested_units = queue_units,
+                .prompt_bytes = prompt_bytes,
+                .prompt_tokens = prompt_tokens,
+                .prefill_chunk_limit = if (config.prefill_chunk_size == 0) idle_prefill_ceiling else 0,
+                .max_tokens = configured_max_tokens,
+            });
+        }
 
         const tok = model.getTokenizer();
         var draft_cb: ?ops.ComputeBackend = null;
@@ -3863,9 +5875,16 @@ pub const Node = struct {
         }
 
         if (effective_draft_model_name) |draft_model_name| {
-            const draft_model_path = self.resolveModelPath(ctx.io, draft_model_name, "generators") catch
-                return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "draft model not found" });
-            if (!std.mem.eql(u8, draft_model_path, model_path)) {
+            if (shouldResolveDraftModel(config.speculation_policy)) {
+                const draft_model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, draft_model_name, "generators") catch |err|
+                    return requestModelResolutionError(ctx, err);
+                draft_model_path_storage = draft_model_path;
+                if (std.mem.eql(u8, draft_model_path, model_path)) {
+                    return ctx.status(400).json(.{
+                        .@"error" = "INVALID_REQUEST",
+                        .message = "draft_model must resolve to a model different from model",
+                    });
+                }
                 config.draft_model = draft_model_path;
                 var load_draft_backend = true;
                 if (config.speculation_policy == .auto) {
@@ -3922,23 +5941,6 @@ pub const Node = struct {
                         draft_model.session,
                         actual_draft_backend,
                     );
-                    draft_resource_estimate = runtime.tier.memory.estimateGptGeneration(
-                        actual_draft_backend,
-                        actual_draft_kv_dtype,
-                        draft_cfg,
-                        prompt_tokens,
-                        @intCast(@max(config.max_tokens, 1)),
-                        admission_prefill_chunk,
-                    ) catch |err| switch (err) {
-                        error.InvalidModelConfig => return ctx.status(400).json(.{
-                            .@"error" = "INVALID_MODEL",
-                            .message = "draft_model contains invalid generation dimensions",
-                        }),
-                        error.ResourceLimitExceeded => return ctx.status(400).json(.{
-                            .@"error" = "MODEL_RESOURCE_LIMIT",
-                            .message = "draft_model resource estimate exceeds addressable memory",
-                        }),
-                    };
                     draft_model_for_generation = draft_model;
                     draft_backend_kind = actual_draft_backend;
                     draft_kv_dtype = actual_draft_kv_dtype;
@@ -3955,33 +5957,138 @@ pub const Node = struct {
         var budget_limits = runtime.tier.memory.defaultLimitsForBackend(budget_backend_class);
         budget_limits = session_factory.widenBudgetLimitsForSession(model.session, budget_limits);
         if (draft_model_for_generation) |draft_model| {
-            budget_limits = session_factory.widenBudgetLimitsForSession(draft_model.session, budget_limits);
+            const draft_budget_class: runtime.tier.memory.BackendClass =
+                if (draft_backend_kind.? == .native) .cpu else .gpu;
+            const draft_budget_limits = self.config.generation_budget_overrides.apply(
+                session_factory.widenBudgetLimitsForSession(
+                    draft_model.session,
+                    runtime.tier.memory.defaultLimitsForBackend(draft_budget_class),
+                ),
+            );
+            budget_limits = runtime.tier.memory.maxCompositeLimits(budget_limits, draft_budget_limits);
         }
         budget_limits = self.config.generation_budget_overrides.apply(budget_limits);
         var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
-        run_budget.reserveEstimate(resource_estimate) catch |err| {
-            if (err == error.MemoryBudgetExceeded) {
+
+        if (draft_model_for_generation != null and config.speculation_policy != .off) {
+            const shared_prompt_limit = generation.nativeGenerationPromptTokenLimit(
+                gpt_config,
+                draft_gpt_config,
+                @intCast(@max(config.max_tokens, 1)),
+                if (config.speculative_k > 0) 1 else 0,
+                0,
+            ) catch return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "requested output leaves no prompt capacity in the target or draft model context window",
+            });
+            if (prompt_tokens > shared_prompt_limit) {
                 return ctx.status(400).json(.{
-                    .@"error" = "MODEL_RESOURCE_LIMIT",
+                    .@"error" = "INVALID_REQUEST",
+                    .message = "prompt exceeds the target or draft model context window",
+                });
+            }
+        }
+
+        var budget_components: [2]runtime.tier.memory.GptGenerationBudgetComponent = undefined;
+        budget_components[0] = .{ .backend = backend_kind, .kv_dtype = kv_dtype, .config = gpt_config };
+        var budget_component_count: usize = 1;
+        if (draft_model_for_generation != null) {
+            budget_components[1] = .{
+                .backend = draft_backend_kind.?,
+                .kv_dtype = draft_kv_dtype.?,
+                .config = draft_gpt_config.?,
+            };
+            budget_component_count = 2;
+        }
+        const scheduler_prefill_ceiling = if (native_generate_lease) |lease|
+            lease.prefill_chunk_size
+        else
+            @min(
+                prompt_tokens,
+                if (config.prefill_chunk_size == 0)
+                    idle_prefill_ceiling
+                else
+                    self.config.generation_batching.schedulerPolicy().max_idle_prefill_chunk_size,
+            );
+        const admission_prefill_ceiling = if (config.prefill_chunk_size > 0)
+            @min(config.prefill_chunk_size, scheduler_prefill_ceiling)
+        else
+            scheduler_prefill_ceiling;
+        const speculative_budget_bonus: usize = if (draft_model_for_generation != null and
+            config.speculation_policy != .off and
+            config.speculative_k > 0) 1 else 0;
+        const budget_max_tokens = @as(usize, @intCast(@max(config.max_tokens, 1))) + speculative_budget_bonus;
+        const prefill_admission = runtime.tier.memory.reserveGptGenerationPrefill(
+            &run_budget,
+            budget_components[0..budget_component_count],
+            prompt_tokens,
+            budget_max_tokens,
+            admission_prefill_ceiling,
+        ) catch |err| {
+            if (err == error.MemoryBudgetExceeded) {
+                return ctx.status(507).json(.{
+                    .@"error" = "MEMORY_BUDGET_EXCEEDED",
                     .message = memoryBudgetExceededMessage(ctx.allocator, model.session, &run_budget),
                 });
             }
-            return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
+            return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = internalErrorMessage("BACKEND_ERROR", err) });
         };
-        if (draft_resource_estimate) |estimate| {
-            run_budget.reserveEstimate(estimate) catch |err| {
-                if (err == error.MemoryBudgetExceeded) {
-                    return ctx.status(400).json(.{
-                        .@"error" = "MODEL_RESOURCE_LIMIT",
-                        .message = memoryBudgetExceededMessage(
-                            ctx.allocator,
-                            draft_model_for_generation.?.session,
-                            &run_budget,
-                        ),
+        config.prefill_chunk_size = prefill_admission.max_chunk_rows;
+        var standalone_prefill_plan: ?runtime.scheduler.native_generate.PrefillChunkPlan = null;
+        defer if (standalone_prefill_plan) |*plan| plan.deinit(ctx.allocator);
+        const prefill_plan_applicable = !generation.messagesHaveImages(messages.items) and
+            !generation.messagesHaveAudio(messages.items) and
+            !(effective_compiled_partition_backend != null and
+                effective_compiled_attachment_target == .whole_model);
+        if (prefill_plan_applicable) {
+            if (model.native_generate_coordinator) |coordinator| {
+                if (native_generate_lease) |*lease| {
+                    coordinator.admitPrefillChunkPlan(
+                        lease,
+                        prompt_tokens,
+                        prefill_admission.max_chunk_rows,
+                        prefill_admission.max_scratch_bytes,
+                        .fixed_ceiling,
+                    ) catch |err| return ctx.status(500).json(.{
+                        .@"error" = "BACKEND_ERROR",
+                        .message = internalErrorMessage("PREFILL_PLAN_ADMISSION_FAILED", err),
                     });
+                    config.prefill_chunk_plan = lease.prefill_chunk_plan;
                 }
-                return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
-            };
+            }
+            if (config.prefill_chunk_plan == null) {
+                standalone_prefill_plan = runtime.scheduler.native_generate.PrefillChunkPlan.init(
+                    ctx.allocator,
+                    prompt_tokens,
+                    prefill_admission.max_chunk_rows,
+                    prefill_admission.max_scratch_bytes,
+                    .sole_idle,
+                    .fixed_ceiling,
+                ) catch |err| return ctx.status(500).json(.{
+                    .@"error" = "BACKEND_ERROR",
+                    .message = internalErrorMessage("PREFILL_PLAN_ADMISSION_FAILED", err),
+                });
+                config.prefill_chunk_plan = standalone_prefill_plan.?;
+            }
+            logAdmittedPrefillChunkPlan(config.prefill_chunk_plan.?);
+        }
+        const resource_estimate = try runtime.tier.memory.estimateGptGeneration(
+            backend_kind,
+            kv_dtype,
+            gpt_config,
+            prompt_tokens,
+            budget_max_tokens,
+            config.prefill_chunk_size,
+        );
+        if (draft_model_for_generation != null) {
+            draft_resource_estimate = try runtime.tier.memory.estimateGptGeneration(
+                draft_backend_kind.?,
+                draft_kv_dtype.?,
+                draft_gpt_config.?,
+                prompt_tokens,
+                budget_max_tokens,
+                config.prefill_chunk_size,
+            );
         }
         const target_backend_class: runtime.tier.memory.BackendClass =
             if (backend_kind == .native) .cpu else .gpu;
@@ -4023,6 +6130,28 @@ pub const Node = struct {
         };
         defer admission_lease.release();
 
+        const first_locked_model = if (draft_model_for_generation) |draft_model|
+            if (@intFromPtr(draft_model) < @intFromPtr(model)) draft_model else model
+        else
+            model;
+        const second_locked_model: ?*model_manager_mod.LoadedModel = if (draft_model_for_generation) |draft_model|
+            // Lock only a *distinct* second model. If the draft and target
+            // resolve to the same *LoadedModel (e.g. a future path-canonicalizing
+            // cache that aliases two dir strings to one pointer), locking the
+            // non-reentrant native-generation mutex twice would self-deadlock and
+            // permanently wedge all generation on that model.
+            if (draft_model == model)
+                null
+            else if (first_locked_model == model) draft_model else model
+        else
+            null;
+        first_locked_model.lockNativeGeneration(ctx.io);
+        if (second_locked_model) |second| second.lockNativeGeneration(ctx.io);
+        defer {
+            if (second_locked_model) |second| second.unlockNativeGeneration();
+            first_locked_model.unlockNativeGeneration();
+        }
+
         if (draft_model_for_generation) |draft_model| {
             draft_cb = session_factory.getComputeBackendWithBudget(draft_model.session, ctx.allocator, &run_budget) catch |err| {
                 if (err == error.MemoryBudgetExceeded) {
@@ -4050,30 +6179,14 @@ pub const Node = struct {
             return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
         };
         defer cb.deinit();
-        const sliding_window_size: ?u32 = if (gpt_config.position_encoding == .absolute)
-            null
-        else if (gpt_config.sliding_window > 0)
-            gpt_config.sliding_window
-        else if (gpt_config.max_position_embeddings > 0)
-            gpt_config.max_position_embeddings
-        else
-            null;
-        const pool_config: runtime.kv.pool.KvPoolConfig = .{
-            .backend = backend_kind,
-            .dtype = kv_dtype,
-            .page_size_tokens = 16,
-            .num_layers_packed = @intCast(gpt_config.num_hidden_layers),
-            .num_kv_heads = gpt_config.maxKvHeads(),
-            .head_dim = gpt_config.maxHeadDim(),
-            .sliding_window_size = sliding_window_size,
-        };
+        const pool_config = generation.kvPoolConfig(backend_kind, kv_dtype, gpt_config, generationKvSlidingTrimForced());
 
         var prompt_cache: ?*runtime.kv.prompt_cache.PromptPrefixCache = null;
         var active_kv_manager: *runtime.kv.manager.KvManager = &kv_manager;
         var active_kv_storage: ?*runtime.kv.storage_runtime.KvStorageRuntime = null;
         var pool_id: runtime.kv.block.KvPoolId = undefined;
-        if (config.prompt_cache_enabled and (backend_kind == .native or backend_kind == .metal or backend_kind == .cuda) and
-            backend_selection.compiled_partition_backend == null and
+        if (config.prompt_cache_enabled and promptCacheBackendEligible(self.config.prompt_cache.mode, backend_kind) and
+            effective_compiled_partition_backend == null and
             effective_draft_model_name == null and
             config.cache_compaction_ratio == null)
         {
@@ -4087,12 +6200,16 @@ pub const Node = struct {
             const cache_ready = if (backend_kind == .metal or backend_kind == .cuda) blk: {
                 const ensured = model.prompt_prefix_cache.ensureStorage(pool_config) catch |err| {
                     self.model_manager.cancelPromptCacheActivation(model, prompt_cache_config);
-                    return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
+                    std.log.warn("prompt cache storage activation failed; using request-local KV: {s}", .{@errorName(err)});
+                    break :blk false;
                 };
                 const storage = if (ensured) |result| result.storage else break :blk false;
                 if (storage.device_write_hook == null) {
-                    cb.provisionKvDeviceWriteHook(storage) catch |err|
-                        return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
+                    cb.provisionKvDeviceWriteHook(storage) catch |err| {
+                        self.model_manager.cancelPromptCacheActivation(model, prompt_cache_config);
+                        std.log.warn("prompt cache device activation failed; using request-local KV: {s}", .{@errorName(err)});
+                        break :blk false;
+                    };
                 }
                 if (storage.device_write_hook == null) break :blk false;
                 active_kv_storage = storage;
@@ -4100,7 +6217,8 @@ pub const Node = struct {
             } else blk: {
                 const maybe_cache_pool_id = model.prompt_prefix_cache.ensurePool(pool_config) catch |err| {
                     self.model_manager.cancelPromptCacheActivation(model, prompt_cache_config);
-                    return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
+                    std.log.warn("prompt cache activation failed; using request-local KV: {s}", .{@errorName(err)});
+                    break :blk false;
                 };
                 break :blk maybe_cache_pool_id != null;
             };
@@ -4145,40 +6263,17 @@ pub const Node = struct {
         if (draft_cb != null) {
             if (draft_gpt_config) |draft_cfg| {
                 draft_kv_manager = runtime.kv.manager.KvManager.init(ctx.allocator);
-                const draft_sliding_window_size: ?u32 = if (draft_cfg.position_encoding == .absolute)
-                    null
-                else if (draft_cfg.sliding_window > 0)
-                    @intCast(draft_cfg.sliding_window)
-                else
-                    null;
-                const draft_pool_id = draft_kv_manager.?.addPool(.{
-                    .backend = draft_backend_kind.?,
-                    .dtype = draft_kv_dtype.?,
-                    .page_size_tokens = 16,
-                    .num_layers_packed = @intCast(draft_cfg.num_hidden_layers),
-                    .num_kv_heads = draft_cfg.maxKvHeads(),
-                    .head_dim = draft_cfg.maxHeadDim(),
-                    .sliding_window_size = draft_sliding_window_size,
-                }) catch |err|
+                const draft_pool_config = generation.kvPoolConfig(
+                    draft_backend_kind.?,
+                    draft_kv_dtype.?,
+                    draft_cfg,
+                    generationKvSlidingTrimForced(),
+                );
+                const draft_pool_id = draft_kv_manager.?.addPool(draft_pool_config) catch |err|
                     return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
                 draft_decode_state = generation.NativeDecodeState.initPaged(ctx.allocator, &draft_kv_manager.?, draft_pool_id, null);
             }
         }
-
-        const auto_metal_whole_model = shouldAutoUseMetalWholeModelGenerate(
-            model.session.backend(),
-            graph_mod.metal_executor.supportsSession(model.session),
-            generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config),
-            backend_selection,
-        );
-        const effective_compiled_partition_backend: ?ops.BackendKind = if (auto_metal_whole_model)
-            .metal
-        else
-            backend_selection.compiled_partition_backend;
-        const effective_compiled_attachment_target: graph_mod.compiled_backend.AttachmentTarget = if (auto_metal_whole_model)
-            .whole_model
-        else
-            backend_selection.compiled_attachment_target;
 
         const graph_mode = backend_selection.graph_mode_requested or
             effective_compiled_partition_backend != null or
@@ -4237,7 +6332,15 @@ pub const Node = struct {
         };
 
         if (want_stream) {
-            return self.streamGenerate(ctx, body.model, &pipeline, messages.items, config, if (tool_parser) |*parser| parser else null);
+            return self.streamGenerate(
+                ctx,
+                body.model,
+                &pipeline,
+                messages.items,
+                config,
+                if (tool_parser) |*parser| parser else null,
+                include_stream_usage,
+            );
         }
 
         var result = generateMaybeStopOnTool(&pipeline, messages.items, config, if (tool_parser) |*parser| parser else null) catch |err|
@@ -4288,6 +6391,12 @@ pub const Node = struct {
             result.tokens_used,
             result.cached_prompt_tokens,
             parsed_tool_calls,
+            effectiveSpeculationStats(
+                result.speculative,
+                config.speculation_requested,
+                config.speculation_policy,
+                config.speculation_calibration,
+            ),
         );
     }
 
@@ -4312,6 +6421,16 @@ pub const Node = struct {
     };
 
     fn parseGenerateMessages(self: *Node, allocator: std.mem.Allocator, body: api.GenerateRequest) !OwnedGenerateMessages {
+        var media_budget = RequestMediaBudget.init(requestMediaMaxBytes(self));
+        return self.parseGenerateMessagesWithBudget(allocator, body, &media_budget);
+    }
+
+    fn parseGenerateMessagesWithBudget(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        body: api.GenerateRequest,
+        media_budget: *RequestMediaBudget,
+    ) !OwnedGenerateMessages {
         var messages = std.ArrayListUnmanaged(generation.Message).empty;
         errdefer {
             for (messages.items) |msg| allocator.free(msg.content);
@@ -4376,9 +6495,12 @@ pub const Node = struct {
                                     } else if (iu == .string) break :blk iu.string;
                                     return error.InvalidImageUrl;
                                 };
-                                const downloaded = try downloadRemoteContent(self, allocator, url_str);
+                                const downloaded = try downloadRemoteContentWithBudgetForRequest(self, allocator, url_str, media_budget);
                                 defer allocator.free(downloaded.content_type);
+                                var owns_downloaded_data = true;
+                                errdefer if (owns_downloaded_data) allocator.free(downloaded.data);
                                 try decoded_images.append(allocator, downloaded.data);
+                                owns_downloaded_data = false;
                                 try msg_images.append(allocator, downloaded.data);
                                 try msg_parts.append(allocator, .{ .image = msg_images.items.len - 1 });
                             }
@@ -4389,16 +6511,28 @@ pub const Node = struct {
             }
 
             const content = try allocator.dupe(u8, text_buf.items);
+            var owns_content = true;
+            errdefer if (owns_content) allocator.free(content);
             const msg_img_slice: ?[]const []const u8 = if (msg_images.items.len > 0)
                 try allocator.dupe([]const u8, msg_images.items)
             else
                 null;
-            if (msg_img_slice) |slice| try image_slices.append(allocator, slice);
+            var owns_msg_img_slice = msg_img_slice != null;
+            errdefer if (owns_msg_img_slice) allocator.free(msg_img_slice.?);
+            if (msg_img_slice) |slice| {
+                try image_slices.append(allocator, slice);
+                owns_msg_img_slice = false;
+            }
             const msg_part_slice: ?[]const generation.Message.ContentPart = if (msg_parts.items.len > 0)
                 try allocator.dupe(generation.Message.ContentPart, msg_parts.items)
             else
                 null;
-            if (msg_part_slice) |parts| try content_parts.append(allocator, parts);
+            var owns_msg_part_slice = msg_part_slice != null;
+            errdefer if (owns_msg_part_slice) allocator.free(msg_part_slice.?);
+            if (msg_part_slice) |parts| {
+                try content_parts.append(allocator, parts);
+                owns_msg_part_slice = false;
+            }
 
             try messages.append(allocator, .{
                 .role = role,
@@ -4406,20 +6540,72 @@ pub const Node = struct {
                 .image_bytes = msg_img_slice,
                 .content_parts = msg_part_slice,
             });
+            owns_content = false;
         }
 
+        const owned_messages = try messages.toOwnedSlice(allocator);
+        errdefer {
+            for (owned_messages) |msg| allocator.free(msg.content);
+            allocator.free(owned_messages);
+        }
+        const owned_decoded_images = try decoded_images.toOwnedSlice(allocator);
+        errdefer {
+            for (owned_decoded_images) |img| allocator.free(img);
+            allocator.free(owned_decoded_images);
+        }
+        const owned_image_slices = try image_slices.toOwnedSlice(allocator);
+        errdefer {
+            for (owned_image_slices) |slice| allocator.free(slice);
+            allocator.free(owned_image_slices);
+        }
+        const owned_content_parts = try content_parts.toOwnedSlice(allocator);
         return .{
             .allocator = allocator,
-            .messages = try messages.toOwnedSlice(allocator),
-            .decoded_images = try decoded_images.toOwnedSlice(allocator),
-            .image_slices = try image_slices.toOwnedSlice(allocator),
-            .content_parts = try content_parts.toOwnedSlice(allocator),
+            .messages = owned_messages,
+            .decoded_images = owned_decoded_images,
+            .image_slices = owned_image_slices,
+            .content_parts = owned_content_parts,
         };
     }
 
     fn generateBatchUnsupportedReasonPreflight(body: api.GenerateRequest) ?api.GenerateBatchError {
         if (body.stream orelse false) return .{ .code = "UNSUPPORTED_STREAM", .message = "batch generation does not support stream=true", .retryable = false };
         if (body.tools != null or body.tool_choice != null) return .{ .code = "UNSUPPORTED_TOOLS", .message = "batch generation does not support tools yet", .retryable = false };
+        _ = parseGenerateNumericOptions(body.max_tokens, body.top_k) catch |err| return .{
+            .code = "INVALID_REQUEST",
+            .message = switch (err) {
+                error.InvalidMaxTokens => "max_tokens must be between 1 and 2147483647",
+                error.InvalidTopK => "top_k must be between 0 and 2147483647",
+            },
+            .retryable = false,
+        };
+        _ = parseGenerateSamplingOptions(
+            body.temperature,
+            body.top_p,
+            body.min_p,
+            body.repetition_penalty,
+            body.frequency_penalty,
+            body.presence_penalty,
+        ) catch |err| return .{
+            .code = "INVALID_REQUEST",
+            .message = generateSamplingErrorMessage(err),
+            .retryable = false,
+        };
+        _ = parseGenerateSpeculationOptions(
+            body.draft_model != null,
+            body.speculative_k,
+            body.speculation_policy,
+            body.speculation_calibration,
+        ) catch |err| return .{
+            .code = "INVALID_REQUEST",
+            .message = generateSpeculationErrorMessage(err),
+            .retryable = false,
+        };
+        if (body.cache_compaction_ratio) |ratio| {
+            validateCacheCompactionRatio(ratio) catch
+                return .{ .code = "INVALID_CACHE_COMPACTION_RATIO", .message = "cache_compaction_ratio must be finite, greater than 0, and at most 1", .retryable = false };
+            return .{ .code = "UNSUPPORTED_CACHE_COMPACTION", .message = "batch generation does not support cache_compaction_ratio", .retryable = false };
+        }
         if (body.draft_model != null) return .{ .code = "UNSUPPORTED_DRAFT_MODEL", .message = "batch generation does not support draft_model yet", .retryable = false };
         if (body.mode) |mode| {
             if (!std.mem.eql(u8, mode, "eager")) return .{ .code = "UNSUPPORTED_MODE", .message = "batch generation requires eager native mode", .retryable = false };
@@ -4433,6 +6619,25 @@ pub const Node = struct {
             return .{ .code = "UNSUPPORTED_MULTIMODAL", .message = "batch generation currently supports text-only native requests", .retryable = false };
         }
         return null;
+    }
+
+    fn generateBatchMessageParseError(err: anyerror) ?api.GenerateBatchError {
+        if (err == error.OutOfMemory) return null;
+        if (remoteContentRequestFailure(err)) |failure| {
+            return .{
+                .code = failure.code,
+                .message = failure.message,
+                .retryable = failure.retryable,
+            };
+        }
+        return .{
+            .code = "INVALID_REQUEST",
+            .message = switch (err) {
+                error.InvalidImageUrl => "image_url must contain a URL string",
+                else => "request messages are invalid",
+            },
+            .retryable = false,
+        };
     }
 
     fn generateRequestHasNonTextContentParts(body: api.GenerateRequest) bool {
@@ -4462,19 +6667,45 @@ pub const Node = struct {
         return null;
     }
 
-    fn generateConfigFromBody(allocator: std.mem.Allocator, body: api.GenerateRequest) !generation.GenerationConfig {
+    fn generateConfigFromBody(
+        allocator: std.mem.Allocator,
+        body: api.GenerateRequest,
+        owned_grammar_out: *?[]u8,
+    ) !generation.GenerationConfig {
+        std.debug.assert(owned_grammar_out.* == null);
+        var owned_grammar: ?[]u8 = null;
+        errdefer if (owned_grammar) |grammar| allocator.free(grammar);
+        const numeric = try parseGenerateNumericOptions(body.max_tokens, body.top_k);
+        const sampling = try parseGenerateSamplingOptions(
+            body.temperature,
+            body.top_p,
+            body.min_p,
+            body.repetition_penalty,
+            body.frequency_penalty,
+            body.presence_penalty,
+        );
+        const speculation = try parseGenerateSpeculationOptions(
+            body.draft_model != null,
+            body.speculative_k,
+            body.speculation_policy,
+            body.speculation_calibration,
+        );
         var config = generation.GenerationConfig{
-            .max_tokens = if (body.max_tokens) |mt| @intCast(mt) else 256,
-            .temperature = body.temperature orelse 0,
-            .top_p = body.top_p orelse 0,
-            .top_k = if (body.top_k) |tk| @intCast(tk) else 0,
-            .min_p = body.min_p orelse 0,
-            .repetition_penalty = body.repetition_penalty orelse 1.0,
-            .frequency_penalty = body.frequency_penalty orelse 0,
-            .presence_penalty = body.presence_penalty orelse 0,
-            .speculative_k = 4,
+            .max_tokens = numeric.max_tokens,
+            .ignore_eos = body.ignore_eos orelse false,
+            .enable_thinking = if (body.chat_template_kwargs) |kwargs| kwargs.enable_thinking else null,
+            .temperature = sampling.temperature,
+            .top_p = sampling.top_p,
+            .top_k = numeric.top_k,
+            .min_p = sampling.min_p,
+            .repetition_penalty = sampling.repetition_penalty,
+            .frequency_penalty = sampling.frequency_penalty,
+            .presence_penalty = sampling.presence_penalty,
+            .speculative_k = speculation.k,
             .speculation_requested = false,
-            .prefill_chunk_size = 256,
+            .speculation_policy = speculation.policy,
+            .speculation_calibration = speculation.calibration,
+            .prefill_chunk_size = 0,
             .cache_dtype = body.cache_dtype,
             .cache_compaction_ratio = body.cache_compaction_ratio,
         };
@@ -4484,7 +6715,8 @@ pub const Node = struct {
             } else if (std.mem.eql(u8, rf.type, "json_schema")) {
                 const schema_cfg = rf.json_schema orelse return error.MissingJsonSchema;
                 const schema = schema_cfg.schema orelse return error.MissingJsonSchema;
-                config.grammar = try grammar_mod.buildJsonSchemaGrammar(allocator, schema);
+                owned_grammar = try grammar_mod.buildJsonSchemaGrammar(allocator, schema);
+                config.grammar = owned_grammar;
             } else if (!std.mem.eql(u8, rf.type, "text")) {
                 return error.UnsupportedResponseFormat;
             }
@@ -4495,8 +6727,13 @@ pub const Node = struct {
                 var compiled = try grammar_mod.GbnfGrammar.parse(allocator, grammar);
                 compiled.deinit();
             }
+            if (owned_grammar) |owned| {
+                allocator.free(owned);
+                owned_grammar = null;
+            }
             config.grammar = grammar;
         }
+        owned_grammar_out.* = owned_grammar;
         return config;
     }
 
@@ -4663,10 +6900,57 @@ pub const Node = struct {
         };
     }
 
+    const BatchModelLock = struct {
+        mutex: *std.atomic.Mutex,
+        owns_outer_lock: bool,
+
+        fn init(
+            execution_mode: BatchExecutionMode,
+            mutex: *std.atomic.Mutex,
+            io: std.Io,
+        ) @This() {
+            const owns_outer_lock = execution_mode == .shared_serial;
+            if (owns_outer_lock) platform.sync.lockYieldingIo(mutex, io);
+            return .{ .mutex = mutex, .owns_outer_lock = owns_outer_lock };
+        }
+
+        fn pipelineExecutionLock(self: *const @This()) ?*std.atomic.Mutex {
+            // The request owns the model mutex for the complete lifetime of a
+            // shared Metal/CUDA backend, so the pipeline must not lock it
+            // again. Besides avoiding self-deadlock, this keeps request-scoped
+            // backend state (including CUDA's RunBudget pointer) from being
+            // rebound by another request between generation steps.
+            return if (self.owns_outer_lock) null else self.mutex;
+        }
+
+        fn deinit(self: *@This()) void {
+            if (!self.owns_outer_lock) return;
+            self.mutex.unlock();
+            self.owns_outer_lock = false;
+        }
+    };
+
     const BatchAdmission = struct {
         lease: runtime.tier.memory.AdmissionLease,
         estimate: runtime.tier.memory.Estimate,
     };
+
+    fn mergeSerialBatchEstimate(
+        current: ?runtime.tier.memory.Estimate,
+        next: runtime.tier.memory.Estimate,
+    ) runtime.tier.memory.Estimate {
+        const existing = current orelse return next;
+        std.debug.assert(existing.kv_tier == next.kv_tier);
+        std.debug.assert(existing.scratch_tier == next.scratch_tier);
+        return .{
+            .prompt_tokens = @max(existing.prompt_tokens, next.prompt_tokens),
+            .retained_tokens = @max(existing.retained_tokens, next.retained_tokens),
+            .kv_bytes = @max(existing.kv_bytes, next.kv_bytes),
+            .kv_tier = existing.kv_tier,
+            .scratch_bytes = @max(existing.scratch_bytes, next.scratch_bytes),
+            .scratch_tier = existing.scratch_tier,
+        };
+    }
 
     fn acquireBatchAdmission(
         self: *Node,
@@ -4699,6 +6983,14 @@ pub const Node = struct {
     }
 
     pub fn generateBatchContent(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        const raw_body = (try ctx.body()) orelse
+            return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
+        if (!rawGenerateChatTemplateKwargsAreValid(ctx.allocator, raw_body, true)) {
+            return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "chat_template_kwargs accepts only a boolean enable_thinking field",
+            });
+        }
         var parsed = (try ctx.parseJson(api.GenerateBatchRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
@@ -4734,14 +7026,26 @@ pub const Node = struct {
                 .custom_id = item.custom_id,
                 .index = @intCast(idx),
             };
+            owned_messages[idx] = .{ .allocator = ctx.allocator };
+            pending[idx] = true;
             if (generateBatchUnsupportedReasonPreflight(item.body)) |batch_err| {
                 results[idx].@"error" = batch_err;
-                owned_messages[idx] = .{ .allocator = ctx.allocator };
                 pending[idx] = false;
-                continue;
             }
-            owned_messages[idx] = parseGenerateMessages(self, ctx.allocator, item.body) catch |err| blk: {
-                results[idx].@"error" = .{ .code = "INVALID_REQUEST", .message = @errorName(err), .retryable = false };
+        }
+
+        const queue_units = self.estimateGenerateBatchQueueUnitsPreflight(body.requests, pending);
+        if (try self.acquireSlotUnits(ctx, queue_units)) |resp| return resp;
+        defer self.releaseSlotUnits(queue_units);
+        self.metrics.incRequest("generate_batch");
+        defer self.metrics.decActive();
+
+        var media_budget = RequestMediaBudget.init(requestMediaMaxBytes(self));
+        for (body.requests, 0..) |item, idx| {
+            if (!pending[idx]) continue;
+            owned_messages[idx] = parseGenerateMessagesWithBudget(self, ctx.allocator, item.body, &media_budget) catch |err| blk: {
+                if (err == error.OutOfMemory) return err;
+                results[idx].@"error" = generateBatchMessageParseError(err).?;
                 break :blk .{ .allocator = ctx.allocator };
             };
             if (results[idx].@"error" == null and owned_messages[idx].messages.len == 0) {
@@ -4753,12 +7057,6 @@ pub const Node = struct {
             pending[idx] = results[idx].@"error" == null;
         }
 
-        const queue_units = self.estimateGenerateBatchQueueUnits(body.requests, owned_messages, pending);
-        if (try self.acquireSlotUnits(ctx, queue_units)) |resp| return resp;
-        defer self.releaseSlotUnits(queue_units);
-        self.metrics.incRequest("generate_batch");
-        defer self.metrics.decActive();
-
         while (true) {
             const first_idx = blk: {
                 for (pending, 0..) |is_pending, idx| {
@@ -4767,11 +7065,16 @@ pub const Node = struct {
                 break :blk null;
             } orelse break;
             const first_body = body.requests[first_idx].body;
-            const model_path = self.resolveModelPath(ctx.io, first_body.model, "generators") catch {
-                results[first_idx].@"error" = .{ .code = "MODEL_NOT_FOUND", .message = "model not found", .retryable = false };
+            const model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, first_body.model, "generators") catch |err| {
+                results[first_idx].@"error" = switch (requestModelResolutionErrorKind(err)) {
+                    .invalid => .{ .code = "INVALID_REQUEST", .message = "model must be a relative identifier within models_dir", .retryable = false },
+                    .missing => .{ .code = "MODEL_NOT_FOUND", .message = "model not found", .retryable = false },
+                    .internal => .{ .code = "MODEL_RESOLUTION_FAILED", .message = internalErrorMessage("MODEL_RESOLUTION_FAILED", err), .retryable = true },
+                };
                 pending[first_idx] = false;
                 continue;
             };
+            defer ctx.allocator.free(model_path);
             const selection = parseGenerateBackendSelection(first_body.backend, first_body.mode, first_body.compiled_target) catch {
                 results[first_idx].@"error" = .{ .code = "INVALID_REQUEST", .message = "unsupported backend", .retryable = false };
                 pending[first_idx] = false;
@@ -4833,10 +7136,8 @@ pub const Node = struct {
             };
             const model = model_handle.get();
 
-            model.lockNativeGeneration();
             {
                 defer model_handle.release();
-                defer model.unlockNativeGeneration();
 
                 const gpt_config = session_factory.getGptConfig(model.session) orelse {
                     for (group_indices.items) |idx| {
@@ -4857,22 +7158,52 @@ pub const Node = struct {
                         continue;
                     },
                 };
+                const execution_mode = batchExecutionMode(backend_kind);
+                const idle_prefill_ceiling = generation.nativeGenerationPrefillChunkCeiling(
+                    backend_kind,
+                    gpt_config,
+                    self.config.generation_batching.schedulerPolicy().max_idle_prefill_chunk_size,
+                );
 
                 var configs = try ctx.allocator.alloc(generation.GenerationConfig, group_indices.items.len);
                 defer ctx.allocator.free(configs);
+                var owned_grammars = try ctx.allocator.alloc(?[]u8, group_indices.items.len);
+                @memset(owned_grammars, null);
+                defer {
+                    for (owned_grammars) |owned_grammar| {
+                        if (owned_grammar) |grammar| ctx.allocator.free(grammar);
+                    }
+                    ctx.allocator.free(owned_grammars);
+                }
                 var prompt_tokens = try ctx.allocator.alloc(usize, group_indices.items.len);
                 defer ctx.allocator.free(prompt_tokens);
                 var prompt_bytes = try ctx.allocator.alloc(usize, group_indices.items.len);
                 defer ctx.allocator.free(prompt_bytes);
                 var valid_count: usize = 0;
                 for (group_indices.items, 0..) |idx, pos| {
-                    configs[pos] = generateConfigFromBody(ctx.allocator, body.requests[idx].body) catch |err| {
-                        results[idx].@"error" = .{ .code = "INVALID_REQUEST", .message = @errorName(err), .retryable = false };
+                    configs[pos] = generateConfigFromBody(ctx.allocator, body.requests[idx].body, &owned_grammars[pos]) catch |err| {
+                        if (err == error.OutOfMemory) return err;
+                        results[idx].@"error" = .{ .code = "INVALID_REQUEST", .message = "generation request options are invalid", .retryable = false };
                         pending[idx] = false;
                         continue;
                     };
-                    prompt_tokens[pos] = self.estimateNativePromptTokens(ctx.allocator, model, owned_messages[idx].messages) catch |err| {
-                        results[idx].@"error" = .{ .code = "TOKENIZE_FAILED", .message = @errorName(err), .retryable = false };
+                    prompt_tokens[pos] = self.estimateNativePromptTokens(
+                        ctx.allocator,
+                        model,
+                        gpt_config,
+                        owned_messages[idx].messages,
+                        configs[pos].max_tokens,
+                        if (configs[pos].speculation_requested and configs[pos].speculation_policy != .off and configs[pos].speculative_k > 0) 1 else 0,
+                        configs[pos].enable_thinking,
+                    ) catch |err| {
+                        results[idx].@"error" = if (err == error.PromptTooLong)
+                            .{
+                                .code = "INVALID_REQUEST",
+                                .message = "prompt exceeds the model context window after reserving output tokens",
+                                .retryable = false,
+                            }
+                        else
+                            .{ .code = "TOKENIZE_FAILED", .message = internalErrorMessage("TOKENIZE_FAILED", err), .retryable = false };
                         pending[idx] = false;
                         continue;
                     };
@@ -4899,7 +7230,49 @@ pub const Node = struct {
                     model.session,
                     runtime.tier.memory.defaultLimitsForBackend(budget_backend_class),
                 ));
-                const execution_mode = batchExecutionMode(backend_kind);
+                var leases = try ctx.allocator.alloc(runtime.scheduler.native_generate.Lease, group_indices.items.len);
+                for (leases) |*lease| lease.* = .{ .request_id = 0, .reserved_units = 0, .prompt_bytes = 0, .max_tokens = 0, .prefill_chunk_size = 0, .active_requests_snapshot = 0 };
+                const standalone_prefill_plans = try ctx.allocator.alloc(
+                    ?runtime.scheduler.native_generate.PrefillChunkPlan,
+                    group_indices.items.len,
+                );
+                @memset(standalone_prefill_plans, null);
+                defer {
+                    if (model.native_generate_coordinator) |coordinator| {
+                        for (leases) |*lease| {
+                            if (lease.request_id != 0) {
+                                coordinator.release(lease.*);
+                                lease.request_id = 0;
+                            }
+                        }
+                    }
+                    for (standalone_prefill_plans) |*maybe_plan| {
+                        if (maybe_plan.*) |*plan| plan.deinit(ctx.allocator);
+                    }
+                    ctx.allocator.free(standalone_prefill_plans);
+                    ctx.allocator.free(leases);
+                }
+                if (model.native_generate_coordinator) |coordinator| {
+                    for (group_indices.items, 0..) |idx, pos| {
+                        if (!pending[idx]) continue;
+                        const queue_item_units = self.estimateGenerateQueueUnits(owned_messages[idx].messages, configs[pos].max_tokens);
+                        leases[pos] = self.acquireNativeGenerateLease(coordinator, .{
+                            .requested_units = queue_item_units,
+                            .prompt_bytes = prompt_bytes[pos],
+                            .prompt_tokens = prompt_tokens[pos],
+                            .prefill_chunk_limit = if (configs[pos].prefill_chunk_size == 0) idle_prefill_ceiling else 0,
+                            .max_tokens = configs[pos].max_tokens,
+                        }) catch |err| {
+                            results[idx].@"error" = .{ .code = "QUEUE_FULL", .message = @errorName(err), .retryable = true };
+                            pending[idx] = false;
+                            continue;
+                        };
+                    }
+                    for (group_indices.items, 0..) |idx, pos| {
+                        if (!pending[idx]) continue;
+                        leases[pos].prefill_chunk_size = coordinator.recommendPrefillChunkFor(leases[pos].request_id);
+                    }
+                }
                 var shared_run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
                 const task_run_budgets = try ctx.allocator.alloc(
                     runtime.tier.memory.RunBudget,
@@ -4930,16 +7303,96 @@ pub const Node = struct {
                     ctx.allocator.free(admissions);
                 }
                 var runnable_count: usize = 0;
+                const budget_components = [_]runtime.tier.memory.GptGenerationBudgetComponent{
+                    .{ .backend = backend_kind, .kv_dtype = kv_dtype, .config = gpt_config },
+                };
                 for (group_indices.items, 0..) |idx, pos| {
                     if (!pending[idx]) continue;
-                    const admission_prefill_chunk = if (configs[pos].prefill_chunk_size > 0) configs[pos].prefill_chunk_size else 256;
+                    const scheduler_ceiling = if (model.native_generate_coordinator != null)
+                        leases[pos].prefill_chunk_size
+                    else
+                        @min(
+                            prompt_tokens[pos],
+                            if (configs[pos].prefill_chunk_size == 0)
+                                idle_prefill_ceiling
+                            else
+                                self.config.generation_batching.schedulerPolicy().max_idle_prefill_chunk_size,
+                        );
+                    const admission_prefill_ceiling = if (configs[pos].prefill_chunk_size > 0)
+                        @min(configs[pos].prefill_chunk_size, scheduler_ceiling)
+                    else
+                        scheduler_ceiling;
+                    const speculative_budget_bonus: usize = if (configs[pos].speculation_requested and
+                        configs[pos].speculation_policy != .off and
+                        configs[pos].speculative_k > 0) 1 else 0;
+                    const budget_max_tokens = @as(usize, @intCast(@max(configs[pos].max_tokens, 1))) + speculative_budget_bonus;
+                    var sizing_budget = runtime.tier.memory.RunBudget.init(budget_limits);
+                    const prefill_admission = runtime.tier.memory.reserveGptGenerationPrefill(
+                        &sizing_budget,
+                        &budget_components,
+                        prompt_tokens[pos],
+                        budget_max_tokens,
+                        admission_prefill_ceiling,
+                    ) catch |err| {
+                        results[idx].@"error" = .{
+                            .code = "MEMORY_BUDGET_EXCEEDED",
+                            .message = @errorName(err),
+                            .retryable = false,
+                        };
+                        pending[idx] = false;
+                        if (model.native_generate_coordinator) |coordinator| {
+                            coordinator.release(leases[pos]);
+                            leases[pos].request_id = 0;
+                        }
+                        continue;
+                    };
+                    configs[pos].prefill_chunk_size = prefill_admission.max_chunk_rows;
+                    if (model.native_generate_coordinator) |coordinator| {
+                        coordinator.admitPrefillChunkPlan(
+                            &leases[pos],
+                            prompt_tokens[pos],
+                            prefill_admission.max_chunk_rows,
+                            prefill_admission.max_scratch_bytes,
+                            .fixed_ceiling,
+                        ) catch |err| {
+                            results[idx].@"error" = .{
+                                .code = "PREFILL_PLAN_ADMISSION_FAILED",
+                                .message = @errorName(err),
+                                .retryable = false,
+                            };
+                            pending[idx] = false;
+                            coordinator.release(leases[pos]);
+                            leases[pos].request_id = 0;
+                            continue;
+                        };
+                        configs[pos].prefill_chunk_plan = leases[pos].prefill_chunk_plan;
+                    } else {
+                        standalone_prefill_plans[pos] = runtime.scheduler.native_generate.PrefillChunkPlan.init(
+                            ctx.allocator,
+                            prompt_tokens[pos],
+                            prefill_admission.max_chunk_rows,
+                            prefill_admission.max_scratch_bytes,
+                            if (valid_count == 1) .sole_idle else .shared,
+                            .fixed_ceiling,
+                        ) catch |err| {
+                            results[idx].@"error" = .{
+                                .code = "PREFILL_PLAN_ADMISSION_FAILED",
+                                .message = @errorName(err),
+                                .retryable = false,
+                            };
+                            pending[idx] = false;
+                            continue;
+                        };
+                        configs[pos].prefill_chunk_plan = standalone_prefill_plans[pos].?;
+                    }
+                    logAdmittedPrefillChunkPlan(configs[pos].prefill_chunk_plan.?);
                     const resource_estimate = runtime.tier.memory.estimateGptGeneration(
                         backend_kind,
                         kv_dtype,
                         gpt_config,
                         prompt_tokens[pos],
-                        @intCast(@max(configs[pos].max_tokens, 1)),
-                        admission_prefill_chunk,
+                        budget_max_tokens,
+                        configs[pos].prefill_chunk_size,
                     ) catch |err| {
                         results[idx].@"error" = .{
                             .code = if (err == error.InvalidModelConfig) "INVALID_MODEL" else "MODEL_RESOURCE_LIMIT",
@@ -4947,6 +7400,10 @@ pub const Node = struct {
                             .retryable = false,
                         };
                         pending[idx] = false;
+                        if (model.native_generate_coordinator) |coordinator| {
+                            coordinator.release(leases[pos]);
+                            leases[pos].request_id = 0;
+                        }
                         continue;
                     };
                     resource_estimates[pos] = resource_estimate;
@@ -4962,31 +7419,78 @@ pub const Node = struct {
                     ) catch |err| {
                         results[idx].@"error" = batchAdmissionError(err);
                         pending[idx] = false;
+                        if (model.native_generate_coordinator) |coordinator| {
+                            coordinator.release(leases[pos]);
+                            leases[pos].request_id = 0;
+                        }
                         continue;
                     };
                     runnable_count += 1;
                 }
                 if (runnable_count == 0) continue;
 
-                var shared_cb: ?ops.ComputeBackend = null;
+                // A shared GPU backend executes these requests serially, so
+                // one reservation covering the largest per-item KV and scratch
+                // working sets is sufficient. Acquire it before the model lock:
+                // admission may evict an idle model and destroy its backend.
+                var shared_batch_admission: ?BatchAdmission = null;
+                defer releaseBatchAdmission(&shared_run_budget, &shared_batch_admission);
                 if (execution_mode == .shared_serial) {
-                    var provision_admitted = false;
-                    for (group_indices.items, 0..) |idx, pos| {
-                        if (!pending[idx]) continue;
-                        admissions[pos] = self.acquireBatchAdmission(
+                    while (runnable_count > 0 and shared_batch_admission == null) {
+                        var combined: ?runtime.tier.memory.Estimate = null;
+                        var largest_pos: ?usize = null;
+                        var largest_pressure: usize = 0;
+                        for (group_indices.items, 0..) |idx, pos| {
+                            if (!pending[idx]) continue;
+                            const estimate = resource_estimates[pos].?;
+                            combined = mergeSerialBatchEstimate(combined, estimate);
+                            const pressure = estimate.kv_bytes +| estimate.scratch_bytes;
+                            if (largest_pos == null or pressure > largest_pressure) {
+                                largest_pos = pos;
+                                largest_pressure = pressure;
+                            }
+                        }
+                        const estimate = combined orelse break;
+                        shared_batch_admission = self.acquireBatchAdmission(
                             budget_backend_class,
                             budget_limits,
                             &shared_run_budget,
-                            resource_estimates[pos].?,
+                            estimate,
                         ) catch |err| {
+                            // Preserve per-item batch semantics: if the largest
+                            // request cannot be admitted, reject it and retry a
+                            // reservation sized for the remaining requests.
+                            const pos = largest_pos.?;
+                            const idx = group_indices.items[pos];
                             results[idx].@"error" = batchAdmissionError(err);
                             pending[idx] = false;
+                            runnable_count -= 1;
+                            if (model.native_generate_coordinator) |coordinator| {
+                                coordinator.release(leases[pos]);
+                                leases[pos].request_id = 0;
+                            }
                             continue;
                         };
-                        provision_admitted = true;
-                        break;
                     }
-                    if (!provision_admitted) continue;
+                    if (shared_batch_admission == null) continue;
+                }
+
+                // Match the single-request lock order: scheduler and resource
+                // admission must complete before the model mutex is acquired.
+                // Metal/CUDA backends reference stateful session-owned runtime
+                // or provider state, so from backend binding onward retain the
+                // mutex until every backend/KV defer has run. Native mode
+                // creates an independent backend per item and instead uses the
+                // scheduler's per-step execution lock below.
+                var batch_model_lock = BatchModelLock.init(
+                    execution_mode,
+                    model.nativeGenerationMutex(),
+                    ctx.io,
+                );
+                defer batch_model_lock.deinit();
+
+                var shared_cb: ?ops.ComputeBackend = null;
+                if (execution_mode == .shared_serial) {
                     shared_cb = session_factory.getComputeBackendWithBudget(
                         model.session,
                         ctx.allocator,
@@ -5004,42 +7508,19 @@ pub const Node = struct {
 
                 var kv_manager = runtime.kv.manager.KvManager.init(ctx.allocator);
                 defer kv_manager.deinit();
-                const sliding_window_size: ?u32 = if (gpt_config.position_encoding == .absolute)
-                    null
-                else if (gpt_config.sliding_window > 0)
-                    gpt_config.sliding_window
-                else if (gpt_config.max_position_embeddings > 0)
-                    gpt_config.max_position_embeddings
-                else
-                    null;
-                const pool_id = kv_manager.addPool(.{
-                    .backend = backend_kind,
-                    .dtype = kv_dtype,
-                    .page_size_tokens = 16,
-                    .num_layers_packed = @intCast(gpt_config.num_hidden_layers),
-                    .num_kv_heads = gpt_config.maxKvHeads(),
-                    .head_dim = gpt_config.maxHeadDim(),
-                    .sliding_window_size = sliding_window_size,
-                }) catch |err| {
+                const kv_pool_config = generation.kvPoolConfig(backend_kind, kv_dtype, gpt_config, generationKvSlidingTrimForced());
+                const pool_id = kv_manager.addPool(kv_pool_config) catch |err| {
                     for (group_indices.items) |idx| {
                         if (!pending[idx]) continue;
-                        results[idx].@"error" = .{ .code = "BACKEND_ERROR", .message = @errorName(err), .retryable = true };
+                        results[idx].@"error" = .{ .code = "BACKEND_ERROR", .message = internalErrorMessage("BACKEND_ERROR", err), .retryable = true };
                         pending[idx] = false;
                     }
                     continue;
                 };
-                var kv_storage = runtime.kv.storage_runtime.KvStorageRuntime.init(ctx.allocator, .{
-                    .backend = backend_kind,
-                    .dtype = kv_dtype,
-                    .page_size_tokens = 16,
-                    .num_layers_packed = @intCast(gpt_config.num_hidden_layers),
-                    .num_kv_heads = gpt_config.maxKvHeads(),
-                    .head_dim = gpt_config.maxHeadDim(),
-                    .sliding_window_size = sliding_window_size,
-                }) catch |err| {
+                var kv_storage = runtime.kv.storage_runtime.KvStorageRuntime.init(ctx.allocator, kv_pool_config) catch |err| {
                     for (group_indices.items) |idx| {
                         if (!pending[idx]) continue;
-                        results[idx].@"error" = .{ .code = "BACKEND_ERROR", .message = @errorName(err), .retryable = true };
+                        results[idx].@"error" = .{ .code = "BACKEND_ERROR", .message = internalErrorMessage("BACKEND_ERROR", err), .retryable = true };
                         pending[idx] = false;
                     }
                     continue;
@@ -5077,19 +7558,6 @@ pub const Node = struct {
                     for (decode_states) |*state| state.deinit();
                     ctx.allocator.free(decode_states);
                 }
-                var leases = try ctx.allocator.alloc(runtime.scheduler.native_generate.Lease, group_indices.items.len);
-                for (leases) |*lease| lease.* = .{ .request_id = 0, .reserved_units = 0, .prompt_bytes = 0, .max_tokens = 0, .prefill_chunk_size = 0, .active_requests_snapshot = 0 };
-                defer {
-                    if (model.native_generate_coordinator) |coordinator| {
-                        for (leases) |*lease| {
-                            if (lease.request_id != 0) {
-                                coordinator.release(lease.*);
-                                lease.request_id = 0;
-                            }
-                        }
-                    }
-                    ctx.allocator.free(leases);
-                }
                 var task_results = try ctx.allocator.alloc(BatchGenerateTaskResult, group_indices.items.len);
                 for (task_results) |*task_result| task_result.* = .{};
                 defer ctx.allocator.free(task_results);
@@ -5104,19 +7572,6 @@ pub const Node = struct {
                 for (group_indices.items, 0..) |idx, pos| {
                     if (!pending[idx]) continue;
                     const task_alloc = task_arenas[pos].allocator();
-                    if (execution_mode == .shared_serial and admissions[pos] == null) {
-                        const resource_estimate = resource_estimates[pos].?;
-                        admissions[pos] = self.acquireBatchAdmission(
-                            budget_backend_class,
-                            budget_limits,
-                            &shared_run_budget,
-                            resource_estimate,
-                        ) catch |err| {
-                            results[idx].@"error" = batchAdmissionError(err);
-                            pending[idx] = false;
-                            continue;
-                        };
-                    }
                     if (execution_mode == .isolated_parallel) {
                         task_cbs[pos] = session_factory.getComputeBackendWithBudget(
                             model.session,
@@ -5126,6 +7581,10 @@ pub const Node = struct {
                             releaseBatchAdmission(&task_run_budgets[pos], &admissions[pos]);
                             results[idx].@"error" = .{ .code = "BACKEND_ERROR", .message = @errorName(err), .retryable = true };
                             pending[idx] = false;
+                            if (model.native_generate_coordinator) |coordinator| {
+                                coordinator.release(leases[pos]);
+                                leases[pos].request_id = 0;
+                            }
                             continue;
                         };
                     }
@@ -5133,28 +7592,9 @@ pub const Node = struct {
                         task_cbs[pos].?
                     else
                         shared_cb.?;
-                    const queue_item_units = self.estimateGenerateQueueUnits(owned_messages[idx].messages, configs[pos].max_tokens);
                     decode_states[pos] = generation.NativeDecodeState.initPaged(task_alloc, &kv_manager, pool_id, model.shared_moe_cache);
                     decode_states[pos].kv_lock = &kv_mutex;
                     decode_states[pos].kv_storage = &kv_storage;
-                    leases[pos] = if (model.native_generate_coordinator) |coordinator| blk: {
-                        const lease = coordinator.acquire(.{
-                            .requested_units = queue_item_units,
-                            .prompt_bytes = prompt_bytes[pos],
-                            .max_tokens = configs[pos].max_tokens,
-                        }) catch |err| {
-                            const item_run_budget = if (execution_mode == .isolated_parallel)
-                                &task_run_budgets[pos]
-                            else
-                                &shared_run_budget;
-                            releaseBatchAdmission(item_run_budget, &admissions[pos]);
-                            results[idx].@"error" = .{ .code = "QUEUE_FULL", .message = @errorName(err), .retryable = true };
-                            pending[idx] = false;
-                            continue;
-                        };
-                        configs[pos].prefill_chunk_size = lease.prefill_chunk_size;
-                        break :blk lease;
-                    } else .{ .request_id = 0, .reserved_units = 0, .prompt_bytes = 0, .max_tokens = 0, .prefill_chunk_size = 256, .active_requests_snapshot = 0 };
                     tasks[pos] = .{
                         .allocator = task_alloc,
                         .pipeline = .{
@@ -5175,6 +7615,7 @@ pub const Node = struct {
                             .decode_state = &decode_states[pos],
                             .scheduler = model.native_generate_coordinator,
                             .scheduler_lease = if (model.native_generate_coordinator != null) &leases[pos] else null,
+                            .execution_lock = batch_model_lock.pipelineExecutionLock(),
                         },
                         .messages = owned_messages[idx].messages,
                         .config = configs[pos],
@@ -5190,7 +7631,6 @@ pub const Node = struct {
                                 leases[pos].request_id = 0;
                             }
                         }
-                        releaseBatchAdmission(&shared_run_budget, &admissions[pos]);
                         decode_states[pos].deinit();
                         decode_states[pos] = generation.NativeDecodeState.initContiguous(ctx.allocator);
                         try applyBatchGenerateTaskResult(
@@ -5289,17 +7729,18 @@ pub const Node = struct {
         model_name: []const u8,
         result: *@import("../pipelines/generation.zig").GenerationResult,
         tool_parser: ?*tool_parser_mod.Parser,
+        include_usage: bool,
     ) !httpx.Response {
         var writer = ctx.streamResponse(200) catch |err| {
             std.debug.print("streamResponse failed: {}\n", .{err});
-            return ctx.status(500).json(.{ .@"error" = "STREAM_INIT_FAILED", .message = @errorName(err) });
+            return ctx.status(500).json(.{ .@"error" = "STREAM_INIT_FAILED", .message = internalErrorMessage("STREAM_INIT_FAILED", err) });
         };
         const stream_id = try allocCompletionId(ctx.allocator);
         defer ctx.allocator.free(stream_id);
         const stream_created = completionCreatedTimestamp();
 
         emitRoleDelta(&writer, ctx.allocator, stream_id, stream_created, model_name) catch |err| {
-            writer.writeEvent("error", @errorName(err)) catch {};
+            writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
             writer.close() catch {};
             return ctx.response.build();
         };
@@ -5313,12 +7754,27 @@ pub const Node = struct {
             result.text,
             result.finish_reason,
             tool_parser,
+            result.speculative,
         ) catch |err| {
-            writer.writeEvent("error", @errorName(err)) catch {};
+            writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
             writer.close() catch {};
             return ctx.response.build();
         };
-        writer.writeEvent(null, "[DONE]") catch {};
+        emitTerminalUsageOrDone(
+            &writer,
+            ctx.allocator,
+            stream_id,
+            stream_created,
+            model_name,
+            result.prompt_tokens,
+            result.tokens_used,
+            result.cached_prompt_tokens,
+            include_usage,
+        ) catch |err| {
+            writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
+            writer.close() catch {};
+            return ctx.response.build();
+        };
         writer.close() catch {};
         return ctx.response.build();
     }
@@ -5359,6 +7815,16 @@ pub const Node = struct {
     }
 
     fn parseChatMessageContentToTextAndImages(self: *Node, allocator: std.mem.Allocator, content: api.ChatMessageContent) !ParsedMultimodalRerankDocument {
+        var media_budget = RequestMediaBudget.init(requestMediaMaxBytes(self));
+        return self.parseChatMessageContentToTextAndImagesWithBudget(allocator, content, &media_budget);
+    }
+
+    fn parseChatMessageContentToTextAndImagesWithBudget(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        content: api.ChatMessageContent,
+        media_budget: *RequestMediaBudget,
+    ) !ParsedMultimodalRerankDocument {
         var text_buf = std.ArrayListUnmanaged(u8).empty;
         errdefer text_buf.deinit(allocator);
         var images = std.ArrayListUnmanaged([]const u8).empty;
@@ -5391,19 +7857,27 @@ pub const Node = struct {
                             null;
                         const url = url_str orelse return error.UnsupportedContentPartType;
                         if (std.mem.startsWith(u8, url, "data:")) {
-                            const decoded = decodeDataUri(allocator, url) catch return error.InvalidImageDataUri;
+                            const decoded = decodeDataUriWithBudget(allocator, url, media_budget) catch |err| switch (err) {
+                                error.OutOfMemory, error.RemoteContentTooLarge => return err,
+                                else => return error.InvalidImageDataUri,
+                            };
+                            errdefer decoded.deinit(allocator);
                             try images.append(allocator, decoded.data);
                         } else {
-                            var downloaded = downloadRemoteContent(self, allocator, url) catch return error.ImageDownloadFailed;
-                            defer downloaded.deinit(allocator);
-                            try images.append(allocator, try allocator.dupe(u8, downloaded.data));
+                            const downloaded = try downloadRemoteContentWithBudgetForRequest(self, allocator, url, media_budget);
+                            defer allocator.free(downloaded.content_type);
+                            errdefer allocator.free(downloaded.data);
+                            try images.append(allocator, downloaded.data);
                         }
                     } else if (std.mem.eql(u8, ptype, "media")) {
                         const data_val = obj.get("data") orelse return error.UnsupportedContentPartType;
                         const mime_val = obj.get("mime_type") orelse return error.UnsupportedContentPartType;
                         if (data_val != .string or mime_val != .string) return error.UnsupportedContentPartType;
                         if (!std.mem.startsWith(u8, mime_val.string, "image/")) return error.UnsupportedContentPartType;
-                        const decoded_payload = decodeMediaData(allocator, data_val.string) catch return error.UnsupportedContentPartType;
+                        const decoded_payload = decodeMediaDataWithBudget(allocator, data_val.string, media_budget) catch |err| switch (err) {
+                            error.OutOfMemory, error.RemoteContentTooLarge => return err,
+                            else => return error.UnsupportedContentPartType,
+                        };
                         const decoded = decoded_payload.data;
                         errdefer allocator.free(decoded);
                         if (!mediaMimeMatches(mime_val.string, decoded_payload.mime_type)) return error.UnsupportedContentPartType;
@@ -5416,15 +7890,18 @@ pub const Node = struct {
             else => return error.UnsupportedContentPartType,
         }
 
+        const owned_text = try text_buf.toOwnedSlice(allocator);
+        errdefer allocator.free(owned_text);
+        const owned_images = try images.toOwnedSlice(allocator);
         return .{
             .allocator = allocator,
-            .text = try text_buf.toOwnedSlice(allocator),
-            .images = try images.toOwnedSlice(allocator),
+            .text = owned_text,
+            .images = owned_images,
         };
     }
 
     fn buildGenerateResponse(
-        _: *Node,
+        self: *Node,
         ctx: *httpx.Context,
         model_name: []const u8,
         response_text: []const u8,
@@ -5433,7 +7910,9 @@ pub const Node = struct {
         completion_tokens: usize,
         cached_prompt_tokens: usize,
         tool_calls: ?[]const tool_parser_mod.ToolCall,
+        speculative: ?generation.SpeculativeDecodeStats,
     ) !httpx.Response {
+        recordSpeculationOutcome(&self.metrics, speculative);
         var arena = std.heap.ArenaAllocator.init(ctx.allocator);
         defer arena.deinit();
         const alloc = arena.allocator();
@@ -5471,12 +7950,8 @@ pub const Node = struct {
             .created = created,
             .model = model_name,
             .choices = &choices,
-            .usage = .{
-                .prompt_tokens = @intCast(prompt_tokens),
-                .completion_tokens = @intCast(completion_tokens),
-                .total_tokens = @intCast(prompt_tokens + completion_tokens),
-                .cached_prompt_tokens = if (cached_prompt_tokens == 0) null else @intCast(cached_prompt_tokens),
-            },
+            .usage = tokenUsageWithCachedPrompt(prompt_tokens, completion_tokens, cached_prompt_tokens),
+            .speculation = generateSpeculationStatus(speculative),
         });
     }
 
@@ -5492,9 +7967,11 @@ pub const Node = struct {
             return;
         }
 
+        const content = try allocator.dupe(u8, prompt);
+        errdefer allocator.free(content);
         try messages.insert(allocator, 0, .{
             .role = "system",
-            .content = try allocator.dupe(u8, prompt),
+            .content = content,
             .image_bytes = null,
         });
     }
@@ -5528,17 +8005,18 @@ pub const Node = struct {
     /// SSE streaming generation: sends token-by-token events via chunked transfer encoding.
     /// OpenAI-compatible format: data: {"choices":[{"delta":{"content":"token"}}]}\n\n
     fn streamGenerate(
-        _: *Node,
+        self: *Node,
         ctx: *httpx.Context,
         model_name: []const u8,
         pipeline: anytype,
         messages: []const @import("../pipelines/generation.zig").Message,
         config: @import("../pipelines/generation.zig").GenerationConfig,
         tool_parser: ?*tool_parser_mod.Parser,
+        include_usage: bool,
     ) !httpx.Response {
         var writer = ctx.streamResponse(200) catch |err| {
             std.debug.print("streamResponse failed: {}\n", .{err});
-            return ctx.status(500).json(.{ .@"error" = "STREAM_INIT_FAILED", .message = @errorName(err) });
+            return ctx.status(500).json(.{ .@"error" = "STREAM_INIT_FAILED", .message = internalErrorMessage("STREAM_INIT_FAILED", err) });
         };
         const stream_id = try allocCompletionId(ctx.allocator);
         defer ctx.allocator.free(stream_id);
@@ -5552,40 +8030,46 @@ pub const Node = struct {
             model_name: []const u8,
             allocator: std.mem.Allocator,
             parser: ?*tool_parser_mod.Parser,
+            cancellation: ?*const std.atomic.Value(bool),
             errored: bool = false,
 
+            fn shouldContinue(raw_ctx: *anyopaque) bool {
+                const stream: *@This() = @ptrCast(@alignCast(raw_ctx));
+                return generationStreamShouldContinue(stream.errored, stream.cancellation);
+            }
+
             fn onToken(raw_ctx: *anyopaque, token_text: []const u8) bool {
-                const self: *@This() = @ptrCast(@alignCast(raw_ctx));
-                if (self.parser) |parser| {
+                const stream: *@This() = @ptrCast(@alignCast(raw_ctx));
+                if (stream.parser) |parser| {
                     const update = parser.feed(token_text) catch {
-                        self.errored = true;
+                        stream.errored = true;
                         return false;
                     };
                     if (update.ready_text.len > 0) {
-                        emitContentDelta(self.writer, self.allocator, self.stream_id, self.stream_created, self.model_name, update.ready_text) catch {
-                            self.errored = true;
+                        emitContentDelta(stream.writer, stream.allocator, stream.stream_id, stream.stream_created, stream.model_name, update.ready_text) catch {
+                            stream.errored = true;
                             return false;
                         };
                     }
                     if (!parser.streamsIncrementalToolDeltas() and update.new_calls.len > 0) {
                         for (update.new_calls, 0..) |call, idx| {
-                            emitToolCallDelta(self.writer, self.allocator, self.stream_id, self.stream_created, self.model_name, update.call_start_index + idx, call) catch {
-                                self.errored = true;
+                            emitToolCallDelta(stream.writer, stream.allocator, stream.stream_id, stream.stream_created, stream.model_name, update.call_start_index + idx, call) catch {
+                                stream.errored = true;
                                 return false;
                             };
                         }
                     }
                     if (update.active_tool_delta) |delta| {
-                        emitToolCallDeltaUpdate(self.writer, self.allocator, self.stream_id, self.stream_created, self.model_name, delta) catch {
-                            self.errored = true;
+                        emitToolCallDeltaUpdate(stream.writer, stream.allocator, stream.stream_id, stream.stream_created, stream.model_name, delta) catch {
+                            stream.errored = true;
                             return false;
                         };
                     }
                     return true;
                 }
                 // Build OpenAI-compatible SSE chunk
-                emitContentDelta(self.writer, self.allocator, self.stream_id, self.stream_created, self.model_name, token_text) catch {
-                    self.errored = true;
+                emitContentDelta(stream.writer, stream.allocator, stream.stream_id, stream.stream_created, stream.model_name, token_text) catch {
+                    stream.errored = true;
                     return false;
                 };
                 return true;
@@ -5599,13 +8083,36 @@ pub const Node = struct {
             .model_name = model_name,
             .allocator = ctx.allocator,
             .parser = tool_parser,
+            .cancellation = ctx.cancellation,
         };
 
+        if (comptime @hasField(@TypeOf(pipeline.*), "continue_ctx") and
+            @hasField(@TypeOf(pipeline.*), "continue_fn"))
+        {
+            pipeline.continue_ctx = @ptrCast(&stream_ctx);
+            pipeline.continue_fn = StreamCtx.shouldContinue;
+        }
+
         emitRoleDelta(&writer, ctx.allocator, stream_id, stream_created, model_name) catch |err| {
-            writer.writeEvent("error", @errorName(err)) catch {};
+            writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
             writer.close() catch {};
             return ctx.response.build();
         };
+
+        // Snapshot CUDA op-profile counters before generation so the emitted
+        // line below reflects this request alone. Mirrors the direct-generator
+        // path so per-op profiling works against the warm server's SSE route
+        // (the one the long-context benchmark harness uses). Only the native
+        // pipeline exposes a backend session; ONNX/ORT pipeline instantiations
+        // must remain valid in CUDA-enabled builds too.
+        const cuda_profile_session: ?backends_mod.Session =
+            if (comptime build_options.enable_cuda) generationPipelineSession(pipeline) else null;
+        const cuda_profile_before: ?session_factory.CudaRuntimeStats =
+            if (comptime build_options.enable_cuda) blk: {
+                if (!session_factory.cudaOpProfileLoggingEnabled()) break :blk null;
+                const sess = cuda_profile_session orelse break :blk null;
+                break :blk session_factory.getCudaRuntimeStats(sess);
+            } else null;
 
         var result = pipeline.generateStreaming(
             messages,
@@ -5613,31 +8120,76 @@ pub const Node = struct {
             @ptrCast(&stream_ctx),
             StreamCtx.onToken,
         ) catch |err| {
+            if (comptime build_options.enable_cuda) {
+                if (cuda_profile_session) |sess| session_factory.drainCudaProfile(sess);
+            }
             // Try to send an error event before closing
-            writer.writeEvent("error", @errorName(err)) catch {};
+            writeInternalStreamError(&writer, "GENERATION_FAILED", err);
             writer.close() catch {};
             return ctx.response.build();
         };
         defer result.deinit();
 
+        // Drain buffered per-op profile events (single host sync, off the hot
+        // path) and emit the same lines the CLI prints.
+        if (comptime build_options.enable_cuda) {
+            if (cuda_profile_before) |before| {
+                if (cuda_profile_session) |sess| {
+                    session_factory.drainCudaProfile(sess);
+                    if (session_factory.getCudaRuntimeStats(sess)) |after| {
+                        const profile_delta = session_factory.cudaStatsDelta(after, before);
+                        var cuda_profile_line_buf: [768]u8 = undefined;
+                        std.log.info("{s}", .{session_factory.formatCudaDecodeProfileLine(&cuda_profile_line_buf, profile_delta)});
+                        std.log.info("{s}", .{session_factory.formatCudaPrefillProfileLine(&cuda_profile_line_buf, profile_delta)});
+                    }
+                }
+            }
+        }
+
         if (stream_ctx.errored) {
-            writer.writeEvent("error", "STREAM_WRITE_FAILED") catch {};
+            if (!builtin.is_test) std.log.err("inference request failed code=STREAM_WRITE_FAILED", .{});
+            writer.writeEvent("error", internal_error_message) catch {};
             writer.close() catch {};
             return ctx.response.build();
         }
 
+        const speculative = effectiveSpeculationStats(
+            result.speculative,
+            config.speculation_requested,
+            config.speculation_policy,
+            config.speculation_calibration,
+        );
+        recordSpeculationOutcome(&self.metrics, speculative);
+
         if (tool_parser != null) {
-            flushStreamParserState(ctx.allocator, &writer, stream_id, stream_created, model_name, result.finish_reason, tool_parser.?) catch |err| {
-                writer.writeEvent("error", @errorName(err)) catch {};
+            flushStreamParserState(ctx.allocator, &writer, stream_id, stream_created, model_name, result.finish_reason, tool_parser.?, speculative) catch |err| {
+                writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
                 writer.close() catch {};
                 return ctx.response.build();
             };
         } else {
-            emitFinishDelta(&writer, ctx.allocator, stream_id, stream_created, model_name, result.finish_reason) catch {};
+            emitFinishDelta(&writer, ctx.allocator, stream_id, stream_created, model_name, result.finish_reason, speculative) catch |err| {
+                writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
+                writer.close() catch {};
+                return ctx.response.build();
+            };
         }
 
-        // Send the final [DONE] event (OpenAI convention)
-        writer.writeEvent(null, "[DONE]") catch {};
+        emitTerminalUsageOrDone(
+            &writer,
+            ctx.allocator,
+            stream_id,
+            stream_created,
+            model_name,
+            result.prompt_tokens,
+            result.tokens_used,
+            result.cached_prompt_tokens,
+            include_usage,
+        ) catch |err| {
+            writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
+            writer.close() catch {};
+            return ctx.response.build();
+        };
         writer.close() catch {};
 
         return ctx.response.build();
@@ -5652,6 +8204,7 @@ pub const Node = struct {
         full_text: []const u8,
         default_finish_reason: []const u8,
         tool_parser: ?*tool_parser_mod.Parser,
+        speculative: ?generation.SpeculativeDecodeStats,
     ) !void {
         if (tool_parser) |parser| {
             parser.reset();
@@ -5668,16 +8221,16 @@ pub const Node = struct {
                     .name = call.function.name,
                     .arguments = call.function.arguments,
                 });
-                try emitFinishDelta(writer, allocator, stream_id, stream_created, model_name, "tool_calls");
+                try emitFinishDelta(writer, allocator, stream_id, stream_created, model_name, "tool_calls", speculative);
                 return;
             }
             if (remaining.len == 0 and full_text.len > 0) try emitContentDelta(writer, allocator, stream_id, stream_created, model_name, full_text);
-            try emitFinishDelta(writer, allocator, stream_id, stream_created, model_name, default_finish_reason);
+            try emitFinishDelta(writer, allocator, stream_id, stream_created, model_name, default_finish_reason, speculative);
             return;
         }
 
         if (full_text.len > 0) try emitContentDelta(writer, allocator, stream_id, stream_created, model_name, full_text);
-        try emitFinishDelta(writer, allocator, stream_id, stream_created, model_name, default_finish_reason);
+        try emitFinishDelta(writer, allocator, stream_id, stream_created, model_name, default_finish_reason, speculative);
     }
 
     fn flushStreamParserState(
@@ -5688,12 +8241,13 @@ pub const Node = struct {
         model_name: []const u8,
         default_finish_reason: []const u8,
         parser: *tool_parser_mod.Parser,
+        speculative: ?generation.SpeculativeDecodeStats,
     ) !void {
         const remaining = try parser.finishRemainingText(allocator);
         defer allocator.free(remaining);
         if (remaining.len > 0) try emitContentDelta(writer, allocator, stream_id, stream_created, model_name, remaining);
         const finish_reason = if (parser.toolCalls().len > 0) "tool_calls" else default_finish_reason;
-        try emitFinishDelta(writer, allocator, stream_id, stream_created, model_name, finish_reason);
+        try emitFinishDelta(writer, allocator, stream_id, stream_created, model_name, finish_reason, speculative);
     }
 
     fn parseFinishReason(s: []const u8) api.FinishReason {
@@ -5708,7 +8262,7 @@ pub const Node = struct {
     }
 
     fn writeGenerateChunkEvent(
-        writer: *httpx.Context.StreamWriter,
+        writer: anytype,
         allocator: std.mem.Allocator,
         chunk: api.GenerateChunk,
     ) !void {
@@ -5808,12 +8362,13 @@ pub const Node = struct {
     }
 
     fn emitFinishDelta(
-        writer: *httpx.Context.StreamWriter,
+        writer: anytype,
         allocator: std.mem.Allocator,
         stream_id: []const u8,
         stream_created: i64,
         model_name: []const u8,
         finish_reason: []const u8,
+        speculative: ?generation.SpeculativeDecodeStats,
     ) !void {
         const choices = [_]api.GenerateChunkChoice{.{
             .index = 0,
@@ -5826,7 +8381,55 @@ pub const Node = struct {
             .created = stream_created,
             .model = model_name,
             .choices = &choices,
+            .speculation = generateSpeculationStatus(speculative),
         });
+    }
+
+    fn emitTerminalUsageAndDone(
+        writer: anytype,
+        allocator: std.mem.Allocator,
+        stream_id: []const u8,
+        stream_created: i64,
+        model_name: []const u8,
+        prompt_tokens: usize,
+        completion_tokens: usize,
+        cached_prompt_tokens: usize,
+    ) !void {
+        try writeGenerateChunkEvent(writer, allocator, .{
+            .id = stream_id,
+            .object = "chat.completion.chunk",
+            .created = stream_created,
+            .model = model_name,
+            .choices = &.{},
+            .usage = tokenUsageWithCachedPrompt(prompt_tokens, completion_tokens, cached_prompt_tokens),
+        });
+        try writer.writeEvent(null, "[DONE]");
+    }
+
+    fn emitTerminalUsageOrDone(
+        writer: anytype,
+        allocator: std.mem.Allocator,
+        stream_id: []const u8,
+        stream_created: i64,
+        model_name: []const u8,
+        prompt_tokens: usize,
+        completion_tokens: usize,
+        cached_prompt_tokens: usize,
+        include_usage: bool,
+    ) !void {
+        if (include_usage) {
+            return emitTerminalUsageAndDone(
+                writer,
+                allocator,
+                stream_id,
+                stream_created,
+                model_name,
+                prompt_tokens,
+                completion_tokens,
+                cached_prompt_tokens,
+            );
+        }
+        try writer.writeEvent(null, "[DONE]");
     }
 
     const EntityExtractionRequest = struct {
@@ -5849,8 +8452,9 @@ pub const Node = struct {
         want_relations: bool,
     ) !httpx.Response {
         const model_name: ?[]const u8 = if (body.model.len > 0) body.model else null;
-        const model_path = self.resolveModelPath(ctx.io, model_name, "extractors") catch
-            return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" });
+        const model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "extractors") catch |err|
+            return requestModelResolutionError(ctx, err);
+        defer ctx.allocator.free(model_path);
 
         if (rebel_mod.isRebelModel(ctx.allocator, model_path)) {
             return self.extractRebel(ctx, model_path, body, texts, want_relations);
@@ -5906,21 +8510,21 @@ pub const Node = struct {
         const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
         const hf_tokenizer = @import("inference_hf_tokenizer");
 
-        const paths = enc_dec_mod.findEncoderDecoderPaths(ctx.allocator, model_path) catch |err|
-            return ctx.status(400).json(.{ .@"error" = "INVALID_MODEL", .message = @errorName(err) });
+        const paths = enc_dec_mod.findEncoderDecoderPaths(ctx.allocator, model_path) catch
+            return ctx.status(400).json(.{ .@"error" = "INVALID_MODEL", .message = "model is not a supported encoder-decoder recognizer" });
         defer ctx.allocator.free(paths.encoder);
         defer ctx.allocator.free(paths.decoder);
 
         const tok_path = std.fmt.allocPrint(ctx.allocator, "{s}/tokenizer.json", .{model_path}) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = @errorName(err) });
+            return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = internalErrorMessage("TOKENIZER_LOAD_FAILED", err) });
         defer ctx.allocator.free(tok_path);
 
         const tok_bytes = c_file.readFile(ctx.allocator, tok_path) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = @errorName(err) });
+            return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = internalErrorMessage("TOKENIZER_LOAD_FAILED", err) });
         defer ctx.allocator.free(tok_bytes);
 
         var hf_tok = hf_tokenizer.HfTokenizer.loadFromBytes(ctx.allocator, tok_bytes) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = @errorName(err) });
+            return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = internalErrorMessage("TOKENIZER_LOAD_FAILED", err) });
         defer hf_tok.deinitSelf();
 
         var config = rebel_mod.loadConfig(ctx.allocator, model_path) catch |err|
@@ -6178,7 +8782,9 @@ pub const Node = struct {
         defer self.metrics.decActive();
 
         const model_name: ?[]const u8 = if (body.model.len > 0) body.model else null;
-        if (self.resolveModelPath(ctx.io, model_name, "classifiers")) |model_path| {
+        if (self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "classifiers")) |model_path| {
+            defer ctx.allocator.free(model_path);
+            if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
             var model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
                 return modelLoadFailureResponse(ctx, err);
             defer model_handle.release();
@@ -6213,9 +8819,14 @@ pub const Node = struct {
                 (countTokenizerTexts(ctx.allocator, self.session_manager.io, model.getTokenizer(), body.texts) catch estimateTextsTokens(body.texts)) +
                 (countTokenizerTexts(ctx.allocator, self.session_manager.io, model.getTokenizer(), body.labels) catch estimateTextsTokens(body.labels));
             return buildClassificationResponse(ctx, body.model, all_results, prompt_tokens);
-        } else |_| {}
+        } else |err| switch (requestModelResolutionErrorKind(err)) {
+            .missing => {},
+            .invalid, .internal => return requestModelResolutionError(ctx, err),
+        }
 
-        if (self.resolveModelPath(ctx.io, model_name, "extractors")) |model_path| {
+        if (self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "extractors")) |model_path| {
+            defer ctx.allocator.free(model_path);
+            if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
             var model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
                 return modelLoadFailureResponse(ctx, err);
             defer model_handle.release();
@@ -6241,7 +8852,10 @@ pub const Node = struct {
                 (countTokenizerTexts(ctx.allocator, self.session_manager.io, model.getTokenizer(), body.texts) catch estimateTextsTokens(body.texts)) +
                 (countTokenizerTexts(ctx.allocator, self.session_manager.io, model.getTokenizer(), body.labels) catch estimateTextsTokens(body.labels));
             return buildClassificationResponse(ctx, body.model, all_results, prompt_tokens);
-        } else |_| {}
+        } else |err| switch (requestModelResolutionErrorKind(err)) {
+            .missing => {},
+            .invalid, .internal => return requestModelResolutionError(ctx, err),
+        }
 
         return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" });
     }
@@ -6257,8 +8871,9 @@ pub const Node = struct {
         defer self.metrics.decActive();
 
         const model_name: ?[]const u8 = if (body.model.len > 0) body.model else null;
-        const model_path = self.resolveModelPath(ctx.io, model_name, "classifiers") catch
-            return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" });
+        const model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "classifiers") catch |err|
+            return requestModelResolutionError(ctx, err);
+        defer ctx.allocator.free(model_path);
 
         const prefix = body.prefix orelse document_classification.default_prefix;
         const checkpoint_path = document_classification.resolveCheckpointPath(ctx.allocator, model_path) catch |err| switch (err) {
@@ -6266,7 +8881,7 @@ pub const Node = struct {
                 .@"error" = "CHECKPOINT_NOT_FOUND",
                 .message = "layoutdoc_sequence_head.safetensors not found",
             }),
-            else => return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) }),
+            else => return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) }),
         };
         defer ctx.allocator.free(checkpoint_path);
 
@@ -6358,8 +8973,9 @@ pub const Node = struct {
         defer self.metrics.decActive();
 
         const model_name: ?[]const u8 = if (body.model.len > 0) body.model else null;
-        const model_path = self.resolveModelPath(ctx.io, model_name, "classifiers") catch
-            return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" });
+        const model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "classifiers") catch |err|
+            return requestModelResolutionError(ctx, err);
+        defer ctx.allocator.free(model_path);
 
         const prefix = body.prefix orelse document_token_classification.default_prefix;
         const checkpoint_path = document_token_classification.resolveCheckpointPath(ctx.allocator, model_path) catch |err| switch (err) {
@@ -6367,7 +8983,7 @@ pub const Node = struct {
                 .@"error" = "CHECKPOINT_NOT_FOUND",
                 .message = "layoutdoc_token_head.safetensors not found",
             }),
-            else => return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) }),
+            else => return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) }),
         };
         defer ctx.allocator.free(checkpoint_path);
 
@@ -6501,8 +9117,9 @@ pub const Node = struct {
 
         // Resolve model
         const model_name: ?[]const u8 = if (body.model.len > 0) body.model else null;
-        const model_path = self.resolveModelPath(ctx.io, model_name, "rewriters") catch
-            return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" });
+        const model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "rewriters") catch |err|
+            return requestModelResolutionError(ctx, err);
+        defer ctx.allocator.free(model_path);
 
         // Check if this is an encoder-decoder model and find ONNX file paths
         const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
@@ -6536,15 +9153,15 @@ pub const Node = struct {
         // Load tokenizer
         const hf_tokenizer = @import("inference_hf_tokenizer");
         const tok_path = std.fmt.allocPrint(ctx.allocator, "{s}/tokenizer.json", .{model_path}) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = @errorName(err) });
+            return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = internalErrorMessage("TOKENIZER_LOAD_FAILED", err) });
         defer ctx.allocator.free(tok_path);
 
         const tok_bytes = c_file.readFile(ctx.allocator, tok_path) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = @errorName(err) });
+            return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = internalErrorMessage("TOKENIZER_LOAD_FAILED", err) });
         defer ctx.allocator.free(tok_bytes);
 
         var hf_tok = hf_tokenizer.HfTokenizer.loadFromBytes(ctx.allocator, tok_bytes) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = @errorName(err) });
+            return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = internalErrorMessage("TOKENIZER_LOAD_FAILED", err) });
         defer hf_tok.deinitSelf();
 
         const rewriting = @import("../pipelines/rewriting.zig");
@@ -6618,38 +9235,27 @@ pub const Node = struct {
                 .@"error" = "INVALID_REQUEST",
                 .message = "'max_tokens' must be between 1 and 1024",
             });
-        const queue_units = estimateReadQueueUnits(body.images.len, max_tokens);
-        if (try self.acquireSlotUnits(ctx, queue_units)) |resp| return resp;
-        defer self.releaseSlotUnits(queue_units);
+        const inline_source_cap = readInlineSourceByteCap(self);
+        var inline_source_bytes: usize = 0;
+        for (body.images) |image| {
+            inline_source_bytes = addReadInlineSourceBytes(inline_source_bytes, image.url, inline_source_cap) catch
+                return ctx.status(413).json(.{
+                    .@"error" = "BATCH_TOO_LARGE",
+                    .message = "total inline image source bytes exceed server capacity",
+                });
+        }
+        const admission = readRequestAdmission(self, body.images.len, inline_source_bytes, max_tokens);
+        if (try self.acquireSlotUnits(ctx, admission.units)) |resp| return resp;
+        var reserved_units = admission.units;
+        defer self.releaseSlotUnits(reserved_units);
         self.metrics.incRequest("read");
         defer self.metrics.decActive();
 
         // Resolve model
         const model_name: ?[]const u8 = if (body.model.len > 0) body.model else null;
-        const model_path = self.resolveModelPath(ctx.io, model_name, "readers") catch
-            return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" });
-
-        var reader = readers_mod.LoadedReader.loadFromDir(
-            ctx.allocator,
-            model_path,
-            &self.session_manager,
-            &self.model_manager,
-        ) catch |err| switch (err) {
-            error.InvalidModelForReading => return ctx.status(400).json(.{
-                .@"error" = "INVALID_MODEL",
-                .message = "model does not support reading (missing encoder/decoder model files)",
-            }),
-            error.NativePix2StructNotYetSupported => return ctx.status(400).json(.{
-                .@"error" = "INVALID_MODEL",
-                .message = "native Pix2Struct reader checkpoints are not supported yet",
-            }),
-            error.MultiStageReaderNotYetSupported => return ctx.status(400).json(.{
-                .@"error" = "INVALID_MODEL",
-                .message = "multi-stage OCR model uses unsupported stages or configuration",
-            }),
-            else => return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) }),
-        };
-        defer reader.deinit();
+        const model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "readers") catch |err|
+            return requestModelResolutionError(ctx, err);
+        defer ctx.allocator.free(model_path);
 
         var arena = std.heap.ArenaAllocator.init(ctx.allocator);
         defer arena.deinit();
@@ -6673,37 +9279,64 @@ pub const Node = struct {
         const image_datas = try ctx.allocator.alloc([]const u8, body.images.len);
         defer ctx.allocator.free(image_datas);
 
-        const batch_byte_cap = readBatchMaxBytes();
+        const batch_byte_cap = admission.byte_cap;
         var batch_bytes: usize = 0;
+        var decoded_budget = ReadDecodedImageBudget.init(admission, effectiveRequestContentSecurity(self).max_image_dimension);
         for (body.images, 0..) |img_url, i| {
-            var item = downloadReadBatchContent(self, ctx.allocator, img_url.url, batch_byte_cap, batch_bytes) catch |err| switch (err) {
-                error.ReadBatchTooLarge,
-                error.StreamTooLong,
-                => return ctx.status(413).json(.{
+            var item = downloadReadBatchContentForRequest(self, ctx.allocator, img_url.url, batch_byte_cap, batch_bytes) catch |err| switch (err) {
+                error.ReadBatchTooLarge => return ctx.status(413).json(.{
                     .@"error" = "BATCH_TOO_LARGE",
                     .message = try std.fmt.allocPrint(ctx.allocator, "total downloaded image bytes must be at most {d}", .{batch_byte_cap}),
                 }),
-                else => return ctx.status(400).json(.{
-                    .@"error" = "INVALID_REQUEST",
-                    .message = "failed to download image content",
-                }),
+                else => return remoteContentErrorResponse(ctx, err),
             };
-            errdefer item.deinit(ctx.allocator);
+            var item_owned = true;
+            defer if (item_owned) item.deinit(ctx.allocator);
             batch_bytes = addReadBatchDownloadedBytes(batch_bytes, item, batch_byte_cap) catch |err| switch (err) {
                 error.ReadBatchTooLarge => return ctx.status(413).json(.{
                     .@"error" = "BATCH_TOO_LARGE",
                     .message = try std.fmt.allocPrint(ctx.allocator, "total downloaded image bytes must be at most {d}", .{batch_byte_cap}),
                 }),
             };
+            decoded_budget.addImage(item.data) catch |err|
+                return readImageErrorResponse(ctx, err);
             downloaded[i] = item;
             downloaded_count += 1;
             image_datas[i] = downloaded[i].data;
+            item_owned = false;
         }
+
+        const required_units = @max(admission.units, decoded_budget.requiredUnits());
+        if (try self.growSlotUnits(ctx, reserved_units, required_units)) |resp| return resp;
+        reserved_units = required_units;
+
+        var reader = readers_mod.LoadedReader.loadFromDir(
+            ctx.allocator,
+            model_path,
+            &self.session_manager,
+            &self.model_manager,
+        ) catch |err| switch (err) {
+            error.InvalidModelForReading => return ctx.status(400).json(.{
+                .@"error" = "INVALID_MODEL",
+                .message = "model does not support reading (missing encoder/decoder model files)",
+            }),
+            error.NativePix2StructNotYetSupported => return ctx.status(400).json(.{
+                .@"error" = "INVALID_MODEL",
+                .message = "native Pix2Struct reader checkpoints are not supported yet",
+            }),
+            error.MultiStageReaderNotYetSupported => return ctx.status(400).json(.{
+                .@"error" = "INVALID_MODEL",
+                .message = "multi-stage OCR model uses unsupported stages or configuration",
+            }),
+            else => return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = internalErrorMessage("MODEL_LOAD_FAILED", err) }),
+        };
+        defer reader.deinit();
 
         const results = reader.readBatch(image_datas, .{
             .prompt = normalizeReadPrompt(body.prompt),
             .max_tokens = max_tokens,
         }) catch |err| switch (err) {
+            error.ImageDecodeFailed => return readImageErrorResponse(ctx, err),
             error.InvalidMaxTokens => return ctx.status(400).json(.{
                 .@"error" = "INVALID_REQUEST",
                 .message = "'max_tokens' exceeds the selected model's context limit",
@@ -6718,7 +9351,7 @@ pub const Node = struct {
             ctx.allocator.free(results);
         }
         if (results.len != body.images.len)
-            return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = "InvalidReadResultCount" });
+            return internalErrorResponse(ctx, "INFERENCE_FAILED", error.InvalidReadResultCount);
 
         var completion_tokens: usize = 0;
         for (results, 0..) |result, i| {
@@ -6781,15 +9414,54 @@ pub const Node = struct {
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
         const body = parsed.value;
-        if (try self.acquireSlot(ctx)) |resp| return resp;
-        defer self.releaseSlot();
+
+        var media_shape: RequestMediaAdmissionShape = .{};
+        media_shape.addInline(body.audio.len, false);
+        const media_admission = requestMediaAdmission(self, media_shape);
+        // The encoded JSON value and decoded compressed payload coexist with
+        // PCM decode, so reserve both before allocating either decoded form.
+        const resident_bytes = std.math.add(
+            usize,
+            media_admission.byte_cap,
+            media_admission.byte_cap,
+        ) catch std.math.maxInt(usize);
+        const audio_admission = audioDecodeAdmission(self, resident_bytes);
+        const queue_units = @max(self.estimateHttpRequestQueueUnits(ctx), audio_admission.units);
+        if (try self.acquireSlotUnits(ctx, queue_units)) |resp| return resp;
+        const reserved_units = queue_units;
+        defer self.releaseSlotUnits(reserved_units);
         self.metrics.incRequest("transcribe");
         defer self.metrics.decActive();
 
+        var media_budget = RequestMediaBudget.init(media_admission.byte_cap);
+        const decoded_audio = decodeMediaDataWithBudget(ctx.allocator, body.audio, &media_budget) catch |err| switch (err) {
+            error.RemoteContentTooLarge => return remoteContentErrorResponse(ctx, err),
+            error.InvalidDataUri, error.InvalidBase64 => return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = if (std.mem.startsWith(u8, body.audio, "data:")) "invalid audio data URI" else "invalid base64 audio data",
+            }),
+            error.OutOfMemory => return err,
+        };
+        defer decoded_audio.deinit(ctx.allocator);
+
+        const decode_options = audio_mod.DecodeOptions{ .mime_hint = decoded_audio.mime_type };
+        var decoded = audio_mod.decodeBounded(
+            ctx.allocator,
+            decoded_audio.data,
+            decode_options,
+            audio_admission.max_decode_working_bytes,
+        ) catch |err| switch (err) {
+            error.AudioTooLarge => return audioTooLargeResponse(ctx),
+            error.OutOfMemory => return err,
+            else => return unsupportedAudioResponse(ctx, "unsupported or corrupt audio input"),
+        };
+        defer decoded.deinit();
+
         // Resolve model
         const transcribe_model_name: ?[]const u8 = if (body.model) |m| (if (m.len > 0) m else null) else null;
-        const model_path = self.resolveModelPath(ctx.io, transcribe_model_name, "transcribers") catch
-            return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" });
+        const model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, transcribe_model_name, "transcribers") catch |err|
+            return requestModelResolutionError(ctx, err);
+        defer ctx.allocator.free(model_path);
 
         // Find encoder/decoder sessions
         const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
@@ -6882,39 +9554,16 @@ pub const Node = struct {
                 .eos_token_id = decoder_config.eos_token_id,
                 .language = body.language,
                 .forced_decoder_ids = forced_ids,
+                .max_decode_working_bytes = audio_admission.max_decode_working_bytes,
                 .language_tokens = effective_prompt_cache.language_tokens,
             },
         );
 
-        // Decode audio data — accept both raw base64 and data URI format
-        const decoded_audio = if (std.mem.startsWith(u8, body.audio, "data:"))
-            decodeDataUri(ctx.allocator, body.audio) catch
-                return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid audio data URI" })
-        else blk: {
-            const audio_bytes = std.base64.standard.Decoder.calcSizeForSlice(body.audio) catch
-                return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid base64 audio data" });
-            const buf2 = ctx.allocator.alloc(u8, audio_bytes) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "ALLOC_FAILED", .message = @errorName(err) });
-            std.base64.standard.Decoder.decode(buf2, body.audio) catch {
-                ctx.allocator.free(buf2);
-                return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid base64 audio data" });
-            };
-            break :blk DecodedDataUri{
-                .mime_type = null,
-                .data = buf2,
-            };
+        var result = pipeline.transcribePcm(decoded.samples, decoded.sample_rate) catch |err| switch (err) {
+            error.UnsupportedAudioFormat => return unsupportedAudioResponse(ctx, "unsupported audio input"),
+            error.OutOfMemory => return err,
+            else => return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) }),
         };
-        defer decoded_audio.deinit(ctx.allocator);
-
-        const decode_options = audio_mod.DecodeOptions{
-            .mime_hint = decoded_audio.mime_type,
-        };
-        if (!audio_mod.canDecodeWithOptions(decoded_audio.data, decode_options)) {
-            return unsupportedAudioResponse(ctx, "unsupported audio input");
-        }
-
-        var result = pipeline.transcribeWithOptions(decoded_audio.data, decode_options) catch |err|
-            return inferenceFailureResponse(ctx, err);
         defer result.deinit();
 
         const model_str = body.model orelse "default";
@@ -7026,8 +9675,10 @@ pub const Node = struct {
         self.metrics.incRequest("extract");
         defer self.metrics.decActive();
 
-        const model_path = self.resolveModelPath(ctx.io, body.model, "extractors") catch
-            return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" });
+        const model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, body.model, "extractors") catch |err|
+            return requestModelResolutionError(ctx, err);
+        defer ctx.allocator.free(model_path);
+        if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
         var model_handle = self.model_manager.acquireFromDir(model_path) catch |err|
             return modelLoadFailureResponse(ctx, err);
         defer model_handle.release();
@@ -7083,7 +9734,13 @@ pub const Node = struct {
         return self.extractJSON(ctx);
     }
 
-    fn downloadImagesForExtraction(self: *Node, ctx: *httpx.Context, images: []const api.ImageURL) ![][]const u8 {
+    fn downloadImagesForExtraction(
+        self: *Node,
+        ctx: *httpx.Context,
+        images: []const api.ImageURL,
+        batch_byte_cap: usize,
+        decoded_budget: *ReadDecodedImageBudget,
+    ) ![][]const u8 {
         const image_datas = try ctx.allocator.alloc([]const u8, images.len);
         var initialized: usize = 0;
         errdefer {
@@ -7091,20 +9748,16 @@ pub const Node = struct {
             ctx.allocator.free(image_datas);
         }
 
-        const batch_byte_cap = readBatchMaxBytes();
         var batch_bytes: usize = 0;
         for (images, 0..) |img_url, i| {
-            var downloaded = downloadReadBatchContent(self, ctx.allocator, img_url.url, batch_byte_cap, batch_bytes) catch |err| switch (err) {
-                error.ReadBatchTooLarge,
-                error.StreamTooLong,
-                => return error.ReadBatchTooLarge,
-                else => return error.ImageDownloadFailed,
-            };
-            defer downloaded.deinit(ctx.allocator);
+            const downloaded = try downloadReadBatchContentForRequest(self, ctx.allocator, img_url.url, batch_byte_cap, batch_bytes);
+            defer ctx.allocator.free(downloaded.content_type);
+            errdefer ctx.allocator.free(downloaded.data);
 
             batch_bytes = addReadBatchDownloadedBytes(batch_bytes, downloaded, batch_byte_cap) catch
                 return error.ReadBatchTooLarge;
-            image_datas[i] = try ctx.allocator.dupe(u8, downloaded.data);
+            try decoded_budget.addImage(downloaded.data);
+            image_datas[i] = downloaded.data;
             initialized += 1;
         }
 
@@ -7183,6 +9836,102 @@ pub const Node = struct {
             "embedders",  "rerankers", "chunkers", "generators",   "classifiers",
             "extractors", "rewriters", "readers",  "transcribers",
         };
+        // Keep every snapshotted model alive while filesystem canonicalization
+        // and manifest rendering run without the manager lock.
+        var loaded_model_snapshot = std.ArrayListUnmanaged(model_manager_mod.ModelHandle).empty;
+        defer {
+            for (loaded_model_snapshot.items) |*handle| handle.release();
+            loaded_model_snapshot.deinit(a);
+        }
+        self.model_manager.lockLoadedModels();
+        loaded_model_snapshot.ensureTotalCapacity(a, self.model_manager.loaded.count()) catch |err| {
+            self.model_manager.unlockLoadedModels();
+            return err;
+        };
+        var loaded_it = self.model_manager.loaded.valueIterator();
+        while (loaded_it.next()) |model| {
+            model.*.active_handles += 1;
+            loaded_model_snapshot.appendAssumeCapacity(.{
+                .manager = &self.model_manager,
+                .model = model.*,
+            });
+        }
+        self.model_manager.unlockLoadedModels();
+
+        const LoadedListing = struct {
+            model: *model_manager_mod.LoadedModel,
+            canonical_model_dir: []u8,
+            identifier: []const u8,
+        };
+        var loaded_listings = std.ArrayListUnmanaged(LoadedListing).empty;
+        var selected_loaded_dirs = std.ArrayListUnmanaged([]const u8).empty;
+        var canonical_discovered_dirs = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (loaded_listings.items) |listing| a.free(listing.canonical_model_dir);
+            for (canonical_discovered_dirs.items) |path| a.free(path);
+            loaded_listings.deinit(a);
+            selected_loaded_dirs.deinit(a);
+            canonical_discovered_dirs.deinit(a);
+        }
+
+        for (discovered) |entry| {
+            const canonical_path = realPathExistingAlloc(a, io, entry.path) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                continue;
+            };
+            if (stringSliceContains(canonical_discovered_dirs.items, canonical_path)) {
+                a.free(canonical_path);
+                continue;
+            }
+            canonical_discovered_dirs.append(a, canonical_path) catch |err| {
+                a.free(canonical_path);
+                return err;
+            };
+        }
+
+        const canonical_models_dir: ?[]u8 = realPathExistingAlloc(a, io, self.config.models_dir) catch |err| blk: {
+            if (err == error.OutOfMemory) return err;
+            break :blk null;
+        };
+        defer if (canonical_models_dir) |path| a.free(path);
+
+        if (canonical_models_dir) |models_root| {
+            for (loaded_model_snapshot.items) |*model_handle| {
+                const model = model_handle.get();
+                if (discoveredContainsModelDir(discovered, model.model_dir)) continue;
+
+                const canonical_model_dir = realPathExistingAlloc(a, io, model.model_dir) catch |err| {
+                    if (err == error.OutOfMemory) return err;
+                    continue;
+                };
+                if (stringSliceContains(canonical_discovered_dirs.items, canonical_model_dir)) {
+                    a.free(canonical_model_dir);
+                    continue;
+                }
+                const identifier = loadedModelRequestIdentifier(models_root, canonical_model_dir) orelse {
+                    a.free(canonical_model_dir);
+                    continue;
+                };
+                if (stringSliceContains(selected_loaded_dirs.items, canonical_model_dir)) {
+                    a.free(canonical_model_dir);
+                    continue;
+                }
+
+                loaded_listings.append(a, .{
+                    .model = model,
+                    .canonical_model_dir = canonical_model_dir,
+                    .identifier = identifier,
+                }) catch |err| {
+                    a.free(canonical_model_dir);
+                    return err;
+                };
+                selected_loaded_dirs.append(a, canonical_model_dir) catch |err| {
+                    loaded_listings.items.len -= 1;
+                    a.free(canonical_model_dir);
+                    return err;
+                };
+            }
+        }
 
         for (task_names, 0..) |task, task_idx| {
             if (task_idx > 0) try body.append(a, ',');
@@ -7317,6 +10066,7 @@ pub const Node = struct {
                         model_count += 1;
                     }
                 }
+                model_count += 1;
             }
 
             try body.append(a, '}');
@@ -7368,7 +10118,7 @@ pub const Node = struct {
             error.BatchTooLarge => return ctx.status(413).json(.{ .@"error" = "BATCH_TOO_LARGE", .message = "batch too large" }),
             error.FeatureMismatch => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "feature vector length mismatch" }),
             error.LoadFailed => return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = "failed to load predictor" }),
-            else => return ctx.status(500).json(.{ .@"error" = "INTERNAL_ERROR", .message = @errorName(err) }),
+            else => return ctx.status(500).json(.{ .@"error" = "INTERNAL_ERROR", .message = internalErrorMessage("INTERNAL_ERROR", err) }),
         };
 
         return ctx.json(api.PredictResponse{
@@ -7403,6 +10153,12 @@ pub const Node = struct {
     /// Register inference API routes on an external server with a compile-time prefix.
     /// Used by standalone mode to register on the unified httpx.Server.
     pub fn registerRoutesOn(self: *Node, comptime prefix: []const u8, server: anytype) !void {
+        try ensureKernelJitRequestSurfacesPublishable(
+            self.config.kernel_jit.mode,
+            self.config.kernel_jit.qualified_profile_path != null,
+            self.startup_preloads_materialized,
+        );
+        self.request_surfaces_published = true;
         const router = api.ServerRouter(Node).init(self);
         var prefixed = PrefixedServer(prefix, @TypeOf(server.*)){ .inner = server };
         if (comptime std.mem.eql(u8, prefix, public_api_prefix)) {
@@ -7416,6 +10172,12 @@ pub const Node = struct {
 
     /// Register AI routes without the Traditional ML predictor endpoints.
     pub fn registerAiRoutesOn(self: *Node, comptime prefix: []const u8, server: anytype) !void {
+        try ensureKernelJitRequestSurfacesPublishable(
+            self.config.kernel_jit.mode,
+            self.config.kernel_jit.qualified_profile_path != null,
+            self.startup_preloads_materialized,
+        );
+        self.request_surfaces_published = true;
         const router = api.ServerRouter(Node).init(self);
         var prefixed = AiPrefixedServer(prefix, @TypeOf(server.*)){ .inner = server };
         try router.register(&prefixed);
@@ -7439,6 +10201,13 @@ pub const Node = struct {
     }
 
     pub fn serve(self: *Node, allocator: std.mem.Allocator, io: std.Io, host: []const u8, port: u16) !void {
+        validateStandaloneBind(host, self.config.allow_insecure_public_bind) catch |err| {
+            std.log.err(
+                "refusing non-loopback inference bind {s}:{d}: standalone inference has no built-in auth or TLS; pass --allow-insecure-public-bind only behind trusted network controls",
+                .{ host, port },
+            );
+            return err;
+        };
         self.attachIo(io);
         var server = httpx.Server.initWithConfig(allocator, io, .{
             .host = host,
@@ -7472,27 +10241,42 @@ pub const Node = struct {
         var writer: std.Io.Writer.Allocating = .init(ctx.allocator);
         defer writer.deinit();
 
+        // Pin model lifetimes while load_lock is held, then read lazy-session
+        // counters only after releasing it. Optional-session loading takes the
+        // inverse embedding-session -> load-lock path under admission pressure.
+        var loaded_snapshot = try node.model_manager.acquireLoadedModelSnapshot(ctx.allocator);
+        defer loaded_snapshot.deinit();
+
         // Core metrics via prometheus lib
         try @constCast(&node.metrics).render(&writer.writer);
 
         // Scheduler metrics (computed on-the-fly from loaded models)
-        node.model_manager.lockLoadedModels();
-        defer node.model_manager.unlockLoadedModels();
-        const aggregate = runtime.scheduler.native_generate.aggregateStats(node.model_manager.loaded);
-        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_waiting_requests", "gauge", "Waiting native scheduler requests across loaded models", aggregate.snapshot.waiting_requests);
-        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_prefill_requests", "gauge", "Prefill-phase native scheduler requests across loaded models", aggregate.snapshot.prefill_requests);
-        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_decode_requests", "gauge", "Decode-phase native scheduler requests across loaded models", aggregate.snapshot.decode_requests);
-        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_active_units", "gauge", "Active native scheduler units across loaded models", aggregate.snapshot.active_units);
-        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_batches_total", "counter", "Total unified scheduler steps (one fused forward pass per step)", aggregate.stats.step_batches_total);
-        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_prefill_items_total", "counter", "Total prefill items packed into unified scheduler steps", aggregate.stats.step_prefill_items_total);
-        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_decode_items_total", "counter", "Total decode items packed into unified scheduler steps", aggregate.stats.step_decode_items_total);
-        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_query_tokens_total", "counter", "Total query tokens fused across unified scheduler steps", aggregate.stats.step_query_tokens_total);
-        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_singleton_batches_total", "counter", "Total unified scheduler steps that contained only the leader item", aggregate.stats.step_singleton_batches_total);
-        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_kv_block_skips_total", "counter", "Total pending items skipped due to per-step KV-block budget", aggregate.stats.step_kv_block_skips_total);
-        try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_turn_yields_total", "counter", "Total cooperative scheduler yields while waiting for turns", aggregate.stats.turn_yields_total);
-        try appendResidentProjectionMetrics(&writer.writer, aggregateResidentProjectionStats(node.model_manager.loaded));
-        try appendGraphExecutorMetrics(&writer.writer, graph_mod.executor_stats.snapshot());
-        try appendPromptCacheMetrics(&writer.writer, node.model_manager.loaded);
+        {
+            node.model_manager.lockLoadedModels();
+            defer node.model_manager.unlockLoadedModels();
+            const aggregate = runtime.scheduler.native_generate.aggregateStats(node.model_manager.loaded);
+            try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_waiting_requests", "gauge", "Waiting native scheduler requests across loaded models", aggregate.snapshot.waiting_requests);
+            try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_prefill_requests", "gauge", "Prefill-phase native scheduler requests across loaded models", aggregate.snapshot.prefill_requests);
+            try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_decode_requests", "gauge", "Decode-phase native scheduler requests across loaded models", aggregate.snapshot.decode_requests);
+            try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_active_units", "gauge", "Active native scheduler units across loaded models", aggregate.snapshot.active_units);
+            try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_batches_total", "counter", "Total unified scheduler steps (one fused forward pass per step)", aggregate.stats.step_batches_total);
+            try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_prefill_items_total", "counter", "Total prefill items packed into unified scheduler steps", aggregate.stats.step_prefill_items_total);
+            try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_decode_items_total", "counter", "Total decode items packed into unified scheduler steps", aggregate.stats.step_decode_items_total);
+            try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_query_tokens_total", "counter", "Total query tokens fused across unified scheduler steps", aggregate.stats.step_query_tokens_total);
+            try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_singleton_batches_total", "counter", "Total unified scheduler steps that contained only the leader item", aggregate.stats.step_singleton_batches_total);
+            try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_kv_block_skips_total", "counter", "Total pending items skipped due to per-step KV-block budget", aggregate.stats.step_kv_block_skips_total);
+            try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_decode_coalesce_waits_total", "counter", "Decode steps intentionally delayed to form a batch", aggregate.stats.decode_coalesce_waits_total);
+            try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_decode_coalesce_wait_us_total", "counter", "Configured microseconds spent waiting to coalesce decode work", aggregate.stats.decode_coalesce_wait_us_total);
+            try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_batch_size_2_total", "counter", "Unified scheduler steps containing two items", aggregate.stats.step_batch_size_2_total);
+            try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_batch_size_3_4_total", "counter", "Unified scheduler steps containing three or four items", aggregate.stats.step_batch_size_3_4_total);
+            try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_batch_size_5_8_total", "counter", "Unified scheduler steps containing five through eight items", aggregate.stats.step_batch_size_5_8_total);
+            try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_step_batch_size_9_16_total", "counter", "Unified scheduler steps containing nine through sixteen items", aggregate.stats.step_batch_size_9_16_total);
+            try appendPromMetric(&writer.writer, "antfly_inference_native_scheduler_turn_yields_total", "counter", "Total cooperative scheduler yields while waiting for turns", aggregate.stats.turn_yields_total);
+            try appendResidentProjectionMetrics(&writer.writer, aggregateResidentProjectionStats(node.model_manager.loaded));
+            try appendGraphExecutorMetrics(&writer.writer, graph_mod.executor_stats.snapshot());
+            try appendPromptCacheMetrics(&writer.writer, node.model_manager.loaded);
+        }
+        try appendMetalExactJitMetrics(&writer.writer, aggregateMetalExactJitStats(loaded_snapshot.handles));
 
         try ctx.setHeader("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
         return ctx.text(writer.writer.buffered());
@@ -7505,34 +10289,14 @@ pub const Node = struct {
     fn readyzHandler(ctx: *httpx.Context) anyerror!httpx.Response {
         const models_dir = active_models_dir orelse return ctx.status(503).json(.{
             .status = "not_ready",
-            .models = .{
-                .embedders = 0,
-                .rerankers = 0,
-                .chunkers = 0,
-                .generators = 0,
-                .classifiers = 0,
-                .rewriters = 0,
-                .readers = 0,
-                .transcribers = 0,
-                .extractors = 0,
-            },
+            .models = ModelCounts{},
         });
         const counts = collectDiscoveredModelCounts(models_dir, ctx.allocator, ctx.io);
         const status_text = if (counts.total() > 0) "ready" else "not_ready";
         const status_code: u16 = if (counts.total() > 0) 200 else 503;
         return ctx.status(status_code).json(.{
             .status = status_text,
-            .models = .{
-                .embedders = counts.embedders,
-                .rerankers = counts.rerankers,
-                .chunkers = counts.chunkers,
-                .generators = counts.generators,
-                .classifiers = counts.classifiers,
-                .rewriters = counts.rewriters,
-                .readers = counts.readers,
-                .transcribers = counts.transcribers,
-                .extractors = counts.extractors,
-            },
+            .models = counts,
         });
     }
 };
@@ -7680,7 +10444,7 @@ fn parseExtractionOptionsJson(allocator: std.mem.Allocator, raw: []const u8) !Di
     out.include_confidence = jsonBoolField(obj, "include_confidence");
     out.include_spans = jsonBoolField(obj, "include_spans");
     if (jsonStringField(obj, "prompt")) |prompt| out.prompt = try allocator.dupe(u8, prompt);
-    out.max_tokens = jsonUsizeField(obj, "max_tokens");
+    out.max_tokens = try readMaxTokensJsonField(obj, "max_tokens");
     return out;
 }
 
@@ -7700,6 +10464,39 @@ const DirectExtractionInputs = struct {
         self.* = undefined;
     }
 };
+
+fn directExtractionMediaShape(
+    allocator: std.mem.Allocator,
+    inputs: []const extracting_api.Input,
+) !RequestMediaAdmissionShape {
+    var shape: RequestMediaAdmissionShape = .{};
+    for (inputs) |input| try addDirectExtractionContentMediaShape(allocator, &shape, input.content_json);
+    return shape;
+}
+
+fn addDirectExtractionContentMediaShape(
+    allocator: std.mem.Allocator,
+    shape: *RequestMediaAdmissionShape,
+    content_json: []const u8,
+) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, content_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .array) return;
+    for (parsed.value.array.items) |part| {
+        if (part != .object) continue;
+        const part_type = part.object.get("type") orelse continue;
+        if (part_type != .string) continue;
+        if (std.mem.eql(u8, part_type.string, "image_url")) {
+            if (part.object.get("image_url")) |image_url| shape.addImageUrl(image_url);
+        } else if (std.mem.eql(u8, part_type.string, "media")) {
+            if (part.object.get("url")) |url| {
+                shape.addImageUrl(url);
+            } else if (part.object.get("data")) |data| {
+                if (data == .string) shape.addInline(data.string.len, true);
+            }
+        }
+    }
+}
 
 fn canonicalExtractingInputs(allocator: std.mem.Allocator, inputs: []const extraction_api.ExtractionInput) ![]extracting_api.Input {
     const out = try allocator.alloc(extracting_api.Input, inputs.len);
@@ -7817,7 +10614,8 @@ fn parseCanonicalTextInputs(
 ) !DirectExtractionInputs {
     const direct = try canonicalExtractingInputs(allocator, inputs);
     defer freeCanonicalExtractingInputs(allocator, direct);
-    var parsed = try parseDirectExtractionInputs(node, allocator, direct, null, null);
+    const media_admission = requestMediaAdmission(node, .{});
+    var parsed = try parseDirectExtractionInputs(node, allocator, direct, null, null, media_admission.byte_cap);
     errdefer parsed.deinit();
     if (parsed.images.items.len > 0 or parsed.texts.items.len != inputs.len) return error.UnsupportedInput;
     return parsed;
@@ -7888,7 +10686,9 @@ fn parseDirectExtractionInputs(
     inputs: []const extracting_api.Input,
     prompt: ?[]const u8,
     max_tokens: ?usize,
+    max_media_bytes: usize,
 ) !DirectExtractionInputs {
+    var media_budget = RequestMediaBudget.init(max_media_bytes);
     var out = DirectExtractionInputs{
         .allocator = allocator,
         .prompt = if (prompt) |value| try allocator.dupe(u8, value) else null,
@@ -7897,7 +10697,7 @@ fn parseDirectExtractionInputs(
     errdefer out.deinit();
 
     for (inputs) |input| {
-        try appendDirectExtractionContent(node, allocator, &out, input.content_json);
+        try appendDirectExtractionContent(node, allocator, &out, input.content_json, &media_budget);
     }
     if (out.texts.items.len > 0 and out.images.items.len > 0) return error.UnsupportedInput;
     if (out.texts.items.len == 0 and out.images.items.len == 0) return error.UnsupportedInput;
@@ -7909,12 +10709,17 @@ fn appendDirectExtractionContent(
     allocator: std.mem.Allocator,
     out: *DirectExtractionInputs,
     content_json: []const u8,
+    media_budget: *RequestMediaBudget,
 ) !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, content_json, .{});
     defer parsed.deinit();
 
     switch (parsed.value) {
-        .string => |text| try out.texts.append(allocator, try allocator.dupe(u8, text)),
+        .string => |text| {
+            const owned_text = try allocator.dupe(u8, text);
+            errdefer allocator.free(owned_text);
+            try out.texts.append(allocator, owned_text);
+        },
         .array => |parts| {
             var text_buf = std.ArrayListUnmanaged(u8).empty;
             defer text_buf.deinit(allocator);
@@ -7937,18 +10742,18 @@ fn appendDirectExtractionContent(
                     else
                         null;
                     if (url) |value| {
-                        try appendDownloadedExtractionImage(node, allocator, out, value);
+                        try appendDownloadedExtractionImage(node, allocator, out, value, media_budget);
                         saw_media = true;
                     }
                 } else if (std.mem.eql(u8, type_value.string, "media")) {
                     if (part.object.get("url")) |url_value| {
                         if (url_value == .string) {
-                            try appendDownloadedExtractionImage(node, allocator, out, url_value.string);
+                            try appendDownloadedExtractionImage(node, allocator, out, url_value.string, media_budget);
                             saw_media = true;
                         }
                     } else if (part.object.get("data")) |data_value| {
                         if (data_value == .string) {
-                            const decoded = try decodeMediaData(allocator, data_value.string);
+                            const decoded = try decodeMediaDataWithBudget(allocator, data_value.string, media_budget);
                             var owns_decoded = true;
                             errdefer if (owns_decoded) allocator.free(decoded.data);
                             if (decoded.mime_type) |mime| {
@@ -7964,11 +10769,14 @@ fn appendDirectExtractionContent(
             if (saw_media) {
                 if (out.prompt == null and text_buf.items.len > 0) out.prompt = try text_buf.toOwnedSlice(allocator);
             } else if (text_buf.items.len > 0) {
-                try out.texts.append(allocator, try text_buf.toOwnedSlice(allocator));
+                const owned_text = try text_buf.toOwnedSlice(allocator);
+                errdefer allocator.free(owned_text);
+                try out.texts.append(allocator, owned_text);
             }
         },
         else => {
             const text = try std.json.Stringify.valueAlloc(allocator, parsed.value, .{});
+            errdefer allocator.free(text);
             try out.texts.append(allocator, text);
         },
     }
@@ -7979,11 +10787,13 @@ fn appendDownloadedExtractionImage(
     allocator: std.mem.Allocator,
     out: *DirectExtractionInputs,
     url: []const u8,
+    media_budget: *RequestMediaBudget,
 ) !void {
-    var downloaded = try downloadRemoteContent(node, allocator, url);
-    defer downloaded.deinit(allocator);
+    const downloaded = try downloadRemoteContentWithBudgetForRequest(node, allocator, url, media_budget);
+    defer allocator.free(downloaded.content_type);
+    errdefer allocator.free(downloaded.data);
     if (!std.mem.startsWith(u8, downloaded.content_type, "image/")) return error.UnsupportedInput;
-    try out.images.append(allocator, try allocator.dupe(u8, downloaded.data));
+    try out.images.append(allocator, downloaded.data);
 }
 
 fn jsonStringField(obj: std.json.ObjectMap, name: []const u8) ?[]const u8 {
@@ -8002,15 +10812,6 @@ fn jsonFloatField(obj: std.json.ObjectMap, name: []const u8) ?f32 {
         .float => |number| @floatCast(number),
         .integer => |number| @floatFromInt(number),
         .number_string => |raw| std.fmt.parseFloat(f32, raw) catch null,
-        else => null,
-    };
-}
-
-fn jsonUsizeField(obj: std.json.ObjectMap, name: []const u8) ?usize {
-    const value = obj.get(name) orelse return null;
-    return switch (value) {
-        .integer => |number| if (number >= 0) @intCast(number) else null,
-        .number_string => |raw| std.fmt.parseInt(usize, raw, 10) catch null,
         else => null,
     };
 }
@@ -8360,6 +11161,36 @@ fn appendGraphExecutorMetrics(writer: *std.Io.Writer, stats: graph_mod.executor_
     try appendPromMetric(writer, "inference_graph_executor_boundary_output_materializations_total", "counter", "Total graph executor boundary output materializations", stats.boundary_output_materializations);
     try appendPromMetric(writer, "inference_graph_executor_graph_plan_slots_reserved_total", "counter", "Total graph executor planned buffer slots reserved", stats.graph_plan_slots_reserved);
     try appendPromMetric(writer, "inference_graph_executor_graph_plan_bytes_reserved_total", "counter", "Total graph executor planned buffer bytes reserved", stats.graph_plan_bytes_reserved);
+    try appendPromMetric(writer, "inference_quant_kernel_planned_ops_total", "counter", "Total quant kernel planned operations", stats.quant_kernel_planned_ops);
+    try appendPromMetric(writer, "inference_quant_kernel_handwritten_production_total", "counter", "Total quant kernel handwritten production routes", stats.quant_kernel_handwritten_production);
+    try appendPromMetric(writer, "inference_quant_kernel_generated_production_total", "counter", "Total quant kernel generated production routes", stats.quant_kernel_generated_production);
+    try appendPromMetric(writer, "inference_quant_kernel_unsupported_routes_total", "counter", "Total quant kernel unsupported routes", stats.quant_kernel_unsupported_routes);
+    try appendPromMetric(writer, "inference_quant_kernel_fast_path_misses_total", "counter", "Total quant kernel fast-path misses", graph_mod.executor_stats.quantKernelFastPathMisses(stats));
+    try appendPromMetric(writer, "inference_quant_kernel_generated_candidates_total", "counter", "Total quant kernel generated dev candidates observed", stats.quant_kernel_generated_candidates);
+    try appendPromMetric(writer, "inference_quant_kernel_fallback_generated_artifact_missing_total", "counter", "Total quant kernel fallbacks because generated artifacts are missing", stats.quant_kernel_fallback_generated_artifact_missing);
+    try appendPromMetric(writer, "inference_quant_kernel_fallback_generated_runtime_not_wired_total", "counter", "Total quant kernel fallbacks because generated artifacts are promoted but runtime dispatch is not wired", stats.quant_kernel_fallback_generated_runtime_not_wired);
+    try appendPromMetric(writer, "inference_quant_kernel_fallback_unsupported_format_total", "counter", "Total quant kernel fallbacks due to unsupported formats", stats.quant_kernel_fallback_unsupported_format);
+    try appendPromMetric(writer, "inference_quant_kernel_fallback_unsupported_shape_total", "counter", "Total quant kernel fallbacks due to unsupported shapes", stats.quant_kernel_fallback_unsupported_shape);
+    try appendPromMetric(writer, "inference_quant_kernel_fallback_unsupported_epilogue_total", "counter", "Total quant kernel fallbacks due to unsupported epilogues", stats.quant_kernel_fallback_unsupported_epilogue);
+    try appendPromMetric(writer, "inference_quant_kernel_fallback_unsupported_backend_total", "counter", "Total quant kernel fallbacks due to unsupported backends", stats.quant_kernel_fallback_unsupported_backend);
+    try appendPromMetric(writer, "inference_quant_kernel_fallback_tensor_core_repack_required_total", "counter", "Total quant kernel fallbacks requiring tensor-core repacking", stats.quant_kernel_fallback_tensor_core_repack_required);
+    try appendPromMetric(writer, "inference_quant_kernel_fallback_unsupported_total", "counter", "Total quant kernel unsupported fallbacks", stats.quant_kernel_fallback_unsupported);
+    const top_fallback = graph_mod.executor_stats.quantKernelTopFallbackReason(stats);
+    try writer.print(
+        "# HELP inference_quant_kernel_top_fallback_reason Current top quant kernel fallback reason by count\n# TYPE inference_quant_kernel_top_fallback_reason gauge\ninference_quant_kernel_top_fallback_reason{{reason=\"{s}\"}} {d}\n",
+        .{ top_fallback.name, top_fallback.count },
+    );
+}
+
+fn appendMetalExactJitMetrics(writer: *std.Io.Writer, stats: session_factory.MetalExactJitDispatchStats) !void {
+    try appendPromMetric(writer, "antfly_inference_metal_jit_exact_q4_0_hits", "gauge", "Exact-profile Q4_0 JIT dispatches retained by currently loaded sessions", stats.q4_0_hits);
+    try appendPromMetric(writer, "antfly_inference_metal_jit_exact_q4_k_hits", "gauge", "Exact-profile Q4_K JIT dispatches retained by currently loaded sessions", stats.q4_k_hits);
+}
+
+fn aggregateMetalExactJitStats(handles: []const model_manager_mod.ModelHandle) session_factory.MetalExactJitDispatchStats {
+    var aggregate = session_factory.MetalExactJitDispatchStats{};
+    for (handles) |handle| aggregate.add(handle.get().metalExactJitDispatchStats());
+    return aggregate;
 }
 
 fn appendPromptCacheMetrics(writer: *std.Io.Writer, models: anytype) !void {
@@ -8374,6 +11205,11 @@ fn appendPromptCacheMetrics(writer: *std.Io.Writer, models: anytype) !void {
     var block_hash_evictions: u64 = 0;
     var block_hash_cached_blocks: u64 = 0;
     var block_hash_collision_guards: u64 = 0;
+    var radix_hits: u64 = 0;
+    var radix_misses: u64 = 0;
+    var radix_evictions: u64 = 0;
+    var radix_cached_nodes: u64 = 0;
+    var radix_collision_guards: u64 = 0;
     var it = models.iterator();
     while (it.next()) |entry| {
         const stats = entry.value_ptr.*.prompt_prefix_cache.stats();
@@ -8388,6 +11224,11 @@ fn appendPromptCacheMetrics(writer: *std.Io.Writer, models: anytype) !void {
         block_hash_evictions += stats.block_hash_evictions;
         block_hash_cached_blocks += @intCast(stats.block_hash_cached_blocks);
         block_hash_collision_guards += stats.block_hash_collision_guards;
+        radix_hits += stats.radix_hits;
+        radix_misses += stats.radix_misses;
+        radix_evictions += stats.radix_evictions;
+        radix_cached_nodes += @intCast(stats.radix_cached_nodes);
+        radix_collision_guards += stats.radix_collision_guards;
     }
     try appendPromMetric(writer, "antfly_inference_prompt_cache_hits_total", "counter", "Total prompt prefix cache hits", hits);
     try appendPromMetric(writer, "antfly_inference_prompt_cache_misses_total", "counter", "Total prompt prefix cache misses", misses);
@@ -8400,6 +11241,11 @@ fn appendPromptCacheMetrics(writer: *std.Io.Writer, models: anytype) !void {
     try appendPromMetric(writer, "antfly_inference_prompt_cache_block_hash_evictions_total", "counter", "Total block-hash prompt cache evictions", block_hash_evictions);
     try appendPromMetric(writer, "antfly_inference_prompt_cache_block_hash_cached_blocks", "gauge", "Block-hash prompt cache retained KV blocks", block_hash_cached_blocks);
     try appendPromMetric(writer, "antfly_inference_prompt_cache_block_hash_collision_guards_total", "counter", "Total block-hash prompt cache collisions detected", block_hash_collision_guards);
+    try appendPromMetric(writer, "antfly_inference_prompt_cache_radix_hits_total", "counter", "Total radix prompt cache hits", radix_hits);
+    try appendPromMetric(writer, "antfly_inference_prompt_cache_radix_misses_total", "counter", "Total radix prompt cache misses", radix_misses);
+    try appendPromMetric(writer, "antfly_inference_prompt_cache_radix_evictions_total", "counter", "Total radix prompt cache node evictions", radix_evictions);
+    try appendPromMetric(writer, "antfly_inference_prompt_cache_radix_cached_nodes", "gauge", "Radix prompt cache retained nodes", radix_cached_nodes);
+    try appendPromMetric(writer, "antfly_inference_prompt_cache_radix_collision_guards_total", "counter", "Total radix edge hash collisions detected", radix_collision_guards);
 }
 
 fn aggregateResidentProjectionStats(models: anytype) embedding_mod.ResidentProjectionStats {
@@ -8428,6 +11274,30 @@ test "resident projection metrics render counters" {
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_embed_resident_projection_audio_fallback_total 6\n") != null);
 }
 
+test "Metal exact JIT metrics render loaded-session gauges" {
+    var writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer writer.deinit();
+    try appendMetalExactJitMetrics(&writer.writer, .{
+        .q4_0_hits = 7,
+        .q4_k_hits = 9,
+    });
+    const output = writer.writer.buffered();
+    try std.testing.expect(std.mem.containsAtLeast(
+        u8,
+        output,
+        1,
+        "# TYPE antfly_inference_metal_jit_exact_q4_0_hits gauge\nantfly_inference_metal_jit_exact_q4_0_hits 7",
+    ));
+    try std.testing.expect(std.mem.containsAtLeast(
+        u8,
+        output,
+        1,
+        "# TYPE antfly_inference_metal_jit_exact_q4_k_hits gauge\nantfly_inference_metal_jit_exact_q4_k_hits 9",
+    ));
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_metal_jit_exact_q4_0_hits_total") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_metal_jit_exact_q4_k_hits_total") == null);
+}
+
 test "graph executor metrics render counters" {
     var writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer writer.deinit();
@@ -8436,11 +11306,39 @@ test "graph executor metrics render counters" {
         .partitions_executed = 1,
         .interpreter_fallbacks = 2,
         .host_materialized_outputs = 3,
+        .quant_kernel_planned_ops = 4,
+        .quant_kernel_handwritten_production = 5,
+        .quant_kernel_generated_production = 6,
+        .quant_kernel_unsupported_routes = 7,
+        .quant_kernel_generated_candidates = 8,
+        .quant_kernel_fallback_generated_artifact_missing = 9,
+        .quant_kernel_fallback_generated_runtime_not_wired = 10,
+        .quant_kernel_fallback_unsupported_format = 10,
+        .quant_kernel_fallback_unsupported_shape = 11,
+        .quant_kernel_fallback_unsupported_epilogue = 12,
+        .quant_kernel_fallback_unsupported_backend = 13,
+        .quant_kernel_fallback_tensor_core_repack_required = 14,
+        .quant_kernel_fallback_unsupported = 15,
     });
     const output = writer.writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, output, "inference_graph_executor_partitions_total 1\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "inference_graph_executor_interpreter_fallbacks_total 2\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "inference_graph_executor_host_materialized_outputs_total 3\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "inference_quant_kernel_planned_ops_total 4\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "inference_quant_kernel_handwritten_production_total 5\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "inference_quant_kernel_generated_production_total 6\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "inference_quant_kernel_unsupported_routes_total 7\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "inference_quant_kernel_fast_path_misses_total 79\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "inference_quant_kernel_generated_candidates_total 8\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "inference_quant_kernel_fallback_generated_artifact_missing_total 9\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "inference_quant_kernel_fallback_generated_runtime_not_wired_total 10\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "inference_quant_kernel_fallback_unsupported_format_total 10\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "inference_quant_kernel_fallback_unsupported_shape_total 11\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "inference_quant_kernel_fallback_unsupported_epilogue_total 12\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "inference_quant_kernel_fallback_unsupported_backend_total 13\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "inference_quant_kernel_fallback_tensor_core_repack_required_total 14\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "inference_quant_kernel_fallback_unsupported_total 15\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "inference_quant_kernel_top_fallback_reason{reason=\"tensor_core_repack_required\"} 14\n") != null);
 }
 
 test "OpenAI model listing deduplicates multi-task models" {
@@ -8720,6 +11618,515 @@ test "node config accepts shared scraping config" {
     try std.testing.expectEqualStrings("s3.amazonaws.com", cfg.s3_credentials.?.endpoint.?);
 }
 
+test "generate speculation options validate the HTTP trust boundary" {
+    const defaults = try parseGenerateSpeculationOptions(true, null, null, null);
+    try std.testing.expectEqual(@as(u32, 4), defaults.k);
+    try std.testing.expectEqual(generation.SpeculationPolicy.auto, defaults.policy);
+    try std.testing.expectEqual(generation.SpeculationCalibration.none, defaults.calibration);
+    const probing = try parseGenerateSpeculationOptions(true, null, null, "probe");
+    try std.testing.expectEqual(generation.SpeculationCalibration.probe, probing.calibration);
+    const forced = try parseGenerateSpeculationOptions(true, null, "force", null);
+    try std.testing.expectEqual(generation.SpeculationCalibration.none, forced.calibration);
+    try std.testing.expect(!shouldResolveDraftModel(.off));
+    try std.testing.expectEqual(@as(usize, 7), generateQueueUnitsForSpeculation(7, false, .auto));
+    try std.testing.expectEqual(@as(usize, 7), generateQueueUnitsForSpeculation(7, true, .off));
+    try std.testing.expectEqual(@as(usize, 14), generateQueueUnitsForSpeculation(7, true, .auto));
+    try std.testing.expectEqual(std.math.maxInt(usize), generateQueueUnitsForSpeculation(std.math.maxInt(usize), true, .force));
+    try std.testing.expectError(error.SpeculationRequiresDraftModel, parseGenerateSpeculationOptions(false, 4, null, null));
+    try std.testing.expectError(error.SpeculationRequiresDraftModel, parseGenerateSpeculationOptions(false, null, "auto", null));
+    try std.testing.expectError(error.SpeculationRequiresDraftModel, parseGenerateSpeculationOptions(false, null, null, "probe"));
+    try std.testing.expectError(error.InvalidSpeculativeK, parseGenerateSpeculationOptions(true, 0, null, null));
+    try std.testing.expectError(error.InvalidSpeculativeK, parseGenerateSpeculationOptions(true, 17, null, null));
+    try std.testing.expectError(error.InvalidSpeculationPolicy, parseGenerateSpeculationOptions(true, 4, "sometimes", null));
+    try std.testing.expectError(error.InvalidSpeculationCalibration, parseGenerateSpeculationOptions(true, 4, null, "calibrate"));
+    try std.testing.expectError(error.InvalidSpeculationCalibration, parseGenerateSpeculationOptions(true, 4, null, "unknown"));
+}
+
+test "generate queue units conservatively charge active draft requests" {
+    const request_json =
+        \\{"model":"m","draft_model":"draft","messages":[{"role":"user","content":"hello"}]}
+    ;
+    var parsed = try std.json.parseFromSlice(api.GenerateRequest, std.testing.allocator, request_json, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 6), Node.estimateGenerateRequestQueueUnits(parsed.value, 256));
+    var probing = parsed.value;
+    probing.speculation_calibration = "probe";
+    try std.testing.expectEqual(@as(usize, 6), Node.estimateGenerateRequestQueueUnits(probing, 256));
+    var off = parsed.value;
+    off.speculation_policy = "off";
+    try std.testing.expectEqual(@as(usize, 3), Node.estimateGenerateRequestQueueUnits(off, 256));
+}
+
+test "generate numeric options validate narrowing at the HTTP trust boundary" {
+    const defaults = try parseGenerateNumericOptions(null, null);
+    try std.testing.expectEqual(@as(i32, 256), defaults.max_tokens);
+    try std.testing.expectEqual(@as(i32, 0), defaults.top_k);
+    try std.testing.expectError(error.InvalidMaxTokens, parseGenerateNumericOptions(0, null));
+    try std.testing.expectError(error.InvalidMaxTokens, parseGenerateNumericOptions(std.math.maxInt(i64), null));
+    try std.testing.expectError(error.InvalidTopK, parseGenerateNumericOptions(null, -1));
+    try std.testing.expectError(error.InvalidTopK, parseGenerateNumericOptions(null, std.math.maxInt(i64)));
+}
+
+test "generate sampling options validate the HTTP trust boundary" {
+    const defaults = try parseGenerateSamplingOptions(null, null, null, null, null, null);
+    try std.testing.expectEqual(@as(f32, 0), defaults.temperature);
+    try std.testing.expectEqual(@as(f32, 0), defaults.top_p);
+    try std.testing.expectEqual(@as(f32, 0), defaults.min_p);
+    try std.testing.expectEqual(@as(f32, 1), defaults.repetition_penalty);
+    try std.testing.expectEqual(@as(f32, 0), defaults.frequency_penalty);
+    try std.testing.expectEqual(@as(f32, 0), defaults.presence_penalty);
+
+    try std.testing.expectError(error.InvalidTemperature, parseGenerateSamplingOptions(std.math.inf(f32), null, null, null, null, null));
+    try std.testing.expectError(error.InvalidTemperature, parseGenerateSamplingOptions(2.01, null, null, null, null, null));
+    try std.testing.expectError(error.InvalidTopP, parseGenerateSamplingOptions(null, std.math.nan(f32), null, null, null, null));
+    try std.testing.expectError(error.InvalidTopP, parseGenerateSamplingOptions(null, 1.01, null, null, null, null));
+    try std.testing.expectError(error.InvalidMinP, parseGenerateSamplingOptions(null, null, -0.01, null, null, null));
+    try std.testing.expectError(error.InvalidRepetitionPenalty, parseGenerateSamplingOptions(null, null, null, 0, null, null));
+    try std.testing.expectError(error.InvalidFrequencyPenalty, parseGenerateSamplingOptions(null, null, null, null, -2.01, null));
+    try std.testing.expectError(error.InvalidPresencePenalty, parseGenerateSamplingOptions(null, null, null, null, null, 2.01));
+}
+
+test "generation SSE usage chunk serializes authoritative accounting" {
+    const allocator = std.testing.allocator;
+    const payload = try std.json.Stringify.valueAlloc(allocator, api.GenerateChunk{
+        .id = "chatcmpl-test",
+        .object = "chat.completion.chunk",
+        .created = 42,
+        .model = "gemma-4",
+        .choices = &.{},
+        .usage = tokenUsageWithCachedPrompt(2003, 300, 512),
+    }, .{});
+    defer allocator.free(payload);
+
+    var parsed = try std.json.parseFromSlice(api.GenerateChunk, allocator, payload, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.choices.len);
+    const usage = parsed.value.usage orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(i64, 2003), usage.prompt_tokens);
+    try std.testing.expectEqual(@as(i64, 300), usage.completion_tokens);
+    try std.testing.expectEqual(@as(i64, 2303), usage.total_tokens);
+    try std.testing.expectEqual(@as(?i64, 512), usage.cached_prompt_tokens);
+
+    const uncached = tokenUsageWithCachedPrompt(7, 3, 0);
+    try std.testing.expectEqual(@as(?i64, null), uncached.cached_prompt_tokens);
+}
+
+test "generation SSE orders finish then usage then done" {
+    const allocator = std.testing.allocator;
+    const Capture = struct {
+        allocator: std.mem.Allocator,
+        events: std.ArrayListUnmanaged([]u8) = .empty,
+
+        fn deinit(self: *@This()) void {
+            for (self.events.items) |event| self.allocator.free(event);
+            self.events.deinit(self.allocator);
+        }
+
+        fn writeEvent(self: *@This(), event_name: ?[]const u8, data: []const u8) !void {
+            try std.testing.expect(event_name == null);
+            const owned = try self.allocator.dupe(u8, data);
+            errdefer self.allocator.free(owned);
+            try self.events.append(self.allocator, owned);
+        }
+    };
+
+    var capture = Capture{ .allocator = allocator };
+    defer capture.deinit();
+    try Node.emitFinishDelta(&capture, allocator, "chatcmpl-test", 42, "gemma-4", "length", null);
+    try Node.emitTerminalUsageAndDone(&capture, allocator, "chatcmpl-test", 42, "gemma-4", 2003, 300, 0);
+
+    try std.testing.expectEqual(@as(usize, 3), capture.events.items.len);
+    var finish = try std.json.parseFromSlice(api.GenerateChunk, allocator, capture.events.items[0], .{});
+    defer finish.deinit();
+    try std.testing.expectEqual(@as(usize, 1), finish.value.choices.len);
+    try std.testing.expectEqual(api.FinishReason.length, finish.value.choices[0].finish_reason.?);
+    try std.testing.expect(finish.value.usage == null);
+
+    var usage = try std.json.parseFromSlice(api.GenerateChunk, allocator, capture.events.items[1], .{});
+    defer usage.deinit();
+    try std.testing.expectEqual(@as(usize, 0), usage.value.choices.len);
+    try std.testing.expectEqual(@as(i64, 300), usage.value.usage.?.completion_tokens);
+    try std.testing.expectEqualStrings("[DONE]", capture.events.items[2]);
+}
+
+test "generation SSE omits usage unless requested" {
+    const allocator = std.testing.allocator;
+    const Capture = struct {
+        allocator: std.mem.Allocator,
+        events: std.ArrayListUnmanaged([]u8) = .empty,
+
+        fn deinit(self: *@This()) void {
+            for (self.events.items) |event| self.allocator.free(event);
+            self.events.deinit(self.allocator);
+        }
+
+        fn writeEvent(self: *@This(), event_name: ?[]const u8, data: []const u8) !void {
+            try std.testing.expect(event_name == null);
+            const owned = try self.allocator.dupe(u8, data);
+            errdefer self.allocator.free(owned);
+            try self.events.append(self.allocator, owned);
+        }
+    };
+
+    var capture = Capture{ .allocator = allocator };
+    defer capture.deinit();
+    try Node.emitFinishDelta(&capture, allocator, "chatcmpl-test", 42, "gemma-4", "length", null);
+    try Node.emitTerminalUsageOrDone(&capture, allocator, "chatcmpl-test", 42, "gemma-4", 2003, 300, 0, false);
+
+    try std.testing.expectEqual(@as(usize, 2), capture.events.items.len);
+    try std.testing.expectEqualStrings("[DONE]", capture.events.items[1]);
+}
+
+test "generate ignore eos defaults false and requires explicit true" {
+    const allocator = std.testing.allocator;
+    const omitted_json =
+        \\{"model":"m","messages":[{"role":"user","content":"hello"}]}
+    ;
+    var omitted = try std.json.parseFromSlice(api.GenerateRequest, allocator, omitted_json, .{ .ignore_unknown_fields = true });
+    defer omitted.deinit();
+    try std.testing.expect(omitted.value.ignore_eos == null);
+    var omitted_grammar: ?[]u8 = null;
+    const omitted_config = try Node.generateConfigFromBody(allocator, omitted.value, &omitted_grammar);
+    defer if (omitted_grammar) |grammar| allocator.free(grammar);
+    try std.testing.expect(!omitted_config.ignore_eos);
+
+    const false_json =
+        \\{"model":"m","ignore_eos":false,"messages":[{"role":"user","content":"hello"}]}
+    ;
+    var explicit_false = try std.json.parseFromSlice(api.GenerateRequest, allocator, false_json, .{ .ignore_unknown_fields = true });
+    defer explicit_false.deinit();
+    try std.testing.expectEqual(@as(?bool, false), explicit_false.value.ignore_eos);
+    var false_grammar: ?[]u8 = null;
+    const false_config = try Node.generateConfigFromBody(allocator, explicit_false.value, &false_grammar);
+    defer if (false_grammar) |grammar| allocator.free(grammar);
+    try std.testing.expect(!false_config.ignore_eos);
+
+    const true_json =
+        \\{"model":"m","ignore_eos":true,"messages":[{"role":"user","content":"hello"}]}
+    ;
+    var explicit_true = try std.json.parseFromSlice(api.GenerateRequest, allocator, true_json, .{ .ignore_unknown_fields = true });
+    defer explicit_true.deinit();
+    try std.testing.expectEqual(@as(?bool, true), explicit_true.value.ignore_eos);
+    var true_grammar: ?[]u8 = null;
+    const true_config = try Node.generateConfigFromBody(allocator, explicit_true.value, &true_grammar);
+    defer if (true_grammar) |grammar| allocator.free(grammar);
+    try std.testing.expect(true_config.ignore_eos);
+}
+
+test "generate chat template kwargs preserve default and parse explicit thinking control" {
+    const allocator = std.testing.allocator;
+    const omitted_json =
+        \\{"model":"m","messages":[{"role":"user","content":"hello"}]}
+    ;
+    var omitted = try std.json.parseFromSlice(api.GenerateRequest, allocator, omitted_json, .{ .ignore_unknown_fields = true });
+    defer omitted.deinit();
+    try std.testing.expect(omitted.value.chat_template_kwargs == null);
+    var omitted_grammar: ?[]u8 = null;
+    const omitted_config = try Node.generateConfigFromBody(allocator, omitted.value, &omitted_grammar);
+    defer if (omitted_grammar) |grammar| allocator.free(grammar);
+    try std.testing.expect(omitted_config.enable_thinking == null);
+
+    const disabled_json =
+        \\{"model":"m","chat_template_kwargs":{"enable_thinking":false},"messages":[{"role":"user","content":"hello"}]}
+    ;
+    var disabled = try std.json.parseFromSlice(api.GenerateRequest, allocator, disabled_json, .{ .ignore_unknown_fields = true });
+    defer disabled.deinit();
+    try std.testing.expectEqual(@as(?bool, false), disabled.value.chat_template_kwargs.?.enable_thinking);
+    var disabled_grammar: ?[]u8 = null;
+    const disabled_config = try Node.generateConfigFromBody(allocator, disabled.value, &disabled_grammar);
+    defer if (disabled_grammar) |grammar| allocator.free(grammar);
+    try std.testing.expectEqual(@as(?bool, false), disabled_config.enable_thinking);
+
+    try std.testing.expect(rawGenerateChatTemplateKwargsAreValid(allocator, omitted_json, false));
+    try std.testing.expect(rawGenerateChatTemplateKwargsAreValid(allocator, disabled_json, false));
+    try std.testing.expect(rawGenerateChatTemplateKwargsAreValid(
+        allocator,
+        \\{"model":"m","chat_template_kwargs":{"enable_thinking":true},"messages":[]}
+    ,
+        false,
+    ));
+    try std.testing.expect(!rawGenerateChatTemplateKwargsAreValid(
+        allocator,
+        \\{"model":"m","chat_template_kwargs":{"enable_thinkng":false},"messages":[]}
+    ,
+        false,
+    ));
+    try std.testing.expect(!rawGenerateChatTemplateKwargsAreValid(
+        allocator,
+        \\{"model":"m","chat_template_kwargs":{"enable_thinking":null},"messages":[]}
+    ,
+        false,
+    ));
+    try std.testing.expect(!rawGenerateChatTemplateKwargsAreValid(
+        allocator,
+        \\{"requests":[{"custom_id":"one","body":{"model":"m","chat_template_kwargs":{"unknown":false},"messages":[]}}]}
+    ,
+        true,
+    ));
+    // Bodies without the field name skip the Value parse entirely via the
+    // substring pre-gate and validate successfully.
+    try std.testing.expect(rawGenerateChatTemplateKwargsAreValid(
+        allocator,
+        \\{"model":"m","messages":[{"role":"user","content":"no kwargs here"}]}
+    ,
+        false,
+    ));
+    // The field name appearing only inside a string value is a pre-gate false
+    // positive: the full parse still runs and the request remains accepted.
+    try std.testing.expect(rawGenerateChatTemplateKwargsAreValid(
+        allocator,
+        \\{"model":"m","messages":[{"role":"user","content":"mention chat_template_kwargs in text"}]}
+    ,
+        false,
+    ));
+    // ... and a real invalid field alongside such a string is still rejected.
+    try std.testing.expect(!rawGenerateChatTemplateKwargsAreValid(
+        allocator,
+        \\{"model":"m","chat_template_kwargs":{"unknown":true},"messages":[{"role":"user","content":"chat_template_kwargs"}]}
+    ,
+        false,
+    ));
+}
+
+test "generate speculation status exposes disabled decisions" {
+    const status = generateSpeculationStatus(.{
+        .speculation_policy = .auto,
+        .speculation_calibration = .none,
+        .speculation_policy_decision = .disabled_uncalibrated,
+        .mtp_disabled_reason = "speculation_calibration_required",
+    }).?;
+    try std.testing.expectEqualStrings("auto", status.policy);
+    try std.testing.expectEqualStrings("none", status.calibration);
+    try std.testing.expectEqualStrings("disabled_uncalibrated", status.decision);
+    try std.testing.expectEqualStrings("speculation_calibration_required", status.disabled_reason.?);
+
+    const unavailable = generateSpeculationStatus(.{ .speculation_policy_decision = .disabled_unavailable }).?;
+    try std.testing.expectEqualStrings("draft_backend_unavailable", unavailable.disabled_reason.?);
+}
+
+test "generate policy off has no effective draft and reports disabled" {
+    try std.testing.expect(effectiveDraftModelName("draft", .off) == null);
+    try std.testing.expectEqualStrings("draft", effectiveDraftModelName("draft", .auto).?);
+
+    const stats = effectiveSpeculationStats(null, true, .off, .none).?;
+    try std.testing.expectEqual(generation.SpeculativeDecodeStats.PolicyDecision.disabled_off, stats.speculation_policy_decision);
+    try std.testing.expectEqualStrings("speculation_policy_off", stats.mtp_disabled_reason.?);
+    try std.testing.expect(effectiveSpeculationStats(null, false, .off, .none) == null);
+}
+
+test "qualified-profile server rejects active draft models explicitly" {
+    try std.testing.expectError(
+        error.KernelJitQualifiedProfileDraftUnsupported,
+        validateQualifiedProfileDraft(true, "draft"),
+    );
+    try validateQualifiedProfileDraft(true, null);
+    try validateQualifiedProfileDraft(false, "draft");
+}
+
+test "generate auto MTP probe does not require replay" {
+    const threshold = generation.gemma4MtpAutoMinGenerationTokens();
+    var config: generation.GenerationConfig = .{
+        .max_tokens = @intCast(threshold),
+        .speculation_policy = .auto,
+        .speculation_calibration = .probe,
+    };
+    const draft_config: gpt_model_mod.Config = .{ .gemma4_mtp_assistant = true };
+    try std.testing.expect(!shouldSkipAutoMtpDraftLoad(config, draft_config));
+
+    config.max_tokens = @intCast(threshold - 1);
+    try std.testing.expect(shouldSkipAutoMtpDraftLoad(config, draft_config));
+    config.max_tokens = @intCast(threshold);
+    config.speculation_calibration = .none;
+    try std.testing.expect(shouldSkipAutoMtpDraftLoad(config, draft_config));
+    config.speculation_policy = .force;
+    try std.testing.expect(!shouldSkipAutoMtpDraftLoad(config, draft_config));
+}
+
+test "generate draft resources follow the draft backend" {
+    try std.testing.expectEqual(@as(?runtime.kv.pool.BackendKind, .native), generationBackendKind(.native));
+    try std.testing.expectEqual(@as(?runtime.kv.pool.BackendKind, .metal), generationBackendKind(.metal));
+    try std.testing.expectEqual(@as(?runtime.kv.pool.BackendKind, .cuda), generationBackendKind(.cuda));
+    try std.testing.expectEqual(@as(?runtime.kv.pool.BackendKind, null), generationBackendKind(.onnx));
+    try std.testing.expectEqual(@as(?runtime.kv.pool.BackendKind, null), generationBackendKind(.pjrt));
+    try std.testing.expectEqual(@as(?runtime.kv.pool.BackendKind, null), generationBackendKind(.wasm));
+
+    const limits = runtime.tier.memory.maxCompositeLimits(
+        .{ .host_limit_bytes = 2, .backend_limit_bytes = 8, .kv_limit_bytes = 3 },
+        .{ .host_limit_bytes = 5, .backend_limit_bytes = 4, .combined_limit_bytes = 9, .scratch_limit_bytes = 7 },
+    );
+    try std.testing.expectEqual(@as(usize, 5), limits.host_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 8), limits.backend_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 9), limits.combined_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 3), limits.kv_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 7), limits.scratch_limit_bytes);
+}
+
+test "generate draft KV pool uses safe model geometry" {
+    const mha = generation.kvPoolConfig(.native, .f16, .{
+        .hidden_size = 1024,
+        .num_hidden_layers = 2,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 0,
+        .position_encoding = .rope,
+        .max_position_embeddings = 4096,
+    }, false);
+    try std.testing.expectEqual(@as(u32, 8), mha.num_kv_heads);
+    try std.testing.expectEqual(@as(u32, 128), mha.head_dim);
+    try std.testing.expectEqual(@as(?u32, 4096), mha.sliding_window_size);
+
+    const gemma4 = generation.kvPoolConfig(.metal, .bf16, .{
+        .family = .gemma,
+        .hidden_size = 512,
+        .num_hidden_layers = 2,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 4,
+        .attention_head_dim = 256,
+        .num_global_key_value_heads = 8,
+        .global_head_dim = 512,
+        .position_encoding = .rope,
+        .sliding_window = 1024,
+    }, false);
+    try std.testing.expectEqual(@as(u32, 8), gemma4.num_kv_heads);
+    try std.testing.expectEqual(@as(u32, 512), gemma4.head_dim);
+    try std.testing.expectEqual(@as(?u32, 1024), gemma4.sliding_window_size);
+
+    const mixed_gemma4_config: gpt_model_mod.Config = .{
+        .family = .gemma,
+        .hidden_size = 512,
+        .num_hidden_layers = 6,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 4,
+        .position_encoding = .rope,
+        .sliding_window = 1024,
+        .sliding_window_pattern = 6,
+    };
+    try std.testing.expectEqual(
+        @as(?u32, null),
+        generation.kvPoolConfig(.metal, .bf16, mixed_gemma4_config, false).sliding_window_size,
+    );
+    try std.testing.expectEqual(
+        @as(?u32, 1024),
+        generation.kvPoolConfig(.metal, .bf16, mixed_gemma4_config, true).sliding_window_size,
+    );
+}
+
+test "generate rejects an ONNX draft before model loading" {
+    const onnx = GenerateBackendSelection{ .native_choice = .onnx };
+    try std.testing.expectError(error.OnnxDraftUnsupported, validateGenerateDraftBackend(onnx, "draft"));
+    try validateGenerateDraftBackend(onnx, null);
+    try validateGenerateDraftBackend(.{ .native_choice = .native }, "draft");
+}
+
+test "generate speculation outcome metrics classify completed requests" {
+    var metrics = metrics_mod.Metrics.default;
+    recordSpeculationOutcome(&metrics, .{ .speculation_policy_decision = .active });
+    recordSpeculationOutcome(&metrics, .{ .speculation_policy_decision = .disabled_off });
+    recordSpeculationOutcome(&metrics, null);
+
+    var writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer writer.deinit();
+    try metrics.render(&writer.writer);
+    const output = writer.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_speculation_active_total 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_speculation_disabled_total 1\n") != null);
+}
+
+test "generate cache compaction ratio validates the HTTP trust boundary" {
+    try validateCacheCompactionRatio(null);
+    try validateCacheCompactionRatio(0.01);
+    try validateCacheCompactionRatio(1.0);
+    try std.testing.expectError(error.InvalidCompactionRatio, validateCacheCompactionRatio(0.0));
+    try std.testing.expectError(error.InvalidCompactionRatio, validateCacheCompactionRatio(-0.1));
+    try std.testing.expectError(error.InvalidCompactionRatio, validateCacheCompactionRatio(1.01));
+    try std.testing.expectError(error.InvalidCompactionRatio, validateCacheCompactionRatio(std.math.nan(f32)));
+    try std.testing.expectError(error.InvalidCompactionRatio, validateCacheCompactionRatio(std.math.inf(f32)));
+}
+
+test "generate config grammar ownership stays flat on success override and later error" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.debug.assert(gpa.deinit() == .ok);
+    const allocator = gpa.allocator();
+    const request_json =
+        \\{"model":"m","messages":[],"response_format":{"type":"json_schema","json_schema":{"schema":{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}}}}
+    ;
+    var parsed = try std.json.parseFromSlice(api.GenerateRequest, allocator, request_json, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+
+    for (0..64) |_| {
+        var owned_grammar: ?[]u8 = null;
+        const config = try Node.generateConfigFromBody(allocator, parsed.value, &owned_grammar);
+        try std.testing.expect(owned_grammar != null);
+        try std.testing.expectEqualStrings(owned_grammar.?, config.grammar.?);
+        allocator.free(owned_grammar.?);
+
+        var override_body = parsed.value;
+        override_body.grammar = "json";
+        var override_owned: ?[]u8 = null;
+        const override_config = try Node.generateConfigFromBody(allocator, override_body, &override_owned);
+        try std.testing.expect(override_owned == null);
+        try std.testing.expectEqualStrings("json", override_config.grammar.?);
+
+        var invalid_body = parsed.value;
+        invalid_body.grammar = "foo ::= \"bar\"";
+        var invalid_owned: ?[]u8 = null;
+        try std.testing.expectError(
+            error.NoRootRule,
+            Node.generateConfigFromBody(allocator, invalid_body, &invalid_owned),
+        );
+        try std.testing.expect(invalid_owned == null);
+    }
+}
+
+test "generate batch rejects draft models instead of ignoring them" {
+    const request_json =
+        \\{"model":"m","draft_model":"draft","messages":[{"role":"user","content":"hello"}]}
+    ;
+    var parsed = try std.json.parseFromSlice(api.GenerateRequest, std.testing.allocator, request_json, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+
+    const reason = Node.generateBatchUnsupportedReasonPreflight(parsed.value) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("UNSUPPORTED_DRAFT_MODEL", reason.code);
+}
+
+test "generate batch validates sampling and speculative options before execution" {
+    const invalid_sampling_json =
+        \\{"model":"m","temperature":2.1,"messages":[{"role":"user","content":"hello"}]}
+    ;
+    var invalid_sampling = try std.json.parseFromSlice(api.GenerateRequest, std.testing.allocator, invalid_sampling_json, .{ .ignore_unknown_fields = true });
+    defer invalid_sampling.deinit();
+    const sampling_reason = Node.generateBatchUnsupportedReasonPreflight(invalid_sampling.value) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("INVALID_REQUEST", sampling_reason.code);
+    try std.testing.expectEqualStrings("temperature must be finite and between 0 and 2", sampling_reason.message);
+
+    const invalid_speculation_json =
+        \\{"model":"m","speculative_k":4,"messages":[{"role":"user","content":"hello"}]}
+    ;
+    var invalid_speculation = try std.json.parseFromSlice(api.GenerateRequest, std.testing.allocator, invalid_speculation_json, .{ .ignore_unknown_fields = true });
+    defer invalid_speculation.deinit();
+    const speculation_reason = Node.generateBatchUnsupportedReasonPreflight(invalid_speculation.value) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("INVALID_REQUEST", speculation_reason.code);
+    try std.testing.expectEqualStrings("speculative_k, speculation_policy, and speculation_calibration require draft_model", speculation_reason.message);
+}
+
+test "generate batch rejects cache compaction clearly" {
+    const unsupported_json =
+        \\{"model":"m","cache_compaction_ratio":0.5,"messages":[{"role":"user","content":"hello"}]}
+    ;
+    var unsupported = try std.json.parseFromSlice(api.GenerateRequest, std.testing.allocator, unsupported_json, .{ .ignore_unknown_fields = true });
+    defer unsupported.deinit();
+    const unsupported_reason = Node.generateBatchUnsupportedReasonPreflight(unsupported.value) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("UNSUPPORTED_CACHE_COMPACTION", unsupported_reason.code);
+
+    const invalid_json =
+        \\{"model":"m","cache_compaction_ratio":0,"messages":[{"role":"user","content":"hello"}]}
+    ;
+    var invalid = try std.json.parseFromSlice(api.GenerateRequest, std.testing.allocator, invalid_json, .{ .ignore_unknown_fields = true });
+    defer invalid.deinit();
+    const invalid_reason = Node.generateBatchUnsupportedReasonPreflight(invalid.value) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("INVALID_CACHE_COMPACTION_RATIO", invalid_reason.code);
+}
+
 test "generate batch preflight rejects image content without parsing media" {
     const request_json =
         \\{"model":"m","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.invalid/image.png"}}]}]}
@@ -8778,6 +12185,171 @@ test "generate batch queue units sum pending generation work" {
     try std.testing.expectEqual(expected, node.estimateGenerateBatchQueueUnits(parsed.value.requests, owned_messages, pending[0..]));
 }
 
+test "generate batch shared backends own the outer model lock" {
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    var mutex: std.atomic.Mutex = .unlocked;
+
+    var isolated = Node.BatchModelLock.init(.isolated_parallel, &mutex, io_impl.io());
+    defer isolated.deinit();
+    try std.testing.expectEqual(
+        &mutex,
+        isolated.pipelineExecutionLock().?,
+    );
+    try std.testing.expect(mutex.tryLock());
+    mutex.unlock();
+
+    var shared = Node.BatchModelLock.init(.shared_serial, &mutex, io_impl.io());
+    try std.testing.expect(shared.pipelineExecutionLock() == null);
+    try std.testing.expect(!mutex.tryLock());
+    shared.deinit();
+    try std.testing.expect(mutex.tryLock());
+    mutex.unlock();
+}
+
+test "serial batch admission covers each request without summing them" {
+    const first = runtime.tier.memory.Estimate{
+        .prompt_tokens = 100,
+        .retained_tokens = 120,
+        .kv_bytes = 900,
+        .kv_tier = .backend,
+        .scratch_bytes = 200,
+        .scratch_tier = .backend,
+    };
+    const second = runtime.tier.memory.Estimate{
+        .prompt_tokens = 300,
+        .retained_tokens = 320,
+        .kv_bytes = 400,
+        .kv_tier = .backend,
+        .scratch_bytes = 700,
+        .scratch_tier = .backend,
+    };
+    const merged = Node.mergeSerialBatchEstimate(first, second);
+    try std.testing.expectEqual(@as(usize, 300), merged.prompt_tokens);
+    try std.testing.expectEqual(@as(usize, 320), merged.retained_tokens);
+    try std.testing.expectEqual(@as(usize, 900), merged.kv_bytes);
+    try std.testing.expectEqual(@as(usize, 700), merged.scratch_bytes);
+}
+
+test "direct generation admission owns queue capacity exactly once" {
+    var node = try Node.init(std.testing.allocator, .{ .max_concurrent_requests = 32 });
+    defer node.deinit();
+
+    var admission = try node.beginDirectGenerateAdmission(.{
+        .text_bytes = 5,
+        .encoded_media_bytes = 4,
+        .decoded_media_bytes = 3,
+        .media_count = 1,
+        .has_audio = true,
+    }, 256);
+    try std.testing.expectEqual(@as(usize, 9), node.request_queue.depth());
+    try std.testing.expectEqual(@as(usize, 1), node.request_queue.requests());
+
+    admission.deinit();
+    try std.testing.expectEqual(@as(usize, 0), node.request_queue.depth());
+    try std.testing.expectEqual(@as(usize, 0), node.request_queue.requests());
+
+    admission.deinit();
+    try std.testing.expectEqual(@as(usize, 0), node.request_queue.depth());
+    try std.testing.expectEqual(@as(usize, 0), node.request_queue.requests());
+}
+
+test "direct generation admission rejects resident media before queue acquisition" {
+    var node = try Node.init(std.testing.allocator, .{
+        .content_security = .{ .max_download_size_bytes = 4 },
+        .max_concurrent_requests = 32,
+    });
+    defer node.deinit();
+
+    try std.testing.expectError(
+        error.RemoteContentTooLarge,
+        node.beginDirectGenerateAdmission(.{
+            .encoded_media_bytes = 3,
+            .decoded_media_bytes = 2,
+            .media_count = 1,
+            .image_count = 1,
+        }, 256),
+    );
+    try std.testing.expectEqual(@as(usize, 0), node.request_queue.depth());
+    try std.testing.expectEqual(@as(usize, 0), node.request_queue.requests());
+}
+
+test "direct generation audio admission honors configured byte capacity boundary" {
+    var bounded = try Node.init(std.testing.allocator, .{ .max_concurrent_requests = 8 });
+    defer bounded.deinit();
+
+    var exact = try bounded.beginDirectGenerateAdmission(.{
+        .media_count = 1,
+        .has_audio = true,
+    }, 256);
+    try std.testing.expectEqual(@as(usize, 8), bounded.request_queue.depth());
+    exact.deinit();
+
+    try std.testing.expectError(
+        error.AudioTooLarge,
+        bounded.beginDirectGenerateAdmission(.{
+            .decoded_media_bytes = 1,
+            .media_count = 1,
+            .has_audio = true,
+        }, 256),
+    );
+    try std.testing.expectEqual(@as(usize, 0), bounded.request_queue.depth());
+    try std.testing.expectEqual(@as(usize, 0), bounded.request_queue.requests());
+
+    var unlimited = try Node.init(std.testing.allocator, .{ .max_concurrent_requests = 0 });
+    defer unlimited.deinit();
+    var admitted = try unlimited.beginDirectGenerateAdmission(.{
+        .decoded_media_bytes = 1,
+        .media_count = 1,
+        .has_audio = true,
+    }, 256);
+    try std.testing.expectEqual(@as(usize, 0), unlimited.request_queue.depth());
+    try std.testing.expectEqual(@as(usize, 1), unlimited.request_queue.requests());
+    admitted.deinit();
+}
+
+test "direct generation media inspection releases admission on early error" {
+    var node = try Node.init(std.testing.allocator, .{ .max_concurrent_requests = 32 });
+    defer node.deinit();
+    const images = [_][]const u8{"not-an-image"};
+    const messages = [_]generation.Message{.{
+        .role = "user",
+        .content = "describe",
+        .image_bytes = &images,
+    }};
+
+    try std.testing.expectError(
+        error.ImageDecodeFailed,
+        node.generateMessagesDirect(std.testing.allocator, "unused", &messages),
+    );
+    try std.testing.expectEqual(@as(usize, 0), node.request_queue.depth());
+    try std.testing.expectEqual(@as(usize, 0), node.request_queue.requests());
+}
+
+test "direct generation image admission subtracts resident bytes from capacity" {
+    var node = try Node.init(std.testing.allocator, .{ .max_concurrent_requests = 1 });
+    defer node.deinit();
+
+    var png = [_]u8{0} ** 24;
+    const signature = [_]u8{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' };
+    @memcpy(png[0..8], &signature);
+    std.mem.writeInt(u32, png[16..20], 1024, .big);
+    std.mem.writeInt(u32, png[20..24], 1024, .big);
+    const images = [_][]const u8{&png};
+    const messages = [_]generation.Message{.{
+        .role = "user",
+        .content = "describe",
+        .image_bytes = &images,
+    }};
+
+    try std.testing.expectError(
+        error.ImageBatchTooLarge,
+        node.generateMessagesDirect(std.testing.allocator, "unused", &messages),
+    );
+    try std.testing.expectEqual(@as(usize, 0), node.request_queue.depth());
+    try std.testing.expectEqual(@as(usize, 0), node.request_queue.requests());
+}
+
 test "generate batch capacity errors include actionable retry metadata" {
     const busy_load = Node.batchModelLoadError(error.ResourceTemporarilyUnavailable);
     try std.testing.expectEqualStrings("MODEL_RESOURCE_BUSY", busy_load.code);
@@ -8810,6 +12382,860 @@ test "read batch downloaded byte accounting enforces aggregate cap" {
     try std.testing.expectError(error.ReadBatchTooLarge, addReadBatchDownloadedBytes(10, item, 14));
 }
 
+test "read inline source accounting is cumulative bounded and overflow safe" {
+    try std.testing.expectEqual(@as(usize, 5), try addReadInlineSourceBytes(0, "data:", 5));
+    try std.testing.expectEqual(@as(usize, 5), try addReadInlineSourceBytes(5, "https://example.invalid/image.png", 5));
+    try std.testing.expectError(error.ReadBatchTooLarge, addReadInlineSourceBytes(5, "data:,x", 11));
+    try std.testing.expectError(error.ReadBatchTooLarge, addReadInlineSourceBytes(std.math.maxInt(usize), "data:", std.math.maxInt(usize)));
+}
+
+test "audio admission accounts resident media plus bounded decode working set" {
+    const normal = audioDecodeAdmissionForLimits(32 * 1024 * 1024, 32);
+    try std.testing.expectEqual(default_max_audio_decode_working_bytes, normal.max_decode_working_bytes);
+    try std.testing.expectEqual(@as(usize, 10), normal.units);
+
+    const small_capacity = audioDecodeAdmissionForLimits(16 * 1024 * 1024, 4);
+    try std.testing.expectEqual(@as(usize, 48 * 1024 * 1024), small_capacity.max_decode_working_bytes);
+    try std.testing.expectEqual(@as(usize, 4), small_capacity.units);
+
+    const exhausted_capacity = audioDecodeAdmissionForLimits(16 * 1024 * 1024, 1);
+    try std.testing.expectEqual(@as(usize, 0), exhausted_capacity.max_decode_working_bytes);
+    try std.testing.expectEqual(@as(usize, 1), exhausted_capacity.units);
+
+    const unlimited_admission = audioDecodeAdmissionForLimits(16 * 1024 * 1024, 0);
+    try std.testing.expectEqual(default_max_audio_decode_working_bytes, unlimited_admission.max_decode_working_bytes);
+    try std.testing.expectEqual(@as(usize, 9), unlimited_admission.units);
+}
+
+test "read admission reserves default batch bytes and image pressure without overflow" {
+    const batch = readRequestAdmissionForLimits(
+        max_read_batch_images,
+        default_max_read_batch_bytes,
+        default_max_request_media_bytes,
+        32,
+        null,
+        0,
+    );
+    try std.testing.expectEqual(default_max_read_batch_bytes, batch.byte_cap);
+    try std.testing.expectEqual(default_max_read_batch_bytes, batch.resident_byte_cap);
+    try std.testing.expectEqual(@as(usize, 32), batch.units);
+
+    const single = readRequestAdmissionForLimits(
+        1,
+        default_max_read_batch_bytes,
+        default_max_request_media_bytes,
+        32,
+        null,
+        0,
+    );
+    try std.testing.expectEqual(default_max_request_media_bytes, single.byte_cap);
+    try std.testing.expectEqual(default_max_request_media_bytes, single.resident_byte_cap);
+    try std.testing.expectEqual(@as(usize, 7), single.units);
+
+    const small_capacity = readRequestAdmissionForLimits(
+        1,
+        default_max_read_batch_bytes,
+        default_max_request_media_bytes,
+        4,
+        null,
+        0,
+    );
+    try std.testing.expectEqual(4 * read_admission_bytes_per_unit, small_capacity.byte_cap);
+    try std.testing.expectEqual(4 * read_admission_bytes_per_unit, small_capacity.resident_byte_cap);
+    try std.testing.expectEqual(@as(usize, 4), small_capacity.units);
+
+    const overflow = readRequestAdmissionForLimits(
+        std.math.maxInt(usize),
+        std.math.maxInt(usize),
+        std.math.maxInt(usize),
+        32,
+        null,
+        0,
+    );
+    try std.testing.expectEqual(32 * read_admission_bytes_per_unit, overflow.byte_cap);
+    var queue = request_queue_mod.RequestQueue.init(32);
+    try std.testing.expectEqual(@as(usize, 32), queue.capacityUnits(overflow.units));
+
+    try std.testing.expectEqual(@as(usize, 16 * 1024 * 1024), batch.decoded_pixel_cap);
+    try std.testing.expectEqual(
+        (32 * read_admission_bytes_per_unit - default_max_request_media_bytes) / read_decoded_working_bytes_per_pixel,
+        single.decoded_pixel_cap,
+    );
+    try std.testing.expectEqual(@as(usize, 0), small_capacity.decoded_pixel_cap);
+    const dimension_limited = readRequestAdmissionForLimits(2, default_max_read_batch_bytes, default_max_request_media_bytes, 32, 2048, 0);
+    try std.testing.expectEqual(@as(usize, 2 * 2048 * 2048), dimension_limited.decoded_pixel_cap);
+    const unlimited_admission = readRequestAdmissionForLimits(max_read_batch_images, default_max_read_batch_bytes, default_max_request_media_bytes, 0, null, 0);
+    try std.testing.expectEqual(default_max_read_decoded_working_bytes / read_decoded_working_bytes_per_pixel, unlimited_admission.decoded_pixel_cap);
+
+    const boundary = readRequestAdmissionForLimits(
+        1,
+        read_admission_bytes_per_unit,
+        read_admission_bytes_per_unit,
+        4,
+        null,
+        read_admission_bytes_per_unit,
+    );
+    try std.testing.expectEqual(2 * read_admission_bytes_per_unit, boundary.resident_byte_cap);
+    try std.testing.expectEqual(@as(usize, 2 * 1024 * 1024), boundary.decoded_pixel_cap);
+    var boundary_budget = ReadDecodedImageBudget.init(boundary, null);
+    try boundary_budget.addPixels(boundary.decoded_pixel_cap);
+    try std.testing.expectEqual(@as(usize, 4), boundary_budget.requiredUnits());
+    try std.testing.expectError(error.ImageBatchTooLarge, boundary_budget.addPixels(1));
+}
+
+test "remote and inline media reserve distinct resident peaks before download" {
+    const allocator = std.testing.allocator;
+    const remote_json =
+        \\[{"type":"image_url","image_url":{"url":"https://media.example/large.png"}}]
+    ;
+    var remote_input = try std.json.parseFromSlice(std.json.Value, allocator, remote_json, .{});
+    defer remote_input.deinit();
+    const remote_shape = denseEmbedRequestMediaShape(remote_input.value);
+    try std.testing.expectEqual(@as(usize, 1), remote_shape.image_count);
+    try std.testing.expect(remote_shape.has_remote);
+
+    const remote = requestMediaAdmissionForLimits(remote_shape, default_max_request_media_bytes, 32, null);
+    try std.testing.expectEqual(default_max_request_media_bytes, remote.byte_cap);
+    try std.testing.expectEqual(default_max_request_media_bytes, remote.resident_byte_cap);
+    try std.testing.expectEqual(@as(usize, 7), remote.units);
+
+    var queue = request_queue_mod.RequestQueue.init(32);
+    for (0..4) |_| try queue.acquireUnits(remote.units);
+    try std.testing.expectEqual(@as(usize, 28), queue.depth());
+    try std.testing.expectError(error.QueueFull, queue.acquireUnits(remote.units));
+    for (0..4) |_| queue.releaseUnits(remote.units);
+    try std.testing.expectEqual(@as(usize, 0), queue.depth());
+
+    const capacity_limited = requestMediaAdmissionForLimits(remote_shape, default_max_request_media_bytes, 1, null);
+    try std.testing.expectEqual(read_admission_bytes_per_unit, capacity_limited.byte_cap);
+    try std.testing.expectEqual(@as(usize, 1), capacity_limited.units);
+
+    const inline_json =
+        \\[{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]
+    ;
+    var inline_input = try std.json.parseFromSlice(std.json.Value, allocator, inline_json, .{});
+    defer inline_input.deinit();
+    const inline_shape = denseEmbedRequestMediaShape(inline_input.value);
+    const inline_admission = requestMediaAdmissionForLimits(inline_shape, default_max_request_media_bytes, 32, null);
+    try std.testing.expectEqual(@as(usize, "data:image/png;base64,AA==".len), inline_admission.byte_cap);
+    try std.testing.expectEqual(@as(usize, 2 * "data:image/png;base64,AA==".len), inline_admission.resident_byte_cap);
+    try std.testing.expectEqual(@as(usize, 1), inline_admission.units);
+}
+
+test "direct dense embed admission counts borrowed media once" {
+    const inline_url = "data:image/png;base64,AA==";
+    const parts = [_]Node.DirectDenseEmbedPart{
+        .{ .media = .{ .mime_type = "image/png", .data = "abc" } },
+        .{ .image_url = inline_url },
+        .{ .media = .{ .mime_type = "audio/wav", .data = "de" } },
+    };
+    const preflight = try directDenseEmbedPreflight(&parts);
+    try std.testing.expectEqual(@as(usize, 5), preflight.shape.borrowed_bytes);
+    try std.testing.expectEqual(@as(usize, inline_url.len), preflight.shape.inline_bytes);
+    try std.testing.expectEqual(@as(usize, 2), preflight.shape.image_count);
+    try std.testing.expect(preflight.has_audio);
+    try std.testing.expectEqual(@as(usize, 5 + inline_url.len), preflight.known_media_bytes);
+
+    const unlimited = requestMediaAdmissionForLimits(
+        preflight.shape,
+        default_max_request_media_bytes,
+        0,
+        null,
+    );
+    try std.testing.expectEqual(preflight.known_media_bytes, unlimited.byte_cap);
+    try std.testing.expectEqual(preflight.known_media_bytes + inline_url.len, unlimited.resident_byte_cap);
+
+    var borrowed_only: RequestMediaAdmissionShape = .{};
+    borrowed_only.addBorrowed(8 * 1024 * 1024, true);
+    const bounded = requestMediaAdmissionForLimits(borrowed_only, default_max_request_media_bytes, 1, null);
+    try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024), bounded.byte_cap);
+    try std.testing.expectEqual(bounded.byte_cap, bounded.resident_byte_cap);
+    try std.testing.expectEqual(@as(usize, 512 * 1024), bounded.decoded_pixel_cap);
+
+    var saturated: RequestMediaAdmissionShape = .{};
+    saturated.addBorrowed(std.math.maxInt(usize), false);
+    saturated.addInline(1, false);
+    try std.testing.expectEqual(
+        default_max_request_media_bytes,
+        saturated.potentialBytes(default_max_request_media_bytes),
+    );
+}
+
+test "direct dense embed parser borrows media and propagates allocator exhaustion" {
+    const backing_allocator = std.testing.allocator;
+    var raw_image = [_]u8{ 1, 2, 3 };
+    var raw_audio = [_]u8{ 4, 5 };
+    const parts = [_]Node.DirectDenseEmbedPart{
+        .{ .text = "caption" },
+        .{ .media = .{ .mime_type = "image/png", .data = &raw_image } },
+        .{ .media = .{ .mime_type = "audio/wav", .data = &raw_audio } },
+    };
+    var node: Node = undefined;
+    node.config = .{};
+    const manifest = manifest_mod.ModelManifest{
+        .allocator = backing_allocator,
+        .model_type = .embedder,
+        .visual_model_path = "visual.onnx",
+        .audio_model_path = "audio.onnx",
+    };
+
+    var budget = RequestMediaBudget.init(32);
+    var parsed = try parseDirectDenseEmbedInputs(&node, backing_allocator, &manifest, &parts, &budget);
+    try std.testing.expectEqual(@as(usize, 3), parsed.total_count);
+    try std.testing.expect(!parsed.images.items[0].owned);
+    try std.testing.expect(!parsed.audio.items[0].owned);
+    try std.testing.expectEqual(@intFromPtr(raw_image[0..].ptr), @intFromPtr(parsed.images.items[0].bytes.ptr));
+    try std.testing.expectEqual(@intFromPtr(raw_audio[0..].ptr), @intFromPtr(parsed.audio.items[0].bytes.ptr));
+    parsed.deinit(backing_allocator);
+    raw_image[0] = 9;
+    raw_audio[0] = 8;
+    try std.testing.expectEqual(@as(u8, 9), raw_image[0]);
+    try std.testing.expectEqual(@as(u8, 8), raw_audio[0]);
+
+    const Runner = struct {
+        fn run(
+            allocator: std.mem.Allocator,
+            target: *Node,
+            model_manifest: *const manifest_mod.ModelManifest,
+            direct_parts: []const Node.DirectDenseEmbedPart,
+        ) !void {
+            var local_budget = RequestMediaBudget.init(32);
+            var inputs = try parseDirectDenseEmbedInputs(
+                target,
+                allocator,
+                model_manifest,
+                direct_parts,
+                &local_budget,
+            );
+            defer inputs.deinit(allocator);
+        }
+    };
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(backing_allocator, .{
+            .fail_index = fail_index,
+            .resize_fail_index = 0,
+        });
+        Runner.run(failing.allocator(), &node, &manifest, &parts) catch |err| switch (err) {
+            error.OutOfMemory => {
+                try std.testing.expect(failing.has_induced_failure);
+                try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+                continue;
+            },
+            else => return err,
+        };
+        try std.testing.expect(!failing.has_induced_failure);
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        break;
+    }
+}
+
+test "direct dense embed precharges borrowed media independent of image url order" {
+    const allocator = std.testing.allocator;
+    const image_url = "data:image/png;base64,AQ==";
+    var raw = [_]u8{ 1, 2, 3 };
+    const url_first = [_]Node.DirectDenseEmbedPart{
+        .{ .image_url = image_url },
+        .{ .media = .{ .mime_type = "image/png", .data = &raw } },
+    };
+    const borrowed_first = [_]Node.DirectDenseEmbedPart{
+        .{ .media = .{ .mime_type = "image/png", .data = &raw } },
+        .{ .image_url = image_url },
+    };
+    var node: Node = undefined;
+    node.config = .{};
+    const manifest = manifest_mod.ModelManifest{
+        .allocator = allocator,
+        .model_type = .embedder,
+        .visual_model_path = "visual.onnx",
+    };
+    const exact_cap = raw.len + image_url.len;
+
+    for ([_][]const Node.DirectDenseEmbedPart{ &url_first, &borrowed_first }) |ordered| {
+        var budget = RequestMediaBudget.init(exact_cap);
+        resetRequestWorkTestCounters();
+        var parsed = try parseDirectDenseEmbedInputs(&node, allocator, &manifest, ordered, &budget);
+        defer parsed.deinit(allocator);
+        try std.testing.expectEqual(exact_cap, budget.used_bytes);
+        try std.testing.expectEqual(@as(usize, 1), request_work_test_counters.media_fetch_attempts);
+    }
+
+    for ([_][]const Node.DirectDenseEmbedPart{ &url_first, &borrowed_first }) |ordered| {
+        var budget = RequestMediaBudget.init(exact_cap - 1);
+        resetRequestWorkTestCounters();
+        try std.testing.expectError(
+            error.RemoteContentTooLarge,
+            parseDirectDenseEmbedInputs(&node, allocator, &manifest, ordered, &budget),
+        );
+        try std.testing.expectEqual(raw.len, budget.used_bytes);
+        try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.media_fetch_attempts);
+    }
+}
+
+test "direct dense embed rejects media and reserves audio before model work" {
+    const allocator = std.testing.allocator;
+    var oversized_node = try Node.init(allocator, .{
+        .models_dir = "missing-model-root",
+        .max_concurrent_requests = 1,
+        .content_security = .{ .max_download_size_bytes = 3 },
+    });
+    defer oversized_node.deinit();
+    const oversized = [_]Node.DirectDenseEmbedPart{.{ .media = .{
+        .mime_type = "image/png",
+        .data = "1234",
+    } }};
+    try std.testing.expectError(
+        error.RemoteContentTooLarge,
+        oversized_node.embedDensePartsDirect(allocator, "missing", &oversized),
+    );
+    try std.testing.expectEqual(@as(usize, 0), oversized_node.request_queue.depth());
+    try std.testing.expectEqual(@as(usize, 0), oversized_node.request_queue.requests());
+
+    const capacity_audio = try allocator.alloc(u8, read_admission_bytes_per_unit);
+    defer allocator.free(capacity_audio);
+    var tiny_node = try Node.init(allocator, .{
+        .models_dir = "missing-model-root",
+        .max_concurrent_requests = 1,
+    });
+    defer tiny_node.deinit();
+    const no_working_room = [_]Node.DirectDenseEmbedPart{.{ .media = .{
+        .mime_type = "audio/wav",
+        .data = capacity_audio,
+    } }};
+    resetRequestWorkTestCounters();
+    try std.testing.expectError(
+        error.AudioTooLarge,
+        tiny_node.embedDensePartsDirect(allocator, "missing", &no_working_room),
+    );
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_load_attempts);
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.media_fetch_attempts);
+    try std.testing.expectEqual(@as(usize, 0), tiny_node.request_queue.depth());
+    try std.testing.expectEqual(@as(usize, 0), tiny_node.request_queue.requests());
+
+    var reserve_node = try Node.init(allocator, .{
+        .models_dir = "missing-model-root",
+        .max_concurrent_requests = 8,
+    });
+    defer reserve_node.deinit();
+    try reserve_node.request_queue.acquire();
+    const small_audio = [_]Node.DirectDenseEmbedPart{.{ .media = .{
+        .mime_type = "audio/wav",
+        .data = "x",
+    } }};
+    try std.testing.expectError(
+        error.QueueFull,
+        reserve_node.embedDensePartsDirect(allocator, "missing", &small_audio),
+    );
+    try std.testing.expectEqual(@as(usize, 1), reserve_node.request_queue.depth());
+    try std.testing.expectEqual(@as(usize, 1), reserve_node.request_queue.requests());
+    reserve_node.request_queue.release();
+    try std.testing.expectEqual(@as(usize, 0), reserve_node.request_queue.depth());
+    try std.testing.expectEqual(@as(usize, 0), reserve_node.request_queue.requests());
+}
+
+test "direct dense embed rejects borrowed image expansion before model loading" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "models/embedders/owner/embed");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "models/embedders/owner/embed/config.json",
+        .data = "{}",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "models/embedders/owner/embed/model_manifest.json",
+        .data = "{\"type\":\"embedder\",\"inputs\":[\"image\"]}",
+    });
+    const models_root = try tmp.dir.realPathFileAlloc(std.testing.io, "models", allocator);
+    defer allocator.free(models_root);
+
+    var png = [_]u8{0} ** 24;
+    const signature = [_]u8{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' };
+    @memcpy(png[0..8], &signature);
+    std.mem.writeInt(u32, png[16..20], 800, .big);
+    std.mem.writeInt(u32, png[20..24], 800, .big);
+    const parts = [_]Node.DirectDenseEmbedPart{
+        .{ .media = .{ .mime_type = "image/png", .data = &png } },
+        .{ .media = .{ .mime_type = "image/png", .data = &png } },
+    };
+
+    var node = try Node.init(allocator, .{ .models_dir = models_root, .max_concurrent_requests = 1 });
+    defer node.deinit();
+    resetRequestWorkTestCounters();
+    try std.testing.expectError(
+        error.ImageBatchTooLarge,
+        node.embedDensePartsDirect(allocator, "owner/embed", &parts),
+    );
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_load_attempts);
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.media_fetch_attempts);
+    try std.testing.expectEqual(@as(usize, 0), node.request_queue.depth());
+    try std.testing.expectEqual(@as(usize, 0), node.request_queue.requests());
+}
+
+test "read decoded image budget rejects aggregate expansion and overflow" {
+    const admission = ReadRequestAdmission{ .units = 1, .byte_cap = 1024, .resident_byte_cap = 1024, .decoded_pixel_cap = 4 };
+    var budget = ReadDecodedImageBudget.init(admission, 2);
+
+    var png = [_]u8{0} ** 24;
+    const signature = [_]u8{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' };
+    @memcpy(png[0..8], &signature);
+    std.mem.writeInt(u32, png[16..20], 2, .big);
+    std.mem.writeInt(u32, png[20..24], 2, .big);
+    try budget.addImage(&png);
+    try std.testing.expectError(error.ImageBatchTooLarge, budget.addImage(&png));
+
+    budget.used_pixels = std.math.maxInt(usize);
+    budget.max_pixels = std.math.maxInt(usize);
+    try std.testing.expectError(error.ImageBatchTooLarge, budget.addPixels(1));
+    try std.testing.expect(budget.requiredUnits() > 0);
+
+    var count_weighted = ReadDecodedImageBudget.init(.{ .units = 7, .byte_cap = 1024, .resident_byte_cap = 1024, .decoded_pixel_cap = 8 }, null);
+    try count_weighted.addPixels(1);
+    try std.testing.expectEqual(@as(usize, 7), count_weighted.requiredUnits());
+
+    const pixels_per_unit = read_admission_bytes_per_unit / read_decoded_working_bytes_per_pixel;
+    var additive = ReadDecodedImageBudget.init(.{
+        .units = 7,
+        .byte_cap = 7 * read_admission_bytes_per_unit,
+        .resident_byte_cap = 7 * read_admission_bytes_per_unit,
+        .decoded_pixel_cap = pixels_per_unit + 1,
+    }, null);
+    try additive.addPixels(pixels_per_unit + 1);
+    try std.testing.expectEqual(@as(usize, 9), additive.requiredUnits());
+
+    var saturated = ReadDecodedImageBudget.init(.{
+        .units = std.math.maxInt(usize),
+        .byte_cap = std.math.maxInt(usize),
+        .resident_byte_cap = std.math.maxInt(usize),
+        .decoded_pixel_cap = pixels_per_unit + 1,
+    }, null);
+    try saturated.addPixels(pixels_per_unit + 1);
+    try std.testing.expectEqual(std.math.maxInt(usize), saturated.requiredUnits());
+}
+
+test "accepted multimodal routes reject tiny high-pixel batches before model loading" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const model_dirs = [_][]const u8{
+        "models/generators/owner/generate",
+        "models/embedders/owner/embed",
+        "models/rerankers/owner/rerank",
+    };
+    for (model_dirs) |dir| {
+        try tmp.dir.createDirPath(std.testing.io, dir);
+        const config_path = try std.fs.path.join(allocator, &.{ dir, "config.json" });
+        defer allocator.free(config_path);
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = config_path, .data = "{}" });
+    }
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "models/embedders/owner/embed/model_manifest.json",
+        .data = "{\"type\":\"embedder\",\"inputs\":[\"image\"]}",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "models/rerankers/owner/rerank/model_manifest.json",
+        .data = "{\"type\":\"reranker\",\"capabilities\":[\"colqwen\"],\"inputs\":[\"text\",\"image\"]}",
+    });
+    const models_root = try tmp.dir.realPathFileAlloc(std.testing.io, "models", allocator);
+    defer allocator.free(models_root);
+
+    // Two 24-byte PNG headers each declare a modest 800x800 canvas. They fit
+    // the encoded-media ceiling but together exceed one 16 MiB admission unit.
+    var png = [_]u8{0} ** 24;
+    const signature = [_]u8{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' };
+    @memcpy(png[0..8], &signature);
+    std.mem.writeInt(u32, png[16..20], 800, .big);
+    std.mem.writeInt(u32, png[20..24], 800, .big);
+    const encoded = try allocator.alloc(u8, std.base64.standard.Encoder.calcSize(png.len));
+    defer allocator.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, &png);
+    const image_parts = try std.fmt.allocPrint(
+        allocator,
+        "[{{\"type\":\"image_url\",\"image_url\":{{\"url\":\"data:image/png;base64,{s}\"}}}},{{\"type\":\"image_url\",\"image_url\":{{\"url\":\"data:image/png;base64,{s}\"}}}}]",
+        .{ encoded, encoded },
+    );
+    defer allocator.free(image_parts);
+
+    var node = try Node.init(allocator, .{ .models_dir = models_root, .max_concurrent_requests = 1 });
+    defer node.deinit();
+
+    {
+        const body = try std.fmt.allocPrint(allocator, "{{\"model\":\"owner/generate\",\"messages\":[{{\"role\":\"user\",\"content\":{s}}}]}}", .{image_parts});
+        defer allocator.free(body);
+        var request = try httpx.Request.init(allocator, .POST, "/ai/v1/generate");
+        defer request.deinit();
+        try request.setJson(body);
+        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try node.generateContent(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 413), response.status.code);
+        try std.testing.expect(std.mem.indexOf(u8, response.body.?, "IMAGE_BATCH_TOO_LARGE") != null);
+    }
+
+    const embed_body = try std.fmt.allocPrint(allocator, "{{\"model\":\"owner/embed\",\"input\":{s}}}", .{image_parts});
+    defer allocator.free(embed_body);
+    {
+        var request = try httpx.Request.init(allocator, .POST, "/ai/v1/embeddings");
+        defer request.deinit();
+        try request.setJson(embed_body);
+        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try node.createEmbedding(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 413), response.status.code);
+        try std.testing.expect(std.mem.indexOf(u8, response.body.?, "IMAGE_BATCH_TOO_LARGE") != null);
+    }
+
+    {
+        const per_item_body = try std.fmt.allocPrint(allocator, "{{\"model\":\"owner/embed\",\"error_policy\":\"per_item\",\"input\":{s}}}", .{image_parts});
+        defer allocator.free(per_item_body);
+        var request = try httpx.Request.init(allocator, .POST, "/ai/v1/embeddings");
+        defer request.deinit();
+        try request.setJson(per_item_body);
+        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try node.createEmbedding(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 413), response.status.code);
+        try std.testing.expect(std.mem.indexOf(u8, response.body.?, "IMAGE_BATCH_TOO_LARGE") != null);
+    }
+
+    {
+        const body = try std.fmt.allocPrint(allocator, "{{\"model\":\"owner/rerank\",\"query\":\"q\",\"documents\":[{{\"content\":{s}}}]}}", .{image_parts});
+        defer allocator.free(body);
+        var request = try httpx.Request.init(allocator, .POST, "/ai/v1/rerank_multimodal");
+        defer request.deinit();
+        try request.setJson(body);
+        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try node.rerankMultimodalPrompts(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 413), response.status.code);
+        try std.testing.expect(std.mem.indexOf(u8, response.body.?, "IMAGE_BATCH_TOO_LARGE") != null);
+    }
+
+    var parsed_input = try std.json.parseFromSlice(std.json.Value, allocator, image_parts, .{});
+    defer parsed_input.deinit();
+    try std.testing.expectError(
+        error.ImageBatchTooLarge,
+        node.embedDenseJsonInputDirect(allocator, "owner/embed", parsed_input.value),
+    );
+    try std.testing.expectEqual(@as(usize, 0), node.request_queue.depth());
+}
+
+test "sparse embed validates text-only input before model loading" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "models/embedders/owner/sparse");
+    // The lightweight manifest is sufficient for request validation. A full
+    // load from this deliberately incomplete model directory would return 500.
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "models/embedders/owner/sparse/config.json",
+        .data = "{}",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "models/embedders/owner/sparse/model_manifest.json",
+        .data = "{\"type\":\"embedder\",\"capabilities\":[\"sparse\"],\"inputs\":[\"text\"]}",
+    });
+    const models_root = try tmp.dir.realPathFileAlloc(std.testing.io, "models", allocator);
+    defer allocator.free(models_root);
+
+    var node = try Node.init(allocator, .{ .models_dir = models_root, .max_concurrent_requests = 1 });
+    defer node.deinit();
+    resetRequestWorkTestCounters();
+    var request = try httpx.Request.init(allocator, .POST, "/ai/v1/embeddings");
+    defer request.deinit();
+    try request.setJson(
+        "{\"model\":\"owner/sparse\",\"input\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,AA==\"}}]}",
+    );
+    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    defer ctx.deinit();
+
+    var response = try node.createEmbedding(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 400), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "sparse models only support text input") != null);
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_load_attempts);
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.media_fetch_attempts);
+    try std.testing.expectEqual(@as(usize, 0), node.request_queue.depth());
+}
+
+test "multimodal rerank rejects incompatible manifest before media or model loading" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "models/rerankers/owner/text-only");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "models/rerankers/owner/text-only/config.json",
+        .data = "{}",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "models/rerankers/owner/text-only/model_manifest.json",
+        .data = "{\"type\":\"reranker\",\"inputs\":[\"text\"]}",
+    });
+    const models_root = try tmp.dir.realPathFileAlloc(std.testing.io, "models", allocator);
+    defer allocator.free(models_root);
+
+    var node = try Node.init(allocator, .{ .models_dir = models_root, .max_concurrent_requests = 1 });
+    defer node.deinit();
+    resetRequestWorkTestCounters();
+    var request = try httpx.Request.init(allocator, .POST, "/ai/v1/rerank_multimodal");
+    defer request.deinit();
+    // The default deny-all policy makes this deterministic and network-free:
+    // reaching media materialization would increment the attempt counter and
+    // return a content-policy error instead of MODEL_NOT_SUPPORTED.
+    try request.setJson(
+        "{\"model\":\"owner/text-only\",\"query\":\"q\",\"documents\":[{\"content\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"https://example.invalid/x\"}}]}]}",
+    );
+    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    defer ctx.deinit();
+
+    var response = try node.rerankMultimodalPrompts(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 400), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "MODEL_NOT_SUPPORTED") != null);
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_load_attempts);
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.media_fetch_attempts);
+    try std.testing.expectEqual(@as(usize, 0), node.request_queue.depth());
+}
+
+test "read weighted admission rejects before model resolution or download" {
+    const allocator = std.testing.allocator;
+    var node = try Node.init(allocator, .{ .max_concurrent_requests = 8 });
+    defer node.deinit();
+    try node.request_queue.acquire();
+    defer node.request_queue.release();
+
+    var body = std.ArrayListUnmanaged(u8).empty;
+    defer body.deinit(allocator);
+    try body.appendSlice(allocator, "{\"model\":\"missing\",\"images\":[");
+    for (0..max_read_batch_images) |idx| {
+        if (idx != 0) try body.append(allocator, ',');
+        try body.appendSlice(allocator, "{\"url\":\"data:image/png;base64,%%%\"}");
+    }
+    try body.appendSlice(allocator, "]}");
+
+    var request = try httpx.Request.init(allocator, .POST, "/ai/v1/read");
+    defer request.deinit();
+    try request.setJson(body.items);
+    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    defer ctx.deinit();
+
+    var response = try node.readImages(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 503), response.status.code);
+    try std.testing.expectEqualStrings("1", response.headers.get("Retry-After").?);
+}
+
+test "transcribe validates encoded audio before model resolution and releases admission" {
+    const allocator = std.testing.allocator;
+    var node = try Node.init(allocator, .{
+        .max_concurrent_requests = 1,
+        .content_security = .{ .max_download_size_bytes = 3 },
+    });
+    defer node.deinit();
+
+    resetRequestWorkTestCounters();
+    var request = try httpx.Request.init(allocator, .POST, "/ai/v1/transcribe");
+    defer request.deinit();
+    try request.setJson("{\"model\":\"missing\",\"audio\":\"YQ==\"}");
+    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    defer ctx.deinit();
+
+    var response = try node.transcribeAudio(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 413), response.status.code);
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_resolution_attempts);
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_load_attempts);
+    try std.testing.expectEqual(@as(usize, 0), node.request_queue.depth());
+    try std.testing.expectEqual(@as(usize, 0), node.request_queue.requests());
+}
+
+test "transcribe bounded-decodes corrupt and metadata-amplified audio before model resolution" {
+    const allocator = std.testing.allocator;
+    var node = try Node.init(allocator, .{ .max_concurrent_requests = 1 });
+    defer node.deinit();
+
+    const malformed_wav = "RIFFxxxxWAVE";
+    const oversized_caf_packet_table = [_]u8{
+        'c',  'a',  'f',  'f',  0x00, 0x01, 0x00, 0x00,
+        'p',  'a',  'k',  't',  0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x4c, 0x4b, 0x40, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+    };
+    const cases = [_]struct {
+        bytes: []const u8,
+        expected_status: u16,
+        expected_code: []const u8,
+    }{
+        .{ .bytes = malformed_wav, .expected_status = 400, .expected_code = "UNSUPPORTED" },
+        .{ .bytes = &oversized_caf_packet_table, .expected_status = 413, .expected_code = "AUDIO_TOO_LARGE" },
+    };
+
+    for (cases) |case| {
+        resetRequestWorkTestCounters();
+        const encoded = try allocator.alloc(u8, std.base64.standard.Encoder.calcSize(case.bytes.len));
+        defer allocator.free(encoded);
+        _ = std.base64.standard.Encoder.encode(encoded, case.bytes);
+        const body = try std.fmt.allocPrint(allocator, "{{\"model\":\"missing\",\"audio\":\"{s}\"}}", .{encoded});
+        defer allocator.free(body);
+
+        var request = try httpx.Request.init(allocator, .POST, "/ai/v1/transcribe");
+        defer request.deinit();
+        try request.setJson(body);
+        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        defer ctx.deinit();
+
+        var response = try node.transcribeAudio(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(case.expected_status, response.status.code);
+        try std.testing.expect(std.mem.indexOf(u8, response.body.?, case.expected_code) != null);
+        try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_resolution_attempts);
+        try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_load_attempts);
+        try std.testing.expectEqual(@as(usize, 0), node.request_queue.depth());
+        try std.testing.expectEqual(@as(usize, 0), node.request_queue.requests());
+    }
+}
+
+test "direct extraction media shape reserves remote and cumulative inline sources" {
+    const allocator = std.testing.allocator;
+    var remote_shape: RequestMediaAdmissionShape = .{};
+    try addDirectExtractionContentMediaShape(
+        allocator,
+        &remote_shape,
+        "[{\"type\":\"image_url\",\"image_url\":{\"url\":\"https://example.invalid/image.png\"}}]",
+    );
+    try std.testing.expect(remote_shape.has_remote);
+    try std.testing.expectEqual(@as(usize, 1), remote_shape.image_count);
+    const remote_admission = requestMediaAdmissionForLimits(remote_shape, default_max_request_media_bytes, 32, null);
+    try std.testing.expectEqual(default_max_request_media_bytes, remote_admission.byte_cap);
+    try std.testing.expectEqual(@as(usize, 7), remote_admission.units);
+
+    const data_uri = "data:image/png;base64,YQ==";
+    var inline_shape: RequestMediaAdmissionShape = .{};
+    try addDirectExtractionContentMediaShape(
+        allocator,
+        &inline_shape,
+        "[{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,YQ==\"}},{\"type\":\"media\",\"data\":\"Yg==\"}]",
+    );
+    try std.testing.expect(!inline_shape.has_remote);
+    try std.testing.expectEqual(@as(usize, 2), inline_shape.image_count);
+    try std.testing.expectEqual(data_uri.len + "Yg==".len, inline_shape.inline_bytes);
+    const inline_admission = requestMediaAdmissionForLimits(inline_shape, default_max_request_media_bytes, 32, null);
+    try std.testing.expectEqual(inline_shape.inline_bytes, inline_admission.byte_cap);
+    try std.testing.expectEqual(2 * inline_shape.inline_bytes, inline_admission.resident_byte_cap);
+    try std.testing.expectEqual(@as(usize, 1), inline_admission.units);
+
+    var text_shape: RequestMediaAdmissionShape = .{};
+    try addDirectExtractionContentMediaShape(allocator, &text_shape, "\"text only\"");
+    const text_admission = requestMediaAdmissionForLimits(text_shape, default_max_request_media_bytes, 32, null);
+    try std.testing.expectEqual(@as(usize, 0), text_admission.byte_cap);
+    try std.testing.expectEqual(@as(usize, 1), text_admission.units);
+
+    try std.testing.expectError(error.UnexpectedEndOfInput, addDirectExtractionContentMediaShape(allocator, &text_shape, "{"));
+}
+
+test "read image preflight maps malformed dimension and aggregate errors before model load" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "models/owner/model");
+    // Enough for path resolution; reaching model load would fail this test with 500.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "models/owner/model/config.json", .data = "{}" });
+    const models_root = try tmp.dir.realPathFileAlloc(std.testing.io, "models", allocator);
+    defer allocator.free(models_root);
+
+    var node = try Node.init(allocator, .{ .models_dir = models_root, .max_concurrent_requests = 1 });
+    defer node.deinit();
+
+    {
+        var request = try httpx.Request.init(allocator, .POST, "/ai/v1/read");
+        defer request.deinit();
+        try request.setJson("{\"model\":\"owner/model\",\"images\":[{\"url\":\"data:image/png;base64,bm90LWFuLWltYWdl\"}]}");
+        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try node.readImages(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 400), response.status.code);
+    }
+
+    var png = [_]u8{0} ** 24;
+    const signature = [_]u8{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' };
+    @memcpy(png[0..8], &signature);
+    std.mem.writeInt(u32, png[16..20], 2, .big);
+    std.mem.writeInt(u32, png[20..24], 2, .big);
+    const encoded = try allocator.alloc(u8, std.base64.standard.Encoder.calcSize(png.len));
+    defer allocator.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, &png);
+    const body = try std.fmt.allocPrint(allocator, "{{\"model\":\"owner/model\",\"images\":[{{\"url\":\"data:image/png;base64,{s}\"}}]}}", .{encoded});
+    defer allocator.free(body);
+
+    node.config.content_security = .{ .max_image_dimension = 1 };
+    {
+        var request = try httpx.Request.init(allocator, .POST, "/ai/v1/read");
+        defer request.deinit();
+        try request.setJson(body);
+        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try node.readImages(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 413), response.status.code);
+    }
+
+    node.config.content_security = null;
+    std.mem.writeInt(u32, png[16..20], 1025, .big);
+    std.mem.writeInt(u32, png[20..24], 1025, .big);
+    _ = std.base64.standard.Encoder.encode(encoded, &png);
+    const aggregate_body = try std.fmt.allocPrint(allocator, "{{\"model\":\"owner/model\",\"images\":[{{\"url\":\"data:image/png;base64,{s}\"}}]}}", .{encoded});
+    defer allocator.free(aggregate_body);
+    {
+        var request = try httpx.Request.init(allocator, .POST, "/ai/v1/read");
+        defer request.deinit();
+        try request.setJson(aggregate_body);
+        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try node.readImages(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 413), response.status.code);
+    }
+    try std.testing.expectEqual(@as(usize, 0), node.request_queue.depth());
+}
+
+test "extraction image downloads transfer ownership and clean up aggregate failures" {
+    const allocator = std.testing.allocator;
+    var node: Node = undefined;
+    node.config = .{};
+    var request = try httpx.Request.init(allocator, .GET, "/");
+    defer request.deinit();
+    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    defer ctx.deinit();
+    const images = [_]api.ImageURL{
+        .{ .url = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==" },
+        .{ .url = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==" },
+    };
+
+    const admission = ReadRequestAdmission{ .units = 1, .byte_cap = 128, .resident_byte_cap = 128, .decoded_pixel_cap = 2 };
+    var budget = ReadDecodedImageBudget.init(admission, null);
+    const downloaded = try node.downloadImagesForExtraction(&ctx, &images, admission.byte_cap, &budget);
+    defer {
+        for (downloaded) |data| allocator.free(data);
+        allocator.free(downloaded);
+    }
+    try std.testing.expectEqual(@as(usize, 1), (try image_pipeline.inspectEncodedForInference(downloaded[0], null)).width);
+    try std.testing.expectEqual(@as(usize, 2), budget.used_pixels);
+
+    var small_budget = ReadDecodedImageBudget.init(admission, null);
+    try std.testing.expectError(
+        error.ReadBatchTooLarge,
+        node.downloadImagesForExtraction(&ctx, &images, 80, &small_budget),
+    );
+}
+
 test "read max tokens preserves omission and rejects unsafe signed values" {
     try std.testing.expectEqual(@as(?usize, null), try validateReadMaxTokens(null));
     try std.testing.expectEqual(@as(?usize, 1), try validateReadMaxTokens(1));
@@ -8832,6 +13258,93 @@ test "read queue units scale with image batch and decode length" {
     try std.testing.expectEqual(@as(usize, 4), estimateReadQueueUnits(4, null));
     try std.testing.expectEqual(@as(usize, 8), estimateReadQueueUnits(4, default_read_queue_max_tokens + 1));
     try std.testing.expectEqual(@as(usize, 16), estimateReadQueueUnits(4, max_read_tokens));
+}
+
+test "direct extraction validates read max tokens" {
+    var valid = try parseExtractionOptionsJson(std.testing.allocator, "{\"max_tokens\":1024}");
+    defer valid.deinit();
+    try std.testing.expectEqual(@as(?usize, max_read_tokens), valid.max_tokens);
+    try std.testing.expectError(
+        error.InvalidMaxTokens,
+        parseExtractionOptionsJson(std.testing.allocator, "{\"max_tokens\":-1}"),
+    );
+    try std.testing.expectError(
+        error.InvalidMaxTokens,
+        parseExtractionOptionsJson(std.testing.allocator, "{\"max_tokens\":1025}"),
+    );
+}
+
+test "direct extraction content shares aggregate budget across downloaded and inline media" {
+    const allocator = std.testing.allocator;
+    var node: Node = undefined;
+    const first_uri = "data:image/png;base64,YWJj";
+    node.config = .{ .content_security = .{ .max_download_size_bytes = first_uri.len + 1 } };
+    var out = DirectExtractionInputs{ .allocator = allocator };
+    defer out.deinit();
+    var media_budget = RequestMediaBudget.init(requestMediaMaxBytes(&node));
+
+    try appendDirectExtractionContent(
+        &node,
+        allocator,
+        &out,
+        "[{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,YWJj\"}}]",
+        &media_budget,
+    );
+    try std.testing.expectEqual(first_uri.len, media_budget.used_bytes);
+    try std.testing.expectError(
+        error.RemoteContentTooLarge,
+        appendDirectExtractionContent(
+            &node,
+            allocator,
+            &out,
+            "[{\"type\":\"media\",\"data\":\"ZGVm\"}]",
+            &media_budget,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 1), out.images.items.len);
+}
+
+test "direct extraction content releases temporary ownership on every allocation failure" {
+    const backing_allocator = std.testing.allocator;
+    var node: Node = undefined;
+    node.config = .{};
+
+    const Runner = struct {
+        fn run(allocator: std.mem.Allocator, target: *Node) !void {
+            var out = DirectExtractionInputs{ .allocator = allocator };
+            defer out.deinit();
+            var budget = RequestMediaBudget.init(32);
+            try appendDirectExtractionContent(target, allocator, &out, "\"plain\"", &budget);
+            try appendDirectExtractionContent(
+                target,
+                allocator,
+                &out,
+                "[{\"type\":\"text\",\"text\":\"first\"},{\"type\":\"text\",\"text\":\"second\"}]",
+                &budget,
+            );
+            try appendDirectExtractionContent(target, allocator, &out, "42", &budget);
+            try std.testing.expectEqual(@as(usize, 3), out.texts.items.len);
+        }
+    };
+
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(backing_allocator, .{
+            .fail_index = fail_index,
+            .resize_fail_index = 0,
+        });
+        Runner.run(failing.allocator(), &node) catch |err| switch (err) {
+            error.OutOfMemory => {
+                try std.testing.expect(failing.has_induced_failure);
+                try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+                continue;
+            },
+            else => return err,
+        };
+        try std.testing.expect(!failing.has_induced_failure);
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        break;
+    }
 }
 
 test "fail-fast embedding capacity response exposes retry contract" {
@@ -9088,6 +13601,22 @@ test "root operational routes stay outside inference API prefix" {
     try std.testing.expect(!server.hasRoute(.get, public_api_prefix ++ "/readyz"));
 }
 
+test "internal error response hides implementation error names" {
+    const allocator = std.testing.allocator;
+    var request = try httpx.Request.init(allocator, .GET, "/ai/v1/models");
+    defer request.deinit();
+    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    defer ctx.deinit();
+
+    var response = try internalErrorResponse(&ctx, "MODEL_LOAD_FAILED", error.SecretModelFilesystemFailure);
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(u16, 500), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"error\":\"MODEL_LOAD_FAILED\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, internal_error_message) != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "SecretModelFilesystemFailure") == null);
+}
+
 test "registerRoutesOn supports alternate prefixes through the shared router" {
     var node = try Node.init(std.testing.allocator, .{});
     defer node.deinit();
@@ -9127,6 +13656,76 @@ test "budget overrides apply selectively" {
     try std.testing.expectEqual(@as(usize, 600), applied.scratch_limit_bytes);
 }
 
+test "generation batching keeps the experimental CUDA envelope default-off" {
+    const config = GenerationBatchingConfig{};
+    try std.testing.expectEqual(GenerationBatchingMode.off, config.mode);
+    try std.testing.expect(!(GenerationBatchingConfig{ .mode = .auto }).enabledForRequest(.cuda, false, false, false));
+
+    const policy = config.schedulerPolicy();
+    try std.testing.expectEqual(@as(usize, 2), policy.max_step_items);
+    try std.testing.expectEqual(@as(?usize, 2), policy.max_active_requests_for_batching);
+    try std.testing.expectEqual(@as(u32, 0), policy.max_decode_wait_us);
+    try std.testing.expectEqual(@as(usize, 2048), policy.max_idle_prefill_chunk_size);
+
+    const enabled_policy = (GenerationBatchingConfig{ .mode = .on }).schedulerPolicy();
+    try std.testing.expectEqual(@as(u32, 1_000), enabled_policy.max_decode_wait_us);
+
+    const clamped = (GenerationBatchingConfig{ .max_step_items = 128 }).schedulerPolicy();
+    try std.testing.expectEqual(@as(usize, 2), clamped.max_step_items);
+    try std.testing.expectEqual(
+        @as(usize, 32),
+        (GenerationBatchingConfig{ .max_idle_prefill_chunk_size = 1 }).schedulerPolicy().max_idle_prefill_chunk_size,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 2048),
+        (GenerationBatchingConfig{ .max_idle_prefill_chunk_size = 4096 }).schedulerPolicy().max_idle_prefill_chunk_size,
+    );
+}
+
+test "native generation applies scheduler policy before the first lease" {
+    var node = try Node.init(std.testing.allocator, .{
+        .generation_batching = .{ .mode = .on, .max_step_items = 128 },
+    });
+    defer node.deinit();
+
+    var coordinator = runtime.scheduler.native_generate.NativeGenerateCoordinator.init(std.testing.allocator);
+    defer coordinator.deinit();
+    const leases = [_]runtime.scheduler.native_generate.Lease{
+        try node.acquireNativeGenerateLease(&coordinator, .{ .requested_units = 1, .prompt_bytes = 8, .max_tokens = 8 }),
+        try node.acquireNativeGenerateLease(&coordinator, .{ .requested_units = 1, .prompt_bytes = 8, .max_tokens = 8 }),
+        try node.acquireNativeGenerateLease(&coordinator, .{ .requested_units = 1, .prompt_bytes = 8, .max_tokens = 8 }),
+    };
+    defer for (leases) |lease| coordinator.release(lease);
+
+    try std.testing.expectEqual(@as(usize, 3), leases[2].active_requests_snapshot);
+    try std.testing.expectEqual(@as(usize, 1), coordinator.defaultStepBudget().max_items);
+}
+
+test "generation batching treats every requested CUDA graph replay mode as serialized" {
+    try std.testing.expect(!cudaDecodeGraphReplayRequested(null));
+    inline for (.{ "off", "0", "false", "no" }) |value| {
+        try std.testing.expect(!cudaDecodeGraphReplayRequested(value));
+    }
+    inline for (.{ "auto", "required", "on", "1", "true", "yes", "unknown", "" }) |value| {
+        try std.testing.expect(cudaDecodeGraphReplayRequested(value));
+    }
+}
+
+test "generation batching serializes request paths outside the row scheduler" {
+    const config = GenerationBatchingConfig{ .mode = .on };
+    try std.testing.expect(config.enabledForRequest(.cuda, false, false, false));
+    try std.testing.expect(!config.enabledForRequest(.cuda, true, false, false));
+    try std.testing.expect(!config.enabledForRequest(.cuda, false, true, false));
+    try std.testing.expect(!config.enabledForRequest(.cuda, false, false, true));
+    try std.testing.expect(!config.enabledForRequest(.metal, false, false, false));
+}
+
+test "prompt cache stays disabled while CUDA continuous batching releases the model lock" {
+    try std.testing.expect(promptCacheEligibleForNativeRequest(true, false, .cuda, false, false, false));
+    try std.testing.expect(!promptCacheEligibleForNativeRequest(true, true, .cuda, false, false, false));
+    try std.testing.expect(!promptCacheEligibleForNativeRequest(true, false, .metal, true, false, false));
+}
+
 test "taskMatchesModelListing exposes extraction-capable models only as extractors" {
     try std.testing.expect(taskMatchesModelListing("extractors", "extractor", "", &.{}, &.{}));
     try std.testing.expect(taskMatchesModelListing("extractors", "recognizer", "", &.{}, &.{"extraction"}));
@@ -9164,15 +13763,24 @@ test "generate backend selection keeps compiled mode explicit" {
     try std.testing.expect(auto_compiled.graph_mode_requested);
 
     const auto_default = try parseGenerateBackendSelection(null, null, null);
-    try std.testing.expectEqual(build_options.enable_metal, shouldAutoUseMetalWholeModelGenerate(.metal, true, false, auto_default));
-    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.native, true, false, auto_default));
-    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, false, false, auto_default));
-    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, true, auto_default));
+    try std.testing.expectEqual(build_options.enable_metal, shouldAutoUseMetalWholeModelGenerate(.metal, true, false, false, auto_default));
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.native, true, false, false, auto_default));
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, false, false, false, auto_default));
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, true, false, auto_default));
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, true, auto_default));
+    try validatePromptCacheExecutionMode(true, auto_default);
+
+    const explicit_compiled = try parseGenerateBackendSelection(null, "compiled", null);
+    try std.testing.expectError(
+        error.PromptCacheCompiledModeUnsupported,
+        validatePromptCacheExecutionMode(true, explicit_compiled),
+    );
+    try validatePromptCacheExecutionMode(false, explicit_compiled);
 
     if (build_options.enable_metal) {
         const metal_eager = try parseGenerateBackendSelection(.metal, "eager", null);
         try std.testing.expect(metal_eager.eager_mode_requested);
-        try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, metal_eager));
+        try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, false, metal_eager));
     } else {
         try std.testing.expectError(
             error.BackendUnavailable,
@@ -9186,6 +13794,142 @@ test "generate backend selection keeps compiled mode explicit" {
 
 test "singleBackendPreference is strict" {
     try std.testing.expectEqualSlices(backends_mod.BackendType, &.{.metal}, singleBackendPreference(.metal));
+}
+
+test "HTTP model identifiers reject path and malformed variant syntax" {
+    for ([_][]const u8{
+        "model",
+        "owner/model",
+        "model:q4_0",
+        "owner/model:q4_0",
+        "hf:owner/model",
+        "hf:owner/model:q4_0",
+        "owner/model:gguf:Q4_K_M",
+    }) |identifier| try validateRequestModelIdentifier(identifier);
+
+    for ([_][]const u8{
+        "",
+        "/tmp/model",
+        ".",
+        "..",
+        "../model",
+        "owner/../model",
+        "owner//model",
+        "owner/model/",
+        "owner\\model",
+        "owner/model:",
+        "owner/model:q4::extra",
+        "hf:",
+        "hf:/model",
+        "owner\x00/model",
+    }) |identifier| try std.testing.expectError(error.InvalidModelIdentifier, validateRequestModelIdentifier(identifier));
+
+    try std.testing.expectEqual(RequestModelResolutionErrorKind.invalid, requestModelResolutionErrorKind(error.InvalidModelIdentifier));
+    try std.testing.expectEqual(RequestModelResolutionErrorKind.missing, requestModelResolutionErrorKind(error.ModelNotFound));
+}
+
+test "HTTP model resolution is canonical and contained while trusted resolution accepts absolute paths" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "models/owner/model");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "models/owner/model/config.json", .data = "{}" });
+    const models_root = try tmp.dir.realPathFileAlloc(std.testing.io, "models", alloc);
+    defer alloc.free(models_root);
+    const model_root = try tmp.dir.realPathFileAlloc(std.testing.io, "models/owner/model", alloc);
+    defer alloc.free(model_root);
+    const explicit_ref = try registry_mod.ModelRef.parse("owner/model:gguf:Q4_K_M");
+    const explicit_variant_root = try registry_mod.modelInstallDirAlloc(alloc, models_root, explicit_ref);
+    defer alloc.free(explicit_variant_root);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, explicit_variant_root);
+    const explicit_variant_config = try std.fs.path.join(alloc, &.{ explicit_variant_root, "config.json" });
+    defer alloc.free(explicit_variant_config);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = explicit_variant_config, .data = "{}" });
+
+    var node: Node = undefined;
+    node.config = .{ .models_dir = models_root };
+    node.allocator = alloc;
+    var request_arena = std.heap.ArenaAllocator.init(alloc);
+    defer request_arena.deinit();
+    const request_allocator = request_arena.allocator();
+
+    const resolved = try node.resolveRequestModelPath(request_allocator, std.testing.io, "hf:owner/model:q4_0", "generators");
+    defer request_allocator.free(resolved);
+    try std.testing.expectEqualStrings(model_root, resolved);
+    const explicit_resolved = try node.resolveRequestModelPath(request_allocator, std.testing.io, "owner/model:gguf:Q4_K_M", "generators");
+    defer request_allocator.free(explicit_resolved);
+    try std.testing.expectEqualStrings(explicit_variant_root, explicit_resolved);
+    const trusted_resolved = try node.resolveModelPath(std.testing.io, model_root, "generators");
+    defer alloc.free(trusted_resolved);
+    try std.testing.expectEqualStrings(model_root, trusted_resolved);
+
+    const builtin_os = @import("builtin").os.tag;
+    if (builtin_os != .windows and builtin_os != .wasi and builtin_os != .freestanding) {
+        try tmp.dir.createDirPath(std.testing.io, "outside");
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "outside/config.json", .data = "{}" });
+        try tmp.dir.symLink(std.testing.io, "../outside", "models/link", .{});
+        try std.testing.expectError(error.ModelOutsideModelsDir, node.resolveRequestModelPath(request_allocator, std.testing.io, "link", "generators"));
+    }
+}
+
+test "HTTP model resolution caller ownership stays flat across repeated requests" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.debug.assert(gpa.deinit() == .ok);
+    const allocator = gpa.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "models/owner/model");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "models/owner/model/config.json", .data = "{}" });
+    const models_root = try tmp.dir.realPathFileAlloc(std.testing.io, "models", allocator);
+    defer allocator.free(models_root);
+    const model_root = try tmp.dir.realPathFileAlloc(std.testing.io, "models/owner/model", allocator);
+    defer allocator.free(model_root);
+
+    var node: Node = undefined;
+    node.config = .{ .models_dir = models_root };
+    node.allocator = allocator;
+
+    for (0..64) |_| {
+        const resolved = try node.resolveRequestModelPath(allocator, std.testing.io, "hf:owner/model:q4_0", "generators");
+        try std.testing.expectEqualStrings(model_root, resolved);
+        allocator.free(resolved);
+    }
+}
+
+test "trusted model resolution caller ownership stays flat across every return shape" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.debug.assert(gpa.deinit() == .ok);
+    const allocator = gpa.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "models/owner/model");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "models/config.json", .data = "{}" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "models/owner/model/config.json", .data = "{}" });
+    const models_root = try tmp.dir.realPathFileAlloc(std.testing.io, "models", allocator);
+    defer allocator.free(models_root);
+    const model_root = try tmp.dir.realPathFileAlloc(std.testing.io, "models/owner/model", allocator);
+    defer allocator.free(model_root);
+
+    var node: Node = undefined;
+    node.config = .{ .models_dir = models_root };
+    node.allocator = allocator;
+
+    for (0..64) |_| {
+        const named = try node.resolveModelPath(std.testing.io, "hf:owner/model:q4_0", "generators");
+        try std.testing.expectEqualStrings(model_root, named);
+        allocator.free(named);
+
+        const absolute = try node.resolveModelPath(std.testing.io, model_root, "generators");
+        try std.testing.expectEqualStrings(model_root, absolute);
+        allocator.free(absolute);
+
+        const configured_root = try node.resolveModelPath(std.testing.io, null, null);
+        try std.testing.expectEqualStrings(models_root, configured_root);
+        allocator.free(configured_root);
+    }
 }
 
 test "download remote content accepts data uri" {
@@ -9208,10 +13952,230 @@ test "download remote content accepts data uri" {
     try std.testing.expectEqualStrings("hello", downloaded.data);
 }
 
+test "remote content request errors preserve client, policy, capacity, and upstream semantics" {
+    const cases = [_]struct {
+        source: anyerror,
+        normalized: anyerror,
+        status: u16,
+        code: []const u8,
+        retryable: bool,
+    }{
+        .{ .source = error.StreamTooLong, .normalized = error.RemoteContentTooLarge, .status = 413, .code = "CONTENT_TOO_LARGE", .retryable = false },
+        .{ .source = error.PrivateIpBlocked, .normalized = error.RemoteContentNotAllowed, .status = 403, .code = "CONTENT_NOT_ALLOWED", .retryable = false },
+        .{ .source = error.UnsupportedUrlScheme, .normalized = error.RemoteContentInvalid, .status = 400, .code = "INVALID_CONTENT_URL", .retryable = false },
+        .{ .source = error.MissingS3Credentials, .normalized = error.RemoteContentNotConfigured, .status = 503, .code = "CONTENT_FETCH_NOT_CONFIGURED", .retryable = false },
+        .{ .source = error.HttpFetchFailed, .normalized = error.RemoteContentUnavailable, .status = 502, .code = "CONTENT_FETCH_FAILED", .retryable = true },
+    };
+
+    for (cases) |case| {
+        const normalized = normalizeRemoteContentRequestError(case.source);
+        try std.testing.expectEqual(case.normalized, normalized);
+        const failure = remoteContentRequestFailure(normalized).?;
+        try std.testing.expectEqual(case.status, failure.status);
+        try std.testing.expectEqualStrings(case.code, failure.code);
+        try std.testing.expectEqual(case.retryable, failure.retryable);
+    }
+    try std.testing.expectEqual(error.OutOfMemory, normalizeRemoteContentRequestError(error.OutOfMemory));
+    try std.testing.expectEqual(error.Timeout, normalizeRemoteContentRequestError(error.Timeout));
+    try std.testing.expectEqual(error.Canceled, normalizeRemoteContentRequestError(error.Canceled));
+    try std.testing.expect(remoteContentRequestFailure(error.OutOfMemory) == null);
+    try std.testing.expect(remoteContentRequestFailure(error.Timeout) == null);
+    try std.testing.expect(remoteContentRequestFailure(error.Canceled) == null);
+}
+
+test "request media budget accounting is cumulative and overflow safe" {
+    var budget = RequestMediaBudget.init(5);
+    try budget.add(3);
+    try std.testing.expectEqual(@as(usize, 3), budget.used_bytes);
+    try std.testing.expectEqual(@as(usize, 2), budget.remaining());
+    try std.testing.expectError(error.RemoteContentTooLarge, budget.add(3));
+    try std.testing.expectEqual(@as(usize, 3), budget.used_bytes);
+
+    var overflow_budget = RequestMediaBudget{ .max_bytes = std.math.maxInt(usize), .used_bytes = std.math.maxInt(usize) - 1 };
+    try std.testing.expectError(error.RemoteContentTooLarge, overflow_budget.add(2));
+    try std.testing.expectEqual(std.math.maxInt(usize) - 1, overflow_budget.used_bytes);
+
+    var zero_budget = RequestMediaBudget.init(0);
+    try zero_budget.add(0);
+    try std.testing.expectError(error.RemoteContentTooLarge, zero_budget.add(1));
+}
+
+test "request media budget clamps an explicit configured maximum to the hard ceiling" {
+    var node: Node = undefined;
+    node.config = .{ .content_security = .{ .max_download_size_bytes = std.math.maxInt(u64) } };
+    try std.testing.expectEqual(default_max_request_media_bytes, requestMediaMaxBytes(&node));
+}
+
+test "configured zero media budget rejects nonempty remote and inline media" {
+    const alloc = std.testing.allocator;
+    var node: Node = undefined;
+    node.config = .{ .content_security = .{ .max_download_size_bytes = 0 } };
+    try std.testing.expectEqual(@as(usize, 0), requestMediaMaxBytes(&node));
+
+    var remote_budget = RequestMediaBudget.init(requestMediaMaxBytes(&node));
+    try std.testing.expectError(
+        error.RemoteContentTooLarge,
+        downloadRemoteContentWithBudgetForRequest(&node, alloc, "data:image/png;base64,AA==", &remote_budget),
+    );
+    var empty_remote = try downloadRemoteContentWithBudgetForRequest(
+        &node,
+        alloc,
+        "data:image/png;base64,",
+        &remote_budget,
+    );
+    defer empty_remote.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), empty_remote.data.len);
+
+    var inline_budget = RequestMediaBudget.init(requestMediaMaxBytes(&node));
+    try std.testing.expectError(
+        error.RemoteContentTooLarge,
+        decodeMediaDataWithBudget(alloc, "AA==", &inline_budget),
+    );
+    var empty = try decodeMediaDataWithBudget(alloc, "", &inline_budget);
+    defer empty.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), empty.data.len);
+}
+
+test "bounded remote content helper enforces cumulative data URI bytes" {
+    const alloc = std.testing.allocator;
+    var node: Node = undefined;
+    node.config = .{};
+    const first_uri = "data:image/png;base64,YWJj";
+    var budget = RequestMediaBudget.init(first_uri.len + 1);
+
+    var first = try downloadRemoteContentWithBudgetForRequest(&node, alloc, first_uri, &budget);
+    defer first.deinit(alloc);
+    try std.testing.expectEqual(first_uri.len, budget.used_bytes);
+    try std.testing.expectError(
+        error.RemoteContentTooLarge,
+        downloadRemoteContentWithBudgetForRequest(&node, alloc, "data:image/png;base64,ZGVm", &budget),
+    );
+    try std.testing.expectEqual(first_uri.len, budget.used_bytes);
+}
+
+test "inline media budgets charge encoded sources before decoding" {
+    const alloc = std.testing.allocator;
+    resetRequestWorkTestCounters();
+
+    // Four encoded bytes produce one decoded byte; the encoded ceiling is the
+    // admission contract and must reject before allocating the output.
+    var raw_budget = RequestMediaBudget.init(3);
+    try std.testing.expectError(
+        error.RemoteContentTooLarge,
+        decodeMediaDataWithBudget(alloc, "YQ==", &raw_budget),
+    );
+    try std.testing.expectEqual(@as(usize, 0), raw_budget.used_bytes);
+
+    const uri = "data:image/png;base64,YQ==";
+    var node: Node = undefined;
+    node.config = .{};
+    var short_budget = RequestMediaBudget.init(uri.len - 1);
+    try std.testing.expectError(
+        error.RemoteContentTooLarge,
+        downloadRemoteContentWithBudgetForRequest(&node, alloc, uri, &short_budget),
+    );
+    try std.testing.expectEqual(@as(usize, 0), short_budget.used_bytes);
+
+    var exact_budget = RequestMediaBudget.init(uri.len);
+    var downloaded = try downloadRemoteContentWithBudgetForRequest(&node, alloc, uri, &exact_budget);
+    defer downloaded.deinit(alloc);
+    try std.testing.expectEqualStrings("a", downloaded.data);
+    try std.testing.expectEqual(uri.len, exact_budget.used_bytes);
+
+    const percent_uri = "data:image/png,%41";
+    var percent_budget = RequestMediaBudget.init(percent_uri.len - 1);
+    try std.testing.expectError(
+        error.RemoteContentTooLarge,
+        downloadRemoteContentWithBudgetForRequest(&node, alloc, percent_uri, &percent_budget),
+    );
+    try std.testing.expectEqual(@as(usize, 0), percent_budget.used_bytes);
+    try std.testing.expectEqual(@as(usize, 1), request_work_test_counters.media_fetch_attempts);
+}
+
+test "download helpers fail closed for null and explicit empty policies" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "image.png", .data = "png" });
+    const file_path = try tmp.dir.realPathFileAlloc(std.testing.io, "image.png", alloc);
+    defer alloc.free(file_path);
+    const file_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{file_path});
+    defer alloc.free(file_uri);
+
+    const configs = [_]NodeConfig{
+        .{ .s3_credentials = .{
+            .endpoint = @constCast("s3.example.com"),
+            .access_key_id = @constCast("test"),
+            .secret_access_key = @constCast("test"),
+        } },
+        .{
+            .content_security = .{},
+            .s3_credentials = .{
+                .endpoint = @constCast("s3.example.com"),
+                .access_key_id = @constCast("test"),
+                .secret_access_key = @constCast("test"),
+            },
+        },
+    };
+    for (configs) |config| {
+        var node: Node = undefined;
+        node.config = config;
+        try std.testing.expectError(error.HostNotAllowed, downloadRemoteContent(&node, alloc, "https://example.com/a.png"));
+        try std.testing.expectError(error.HostNotAllowed, downloadReadBatchContent(&node, alloc, "https://example.com/a.png", 1024, 0));
+        try std.testing.expectError(error.PathNotAllowed, downloadRemoteContent(&node, alloc, "s3://bucket/object.png"));
+        try std.testing.expectError(error.PathNotAllowed, downloadReadBatchContent(&node, alloc, "s3://bucket/object.png", 1024, 0));
+        try std.testing.expectError(error.PathNotAllowed, downloadRemoteContent(&node, alloc, file_uri));
+        try std.testing.expectError(error.PathNotAllowed, downloadReadBatchContent(&node, alloc, file_uri, 1024, 0));
+    }
+}
+
+test "partial content policy retains deny by default allowlists" {
+    var node: Node = undefined;
+    node.config = .{ .content_security = .{ .max_download_size_bytes = 4096 } };
+    const effective = effectiveRequestContentSecurity(&node);
+    try std.testing.expectEqual(@as(usize, 0), effective.allowed_hosts.?.len);
+    try std.testing.expectEqual(@as(usize, 0), effective.allowed_paths.?.len);
+    try std.testing.expectEqual(@as(?bool, true), effective.block_private_ips);
+    try std.testing.expectEqual(@as(?u64, 4096), effective.max_download_size_bytes);
+}
+
+test "explicit private IP override does not implicitly allow hosts or files" {
+    var node: Node = undefined;
+    node.config = .{ .content_security = .{ .block_private_ips = false } };
+    const effective = effectiveRequestContentSecurity(&node);
+    try std.testing.expectEqual(@as(usize, 0), effective.allowed_hosts.?.len);
+    try std.testing.expectEqual(@as(usize, 0), effective.allowed_paths.?.len);
+    try std.testing.expectEqual(@as(?bool, false), effective.block_private_ips);
+}
+
+test "download remote content honors an explicit file allowlist" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "image.png", .data = "png" });
+    const allowed_root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(allowed_root);
+    const file_path = try tmp.dir.realPathFileAlloc(std.testing.io, "image.png", alloc);
+    defer alloc.free(file_path);
+    const file_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{file_path});
+    defer alloc.free(file_uri);
+    const allowed_paths = [_][]u8{allowed_root};
+
+    var node: Node = undefined;
+    node.config = .{ .content_security = .{ .allowed_paths = &allowed_paths } };
+    var downloaded = try downloadRemoteContent(&node, alloc, file_uri);
+    defer downloaded.deinit(alloc);
+    try std.testing.expectEqualStrings("png", downloaded.data);
+}
+
 test "download remote content blocks private ip urls when configured" {
     const alloc = std.testing.allocator;
+    const allowed_hosts = [_][]u8{@constCast("127.0.0.1")};
     const node = Node{
-        .config = .{ .content_security = .{ .block_private_ips = true } },
+        .config = .{ .content_security = .{
+            .allowed_hosts = &allowed_hosts,
+            .block_private_ips = true,
+        } },
         .allocator = undefined,
         .session_manager = undefined,
         .model_manager = undefined,
@@ -9574,8 +14538,9 @@ const ParsedTextEmbedInput = struct {
 
 const ParsedBinaryEmbedInput = struct {
     index: usize,
-    bytes: []u8,
+    bytes: []const u8,
     mime_type: ?[]const u8 = null,
+    owned: bool = true,
 };
 
 const ParsedDenseEmbedInputs = struct {
@@ -9587,9 +14552,9 @@ const ParsedDenseEmbedInputs = struct {
 
     fn deinit(self: *ParsedDenseEmbedInputs, allocator: std.mem.Allocator) void {
         self.texts.deinit(allocator);
-        for (self.images.items) |item| allocator.free(item.bytes);
+        for (self.images.items) |item| if (item.owned) allocator.free(@constCast(item.bytes));
         self.images.deinit(allocator);
-        for (self.audio.items) |item| allocator.free(item.bytes);
+        for (self.audio.items) |item| if (item.owned) allocator.free(@constCast(item.bytes));
         self.audio.deinit(allocator);
         self.parse_errors.deinit(allocator);
     }
@@ -9718,6 +14683,39 @@ fn parseDenseEmbedInputs(
     manifest: *const manifest_mod.ModelManifest,
     input: std.json.Value,
 ) !ParsedDenseEmbedInputs {
+    var media_budget = RequestMediaBudget.init(requestMediaMaxBytes(self));
+    return parseDenseEmbedInputsWithBudget(self, allocator, manifest, input, &media_budget);
+}
+
+fn parseDenseEmbedInputsWithBudget(
+    self: *Node,
+    allocator: std.mem.Allocator,
+    manifest: *const manifest_mod.ModelManifest,
+    input: std.json.Value,
+    media_budget: *RequestMediaBudget,
+) !ParsedDenseEmbedInputs {
+    return parseDenseEmbedInputsWithBudgetOptionalContext(self, allocator, manifest, input, media_budget, null);
+}
+
+fn parseDenseEmbedInputsWithBudgetAndContext(
+    self: *Node,
+    allocator: std.mem.Allocator,
+    manifest: *const manifest_mod.ModelManifest,
+    input: std.json.Value,
+    media_budget: *RequestMediaBudget,
+    request_context: DenseEmbedRequestContext,
+) !ParsedDenseEmbedInputs {
+    return parseDenseEmbedInputsWithBudgetOptionalContext(self, allocator, manifest, input, media_budget, request_context);
+}
+
+fn parseDenseEmbedInputsWithBudgetOptionalContext(
+    self: *Node,
+    allocator: std.mem.Allocator,
+    manifest: *const manifest_mod.ModelManifest,
+    input: std.json.Value,
+    media_budget: *RequestMediaBudget,
+    request_context: ?DenseEmbedRequestContext,
+) !ParsedDenseEmbedInputs {
     var parsed: ParsedDenseEmbedInputs = .{};
     errdefer parsed.deinit(allocator);
 
@@ -9731,7 +14729,7 @@ fn parseDenseEmbedInputs(
             if (arr.items.len == 0) return parsed;
 
             for (arr.items, 0..) |item, index| {
-                try appendDenseEmbedInput(self, allocator, manifest, &parsed, item, index);
+                try appendDenseEmbedInput(self, allocator, manifest, &parsed, item, index, media_budget, request_context);
             }
 
             parsed.total_count = arr.items.len;
@@ -9742,11 +14740,113 @@ fn parseDenseEmbedInputs(
     return parsed;
 }
 
+fn parseDirectDenseEmbedInputs(
+    self: *Node,
+    allocator: std.mem.Allocator,
+    manifest: *const manifest_mod.ModelManifest,
+    parts: []const Node.DirectDenseEmbedPart,
+    media_budget: *RequestMediaBudget,
+) !ParsedDenseEmbedInputs {
+    return parseDirectDenseEmbedInputsOptionalContext(self, allocator, manifest, parts, media_budget, null);
+}
+
+fn parseDirectDenseEmbedInputsWithContext(
+    self: *Node,
+    allocator: std.mem.Allocator,
+    manifest: *const manifest_mod.ModelManifest,
+    parts: []const Node.DirectDenseEmbedPart,
+    media_budget: *RequestMediaBudget,
+    request_context: DenseEmbedRequestContext,
+) !ParsedDenseEmbedInputs {
+    return parseDirectDenseEmbedInputsOptionalContext(self, allocator, manifest, parts, media_budget, request_context);
+}
+
+fn parseDirectDenseEmbedInputsOptionalContext(
+    self: *Node,
+    allocator: std.mem.Allocator,
+    manifest: *const manifest_mod.ModelManifest,
+    parts: []const Node.DirectDenseEmbedPart,
+    media_budget: *RequestMediaBudget,
+    request_context: ?DenseEmbedRequestContext,
+) !ParsedDenseEmbedInputs {
+    var parsed: ParsedDenseEmbedInputs = .{};
+    errdefer parsed.deinit(allocator);
+
+    // Borrowed buffers are already resident before parsing begins. Charge all
+    // of them up front so a leading remote/image URL can only consume the
+    // remaining request budget, independent of content-part order.
+    const preflight = try directDenseEmbedPreflight(parts);
+    try media_budget.add(preflight.shape.borrowed_bytes);
+
+    for (parts, 0..) |part, index| switch (part) {
+        .text => |text| {
+            if (!model_caps.modelAcceptsInput(manifest, "text")) return error.ModelDoesNotSupportTextInput;
+            try parsed.texts.append(allocator, .{ .index = index, .text = text });
+        },
+        .image_url => |url| try appendDenseEmbedImageUrl(
+            self,
+            allocator,
+            manifest,
+            &parsed,
+            url,
+            index,
+            media_budget,
+            request_context,
+        ),
+        .media => |media| {
+            try appendDenseEmbedBinary(
+                allocator,
+                manifest,
+                &parsed,
+                media.data,
+                media.mime_type,
+                index,
+                false,
+            );
+        },
+    };
+    parsed.total_count = parts.len;
+    return parsed;
+}
+
 fn parseDenseEmbedInputsPerItem(
     self: *Node,
     allocator: std.mem.Allocator,
     manifest: *const manifest_mod.ModelManifest,
     input: std.json.Value,
+) !ParsedDenseEmbedInputs {
+    var media_budget = RequestMediaBudget.init(requestMediaMaxBytes(self));
+    return parseDenseEmbedInputsPerItemWithBudget(self, allocator, manifest, input, &media_budget);
+}
+
+fn parseDenseEmbedInputsPerItemWithBudget(
+    self: *Node,
+    allocator: std.mem.Allocator,
+    manifest: *const manifest_mod.ModelManifest,
+    input: std.json.Value,
+    media_budget: *RequestMediaBudget,
+) !ParsedDenseEmbedInputs {
+    return parseDenseEmbedInputsPerItemWithBudgetOptionalContext(self, allocator, manifest, input, media_budget, null);
+}
+
+fn parseDenseEmbedInputsPerItemWithBudgetAndContext(
+    self: *Node,
+    allocator: std.mem.Allocator,
+    manifest: *const manifest_mod.ModelManifest,
+    input: std.json.Value,
+    media_budget: *RequestMediaBudget,
+    request_context: DenseEmbedRequestContext,
+) !ParsedDenseEmbedInputs {
+    return parseDenseEmbedInputsPerItemWithBudgetOptionalContext(self, allocator, manifest, input, media_budget, request_context);
+}
+
+fn parseDenseEmbedInputsPerItemWithBudgetOptionalContext(
+    self: *Node,
+    allocator: std.mem.Allocator,
+    manifest: *const manifest_mod.ModelManifest,
+    input: std.json.Value,
+    media_budget: *RequestMediaBudget,
+    request_context: ?DenseEmbedRequestContext,
 ) !ParsedDenseEmbedInputs {
     var parsed: ParsedDenseEmbedInputs = .{};
     errdefer parsed.deinit(allocator);
@@ -9754,14 +14854,16 @@ fn parseDenseEmbedInputsPerItem(
     switch (input) {
         .string => |value| {
             parsed.total_count = 1;
-            appendDenseEmbedInput(self, allocator, manifest, &parsed, .{ .string = value }, 0) catch |err| {
+            appendDenseEmbedInput(self, allocator, manifest, &parsed, .{ .string = value }, 0, media_budget, request_context) catch |err| {
+                if (isDenseEmbedRequestAbort(err)) return err;
                 try parsed.parse_errors.append(allocator, embedInputItemFailure(0, err));
             };
         },
         .array => |arr| {
             parsed.total_count = arr.items.len;
             for (arr.items, 0..) |item, index| {
-                appendDenseEmbedInput(self, allocator, manifest, &parsed, item, index) catch |err| {
+                appendDenseEmbedInput(self, allocator, manifest, &parsed, item, index, media_budget, request_context) catch |err| {
+                    if (isDenseEmbedRequestAbort(err)) return err;
                     try parsed.parse_errors.append(allocator, embedInputItemFailure(index, err));
                 };
             }
@@ -9772,6 +14874,66 @@ fn parseDenseEmbedInputsPerItem(
     return parsed;
 }
 
+fn appendDenseEmbedImageUrl(
+    self: *Node,
+    allocator: std.mem.Allocator,
+    manifest: *const manifest_mod.ModelManifest,
+    parsed: *ParsedDenseEmbedInputs,
+    url: []const u8,
+    index: usize,
+    media_budget: *RequestMediaBudget,
+    request_context: ?DenseEmbedRequestContext,
+) !void {
+    if (!model_caps.modelAcceptsInput(manifest, "image")) return error.ModelDoesNotSupportImageInput;
+    const downloaded = if (request_context) |context|
+        try downloadRemoteContentWithBudgetForRequestWithContext(self, allocator, context, url, media_budget)
+    else
+        try downloadRemoteContentWithBudgetForRequest(self, allocator, url, media_budget);
+    errdefer allocator.free(downloaded.data);
+    defer allocator.free(downloaded.content_type);
+
+    if (!std.mem.startsWith(u8, downloaded.content_type, "image/")) return error.ImageUrlMustResolveToImage;
+    try parsed.images.append(allocator, .{
+        .index = index,
+        .bytes = downloaded.data,
+        .mime_type = null,
+    });
+}
+
+fn appendDenseEmbedBinary(
+    allocator: std.mem.Allocator,
+    manifest: *const manifest_mod.ModelManifest,
+    parsed: *ParsedDenseEmbedInputs,
+    bytes: []const u8,
+    mime_type: []const u8,
+    index: usize,
+    owned: bool,
+) !void {
+    if (std.mem.startsWith(u8, mime_type, "image/")) {
+        if (!model_caps.modelAcceptsInput(manifest, "image")) return error.ModelDoesNotSupportImageInput;
+        try parsed.images.append(allocator, .{
+            .index = index,
+            .bytes = bytes,
+            .mime_type = mime_type,
+            .owned = owned,
+        });
+        return;
+    }
+
+    if (std.mem.startsWith(u8, mime_type, "audio/")) {
+        if (!model_caps.modelAcceptsInput(manifest, "audio")) return error.ModelDoesNotSupportAudioInput;
+        try parsed.audio.append(allocator, .{
+            .index = index,
+            .bytes = bytes,
+            .mime_type = mime_type,
+            .owned = owned,
+        });
+        return;
+    }
+
+    return error.UnsupportedMediaMimeType;
+}
+
 fn appendDenseEmbedInput(
     self: *Node,
     allocator: std.mem.Allocator,
@@ -9779,6 +14941,8 @@ fn appendDenseEmbedInput(
     parsed: *ParsedDenseEmbedInputs,
     item: std.json.Value,
     index: usize,
+    media_budget: *RequestMediaBudget,
+    request_context: ?DenseEmbedRequestContext,
 ) !void {
     if (item == .string) {
         if (!model_caps.modelAcceptsInput(manifest, "text")) return error.ModelDoesNotSupportTextInput;
@@ -9802,7 +14966,6 @@ fn appendDenseEmbedInput(
     }
 
     if (std.mem.eql(u8, part_type, "image_url")) {
-        if (!model_caps.modelAcceptsInput(manifest, "image")) return error.ModelDoesNotSupportImageInput;
         const image_url = obj.get("image_url") orelse return error.ImageUrlContentPartMissingImageUrl;
         const url = switch (image_url) {
             .string => image_url.string,
@@ -9813,18 +14976,7 @@ fn appendDenseEmbedInput(
             },
             else => return error.ImageUrlContentPartMissingUrl,
         };
-
-        const downloaded = downloadRemoteContent(self, allocator, url) catch return error.ImageUrlDownloadFailed;
-        errdefer allocator.free(downloaded.data);
-        defer allocator.free(downloaded.content_type);
-
-        if (!std.mem.startsWith(u8, downloaded.content_type, "image/")) return error.ImageUrlMustResolveToImage;
-        try parsed.images.append(allocator, .{
-            .index = index,
-            .bytes = downloaded.data,
-            .mime_type = null,
-        });
-        return;
+        return appendDenseEmbedImageUrl(self, allocator, manifest, parsed, url, index, media_budget, request_context);
     }
 
     if (std.mem.eql(u8, part_type, "media")) {
@@ -9833,32 +14985,22 @@ fn appendDenseEmbedInput(
         const mime_value = obj.get("mime_type") orelse return error.MediaContentPartMissingMimeType;
         if (mime_value != .string) return error.MediaContentPartMissingMimeType;
 
-        const decoded_payload = decodeMediaData(allocator, data_value.string) catch return error.InvalidMediaBase64;
+        const decoded_payload = decodeMediaDataWithBudget(allocator, data_value.string, media_budget) catch |err| switch (err) {
+            error.OutOfMemory, error.RemoteContentTooLarge => return err,
+            else => return error.InvalidMediaBase64,
+        };
         const decoded = decoded_payload.data;
         errdefer allocator.free(decoded);
         if (!mediaMimeMatches(mime_value.string, decoded_payload.mime_type)) return error.MediaDataMimeTypeMismatch;
-
-        if (std.mem.startsWith(u8, mime_value.string, "image/")) {
-            if (!model_caps.modelAcceptsInput(manifest, "image")) return error.ModelDoesNotSupportImageInput;
-            try parsed.images.append(allocator, .{
-                .index = index,
-                .bytes = decoded,
-                .mime_type = mime_value.string,
-            });
-            return;
-        }
-
-        if (std.mem.startsWith(u8, mime_value.string, "audio/")) {
-            if (!model_caps.modelAcceptsInput(manifest, "audio")) return error.ModelDoesNotSupportAudioInput;
-            try parsed.audio.append(allocator, .{
-                .index = index,
-                .bytes = decoded,
-                .mime_type = mime_value.string,
-            });
-            return;
-        }
-
-        return error.UnsupportedMediaMimeType;
+        return appendDenseEmbedBinary(
+            allocator,
+            manifest,
+            parsed,
+            decoded,
+            mime_value.string,
+            index,
+            true,
+        );
     }
 
     return error.UnknownContentPartType;
@@ -9913,7 +15055,7 @@ fn embedDenseInputFailure(err: anyerror) EmbedDenseInputFailure {
         else => .{
             .status = 500,
             .code = "INFERENCE_FAILED",
-            .message = @errorName(err),
+            .message = internalErrorMessage("INFERENCE_FAILED", err),
         },
     };
 }
@@ -10013,7 +15155,7 @@ fn embedItemFailure(index: usize, err: anyerror, stage: []const u8) EmbedItemErr
         else => .{
             .index = @intCast(index),
             .code = "INFERENCE_FAILED",
-            .message = @errorName(err),
+            .message = internalErrorMessage("INFERENCE_FAILED", err),
             .stage = stage,
             .retryable = true,
             .status = 500,
@@ -10022,15 +15164,17 @@ fn embedItemFailure(index: usize, err: anyerror, stage: []const u8) EmbedItemErr
 }
 
 fn embedInputItemFailure(index: usize, err: anyerror) EmbedItemError {
-    return switch (err) {
-        error.ImageUrlDownloadFailed => .{
+    if (remoteContentRequestFailure(err)) |failure| {
+        return .{
             .index = @intCast(index),
-            .code = "IMAGE_FETCH_FAILED",
-            .message = "failed to download image_url content",
+            .code = failure.code,
+            .message = failure.message,
             .stage = "fetch",
-            .retryable = true,
-            .status = 502,
-        },
+            .retryable = failure.retryable,
+            .status = failure.status,
+        };
+    }
+    return switch (err) {
         error.ImageUrlMustResolveToImage => .{
             .index = @intCast(index),
             .code = "INVALID_IMAGE_URL",
@@ -10088,7 +15232,7 @@ fn embedInputItemFailure(index: usize, err: anyerror) EmbedItemError {
         else => .{
             .index = @intCast(index),
             .code = "INPUT_PREP_FAILED",
-            .message = @errorName(err),
+            .message = internalErrorMessage("INPUT_PREP_FAILED", err),
             .stage = "parse",
             .retryable = true,
             .status = 500,
@@ -10305,7 +15449,8 @@ fn embedDenseInputsPartial(
                 for (inputs.audio.items, 0..) |item, i| {
                     result.embeddings[item.index] = embeddings[i];
                 }
-            } else |_| {
+            } else |err| {
+                if (shouldAbortDensePartialFallback(err)) return err;
                 try embedAudioInputsIndividually(allocator, pipeline, inputs.audio.items, audio_inputs, &errors, &result);
             }
         }
@@ -10316,9 +15461,11 @@ fn embedDenseInputsPartial(
             asset_lease.release();
         }
         if (primary_admission.text_error) |err| {
+            if (shouldAbortDensePartialFallback(err)) return err;
             try appendDenseEmbeddingItemErrors(allocator, &errors, inputs.texts.items, err, "model_admission");
         }
         if (primary_admission.image_error) |err| {
+            if (shouldAbortDensePartialFallback(err)) return err;
             try appendDenseEmbeddingItemErrors(allocator, &errors, inputs.images.items, err, "model_admission");
         }
     }
@@ -10333,7 +15480,8 @@ fn embedDenseInputsPartial(
             for (inputs.texts.items, 0..) |item, i| {
                 result.embeddings[item.index] = embeddings[i];
             }
-        } else |_| {
+        } else |err| {
+            if (shouldAbortDensePartialFallback(err)) return err;
             try embedTextInputsIndividually(allocator, pipeline, inputs.texts.items, texts, &errors, &result);
         }
     }
@@ -10348,7 +15496,8 @@ fn embedDenseInputsPartial(
             for (inputs.images.items, 0..) |item, i| {
                 result.embeddings[item.index] = embeddings[i];
             }
-        } else |_| {
+        } else |err| {
+            if (shouldAbortDensePartialFallback(err)) return err;
             try embedImageInputsIndividually(allocator, pipeline, inputs.images.items, images, &errors, &result);
         }
     }
@@ -10407,6 +15556,7 @@ fn embedTextInputsIndividually(
 ) !void {
     for (items, 0..) |item, i| {
         const single = pipeline.embed(texts[i .. i + 1]) catch |single_err| {
+            if (shouldAbortDensePartialFallback(single_err)) return single_err;
             try errors.append(allocator, embedItemFailure(item.index, single_err, "text_inference"));
             continue;
         };
@@ -10430,6 +15580,7 @@ fn embedImageInputsIndividually(
 ) !void {
     for (items, 0..) |item, i| {
         const single = pipeline.embedImages(images[i .. i + 1]) catch |single_err| {
+            if (shouldAbortDensePartialFallback(single_err)) return single_err;
             try errors.append(allocator, embedItemFailure(item.index, single_err, "image_inference"));
             continue;
         };
@@ -10453,6 +15604,7 @@ fn embedAudioInputsIndividually(
 ) !void {
     for (items, 0..) |item, i| {
         const single = pipeline.embedEncodedAudio(audio_inputs[i .. i + 1]) catch |single_err| {
+            if (shouldAbortDensePartialFallback(single_err)) return single_err;
             try errors.append(allocator, embedItemFailure(item.index, single_err, "audio_inference"));
             continue;
         };
@@ -10778,6 +15930,59 @@ test "Antfly inference per-item dense parser records invalid media and keeps sib
     try std.testing.expectEqualStrings("INVALID_MEDIA", inputs.parse_errors.items[0].code);
     try std.testing.expectEqualStrings("parse", inputs.parse_errors.items[0].stage);
     try std.testing.expectEqual(false, inputs.parse_errors.items[0].retryable);
+}
+
+test "Antfly inference per-item dense parser never masks allocator exhaustion" {
+    const backing_allocator = std.testing.allocator;
+    const body =
+        \\{
+        \\  "model": "clipclap",
+        \\  "error_policy": "per_item",
+        \\  "input": [{"type":"media","mime_type":"image/png","data":"AQI="}]
+        \\}
+    ;
+    var parsed_json = try std.json.parseFromSlice(std.json.Value, backing_allocator, body, .{});
+    defer parsed_json.deinit();
+    const request = try parseEmbedRequest(parsed_json.value);
+    var node: Node = undefined;
+    node.config = .{};
+    const manifest = manifest_mod.ModelManifest{
+        .allocator = backing_allocator,
+        .model_type = .embedder,
+        .visual_model_path = "visual.onnx",
+    };
+
+    const Runner = struct {
+        fn run(
+            allocator: std.mem.Allocator,
+            target: *Node,
+            model_manifest: *const manifest_mod.ModelManifest,
+            input: std.json.Value,
+        ) !void {
+            var budget = RequestMediaBudget.init(1024);
+            var inputs = try parseDenseEmbedInputsPerItemWithBudget(target, allocator, model_manifest, input, &budget);
+            defer inputs.deinit(allocator);
+        }
+    };
+
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(backing_allocator, .{
+            .fail_index = fail_index,
+            .resize_fail_index = 0,
+        });
+        Runner.run(failing.allocator(), &node, &manifest, request.input) catch |err| switch (err) {
+            error.OutOfMemory => {
+                try std.testing.expect(failing.has_induced_failure);
+                try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+                continue;
+            },
+            else => return err,
+        };
+        try std.testing.expect(!failing.has_induced_failure);
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        break;
+    }
 }
 
 test "dense partial result cleanup owns every allocation exactly once" {
@@ -11121,6 +16326,36 @@ test "Antfly inference embed parser accepts data uri media payloads" {
     try std.testing.expectEqualSlices(u8, &.{ 1, 2 }, inputs.images.items[0].bytes);
 }
 
+test "Antfly inference embed parser applies one aggregate budget to inline media" {
+    const alloc = std.testing.allocator;
+    const body =
+        \\{
+        \\  "model": "clipclap",
+        \\  "input": [
+        \\    {"type":"media","mime_type":"image/png","data":"YWJj"},
+        \\    {"type":"media","mime_type":"image/png","data":"ZGVm"}
+        \\  ]
+        \\}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const request = try parseEmbedRequest(parsed.value);
+    var node: Node = undefined;
+    node.config = .{};
+    const manifest = manifest_mod.ModelManifest{
+        .allocator = alloc,
+        .model_type = .embedder,
+        .visual_model_path = "visual.onnx",
+    };
+    var budget = RequestMediaBudget.init(5);
+
+    try std.testing.expectError(
+        error.RemoteContentTooLarge,
+        parseDenseEmbedInputsWithBudget(&node, alloc, &manifest, request.input, &budget),
+    );
+    try std.testing.expectEqual(@as(usize, 4), budget.used_bytes);
+}
+
 test "Antfly inference embed parser rejects mismatched data uri media mime type" {
     const alloc = std.testing.allocator;
     const body =
@@ -11200,6 +16435,78 @@ test "multimodal rerank parser accepts colqwen-style text and image content part
     try std.testing.expectEqual(@as(u8, 1), doc.images[1][0]);
 }
 
+test "multimodal rerank parser releases both owned slices on every allocation failure" {
+    const backing_allocator = std.testing.allocator;
+    const body =
+        \\{
+        \\  "model": "vidore/colqwen2-v1.0",
+        \\  "query": "invoice",
+        \\  "documents": [{"content": [
+        \\    {"type":"text","text":"invoice page"},
+        \\    {"type":"image_url","image_url":{"url":"data:image/png;base64,YWJj"}},
+        \\    {"type":"media","mime_type":"image/png","data":"ZGVm"}
+        \\  ]}]
+        \\}
+    ;
+    var parsed = try std.json.parseFromSlice(api.RerankMultimodalRequest, backing_allocator, body, .{});
+    defer parsed.deinit();
+    var node: Node = undefined;
+    node.config = .{};
+
+    const Runner = struct {
+        fn run(allocator: std.mem.Allocator, target: *Node, content: api.ChatMessageContent) !void {
+            var budget = RequestMediaBudget.init(32);
+            var document = try target.parseChatMessageContentToTextAndImagesWithBudget(allocator, content, &budget);
+            defer document.deinit();
+        }
+    };
+
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(backing_allocator, .{
+            .fail_index = fail_index,
+            .resize_fail_index = 0,
+        });
+        Runner.run(failing.allocator(), &node, parsed.value.documents[0].content) catch |err| switch (err) {
+            error.OutOfMemory => {
+                try std.testing.expect(failing.has_induced_failure);
+                try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+                continue;
+            },
+            else => return err,
+        };
+        try std.testing.expect(!failing.has_induced_failure);
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        break;
+    }
+}
+
+test "multimodal rerank parser applies one aggregate budget to data URI media" {
+    const alloc = std.testing.allocator;
+    const body =
+        \\{
+        \\  "model": "vidore/colqwen2-v1.0",
+        \\  "query": "invoice",
+        \\  "documents": [{"content": [
+        \\    {"type":"image_url","image_url":{"url":"data:image/png;base64,YWJj"}},
+        \\    {"type":"image_url","image_url":{"url":"data:image/png;base64,ZGVm"}}
+        \\  ]}]
+        \\}
+    ;
+    var parsed = try std.json.parseFromSlice(api.RerankMultimodalRequest, alloc, body, .{});
+    defer parsed.deinit();
+    var node: Node = undefined;
+    node.config = .{};
+    const first_uri = "data:image/png;base64,YWJj";
+    var budget = RequestMediaBudget.init(first_uri.len + 1);
+
+    try std.testing.expectError(
+        error.RemoteContentTooLarge,
+        node.parseChatMessageContentToTextAndImagesWithBudget(alloc, parsed.value.documents[0].content, &budget),
+    );
+    try std.testing.expectEqual(first_uri.len, budget.used_bytes);
+}
+
 test "multimodal rerank parser rejects non-image media content parts" {
     const alloc = std.testing.allocator;
     const body =
@@ -11257,10 +16564,377 @@ test "multimodal rerank parser rejects invalid image data uris" {
 }
 
 /// Decode a data URI (data:mime/type;base64,...) to raw bytes.
+fn effectiveRequestContentSecurity(self: *const Node) scraping.ContentSecurityConfig {
+    var effective = default_request_content_security;
+    const configured = self.config.content_security orelse return effective;
+    if (configured.allowed_hosts != null) effective.allowed_hosts = configured.allowed_hosts;
+    if (configured.block_private_ips != null) effective.block_private_ips = configured.block_private_ips;
+    if (configured.max_download_size_bytes != null) effective.max_download_size_bytes = configured.max_download_size_bytes;
+    if (configured.download_timeout_seconds != null) effective.download_timeout_seconds = configured.download_timeout_seconds;
+    if (configured.max_image_dimension != null) effective.max_image_dimension = configured.max_image_dimension;
+    if (configured.allowed_paths != null) effective.allowed_paths = configured.allowed_paths;
+    if (configured.user_agent != null) effective.user_agent = configured.user_agent;
+    return effective;
+}
+
+const RequestMediaBudget = struct {
+    // Bounds downloaded and inline encoded media. Accepted image routes apply
+    // decoded-pixel admission separately before model execution.
+    max_bytes: usize,
+    used_bytes: usize = 0,
+
+    fn init(max_bytes: usize) RequestMediaBudget {
+        return .{ .max_bytes = max_bytes };
+    }
+
+    fn remaining(self: *const RequestMediaBudget) usize {
+        return self.max_bytes -| self.used_bytes;
+    }
+
+    fn add(self: *RequestMediaBudget, bytes: usize) !void {
+        if (bytes > self.remaining()) return error.RemoteContentTooLarge;
+        self.used_bytes += bytes;
+    }
+};
+
+const RequestMediaAdmissionShape = struct {
+    image_count: usize = 0,
+    // Inline encoded sources coexist with a separately allocated decoded copy.
+    inline_bytes: usize = 0,
+    // Direct callers already own decoded media. It is part of the logical
+    // media budget but is borrowed and therefore resident only once.
+    borrowed_bytes: usize = 0,
+    has_remote: bool = false,
+
+    fn addInline(self: *RequestMediaAdmissionShape, encoded_bytes: usize, is_image: bool) void {
+        if (is_image) self.image_count = std.math.add(usize, self.image_count, 1) catch std.math.maxInt(usize);
+        self.inline_bytes = std.math.add(usize, self.inline_bytes, encoded_bytes) catch std.math.maxInt(usize);
+    }
+
+    fn addBorrowed(self: *RequestMediaAdmissionShape, bytes: usize, is_image: bool) void {
+        if (is_image) self.image_count = std.math.add(usize, self.image_count, 1) catch std.math.maxInt(usize);
+        self.borrowed_bytes = std.math.add(usize, self.borrowed_bytes, bytes) catch std.math.maxInt(usize);
+    }
+
+    fn addImageUrlSlice(self: *RequestMediaAdmissionShape, source: []const u8) void {
+        if (std.mem.startsWith(u8, source, "data:")) {
+            self.addInline(source.len, true);
+            return;
+        }
+        self.image_count = std.math.add(usize, self.image_count, 1) catch std.math.maxInt(usize);
+        self.has_remote = true;
+    }
+
+    fn addImageUrl(self: *RequestMediaAdmissionShape, value: std.json.Value) void {
+        const url: ?[]const u8 = switch (value) {
+            .string => |string| string,
+            .object => |object| if (object.get("url")) |candidate|
+                if (candidate == .string) candidate.string else null
+            else
+                null,
+            else => null,
+        };
+        self.addImageUrlSlice(url orelse return);
+    }
+
+    fn potentialBytes(self: RequestMediaAdmissionShape, request_cap: usize) usize {
+        if (self.has_remote) return request_cap;
+        const known_bytes = std.math.add(usize, self.inline_bytes, self.borrowed_bytes) catch std.math.maxInt(usize);
+        return @min(known_bytes, request_cap);
+    }
+};
+
+const DirectDenseEmbedPreflight = struct {
+    shape: RequestMediaAdmissionShape,
+    known_media_bytes: usize,
+    has_audio: bool,
+};
+
+fn directDenseEmbedPreflight(parts: []const Node.DirectDenseEmbedPart) !DirectDenseEmbedPreflight {
+    var shape: RequestMediaAdmissionShape = .{};
+    var has_audio = false;
+    for (parts) |part| switch (part) {
+        .text => {},
+        .image_url => |url| shape.addImageUrlSlice(url),
+        .media => |media| {
+            const is_image = std.mem.startsWith(u8, media.mime_type, "image/");
+            const is_audio = std.mem.startsWith(u8, media.mime_type, "audio/");
+            if (!is_image and !is_audio) return error.UnsupportedMediaMimeType;
+            has_audio = has_audio or is_audio;
+            shape.addBorrowed(media.data.len, is_image);
+        },
+    };
+    return .{
+        .shape = shape,
+        .known_media_bytes = std.math.add(usize, shape.inline_bytes, shape.borrowed_bytes) catch
+            std.math.maxInt(usize),
+        .has_audio = has_audio,
+    };
+}
+
+fn generateRequestMediaShape(body: api.GenerateRequest) RequestMediaAdmissionShape {
+    var shape: RequestMediaAdmissionShape = .{};
+    for (body.messages) |message| {
+        const content = message.content orelse continue;
+        if (content != .array) continue;
+        for (content.array.items) |part| {
+            if (part != .object) continue;
+            const part_type = part.object.get("type") orelse continue;
+            if (part_type != .string or !std.mem.eql(u8, part_type.string, "image_url")) continue;
+            const image_url = part.object.get("image_url") orelse continue;
+            shape.addImageUrl(image_url);
+        }
+    }
+    return shape;
+}
+
+fn denseEmbedRequestMediaShape(input: std.json.Value) RequestMediaAdmissionShape {
+    var shape: RequestMediaAdmissionShape = .{};
+    if (input != .array) return shape;
+    for (input.array.items) |part| {
+        if (part != .object) continue;
+        const part_type = part.object.get("type") orelse continue;
+        if (part_type != .string) continue;
+        if (std.mem.eql(u8, part_type.string, "image_url")) {
+            const image_url = part.object.get("image_url") orelse continue;
+            shape.addImageUrl(image_url);
+            continue;
+        }
+        if (!std.mem.eql(u8, part_type.string, "media")) continue;
+        const data = part.object.get("data") orelse continue;
+        const mime = part.object.get("mime_type") orelse continue;
+        if (data != .string or mime != .string) continue;
+        shape.addInline(data.string.len, std.mem.startsWith(u8, mime.string, "image/"));
+    }
+    return shape;
+}
+
+fn multimodalRerankRequestMediaShape(body: api.RerankMultimodalRequest) RequestMediaAdmissionShape {
+    var shape: RequestMediaAdmissionShape = .{};
+    for (body.documents) |document| {
+        const content = document.content;
+        if (content != .array) continue;
+        for (content.array.items) |part| {
+            if (part != .object) continue;
+            const part_type = part.object.get("type") orelse continue;
+            if (part_type != .string) continue;
+            if (std.mem.eql(u8, part_type.string, "image_url")) {
+                const image_url = part.object.get("image_url") orelse continue;
+                shape.addImageUrl(image_url);
+                continue;
+            }
+            if (!std.mem.eql(u8, part_type.string, "media")) continue;
+            const data = part.object.get("data") orelse continue;
+            const mime = part.object.get("mime_type") orelse continue;
+            if (data != .string or mime != .string or !std.mem.startsWith(u8, mime.string, "image/")) continue;
+            shape.addInline(data.string.len, true);
+        }
+    }
+    return shape;
+}
+
+fn requestMediaMaxBytes(self: *const Node) usize {
+    const configured_u64 = effectiveRequestContentSecurity(self).max_download_size_bytes orelse
+        default_max_request_media_bytes;
+    const configured = std.math.cast(usize, configured_u64) orelse std.math.maxInt(usize);
+    return @min(default_max_request_media_bytes, configured);
+}
+
 fn downloadRemoteContent(self: *const Node, alloc: std.mem.Allocator, url: []const u8) !scraping.DownloadedContent {
-    const security = if (self.config.content_security) |*cfg| cfg else null;
+    var security = effectiveRequestContentSecurity(self);
     const s3_credentials = if (self.config.s3_credentials) |*cfg| cfg else null;
-    return try scraping.downloadContentAlloc(alloc, url, security, s3_credentials);
+    return try scraping.downloadContentAlloc(alloc, url, &security, s3_credentials);
+}
+
+const RemoteContentRequestFailure = struct {
+    status: u16,
+    code: []const u8,
+    message: []const u8,
+    retryable: bool,
+};
+
+fn normalizeRemoteContentRequestError(err: anyerror) anyerror {
+    return switch (err) {
+        error.OutOfMemory, error.Timeout, error.Canceled => err,
+        error.StreamTooLong => error.RemoteContentTooLarge,
+        error.HostNotAllowed,
+        error.PathNotAllowed,
+        error.PrivateIpBlocked,
+        => error.RemoteContentNotAllowed,
+        error.InvalidDataUri,
+        error.InvalidBase64,
+        error.InvalidHost,
+        error.InvalidS3Url,
+        error.UnexpectedCharacter,
+        error.InvalidFormat,
+        error.InvalidPort,
+        error.InvalidHostName,
+        error.UnsupportedUrlScheme,
+        => error.RemoteContentInvalid,
+        error.MissingS3Credentials,
+        error.MissingEndpoint,
+        error.MissingAccessKeyId,
+        error.MissingSecretAccessKey,
+        => error.RemoteContentNotConfigured,
+        else => error.RemoteContentUnavailable,
+    };
+}
+
+fn isDenseEmbedRequestAbort(err: anyerror) bool {
+    return err == error.OutOfMemory or err == error.Timeout or err == error.Canceled;
+}
+
+fn downloadRemoteContentWithBudgetForRequest(
+    self: *Node,
+    alloc: std.mem.Allocator,
+    url: []const u8,
+    budget: *RequestMediaBudget,
+) !scraping.DownloadedContent {
+    return downloadRemoteContentWithBudgetForRequestOptionalContext(self, alloc, null, url, budget);
+}
+
+fn downloadRemoteContentWithBudgetForRequestWithContext(
+    self: *Node,
+    alloc: std.mem.Allocator,
+    request_context: DenseEmbedRequestContext,
+    url: []const u8,
+    budget: *RequestMediaBudget,
+) !scraping.DownloadedContent {
+    return downloadRemoteContentWithBudgetForRequestOptionalContext(self, alloc, request_context, url, budget);
+}
+
+fn downloadRemoteContentWithBudgetForRequestOptionalContext(
+    self: *Node,
+    alloc: std.mem.Allocator,
+    request_context: ?DenseEmbedRequestContext,
+    url: []const u8,
+    budget: *RequestMediaBudget,
+) !scraping.DownloadedContent {
+    const remaining = budget.remaining();
+    // data: URLs are already resident in the request body. Enforce the
+    // encoded-source ceiling before allocating their decoded payload; remote
+    // sources continue to charge the downloaded payload bytes.
+    const inline_budget_bytes: ?usize = if (std.mem.startsWith(u8, url, "data:"))
+        encodedMediaBudgetSize(url) catch null
+    else
+        null;
+    if (inline_budget_bytes) |bytes| {
+        if (bytes > remaining) return error.RemoteContentTooLarge;
+    }
+
+    var bounded_security = effectiveRequestContentSecurity(self);
+    const remaining_u64: u64 = @intCast(remaining);
+    bounded_security.max_download_size_bytes = if (bounded_security.max_download_size_bytes) |configured|
+        @min(configured, remaining_u64)
+    else
+        remaining_u64;
+    const s3_credentials = if (self.config.s3_credentials) |*cfg| cfg else null;
+    const download_context = if (request_context) |context|
+        try denseEmbedDownloadContext(context)
+    else
+        null;
+    if (comptime builtin.is_test) request_work_test_counters.media_fetch_attempts += 1;
+    var downloaded = (if (download_context) |context|
+        scraping.downloadContentAllocWithContext(alloc, context, url, &bounded_security, s3_credentials)
+    else
+        scraping.downloadContentAlloc(alloc, url, &bounded_security, s3_credentials)) catch |err|
+        return normalizeRemoteContentRequestError(err);
+    errdefer downloaded.deinit(alloc);
+    try budget.add(inline_budget_bytes orelse downloaded.data.len);
+    return downloaded;
+}
+
+fn remoteContentRequestFailure(err: anyerror) ?RemoteContentRequestFailure {
+    return switch (err) {
+        error.RemoteContentTooLarge => .{
+            .status = 413,
+            .code = "CONTENT_TOO_LARGE",
+            .message = "media content exceeds the configured size limit",
+            .retryable = false,
+        },
+        error.RemoteContentNotAllowed => .{
+            .status = 403,
+            .code = "CONTENT_NOT_ALLOWED",
+            .message = "remote content URL is blocked by content security policy",
+            .retryable = false,
+        },
+        error.RemoteContentInvalid => .{
+            .status = 400,
+            .code = "INVALID_CONTENT_URL",
+            .message = "remote content URL or inline data is invalid",
+            .retryable = false,
+        },
+        error.RemoteContentNotConfigured => .{
+            .status = 503,
+            .code = "CONTENT_FETCH_NOT_CONFIGURED",
+            .message = "remote content storage is not configured",
+            .retryable = false,
+        },
+        error.RemoteContentUnavailable => .{
+            .status = 502,
+            .code = "CONTENT_FETCH_FAILED",
+            .message = "remote content could not be fetched",
+            .retryable = true,
+        },
+        else => null,
+    };
+}
+
+fn isRemoteContentRequestError(err: anyerror) bool {
+    return remoteContentRequestFailure(err) != null;
+}
+
+const internal_error_message = "internal inference error";
+
+fn internalErrorMessage(code: []const u8, err: anyerror) []const u8 {
+    if (!builtin.is_test) std.log.err("inference request failed code={s}: {s}", .{ code, @errorName(err) });
+    return internal_error_message;
+}
+
+fn internalErrorResponse(ctx: *httpx.Context, code: []const u8, err: anyerror) !httpx.Response {
+    return ctx.status(500).json(.{
+        .@"error" = code,
+        .message = internalErrorMessage(code, err),
+    });
+}
+
+fn writeInternalStreamError(
+    writer: *httpx.Context.StreamWriter,
+    stage: []const u8,
+    err: anyerror,
+) void {
+    writer.writeEvent("error", internalErrorMessage(stage, err)) catch {};
+}
+
+fn remoteContentErrorResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    if (err == error.OutOfMemory) return err;
+    const failure = remoteContentRequestFailure(err) orelse return err;
+    return ctx.status(failure.status).json(.{
+        .@"error" = failure.code,
+        .message = failure.message,
+        .retryable = failure.retryable,
+    });
+}
+
+fn readImageErrorResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    return switch (err) {
+        error.ImageDecodeFailed => ctx.status(400).json(.{
+            .@"error" = "INVALID_IMAGE",
+            .message = "image input is unsupported, corrupt, or has a malformed header",
+            .retryable = false,
+        }),
+        error.ImageTooLarge => ctx.status(413).json(.{
+            .@"error" = "IMAGE_TOO_LARGE",
+            .message = "image dimensions exceed the configured inference limit",
+            .retryable = false,
+        }),
+        error.ImageBatchTooLarge => ctx.status(413).json(.{
+            .@"error" = "IMAGE_BATCH_TOO_LARGE",
+            .message = "aggregate decoded image pixels exceed server capacity",
+            .retryable = false,
+        }),
+        else => err,
+    };
 }
 
 fn downloadReadBatchContent(
@@ -11272,7 +16946,7 @@ fn downloadReadBatchContent(
 ) !scraping.DownloadedContent {
     if (current_bytes >= max_bytes) return error.ReadBatchTooLarge;
     const remaining = max_bytes - current_bytes;
-    var bounded_security = if (self.config.content_security) |cfg| cfg else scraping.ContentSecurityConfig{};
+    var bounded_security = effectiveRequestContentSecurity(self);
     const remaining_u64: u64 = @intCast(remaining);
     bounded_security.max_download_size_bytes = if (bounded_security.max_download_size_bytes) |configured|
         @min(configured, remaining_u64)
@@ -11282,14 +16956,268 @@ fn downloadReadBatchContent(
     return try scraping.downloadContentAlloc(alloc, url, &bounded_security, s3_credentials);
 }
 
+fn downloadReadBatchContentForRequest(
+    self: *const Node,
+    alloc: std.mem.Allocator,
+    url: []const u8,
+    max_bytes: usize,
+    current_bytes: usize,
+) !scraping.DownloadedContent {
+    return downloadReadBatchContent(self, alloc, url, max_bytes, current_bytes) catch |err| {
+        if (err == error.ReadBatchTooLarge) return err;
+        return normalizeRemoteContentRequestError(err);
+    };
+}
+
 fn readBatchMaxBytes() usize {
     return @max(@as(usize, 1), platform.env.getenvUsize("ANTFLY_INFERENCE_READ_BATCH_BYTES") orelse default_max_read_batch_bytes);
 }
+
+fn readInlineSourceByteCap(self: *const Node) usize {
+    if (self.request_queue.max_concurrent == 0) return readBatchMaxBytes();
+    const capacity_bytes = std.math.mul(
+        usize,
+        self.request_queue.max_concurrent,
+        read_admission_bytes_per_unit,
+    ) catch std.math.maxInt(usize);
+    return @min(readBatchMaxBytes(), capacity_bytes);
+}
+
+fn addReadInlineSourceBytes(current: usize, url: []const u8, max_bytes: usize) !usize {
+    if (!std.mem.startsWith(u8, url, "data:")) return current;
+    const total = std.math.add(usize, current, url.len) catch return error.ReadBatchTooLarge;
+    if (total > max_bytes) return error.ReadBatchTooLarge;
+    return total;
+}
+
+const ReadRequestAdmission = struct {
+    units: usize,
+    // Logical downloaded/encoded-media ceiling passed to decoders and fetchers.
+    byte_cap: usize,
+    // Peak compressed-media residence. Inline sources keep their encoded bytes
+    // alive while a separately allocated decoded copy is processed.
+    resident_byte_cap: usize,
+    decoded_pixel_cap: usize,
+};
+
+fn admissionUnitsFor(value: usize, per_unit: usize) usize {
+    if (value == 0) return 0;
+    return 1 + ((value - 1) / per_unit);
+}
+
+const AudioDecodeAdmission = struct {
+    units: usize,
+    max_decode_working_bytes: usize,
+};
+
+fn audioDecodeAdmissionForLimits(resident_bytes: usize, max_concurrent_units: usize) AudioDecodeAdmission {
+    const admitted_resident, const max_decode_working_bytes = if (max_concurrent_units == 0)
+        .{ resident_bytes, default_max_audio_decode_working_bytes }
+    else blk: {
+        const capacity_bytes = std.math.mul(
+            usize,
+            max_concurrent_units,
+            read_admission_bytes_per_unit,
+        ) catch std.math.maxInt(usize);
+        const admitted = @min(resident_bytes, capacity_bytes);
+        break :blk .{
+            admitted,
+            @min(default_max_audio_decode_working_bytes, capacity_bytes - admitted),
+        };
+    };
+    const combined_bytes = std.math.add(usize, admitted_resident, max_decode_working_bytes) catch
+        std.math.maxInt(usize);
+    return .{
+        .units = @max(@as(usize, 1), admissionUnitsFor(combined_bytes, read_admission_bytes_per_unit)),
+        .max_decode_working_bytes = max_decode_working_bytes,
+    };
+}
+
+fn audioDecodeAdmission(self: *const Node, resident_bytes: usize) AudioDecodeAdmission {
+    return audioDecodeAdmissionForLimits(resident_bytes, self.request_queue.max_concurrent);
+}
+
+fn readRequestAdmissionForLimits(
+    image_count: usize,
+    configured_batch_byte_cap: usize,
+    configured_per_image_byte_cap: usize,
+    max_concurrent_units: usize,
+    max_image_dimension: ?u32,
+    inline_source_bytes: usize,
+) ReadRequestAdmission {
+    const capacity_bytes = if (max_concurrent_units == 0)
+        configured_batch_byte_cap
+    else
+        std.math.mul(usize, max_concurrent_units, read_admission_bytes_per_unit) catch std.math.maxInt(usize);
+    const aggregate_image_cap = std.math.mul(usize, image_count, configured_per_image_byte_cap) catch std.math.maxInt(usize);
+    const available_download_bytes = if (max_concurrent_units == 0)
+        configured_batch_byte_cap
+    else
+        capacity_bytes -| inline_source_bytes;
+    const byte_cap = @min(@min(configured_batch_byte_cap, available_download_bytes), aggregate_image_cap);
+    const resident_byte_cap = std.math.add(usize, inline_source_bytes, byte_cap) catch std.math.maxInt(usize);
+    const byte_units = admissionUnitsFor(resident_byte_cap, read_admission_bytes_per_unit);
+    const image_units = admissionUnitsFor(image_count, read_admission_images_per_unit);
+    return .{
+        .units = @max(@as(usize, 1), @max(byte_units, image_units)),
+        .byte_cap = byte_cap,
+        .resident_byte_cap = resident_byte_cap,
+        .decoded_pixel_cap = readDecodedPixelCapForLimits(
+            image_count,
+            max_concurrent_units,
+            max_image_dimension,
+            resident_byte_cap,
+        ),
+    };
+}
+
+fn readDecodedPixelCapForLimits(
+    image_count: usize,
+    max_concurrent_units: usize,
+    max_image_dimension: ?u32,
+    resident_byte_cap: usize,
+) usize {
+    const configured_working_bytes = if (max_concurrent_units == 0)
+        default_max_read_decoded_working_bytes
+    else blk: {
+        const capacity_bytes = std.math.mul(usize, max_concurrent_units, read_admission_bytes_per_unit) catch
+            std.math.maxInt(usize);
+        break :blk capacity_bytes -| resident_byte_cap;
+    };
+    const working_byte_cap = @min(default_max_read_decoded_working_bytes, configured_working_bytes);
+    const capacity_pixels = working_byte_cap / read_decoded_working_bytes_per_pixel;
+
+    var per_image_pixels = image_pipeline.DecodeLimits.inference_default.max_pixels;
+    if (max_image_dimension) |dimension| {
+        const dimension_usize: usize = @intCast(dimension);
+        const configured_pixels = std.math.mul(usize, dimension_usize, dimension_usize) catch std.math.maxInt(usize);
+        per_image_pixels = @min(per_image_pixels, configured_pixels);
+    }
+    const requested_pixels = std.math.mul(usize, image_count, per_image_pixels) catch std.math.maxInt(usize);
+    return @min(capacity_pixels, requested_pixels);
+}
+
+fn readRequestAdmission(
+    self: *const Node,
+    image_count: usize,
+    inline_source_bytes: usize,
+    max_tokens: ?usize,
+) ReadRequestAdmission {
+    const security = effectiveRequestContentSecurity(self);
+    const configured_u64 = security.max_download_size_bytes orelse
+        default_max_request_media_bytes;
+    const per_image_byte_cap = std.math.cast(usize, configured_u64) orelse std.math.maxInt(usize);
+    var admission = readRequestAdmissionForLimits(
+        image_count,
+        readBatchMaxBytes(),
+        per_image_byte_cap,
+        self.request_queue.max_concurrent,
+        security.max_image_dimension,
+        inline_source_bytes,
+    );
+    admission.units = @max(admission.units, estimateReadQueueUnits(image_count, max_tokens));
+    return admission;
+}
+
+fn requestMediaAdmissionForLimits(
+    shape: RequestMediaAdmissionShape,
+    request_byte_cap: usize,
+    max_concurrent_units: usize,
+    max_image_dimension: ?u32,
+) ReadRequestAdmission {
+    const potential_bytes = shape.potentialBytes(request_byte_cap);
+    const byte_cap = if (max_concurrent_units == 0)
+        potential_bytes
+    else blk: {
+        const capacity_bytes = std.math.mul(usize, max_concurrent_units, read_admission_bytes_per_unit) catch
+            std.math.maxInt(usize);
+        const inline_potential = @min(shape.inline_bytes, potential_bytes);
+        const max_logical_bytes = if (inline_potential >= capacity_bytes / 2)
+            capacity_bytes / 2
+        else
+            capacity_bytes - inline_potential;
+        break :blk @min(potential_bytes, max_logical_bytes);
+    };
+    const resident_byte_cap = std.math.add(usize, byte_cap, @min(shape.inline_bytes, byte_cap)) catch
+        std.math.maxInt(usize);
+    return .{
+        .units = @max(
+            @as(usize, 1),
+            @max(
+                admissionUnitsFor(resident_byte_cap, read_admission_bytes_per_unit),
+                admissionUnitsFor(shape.image_count, read_admission_images_per_unit),
+            ),
+        ),
+        .byte_cap = byte_cap,
+        .resident_byte_cap = resident_byte_cap,
+        .decoded_pixel_cap = readDecodedPixelCapForLimits(
+            shape.image_count,
+            max_concurrent_units,
+            max_image_dimension,
+            resident_byte_cap,
+        ),
+    };
+}
+
+fn requestMediaAdmission(self: *const Node, shape: RequestMediaAdmissionShape) ReadRequestAdmission {
+    return requestMediaAdmissionForLimits(
+        shape,
+        requestMediaMaxBytes(self),
+        self.request_queue.max_concurrent,
+        effectiveRequestContentSecurity(self).max_image_dimension,
+    );
+}
+
+const ReadDecodedImageBudget = struct {
+    base_units: usize,
+    base_bytes: usize,
+    max_pixels: usize,
+    used_pixels: usize = 0,
+    max_dimension: ?u32,
+
+    fn init(admission: ReadRequestAdmission, max_dimension: ?u32) ReadDecodedImageBudget {
+        return .{
+            .base_units = admission.units,
+            .base_bytes = admission.resident_byte_cap,
+            .max_pixels = admission.decoded_pixel_cap,
+            .max_dimension = max_dimension,
+        };
+    }
+
+    fn addPixels(self: *ReadDecodedImageBudget, pixels: usize) !void {
+        if (pixels > self.max_pixels -| self.used_pixels) return error.ImageBatchTooLarge;
+        self.used_pixels += pixels;
+    }
+
+    fn addImage(self: *ReadDecodedImageBudget, image_bytes: []const u8) !void {
+        const info = try image_pipeline.inspectEncodedForInference(image_bytes, self.max_dimension);
+        const pixels = std.math.mul(usize, @as(usize, info.width), @as(usize, info.height)) catch
+            return error.ImageBatchTooLarge;
+        try self.addPixels(pixels);
+    }
+
+    fn requiredUnits(self: *const ReadDecodedImageBudget) usize {
+        const working_bytes = std.math.mul(usize, self.used_pixels, read_decoded_working_bytes_per_pixel) catch
+            std.math.maxInt(usize);
+        const total_bytes = std.math.add(usize, self.base_bytes, working_bytes) catch std.math.maxInt(usize);
+        return @max(self.base_units, @max(@as(usize, 1), admissionUnitsFor(total_bytes, read_admission_bytes_per_unit)));
+    }
+};
 
 fn validateReadMaxTokens(value: ?i64) !?usize {
     const requested = value orelse return null;
     if (requested < 1 or requested > @as(i64, @intCast(max_read_tokens))) return error.InvalidMaxTokens;
     return @intCast(requested);
+}
+
+fn readMaxTokensJsonField(obj: std.json.ObjectMap, name: []const u8) !?usize {
+    const value = obj.get(name) orelse return null;
+    const requested = switch (value) {
+        .integer => |number| number,
+        .number_string => |raw| std.fmt.parseInt(i64, raw, 10) catch return error.InvalidMaxTokens,
+        else => return error.InvalidMaxTokens,
+    };
+    return validateReadMaxTokens(requested);
 }
 
 fn normalizeReadPrompt(prompt: ?[]const u8) ?[]const u8 {
@@ -11355,6 +17283,52 @@ fn decodeMediaData(allocator: std.mem.Allocator, data: []const u8) !DecodedDataU
     };
 }
 
+fn decodedMediaDataSize(data: []const u8) !usize {
+    const encoded = if (std.mem.startsWith(u8, data, "data:")) blk: {
+        const marker = ";base64,";
+        const marker_pos = std.mem.indexOf(u8, data, marker) orelse return error.InvalidDataUri;
+        break :blk data[marker_pos + marker.len ..];
+    } else data;
+    return std.base64.standard.Decoder.calcSizeForSlice(encoded) catch error.InvalidBase64;
+}
+
+fn encodedMediaBudgetSize(data: []const u8) !usize {
+    // Size data URIs independently of their transfer encoding. The scraping
+    // layer accepts both base64 and percent-encoded payloads, and both must be
+    // admitted by their resident request-body footprint before decoding.
+    if (std.mem.startsWith(u8, data, "data:")) {
+        const comma = std.mem.indexOfScalar(u8, data, ',') orelse return error.InvalidDataUri;
+        return if (comma + 1 == data.len) 0 else data.len;
+    }
+    return if (data.len == 0) 0 else data.len;
+}
+
+fn decodeDataUriWithBudget(
+    allocator: std.mem.Allocator,
+    uri: []const u8,
+    budget: *RequestMediaBudget,
+) !DecodedDataUri {
+    const encoded_size = try encodedMediaBudgetSize(uri);
+    if (encoded_size > budget.remaining()) return error.RemoteContentTooLarge;
+    const decoded = try decodeDataUri(allocator, uri);
+    errdefer decoded.deinit(allocator);
+    try budget.add(encoded_size);
+    return decoded;
+}
+
+fn decodeMediaDataWithBudget(
+    allocator: std.mem.Allocator,
+    data: []const u8,
+    budget: *RequestMediaBudget,
+) !DecodedDataUri {
+    const encoded_size = try encodedMediaBudgetSize(data);
+    if (encoded_size > budget.remaining()) return error.RemoteContentTooLarge;
+    const decoded = try decodeMediaData(allocator, data);
+    errdefer decoded.deinit(allocator);
+    try budget.add(encoded_size);
+    return decoded;
+}
+
 fn mediaMimeMatches(declared: ?[]const u8, embedded: ?[]const u8) bool {
     const embedded_mime = embedded orelse return true;
     const declared_mime = declared orelse return true;
@@ -11370,6 +17344,14 @@ fn unsupportedAudioResponse(ctx: *httpx.Context, message: []const u8) !httpx.Res
     return ctx.status(400).json(.{
         .@"error" = "UNSUPPORTED",
         .message = message,
+    });
+}
+
+fn audioTooLargeResponse(ctx: *httpx.Context) !httpx.Response {
+    return ctx.status(413).json(.{
+        .@"error" = "AUDIO_TOO_LARGE",
+        .message = "decoded audio exceeds the server working-memory limit",
+        .retryable = false,
     });
 }
 
@@ -11455,6 +17437,33 @@ test "structured output validation fails closed instead of fabricating JSON" {
             "{\"answer\":\"ok\"}",
         ),
     );
+}
+
+test "admission rejection includes Retry-After" {
+    const allocator = std.testing.allocator;
+    var node = try Node.init(allocator, .{ .max_concurrent_requests = 1 });
+    defer node.deinit();
+
+    try node.request_queue.acquire();
+    defer node.request_queue.release();
+
+    var request = try httpx.Request.init(allocator, .GET, "/ai/v1/models");
+    defer request.deinit();
+    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    defer ctx.deinit();
+
+    var response = (try node.acquireSlot(&ctx)) orelse return error.TestExpectedAdmissionRejection;
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 503), response.status.code);
+    try std.testing.expectEqualStrings("1", response.headers.get("Retry-After").?);
+    var payload = try std.json.parseFromSlice(
+        struct { retryable: bool },
+        allocator,
+        response.body.?,
+        .{ .ignore_unknown_fields = true },
+    );
+    defer payload.deinit();
+    try std.testing.expect(payload.value.retryable);
 }
 
 test "shared json schema validator: additionalProperties schema object" {

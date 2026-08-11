@@ -35,11 +35,13 @@ pub const default_rbac_model_text =
 pub const ResourceType = enum {
     table,
     user,
+    inference,
     @"*",
 
     pub fn fromSlice(raw: []const u8) !ResourceType {
         if (std.mem.eql(u8, raw, "table")) return .table;
         if (std.mem.eql(u8, raw, "user")) return .user;
+        if (std.mem.eql(u8, raw, "inference")) return .inference;
         if (std.mem.eql(u8, raw, "*")) return .@"*";
         return error.InvalidResourceType;
     }
@@ -48,10 +50,16 @@ pub const ResourceType = enum {
         return switch (self) {
             .table => "table",
             .user => "user",
+            .inference => "inference",
             .@"*" => "*",
         };
     }
 };
+
+test "inference resource type round trips through persisted strings" {
+    try std.testing.expectEqual(ResourceType.inference, try ResourceType.fromSlice("inference"));
+    try std.testing.expectEqualStrings("inference", ResourceType.inference.slice());
+}
 
 pub const PermissionType = enum {
     read,

@@ -25204,6 +25204,7 @@ fn generatedEmbedBatchBytes() usize {
 fn remoteRenderConfig(
     secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
+    max_media_parts: ?usize,
 ) template_remote.RenderConfig {
     var config: template_remote.RenderConfig = .{};
     if (comptime @hasField(template_remote.RenderConfig, "secret_store")) {
@@ -25211,6 +25212,9 @@ fn remoteRenderConfig(
     }
     if (comptime @hasField(template_remote.RenderConfig, "remote_content")) {
         config.remote_content = remote_content;
+    }
+    if (comptime @hasField(template_remote.RenderConfig, "max_media_parts")) {
+        config.max_media_parts = max_media_parts;
     }
     return config;
 }
@@ -25227,14 +25231,14 @@ fn renderSourceTemplateText(
             alloc,
             template_source,
             doc_value,
-            remoteRenderConfig(secret_store, remote_content),
+            remoteRenderConfig(secret_store, remote_content, null),
         );
     }
     return try template_remote.renderJsonToTextWithConfig(
         alloc,
         template_source,
         doc_value,
-        remoteRenderConfig(secret_store, remote_content),
+        remoteRenderConfig(secret_store, remote_content, null),
     );
 }
 
@@ -25244,13 +25248,14 @@ fn renderSourceTemplateParts(
     remote_content: ?*const scraping.RemoteContentConfig,
     template_source: []const u8,
     doc_value: []const u8,
+    max_media_parts: ?usize,
 ) ![]template_mod.ContentPart {
     if (comptime @hasDecl(template_remote, "renderJsonToPartsWithConfig")) {
         return try template_remote.renderJsonToPartsWithConfig(
             alloc,
             template_source,
             doc_value,
-            remoteRenderConfig(secret_store, remote_content),
+            remoteRenderConfig(secret_store, remote_content, max_media_parts),
         );
     }
     return try template_remote.renderJsonToParts(alloc, template_source, doc_value);
@@ -29047,7 +29052,13 @@ fn computeDenseRequestImpl(
     }
 
     if (request.source_template.len > 0 and dense_embedder.supportsParts()) {
-        const source_parts = try renderSourceParts(alloc, db, doc_value, request);
+        const source_parts = try renderSourceParts(
+            alloc,
+            db,
+            doc_value,
+            request,
+            dense_embedder.mediaPartLimit(embedding_name),
+        );
         if (source_parts) |parts| {
             defer template_mod.freeContentParts(alloc, parts);
 
@@ -29480,9 +29491,10 @@ fn renderSourceParts(
     db: *DB,
     doc_value: []const u8,
     request: enrichment_types.GeneratedEnrichmentRequest,
+    max_media_parts: ?usize,
 ) !?[]template_mod.ContentPart {
     if (request.source_template.len == 0) return null;
-    const parts = renderSourceTemplateParts(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch |err| switch (err) {
+    const parts = renderSourceTemplateParts(alloc, db.secret_store, db.remote_content, request.source_template, doc_value, max_media_parts) catch |err| switch (err) {
         error.PermanentPromptFailure, error.TransientPromptFailure => return err,
         else => return null,
     };
@@ -29499,7 +29511,7 @@ fn renderSourcePartsJson(
     doc_value: []const u8,
     request: enrichment_types.GeneratedEnrichmentRequest,
 ) !?[]u8 {
-    const parts = try renderSourceParts(alloc, db, doc_value, request) orelse return null;
+    const parts = try renderSourceParts(alloc, db, doc_value, request, null) orelse return null;
     defer template_mod.freeContentParts(alloc, parts);
     return try contentPartsJsonAlloc(alloc, parts);
 }
@@ -39904,26 +39916,28 @@ fn flushFinishedDenseAppliedSequenceLocked(
     // backends. Hold a shared apply lease so concurrent persistence remains
     // parallel while catalog replacement's exclusive lease cannot retire a
     // backend underneath this durability boundary.
-    ctx.apply_mutex.lockShared();
-    defer ctx.apply_mutex.unlockShared();
-    const raw_update = [_]apply_state.AppliedSequenceUpdate{.{
-        .index_name = pending.owned_name,
-        .sequence = pending.sequence,
-    }};
-    const enriched_updates = try appliedSequenceUpdatesWithConfigHashes(ctx.alloc, ctx.index_manager, &raw_update);
-    defer ctx.alloc.free(enriched_updates);
-    try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
-    try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
-    try apply_state.saveAppliedSequencesWithCheckpoint(
-        ctx.alloc,
-        ctx.index_manager.checkpointIo(),
-        ctx.store,
-        ctx.applied_sequence_checkpoint_path,
-        enriched_updates,
-    );
-    lifecycle_completed.* = try finalizeCoveredDenseProjectionCheckpoint(ctx, pending.owned_name, pending.sequence) or lifecycle_completed.*;
-    try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, enriched_updates);
-    const save_ns = elapsedSince(save_start_ns);
+    const save_ns = blk: {
+        ctx.apply_mutex.lockShared();
+        defer ctx.apply_mutex.unlockShared();
+        const raw_update = [_]apply_state.AppliedSequenceUpdate{.{
+            .index_name = pending.owned_name,
+            .sequence = pending.sequence,
+        }};
+        const enriched_updates = try appliedSequenceUpdatesWithConfigHashes(ctx.alloc, ctx.index_manager, &raw_update);
+        defer ctx.alloc.free(enriched_updates);
+        try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
+        try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
+        try apply_state.saveAppliedSequencesWithCheckpoint(
+            ctx.alloc,
+            ctx.index_manager.checkpointIo(),
+            ctx.store,
+            ctx.applied_sequence_checkpoint_path,
+            enriched_updates,
+        );
+        lifecycle_completed.* = try finalizeCoveredDenseProjectionCheckpoint(ctx, pending.owned_name, pending.sequence) or lifecycle_completed.*;
+        try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, enriched_updates);
+        break :blk elapsedSince(save_start_ns);
+    };
 
     ctx.applied_sequence_coalescer.last_flush_ns = monotonicTimeNs();
     const flush_ns = elapsedSince(flush_start_ns);
@@ -39963,22 +39977,24 @@ fn flushPendingAppliedSequencesLocked(
     // Keep the complete metadata/checkpoint/status transaction on one stable
     // index generation. Shared holders may proceed concurrently; index
     // replacement and teardown require the exclusive lease.
-    ctx.apply_mutex.lockShared();
-    defer ctx.apply_mutex.unlockShared();
-    try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
-    try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
-    try apply_state.saveAppliedSequencesWithCheckpoint(
-        ctx.alloc,
-        ctx.index_manager.checkpointIo(),
-        ctx.store,
-        ctx.applied_sequence_checkpoint_path,
-        enriched_updates,
-    );
-    for (enriched_updates) |update| {
-        lifecycle_completed.* = try finalizeCoveredDenseProjectionCheckpoint(ctx, update.index_name, update.sequence) or lifecycle_completed.*;
-    }
-    try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, enriched_updates);
-    const save_ns = elapsedSince(save_start_ns);
+    const save_ns = blk: {
+        ctx.apply_mutex.lockShared();
+        defer ctx.apply_mutex.unlockShared();
+        try saveDenseProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
+        try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
+        try apply_state.saveAppliedSequencesWithCheckpoint(
+            ctx.alloc,
+            ctx.index_manager.checkpointIo(),
+            ctx.store,
+            ctx.applied_sequence_checkpoint_path,
+            enriched_updates,
+        );
+        for (enriched_updates) |update| {
+            lifecycle_completed.* = try finalizeCoveredDenseProjectionCheckpoint(ctx, update.index_name, update.sequence) or lifecycle_completed.*;
+        }
+        try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, enriched_updates);
+        break :blk elapsedSince(save_start_ns);
+    };
     ctx.applied_sequence_coalescer.clearPending(ctx.alloc);
     ctx.applied_sequence_coalescer.last_flush_ns = monotonicTimeNs();
     const flush_ns = elapsedSince(flush_start_ns);
@@ -40576,7 +40592,8 @@ const GateDenseEmbedder = struct {
     allowed_successes: std.atomic.Value(usize) = .init(1),
     successful_requests: std.atomic.Value(usize) = .init(0),
     total_requests: std.atomic.Value(usize) = .init(0),
-    rate_limited_requests: std.atomic.Value(usize) = .init(0),
+    blocked_requests: std.atomic.Value(usize) = .init(0),
+    blocked_error: anyerror = error.EmbedRateLimited,
 
     fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
         if (needle.len == 0) return true;
@@ -40614,8 +40631,8 @@ const GateDenseEmbedder = struct {
         const previous_successes = self.successful_requests.fetchAdd(1, .acq_rel);
         if (previous_successes >= self.allowed_successes.load(.acquire)) {
             _ = self.successful_requests.fetchSub(1, .acq_rel);
-            _ = self.rate_limited_requests.fetchAdd(1, .monotonic);
-            return error.EmbedRateLimited;
+            _ = self.blocked_requests.fetchAdd(1, .monotonic);
+            return self.blocked_error;
         }
         if (dims != 3) return error.InvalidVectorDimensions;
         const vector = try alloc.alloc(f32, 3);
@@ -40638,12 +40655,12 @@ const GateDenseEmbedder = struct {
 
     fn snapshot(self: *GateDenseEmbedder) struct {
         total_requests: usize,
-        rate_limited_requests: usize,
+        blocked_requests: usize,
         successful_requests: usize,
     } {
         return .{
             .total_requests = self.total_requests.load(.acquire),
-            .rate_limited_requests = self.rate_limited_requests.load(.acquire),
+            .blocked_requests = self.blocked_requests.load(.acquire),
             .successful_requests = self.successful_requests.load(.acquire),
         };
     }
@@ -40665,6 +40682,37 @@ const CountingSparseEmbedder = struct {
             .sparse_embed_fn = embedSparse,
             .deinit_fn = null,
         };
+    }
+};
+
+const GateSparseEmbedder = struct {
+    deterministic: embedder_mod.DeterministicSparseEmbedder = .{},
+    allowed_successes: std.atomic.Value(usize) = .init(0),
+    successful_requests: std.atomic.Value(usize) = .init(0),
+    blocked_requests: std.atomic.Value(usize) = .init(0),
+    blocked_error: anyerror = error.ResourceTemporarilyUnavailable,
+
+    fn embedSparse(ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, text: []const u8) !embedder_mod.SparseEmbedding {
+        const self: *GateSparseEmbedder = @ptrCast(@alignCast(ptr));
+        const previous_successes = self.successful_requests.fetchAdd(1, .acq_rel);
+        if (previous_successes >= self.allowed_successes.load(.acquire)) {
+            _ = self.successful_requests.fetchSub(1, .acq_rel);
+            _ = self.blocked_requests.fetchAdd(1, .monotonic);
+            return self.blocked_error;
+        }
+        return try embedder_mod.DeterministicSparseEmbedder.embedSparse(&self.deterministic, alloc, embedding_name, text);
+    }
+
+    fn interface(self: *GateSparseEmbedder) embedder_mod.SparseEmbedder {
+        return .{
+            .ptr = self,
+            .sparse_embed_fn = embedSparse,
+            .deinit_fn = null,
+        };
+    }
+
+    fn allowAll(self: *GateSparseEmbedder) void {
+        self.allowed_successes.store(std.math.maxInt(usize), .release);
     }
 };
 
@@ -43002,6 +43050,7 @@ test "remote template host-rendered parts preserve prompt failures" {
             null,
             "{{remoteMedia url=this}}",
             "\"https://example.com/photo.png\"",
+            null,
         ),
     );
 }
@@ -54517,12 +54566,12 @@ test "db managed dense enrichment remains searchable after transient rate limits
     var attempts: usize = 0;
     while (attempts < 200) : (attempts += 1) {
         const snapshot = gated.snapshot();
-        if (snapshot.rate_limited_requests > 0 and snapshot.successful_requests >= 1) break;
+        if (snapshot.blocked_requests > 0 and snapshot.successful_requests >= 1) break;
         sleepNs(10 * std.time.ns_per_ms);
     }
 
     const before_release = gated.snapshot();
-    try std.testing.expect(before_release.rate_limited_requests > 0);
+    try std.testing.expect(before_release.blocked_requests > 0);
     try std.testing.expect(before_release.successful_requests >= 1);
 
     gated.allowAll();
@@ -54563,6 +54612,242 @@ test "db managed dense enrichment remains searchable after transient rate limits
     try db.runUntilIdle();
 }
 
+test "db managed dense enrichment retries temporary model capacity without terminal coverage" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var gated = GateDenseEmbedder{
+        .allowed_successes = .init(0),
+        .blocked_error = error.ResourceTemporarilyUnavailable,
+    };
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = gated.interface(),
+            .inline_retry_max_attempts = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"cosine\",\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"semantic_idx\"}}",
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"alpha concept overview\"}" },
+            .{ .key = "doc:b", .value = "{\"body\":\"beta architecture notes\"}" },
+            .{ .key = "doc:c", .value = "{\"body\":\"gamma implementation details\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    var observed_retry = false;
+    var attempts: usize = 0;
+    while (attempts < default_test_wait_attempts) : (attempts += 1) {
+        const stats = try db.stats(alloc);
+        if (gated.snapshot().blocked_requests > 0 and stats.enrichment.retryable_error_count > 0) {
+            try std.testing.expect(stats.enrichment.retrying);
+            try std.testing.expect(!stats.enrichment.worker_failed);
+            try std.testing.expectEqual(@as(u64, 0), stats.enrichment.fatal_error_count);
+            for (stats.indexes) |index_stats| {
+                if (!std.mem.eql(u8, index_stats.name, "semantic_idx")) continue;
+                try std.testing.expect(!index_stats.enrichment_failed);
+                try std.testing.expectEqual(@as(u64, 0), index_stats.coverage_terminal_failed_count);
+            }
+            observed_retry = true;
+        }
+        types.freeDBStats(alloc, stats);
+        if (observed_retry) break;
+        sleepNs(10 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(observed_retry);
+
+    gated.allowAll();
+    try db.runUntilIdle();
+
+    const final_stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, final_stats);
+    try std.testing.expectEqual(@as(u64, 0), final_stats.enrichment.fatal_error_count);
+    try std.testing.expect(!final_stats.enrichment.worker_failed);
+    for (final_stats.indexes) |index_stats| {
+        if (!std.mem.eql(u8, index_stats.name, "semantic_idx")) continue;
+        try std.testing.expectEqual(@as(u64, 3), index_stats.doc_count);
+        try std.testing.expectEqual(@as(u64, 3), index_stats.coverage_produced_count);
+        try std.testing.expectEqual(@as(u64, 0), index_stats.coverage_terminal_failed_count);
+        try std.testing.expect(!index_stats.enrichment_failed);
+    }
+
+    var result = try db.search(alloc, .{
+        .index_name = "semantic_idx",
+        .dense = .{
+            .vector = &.{ 1.0, 0.0, 0.0 },
+            .k = 3,
+        },
+        .limit = 3,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 3), result.total_hits);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+}
+
+test "db managed sparse enrichment retries temporary model capacity without terminal coverage" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var gated = GateSparseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .sparse_embedder = gated.interface(),
+            .inline_retry_max_attempts = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "sp_v1",
+        .kind = .sparse_vector,
+        .config_json = "{\"field\":\"sparse_embedding\",\"generator\":{\"kind\":\"sparse_embedding\",\"source_field\":\"body\"}}",
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha concept overview\"}" }},
+        .sync_level = .write,
+    });
+
+    var observed_retry = false;
+    var attempts: usize = 0;
+    while (attempts < default_test_wait_attempts) : (attempts += 1) {
+        const stats = try db.stats(alloc);
+        if (gated.blocked_requests.load(.acquire) > 0 and stats.enrichment.retryable_error_count > 0) {
+            try std.testing.expect(stats.enrichment.retrying);
+            try std.testing.expect(!stats.enrichment.worker_failed);
+            try std.testing.expectEqual(@as(u64, 0), stats.enrichment.fatal_error_count);
+            for (stats.indexes) |index_stats| {
+                if (!std.mem.eql(u8, index_stats.name, "sp_v1")) continue;
+                try std.testing.expect(!index_stats.enrichment_failed);
+                try std.testing.expectEqual(@as(u64, 0), index_stats.coverage_terminal_failed_count);
+            }
+            observed_retry = true;
+        }
+        types.freeDBStats(alloc, stats);
+        if (observed_retry) break;
+        sleepNs(10 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(observed_retry);
+
+    gated.allowAll();
+    try db.runUntilIdle();
+
+    const final_stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, final_stats);
+    try std.testing.expectEqual(@as(u64, 0), final_stats.enrichment.fatal_error_count);
+    try std.testing.expect(!final_stats.enrichment.worker_failed);
+    for (final_stats.indexes) |index_stats| {
+        if (!std.mem.eql(u8, index_stats.name, "sp_v1")) continue;
+        try std.testing.expectEqual(@as(u64, 1), index_stats.doc_count);
+        try std.testing.expectEqual(@as(u64, 1), index_stats.coverage_produced_count);
+        try std.testing.expectEqual(@as(u64, 0), index_stats.coverage_terminal_failed_count);
+        try std.testing.expect(!index_stats.enrichment_failed);
+    }
+
+    var query = try gated.deterministic.interface().embedSparse(alloc, "sp_v1", "alpha concept overview");
+    defer query.deinit(alloc);
+    var result = try db.search(alloc, .{
+        .index_name = "sp_v1",
+        .query = .{ .sparse_knn = .{
+            .indices = query.indices,
+            .values = query.values,
+            .k = 1,
+        } },
+        .limit = 1,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+}
+
+test "db chunked dense enrichment retries temporary model capacity without terminal coverage" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var gated = GateDenseEmbedder{
+        .allowed_successes = .init(0),
+        .blocked_error = error.ResourceTemporarilyUnavailable,
+    };
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = gated.interface(),
+            .inline_retry_max_attempts = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"chunk_dense_v1\"}}",
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"abcdefghijklmno\"}" }},
+        .sync_level = .write,
+    });
+
+    var observed_retry = false;
+    var attempts: usize = 0;
+    while (attempts < default_test_wait_attempts) : (attempts += 1) {
+        const stats = try db.stats(alloc);
+        if (gated.snapshot().blocked_requests > 0 and stats.enrichment.retryable_error_count > 0) {
+            try std.testing.expectEqual(@as(u64, 0), stats.enrichment.fatal_error_count);
+            for (stats.indexes) |index_stats| {
+                if (!std.mem.eql(u8, index_stats.name, "dv_v1")) continue;
+                try std.testing.expect(!index_stats.enrichment_failed);
+                try std.testing.expectEqual(@as(u64, 0), index_stats.coverage_terminal_failed_count);
+            }
+            observed_retry = true;
+        }
+        types.freeDBStats(alloc, stats);
+        if (observed_retry) break;
+        sleepNs(10 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(observed_retry);
+
+    gated.allowAll();
+    try db.runUntilIdle();
+
+    const final_stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, final_stats);
+    try std.testing.expectEqual(@as(u64, 0), final_stats.enrichment.fatal_error_count);
+    for (final_stats.indexes) |index_stats| {
+        if (!std.mem.eql(u8, index_stats.name, "dv_v1")) continue;
+        try std.testing.expectEqual(@as(u64, 0), index_stats.coverage_terminal_failed_count);
+        try std.testing.expect(!index_stats.enrichment_failed);
+    }
+    try std.testing.expectEqual(@as(u64, 3), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
+
+    const query_vec = try gated.interface().embedDense(alloc, "chunk_dense_v1", "abcdefgh", 3);
+    defer alloc.free(query_vec);
+    var result = try db.search(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{ .vector = query_vec, .k = 3 },
+        .return_mode = .parent,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+}
+
 test "db managed dense delete quiesces rate-limited enrichment and recreates cleanly" {
     const alloc = std.testing.allocator;
 
@@ -54595,10 +54880,10 @@ test "db managed dense delete quiesces rate-limited enrichment and recreates cle
     });
 
     var attempts: usize = 0;
-    while (attempts < 200 and gated.snapshot().rate_limited_requests == 0) : (attempts += 1) {
+    while (attempts < 200 and gated.snapshot().blocked_requests == 0) : (attempts += 1) {
         sleepNs(10 * std.time.ns_per_ms);
     }
-    try std.testing.expect(gated.snapshot().rate_limited_requests > 0);
+    try std.testing.expect(gated.snapshot().blocked_requests > 0);
 
     const delete_started_ns = monotonicTimeNs();
     try std.testing.expect(try db.deleteIndex("semantic_idx"));
@@ -59610,10 +59895,10 @@ test "db restart after provider failure resumes enrichment from retained async r
         try std.testing.expect(failed_target_sequence > first_applied_sequence);
 
         var attempts: usize = 0;
-        while (attempts < default_test_wait_attempts and gated.snapshot().rate_limited_requests == 0) : (attempts += 1) {
+        while (attempts < default_test_wait_attempts and gated.snapshot().blocked_requests == 0) : (attempts += 1) {
             sleepPollInterval();
         }
-        try std.testing.expect(gated.snapshot().rate_limited_requests > 0);
+        try std.testing.expect(gated.snapshot().blocked_requests > 0);
 
         // Stop at the observed provider failure boundary, then let the
         // independent executor finish and attempt async truncation. This
@@ -59717,10 +60002,10 @@ test "db async replay truncation retains journal behind generated enrichment" {
     _ = try waitForAppliedSequenceAdvance(alloc, &db, "ft_v1", 0);
     _ = try waitForAppliedSequenceAdvance(alloc, &db, "semantic_idx", 0);
     var attempts: usize = 0;
-    while (attempts < default_test_wait_attempts and gated.snapshot().rate_limited_requests == 0) : (attempts += 1) {
+    while (attempts < default_test_wait_attempts and gated.snapshot().blocked_requests == 0) : (attempts += 1) {
         sleepPollInterval();
     }
-    try std.testing.expect(gated.snapshot().rate_limited_requests > 0);
+    try std.testing.expect(gated.snapshot().blocked_requests > 0);
     try std.testing.expectEqual(
         @as(u64, 0),
         try enrichment_state.loadAppliedSequence(alloc, db.core.store, enrichment_runtime_mod.scope_name),

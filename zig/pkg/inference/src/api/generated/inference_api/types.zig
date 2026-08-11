@@ -166,7 +166,7 @@ pub const Config = struct {
     models_dir: ?[]const u8 = null,
     /// Base directory containing Traditional ML predictor subdirectories. The `/ml/v1/*` API auto-discovers predictors from `{ml_dir}/{name}/tabular_model.json`. Defaults to ~/.antfly/inference/ml.
     ml_dir: ?[]const u8 = null,
-    /// Security settings for downloading content from URLs (e.g., images for CLIP models). Controls allowed hosts, private IP blocking, download limits, and timeouts.
+    /// Configured fields are merged individually over a fail-closed inference baseline. Omitted or empty policies deny HTTP(S), file, and S3 while allowing data URIs; omitted allowed_hosts and allowed_paths remain explicit deny-all lists even when another field is configured. Enable remote sources only with explicit allowlists. block_private_ips defaults to true; while enabled, IP literals and every address resolved from an allowlisted DNS hostname must be globally routable, and the connection is pinned to a vetted address. Setting it to false explicitly opts into private and special destinations. Across generate, dense embed, and multimodal rerank, downloaded and inline encoded media is capped cumulatively per request at the lower of 100 MiB, max_download_size_bytes, and—when max_concurrent_requests is positive—16 MiB times that capacity; zero max_download_size_bytes disables nonempty media. Remote URL byte potential is reserved before fetch, while inline sources use their actual encoded size. Accepted image inputs also undergo header-only dimension and aggregate decoded-pixel admission before model execution. Batch generation rejects multimodal content before fetch. Embedded direct transcription and extraction use the configured encoded-media per-call ceiling, and direct dense embedding also applies pre-allocation and decoded-image admission. In unified Antfly configuration, an empty inference policy may first inherit a nonempty remote_content security policy, which is then merged over this baseline.
     content_security: ?ContentSecurityConfig = null,
     /// S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail.
     s3_credentials: ?Credentials = null,
@@ -174,43 +174,44 @@ pub const Config = struct {
     keep_alive: ?[]const u8 = null,
     /// Maximum total models loaded across all registry types (embedders, rerankers, generators, chunkers, etc.). When the limit is reached, the least-recently-used idle model from any registry is evicted to make room. Set to 0 for unlimited. Defaults to 10.
     max_loaded_models: ?i64 = null,
-    /// Number of concurrent inference pipelines per model. Each pipeline loads a copy of the model, so higher values use more memory but allow more concurrent requests. Note: pool_size multiplies per-model memory independently of max_loaded_models.
+    /// Legacy compatibility field. The current Zig inference runtime does not create per-model pipeline pools from this setting; configuring it has no effect.
     pool_size: ?i64 = null,
     /// Native generator prompt KV cache settings.
     prompt_cache: ?PromptCacheConfig = null,
-    /// Backend priority order for model loading with optional device specifiers. Format: `backend` or `backend:device` where device defaults to `auto`. Antfly inference tries entries in order and uses the first available backend+device combination that supports the model. **Examples**: - `["native", "onnx", "xla"]` - Try backends with auto device detection - `["cuda", "onnx:cuda", "xla:tpu", "native"]` - Prefer GPU, fall back to CPU
+    /// Legacy compatibility field. The current Zig inference runtime selects a backend from model metadata, explicit preload settings, and compiled capabilities; configuring this list has no effect.
     backend_priority: ?[]const BackendPriorityEntry = null,
-    /// Maximum number of concurrent inference requests allowed. Additional requests will be queued up to max_queue_size. Set to 0 for unlimited (default).
+    /// Maximum concurrent weighted inference admission units in the Zig runtime. Request body size, generation workload, and image byte/count reservations can consume more than one unit. Read and image-extraction admission reserves the effective downloaded-byte ceiling at 16 MiB per unit and at least one unit per two images. A positive capacity also clamps each such request's downloaded-image ceiling to 16 MiB times this value. Set to 0 disables both admission accounting and that capacity-derived clamp. When a positive limit is exhausted, new requests are rejected immediately with 503 Service Unavailable and Retry-After: 1; they are not retained in an in-process queue. Set to 0 only as an operational escape hatch for trusted testing environments; unlimited admission is not recommended for production native generation. Use a positive production limit. The default is 32.
     max_concurrent_requests: ?i64 = null,
-    /// Maximum number of requests to queue when max_concurrent_requests is reached. When the queue is full, new requests receive 503 Service Unavailable with Retry-After header. Set to 0 for unlimited queue (default). Only effective when max_concurrent_requests > 0.
+    /// Legacy Go-runtime queue setting. The current Zig runtime does not retain excess inference requests in memory and ignores this field.
     max_queue_size: ?i64 = null,
-    /// Maximum time to wait for a request to complete, including queue wait time. Use Go duration format: "30s", "1m", "0" (no timeout, default). Requests exceeding this timeout receive 504 Gateway Timeout.
+    /// Legacy Go-runtime queue/request timeout. The current Zig runtime ignores this field; its HTTP listener applies a separate fixed transport timeout.
     request_timeout: ?[]const u8 = null,
     /// Models to preload and warm at startup. Generators run a tiny generation request so native/Metal weights, KV setup, and kernels use the same budgeted path as request-time generation. Other model kinds use the best available warm path for that kind.
     preload: ?[]const ModelRef = null,
-    /// Maximum memory (in MB) to use for loaded models. When this limit is approached, least recently used models are unloaded. Set to 0 for unlimited (default). This is an advisory limit - actual memory usage depends on model sizes and may temporarily exceed this value. Works alongside max_loaded_models for fine-grained control.
+    /// Legacy compatibility field. The current Zig runtime uses explicit host, backend, combined, KV, and scratch budgets instead and ignores this field.
     max_memory_mb: ?i64 = null,
     /// Per-model loading strategy overrides. Maps model names to their loading strategy. Models not in this map load on demand. keep_alive controls their idle eviction; setting it to "0" disables idle eviction but does not preload or pin them. When a model has strategy "eager" in this map: - It is loaded at startup through the same startup warmup path - It is never unloaded, even when keep_alive>0 (pinned in memory) This allows mixing eager and lazy models in the same pool.
     model_strategies: ?std.json.ArrayHashMap([]const u8) = null,
-    /// Whether the dashboard should show model download commands. Defaults to true for standalone inference and Antfly standalone deployments. Set to false in managed deployments (e.g., Kubernetes operator) where models are managed externally.
+    /// Legacy compatibility field controlling whether dashboards show model download commands. It defaults to true for standalone deployments; managed deployments historically set it to false. Download-command availability is a build-time setting in the current Zig runtime, so configuring this field has no effect.
     allow_downloads: ?bool = null,
     log: ?SchemasConfig = null,
 };
 
 pub const ContentPart = antfly_generating_openapi.ContentPart;
 
+/// Inference merges configured fields over a fail-closed baseline. HTTP(S), file, and S3 content require explicit allowlists; data URIs remain allowed within the configured size budget.
 pub const ContentSecurityConfig = struct {
-    /// Whitelist of allowed hostnames/IPs for link downloads. If empty, all hosts are allowed (except private IPs if block_private_ips is true).
+    /// Explicit HTTP(S) host allowlist for inference downloads. Omission and an explicit empty list both deny all hosts. With block_private_ips enabled, IP literals and every address resolved from an allowlisted DNS hostname must be globally routable; the connection is pinned to a vetted address.
     allowed_hosts: ?[]const []const u8 = null,
-    /// Block requests to private IP ranges (127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16)
+    /// Reject loopback, private, link-local, carrier-grade NAT, reserved, and multicast destinations. Allowlisted DNS hostnames are resolved, every result is filtered by this policy, and the connection is pinned to a vetted address. Set false only as an explicit opt-out that permits private and special destinations.
     block_private_ips: ?bool = null,
     /// Maximum size of downloaded content in bytes
     max_download_size_bytes: ?i64 = null,
-    /// Timeout for individual download operations in seconds
+    /// Maximum HTTP download duration in seconds. Defaults to 30; 0 disables the deadline.
     download_timeout_seconds: ?i64 = null,
-    /// Maximum image width/height in pixels (images will be resized)
+    /// Maximum source-image width or height for accepted inference image inputs, including generate/chat, dense embed, multimodal rerank, `/read`, image `/extract`, and their embedded direct APIs. Headers exceeding this limit are rejected before model execution; images are not resized. Batch generation rejects multimodal content before fetch. Non-inference scraping consumers do not enforce this setting.
     max_image_dimension: ?i64 = null,
-    /// Whitelist of allowed path prefixes for file:// and s3:// URLs. If empty, all paths are allowed. For file:// use absolute paths (e.g., /Users/data/). For s3:// use bucket/prefix (e.g., my-bucket/uploads/).
+    /// Explicit path-prefix allowlist for inference file:// and s3:// URLs. Omission and an explicit empty list both deny all file and S3 paths. For file:// use absolute paths (e.g., /Users/data/). For s3:// use bucket/prefix (e.g., my-bucket/uploads/).
     allowed_paths: ?[]const []const u8 = null,
     /// User-Agent header for HTTP downloads. Defaults to 'AntflyDB/1.0' if not set. Some servers (e.g., Wikipedia) reject requests without a User-Agent.
     user_agent: ?[]const u8 = null,
@@ -250,7 +251,7 @@ pub const DocumentClassificationObject = struct {
     prefix: []const u8,
     input: std.json.Value,
     features: DocumentClassificationFeatures,
-    best: ?std.json.Value = null,
+    best: ?DocumentClassificationResult = null,
     scores: []const DocumentClassificationResult,
 };
 
@@ -310,7 +311,7 @@ pub const DocumentTokenClassificationPrediction = struct {
     text: []const u8,
     bbox: []const i64,
     features: DocumentTokenClassificationFeatures,
-    best: ?std.json.Value = null,
+    best: ?DocumentTokenClassificationResult = null,
     scores: []const DocumentTokenClassificationResult,
 };
 
@@ -419,7 +420,7 @@ pub const Error = struct {
     message: ?[]const u8 = null,
     /// Machine-readable capacity source when the failure is retryable
     reason: ?[]const u8 = null,
-    /// Whether retrying the same request may succeed
+    /// Whether retrying the request may succeed
     retryable: ?bool = null,
     /// Minimum retry delay in milliseconds
     retry_after_ms: ?i64 = null,
@@ -473,6 +474,7 @@ pub const FunctionDefinition = struct {
 };
 
 pub const GenerateBatchError = struct {
+    /// Stable machine-readable item error code, including `CONTENT_TOO_LARGE` for aggregate media-budget failures.
     code: []const u8,
     message: []const u8,
     retryable: bool,
@@ -534,6 +536,12 @@ pub const GenerateBatchSummary = struct {
     failed: i64,
 };
 
+/// Typed options passed to the model's chat template.
+pub const GenerateChatTemplateKwargs = struct {
+    /// Controls templates that support an `enable_thinking` variable. False asks the template to open a public/final response channel directly. Omitted preserves the model template's default behavior.
+    enable_thinking: ?bool = null,
+};
+
 pub const GenerateChoice = struct {
     /// Index of this choice in the list
     index: i64,
@@ -550,6 +558,9 @@ pub const GenerateChunk = struct {
     created: i64,
     model: []const u8,
     choices: []const GenerateChunkChoice,
+    /// Authoritative token accounting. When `stream_options.include_usage` is true, streaming responses emit this only on the final chunk, after the finish chunk and before the `[DONE]` sentinel; that chunk has an empty `choices` array.
+    usage: ?GenerateUsage = null,
+    speculation: ?GenerateSpeculationStatus = null,
 };
 
 pub const GenerateChunkChoice = struct {
@@ -599,6 +610,10 @@ pub const GenerateRequest = struct {
     top_k: ?i64 = null,
     /// If true, partial message deltas will be sent as SSE events
     stream: ?bool = null,
+    stream_options: ?GenerateStreamOptions = null,
+    chat_template_kwargs: ?GenerateChatTemplateKwargs = null,
+    /// inference-native benchmarking and controlled-generation extension. When true, generation does not stop on the model's end-of-sequence token and continues until another stop condition, such as `max_tokens`, is reached. Omitted or false preserves normal EOS handling.
+    ignore_eos: ?bool = null,
     /// List of tools (functions) the model can call. Only supported by models with tool_call_format configured.
     tools: ?[]const Tool = null,
     /// Min-p sampling threshold. Filters tokens where p < min_p * max_p. Simpler alternative to top_p.
@@ -617,13 +632,17 @@ pub const GenerateRequest = struct {
     draft_model: ?[]const u8 = null,
     /// inference-native speculative decoding extension. Number of draft tokens proposed per verification round.
     speculative_k: ?i64 = null,
+    /// inference-native speculative decoding policy: `auto`, `force`, or `off`. Defaults to `auto` when a draft model is requested.
+    speculation_policy: ?[]const u8 = null,
+    /// inference-native speculative decoding calibration state: `none`, `probe`, or `positive`. Defaults to `probe` for `auto` draft requests so they are measured instead of silently disabled, and to `none` for `force` or `off`.
+    speculation_calibration: ?[]const u8 = null,
     /// inference-native KV cache quantization format. Lower precision reduces memory usage but may affect generation quality. Default auto-selects based on backend (f16 for GPU, f32 for CPU).
     cache_dtype: ?[]const u8 = null,
-    /// inference-native KV cache compaction ratio applied after prefill via Attention Matching. Selects a subset of keys and fits new values via OLS to preserve attention behavior. 0.02 = 50x compression, 0.1 = 10x, 0.5 = 2x. Null/omitted = no compaction.
+    /// inference-native KV cache compaction ratio applied after prefill via Attention Matching. Selects a subset of keys and fits new values via OLS to preserve attention behavior. 0.02 = 50x compression, 0.1 = 10x, 0.5 = 2x. Null/omitted = no compaction. The resident HTTP server currently rejects non-null values with `UNSUPPORTED_FEATURE`; device-backed compaction is not yet supported.
     cache_compaction_ratio: ?f32 = null,
     /// inference-native prompt prefix cache namespace key. Requests with the same key can reuse matching prompt-prefix KV on the same node. Required to enable prompt caching; requests without a key are never cached.
     prompt_cache_key: ?[]const u8 = null,
-    /// inference-native prompt prefix cache control. False bypasses prompt cache for this request.
+    /// inference-native prompt prefix cache control. False bypasses prompt cache for this request. On Metal, an eligible cache request stays on the eager paged-attention path instead of automatically selecting whole-model compiled execution. Explicit `mode: compiled` is rejected while prompt caching is active.
     prompt_cache: ?bool = null,
     backend: ?ModelBackend = null,
     /// inference-native graph execution mode. `eager` keeps the direct runtime path when possible. `compiled` runs inference graph planning, partitioning, and backend executor attachment.
@@ -647,6 +666,7 @@ pub const GenerateResponse = struct {
     /// List of completion choices (currently always 1)
     choices: []const GenerateChoice,
     usage: GenerateUsage,
+    speculation: ?GenerateSpeculationStatus = null,
 };
 
 pub const GenerateResponseFormat = struct {
@@ -654,6 +674,20 @@ pub const GenerateResponseFormat = struct {
     type: []const u8,
     /// Optional schema payload for `type=json_schema`. Enforced during native constrained decoding and validated after generation.
     json_schema: ?GenerateJsonSchemaConfig = null,
+};
+
+/// Effective speculative-decoding decision for this completion.
+pub const GenerateSpeculationStatus = struct {
+    policy: []const u8,
+    calibration: []const u8,
+    decision: []const u8,
+    disabled_reason: ?[]const u8 = null,
+};
+
+/// Options that apply only to streamed generation responses.
+pub const GenerateStreamOptions = struct {
+    /// When true, emit a final usage-only chunk before the `[DONE]` sentinel. All preceding chunks carry null or omitted usage.
+    include_usage: ?bool = null,
 };
 
 pub const GenerateUsage = struct {
@@ -973,7 +1007,7 @@ pub const PredictorsResponse = struct {
 pub const PromptCacheConfig = struct {
     /// Enable inference-native prompt KV cache reuse for generator requests.
     enabled: ?bool = null,
-    /// Prompt KV cache implementation. `block_hash` (default) uses hash-addressed full KV blocks under prompt_cache_key with O(1) block lookup and is the scalable production mode. `simple` keeps the linear-scan retained-prefix cache and is only suitable for small caches or debugging.
+    /// Prompt KV cache implementation. `block_hash` (default) uses hash-addressed full KV blocks under prompt_cache_key with O(1) block lookup. `radix` is an opt-in page-aligned compressed radix tree with shared-prefix ownership and leaf-only LRU eviction; it is currently qualified for native and Metal backends. Eligible Metal requests use eager paged attention; explicit compiled generation is incompatible with prompt caching. `simple` keeps the linear-scan retained-prefix cache and is only suitable for small caches or debugging.
     mode: ?[]const u8 = null,
     /// Node-wide target for live prompt-cache entries. The runtime divides it across participating model caches and evicts using estimated metadata and logical host/device KV bytes. Backend allocators may retain reusable capacity, so this is not a hard cap on process or accelerator memory.
     max_bytes_mb: ?i64 = null,
@@ -1196,6 +1230,11 @@ pub const ToolCallFunctionDelta = struct {
 /// Controls how the model uses tools. Options: - "auto": Model decides whether to call a tool (default) - "none": Model will not call any tools - "required": Model must call at least one tool - object: Force a specific function to be called
 pub const ToolChoice = std.json.Value;
 
+pub const ToolChoiceFunction = struct {
+    /// The name of the function to call
+    name: []const u8,
+};
+
 pub const TranscribeObject = struct {
     object: []const u8,
     /// Input audio index.
@@ -1241,7 +1280,7 @@ pub const TransientCapacityError = struct {
 
 pub const VADOptions = antfly_chunking_api_openapi.VADOptions;
 
-/// Logging configuration for inference services
+/// Legacy inference-local logging configuration. The current unified Zig runtime ignores it; configure the top-level `log` object instead.
 pub const SchemasConfig = struct {
     level: ?Level = null,
     style: ?Style = null,

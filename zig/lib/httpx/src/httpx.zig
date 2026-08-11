@@ -202,6 +202,7 @@ pub const WriterProgressCallback = client_mod.WriterProgressCallback;
 pub const Interceptor = client_mod.Interceptor;
 pub const RequestInterceptor = client_mod.RequestInterceptor;
 pub const ResponseInterceptor = client_mod.ResponseInterceptor;
+pub const AddressFilter = socket.AddressFilter;
 
 pub const ConnectionPool = pool.ConnectionPool;
 pub const PoolConfig = pool.PoolConfig;

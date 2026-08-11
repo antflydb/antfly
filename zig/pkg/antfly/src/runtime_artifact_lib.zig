@@ -293,6 +293,7 @@ comptime {
             exportInternal(&api_kernel_exports.prepareRestoreLeadership, "antfly_api_kernel_prepare_restore_leadership");
             exportInternal(&api_kernel_exports.scheduleSessionMaintenance, "antfly_api_kernel_schedule_session_maintenance");
             exportInternal(&api_kernel_exports.storageMaintenanceActive, "antfly_api_kernel_storage_maintenance_active");
+            exportInternal(&api_kernel_exports.authorizeInference, "antfly_api_kernel_authorize_inference");
             exportInternal(&api_kernel_exports.handle, "antfly_api_kernel_handle");
             exportInternal(&api_kernel_exports.handleInternal, "antfly_api_kernel_handle_internal");
             exportInternal(&api_kernel_exports.handlerCreate, "antfly_api_kernel_handler_create");

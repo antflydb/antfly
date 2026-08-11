@@ -647,6 +647,7 @@ pub const ManagedEmbedder = struct {
             .dense_embed_fn = embedDense,
             .dense_embed_batch_fn = embedDenseBatch,
             .dense_embed_parts_fn = embedDenseParts,
+            .media_part_limit_fn = denseMediaPartLimit,
             .deinit_fn = deinitDenseEmbedder,
         };
     }
@@ -766,6 +767,7 @@ pub const ManagedEmbedder = struct {
         const entry = self.findEntry(index_name) orelse return error.EmbeddingIndexNotFound;
         const rendered = try renderQueryTemplateWithEntry(alloc, embedding_template, text, entry);
         defer alloc.free(rendered);
+        try ensureEntryDeadline(entry);
         try validateRenderedTemplate(alloc, rendered);
         const parts = try template_mod.textToParts(alloc, rendered);
         defer template_mod.freeContentParts(alloc, parts);
@@ -813,6 +815,12 @@ pub const ManagedEmbedder = struct {
         const entry = self.findEntry(embedding_name) orelse return error.EmbeddingIndexNotFound;
         if (entry.sparse) return error.UnsupportedEmbeddingProvider;
         return try embedWithEntryParts(alloc, entry, parts, dims);
+    }
+
+    fn denseMediaPartLimit(ptr: *anyopaque, embedding_name: []const u8) ?usize {
+        const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
+        const entry = self.findEntry(embedding_name) orelse return null;
+        return if (isAntflyProvider(entry.provider)) 1 else null;
     }
 
     fn deinitDenseEmbedder(ptr: *anyopaque, alloc: std.mem.Allocator) void {
@@ -945,6 +953,17 @@ pub fn testEmbeddingProviderDeadlines() !void {
     defer managed.deinit();
     try std.testing.expectEqual(expired_deadline, managed.entries[0].deadline_ns.?);
     try std.testing.expectError(error.Timeout, embeddingHttpClientConfig(&managed.entries[0]));
+    const render_config = queryTemplateRenderConfig(&managed.entries[0]);
+    if (comptime @hasField(template_remote.RenderConfig, "io")) {
+        try std.testing.expect(render_config.io == null);
+    }
+    if (comptime @hasField(template_remote.RenderConfig, "deadline_ns")) {
+        try std.testing.expectEqual(expired_deadline, render_config.deadline_ns.?);
+    }
+    try std.testing.expectError(
+        error.Timeout,
+        renderQueryTemplateWithEntry(std.testing.allocator, "{{this}}", "query", &managed.entries[0]),
+    );
 
     managed.entries[0].deadline_ns = monotonicNowNs() + 5 * std.time.ns_per_s;
     const config = try embeddingHttpClientConfig(&managed.entries[0]);
@@ -1660,8 +1679,6 @@ const QueryTemplateRenderContext = struct {
     alloc: std.mem.Allocator,
 };
 
-threadlocal var active_query_template_render_context: ?*QueryTemplateRenderContext = null;
-
 fn renderQueryTemplate(
     alloc: std.mem.Allocator,
     embedding_template: []const u8,
@@ -1670,21 +1687,18 @@ fn renderQueryTemplate(
     const query_json = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(text, .{})});
     defer alloc.free(query_json);
 
+    var render_ctx = QueryTemplateRenderContext{
+        .alloc = alloc,
+    };
+
     var helper_arena_state = std.heap.ArenaAllocator.init(alloc);
     defer helper_arena_state.deinit();
     const helper_arena = helper_arena_state.allocator();
 
     var extra_helpers: hbs.HelperMap = .{};
-    try extra_helpers.put(helper_arena, "remoteMedia", hbs.Helper.from(&remoteMediaQueryHelper));
-    try extra_helpers.put(helper_arena, "remotePDF", hbs.Helper.from(&remotePdfQueryHelper));
-    try extra_helpers.put(helper_arena, "remoteText", hbs.Helper.from(&remoteTextQueryHelper));
-
-    var render_ctx = QueryTemplateRenderContext{
-        .alloc = alloc,
-    };
-    const prev_ctx = active_query_template_render_context;
-    active_query_template_render_context = &render_ctx;
-    defer active_query_template_render_context = prev_ctx;
+    try extra_helpers.put(helper_arena, "remoteMedia", hbs.Helper.withData(&remoteMediaQueryHelper, @ptrCast(&render_ctx)));
+    try extra_helpers.put(helper_arena, "remotePDF", hbs.Helper.withData(&remotePdfQueryHelper, @ptrCast(&render_ctx)));
+    try extra_helpers.put(helper_arena, "remoteText", hbs.Helper.withData(&remoteTextQueryHelper, @ptrCast(&render_ctx)));
 
     return try template_mod.renderDocumentWithHelpers(alloc, embedding_template, query_json, &extra_helpers);
 }
@@ -1695,10 +1709,18 @@ fn renderQueryTemplateWithEntry(
     text: []const u8,
     entry: *const ManagedEmbeddingEntry,
 ) ![]const u8 {
+    try ensureEntryDeadline(entry);
     if (comptime builtin.is_test) {
         return try renderQueryTemplate(alloc, embedding_template, text);
     }
 
+    const config = queryTemplateRenderConfig(entry);
+    const query_json = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(text, .{})});
+    defer alloc.free(query_json);
+    return try template_remote.renderJsonToTextWithConfig(alloc, embedding_template, query_json, config);
+}
+
+fn queryTemplateRenderConfig(entry: *const ManagedEmbeddingEntry) template_remote.RenderConfig {
     var config: template_remote.RenderConfig = .{};
     if (comptime @hasField(template_remote.RenderConfig, "remote_content")) {
         config.remote_content = entry.remote_content;
@@ -1706,9 +1728,20 @@ fn renderQueryTemplateWithEntry(
     if (comptime @hasField(template_remote.RenderConfig, "secret_store")) {
         config.secret_store = entry.secret_store;
     }
-    const query_json = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(text, .{})});
-    defer alloc.free(query_json);
-    return try template_remote.renderJsonToTextWithConfig(alloc, embedding_template, query_json, config);
+    if (comptime @hasField(template_remote.RenderConfig, "io")) {
+        // Preserve the distinction between caller-owned request I/O and no
+        // request context. The renderer creates and owns its fallback I/O;
+        // substituting the process-global single-threaded executor here can
+        // make remote helpers fail under the server's concurrent workload.
+        config.io = entry.io;
+    }
+    if (comptime @hasField(template_remote.RenderConfig, "deadline_ns")) {
+        config.deadline_ns = entry.deadline_ns;
+    }
+    if (comptime @hasField(template_remote.RenderConfig, "max_media_parts")) {
+        if (isAntflyProvider(entry.provider)) config.max_media_parts = 1;
+    }
+    return config;
 }
 
 fn validateRenderedTemplate(alloc: std.mem.Allocator, rendered: []const u8) !void {
@@ -1736,7 +1769,7 @@ fn remoteMediaQueryHelper(ctx: hbs.HelperContext) anyerror!hbs.Value {
         return .{ .safe_string = result };
     }
 
-    const render_ctx = active_query_template_render_context orelse {
+    const render_ctx = queryTemplateRenderContext(ctx) orelse {
         const result = try template_mod.formatErrorDirective(ctx.arena, 0, "remoteMedia missing HTTP context");
         return .{ .safe_string = result };
     };
@@ -1783,7 +1816,7 @@ fn remoteTextQueryHelper(ctx: hbs.HelperContext) anyerror!hbs.Value {
     };
     if (url_str.len == 0) return .{ .string = "" };
 
-    const render_ctx = active_query_template_render_context orelse {
+    const render_ctx = queryTemplateRenderContext(ctx) orelse {
         const result = try template_mod.formatErrorDirective(ctx.arena, 0, "remoteText missing HTTP context");
         return .{ .safe_string = result };
     };
@@ -1820,7 +1853,7 @@ fn remotePdfQueryHelper(ctx: hbs.HelperContext) anyerror!hbs.Value {
     };
     if (url_str.len == 0) return .{ .safe_string = "" };
 
-    const render_ctx = active_query_template_render_context orelse {
+    const render_ctx = queryTemplateRenderContext(ctx) orelse {
         const result = try template_mod.formatErrorDirective(ctx.arena, 0, "remotePDF missing HTTP context");
         return .{ .safe_string = result };
     };
@@ -1845,6 +1878,11 @@ fn remotePdfQueryHelper(ctx: hbs.HelperContext) anyerror!hbs.Value {
 
     const result = try template_mod.formatErrorDirective(ctx.arena, 0, "remotePDF extraction is unsupported");
     return .{ .safe_string = result };
+}
+
+fn queryTemplateRenderContext(ctx: hbs.HelperContext) ?*QueryTemplateRenderContext {
+    const userdata = ctx.userdata orelse return null;
+    return @ptrCast(@alignCast(userdata));
 }
 
 fn flattenContentPartsToText(
@@ -1898,6 +1936,15 @@ fn validateSparseBatch(embeddings: []const db_embedder.SparseEmbedding, expected
     }
 }
 
+fn normalizeLocalEmbeddingError(err: anyerror) anyerror {
+    return switch (err) {
+        error.QueueFull,
+        error.ResourceTemporarilyUnavailable,
+        => error.EmbedTransientFailure,
+        else => err,
+    };
+}
+
 fn embedWithEntryParts(
     alloc: std.mem.Allocator,
     entry: *const ManagedEmbeddingEntry,
@@ -1928,6 +1975,7 @@ fn embedWithEntryParts(
     }
 
     if (isAntflyProvider(entry.provider) and (entry.multimodal or partsContainMedia(parts))) {
+        if (parts.len == 0) return error.EmptyEmbeddingResponse;
         if (entry.antfly_provider) |local| {
             if (local.embed_dense_parts) |embed_parts| {
                 try waitForEntryPacer(entry);
@@ -1959,7 +2007,10 @@ fn embedWithEntryParts(
             }
         }
 
-        var result = try provider.embedParts(alloc, entry.model, parts);
+        var result = provider.embedParts(alloc, entry.model, parts) catch |err| switch (err) {
+            error.EmptyResponse => return error.EmptyEmbeddingResponse,
+            else => return err,
+        };
         defer result.deinit();
         if (result.vectors.len == 0) return error.EmptyEmbeddingResponse;
         if (result.vectors.len != 1) return error.InvalidEmbeddingResponse;
@@ -3536,6 +3587,88 @@ test "managed embedder routes antfly model to local provider" {
     try std.testing.expectEqualSlices(f32, &.{ 0.25, 0.5, 0.75 }, vector);
 }
 
+pub fn testLocalAdmissionOverloadNormalization() !void {
+    const Local = struct {
+        failure: anyerror = error.QueueFull,
+
+        fn dense(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![][]f32 {
+            return error.TestUnexpectedResult;
+        }
+
+        fn denseWithContext(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const []const u8,
+            _: EmbeddingRequestContext,
+        ) anyerror![][]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.failure;
+        }
+
+        fn sparse(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![]db_embedder.SparseEmbedding {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.failure;
+        }
+
+        fn parts(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const template_mod.ContentPart) anyerror![][]f32 {
+            return error.TestUnexpectedResult;
+        }
+
+        fn partsWithContext(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const template_mod.ContentPart,
+            _: EmbeddingRequestContext,
+        ) anyerror![][]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.failure;
+        }
+    };
+
+    var local = Local{};
+    const provider = AntflyProvider{
+        .ptr = &local,
+        .embed_dense_texts = Local.dense,
+        .embed_dense_texts_with_context = Local.denseWithContext,
+        .embed_sparse_texts = Local.sparse,
+        .embed_dense_parts = Local.parts,
+        .embed_dense_parts_with_context = Local.partsWithContext,
+    };
+    var managed = try ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(std.testing.allocator,
+        \\{
+        \\  "dense_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"local-model"}},
+        \\  "sparse_idx":{"type":"embeddings","field":"body","sparse":true,"embedder":{"provider":"antfly","model":"local-model"}},
+        \\  "multimodal_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"local-model","multimodal":true}}
+        \\}
+    , provider);
+    defer managed.deinit();
+
+    const media_parts = [_]template_mod.ContentPart{.{ .media_url = "data:image/png;base64,aaa" }};
+    const sparse_entry = managed.findEntry("sparse_idx").?;
+    const multimodal_entry = managed.findEntry("multimodal_idx").?;
+
+    try std.testing.expectError(error.EmbedTransientFailure, managed.embedQuery(std.testing.allocator, "dense_idx", "query"));
+    try std.testing.expectError(error.EmbedTransientFailure, embedSparseWithEntry(std.testing.allocator, sparse_entry, "query"));
+    try std.testing.expectError(error.EmbedTransientFailure, embedWithEntryParts(std.testing.allocator, multimodal_entry, &media_parts, 3));
+
+    local.failure = error.ResourceTemporarilyUnavailable;
+    try std.testing.expectError(error.EmbedTransientFailure, managed.embedQuery(std.testing.allocator, "dense_idx", "query"));
+    try std.testing.expectError(error.EmbedTransientFailure, embedSparseWithEntry(std.testing.allocator, sparse_entry, "query"));
+    try std.testing.expectError(error.EmbedTransientFailure, embedWithEntryParts(std.testing.allocator, multimodal_entry, &media_parts, 3));
+
+    local.failure = error.ResourceLimitExceeded;
+    try std.testing.expectError(error.ResourceLimitExceeded, managed.embedQuery(std.testing.allocator, "dense_idx", "query"));
+    try std.testing.expectError(error.ResourceLimitExceeded, embedSparseWithEntry(std.testing.allocator, sparse_entry, "query"));
+    try std.testing.expectError(error.ResourceLimitExceeded, embedWithEntryParts(std.testing.allocator, multimodal_entry, &media_parts, 3));
+
+    local.failure = error.TestUnexpectedResult;
+    try std.testing.expectError(error.TestUnexpectedResult, managed.embedQuery(std.testing.allocator, "dense_idx", "query"));
+    try std.testing.expectError(error.TestUnexpectedResult, embedSparseWithEntry(std.testing.allocator, sparse_entry, "query"));
+    try std.testing.expectError(error.TestUnexpectedResult, embedWithEntryParts(std.testing.allocator, multimodal_entry, &media_parts, 3));
+}
+
 test "managed embedder routes antfly without api_url to local provider" {
     const Local = struct {
         calls: usize = 0,
@@ -3717,9 +3850,10 @@ test "managed embedder routes antfly with configured inference api url to antfly
     try testConfiguredInferenceAPIURLPrecedence();
 }
 
-test "managed embedder sends antfly media parts when local provider is configured" {
+pub fn testAntflyEmbedPartSelectionAndCardinality() !void {
     const Local = struct {
         saw_parts: bool = false,
+        response_count: usize = 1,
 
         fn dense(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) ![][]f32 {
             return error.TestUnexpectedResult;
@@ -3736,12 +3870,16 @@ test "managed embedder sends antfly media parts when local provider is configure
             try std.testing.expectEqualStrings("caption", parts_slice[0].text);
             try std.testing.expectEqualStrings("data:image/png;base64,aaa", parts_slice[1].media_url);
             try std.testing.expectEqualStrings("image/png", parts_slice[2].binary.mime_type);
-            try std.testing.expectEqualStrings(&[_]u8{ 1, 2, 3 }, parts_slice[2].binary.data);
             self.saw_parts = true;
 
-            const vectors = try alloc.alloc([]f32, 1);
+            const vectors = try alloc.alloc([]f32, self.response_count);
             errdefer alloc.free(vectors);
-            vectors[0] = try alloc.dupe(f32, &.{ 0.25, 0.5, 0.75 });
+            var initialized: usize = 0;
+            errdefer for (vectors[0..initialized]) |vector| alloc.free(vector);
+            for (vectors) |*vector| {
+                vector.* = try alloc.dupe(f32, &.{ 0.25, 0.5, 0.75 });
+                initialized += 1;
+            }
             return vectors;
         }
     };
@@ -3759,6 +3897,15 @@ test "managed embedder sends antfly media parts when local provider is configure
     ;
     var managed = try ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(std.testing.allocator, indexes_json, provider);
     defer managed.deinit();
+    const dense_interface = managed.denseInterface();
+    try std.testing.expectEqual(@as(?usize, 1), dense_interface.mediaPartLimit("semantic_idx"));
+    try std.testing.expectEqual(@as(?usize, null), dense_interface.mediaPartLimit("missing"));
+
+    var bedrock_managed = try ManagedEmbedder.initFromIndexesJson(std.testing.allocator,
+        \\{"bedrock_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"bedrock","model":"amazon.titan-embed-image-v1","region":"us-east-1","multimodal":true}}}
+    );
+    defer bedrock_managed.deinit();
+    try std.testing.expectEqual(@as(?usize, null), bedrock_managed.denseInterface().mediaPartLimit("bedrock_idx"));
 
     const parts = [_]template_mod.ContentPart{
         .{ .text = "caption" },
@@ -3769,6 +3916,13 @@ test "managed embedder sends antfly media parts when local provider is configure
     defer std.testing.allocator.free(vector);
     try std.testing.expectEqualSlices(f32, &.{ 0.25, 0.5, 0.75 }, vector);
     try std.testing.expect(local.saw_parts);
+
+    local.response_count = 0;
+    try std.testing.expectError(error.EmptyEmbeddingResponse, embedWithEntryParts(std.testing.allocator, &managed.entries[0], &parts, 3));
+    local.response_count = 2;
+    try std.testing.expectError(error.InvalidEmbeddingResponse, embedWithEntryParts(std.testing.allocator, &managed.entries[0], &parts, 3));
+
+    try std.testing.expectError(error.EmptyEmbeddingResponse, embedWithEntryParts(std.testing.allocator, &managed.entries[0], &.{}, 3));
 }
 
 test "managed embedder preserves antfly api_url path for shared antfly endpoint" {

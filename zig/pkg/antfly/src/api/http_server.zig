@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const kernel_abi = @import("kernel_abi.zig");
 const builtin = @import("builtin");
 const platform = @import("antfly_platform");
 const build_options = @import("build_options");
@@ -3542,6 +3543,33 @@ pub const ApiHttpServer = struct {
         }
 
         return error.Unauthorized;
+    }
+
+    pub fn authorizeInferenceRequest(
+        self: *ApiHttpServer,
+        request: AuthenticatedRequest,
+        permission: kernel_abi.InferencePermission,
+    ) !kernel_abi.AuthorizationDecision {
+        if (!self.cfg.auth_enabled and self.cfg.trusted_principal_secret == null)
+            return .allowed;
+        if (self.cfg.auth_enabled and
+            self.cfg.user_manager == null and
+            self.cfg.trusted_principal_secret == null)
+            return .not_ready;
+
+        var identity = self.authenticateRequest(request) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return .unauthorized,
+        };
+        defer identity.deinit(self.alloc);
+        const required: usermgr.PermissionType = switch (permission) {
+            .read => .read,
+            .write => .write,
+        };
+        return if (permissionsAllow(identity.permissions, .inference, "*", required))
+            .allowed
+        else
+            .forbidden;
     }
 
     fn authenticateTrustedPrincipal(self: *ApiHttpServer, token: []const u8, secret: []const u8) !AuthenticatedIdentity {
@@ -15788,6 +15816,7 @@ fn resourceTypeFromOpenApi(value: usermgr_openapi.ResourceType) usermgr.Resource
     return switch (value) {
         .table => .table,
         .user => .user,
+        .inference => .inference,
         .@"*" => .@"*",
     };
 }
@@ -15804,6 +15833,7 @@ fn resourceTypeToOpenApi(value: usermgr.ResourceType) usermgr_openapi.ResourceTy
     return switch (value) {
         .table => .table,
         .user => .user,
+        .inference => .inference,
         .@"*" => .@"*",
     };
 }

@@ -683,40 +683,63 @@ pub const Context = struct {
 
         /// Convenience: write a complete SSE event (formats `event:`, `data:`, trailing newline).
         pub fn writeEvent(self: *StreamWriter, event_name: ?[]const u8, data: []const u8) !void {
-            // Build the SSE text in a stack buffer to send as one chunk.
+            return writeEventTo(self, event_name, data);
+        }
+
+        fn writeEventTo(writer: anytype, event_name: ?[]const u8, data: []const u8) !void {
+            var required: usize = 1;
+            if (event_name) |name| {
+                required = std.math.add(usize, required, "event: ".len + 1) catch return error.EventTooLarge;
+                required = std.math.add(usize, required, name.len) catch return error.EventTooLarge;
+            }
+            var size_lines = mem.splitScalar(u8, data, '\n');
+            while (size_lines.next()) |line| {
+                required = std.math.add(usize, required, "data: ".len + 1) catch return error.EventTooLarge;
+                required = std.math.add(usize, required, line.len) catch return error.EventTooLarge;
+            }
+
+            // Keep the normal per-token path to one transport write. Oversized
+            // completion/tool events fall back to equivalent incremental SSE
+            // framing instead of failing an otherwise successful stream.
             var buf: [8192]u8 = undefined;
-            var pos: usize = 0;
+            if (required <= buf.len) {
+                var pos: usize = 0;
+                if (event_name) |name| {
+                    @memcpy(buf[pos..][0.."event: ".len], "event: ");
+                    pos += "event: ".len;
+                    @memcpy(buf[pos..][0..name.len], name);
+                    pos += name.len;
+                    buf[pos] = '\n';
+                    pos += 1;
+                }
+                var lines = mem.splitScalar(u8, data, '\n');
+                while (lines.next()) |line| {
+                    @memcpy(buf[pos..][0.."data: ".len], "data: ");
+                    pos += "data: ".len;
+                    @memcpy(buf[pos..][0..line.len], line);
+                    pos += line.len;
+                    buf[pos] = '\n';
+                    pos += 1;
+                }
+                buf[pos] = '\n';
+                pos += 1;
+                std.debug.assert(pos == required);
+                return writer.write(buf[0..pos]);
+            }
 
             if (event_name) |name| {
-                const prefix = "event: ";
-                if (pos + prefix.len + name.len + 1 > buf.len) return error.EventTooLarge;
-                @memcpy(buf[pos..][0..prefix.len], prefix);
-                pos += prefix.len;
-                @memcpy(buf[pos..][0..name.len], name);
-                pos += name.len;
-                buf[pos] = '\n';
-                pos += 1;
+                try writer.write("event: ");
+                try writer.write(name);
+                try writer.write("\n");
             }
 
-            // Write data lines
             var lines = mem.splitScalar(u8, data, '\n');
             while (lines.next()) |line| {
-                const prefix = "data: ";
-                if (pos + prefix.len + line.len + 1 > buf.len) return error.EventTooLarge;
-                @memcpy(buf[pos..][0..prefix.len], prefix);
-                pos += prefix.len;
-                @memcpy(buf[pos..][0..line.len], line);
-                pos += line.len;
-                buf[pos] = '\n';
-                pos += 1;
+                try writer.write("data: ");
+                try writer.write(line);
+                try writer.write("\n");
             }
-
-            // Trailing blank line to terminate the event
-            if (pos + 1 > buf.len) return error.EventTooLarge;
-            buf[pos] = '\n';
-            pos += 1;
-
-            try self.write(buf[0..pos]);
+            try writer.write("\n");
         }
     };
 
@@ -3501,6 +3524,33 @@ test "containsTraversal allows safe paths" {
     try std.testing.expect(!containsTraversal("assets/style.css"));
     try std.testing.expect(!containsTraversal("images/photo.jpg"));
     try std.testing.expect(!containsTraversal("file.txt"));
+}
+
+test "stream writer preserves small SSE write density and supports oversized events" {
+    const Capture = struct {
+        bytes: std.ArrayListUnmanaged(u8) = .empty,
+        writes: usize = 0,
+
+        fn write(self: *@This(), data: []const u8) !void {
+            try self.bytes.appendSlice(std.testing.allocator, data);
+            self.writes += 1;
+        }
+    };
+
+    var capture = Capture{};
+    defer capture.bytes.deinit(std.testing.allocator);
+    try Context.StreamWriter.writeEventTo(&capture, null, "small");
+    try std.testing.expectEqual(@as(usize, 1), capture.writes);
+    try std.testing.expectEqualStrings("data: small\n\n", capture.bytes.items);
+
+    capture.bytes.clearRetainingCapacity();
+    capture.writes = 0;
+    const large = [_]u8{'x'} ** 9000;
+    try Context.StreamWriter.writeEventTo(&capture, "message", &large);
+    try std.testing.expect(capture.writes > 1);
+    try std.testing.expect(std.mem.startsWith(u8, capture.bytes.items, "event: message\ndata: "));
+    try std.testing.expect(std.mem.endsWith(u8, capture.bytes.items, "\n\n"));
+    try std.testing.expectEqual(@as(usize, "event: message\ndata: ".len + large.len + 2), capture.bytes.items.len);
 }
 
 test "SSE rejects CR in id field" {

@@ -57,6 +57,7 @@ extern fn antfly_api_kernel_poll_restore_jobs(context: *const CallContext) callc
 extern fn antfly_api_kernel_prepare_restore_leadership(context: *const CallContext) callconv(.c) abi.Status;
 extern fn antfly_api_kernel_schedule_session_maintenance(context: *const CallContext) callconv(.c) abi.Status;
 extern fn antfly_api_kernel_storage_maintenance_active(context: *const CallContext) callconv(.c) abi.Status;
+extern fn antfly_api_kernel_authorize_inference(context: *const abi.AuthorizeInferenceContext) callconv(.c) abi.Status;
 extern fn antfly_api_kernel_handle(context: *const CallContext) callconv(.c) abi.Status;
 extern fn antfly_api_kernel_handle_internal(context: *const CallContext) callconv(.c) abi.Status;
 extern fn antfly_api_kernel_handler_create(context: *const HandlerCreateContext) callconv(.c) abi.Status;
@@ -168,6 +169,23 @@ const OpaqueApiHttpServer = struct {
         var out = false;
         callInfallible(void, bool, antfly_api_kernel_storage_maintenance_active, self.opaque_handle, null, &out);
         return out;
+    }
+
+    pub fn authorizeInferenceRequest(
+        self: *OpaqueApiHttpServer,
+        request: server_mod.AuthenticatedRequest,
+        permission: abi.InferencePermission,
+    ) !abi.AuthorizationDecision {
+        var decision: abi.AuthorizationDecision = undefined;
+        try callError(antfly_api_kernel_authorize_inference(&.{
+            .abi_version = abi.abi_version,
+            .handle = self.opaque_handle,
+            .authorization = abi.OptionalBytes.init(request.authorization),
+            .trusted_principal = abi.OptionalBytes.init(request.trusted_principal),
+            .permission = permission,
+            .out_decision = &decision,
+        }));
+        return decision;
     }
 
     pub fn handle(self: *OpaqueApiHttpServer, req: http_common.HttpRequest) !http_common.HttpResponse {

@@ -29,7 +29,11 @@ pub const RenderError = error{
     TransientPromptFailure,
 };
 
-pub const RenderConfig = struct {};
+pub const RenderConfig = struct {
+    io: ?std.Io = null,
+    deadline_ns: ?u64 = null,
+    max_media_parts: ?usize = null,
+};
 
 pub const default_remote_fetch_max_download_size_bytes: u64 = 100 * 1024 * 1024;
 

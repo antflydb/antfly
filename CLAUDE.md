@@ -82,7 +82,7 @@ cd go/pkg/antfly && go run ./cmd standalone        # Single-node dev
 
 **Antfly inference**: ML service for embeddings/chunking/reranking, enabled by default in standalone mode. Models auto-discovered from `~/.antfly/inference/models/`.
 
-**Model Registry**: Export HuggingFace models to ONNX via `scripts/export_model_to_registry.py`. Supports embedders, rerankers, chunkers, and multimodal (CLIP).
+**Model Registry**: Pull models with `antfly inference pull <owner/name[:variant]>` (HuggingFace; GGUF/safetensors/ONNX variants) or chat with generative models via `antfly inference chat <model>` (friendly aliases like `gemma4-e2b` auto-pull). Reranker ONNX export: `scripts/export_reranker_to_onnx_static.py`.
 
 ## API Development
 

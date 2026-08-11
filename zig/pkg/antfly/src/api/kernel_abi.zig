@@ -27,7 +27,7 @@ pub const StatusDetail = error_abi.Detail;
 /// Version of the API-kernel control structs below. This is intentionally
 /// independent of the status ABI: adding flags/reserved fields must invalidate
 /// an older context before the callee reads beyond its layout.
-pub const abi_version: u32 = 2;
+pub const abi_version: u32 = 3;
 pub const statusFromError = error_abi.statusFromError;
 pub const errorFromStatus = error_abi.errorFromStatus;
 
@@ -64,6 +64,28 @@ pub const HandlerCreateContext = extern struct {
     _reserved: u32 = 0,
     api_server_handle: *anyopaque,
     out_handle: *?*anyopaque,
+};
+
+pub const InferencePermission = enum(c_int) {
+    read = 1,
+    write = 2,
+};
+
+pub const AuthorizationDecision = enum(c_int) {
+    allowed = 0,
+    unauthorized = 1,
+    forbidden = 2,
+    not_ready = 3,
+};
+
+pub const AuthorizeInferenceContext = extern struct {
+    abi_version: u32,
+    _reserved: u32 = 0,
+    handle: *anyopaque,
+    authorization: OptionalBytes = .{},
+    trusted_principal: OptionalBytes = .{},
+    permission: InferencePermission,
+    out_decision: *AuthorizationDecision,
 };
 
 pub const HttpMethod = http_abi.HttpMethod;
@@ -113,6 +135,7 @@ test "API kernel control contexts retain C layout" {
     try std.testing.expectEqual(.@"extern", @typeInfo(CreateContext).@"struct".layout);
     try std.testing.expectEqual(.@"extern", @typeInfo(CallContext).@"struct".layout);
     try std.testing.expectEqual(.@"extern", @typeInfo(HandlerCreateContext).@"struct".layout);
+    try std.testing.expectEqual(.@"extern", @typeInfo(AuthorizeInferenceContext).@"struct".layout);
     try std.testing.expectEqual(.@"extern", @typeInfo(native_abi.TypeContract).@"struct".layout);
     try std.testing.expectEqual(.@"extern", @typeInfo(memory_abi.Allocator).@"struct".layout);
 }

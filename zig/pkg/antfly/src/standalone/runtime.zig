@@ -47,6 +47,9 @@ const LocalSchemaProgressProvider = struct {
     ) anyerror!antfly.data.runtime.DataServer.LocalSchemaProgressSnapshot,
 };
 const default_public_port: u16 = 8080;
+const cors_default_methods = [_][]const u8{ "GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH" };
+const cors_default_headers = [_][]const u8{ "Content-Type", "Authorization", "X-Requested-With", "Accept", "Origin" };
+const cors_default_max_age: u32 = 3600;
 const antfarm_max_file_bytes: usize = 64 * 1024 * 1024;
 const standalone_session_ttl_ns: u64 = std.time.ns_per_hour;
 const standalone_session_cleanup_interval_ns: u64 = std.time.ns_per_min;
@@ -135,6 +138,7 @@ const CliConfig = struct {
     inference_combined_budget_mb: usize = 0,
     inference_kv_budget_mb: usize = 0,
     inference_scratch_budget_mb: usize = 0,
+    inference_kernel_jit_mode: ?antfly.common.config.Config.InferenceConfig.KernelJitConfig.Mode = null,
     inference_preload_models: std.ArrayListUnmanaged(inference_bridge.WarmModel) = .empty,
     data_dir: ?[]const u8 = null,
     storage_engine: ?antfly.common.config.StorageEngine = null,
@@ -198,6 +202,43 @@ const CliConfig = struct {
         return self.secret_store_paths.items[0];
     }
 };
+
+// JSON is used only as a versioned, language-neutral payload inside the
+// inference CreateContext. The distributed unit owns config parsing; the
+// inference unit owns translation into inference runtime types.
+const InferenceRuntimeConfigWire = struct {
+    const KernelJit = struct {
+        mode: antfly.common.config.Config.InferenceConfig.KernelJitConfig.Mode = .off,
+        cache_dir: ?[]const u8 = null,
+        max_cache_bytes_mb: usize = 1024,
+        preload_budget_ms: u64 = 300_000,
+    };
+    const PromptCache = struct {
+        enabled: bool = false,
+        mode: antfly.common.config.Config.InferenceConfig.PromptCacheConfig.Mode = .block_hash,
+        max_bytes_mb: usize = 512,
+        min_tokens: usize = 64,
+        ttl_ms: u64 = 300_000,
+    };
+
+    max_concurrent_requests: ?usize = null,
+    kernel_jit: KernelJit = .{},
+    prompt_cache: PromptCache = .{},
+};
+
+fn resolveKernelJitMode(
+    configured: antfly.common.config.Config.InferenceConfig.KernelJitConfig.Mode,
+    environment: ?[]const u8,
+    cli: ?antfly.common.config.Config.InferenceConfig.KernelJitConfig.Mode,
+) !antfly.common.config.Config.InferenceConfig.KernelJitConfig.Mode {
+    if (cli) |mode| return mode;
+    if (environment) |raw|
+        return std.meta.stringToEnum(
+            antfly.common.config.Config.InferenceConfig.KernelJitConfig.Mode,
+            raw,
+        ) orelse error.InvalidArguments;
+    return configured;
+}
 
 const RuntimeLeaseWatchdog = struct {
     const ObservationFailureStage = enum { fetch, validation };
@@ -1681,6 +1722,15 @@ pub fn runFromIterator(
         null;
     defer if (loaded_config) |*cfg| cfg.deinit();
 
+    validateServerTlsConfig(if (loaded_config) |*cfg| cfg.tls else null) catch |err| {
+        std.log.err("standalone startup rejected configured tls: built-in server TLS is unsupported; terminate TLS at a trusted reverse proxy", .{});
+        return err;
+    };
+    validateCorsConfig(configuredCors(if (loaded_config) |*cfg| cfg else null)) catch |err| {
+        std.log.err("standalone startup rejected invalid cors configuration err={}", .{err});
+        return err;
+    };
+
     var remote_content_runtime: antfly.common.remote_content_runtime.Runtime = undefined;
     var remote_content_runtime_initialized = false;
     defer if (remote_content_runtime_initialized) remote_content_runtime.deinit();
@@ -1811,6 +1861,31 @@ pub fn runFromIterator(
         null;
     defer if (s3_credentials_json) |json| alloc.free(json);
 
+    const configured_inference: antfly.common.config.Config.InferenceConfig =
+        if (loaded_cfg) |cfg| cfg.inference else .{};
+    const effective_kernel_jit_mode = try resolveKernelJitMode(
+        configured_inference.kernel_jit.mode,
+        platform.env.getenv("ANTFLY_INFERENCE_KERNEL_JIT_MODE"),
+        cli.inference_kernel_jit_mode,
+    );
+    const inference_runtime_config_json = try std.json.Stringify.valueAlloc(alloc, InferenceRuntimeConfigWire{
+        .max_concurrent_requests = configured_inference.max_concurrent_requests,
+        .kernel_jit = .{
+            .mode = effective_kernel_jit_mode,
+            .cache_dir = configured_inference.kernel_jit.cache_dir,
+            .max_cache_bytes_mb = configured_inference.kernel_jit.max_cache_bytes_mb,
+            .preload_budget_ms = configured_inference.kernel_jit.preload_budget_ms,
+        },
+        .prompt_cache = .{
+            .enabled = configured_inference.prompt_cache.enabled,
+            .mode = configured_inference.prompt_cache.mode,
+            .max_bytes_mb = configured_inference.prompt_cache.max_bytes_mb,
+            .min_tokens = configured_inference.prompt_cache.min_tokens,
+            .ttl_ms = configured_inference.prompt_cache.ttl_ms,
+        },
+    }, .{});
+    defer alloc.free(inference_runtime_config_json);
+
     var handle: ?*anyopaque = null;
     const inference_create_context = inference_bridge.CreateContext{
         .abi_version = inference_bridge.abi_version,
@@ -1830,6 +1905,7 @@ pub fn runFromIterator(
         .has_max_loaded_models = if (loaded_cfg) |cfg| @intFromBool(cfg.inference.max_loaded_models != null) else 0,
         .content_security_json = inference_bridge.OptionalString.init(content_security_json),
         .s3_credentials_json = inference_bridge.OptionalString.init(s3_credentials_json),
+        .runtime_config_json = inference_bridge.String.init(inference_runtime_config_json),
         .out_handle = &handle,
     };
     const antfly_node = if (comptime inline_inference_codegen) blk: {
@@ -2191,6 +2267,9 @@ pub fn runFromIterator(
 
     const bind_host = public_listener.bind_host;
     const bind_port = public_listener.bind_port;
+    active_cors_config = configuredCors(api_server.cfg.node_config);
+    defer active_cors_config = null;
+
     var unified_api_ready = std.atomic.Value(bool).init(false);
 
     var public_listener_lease = try PublicListenerLease.acquire(alloc, bind_port);
@@ -2430,6 +2509,10 @@ fn serveUnifiedInner(
     lifecycle.attach(&server);
     defer lifecycle.detach(&server);
 
+    if (corsEnabled(active_cors_config)) try server.use(corsMiddleware());
+    try server.use(inferenceAuthMiddleware());
+    try server.use(interactiveGenerateMiddleware());
+
     // Register inference AI routes under /ai/v1 and Traditional ML routes under /ml/v1.
     if (comptime inline_inference) {
         try inference_host.linkedInferenceRegisterRoutes(&.{
@@ -2561,13 +2644,17 @@ fn healthzHandler(ctx: *httpx.Context) anyerror!httpx.Response {
 }
 
 fn readyzHandler(ctx: *httpx.Context) anyerror!httpx.Response {
-    if (active_api_server) |api_server| {
-        if (api_server.storageMaintenanceExclusiveActive()) {
-            _ = ctx.status(503);
-            return ctx.json(.{ .status = "maintenance" });
-        }
+    const server = active_api_server orelse {
+        try ctx.setHeader("Retry-After", "1");
+        return ctx.status(503).json(.{ .status = "not_ready" });
+    };
+    if (server.storageMaintenanceExclusiveActive()) {
+        try ctx.setHeader("Retry-After", "1");
+        return ctx.status(503).json(.{ .status = "maintenance" });
     }
-    return ctx.json(.{ .status = "ready" });
+    var response = try server.handle(.{ .method = .GET, .uri = antfly.public_api.http_routes.Routes.readyz });
+    if (response.status == 503) try ctx.setHeader("Retry-After", "1");
+    return AntflyApiHandler.respond(ctx, &response);
 }
 
 fn storageMaintenanceAdmission(ctx: *httpx.Context, next: *httpx.Next) anyerror!httpx.Response {
@@ -2582,6 +2669,322 @@ fn storageMaintenanceAdmission(ctx: *httpx.Context, next: *httpx.Next) anyerror!
     }
     _ = ctx.status(503);
     return ctx.text("storage maintenance in progress");
+}
+
+fn inferenceAuthMiddleware() httpx.Middleware {
+    return .{
+        .name = "inference_auth",
+        .handler = struct {
+            fn handler(ctx: *httpx.Context, next: *httpx.Next) anyerror!httpx.Response {
+                if (!isInferenceApiPath(ctx.request.uri.path)) return next.call(ctx);
+
+                const server = active_api_server orelse return inferenceNotReadyResponse(ctx);
+                const permission: antfly.public_api.kernel_abi.InferencePermission = switch (ctx.request.method) {
+                    .GET, .HEAD, .OPTIONS => .read,
+                    else => .write,
+                };
+                const decision = server.authorizeInferenceRequest(.{
+                    .authorization = ctx.header("authorization"),
+                    .trusted_principal = ctx.header(antfly.public_api.http_server.trusted_principal_header),
+                }, permission) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => return inferenceNotReadyResponse(ctx),
+                };
+                return switch (decision) {
+                    .allowed => next.call(ctx),
+                    .unauthorized => inferenceUnauthorizedResponse(ctx),
+                    .forbidden => inferenceForbiddenResponse(ctx, permission),
+                    .not_ready => inferenceNotReadyResponse(ctx),
+                };
+            }
+        }.handler,
+    };
+}
+
+fn interactiveGenerateMiddleware() httpx.Middleware {
+    return .{
+        .name = "interactive_generate",
+        .handler = struct {
+            fn handler(ctx: *httpx.Context, next: *httpx.Next) anyerror!httpx.Response {
+                if (!isInteractiveGeneratePath(ctx.request.uri.path)) return next.call(ctx);
+                _ = antfly.db.enrichment_types.interactive_generate_inflight.fetchAdd(1, .monotonic);
+                defer _ = antfly.db.enrichment_types.interactive_generate_inflight.fetchSub(1, .monotonic);
+                return next.call(ctx);
+            }
+        }.handler,
+    };
+}
+
+fn corsMiddleware() httpx.Middleware {
+    return .{
+        .name = "cors",
+        .handler = struct {
+            fn handler(ctx: *httpx.Context, next: *httpx.Next) anyerror!httpx.Response {
+                const config = active_cors_config orelse return next.call(ctx);
+                if (!(config.enabled orelse true)) return next.call(ctx);
+
+                const origin = ctx.header("origin") orelse return next.call(ctx);
+                const requested_method = if (ctx.request.method == .OPTIONS)
+                    ctx.header("access-control-request-method")
+                else
+                    null;
+                const is_preflight = requested_method != null;
+                const allowed_origin = corsAllowedOrigin(config, origin);
+
+                if (allowed_origin == null or
+                    (is_preflight and !corsMethodAllowed(config, requested_method.?)) or
+                    (is_preflight and !corsRequestHeadersAllowed(config, ctx.header("access-control-request-headers"))) or
+                    (!is_preflight and !corsMethodAllowed(config, ctx.request.method.toString())))
+                {
+                    if (!is_preflight) {
+                        try ctx.response.headers.append("Vary", "Origin");
+                        return next.call(ctx);
+                    }
+                    try appendCorsPreflightVary(&ctx.response.headers, true);
+                    return ctx.status(403).text("CORS request denied");
+                }
+
+                try applyCorsOriginHeaders(&ctx.response.headers, config, allowed_origin.?);
+                if (!is_preflight) {
+                    try applyCorsExposedHeaders(ctx, config);
+                    return next.call(ctx);
+                }
+
+                try appendCorsPreflightVary(&ctx.response.headers, false);
+                try applyCorsPreflightHeaders(ctx, config);
+                return ctx.status(204).text("");
+            }
+        }.handler,
+    };
+}
+
+fn applyCorsOriginHeaders(
+    headers: *httpx.Headers,
+    config: *const antfly.common.config.Config.CorsConfig,
+    allowed_origin: []const u8,
+) !void {
+    try headers.set("Access-Control-Allow-Origin", allowed_origin);
+    if (!std.mem.eql(u8, allowed_origin, "*")) try headers.append("Vary", "Origin");
+    if (config.allow_credentials orelse false) try headers.set("Access-Control-Allow-Credentials", "true");
+}
+
+fn appendCorsPreflightVary(headers: *httpx.Headers, include_origin: bool) !void {
+    if (include_origin) try headers.append("Vary", "Origin");
+    try headers.append("Vary", "Access-Control-Request-Method");
+    try headers.append("Vary", "Access-Control-Request-Headers");
+}
+
+fn applyCorsExposedHeaders(ctx: *httpx.Context, config: *const antfly.common.config.Config.CorsConfig) !void {
+    const exposed = config.exposed_headers orelse return;
+    if (exposed.len == 0) return;
+    const joined = try joinCorsValues(ctx.allocator, exposed);
+    defer ctx.allocator.free(joined);
+    try ctx.response.headers.set("Access-Control-Expose-Headers", joined);
+}
+
+fn applyCorsPreflightHeaders(ctx: *httpx.Context, config: *const antfly.common.config.Config.CorsConfig) !void {
+    const methods = if (config.allowed_methods) |values|
+        try joinCorsValues(ctx.allocator, values)
+    else
+        try joinCorsValues(ctx.allocator, &cors_default_methods);
+    defer ctx.allocator.free(methods);
+    try ctx.response.headers.set("Access-Control-Allow-Methods", methods);
+
+    // With credentials, Fetch treats `*` as the literal header name rather
+    // than a wildcard. The request list has already been token-validated, so
+    // reflect it explicitly to preserve the configured "allow any" intent.
+    const credentialed_wildcard_headers = (config.allow_credentials orelse false) and corsAllowsAnyHeader(config);
+    const headers = if (credentialed_wildcard_headers and ctx.header("access-control-request-headers") != null)
+        try ctx.allocator.dupe(u8, ctx.header("access-control-request-headers").?)
+    else if (config.allowed_headers) |values|
+        try joinCorsValues(ctx.allocator, values)
+    else
+        try joinCorsValues(ctx.allocator, &cors_default_headers);
+    defer ctx.allocator.free(headers);
+    try ctx.response.headers.set("Access-Control-Allow-Headers", headers);
+
+    var max_age_buf: [10]u8 = undefined;
+    const max_age = try std.fmt.bufPrint(&max_age_buf, "{d}", .{config.max_age orelse cors_default_max_age});
+    try ctx.response.headers.set("Access-Control-Max-Age", max_age);
+}
+
+fn joinCorsValues(alloc: std.mem.Allocator, values: anytype) ![]u8 {
+    var size: usize = 0;
+    for (values, 0..) |value, i| size += value.len + @as(usize, if (i == 0) 0 else 2);
+    const joined = try alloc.alloc(u8, size);
+    var offset: usize = 0;
+    for (values, 0..) |value, i| {
+        if (i != 0) {
+            @memcpy(joined[offset..][0..2], ", ");
+            offset += 2;
+        }
+        @memcpy(joined[offset..][0..value.len], value);
+        offset += value.len;
+    }
+    return joined;
+}
+
+fn corsAllowedOrigin(config: *const antfly.common.config.Config.CorsConfig, origin: []const u8) ?[]const u8 {
+    if (!isSafeCorsOrigin(origin)) return null;
+    if (config.allowed_origins) |origins| {
+        if (origins.len != 0) {
+            for (origins) |allowed| if (std.mem.eql(u8, allowed, "*")) return "*";
+            for (origins) |allowed| {
+                if (std.mem.eql(u8, allowed, origin)) return origin;
+            }
+            return null;
+        }
+    }
+    return "*";
+}
+
+fn corsMethodAllowed(config: *const antfly.common.config.Config.CorsConfig, method: []const u8) bool {
+    if (config.allowed_methods) |methods| {
+        for (methods) |allowed| if (std.mem.eql(u8, allowed, method)) return true;
+        return false;
+    }
+    for (cors_default_methods) |allowed| if (std.mem.eql(u8, allowed, method)) return true;
+    return false;
+}
+
+fn corsRequestHeadersAllowed(config: *const antfly.common.config.Config.CorsConfig, requested: ?[]const u8) bool {
+    const raw = requested orelse return true;
+    var values = std.mem.splitScalar(u8, raw, ',');
+    while (values.next()) |value| {
+        const name = std.mem.trim(u8, value, " \t");
+        if (!isHttpToken(name) or !corsHeaderAllowed(config, name)) return false;
+    }
+    return true;
+}
+
+fn corsHeaderAllowed(config: *const antfly.common.config.Config.CorsConfig, name: []const u8) bool {
+    if (config.allowed_headers) |headers| {
+        for (headers) |allowed| {
+            if (std.mem.eql(u8, allowed, "*") or std.ascii.eqlIgnoreCase(allowed, name)) return true;
+        }
+        return false;
+    }
+    for (cors_default_headers) |allowed| if (std.ascii.eqlIgnoreCase(allowed, name)) return true;
+    return false;
+}
+
+fn corsAllowsAnyHeader(config: *const antfly.common.config.Config.CorsConfig) bool {
+    const headers = config.allowed_headers orelse return false;
+    for (headers) |allowed| if (std.mem.eql(u8, allowed, "*")) return true;
+    return false;
+}
+
+fn configuredCors(config: ?*const antfly.common.config.Config) ?*const antfly.common.config.Config.CorsConfig {
+    const loaded = config orelse return null;
+    return if (loaded.cors) |*cors| cors else null;
+}
+
+fn corsEnabled(config: ?*const antfly.common.config.Config.CorsConfig) bool {
+    const cors = config orelse return false;
+    return cors.enabled orelse true;
+}
+
+fn validateCorsConfig(config: ?*const antfly.common.config.Config.CorsConfig) !void {
+    const cors = config orelse return;
+    if (!(cors.enabled orelse true)) return;
+
+    const allow_credentials = cors.allow_credentials orelse false;
+    if (cors.allowed_origins) |origins| {
+        if (origins.len == 0 and allow_credentials) return error.CorsCredentialsWithWildcardOrigin;
+        for (origins) |origin| {
+            if (!isSafeCorsOrigin(origin)) return error.InvalidCorsOrigin;
+            if (allow_credentials and std.mem.eql(u8, origin, "*")) return error.CorsCredentialsWithWildcardOrigin;
+            if (allow_credentials and std.mem.eql(u8, origin, "null")) return error.CorsCredentialsWithOpaqueOrigin;
+        }
+    } else if (allow_credentials) {
+        return error.CorsCredentialsWithWildcardOrigin;
+    }
+
+    if (cors.allowed_methods) |methods| for (methods) |method| {
+        if (httpx.Method.fromString(method) == null) return error.InvalidCorsMethod;
+    };
+    if (cors.allowed_headers) |headers| for (headers) |header| {
+        if (!isHttpToken(header)) return error.InvalidCorsHeader;
+    };
+    if (cors.exposed_headers) |headers| for (headers) |header| {
+        if (!isHttpToken(header)) return error.InvalidCorsHeader;
+        if (allow_credentials and std.mem.eql(u8, header, "*")) return error.CorsCredentialsWithWildcardExposedHeaders;
+    };
+}
+
+fn isSafeCorsOrigin(origin: []const u8) bool {
+    if (std.mem.eql(u8, origin, "*") or std.mem.eql(u8, origin, "null")) return true;
+    const scheme_end = std.mem.indexOf(u8, origin, "://") orelse return false;
+    if (scheme_end == 0 or scheme_end + 3 == origin.len or !std.ascii.isAlphabetic(origin[0])) return false;
+    for (origin[1..scheme_end]) |char| {
+        if (!std.ascii.isAlphanumeric(char) and char != '+' and char != '-' and char != '.') return false;
+    }
+    for (origin[scheme_end + 3 ..]) |char| {
+        if (char <= ' ' or char >= 0x7f or char == '/' or char == '?' or char == '#' or char == '@' or char == ',') return false;
+    }
+    return true;
+}
+
+fn isHttpToken(value: []const u8) bool {
+    if (value.len == 0) return false;
+    for (value) |char| switch (char) {
+        'a'...'z', 'A'...'Z', '0'...'9', '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => {},
+        else => return false,
+    };
+    return true;
+}
+
+fn isInferenceApiPath(path: []const u8) bool {
+    return hasPathComponentPrefix(path, inference_bridge.ai_api_prefix) or
+        hasPathComponentPrefix(path, inference_bridge.public_api_prefix);
+}
+
+fn isInteractiveGeneratePath(path: []const u8) bool {
+    for ([_][]const u8{ inference_bridge.ai_api_prefix, inference_bridge.public_api_prefix }) |prefix| {
+        if (!std.mem.startsWith(u8, path, prefix)) continue;
+        const suffix = path[prefix.len..];
+        if (std.mem.eql(u8, suffix, "/generate") or
+            std.mem.eql(u8, suffix, "/generate/batch") or
+            std.mem.eql(u8, suffix, "/chat/completions")) return true;
+    }
+    return false;
+}
+
+fn hasPathComponentPrefix(path: []const u8, prefix: []const u8) bool {
+    return std.mem.eql(u8, path, prefix) or
+        (std.mem.startsWith(u8, path, prefix) and path.len > prefix.len and path[prefix.len] == '/');
+}
+
+fn inferenceUnauthorizedResponse(ctx: *httpx.Context) !httpx.Response {
+    try ctx.setHeader("WWW-Authenticate", "Basic realm=\"antfly\", Bearer realm=\"antfly\", ApiKey realm=\"antfly\"");
+    return ctx.status(401).json(.{
+        .@"error" = "unauthorized",
+        .message = "valid Basic, Bearer, or ApiKey credentials are required",
+        .retryable = false,
+    });
+}
+
+fn inferenceForbiddenResponse(
+    ctx: *httpx.Context,
+    permission: antfly.public_api.kernel_abi.InferencePermission,
+) !httpx.Response {
+    return ctx.status(403).json(.{
+        .@"error" = "forbidden",
+        .message = switch (permission) {
+            .read => "inference read permission is required",
+            .write => "inference write permission is required",
+        },
+        .retryable = false,
+    });
+}
+
+fn inferenceNotReadyResponse(ctx: *httpx.Context) !httpx.Response {
+    try ctx.setHeader("Retry-After", "1");
+    return ctx.status(503).json(.{
+        .@"error" = "not_ready",
+        .message = "inference authentication is not ready",
+        .retryable = true,
+    });
 }
 
 fn registerMcpRoutes(server: anytype) !void {
@@ -3111,6 +3514,7 @@ fn extensionBridgeHandler(ctx: *httpx.Context) anyerror!httpx.Response {
 // Module-level pointer set by the serve thread before listen().
 // Used by explicitly registered protocol/internal bridge handlers.
 var active_api_server: ?*ApiHttpServer = null;
+var active_cors_config: ?*const antfly.common.config.Config.CorsConfig = null;
 
 // ---------------------------------------------------------------
 // CLI parsing
@@ -3259,6 +3663,13 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
         }
         if (std.mem.eql(u8, arg, "--inference-scratch-budget-mb")) {
             cfg.inference_scratch_budget_mb = try std.fmt.parseInt(usize, args.next() orelse return error.InvalidArguments, 10);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--kernel-jit-mode")) {
+            cfg.inference_kernel_jit_mode = std.meta.stringToEnum(
+                antfly.common.config.Config.InferenceConfig.KernelJitConfig.Mode,
+                args.next() orelse return error.InvalidArguments,
+            ) orelse return error.InvalidArguments;
             continue;
         }
         if (std.mem.eql(u8, arg, "--preload-model")) {
@@ -3677,6 +4088,10 @@ fn resolvePublicListener(cli: CliConfig) antfly.metadata.runtime.ListenerConfig 
         .bind_host = cli.bind_host orelse "127.0.0.1",
         .bind_port = cli.bind_port orelse default_public_port,
     };
+}
+
+fn validateServerTlsConfig(tls: ?antfly.common.config.Config.TlsConfig) !void {
+    if (tls != null) return error.ServerTlsUnsupported;
 }
 
 fn haPrimaryRequested(cli: CliConfig) bool {
@@ -4407,6 +4822,7 @@ fn printUsage() void {
         \\  --config <path>                       JSON common config file
         \\  --host <host>                         Public API host (default: 127.0.0.1)
         \\  --port <port>                         Public API port (default: 8080)
+        \\  --auth <true|false>                   Enable authentication for public APIs (default: false)
         \\  --id <node-id>                        Local node id (default: 1)
         \\  --health <true|false>                 Enable health/metrics server (default: true)
         \\  --health-port <port>                  Dedicated health/metrics port on --host (default: 4200)
@@ -4423,6 +4839,7 @@ fn printUsage() void {
         \\  --inference-combined-budget-mb <n>    Embedded inference native generation combined budget override
         \\  --inference-kv-budget-mb <n>          Embedded inference native generation KV cache budget override
         \\  --inference-scratch-budget-mb <n>     Embedded inference native generation scratch budget override
+        \\  --kernel-jit-mode <off|shadow|on|required> Embedded inference runtime JIT mode override
         \\  --preload-model <kind:name|kind:backend:name> Preload and warm an embedded model before serving
         \\  --data-dir <path>                     Local Antfly data directory root
         \\  --storage-engine lite                 Use the single-file Lite engine
@@ -4568,6 +4985,11 @@ const RecordingServer = struct {
 test "standalone runtime module compiles" {
     _ = run;
     _ = runFromIterator;
+    try std.testing.expect(isInteractiveGeneratePath("/ai/v1/generate"));
+    try std.testing.expect(isInteractiveGeneratePath("/ai/v1/chat/completions"));
+    try std.testing.expect(isInteractiveGeneratePath("/ml/v1/generate/batch"));
+    try std.testing.expect(!isInteractiveGeneratePath("/ai/v1/embed"));
+    try std.testing.expect(!isInteractiveGeneratePath("/ai/v10/generate"));
 }
 
 test "HA Lease minimum grace contains poll request and scheduling margin" {
@@ -4670,7 +5092,8 @@ test "standalone runtime local generator accepts media url data uris" {
         } },
     }};
 
-    var converted = try inference_host.convertLocalGenerateMessages(alloc, &messages);
+    const preflight = try inference_host.preflightLocalGenerateMessages(&messages);
+    var converted = try inference_host.convertLocalGenerateMessages(alloc, &messages, preflight.decoded_media_bytes);
     defer converted.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 1), converted.messages.len);
@@ -4680,6 +5103,66 @@ test "standalone runtime local generator accepts media url data uris" {
     try std.testing.expectEqualSlices(u8, &.{ 1, 2 }, message.image_bytes.?[0]);
     try std.testing.expectEqual(@as(usize, 2), message.content_parts.?.len);
     try std.testing.expectEqual(@as(usize, 0), message.content_parts.?[1].image);
+}
+
+test "standalone runtime local dense embed preserves borrowed binary media" {
+    const raw = [_]u8{ 1, 2, 3 };
+    const parts = [_]antfly.template.ContentPart{
+        .{ .text = "caption" },
+        .{ .media_url = "data:image/png;base64,AA==" },
+        .{ .binary = .{ .mime_type = "image/png", .data = &raw } },
+    };
+    const direct = try inference_host.localAntflyDirectDenseParts(std.testing.allocator, &parts);
+    defer std.testing.allocator.free(direct);
+
+    try std.testing.expectEqual(@as(usize, 3), direct.len);
+    try std.testing.expectEqualStrings("caption", direct[0].text);
+    try std.testing.expectEqualStrings("data:image/png;base64,AA==", direct[1].image_url);
+    try std.testing.expectEqualStrings("image/png", direct[2].media.mime_type);
+    try std.testing.expectEqual(@intFromPtr(raw[0..].ptr), @intFromPtr(direct[2].media.data.ptr));
+    try std.testing.expectEqualSlices(u8, &raw, direct[2].media.data);
+}
+
+test "standalone runtime local generator preflights mixed resident media exactly" {
+    const messages = [_]antfly.inference.ChatMessage{.{
+        .role = .user,
+        .content = .{ .parts = &.{
+            .{ .text = "listen" },
+            .{ .media = .{
+                .data = "AQID",
+                .mime_type = "audio/wav",
+            } },
+            .{ .image_url = .{ .url = "data:image/png;base64,BAU=" } },
+        } },
+    }};
+
+    const preflight = try inference_host.preflightLocalGenerateMessages(&messages);
+    try std.testing.expectEqual(@as(usize, "listen".len), preflight.text_bytes);
+    try std.testing.expectEqual(
+        @as(usize, "AQID".len + "data:image/png;base64,BAU=".len),
+        preflight.encoded_media_bytes,
+    );
+    try std.testing.expectEqual(@as(usize, 5), preflight.decoded_media_bytes);
+    try std.testing.expectEqual(@as(usize, 2), preflight.media_count);
+    try std.testing.expectEqual(@as(usize, 1), preflight.image_count);
+    try std.testing.expect(preflight.has_audio);
+}
+
+test "standalone runtime local generator refuses decode allocation beyond preflight" {
+    var no_storage: [0]u8 = .{};
+    var fixed = std.heap.FixedBufferAllocator.init(&no_storage);
+    var budget = inference_host.LocalGenerateDecodeBudget{ .remaining_bytes = 1 };
+
+    try std.testing.expectError(
+        error.RemoteContentTooLarge,
+        inference_host.decodeLocalGenerateDataUri(
+            fixed.allocator(),
+            "data:image/png;base64,AQI=",
+            null,
+            &budget,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 1), budget.remaining_bytes);
 }
 
 test "standalone runtime leaves auth disabled unless config or cli enables it" {
@@ -4711,6 +5194,311 @@ test "standalone runtime parses experimental flag" {
     var parsed = try parseCli(std.testing.allocator, &iter);
     defer parsed.deinit(std.testing.allocator);
     try std.testing.expect(parsed.experimental);
+}
+
+test "standalone inference middleware reuses public API authentication" {
+    const alloc = std.testing.allocator;
+    const Harness = struct {
+        fn next(_: *httpx.Next, ctx: *httpx.Context) anyerror!httpx.Response {
+            return ctx.status(204).text("next");
+        }
+
+        fn expect(
+            middleware: httpx.Middleware,
+            path: []const u8,
+            authorization: ?[]const u8,
+            expected_status: u16,
+        ) !void {
+            return expectMethod(middleware, .GET, path, authorization, expected_status);
+        }
+
+        fn expectMethod(
+            middleware: httpx.Middleware,
+            method: httpx.Method,
+            path: []const u8,
+            authorization: ?[]const u8,
+            expected_status: u16,
+        ) !void {
+            var request = try httpx.Request.init(std.testing.allocator, method, path);
+            defer request.deinit();
+            if (authorization) |value| try request.setHeader("authorization", value);
+
+            var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+            defer ctx.deinit();
+            var next_handler = httpx.Next{ ._call = next };
+            var response = try middleware.handler(&ctx, &next_handler);
+            defer response.deinit();
+
+            try std.testing.expectEqual(expected_status, response.status.code);
+            if (expected_status == 401) {
+                try std.testing.expectEqualStrings(
+                    "{\"error\":\"unauthorized\",\"message\":\"valid Basic, Bearer, or ApiKey credentials are required\",\"retryable\":false}",
+                    response.body.?,
+                );
+                try std.testing.expectEqualStrings(
+                    "Basic realm=\"antfly\", Bearer realm=\"antfly\", ApiKey realm=\"antfly\"",
+                    response.headers.get("WWW-Authenticate").?,
+                );
+            } else if (expected_status == 403) {
+                const required = if (method == .GET or method == .HEAD or method == .OPTIONS) "read" else "write";
+                const expected = try std.fmt.allocPrint(
+                    std.testing.allocator,
+                    "{{\"error\":\"forbidden\",\"message\":\"inference {s} permission is required\",\"retryable\":false}}",
+                    .{required},
+                );
+                defer std.testing.allocator.free(expected);
+                try std.testing.expectEqualStrings(
+                    expected,
+                    response.body.?,
+                );
+            } else if (expected_status == 503) {
+                try std.testing.expectEqualStrings(
+                    "{\"error\":\"not_ready\",\"message\":\"inference authentication is not ready\",\"retryable\":true}",
+                    response.body.?,
+                );
+                try std.testing.expectEqualStrings("1", response.headers.get("Retry-After").?);
+            }
+        }
+    };
+
+    const previous_active_server = active_api_server;
+    active_api_server = null;
+    defer active_api_server = previous_active_server;
+    try Harness.expect(inferenceAuthMiddleware(), "/ai/v1/models", null, 503);
+
+    var store = antfly.usermgr.MemoryStore.init(alloc);
+    defer store.deinit();
+    var policy_store = antfly.casbin.MemoryAdapter.init(alloc);
+    defer policy_store.deinit();
+    var manager = try antfly.usermgr.UserManager.init(
+        alloc,
+        store.iface(),
+        try antfly.usermgr.initDefaultEnforcer(alloc, policy_store.iface()),
+    );
+    defer manager.deinit();
+    var user = try manager.createUser("admin", "admin", &.{});
+    defer user.deinit(alloc);
+
+    var api_server = antfly.public_api.http_server.ApiHttpServer.init(alloc, .{
+        .auth_enabled = true,
+        .user_manager = &manager,
+    }, .{ .ptr = undefined, .vtable = undefined }, null, null);
+    defer api_server.deinit();
+
+    active_api_server = &api_server;
+
+    const middleware = inferenceAuthMiddleware();
+    var table_read = try antfly.usermgr.Permission.initOwned(alloc, .table, "documents", .read);
+    defer table_read.deinit(alloc);
+    try manager.addPermissionToUser("admin", table_read);
+    for ([_][]const u8{ "/ai/v1/models", "/ml/v1/metrics" }) |path| {
+        try Harness.expect(middleware, path, null, 401);
+        try Harness.expect(middleware, path, "Basic YWRtaW46d3Jvbmc=", 401);
+        try Harness.expect(middleware, path, "Basic YWRtaW46YWRtaW4=", 403);
+    }
+
+    var inference_read = try antfly.usermgr.Permission.initOwned(alloc, .inference, "*", .read);
+    defer inference_read.deinit(alloc);
+    try manager.addPermissionToUser("admin", inference_read);
+    for ([_][]const u8{ "/ai/v1/models", "/ml/v1/metrics" }) |path| {
+        try Harness.expect(middleware, path, "Basic YWRtaW46YWRtaW4=", 204);
+    }
+    try Harness.expectMethod(middleware, .POST, "/ai/v1/generate", "Basic YWRtaW46YWRtaW4=", 403);
+
+    var inference_write = try antfly.usermgr.Permission.initOwned(alloc, .inference, "*", .write);
+    defer inference_write.deinit(alloc);
+    try manager.addPermissionToUser("admin", inference_write);
+    try Harness.expectMethod(middleware, .POST, "/ai/v1/generate", "Basic YWRtaW46YWRtaW4=", 204);
+
+    var global_read = try antfly.usermgr.Permission.initOwned(alloc, .@"*", "*", .read);
+    defer global_read.deinit(alloc);
+    try std.testing.expect(antfly.public_api.http_server.permissionsAllow(&.{global_read}, .inference, "*", .read));
+
+    for ([_][]const u8{ "/ai/v10/models", "/ml/v1evil/metrics", "/healthz", "/auth/v1/login" }) |path| {
+        try Harness.expect(middleware, path, null, 204);
+    }
+
+    api_server.cfg.user_manager = null;
+    try Harness.expect(middleware, "/ai/v1/models", null, 503);
+
+    api_server.cfg.auth_enabled = false;
+    api_server.cfg.user_manager = &manager;
+    try Harness.expect(middleware, "/ai/v1/models", null, 204);
+
+    api_server.cfg.user_manager = null;
+    api_server.cfg.trusted_principal_secret = "test-secret";
+    try Harness.expect(middleware, "/ai/v1/models", null, 401);
+}
+
+test "standalone CORS middleware enforces dynamic configuration" {
+    const Harness = struct {
+        fn next(_: *httpx.Next, ctx: *httpx.Context) anyerror!httpx.Response {
+            return ctx.status(209).text("next");
+        }
+
+        fn execute(
+            config: *const antfly.common.config.Config.CorsConfig,
+            method: httpx.Method,
+            origin: ?[]const u8,
+            requested_method: ?[]const u8,
+            requested_headers: ?[]const u8,
+        ) !httpx.Response {
+            var request = try httpx.Request.init(std.testing.allocator, method, "/ai/v1/models");
+            defer request.deinit();
+            if (origin) |value| try request.setHeader("origin", value);
+            if (requested_method) |value| try request.setHeader("access-control-request-method", value);
+            if (requested_headers) |value| try request.setHeader("access-control-request-headers", value);
+
+            var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+            defer ctx.deinit();
+            var next_handler = httpx.Next{ ._call = next };
+            const previous = active_cors_config;
+            active_cors_config = config;
+            defer active_cors_config = previous;
+            return corsMiddleware().handler(&ctx, &next_handler);
+        }
+    };
+
+    var defaults: antfly.common.config.Config.CorsConfig = .{};
+    try validateCorsConfig(&defaults);
+    {
+        var response = try Harness.execute(&defaults, .GET, "https://any.example", null, null);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 209), response.status.code);
+        try std.testing.expectEqualStrings("*", response.headers.get("Access-Control-Allow-Origin").?);
+    }
+    {
+        var response = try Harness.execute(
+            &defaults,
+            .OPTIONS,
+            "https://any.example",
+            "POST",
+            "content-type, AUTHORIZATION",
+        );
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 204), response.status.code);
+        try std.testing.expectEqualStrings("GET, POST, PUT, DELETE, OPTIONS, PATCH", response.headers.get("Access-Control-Allow-Methods").?);
+        try std.testing.expectEqualStrings("Content-Type, Authorization, X-Requested-With, Accept, Origin", response.headers.get("Access-Control-Allow-Headers").?);
+        try std.testing.expectEqualStrings("3600", response.headers.get("Access-Control-Max-Age").?);
+    }
+    {
+        var response = try Harness.execute(&defaults, .OPTIONS, "https://any.example", "BREW", null);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 403), response.status.code);
+        try std.testing.expect(response.headers.get("Access-Control-Allow-Origin") == null);
+    }
+    {
+        var response = try Harness.execute(&defaults, .OPTIONS, null, "POST", null);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 209), response.status.code);
+    }
+
+    var exact_origin = "https://allowed.example".*;
+    var post_method = "POST".*;
+    var allowed_header = "X-Token".*;
+    var exposed_header = "X-Request-Id".*;
+    var exact_origins = [_][]u8{exact_origin[0..]};
+    var post_methods = [_][]u8{post_method[0..]};
+    var allowed_headers = [_][]u8{allowed_header[0..]};
+    var exposed_headers = [_][]u8{exposed_header[0..]};
+    var exact = antfly.common.config.Config.CorsConfig{
+        .allowed_origins = &exact_origins,
+        .allowed_methods = &post_methods,
+        .allowed_headers = &allowed_headers,
+        .exposed_headers = &exposed_headers,
+        .allow_credentials = true,
+        .max_age = 7,
+    };
+    try validateCorsConfig(&exact);
+    {
+        var response = try Harness.execute(&exact, .POST, exact_origin[0..], null, null);
+        defer response.deinit();
+        try std.testing.expectEqualStrings(exact_origin[0..], response.headers.get("Access-Control-Allow-Origin").?);
+        try std.testing.expectEqualStrings("true", response.headers.get("Access-Control-Allow-Credentials").?);
+        try std.testing.expectEqualStrings("X-Request-Id", response.headers.get("Access-Control-Expose-Headers").?);
+    }
+    {
+        var response = try Harness.execute(&exact, .POST, "https://denied.example", null, null);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 209), response.status.code);
+        try std.testing.expect(response.headers.get("Access-Control-Allow-Origin") == null);
+        try std.testing.expectEqualStrings("Origin", response.headers.get("Vary").?);
+    }
+    {
+        var response = try Harness.execute(&exact, .GET, exact_origin[0..], null, null);
+        defer response.deinit();
+        try std.testing.expect(response.headers.get("Access-Control-Allow-Origin") == null);
+        try std.testing.expectEqualStrings("Origin", response.headers.get("Vary").?);
+    }
+    {
+        var response = try Harness.execute(&exact, .OPTIONS, exact_origin[0..], "POST", "x-token");
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 204), response.status.code);
+        try std.testing.expectEqualStrings("POST", response.headers.get("Access-Control-Allow-Methods").?);
+        try std.testing.expectEqualStrings("X-Token", response.headers.get("Access-Control-Allow-Headers").?);
+        try std.testing.expectEqualStrings("7", response.headers.get("Access-Control-Max-Age").?);
+    }
+
+    var wildcard = "*".*;
+    var wildcard_origins = [_][]u8{wildcard[0..]};
+    var wildcard_credentials = antfly.common.config.Config.CorsConfig{
+        .allowed_origins = &wildcard_origins,
+        .allow_credentials = true,
+    };
+    try std.testing.expectError(error.CorsCredentialsWithWildcardOrigin, validateCorsConfig(&wildcard_credentials));
+    var default_wildcard_credentials = antfly.common.config.Config.CorsConfig{ .allow_credentials = true };
+    try std.testing.expectError(error.CorsCredentialsWithWildcardOrigin, validateCorsConfig(&default_wildcard_credentials));
+    var opaque_origin = "null".*;
+    var opaque_origins = [_][]u8{opaque_origin[0..]};
+    var opaque_credentials = antfly.common.config.Config.CorsConfig{
+        .allowed_origins = &opaque_origins,
+        .allow_credentials = true,
+    };
+    try std.testing.expectError(error.CorsCredentialsWithOpaqueOrigin, validateCorsConfig(&opaque_credentials));
+
+    var wildcard_header = "*".*;
+    var wildcard_headers = [_][]u8{wildcard_header[0..]};
+    var credentialed_any_header = antfly.common.config.Config.CorsConfig{
+        .allowed_origins = &exact_origins,
+        .allowed_methods = &post_methods,
+        .allowed_headers = &wildcard_headers,
+        .allow_credentials = true,
+    };
+    try validateCorsConfig(&credentialed_any_header);
+    {
+        var response = try Harness.execute(
+            &credentialed_any_header,
+            .OPTIONS,
+            exact_origin[0..],
+            "POST",
+            "X-Trace-Id, X-Client-Version",
+        );
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 204), response.status.code);
+        try std.testing.expectEqualStrings(
+            "X-Trace-Id, X-Client-Version",
+            response.headers.get("Access-Control-Allow-Headers").?,
+        );
+    }
+
+    var credentialed_wildcard_exposed = credentialed_any_header;
+    credentialed_wildcard_exposed.exposed_headers = &wildcard_headers;
+    try std.testing.expectError(
+        error.CorsCredentialsWithWildcardExposedHeaders,
+        validateCorsConfig(&credentialed_wildcard_exposed),
+    );
+
+    var injected_origin = "https://allowed.example\r\nX-Injected: true".*;
+    var injected_origins = [_][]u8{injected_origin[0..]};
+    var unsafe = antfly.common.config.Config.CorsConfig{ .allowed_origins = &injected_origins };
+    try std.testing.expectError(error.InvalidCorsOrigin, validateCorsConfig(&unsafe));
+    unsafe.enabled = false;
+    try validateCorsConfig(&unsafe);
+
+    var injected_header = "X-Safe\r\nX-Injected".*;
+    var injected_headers = [_][]u8{injected_header[0..]};
+    var unsafe_header = antfly.common.config.Config.CorsConfig{ .allowed_headers = &injected_headers };
+    try std.testing.expectError(error.InvalidCorsHeader, validateCorsConfig(&unsafe_header));
 }
 
 test "standalone bridge shared adapter preserves protocol headers and absent body" {
@@ -5918,6 +6706,11 @@ test "standalone public HTTP server is restart-safe and uses public API request 
     try std.testing.expectEqual(@as(u32, 1), publicHttpConnectionLimitForFdSoftLimit(3));
 }
 
+test "standalone rejects configured server TLS instead of serving plaintext" {
+    try validateServerTlsConfig(null);
+    try std.testing.expectError(error.ServerTlsUnsupported, validateServerTlsConfig(.{}));
+}
+
 test "standalone Lite transaction sessions survive file reopen" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -6016,6 +6809,23 @@ test "standalone startup checkpoint readiness requires applied and safe-read pro
     try std.testing.expect(startupCheckpointSatisfied(.{ .received_lsn = 11, .applied_lsn = 11, .safe_read_lsn = 11 }, 11));
 }
 
+test "standalone public ready endpoint fails closed before API initialization" {
+    const previous_active_server = active_api_server;
+    active_api_server = null;
+    defer active_api_server = previous_active_server;
+
+    var request = try httpx.Request.init(std.testing.allocator, .GET, "/readyz");
+    defer request.deinit();
+    var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try readyzHandler(&ctx);
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(u16, 503), response.status.code);
+    try std.testing.expectEqualStrings("{\"status\":\"not_ready\"}", response.body.?);
+    try std.testing.expectEqualStrings("1", response.headers.get("Retry-After").?);
+}
+
 test "parse cli accepts inference budget overrides" {
     var argv = [_][*:0]const u8{
         "--inference-host-budget-mb",
@@ -6028,6 +6838,8 @@ test "parse cli accepts inference budget overrides" {
         "2048",
         "--inference-scratch-budget-mb",
         "1024",
+        "--kernel-jit-mode",
+        "required",
     };
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
     var cfg = try parseCli(std.testing.allocator, &iter);
@@ -6037,6 +6849,14 @@ test "parse cli accepts inference budget overrides" {
     try std.testing.expectEqual(@as(usize, 16384), cfg.inference_combined_budget_mb);
     try std.testing.expectEqual(@as(usize, 2048), cfg.inference_kv_budget_mb);
     try std.testing.expectEqual(@as(usize, 1024), cfg.inference_scratch_budget_mb);
+    try std.testing.expectEqual(antfly.common.config.Config.InferenceConfig.KernelJitConfig.Mode.required, cfg.inference_kernel_jit_mode.?);
+}
+
+test "standalone kernel JIT mode precedence is CLI then environment then config" {
+    const Mode = antfly.common.config.Config.InferenceConfig.KernelJitConfig.Mode;
+    try std.testing.expectEqual(Mode.on, try resolveKernelJitMode(.shadow, "on", null));
+    try std.testing.expectEqual(Mode.required, try resolveKernelJitMode(.shadow, "invalid", .required));
+    try std.testing.expectError(error.InvalidArguments, resolveKernelJitMode(.shadow, "invalid", null));
 }
 
 test "inference config falls back to common config" {
@@ -6050,6 +6870,20 @@ test "inference config falls back to common config" {
             .api_url = try alloc.dupe(u8, "http://127.0.0.1:8089"),
             .models_dir = try alloc.dupe(u8, "/tmp/antfly-models"),
             .ml_dir = try alloc.dupe(u8, "/tmp/antfly-ml"),
+            .max_concurrent_requests = 0,
+            .kernel_jit = .{
+                .mode = .shadow,
+                .cache_dir = try alloc.dupe(u8, "/tmp/antfly-jit"),
+                .max_cache_bytes_mb = 256,
+                .preload_budget_ms = 120_000,
+            },
+            .prompt_cache = .{
+                .enabled = true,
+                .mode = .simple,
+                .max_bytes_mb = 256,
+                .min_tokens = 48,
+                .ttl_ms = 120_000,
+            },
             .preload = try alloc.dupe(antfly.common.config.Config.InferenceConfig.WarmModelConfig, &.{
                 .{
                     .kind = try alloc.dupe(u8, "generator"),

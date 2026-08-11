@@ -1323,7 +1323,7 @@ test "open split gliner gguf bundle from manifest" {
     defer head_data.deinit(allocator);
     try head_data.appendSlice(allocator, "GGUF");
     try appendLe(u32, allocator, &head_data, 3);
-    try appendLe(u64, allocator, &head_data, 1);
+    try appendLe(u64, allocator, &head_data, 2);
     try appendLe(u64, allocator, &head_data, 1);
     try appendString(allocator, &head_data, "general.architecture");
     try appendLe(u32, allocator, &head_data, 8);
@@ -1333,8 +1333,16 @@ test "open split gliner gguf bundle from manifest" {
     try appendLe(u64, allocator, &head_data, 2);
     try appendLe(u32, allocator, &head_data, @intFromEnum(gguf_mod.tensor_types.KnownTensorType.F32));
     try appendLe(u64, allocator, &head_data, 0);
+    try appendString(allocator, &head_data, "span_rep.quant.weight");
+    try appendLe(u32, allocator, &head_data, 2);
+    try appendLe(u64, allocator, &head_data, 256);
+    try appendLe(u64, allocator, &head_data, 2);
+    try appendLe(u32, allocator, &head_data, @intFromEnum(gguf_mod.tensor_types.KnownTensorType.Q4_K));
+    try appendLe(u64, allocator, &head_data, gguf_mod.format.default_alignment);
     try padToAlignment(allocator, &head_data, gguf_mod.format.default_alignment);
     try head_data.appendSlice(allocator, std.mem.asBytes(&[_]f32{ 5.0, 6.0 }));
+    try padToAlignment(allocator, &head_data, gguf_mod.format.default_alignment);
+    try head_data.appendNTimes(allocator, 0, 288);
 
     const dir_path = try testScratchDir(allocator, "tensor-store-gliner-split");
     defer {
@@ -1364,7 +1372,7 @@ test "open split gliner gguf bundle from manifest" {
     const source = (try store.weightSource()) orelse return error.TestUnexpectedResult;
     const names = try source.listNames(allocator);
     defer allocator.free(names);
-    try std.testing.expectEqual(@as(usize, 2), names.len);
+    try std.testing.expectEqual(@as(usize, 3), names.len);
 
     var head_ref = try store.describeTensor(allocator, "span_rep.test");
     defer head_ref.deinit(allocator);
@@ -1375,6 +1383,19 @@ test "open split gliner gguf bundle from manifest" {
     const second_bits = std.mem.readInt(u32, head_loaded.tensor.data[4..8], .little);
     try std.testing.expectApproxEqAbs(@as(f32, 5.0), @as(f32, @bitCast(first_bits)), 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 6.0), @as(f32, @bitCast(second_bits)), 1e-6);
+
+    var quant_ref = try store.describeTensor(allocator, "span_rep.quant.weight");
+    defer quant_ref.deinit(allocator);
+    try std.testing.expect(quant_ref.quantized);
+    var quant_storage = (try store.loadQuantizedStorageRef(&quant_ref)) orelse return error.TestUnexpectedResult;
+    defer quant_storage.deinit();
+    try std.testing.expectEqual(
+        gguf_mod.tensor_types.TensorType{ .known = .Q4_K },
+        quant_storage.tensor_type,
+    );
+    try std.testing.expectEqualSlices(i64, &.{ 2, 256 }, quant_storage.shape);
+    try std.testing.expectEqual(@as(usize, 288), quant_storage.raw_bytes.len);
+    try std.testing.expect(!quant_storage.raw_owned);
 
     var encoder_ref = try store.describeTensor(allocator, "embeddings.word_embeddings.weight");
     defer encoder_ref.deinit(allocator);

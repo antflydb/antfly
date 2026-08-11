@@ -6420,6 +6420,13 @@ pub const ProvisionedTableWriteSource = struct {
         return true;
     }
 
+    fn beginReplicatedApplyOperationLocked(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
+        const io = self.table_activity_threaded.io();
+        while (!self.tryBeginReadCompatibleGroupOperationLocked(table_name, group_id)) {
+            self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
+        }
+    }
+
     fn beginGroupTransitionOperationLocked(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
         const io = self.table_activity_threaded.io();
         self.activityEntryLocked(table_name, group_id).transition_waiters += 1;
@@ -6684,6 +6691,13 @@ pub const ProvisionedTableWriteSource = struct {
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         return self.tryBeginReadCompatibleGroupOperationLocked(table_name, group_id);
+    }
+
+    fn beginReplicatedApplyOperation(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
+        const io = self.table_activity_threaded.io();
+        self.table_activity_mutex.lockUncancelable(io);
+        defer self.table_activity_mutex.unlock(io);
+        self.beginReplicatedApplyOperationLocked(table_name, group_id);
     }
 
     fn beginGroupTransitionOperation(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
@@ -13824,7 +13838,12 @@ pub const ProvisionedTableWriteSource = struct {
         if (metadata_source == .catalog) if (apply_req.split_replication) |replication| {
             try validateSplitReplicationIdentityAgainstCatalog(alloc, self.catalog, table_name, replication);
         };
-        self.beginGroupOperation(table_name, group_id);
+        // A read may already be waiting for this committed entry at its Raft
+        // read barrier. Replicated apply must therefore coexist with active
+        // generation-pinned readers; making it read-exclusive would deadlock
+        // the barrier behind the apply it is waiting for. Structural and
+        // generation transitions remain exclusive in the activity gate.
+        self.beginReplicatedApplyOperation(table_name, group_id);
         lockAtomic(&self.local_db_mutex);
         self.invalidateReadCache(table_name);
         self.markWriteCacheDirty(table_name);
@@ -30902,6 +30921,34 @@ test "provisioned table write source read request blocks group operation" {
 
     try std.testing.expect(!source.tryBeginGroupOperation("docs", 7001));
     try std.testing.expect(source.hasReadBlockingActivityBestEffort("docs", 7001));
+}
+
+test "provisioned table write source read request permits replicated apply activity" {
+    const NoCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedCatalogCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+    var source = ProvisionedTableWriteSource.init("/tmp/unused-antfly-read-request-allows-apply", NoCatalog.iface());
+    var activity = source.readPreparation().beginRead("docs", .general).?;
+    defer activity.deinit();
+
+    source.beginReplicatedApplyOperation("docs", 7001);
+    defer source.endGroupOperation("docs", 7001);
+
+    try std.testing.expect(source.readCompatibleMaintenanceActiveBestEffort("docs", 7001));
 }
 
 test "provisioned table group operation waiter queues ahead of later readers" {

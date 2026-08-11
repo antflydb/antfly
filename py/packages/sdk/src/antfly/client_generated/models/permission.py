@@ -16,8 +16,10 @@ T = TypeVar("T", bound="Permission")
 class Permission:
     """
     Attributes:
-        resource (str): Resource name (e.g., table name, target username, or '*' for global). Example: orders_table.
-        resource_type (ResourceType): Type of the resource, e.g., table, user, or global ('*'). Example: table.
+        resource (str): Resource name (e.g., table name, target username, or '*' for all inference operations or a
+            global grant). Example: orders_table.
+        resource_type (ResourceType): Type of resource: table, user, inference, or global ('*'). Use inference with
+            resource '*' to grant access to unified inference routes. Example: table.
         type_ (PermissionType): Type of permission. Example: read.
     """
 

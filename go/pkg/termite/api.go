@@ -1973,14 +1973,14 @@ func (ln *TermiteNode) handleApiGenerate(w http.ResponseWriter, r *http.Request)
 	if req.MaxTokens > 0 {
 		opts.MaxTokens = req.MaxTokens
 	}
-	if req.Temperature > 0 {
-		opts.Temperature = req.Temperature
+	if req.Temperature != nil {
+		opts.Temperature = *req.Temperature
 	}
-	if req.TopP > 0 {
-		opts.TopP = req.TopP
+	if req.TopP != nil {
+		opts.TopP = *req.TopP
 	}
-	if req.TopK > 0 {
-		opts.TopK = req.TopK
+	if req.TopK != nil {
+		opts.TopK = *req.TopK
 	}
 	// Try to extract tool choice from union type
 	// First try string variant (auto, none, required)

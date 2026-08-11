@@ -235,6 +235,17 @@ pub fn storageMaintenanceActive(context: *const CallContext) callconv(.c) abi.St
     return .ok;
 }
 
+pub fn authorizeInference(context: *const abi.AuthorizeInferenceContext) callconv(.c) abi.Status {
+    if (validateVersion(context.abi_version)) |failure| return failure;
+    if (context._reserved != 0) return fail(error.UnsupportedVersion);
+    const state: *ServerState = @ptrCast(@alignCast(context.handle));
+    context.out_decision.* = state.server.authorizeInferenceRequest(.{
+        .authorization = context.authorization.slice(),
+        .trusted_principal = context.trusted_principal.slice(),
+    }, context.permission) catch |err| return fail(err);
+    return .ok;
+}
+
 pub fn handle(context: *const CallContext) callconv(.c) abi.Status {
     if (validateCall(http_common.HttpRequest, http_common.HttpResponse, context)) |failure| return failure;
     output(http_common.HttpResponse, context).* = serverState(context).server.handle(input(http_common.HttpRequest, context).*) catch |err|
