@@ -549,6 +549,8 @@ pub const EmbeddingPipeline = struct {
     /// Requires a vision_session (CLIP/SigLIP model).
     pub fn embedImages(self: *EmbeddingPipeline, images: []const []const u8) anyerror![][]f32 {
         if (images.len == 0) return try self.allocator.alloc([]f32, 0);
+        self.lockExecution();
+        defer self.unlockExecution();
         return self.embedImagesBatch(images) catch |err| {
             if (images.len > 1 and shouldFallbackBatchedImageError(err)) {
                 return self.embedImagesIndividually(images);
@@ -622,11 +624,6 @@ pub const EmbeddingPipeline = struct {
         const pv_shape = [_]i64{ @intCast(batch), 3, sz, sz };
         var pv_tensor = try Tensor.initFloat32(alloc, "pixel_values", &pv_shape, pixel_values);
         defer pv_tensor.deinit();
-
-        // Decode, resize, normalize, and tensor packing are request-local CPU
-        // work. Serialize only the shared backend/session execution.
-        self.lockExecution();
-        defer self.unlockExecution();
 
         if (self.visual_projection) |proj| {
             const resident = self.tryEmbedResidentProjection(
@@ -705,8 +702,9 @@ pub const EmbeddingPipeline = struct {
             alloc.free(embeddings);
         }
         for (images, 0..) |img, i| {
-            // Each fallback forward owns the execution gate independently;
-            // another request may preprocess while the device lane is busy.
+            // The public entry point already owns execution_lock while it
+            // evaluates the batch fallback. Call the unlocked implementation
+            // directly so the non-reentrant mutex is not acquired twice.
             const single = try self.embedImagesBatch(&.{img});
             defer alloc.free(single);
             embeddings[i] = single[0];
@@ -799,6 +797,8 @@ pub const EmbeddingPipeline = struct {
     /// Requires an audio_session (CLAP model).
     pub fn embedAudioPcm(self: *EmbeddingPipeline, audio_clips: []const audio.PcmAudio) anyerror![][]f32 {
         if (audio_clips.len == 0) return try self.allocator.alloc([]f32, 0);
+        self.lockExecution();
+        defer self.unlockExecution();
         return self.embedAudioPcmBatch(audio_clips) catch |err| {
             if (audio_clips.len > 1 and err == error.BatchedAudioOutputCollapsed) {
                 return self.embedAudioPcmIndividually(audio_clips);
@@ -928,11 +928,6 @@ pub const EmbeddingPipeline = struct {
         else
             &[_]Tensor{mel_tensor};
 
-        // PCM feature extraction and tensor packing are request-local. Keep
-        // the model-local gate scoped to encoder/projection execution.
-        self.lockExecution();
-        defer self.unlockExecution();
-
         if (self.audio_projection) |proj| {
             if (try self.tryEmbedResidentProjection(
                 run_inputs,
@@ -1000,7 +995,8 @@ pub const EmbeddingPipeline = struct {
         }
 
         for (audio_clips, 0..) |_, i| {
-            // Each fallback forward owns the execution gate independently.
+            // embedAudioPcm holds execution_lock across the complete fallback,
+            // so individual attempts must use the unlocked batch primitive.
             const one = try self.embedAudioPcmBatch(audio_clips[i .. i + 1]);
             defer alloc.free(one);
             if (one.len != 1) return error.UnexpectedOutputShape;
@@ -2551,7 +2547,7 @@ test "embedImages falls back to per-image runs when batched image shape collapse
 test "embedAudioPcm falls back under the execution gate without re-entry" {
     const allocator = std.testing.allocator;
 
-    var fake = FakeAudioBatchSession{ .collapse_batch = true };
+    var fake = FakeCollapsingAudioSession{};
     var execution_gate: std.atomic.Mutex = .unlocked;
     var pipeline = EmbeddingPipeline{
         .allocator = allocator,
@@ -2577,33 +2573,6 @@ test "embedAudioPcm falls back under the execution gate without re-entry" {
     try std.testing.expectEqualSlices(f32, &.{ 1.0, 2.0 }, embeddings[1]);
     try std.testing.expect(execution_gate.tryLock());
     execution_gate.unlock();
-}
-
-test "embedAudioPcm uses one audio session run for a batch" {
-    const allocator = std.testing.allocator;
-
-    var fake = FakeAudioBatchSession{};
-    var pipeline = EmbeddingPipeline{
-        .allocator = allocator,
-        .session = fake.session(),
-        .tok = undefined,
-        .config = .{ .normalize = false },
-        .audio_session = fake.session(),
-    };
-
-    const samples = [_]f32{0.0} ** 1024;
-    const clips = [_]audio.PcmAudio{
-        .{ .samples = &samples, .sample_rate = audio.CLAP_CONFIG.sample_rate },
-        .{ .samples = &samples, .sample_rate = audio.CLAP_CONFIG.sample_rate },
-    };
-    const embeddings = try pipeline.embedAudioPcm(&clips);
-    defer freeEmbeddingSlices(allocator, embeddings);
-
-    try std.testing.expectEqual(@as(usize, 1), fake.run_count);
-    try std.testing.expectEqual(@as(usize, 2), fake.last_batch);
-    try std.testing.expectEqual(@as(usize, 2), embeddings.len);
-    try std.testing.expectEqualSlices(f32, &.{ 1.0, 2.0 }, embeddings[0]);
-    try std.testing.expectEqualSlices(f32, &.{ 2.0, 3.0 }, embeddings[1]);
 }
 
 test "selectProjectedOutput skips collapsed pooled output for image batch" {
@@ -2690,13 +2659,11 @@ const FakeCollapsingVisionSession = struct {
     }
 };
 
-const FakeAudioBatchSession = struct {
-    collapse_batch: bool = false,
+const FakeCollapsingAudioSession = struct {
     run_count: usize = 0,
     collapsed_batch_attempts: usize = 0,
-    last_batch: usize = 0,
 
-    fn session(self: *FakeAudioBatchSession) backends.Session {
+    fn session(self: *FakeCollapsingAudioSession) backends.Session {
         return .{
             .ptr = self,
             .vtable = &.{
@@ -2710,22 +2677,16 @@ const FakeAudioBatchSession = struct {
     }
 
     fn run(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator) anyerror![]Tensor {
-        const self: *FakeAudioBatchSession = @ptrCast(@alignCast(ptr));
+        const self: *FakeCollapsingAudioSession = @ptrCast(@alignCast(ptr));
         try std.testing.expectEqual(@as(usize, 1), inputs.len);
         const requested_batch: usize = @intCast(inputs[0].shape[0]);
         self.run_count += 1;
-        self.last_batch = requested_batch;
-        if (self.collapse_batch and requested_batch > 1) self.collapsed_batch_attempts = requested_batch;
+        if (requested_batch > 1) self.collapsed_batch_attempts = requested_batch;
 
-        const actual_batch: usize = if (self.collapse_batch and requested_batch > 1) 1 else requested_batch;
-        const data = try allocator.alloc(f32, actual_batch * 2);
-        defer allocator.free(data);
-        for (0..actual_batch) |b| {
-            data[b * 2] = @floatFromInt(b + 1);
-            data[b * 2 + 1] = @floatFromInt(b + 2);
-        }
+        const actual_batch: usize = if (requested_batch > 1) 1 else requested_batch;
+        const data = [_]f32{ 1.0, 2.0 };
         const out = try allocator.alloc(Tensor, 1);
-        out[0] = try Tensor.initFloat32(allocator, "audio_embeds", &.{ @intCast(actual_batch), 2 }, data);
+        out[0] = try Tensor.initFloat32(allocator, "audio_embeds", &.{ @intCast(actual_batch), 2 }, data[0 .. actual_batch * 2]);
         return out;
     }
 

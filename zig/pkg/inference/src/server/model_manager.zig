@@ -2069,10 +2069,9 @@ pub const LoadedModel = struct {
     // lifetime during execution; the mutex protects short slot mutations.
     embedding_asset_gate: EmbeddingAssetGate = .{},
     embedding_session_lock: std.atomic.Mutex = .unlocked,
-    /// Targeted stateful GPU pipelines share mutable command-frame and
-    /// resident-slot state within a loaded model. Keep one model-local lane
-    /// for ClipClap, reranking, and GLiNER2 while allowing independent models
-    /// and request-local preprocessing to overlap.
+    /// Stateful GPU pipelines share mutable command-frame and resident-slot
+    /// state within a loaded model. Keep one model-local lane while allowing
+    /// independent models to overlap.
     target_inference_run_lock: std.atomic.Mutex = .unlocked,
     vision_session: ?backends.Session = null,
     audio_session: ?backends.Session = null,

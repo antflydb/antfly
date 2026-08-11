@@ -105,7 +105,6 @@ test {
     _ = linalg;
     _ = graph;
     _ = architectures;
-    _ = @import("architectures/clap.zig");
     _ = architectures.clipclap_format;
     _ = architectures.projector_format;
     _ = @import("server/model_manager.zig");

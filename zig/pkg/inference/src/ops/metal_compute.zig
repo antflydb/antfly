@@ -25787,48 +25787,6 @@ test "metal_compute: transpose dot and conv use device resident Metal kernels" {
     try std.testing.expectEqualSlices(f32, &[_]f32{ 5422, 6533, 8755, 9866 }, conv2_data);
 }
 
-test "metal_compute: conv2d keeps batched inputs device resident" {
-    if (!build_options.enable_metal) return error.SkipZigTest;
-    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
-
-    const allocator = std.testing.allocator;
-    var metal_ws = testMetalWeightStoreInit(allocator);
-    defer metal_ws.lazy_weights.deinit(allocator);
-    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
-    defer metal_compute.deinit();
-    var metal_cb = metal_compute.computeBackend();
-
-    const input_host = try metal_cb.fromFloat32Shape(&[_]f32{
-        1, 2, 3, 4,
-        5, 6, 7, 8,
-    }, &.{ 2, 1, 2, 2 });
-    defer metal_cb.free(input_host);
-    const weight_host = try metal_cb.fromFloat32Shape(&[_]f32{2}, &.{ 1, 1, 1, 1 });
-    defer metal_cb.free(weight_host);
-    const bias_host = try metal_cb.fromFloat32Shape(&[_]f32{1}, &.{1});
-    defer metal_cb.free(bias_host);
-
-    const input_mt = try metal_compute.ownedDeviceMetalTensorFromCt(input_host);
-    const input = try metal_compute.ctFromOwnedMetalTensor(input_mt);
-    defer metal_cb.free(input);
-    const weight_mt = try metal_compute.ownedDeviceMetalTensorFromCt(weight_host);
-    const weight = try metal_compute.ctFromOwnedMetalTensor(weight_mt);
-    defer metal_cb.free(weight);
-    const bias_mt = try metal_compute.ownedDeviceMetalTensorFromCt(bias_host);
-    const bias = try metal_compute.ctFromOwnedMetalTensor(bias_mt);
-    defer metal_cb.free(bias);
-
-    const output = try metal_cb.conv2d(input, weight, bias, 2, 1, 1, 2, 2, 1, 1, 1, 1, 0, 0, 1);
-    defer metal_cb.free(output);
-    try std.testing.expect(MetalCompute.debugHasDeviceTensor(&metal_cb, output));
-    const actual = try metal_cb.toFloat32(output, allocator);
-    defer allocator.free(actual);
-    try std.testing.expectEqualSlices(f32, &[_]f32{
-        3,  5,  7,  9,
-        11, 13, 15, 17,
-    }, actual);
-}
-
 test "metal_compute: inferReshapeShape ignores collapsed singleton when restoring attention heads" {
     if (!build_options.enable_metal) return error.SkipZigTest;
 

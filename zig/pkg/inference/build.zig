@@ -561,7 +561,7 @@ pub fn build(b: *std.Build) void {
     clipclap_native_bench_exe.root_module.addImport("protobuf", protobuf_mod);
     clipclap_native_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
     clipclap_native_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
-    clipclap_native_bench_exe.root_module.link_libc = true;
+    configureNativeTool(b, clipclap_native_bench_exe, target, enable_system_blas, blas_root, enable_metal);
     configureOnnxRuntime(b, clipclap_native_bench_exe.root_module, enable_onnx, effective_onnx_root);
     const run_clipclap_native_bench = b.addRunArtifact(clipclap_native_bench_exe);
     if (b.args) |args| {
@@ -588,7 +588,7 @@ pub fn build(b: *std.Build) void {
     clipclap_e2e_bench_exe.root_module.addImport("protobuf", protobuf_mod);
     clipclap_e2e_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
     clipclap_e2e_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
-    clipclap_e2e_bench_exe.root_module.link_libc = true;
+    configureNativeTool(b, clipclap_e2e_bench_exe, target, enable_system_blas, blas_root, enable_metal);
     configureOnnxRuntime(b, clipclap_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);
     const run_clipclap_e2e_bench = b.addRunArtifact(clipclap_e2e_bench_exe);
     if (b.args) |args| {
