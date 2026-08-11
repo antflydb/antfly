@@ -73,6 +73,13 @@ jobs:
           # critical units. The pod reserve covers runner state, linker work,
           # page cache, and measurement drift.
           cd zig
+          runner_root="$(dirname "$(dirname "$RUNNER_TEMP")")"
+          node_bin="$runner_root/externals/node24/bin/node"
+          if [ ! -x "$node_bin" ]; then
+            echo "Actions runner Node 24 binary not found at $node_bin" >&2
+            exit 1
+          fi
+          "$node_bin" --version
           /usr/bin/time -v -o "$RUNNER_TEMP/linked-runtime.time" \
             zig build install lite-capi \
             --build-runner "$RUNNER_TEMP/zig-build-runner-maxrss.zig" \
@@ -140,19 +147,19 @@ jobs:
             exit 1
           fi
 
-          node tools/capture_zig_time_report.mjs \
+          "$node_bin" tools/capture_zig_time_report.mjs \
             ws://127.0.0.1:19125/ antfly-storage-kernel \
             "$RUNNER_TEMP/linked-runtime-reports/storage.json" 30 &
           storage_report_pid=$!
-          node tools/capture_zig_time_report.mjs \
+          "$node_bin" tools/capture_zig_time_report.mjs \
             ws://127.0.0.1:19125/ antfly-runtime-distributed \
             "$RUNNER_TEMP/linked-runtime-reports/distributed.json" 30 &
           distributed_report_pid=$!
-          node tools/capture_zig_time_report.mjs \
+          "$node_bin" tools/capture_zig_time_report.mjs \
             ws://127.0.0.1:19125/ antfly-runtime-inference \
             "$RUNNER_TEMP/linked-runtime-reports/inference.json" 30 &
           inference_report_pid=$!
-          node tools/capture_zig_time_report.mjs \
+          "$node_bin" tools/capture_zig_time_report.mjs \
             ws://127.0.0.1:19125/ antfly-runtime-cli \
             "$RUNNER_TEMP/linked-runtime-reports/cli.json" 5 &
           cli_report_pid=$!
@@ -165,6 +172,11 @@ jobs:
             "$cli_report_pid"; do
             wait "$report_pid" || report_status=$?
           done
+          if [ "$report_status" -ne 0 ]; then
+            stop_webui_build
+            cat "$RUNNER_TEMP/linked-runtime.log"
+            exit "$report_status"
+          fi
 
           # A Zig 0.16 WebUI build does not exit after completing its steps; it
           # waits for an interactive rebuild request. The full summary is the
@@ -183,7 +195,6 @@ jobs:
           stop_webui_build
           cat "$RUNNER_TEMP/linked-runtime.log"
 
-          if [ "$report_status" -ne 0 ]; then exit "$report_status"; fi
           if [ "$build_complete" != true ]; then
             echo "Zig time-report build did not reach a final summary" >&2
             exit 1

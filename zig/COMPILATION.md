@@ -2863,6 +2863,14 @@ all four compiler units and uploads their cross-unit overlap summary. That
 evidence, rather than the much faster local-host ratios, determines the next
 coarse ownership slice.
 
+The first report-capture attempt, run `31448346954`, is not a compiler
+measurement. The ARC image did not expose `node` on `PATH`, so all collectors
+exited before receiving a report and the diagnostic wrapper interrupted the
+still-running storage compiler after its completion-marker timeout. The
+workflow now invokes the Node 24 binary bundled with the Actions runner and
+fails collector setup immediately; this run neither accepts nor rejects the
+architecture.
+
 Artifact validation found one stripped static ARM64 executable, a 16,682,104 B
 `libantfly.so`, and one 36,705,768 B storage archive reused by both product
 links. The storage archive contains no native `mdb_*`, `lmdb_backend`, or
