@@ -3421,6 +3421,82 @@ exported function signature. Every new coarse operation must use this shape
 for call failures and use the same semantic identity inside per-item tagged
 outcomes; it must not introduce a boundary-specific broad error mapper.
 
+### Phase 4s: document/media compute island
+
+The first post-hardening physical split moves document extraction, archive
+decoding, PDF text extraction, and PDF page rendering into one separately
+compiled PIC unit. Storage still owns remote-download policy, replay windows,
+catalog and index access, generated-text batching, resource accounting,
+manifests, failure debt, checkpoints, and atomic derived writes. The provider
+receives one already-downloaded bounded source plus immutable configuration
+and returns extraction metadata followed by JSON batches capped at 64 units or
+4 MiB. No store key, document lookup, index operation, or backend call crosses
+the boundary.
+
+Both production extraction roots use the compiled provider under the opt-in
+experiment: the three-pass managed enrichment path and the direct DB/CAPI
+precompute path. PDF OCR rendering crosses the same compute boundary. Native
+implementations remain compile-time fallbacks for tests and for the disabled
+experiment, rather than runtime fallbacks that could emit a second production
+copy.
+
+ABI 31 applies the Phase 4q/4r identity contract without exceptions:
+
+- expected extraction/config/archive failures have distinct registered
+  statuses and map back to the original Zig error;
+- every provider failure returns `FailureIdentity`, so an undeclared defect
+  retains its exact bounded name, full-name hash, boundary version, and
+  operation ID even though control flow remains `internal`;
+- extraction manifests and per-unit PDF warnings consume that diagnostic
+  identity instead of replacing it with `StorageKernelFailure`; and
+- callback failures remain consumer-owned and rethrow the exact original
+  `anyerror`; the provider unwind sentinel is cleared from the diagnostic
+  channel and cannot overwrite that identity.
+
+The first genuinely empty-cache Apple-Silicon cross-build to ARM64 Linux musl
+`ReleaseFast` produced these compiler reports:
+
+| Unit | Compiler time | LLVM emission | Repository graph | Declarations |
+|---|---:|---:|---:|---:|
+| Storage kernel | 320.571 s | 314.118 s | 589 files / 918,103 lines | 33,331 |
+| Distributed/API control | 245.387 s | 239.775 s | 542 files / 763,217 lines | 28,509 |
+| Inference | 230.676 s | 223.670 s | 524 files / 580,416 lines | 24,999 |
+| Enrichment compute | 18.428 s | 17.364 s | 34 files / 55,694 lines | 3,275 |
+| Remote CLI | 39.453 s | 37.416 s | 53 files / 39,130 lines | 5,807 |
+
+The first profile still made inference wait for storage and took about 598
+seconds end to end. The dependency gate now admits inference after distributed
+finishes: storage's 10.25 GiB claim plus inference's 8 GiB claim remains below
+the unchanged 20,000 MiB budget, while the scheduler holds the short 4 GiB
+enrichment claim when necessary. A second empty-cache build of both `install`
+and `capi` then completed all 40 Zig steps in 424.44 seconds. Its summary
+reported storage at 4 minutes / 3 GiB, distributed at 3 minutes / 3 GiB,
+inference at 3 minutes / 4 GiB, enrichment at 15 seconds / 783 MiB, and CLI at
+33 seconds / 874 MiB, with no discarded or retried compiler step.
+
+The stripped output remains one static executable. It is 61,367,008 B, a
+2.1% increase from the 60,120,968 B normal-runner checkpoint and below the 5%
+gate. `libantfly.so` is 17,877,824 B, up 1,262,424 B but still within the
+documented 16--18 MB range. Both enrichment and storage archives are PIC and
+shared by the executable and CAPI libraries. Dynamic-symbol inspection exposes
+neither internal storage/enrichment entry points nor LMDB symbols.
+
+Behavioral validation currently includes 91 storage-owner tests, 11 public
+CAPI tests, five cross-archive enrichment tests, all three graph gates, and all
+17 analyzer tests, with zero leaks. The enrichment suite covers owned text
+results, PDF text/regions/rendered PNG bytes, a declared provider error, an
+undeclared provider diagnostic identity, and an intentionally unregistered
+consumer callback error.
+
+Decision: **keep this slice behind the opt-in experiment and send it to the
+normal runner**. It clears the local per-unit compiler gate and is the first
+physical split to reduce both large units while adding only an 18-second
+island. It does not yet enable the experiment by default: normal-runner
+reliability/time/RSS, the complete archive checks, and representative runtime
+throughput remain authoritative. The next graph experiment should use the
+fresh emitted-object ranking rather than broaden this ABI into storage-shaped
+callbacks.
+
 ## Holistic target architecture
 
 The current candidate is the opt-in four-unit source-selected topology above.

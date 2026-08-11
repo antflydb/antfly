@@ -44,6 +44,10 @@ const storage_kernel_exports = if (owns_storage_kernel)
     @import("capi/db.zig")
 else
     struct {};
+const enrichment_compute_exports = if (unit_options.unit == .enrichment_compute)
+    @import("storage/enrichment_compute_provider.zig")
+else
+    struct {};
 
 const cli_runtime = if (unit_options.unit == .cli or unit_options.unit == .control_probe or
     unit_options.unit == .cli_pic_probe)
@@ -478,6 +482,11 @@ comptime {
             exportInternal(&storage_kernel_exports.storageWalStatsSnapshot, "antfly_storage_wal_stats_snapshot");
             exportInternal(&storage_kernel_exports.storageWalLastLsn, "antfly_storage_wal_last_lsn");
             exportInternal(&storage_kernel_exports.storageOwnerBufferDestroy, "antfly_storage_owner_buffer_destroy");
+        },
+        .enrichment_compute => {
+            exportInternal(&enrichment_compute_exports.extractStream, "antfly_enrichment_extract_stream");
+            exportInternal(&enrichment_compute_exports.renderPdfPagePng, "antfly_enrichment_render_pdf_page_png");
+            exportInternal(&enrichment_compute_exports.bufferDestroy, "antfly_enrichment_buffer_destroy");
         },
         .inference => {
             exportInternal(&inferenceEntry, "antfly_runtime_inference");

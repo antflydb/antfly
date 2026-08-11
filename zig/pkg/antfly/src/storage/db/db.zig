@@ -86,6 +86,11 @@ const vectorindex_mod = @import("antfly_vectorindex");
 const embedder_mod = @import("enrichment/embedder.zig");
 const asset_producer_mod = @import("enrichment/asset_producer.zig");
 const document_extraction_mod = @import("enrichment/document_extraction.zig");
+const kernel_owner_abi = @import("kernel_owner_abi");
+const document_extraction_client = if (!builtin.is_test and build_options.storage_kernel_experiment)
+    @import("enrichment/document_extraction_client.zig")
+else
+    struct {};
 const chunker_mod = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
     @import("enrichment/chunker_stub.zig")
 else
@@ -25596,10 +25601,11 @@ fn computeDocumentExtractionAssetRequestDerived(
     var downloaded_mut = downloaded;
     defer downloaded_mut.deinit(alloc);
 
-    var extraction = document_extraction_mod.extractDownloadedAlloc(alloc, downloaded_mut, source_url, config) catch |err| switch (err) {
+    var extraction_failure: kernel_owner_abi.FailureIdentity = .{};
+    var extraction = extractDocumentDownloadedAlloc(alloc, downloaded_mut, source_url, config, config_json, doc_value, &extraction_failure) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => {
-            try appendDocumentExtractionFailureManifest(alloc, db, request.doc_key, artifact_name, source_url, manifest_key, state_key, existing_state, from_generation, to_generation, @errorName(err), "document extraction failed", artifact_writes, artifact_delete_keys);
+            try appendDocumentExtractionFailureManifest(alloc, db, request.doc_key, artifact_name, source_url, manifest_key, state_key, existing_state, from_generation, to_generation, boundaryFailureErrorName(&extraction_failure, err), "document extraction failed", artifact_writes, artifact_delete_keys);
             return;
         },
     };
@@ -25792,10 +25798,11 @@ fn completeDocumentExtractionGeneratedText(
             var rendered_page: ?[]u8 = null;
             defer if (rendered_page) |png| alloc.free(png);
             if (std.mem.eql(u8, extraction.route_type, "pdf")) {
-                rendered_page = document_extraction_mod.renderPdfPagePngAlloc(alloc, source_bytes, unit.page_number orelse 1) catch |err| {
+                var render_failure: kernel_owner_abi.FailureIdentity = .{};
+                rendered_page = renderDocumentPdfPagePngAlloc(alloc, source_bytes, unit.page_number orelse 1, &render_failure) catch |err| {
                     const any_err: anyerror = err;
                     if (any_err == error.OutOfMemory) return any_err;
-                    try markGeneratedUnitTextFailure(alloc, unit, "ocr_text", .ocr, any_err);
+                    try markGeneratedUnitTextFailureNamed(alloc, unit, "ocr_text", .ocr, boundaryFailureErrorName(&render_failure, any_err));
                     continue;
                 };
             }
@@ -25842,6 +25849,46 @@ fn completeDocumentExtractionGeneratedText(
             try applyGeneratedUnitText(alloc, unit, produced, "transcript_text", "completed", .transcript);
         }
     }
+}
+
+fn extractDocumentDownloadedAlloc(
+    alloc: Allocator,
+    downloaded: anytype,
+    source_url: []const u8,
+    config: document_extraction_mod.Config,
+    config_json: []const u8,
+    raw_document_json: []const u8,
+    out_failure: *kernel_owner_abi.FailureIdentity,
+) !document_extraction_mod.Result {
+    out_failure.* = .{};
+    if (comptime !builtin.is_test and build_options.storage_kernel_experiment) {
+        return document_extraction_client.extractDownloadedAllocWithFailure(
+            alloc,
+            downloaded,
+            source_url,
+            config_json,
+            raw_document_json,
+            out_failure,
+        );
+    }
+    return document_extraction_mod.extractDownloadedAlloc(alloc, downloaded, source_url, config);
+}
+
+fn renderDocumentPdfPagePngAlloc(
+    alloc: Allocator,
+    pdf_bytes: []const u8,
+    page_number: usize,
+    out_failure: *kernel_owner_abi.FailureIdentity,
+) ![]u8 {
+    out_failure.* = .{};
+    if (comptime !builtin.is_test and build_options.storage_kernel_experiment) {
+        return document_extraction_client.renderPdfPagePngAllocWithFailure(alloc, pdf_bytes, page_number, out_failure);
+    }
+    return document_extraction_mod.renderPdfPagePngAlloc(alloc, pdf_bytes, page_number);
+}
+
+fn boundaryFailureErrorName(failure: *const kernel_owner_abi.FailureIdentity, fallback: anyerror) []const u8 {
+    return if (failure.error_name_len > 0) failure.errorName() else @errorName(fallback);
 }
 
 const GeneratedUnitTextKind = enum { ocr, transcript };
@@ -25931,11 +25978,21 @@ fn markGeneratedUnitTextFailure(
     kind: GeneratedUnitTextKind,
     err: anyerror,
 ) !void {
+    return markGeneratedUnitTextFailureNamed(alloc, unit, method, kind, @errorName(err));
+}
+
+fn markGeneratedUnitTextFailureNamed(
+    alloc: Allocator,
+    unit: *document_extraction_mod.Unit,
+    method: []const u8,
+    kind: GeneratedUnitTextKind,
+    error_name: []const u8,
+) !void {
     const failed_status = switch (kind) {
         .ocr => "failed_ocr",
         .transcript => "failed_transcription",
     };
-    const warning = try std.fmt.allocPrint(alloc, "{s} failed: {s}", .{ method, @errorName(err) });
+    const warning = try std.fmt.allocPrint(alloc, "{s} failed: {s}", .{ method, error_name });
     errdefer alloc.free(warning);
     const owned_text = try alloc.dupe(u8, "");
     errdefer alloc.free(owned_text);

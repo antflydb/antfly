@@ -71,6 +71,10 @@ const RuntimeLibraryUnit = enum {
     // Under the storage-kernel experiment, physical storage and restore
     // staging live in the separate storage unit.
     distributed,
+    // Physical document/media extraction compute. Storage retains replay,
+    // durability, manifests, and index ownership and calls this unit once per
+    // bounded extraction operation.
+    enrichment_compute,
     inference,
     // Short remote/client unit. Its compile-step gate below keeps it from
     // competing with the initial API plus application memory group.
@@ -8836,6 +8840,7 @@ pub fn build(b: *std.Build) void {
         var application_runtime_artifact: ?*std.Build.Step.Compile = null;
         var inference_runtime_artifact: ?*std.Build.Step.Compile = null;
         var storage_runtime_artifact: ?*std.Build.Step.Compile = null;
+        var enrichment_compute_artifact: ?*std.Build.Step.Compile = null;
         var storage_owner_tests: ?*std.Build.Step.Compile = null;
         var storage_provisioned_owner_tests: ?*std.Build.Step.Compile = null;
         var storage_data_runtime_owner_tests: ?*std.Build.Step.Compile = null;
@@ -8845,7 +8850,8 @@ pub fn build(b: *std.Build) void {
                 unit != .application_pic_probe and unit != .control_probe and
                 unit != .cli_pic_probe and unit != .control_api_probe and
                 (unit != .api_kernel or !storage_kernel_experiment) and
-                (unit != .storage_kernel or storage_kernel_experiment);
+                (unit != .storage_kernel or storage_kernel_experiment) and
+                (unit != .enrichment_compute or storage_kernel_experiment);
             const owns_storage_kernel = unit == .storage_kernel or unit == .data_pic_probe or
                 unit == .storage_runtime_pic_probe or unit == .application_pic_probe or
                 (unit == .distributed and !storage_kernel_experiment);
@@ -8858,7 +8864,7 @@ pub fn build(b: *std.Build) void {
                 .target = target,
                 .optimize = optimize,
                 .sanitize_thread = sanitize_thread,
-                .pic = if (owns_storage_kernel) true else null,
+                .pic = if (owns_storage_kernel or unit == .enrichment_compute) true else null,
             });
             antfly_imports.configureStorageSources(
                 b,
@@ -8920,6 +8926,7 @@ pub fn build(b: *std.Build) void {
                     .cli_pic_probe => 8 * 1024 * 1024 * 1024,
                     .control_api_probe => 11 * 1024 * 1024 * 1024,
                     .distributed => @as(usize, if (storage_kernel_experiment) 9 else 11) * 1024 * 1024 * 1024,
+                    .enrichment_compute => 4 * 1024 * 1024 * 1024,
                     .inference => 8 * 1024 * 1024 * 1024,
                 },
             });
@@ -8930,8 +8937,9 @@ pub fn build(b: *std.Build) void {
             // application/storage (11 GiB), then inference (8 GiB) with the
             // latter after API. The physical-source experiment schedules
             // storage (10.25 GiB) with distributed/API/composition (9 GiB),
-            // then admits inference when the shorter storage unit finishes so
-            // it overlaps the tail of distributed without exceeding 20 GiB.
+            // then admits inference after distributed so its 8 GiB claim can
+            // overlap the storage tail at 18.25 GiB. The build scheduler holds
+            // the 4 GiB enrichment unit until either claim becomes available.
             //
             // This is still concurrent code generation; it only prevents a
             // short or later unit from consuming the claim needed by a
@@ -8944,10 +8952,17 @@ pub fn build(b: *std.Build) void {
                     application_runtime_artifact = role_artifact;
                     if (storage_kernel_experiment) api_runtime_artifact = role_artifact;
                 },
+                .enrichment_compute => {
+                    enrichment_compute_artifact = role_artifact;
+                    // Preserve the measured 19.25 GiB storage+distributed
+                    // launch group. This small unit overlaps the tail after
+                    // distributed without delaying either critical root.
+                    role_artifact.step.dependOn(&application_runtime_artifact.?.step);
+                },
                 .inference => {
                     inference_runtime_artifact = role_artifact;
                     role_artifact.step.dependOn(if (storage_kernel_experiment)
-                        &storage_runtime_artifact.?.step
+                        &application_runtime_artifact.?.step
                     else
                         &api_runtime_artifact.?.step);
                 },
@@ -9178,10 +9193,10 @@ pub fn build(b: *std.Build) void {
             // steps concurrently as fit in available RAM. The explicit gates
             // above establish the initial groups described above, then overlap
             // inference and CLI with the opposite long path as claims become
-            // available. The storage-owning archive is PIC because the
-            // executable and C ABI libraries share it; all three consumers
-            // reuse the same analyzed and optimized graph.
-            if (unit_enabled and owns_storage_kernel) {
+            // available. Storage and enrichment are PIC because the
+            // executable and C ABI libraries share both archives; all three
+            // consumers reuse the same analyzed and optimized graphs.
+            if (unit_enabled and (owns_storage_kernel or unit == .enrichment_compute)) {
                 capi_link_mod.linkLibrary(role_artifact);
                 lite_capi_link_mod.linkLibrary(role_artifact);
             }
@@ -9209,6 +9224,32 @@ pub fn build(b: *std.Build) void {
             const tests = maybe_tests orelse continue;
             tests.root_module.linkLibrary(api_runtime_artifact.?);
             tests.root_module.linkLibrary(inference_runtime_artifact.?);
+            tests.root_module.linkLibrary(enrichment_compute_artifact.?);
+        }
+        if (storage_kernel_experiment) {
+            const enrichment_test_mod = b.createModule(.{
+                .root_source_file = b.path("pkg/antfly/src/enrichment_compute_test_root.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            });
+            antfly_imports.configureStorageSources(b, enrichment_test_mod, false, true, true);
+            const enrichment_tests = b.addTest(.{
+                .root_module = enrichment_test_mod,
+                .filters = &.{"enrichment compute boundary"},
+                .test_runner = .{
+                    .path = b.path("pkg/antfly/src/test_runner.zig"),
+                    .mode = .simple,
+                },
+            });
+            enrichment_tests.root_module.linkLibrary(enrichment_compute_artifact.?);
+            const run_enrichment_tests = b.addRunArtifact(enrichment_tests);
+            run_enrichment_tests.setCwd(b.path("."));
+            const enrichment_test_step = b.step(
+                "enrichment-compute-boundary-test",
+                "Run document/media compute tests across its static archive boundary",
+            );
+            enrichment_test_step.dependOn(&run_enrichment_tests.step);
         }
     }
 

@@ -15,7 +15,7 @@
 //! Versioned internal ABI for the storage kernel's live DB owner. Keep this
 //! module free of storage and distributed-runtime imports.
 
-pub const abi_version: u32 = 30;
+pub const abi_version: u32 = 31;
 
 pub const BorrowedBytes = extern struct {
     ptr: ?[*]const u8 = null,
@@ -298,6 +298,24 @@ pub const Status = enum(u32) {
     unsupported_platform = 145,
     unsupported_evented_io_runtime = 146,
     dense_repair_backpressure = 147,
+    invalid_document_extraction_config = 148,
+    bad_unit_input = 149,
+    document_extraction_chunk_range_missing = 150,
+    document_extraction_working_set_too_large = 151,
+    invalid_document_extraction_manifest = 152,
+    invalid_document_extraction_state = 153,
+    invalid_graph_asset_state = 154,
+    missing_docx_document_xml = 155,
+    pdf_extraction_unavailable = 156,
+    unsupported_compression_method = 157,
+    zip64_unsupported = 158,
+    zip_bad_cd_offset = 159,
+    zip_bad_file_offset = 160,
+    zip_cd_size_mismatch = 161,
+    zip_decompress_size_mismatch = 162,
+    zip_encryption_unsupported = 163,
+    zip_no_end_record = 164,
+    zip_truncated = 165,
     internal = 255,
 };
 
@@ -323,6 +341,36 @@ pub const FailureIdentity = extern struct {
     pub fn errorName(self: *const FailureIdentity) []const u8 {
         return self.error_name[0..self.error_name_len];
     }
+};
+
+pub const EnrichmentStreamBeginFn = *const fn (
+    ?*anyopaque,
+    BorrowedBytes,
+    BorrowedBytes,
+    BorrowedBytes,
+) callconv(.c) Status;
+
+/// One coarse media/document extraction call. Unit delivery is batched JSON
+/// because extraction metadata is naturally textual and heterogeneous; the
+/// callback is never invoked once per store operation or index mutation.
+pub const EnrichmentExtractRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved0: u32 = 0,
+    downloaded: BorrowedBytes = .{},
+    downloaded_content_type: BorrowedBytes = .{},
+    source_url: BorrowedBytes = .{},
+    config_json: BorrowedBytes = .{},
+    raw_document_json: BorrowedBytes = .{},
+    callback_ctx: ?*anyopaque = null,
+    on_begin: ?EnrichmentStreamBeginFn = null,
+    on_units_json: ?*const fn (?*anyopaque, BorrowedBytes) callconv(.c) Status = null,
+};
+
+pub const EnrichmentRenderPdfRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved0: u32 = 0,
+    pdf_bytes: BorrowedBytes = .{},
+    page_number: u64 = 1,
 };
 
 /// Process-scoped physical-storage owner. The handle owns shared caches and
@@ -1686,3 +1734,16 @@ pub extern fn antfly_storage_wal_last_lsn(
 pub extern fn antfly_storage_owner_buffer_destroy(
     buffer: *OwnedBytes,
 ) callconv(.c) void;
+
+pub extern fn antfly_enrichment_extract_stream(
+    request: *const EnrichmentExtractRequest,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
+
+pub extern fn antfly_enrichment_render_pdf_page_png(
+    request: *const EnrichmentRenderPdfRequest,
+    out_png: *OwnedBytes,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
+
+pub extern fn antfly_enrichment_buffer_destroy(buffer: *OwnedBytes) callconv(.c) void;

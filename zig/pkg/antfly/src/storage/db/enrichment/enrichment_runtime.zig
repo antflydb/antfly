@@ -35,6 +35,11 @@ const enrichment_state = @import("enrichment_state.zig");
 const embedder_mod = @import("embedder.zig");
 const asset_producer_mod = @import("asset_producer.zig");
 const document_extraction_mod = @import("document_extraction.zig");
+const kernel_owner_abi = @import("kernel_owner_abi");
+const document_extraction_client = if (!builtin.is_test and build_options.storage_kernel_experiment)
+    @import("document_extraction_client.zig")
+else
+    struct {};
 const artifact_ids = @import("../artifact_ids.zig");
 const chunker_mod = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
     @import("chunker_stub.zig")
@@ -3292,7 +3297,8 @@ fn processDocumentExtractionAsset(
         .generated_units = &generated_units,
     };
     defer collect_ctx.deinit(runtime.alloc);
-    document_extraction_mod.extractDownloadedStreaming(runtime.alloc, downloaded_mut, source_url, config, collect_ctx.sink()) catch |err| {
+    var collect_failure: kernel_owner_abi.FailureIdentity = .{};
+    extractDocumentDownloadedStreaming(runtime.alloc, downloaded_mut, source_url, config, config_json, raw_doc, collect_ctx.sink(), &collect_failure) catch |err| {
         if (shouldYieldRequestError(runtime, err)) return err;
         try writeDocumentExtractionFailureManifest(
             runtime,
@@ -3301,7 +3307,7 @@ fn processDocumentExtractionAsset(
             source_url,
             source_fingerprint,
             if (config.content_type.len > 0) config.content_type else downloaded_mut.content_type,
-            @errorName(err),
+            boundaryFailureErrorName(&collect_failure, err),
             "document extraction failed",
             manifest_key,
             state_key,
@@ -3430,7 +3436,8 @@ fn processDocumentExtractionAsset(
         .generated_units = &generated_units,
         .mode = .store_artifacts,
     };
-    document_extraction_mod.extractDownloadedStreaming(runtime.alloc, downloaded_mut, source_url, config, store_ctx.sink()) catch |err| {
+    var store_failure: kernel_owner_abi.FailureIdentity = .{};
+    extractDocumentDownloadedStreaming(runtime.alloc, downloaded_mut, source_url, config, config_json, raw_doc, store_ctx.sink(), &store_failure) catch |err| {
         if (shouldYieldRequestError(runtime, err)) return err;
         try writeDocumentExtractionFailureManifest(
             runtime,
@@ -3439,7 +3446,7 @@ fn processDocumentExtractionAsset(
             source_url,
             source_fingerprint,
             collect_ctx.info.content_type,
-            @errorName(err),
+            boundaryFailureErrorName(&store_failure, err),
             "document extraction materialization failed",
             manifest_key,
             state_key,
@@ -3506,7 +3513,8 @@ fn processDocumentExtractionAsset(
         .generated_units = &generated_units,
         .mode = .publish_replay,
     };
-    try document_extraction_mod.extractDownloadedStreaming(runtime.alloc, downloaded_mut, source_url, config, replay_ctx.sink());
+    var replay_failure: kernel_owner_abi.FailureIdentity = .{};
+    try extractDocumentDownloadedStreaming(runtime.alloc, downloaded_mut, source_url, config, config_json, raw_doc, replay_ctx.sink(), &replay_failure);
     try flushGeneratedReplayWindow(runtime, window);
 
     try writes.append(runtime.alloc, .{
@@ -3515,6 +3523,48 @@ fn processDocumentExtractionAsset(
     });
     try storePutBatchWithRetry(runtime, writes.items, deletes.items);
     clearRuntimeKVBatch(runtime, &writes, &deletes);
+}
+
+fn extractDocumentDownloadedStreaming(
+    alloc: Allocator,
+    downloaded: anytype,
+    source_url: []const u8,
+    config: document_extraction_mod.Config,
+    config_json: []const u8,
+    raw_document_json: []const u8,
+    sink: document_extraction_mod.UnitSink,
+    out_failure: *kernel_owner_abi.FailureIdentity,
+) !void {
+    out_failure.* = .{};
+    if (comptime !builtin.is_test and build_options.storage_kernel_experiment) {
+        return document_extraction_client.extractDownloadedStreamingWithFailure(
+            alloc,
+            downloaded,
+            source_url,
+            config_json,
+            raw_document_json,
+            sink,
+            out_failure,
+        );
+    }
+    return document_extraction_mod.extractDownloadedStreaming(alloc, downloaded, source_url, config, sink);
+}
+
+fn renderDocumentPdfPagePngAlloc(
+    alloc: Allocator,
+    pdf_bytes: []const u8,
+    page_number: usize,
+    out_failure: *kernel_owner_abi.FailureIdentity,
+) ![]u8 {
+    out_failure.* = .{};
+    if (comptime !builtin.is_test and build_options.storage_kernel_experiment) {
+        return document_extraction_client.renderPdfPagePngAllocWithFailure(alloc, pdf_bytes, page_number, out_failure);
+    }
+    return document_extraction_mod.renderPdfPagePngAlloc(alloc, pdf_bytes, page_number);
+}
+
+fn boundaryFailureErrorName(failure: *const kernel_owner_abi.FailureIdentity, fallback: anyerror) []const u8 {
+    return if (failure.error_name_len > 0) failure.errorName() else @errorName(fallback);
 }
 
 fn writeDocumentExtractionFailureManifest(
@@ -3713,9 +3763,10 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatch(
         var rendered_page: ?[]u8 = null;
         defer if (rendered_page) |png| runtime.alloc.free(png);
         if (kind == .ocr and std.mem.eql(u8, route_type, "pdf")) {
-            rendered_page = document_extraction_mod.renderPdfPagePngAlloc(runtime.alloc, source_bytes, unit.page_number orelse 1) catch |err| {
+            var render_failure: kernel_owner_abi.FailureIdentity = .{};
+            rendered_page = renderDocumentPdfPagePngAlloc(runtime.alloc, source_bytes, unit.page_number orelse 1, &render_failure) catch |err| {
                 if (shouldYieldRequestError(runtime, err)) return err;
-                try markRuntimeGeneratedUnitTextFailure(runtime.alloc, &units[idx], method, kind, err);
+                try markRuntimeGeneratedUnitTextFailureNamed(runtime.alloc, &units[idx], method, kind, boundaryFailureErrorName(&render_failure, err));
                 continue;
             };
         }
@@ -3908,11 +3959,21 @@ fn markRuntimeGeneratedUnitTextFailure(
     kind: RuntimeGeneratedUnitTextKind,
     err: anyerror,
 ) !void {
+    return markRuntimeGeneratedUnitTextFailureNamed(alloc, unit, method, kind, @errorName(err));
+}
+
+fn markRuntimeGeneratedUnitTextFailureNamed(
+    alloc: Allocator,
+    unit: *document_extraction_mod.Unit,
+    method: []const u8,
+    kind: RuntimeGeneratedUnitTextKind,
+    error_name: []const u8,
+) !void {
     const failed_status = switch (kind) {
         .ocr => "failed_ocr",
         .transcript => "failed_transcription",
     };
-    const warning = try std.fmt.allocPrint(alloc, "{s} failed: {s}", .{ method, @errorName(err) });
+    const warning = try std.fmt.allocPrint(alloc, "{s} failed: {s}", .{ method, error_name });
     errdefer alloc.free(warning);
     const owned_text = try alloc.dupe(u8, "");
     errdefer alloc.free(owned_text);
