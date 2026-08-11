@@ -8977,18 +8977,15 @@ pub fn build(b: *std.Build) void {
             .root_module = role_mod,
             .linkage = .static,
             .max_rss = switch (unit) {
-                // Claims include roughly 1 GiB of headroom above observed
-                // ReleaseFast peaks. They are scheduling limits, not
-                // forced serialization: under CI's 12 GiB budget the API
-                // and inference units can compile together while the
-                // storage-heavy distributed unit runs alone.
-                .api_kernel => 6 * 1024 * 1024 * 1024,
-                // Native Darwin's object/Mach-O pipeline retains roughly
-                // 1.7 GiB more than ELF for this same PIC unit. Keep the
-                // scheduler claim honest on developer Macs without
-                // penalizing Linux CI concurrency.
-                .distributed => @as(usize, if (target.result.os.tag == .macos) 13 else 11) * 1024 * 1024 * 1024,
-                .inference => @as(usize, if (target.result.os.tag == .macos) 8 else 5) * 1024 * 1024 * 1024,
+                // Claims conservatively cover clean production ReleaseFast
+                // peaks measured for both aarch64-linux-musl and explicit
+                // aarch64-macos (including Metal and Accelerate). They are
+                // scheduling reservations, not hard process limits. A 20 GiB
+                // budget can overlap all four units while a smaller cgroup
+                // automatically schedules only the subset that fits.
+                .api_kernel => 4 * 1024 * 1024 * 1024,
+                .distributed => 8 * 1024 * 1024 * 1024,
+                .inference => 5 * 1024 * 1024 * 1024,
                 .cli => 2 * 1024 * 1024 * 1024,
             },
         });

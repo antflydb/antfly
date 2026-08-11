@@ -171,7 +171,7 @@ run_zig_build_steps() {
     --zig
     zig
     --max-rss-cap
-    17179869184
+    21474836480
     --
     build
   )
