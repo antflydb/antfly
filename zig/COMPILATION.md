@@ -182,6 +182,7 @@ the same host, target, cache state, and report set.
 | Combined provisioned + hosted read-vtable probe | Distributed 415.352 s → 367.185 s and 41,984 → 40,585 declarations | Go for a local-query island, but revert the raw prototype and redesign the ABI/ownership split |
 | Post-serverless compile-once control | Repeated cold combined distributed/storage builds: 358.589 s and 352.900 s; aggregate duplicate instances 873 → 482; executable 72.121 MB → 60.804 MB; C API unchanged at 16.382 MB | Historical keep decision; superseded by repeated 9–11 m normal-runner results |
 | Post-main normal-runner controls | Two clean ARM64 musl `ReleaseFast` archives succeeded on the normal 24 GiB publish runner; application/storage varied from 9 m to 11 m at 10 GB MaxRSS, with zero swap | Reliability and artifact gates pass, but the critical unit repeatedly misses the 380-second target; continue architecture work at the existing runner cost |
+| Document/media compute island, normal runner | Storage 615.200 s, distributed 459.376 s, inference 498.361 s, enrichment 34 s; archive 17:52.22; observed cgroup peak 15.51 GiB with zero OOM events | Boundary and artifacts pass, but overlapping the large initial units causes CPU contention and misses the time gate; keep the boundary opt-in and revise scheduling/composition |
 | Data-only PIC storage probe | 283.018 s, 277.375 s LLVM, 593 repository files, 36,065 declarations | Establishes that PIC/CAPI storage ownership is not the excess cost |
 | Data + standalone/Lite + CAPI PIC probe | 288.171 s, only +5.153 s over data alone; 614 repository files, 37,166 declarations | Strong candidate ownership island; CLI/metadata roots account for the remaining 82.685 s |
 | CLI + metadata control-only probe | 295.647 s, 289.733 s LLVM, 600 repository files | A separate control unit meets the time gate but duplicates too much physical storage by itself |
@@ -3496,6 +3497,40 @@ reliability/time/RSS, the complete archive checks, and representative runtime
 throughput remain authoritative. The next graph experiment should use the
 fresh emitted-object ranking rather than broaden this ABI into storage-shaped
 callbacks.
+
+The authoritative normal-runner build then passed in GitHub Actions run
+`31530408426`, job `93908799932`, at commit `9bea66b75`. All 38 build steps,
+the static ARM64 musl executable, the shared C API, symbol checks, and artifact
+upload succeeded on the unchanged runner with normal concurrency. The live
+cgroup peak was 16,655,601,664 B (15.51 GiB), every cgroup OOM counter remained
+zero, and swap remained zero. The final executable was 61,366,960 B and
+`libantfly.so` was 17,877,808 B.
+
+The compiler reports were materially slower than the empty-cache local result:
+
+| Unit | Compiler time | LLVM emission | Repository graph | Declarations |
+|---|---:|---:|---:|---:|
+| Storage kernel | 615.200 s | 602.403 s | 589 files / 918,103 lines | 33,324 |
+| Distributed/API control | 459.376 s | 448.265 s | 542 files / 763,217 lines | 28,502 |
+| Inference | 498.361 s | 446.889 s | 524 files / 580,416 lines | 24,994 |
+| Remote CLI | 72.376 s | 68.375 s | 53 files / 39,130 lines | 5,804 |
+
+The enrichment summary reported 34 seconds / 1 GiB; its first workflow did not
+capture the new WebUI JSON report, which the follow-up workflow now corrects.
+The complete archive took 17:52.22. Storage and distributed began together;
+inference became eligible after distributed and overlapped the storage tail.
+The resulting CPU contention inflated every large compiler unit relative to
+the prior normal-runner control and did not improve the end-to-end critical
+path.
+
+Revised decision: **keep the physical compute boundary, reject this schedule
+as a performance solution, and continue the goal loop**. The run is strong
+reliability evidence and the boundary preserves exact failure identity, but it
+does not satisfy the 380-second compiler-unit gate. Do not enable the experiment
+by default or increase runner cost. Use the newly captured enrichment report
+and emitted-object ranking to select the next coarse source cut; separately
+measure a schedule that avoids contending two LLVM-heavy units before accepting
+any concurrency-policy change.
 
 ## Holistic target architecture
 
