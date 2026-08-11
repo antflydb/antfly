@@ -3435,7 +3435,7 @@ test "document extraction parses generated OCR and transcription config" {
     var config = try parseConfig(alloc,
         \\{
         \\  "ocr_fallback": true,
-        \\  "ocr": {"config": {"provider": "mock-reader"}},
+        \\  "ocr": {"config": {"provider": "antfly"}},
         \\  "transcription": {"enabled": true, "config": {"provider": "mock-transcriber"}}
         \\}
     );
@@ -3443,7 +3443,7 @@ test "document extraction parses generated OCR and transcription config" {
 
     try std.testing.expect(config.ocr_enabled);
     try std.testing.expect(config.transcription_enabled);
-    try std.testing.expect(std.mem.indexOf(u8, config.ocr_config_json, "mock-reader") != null);
+    try std.testing.expect(std.mem.indexOf(u8, config.ocr_config_json, "antfly") != null);
     try std.testing.expect(std.mem.indexOf(u8, config.transcription_config_json, "mock-transcriber") != null);
 }
 
@@ -3457,7 +3457,7 @@ test "document extraction defaults OCR to PDF routes and accepts explicit image 
     try std.testing.expect(!ocrEnabledForRoute(defaults, "image"));
     try std.testing.expectEqualStrings(default_ocr_config_json, effectiveOcrConfigJson(defaults));
 
-    var image_enabled = try parseConfig(alloc, "{\"ocr\":{\"config\":{\"provider\":\"mock-reader\"}}}");
+    var image_enabled = try parseConfig(alloc, "{\"ocr\":{\"config\":{\"provider\":\"antfly\"}}}");
     defer image_enabled.deinit(alloc);
     try std.testing.expect(ocrEnabledForRoute(image_enabled, "image"));
 

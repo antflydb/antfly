@@ -465,7 +465,7 @@ fn selectHttpCredential(
     while (it.next()) |entry| {
         const credential = entry.value_ptr;
         const base_url = credential.base_url orelse continue;
-        if (httpUrlMatchesBase(parsed, base_url)) return credential;
+        if (scraping.httpUrlMatchesBase(parsed, base_url)) return credential;
     }
     return null;
 }
@@ -480,7 +480,7 @@ fn httpCredentialAllowsDestination(
     credential: *const scraping.HTTPCredentialConfig,
     parsed: std.Uri,
 ) bool {
-    if (credential.base_url) |base_url| return httpUrlMatchesBase(parsed, base_url);
+    if (credential.base_url) |base_url| return scraping.httpUrlMatchesBase(parsed, base_url);
     const effective = effectiveRemoteContentSecurity(cfg, credential.security);
     const allowed_hosts = effective.allowed_hosts orelse return false;
     const host = (parsed.host orelse return false).percent_encoded;
@@ -488,30 +488,6 @@ fn httpCredentialAllowsDestination(
         if (std.ascii.eqlIgnoreCase(host, allowed)) return true;
     }
     return false;
-}
-
-fn httpUrlMatchesBase(target: std.Uri, base_url: []const u8) bool {
-    const base = std.Uri.parse(base_url) catch return false;
-    const target_host = target.host orelse return false;
-    const base_host = base.host orelse return false;
-    if (!std.ascii.eqlIgnoreCase(target.scheme, base.scheme) or
-        !std.ascii.eqlIgnoreCase(target_host.percent_encoded, base_host.percent_encoded) or
-        effectiveUriPort(target) != effectiveUriPort(base))
-    {
-        return false;
-    }
-
-    const base_path = base.path.percent_encoded;
-    const target_path = target.path.percent_encoded;
-    if (base_path.len == 0 or std.mem.eql(u8, base_path, "/")) return true;
-    if (std.mem.eql(u8, target_path, base_path)) return true;
-    if (!std.mem.startsWith(u8, target_path, base_path)) return false;
-    return std.mem.endsWith(u8, base_path, "/") or
-        (target_path.len > base_path.len and target_path[base_path.len] == '/');
-}
-
-fn effectiveUriPort(uri: std.Uri) u16 {
-    return uri.port orelse if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) 443 else 80;
 }
 
 fn resolveS3Credential(
@@ -560,6 +536,7 @@ fn resolveHttpHeaders(
         headers[written] = .{
             .name = name,
             .value = value,
+            .credential_base_url = credential.base_url,
         };
         written += 1;
     }
@@ -813,6 +790,7 @@ test "template remote binds named HTTP credentials to their configured destinati
     defer resolved.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), resolved.http_headers.?.len);
     try std.testing.expectEqualStrings("Bearer secret", resolved.http_headers.?[0].value);
+    try std.testing.expectEqualStrings("https://api.example.com/v1", resolved.http_headers.?[0].credential_base_url.?);
 }
 
 test "template remote requires an allowlist for unbased named HTTP credentials" {
