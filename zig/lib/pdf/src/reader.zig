@@ -583,6 +583,15 @@ pub const ShapeRun = struct {
     }
 };
 
+/// Appends a fully-owned value without exposing the common allocation-failure
+/// hole between constructing the value and growing the destination list.
+/// Every supported value type provides `deinit(Allocator)`.
+fn appendOwnedValue(comptime T: type, alloc: Allocator, out: *std.ArrayList(T), value: T) !void {
+    var owned = value;
+    errdefer owned.deinit(alloc);
+    try out.append(alloc, owned);
+}
+
 pub const PageRenderRuns = struct {
     page_box: PageBox = .{ .min_x = 0, .min_y = 0, .max_x = 612, .max_y = 792 },
     text_runs: []TextRun = &.{},
@@ -930,7 +939,7 @@ fn extractTextRunsFromContentAppendWithState(
         try scanner.unreadLexeme(try cloneLexemeForContent(alloc, lex));
         const maybe_obj = try readContentObject(&scanner);
         if (maybe_obj) |obj| {
-            try operands.append(alloc, obj);
+            try appendOwnedSyntaxObject(alloc, &operands, obj);
         } else {
             clearContentOperands(alloc, &operands);
         }
@@ -1004,7 +1013,7 @@ fn extractImageRunsFromContentAppendWithState(
         try scanner.unreadLexeme(try cloneLexemeForContent(alloc, lex));
         const maybe_obj = try readContentObject(&scanner);
         if (maybe_obj) |obj| {
-            try operands.append(alloc, obj);
+            try appendOwnedSyntaxObject(alloc, &operands, obj);
         } else {
             clearContentOperands(alloc, &operands);
         }
@@ -1103,7 +1112,7 @@ fn extractShadingRunsFromContentAppendWithState(
         try scanner.unreadLexeme(try cloneLexemeForContent(alloc, lex));
         const maybe_obj = try readContentObject(&scanner);
         if (maybe_obj) |obj| {
-            try operands.append(alloc, obj);
+            try appendOwnedSyntaxObject(alloc, &operands, obj);
         } else {
             clearContentOperands(alloc, &operands);
         }
@@ -1174,7 +1183,7 @@ fn extractPatternRunsFromContentAppendWithState(
         try scanner.unreadLexeme(try cloneLexemeForContent(alloc, lex));
         const maybe_obj = try readContentObject(&scanner);
         if (maybe_obj) |obj| {
-            try operands.append(alloc, obj);
+            try appendOwnedSyntaxObject(alloc, &operands, obj);
         } else {
             clearContentOperands(alloc, &operands);
         }
@@ -1244,7 +1253,7 @@ fn extractShapeRunsFromContentAppendWithState(
         try scanner.unreadLexeme(try cloneLexemeForContent(alloc, lex));
         const maybe_obj = try readContentObject(&scanner);
         if (maybe_obj) |obj| {
-            try operands.append(alloc, obj);
+            try appendOwnedSyntaxObject(alloc, &operands, obj);
         } else {
             clearContentOperands(alloc, &operands);
         }
@@ -1965,6 +1974,7 @@ pub const Reader = struct {
 
         var out = std.ArrayList(ShapeRun).empty;
         defer out.deinit(self.alloc);
+        errdefer for (out.items) |*run| run.deinit(self.alloc);
         for (text_runs) |run| {
             if (run.fill_pattern_name != null or run.stroke_pattern_name != null) continue;
             const font_index = run.font_index orelse continue;
@@ -2012,6 +2022,7 @@ pub const Reader = struct {
 
         var out = std.ArrayList(PatternRun).empty;
         defer out.deinit(self.alloc);
+        errdefer for (out.items) |*run| run.deinit(self.alloc);
         try appendVectorTextPatternRunsAlloc(self.alloc, &out, fonts, patterns, text_runs);
         return try out.toOwnedSlice(self.alloc);
     }
@@ -2053,7 +2064,7 @@ pub const Reader = struct {
                 } orelse continue;
                 const pattern = findPagePattern(patterns, pattern_name) orelse continue;
                 if (pattern.kind == .shading) {
-                    try out.append(alloc, try buildShadingPatternRunAlloc(
+                    try appendOwnedValue(PatternRun, alloc, out, try buildShadingPatternRunAlloc(
                         alloc,
                         pattern,
                         .{
@@ -2086,7 +2097,7 @@ pub const Reader = struct {
                         shape.paint_order,
                     ));
                 } else {
-                    try out.append(alloc, try buildPatternRunAlloc(
+                    try appendOwnedValue(PatternRun, alloc, out, try buildPatternRunAlloc(
                         alloc,
                         pattern,
                         .{
@@ -2143,6 +2154,7 @@ pub const Reader = struct {
     fn extractContentsTextRunsAlloc(self: *const Reader, contents: *const syntax.Object, fonts: []const PageFont, gstates: []const PageExtGState, forms: []const PageForm) ![]TextRun {
         var out = std.ArrayList(TextRun).empty;
         defer out.deinit(self.alloc);
+        errdefer for (out.items) |*run| run.deinit(self.alloc);
 
         const streams = try self.collectContentStreamsAlloc(contents);
         defer {
@@ -2157,6 +2169,7 @@ pub const Reader = struct {
     fn extractContentsImageRunsAlloc(self: *const Reader, contents: *const syntax.Object, images: []const PageImage, gstates: []const PageExtGState, forms: []const PageForm) ![]ImageRun {
         var out = std.ArrayList(ImageRun).empty;
         defer out.deinit(self.alloc);
+        errdefer for (out.items) |*run| run.deinit(self.alloc);
 
         const streams = try self.collectContentStreamsAlloc(contents);
         defer {
@@ -2171,6 +2184,7 @@ pub const Reader = struct {
     fn extractContentsShadingRunsAlloc(self: *const Reader, contents: *const syntax.Object, shadings: []const PageShading, gstates: []const PageExtGState, forms: []const PageForm) ![]ShadingRun {
         var out = std.ArrayList(ShadingRun).empty;
         defer out.deinit(self.alloc);
+        errdefer for (out.items) |*run| run.deinit(self.alloc);
 
         const streams = try self.collectContentStreamsAlloc(contents);
         defer {
@@ -2185,6 +2199,7 @@ pub const Reader = struct {
     fn extractContentsShapeRunsAlloc(self: *const Reader, contents: *const syntax.Object, gstates: []const PageExtGState, forms: []const PageForm) ![]ShapeRun {
         var out = std.ArrayList(ShapeRun).empty;
         defer out.deinit(self.alloc);
+        errdefer for (out.items) |*run| run.deinit(self.alloc);
 
         const streams = try self.collectContentStreamsAlloc(contents);
         defer {
@@ -2199,6 +2214,7 @@ pub const Reader = struct {
     fn extractContentsPatternRunsAlloc(self: *const Reader, contents: *const syntax.Object, patterns: []const PagePattern, gstates: []const PageExtGState, forms: []const PageForm) ![]PatternRun {
         var out = std.ArrayList(PatternRun).empty;
         defer out.deinit(self.alloc);
+        errdefer for (out.items) |*run| run.deinit(self.alloc);
 
         const streams = try self.collectContentStreamsAlloc(contents);
         defer {
@@ -2494,7 +2510,7 @@ pub const Reader = struct {
             }
             try extractShapeRunsFromContentAppend(alloc, &glyph_shapes, glyph.content, &.{}, &.{});
             for (glyph_shapes.items) |shape| {
-                try out.append(alloc, try transformType3ShapeRunAlloc(alloc, shape, run, type3, cursor_x, cursor_y));
+                try appendOwnedValue(ShapeRun, alloc, out, try transformType3ShapeRunAlloc(alloc, shape, run, type3, cursor_x, cursor_y));
             }
 
             cursor_x += glyph.advance_x * run.font_size * run.horizontal_scale;
@@ -2517,6 +2533,10 @@ pub const Reader = struct {
         for (shape.points, 0..) |point, i| {
             points[i] = transformType3Point(point, run, type3, cursor_x, cursor_y);
         }
+        const dash_array = if (shape.dash_array) |dash| try alloc.dupe(f64, dash) else null;
+        errdefer if (dash_array) |dash| alloc.free(dash);
+        const clip_points = if (run.clip_points) |points_in| try alloc.dupe([2]f64, points_in) else null;
+        errdefer if (clip_points) |clip| alloc.free(clip);
 
         return .{
             .paint_order = run.paint_order,
@@ -2530,7 +2550,7 @@ pub const Reader = struct {
             .line_cap = shape.line_cap,
             .line_join = shape.line_join,
             .miter_limit = shape.miter_limit,
-            .dash_array = if (shape.dash_array) |dash| try alloc.dupe(f64, dash) else null,
+            .dash_array = dash_array,
             .dash_phase = shape.dash_phase,
             .color = if (type3.paint_type == 2)
                 switch (shape.kind) {
@@ -2542,10 +2562,43 @@ pub const Reader = struct {
             .stroke_width = scaleType3StrokeWidth(shape.stroke_width, run, type3),
             .closed = shape.closed,
             .clip_box = run.clip_box,
-            .clip_points = if (run.clip_points) |points_in| try alloc.dupe([2]f64, points_in) else null,
+            .clip_points = clip_points,
             .clip_fill_rule = run.clip_fill_rule,
             .points = points,
         };
+    }
+
+    fn appendFontOutlineShapeRunAlloc(
+        alloc: Allocator,
+        out: *std.ArrayList(ShapeRun),
+        run: TextRun,
+        points: []const [2]f64,
+        kind: @FieldType(ShapeRun, "kind"),
+    ) !void {
+        const clip_points = if (run.clip_points) |clip| try alloc.dupe([2]f64, clip) else null;
+        errdefer if (clip_points) |clip| alloc.free(clip);
+        const owned_points = try alloc.dupe([2]f64, points);
+        errdefer alloc.free(owned_points);
+        try out.append(alloc, .{
+            .paint_order = run.paint_order,
+            .blend_mode = run.blend_mode,
+            .group_id = run.group_id,
+            .group_parent_id = run.group_parent_id,
+            .group_isolated = run.group_isolated,
+            .group_knockout = run.group_knockout,
+            .kind = kind,
+            .fill_rule = .nonzero,
+            .color = if (kind == .fill)
+                colorWithAlpha(run.fill_color, run.alpha)
+            else
+                colorWithAlpha(run.stroke_color, run.stroke_alpha),
+            .stroke_width = if (kind == .fill) 0 else run.stroke_width,
+            .closed = true,
+            .clip_box = run.clip_box,
+            .clip_points = clip_points,
+            .clip_fill_rule = run.clip_fill_rule,
+            .points = owned_points,
+        });
     }
 
     fn appendTrueTypeRunShapesAlloc(
@@ -2581,42 +2634,10 @@ pub const Reader = struct {
                     if (points.len < 3) continue;
 
                     if (mode == 0 or mode == 2 or mode == 4 or mode == 6) {
-                        try out.append(alloc, .{
-                            .paint_order = run.paint_order,
-                            .blend_mode = run.blend_mode,
-                            .group_id = run.group_id,
-                            .group_parent_id = run.group_parent_id,
-                            .group_isolated = run.group_isolated,
-                            .group_knockout = run.group_knockout,
-                            .kind = .fill,
-                            .fill_rule = .nonzero,
-                            .color = colorWithAlpha(run.fill_color, run.alpha),
-                            .stroke_width = 0,
-                            .closed = true,
-                            .clip_box = run.clip_box,
-                            .clip_points = if (run.clip_points) |clip| try alloc.dupe([2]f64, clip) else null,
-                            .clip_fill_rule = run.clip_fill_rule,
-                            .points = try alloc.dupe([2]f64, points),
-                        });
+                        try appendFontOutlineShapeRunAlloc(alloc, out, run, points, .fill);
                     }
                     if (mode == 1 or mode == 2 or mode == 5 or mode == 6) {
-                        try out.append(alloc, .{
-                            .paint_order = run.paint_order,
-                            .blend_mode = run.blend_mode,
-                            .group_id = run.group_id,
-                            .group_parent_id = run.group_parent_id,
-                            .group_isolated = run.group_isolated,
-                            .group_knockout = run.group_knockout,
-                            .kind = .stroke,
-                            .fill_rule = .nonzero,
-                            .color = colorWithAlpha(run.stroke_color, run.stroke_alpha),
-                            .stroke_width = run.stroke_width,
-                            .closed = true,
-                            .clip_box = run.clip_box,
-                            .clip_points = if (run.clip_points) |clip| try alloc.dupe([2]f64, clip) else null,
-                            .clip_fill_rule = run.clip_fill_rule,
-                            .points = try alloc.dupe([2]f64, points),
-                        });
+                        try appendFontOutlineShapeRunAlloc(alloc, out, run, points, .stroke);
                     }
                 }
             }
@@ -2712,42 +2733,10 @@ pub const Reader = struct {
             if (points.len < 3) continue;
 
             if (mode == 0 or mode == 2 or mode == 4 or mode == 6) {
-                try out.append(alloc, .{
-                    .paint_order = run.paint_order,
-                    .blend_mode = run.blend_mode,
-                    .group_id = run.group_id,
-                    .group_parent_id = run.group_parent_id,
-                    .group_isolated = run.group_isolated,
-                    .group_knockout = run.group_knockout,
-                    .kind = .fill,
-                    .fill_rule = .nonzero,
-                    .color = colorWithAlpha(run.fill_color, run.alpha),
-                    .stroke_width = 0,
-                    .closed = true,
-                    .clip_box = run.clip_box,
-                    .clip_points = if (run.clip_points) |clip| try alloc.dupe([2]f64, clip) else null,
-                    .clip_fill_rule = run.clip_fill_rule,
-                    .points = try alloc.dupe([2]f64, points),
-                });
+                try appendFontOutlineShapeRunAlloc(alloc, out, run, points, .fill);
             }
             if (mode == 1 or mode == 2 or mode == 5 or mode == 6) {
-                try out.append(alloc, .{
-                    .paint_order = run.paint_order,
-                    .blend_mode = run.blend_mode,
-                    .group_id = run.group_id,
-                    .group_parent_id = run.group_parent_id,
-                    .group_isolated = run.group_isolated,
-                    .group_knockout = run.group_knockout,
-                    .kind = .stroke,
-                    .fill_rule = .nonzero,
-                    .color = colorWithAlpha(run.stroke_color, run.stroke_alpha),
-                    .stroke_width = run.stroke_width,
-                    .closed = true,
-                    .clip_box = run.clip_box,
-                    .clip_points = if (run.clip_points) |clip| try alloc.dupe([2]f64, clip) else null,
-                    .clip_fill_rule = run.clip_fill_rule,
-                    .points = try alloc.dupe([2]f64, points),
-                });
+                try appendFontOutlineShapeRunAlloc(alloc, out, run, points, .stroke);
             }
         }
     }
@@ -2785,42 +2774,10 @@ pub const Reader = struct {
                     if (points.len < 3) continue;
 
                     if (mode == 0 or mode == 2 or mode == 4 or mode == 6) {
-                        try out.append(alloc, .{
-                            .paint_order = run.paint_order,
-                            .blend_mode = run.blend_mode,
-                            .group_id = run.group_id,
-                            .group_parent_id = run.group_parent_id,
-                            .group_isolated = run.group_isolated,
-                            .group_knockout = run.group_knockout,
-                            .kind = .fill,
-                            .fill_rule = .nonzero,
-                            .color = colorWithAlpha(run.fill_color, run.alpha),
-                            .stroke_width = 0,
-                            .closed = true,
-                            .clip_box = run.clip_box,
-                            .clip_points = if (run.clip_points) |clip| try alloc.dupe([2]f64, clip) else null,
-                            .clip_fill_rule = run.clip_fill_rule,
-                            .points = try alloc.dupe([2]f64, points),
-                        });
+                        try appendFontOutlineShapeRunAlloc(alloc, out, run, points, .fill);
                     }
                     if (mode == 1 or mode == 2 or mode == 5 or mode == 6) {
-                        try out.append(alloc, .{
-                            .paint_order = run.paint_order,
-                            .blend_mode = run.blend_mode,
-                            .group_id = run.group_id,
-                            .group_parent_id = run.group_parent_id,
-                            .group_isolated = run.group_isolated,
-                            .group_knockout = run.group_knockout,
-                            .kind = .stroke,
-                            .fill_rule = .nonzero,
-                            .color = colorWithAlpha(run.stroke_color, run.stroke_alpha),
-                            .stroke_width = run.stroke_width,
-                            .closed = true,
-                            .clip_box = run.clip_box,
-                            .clip_points = if (run.clip_points) |clip| try alloc.dupe([2]f64, clip) else null,
-                            .clip_fill_rule = run.clip_fill_rule,
-                            .points = try alloc.dupe([2]f64, points),
-                        });
+                        try appendFontOutlineShapeRunAlloc(alloc, out, run, points, .stroke);
                     }
                 }
             }
@@ -2959,13 +2916,15 @@ pub const Reader = struct {
 
         var out = std.ArrayList(PageShading).empty;
         defer out.deinit(self.alloc);
+        errdefer for (out.items) |*shading| shading.deinit(self.alloc);
         for (resolved_shadings.dict) |entry| {
             var shading_obj = try self.resolveValue(&entry.value);
             defer shading_obj.deinit(self.alloc);
-            const shading = self.buildPageShading(entry.key, &shading_obj) catch |err| switch (err) {
+            var shading = self.buildPageShading(entry.key, &shading_obj) catch |err| switch (err) {
                 error.UnsupportedPdfRendering => continue,
                 else => return err,
             };
+            errdefer shading.deinit(self.alloc);
             try out.append(self.alloc, shading);
         }
         return try out.toOwnedSlice(self.alloc);
@@ -2979,6 +2938,7 @@ pub const Reader = struct {
 
         var out = std.ArrayList(PageExtGState).empty;
         defer out.deinit(self.alloc);
+        errdefer for (out.items) |*gstate| gstate.deinit(self.alloc);
         for (resolved_ext.dict) |entry| {
             var gs = try self.resolveValue(&entry.value);
             defer gs.deinit(self.alloc);
@@ -2986,12 +2946,15 @@ pub const Reader = struct {
             const fill_alpha = if (gs.get("ca")) |obj| alphaByteFromNumber(numericObjectValue(obj) orelse 1.0) else @as(u8, 0xff);
             const stroke_alpha = if (gs.get("CA")) |obj| alphaByteFromNumber(numericObjectValue(obj) orelse 1.0) else @as(u8, 0xff);
             const blend_mode = if (gs.get("BM")) |obj| parseBlendModeObject(obj) else BlendMode.normal;
+            var name: ?[]u8 = try self.alloc.dupe(u8, entry.key);
+            errdefer if (name) |owned| self.alloc.free(owned);
             try out.append(self.alloc, .{
-                .name = try self.alloc.dupe(u8, entry.key),
+                .name = name.?,
                 .fill_alpha = fill_alpha,
                 .stroke_alpha = stroke_alpha,
                 .blend_mode = blend_mode,
             });
+            name = null;
         }
         return try out.toOwnedSlice(self.alloc);
     }
@@ -3005,6 +2968,7 @@ pub const Reader = struct {
 
         var out = std.ArrayList(PagePattern).empty;
         defer out.deinit(self.alloc);
+        errdefer for (out.items) |*pattern| pattern.deinit(self.alloc);
         for (resolved_patterns.dict) |entry| {
             var pat = try self.resolveValue(&entry.value);
             defer pat.deinit(self.alloc);
@@ -3029,21 +2993,29 @@ pub const Reader = struct {
                 const shading_obj = pat.get("Shading") orelse continue;
                 var resolved_shading = try self.resolveValue(shading_obj);
                 defer resolved_shading.deinit(self.alloc);
-                const shading = self.buildPageShading(entry.key, &resolved_shading) catch |err| switch (err) {
+                var shading: ?PageShading = self.buildPageShading(entry.key, &resolved_shading) catch |err| switch (err) {
                     error.UnsupportedPdfRendering => continue,
                     else => return err,
                 };
+                errdefer if (shading) |*owned| owned.deinit(self.alloc);
+                var name: ?[]u8 = try self.alloc.dupe(u8, entry.key);
+                errdefer if (name) |owned| self.alloc.free(owned);
+                var content: ?[]u8 = try self.alloc.alloc(u8, 0);
+                errdefer if (content) |owned| self.alloc.free(owned);
                 try out.append(self.alloc, .{
-                    .name = try self.alloc.dupe(u8, entry.key),
+                    .name = name.?,
                     .kind = .shading,
-                    .content = try self.alloc.alloc(u8, 0),
+                    .content = content.?,
                     .bbox = .{ .min_x = 0, .min_y = 0, .max_x = 0, .max_y = 0 },
                     .x_step = 0,
                     .y_step = 0,
                     .matrix = matrix,
                     .colored = true,
-                    .shading = shading,
+                    .shading = shading.?,
                 });
+                name = null;
+                content = null;
+                shading = null;
                 continue;
             }
 
@@ -3097,8 +3069,10 @@ pub const Reader = struct {
                 if (forms.len > 0) self.alloc.free(forms);
             }
 
+            var name: ?[]u8 = try self.alloc.dupe(u8, entry.key);
+            errdefer if (name) |owned| self.alloc.free(owned);
             try out.append(self.alloc, .{
-                .name = try self.alloc.dupe(u8, entry.key),
+                .name = name.?,
                 .content = content,
                 .bbox = bbox,
                 .x_step = x_step,
@@ -3112,6 +3086,7 @@ pub const Reader = struct {
                 .gstates = gstates,
                 .forms = forms,
             });
+            name = null;
         }
         return try out.toOwnedSlice(self.alloc);
     }
@@ -3125,6 +3100,7 @@ pub const Reader = struct {
 
         var out = std.ArrayList(PageForm).empty;
         defer out.deinit(self.alloc);
+        errdefer for (out.items) |*form| form.deinit(self.alloc);
         for (resolved_xobjects.dict) |entry| {
             var xobj = try self.resolveValue(&entry.value);
             defer xobj.deinit(self.alloc);
@@ -3174,8 +3150,10 @@ pub const Reader = struct {
                 if (forms.len > 0) self.alloc.free(forms);
             }
 
+            var name: ?[]u8 = try self.alloc.dupe(u8, entry.key);
+            errdefer if (name) |owned| self.alloc.free(owned);
             try out.append(self.alloc, .{
-                .name = try self.alloc.dupe(u8, entry.key),
+                .name = name.?,
                 .content = content,
                 .matrix = blk: {
                     const matrix_obj = xobj.get("Matrix") orelse break :blk .{};
@@ -3227,6 +3205,7 @@ pub const Reader = struct {
                 .gstates = gstates,
                 .forms = forms,
             });
+            name = null;
         }
         return try out.toOwnedSlice(self.alloc);
     }
@@ -4105,6 +4084,7 @@ pub const Reader = struct {
 
         var glyphs = std.ArrayList(Type3Glyph).empty;
         defer glyphs.deinit(self.alloc);
+        errdefer for (glyphs.items) |*glyph| glyph.deinit(self.alloc);
         for (code_to_name, 0..) |maybe_name, code| {
             const glyph_name = maybe_name orelse continue;
             const proc_obj = resolved_charprocs.get(glyph_name) orelse continue;
@@ -4121,18 +4101,21 @@ pub const Reader = struct {
                 advance_x = width_value * font.font_matrix[0];
                 advance_y = width_value * font.font_matrix[1];
             }
-            if (parseType3GlyphAdvance(content)) |advance| {
+            if (try parseType3GlyphAdvance(self.alloc, content)) |advance| {
                 advance_x = advance[0] * font.font_matrix[0] + advance[1] * font.font_matrix[2];
                 advance_y = advance[0] * font.font_matrix[1] + advance[1] * font.font_matrix[3];
             }
 
+            var name: ?[]u8 = try self.alloc.dupe(u8, glyph_name);
+            errdefer if (name) |owned| self.alloc.free(owned);
             try glyphs.append(self.alloc, .{
                 .code = @intCast(code),
-                .name = try self.alloc.dupe(u8, glyph_name),
+                .name = name.?,
                 .content = content,
                 .advance_x = advance_x,
                 .advance_y = advance_y,
             });
+            name = null;
         }
 
         font.glyphs = try glyphs.toOwnedSlice(self.alloc);
@@ -4221,7 +4204,7 @@ pub const Reader = struct {
         const bytes = try normalizeType1ProgramAlloc(self.alloc, raw_bytes);
         errdefer self.alloc.free(bytes);
 
-        const len_iv = try parseType1LenIV(bytes);
+        const len_iv = try parseType1LenIV(self.alloc, bytes);
         const local_subrs = try parseType1LocalSubrsAlloc(self.alloc, bytes, len_iv);
         errdefer {
             for (local_subrs) |subr| self.alloc.free(subr);
@@ -4402,11 +4385,14 @@ pub const Reader = struct {
                     if (src != .string or dst != .string) return error.InvalidToUnicodeMap;
                     const code_len: u8 = @intCast(src.string.len);
                     if (code_len > code_bytes_out.*) code_bytes_out.* = code_len;
+                    var decoded_dst: ?[]u8 = try decodeToUnicodeDestAlloc(self.alloc, dst.string);
+                    errdefer if (decoded_dst) |owned| self.alloc.free(owned);
                     try entries.append(self.alloc, .{
                         .src = try parseCodeBytesToU32(src.string),
                         .src_len = code_len,
-                        .dst = try decodeToUnicodeDestAlloc(self.alloc, dst.string),
+                        .dst = decoded_dst.?,
                     });
+                    decoded_dst = null;
                 },
                 .bfrange => {
                     var src_lo = try scanner.readObject();
@@ -4432,11 +4418,14 @@ pub const Reader = struct {
                             defer self.alloc.free(dst_bytes);
                             var current_src: u32 = lo;
                             while (current_src <= hi) {
+                                var decoded_dst: ?[]u8 = try decodeToUnicodeDestAlloc(self.alloc, dst_bytes);
+                                errdefer if (decoded_dst) |owned| self.alloc.free(owned);
                                 try entries.append(self.alloc, .{
                                     .src = current_src,
                                     .src_len = code_len,
-                                    .dst = try decodeToUnicodeDestAlloc(self.alloc, dst_bytes),
+                                    .dst = decoded_dst.?,
                                 });
+                                decoded_dst = null;
                                 if (current_src == hi) break;
                                 if (!incrementBigEndianBytes(dst_bytes)) return error.InvalidToUnicodeMap;
                                 current_src += 1;
@@ -4447,11 +4436,14 @@ pub const Reader = struct {
                             for (dst.array) |item| {
                                 if (current_src > hi) break;
                                 if (item != .string) return error.InvalidToUnicodeMap;
+                                var decoded_dst: ?[]u8 = try decodeToUnicodeDestAlloc(self.alloc, item.string);
+                                errdefer if (decoded_dst) |owned| self.alloc.free(owned);
                                 try entries.append(self.alloc, .{
                                     .src = current_src,
                                     .src_len = code_len,
-                                    .dst = try decodeToUnicodeDestAlloc(self.alloc, item.string),
+                                    .dst = decoded_dst.?,
                                 });
+                                decoded_dst = null;
                                 current_src += 1;
                             }
                         },
@@ -5567,18 +5559,18 @@ fn applyEncodingDifferenceNames(names: *[256]?[]const u8, obj: *const syntax.Obj
     }
 }
 
-fn parseType1LenIV(bytes: []const u8) !i64 {
-    var scanner = syntax.Scanner.init(std.heap.page_allocator, bytes);
+fn parseType1LenIV(alloc: Allocator, bytes: []const u8) !i64 {
+    var scanner = syntax.Scanner.init(alloc, bytes);
     defer scanner.deinit();
     while (true) {
         var tok = try scanner.readLexeme();
-        defer syntax.Scanner.freeLexeme(std.heap.page_allocator, &tok);
+        defer syntax.Scanner.freeLexeme(alloc, &tok);
         switch (tok) {
             .eof => return 4,
             .name => |name| {
                 if (!std.mem.eql(u8, name, "lenIV")) continue;
                 var value_tok = try scanner.readLexeme();
-                defer syntax.Scanner.freeLexeme(std.heap.page_allocator, &value_tok);
+                defer syntax.Scanner.freeLexeme(alloc, &value_tok);
                 return switch (value_tok) {
                     .integer => |value| value,
                     else => 4,
@@ -5743,7 +5735,10 @@ fn parseType1LocalSubrsAlloc(alloc: Allocator, bytes: []const u8, len_iv: i64) !
     // binary can spend minutes attempting to tokenize a small embedded font.
     // Prefer the format-aware parser and retain the lexer only for unusual
     // string-encoded programs.
-    const rd_result = parseType1LocalSubrsRdAlloc(alloc, bytes, len_iv) catch null;
+    const rd_result = parseType1LocalSubrsRdAlloc(alloc, bytes, len_iv) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => null,
+    };
     if (rd_result) |subrs| {
         if (subrs.len > 0) return subrs;
         alloc.free(subrs);
@@ -5780,8 +5775,9 @@ fn parseType1LocalSubrsLexAlloc(alloc: Allocator, bytes: []const u8, len_iv: i64
                     if (value_tok != .string) continue;
                     const idx: usize = @intCast(idx_tok.integer);
                     try ensureType1SubrCapacity(alloc, &subrs, idx);
+                    const decrypted = try decryptType1BytesAlloc(alloc, len_iv, value_tok.string);
                     if (subrs.items[idx].len > 0) alloc.free(subrs.items[idx]);
-                    subrs.items[idx] = try decryptType1BytesAlloc(alloc, len_iv, value_tok.string);
+                    subrs.items[idx] = decrypted;
                     continue;
                 }
                 if (std.mem.eql(u8, kw, "end")) in_subrs = false;
@@ -5802,7 +5798,10 @@ fn parseType1GlyphsAlloc(
     first_char: usize,
     widths: []const syntax.Object,
 ) ![]Type1Glyph {
-    const rd_result = parseType1GlyphsRdAlloc(alloc, bytes, len_iv, font_obj, code_to_name, first_char, widths) catch null;
+    const rd_result = parseType1GlyphsRdAlloc(alloc, bytes, len_iv, font_obj, code_to_name, first_char, widths) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => null,
+    };
     if (rd_result) |glyphs| {
         if (glyphs.len > 0) return glyphs;
         alloc.free(glyphs);
@@ -5826,7 +5825,7 @@ fn parseType1GlyphsLexAlloc(
     defer if (pending_name) |name| alloc.free(name);
     var glyph_names = std.ArrayList([]u8).empty;
     var glyph_programs = std.ArrayList([]u8).empty;
-    errdefer {
+    defer {
         for (glyph_names.items) |name| alloc.free(name);
         glyph_names.deinit(alloc);
         for (glyph_programs.items) |program| alloc.free(program);
@@ -5849,7 +5848,10 @@ fn parseType1GlyphsLexAlloc(
             .string => |program| if (in_charstrings and pending_name != null) {
                 try glyph_names.append(alloc, pending_name.?);
                 pending_name = null;
-                try glyph_programs.append(alloc, try decryptType1BytesAlloc(alloc, len_iv, program));
+                var decrypted: ?[]u8 = try decryptType1BytesAlloc(alloc, len_iv, program);
+                errdefer if (decrypted) |owned| alloc.free(owned);
+                try glyph_programs.append(alloc, decrypted.?);
+                decrypted = null;
             },
             .keyword => |kw| {
                 if (!in_charstrings) continue;
@@ -5860,8 +5862,14 @@ fn parseType1GlyphsLexAlloc(
                     var value_tok = try scanner.readLexeme();
                     defer syntax.Scanner.freeLexeme(alloc, &value_tok);
                     if (value_tok != .string) continue;
-                    try glyph_names.append(alloc, try alloc.dupe(u8, name_tok.name));
-                    try glyph_programs.append(alloc, try decryptType1BytesAlloc(alloc, len_iv, value_tok.string));
+                    var owned_name: ?[]u8 = try alloc.dupe(u8, name_tok.name);
+                    errdefer if (owned_name) |owned| alloc.free(owned);
+                    try glyph_names.append(alloc, owned_name.?);
+                    owned_name = null;
+                    var decrypted: ?[]u8 = try decryptType1BytesAlloc(alloc, len_iv, value_tok.string);
+                    errdefer if (decrypted) |owned| alloc.free(owned);
+                    try glyph_programs.append(alloc, decrypted.?);
+                    decrypted = null;
                     continue;
                 }
                 if (std.mem.eql(u8, kw, "end")) in_charstrings = false;
@@ -5888,20 +5896,22 @@ fn parseType1GlyphsLexAlloc(
                 numericObjectValue(&widths[code - first_char]) orelse 1000.0
             else
                 1000.0;
+            var name: ?[]u8 = try alloc.dupe(u8, glyph_name);
+            errdefer if (name) |owned| alloc.free(owned);
+            var charstring: ?[]u8 = try alloc.dupe(u8, program);
+            errdefer if (charstring) |owned| alloc.free(owned);
             try glyphs.append(alloc, .{
                 .code = @intCast(code),
-                .name = try alloc.dupe(u8, glyph_name),
-                .charstring = try alloc.dupe(u8, program),
+                .name = name.?,
+                .charstring = charstring.?,
                 .advance = advance,
             });
+            name = null;
+            charstring = null;
             break;
         }
     }
 
-    for (glyph_names.items) |name| alloc.free(name);
-    glyph_names.deinit(alloc);
-    for (glyph_programs.items) |program| alloc.free(program);
-    glyph_programs.deinit(alloc);
     return try glyphs.toOwnedSlice(alloc);
 }
 
@@ -5951,8 +5961,9 @@ fn parseType1LocalSubrsRdAlloc(alloc: Allocator, bytes: []const u8, len_iv: i64)
         }
         defer if (raw.len > 0) alloc.free(raw);
         try ensureType1SubrCapacity(alloc, &subrs, idx);
+        const decrypted = try decryptType1BytesAlloc(alloc, len_iv, raw);
         if (subrs.items[idx].len > 0) alloc.free(subrs.items[idx]);
-        subrs.items[idx] = try decryptType1BytesAlloc(alloc, len_iv, raw);
+        subrs.items[idx] = decrypted;
     }
 
     return try subrs.toOwnedSlice(alloc);
@@ -5971,7 +5982,7 @@ fn parseType1GlyphsRdAlloc(
     var i: usize = section_start + "/CharStrings".len;
     var glyph_names = std.ArrayList([]u8).empty;
     var glyph_programs = std.ArrayList([]u8).empty;
-    errdefer {
+    defer {
         for (glyph_names.items) |name| alloc.free(name);
         glyph_names.deinit(alloc);
         for (glyph_programs.items) |program| alloc.free(program);
@@ -6010,8 +6021,14 @@ fn parseType1GlyphsRdAlloc(
             i += byte_len;
         }
         defer if (raw.len > 0) alloc.free(raw);
-        try glyph_names.append(alloc, try alloc.dupe(u8, name));
-        try glyph_programs.append(alloc, try decryptType1BytesAlloc(alloc, len_iv, raw));
+        var owned_name: ?[]u8 = try alloc.dupe(u8, name);
+        errdefer if (owned_name) |owned| alloc.free(owned);
+        try glyph_names.append(alloc, owned_name.?);
+        owned_name = null;
+        var decrypted: ?[]u8 = try decryptType1BytesAlloc(alloc, len_iv, raw);
+        errdefer if (decrypted) |owned| alloc.free(owned);
+        try glyph_programs.append(alloc, decrypted.?);
+        decrypted = null;
     }
 
     for (glyph_names.items) |name| {
@@ -6032,20 +6049,22 @@ fn parseType1GlyphsRdAlloc(
                 numericObjectValue(&widths[code - first_char]) orelse 1000.0
             else
                 1000.0;
+            var owned_name: ?[]u8 = try alloc.dupe(u8, glyph_name);
+            errdefer if (owned_name) |owned| alloc.free(owned);
+            var charstring: ?[]u8 = try alloc.dupe(u8, program);
+            errdefer if (charstring) |owned| alloc.free(owned);
             try glyphs.append(alloc, .{
                 .code = @intCast(code),
-                .name = try alloc.dupe(u8, glyph_name),
-                .charstring = try alloc.dupe(u8, program),
+                .name = owned_name.?,
+                .charstring = charstring.?,
                 .advance = advance,
             });
+            owned_name = null;
+            charstring = null;
             break;
         }
     }
 
-    for (glyph_names.items) |name| alloc.free(name);
-    glyph_names.deinit(alloc);
-    for (glyph_programs.items) |program| alloc.free(program);
-    glyph_programs.deinit(alloc);
     return try glyphs.toOwnedSlice(alloc);
 }
 
@@ -6134,43 +6153,33 @@ fn parseType1HexStringAlloc(alloc: Allocator, bytes: []const u8, index: *usize) 
     return out;
 }
 
-fn parseType3GlyphAdvance(content: []const u8) ?[2]f64 {
-    var scanner = syntax.Scanner.init(std.heap.page_allocator, content);
+fn parseType3GlyphAdvance(alloc: Allocator, content: []const u8) !?[2]f64 {
+    var scanner = syntax.Scanner.init(alloc, content);
     defer scanner.deinit();
-    var operands = std.ArrayList(syntax.Object).empty;
-    defer {
-        for (operands.items) |*obj| obj.deinit(std.heap.page_allocator);
-        operands.deinit(std.heap.page_allocator);
-    }
+    var operands: [2]f64 = undefined;
+    var operand_count: usize = 0;
 
     while (true) {
-        var lex = scanner.readLexeme() catch return null;
-        defer syntax.Scanner.freeLexeme(std.heap.page_allocator, &lex);
+        var lex = try scanner.readLexeme();
+        defer syntax.Scanner.freeLexeme(alloc, &lex);
         if (lex == .eof) break;
 
         switch (lex) {
-            .integer => {
-                const cloned = syntax.Object{ .integer = lex.integer };
-                operands.append(std.heap.page_allocator, cloned) catch return null;
+            .integer => |value| {
+                if (operand_count < operands.len) operands[operand_count] = @floatFromInt(value);
+                operand_count +|= 1;
             },
-            .real => {
-                const cloned = syntax.Object{ .real = lex.real };
-                operands.append(std.heap.page_allocator, cloned) catch return null;
+            .real => |value| {
+                if (operand_count < operands.len) operands[operand_count] = value;
+                operand_count +|= 1;
             },
             .keyword => |keyword| {
-                if ((std.mem.eql(u8, keyword, "d0") or std.mem.eql(u8, keyword, "d1")) and operands.items.len >= 2) {
-                    return .{
-                        numericObjectValue(&operands.items[0]) orelse 0,
-                        numericObjectValue(&operands.items[1]) orelse 0,
-                    };
+                if ((std.mem.eql(u8, keyword, "d0") or std.mem.eql(u8, keyword, "d1")) and operand_count >= 2) {
+                    return operands;
                 }
-                for (operands.items) |*obj| obj.deinit(std.heap.page_allocator);
-                operands.clearRetainingCapacity();
+                operand_count = 0;
             },
-            else => {
-                for (operands.items) |*obj| obj.deinit(std.heap.page_allocator);
-                operands.clearRetainingCapacity();
-            },
+            else => operand_count = 0,
         }
     }
     return null;
@@ -6179,12 +6188,16 @@ fn parseType3GlyphAdvance(content: []const u8) ?[2]f64 {
 fn extractHexStringsAlloc(alloc: Allocator, line: []const u8) ![][]u8 {
     var out = std.ArrayList([]u8).empty;
     defer out.deinit(alloc);
+    errdefer for (out.items) |value| alloc.free(value);
 
     var i: usize = 0;
     while (i < line.len) {
         const start = std.mem.indexOfScalarPos(u8, line, i, '<') orelse break;
         const end = std.mem.indexOfScalarPos(u8, line, start + 1, '>') orelse break;
-        try out.append(alloc, try alloc.dupe(u8, line[start + 1 .. end]));
+        var value: ?[]u8 = try alloc.dupe(u8, line[start + 1 .. end]);
+        errdefer if (value) |owned| alloc.free(owned);
+        try out.append(alloc, value.?);
+        value = null;
         i = end + 1;
     }
     return try out.toOwnedSlice(alloc);
@@ -6314,7 +6327,7 @@ fn extractTextFromContentAlloc(
         try scanner.unreadLexeme(try cloneLexemeForContent(alloc, lex));
         const maybe_obj = try readContentObject(&scanner);
         if (maybe_obj) |obj| {
-            try operands.append(alloc, obj);
+            try appendOwnedSyntaxObject(alloc, &operands, obj);
         } else {
             clearContentOperands(alloc, &operands);
         }
@@ -6340,6 +6353,12 @@ fn readContentObject(scanner: *syntax.Scanner) anyerror!?syntax.Object {
 fn clearContentOperands(alloc: Allocator, operands: *std.ArrayList(syntax.Object)) void {
     for (operands.items) |*obj| obj.deinit(alloc);
     operands.clearRetainingCapacity();
+}
+
+fn appendOwnedSyntaxObject(alloc: Allocator, out: *std.ArrayList(syntax.Object), value: syntax.Object) !void {
+    var owned = value;
+    errdefer owned.deinit(alloc);
+    try out.append(alloc, owned);
 }
 
 fn clearContentOperandsRetainingNames(
@@ -6470,6 +6489,8 @@ fn applyTextRunOperator(
         paint_order.* += 1;
     }
     if (std.mem.eql(u8, op, "q")) {
+        const clip_points = try alloc.dupe([2]f64, current_clip_points.items);
+        errdefer alloc.free(clip_points);
         try stack.append(alloc, .{
             .matrix = state.matrix,
             .alpha = state.alpha,
@@ -6491,7 +6512,7 @@ fn applyTextRunOperator(
             .fill_pattern_name = state.fill_pattern_name,
             .stroke_pattern_name = state.stroke_pattern_name,
             .clip_box = state.clip_box,
-            .clip_points = try alloc.dupe([2]f64, current_clip_points.items),
+            .clip_points = clip_points,
             .clip_fill_rule = current_clip_fill_rule.*,
         });
         return;
@@ -6499,6 +6520,7 @@ fn applyTextRunOperator(
     if (std.mem.eql(u8, op, "Q")) {
         if (stack.items.len > 0) {
             var entry = stack.pop().?;
+            defer entry.deinit(alloc);
             state.matrix = entry.matrix;
             state.alpha = entry.alpha;
             state.stroke_alpha = entry.stroke_alpha;
@@ -6522,7 +6544,6 @@ fn applyTextRunOperator(
             current_clip_points.clearRetainingCapacity();
             try current_clip_points.appendSlice(alloc, entry.clip_points);
             current_clip_fill_rule.* = entry.clip_fill_rule;
-            entry.deinit(alloc);
         }
         current_path.clearRetainingCapacity();
         current_path_closed.* = false;
@@ -6949,9 +6970,11 @@ fn applyImageOperator(
 ) anyerror!void {
     if (isTextShowOperator(op) or isShapePaintOperator(op) or std.mem.eql(u8, op, "sh")) paint_order.* += 1;
     if (std.mem.eql(u8, op, "q")) {
+        const clip_points = try alloc.dupe([2]f64, current_clip_points.items);
+        errdefer alloc.free(clip_points);
         try stack.append(alloc, .{
             .state = state.*,
-            .clip_points = try alloc.dupe([2]f64, current_clip_points.items),
+            .clip_points = clip_points,
             .clip_fill_rule = current_clip_fill_rule.*,
         });
         return;
@@ -6959,11 +6982,11 @@ fn applyImageOperator(
     if (std.mem.eql(u8, op, "Q")) {
         if (stack.items.len > 0) {
             var entry = stack.pop().?;
+            defer entry.deinit(alloc);
             state.* = entry.state;
             current_clip_points.clearRetainingCapacity();
             try current_clip_points.appendSlice(alloc, entry.clip_points);
             current_clip_fill_rule.* = entry.clip_fill_rule;
-            entry.deinit(alloc);
         }
         current_path.clearRetainingCapacity();
         current_path_closed.* = false;
@@ -7081,8 +7104,12 @@ fn applyImageOperator(
         const name = operands[operands.len - 1].name;
         for (images) |image| {
             if (!std.mem.eql(u8, image.name, name)) continue;
+            const rgba = try alloc.dupe(u8, image.rgba);
+            errdefer alloc.free(rgba);
+            const clip_points = if (current_clip_points.items.len > 0) try alloc.dupe([2]f64, current_clip_points.items) else null;
+            errdefer if (clip_points) |clip| alloc.free(clip);
             try out.append(alloc, .{
-                .rgba = try alloc.dupe(u8, image.rgba),
+                .rgba = rgba,
                 .width = image.width,
                 .height = image.height,
                 .alpha = state.fill_alpha,
@@ -7093,7 +7120,7 @@ fn applyImageOperator(
                 .group_isolated = state.group_isolated,
                 .group_knockout = state.group_knockout,
                 .clip_box = state.clip_box,
-                .clip_points = if (current_clip_points.items.len > 0) try alloc.dupe([2]f64, current_clip_points.items) else null,
+                .clip_points = clip_points,
                 .clip_fill_rule = current_clip_fill_rule.*,
                 .a = state.matrix.a,
                 .b = state.matrix.b,
@@ -7147,11 +7174,15 @@ fn applyShapeOperator(
         paint_order.* += 1;
     }
     if (std.mem.eql(u8, op, "q")) {
+        const dash_array = try alloc.dupe(f64, current_dash.items);
+        errdefer alloc.free(dash_array);
+        const clip_points = try alloc.dupe([2]f64, current_clip_points.items);
+        errdefer alloc.free(clip_points);
         try stack.append(alloc, .{
             .state = state.*,
             .dash_phase = dash_phase.*,
-            .dash_array = try alloc.dupe(f64, current_dash.items),
-            .clip_points = try alloc.dupe([2]f64, current_clip_points.items),
+            .dash_array = dash_array,
+            .clip_points = clip_points,
             .clip_fill_rule = current_clip_fill_rule.*,
         });
         return;
@@ -7159,6 +7190,7 @@ fn applyShapeOperator(
     if (std.mem.eql(u8, op, "Q")) {
         if (stack.items.len > 0) {
             var entry = stack.pop().?;
+            defer entry.deinit(alloc);
             state.* = entry.state;
             dash_phase.* = entry.dash_phase;
             current_dash.clearRetainingCapacity();
@@ -7166,7 +7198,6 @@ fn applyShapeOperator(
             current_clip_points.clearRetainingCapacity();
             try current_clip_points.appendSlice(alloc, entry.clip_points);
             current_clip_fill_rule.* = entry.clip_fill_rule;
-            entry.deinit(alloc);
         }
         current_path.clearRetainingCapacity();
         current_path_closed.* = false;
@@ -7535,9 +7566,11 @@ fn applyShadingOperator(
         paint_order.* += 1;
     }
     if (std.mem.eql(u8, op, "q")) {
+        const clip_points = try alloc.dupe([2]f64, current_clip_points.items);
+        errdefer alloc.free(clip_points);
         try stack.append(alloc, .{
             .state = state.*,
-            .clip_points = try alloc.dupe([2]f64, current_clip_points.items),
+            .clip_points = clip_points,
             .clip_fill_rule = current_clip_fill_rule.*,
         });
         return;
@@ -7545,11 +7578,11 @@ fn applyShadingOperator(
     if (std.mem.eql(u8, op, "Q")) {
         if (stack.items.len > 0) {
             var entry = stack.pop().?;
+            defer entry.deinit(alloc);
             state.* = entry.state;
             current_clip_points.clearRetainingCapacity();
             try current_clip_points.appendSlice(alloc, entry.clip_points);
             current_clip_fill_rule.* = entry.clip_fill_rule;
-            entry.deinit(alloc);
         }
         current_path.clearRetainingCapacity();
         current_path_closed.* = false;
@@ -7660,6 +7693,8 @@ fn applyShadingOperator(
             if (!std.mem.eql(u8, shading.name, name)) continue;
             const p0 = applyMatrixToPoint(state.matrix, shading.x0, shading.y0);
             const p1 = applyMatrixToPoint(state.matrix, shading.x1, shading.y1);
+            const clip_points = if (current_clip_points.items.len > 0) try alloc.dupe([2]f64, current_clip_points.items) else null;
+            errdefer if (clip_points) |clip| alloc.free(clip);
             try out.append(alloc, .{
                 .kind = shading.kind,
                 .paint_order = paint_order.*,
@@ -7669,7 +7704,7 @@ fn applyShadingOperator(
                 .group_isolated = state.group_isolated,
                 .group_knockout = state.group_knockout,
                 .clip_box = state.clip_box,
-                .clip_points = if (current_clip_points.items.len > 0) try alloc.dupe([2]f64, current_clip_points.items) else null,
+                .clip_points = clip_points,
                 .clip_fill_rule = current_clip_fill_rule.*,
                 .x0 = p0[0],
                 .y0 = p0[1],
@@ -7708,11 +7743,15 @@ fn applyPatternOperator(
     operands: []const syntax.Object,
 ) anyerror!void {
     if (std.mem.eql(u8, op, "q")) {
+        const dash_array = try alloc.dupe(f64, current_dash.items);
+        errdefer alloc.free(dash_array);
+        const clip_points = try alloc.dupe([2]f64, current_clip_points.items);
+        errdefer alloc.free(clip_points);
         try stack.append(alloc, .{
             .state = state.*,
             .dash_phase = dash_phase.*,
-            .dash_array = try alloc.dupe(f64, current_dash.items),
-            .clip_points = try alloc.dupe([2]f64, current_clip_points.items),
+            .dash_array = dash_array,
+            .clip_points = clip_points,
             .clip_fill_rule = current_clip_fill_rule.*,
         });
         return;
@@ -7720,6 +7759,7 @@ fn applyPatternOperator(
     if (std.mem.eql(u8, op, "Q")) {
         if (stack.items.len > 0) {
             var entry = stack.pop().?;
+            defer entry.deinit(alloc);
             state.* = entry.state;
             dash_phase.* = entry.dash_phase;
             current_dash.clearRetainingCapacity();
@@ -7727,7 +7767,6 @@ fn applyPatternOperator(
             current_clip_points.clearRetainingCapacity();
             try current_clip_points.appendSlice(alloc, entry.clip_points);
             current_clip_fill_rule.* = entry.clip_fill_rule;
-            entry.deinit(alloc);
         }
         current_path.clearRetainingCapacity();
         current_path_closed.* = false;
@@ -7945,9 +7984,9 @@ fn applyPatternOperator(
                     return;
                 };
                 if (pattern.kind == .tiling) {
-                    try out.append(alloc, try buildPatternRunAlloc(alloc, pattern, state.*, current_path.items, .fill, true, if (std.mem.eql(u8, op, "f*")) .even_odd else .nonzero, current_dash.items, dash_phase.*, current_clip_points.items, current_clip_fill_rule.*, paint_order.*));
+                    try appendOwnedValue(PatternRun, alloc, out, try buildPatternRunAlloc(alloc, pattern, state.*, current_path.items, .fill, true, if (std.mem.eql(u8, op, "f*")) .even_odd else .nonzero, current_dash.items, dash_phase.*, current_clip_points.items, current_clip_fill_rule.*, paint_order.*));
                 } else if (pattern.kind == .shading) {
-                    try out.append(alloc, try buildShadingPatternRunAlloc(alloc, pattern, state.*, current_path.items, .fill, true, if (std.mem.eql(u8, op, "f*")) .even_odd else .nonzero, current_dash.items, dash_phase.*, current_clip_points.items, current_clip_fill_rule.*, paint_order.*));
+                    try appendOwnedValue(PatternRun, alloc, out, try buildShadingPatternRunAlloc(alloc, pattern, state.*, current_path.items, .fill, true, if (std.mem.eql(u8, op, "f*")) .even_odd else .nonzero, current_dash.items, dash_phase.*, current_clip_points.items, current_clip_fill_rule.*, paint_order.*));
                 }
                 paint_order.* += 1;
             }
@@ -7965,7 +8004,7 @@ fn applyPatternOperator(
                     current_path_closed.* = false;
                     return;
                 };
-                try out.append(alloc, try buildPatternRunAlloc(alloc, pattern, state.*, current_path.items, .stroke, current_path_closed.*, .nonzero, current_dash.items, dash_phase.*, current_clip_points.items, current_clip_fill_rule.*, paint_order.*));
+                try appendOwnedValue(PatternRun, alloc, out, try buildPatternRunAlloc(alloc, pattern, state.*, current_path.items, .stroke, current_path_closed.*, .nonzero, current_dash.items, dash_phase.*, current_clip_points.items, current_clip_fill_rule.*, paint_order.*));
                 paint_order.* += 1;
             }
         }
@@ -7979,9 +8018,9 @@ fn applyPatternOperator(
             if (state.fill_pattern_name) |fill_pattern_name| {
                 if (findPagePattern(patterns, fill_pattern_name)) |pattern| {
                     if (pattern.kind == .tiling) {
-                        try out.append(alloc, try buildPatternRunAlloc(alloc, pattern, state.*, current_path.items, .fill, true, if (std.mem.eql(u8, op, "B*") or std.mem.eql(u8, op, "b*")) .even_odd else .nonzero, current_dash.items, dash_phase.*, current_clip_points.items, current_clip_fill_rule.*, paint_order.*));
+                        try appendOwnedValue(PatternRun, alloc, out, try buildPatternRunAlloc(alloc, pattern, state.*, current_path.items, .fill, true, if (std.mem.eql(u8, op, "B*") or std.mem.eql(u8, op, "b*")) .even_odd else .nonzero, current_dash.items, dash_phase.*, current_clip_points.items, current_clip_fill_rule.*, paint_order.*));
                     } else if (pattern.kind == .shading) {
-                        try out.append(alloc, try buildShadingPatternRunAlloc(alloc, pattern, state.*, current_path.items, .fill, true, if (std.mem.eql(u8, op, "B*") or std.mem.eql(u8, op, "b*")) .even_odd else .nonzero, current_dash.items, dash_phase.*, current_clip_points.items, current_clip_fill_rule.*, paint_order.*));
+                        try appendOwnedValue(PatternRun, alloc, out, try buildShadingPatternRunAlloc(alloc, pattern, state.*, current_path.items, .fill, true, if (std.mem.eql(u8, op, "B*") or std.mem.eql(u8, op, "b*")) .even_odd else .nonzero, current_dash.items, dash_phase.*, current_clip_points.items, current_clip_fill_rule.*, paint_order.*));
                     }
                 }
             }
@@ -7989,7 +8028,7 @@ fn applyPatternOperator(
         if (current_path.items.len >= 2) {
             if (state.stroke_pattern_name) |stroke_pattern_name| {
                 if (findPagePattern(patterns, stroke_pattern_name)) |pattern| {
-                    try out.append(alloc, try buildPatternRunAlloc(alloc, pattern, state.*, current_path.items, .stroke, closed, .nonzero, current_dash.items, dash_phase.*, current_clip_points.items, current_clip_fill_rule.*, paint_order.*));
+                    try appendOwnedValue(PatternRun, alloc, out, try buildPatternRunAlloc(alloc, pattern, state.*, current_path.items, .stroke, closed, .nonzero, current_dash.items, dash_phase.*, current_clip_points.items, current_clip_fill_rule.*, paint_order.*));
                 }
             }
         }
@@ -8045,6 +8084,11 @@ fn emitPatternShadingRun(
     shading: PageShading,
     scale: f64,
 ) !void {
+    const owned_clip = if (clip_points.len > 0)
+        try alloc.dupe([2]f64, clip_points)
+    else
+        try alloc.dupe([2]f64, path_points);
+    errdefer alloc.free(owned_clip);
     try out.append(alloc, .{
         .kind = shading.kind,
         .paint_order = paint_order,
@@ -8053,10 +8097,7 @@ fn emitPatternShadingRun(
         .group_parent_id = state.group_parent_id,
         .group_isolated = state.group_isolated,
         .clip_box = if (state.clip_box) |clip_box| intersectPageBoxes(clip_box, pathBounds(path_points)) else pathBounds(path_points),
-        .clip_points = if (clip_points.len > 0)
-            try alloc.dupe([2]f64, clip_points)
-        else
-            try alloc.dupe([2]f64, path_points),
+        .clip_points = owned_clip,
         .clip_fill_rule = if (clip_points.len > 0) clip_fill_rule else path_fill_rule,
         .x0 = p0[0],
         .y0 = p0[1],
@@ -8169,9 +8210,19 @@ fn appendTextRunDecodedString(
                 fonts[font_idx].cff_otf != null
         else
             false;
+        const text = try alloc.dupe(u8, decoded);
+        errdefer alloc.free(text);
+        const raw_text = try alloc.dupe(u8, raw);
+        errdefer alloc.free(raw_text);
+        const fill_pattern_name = if (state.fill_pattern_name) |name| try alloc.dupe(u8, name) else null;
+        errdefer if (fill_pattern_name) |name| alloc.free(name);
+        const stroke_pattern_name = if (state.stroke_pattern_name) |name| try alloc.dupe(u8, name) else null;
+        errdefer if (stroke_pattern_name) |name| alloc.free(name);
+        const clip_points = if (current_clip_points.len > 0) try alloc.dupe([2]f64, current_clip_points) else null;
+        errdefer if (clip_points) |clip| alloc.free(clip);
         try out.append(alloc, .{
-            .text = try alloc.dupe(u8, decoded),
-            .raw_text = try alloc.dupe(u8, raw),
+            .text = text,
+            .raw_text = raw_text,
             .font_index = if (state.current_font_index) |idx| @intCast(idx) else null,
             .vectorizable = vectorizable,
             .x = position[0],
@@ -8199,10 +8250,10 @@ fn appendTextRunDecodedString(
             .group_parent_id = state.group_parent_id,
             .group_isolated = state.group_isolated,
             .group_knockout = state.group_knockout,
-            .fill_pattern_name = if (state.fill_pattern_name) |name| try alloc.dupe(u8, name) else null,
-            .stroke_pattern_name = if (state.stroke_pattern_name) |name| try alloc.dupe(u8, name) else null,
+            .fill_pattern_name = fill_pattern_name,
+            .stroke_pattern_name = stroke_pattern_name,
             .clip_box = state.clip_box,
-            .clip_points = if (current_clip_points.len > 0) try alloc.dupe([2]f64, current_clip_points) else null,
+            .clip_points = clip_points,
             .clip_fill_rule = current_clip_fill_rule,
         });
     }
@@ -8542,6 +8593,12 @@ fn buildPatternRunFromShapeAlloc(
 ) !PatternRun {
     if (pattern.kind == .shading) {
         const shading = pattern.shading orelse return error.UnsupportedPdfRendering;
+        const owned_dash = if (shape.dash_array) |dash| try alloc.dupe(f64, dash) else null;
+        errdefer if (owned_dash) |dash| alloc.free(dash);
+        const owned_clip = if (shape.clip_points) |clip| try alloc.dupe([2]f64, clip) else null;
+        errdefer if (owned_clip) |clip| alloc.free(clip);
+        const owned_points = try alloc.dupe([2]f64, shape.points);
+        errdefer alloc.free(owned_points);
         return .{
             .kind = shape.kind,
             .mode = .shading,
@@ -8555,14 +8612,14 @@ fn buildPatternRunFromShapeAlloc(
             .line_cap = shape.line_cap,
             .line_join = shape.line_join,
             .miter_limit = shape.miter_limit,
-            .dash_array = if (shape.dash_array) |dash| try alloc.dupe(f64, dash) else null,
+            .dash_array = owned_dash,
             .dash_phase = shape.dash_phase,
             .stroke_width = shape.stroke_width,
             .closed = shape.closed,
             .clip_box = shape.clip_box,
-            .clip_points = if (shape.clip_points) |clip| try alloc.dupe([2]f64, clip) else null,
+            .clip_points = owned_clip,
             .clip_fill_rule = shape.clip_fill_rule,
-            .points = try alloc.dupe([2]f64, shape.points),
+            .points = owned_points,
             .pattern_matrix = pattern.matrix,
             .pattern_bbox = pattern.bbox,
             .pattern_x_step = pattern.x_step,
@@ -8647,17 +8704,20 @@ fn buildPatternRunAlloc(
 
     var tile_text_list = std.ArrayList(TextRun).empty;
     defer tile_text_list.deinit(alloc);
+    errdefer for (tile_text_list.items) |*run| run.deinit(alloc);
     const text_state = buildPatternTextState(state);
     try extractTextRunsFromContentAppendWithState(alloc, &tile_text_list, pattern.content, pattern.fonts, pattern.gstates, pattern.forms, text_state, &.{}, .nonzero, &tile_paint_order, &tile_group_id);
 
     var tile_pattern_list = std.ArrayList(PatternRun).empty;
     defer tile_pattern_list.deinit(alloc);
+    errdefer for (tile_pattern_list.items) |*run| run.deinit(alloc);
     try Reader.appendVectorTextPatternRunsAlloc(alloc, &tile_pattern_list, pattern.fonts, pattern.patterns, tile_text_list.items);
 
     tile_paint_order = 0;
     tile_group_id = 1;
     var tile_image_list = std.ArrayList(ImageRun).empty;
     defer tile_image_list.deinit(alloc);
+    errdefer for (tile_image_list.items) |*run| run.deinit(alloc);
     const image_state = buildPatternGraphicsState(state);
     try extractImageRunsFromContentAppendWithState(alloc, &tile_image_list, pattern.content, pattern.images, pattern.gstates, pattern.forms, image_state, &.{}, .nonzero, &tile_paint_order, &tile_group_id);
 
@@ -8665,6 +8725,7 @@ fn buildPatternRunAlloc(
     tile_group_id = 1;
     var tile_shading_list = std.ArrayList(ShadingRun).empty;
     defer tile_shading_list.deinit(alloc);
+    errdefer for (tile_shading_list.items) |*run| run.deinit(alloc);
     const shading_state = buildPatternGraphicsState(state);
     try extractShadingRunsFromContentAppendWithState(alloc, &tile_shading_list, pattern.content, pattern.shadings, pattern.gstates, pattern.forms, shading_state, &.{}, .nonzero, &tile_paint_order, &tile_group_id);
 
@@ -8677,8 +8738,42 @@ fn buildPatternRunAlloc(
     tile_group_id = 1;
     var tile_shape_list = std.ArrayList(ShapeRun).empty;
     defer tile_shape_list.deinit(alloc);
+    errdefer for (tile_shape_list.items) |*run| run.deinit(alloc);
     const shape_state = buildPatternGraphicsState(state);
     try extractShapeRunsFromContentAppendWithState(alloc, &tile_shape_list, pattern.content, pattern.gstates, pattern.forms, shape_state, &.{}, .nonzero, &.{}, 0, &tile_paint_order, &tile_group_id);
+
+    const owned_dash = if (kind == .stroke and dash_array.len > 0) try scaleDashArrayAlloc(alloc, dash_array, state.matrix) else null;
+    errdefer if (owned_dash) |dash| alloc.free(dash);
+    const owned_clip = if (clip_points.len > 0) try alloc.dupe([2]f64, clip_points) else null;
+    errdefer if (owned_clip) |clip| alloc.free(clip);
+    const owned_points = try alloc.dupe([2]f64, points);
+    errdefer alloc.free(owned_points);
+
+    const tile_text_runs = try tile_text_list.toOwnedSlice(alloc);
+    errdefer {
+        for (tile_text_runs) |*run| run.deinit(alloc);
+        if (tile_text_runs.len > 0) alloc.free(tile_text_runs);
+    }
+    const tile_image_runs = try tile_image_list.toOwnedSlice(alloc);
+    errdefer {
+        for (tile_image_runs) |*run| run.deinit(alloc);
+        if (tile_image_runs.len > 0) alloc.free(tile_image_runs);
+    }
+    const tile_shading_runs = try tile_shading_list.toOwnedSlice(alloc);
+    errdefer {
+        for (tile_shading_runs) |*run| run.deinit(alloc);
+        if (tile_shading_runs.len > 0) alloc.free(tile_shading_runs);
+    }
+    const tile_pattern_runs = try tile_pattern_list.toOwnedSlice(alloc);
+    errdefer {
+        for (tile_pattern_runs) |*run| run.deinit(alloc);
+        if (tile_pattern_runs.len > 0) alloc.free(tile_pattern_runs);
+    }
+    const tile_shape_runs = try tile_shape_list.toOwnedSlice(alloc);
+    errdefer {
+        for (tile_shape_runs) |*run| run.deinit(alloc);
+        if (tile_shape_runs.len > 0) alloc.free(tile_shape_runs);
+    }
 
     return .{
         .kind = kind,
@@ -8693,14 +8788,14 @@ fn buildPatternRunAlloc(
         .line_cap = state.line_cap,
         .line_join = state.line_join,
         .miter_limit = state.miter_limit,
-        .dash_array = if (kind == .stroke and dash_array.len > 0) try scaleDashArrayAlloc(alloc, dash_array, state.matrix) else null,
+        .dash_array = owned_dash,
         .dash_phase = if (kind == .stroke) dash_phase * graphicsStrokeScale(state.matrix) else 0,
         .stroke_width = state.stroke_width * graphicsStrokeScale(state.matrix),
         .closed = closed,
         .clip_box = state.clip_box,
-        .clip_points = if (clip_points.len > 0) try alloc.dupe([2]f64, clip_points) else null,
+        .clip_points = owned_clip,
         .clip_fill_rule = clip_fill_rule,
-        .points = try alloc.dupe([2]f64, points),
+        .points = owned_points,
         .pattern_matrix = multiplyGraphicsMatrix(state.matrix, pattern.matrix),
         .pattern_bbox = pattern.bbox,
         .pattern_x_step = pattern.x_step,
@@ -8711,11 +8806,11 @@ fn buildPatternRunAlloc(
             colorWithAlpha(state.fill_color, state.fill_alpha)
         else
             colorWithAlpha(state.stroke_color, state.stroke_alpha),
-        .tile_text_runs = try tile_text_list.toOwnedSlice(alloc),
-        .tile_image_runs = try tile_image_list.toOwnedSlice(alloc),
-        .tile_shading_runs = try tile_shading_list.toOwnedSlice(alloc),
-        .tile_pattern_runs = try tile_pattern_list.toOwnedSlice(alloc),
-        .tile_shape_runs = try tile_shape_list.toOwnedSlice(alloc),
+        .tile_text_runs = tile_text_runs,
+        .tile_image_runs = tile_image_runs,
+        .tile_shading_runs = tile_shading_runs,
+        .tile_pattern_runs = tile_pattern_runs,
+        .tile_shape_runs = tile_shape_runs,
     };
 }
 
@@ -8737,6 +8832,12 @@ fn buildShadingPatternRunAlloc(
     const shading_matrix = multiplyGraphicsMatrix(state.matrix, pattern.matrix);
     const p0 = applyMatrixToPoint(shading_matrix, shading.x0, shading.y0);
     const p1 = applyMatrixToPoint(shading_matrix, shading.x1, shading.y1);
+    const owned_dash = if (kind == .stroke and dash_array.len > 0) try scaleDashArrayAlloc(alloc, dash_array, state.matrix) else null;
+    errdefer if (owned_dash) |dash| alloc.free(dash);
+    const owned_clip = if (clip_points.len > 0) try alloc.dupe([2]f64, clip_points) else null;
+    errdefer if (owned_clip) |clip| alloc.free(clip);
+    const owned_points = try alloc.dupe([2]f64, points);
+    errdefer alloc.free(owned_points);
     return .{
         .kind = kind,
         .mode = .shading,
@@ -8750,14 +8851,14 @@ fn buildShadingPatternRunAlloc(
         .line_cap = state.line_cap,
         .line_join = state.line_join,
         .miter_limit = state.miter_limit,
-        .dash_array = if (kind == .stroke and dash_array.len > 0) try scaleDashArrayAlloc(alloc, dash_array, state.matrix) else null,
+        .dash_array = owned_dash,
         .dash_phase = if (kind == .stroke) dash_phase * graphicsStrokeScale(state.matrix) else 0,
         .stroke_width = state.stroke_width * graphicsStrokeScale(state.matrix),
         .closed = closed,
         .clip_box = state.clip_box,
-        .clip_points = if (clip_points.len > 0) try alloc.dupe([2]f64, clip_points) else null,
+        .clip_points = owned_clip,
         .clip_fill_rule = clip_fill_rule,
-        .points = try alloc.dupe([2]f64, points),
+        .points = owned_points,
         .pattern_matrix = pattern.matrix,
         .pattern_bbox = pattern.bbox,
         .pattern_x_step = pattern.x_step,
@@ -8940,6 +9041,12 @@ fn emitPolygonShapeRun(
     clip_points: []const [2]f64,
     clip_fill_rule: FillRule,
 ) !void {
+    const owned_dash = if (kind == .stroke and dash_array.len > 0) try scaleDashArrayAlloc(alloc, dash_array, state.matrix) else null;
+    errdefer if (owned_dash) |dash| alloc.free(dash);
+    const owned_clip = if (clip_points.len > 0) try alloc.dupe([2]f64, clip_points) else null;
+    errdefer if (owned_clip) |clip| alloc.free(clip);
+    const owned_points = try alloc.dupe([2]f64, points);
+    errdefer alloc.free(owned_points);
     try out.append(alloc, .{
         .paint_order = paint_order,
         .blend_mode = state.blend_mode,
@@ -8952,7 +9059,7 @@ fn emitPolygonShapeRun(
         .line_cap = state.line_cap,
         .line_join = state.line_join,
         .miter_limit = state.miter_limit,
-        .dash_array = if (kind == .stroke and dash_array.len > 0) try scaleDashArrayAlloc(alloc, dash_array, state.matrix) else null,
+        .dash_array = owned_dash,
         .dash_phase = if (kind == .stroke) dash_phase * graphicsStrokeScale(state.matrix) else 0,
         .color = blk: {
             var color = if (kind == .fill) state.fill_color else state.stroke_color;
@@ -8962,9 +9069,9 @@ fn emitPolygonShapeRun(
         .stroke_width = state.stroke_width * graphicsStrokeScale(state.matrix),
         .closed = closed,
         .clip_box = state.clip_box,
-        .clip_points = if (clip_points.len > 0) try alloc.dupe([2]f64, clip_points) else null,
+        .clip_points = owned_clip,
         .clip_fill_rule = clip_fill_rule,
-        .points = try alloc.dupe([2]f64, points),
+        .points = owned_points,
     });
 }
 
@@ -9927,6 +10034,54 @@ test "recursive page and content collectors are allocation-failure safe" {
                 alloc.free(streams);
             }
             try std.testing.expectEqual(@as(usize, 2), streams.len);
+        }
+    };
+
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "reader resource collectors release owned elements on allocation failure" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            var first_state_entries = [_]syntax.DictEntry{
+                .{ .key = @constCast("ca"), .value = .{ .real = 0.5 } },
+                .{ .key = @constCast("CA"), .value = .{ .real = 0.75 } },
+            };
+            var second_state_entries = [_]syntax.DictEntry{
+                .{ .key = @constCast("ca"), .value = .{ .real = 0.25 } },
+                .{ .key = @constCast("BM"), .value = .{ .name = @constCast("Multiply") } },
+            };
+            var state_entries = [_]syntax.DictEntry{
+                .{ .key = @constCast("GS1"), .value = .{ .dict = &first_state_entries } },
+                .{ .key = @constCast("GS2"), .value = .{ .dict = &second_state_entries } },
+            };
+            var resource_entries = [_]syntax.DictEntry{
+                .{ .key = @constCast("ExtGState"), .value = .{ .dict = &state_entries } },
+            };
+            var resources = syntax.Object{ .dict = &resource_entries };
+
+            var font_cache: std.AutoHashMapUnmanaged(u64, PageFont) = .empty;
+            defer font_cache.deinit(alloc);
+            var decrypted_streams: std.AutoHashMapUnmanaged(usize, []u8) = .empty;
+            defer decrypted_streams.deinit(alloc);
+            var reader = Reader{
+                .alloc = alloc,
+                .bytes = "",
+                .decode_limits = .{},
+                .version_minor = 7,
+                .startxref_offset = 0,
+                .xref_entries = &.{},
+                .trailer = .null,
+                .font_cache = &font_cache,
+                .decrypted_streams = &decrypted_streams,
+            };
+
+            const states = try reader.collectExtGStatesFromResourcesAlloc(&resources);
+            defer {
+                for (states) |*state| state.deinit(alloc);
+                if (states.len > 0) alloc.free(states);
+            }
+            try std.testing.expectEqual(@as(usize, 2), states.len);
         }
     };
 
@@ -11080,9 +11235,82 @@ test "reader keeps Type3 encoding difference names alive while building glyphs" 
 }
 
 test "parse Type3 glyph advance from d1" {
-    const advance = parseType3GlyphAdvance("1000 0 0 0 1000 1000 d1\n0 0 1000 1000 re\nf\n").?;
+    const advance = (try parseType3GlyphAdvance(std.testing.allocator, "1000 0 0 0 1000 1000 d1\n0 0 1000 1000 re\nf\n")).?;
     try std.testing.expectApproxEqAbs(@as(f64, 1000), advance[0], 0.001);
     try std.testing.expectApproxEqAbs(@as(f64, 0), advance[1], 0.001);
+}
+
+test "parse Type3 glyph advance uses constant operand storage" {
+    const alloc = std.testing.allocator;
+    var content = std.ArrayList(u8).empty;
+    defer content.deinit(alloc);
+    try content.appendSlice(alloc, "1000 0 ");
+    for (0..16_384) |_| try content.appendSlice(alloc, "1 ");
+    try content.appendSlice(alloc, "d1");
+
+    // The scanner may need a small token buffer, but operand count must not
+    // translate into proportional heap growth outside the PDF budget.
+    var storage: [256]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    const advance = (try parseType3GlyphAdvance(fixed.allocator(), content.items)).?;
+    try std.testing.expectApproxEqAbs(@as(f64, 1000), advance[0], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0), advance[1], 0.001);
+}
+
+test "PDF render run ownership is allocation-failure safe" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            const clip = [_][2]f64{ .{ 0, 0 }, .{ 10, 0 }, .{ 10, 10 }, .{ 0, 10 } };
+            var text_runs = std.ArrayList(TextRun).empty;
+            defer {
+                for (text_runs.items) |*item| item.deinit(alloc);
+                text_runs.deinit(alloc);
+            }
+            var text_state = TextRunState{
+                .fill_pattern_name = "fill-pattern",
+                .stroke_pattern_name = "stroke-pattern",
+            };
+            try appendTextRunDecodedString(alloc, &text_runs, &text_state, &clip, .nonzero, &.{}, 1, "owned text");
+            try appendTextRunDecodedString(alloc, &text_runs, &text_state, &clip, .nonzero, &.{}, 2, "second run");
+
+            var shape_runs = std.ArrayList(ShapeRun).empty;
+            defer {
+                for (shape_runs.items) |*item| item.deinit(alloc);
+                shape_runs.deinit(alloc);
+            }
+            try emitPolygonShapeRun(alloc, &shape_runs, 1, .{}, &clip, .stroke, true, .nonzero, &.{ 1, 2 }, 0, &clip, .nonzero);
+            try emitPolygonShapeRun(alloc, &shape_runs, 2, .{}, &clip, .fill, true, .nonzero, &.{}, 0, &clip, .nonzero);
+
+            const pattern = PagePattern{
+                .name = @constCast("P1"),
+                .content = @constCast("0 0 1 1 re f\n"),
+                .bbox = .{ .min_x = 0, .min_y = 0, .max_x = 1, .max_y = 1 },
+                .x_step = 1,
+                .y_step = 1,
+            };
+            var pattern_runs = std.ArrayList(PatternRun).empty;
+            defer {
+                for (pattern_runs.items) |*item| item.deinit(alloc);
+                pattern_runs.deinit(alloc);
+            }
+            try appendOwnedValue(PatternRun, alloc, &pattern_runs, try buildPatternRunAlloc(
+                alloc,
+                &pattern,
+                .{},
+                &clip,
+                .fill,
+                true,
+                .nonzero,
+                &.{},
+                0,
+                &clip,
+                .nonzero,
+                3,
+            ));
+        }
+    };
+
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "reader prefers Type3 charproc advance over widths array" {
@@ -14473,4 +14701,35 @@ test "type1 RD parsers advance across slash and binary delimiters" {
     try std.testing.expectEqual(@as(usize, 1), glyphs.len);
     try std.testing.expectEqual(@as(u8, 'A'), glyphs[0].code);
     try std.testing.expectEqualStrings("xyz", glyphs[0].charstring);
+}
+
+test "type1 font parsing is allocation-failure safe" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            const program =
+                "/Subrs 1 array\n" ++
+                "dup 0 3 RD abc NP\n" ++
+                "/CharStrings 1 dict dup begin\n" ++
+                "dup /A 3 RD xyz ND\n" ++
+                "end\n";
+
+            const subrs = try parseType1LocalSubrsAlloc(alloc, program, -1);
+            defer {
+                for (subrs) |subr| alloc.free(subr);
+                if (subrs.len > 0) alloc.free(subrs);
+            }
+
+            var code_to_name = [_]?[]const u8{null} ** 256;
+            code_to_name['A'] = "A";
+            const empty_font = syntax.Object{ .dict = &.{} };
+            const glyphs = try parseType1GlyphsAlloc(alloc, program, -1, &empty_font, &code_to_name, 0, &.{});
+            defer {
+                for (glyphs) |*glyph| glyph.deinit(alloc);
+                if (glyphs.len > 0) alloc.free(glyphs);
+            }
+            try std.testing.expectEqual(@as(usize, 1), glyphs.len);
+        }
+    };
+
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
