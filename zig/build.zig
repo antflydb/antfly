@@ -5198,6 +5198,7 @@ pub fn build(b: *std.Build) void {
             "provisioned table write source drop table closes schema-bearing cached writer once",
             "provisioned table write source backup releases read cache exclusive before native snapshot copy",
             "managed startup catch-up repeats replay while dense debt progresses",
+            "managed startup catch-up open constructs bounded enrichment runtime without workers",
             "provisioned group storage wires remote content to writer caches",
             "startup runtime status snapshot publishes live db when active cache is empty",
             "best effort startup runtime status publishes live db when cache is empty",

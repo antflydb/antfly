@@ -19031,10 +19031,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
         reconcile_options.ha_async_batch_mirror = null;
         reconcile_options.ha_async_metadata_mirror = null;
     }
-    var enrichments = if (reconcile_mode == .startup_catch_up)
-        ManagedDbEnrichmentSet{}
-    else
-        try createManagedDbEnrichments(alloc, indexes_json, backend_runtime, antfly_provider, options.inference_api_url, secret_store, remote_content);
+    var enrichments = try createManagedDbEnrichments(alloc, indexes_json, backend_runtime, antfly_provider, options.inference_api_url, secret_store, remote_content);
     errdefer enrichments.deinit(alloc);
 
     const openDb = struct {
@@ -19153,6 +19150,13 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                         // attempt records durable retry state; the startup
                         // scheduler owns later attempts.
                         bounded.inline_retry_max_attempts = 1;
+                        // Startup is a short-lived foreground owner. If a
+                        // retry budget was nearly exhausted before shutdown,
+                        // do not convert one startup probe into terminal
+                        // coverage before the long-lived worker can resume it.
+                        // The persisted attempt count is retained, so the
+                        // normal worker still enforces its bounded budget.
+                        bounded.worker_retry_max_attempts = std.math.maxInt(u32);
                         break :blk bounded;
                     } else null,
                     // Startup catch-up drives enrichment synchronously below.
@@ -35779,7 +35783,7 @@ test "provisioned table write source maintenance probes are best effort when loc
     try std.testing.expect(!try source.runLsmMaintenanceRoundBestEffort());
 }
 
-test "managed startup catch-up open disables optional runtimes and workers" {
+test "managed startup catch-up open constructs bounded enrichment runtime without workers" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -35791,7 +35795,7 @@ test "managed startup catch-up open disables optional runtimes and workers" {
     var db = try openManagedDbWithIndexesJsonAndCacheMode(
         alloc,
         path,
-        "{\"indexes\":[{\"name\":\"dv_v1\",\"type\":\"embeddings\",\"config\":{\"field\":\"embedding\",\"dims\":2}}]}",
+        "{\"semantic_idx\":{\"name\":\"semantic_idx\",\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedder\":{\"provider\":\"openai\",\"model\":\"text-embedding-3-small\",\"url\":\"http://127.0.0.1:1\"}}}",
         null,
         null,
         0,
@@ -35801,9 +35805,11 @@ test "managed startup catch-up open disables optional runtimes and workers" {
     defer db.close();
 
     try std.testing.expect(!db.start_index_workers);
-    try std.testing.expect(db.enrichment_runtime == null);
-    try std.testing.expect(db.resolution_runtime == null);
-    try std.testing.expect(db.promotion_runtime == null);
+    const enrichment_runtime = db.enrichment_runtime orelse return error.MissingStartupEnrichmentRuntime;
+    try std.testing.expectEqual(@as(u32, 1), enrichment_runtime.config.inline_retry_max_attempts);
+    try std.testing.expectEqual(std.math.maxInt(u32), enrichment_runtime.config.worker_retry_max_attempts);
+    try std.testing.expect(!enrichment_runtime.stats().worker_started);
+    try std.testing.expect(!db.optional_runtime_workers_enabled);
     try std.testing.expect(db.ttl_runtime == null);
     try std.testing.expect(db.transaction_runtime == null);
     try std.testing.expect(db.text_merge_runtime == null);
