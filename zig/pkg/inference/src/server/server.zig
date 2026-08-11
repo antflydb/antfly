@@ -3182,6 +3182,14 @@ pub const Node = struct {
         const prep_cfg = multimodal_qwen_adapter.loadPreprocessorConfig(ctx.allocator, model_path) catch |err|
             return ctx.status(400).json(.{ .@"error" = "MODEL_NOT_SUPPORTED", .message = @errorName(err) });
 
+        // The compute backend and resident slots below share the loaded
+        // model's stateful GPU runtime. Hold the target-model lane for their
+        // complete lifetime; request parsing and image preparation remain
+        // outside it.
+        const execution_mutex = model.targetInferenceExecutionMutex();
+        if (execution_mutex) |mutex| platform.sync.lockYieldingIo(mutex, ctx.io);
+        defer if (execution_mutex) |mutex| mutex.unlock();
+
         var cb = session_factory.getComputeBackend(model.session, ctx.allocator) catch |err|
             return ctx.status(400).json(.{ .@"error" = "MODEL_NOT_SUPPORTED", .message = @errorName(err) });
         defer cb.deinit();
@@ -3208,6 +3216,8 @@ pub const Node = struct {
         for (parsed_docs.items, 0..) |doc, idx| {
             if (doc.images.len == 0) {
                 var text_pipeline = model.rerankingPipeline(ctx.allocator);
+                // This request already owns the non-reentrant model lane.
+                text_pipeline.execution_lock = null;
                 const text_scores = text_pipeline.rerank(body.query, &.{doc.text}) catch |err|
                     return inferenceFailureResponse(ctx, err);
                 defer ctx.allocator.free(text_scores);
