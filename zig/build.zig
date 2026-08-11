@@ -6914,7 +6914,12 @@ pub fn build(b: *std.Build) void {
             run_unit_storage_tests.addArg("--allow-empty-test-filter");
         }
         addRuntimeSkipTestFilters(run_unit_storage_tests, lib_unit_filters);
+        const is_ha_shard = std.mem.eql(u8, shard_name, "storage-ha-tests");
         for (root_test_skip_filters) |filter| {
+            // `storage.ha` keeps the HA suite out of broad root-module test
+            // runs. Applying that same exclusion to its dedicated shard makes
+            // the shard select zero tests and fail before exercising anything.
+            if (is_ha_shard and std.mem.eql(u8, filter, "storage.ha")) continue;
             run_unit_storage_tests.addArgs(&.{ "--skip-test-filter", filter });
         }
         addRuntimeSkipTestFilters(run_unit_storage_tests, &release_scale_test_filters);
@@ -8830,8 +8835,6 @@ pub fn build(b: *std.Build) void {
         .root_module = antfly_main_mod,
     });
 
-    var api_runtime_artifact: ?*std.Build.Step.Compile = null;
-    var distributed_runtime_artifact: ?*std.Build.Step.Compile = null;
     inline for (std.meta.tags(RuntimeLibraryUnit)) |unit| {
         // The C API reuses the distributed PIC archive independently of the
         // executable edition. Other runtime units exist only in the full graph.
@@ -8867,22 +8870,21 @@ pub fn build(b: *std.Build) void {
                 .root_module = role_mod,
                 .linkage = .static,
                 .max_rss = switch (unit) {
-                    .api_kernel => 5 * 1024 * 1024 * 1024,
-                    .distributed => 11 * 1024 * 1024 * 1024,
-                    .inference => 8 * 1024 * 1024 * 1024,
-                    .cli => 3 * 1024 * 1024 * 1024,
+                    // Claims include roughly 1 GiB of headroom above observed
+                    // ReleaseFast peaks. They are scheduling limits, not
+                    // forced serialization: under CI's 12 GiB budget the API
+                    // and inference units can compile together while the
+                    // storage-heavy distributed unit runs alone.
+                    .api_kernel => 6 * 1024 * 1024 * 1024,
+                    // Native Darwin's object/Mach-O pipeline retains roughly
+                    // 1.7 GiB more than ELF for this same PIC unit. Keep the
+                    // scheduler claim honest on developer Macs without
+                    // penalizing Linux CI concurrency.
+                    .distributed => @as(usize, if (target.result.os.tag == .macos) 13 else 11) * 1024 * 1024 * 1024,
+                    .inference => 5 * 1024 * 1024 * 1024,
+                    .cli => 2 * 1024 * 1024 * 1024,
                 },
             });
-            // Dependency traversal is randomized in Zig 0.16. Preserve the
-            // measured bounded-memory schedule explicitly: API overlaps the
-            // application/storage unit, inference starts after API, and the
-            // short CLI unit starts after application/storage.
-            switch (unit) {
-                .api_kernel => api_runtime_artifact = role_artifact,
-                .distributed => distributed_runtime_artifact = role_artifact,
-                .inference => role_artifact.step.dependOn(&api_runtime_artifact.?.step),
-                .cli => role_artifact.step.dependOn(&distributed_runtime_artifact.?.step),
-            }
             if (unit == .distributed) {
                 // The executable and C ABI libraries share this one optimized
                 // PIC object. Give the final links enough section granularity

@@ -60,9 +60,10 @@ const process_memory_mod = @import("antfly_platform").process_memory;
 const platform_time = @import("antfly_platform").time;
 const platform = @import("antfly_platform");
 const raft_engine = @import("raft_engine");
+const thread_config = @import("../runtime_thread_config.zig");
 
 const health_metrics = antfly.common.health_server;
-const setup_io_thread_stack_size = 1 * 1024 * 1024;
+const setup_io_thread_stack_size = thread_config.minimum_partitioned_stack_size;
 const local_group_status_cache_ttl_ms: u64 = 60 * std.time.ms_per_s;
 const store_status_report_interval_ticks: usize = 40;
 const store_status_heartbeat_interval_ms: u64 = 30 * std.time.ms_per_s;

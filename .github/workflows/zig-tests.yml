@@ -695,14 +695,68 @@ jobs:
           test "$X86_64_RESULT" = "success"
           test "$ARM64_CODEC_RESULT" = "success"
 
-  e2e-base:
-    name: e2e-base
+  e2e-base-build:
+    name: e2e-base / build
     needs: changes
     if: github.event_name == 'pull_request' && needs.changes.outputs.e2e == 'true'
     runs-on: arc-antfly-heavy
-    timeout-minutes: 45
+    timeout-minutes: 90
     env:
       ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
+      ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
+      ANTFLY_CI_TRACE: "1"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+          use-cache: false
+
+      - name: Restore ARC Zig cache dirs
+        run: |
+          local_cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
+          global_cache="/mnt/cache/antfly/zig/zig-global"
+          echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
+          echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
+          mkdir -p "$local_cache" "$global_cache"
+
+      - name: Build E2E executable once
+        run: scripts/ci/zig-build-e2e-binaries.sh
+
+      - name: Package E2E executable
+        run: tar -C zig -czf "${RUNNER_TEMP}/antfly-e2e-base.tar.gz" zig-out/bin/antfly
+
+      - name: Upload E2E executable
+        uses: actions/upload-artifact@v6
+        with:
+          name: antfly-e2e-base-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/antfly-e2e-base.tar.gz
+          compression-level: 0
+          retention-days: 1
+
+  e2e-base-tests:
+    name: e2e-base / ${{ matrix.suite }}
+    needs: [changes, e2e-base-build]
+    if: |
+      always() &&
+      github.event_name == 'pull_request' &&
+      needs.changes.outputs.e2e == 'true' &&
+      needs.e2e-base-build.result == 'success'
+    runs-on: arc-antfly-heavy
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [antfly, inference]
+    env:
+      ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ matrix.suite }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
       UV_CACHE_DIR: /mnt/cache/antfly/zig/uv
       HF_HOME: /mnt/cache/antfly/zig/hf
@@ -723,15 +777,15 @@ jobs:
 
       - name: Restore ARC cache dirs
         run: |
-          local_cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
+          local_cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ matrix.suite }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
           global_cache="/mnt/cache/antfly/zig/zig-global"
           echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
           echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
           mkdir -p "$local_cache" "$global_cache" "$UV_CACHE_DIR" "$HF_HOME"
-          mkdir -p /mnt/cache/antfly/zig/home-cache /mnt/cache/antfly/zig/home-antfly
+          mkdir -p "/mnt/cache/antfly/zig/home-cache-${{ matrix.suite }}" "/mnt/cache/antfly/zig/home-antfly-${{ matrix.suite }}"
           rm -rf ~/.cache ~/.antfly
-          ln -s /mnt/cache/antfly/zig/home-cache ~/.cache
-          ln -s /mnt/cache/antfly/zig/home-antfly ~/.antfly
+          ln -s "/mnt/cache/antfly/zig/home-cache-${{ matrix.suite }}" ~/.cache
+          ln -s "/mnt/cache/antfly/zig/home-antfly-${{ matrix.suite }}" ~/.antfly
 
       - name: Install uv
         uses: astral-sh/setup-uv@v8.1.0
@@ -743,15 +797,23 @@ jobs:
           if [ "$jobs" -gt 8 ]; then jobs=8; fi
           echo "list=0-$((jobs - 1))" >> "$GITHUB_OUTPUT"
 
-      - name: Build E2E binaries
-        run: scripts/ci/zig-build-e2e-binaries.sh
+      - name: Download E2E executable
+        uses: actions/download-artifact@v6
+        with:
+          name: antfly-e2e-base-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/antfly-e2e-base
+
+      - name: Install E2E executable
+        run: tar -xzf "${RUNNER_TEMP}/antfly-e2e-base/antfly-e2e-base.tar.gz" -C zig
 
       - name: Run base E2E
         env:
           SKIP_BUILD: "1"
+          ANTFLY_E2E_SUITE: ${{ matrix.suite }}
         run: taskset -c ${{ steps.e2e_cpus.outputs.list }} scripts/ci/zig-e2e-base-linux.sh
 
       - name: Run low-FD HTTP worker ratchet regression
+        if: matrix.suite == 'antfly'
         working-directory: zig
         env:
           ANTFLY_REQUIRE_LOW_FD_HTTP_RATCHET: "1"
@@ -760,6 +822,7 @@ jobs:
           taskset -c ${{ steps.e2e_cpus.outputs.list }} zig build http-low-fd-ratchet-test
 
       - name: Run low-FD Autograph regression
+        if: matrix.suite == 'antfly'
         env:
           SKIP_BUILD: "1"
           ANTFLY_E2E_NOFILE_LIMIT: "256"
@@ -768,6 +831,24 @@ jobs:
           taskset -c ${{ steps.e2e_cpus.outputs.list }}
           scripts/ci/zig-e2e-regression-loop.sh
           e2e/antfly/test_resolution.py::test_multinode_autograph_resolves_promotes_and_hydrates_entities
+
+  e2e-base:
+    name: e2e-base
+    needs: [changes, e2e-base-build, e2e-base-tests]
+    if: |
+      always() &&
+      github.event_name == 'pull_request' &&
+      needs.changes.outputs.e2e == 'true'
+    runs-on: arc-antfly-standard
+    steps:
+      - name: Verify base E2E shards
+        env:
+          BUILD_RESULT: ${{ needs.e2e-base-build.result }}
+          TEST_RESULT: ${{ needs.e2e-base-tests.result }}
+        run: |
+          set -euo pipefail
+          test "$BUILD_RESULT" = "success"
+          test "$TEST_RESULT" = "success"
 
   e2e-full:
     name: e2e-full

@@ -1,149 +1,419 @@
 // Copyright 2026 Antfly, Inc.
-//
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the License at https://www.antfly.io/licensing/ELv2-license
+// SPDX-License-Identifier: Elastic-2.0
 
-//! Error identity shared by independently generated runtime archives.
-//! This module is deliberately domain-free: importing it must not make one
-//! runtime unit reachable from another.
+//! Stable error transport for independently generated runtime archives.
+//!
+//! Zig error integers and error-union layouts are compilation-local.  Runtime
+//! archives therefore exchange only these explicit C-layout values.  `Code`
+//! carries the language-neutral behavior class; `Detail` preserves the small
+//! set of domain outcomes that callers intentionally distinguish.
 
 const std = @import("std");
 
-/// Stable cross-codegen status. Zero is success; all other values are the
-/// FNV-1a hash of the error's source-level name. Zig's integer error identity
-/// is local to a compilation, so it must never be interpreted by another unit.
+pub const abi_version: u32 = 1;
+
+pub const Code = enum(c_int) {
+    ok = 0,
+    out_of_memory,
+    invalid_argument,
+    not_found,
+    already_exists,
+    conflict,
+    unauthorized,
+    forbidden,
+    unavailable,
+    retryable,
+    timeout,
+    cancelled,
+    unsupported,
+    corrupt,
+    internal,
+};
+
+pub const Detail = enum(c_int) {
+    none = 0,
+    out_of_memory,
+    invalid_argument,
+    invalid_arguments,
+    invalid_request,
+    invalid_query_request,
+    invalid_filter_query_request,
+    invalid_exclusion_query_request,
+    invalid_batch_request,
+    invalid_create_table_request,
+    unsupported_create_table_request,
+    invalid_schema_update_request,
+    invalid_manifest,
+    invalid_table_file,
+    invalid_txn_record,
+    not_found,
+    file_not_found,
+    table_not_found,
+    table_already_exists,
+    index_not_found,
+    model_not_found,
+    secret_not_found,
+    user_not_found,
+    unknown_group,
+    txn_not_found,
+    conflict,
+    decision_conflict,
+    table_transition_active,
+    extension_owned_object,
+    restore_intent_conflict,
+    unauthorized,
+    forbidden,
+    unavailable,
+    write_unavailable,
+    read_unavailable,
+    read_requires_primary,
+    storage_read_temporarily_unavailable,
+    resource_request_too_large,
+    resource_temporarily_unavailable,
+    restore_job_persistence_unavailable,
+    backpressured,
+    dense_repair_backpressure,
+    outcome_unknown,
+    commit_propagation_incomplete,
+    commit_decision_unknown,
+    committed_pending,
+    write_outcome_unknown,
+    doc_identity_unavailable,
+    ha_read_only_standby,
+    ha_promoted_standby_requires_primary_open,
+    ha_fenced_primary,
+    internal_failure,
+    not_leader,
+    topology_changed,
+    identity_read_generation_changed,
+    doc_identity_namespace_mismatch,
+    table_generation_changed,
+    generation_durability_uncertain,
+    index_rebuilding,
+    table_visibility_timeout,
+    writer_locked,
+    lsm_root_writer_already_open,
+    unexpected_http_status,
+    method_not_allowed,
+    unsupported,
+    unsupported_operation,
+    unsupported_query_request,
+    unsupported_filter_query_request,
+    unsupported_exclusion_query_request,
+    unsupported_sync_level,
+    unsupported_exact_sort,
+    unsupported_version,
+    timeout,
+    connection_timeout,
+    connection_timed_out,
+    cancelled,
+    canceled,
+    connection_refused,
+    connection_reset_by_peer,
+    network_unreachable,
+    host_unreachable,
+    temporary_name_server_failure,
+    name_server_failure,
+    query_candidate_budget_exceeded,
+    query_embedding_input_too_large,
+    query_embedding_overloaded,
+    embed_rate_limited,
+    embed_transient_failure,
+    embed_upstream_failure,
+    embedding_probe_unavailable,
+    invalid_embedding_response,
+    invalid_embedding_dimensions,
+    backup_already_exists,
+    backup_manifest_too_large,
+    backup_integrity_failure,
+    backup_artifact_integrity_mismatch,
+    backup_repository_busy,
+    invalid_backup_request,
+    restore_durability_pending,
+    restore_durability_confirmed,
+    corrupt_input,
+    corrupted,
+    corrupt_restore_job_store,
+    table_block_checksum_mismatch,
+    value_too_long,
+};
+
 pub const Status = extern struct {
-    code: u64 = 0,
+    // Keep the wire fields as integers so a newer peer's enum value can be
+    // rejected without constructing an invalid exhaustive Zig enum.
+    code: c_int = @intFromEnum(Code.ok),
+    detail: c_int = @intFromEnum(Detail.none),
 
     pub const ok: Status = .{};
 
     pub fn isOk(self: Status) bool {
-        return self.code == 0;
+        return self.code == @intFromEnum(Code.ok);
     }
 };
-
-pub const BoundaryErrors = error{
-    OutOfMemory,
-    InvalidArgument,
-    InvalidArguments,
-    InvalidRequest,
-    InvalidQueryRequest,
-    InvalidFilterQueryRequest,
-    InvalidExclusionQueryRequest,
-    InvalidBatchRequest,
-    InvalidCreateTableRequest,
-    InvalidSchemaUpdateRequest,
-    InvalidManifest,
-    InvalidTableFile,
-    InvalidTxnRecord,
-    NotFound,
-    FileNotFound,
-    TableNotFound,
-    TableAlreadyExists,
-    IndexNotFound,
-    ModelNotFound,
-    SecretNotFound,
-    UserNotFound,
-    UnknownGroup,
-    TxnNotFound,
-    Conflict,
-    DecisionConflict,
-    Unauthorized,
-    Forbidden,
-    Unavailable,
-    WriteUnavailable,
-    ReadUnavailable,
-    ReadRequiresPrimary,
-    StorageReadTemporarilyUnavailable,
-    Backpressured,
-    DenseRepairBackpressure,
-    OutcomeUnknown,
-    CommittedPending,
-    WriteOutcomeUnknown,
-    DocIdentityUnavailable,
-    HAReadOnlyStandby,
-    HAPromotedStandbyRequiresPrimaryOpen,
-    HAFencedPrimary,
-    InternalFailure,
-    NotLeader,
-    TopologyChanged,
-    IdentityReadGenerationChanged,
-    DocIdentityNamespaceMismatch,
-    TableGenerationChanged,
-    GenerationDurabilityUncertain,
-    IndexRebuilding,
-    MethodNotAllowed,
-    Unsupported,
-    UnsupportedOperation,
-    UnsupportedQueryRequest,
-    UnsupportedFilterQueryRequest,
-    UnsupportedExclusionQueryRequest,
-    UnsupportedSyncLevel,
-    UnsupportedExactSort,
-    UnsupportedVersion,
-    Timeout,
-    ConnectionTimeout,
-    ConnectionTimedOut,
-    Cancelled,
-    Canceled,
-    ConnectionRefused,
-    ConnectionResetByPeer,
-    NetworkUnreachable,
-    HostUnreachable,
-    TemporaryNameServerFailure,
-    NameServerFailure,
-    QueryCandidateBudgetExceeded,
-    QueryEmbeddingInputTooLarge,
-    QueryEmbeddingOverloaded,
-    EmbedRateLimited,
-    EmbedTransientFailure,
-    EmbedUpstreamFailure,
-    InvalidEmbeddingResponse,
-    InvalidEmbeddingDimensions,
-    BackupAlreadyExists,
-    BackupManifestTooLarge,
-    BackupIntegrityFailure,
-    BackupArtifactIntegrityMismatch,
-    BackupRepositoryBusy,
-    InvalidBackupRequest,
-    RestoreDurabilityPending,
-    RestoreDurabilityConfirmed,
-    CorruptInput,
-    Corrupted,
-    TableBlockChecksumMismatch,
-    ValueTooLong,
-};
-
-pub fn statusCode(name: []const u8) u64 {
-    var hash: u64 = 0xcbf29ce484222325;
-    for (name) |byte| {
-        hash ^= byte;
-        hash *%= 0x100000001b3;
-    }
-    return if (hash == 0) 1 else hash;
-}
 
 pub fn statusFromError(err: anyerror) Status {
-    return .{ .code = statusCode(@errorName(err)) };
+    return switch (err) {
+        error.OutOfMemory => status(.out_of_memory, .out_of_memory),
+        error.InvalidArgument => status(.invalid_argument, .invalid_argument),
+        error.InvalidArguments => status(.invalid_argument, .invalid_arguments),
+        error.InvalidRequest => status(.invalid_argument, .invalid_request),
+        error.InvalidQueryRequest => status(.invalid_argument, .invalid_query_request),
+        error.InvalidFilterQueryRequest => status(.invalid_argument, .invalid_filter_query_request),
+        error.InvalidExclusionQueryRequest => status(.invalid_argument, .invalid_exclusion_query_request),
+        error.InvalidBatchRequest => status(.invalid_argument, .invalid_batch_request),
+        error.InvalidCreateTableRequest => status(.invalid_argument, .invalid_create_table_request),
+        error.UnsupportedCreateTableRequest => status(.unsupported, .unsupported_create_table_request),
+        error.InvalidSchemaUpdateRequest => status(.invalid_argument, .invalid_schema_update_request),
+        error.InvalidManifest => status(.invalid_argument, .invalid_manifest),
+        error.InvalidTableFile => status(.invalid_argument, .invalid_table_file),
+        error.InvalidTxnRecord => status(.invalid_argument, .invalid_txn_record),
+        error.NotFound => status(.not_found, .not_found),
+        error.FileNotFound => status(.not_found, .file_not_found),
+        error.TableNotFound => status(.not_found, .table_not_found),
+        error.TableAlreadyExists => status(.already_exists, .table_already_exists),
+        error.IndexNotFound => status(.not_found, .index_not_found),
+        error.ModelNotFound => status(.not_found, .model_not_found),
+        error.SecretNotFound => status(.not_found, .secret_not_found),
+        error.UserNotFound => status(.not_found, .user_not_found),
+        error.UnknownGroup => status(.not_found, .unknown_group),
+        error.TxnNotFound => status(.not_found, .txn_not_found),
+        error.Conflict => status(.conflict, .conflict),
+        error.DecisionConflict => status(.conflict, .decision_conflict),
+        error.TableTransitionActive => status(.conflict, .table_transition_active),
+        error.ExtensionOwnedObject => status(.conflict, .extension_owned_object),
+        error.RestoreIntentConflict => status(.conflict, .restore_intent_conflict),
+        error.Unauthorized => status(.unauthorized, .unauthorized),
+        error.Forbidden => status(.forbidden, .forbidden),
+        error.Unavailable => status(.unavailable, .unavailable),
+        error.WriteUnavailable => status(.unavailable, .write_unavailable),
+        error.ReadUnavailable => status(.unavailable, .read_unavailable),
+        error.ReadRequiresPrimary => status(.unavailable, .read_requires_primary),
+        error.StorageReadTemporarilyUnavailable => status(.retryable, .storage_read_temporarily_unavailable),
+        error.ResourceRequestTooLarge => status(.invalid_argument, .resource_request_too_large),
+        error.ResourceTemporarilyUnavailable => status(.retryable, .resource_temporarily_unavailable),
+        error.RestoreJobPersistenceUnavailable => status(.unavailable, .restore_job_persistence_unavailable),
+        error.Backpressured => status(.retryable, .backpressured),
+        error.DenseRepairBackpressure => status(.retryable, .dense_repair_backpressure),
+        error.OutcomeUnknown => status(.retryable, .outcome_unknown),
+        error.CommitPropagationIncomplete => status(.retryable, .commit_propagation_incomplete),
+        error.CommitDecisionUnknown => status(.retryable, .commit_decision_unknown),
+        error.CommittedPending => status(.retryable, .committed_pending),
+        error.WriteOutcomeUnknown => status(.retryable, .write_outcome_unknown),
+        error.DocIdentityUnavailable => status(.retryable, .doc_identity_unavailable),
+        error.HAReadOnlyStandby => status(.unavailable, .ha_read_only_standby),
+        error.HAPromotedStandbyRequiresPrimaryOpen => status(.unavailable, .ha_promoted_standby_requires_primary_open),
+        error.HAFencedPrimary => status(.conflict, .ha_fenced_primary),
+        error.InternalFailure => status(.internal, .internal_failure),
+        error.NotLeader => status(.retryable, .not_leader),
+        error.TopologyChanged => status(.retryable, .topology_changed),
+        error.IdentityReadGenerationChanged => status(.conflict, .identity_read_generation_changed),
+        error.DocIdentityNamespaceMismatch => status(.conflict, .doc_identity_namespace_mismatch),
+        error.TableGenerationChanged => status(.conflict, .table_generation_changed),
+        error.GenerationDurabilityUncertain => status(.retryable, .generation_durability_uncertain),
+        error.IndexRebuilding => status(.retryable, .index_rebuilding),
+        error.TableVisibilityTimeout => status(.timeout, .table_visibility_timeout),
+        error.WriterLocked => status(.retryable, .writer_locked),
+        error.LsmRootWriterAlreadyOpen => status(.retryable, .lsm_root_writer_already_open),
+        error.UnexpectedHttpStatus => status(.retryable, .unexpected_http_status),
+        error.MethodNotAllowed => status(.unsupported, .method_not_allowed),
+        error.Unsupported => status(.unsupported, .unsupported),
+        error.UnsupportedOperation => status(.unsupported, .unsupported_operation),
+        error.UnsupportedQueryRequest => status(.unsupported, .unsupported_query_request),
+        error.UnsupportedFilterQueryRequest => status(.unsupported, .unsupported_filter_query_request),
+        error.UnsupportedExclusionQueryRequest => status(.unsupported, .unsupported_exclusion_query_request),
+        error.UnsupportedSyncLevel => status(.unsupported, .unsupported_sync_level),
+        error.UnsupportedExactSort => status(.unsupported, .unsupported_exact_sort),
+        error.UnsupportedVersion => status(.unsupported, .unsupported_version),
+        error.Timeout => status(.timeout, .timeout),
+        error.ConnectionTimeout => status(.timeout, .connection_timeout),
+        error.ConnectionTimedOut => status(.timeout, .connection_timed_out),
+        error.Cancelled => status(.cancelled, .cancelled),
+        error.Canceled => status(.cancelled, .canceled),
+        error.ConnectionRefused => status(.unavailable, .connection_refused),
+        error.ConnectionResetByPeer => status(.unavailable, .connection_reset_by_peer),
+        error.NetworkUnreachable => status(.unavailable, .network_unreachable),
+        error.HostUnreachable => status(.unavailable, .host_unreachable),
+        error.TemporaryNameServerFailure => status(.retryable, .temporary_name_server_failure),
+        error.NameServerFailure => status(.unavailable, .name_server_failure),
+        error.QueryCandidateBudgetExceeded => status(.unavailable, .query_candidate_budget_exceeded),
+        error.QueryEmbeddingInputTooLarge => status(.invalid_argument, .query_embedding_input_too_large),
+        error.QueryEmbeddingOverloaded => status(.unavailable, .query_embedding_overloaded),
+        error.EmbedRateLimited => status(.retryable, .embed_rate_limited),
+        error.EmbedTransientFailure => status(.retryable, .embed_transient_failure),
+        error.EmbedUpstreamFailure => status(.unavailable, .embed_upstream_failure),
+        error.EmbeddingProbeUnavailable => status(.unavailable, .embedding_probe_unavailable),
+        error.InvalidEmbeddingResponse => status(.invalid_argument, .invalid_embedding_response),
+        error.InvalidEmbeddingDimensions => status(.invalid_argument, .invalid_embedding_dimensions),
+        error.BackupAlreadyExists => status(.already_exists, .backup_already_exists),
+        error.BackupManifestTooLarge => status(.invalid_argument, .backup_manifest_too_large),
+        error.BackupIntegrityFailure => status(.corrupt, .backup_integrity_failure),
+        error.BackupArtifactIntegrityMismatch => status(.corrupt, .backup_artifact_integrity_mismatch),
+        error.BackupRepositoryBusy => status(.retryable, .backup_repository_busy),
+        error.InvalidBackupRequest => status(.invalid_argument, .invalid_backup_request),
+        error.RestoreDurabilityPending => status(.retryable, .restore_durability_pending),
+        // This is still transported as an error-union failure by existing
+        // callers.  Never encode it as `ok`: doing so would discard the
+        // detail before the receiving unit can reconstruct the local error.
+        error.RestoreDurabilityConfirmed => status(.retryable, .restore_durability_confirmed),
+        error.CorruptInput => status(.corrupt, .corrupt_input),
+        error.Corrupted => status(.corrupt, .corrupted),
+        error.CorruptRestoreJobStore => status(.corrupt, .corrupt_restore_job_store),
+        error.TableBlockChecksumMismatch => status(.corrupt, .table_block_checksum_mismatch),
+        error.ValueTooLong => status(.invalid_argument, .value_too_long),
+        else => status(.internal, .none),
+    };
 }
 
-pub fn errorFromStatus(status: Status) anyerror {
-    @setEvalBranchQuota(10_000);
-    inline for (@typeInfo(BoundaryErrors).error_set.?) |entry| {
-        if (status.code == comptime statusCode(entry.name))
-            return @field(BoundaryErrors, entry.name);
-    }
-    return error.RuntimeBoundaryFailure;
+fn status(code: Code, detail: Detail) Status {
+    return .{ .code = @intFromEnum(code), .detail = @intFromEnum(detail) };
 }
 
-test "status identity is stable and zero remains reserved for success" {
+pub fn errorFromStatus(value: Status) anyerror {
+    const code = std.enums.fromInt(Code, value.code) orelse return error.RuntimeBoundaryFailure;
+    if (code == .ok) return error.RuntimeBoundaryFailure;
+    const detail = std.enums.fromInt(Detail, value.detail) orelse return error.RuntimeBoundaryFailure;
+    const err: anyerror = switch (detail) {
+        .none => error.RuntimeBoundaryFailure,
+        inline else => |known_detail| @field(anyerror, detailErrorName(known_detail)),
+    };
+    if (err == error.RuntimeBoundaryFailure) return err;
+    const canonical = statusFromError(err);
+    if (canonical.code != value.code or canonical.detail != value.detail)
+        return error.RuntimeBoundaryFailure;
+    return err;
+}
+
+fn detailErrorName(comptime detail: Detail) []const u8 {
+    return switch (detail) {
+        .none => "RuntimeBoundaryFailure",
+        .out_of_memory => "OutOfMemory",
+        .invalid_argument => "InvalidArgument",
+        .invalid_arguments => "InvalidArguments",
+        .invalid_request => "InvalidRequest",
+        .invalid_query_request => "InvalidQueryRequest",
+        .invalid_filter_query_request => "InvalidFilterQueryRequest",
+        .invalid_exclusion_query_request => "InvalidExclusionQueryRequest",
+        .invalid_batch_request => "InvalidBatchRequest",
+        .invalid_create_table_request => "InvalidCreateTableRequest",
+        .unsupported_create_table_request => "UnsupportedCreateTableRequest",
+        .invalid_schema_update_request => "InvalidSchemaUpdateRequest",
+        .invalid_manifest => "InvalidManifest",
+        .invalid_table_file => "InvalidTableFile",
+        .invalid_txn_record => "InvalidTxnRecord",
+        .not_found => "NotFound",
+        .file_not_found => "FileNotFound",
+        .table_not_found => "TableNotFound",
+        .table_already_exists => "TableAlreadyExists",
+        .index_not_found => "IndexNotFound",
+        .model_not_found => "ModelNotFound",
+        .secret_not_found => "SecretNotFound",
+        .user_not_found => "UserNotFound",
+        .unknown_group => "UnknownGroup",
+        .txn_not_found => "TxnNotFound",
+        .conflict => "Conflict",
+        .decision_conflict => "DecisionConflict",
+        .table_transition_active => "TableTransitionActive",
+        .extension_owned_object => "ExtensionOwnedObject",
+        .restore_intent_conflict => "RestoreIntentConflict",
+        .unauthorized => "Unauthorized",
+        .forbidden => "Forbidden",
+        .unavailable => "Unavailable",
+        .write_unavailable => "WriteUnavailable",
+        .read_unavailable => "ReadUnavailable",
+        .read_requires_primary => "ReadRequiresPrimary",
+        .storage_read_temporarily_unavailable => "StorageReadTemporarilyUnavailable",
+        .resource_request_too_large => "ResourceRequestTooLarge",
+        .resource_temporarily_unavailable => "ResourceTemporarilyUnavailable",
+        .restore_job_persistence_unavailable => "RestoreJobPersistenceUnavailable",
+        .backpressured => "Backpressured",
+        .dense_repair_backpressure => "DenseRepairBackpressure",
+        .outcome_unknown => "OutcomeUnknown",
+        .commit_propagation_incomplete => "CommitPropagationIncomplete",
+        .commit_decision_unknown => "CommitDecisionUnknown",
+        .committed_pending => "CommittedPending",
+        .write_outcome_unknown => "WriteOutcomeUnknown",
+        .doc_identity_unavailable => "DocIdentityUnavailable",
+        .ha_read_only_standby => "HAReadOnlyStandby",
+        .ha_promoted_standby_requires_primary_open => "HAPromotedStandbyRequiresPrimaryOpen",
+        .ha_fenced_primary => "HAFencedPrimary",
+        .internal_failure => "InternalFailure",
+        .not_leader => "NotLeader",
+        .topology_changed => "TopologyChanged",
+        .identity_read_generation_changed => "IdentityReadGenerationChanged",
+        .doc_identity_namespace_mismatch => "DocIdentityNamespaceMismatch",
+        .table_generation_changed => "TableGenerationChanged",
+        .generation_durability_uncertain => "GenerationDurabilityUncertain",
+        .index_rebuilding => "IndexRebuilding",
+        .table_visibility_timeout => "TableVisibilityTimeout",
+        .writer_locked => "WriterLocked",
+        .lsm_root_writer_already_open => "LsmRootWriterAlreadyOpen",
+        .unexpected_http_status => "UnexpectedHttpStatus",
+        .method_not_allowed => "MethodNotAllowed",
+        .unsupported => "Unsupported",
+        .unsupported_operation => "UnsupportedOperation",
+        .unsupported_query_request => "UnsupportedQueryRequest",
+        .unsupported_filter_query_request => "UnsupportedFilterQueryRequest",
+        .unsupported_exclusion_query_request => "UnsupportedExclusionQueryRequest",
+        .unsupported_sync_level => "UnsupportedSyncLevel",
+        .unsupported_exact_sort => "UnsupportedExactSort",
+        .unsupported_version => "UnsupportedVersion",
+        .timeout => "Timeout",
+        .connection_timeout => "ConnectionTimeout",
+        .connection_timed_out => "ConnectionTimedOut",
+        .cancelled => "Cancelled",
+        .canceled => "Canceled",
+        .connection_refused => "ConnectionRefused",
+        .connection_reset_by_peer => "ConnectionResetByPeer",
+        .network_unreachable => "NetworkUnreachable",
+        .host_unreachable => "HostUnreachable",
+        .temporary_name_server_failure => "TemporaryNameServerFailure",
+        .name_server_failure => "NameServerFailure",
+        .query_candidate_budget_exceeded => "QueryCandidateBudgetExceeded",
+        .query_embedding_input_too_large => "QueryEmbeddingInputTooLarge",
+        .query_embedding_overloaded => "QueryEmbeddingOverloaded",
+        .embed_rate_limited => "EmbedRateLimited",
+        .embed_transient_failure => "EmbedTransientFailure",
+        .embed_upstream_failure => "EmbedUpstreamFailure",
+        .embedding_probe_unavailable => "EmbeddingProbeUnavailable",
+        .invalid_embedding_response => "InvalidEmbeddingResponse",
+        .invalid_embedding_dimensions => "InvalidEmbeddingDimensions",
+        .backup_already_exists => "BackupAlreadyExists",
+        .backup_manifest_too_large => "BackupManifestTooLarge",
+        .backup_integrity_failure => "BackupIntegrityFailure",
+        .backup_artifact_integrity_mismatch => "BackupArtifactIntegrityMismatch",
+        .backup_repository_busy => "BackupRepositoryBusy",
+        .invalid_backup_request => "InvalidBackupRequest",
+        .restore_durability_pending => "RestoreDurabilityPending",
+        .restore_durability_confirmed => "RestoreDurabilityConfirmed",
+        .corrupt_input => "CorruptInput",
+        .corrupted => "Corrupted",
+        .corrupt_restore_job_store => "CorruptRestoreJobStore",
+        .table_block_checksum_mismatch => "TableBlockChecksumMismatch",
+        .value_too_long => "ValueTooLong",
+    };
+}
+
+test "stable status preserves public boundary semantics" {
     try std.testing.expect(Status.ok.isOk());
-    try std.testing.expectEqual(statusCode("TableNotFound"), statusFromError(error.TableNotFound).code);
-    try std.testing.expect(statusCode("") != 0);
+    try std.testing.expectEqual(error.TableNotFound, errorFromStatus(statusFromError(error.TableNotFound)));
+    try std.testing.expectEqual(error.TableVisibilityTimeout, errorFromStatus(statusFromError(error.TableVisibilityTimeout)));
+    try std.testing.expectEqual(error.ExtensionOwnedObject, errorFromStatus(statusFromError(error.ExtensionOwnedObject)));
+    try std.testing.expectEqual(error.ResourceRequestTooLarge, errorFromStatus(statusFromError(error.ResourceRequestTooLarge)));
+    try std.testing.expectEqual(error.ResourceTemporarilyUnavailable, errorFromStatus(statusFromError(error.ResourceTemporarilyUnavailable)));
+    try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(statusFromError(error.UnitPrivateError)));
 }
 
-test "known and unknown boundary statuses map locally" {
-    try std.testing.expectEqual(error.TableNotFound, errorFromStatus(statusFromError(error.TableNotFound)));
-    try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(.{ .code = statusCode("UnitPrivateError") }));
+test "stable status has a C layout" {
+    try std.testing.expectEqual(@sizeOf(c_int) * 2, @sizeOf(Status));
+    try std.testing.expectEqual(@as(usize, 0), @offsetOf(Status, "code"));
+    try std.testing.expectEqual(@sizeOf(c_int), @offsetOf(Status, "detail"));
+}
+
+test "unknown wire values fail closed" {
+    try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(.{ .code = 999, .detail = 999 }));
+    try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(.{ .code = @intFromEnum(Code.internal), .detail = 999 }));
+    try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(.{
+        .code = @intFromEnum(Code.invalid_argument),
+        .detail = @intFromEnum(Detail.table_not_found),
+    }));
 }

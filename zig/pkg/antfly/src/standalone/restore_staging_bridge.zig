@@ -18,6 +18,7 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
+const error_abi = @import("../runtime_error_abi.zig");
 const direct_codegen = builtin.is_test;
 
 const direct_impl = if (direct_codegen)
@@ -27,12 +28,9 @@ else
 
 pub const max_afb_file_bytes: usize = 16 * 1024 * 1024 * 1024;
 
-pub const Status = struct {
-    pub const ok: c_int = 0;
-    pub const out_of_memory: c_int = 1;
-    pub const invalid_arguments: c_int = 2;
-    pub const failed: c_int = 3;
-};
+pub const abi_version = error_abi.abi_version;
+pub const Status = error_abi.Status;
+pub const statusFromError = error_abi.statusFromError;
 
 pub const Result = extern struct {
     handle: ?*anyopaque = null,
@@ -47,7 +45,7 @@ pub const Result = extern struct {
 };
 
 pub const CreateContext = extern struct {
-    allocator: *const anyopaque,
+    abi_version: u32,
     input_path_ptr: [*]const u8,
     input_path_len: usize,
     table_name_ptr: [*]const u8,
@@ -59,7 +57,7 @@ pub const CreateContext = extern struct {
     result: *Result,
 };
 
-extern fn antfly_restore_staging_create(context: *const CreateContext) callconv(.c) c_int;
+extern fn antfly_restore_staging_create(context: *const CreateContext) callconv(.c) Status;
 extern fn antfly_restore_staging_destroy(handle: *anyopaque) callconv(.c) void;
 
 pub const StagedRestore = struct {
@@ -123,10 +121,9 @@ pub fn stageInputRestoreBackup(
         };
     }
 
-    var allocator_copy = allocator;
     var result = Result{};
     const status = antfly_restore_staging_create(&.{
-        .allocator = &allocator_copy,
+        .abi_version = abi_version,
         .input_path_ptr = input_path.ptr,
         .input_path_len = input_path.len,
         .table_name_ptr = table_name.ptr,
@@ -137,12 +134,7 @@ pub fn stageInputRestoreBackup(
         .location_len = location.len,
         .result = &result,
     });
-    switch (status) {
-        Status.ok => {},
-        Status.out_of_memory => return error.OutOfMemory,
-        Status.invalid_arguments => return error.InvalidArguments,
-        else => return error.RestoreStagingFailed,
-    }
+    if (!status.isOk()) return error_abi.errorFromStatus(status);
     return .{
         .handle = result.handle orelse return error.RestoreStagingFailed,
         .backup_id = result.backup_id_ptr[0..result.backup_id_len],

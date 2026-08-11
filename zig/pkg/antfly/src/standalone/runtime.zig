@@ -1412,31 +1412,69 @@ pub fn runFromIterator(
     // Standalone always owns a local Antfly node. In production its heavy
     // implementation is code-generated in the inference archive and reached
     // through an opaque internal ABI; the shipped artifact remains one binary.
+    const loaded_cfg = if (loaded_config) |*cfg| cfg else null;
+    const configured_preload = if (loaded_cfg) |cfg| cfg.inference.preload else &.{};
+    const loaded_preload = if (cli.inference_preload_models.items.len == 0 and configured_preload.len != 0) blk: {
+        const out = try alloc.alloc(inference_bridge.WarmModel, configured_preload.len);
+        for (configured_preload, 0..) |model, i| {
+            out[i] = .{
+                .kind = inference_bridge.String.init(model.kind),
+                .name = inference_bridge.String.init(model.name),
+                .backend = inference_bridge.OptionalString.init(model.backend),
+                .format = inference_bridge.OptionalString.init(model.format),
+                .quantization = inference_bridge.OptionalString.init(model.quantization),
+            };
+        }
+        break :blk out;
+    } else &.{};
+    defer if (loaded_preload.len != 0) alloc.free(loaded_preload);
+    const active_preload = if (cli.inference_preload_models.items.len != 0)
+        cli.inference_preload_models.items
+    else
+        loaded_preload;
+    const content_security_json = if (loaded_cfg) |cfg|
+        if (cfg.effectiveAntflyContentSecurity()) |security|
+            try std.json.Stringify.valueAlloc(alloc, security.*, .{})
+        else
+            null
+    else
+        null;
+    defer if (content_security_json) |json| alloc.free(json);
+    const s3_credentials_json = if (loaded_cfg) |cfg|
+        if (cfg.inference.s3_credentials) |credentials|
+            try std.json.Stringify.valueAlloc(alloc, credentials, .{})
+        else
+            null
+    else
+        null;
+    defer if (s3_credentials_json) |json| alloc.free(json);
+
     var handle: ?*anyopaque = null;
     const inference_create_context = inference_bridge.CreateContext{
-        .init = &init,
-        .loaded_config = if (loaded_config) |*cfg| cfg else null,
+        .abi_version = inference_bridge.abi_version,
         .data_dir_ptr = data_dir.ptr,
         .data_dir_len = data_dir.len,
-        .models_dir = inference_bridge.OptionalString.init(cli.inference_models_dir),
-        .ml_dir = inference_bridge.OptionalString.init(cli.inference_ml_dir),
+        .models_dir = inference_bridge.OptionalString.init(cli.inference_models_dir orelse if (loaded_cfg) |cfg| cfg.inference.models_dir else null),
+        .ml_dir = inference_bridge.OptionalString.init(cli.inference_ml_dir orelse if (loaded_cfg) |cfg| cfg.inference.ml_dir else null),
         .host_limit_bytes = mbToBytes(cli.inference_host_budget_mb),
         .backend_limit_bytes = mbToBytes(cli.inference_backend_budget_mb),
         .combined_limit_bytes = mbToBytes(cli.inference_combined_budget_mb),
         .kv_limit_bytes = mbToBytes(cli.inference_kv_budget_mb),
         .scratch_limit_bytes = mbToBytes(cli.inference_scratch_budget_mb),
-        .preload_ptr = if (cli.inference_preload_models.items.len == 0)
-            null
-        else
-            cli.inference_preload_models.items.ptr,
-        .preload_len = cli.inference_preload_models.items.len,
+        .preload_ptr = if (active_preload.len == 0) null else active_preload.ptr,
+        .preload_len = active_preload.len,
+        .keep_alive = inference_bridge.OptionalString.init(if (loaded_cfg) |cfg| cfg.inference.keep_alive else null),
+        .max_loaded_models = if (loaded_cfg) |cfg| cfg.inference.max_loaded_models orelse 0 else 0,
+        .has_max_loaded_models = if (loaded_cfg) |cfg| @intFromBool(cfg.inference.max_loaded_models != null) else 0,
+        .content_security_json = inference_bridge.OptionalString.init(content_security_json),
+        .s3_credentials_json = inference_bridge.OptionalString.init(s3_credentials_json),
         .out_handle = &handle,
     };
     const antfly_node = if (comptime inline_inference_codegen) blk: {
         break :blk try inference_host.linkedInferenceCreate(&inference_create_context);
     } else blk: {
-        if (inference_bridge.antfly_standalone_inference_create(&inference_create_context) != 0)
-            return error.InferenceRuntimeStartupFailed;
+        const status = inference_bridge.antfly_standalone_inference_create(&inference_create_context);
+        if (!status.isOk()) return inference_bridge.errorFromStatus(status);
         break :blk handle orelse return error.InferenceRuntimeStartupFailed;
     };
     // Until DataServer exists, error cleanup is owned here. Once its
@@ -1638,35 +1676,27 @@ pub fn runFromIterator(
             inference_bridge.antfly_standalone_inference_destroy(antfly_node);
     }
 
-    var attached_io: std.Io = undefined;
-    const io_ptr: ?*const anyopaque = if (node_backend_runtime.ptr().io()) |io| blk: {
-        attached_io = io;
-        break :blk &attached_io;
-    } else null;
+    var inference_resource_budget = inference_bridge.ResourceBudget{
+        .abi_version = inference_bridge.abi_version,
+        .context = &data_server.provisioned_storage.resource_manager,
+        .reserve_admission = reserveInferenceResources,
+        .release_admission = releaseInferenceResources,
+        .observe_prompt_cache = observeInferencePromptCache,
+        .reserve_tokenizer_cache = reserveInferenceTokenizerCache,
+        .release_tokenizer_cache = releaseInferenceTokenizerCache,
+    };
     const configure_context = inference_bridge.ConfigureContext{
+        .abi_version = inference_bridge.abi_version,
         .handle = antfly_node,
-        .resource_manager = &data_server.provisioned_storage.resource_manager,
-        .io = io_ptr,
+        .resource_budget = &inference_resource_budget,
     };
     if (comptime inline_inference_codegen) {
         try inference_host.linkedInferenceConfigure(&configure_context);
-        var provider: antfly.inference.managed_embedder.AntflyProvider = undefined;
-        inference_host.linkedInferenceProvider(&.{
-            .handle = antfly_node,
-            .out_provider = &provider,
-        });
-        data_server.setAntflyProvider(provider);
     } else {
-        if (inference_bridge.antfly_standalone_inference_configure(&configure_context) != 0)
-            return error.InferenceRuntimeStartupFailed;
-
-        var provider: antfly.inference.managed_embedder.AntflyProvider = undefined;
-        inference_bridge.antfly_standalone_inference_provider(&.{
-            .handle = antfly_node,
-            .out_provider = &provider,
-        });
-        data_server.setAntflyProvider(provider);
+        const configure_status = inference_bridge.antfly_standalone_inference_configure(&configure_context);
+        if (!configure_status.isOk()) return inference_bridge.errorFromStatus(configure_status);
     }
+    data_server.setAntflyProvider(inferenceBoundaryProvider(antfly_node));
 
     // Initialize API server (wires caches + sources) without binding a listener.
     try data_server.initApiServer();
@@ -1937,14 +1967,17 @@ fn serveUnifiedInner(
     // Register inference AI routes under /ai/v1 and Traditional ML routes under /ml/v1.
     if (comptime inline_inference) {
         try inference_host.linkedInferenceRegisterRoutes(&.{
+            .abi_version = inference_bridge.abi_version,
             .handle = antfly_node,
-            .server = &server,
+            .registrar_handle = &server,
         });
     } else {
-        if (inference_bridge.antfly_standalone_inference_register_routes(&.{
+        const status = inference_bridge.antfly_standalone_inference_register_routes(&.{
+            .abi_version = inference_bridge.abi_version,
             .handle = antfly_node,
-            .server = &server,
-        }) != 0) return error.InferenceRouteRegistrationFailed;
+            .registrar_handle = &server,
+        });
+        if (!status.isOk()) return inference_bridge.errorFromStatus(status);
     }
 
     // Register antfly public API routes under /db/v1
@@ -3468,6 +3501,261 @@ fn resolveInferenceBudgetOverrides(cli: CliConfig) InferenceBudgetOverrides {
         .kv_limit_bytes = mbToBytes(cli.inference_kv_budget_mb),
         .scratch_limit_bytes = mbToBytes(cli.inference_scratch_budget_mb),
     };
+}
+
+fn inferenceBoundaryProvider(handle: *anyopaque) antfly.inference.managed_embedder.AntflyProvider {
+    return .{
+        .ptr = handle,
+        .embed_dense_texts = inferenceProviderEmbedDenseTexts,
+        .embed_dense_texts_with_context = inferenceProviderEmbedDenseTextsWithContext,
+        .embed_sparse_texts = inferenceProviderEmbedSparseTexts,
+        .embed_dense_parts = inferenceProviderEmbedDenseParts,
+        .embed_dense_parts_with_context = inferenceProviderEmbedDensePartsWithContext,
+        .rerank_texts = inferenceProviderRerankTexts,
+        .generate_text = inferenceProviderGenerateText,
+        .generate_messages = inferenceProviderGenerateMessages,
+        .read_images = inferenceProviderReadImages,
+        .transcribe_audio = inferenceProviderTranscribeAudio,
+        .extract = inferenceProviderExtract,
+        .list_models_json = inferenceProviderListModelsJson,
+    };
+}
+
+fn invokeInferenceProvider(
+    comptime Result: type,
+    alloc: std.mem.Allocator,
+    handle: *anyopaque,
+    operation: inference_bridge.ProviderOperation,
+    request: anytype,
+    deadline_ns: ?u64,
+) !Result {
+    const request_json = try std.json.Stringify.valueAlloc(alloc, request, .{});
+    defer alloc.free(request_json);
+    var response_handle: ?*anyopaque = null;
+    var response_json: inference_bridge.String = undefined;
+    const context = inference_bridge.ProviderInvokeContext{
+        .abi_version = inference_bridge.abi_version,
+        .handle = handle,
+        .operation = @intFromEnum(operation),
+        .request_json = inference_bridge.String.init(request_json),
+        .deadline_ns = deadline_ns orelse 0,
+        .has_deadline = @intFromBool(deadline_ns != null),
+        .out_response_handle = &response_handle,
+        .out_response_json = &response_json,
+    };
+    if (comptime inline_inference_codegen) {
+        try inference_host.linkedInferenceInvokeProvider(&context);
+    } else {
+        const status = inference_bridge.antfly_standalone_inference_invoke_provider(&context);
+        if (!status.isOk()) return inference_bridge.errorFromStatus(status);
+    }
+    const owned_response = response_handle orelse return error.InferenceRuntimeResponseMissing;
+    defer if (comptime inline_inference_codegen)
+        inference_host.linkedInferenceDestroyProviderResponse(owned_response)
+    else
+        inference_bridge.antfly_standalone_inference_destroy_provider_response(owned_response);
+    return try std.json.parseFromSliceLeaky(Result, alloc, response_json.slice(), .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+}
+
+fn inferenceProviderEmbedDenseTexts(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    texts: []const []const u8,
+) anyerror![][]f32 {
+    return try invokeInferenceProvider([][]f32, alloc, handle, .embed_dense_texts, .{
+        .model = model,
+        .texts = texts,
+    }, null);
+}
+
+fn inferenceProviderEmbedDenseTextsWithContext(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    texts: []const []const u8,
+    context: antfly.inference.managed_embedder.EmbeddingRequestContext,
+) anyerror![][]f32 {
+    try context.check();
+    return try invokeInferenceProvider([][]f32, alloc, handle, .embed_dense_texts_with_context, .{
+        .model = model,
+        .texts = texts,
+    }, context.deadline_ns);
+}
+
+fn inferenceProviderEmbedSparseTexts(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    texts: []const []const u8,
+) anyerror![]antfly.db.embedder.SparseEmbedding {
+    return try invokeInferenceProvider([]antfly.db.embedder.SparseEmbedding, alloc, handle, .embed_sparse_texts, .{
+        .model = model,
+        .texts = texts,
+    }, null);
+}
+
+fn inferenceProviderEmbedDenseParts(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    parts: []const antfly.template.ContentPart,
+) anyerror![][]f32 {
+    return try invokeInferenceProvider([][]f32, alloc, handle, .embed_dense_parts, .{
+        .model = model,
+        .parts = parts,
+    }, null);
+}
+
+fn inferenceProviderEmbedDensePartsWithContext(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    parts: []const antfly.template.ContentPart,
+    context: antfly.inference.managed_embedder.EmbeddingRequestContext,
+) anyerror![][]f32 {
+    try context.check();
+    return try invokeInferenceProvider([][]f32, alloc, handle, .embed_dense_parts_with_context, .{
+        .model = model,
+        .parts = parts,
+    }, context.deadline_ns);
+}
+
+fn inferenceProviderRerankTexts(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    query: []const u8,
+    documents: []const []const u8,
+) anyerror![]f32 {
+    return try invokeInferenceProvider([]f32, alloc, handle, .rerank_texts, .{
+        .model = model,
+        .query = query,
+        .documents = documents,
+    }, null);
+}
+
+fn inferenceProviderGenerateText(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    roles: []const []const u8,
+    contents: []const []const u8,
+) anyerror![]u8 {
+    return try invokeInferenceProvider([]u8, alloc, handle, .generate_text, .{
+        .model = model,
+        .roles = roles,
+        .contents = contents,
+    }, null);
+}
+
+fn inferenceProviderGenerateMessages(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    messages: []const antfly.inference.ChatMessage,
+) anyerror![]u8 {
+    return try invokeInferenceProvider([]u8, alloc, handle, .generate_messages, .{
+        .model = model,
+        .messages = messages,
+    }, null);
+}
+
+fn inferenceProviderReadImages(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    request: antfly.readers.Request,
+) anyerror![]antfly.readers.Result {
+    return try invokeInferenceProvider([]antfly.readers.Result, alloc, handle, .read_images, .{
+        .model = model,
+        .request = request,
+    }, null);
+}
+
+fn inferenceProviderTranscribeAudio(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    request: antfly.transcribing.Request,
+) anyerror!antfly.transcribing.Response {
+    return try invokeInferenceProvider(antfly.transcribing.Response, alloc, handle, .transcribe_audio, .{
+        .model = model,
+        .request = request,
+    }, null);
+}
+
+fn inferenceProviderExtract(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    request: antfly.extracting.Request,
+) anyerror!antfly.extracting.Response {
+    const json = try invokeInferenceProvider([]u8, alloc, handle, .extract, .{
+        .model = model,
+        .request = request,
+    }, null);
+    return .{ .allocator = alloc, .json = json };
+}
+
+fn inferenceProviderListModelsJson(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+) anyerror![]u8 {
+    return try invokeInferenceProvider([]u8, alloc, handle, .list_models_json, .{}, null);
+}
+
+fn inferenceResourceSlices(amounts: *const inference_bridge.AdmissionAmounts) ![3]antfly.resource_manager.SliceAmount {
+    return .{
+        .{
+            .slice = .inference_model_residency,
+            .bytes = @intCast(try std.math.add(usize, amounts.host_weight_bytes, amounts.backend_weight_bytes)),
+        },
+        .{
+            .slice = .inference_kv_working_set,
+            .bytes = @intCast(try std.math.add(usize, amounts.host_kv_bytes, amounts.backend_kv_bytes)),
+        },
+        .{
+            .slice = .inference_scratch_working_set,
+            .bytes = @intCast(try std.math.add(usize, amounts.host_scratch_bytes, amounts.backend_scratch_bytes)),
+        },
+    };
+}
+
+fn reserveInferenceResources(context: *anyopaque, amounts: *const inference_bridge.AdmissionAmounts) callconv(.c) inference_bridge.Status {
+    const manager: *antfly.resource_manager.ResourceManager = @ptrCast(@alignCast(context));
+    const slices = inferenceResourceSlices(amounts) catch |err| return inference_bridge.statusFromError(err);
+    manager.reserveBatchClassified(&slices) catch |err| return inference_bridge.statusFromError(err);
+    return .ok;
+}
+
+fn releaseInferenceResources(context: *anyopaque, amounts: *const inference_bridge.AdmissionAmounts) callconv(.c) void {
+    const manager: *antfly.resource_manager.ResourceManager = @ptrCast(@alignCast(context));
+    const slices = inferenceResourceSlices(amounts) catch return;
+    manager.releaseBatch(&slices);
+}
+
+fn observeInferencePromptCache(context: *anyopaque, previous: u64, next: u64) callconv(.c) void {
+    const manager: *antfly.resource_manager.ResourceManager = @ptrCast(@alignCast(context));
+    var current = previous;
+    manager.observeUsage(.inference_prompt_cache, &current, next);
+}
+
+fn reserveInferenceTokenizerCache(context: *anyopaque, bytes: usize) callconv(.c) u8 {
+    const manager: *antfly.resource_manager.ResourceManager = @ptrCast(@alignCast(context));
+    if (manager.admissionDecision(.inference_tokenizer_cache, @intCast(bytes)).action == .shrink_cache)
+        return 0;
+    var reservation = manager.reserve(.inference_tokenizer_cache, @intCast(bytes)) catch return 0;
+    reservation.released = true;
+    return 1;
+}
+
+fn releaseInferenceTokenizerCache(context: *anyopaque, bytes: usize) callconv(.c) void {
+    const manager: *antfly.resource_manager.ResourceManager = @ptrCast(@alignCast(context));
+    manager.releaseBytes(.inference_tokenizer_cache, @intCast(bytes));
 }
 
 fn mbToBytes(value: usize) usize {
@@ -5003,6 +5291,63 @@ test "inference config falls back to common config" {
     try std.testing.expectEqualStrings("metal", cfg.inference.preload[0].backend.?);
     try std.testing.expectEqualStrings("gguf", cfg.inference.preload[0].format.?);
     try std.testing.expectEqualStrings("q4_k", cfg.inference.preload[0].quantization.?);
+}
+
+test "inference admission bridge charges combined native residency to resource manager" {
+    var budgets = antfly.resource_manager.Options.defaultBudgets();
+    budgets[@intFromEnum(antfly.resource_manager.Slice.inference_model_residency)] =
+        .{ .hard_limit_bytes = 100 };
+    var manager = antfly.resource_manager.ResourceManager.init(.{ .budgets = budgets });
+
+    const oversized = inference_bridge.AdmissionAmounts{
+        .host_weight_bytes = 80,
+        .backend_weight_bytes = 30,
+        .host_kv_bytes = 0,
+        .backend_kv_bytes = 0,
+        .host_scratch_bytes = 0,
+        .backend_scratch_bytes = 0,
+    };
+    try std.testing.expectEqual(
+        error.ResourceRequestTooLarge,
+        inference_bridge.errorFromStatus(reserveInferenceResources(&manager, &oversized)),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        manager.sliceStats(.inference_model_residency).used_bytes,
+    );
+
+    const admitted = inference_bridge.AdmissionAmounts{
+        .host_weight_bytes = 60,
+        .backend_weight_bytes = 30,
+        .host_kv_bytes = 0,
+        .backend_kv_bytes = 0,
+        .host_scratch_bytes = 0,
+        .backend_scratch_bytes = 0,
+    };
+    try std.testing.expect(reserveInferenceResources(&manager, &admitted).isOk());
+    try std.testing.expectEqual(
+        @as(u64, 90),
+        manager.sliceStats(.inference_model_residency).used_bytes,
+    );
+
+    const unavailable = inference_bridge.AdmissionAmounts{
+        .host_weight_bytes = 11,
+        .backend_weight_bytes = 0,
+        .host_kv_bytes = 0,
+        .backend_kv_bytes = 0,
+        .host_scratch_bytes = 0,
+        .backend_scratch_bytes = 0,
+    };
+    try std.testing.expectEqual(
+        error.ResourceTemporarilyUnavailable,
+        inference_bridge.errorFromStatus(reserveInferenceResources(&manager, &unavailable)),
+    );
+
+    releaseInferenceResources(&manager, &admitted);
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        manager.sliceStats(.inference_model_residency).used_bytes,
+    );
 }
 
 test "standalone runtime resolves paths from common storage base dir" {

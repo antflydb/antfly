@@ -188,6 +188,7 @@ fn createOpaqueServer(
     var handle: ?*anyopaque = null;
     var request_alloc: std.mem.Allocator = undefined;
     const status = antfly_api_kernel_create(&.{
+        .abi_version = abi.abi_version,
         .owner_alloc = &alloc_copy,
         .cfg = &cfg_copy,
         .source = &source_copy,
@@ -207,7 +208,12 @@ fn callFallible(
     input: ?*const anyopaque,
     output: ?*anyopaque,
 ) !void {
-    try callError(function(&.{ .handle = handle, .input = input, .output = output }));
+    try callError(function(&.{
+        .abi_version = abi.abi_version,
+        .handle = handle,
+        .input = input,
+        .output = output,
+    }));
 }
 
 fn callInfallible(
@@ -225,8 +231,8 @@ const OpaqueHttpxHandler = struct {
     handle: *anyopaque,
 
     pub fn initRuntime(self: *OpaqueHttpxHandler, alloc: std.mem.Allocator) !void {
-        var input = alloc;
-        try callFallible(antfly_api_kernel_handler_init, self.handle, &input, null);
+        _ = alloc;
+        try callFallible(antfly_api_kernel_handler_init, self.handle, null, null);
     }
 
     pub fn stats(self: *const OpaqueHttpxHandler) HandlerStats {
@@ -249,6 +255,7 @@ pub fn createHandler(server: *ApiHttpServer) !HttpxHandler {
     if (comptime direct_codegen) return .{ .api_server = server };
     var handle: ?*anyopaque = null;
     const status = antfly_api_kernel_handler_create(&.{
+        .abi_version = abi.abi_version,
         .api_server_handle = server.opaque_handle,
         .out_handle = &handle,
     });

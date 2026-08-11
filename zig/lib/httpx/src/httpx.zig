@@ -212,6 +212,7 @@ pub const Server = server_mod.Server;
 pub const ServerConfig = server_mod.ServerConfig;
 pub const Context = server_mod.Context;
 pub const Handler = server_mod.Handler;
+pub const RouteParam = router.RouteParam;
 pub const CookieOptions = server_mod.CookieOptions;
 pub const SameSite = server_mod.SameSite;
 pub const SseEvent = server_mod.SseEvent;
@@ -266,7 +267,6 @@ pub fn any(allocator: std.mem.Allocator, client: *Client, specs: []const Request
 pub fn race(allocator: std.mem.Allocator, client: *Client, specs: []const RequestSpec) !RequestResult {
     return concurrency.race(allocator, client, specs);
 }
-
 
 /// Convenience function to create a GET request.
 pub fn get(allocator: std.mem.Allocator, io: std.Io, url: []const u8) !Response {

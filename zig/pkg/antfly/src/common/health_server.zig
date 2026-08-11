@@ -31,6 +31,7 @@ const http_common = @import("http/http_common.zig");
 const std_http_listener = @import("http/std_http_listener.zig");
 const platform_time = @import("antfly_platform").time;
 const prometheus = @import("prometheus.zig");
+const thread_config = @import("../runtime_thread_config.zig");
 
 const StdHttpListener = std_http_listener.StdHttpListener;
 const StdHttpListenerConfig = std_http_listener.StdHttpListenerConfig;
@@ -38,7 +39,7 @@ const HttpRequest = http_common.HttpRequest;
 const HttpResponse = http_common.HttpResponse;
 const RequestExecutor = http_common.RequestExecutor;
 const metrics_cache_ttl_ms: u64 = 5 * std.time.ms_per_s;
-const health_thread_stack_size: usize = 1 * 1024 * 1024;
+const health_thread_stack_size = thread_config.minimum_partitioned_stack_size;
 
 pub const ReadinessChecker = struct {
     ptr: *anyopaque,

@@ -46,7 +46,9 @@ comptime {
         "antfly_api_kernel_handle",
         "antfly_api_kernel_handle_internal",
         "antfly_api_kernel_handler_create",
+        "antfly_api_kernel_handler_destroy_http_response",
         "antfly_api_kernel_handler_destroy",
+        "antfly_api_kernel_handler_handle_http",
         "antfly_api_kernel_handler_init",
         "antfly_api_kernel_handler_register_routes",
         "antfly_api_kernel_handler_stats",
@@ -62,7 +64,10 @@ comptime {
         "antfly_standalone_inference_configure",
         "antfly_standalone_inference_create",
         "antfly_standalone_inference_destroy",
-        "antfly_standalone_inference_provider",
+        "antfly_standalone_inference_destroy_http_response",
+        "antfly_standalone_inference_destroy_provider_response",
+        "antfly_standalone_inference_handle_http",
+        "antfly_standalone_inference_invoke_provider",
         "antfly_standalone_inference_register_routes",
     }) |name| {
         @export(&unavailableExecutableRuntimeDependency, .{

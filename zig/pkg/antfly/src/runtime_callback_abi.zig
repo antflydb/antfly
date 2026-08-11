@@ -7,7 +7,6 @@
 //! returns a stable Status and writes successful values through an output
 //! pointer.
 
-const builtin = @import("builtin");
 const std = @import("std");
 const error_abi = @import("runtime_error_abi.zig");
 
@@ -19,10 +18,10 @@ pub const CallbackDispatch = *const fn (
 ) callconv(.c) error_abi.Status;
 
 pub fn Boundary(comptime VTable: type) type {
-    return BoundaryImpl(VTable, true);
+    return BoundaryImpl(VTable);
 }
 
-fn BoundaryImpl(comptime VTable: type, comptime direct_in_tests: bool) type {
+fn BoundaryImpl(comptime VTable: type) type {
     return struct {
         const Self = @This();
 
@@ -44,10 +43,11 @@ fn BoundaryImpl(comptime VTable: type, comptime direct_in_tests: bool) type {
                 @compileError("unknown boundary vtable field: " ++ field_name);
             var typed_args: Args = args;
 
-            // Focused unit tests intentionally stay within one compilation and
-            // should preserve the exact local error set. Production artifacts
-            // always use the owner-side dispatcher below.
-            if (builtin.is_test and direct_in_tests) return @call(.auto, callback, typed_args);
+            // A vtable created and consumed in this compilation unit retains
+            // normal Zig error and return semantics. Only a dispatcher owned
+            // by another runtime unit takes the C ABI path below.
+            if (dispatch == local_dispatch)
+                return @call(.auto, callback, typed_args);
 
             if (Payload == void) {
                 const status = dispatch(
@@ -164,18 +164,31 @@ fn BoundaryImpl(comptime VTable: type, comptime direct_in_tests: bool) type {
     };
 }
 
-test "boundary dispatcher maps owner errors and writes outputs" {
+test "boundary dispatcher preserves local calls and maps cross-unit calls" {
     const TestVTable = struct {
         value: *const fn (*u32, u32) anyerror!u32,
         fail: ?*const fn (*u32) anyerror!void = null,
     };
-    const TestBoundary = BoundaryImpl(TestVTable, false);
+    const TestBoundary = BoundaryImpl(TestVTable);
     const callbacks = struct {
         fn value(ptr: *u32, addend: u32) anyerror!u32 {
             return ptr.* + addend;
         }
         fn fail(_: *u32) anyerror!void {
             return error.Conflict;
+        }
+
+        fn privateFail(_: *u32) anyerror!void {
+            return error.UnitPrivateError;
+        }
+
+        fn foreignDispatch(
+            field_index: u16,
+            callback: *const anyopaque,
+            args: *const anyopaque,
+            output: ?*anyopaque,
+        ) callconv(.c) error_abi.Status {
+            return TestBoundary.local_dispatch(field_index, callback, args, output);
         }
     };
 
@@ -187,5 +200,13 @@ test "boundary dispatcher maps owner errors and writes outputs" {
     try std.testing.expectError(
         error.Conflict,
         TestBoundary.call("fail", TestBoundary.local_dispatch, &callbacks.fail, .{&base}),
+    );
+    try std.testing.expectError(
+        error.UnitPrivateError,
+        TestBoundary.call("fail", TestBoundary.local_dispatch, &callbacks.privateFail, .{&base}),
+    );
+    try std.testing.expectError(
+        error.RuntimeBoundaryFailure,
+        TestBoundary.call("fail", &callbacks.foreignDispatch, &callbacks.privateFail, .{&base}),
     );
 }

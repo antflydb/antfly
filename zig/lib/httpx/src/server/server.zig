@@ -204,6 +204,8 @@ pub const Context = struct {
     request: *Request,
     response: ResponseBuilder,
     params: []const RouteParam = &.{},
+    /// Borrowed opaque value associated with the matched route.
+    route_data: ?*anyopaque = null,
     data: ?std.StringHashMap(DataEntry) = null,
     decoded_query_values: std.ArrayListUnmanaged([]u8) = .empty,
     max_file_size: usize = types.default_max_body_size,
@@ -910,6 +912,11 @@ pub const Server = struct {
         try self.router.add(method, path, handler);
     }
 
+    /// Registers a route with borrowed opaque data copied into Context.
+    pub fn routeWithData(self: *Self, method: types.Method, path: []const u8, handler: Handler, data: *anyopaque) !void {
+        try self.router.addWithData(method, path, handler, data);
+    }
+
     /// Registers a GET route.
     pub fn get(self: *Self, path: []const u8, handler: Handler) !void {
         try self.route(.GET, path, handler);
@@ -1384,6 +1391,7 @@ pub const Server = struct {
 
             if (route_result) |r| {
                 ctx.params = r.params;
+                ctx.route_data = r.data;
             }
 
             var response: Response = undefined;
@@ -2069,6 +2077,7 @@ pub const Server = struct {
 
         if (route_result) |r| {
             ctx.params = r.params;
+            ctx.route_data = r.data;
         }
 
         var response: Response = undefined;

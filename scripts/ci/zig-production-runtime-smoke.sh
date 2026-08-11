@@ -119,6 +119,8 @@ run_profile() {
     "http://127.0.0.1:${port}/db/v1/tables/does-not-exist/query" '{'
   assert_http_status "$profile-invalid-restore" 400 POST \
     "http://127.0.0.1:${port}/db/v1/tables/does-not-exist/restore" '{}'
+  assert_http_status "$profile-inference-models" 200 GET \
+    "http://127.0.0.1:${port}/ai/v1/models"
   if [[ "$profile" == "local" ]]; then
     exercise_post_handler_init_failure "$port"
   fi

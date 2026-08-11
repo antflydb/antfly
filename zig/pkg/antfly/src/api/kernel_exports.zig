@@ -40,10 +40,28 @@ const ServerState = struct {
 const HandlerState = struct {
     alloc: std.mem.Allocator,
     handler: handler_mod.AntflyApiHandler,
+    io_impl: ?std.Io.Threaded = null,
+    routes: std.ArrayListUnmanaged(*RouteState) = .empty,
+};
+
+const RouteState = struct {
+    owner: *HandlerState,
+    handler: httpx.Handler,
+};
+
+const HttpResponseState = struct {
+    alloc: std.mem.Allocator,
+    response: httpx.Response,
+    header_views: []abi.HeaderView,
 };
 
 fn fail(err: anyerror) abi.Status {
     return abi.statusFromError(err);
+}
+
+fn validateVersion(version: u32) ?abi.Status {
+    if (version == abi.abi_version) return null;
+    return fail(error.UnsupportedVersion);
 }
 
 fn serverState(context: *const CallContext) *ServerState {
@@ -59,6 +77,7 @@ fn output(comptime T: type, context: *const CallContext) *T {
 }
 
 pub fn create(context: *const CreateContext) callconv(.c) abi.Status {
+    if (validateVersion(context.abi_version)) |failure| return failure;
     const owner_alloc_ptr: *const std.mem.Allocator = @ptrCast(@alignCast(context.owner_alloc));
     const cfg: *const server_mod.ApiHttpServerConfig = @ptrCast(@alignCast(context.cfg));
     const source: *const server_mod.StatusSource = @ptrCast(@alignCast(context.source));
@@ -90,80 +109,95 @@ pub fn destroy(opaque_handle: *anyopaque) callconv(.c) void {
 }
 
 pub fn requestStats(context: *const CallContext) callconv(.c) abi.Status {
+    if (validateVersion(context.abi_version)) |failure| return failure;
     output(server_mod.ApiHttpServer.RequestStats, context).* = serverState(context).server.requestStats();
     return .ok;
 }
 
 pub fn setProvider(context: *const CallContext) callconv(.c) abi.Status {
+    if (validateVersion(context.abi_version)) |failure| return failure;
     serverState(context).server.antfly_provider = input(?managed_embedder.AntflyProvider, context).*;
     return .ok;
 }
 
 pub fn setHAExecutor(context: *const CallContext) callconv(.c) abi.Status {
+    if (validateVersion(context.abi_version)) |failure| return failure;
     serverState(context).server.setHAInternalExecutor(input(?http_common.RequestExecutor, context).*);
     return .ok;
 }
 
 pub fn executor(context: *const CallContext) callconv(.c) abi.Status {
+    if (validateVersion(context.abi_version)) |failure| return failure;
     output(http_common.RequestExecutor, context).* = serverState(context).server.executor();
     return .ok;
 }
 
 pub fn streamingExecutor(context: *const CallContext) callconv(.c) abi.Status {
+    if (validateVersion(context.abi_version)) |failure| return failure;
     output(http_common.StreamingRequestExecutor, context).* = serverState(context).server.streamingExecutor();
     return .ok;
 }
 
 pub fn attachRuntimeRestoreStore(context: *const CallContext) callconv(.c) abi.Status {
+    if (validateVersion(context.abi_version)) |failure| return failure;
     serverState(context).server.attachRestoreJobRuntimeStore(@constCast(input(backend_erased.Store, context))) catch |err|
         return fail(err);
     return .ok;
 }
 
 pub fn attachReplicatedRestoreStore(context: *const CallContext) callconv(.c) abi.Status {
+    if (validateVersion(context.abi_version)) |failure| return failure;
     serverState(context).server.attachReplicatedRestoreJobStore(input(restore_jobs.ReplicatedPersistence, context).*) catch |err|
         return fail(err);
     return .ok;
 }
 
 pub fn resumeRestoreJobs(context: *const CallContext) callconv(.c) abi.Status {
+    if (validateVersion(context.abi_version)) |failure| return failure;
     serverState(context).server.resumeRestoreJobsOnce() catch |err| return fail(err);
     return .ok;
 }
 
 pub fn pollRestoreJobs(context: *const CallContext) callconv(.c) abi.Status {
+    if (validateVersion(context.abi_version)) |failure| return failure;
     serverState(context).server.pollRestoreJobsOnce() catch |err| return fail(err);
     return .ok;
 }
 
 pub fn prepareRestoreLeadership(context: *const CallContext) callconv(.c) abi.Status {
+    if (validateVersion(context.abi_version)) |failure| return failure;
     serverState(context).server.prepareRestoreLeadership(input(u64, context).*) catch |err| return fail(err);
     return .ok;
 }
 
 pub fn scheduleSessionMaintenance(context: *const CallContext) callconv(.c) abi.Status {
+    if (validateVersion(context.abi_version)) |failure| return failure;
     serverState(context).server.scheduleSessionMaintenance() catch |err| return fail(err);
     return .ok;
 }
 
 pub fn storageMaintenanceActive(context: *const CallContext) callconv(.c) abi.Status {
+    if (validateVersion(context.abi_version)) |failure| return failure;
     output(bool, context).* = serverState(context).server.storageMaintenanceExclusiveActive();
     return .ok;
 }
 
 pub fn handle(context: *const CallContext) callconv(.c) abi.Status {
+    if (validateVersion(context.abi_version)) |failure| return failure;
     output(http_common.HttpResponse, context).* = serverState(context).server.handle(input(http_common.HttpRequest, context).*) catch |err|
         return fail(err);
     return .ok;
 }
 
 pub fn handleInternal(context: *const CallContext) callconv(.c) abi.Status {
+    if (validateVersion(context.abi_version)) |failure| return failure;
     output(?http_common.HttpResponse, context).* = serverState(context).server.handleInternalRoute(input(http_common.HttpRequest, context).*) catch |err|
         return fail(err);
     return .ok;
 }
 
 pub fn handlerCreate(context: *const HandlerCreateContext) callconv(.c) abi.Status {
+    if (validateVersion(context.abi_version)) |failure| return failure;
     const api_state: *ServerState = @ptrCast(@alignCast(context.api_server_handle));
     const state = api_state.owner_alloc.create(HandlerState) catch |err| return fail(err);
     state.* = .{
@@ -179,12 +213,16 @@ fn handlerState(context: *const CallContext) *HandlerState {
 }
 
 pub fn handlerInit(context: *const CallContext) callconv(.c) abi.Status {
-    handlerState(context).handler.initRuntime(input(std.mem.Allocator, context).*) catch |err|
+    if (validateVersion(context.abi_version)) |failure| return failure;
+    const state = handlerState(context);
+    state.handler.initRuntime(state.alloc) catch |err|
         return fail(err);
+    state.io_impl = std.Io.Threaded.init(state.alloc, .{});
     return .ok;
 }
 
 pub fn handlerStats(context: *const CallContext) callconv(.c) abi.Status {
+    if (validateVersion(context.abi_version)) |failure| return failure;
     const handler = &handlerState(context).handler;
     const query = handler.query_admission.stats();
     const query_body = handler.query_body_admission.stats();
@@ -207,49 +245,129 @@ pub fn handlerStats(context: *const CallContext) callconv(.c) abi.Status {
 }
 
 pub fn handlerRegisterRoutes(context: *const CallContext) callconv(.c) abi.Status {
+    if (validateVersion(context.abi_version)) |failure| return failure;
     const server: *httpx.Server = @constCast(input(httpx.Server, context));
-    const handler = &handlerState(context).handler;
+    const state = handlerState(context);
+    const handler = &state.handler;
     const public_router = metadata_openapi.server.ServerRouter(handler_mod.AntflyApiHandler).init(handler);
-    var public_prefixed = BoundaryServer("/db/v1"){ .inner = server };
+    var public_prefixed = BoundaryServer("/db/v1"){
+        .inner = server,
+        .owner = state,
+    };
     public_router.register(&public_prefixed) catch |err| return fail(err);
     const usermgr_router = usermgr_openapi.server.ServerRouter(handler_mod.AntflyApiHandler).init(handler);
-    var usermgr_boundary = BoundaryServer(""){ .inner = server };
+    var usermgr_boundary = BoundaryServer(""){
+        .inner = server,
+        .owner = state,
+    };
     usermgr_router.register(&usermgr_boundary) catch |err| return fail(err);
     return .ok;
+}
+
+pub fn handlerHandleHttp(context: *const abi.HttpHandleContext) callconv(.c) abi.Status {
+    if (validateVersion(context.abi_version)) |failure| return failure;
+    const route: *RouteState = @ptrCast(@alignCast(context.route_handle));
+    const state = route.owner;
+    const request = context.request;
+    const alloc = state.alloc;
+    const input_headers = if (request.headers_ptr) |ptr| ptr[0..request.headers_len] else &.{};
+
+    const query = request.query.slice();
+    const target = if (query) |value|
+        std.fmt.allocPrint(alloc, "{s}?{s}", .{ request.path.slice(), value }) catch |err| return fail(err)
+    else
+        alloc.dupe(u8, request.path.slice()) catch |err| return fail(err);
+    defer alloc.free(target);
+
+    var http_request = httpx.Request.init(alloc, switch (request.method) {
+        .get => .GET,
+        .post => .POST,
+        .put => .PUT,
+        .delete => .DELETE,
+    }, target) catch |err| return fail(err);
+    defer http_request.deinit();
+    for (input_headers) |header|
+        http_request.headers.append(header.name.slice(), header.value.slice()) catch |err| return fail(err);
+    http_request.body = request.body.slice();
+
+    const input_params = if (request.params_ptr) |ptr| ptr[0..request.params_len] else &.{};
+    const params = alloc.alloc(httpx.RouteParam, input_params.len) catch |err| return fail(err);
+    defer alloc.free(params);
+    for (input_params, 0..) |param, i| {
+        params[i] = .{ .name = param.name.slice(), .value = param.value.slice() };
+    }
+
+    const io_impl = &(state.io_impl orelse return fail(error.ApiKernelNotInitialized));
+    var http_context = httpx.Context.init(alloc, io_impl.io(), &http_request);
+    defer http_context.deinit();
+    http_context.params = params;
+    var response = route.handler(&http_context) catch |err| return fail(err);
+    errdefer response.deinit();
+
+    const response_state = alloc.create(HttpResponseState) catch |err| return fail(err);
+    errdefer alloc.destroy(response_state);
+    const response_headers = response.headers.iterator();
+    const header_views = alloc.alloc(abi.HeaderView, response_headers.len) catch |err| return fail(err);
+    errdefer alloc.free(header_views);
+    for (response_headers, 0..) |header, i| {
+        header_views[i] = .{
+            .name = abi.Bytes.init(header.name),
+            .value = abi.Bytes.init(header.value),
+        };
+    }
+    response_state.* = .{
+        .alloc = alloc,
+        .response = response,
+        .header_views = header_views,
+    };
+    context.out_response_handle.* = response_state;
+    context.out_response.* = .{
+        .status = response.status.code,
+        .content_type = abi.OptionalBytes.init(response.contentType()),
+        .headers_ptr = if (header_views.len == 0) null else header_views.ptr,
+        .headers_len = header_views.len,
+        .body = abi.Bytes.init(response.body orelse ""),
+    };
+    return .ok;
+}
+
+pub fn handlerDestroyHttpResponse(response_handle: *anyopaque) callconv(.c) void {
+    const state: *HttpResponseState = @ptrCast(@alignCast(response_handle));
+    const alloc = state.alloc;
+    state.response.deinit();
+    alloc.free(state.header_views);
+    alloc.destroy(state);
 }
 
 pub fn handlerDestroy(opaque_handle: *anyopaque) callconv(.c) void {
     const state: *HandlerState = @ptrCast(@alignCast(opaque_handle));
     const alloc = state.alloc;
+    for (state.routes.items) |route| alloc.destroy(route);
+    state.routes.deinit(alloc);
     state.handler.deinitRuntime();
+    if (state.io_impl) |*io_impl| io_impl.deinit();
     alloc.destroy(state);
-}
-
-fn stableHandler(comptime handler: httpx.Handler) httpx.Handler {
-    return struct {
-        fn call(context: *httpx.Context) anyerror!httpx.Response {
-            return handler(context) catch |err| {
-                // Interpret and log the error while still in the API owner's
-                // codegen unit. The distributed server sees only a response.
-                std.log.err("API route failed err={s}", .{@errorName(err)});
-                return httpx.Response.init(context.allocator, 500);
-            };
-        }
-    }.call;
 }
 
 fn BoundaryServer(comptime prefix: []const u8) type {
     return struct {
         inner: *httpx.Server,
+        owner: *HandlerState,
 
         fn register(self: *const @This(), method: abi.HttpMethod, comptime path: []const u8, comptime handler: httpx.Handler) !void {
+            const route = self.owner.alloc.create(RouteState) catch |err| return err;
+            errdefer self.owner.alloc.destroy(route);
+            route.* = .{ .owner = self.owner, .handler = handler };
+            self.owner.routes.append(self.owner.alloc, route) catch |err| return err;
+            errdefer _ = self.owner.routes.pop();
             const full_path = prefix ++ path;
             const status = antfly_distributed_httpx_register(&.{
+                .abi_version = abi.abi_version,
                 .server = self.inner,
+                .route_handle = route,
                 .method = method,
                 .path_ptr = full_path.ptr,
                 .path_len = full_path.len,
-                .handler = @ptrCast(stableHandler(handler)),
             });
             if (!status.isOk()) return abi.errorFromStatus(status);
         }

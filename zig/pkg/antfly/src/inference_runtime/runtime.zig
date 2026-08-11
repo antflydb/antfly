@@ -39,9 +39,21 @@ pub fn defaultModelsDirForDataDir(allocator: std.mem.Allocator, data_dir: []cons
     return std.fs.path.join(allocator, &.{ data_dir, "inference", "models" }) catch defaultModelsDir(allocator);
 }
 
+pub fn defaultModelsDirForDataDirAlloc(allocator: std.mem.Allocator, data_dir: []const u8) ![]u8 {
+    if (platform.env.getenv("ANTFLY_INFERENCE_MODELS_DIR")) |value|
+        return try allocator.dupe(u8, value);
+    return try std.fs.path.join(allocator, &.{ data_dir, "inference", "models" });
+}
+
 pub fn defaultMlDirForDataDir(allocator: std.mem.Allocator, data_dir: []const u8) []const u8 {
     if (platform.env.getenv("ANTFLY_INFERENCE_ML_DIR")) |value| return value;
     return std.fs.path.join(allocator, &.{ data_dir, "inference", "ml" }) catch defaultMlDir(allocator);
+}
+
+pub fn defaultMlDirForDataDirAlloc(allocator: std.mem.Allocator, data_dir: []const u8) ![]u8 {
+    if (platform.env.getenv("ANTFLY_INFERENCE_ML_DIR")) |value|
+        return try allocator.dupe(u8, value);
+    return try std.fs.path.join(allocator, &.{ data_dir, "inference", "ml" });
 }
 
 pub const SpawnedServer = struct {
