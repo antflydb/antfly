@@ -873,6 +873,8 @@ pub const DecoderRuntimeLayerSpec = struct {
     sliding_window: usize,
     rope_dim: usize,
     rope_active_dim: usize,
+    /// Theta already adjusted for `rope_active_dim`; consumers must not fold
+    /// the frequency-domain ratio into it again.
     rope_theta: f32,
     attn_pre_norm_slot: usize,
     attn_post_norm_slot: usize,

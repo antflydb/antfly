@@ -101,6 +101,15 @@ pub fn messagesHaveAudio(messages: []const Message) bool {
 /// with the clip and projector metadata.
 pub fn nativeGenerationMediaTokenAllowance(messages: []const Message, config: gpt_mod.Config) usize {
     if (config.mm_tokens_per_image == 0) return 0;
+    return nativeGenerationImageCount(messages) *| (@as(usize, config.mm_tokens_per_image) + 1);
+}
+
+fn preliminaryTextMediaTokenAllowance(messages: []const Message, config: gpt_mod.Config) usize {
+    if (config.family == .qwen3_5) return 0;
+    return nativeGenerationMediaTokenAllowance(messages, config);
+}
+
+fn nativeGenerationImageCount(messages: []const Message) usize {
     var image_count: usize = 0;
     for (messages) |message| {
         if (message.content_parts) |parts| {
@@ -112,7 +121,27 @@ pub fn nativeGenerationMediaTokenAllowance(messages: []const Message, config: gp
             image_count +|= images.len;
         }
     }
-    return image_count *| (@as(usize, config.mm_tokens_per_image) + 1);
+    return image_count;
+}
+
+/// Admission-time media allowance for models whose visual token count is
+/// determined by the image preprocessor rather than model metadata.
+pub fn nativeGenerationMediaTokenAllowanceForModelDir(
+    allocator: std.mem.Allocator,
+    messages: []const Message,
+    config: gpt_mod.Config,
+    model_dir: []const u8,
+) !usize {
+    const declared = nativeGenerationMediaTokenAllowance(messages, config);
+    if (config.family != .qwen3_5) return declared;
+    const image_count = nativeGenerationImageCount(messages);
+    if (image_count == 0) return 0;
+    const preprocessor = try qwen2vl_mm.loadPreprocessorConfig(allocator, model_dir);
+    const per_image = @max(
+        try qwen2vl_mm.maxImageTokenCount(preprocessor),
+        @as(usize, config.mm_tokens_per_image),
+    );
+    return image_count *| (per_image +| 1);
 }
 
 pub fn userFacingErrorMessage(err: anyerror) []const u8 {
@@ -204,6 +233,24 @@ pub const GenerationConfig = struct {
     ignore_eos: bool = false,
 };
 
+pub fn kvSlidingTrimForced() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_KV_SLIDING_TRIM", false);
+}
+
+pub fn metalSplitSwaRingEligible(
+    model_config: gpt_mod.Config,
+    generation_config: GenerationConfig,
+    kv_dtype: runtime.kv.pool.KvDType,
+) bool {
+    if (comptime !build_options.enable_metal) return false;
+    return model_config.supportsSplitSwaGlobalKvRing() and
+        !generation_config.prompt_cache_enabled and
+        generation_config.cache_compaction_ratio == null and
+        !kvSlidingTrimForced() and
+        backends.metal_kv_storage.KeyFormat.fromKvDType(kv_dtype) != null and
+        backends.metal_kv_storage.MetalKvStorage.splitSwaKvRingEnabled();
+}
+
 pub fn kvPoolConfig(
     backend: runtime.kv.pool.BackendKind,
     dtype: runtime.kv.pool.KvDType,
@@ -213,7 +260,7 @@ pub fn kvPoolConfig(
     return .{
         .backend = backend,
         .dtype = dtype,
-        .page_size_tokens = 16,
+        .page_size_tokens = runtime.tier.memory.generation_kv_page_size_tokens,
         .num_layers_packed = @intCast(config.num_hidden_layers),
         .num_kv_heads = config.maxKvHeads(),
         .head_dim = config.maxHeadDim(),
@@ -696,8 +743,9 @@ fn emitDecodedDeltaForTokenizer(
     const prefix_len = std.mem.indexOfDiff(u8, state.emitted_text, decoded_text) orelse @min(state.emitted_text.len, decoded_text.len);
     const delta = decoded_text[prefix_len..];
 
+    const next_emitted_text = try allocator.dupe(u8, decoded_text);
     allocator.free(state.emitted_text);
-    state.emitted_text = try allocator.dupe(u8, decoded_text);
+    state.emitted_text = next_emitted_text;
     if (delta.len == 0) return true;
     return on_token_fn(on_token_ctx, delta);
 }
@@ -1462,6 +1510,22 @@ fn schedulerChunkForPrefillIteration(scheduler_chunk: usize, current_chunk_size:
     return current_chunk_size;
 }
 
+fn wholeModelPrefillChunkSize(configured_chunk: usize, scheduler_chunk: usize, prompt_tokens: usize) usize {
+    const requested = if (configured_chunk > 0)
+        configured_chunk
+    else
+        runtime.tier.memory.generation_default_prefill_chunk_tokens;
+    return @max(@min(@min(requested, if (scheduler_chunk > 0) scheduler_chunk else requested), prompt_tokens), 1);
+}
+
+fn validateSpeculativeK(draft_requested: bool, speculative_k: u32) !void {
+    if (draft_requested and
+        (speculative_k == 0 or speculative_k > runtime.tier.memory.generation_max_speculative_k))
+    {
+        return error.InvalidSpeculativeK;
+    }
+}
+
 pub const DecoderRuntimeDebugStats = struct {
     forward_attempts: u64 = 0,
     flag_disabled: u64 = 0,
@@ -1569,8 +1633,12 @@ pub const NativeDecodeState = struct {
 
     pub fn configureForGptConfig(self: *NativeDecodeState, config: gpt_mod.Config) void {
         self.force_full_recompute = false;
-        if (self.total_tokens == 0) self.kv_max_inflight_tokens = 0;
-        self.allow_swa_ring = config.supportsSplitSwaGlobalKvRing();
+        if (self.total_tokens == 0) {
+            self.kv_max_inflight_tokens = 0;
+            self.allow_swa_ring = config.supportsSplitSwaGlobalKvRing();
+        } else {
+            self.configureKvMaxInflightTokens(0, false);
+        }
         if (config.family != .gemma) self.gemma4_layer_spec_cache.reset();
         if (!requiresDeepSeekV4CompressedCache(config)) self.clearDeepSeekV4CompressedCache();
     }
@@ -2608,6 +2676,7 @@ pub const NativeGenerationPipeline = struct {
         }
         const loaded_draft_requested = self.draft_cb != null and self.draft_gpt_config != null;
         const draft_requested = loaded_draft_requested or config.speculation_requested;
+        try validateSpeculativeK(draft_requested, config.speculative_k);
         const speculation_policy = config.speculation_policy;
         const mtp_auto_uncalibrated =
             speculation_policy == .auto and
@@ -2640,12 +2709,17 @@ pub const NativeGenerationPipeline = struct {
             speculative_bonus_tokens,
             0,
         );
+        // Qwen replaces textual image markers with exact visual-token spans
+        // below, then validates the fully expanded prompt. Reserving its
+        // coarse media allowance during this preliminary text-only encode can
+        // reject text that the real multimodal encode accepts.
+        const preliminary_media_allowance = preliminaryTextMediaTokenAllowance(messages, self.gpt_config);
         const text_prompt_token_limit = try nativeGenerationPromptTokenLimit(
             self.gpt_config,
             relevant_draft_config,
             requested_max_tokens,
             speculative_bonus_tokens,
-            nativeGenerationMediaTokenAllowance(messages, self.gpt_config),
+            preliminary_media_allowance,
         );
         var encoded = try encodeNativeGenerationPrompt(
             self.tokenizer,
@@ -2817,6 +2891,13 @@ pub const NativeGenerationPipeline = struct {
             }
             break :blk prepared_multimodal_prompt.?.token_ids.len;
         };
+        try validateNativeGenerationPromptTokenCount(
+            prompt_token_count,
+            self.gpt_config,
+            relevant_draft_config,
+            requested_max_tokens,
+            speculative_bonus_tokens,
+        );
 
         // Build token sequence. Add slack only when speculative decoding is
         // active; the bonus token can write one position past max_tokens.
@@ -2837,10 +2918,28 @@ pub const NativeGenerationPipeline = struct {
         );
 
         const runtime_prepare_started_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
-        const runtime_prepared = try self.prepareCompiledGenerationRuntime(prompt_token_count);
+        const runtime_prepare_token_hint = if (self.compiled_partition_backend != null and
+            self.compiled_attachment_target == .whole_model and
+            self.graph_cache != null and
+            decode_state.isPaged() and
+            self.cb.kind() == .metal and
+            self.gpt_config.supportsSplitSwaGlobalKvRing() and
+            !config.prompt_cache_enabled and
+            config.cache_compaction_ratio == null)
+            wholeModelPrefillChunkSize(
+                config.prefill_chunk_size,
+                if (self.scheduler_lease) |lease| lease.prefill_chunk_size else 0,
+                prompt_token_count,
+            )
+        else
+            prompt_token_count;
+        const runtime_prepared = try self.prepareCompiledGenerationRuntime(runtime_prepare_token_hint);
         const prefill_started_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
         if (runtime_prepared) {
-            debugGenerationStage("prepared compiled generation runtime prompt_token_count={d}", .{prompt_token_count});
+            debugGenerationStage(
+                "prepared compiled generation runtime prompt_token_count={d} token_hint={d}",
+                .{ prompt_token_count, runtime_prepare_token_hint },
+            );
         }
 
         var cached_prompt_tokens: usize = 0;
@@ -3731,38 +3830,86 @@ pub const NativeGenerationPipeline = struct {
 
         if (self.compiled_partition_backend != null and self.compiled_attachment_target == .whole_model and self.graph_cache != null) {
             if (prefilled_tokens != 0) return error.UnsupportedShape;
-            const max_speculative_rows = @min(@as(usize, @intCast(config.speculative_k)), 16) + 1;
+            const bounded_swa_prefill = self.cb.kind() == .metal and
+                decode_state.isPaged() and
+                self.gpt_config.supportsSplitSwaGlobalKvRing() and
+                !config.prompt_cache_enabled and
+                config.cache_compaction_ratio == null;
+            const prefill_chunk_size = if (bounded_swa_prefill)
+                wholeModelPrefillChunkSize(
+                    config.prefill_chunk_size,
+                    if (self.scheduler_lease) |lease| lease.prefill_chunk_size else 0,
+                    prompt_ids.len,
+                )
+            else
+                prompt_ids.len;
+            const max_speculative_rows = @min(
+                @as(usize, @intCast(config.speculative_k)),
+                @as(usize, runtime.tier.memory.generation_max_speculative_k),
+            ) + 1;
             decode_state.configureKvMaxInflightTokens(
-                @max(seq_len, max_speculative_rows),
-                self.cb.kind() == .metal and
-                    !config.prompt_cache_enabled and
-                    config.cache_compaction_ratio == null,
+                @max(prefill_chunk_size, max_speculative_rows),
+                bounded_swa_prefill,
             );
-            debugGenerationStage("executePrefill whole-model fast path seq_len={d}", .{seq_len});
-            const decode_context = try decode_runtime.preparePrefill(seq_len, seq_len);
-            if (allow_resident_greedy_token) {
-                if (try self.forwardGreedyCompiledModelToken(
-                    prompt_ids,
+            debugGenerationStage(
+                "executePrefill whole-model fast path seq_len={d} chunk_size={d} ring={}",
+                .{ seq_len, prefill_chunk_size, decode_state.allow_swa_ring },
+            );
+            var processed: usize = 0;
+            while (processed < prompt_ids.len) {
+                const chunk_end = @min(prompt_ids.len, processed + prefill_chunk_size);
+                const chunk = prompt_ids[processed..chunk_end];
+                const total_chunk_end = prefilled_tokens + chunk_end;
+                const decode_context = decode_runtime.preparePrefill(total_chunk_end, chunk.len) catch |err| {
+                    debugGenerationStage(
+                        "executePrefill whole-model KV advance failed chunk_start={d} chunk_end={d} err={s}",
+                        .{ processed, chunk_end, @errorName(err) },
+                    );
+                    return err;
+                };
+                const is_last_chunk = chunk_end == prompt_ids.len;
+                var output = (graph_mod.execution.graphForwardCompiledModelOutput(
+                    self,
+                    self.graph_cache.?,
+                    chunk,
                     1,
-                    seq_len,
+                    total_chunk_end,
                     &decode_context,
-                    config,
-                    false,
-                )) |token| {
+                ) catch |err| {
+                    debugGenerationStage(
+                        "executePrefill whole-model chunk failed chunk_start={d} chunk_end={d} err={s}",
+                        .{ processed, chunk_end, @errorName(err) },
+                    );
+                    return err;
+                }) orelse {
+                    debugGenerationStage(
+                        "executePrefill whole-model chunk declined chunk_start={d} chunk_end={d}",
+                        .{ processed, chunk_end },
+                    );
+                    return error.MissingCompiledModelRuntime;
+                };
+                defer output.deinit(allocator);
+                if (is_last_chunk and allow_resident_greedy_token and
+                    isPureGreedyConfig(config) and config.grammar == null)
+                {
+                    const token = try output.greedyToken(allocator, self.gpt_config.vocab_size);
+                    if (token < 0) return error.InvalidModelOutput;
                     if (self.scheduler) |scheduler| {
                         if (self.scheduler_lease) |lease| {
-                            scheduler.notePrefillProgress(lease, seq_len, seq_len);
+                            scheduler.notePrefillProgress(lease, total_chunk_end, seq_len);
                             scheduler.finishTurn(lease, .prefill);
                         }
                     }
-                    return .{ .greedy_token = token };
+                    return .{ .greedy_token = @intCast(token) };
+                } else if (is_last_chunk) {
+                    prefill_last_logits = try output.takeHostLogits(allocator);
                 }
-            }
-            prefill_last_logits = try self.forwardLastLogits(prompt_ids, 1, seq_len, &decode_context);
-            if (self.scheduler) |scheduler| {
-                if (self.scheduler_lease) |lease| {
-                    scheduler.notePrefillProgress(lease, seq_len, seq_len);
-                    scheduler.finishTurn(lease, .prefill);
+                processed = chunk_end;
+                if (self.scheduler) |scheduler| {
+                    if (self.scheduler_lease) |lease| {
+                        scheduler.notePrefillProgress(lease, total_chunk_end, seq_len);
+                        if (is_last_chunk) scheduler.finishTurn(lease, .prefill);
+                    }
                 }
             }
             return .{ .last_logits = prefill_last_logits };
@@ -8273,6 +8420,23 @@ pub fn nativeGenerationPromptTokenLimit(
     return context_tokens - reserved_tokens;
 }
 
+pub fn validateNativeGenerationPromptTokenCount(
+    prompt_tokens: usize,
+    target_config: gpt_mod.Config,
+    draft_config: ?gpt_mod.Config,
+    requested_output_tokens: usize,
+    speculative_bonus_tokens: usize,
+) !void {
+    const limit = try nativeGenerationPromptTokenLimit(
+        target_config,
+        draft_config,
+        requested_output_tokens,
+        speculative_bonus_tokens,
+        0,
+    );
+    if (prompt_tokens > limit) return error.PromptTooLong;
+}
+
 /// Encode one native-generation prompt without silently dropping tokens at the
 /// model boundary. The extra slot distinguishes an exact fit from overflow.
 pub fn encodeNativeGenerationPrompt(
@@ -8422,12 +8586,25 @@ test "native generation prompt limit reserves output media and draft context" {
         error.PromptTooLong,
         nativeGenerationPromptTokenLimit(target, null, std.math.maxInt(usize), 1, 0),
     );
+    try validateNativeGenerationPromptTokenCount(4031, target, draft, 64, 1);
+    try std.testing.expectError(
+        error.PromptTooLong,
+        validateNativeGenerationPromptTokenCount(4032, target, draft, 64, 1),
+    );
 
     const images = [_][]const u8{ "a", "b" };
     const messages = [_]Message{.{ .role = "user", .content = "describe", .image_bytes = &images }};
     try std.testing.expectEqual(
         @as(usize, 514),
         nativeGenerationMediaTokenAllowance(&messages, .{ .mm_tokens_per_image = 256 }),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        preliminaryTextMediaTokenAllowance(&messages, .{ .family = .qwen3_5, .mm_tokens_per_image = 256 }),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 514),
+        preliminaryTextMediaTokenAllowance(&messages, .{ .family = .gemma, .mm_tokens_per_image = 256 }),
     );
 }
 
@@ -9608,6 +9785,18 @@ test "cuda first-token coalesced prefill preserves chunk over scheduler lease" {
     try std.testing.expectEqual(@as(usize, 449), schedulerChunkForPrefillIteration(0, 449, false));
 }
 
+test "whole-model prefill stays bounded and speculative width is validated" {
+    try std.testing.expectEqual(@as(usize, 256), wholeModelPrefillChunkSize(0, 0, 2000));
+    try std.testing.expectEqual(@as(usize, 128), wholeModelPrefillChunkSize(512, 128, 2000));
+    try std.testing.expectEqual(@as(usize, 64), wholeModelPrefillChunkSize(256, 0, 64));
+    try validateSpeculativeK(true, runtime.tier.memory.generation_max_speculative_k);
+    try std.testing.expectError(
+        error.InvalidSpeculativeK,
+        validateSpeculativeK(true, runtime.tier.memory.generation_max_speculative_k + 1),
+    );
+    try validateSpeculativeK(false, runtime.tier.memory.generation_max_speculative_k + 1);
+}
+
 test "native generation suppress token mask removes configured logits" {
     var logits = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
     NativeGenerationPipeline.applySuppressTokenMask(&logits, &.{ 1, 3, 99, -1 });
@@ -9680,7 +9869,7 @@ test "native decode state can disable an initialized SWA ring policy" {
     const pool_id = try manager.addPool(.{
         .backend = .metal,
         .dtype = .f16,
-        .page_size_tokens = 16,
+        .page_size_tokens = runtime.tier.memory.generation_kv_page_size_tokens,
         .num_kv_heads = 4,
         .head_dim = 256,
     });

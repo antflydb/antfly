@@ -654,15 +654,7 @@ fn prepareKeyForPagedPrefillSeed(
     if (gpt_config.position_encoding != .rope) return k_input;
     const rope_dim: usize = gpt_config.layerRopeActiveDim(layer);
     const rope_consecutive_pairs = gpt_config.rope_layout == .consecutive_pairs;
-    const rope_theta = blk: {
-        const base_theta = gpt_config.layerRopeTheta(layer);
-        const freq_dim: f32 = @floatFromInt(gpt_config.layerRopeFrequencyDim(layer));
-        const active_dim: f32 = @floatFromInt(rope_dim);
-        if (active_dim < freq_dim) {
-            break :blk std.math.pow(f32, base_theta, active_dim / freq_dim);
-        }
-        break :blk base_theta;
-    };
+    const rope_theta = gpt_config.layerRopeEffectiveTheta(layer);
     const position_offset = seq_len - query_sequence_len;
     return cb.rope(
         k_input,
@@ -688,15 +680,7 @@ fn prepareRopeForDirectAttention(
     if (gpt_config.position_encoding != .rope) return input;
     const rope_dim: usize = gpt_config.layerRopeActiveDim(layer);
     const rope_consecutive_pairs = gpt_config.rope_layout == .consecutive_pairs;
-    const rope_theta = blk: {
-        const base_theta = gpt_config.layerRopeTheta(layer);
-        const freq_dim: f32 = @floatFromInt(gpt_config.layerRopeFrequencyDim(layer));
-        const active_dim: f32 = @floatFromInt(rope_dim);
-        if (active_dim < freq_dim) {
-            break :blk std.math.pow(f32, base_theta, active_dim / freq_dim);
-        }
-        break :blk base_theta;
-    };
+    const rope_theta = gpt_config.layerRopeEffectiveTheta(layer);
     const position_offset = seq_len - query_sequence_len;
     return cb.rope(
         input,
@@ -723,15 +707,7 @@ fn prepareScaledRopeForDirectAttention(
     if (gpt_config.position_encoding != .rope) return null;
     const rope_dim: usize = gpt_config.layerRopeActiveDim(layer);
     const rope_consecutive_pairs = gpt_config.rope_layout == .consecutive_pairs;
-    const rope_theta = blk: {
-        const base_theta = gpt_config.layerRopeTheta(layer);
-        const freq_dim: f32 = @floatFromInt(gpt_config.layerRopeFrequencyDim(layer));
-        const active_dim: f32 = @floatFromInt(rope_dim);
-        if (active_dim < freq_dim) {
-            break :blk std.math.pow(f32, base_theta, active_dim / freq_dim);
-        }
-        break :blk base_theta;
-    };
+    const rope_theta = gpt_config.layerRopeEffectiveTheta(layer);
     const position_offset = seq_len - query_sequence_len;
     return try cb.ropeScaled(
         input,
@@ -976,17 +952,6 @@ fn kHeadNormSlot(configured_layer_count: usize, layer: usize) usize {
     return gemma4_runtime.kHeadNormSlot(configured_layer_count, layer);
 }
 
-fn layerRopeThetaForActiveDim(gpt_config: gpt_mod.Config, layer: usize) f32 {
-    const rope_dim: usize = gpt_config.layerRopeActiveDim(layer);
-    const base_theta = gpt_config.layerRopeTheta(layer);
-    const freq_dim: f32 = @floatFromInt(gpt_config.layerRopeFrequencyDim(layer));
-    const active_dim: f32 = @floatFromInt(rope_dim);
-    if (active_dim < freq_dim) {
-        return std.math.pow(f32, base_theta, active_dim / freq_dim);
-    }
-    return base_theta;
-}
-
 pub fn fillDenseQwen3LayerSpecs(
     gpt_config: gpt_mod.Config,
     configured_layer_count: usize,
@@ -1007,7 +972,7 @@ pub fn fillDenseQwen3LayerSpecs(
             .sliding_window = 0,
             .rope_dim = @intCast(gpt_config.layerRopeDim(layer)),
             .rope_active_dim = @intCast(gpt_config.layerRopeActiveDim(layer)),
-            .rope_theta = layerRopeThetaForActiveDim(gpt_config, layer),
+            .rope_theta = gpt_config.layerRopeEffectiveTheta(layer),
             .attn_pre_norm_slot = normSlot(layer, .attn_pre),
             .attn_post_norm_slot = normSlot(layer, .ffn_pre),
             .ffn_pre_norm_slot = normSlot(layer, .ffn_pre),
@@ -2183,15 +2148,7 @@ fn forwardFinalHiddenTensorGemmaDirect(
             attention.layer_index = kv_layer_index;
             attention.skip_kv_write = shares_kv;
             const rope_dim: usize = gpt_config.layerRopeActiveDim(layer);
-            const rope_theta = blk: {
-                const base_theta = gpt_config.layerRopeTheta(layer);
-                const freq_dim: f32 = @floatFromInt(gpt_config.layerRopeFrequencyDim(layer));
-                const active_dim: f32 = @floatFromInt(rope_dim);
-                if (active_dim < freq_dim) {
-                    break :blk std.math.pow(f32, base_theta, active_dim / freq_dim);
-                }
-                break :blk base_theta;
-            };
+            const rope_theta = gpt_config.layerRopeEffectiveTheta(layer);
 
             const block_started_at = monotonicNowNs();
             if (try cb.runGatedDecoderBlock(&.{
@@ -2426,13 +2383,7 @@ fn forwardFinalHiddenTensorGemmaDirect(
         var fused_k_rope: ?ops.CT = null;
         if (!shares_kv and gpt_config.family == .gemma and gpt_config.position_encoding == .rope and decode_context.query_sequence_len == 1) fused_blk: {
             const rope_dim = gpt_config.layerRopeActiveDim(layer);
-            const rope_theta = theta_blk: {
-                const base_theta = gpt_config.layerRopeTheta(layer);
-                const freq_dim: f32 = @floatFromInt(gpt_config.layerRopeFrequencyDim(layer));
-                const active_dim: f32 = @floatFromInt(rope_dim);
-                if (active_dim < freq_dim) break :theta_blk std.math.pow(f32, base_theta, active_dim / freq_dim);
-                break :theta_blk base_theta;
-            };
+            const rope_theta = gpt_config.layerRopeEffectiveTheta(layer);
             const position_offset = gpt_arch.positionOffset(seq_len, decode_context.query_sequence_len, decode_context);
             const rope_consecutive_pairs = gpt_config.rope_layout == .consecutive_pairs;
             const q_scale: f32 = @sqrt(@as(f32, @floatFromInt(head_dim)));

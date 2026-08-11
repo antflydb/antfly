@@ -2278,6 +2278,8 @@ components:
             inference-native speculative decoding extension. Path or model identifier for a smaller draft model.
         speculative_k:
           type: integer
+          minimum: 1
+          maximum: 16
           description: |
             inference-native speculative decoding extension. Number of draft tokens proposed per verification round.
           default: 4

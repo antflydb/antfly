@@ -104,6 +104,10 @@ const SlotBinding = struct {
     fn ownsSlot(self: SlotBinding) bool {
         return self.sequence_owned;
     }
+
+    fn covers(self: SlotBinding, token_count: usize) bool {
+        return self.written_tokens >= token_count;
+    }
 };
 
 pub const MetalKvStorage = struct {
@@ -237,6 +241,11 @@ pub const MetalKvStorage = struct {
         return flagValueEnabled(std.mem.span(value));
     }
 
+    pub fn splitSwaKvRingEnabled() bool {
+        return !envFlagEnabled("TERMITE_METAL_DISABLE_SPLIT_SWA_KV_RING") and
+            !envFlagEnabled("TERMITE_METAL_DISABLE_PAGED_SLOT_ATTENTION");
+    }
+
     fn requestedRingPageCount(
         page_size_tokens: u16,
         sliding_window: usize,
@@ -246,8 +255,7 @@ pub const MetalKvStorage = struct {
         if (!allow_swa_ring or sliding_window == 0 or max_inflight_tokens == 0 or page_size_tokens == 0) return 0;
         // Production requests opt in through the typed KV policy. Keep only a
         // hard rollback flag here.
-        if (envFlagEnabled("TERMITE_METAL_DISABLE_SPLIT_SWA_KV_RING")) return 0;
-        if (envFlagEnabled("TERMITE_METAL_DISABLE_PAGED_SLOT_ATTENTION")) return 0;
+        if (!splitSwaKvRingEnabled()) return 0;
         return storage_runtime.swaRingPageCount(page_size_tokens, sliding_window, max_inflight_tokens, allow_swa_ring);
     }
 
@@ -661,7 +669,7 @@ pub const MetalKvStorage = struct {
         const slot = binding.slot;
         if (binding.ring_page_count > 0) return error.RingKvRequiresPagedAttention;
         if (!binding.logical_contiguous) return error.DeviceReadFallback;
-        if (binding.written_tokens < gather.token_count) return error.DeviceReadFallback;
+        if (!binding.covers(gather.token_count)) return error.DeviceReadFallback;
         const info = try self.slotInfo(slot);
 
         const k_handle = info.encoded_key_handle orelse return error.DeviceReadFallback;
@@ -749,7 +757,7 @@ pub const MetalKvStorage = struct {
         const slot = binding.slot;
         if (binding.ring_page_count > 0) return error.RingKvRequiresPagedAttention;
         if (!binding.logical_contiguous) return error.DeviceReadFallback;
-        if (binding.written_tokens < gather.token_count) return error.DeviceReadFallback;
+        if (!binding.covers(gather.token_count)) return error.DeviceReadFallback;
         const info = try self.slotInfo(slot);
         if (info.key_row_bytes != token_width * @sizeOf(f32)) return error.DeviceReadFallback;
         if (info.v_row_stride != token_width) return error.DeviceReadFallback;
@@ -813,7 +821,12 @@ pub const MetalKvStorage = struct {
             if (!active_frame) return err;
             break :blk null;
         };
-        if (!active_frame and binding.written_tokens < gather.token_count) return error.DeviceReadFallback;
+        // An active frame may not expose queued slot metadata through
+        // slotInfo yet, but the sequence-local binding must still cover the
+        // requested logical span. Its count advances only after the device
+        // write was encoded successfully on this frame's ordered command
+        // buffer.
+        if (!binding.covers(gather.token_count)) return error.DeviceReadFallback;
         if (info_opt) |info| {
             if (info.key_row_bytes != 0 and info.key_row_bytes != key_row_bytes) return error.DeviceReadFallback;
             if (info.v_row_stride != 0 and info.v_row_stride != token_width) return error.DeviceReadFallback;
@@ -885,6 +898,15 @@ test "Metal KV rollout flags recognize common false values" {
     try std.testing.expect(!MetalKvStorage.flagValueEnabled("Off"));
     try std.testing.expect(MetalKvStorage.flagValueEnabled("1"));
     try std.testing.expect(MetalKvStorage.flagValueEnabled("true"));
+}
+
+test "Metal KV binding only covers successfully encoded tokens" {
+    const binding = SlotBinding{
+        .slot = 0,
+        .written_tokens = 32,
+    };
+    try std.testing.expect(binding.covers(32));
+    try std.testing.expect(!binding.covers(33));
 }
 
 const hook_vtable: storage_runtime.DeviceWriteHook.VTable = .{

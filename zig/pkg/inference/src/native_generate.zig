@@ -427,7 +427,12 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     else
         try generation.formatMessages(allocator, &messages);
     defer allocator.free(rendered_prompt);
-    const prompt_media_allowance = generation.nativeGenerationMediaTokenAllowance(&messages, gpt_config);
+    const prompt_media_allowance = try generation.nativeGenerationMediaTokenAllowanceForModelDir(
+        allocator,
+        &messages,
+        gpt_config,
+        opts.model_dir,
+    );
     const prompt_token_limit = try generation.nativeGenerationPromptTokenLimit(
         gpt_config,
         if (draft_model != null and opts.speculation_policy != .off) draft_gpt_config else null,
@@ -610,14 +615,27 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         budget_limits.backend_limit_bytes / (1024 * 1024),
         budget_limits.combined_limit_bytes / (1024 * 1024),
     });
-    const admission_prefill_chunk = if (opts.prefill_chunk_size > 0) opts.prefill_chunk_size else 256;
-    run_budget.reserveEstimate(try runtime.tier.memory.estimateGptGeneration(
+    const admission_prefill_chunk = if (opts.prefill_chunk_size > 0)
+        opts.prefill_chunk_size
+    else
+        runtime.tier.memory.generation_default_prefill_chunk_tokens;
+    const kv_capacity_policy: runtime.tier.memory.GenerationKvCapacityPolicy = if (graph_mode and
+        explicit_partition_backend == .metal and
+        compiled_attachment_target == .whole_model and
+        backend_kind == .metal and
+        graph_mod.metal_executor.supportsSession(model.session) and
+        generation.metalSplitSwaRingEligible(gpt_config, config, kv_dtype))
+        .split_swa_ring
+    else
+        .full_history;
+    run_budget.reserveEstimate(try runtime.tier.memory.estimateGptGenerationForKvPolicy(
         backend_kind,
         kv_dtype,
         gpt_config,
         prompt_tokens,
         @intCast(@max(opts.max_tokens, 1)),
         admission_prefill_chunk,
+        kv_capacity_policy,
     )) catch |err| {
         if (err == error.MemoryBudgetExceeded) {
             printBudgetExceeded(model.session, &run_budget);
@@ -682,12 +700,12 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         null;
     defer if (draft_cb) |*backend| backend.deinit();
 
-    const sliding_window_size = gpt_config.kvPoolSlidingWindowSize(kvSlidingTrimForced());
+    const sliding_window_size = gpt_config.kvPoolSlidingWindowSize(generation.kvSlidingTrimForced());
 
     const pool_id = try kv_manager.addPool(.{
         .backend = backend_kind,
         .dtype = kv_dtype,
-        .page_size_tokens = 16,
+        .page_size_tokens = runtime.tier.memory.generation_kv_page_size_tokens,
         .num_layers_packed = @intCast(gpt_config.num_hidden_layers),
         .num_kv_heads = gpt_config.maxKvHeads(),
         .head_dim = gpt_config.maxHeadDim(),
@@ -696,7 +714,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     var kv_storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, .{
         .backend = backend_kind,
         .dtype = kv_dtype,
-        .page_size_tokens = 16,
+        .page_size_tokens = runtime.tier.memory.generation_kv_page_size_tokens,
         .num_layers_packed = @intCast(gpt_config.num_hidden_layers),
         .num_kv_heads = gpt_config.maxKvHeads(),
         .head_dim = gpt_config.maxHeadDim(),
@@ -736,11 +754,11 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     if (draft_model != null) {
         if (draft_gpt_config) |draft_cfg| {
             draft_kv_manager = runtime.kv.manager.KvManager.init(allocator);
-            const draft_sliding_window_size = draft_cfg.kvPoolSlidingWindowSize(kvSlidingTrimForced());
+            const draft_sliding_window_size = draft_cfg.kvPoolSlidingWindowSize(generation.kvSlidingTrimForced());
             const draft_pool_id = try draft_kv_manager.?.addPool(.{
                 .backend = draft_backend_kind.?,
                 .dtype = draft_kv_dtype.?,
-                .page_size_tokens = 16,
+                .page_size_tokens = runtime.tier.memory.generation_kv_page_size_tokens,
                 .num_layers_packed = @intCast(draft_cfg.num_hidden_layers),
                 .num_kv_heads = draft_cfg.maxKvHeads(),
                 .head_dim = draft_cfg.maxHeadDim(),
@@ -3992,10 +4010,6 @@ fn traceGenerateTopLogits(label: []const u8, step: usize, logits: []const f32) v
     std.debug.print("\n", .{});
 }
 
-fn kvSlidingTrimForced() bool {
-    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_KV_SLIDING_TRIM", false);
-}
-
 fn cudaGemmaPrefillPrewarmEnabled() bool {
     if (envFlagEnabled("ANTFLY_INFERENCE_DISABLE_GEMMA_PREFILL_PREWARM")) return false;
     if (envFlagEnabled("ANTFLY_INFERENCE_CUDA_DISABLE_GEMMA_PREFILL_PREWARM")) return false;
@@ -4071,14 +4085,8 @@ fn liveWholeModelExecutorRequested(opts: *const Options) bool {
     };
 }
 
-fn liveWholeModelSupportsSplitSwaRing(gpt_config: gpt_mod.Config) bool {
-    return gpt_config.supportsSplitSwaGlobalKvRing();
-}
-
-fn liveWholeModelAllowsSplitSwaRing(gpt_config: gpt_mod.Config, config: generation.GenerationConfig) bool {
-    return liveWholeModelSupportsSplitSwaRing(gpt_config) and
-        !config.prompt_cache_enabled and
-        config.cache_compaction_ratio == null;
+fn liveWholeModelShouldStopOnEos(gpt_config: gpt_mod.Config, ignore_eos: bool, token_id: i32) bool {
+    return !ignore_eos and token_id >= 0 and gpt_config.isEosToken(@intCast(token_id));
 }
 
 fn runLiveWholeModelExecutorReuseProbe(
@@ -4105,7 +4113,7 @@ fn runLiveWholeModelExecutorReuseProbe(
     var processed: usize = 0;
     var output_accum: ?graph_mod.model_runtime.ModelOutput = null;
     errdefer if (output_accum) |*owned| owned.deinit(allocator);
-    const allow_swa_ring = liveWholeModelSupportsSplitSwaRing(gpt_config);
+    const allow_swa_ring = generation.metalSplitSwaRingEligible(gpt_config, .{}, kv_dtype);
     while (processed < prompt_ids.len) {
         const chunk_end = @min(prompt_ids.len, processed + @max(prefill_chunk_size, 1));
         if (output_accum) |*owned| owned.deinit(allocator);
@@ -4250,9 +4258,12 @@ fn tryRunLiveWholeModelExecutorGenerate(
     const use_greedy_decode = use_runtime_token_decode and runtime_caps.supports_greedy_decode and isPureGreedyConfig(config);
     const use_sample_decode = use_runtime_token_decode and runtime_caps.supports_sample_decode and !use_greedy_decode;
     const prefer_prefill_greedy_token = prefillGreedyTokenEnabled() and use_greedy_decode;
-    var prefill_chunk_size = if (config.prefill_chunk_size > 0) config.prefill_chunk_size else prompt_ids.len;
+    var prefill_chunk_size = if (config.prefill_chunk_size > 0)
+        config.prefill_chunk_size
+    else
+        runtime.tier.memory.generation_default_prefill_chunk_tokens;
     prefill_chunk_size = @max(@min(prefill_chunk_size, prompt_ids.len), 1);
-    const allow_swa_ring = liveWholeModelAllowsSplitSwaRing(gpt_config, config);
+    const allow_swa_ring = generation.metalSplitSwaRingEligible(gpt_config, config, kv_dtype);
     const prefill_started_at = std.Io.Timestamp.now(io, .awake);
     var output = blk: {
         var processed: usize = 0;
@@ -4332,7 +4343,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
         generated += 1;
         if (generated == 1) first_token_at = std.Io.Timestamp.now(io, .awake);
 
-        if (gpt_config.eos_token_id >= 0 and next_token_i32 == gpt_config.eos_token_id) {
+        if (liveWholeModelShouldStopOnEos(gpt_config, config.ignore_eos, next_token_i32)) {
             finish_reason = "stop";
             break;
         }
@@ -4778,11 +4789,11 @@ fn runOnnxWholeModelGraphGenerate(
     const created_backend_at = std.Io.Timestamp.now(io, .awake);
     defer cb.deinit();
 
-    const sliding_window_size = gpt_config.kvPoolSlidingWindowSize(kvSlidingTrimForced());
+    const sliding_window_size = gpt_config.kvPoolSlidingWindowSize(generation.kvSlidingTrimForced());
     const pool_id = try kv_manager.addPool(.{
         .backend = backend_kind,
         .dtype = kv_dtype,
-        .page_size_tokens = 16,
+        .page_size_tokens = runtime.tier.memory.generation_kv_page_size_tokens,
         .num_layers_packed = @intCast(gpt_config.num_hidden_layers),
         .num_kv_heads = gpt_config.maxKvHeads(),
         .head_dim = gpt_config.maxHeadDim(),
@@ -4791,7 +4802,7 @@ fn runOnnxWholeModelGraphGenerate(
     var kv_storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, .{
         .backend = backend_kind,
         .dtype = kv_dtype,
-        .page_size_tokens = 16,
+        .page_size_tokens = runtime.tier.memory.generation_kv_page_size_tokens,
         .num_layers_packed = @intCast(gpt_config.num_hidden_layers),
         .num_kv_heads = gpt_config.maxKvHeads(),
         .head_dim = gpt_config.maxHeadDim(),
@@ -5383,7 +5394,9 @@ fn parseArgs(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingSpeculativeK;
             opts.speculative_k = try std.fmt.parseInt(u32, args[i], 10);
-            if (opts.speculative_k == 0) return error.InvalidSpeculativeK;
+            if (opts.speculative_k == 0 or opts.speculative_k > runtime.tier.memory.generation_max_speculative_k) {
+                return error.InvalidSpeculativeK;
+            }
         } else if (std.mem.eql(u8, arg, "--speculation-policy")) {
             i += 1;
             if (i >= args.len) return error.InvalidArguments;
@@ -6060,4 +6073,18 @@ test "explicit compiled whole model does not route through live executor" {
         .compiled_target = .whole_model,
     };
     try std.testing.expect(!liveWholeModelExecutorRequested(&opts));
+}
+
+test "live whole-model generation honors all EOS tokens and ignore EOS" {
+    var gpt_config = gpt_mod.Config{
+        .eos_token_id = 7,
+        .extra_eos_token_ids_len = 1,
+    };
+    gpt_config.extra_eos_token_ids[0] = 9;
+
+    try std.testing.expect(liveWholeModelShouldStopOnEos(gpt_config, false, 7));
+    try std.testing.expect(liveWholeModelShouldStopOnEos(gpt_config, false, 9));
+    try std.testing.expect(!liveWholeModelShouldStopOnEos(gpt_config, false, 4));
+    try std.testing.expect(!liveWholeModelShouldStopOnEos(gpt_config, true, 7));
+    try std.testing.expect(!liveWholeModelShouldStopOnEos(gpt_config, false, -1));
 }

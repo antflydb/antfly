@@ -19205,11 +19205,6 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     fn decodeLayerRopeTheta(layer: *const ops.DecoderRuntimeLayerSpec) f32 {
-        if (layer.rope_dim > 0 and layer.rope_active_dim > 0 and layer.rope_active_dim < layer.rope_dim) {
-            const freq_dim: f32 = @floatFromInt(layer.rope_dim);
-            const active_dim: f32 = @floatFromInt(layer.rope_active_dim);
-            return std.math.pow(f32, layer.rope_theta, active_dim / freq_dim);
-        }
         return layer.rope_theta;
     }
 
@@ -30057,4 +30052,12 @@ test "metal_compute: primitive tanh saturates large finite inputs" {
         try std.testing.expect(std.math.isFinite(actual_value));
         try std.testing.expectApproxEqAbs(expected_value, actual_value, 1e-5);
     }
+}
+
+test "metal decoder runtime consumes effective RoPE theta once" {
+    var layer = std.mem.zeroes(ops.DecoderRuntimeLayerSpec);
+    layer.rope_dim = 512;
+    layer.rope_active_dim = 128;
+    layer.rope_theta = std.math.pow(f32, 1_000_000.0, 0.25);
+    try std.testing.expectApproxEqAbs(layer.rope_theta, MetalCompute.decodeLayerRopeTheta(&layer), 1e-6);
 }

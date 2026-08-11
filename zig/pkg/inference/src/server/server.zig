@@ -79,6 +79,15 @@ const pjrt_lib = if (build_options.enable_pjrt) @import("pjrt") else struct {
 pub const metrics_mod = @import("metrics.zig");
 const request_queue_mod = @import("request_queue.zig");
 
+fn requestedSpeculativeK(value: ?i64, draft_requested: bool) !u32 {
+    if (!draft_requested) return 4;
+    const candidate = value orelse 4;
+    if (candidate < 1 or candidate > runtime.tier.memory.generation_max_speculative_k) {
+        return error.InvalidSpeculativeK;
+    }
+    return @intCast(candidate);
+}
+
 fn spinLock(mutex: *std.atomic.Mutex) void {
     while (!mutex.tryLock()) std.atomic.spinLoopHint();
 }
@@ -379,10 +388,6 @@ fn singleBackendPreference(backend: backends_mod.BackendType) []const backends_m
 /// Global node pointer for operational handlers.
 var active_node: ?*Node = null;
 var active_models_dir: ?[]const u8 = null;
-
-fn generationKvSlidingTrimForced() bool {
-    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_KV_SLIDING_TRIM", false);
-}
 
 fn embedTimingEnabled() bool {
     return platform.env.getenvBoolDefault("TERMITE_EMBED_TIMING", false);
@@ -1883,7 +1888,12 @@ pub const Node = struct {
             try generation.formatMessages(allocator, messages);
         defer allocator.free(prompt);
 
-        const media_allowance = generation.nativeGenerationMediaTokenAllowance(messages, gpt_config);
+        const media_allowance = try generation.nativeGenerationMediaTokenAllowanceForModelDir(
+            allocator,
+            messages,
+            gpt_config,
+            model.model_dir,
+        );
         const prompt_token_limit = try generation.nativeGenerationPromptTokenLimit(
             gpt_config,
             null,
@@ -1999,7 +2009,7 @@ pub const Node = struct {
         };
         defer cb.deinit();
 
-        const kv_pool_config = generation.kvPoolConfig(backend_kind, kv_dtype, gpt_config, generationKvSlidingTrimForced());
+        const kv_pool_config = generation.kvPoolConfig(backend_kind, kv_dtype, gpt_config, generation.kvSlidingTrimForced());
         const pool_id = try kv_manager.addPool(kv_pool_config);
         var kv_storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, kv_pool_config);
         defer kv_storage.deinit();
@@ -2035,7 +2045,10 @@ pub const Node = struct {
         const debug_metal_timing = timing != null and use_metal_whole_model and platform.env.getenvBool("TERMITE_DEBUG_METAL_TIMING");
         if (debug_metal_timing) graph_mod.metal_executor.resetTimingStats();
         const setup_at_ns = embedTimingNowNs();
-        var result = try pipeline.generate(messages, .{ .max_tokens = max_tokens, .prefill_chunk_size = 256 });
+        var result = try pipeline.generate(messages, .{
+            .max_tokens = max_tokens,
+            .prefill_chunk_size = runtime.tier.memory.generation_default_prefill_chunk_tokens,
+        });
         const generated_at_ns = embedTimingNowNs();
         defer result.deinit();
         if (debug_metal_timing) {
@@ -2765,7 +2778,12 @@ pub const Node = struct {
         else
             try generation.formatMessages(allocator, messages);
         defer allocator.free(prompt);
-        const media_allowance = generation.nativeGenerationMediaTokenAllowance(messages, gpt_config);
+        const media_allowance = try generation.nativeGenerationMediaTokenAllowanceForModelDir(
+            allocator,
+            messages,
+            gpt_config,
+            model.model_dir,
+        );
         const prompt_token_limit = try generation.nativeGenerationPromptTokenLimit(
             gpt_config,
             null,
@@ -3467,6 +3485,13 @@ pub const Node = struct {
         else
             false;
         const effective_draft_model_name: ?[]const u8 = if (same_named_draft_model) null else body.draft_model;
+        const requested_speculative_k = requestedSpeculativeK(
+            body.speculative_k,
+            effective_draft_model_name != null,
+        ) catch return ctx.status(400).json(.{
+            .@"error" = "INVALID_REQUEST",
+            .message = "speculative_k must be between 1 and 16",
+        });
 
         const want_stream = body.stream orelse false;
         // Caching requires an explicit non-empty key: keyless requests would all
@@ -3489,12 +3514,9 @@ pub const Node = struct {
             .repetition_penalty = body.repetition_penalty orelse 1.0,
             .frequency_penalty = body.frequency_penalty orelse 0,
             .presence_penalty = body.presence_penalty orelse 0,
-            .speculative_k = if (effective_draft_model_name != null)
-                if (body.speculative_k) |k| @intCast(@max(k, 1)) else 4
-            else
-                4,
+            .speculative_k = requested_speculative_k,
             .speculation_requested = effective_draft_model_name != null,
-            .prefill_chunk_size = 256,
+            .prefill_chunk_size = runtime.tier.memory.generation_default_prefill_chunk_tokens,
             .cache_dtype = body.cache_dtype,
             .cache_compaction_ratio = body.cache_compaction_ratio,
             .prompt_cache_enabled = self.config.prompt_cache.enabled and (body.prompt_cache orelse true) and prompt_cache_key != null and !want_stream,
@@ -3834,14 +3856,49 @@ pub const Node = struct {
                 return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid cache_dtype value" })
         else
             session_factory.recommendedKvDTypeForSession(model.session, backend_kind);
-        const admission_prefill_chunk = if (config.prefill_chunk_size > 0) config.prefill_chunk_size else 256;
-        const resource_estimate = runtime.tier.memory.estimateGptGeneration(
+        const admission_prefill_chunk = if (config.prefill_chunk_size > 0)
+            config.prefill_chunk_size
+        else
+            runtime.tier.memory.generation_default_prefill_chunk_tokens;
+        const metal_executor_supported = graph_mod.metal_executor.supportsSession(model.session);
+        const deepseek_compressed_cache = generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config);
+        const auto_metal_whole_model = shouldAutoUseMetalWholeModelGenerate(
+            model.session.backend(),
+            metal_executor_supported,
+            deepseek_compressed_cache,
+            backend_selection,
+        );
+        const effective_compiled_partition_backend: ?ops.BackendKind = if (auto_metal_whole_model)
+            .metal
+        else
+            backend_selection.compiled_partition_backend;
+        const effective_compiled_attachment_target: graph_mod.compiled_backend.AttachmentTarget = if (auto_metal_whole_model)
+            .whole_model
+        else
+            backend_selection.compiled_attachment_target;
+        const graph_mode = backend_selection.graph_mode_requested or
+            effective_compiled_partition_backend != null or
+            graphModeEnabled();
+        const use_model_graph_cache = graph_mode and
+            build_options.enable_metal and
+            model.session.backend() == .metal and
+            effective_compiled_partition_backend == .metal and
+            effective_compiled_attachment_target == .whole_model and
+            metal_executor_supported and
+            !deepseek_compressed_cache;
+        const kv_capacity_policy: runtime.tier.memory.GenerationKvCapacityPolicy = if (use_model_graph_cache and
+            generation.metalSplitSwaRingEligible(gpt_config, config, kv_dtype))
+            .split_swa_ring
+        else
+            .full_history;
+        const resource_estimate = runtime.tier.memory.estimateGptGenerationForKvPolicy(
             backend_kind,
             kv_dtype,
             gpt_config,
             prompt_tokens,
             @intCast(@max(config.max_tokens, 1)),
             admission_prefill_chunk,
+            kv_capacity_policy,
         ) catch |err| switch (err) {
             error.InvalidModelConfig => return ctx.status(400).json(.{
                 .@"error" = "INVALID_MODEL",
@@ -3938,6 +3995,16 @@ pub const Node = struct {
                         draft_model.session,
                         actual_draft_backend,
                     );
+                    generation.validateNativeGenerationPromptTokenCount(
+                        prompt_tokens,
+                        gpt_config,
+                        draft_cfg,
+                        @intCast(@max(config.max_tokens, 1)),
+                        if (config.speculative_k > 0) 1 else 0,
+                    ) catch return ctx.status(400).json(.{
+                        .@"error" = "INVALID_REQUEST",
+                        .message = "prompt exceeds the draft model context window after reserving output tokens",
+                    });
                     draft_resource_estimate = runtime.tier.memory.estimateGptGeneration(
                         actual_draft_backend,
                         actual_draft_kv_dtype,
@@ -4066,7 +4133,7 @@ pub const Node = struct {
             return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
         };
         defer cb.deinit();
-        const pool_config = generation.kvPoolConfig(backend_kind, kv_dtype, gpt_config, generationKvSlidingTrimForced());
+        const pool_config = generation.kvPoolConfig(backend_kind, kv_dtype, gpt_config, generation.kvSlidingTrimForced());
 
         var prompt_cache: ?*runtime.kv.prompt_cache.PromptPrefixCache = null;
         var active_kv_manager: *runtime.kv.manager.KvManager = &kv_manager;
@@ -4149,7 +4216,7 @@ pub const Node = struct {
                     draft_backend_kind.?,
                     draft_kv_dtype.?,
                     draft_cfg,
-                    generationKvSlidingTrimForced(),
+                    generation.kvSlidingTrimForced(),
                 );
                 const draft_pool_id = draft_kv_manager.?.addPool(draft_pool_config) catch |err|
                     return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
@@ -4157,32 +4224,7 @@ pub const Node = struct {
             }
         }
 
-        const auto_metal_whole_model = shouldAutoUseMetalWholeModelGenerate(
-            model.session.backend(),
-            graph_mod.metal_executor.supportsSession(model.session),
-            generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config),
-            backend_selection,
-        );
-        const effective_compiled_partition_backend: ?ops.BackendKind = if (auto_metal_whole_model)
-            .metal
-        else
-            backend_selection.compiled_partition_backend;
-        const effective_compiled_attachment_target: graph_mod.compiled_backend.AttachmentTarget = if (auto_metal_whole_model)
-            .whole_model
-        else
-            backend_selection.compiled_attachment_target;
-
-        const graph_mode = backend_selection.graph_mode_requested or
-            effective_compiled_partition_backend != null or
-            graphModeEnabled();
         const use_scheduler = !graph_mode;
-        const use_model_graph_cache = graph_mode and
-            build_options.enable_metal and
-            model.session.backend() == .metal and
-            effective_compiled_partition_backend == .metal and
-            effective_compiled_attachment_target == .whole_model and
-            graph_mod.metal_executor.supportsSession(model.session) and
-            !generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config);
         var request_graph_cache: ?graph_mod.cache.GraphCache = if (graph_mode and !use_model_graph_cache)
             graph_mod.cache.GraphCache.init(ctx.allocator)
         else
@@ -4466,7 +4508,7 @@ pub const Node = struct {
             .presence_penalty = body.presence_penalty orelse 0,
             .speculative_k = 4,
             .speculation_requested = false,
-            .prefill_chunk_size = 256,
+            .prefill_chunk_size = runtime.tier.memory.generation_default_prefill_chunk_tokens,
             .cache_dtype = body.cache_dtype,
             .cache_compaction_ratio = body.cache_compaction_ratio,
         };
@@ -4938,7 +4980,10 @@ pub const Node = struct {
                 var runnable_count: usize = 0;
                 for (group_indices.items, 0..) |idx, pos| {
                     if (!pending[idx]) continue;
-                    const admission_prefill_chunk = if (configs[pos].prefill_chunk_size > 0) configs[pos].prefill_chunk_size else 256;
+                    const admission_prefill_chunk = if (configs[pos].prefill_chunk_size > 0)
+                        configs[pos].prefill_chunk_size
+                    else
+                        runtime.tier.memory.generation_default_prefill_chunk_tokens;
                     const resource_estimate = runtime.tier.memory.estimateGptGeneration(
                         backend_kind,
                         kv_dtype,
@@ -5010,7 +5055,7 @@ pub const Node = struct {
 
                 var kv_manager = runtime.kv.manager.KvManager.init(ctx.allocator);
                 defer kv_manager.deinit();
-                const kv_pool_config = generation.kvPoolConfig(backend_kind, kv_dtype, gpt_config, generationKvSlidingTrimForced());
+                const kv_pool_config = generation.kvPoolConfig(backend_kind, kv_dtype, gpt_config, generation.kvSlidingTrimForced());
                 const pool_id = kv_manager.addPool(kv_pool_config) catch |err| {
                     for (group_indices.items) |idx| {
                         if (!pending[idx]) continue;
@@ -5137,7 +5182,14 @@ pub const Node = struct {
                         };
                         configs[pos].prefill_chunk_size = lease.prefill_chunk_size;
                         break :blk lease;
-                    } else .{ .request_id = 0, .reserved_units = 0, .prompt_bytes = 0, .max_tokens = 0, .prefill_chunk_size = 256, .active_requests_snapshot = 0 };
+                    } else .{
+                        .request_id = 0,
+                        .reserved_units = 0,
+                        .prompt_bytes = 0,
+                        .max_tokens = 0,
+                        .prefill_chunk_size = runtime.tier.memory.generation_default_prefill_chunk_tokens,
+                        .active_requests_snapshot = 0,
+                    };
                     tasks[pos] = .{
                         .allocator = task_alloc,
                         .pipeline = .{
@@ -8791,6 +8843,20 @@ test "read batch downloaded byte accounting enforces aggregate cap" {
     };
     try std.testing.expectEqual(@as(usize, 14), try addReadBatchDownloadedBytes(0, item, 14));
     try std.testing.expectError(error.ReadBatchTooLarge, addReadBatchDownloadedBytes(10, item, 14));
+}
+
+test "generate speculative width is bounded at the HTTP boundary" {
+    try std.testing.expectEqual(@as(u32, 4), try requestedSpeculativeK(null, true));
+    try std.testing.expectEqual(
+        runtime.tier.memory.generation_max_speculative_k,
+        try requestedSpeculativeK(runtime.tier.memory.generation_max_speculative_k, true),
+    );
+    try std.testing.expectError(error.InvalidSpeculativeK, requestedSpeculativeK(0, true));
+    try std.testing.expectError(
+        error.InvalidSpeculativeK,
+        requestedSpeculativeK(runtime.tier.memory.generation_max_speculative_k + 1, true),
+    );
+    try std.testing.expectEqual(@as(u32, 4), try requestedSpeculativeK(std.math.maxInt(i64), false));
 }
 
 test "read max tokens preserves omission and rejects unsafe signed values" {
