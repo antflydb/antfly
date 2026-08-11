@@ -18,6 +18,8 @@
 
 const error_abi = @import("../runtime_error_abi.zig");
 const http_abi = @import("../runtime_http_abi.zig");
+pub const memory_abi = @import("../runtime_memory_abi.zig");
+pub const native_abi = @import("../runtime_native_abi.zig");
 
 pub const Status = error_abi.Status;
 pub const StatusCode = error_abi.Code;
@@ -28,21 +30,27 @@ pub const errorFromStatus = error_abi.errorFromStatus;
 
 pub const CreateContext = extern struct {
     abi_version: u32,
-    owner_alloc: *const anyopaque,
+    owner_alloc: *const memory_abi.Allocator,
     cfg: *const anyopaque,
+    cfg_contract: native_abi.TypeContract,
     source: *const anyopaque,
+    source_contract: native_abi.TypeContract,
     table_reads: *const anyopaque,
+    table_reads_contract: native_abi.TypeContract,
     table_writes: *const anyopaque,
+    table_writes_contract: native_abi.TypeContract,
     fallible: bool,
     out_handle: *?*anyopaque,
-    out_request_alloc: *anyopaque,
+    out_request_alloc: *?*const memory_abi.Allocator,
 };
 
 pub const CallContext = extern struct {
     abi_version: u32,
     handle: *anyopaque,
     input: ?*const anyopaque = null,
+    input_contract: native_abi.TypeContract = .of(void),
     output: ?*anyopaque = null,
+    output_contract: native_abi.TypeContract = .of(void),
 };
 
 pub const HandlerCreateContext = extern struct {
@@ -90,3 +98,12 @@ pub const HandlerStats = extern struct {
     peer_observer_failures_total: u64,
     active_peer_observers: usize,
 };
+
+test "API kernel control contexts retain C layout" {
+    const std = @import("std");
+    try std.testing.expectEqual(.@"extern", @typeInfo(CreateContext).@"struct".layout);
+    try std.testing.expectEqual(.@"extern", @typeInfo(CallContext).@"struct".layout);
+    try std.testing.expectEqual(.@"extern", @typeInfo(HandlerCreateContext).@"struct".layout);
+    try std.testing.expectEqual(.@"extern", @typeInfo(native_abi.TypeContract).@"struct".layout);
+    try std.testing.expectEqual(.@"extern", @typeInfo(memory_abi.Allocator).@"struct".layout);
+}

@@ -35,6 +35,7 @@ pub const HandlerCreateContext = abi.HandlerCreateContext;
 const ServerState = struct {
     owner_alloc: std.mem.Allocator,
     server: server_mod.ApiHttpServer,
+    request_alloc_abi: abi.memory_abi.Allocator,
 };
 
 const HandlerState = struct {
@@ -64,6 +65,36 @@ fn validateVersion(version: u32) ?abi.Status {
     return fail(error.UnsupportedVersion);
 }
 
+fn validateNativeValue(
+    comptime T: type,
+    pointer: ?*const anyopaque,
+    contract: abi.native_abi.TypeContract,
+) ?abi.Status {
+    if (T == void) {
+        if (pointer != null or !contract.matches(.of(void)))
+            return fail(error.InvalidArgument);
+        return null;
+    }
+    if (pointer == null or !contract.matches(.of(T)))
+        return fail(error.InvalidArgument);
+    return null;
+}
+
+fn validateNativeOutput(
+    comptime T: type,
+    pointer: ?*anyopaque,
+    contract: abi.native_abi.TypeContract,
+) ?abi.Status {
+    return validateNativeValue(T, pointer, contract);
+}
+
+fn validateCall(comptime Input: type, comptime Output: type, context: *const CallContext) ?abi.Status {
+    if (validateVersion(context.abi_version)) |failure| return failure;
+    if (validateNativeValue(Input, context.input, context.input_contract)) |failure| return failure;
+    if (validateNativeOutput(Output, context.output, context.output_contract)) |failure| return failure;
+    return null;
+}
+
 fn serverState(context: *const CallContext) *ServerState {
     return @ptrCast(@alignCast(context.handle));
 }
@@ -78,12 +109,18 @@ fn output(comptime T: type, context: *const CallContext) *T {
 
 pub fn create(context: *const CreateContext) callconv(.c) abi.Status {
     if (validateVersion(context.abi_version)) |failure| return failure;
-    const owner_alloc_ptr: *const std.mem.Allocator = @ptrCast(@alignCast(context.owner_alloc));
+    if (context.owner_alloc.version != abi.memory_abi.Allocator.abi_version)
+        return fail(error.UnsupportedVersion);
+    if (!context.cfg_contract.matches(.of(server_mod.ApiHttpServerConfig)) or
+        !context.source_contract.matches(.of(server_mod.StatusSource)) or
+        !context.table_reads_contract.matches(.of(?table_reads.TableReadSource)) or
+        !context.table_writes_contract.matches(.of(?table_writes.TableWriteSource)))
+        return fail(error.InvalidArgument);
     const cfg: *const server_mod.ApiHttpServerConfig = @ptrCast(@alignCast(context.cfg));
     const source: *const server_mod.StatusSource = @ptrCast(@alignCast(context.source));
     const reads: *const ?table_reads.TableReadSource = @ptrCast(@alignCast(context.table_reads));
     const writes: *const ?table_writes.TableWriteSource = @ptrCast(@alignCast(context.table_writes));
-    const owner_alloc = owner_alloc_ptr.*;
+    const owner_alloc = context.owner_alloc.asStd();
     const state = owner_alloc.create(ServerState) catch |err| {
         std.log.err("API kernel create failed allocating state: error.{s}", .{@errorName(err)});
         return fail(err);
@@ -99,10 +136,11 @@ pub fn create(context: *const CreateContext) callconv(.c) abi.Status {
             }
         else
             server_mod.ApiHttpServer.initWithProcessRequestAllocator(owner_alloc, cfg.*, source.*, reads.*, writes.*),
+        .request_alloc_abi = undefined,
     };
+    state.request_alloc_abi = .fromStd(&state.server.alloc);
     context.out_handle.* = state;
-    const out_alloc: *std.mem.Allocator = @ptrCast(@alignCast(context.out_request_alloc));
-    out_alloc.* = state.server.alloc;
+    context.out_request_alloc.* = &state.request_alloc_abi;
     return .ok;
 }
 
@@ -114,37 +152,37 @@ pub fn destroy(opaque_handle: *anyopaque) callconv(.c) void {
 }
 
 pub fn requestStats(context: *const CallContext) callconv(.c) abi.Status {
-    if (validateVersion(context.abi_version)) |failure| return failure;
+    if (validateCall(void, server_mod.ApiHttpServer.RequestStats, context)) |failure| return failure;
     output(server_mod.ApiHttpServer.RequestStats, context).* = serverState(context).server.requestStats();
     return .ok;
 }
 
 pub fn setProvider(context: *const CallContext) callconv(.c) abi.Status {
-    if (validateVersion(context.abi_version)) |failure| return failure;
+    if (validateCall(?managed_embedder.AntflyProvider, void, context)) |failure| return failure;
     serverState(context).server.antfly_provider = input(?managed_embedder.AntflyProvider, context).*;
     return .ok;
 }
 
 pub fn setHAExecutor(context: *const CallContext) callconv(.c) abi.Status {
-    if (validateVersion(context.abi_version)) |failure| return failure;
+    if (validateCall(?http_common.RequestExecutor, void, context)) |failure| return failure;
     serverState(context).server.setHAInternalExecutor(input(?http_common.RequestExecutor, context).*);
     return .ok;
 }
 
 pub fn executor(context: *const CallContext) callconv(.c) abi.Status {
-    if (validateVersion(context.abi_version)) |failure| return failure;
+    if (validateCall(void, http_common.RequestExecutor, context)) |failure| return failure;
     output(http_common.RequestExecutor, context).* = serverState(context).server.executor();
     return .ok;
 }
 
 pub fn streamingExecutor(context: *const CallContext) callconv(.c) abi.Status {
-    if (validateVersion(context.abi_version)) |failure| return failure;
+    if (validateCall(void, http_common.StreamingRequestExecutor, context)) |failure| return failure;
     output(http_common.StreamingRequestExecutor, context).* = serverState(context).server.streamingExecutor();
     return .ok;
 }
 
 pub fn attachRuntimeRestoreStore(context: *const CallContext) callconv(.c) abi.Status {
-    if (validateVersion(context.abi_version)) |failure| return failure;
+    if (validateCall(backend_erased.Store, void, context)) |failure| return failure;
     serverState(context).server.attachRestoreJobRuntimeStore(@constCast(input(backend_erased.Store, context))) catch |err|
         return fail(err);
     return .ok;
@@ -165,44 +203,44 @@ pub fn attachReplicatedRestoreStore(
 }
 
 pub fn resumeRestoreJobs(context: *const CallContext) callconv(.c) abi.Status {
-    if (validateVersion(context.abi_version)) |failure| return failure;
+    if (validateCall(void, void, context)) |failure| return failure;
     serverState(context).server.resumeRestoreJobsOnce() catch |err| return fail(err);
     return .ok;
 }
 
 pub fn pollRestoreJobs(context: *const CallContext) callconv(.c) abi.Status {
-    if (validateVersion(context.abi_version)) |failure| return failure;
+    if (validateCall(void, void, context)) |failure| return failure;
     serverState(context).server.pollRestoreJobsOnce() catch |err| return fail(err);
     return .ok;
 }
 
 pub fn prepareRestoreLeadership(context: *const CallContext) callconv(.c) abi.Status {
-    if (validateVersion(context.abi_version)) |failure| return failure;
+    if (validateCall(u64, void, context)) |failure| return failure;
     serverState(context).server.prepareRestoreLeadership(input(u64, context).*) catch |err| return fail(err);
     return .ok;
 }
 
 pub fn scheduleSessionMaintenance(context: *const CallContext) callconv(.c) abi.Status {
-    if (validateVersion(context.abi_version)) |failure| return failure;
+    if (validateCall(void, void, context)) |failure| return failure;
     serverState(context).server.scheduleSessionMaintenance() catch |err| return fail(err);
     return .ok;
 }
 
 pub fn storageMaintenanceActive(context: *const CallContext) callconv(.c) abi.Status {
-    if (validateVersion(context.abi_version)) |failure| return failure;
+    if (validateCall(void, bool, context)) |failure| return failure;
     output(bool, context).* = serverState(context).server.storageMaintenanceExclusiveActive();
     return .ok;
 }
 
 pub fn handle(context: *const CallContext) callconv(.c) abi.Status {
-    if (validateVersion(context.abi_version)) |failure| return failure;
+    if (validateCall(http_common.HttpRequest, http_common.HttpResponse, context)) |failure| return failure;
     output(http_common.HttpResponse, context).* = serverState(context).server.handle(input(http_common.HttpRequest, context).*) catch |err|
         return fail(err);
     return .ok;
 }
 
 pub fn handleInternal(context: *const CallContext) callconv(.c) abi.Status {
-    if (validateVersion(context.abi_version)) |failure| return failure;
+    if (validateCall(http_common.HttpRequest, ?http_common.HttpResponse, context)) |failure| return failure;
     output(?http_common.HttpResponse, context).* = serverState(context).server.handleInternalRoute(input(http_common.HttpRequest, context).*) catch |err|
         return fail(err);
     return .ok;
@@ -225,7 +263,7 @@ fn handlerState(context: *const CallContext) *HandlerState {
 }
 
 pub fn handlerInit(context: *const CallContext) callconv(.c) abi.Status {
-    if (validateVersion(context.abi_version)) |failure| return failure;
+    if (validateCall(void, void, context)) |failure| return failure;
     const state = handlerState(context);
     state.handler.initRuntime(state.alloc) catch |err|
         return fail(err);
@@ -234,7 +272,7 @@ pub fn handlerInit(context: *const CallContext) callconv(.c) abi.Status {
 }
 
 pub fn handlerStats(context: *const CallContext) callconv(.c) abi.Status {
-    if (validateVersion(context.abi_version)) |failure| return failure;
+    if (validateCall(void, abi.HandlerStats, context)) |failure| return failure;
     const handler = &handlerState(context).handler;
     const query = handler.query_admission.stats();
     const query_body = handler.query_body_admission.stats();
@@ -257,7 +295,7 @@ pub fn handlerStats(context: *const CallContext) callconv(.c) abi.Status {
 }
 
 pub fn handlerRegisterRoutes(context: *const CallContext) callconv(.c) abi.Status {
-    if (validateVersion(context.abi_version)) |failure| return failure;
+    if (validateCall(httpx.Server, void, context)) |failure| return failure;
     const server: *httpx.Server = @constCast(input(httpx.Server, context));
     const state = handlerState(context);
     const handler = &state.handler;

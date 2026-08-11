@@ -19,6 +19,7 @@ class StorageTestShardAuditTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
+        self.manifest = self.root / "test_manifest.zig"
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -28,26 +29,50 @@ class StorageTestShardAuditTest(unittest.TestCase):
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_text(contents, encoding="utf-8")
 
-    def test_allows_test_modules_owned_by_a_shard(self):
+    def audit(self, filters):
+        return audit.audit_manifest(self.root, self.manifest, filters)
+
+    def test_accepts_authoritative_exactly_once_ownership(self):
         self.write("db/query/scan.zig", 'test "scan" {}\n')
+        self.write("test_manifest.zig", '_ = @import("db/query/scan.zig");\n')
+        self.assertEqual([], self.audit(["storage.db.query."]))
+
+    def test_rejects_unimported_test_under_an_owned_directory(self):
+        self.write("db/query/scan.zig", 'test "scan" {}\n')
+        self.write("test_manifest.zig", "")
+        self.assertEqual(
+            ["test source missing from manifest: db/query/scan.zig"],
+            self.audit(["storage.db.query."]),
+        )
+
+    def test_rejects_duplicate_manifest_import(self):
+        self.write("db/query/scan.zig", 'test "scan" {}\n')
+        self.write(
+            "test_manifest.zig",
+            '_ = @import("db/query/scan.zig");\n_ = @import("db/query/scan.zig");\n',
+        )
+        self.assertEqual(
+            ["manifest imports db/query/scan.zig 2 times"],
+            self.audit(["storage.db.query."]),
+        )
+
+    def test_rejects_multiple_shard_owners(self):
+        self.write("db/query/scan.zig", 'test "scan" {}\n')
+        self.write("test_manifest.zig", '_ = @import("db/query/scan.zig");\n')
+        self.assertEqual(
+            [
+                "test source has multiple shard owners: db/query/scan.zig "
+                "(storage.db., storage.db.query.)"
+            ],
+            self.audit(["storage.db.", "storage.db.query."]),
+        )
+
+    def test_rejects_stale_manifest_entry(self):
         self.write("db/query/helper.zig", "pub fn helper() void {}\n")
+        self.write("test_manifest.zig", '_ = @import("db/query/helper.zig");\n')
         self.assertEqual(
-            [],
-            audit.uncovered_modules(self.root, ["storage.db.query."]),
-        )
-
-    def test_reports_new_unowned_test_module(self):
-        self.write("new_backend.zig", 'test "round trip" {}\n')
-        self.assertEqual(
-            ["new_backend.zig (storage.new_backend.)"],
-            audit.uncovered_modules(self.root, ["storage.db."]),
-        )
-
-    def test_mod_file_accepts_directory_namespace(self):
-        self.write("lsm/mod.zig", 'test "manifest" {}\n')
-        self.assertEqual(
-            [],
-            audit.uncovered_modules(self.root, ["storage.lsm."]),
+            ["manifest entry has no test declarations: db/query/helper.zig"],
+            self.audit(["storage.db.query."]),
         )
 
 

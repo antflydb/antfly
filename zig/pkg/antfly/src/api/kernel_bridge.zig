@@ -34,6 +34,11 @@ const CallContext = abi.CallContext;
 const HandlerCreateContext = abi.HandlerCreateContext;
 const direct_codegen = builtin.is_test;
 
+const BoundaryAllocator = struct {
+    allocator: std.mem.Allocator,
+    abi_allocator: abi.memory_abi.Allocator,
+};
+
 extern fn antfly_api_kernel_create(context: *const CreateContext) callconv(.c) abi.Status;
 extern fn antfly_api_kernel_destroy(handle: *anyopaque) callconv(.c) void;
 extern fn antfly_api_kernel_request_stats(context: *const CallContext) callconv(.c) abi.Status;
@@ -70,6 +75,7 @@ pub const HttpxHandler = if (direct_codegen) handler_mod.AntflyApiHandler else O
 
 const OpaqueApiHttpServer = struct {
     opaque_handle: *anyopaque,
+    boundary_allocator: *BoundaryAllocator,
     alloc: std.mem.Allocator,
     cfg: server_mod.ApiHttpServerConfig,
 
@@ -97,40 +103,43 @@ const OpaqueApiHttpServer = struct {
     }
 
     pub fn deinit(self: *OpaqueApiHttpServer) void {
+        const boundary_allocator = self.boundary_allocator;
+        const allocator = boundary_allocator.allocator;
         antfly_api_kernel_destroy(self.opaque_handle);
+        allocator.destroy(boundary_allocator);
         self.* = undefined;
     }
 
     pub fn requestStats(self: *OpaqueApiHttpServer) RequestStats {
         var out: RequestStats = undefined;
-        callInfallible(antfly_api_kernel_request_stats, self.opaque_handle, null, &out);
+        callInfallible(void, RequestStats, antfly_api_kernel_request_stats, self.opaque_handle, null, &out);
         return out;
     }
 
     pub fn setAntflyProvider(self: *OpaqueApiHttpServer, provider: ?managed_embedder.AntflyProvider) void {
         var input = provider;
-        callInfallible(antfly_api_kernel_set_provider, self.opaque_handle, &input, null);
+        callInfallible(?managed_embedder.AntflyProvider, void, antfly_api_kernel_set_provider, self.opaque_handle, &input, null);
     }
 
     pub fn setHAInternalExecutor(self: *OpaqueApiHttpServer, executor_value: ?http_common.RequestExecutor) void {
         var input = executor_value;
-        callInfallible(antfly_api_kernel_set_ha_executor, self.opaque_handle, &input, null);
+        callInfallible(?http_common.RequestExecutor, void, antfly_api_kernel_set_ha_executor, self.opaque_handle, &input, null);
     }
 
     pub fn executor(self: *OpaqueApiHttpServer) http_common.RequestExecutor {
         var out: http_common.RequestExecutor = undefined;
-        callInfallible(antfly_api_kernel_executor, self.opaque_handle, null, &out);
+        callInfallible(void, http_common.RequestExecutor, antfly_api_kernel_executor, self.opaque_handle, null, &out);
         return out;
     }
 
     pub fn streamingExecutor(self: *OpaqueApiHttpServer) http_common.StreamingRequestExecutor {
         var out: http_common.StreamingRequestExecutor = undefined;
-        callInfallible(antfly_api_kernel_streaming_executor, self.opaque_handle, null, &out);
+        callInfallible(void, http_common.StreamingRequestExecutor, antfly_api_kernel_streaming_executor, self.opaque_handle, null, &out);
         return out;
     }
 
     pub fn attachRestoreJobRuntimeStore(self: *OpaqueApiHttpServer, store: *backend_erased.Store) !void {
-        try callFallible(antfly_api_kernel_attach_runtime_restore_store, self.opaque_handle, store, null);
+        try callFallible(backend_erased.Store, void, antfly_api_kernel_attach_runtime_restore_store, self.opaque_handle, store, null);
     }
 
     pub fn attachReplicatedRestoreJobStore(self: *OpaqueApiHttpServer, persistence: restore_jobs.ReplicatedPersistence) !void {
@@ -139,39 +148,39 @@ const OpaqueApiHttpServer = struct {
     }
 
     pub fn resumeRestoreJobsOnce(self: *OpaqueApiHttpServer) !void {
-        try callFallible(antfly_api_kernel_resume_restore_jobs, self.opaque_handle, null, null);
+        try callFallible(void, void, antfly_api_kernel_resume_restore_jobs, self.opaque_handle, null, null);
     }
 
     pub fn pollRestoreJobsOnce(self: *OpaqueApiHttpServer) !void {
-        try callFallible(antfly_api_kernel_poll_restore_jobs, self.opaque_handle, null, null);
+        try callFallible(void, void, antfly_api_kernel_poll_restore_jobs, self.opaque_handle, null, null);
     }
 
     pub fn prepareRestoreLeadership(self: *OpaqueApiHttpServer, term: u64) !void {
         var input = term;
-        try callFallible(antfly_api_kernel_prepare_restore_leadership, self.opaque_handle, &input, null);
+        try callFallible(u64, void, antfly_api_kernel_prepare_restore_leadership, self.opaque_handle, &input, null);
     }
 
     pub fn scheduleSessionMaintenance(self: *OpaqueApiHttpServer) !void {
-        try callFallible(antfly_api_kernel_schedule_session_maintenance, self.opaque_handle, null, null);
+        try callFallible(void, void, antfly_api_kernel_schedule_session_maintenance, self.opaque_handle, null, null);
     }
 
     pub fn storageMaintenanceExclusiveActive(self: *const OpaqueApiHttpServer) bool {
         var out = false;
-        callInfallible(antfly_api_kernel_storage_maintenance_active, self.opaque_handle, null, &out);
+        callInfallible(void, bool, antfly_api_kernel_storage_maintenance_active, self.opaque_handle, null, &out);
         return out;
     }
 
     pub fn handle(self: *OpaqueApiHttpServer, req: http_common.HttpRequest) !http_common.HttpResponse {
         var input = req;
         var out: http_common.HttpResponse = undefined;
-        try callFallible(antfly_api_kernel_handle, self.opaque_handle, &input, &out);
+        try callFallible(http_common.HttpRequest, http_common.HttpResponse, antfly_api_kernel_handle, self.opaque_handle, &input, &out);
         return out;
     }
 
     pub fn handleInternalRoute(self: *OpaqueApiHttpServer, req: http_common.HttpRequest) !?http_common.HttpResponse {
         var input = req;
         var out: ?http_common.HttpResponse = null;
-        try callFallible(antfly_api_kernel_handle_internal, self.opaque_handle, &input, &out);
+        try callFallible(http_common.HttpRequest, ?http_common.HttpResponse, antfly_api_kernel_handle_internal, self.opaque_handle, &input, &out);
         return out;
     }
 };
@@ -184,49 +193,72 @@ fn createOpaqueServer(
     write_source: ?table_writes.TableWriteSource,
     fallible: bool,
 ) !OpaqueApiHttpServer {
-    var alloc_copy = owner_alloc;
     var cfg_copy = cfg;
     var source_copy = source;
     var reads_copy = read_source;
     var writes_copy = write_source;
     var handle: ?*anyopaque = null;
-    var request_alloc: std.mem.Allocator = undefined;
+    var request_alloc_abi: ?*const abi.memory_abi.Allocator = null;
+    const boundary_allocator = try owner_alloc.create(BoundaryAllocator);
+    errdefer owner_alloc.destroy(boundary_allocator);
+    boundary_allocator.allocator = owner_alloc;
+    boundary_allocator.abi_allocator = .fromStd(&boundary_allocator.allocator);
     const status = antfly_api_kernel_create(&.{
         .abi_version = abi.abi_version,
-        .owner_alloc = &alloc_copy,
+        .owner_alloc = &boundary_allocator.abi_allocator,
         .cfg = &cfg_copy,
+        .cfg_contract = .of(server_mod.ApiHttpServerConfig),
         .source = &source_copy,
+        .source_contract = .of(server_mod.StatusSource),
         .table_reads = &reads_copy,
+        .table_reads_contract = .of(?table_reads.TableReadSource),
         .table_writes = &writes_copy,
+        .table_writes_contract = .of(?table_writes.TableWriteSource),
         .fallible = fallible,
         .out_handle = &handle,
-        .out_request_alloc = &request_alloc,
+        .out_request_alloc = &request_alloc_abi,
     });
     try callError(status);
-    return .{ .opaque_handle = handle orelse return error.ApiKernelOperationFailed, .alloc = request_alloc, .cfg = cfg };
+    const owned_handle = handle orelse return error.ApiKernelOperationFailed;
+    const owned_request_alloc = request_alloc_abi orelse {
+        antfly_api_kernel_destroy(owned_handle);
+        return error.ApiKernelOperationFailed;
+    };
+    return .{
+        .opaque_handle = owned_handle,
+        .boundary_allocator = boundary_allocator,
+        .alloc = owned_request_alloc.asStd(),
+        .cfg = cfg,
+    };
 }
 
 fn callFallible(
+    comptime Input: type,
+    comptime Output: type,
     comptime function: fn (*const CallContext) callconv(.c) abi.Status,
     handle: *anyopaque,
-    input: ?*const anyopaque,
-    output: ?*anyopaque,
+    input: ?*const Input,
+    output: ?*Output,
 ) !void {
     try callError(function(&.{
         .abi_version = abi.abi_version,
         .handle = handle,
         .input = input,
+        .input_contract = .of(Input),
         .output = output,
+        .output_contract = .of(Output),
     }));
 }
 
 fn callInfallible(
+    comptime Input: type,
+    comptime Output: type,
     comptime function: fn (*const CallContext) callconv(.c) abi.Status,
     handle: *anyopaque,
-    input: ?*const anyopaque,
-    output: ?*anyopaque,
+    input: ?*const Input,
+    output: ?*Output,
 ) void {
-    callFallible(function, handle, input, output) catch @panic("infallible API kernel call failed");
+    callFallible(Input, Output, function, handle, input, output) catch @panic("infallible API kernel call failed");
 }
 
 pub const HandlerStats = abi.HandlerStats;
@@ -236,17 +268,17 @@ const OpaqueHttpxHandler = struct {
 
     pub fn initRuntime(self: *OpaqueHttpxHandler, alloc: std.mem.Allocator) !void {
         _ = alloc;
-        try callFallible(antfly_api_kernel_handler_init, self.handle, null, null);
+        try callFallible(void, void, antfly_api_kernel_handler_init, self.handle, null, null);
     }
 
     pub fn stats(self: *const OpaqueHttpxHandler) HandlerStats {
         var out: HandlerStats = undefined;
-        callInfallible(antfly_api_kernel_handler_stats, self.handle, null, &out);
+        callInfallible(void, HandlerStats, antfly_api_kernel_handler_stats, self.handle, null, &out);
         return out;
     }
 
     pub fn registerRoutes(self: *OpaqueHttpxHandler, server: *httpx.Server) !void {
-        try callFallible(antfly_api_kernel_handler_register_routes, self.handle, server, null);
+        try callFallible(httpx.Server, void, antfly_api_kernel_handler_register_routes, self.handle, server, null);
     }
 
     pub fn deinit(self: *OpaqueHttpxHandler) void {

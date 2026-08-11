@@ -6912,6 +6912,8 @@ pub fn build(b: *std.Build) void {
     unit_storage_shard_audit.addFileArg(b.path("tools/audit_storage_test_shards.py"));
     unit_storage_shard_audit.addArg("--root");
     unit_storage_shard_audit.addDirectoryArg(b.path("pkg/antfly/src/storage"));
+    unit_storage_shard_audit.addArg("--manifest");
+    unit_storage_shard_audit.addFileArg(b.path("pkg/antfly/src/storage/test_manifest.zig"));
     for (unit_storage_shard_filters) |shard_filters| {
         for (shard_filters) |shard_filter| {
             unit_storage_shard_audit.addArgs(&.{ "--filter", shard_filter });

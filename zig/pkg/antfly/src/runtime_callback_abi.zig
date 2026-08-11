@@ -1,17 +1,20 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
 
-//! Uniform callback trampoline for independently generated runtime archives.
-//! Domain vtables may keep idiomatic Zig signatures inside their owning unit;
-//! callers cross the unit boundary through one C-callable dispatcher that
-//! returns a stable Status and writes successful values through an output
-//! pointer.
+//! Checked native callback trampoline for hidden static runtime archives.
+//!
+//! The data plane deliberately remains zero-copy and native because all units
+//! are compiled and statically linked by one Zig invocation. Every foreign call
+//! carries a versioned method/signature/layout contract; the owning unit checks
+//! it before interpreting a pointer. Errors use the language-neutral status
+//! ABI, and allocator ownership uses runtime_memory_abi at explicit owner ABIs.
 
 const std = @import("std");
 const error_abi = @import("runtime_error_abi.zig");
+const native_abi = @import("runtime_native_abi.zig");
 
 pub const CallbackDispatch = *const fn (
-    field_index: u16,
+    contract: *const native_abi.CallContract,
     callback: *const anyopaque,
     args: *const anyopaque,
     output: ?*anyopaque,
@@ -29,6 +32,10 @@ fn BoundaryImpl(comptime VTable: type) type {
 
         pub const local_dispatch: Dispatch = &dispatchLocal;
 
+        comptime {
+            native_abi.assertUniqueMethodIds(VTable);
+        }
+
         pub fn call(
             comptime field_name: []const u8,
             dispatch: Dispatch,
@@ -39,7 +46,7 @@ fn BoundaryImpl(comptime VTable: type) type {
             const Function = functionType(Callback);
             const Args = std.meta.ArgsTuple(Function);
             const Payload = payloadType(Callback);
-            const field_index = std.meta.fieldIndex(VTable, field_name) orelse
+            _ = std.meta.fieldIndex(VTable, field_name) orelse
                 @compileError("unknown boundary vtable field: " ++ field_name);
             var typed_args: Args = args;
 
@@ -50,8 +57,9 @@ fn BoundaryImpl(comptime VTable: type) type {
                 return @call(.auto, callback, typed_args);
 
             if (Payload == void) {
+                const contract = native_abi.CallContract.of(field_name, Callback, Args, Payload);
                 const status = dispatch(
-                    @intCast(field_index),
+                    &contract,
                     @ptrCast(callback),
                     @ptrCast(&typed_args),
                     null,
@@ -61,8 +69,9 @@ fn BoundaryImpl(comptime VTable: type) type {
             }
 
             var output: Payload = undefined;
+            const contract = native_abi.CallContract.of(field_name, Callback, Args, Payload);
             const status = dispatch(
-                @intCast(field_index),
+                &contract,
                 @ptrCast(callback),
                 @ptrCast(&typed_args),
                 @ptrCast(&output),
@@ -76,15 +85,25 @@ fn BoundaryImpl(comptime VTable: type) type {
         }
 
         fn dispatchLocal(
-            field_index: u16,
+            contract: *const native_abi.CallContract,
             callback: *const anyopaque,
             args: *const anyopaque,
             output: ?*anyopaque,
         ) callconv(.c) error_abi.Status {
-            inline for (std.meta.fields(VTable), 0..) |field, index| {
-                if (field_index == index) {
-                    if (comptime isCallbackField(field.type))
+            if (contract.version != native_abi.abi_version)
+                return error_abi.statusFromError(error.UnsupportedVersion);
+            inline for (std.meta.fields(VTable)) |field| {
+                if (contract.method_id == native_abi.stableId(field.name)) {
+                    if (comptime isCallbackField(field.type)) {
+                        const Callback = callbackType(field.type);
+                        const Function = functionType(Callback);
+                        const Args = std.meta.ArgsTuple(Function);
+                        const Payload = payloadType(Callback);
+                        const expected = native_abi.CallContract.of(field.name, Callback, Args, Payload);
+                        if (!contract.matches(expected))
+                            return error_abi.statusFromError(error.InvalidArgument);
                         return invoke(field.type, callback, args, output);
+                    }
                     return error_abi.statusFromError(error.InvalidArgument);
                 }
             }
@@ -183,12 +202,23 @@ test "boundary dispatcher preserves local calls and maps cross-unit calls" {
         }
 
         fn foreignDispatch(
-            field_index: u16,
+            contract: *const native_abi.CallContract,
             callback: *const anyopaque,
             args: *const anyopaque,
             output: ?*anyopaque,
         ) callconv(.c) error_abi.Status {
-            return TestBoundary.local_dispatch(field_index, callback, args, output);
+            return TestBoundary.local_dispatch(contract, callback, args, output);
+        }
+
+        fn rejectingDispatch(
+            contract: *const native_abi.CallContract,
+            callback: *const anyopaque,
+            args: *const anyopaque,
+            output: ?*anyopaque,
+        ) callconv(.c) error_abi.Status {
+            var incompatible = contract.*;
+            incompatible.arguments.size += 1;
+            return TestBoundary.local_dispatch(&incompatible, callback, args, output);
         }
     };
 
@@ -208,5 +238,9 @@ test "boundary dispatcher preserves local calls and maps cross-unit calls" {
     try std.testing.expectError(
         error.RuntimeBoundaryFailure,
         TestBoundary.call("fail", &callbacks.foreignDispatch, &callbacks.privateFail, .{&base}),
+    );
+    try std.testing.expectError(
+        error.InvalidArgument,
+        TestBoundary.call("value", &callbacks.rejectingDispatch, &callbacks.value, .{ &base, 2 }),
     );
 }

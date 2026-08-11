@@ -161,12 +161,12 @@ pub const AntflyProvider = struct {
 const AntflyProviderBoundary = runtime_callback_abi.Boundary(AntflyProvider);
 
 fn antflyProviderBoundaryDispatch(
-    field_index: u16,
+    contract: *const @import("../runtime_native_abi.zig").CallContract,
     callback: *const anyopaque,
     args: *const anyopaque,
     output: ?*anyopaque,
 ) callconv(.c) runtime_error_abi.Status {
-    return AntflyProviderBoundary.local_dispatch(field_index, callback, args, output);
+    return AntflyProviderBoundary.local_dispatch(contract, callback, args, output);
 }
 
 pub const InitOptions = struct {
