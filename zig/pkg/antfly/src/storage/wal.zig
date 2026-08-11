@@ -807,6 +807,14 @@ pub const WAL = struct {
         return self.next_lsn - 1;
     }
 
+    /// Thread-safe snapshot for compiled owners whose callers cannot borrow
+    /// the in-process WAL fields directly.
+    pub fn lastLsnSnapshot(self: *WAL) u64 {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        return self.lastLsn();
+    }
+
     fn enqueueAppendRequestLocked(self: *WAL, request: *AppendRequest) void {
         request.next = null;
         if (self.pending_tail) |tail| {
@@ -921,6 +929,14 @@ pub const WAL = struct {
             .entry_count = batch.entry_count,
         };
         const first_lsn = self.next_lsn;
+        const entry_count = std.math.cast(u64, batch.entry_count) orelse return .{
+            .result = .{ .failure = error.Overflow },
+            .stats = stats,
+        };
+        _ = std.math.add(u64, first_lsn, entry_count) catch return .{
+            .result = .{ .failure = error.Overflow },
+            .stats = stats,
+        };
         var lsn = first_lsn;
 
         const txn_open_started = self.nowNs();

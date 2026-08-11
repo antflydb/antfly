@@ -23,7 +23,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Crc32 = std.hash.Crc32;
-const wal_mod = @import("../wal.zig");
+const wal_mod = @import("../wal_runtime.zig");
 
 const magic = [8]u8{ 'A', 'F', 'H', 'A', 'S', 'L', 'T', '\n' };
 const version: u16 = 3;

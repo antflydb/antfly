@@ -62,6 +62,19 @@ CODEGEN_BOUNDARIES = (
     ("standalone/inference_host.zig", "metadata/runtime.zig"),
 )
 
+# Control-plane consumers must use the storage-free WAL facade.  The facade
+# itself selects the native implementation when it is compiled into the
+# storage owner, so lexical transitive reachability is intentional; only a
+# direct import of the physical WAL bypasses the compiled ownership boundary.
+CONTROL_WAL_CONSUMERS = (
+    "storage/ha/replication_log.zig",
+    "storage/ha/standby.zig",
+    "storage/ha/fencing.zig",
+    "storage/ha/slot_store.zig",
+    "raft/storage/wal_replica_state.zig",
+)
+NATIVE_WAL_IMPLEMENTATION = "storage/wal.zig"
+
 # These files form the source-level ABI between the separately code-generated
 # API and distributed runtime units. Keep their direct imports data-only. The
 # lexical graph intentionally sees lazy/test imports, so transitive enforcement
@@ -825,6 +838,18 @@ def check_codegen_boundary(graph: ImportGraph) -> bool:
         clean = False
         rendered = " -> ".join(graph.relative_name(item) for item in path)
         print(f"codegen boundary violation: {rendered}", file=sys.stderr)
+
+    native_wal = graph.resolve_source(NATIVE_WAL_IMPLEMENTATION)
+    for source_name in CONTROL_WAL_CONSUMERS:
+        source = graph.resolve_source(source_name)
+        if native_wal not in graph.relative_edges(source):
+            continue
+        clean = False
+        print(
+            f"codegen boundary violation: {source_name} directly imports "
+            f"{NATIVE_WAL_IMPLEMENTATION}; import storage/wal_runtime.zig instead",
+            file=sys.stderr,
+        )
     return clean
 
 

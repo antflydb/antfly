@@ -15,7 +15,7 @@
 //! Versioned internal ABI for the storage kernel's live DB owner. Keep this
 //! module free of storage and distributed-runtime imports.
 
-pub const abi_version: u32 = 28;
+pub const abi_version: u32 = 29;
 
 pub const BorrowedBytes = extern struct {
     ptr: ?[*]const u8 = null,
@@ -47,6 +47,96 @@ pub const OwnedBytes = extern struct {
 pub const VersionedOwnedBytes = extern struct {
     buffer: OwnedBytes = .{},
     version: u64 = 0,
+};
+
+/// The WAL boundary owns the physical ordered store in the storage archive.
+/// Control units retain only this opaque handle and cross once per logical
+/// durable log operation; backend transactions and LSM records never cross.
+pub const WalOpenRequest = extern struct {
+    version: u32 = abi_version,
+    commit_backend: u32 = 3, // adaptive
+    path: BorrowedBytes = .{},
+    artificial_sync_delay_ns: u64 = 0,
+    group_commit_window_ns: u64 = 0,
+    group_commit_max_requests: u64 = 64,
+    no_sync: u8 = 0,
+    read_only: u8 = 0,
+    model_commit_backend_completions: u8 = 0,
+    _reserved0: [5]u8 = @splat(0),
+};
+
+pub const WalOpenResult = extern struct {
+    handle: ?*anyopaque = null,
+    next_lsn: u64 = 1,
+};
+
+pub const WalAppendRequest = extern struct {
+    version: u32 = abi_version,
+    reposition_if_empty: u8 = 0,
+    _reserved0: [3]u8 = @splat(0),
+    expected_next_lsn: u64 = 1,
+    data: BorrowedBytes = .{},
+};
+
+pub const WalAppendResult = extern struct {
+    assigned_lsn: u64 = 0,
+    next_lsn: u64 = 1,
+};
+
+pub const WalPositionRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved0: u32 = 0,
+    lsn: u64 = 0,
+};
+
+pub const WalScanRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved0: u32 = 0,
+    from_lsn: u64 = 0,
+    max_entries: u64 = 0,
+    max_bytes: u64 = 0,
+};
+
+pub const WalScanResult = extern struct {
+    entries: OwnedBytes = .{},
+    next_lsn: u64 = 0,
+    done: u8 = 1,
+    _reserved0: [7]u8 = @splat(0),
+};
+
+pub const WalSyncRequest = extern struct {
+    version: u32 = abi_version,
+    force: u8 = 0,
+    _reserved0: [3]u8 = @splat(0),
+};
+
+pub const WalReadResult = extern struct {
+    buffer: OwnedBytes = .{},
+    found: u8 = 0,
+    _reserved0: [7]u8 = @splat(0),
+};
+
+/// Exact provider-side WAL counters. Keep this field-for-field compatible
+/// with `storage/wal.zig:WalStats`; diagnostics must not become synthetic or
+/// lose their meaning merely because the WAL moved behind this ABI.
+pub const WalStats = extern struct {
+    append_calls: u64 = 0,
+    append_batch_calls: u64 = 0,
+    logical_entries: u64 = 0,
+    physical_commits: u64 = 0,
+    grouped_commits: u64 = 0,
+    grouped_requests: u64 = 0,
+    max_requests_per_commit: u64 = 0,
+    max_entries_per_commit: u64 = 0,
+    total_wait_ns: u64 = 0,
+    total_coalesce_ns: u64 = 0,
+    total_txn_open_ns: u64 = 0,
+    total_put_ns: u64 = 0,
+    total_commit_ns: u64 = 0,
+    inner_segment_syncs: u64 = 0,
+    inner_index_syncs: u64 = 0,
+    post_commit_segment_syncs: u64 = 0,
+    post_commit_index_syncs: u64 = 0,
 };
 
 pub const TxnId = extern struct {
@@ -171,6 +261,42 @@ pub const Status = enum(u32) {
     unsupported_version = 108,
     block_crc_mismatch = 109,
     writer_locked = 110,
+    corrupt_wal = 111,
+    unsupported_kernel_wal_options = 112,
+    wal_lsn_mismatch = 113,
+    read_only_transaction = 114,
+    arithmetic_overflow = 115,
+    access_denied = 116,
+    disk_quota = 117,
+    file_too_big = 118,
+    input_output = 119,
+    is_dir = 120,
+    link_quota_exceeded = 121,
+    name_too_long = 122,
+    no_device = 123,
+    not_dir = 124,
+    read_only_file_system = 125,
+    sym_link_loop = 126,
+    system_resources = 127,
+    write_zero = 128,
+    broken_pipe = 129,
+    storage_closed = 130,
+    backend_closing = 131,
+    wal_record_too_large = 132,
+    wal_retention_limit_exceeded = 133,
+    write_pressure_exceeded = 134,
+    corrupt_lsm_wal = 135,
+    corrupt_lsm_wal_index = 136,
+    truncated_lsm_wal_sparse_hole = 137,
+    truncated_lsm_wal_tail_junk = 138,
+    unsupported_lsm_wal_header = 139,
+    unsupported_lsm_wal_version = 140,
+    durable_atomic_rename_unsupported = 141,
+    durable_atomic_write_unsupported = 142,
+    durable_directory_sync_unsupported = 143,
+    durable_file_sync_unsupported = 144,
+    unsupported_platform = 145,
+    unsupported_evented_io_runtime = 146,
     internal = 255,
 };
 
@@ -1479,6 +1605,57 @@ pub extern fn antfly_storage_owner_maintenance(
     owner: ?*anyopaque,
     request: *const MaintenanceRequest,
     out_result: *MaintenanceResult,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_wal_open(
+    request: *const WalOpenRequest,
+    out_result: *WalOpenResult,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_wal_close(wal: ?*anyopaque) callconv(.c) void;
+
+pub extern fn antfly_storage_wal_append(
+    wal: ?*anyopaque,
+    request: *const WalAppendRequest,
+    out_result: *WalAppendResult,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_wal_sync(
+    wal: ?*anyopaque,
+    request: *const WalSyncRequest,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_wal_truncate_prefix(
+    wal: ?*anyopaque,
+    request: *const WalPositionRequest,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_wal_truncate_suffix(
+    wal: ?*anyopaque,
+    request: *const WalPositionRequest,
+    out_next_lsn: *u64,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_wal_iterate(
+    wal: ?*anyopaque,
+    request: *const WalScanRequest,
+    out_result: *WalScanResult,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_wal_read(
+    wal: ?*anyopaque,
+    request: *const WalPositionRequest,
+    out_result: *WalReadResult,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_wal_stats_snapshot(
+    wal: ?*anyopaque,
+    out_stats: *WalStats,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_wal_last_lsn(
+    wal: ?*anyopaque,
+    out_last_lsn: *u64,
 ) callconv(.c) Status;
 
 pub extern fn antfly_storage_owner_buffer_destroy(

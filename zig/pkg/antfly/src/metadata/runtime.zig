@@ -35,6 +35,14 @@ else
             self.* = .{};
         }
     };
+
+fn storageKernelContextHandle(context: ?StorageKernelContext) ?*anyopaque {
+    if (comptime storage_kernel_experiment) {
+        return if (context) |value| value.handle else null;
+    }
+    return null;
+}
+
 const LegacyAuthBackend = if (storage_kernel_experiment) struct {} else antfly.lsm_backend.BackendHandle;
 const KernelReplicaRootReconciler = if (storage_kernel_experiment) struct {
     alloc: std.mem.Allocator,
@@ -989,7 +997,7 @@ pub fn runFromIterator(
             .extension_package_store_dir = resolved.extension_package_store_dir,
             .node_config = if (loaded_config) |*cfg| cfg else null,
         },
-        .storage_context = if (storage_kernel_context) |context| context.handle else null,
+        .storage_context = storageKernelContextHandle(storage_kernel_context),
     });
     defer server.deinit();
     try server.start();

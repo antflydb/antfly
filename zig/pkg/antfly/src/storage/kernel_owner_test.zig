@@ -15,6 +15,7 @@
 const std = @import("std");
 const abi = @import("kernel_owner_abi");
 const client = @import("kernel_owner_client.zig");
+const wal_client = @import("kernel_wal_client.zig");
 const data_apply_client = @import("data_raft_apply_client.zig");
 const metadata_apply_client = @import("metadata_raft_apply_client.zig");
 
@@ -22,6 +23,92 @@ fn cleanup(path: []const u8) void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+}
+
+const TestWalOptions = struct {
+    const Backend = enum { lmdb, lsm, lsm_memory };
+    const CommitBackend = enum { sync, worker_thread, async_io, adaptive };
+    const Empty = struct {};
+    const Hook = struct { ctx: ?*anyopaque = null };
+
+    backend: ?Backend = null,
+    storage: ?*anyopaque = null,
+    lsm_options: Empty = .{},
+    clock: Hook = .{},
+    commit_scheduler: Hook = .{},
+    artificial_sync_delay_ns: u64 = 0,
+    group_commit_window_ns: u64 = 0,
+    group_commit_max_requests: usize = 64,
+    commit_backend: CommitBackend = .adaptive,
+    no_sync: bool = false,
+    read_only: bool = false,
+    model_commit_backend_completions: bool = false,
+
+    pub fn resolvedBackend(self: @This()) Backend {
+        return self.backend orelse .lsm;
+    }
+};
+
+test "opaque WAL preserves durable operations and exact failure identity" {
+    const root = "/tmp/antfly-storage-kernel-wal-owner";
+    const path = root ++ "/wal";
+    const bootstrap_path = root ++ "/bootstrap";
+    const read_only_path = root ++ "/read-only";
+    cleanup(root);
+    defer cleanup(root);
+
+    const path_z = try std.testing.allocator.dupeZ(u8, path);
+    defer std.testing.allocator.free(path_z);
+    var wal = try wal_client.WAL.open(path_z.ptr, TestWalOptions{});
+    defer wal.close();
+    try std.testing.expectEqual(@as(u64, 1), try wal.append("alpha"));
+    try std.testing.expectEqual(@as(u64, 2), try wal.append("beta"));
+    try std.testing.expectEqual(@as(u64, 2), wal.lastLsn());
+
+    const entries = try wal.iterateFrom(std.testing.allocator, 1);
+    defer {
+        for (entries) |entry| std.testing.allocator.free(@constCast(entry.data));
+        std.testing.allocator.free(entries);
+    }
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    try std.testing.expectEqualStrings("alpha", entries[0].data);
+    try std.testing.expectEqualStrings("beta", entries[1].data);
+
+    const second = (try wal.readAt(std.testing.allocator, 2)).?;
+    defer std.testing.allocator.free(@constCast(second.data));
+    try std.testing.expectEqualStrings("beta", second.data);
+    try wal.truncate(1);
+    try std.testing.expect((try wal.readAt(std.testing.allocator, 1)) == null);
+
+    try std.testing.expectError(error.WalLsnMismatch, wal.appendAt(9, "must-not-append"));
+    try wal.truncateAfter(1);
+    try std.testing.expectEqual(@as(u64, 2), try wal.append("gamma"));
+    const stats = wal.statsSnapshot();
+    try std.testing.expectEqual(@as(u64, 3), stats.append_calls);
+    try std.testing.expectEqual(@as(u64, 3), stats.logical_entries);
+    try std.testing.expectError(error.Overflow, wal.truncateAfter(std.math.maxInt(u64)));
+
+    const bootstrap_z = try std.testing.allocator.dupeZ(u8, bootstrap_path);
+    defer std.testing.allocator.free(bootstrap_z);
+    var bootstrap = try wal_client.WAL.open(bootstrap_z.ptr, TestWalOptions{});
+    defer bootstrap.close();
+    try std.testing.expectEqual(@as(u64, 7), try bootstrap.appendAt(7, "timeline"));
+
+    const read_only_z = try std.testing.allocator.dupeZ(u8, read_only_path);
+    defer std.testing.allocator.free(read_only_z);
+    {
+        var writable = try wal_client.WAL.open(read_only_z.ptr, TestWalOptions{});
+        defer writable.close();
+        _ = try writable.append("durable");
+    }
+    var read_only = try wal_client.WAL.open(read_only_z.ptr, TestWalOptions{ .read_only = true });
+    defer read_only.close();
+    try std.testing.expectError(error.ReadOnly, read_only.append("rejected"));
+
+    try std.testing.expectError(
+        error.UnsupportedKernelWalOptions,
+        wal_client.WAL.open(path_z.ptr, TestWalOptions{ .backend = .lsm_memory }),
+    );
 }
 
 test "coarse aggregation ABI preserves results and semantic error identities" {

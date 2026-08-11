@@ -102,6 +102,8 @@ class ImportGraphTest(unittest.TestCase):
             source for source, _ in analyzer.CODEGEN_BOUNDARIES
         } | {
             target for _, target in analyzer.CODEGEN_BOUNDARIES
+        } | set(analyzer.CONTROL_WAL_CONSUMERS) | {
+            analyzer.NATIVE_WAL_IMPLEMENTATION,
         }:
             path = self.root / name
             if not path.exists():
@@ -181,6 +183,36 @@ class ImportGraphTest(unittest.TestCase):
             self.assertFalse(analyzer.check_codegen_boundary(graph))
         self.assertIn(
             "standalone/inference_host.zig -> standalone/runtime.zig",
+            diagnostics.getvalue(),
+        )
+
+    def test_codegen_boundary_accepts_control_wal_runtime_selector(self):
+        self.write_codegen_boundaries()
+        self.write(
+            "storage/ha/replication_log.zig",
+            'const wal = @import("../wal_runtime.zig");\n',
+        )
+        self.write(
+            "storage/wal_runtime.zig",
+            'const native = @import("wal.zig");\n',
+        )
+        graph = analyzer.ImportGraph(self.root)
+
+        self.assertTrue(analyzer.check_codegen_boundary(graph))
+
+    def test_codegen_boundary_rejects_direct_native_wal_import(self):
+        self.write_codegen_boundaries()
+        self.write(
+            "storage/ha/replication_log.zig",
+            'const wal = @import("../wal.zig");\n',
+        )
+        graph = analyzer.ImportGraph(self.root)
+
+        diagnostics = io.StringIO()
+        with redirect_stderr(diagnostics):
+            self.assertFalse(analyzer.check_codegen_boundary(graph))
+        self.assertIn(
+            "storage/ha/replication_log.zig directly imports storage/wal.zig",
             diagnostics.getvalue(),
         )
 

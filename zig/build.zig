@@ -7404,6 +7404,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_wal_bench = b.addRunArtifact(wal_bench);
+    if (b.args) |args| run_wal_bench.addArgs(args);
     const wal_bench_step = b.step("wal-bench", "Benchmark WAL append throughput with and without group commit");
     wal_bench_step.dependOn(&run_wal_bench.step);
 
@@ -9031,6 +9032,34 @@ pub fn build(b: *std.Build) void {
                 );
                 owner_test_step.dependOn(&run_owner_tests.step);
 
+                const kernel_wal_bench_adapter_mod = b.createModule(.{
+                    .root_source_file = b.path("pkg/antfly/src/storage/kernel_wal_bench_adapter.zig"),
+                    .target = target,
+                    .optimize = .ReleaseFast,
+                    .link_libc = true,
+                });
+                kernel_wal_bench_adapter_mod.addImport("kernel_owner_abi", kernel_owner_abi_mod);
+                kernel_wal_bench_adapter_mod.addImport("kernel_error_identity", kernel_error_identity_mod);
+                kernel_wal_bench_adapter_mod.addImport("antfly_platform", platform_mod);
+                const kernel_wal_bench_mod = b.createModule(.{
+                    .root_source_file = b.path("bench/storage/wal_bench.zig"),
+                    .target = target,
+                    .optimize = .ReleaseFast,
+                });
+                kernel_wal_bench_mod.addImport("wal", kernel_wal_bench_adapter_mod);
+                const kernel_wal_bench = b.addExecutable(.{
+                    .name = "kernel_wal_bench",
+                    .root_module = kernel_wal_bench_mod,
+                });
+                kernel_wal_bench.root_module.linkLibrary(role_artifact);
+                const run_kernel_wal_bench = b.addRunArtifact(kernel_wal_bench);
+                if (b.args) |args| run_kernel_wal_bench.addArgs(args);
+                const kernel_wal_bench_step = b.step(
+                    "storage-kernel-wal-bench",
+                    "Benchmark WAL append throughput through the opaque storage ABI",
+                );
+                kernel_wal_bench_step.dependOn(&run_kernel_wal_bench.step);
+
                 const provisioned_owner_test_mod = b.createModule(.{
                     .root_source_file = b.path("pkg/antfly/src/storage_kernel_provisioned_source_test_root.zig"),
                     .target = target,
@@ -9082,6 +9111,13 @@ pub fn build(b: *std.Build) void {
                         "data runtime local merge fallback uses its durable table contract",
                         "data runtime provisioned cache warmup populates runtime status without pinning db caches",
                         "data server applies routed HA replication records through standby write gate",
+                        "storage.ha replication log appends and iterates records in wal order",
+                        "storage.ha replication log survives reopen and keeps next lsn",
+                        "storage.ha replication log truncates divergent suffix and reuses next lsn",
+                        "storage.ha replication log bootstraps an empty log at a checkpoint lsn",
+                        "storage.ha fencing persists promotion receipt and builds promotion request",
+                        "storage.ha slot store persists slot progress across reopen",
+                        "storage.ha standby receives applies and persists progress across reopen",
                     },
                     .test_runner = .{
                         .path = b.path("pkg/antfly/src/test_runner.zig"),

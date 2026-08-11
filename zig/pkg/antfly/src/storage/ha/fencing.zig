@@ -27,7 +27,7 @@ const Crc32 = std.hash.Crc32;
 const replication_record = @import("replication_record.zig");
 const standby_mod = @import("standby.zig");
 const validation = @import("validation.zig");
-const wal_mod = @import("../wal.zig");
+const wal_mod = @import("../wal_runtime.zig");
 
 const magic = [8]u8{ 'A', 'F', 'H', 'A', 'F', 'N', 'C', '\n' };
 const version: u16 = 1;

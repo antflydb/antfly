@@ -36,6 +36,10 @@ const api_kernel_exports = if (unit_options.unit == .api_kernel or unit_options.
     @import("api/kernel_exports.zig")
 else
     struct {};
+pub const kernel_wal_owner = if (owns_storage_kernel)
+    @import("storage/kernel_wal_owner.zig")
+else
+    struct {};
 const storage_kernel_exports = if (owns_storage_kernel)
     @import("capi/db.zig")
 else
@@ -461,6 +465,16 @@ comptime {
             exportInternal(&storage_kernel_exports.storageOwnerRestoreStateJson, "antfly_storage_owner_restore_state_json");
             exportInternal(&storage_kernel_exports.storageOwnerTextMemoryJson, "antfly_storage_owner_text_memory_json");
             exportInternal(&storage_kernel_exports.storageOwnerMaintenance, "antfly_storage_owner_maintenance");
+            exportInternal(&storage_kernel_exports.storageWalOpen, "antfly_storage_wal_open");
+            exportInternal(&storage_kernel_exports.storageWalClose, "antfly_storage_wal_close");
+            exportInternal(&storage_kernel_exports.storageWalAppend, "antfly_storage_wal_append");
+            exportInternal(&storage_kernel_exports.storageWalSync, "antfly_storage_wal_sync");
+            exportInternal(&storage_kernel_exports.storageWalTruncatePrefix, "antfly_storage_wal_truncate_prefix");
+            exportInternal(&storage_kernel_exports.storageWalTruncateSuffix, "antfly_storage_wal_truncate_suffix");
+            exportInternal(&storage_kernel_exports.storageWalIterate, "antfly_storage_wal_iterate");
+            exportInternal(&storage_kernel_exports.storageWalRead, "antfly_storage_wal_read");
+            exportInternal(&storage_kernel_exports.storageWalStatsSnapshot, "antfly_storage_wal_stats_snapshot");
+            exportInternal(&storage_kernel_exports.storageWalLastLsn, "antfly_storage_wal_last_lsn");
             exportInternal(&storage_kernel_exports.storageOwnerBufferDestroy, "antfly_storage_owner_buffer_destroy");
         },
         .inference => {

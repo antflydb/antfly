@@ -113,6 +113,45 @@ const mappings = [_]Mapping{
     .{ .status = .unsupported_version, .err = error.UnsupportedVersion },
     .{ .status = .block_crc_mismatch, .err = error.BlockCrcMismatch },
     .{ .status = .writer_locked, .err = error.WriterLocked },
+    .{ .status = .corrupt_wal, .err = error.CorruptWal },
+    .{ .status = .unsupported_kernel_wal_options, .err = error.UnsupportedKernelWalOptions },
+    .{ .status = .wal_lsn_mismatch, .err = error.WalLsnMismatch },
+    .{ .status = .read_only_transaction, .err = error.ReadOnlyTransaction },
+    .{ .status = .arithmetic_overflow, .err = error.Overflow },
+    // Expected operating-system and physical-WAL failures are domain-visible
+    // too.  Do not collapse them into `.internal`: callers use these exact
+    // identities for retry, read-only failover, and operator diagnostics.
+    .{ .status = .access_denied, .err = error.AccessDenied },
+    .{ .status = .disk_quota, .err = error.DiskQuota },
+    .{ .status = .file_too_big, .err = error.FileTooBig },
+    .{ .status = .input_output, .err = error.InputOutput },
+    .{ .status = .is_dir, .err = error.IsDir },
+    .{ .status = .link_quota_exceeded, .err = error.LinkQuotaExceeded },
+    .{ .status = .name_too_long, .err = error.NameTooLong },
+    .{ .status = .no_device, .err = error.NoDevice },
+    .{ .status = .not_dir, .err = error.NotDir },
+    .{ .status = .read_only_file_system, .err = error.ReadOnlyFileSystem },
+    .{ .status = .sym_link_loop, .err = error.SymLinkLoop },
+    .{ .status = .system_resources, .err = error.SystemResources },
+    .{ .status = .write_zero, .err = error.WriteZero },
+    .{ .status = .broken_pipe, .err = error.BrokenPipe },
+    .{ .status = .storage_closed, .err = error.StorageClosed },
+    .{ .status = .backend_closing, .err = error.BackendClosing },
+    .{ .status = .wal_record_too_large, .err = error.WalRecordTooLarge },
+    .{ .status = .wal_retention_limit_exceeded, .err = error.WalRetentionLimitExceeded },
+    .{ .status = .write_pressure_exceeded, .err = error.WritePressureExceeded },
+    .{ .status = .corrupt_lsm_wal, .err = error.CorruptLsmWal },
+    .{ .status = .corrupt_lsm_wal_index, .err = error.CorruptLsmWalIndex },
+    .{ .status = .truncated_lsm_wal_sparse_hole, .err = error.TruncatedLsmWalSparseHole },
+    .{ .status = .truncated_lsm_wal_tail_junk, .err = error.TruncatedLsmWalTailJunk },
+    .{ .status = .unsupported_lsm_wal_header, .err = error.UnsupportedLsmWalHeader },
+    .{ .status = .unsupported_lsm_wal_version, .err = error.UnsupportedLsmWalVersion },
+    .{ .status = .durable_atomic_rename_unsupported, .err = error.DurableAtomicRenameUnsupported },
+    .{ .status = .durable_atomic_write_unsupported, .err = error.DurableAtomicWriteUnsupported },
+    .{ .status = .durable_directory_sync_unsupported, .err = error.DurableDirectorySyncUnsupported },
+    .{ .status = .durable_file_sync_unsupported, .err = error.DurableFileSyncUnsupported },
+    .{ .status = .unsupported_platform, .err = error.UnsupportedPlatform },
+    .{ .status = .unsupported_evented_io_runtime, .err = error.UnsupportedEventedIoRuntime },
     .{ .status = .active_node_finalize_rejected, .err = error.ActiveNodeFinalizeRejected },
     .{ .status = .applied_snapshot_index_mismatch, .err = error.AppliedSnapshotIndexMismatch },
     .{ .status = .invalid_committed_entries_encoding, .err = error.InvalidCommittedEntriesEncoding },
@@ -184,7 +223,7 @@ pub fn validateForTest() !void {
         try std.testing.expect(hasRegisteredIdentity(status));
     }
 
-    @setEvalBranchQuota(20_000);
+    @setEvalBranchQuota(100_000);
     inline for (mappings, 0..) |lhs, i| {
         inline for (mappings[i + 1 ..]) |rhs| {
             try std.testing.expect(lhs.status != rhs.status);

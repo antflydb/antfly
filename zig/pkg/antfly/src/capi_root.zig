@@ -31,6 +31,7 @@ pub const graph_query = @import("graph/query.zig");
 pub const hbc = @import("storage/hbc_adapter.zig");
 pub const lite = @import("storage/lite/mod.zig");
 pub const lsm_backend = @import("storage/lsm_backend/mod.zig");
+pub const kernel_wal_owner = @import("storage/kernel_wal_owner.zig");
 pub const metadata_raft_apply = @import("metadata/storage/raft_apply_store.zig");
 pub const metadata_table_manager = @import("metadata/table_manager.zig");
 pub const metadata_table_provisioner = @import("metadata/table_provisioner.zig");

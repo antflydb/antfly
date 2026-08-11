@@ -3174,6 +3174,89 @@ normal-runner cold build must show that the critical path remains within the
 gate. If it regresses materially, revise the serialization/provider shape or
 revert this slice rather than enabling it by architectural preference alone.
 
+### Phase 4o: opaque physical-WAL ownership
+
+The next coarse cut moves the production WAL and its physical LSM store out of
+distributed control and into the compiled storage owner. HA replication,
+fencing, standby apply, slot persistence, and the Raft WAL replica state now
+import `storage/wal_runtime.zig`. That facade selects the native WAL only in an
+owner compilation and otherwise exposes a storage-free client over one opaque
+handle. A source-graph gate rejects any control consumer that imports
+`storage/wal.zig` directly while deliberately allowing the facade's native
+compile-time branch.
+
+The ABI crosses once per durable log operation: open/close, append, sync,
+prefix or suffix truncation, bounded iteration, point read, exact statistics,
+and last-LSN inspection. Iteration returns coarse pages bounded at 512 entries
+and 4 MiB in production. The provider encodes each page directly while walking
+its native streaming cursor, so it does not materialize the full log or invoke
+control once per record. Wire framing has explicit magic, version, length, and
+trailing-data validation. Tests force one-entry pages to exercise continuation
+and ownership even for small fixtures.
+
+Control does not mirror physical WAL state. The provider remains authoritative
+for last LSN and every statistics counter. Concurrent append results return
+the assigned operation's `lsn + 1`, not a later read of the shared global
+cursor; the four-thread ABI benchmark caught this distinction when another
+append advanced the physical WAL before the first response was copied.
+Empty-timeline repositioning is an explicit bootstrap operation and rejects a
+nonempty or unexpectedly positioned log with `WalLsnMismatch`.
+
+ABI version 29 retains the lossless error rule. The shared bidirectional
+registry now includes the WAL's declared semantic failures and its expected
+operating-system/durability failures: corruption and truncation variants,
+unsupported physical formats, record/retention/pressure limits, access and
+read-only failures, disk quota/full, I/O, resource exhaustion, and unsupported
+durability primitives. These are stable explicit status discriminants and
+round-trip to their original Zig errors. Only an error absent from the declared
+registry becomes the explicit `internal` / `StorageKernelFailure` sentinel.
+Operation state is not overloaded onto that error enum: transaction state,
+scan continuation, exact WAL counters, and LSN position retain their own typed
+fields and discriminants. Adding an ABI status without an inverse mapping
+continues to fail the exhaustive identity canary.
+
+The final populated-dependency ARM64 Linux musl `ReleaseFast` object
+comparison shows the intended source removal:
+
+| Metric | Phase 4n | WAL ownership | Change |
+|---|---:|---:|---:|
+| Distributed object | 27,172,752 B | 26,327,856 B | -844,896 B (-3.1%) |
+| Storage object | 31,255,000 B | 31,269,608 B | +14,608 B |
+| Conservative storage/distributed duplicate text | 2,309,244 B | 1,854,020 B | -455,224 B (-19.7%) |
+| Static stripped executable | 60,663,400 B | 60,121,016 B | -542,384 B (-0.9%) |
+| `libantfly.so` | 16,614,968 B | 16,614,968 B | unchanged |
+
+Eleven duplicated native WAL/LSM modules disappear from the emitted-object
+overlap report; duplicated modules fall from 122 to 111. The final production
+objects contain no `storage.lmdb`, `lmdb_backend`, or `mdb_*` emission.
+
+Behavioral validation passed with zero leaks: 91 opaque-owner tests, 20
+experiment-enabled data/HA tests, 5 metadata-runtime tests, 6 provisioned-source
+tests, 275 native HA tests, 196 Antfly Raft tests, 354 standalone Raft-library
+tests, 43 standalone tests, and 11 CAPI tests. The experiment-disabled full
+x86_64 Linux GNU Debug executable also compiles. Analyzer unit tests and all
+three source-graph gates pass.
+
+The existing four-thread WAL workload was run as four back-to-back native and
+opaque pairs (2,048 256-byte appends, adaptive backend, no sync). Native versus
+opaque averages were 815.752 versus 825.546 ms for the plain case (+1.2%) and
+901.688 versus 910.411 ms for grouped commit (+1.0%). That is within local host
+variance and is not a meaningful throughput regression. The exercise also
+fixed the benchmark's pre-existing defer order so it now closes the WAL before
+deleting its temporary directory.
+
+Decision: **keep this slice behind the opt-in experiment**. It removes a real
+physical implementation family, shrinks the executable, leaves the CAPI
+unchanged, preserves exact results and failure identities, and introduces no
+measurable WAL regression. A genuinely empty-cache Apple-Silicon cross-build
+to ARM64 Linux musl `ReleaseFast` then completed with normal scheduling in
+468.48 seconds without `bad_alloc`, OOM, swap, or a compiler-protocol failure.
+The first large-unit wave ran concurrently at observed RSS of approximately
+3.6 and 3.8 GiB; the remaining large unit was approximately 2.9 GiB. Its
+objects and executable exactly match the sizes above. The normal Linux runner
+cold build remains the authoritative per-unit timing gate before enabling the
+experiment by default.
+
 ## Holistic target architecture
 
 The current candidate is the opt-in four-unit source-selected topology above.

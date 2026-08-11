@@ -193,6 +193,7 @@ fn runCase(alloc: std.mem.Allocator, cfg: Config, grouped: bool) !RunResult {
     var path_buf: [256]u8 = undefined;
     const path = benchTmpPath(&path_buf, if (grouped) "grouped" else "plain");
     cleanupBenchDirAt(path);
+    defer cleanupBenchDirAt(path);
 
     var wal_impl = try wal.WAL.open(path, .{
         .no_sync = cfg.no_sync,
@@ -202,7 +203,6 @@ fn runCase(alloc: std.mem.Allocator, cfg: Config, grouped: bool) !RunResult {
         .commit_backend = cfg.commit_backend,
     });
     defer wal_impl.close();
-    defer cleanupBenchDirAt(path);
 
     const payload = try alloc.alloc(u8, cfg.payload_size);
     defer alloc.free(payload);

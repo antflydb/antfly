@@ -22,7 +22,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const replication_record = @import("replication_record.zig");
-const wal_mod = @import("../wal.zig");
+const wal_mod = @import("../wal_runtime.zig");
 
 var test_path_counter: u64 = 0;
 
@@ -81,10 +81,9 @@ pub const ReplicationLog = struct {
         if (record.lsn == 0) return error.InvalidBootstrapLsn;
         if (record.previous_lsn != record.lsn - 1) return error.UnexpectedPreviousLsn;
 
-        const original_next_lsn = self.wal.next_lsn;
-        self.wal.next_lsn = record.lsn;
-        errdefer self.wal.next_lsn = original_next_lsn;
-        return try self.append(alloc, record);
+        const encoded = try replication_record.encodeAlloc(alloc, record);
+        defer alloc.free(encoded);
+        return wal_mod.appendAt(&self.wal, record.lsn, encoded);
     }
 
     pub fn iterateFrom(self: *ReplicationLog, alloc: Allocator, from_lsn: u64) ![]Entry {

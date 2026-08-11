@@ -19,6 +19,18 @@ const capi = @import("types.zig");
 const search_wire = @import("search_wire.zig");
 const kernel_owner_abi = @import("kernel_owner_abi");
 const kernel_error_identity = @import("kernel_error_identity");
+const kernel_wal_owner = antfly.kernel_wal_owner;
+
+pub const storageWalOpen = kernel_wal_owner.open;
+pub const storageWalClose = kernel_wal_owner.close;
+pub const storageWalAppend = kernel_wal_owner.append;
+pub const storageWalSync = kernel_wal_owner.sync;
+pub const storageWalTruncatePrefix = kernel_wal_owner.truncatePrefix;
+pub const storageWalTruncateSuffix = kernel_wal_owner.truncateSuffix;
+pub const storageWalIterate = kernel_wal_owner.iterate;
+pub const storageWalRead = kernel_wal_owner.read;
+pub const storageWalStatsSnapshot = kernel_wal_owner.statsSnapshot;
+pub const storageWalLastLsn = kernel_wal_owner.lastLsn;
 
 const db_mod = antfly.db;
 const backend_types = antfly.storage_backend;
