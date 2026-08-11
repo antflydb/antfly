@@ -37,7 +37,7 @@ class BoundedZigBuildTest(unittest.TestCase):
             ):
                 self.assertEqual(8_000, launcher.detect_max_rss())
 
-    def test_large_host_cannot_admit_every_runtime_unit_together(self):
+    def test_workload_cap_limits_a_large_host(self):
         with mock.patch.dict(os.environ, {}, clear=True):
             with mock.patch.object(
                 launcher,
@@ -45,9 +45,14 @@ class BoundedZigBuildTest(unittest.TestCase):
                 return_value=64 * 1024 * 1024 * 1024,
             ):
                 self.assertEqual(
-                    launcher.DEFAULT_SCHEDULER_CEILING,
-                    launcher.detect_max_rss(),
+                    16 * 1024 * 1024 * 1024,
+                    launcher.detect_max_rss(16 * 1024 * 1024 * 1024),
                 )
+
+    def test_uncapped_build_uses_detected_host_budget(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with mock.patch.object(launcher, "detect_memory_limit", return_value=40_000):
+                self.assertEqual(32_000, launcher.detect_max_rss())
 
     def test_command_adds_missing_scheduler_options(self):
         command = launcher.build_command(

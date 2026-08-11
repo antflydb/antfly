@@ -17,12 +17,6 @@ from patch_zig_0_16_build_runner_maxrss import patch_build_runner
 
 
 DEFAULT_MEMORY_FRACTION = 4 / 5
-# Keep enough aggregate headroom for the build runner, linker, filesystem
-# cache, and unrelated job processes even on large shared hosts. This ceiling
-# is deliberately above the largest measured compilation unit (distributed,
-# about 11 GiB), while preventing the distributed, API, inference, and CLI
-# claims from all being admitted together.
-DEFAULT_SCHEDULER_CEILING = 16 * 1024 * 1024 * 1024
 MAX_RSS_ENV = "ANTFLY_ZIG_MAX_RSS"
 CGROUP_MEMORY_LIMITS = (
     Path("/sys/fs/cgroup/memory.max"),
@@ -38,16 +32,16 @@ def _positive_integer(value: str) -> int | None:
     return parsed if parsed > 0 else None
 
 
-def detect_max_rss() -> int:
+def detect_max_rss(cap: int | None = None) -> int:
     override = os.environ.get(MAX_RSS_ENV)
     if override is not None:
         parsed = _positive_integer(override)
         if parsed is None:
             raise RuntimeError(f"{MAX_RSS_ENV} must be a positive byte count")
-        return parsed
+        return min(parsed, cap) if cap is not None else parsed
 
     detected_budget = int(detect_memory_limit() * DEFAULT_MEMORY_FRACTION)
-    return min(detected_budget, DEFAULT_SCHEDULER_CEILING)
+    return min(detected_budget, cap) if cap is not None else detected_budget
 
 
 def detect_memory_limit() -> int:
@@ -160,12 +154,19 @@ def main() -> int:
         action="store_true",
         help="print the detected scheduler budget in bytes and exit",
     )
+    parser.add_argument(
+        "--max-rss-cap",
+        type=int,
+        help="cap the detected aggregate scheduler budget to this byte count",
+    )
     parser.add_argument("build_arguments", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     if args.print_max_rss:
         if args.build_arguments:
             parser.error("--print-max-rss does not accept build arguments")
-        print(detect_max_rss())
+        if args.max_rss_cap is not None and args.max_rss_cap <= 0:
+            parser.error("--max-rss-cap must be a positive byte count")
+        print(detect_max_rss(args.max_rss_cap))
         return 0
     build_arguments = args.build_arguments
     if build_arguments[:1] == ["--"]:
@@ -175,7 +176,9 @@ def main() -> int:
 
     needs_runner = not has_build_option(build_arguments, "--build-runner")
     needs_budget = not has_build_option(build_arguments, "--maxrss")
-    max_rss = detect_max_rss() if needs_budget else None
+    if args.max_rss_cap is not None and args.max_rss_cap <= 0:
+        parser.error("--max-rss-cap must be a positive byte count")
+    max_rss = detect_max_rss(args.max_rss_cap) if needs_budget else None
 
     if not needs_runner:
         return subprocess.run(

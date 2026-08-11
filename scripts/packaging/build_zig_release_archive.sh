@@ -163,6 +163,8 @@ run_zig_build_steps() {
     "$repo_root/zig/tools/run_bounded_zig_build.py"
     --zig
     zig
+    --max-rss-cap
+    17179869184
     --
     build
   )
