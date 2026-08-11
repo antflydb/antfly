@@ -744,6 +744,25 @@ fn ocrTriggerReasonsAlloc(alloc: Allocator, quality: OcrQuality, forced: bool) !
     return try out.toOwnedSlice(alloc);
 }
 
+const PendingOcrMetadata = struct {
+    trigger_reasons: ?[]u8 = null,
+    embedded_quality: ?[]u8 = null,
+
+    fn initAlloc(alloc: Allocator, quality: OcrQuality, forced: bool) !PendingOcrMetadata {
+        var metadata = PendingOcrMetadata{};
+        errdefer metadata.deinit(alloc);
+        metadata.trigger_reasons = try ocrTriggerReasonsAlloc(alloc, quality, forced);
+        metadata.embedded_quality = try ocrQualityJsonAlloc(alloc, quality);
+        return metadata;
+    }
+
+    fn deinit(self: *PendingOcrMetadata, alloc: Allocator) void {
+        if (self.trigger_reasons) |value| alloc.free(value);
+        if (self.embedded_quality) |value| alloc.free(value);
+        self.* = .{};
+    }
+};
+
 const RoutePreset = enum {
     mixed_files,
     explicit_only,
@@ -1548,6 +1567,8 @@ fn extractPdfAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8
         errdefer if (extraction_status) |value| alloc.free(value);
         var page_label: ?[]u8 = try std.fmt.allocPrint(alloc, "{d}", .{page_num});
         errdefer if (page_label) |value| alloc.free(value);
+        var ocr_metadata = if (scanned_page) try PendingOcrMetadata.initAlloc(alloc, quality, force_ocr) else PendingOcrMetadata{};
+        defer ocr_metadata.deinit(alloc);
         units[initialized] = .{
             .unit_id = unit_id.?,
             .unit_type = unit_type.?,
@@ -1555,8 +1576,8 @@ fn extractPdfAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8
             .method = method.?,
             .extraction_status = extraction_status,
             .ocr_used = false,
-            .ocr_trigger_reasons = if (scanned_page) try ocrTriggerReasonsAlloc(alloc, quality, force_ocr) else null,
-            .ocr_embedded_quality = if (scanned_page) try ocrQualityJsonAlloc(alloc, quality) else null,
+            .ocr_trigger_reasons = ocr_metadata.trigger_reasons,
+            .ocr_embedded_quality = ocr_metadata.embedded_quality,
             .extraction_warning = extraction_warning,
             .page_number = @intCast(page_num),
             .page_label = page_label.?,
@@ -1571,6 +1592,7 @@ fn extractPdfAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8
         method = null;
         extraction_status = null;
         page_label = null;
+        ocr_metadata = .{};
         cursor += text.len;
         initialized += 1;
     }
@@ -1624,6 +1646,8 @@ fn extractPdfStreaming(alloc: Allocator, bytes: []const u8, content_type: []cons
         errdefer if (extraction_status) |value| alloc.free(value);
         var page_label: ?[]u8 = try std.fmt.allocPrint(alloc, "{d}", .{page_num});
         errdefer if (page_label) |value| alloc.free(value);
+        var ocr_metadata = if (scanned_page) try PendingOcrMetadata.initAlloc(alloc, quality, force_ocr) else PendingOcrMetadata{};
+        defer ocr_metadata.deinit(alloc);
         var unit = Unit{
             .unit_id = unit_id.?,
             .unit_type = unit_type.?,
@@ -1631,8 +1655,8 @@ fn extractPdfStreaming(alloc: Allocator, bytes: []const u8, content_type: []cons
             .method = method.?,
             .extraction_status = extraction_status,
             .ocr_used = false,
-            .ocr_trigger_reasons = if (scanned_page) try ocrTriggerReasonsAlloc(alloc, quality, force_ocr) else null,
-            .ocr_embedded_quality = if (scanned_page) try ocrQualityJsonAlloc(alloc, quality) else null,
+            .ocr_trigger_reasons = ocr_metadata.trigger_reasons,
+            .ocr_embedded_quality = ocr_metadata.embedded_quality,
             .extraction_warning = extraction_warning,
             .page_number = @intCast(page_num),
             .page_label = page_label.?,
@@ -1647,6 +1671,7 @@ fn extractPdfStreaming(alloc: Allocator, bytes: []const u8, content_type: []cons
         method = null;
         extraction_status = null;
         page_label = null;
+        ocr_metadata = .{};
         text = &.{};
         text_regions = &.{};
         extraction_warning = null;
@@ -3683,6 +3708,24 @@ test "OCR quality fallback covers born digital scanned garbled and encoding fail
         .font_corrupted = true,
         .replacement_corrupted = true,
     }).failureCount());
+}
+
+test "OCR pending metadata construction is allocation-failure safe" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            var metadata = try PendingOcrMetadata.initAlloc(alloc, .{
+                .too_short = true,
+                .garbled = true,
+                .font_corrupted = true,
+                .replacement_corrupted = true,
+            }, true);
+            defer metadata.deinit(alloc);
+            try std.testing.expect(std.mem.indexOf(u8, metadata.trigger_reasons.?, "always") != null);
+            try std.testing.expect(std.mem.indexOf(u8, metadata.embedded_quality.?, "too_short") != null);
+        }
+    };
+
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "OCR text selection retains embedded text on ties and chooses a better transcription" {

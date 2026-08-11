@@ -18,6 +18,13 @@ const image = @import("antfly_image");
 
 const Allocator = std.mem.Allocator;
 
+pub const PageRotation = enum(u16) {
+    none = 0,
+    clockwise_90 = 90,
+    clockwise_180 = 180,
+    clockwise_270 = 270,
+};
+
 pub fn renderTextPreviewPng(alloc: Allocator, text: []const u8) ![]u8 {
     var max_cols: usize = 0;
     var lines: usize = 1;
@@ -75,8 +82,22 @@ pub fn renderPageContentPngInBox(
     pattern_runs: []const reader.PatternRun,
     shape_runs: []const reader.ShapeRun,
 ) ![]u8 {
-    const raw = try renderPageContentRgbaInBoxAlloc(alloc, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs);
+    return try renderPageContentPngInBoxRotated(alloc, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, .none);
+}
+
+pub fn renderPageContentPngInBoxRotated(
+    alloc: Allocator,
+    page_box: reader.PageBox,
+    text_runs: []const reader.TextRun,
+    image_runs: []const reader.ImageRun,
+    shading_runs: []const reader.ShadingRun,
+    pattern_runs: []const reader.PatternRun,
+    shape_runs: []const reader.ShapeRun,
+    rotation: PageRotation,
+) ![]u8 {
+    var raw = try renderPageContentRgbaInBoxAlloc(alloc, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs);
     defer alloc.free(raw.rgba);
+    try rotateRawPageCanvasAlloc(alloc, &raw, rotation);
     return try image.png.encodeRgba(alloc, @intCast(raw.width), @intCast(raw.height), raw.rgba);
 }
 
@@ -85,6 +106,46 @@ const RawPageCanvas = struct {
     width: usize,
     height: usize,
 };
+
+fn rotateRawPageCanvasAlloc(alloc: Allocator, raw: *RawPageCanvas, rotation: PageRotation) !void {
+    switch (rotation) {
+        .none => return,
+        .clockwise_180 => {
+            const pixel_count = raw.width * raw.height;
+            var left: usize = 0;
+            var right = pixel_count - 1;
+            while (left < right) : ({
+                left += 1;
+                right -= 1;
+            }) {
+                const left_offset = left * 4;
+                const right_offset = right * 4;
+                for (0..4) |channel| {
+                    std.mem.swap(u8, &raw.rgba[left_offset + channel], &raw.rgba[right_offset + channel]);
+                }
+            }
+        },
+        .clockwise_90, .clockwise_270 => {
+            const rotated = try alloc.alloc(u8, raw.rgba.len);
+            errdefer alloc.free(rotated);
+            // Traverse the destination in row-major order so the full-page
+            // write remains cache-friendly. Source reads are necessarily
+            // column-strided for a quarter turn.
+            for (0..raw.width) |dst_y| {
+                for (0..raw.height) |dst_x| {
+                    const src_x = if (rotation == .clockwise_90) dst_y else raw.width - 1 - dst_y;
+                    const src_y = if (rotation == .clockwise_90) raw.height - 1 - dst_x else dst_x;
+                    const src_offset = (src_y * raw.width + src_x) * 4;
+                    const dst_offset = (dst_y * raw.height + dst_x) * 4;
+                    @memcpy(rotated[dst_offset .. dst_offset + 4], raw.rgba[src_offset .. src_offset + 4]);
+                }
+            }
+            alloc.free(raw.rgba);
+            raw.rgba = rotated;
+            std.mem.swap(usize, &raw.width, &raw.height);
+        },
+    }
+}
 
 fn finite(value: f64) bool {
     return value == value and value != std.math.inf(f64) and value != -std.math.inf(f64);
@@ -1824,6 +1885,40 @@ test "render page content in box uses page dimensions" {
     try std.testing.expectEqualSlices(u8, &.{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' }, png[0..8]);
     try std.testing.expectEqual(@as(u32, 200), std.mem.readInt(u32, png[16..20], .big));
     try std.testing.expectEqual(@as(u32, 100), std.mem.readInt(u32, png[20..24], .big));
+}
+
+test "raw page rotation normalizes dimensions and pixel orientation" {
+    const alloc = std.testing.allocator;
+    const Case = struct {
+        rotation: PageRotation,
+        width: usize,
+        height: usize,
+        expected: []const u8,
+    };
+    const cases = [_]Case{
+        .{ .rotation = .clockwise_90, .width = 3, .height = 2, .expected = &.{ 4, 2, 0, 5, 3, 1 } },
+        .{ .rotation = .clockwise_180, .width = 2, .height = 3, .expected = &.{ 5, 4, 3, 2, 1, 0 } },
+        .{ .rotation = .clockwise_270, .width = 3, .height = 2, .expected = &.{ 1, 3, 5, 0, 2, 4 } },
+    };
+
+    for (cases) |case| {
+        var raw = RawPageCanvas{
+            .rgba = try alloc.alloc(u8, 2 * 3 * 4),
+            .width = 2,
+            .height = 3,
+        };
+        defer alloc.free(raw.rgba);
+        for (0..6) |pixel| {
+            @memset(raw.rgba[pixel * 4 .. pixel * 4 + 4], @intCast(pixel));
+        }
+
+        try rotateRawPageCanvasAlloc(alloc, &raw, case.rotation);
+        try std.testing.expectEqual(case.width, raw.width);
+        try std.testing.expectEqual(case.height, raw.height);
+        for (case.expected, 0..) |expected, pixel| {
+            try std.testing.expectEqual(expected, raw.rgba[pixel * 4]);
+        }
+    }
 }
 
 test "estimate run width includes spacing and horizontal scale" {

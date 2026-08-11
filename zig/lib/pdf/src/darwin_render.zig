@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const image = @import("antfly_image");
+const render = @import("render.zig");
 
 const CFData = opaque {};
 const CGDataProvider = opaque {};
@@ -46,6 +47,7 @@ pub fn renderPagePngAlloc(
     page_number: usize,
     dpi: u16,
     max_pixels: u64,
+    rotation: render.PageRotation,
 ) ![]u8 {
     if (page_number == 0) return error.InvalidPageNumber;
     const data = CFDataCreate(null, pdf_bytes.ptr, std.math.cast(isize, pdf_bytes.len) orelse return error.PdfTooLarge) orelse return error.SystemPdfRenderingFailed;
@@ -59,8 +61,11 @@ pub fn renderPagePngAlloc(
     const box = CGPDFPageGetBoxRect(page, crop_box);
     if (!(box.size.width > 0) or !(box.size.height > 0)) return error.InvalidPageBox;
     const scale = @as(f64, @floatFromInt(dpi)) / 72.0;
-    const width_f = @ceil(box.size.width * scale);
-    const height_f = @ceil(box.size.height * scale);
+    const swaps_dimensions = rotation == .clockwise_90 or rotation == .clockwise_270;
+    const display_width = if (swaps_dimensions) box.size.height else box.size.width;
+    const display_height = if (swaps_dimensions) box.size.width else box.size.height;
+    const width_f = @ceil(display_width * scale);
+    const height_f = @ceil(display_height * scale);
     if (width_f > @as(f64, @floatFromInt(std.math.maxInt(u32))) or height_f > @as(f64, @floatFromInt(std.math.maxInt(u32)))) return error.RenderedPageTooLarge;
     const width: u32 = @intFromFloat(width_f);
     const height: u32 = @intFromFloat(height_f);
